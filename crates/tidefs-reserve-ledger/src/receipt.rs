@@ -19,8 +19,9 @@ use super::{BudgetDomainId, ReserveClass, ReserveLedger, ReservePressureState};
 
 /// Validation tier for a receipt.
 ///
-/// Authoritative receipts are checked against hard conservation rules.
-/// Informational receipts are logged but not enforcement-gated.
+/// Authoritative receipts are suitable for hard conservation gates.
+/// Informational receipts still participate in audits so malformed
+/// evidence is reported instead of silently blessed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ValidationTier {
     /// Receipt is logged for informational purposes only.
@@ -231,8 +232,7 @@ impl ReceiptLog {
         self.receipts
             .iter()
             .filter(|r| matches!(r.operation, ReceiptOperation::Allocate))
-            .map(|r| r.bytes)
-            .sum()
+            .fold(0, |total, r| total.saturating_add(r.bytes))
     }
 
     /// Sum of released bytes (all Release receipts).
@@ -240,8 +240,7 @@ impl ReceiptLog {
         self.receipts
             .iter()
             .filter(|r| matches!(r.operation, ReceiptOperation::Release))
-            .map(|r| r.bytes)
-            .sum()
+            .fold(0, |total, r| total.saturating_add(r.bytes))
     }
 
     /// Net admitted bytes (admitted minus released).
@@ -251,11 +250,7 @@ impl ReceiptLog {
     }
 
     /// Total admitted bytes for a specific (domain, class) pair.
-    pub fn admitted_for(
-        &self,
-        budget_domain: &BudgetDomainId,
-        reserve_class: ReserveClass,
-    ) -> u64 {
+    pub fn admitted_for(&self, budget_domain: &BudgetDomainId, reserve_class: ReserveClass) -> u64 {
         self.receipts
             .iter()
             .filter(|r| {
@@ -263,16 +258,11 @@ impl ReceiptLog {
                     && &r.budget_domain == budget_domain
                     && r.reserve_class == reserve_class
             })
-            .map(|r| r.bytes)
-            .sum()
+            .fold(0, |total, r| total.saturating_add(r.bytes))
     }
 
     /// Total released bytes for a specific (domain, class) pair.
-    pub fn released_for(
-        &self,
-        budget_domain: &BudgetDomainId,
-        reserve_class: ReserveClass,
-    ) -> u64 {
+    pub fn released_for(&self, budget_domain: &BudgetDomainId, reserve_class: ReserveClass) -> u64 {
         self.receipts
             .iter()
             .filter(|r| {
@@ -280,8 +270,7 @@ impl ReceiptLog {
                     && &r.budget_domain == budget_domain
                     && r.reserve_class == reserve_class
             })
-            .map(|r| r.bytes)
-            .sum()
+            .fold(0, |total, r| total.saturating_add(r.bytes))
     }
 
     /// Net admitted bytes for a specific (domain, class) pair.
@@ -401,7 +390,7 @@ impl std::fmt::Display for ConservationViolation {
 ///
 /// Checks:
 /// - Underflow releases (released > admitted per domain+class)
-/// - Over-admission (net admitted > reserve ceiling)
+/// - Over-admission (peak outstanding admitted bytes > reserve ceiling)
 /// - Floor breach without violated/emergency state
 /// - Product-write admission while violated
 ///
@@ -434,20 +423,16 @@ pub fn conservation_audit(
         let admitted: u64 = domain_receipts
             .iter()
             .filter(|r| {
-                matches!(r.operation, ReceiptOperation::Allocate)
-                    && r.reserve_class == *class
+                matches!(r.operation, ReceiptOperation::Allocate) && r.reserve_class == *class
             })
-            .map(|r| r.bytes)
-            .sum();
+            .fold(0, |total, r| total.saturating_add(r.bytes));
 
         let released: u64 = domain_receipts
             .iter()
             .filter(|r| {
-                matches!(r.operation, ReceiptOperation::Release)
-                    && r.reserve_class == *class
+                matches!(r.operation, ReceiptOperation::Release) && r.reserve_class == *class
             })
-            .map(|r| r.bytes)
-            .sum();
+            .fold(0, |total, r| total.saturating_add(r.bytes));
 
         // Underflow: released > admitted
         if released > admitted {
@@ -459,25 +444,26 @@ pub fn conservation_audit(
             });
         }
 
-        // Over-admission: admitted > ceiling
-        let ceiling = ledger.reserve_ceiling_bytes;
-        if admitted > ceiling {
-            violations.push(ConservationViolation::OverAdmission {
-                admitted,
-                ceiling,
-                budget_domain: domain.to_string(),
-                reserve_class: class.as_str().to_string(),
-            });
-        }
-
-        // Release without allocation: scan in order, checking running balance
+        // Scan in order to catch release underflow and peak over-admission.
         let mut running_balance: u64 = 0;
-        for r in domain_receipts.iter().filter(|r| {
-            r.reserve_class == *class
-        }) {
+        let mut over_admission_reported = false;
+        for r in domain_receipts.iter().filter(|r| r.reserve_class == *class) {
             match r.operation {
                 ReceiptOperation::Allocate => {
-                    running_balance = running_balance.saturating_add(r.bytes);
+                    let next_balance = running_balance.checked_add(r.bytes);
+                    running_balance = next_balance.unwrap_or(u64::MAX);
+                    if !over_admission_reported
+                        && (next_balance.is_none()
+                            || running_balance > ledger.reserve_ceiling_bytes)
+                    {
+                        violations.push(ConservationViolation::OverAdmission {
+                            admitted: running_balance,
+                            ceiling: ledger.reserve_ceiling_bytes,
+                            budget_domain: domain.to_string(),
+                            reserve_class: class.as_str().to_string(),
+                        });
+                        over_admission_reported = true;
+                    }
                 }
                 ReceiptOperation::Release => {
                     if r.bytes > running_balance {
@@ -556,23 +542,11 @@ mod tests {
     }
 
     fn test_ledger() -> ReserveLedger {
-        ReserveLedger::new(
-            1,
-            test_domain(),
-            ReserveClass::Rebuild,
-            100_000,
-            200_000,
-        )
+        ReserveLedger::new(1, test_domain(), ReserveClass::Rebuild, 100_000, 200_000)
     }
 
     fn test_ledger_snapshot() -> ReserveLedger {
-        ReserveLedger::new(
-            2,
-            test_domain(),
-            ReserveClass::Snapshot,
-            50_000,
-            100_000,
-        )
+        ReserveLedger::new(2, test_domain(), ReserveClass::Snapshot, 50_000, 100_000)
     }
 
     // --- ReceiptLog basics ---
@@ -628,6 +602,43 @@ mod tests {
     }
 
     #[test]
+    fn receipt_log_totals_saturate_on_overflow() {
+        let mut log = ReceiptLog::new();
+        log.record_allocate(
+            ReserveClass::Rebuild,
+            test_domain(),
+            u64::MAX,
+            ReservePressureState::Healthy,
+            ValidationTier::Authoritative,
+        );
+        log.record_allocate(
+            ReserveClass::Rebuild,
+            test_domain(),
+            1,
+            ReservePressureState::Healthy,
+            ValidationTier::Authoritative,
+        );
+        log.record_release(
+            ReserveClass::Rebuild,
+            test_domain(),
+            u64::MAX,
+            ReservePressureState::Healthy,
+            ValidationTier::Authoritative,
+        );
+        log.record_release(
+            ReserveClass::Rebuild,
+            test_domain(),
+            1,
+            ReservePressureState::Healthy,
+            ValidationTier::Authoritative,
+        );
+
+        assert_eq!(log.total_admitted_bytes(), u64::MAX);
+        assert_eq!(log.total_released_bytes(), u64::MAX);
+        assert_eq!(log.net_admitted_bytes(), 0);
+    }
+
+    #[test]
     fn receipt_log_ids_are_monotonic() {
         let mut log = ReceiptLog::new();
         let id1 = log.record_allocate(
@@ -677,18 +688,9 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        assert_eq!(
-            log.admitted_for(&domain_a, ReserveClass::Rebuild),
-            10_000
-        );
-        assert_eq!(
-            log.admitted_for(&domain_b, ReserveClass::Rebuild),
-            20_000
-        );
-        assert_eq!(
-            log.admitted_for(&domain_a, ReserveClass::Failover),
-            5_000
-        );
+        assert_eq!(log.admitted_for(&domain_a, ReserveClass::Rebuild), 10_000);
+        assert_eq!(log.admitted_for(&domain_b, ReserveClass::Rebuild), 20_000);
+        assert_eq!(log.admitted_for(&domain_a, ReserveClass::Failover), 5_000);
     }
 
     #[test]
@@ -711,10 +713,7 @@ mod tests {
             ValidationTier::Authoritative,
         );
 
-        assert_eq!(
-            log.released_for(&domain, ReserveClass::Rebuild),
-            40_000
-        );
+        assert_eq!(log.released_for(&domain, ReserveClass::Rebuild), 40_000);
     }
 
     #[test]
@@ -822,6 +821,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conservation_audit_allows_capacity_reuse_after_release() {
+        let mut log = ReceiptLog::new();
+        let domain = test_domain();
+        let ledger = test_ledger(); // ceiling = 200_000
+
+        log.record_allocate(
+            ReserveClass::Rebuild,
+            domain.clone(),
+            150_000,
+            ReservePressureState::Healthy,
+            ValidationTier::Authoritative,
+        );
+        log.record_release(
+            ReserveClass::Rebuild,
+            domain.clone(),
+            150_000,
+            ReservePressureState::Healthy,
+            ValidationTier::Authoritative,
+        );
+        log.record_allocate(
+            ReserveClass::Rebuild,
+            domain.clone(),
+            150_000,
+            ReservePressureState::Healthy,
+            ValidationTier::Authoritative,
+        );
+
+        let result = conservation_audit(log.receipts(), &ledger, 500_000);
+        assert!(result.is_ok(), "expected clean audit, got {:?}", result);
+    }
+
     // --- Conservation audit: floor breach without violation ---
 
     #[test]
@@ -843,10 +874,9 @@ mod tests {
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert!(
-            violations.iter().any(|v| matches!(
-                v,
-                ConservationViolation::FloorBreachWithoutViolation { .. }
-            )),
+            violations
+                .iter()
+                .any(|v| matches!(v, ConservationViolation::FloorBreachWithoutViolation { .. })),
             "expected FloorBreachWithoutViolation, got {:?}",
             violations
         );
@@ -908,10 +938,9 @@ mod tests {
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert!(
-            violations.iter().any(|v| matches!(
-                v,
-                ConservationViolation::ProductWriteWhileViolated { .. }
-            )),
+            violations
+                .iter()
+                .any(|v| matches!(v, ConservationViolation::ProductWriteWhileViolated { .. })),
             "expected ProductWriteWhileViolated, got {:?}",
             violations
         );
@@ -955,10 +984,9 @@ mod tests {
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert!(
-            violations.iter().any(|v| matches!(
-                v,
-                ConservationViolation::ReleaseWithoutAllocation { .. }
-            )),
+            violations
+                .iter()
+                .any(|v| matches!(v, ConservationViolation::ReleaseWithoutAllocation { .. })),
             "expected ReleaseWithoutAllocation, got {:?}",
             violations
         );
@@ -1027,10 +1055,9 @@ mod tests {
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert!(
-            violations.iter().any(|v| matches!(
-                v,
-                ConservationViolation::FloorBreachWithoutViolation { .. }
-            )),
+            violations
+                .iter()
+                .any(|v| matches!(v, ConservationViolation::FloorBreachWithoutViolation { .. })),
             "expected FloorBreachWithoutViolation, got {:?}",
             violations
         );
@@ -1053,12 +1080,10 @@ mod tests {
         // free = 80_000 < floor = 100_000, state = Encroached (not Violated/Emergency)
         let result = conservation_audit(log.receipts(), &ledger, 80_000);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .iter()
-                .any(|v| matches!(v, ConservationViolation::FloorBreachWithoutViolation { .. }))
-        );
+        assert!(result
+            .unwrap_err()
+            .iter()
+            .any(|v| matches!(v, ConservationViolation::FloorBreachWithoutViolation { .. })));
     }
 
     // --- Validation tier ---
@@ -1086,12 +1111,10 @@ mod tests {
 
         let result = conservation_audit(log.receipts(), &ledger, 500_000);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .iter()
-                .any(|v| matches!(v, ConservationViolation::UnderflowRelease { .. }))
-        );
+        assert!(result
+            .unwrap_err()
+            .iter()
+            .any(|v| matches!(v, ConservationViolation::UnderflowRelease { .. })));
     }
 
     // --- Multiple domains ---
@@ -1101,8 +1124,7 @@ mod tests {
         let mut log = ReceiptLog::new();
         let dom_a = BudgetDomainId::from_str("dom_a");
         let dom_b = BudgetDomainId::from_str("dom_b");
-        let ledger_a =
-            ReserveLedger::new(1, dom_a.clone(), ReserveClass::Rebuild, 50_000, 100_000);
+        let ledger_a = ReserveLedger::new(1, dom_a.clone(), ReserveClass::Rebuild, 50_000, 100_000);
         let ledger_b =
             ReserveLedger::new(2, dom_b.clone(), ReserveClass::Failover, 50_000, 100_000);
 
@@ -1141,25 +1163,18 @@ mod tests {
 
         let r_b = conservation_audit(log.receipts(), &ledger_b, 500_000);
         assert!(r_b.is_err());
-        assert!(
-            r_b.unwrap_err()
-                .iter()
-                .any(|v| matches!(v, ConservationViolation::UnderflowRelease { .. }))
-        );
+        assert!(r_b
+            .unwrap_err()
+            .iter()
+            .any(|v| matches!(v, ConservationViolation::UnderflowRelease { .. })));
     }
 
     // --- Display impls ---
 
     #[test]
     fn validation_tier_display() {
-        assert_eq!(
-            ValidationTier::Authoritative.to_string(),
-            "authoritative"
-        );
-        assert_eq!(
-            ValidationTier::Informational.to_string(),
-            "informational"
-        );
+        assert_eq!(ValidationTier::Authoritative.to_string(), "authoritative");
+        assert_eq!(ValidationTier::Informational.to_string(), "informational");
     }
 
     #[test]

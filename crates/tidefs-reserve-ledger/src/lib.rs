@@ -27,8 +27,8 @@ pub use tidefs_types_claim_ledger_core::{BudgetDomainId, ClaimId};
 
 mod persistence;
 mod receipt;
-pub use receipt::*;
 pub use persistence::ReserveLedgerRecord;
+pub use receipt::*;
 
 // ---------------------------------------------------------------------------
 // ReserveClass — what the reserve guarantees space for
