@@ -433,23 +433,6 @@ pub fn handle_dataset(cmd: DatasetCommand) {
         DatasetCommand::ListProps(args) => handle_list_props(args),
     }
 }
-fn open_filesystem(
-    pool: &str,
-    devices: Option<&[PathBuf]>,
-    operation: &str,
-    recovery_policy: RecoveryPolicy,
-    json: bool,
-) -> LocalFileSystem {
-    open_filesystem_with_live_args(
-        pool,
-        devices,
-        operation,
-        recovery_policy,
-        json,
-        serde_json::Value::Null,
-    )
-}
-
 fn open_filesystem_with_live_args(
     pool: &str,
     devices: Option<&[PathBuf]>,
