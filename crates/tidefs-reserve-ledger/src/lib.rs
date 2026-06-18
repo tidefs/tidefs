@@ -7,17 +7,27 @@
 //! reserve ledgers, witness sets, and receipts are the scarce authority
 //! objects."
 //!
+//! The reserve ledger is **authority evidence** for admission decisions:
+//! it records what was allocated, released, and under what pressure state,
+//! enabling conservation audits that verify reserve invariants. It is not
+//! a full capacity-accounting proof; it does not replace the allocator,
+//! local-filesystem block accounting, or rebuild capacity tracking.
+//!
 //! This crate provides:
 //! - `ReserveLedger` — guaranteed space for critical operations
 //! - `ReservePressureState` — state machine: Healthy → Encroached → Violated → Emergency
 //! - `BudgetDomain` — named resource pool binding claim ledger + reserve ledger
-
+//! - `ReserveReceipt` / `ReceiptLog` — authority evidence for conservation audits
+//! - `conservation_audit` — verifies no receipt sequence violates reserve invariants
+//!
 use std::fmt;
 use tidefs_claim_ledger::{ClaimClass, ClaimLedger, ClaimLedgerError, ClaimLedgerReport};
 use tidefs_types_claim_ledger_core::StorageAuthorityToken;
 pub use tidefs_types_claim_ledger_core::{BudgetDomainId, ClaimId};
 
 mod persistence;
+mod receipt;
+pub use receipt::*;
 pub use persistence::ReserveLedgerRecord;
 
 // ---------------------------------------------------------------------------
