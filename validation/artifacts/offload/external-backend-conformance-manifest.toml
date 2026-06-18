@@ -1,0 +1,37 @@
+artifact_version = 1
+claim = "offload.ready.non_authoritative.v1"
+evidence_class = "external-backend-conformance-manifest"
+source_crate = "crates/tidefs-offload-core"
+issue = 540
+
+[manifest]
+backend_name = "cpu-reference"
+backend_class = "cpu_reference"
+validation_tier = "cpu_equivalent"
+authority_scope = "non_authoritative_only"
+descriptor_abi_version = 1
+completion_abi_version = 1
+vector_digest_algorithm = "sha256"
+vector_digest = "56e671f638bdc4c80c45af3bde9816192f079f3f1dbed6721ac91220616728ee"
+cpu_reference_digest_algorithm = "sha256"
+cpu_reference_digest = "56e671f638bdc4c80c45af3bde9816192f079f3f1dbed6721ac91220616728ee"
+
+status_mapping = [
+  { reference = "success", backend = "success" },
+  { reference = "rejected", backend = "rejected" },
+  { reference = "invalid_descriptor", backend = "invalid_descriptor" },
+  { reference = "invalid_lease", backend = "invalid_lease" },
+  { reference = "buffer_mismatch", backend = "buffer_mismatch" },
+  { reference = "kernel_failed", backend = "kernel_failed" },
+  { reference = "unsupported", backend = "unsupported" },
+]
+
+validated_behaviors = [
+  "The manifest records backend identity, backend class, descriptor/completion ABI version, backend result vector digest, CPU reference digest, exact status mapping, validation tier, and non-authoritative scope.",
+  "tidefs-offload-core validation rejects missing CPU reference comparison, authoritative storage-semantics claims, unsupported backend classes, unsupported descriptor/completion ABI versions, digest mismatch, and status-value collapse.",
+]
+
+non_claims = [
+  "This manifest fixture does not validate GPU, FPGA, DMA, kernel, RDMA, SIMD, or other production acceleration by itself.",
+  "Offload remains non-authoritative and is not storage semantics authority.",
+]
