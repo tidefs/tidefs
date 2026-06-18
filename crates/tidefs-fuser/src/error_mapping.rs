@@ -120,6 +120,7 @@ mod tests {
             (ReadError::InvalidRange, libc::EINVAL),
             (ReadError::IoError("x".into()), libc::EIO),
             (ReadError::MissingObject, libc::EIO),
+            (ReadError::CorruptExtent("x".into()), libc::EIO),
             (ReadError::HoleBeyondEof, libc::EINVAL),
             (ReadError::Internal("x".into()), libc::EIO),
             (ReadError::PermissionDenied, libc::EACCES),
@@ -450,11 +451,12 @@ mod tests {
         // Collect all errno codes produced by all typed error enums.
         let mut codes = Vec::new();
 
-        // ReadError (6 variants)
+        // ReadError (7 variants)
         for v in &[
             ReadError::InvalidRange,
             ReadError::IoError("test".into()),
             ReadError::MissingObject,
+            ReadError::CorruptExtent("test".into()),
             ReadError::HoleBeyondEof,
             ReadError::Internal("test".into()),
             ReadError::PermissionDenied,
@@ -508,8 +510,8 @@ mod tests {
         codes.push(LinkError::NlinkOverflow.to_errno());
         codes.push(LinkError::PermissionDenied.to_errno());
 
-        // Total: 6+6+2+4+2+4+4+6 = 34
-        assert_eq!(codes.len(), 34);
+        // Total: 7+6+2+4+2+4+4+6 = 35
+        assert_eq!(codes.len(), 35);
 
         for &code in codes.iter() {
             assert!(
@@ -536,6 +538,7 @@ mod tests {
             ReadError::InvalidRange,
             ReadError::IoError("test".into()),
             ReadError::MissingObject,
+            ReadError::CorruptExtent("test".into()),
             ReadError::HoleBeyondEof,
             ReadError::Internal("test".into()),
             ReadError::PermissionDenied,
