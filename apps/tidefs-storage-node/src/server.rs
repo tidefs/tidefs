@@ -4765,6 +4765,49 @@ fn handle_frame_ctx(
                 Err(e) => Some(Frame::Error { message: e }),
             }
         }
+        Frame::PutWithReceipt {
+            key,
+            placement_receipt_ref,
+            value,
+        } => {
+            let mut s = store.lock().unwrap();
+            let result: Result<Option<PlacementReceiptRef>, String> = match &mut *s {
+                StoreBackend::Local(rs) => rs
+                    .put_named(key.clone(), value)
+                    .map(|_| None)
+                    .map_err(|e| e.to_string()),
+                StoreBackend::TransportBacked(ts) => {
+                    // TransportReplicatedPutResult does not carry a receipt;
+                    // receipt validation is performed internally by the
+                    // put_named_with_receipt method against replica acks.
+                    match ts.put_named_with_receipt(key, value, *placement_receipt_ref) {
+                        Ok(outcome) if outcome.quorum_reached => Ok(None),
+                        Ok(outcome) => Err(format!(
+                            "write quorum not reached: {}/{} acknowledgements (need {})",
+                            outcome.acks, outcome.total_targets, outcome.quorum_size
+                        )),
+                        Err(e) => Err(e),
+                    }
+                }
+                StoreBackend::PoolBacked(pool) => {
+                    match pool_put_named_with_receipt(pool, key, value) {
+                        Ok((_stored, receipt)) => {
+                            let shared = receipt.shared_receipt_ref()
+                                .map_err(|e| format!("receipt projection: {e}"))?;
+                            Ok(Some(shared))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+            match result {
+                Ok(recorded_receipt_ref) => Some(Frame::PutWithReceiptResponse {
+                    key: key.clone(),
+                    recorded_receipt_ref,
+                }),
+                Err(e) => Some(Frame::Error { message: e }),
+            }
+        }
         Frame::Get { key } => {
             let mut s = store.lock().unwrap();
             let result = match &mut *s {

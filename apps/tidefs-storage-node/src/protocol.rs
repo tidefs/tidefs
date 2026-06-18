@@ -50,6 +50,12 @@ pub mod tag {
     ///           + optional has_repaired_receipt(u8) + placement_receipt_ref
     pub const RPRR: &[u8; 4] = b"RPRR";
 
+    /// Put object with placement receipt authority:
+    /// key_len(u32 LE) + key + placement_receipt_ref + value_len(u32 LE) + value
+    /// Response: ok(u8=1) + key_len(u32 LE) + key
+    ///           + has_recorded_receipt(u8) + placement_receipt_ref
+    pub const PUTW: &[u8; 4] = b"PUTW";
+
     /// Snapshot lifecycle operations dispatched through the clustered path.
     /// Snapshot create: name_len(u8) + snapshot_name
     pub const SNPC: &[u8; 4] = b"SNPC";
@@ -255,6 +261,22 @@ pub enum Frame {
         key: Vec<u8>,
         success: bool,
         repaired_placement_receipt_ref: Option<PlacementReceiptRef>,
+    },
+
+    /// Put object with placement receipt authority.
+    /// The caller carries a PlacementReceiptRef that binds the write
+    /// to a specific redundancy policy, epoch, and target set.
+    PutWithReceipt {
+        key: Vec<u8>,
+        placement_receipt_ref: PlacementReceiptRef,
+        value: Vec<u8>,
+    },
+    /// Response to a receipt-authorized put.
+    /// Carries the pool-recorded placement receipt so the caller
+    /// can validate durable placement authority.
+    PutWithReceiptResponse {
+        key: Vec<u8>,
+        recorded_receipt_ref: Option<PlacementReceiptRef>,
     },
 
     // ── Snapshot lifecycle operations through the clustered storage-node path ──
@@ -492,6 +514,33 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             if let Some(receipt) = repaired_placement_receipt_ref {
                 buf.push(1);
                 encode_placement_receipt_ref(&mut buf, receipt);
+            }
+        }
+        Frame::PutWithReceipt {
+            key,
+            placement_receipt_ref,
+            value,
+        } => {
+            buf.extend_from_slice(tag::PUTW);
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+            encode_placement_receipt_ref(&mut buf, placement_receipt_ref);
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value);
+        }
+        Frame::PutWithReceiptResponse {
+            key,
+            recorded_receipt_ref,
+        } => {
+            buf.extend_from_slice(tag::PUTW);
+            buf.push(1u8);
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+            if let Some(receipt) = recorded_receipt_ref {
+                buf.push(1);
+                encode_placement_receipt_ref(&mut buf, receipt);
+            } else {
+                buf.push(0);
             }
         }
         // ── Snapshot lifecycle encode ──
@@ -992,6 +1041,68 @@ pub fn decode(data: &[u8]) -> Option<Frame> {
                 None
             }
         }
+        t if t == tag::PUTW => {
+            if payload.is_empty() {
+                return None;
+            }
+            if payload[0] == 1 && payload.len() >= 6 {
+                // Response: ok(u8=1) + key_len(u32 LE) + key
+                // + has_recorded_receipt(u8) + optional placement_receipt_ref.
+                let key_len = u32::from_le_bytes(payload[1..5].try_into().ok()?) as usize;
+                if payload.len() < 5 + key_len + 1 {
+                    return None;
+                }
+                let key = payload[5..5 + key_len].to_vec();
+                let has_receipt = payload[5 + key_len];
+                if has_receipt == 1 {
+                    let receipt_start = 6 + key_len;
+                    if payload.len() < receipt_start + PLACEMENT_RECEIPT_REF_WIRE_LEN {
+                        return None;
+                    }
+                    let (receipt, receipt_len) =
+                        decode_placement_receipt_ref(&payload[receipt_start..])?;
+                    if receipt_len == PLACEMENT_RECEIPT_REF_WIRE_LEN {
+                        return Some(Frame::PutWithReceiptResponse {
+                            key,
+                            recorded_receipt_ref: Some(receipt),
+                        });
+                    }
+                    return None;
+                }
+                return Some(Frame::PutWithReceiptResponse {
+                    key,
+                    recorded_receipt_ref: None,
+                });
+            }
+            if payload.len() >= 4 {
+                // Request: key_len(u32 LE) + key + placement_receipt_ref
+                // + value_len(u32 LE) + value.
+                let key_len = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
+                if payload.len() < 4 + key_len + PLACEMENT_RECEIPT_REF_WIRE_LEN + 4 {
+                    return None;
+                }
+                let key = payload[4..4 + key_len].to_vec();
+                let (placement_receipt_ref, receipt_len) =
+                    decode_placement_receipt_ref(&payload[4 + key_len..])?;
+                if receipt_len != PLACEMENT_RECEIPT_REF_WIRE_LEN {
+                    return None;
+                }
+                let val_start = 4 + key_len + receipt_len;
+                let val_len =
+                    u32::from_le_bytes(payload[val_start..val_start + 4].try_into().ok()?) as usize;
+                if payload.len() < val_start + 4 + val_len {
+                    return None;
+                }
+                let value = payload[val_start + 4..val_start + 4 + val_len].to_vec();
+                Some(Frame::PutWithReceipt {
+                    key,
+                    placement_receipt_ref,
+                    value,
+                })
+            } else {
+                None
+            }
+        }
         // ── Snapshot lifecycle tag decoders ──
         t if t == tag::SNPC => {
             if payload.is_empty() {
@@ -1453,6 +1564,70 @@ mod tests {
         let f = Frame::Receive {
             export: vec![0xCC; 65536],
             root_authentication_key: vec![0x41; 32],
+        };
+        assert_eq!(decode(&encode(&f)), Some(f));
+    }
+
+    // ── PutWithReceipt roundtrip tests ──
+    #[test]
+    fn roundtrip_put_with_receipt_request() {
+        let key = b"object-1".to_vec();
+        let payload = b"example-data";
+        let receipt = receipt_ref(&key, payload, 7);
+        let f = Frame::PutWithReceipt {
+            key,
+            placement_receipt_ref: receipt,
+            value: payload.to_vec(),
+        };
+        assert_eq!(decode(&encode(&f)), Some(f));
+    }
+
+    #[test]
+    fn roundtrip_put_with_receipt_response_with_receipt() {
+        let key = b"obj".to_vec();
+        let payload = b"data";
+        let receipt = receipt_ref(&key, payload, 42);
+        let f = Frame::PutWithReceiptResponse {
+            key,
+            recorded_receipt_ref: Some(receipt),
+        };
+        assert_eq!(decode(&encode(&f)), Some(f));
+    }
+
+    #[test]
+    fn roundtrip_put_with_receipt_response_without_receipt() {
+        let key = b"obj".to_vec();
+        let f = Frame::PutWithReceiptResponse {
+            key,
+            recorded_receipt_ref: None,
+        };
+        assert_eq!(decode(&encode(&f)), Some(f));
+    }
+
+    #[test]
+    fn roundtrip_put_with_receipt_erasure_policy() {
+        let key = b"erasure-obj".to_vec();
+        let payload = b"erasure-data";
+        let mut obj_key = [0u8; 32];
+        let len = key.len().min(32);
+        obj_key[..len].copy_from_slice(&key[..len]);
+        let receipt = PlacementReceiptRef {
+            object_id: 99,
+            object_key: obj_key,
+            receipt_epoch: tidefs_membership_epoch::EpochId(3),
+            receipt_generation: 100,
+            redundancy_policy: ReceiptRedundancyPolicy::Erasure {
+                data_shards: 4,
+                parity_shards: 2,
+            },
+            payload_len: payload.len() as u64,
+            payload_digest: [0xAA; 32],
+            target_count: 6,
+        };
+        let f = Frame::PutWithReceipt {
+            key,
+            placement_receipt_ref: receipt,
+            value: payload.to_vec(),
         };
         assert_eq!(decode(&encode(&f)), Some(f));
     }
