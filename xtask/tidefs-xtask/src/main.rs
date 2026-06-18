@@ -1129,7 +1129,27 @@ fn main() {
             }
         }
         Some("check-secret-policy") => {
-            if let Err(err) = policy::check_secret_policy_current_workspace() {
+            let mode = args.next();
+            let result = match mode.as_deref() {
+                None => policy::check_secret_policy_current_workspace(),
+                Some("--seeded-violation-fixtures") => {
+                    if let Some(extra) = args.next() {
+                        eprintln!(
+                            "check-secret-policy --seeded-violation-fixtures accepts no extra argument, got `{extra}`"
+                        );
+                        process::exit(2);
+                    }
+                    policy::check_secret_policy_seeded_violation_fixtures()
+                }
+                Some(extra) => {
+                    eprintln!(
+                        "usage: cargo run -p tidefs-xtask -- check-secret-policy [--seeded-violation-fixtures]"
+                    );
+                    eprintln!("unexpected check-secret-policy argument `{extra}`");
+                    process::exit(2);
+                }
+            };
+            if let Err(err) = result {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -2150,7 +2170,7 @@ fn print_help() {
     println!("  check-local-gc         alias for check-safe-local-reclamation");
     println!("  check-dead-crates      audit all crates for zero consumers (dead crates)");
     println!("  check-dead-crate-audit alias for check-dead-crates");
-    println!("  check-secret-policy    scan workflows and policy docs for forbidden GitHub secret surfaces");
+    println!("  check-secret-policy [--seeded-violation-fixtures] scan workflows and policy docs for forbidden GitHub secret surfaces");
     println!("  check-coverage-closure  audit coverage gaps: scan /root/ai/tmp/tidefs-validation/ receipts and print closure snapshot");
     println!("  check-kmod-blake3-guard  scan kmod-posix-vfs source/docs for BLAKE3 proof-marker regressions");
     println!("  check-dispatch-exists  check whether a FUSE callback method already exists in FuseVfsAdapter (exits 0 with line if found, 1 if missing)");

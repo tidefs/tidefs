@@ -1653,6 +1653,29 @@ const SECRET_POLICY_ALLOWLIST: &[(&str, &str)] = &[
     ),
 ];
 
+const SECRET_POLICY_SEEDED_VIOLATION_FIXTURES: &[(&str, &str, SecretViolationClass)] = &[
+    (
+        ".github/workflows/seeded-secret-policy-fixture.yml",
+        "          TOKEN: ${{ secrets.TIDEFS_SEEDED_TOKEN }}",
+        SecretViolationClass::SecretsContext,
+    ),
+    (
+        ".github/workflows/seeded-secret-policy-fixture.yml",
+        "          deploy-key: inert-public-fixture",
+        SecretViolationClass::DeployKey,
+    ),
+    (
+        ".github/workflows/seeded-secret-policy-fixture.yml",
+        "          RUNNER_TOKEN: inert-public-fixture",
+        SecretViolationClass::RunnerToken,
+    ),
+    (
+        ".github/workflows/seeded-secret-policy-fixture.yml",
+        "          # Store the encrypted secret in GitHub for recovery",
+        SecretViolationClass::EncryptedBlob,
+    ),
+];
+
 // ── Pattern matchers (no regex dependency — simple substring matching) ──
 
 /// Returns the violation class if `line` contains a forbidden secret surface,
@@ -1834,6 +1857,33 @@ pub fn check_secret_policy_current_workspace() -> Result<(), WorkspacePolicyErro
 
     if violations.is_empty() {
         println!("secret-policy ok");
+        Ok(())
+    } else {
+        Err(WorkspacePolicyError { violations })
+    }
+}
+
+pub fn check_secret_policy_seeded_violation_fixtures() -> Result<(), WorkspacePolicyError> {
+    let mut violations = Vec::new();
+
+    for (idx, (rel_path, line, expected)) in
+        SECRET_POLICY_SEEDED_VIOLATION_FIXTURES.iter().enumerate()
+    {
+        match classify_secret_violation(rel_path, line) {
+            Some(actual) if actual == *expected => {}
+            Some(actual) => violations.push(format!(
+                "secret-policy seeded violation fixture {} classified as {actual}, expected {expected}",
+                idx + 1
+            )),
+            None => violations.push(format!(
+                "secret-policy seeded violation fixture {} did not report {expected}",
+                idx + 1
+            )),
+        }
+    }
+
+    if violations.is_empty() {
+        println!("secret-policy seeded violation fixtures ok");
         Ok(())
     } else {
         Err(WorkspacePolicyError { violations })
@@ -3194,6 +3244,12 @@ license = "GPL-2.0-only WITH Linux-syscall-note"
             classify_secret_violation(".github/workflows/secret-policy.yml", line),
             Some(SecretViolationClass::SecretsContext)
         );
+    }
+
+    #[test]
+    fn seeded_secret_policy_violation_fixtures_fail_closed() {
+        check_secret_policy_seeded_violation_fixtures()
+            .expect("seeded violation fixtures should fail closed");
     }
 
     #[test]
