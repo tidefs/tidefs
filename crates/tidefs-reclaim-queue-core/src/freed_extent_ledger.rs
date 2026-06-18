@@ -24,6 +24,8 @@ use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
 use tidefs_types_orphan_index_core::OrphanReplayWatermark;
 
+use crate::dead_object_queue::{OrphanWatermarkBlock, OrphanWatermarkBlockSummary};
+
 // ---------------------------------------------------------------------------
 // FreedExtent
 // ---------------------------------------------------------------------------
@@ -361,20 +363,39 @@ impl ReclaimQueueLedger {
         &self,
         watermark: Option<OrphanReplayWatermark>,
     ) -> usize {
-        let wm = match watermark {
-            Some(w) => w,
-            None => return 0,
+        self.orphan_watermark_block_summary(watermark).total()
+    }
+
+    /// Summarize freed extents blocked by orphan replay watermark evidence.
+    ///
+    /// Operator-visible reporting can use this to classify reclaim waits as
+    /// missing-watermark, behind-watermark, or missing-inode-mapping evidence.
+    #[must_use]
+    pub fn orphan_watermark_block_summary(
+        &self,
+        watermark: Option<OrphanReplayWatermark>,
+    ) -> OrphanWatermarkBlockSummary {
+        let Some(wm) = watermark else {
+            return OrphanWatermarkBlockSummary::ZERO;
         };
+        let mut summary = OrphanWatermarkBlockSummary::ZERO;
         if wm.is_none() {
-            return self.entries.len();
+            summary.watermark_none = self.entries.len();
+            return summary;
         }
-        self.entries
-            .iter()
-            .filter(|e| match e.inode_id {
-                Some(inode_id) => !wm.covers(inode_id),
-                None => true, // conservative: block when no inode association
-            })
-            .count()
+        for extent in &self.entries {
+            match extent.inode_id {
+                Some(inode_id) if !wm.covers(inode_id) => {
+                    summary.record(OrphanWatermarkBlock::WatermarkBehind {
+                        inode_id,
+                        watermark_position: wm.position,
+                    });
+                }
+                None => summary.record(OrphanWatermarkBlock::NoInodeMapping),
+                Some(_) => {}
+            }
+        }
+        summary
     }
 
     /// Peek at up to `max_count` extents from the front without removing
@@ -1332,10 +1353,7 @@ mod watermark_tests {
         let mut l = ReclaimQueueLedger::with_defaults();
         l.enqueue(fe_inode(1, 10));
         l.enqueue(fe_inode(2, 20));
-        let batch = l.dequeue_batch_with_orphan_watermark(
-            10,
-            Some(OrphanReplayWatermark::NONE),
-        );
+        let batch = l.dequeue_batch_with_orphan_watermark(10, Some(OrphanReplayWatermark::NONE));
         assert_eq!(batch.len(), 0);
         assert_eq!(l.len(), 2);
     }
@@ -1425,6 +1443,37 @@ mod watermark_tests {
         l.enqueue(fe_inode(1, 10));
         l.enqueue(fe_inode(2, 20));
         assert_eq!(l.orphan_watermark_blocked_count(Some(wm(100))), 0);
+    }
+
+    #[test]
+    fn watermark_block_summary_classifies_wait_reasons() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_inode(2, 100));
+        l.enqueue(fe_no_inode(3));
+
+        let summary = l.orphan_watermark_block_summary(Some(wm(50)));
+
+        assert_eq!(summary.total(), 2);
+        assert_eq!(summary.watermark_behind, 1);
+        assert_eq!(summary.no_inode_mapping, 1);
+        assert_eq!(summary.watermark_none, 0);
+        assert!(summary.is_waiting_for_orphan_replay());
+    }
+
+    #[test]
+    fn watermark_block_summary_none_watermark_blocks_all_extents() {
+        let mut l = ReclaimQueueLedger::with_defaults();
+        l.enqueue(fe_inode(1, 10));
+        l.enqueue(fe_no_inode(2));
+
+        let summary = l.orphan_watermark_block_summary(Some(OrphanReplayWatermark::NONE));
+
+        assert_eq!(summary.total(), 2);
+        assert_eq!(summary.watermark_none, 2);
+        assert_eq!(summary.watermark_behind, 0);
+        assert_eq!(summary.no_inode_mapping, 0);
+        assert!(format!("{summary}").contains("watermark_none=2"));
     }
 
     // -- watermark + encode/decode round-trip preserves inode_id --

@@ -204,6 +204,61 @@ impl fmt::Display for OrphanWatermarkBlock {
     }
 }
 
+/// Operator-visible summary of reclaim entries waiting on orphan replay.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OrphanWatermarkBlockSummary {
+    /// Entries blocked because no inode mapping is available for the gate.
+    pub no_inode_mapping: usize,
+    /// Entries blocked because no orphan replay watermark has been committed.
+    pub watermark_none: usize,
+    /// Entries blocked because their inode ID is above the committed watermark.
+    pub watermark_behind: usize,
+}
+
+impl OrphanWatermarkBlockSummary {
+    /// Empty summary.
+    pub const ZERO: Self = Self {
+        no_inode_mapping: 0,
+        watermark_none: 0,
+        watermark_behind: 0,
+    };
+
+    /// Add one blocked entry to the appropriate class.
+    pub fn record(&mut self, block: OrphanWatermarkBlock) {
+        match block {
+            OrphanWatermarkBlock::NoInodeMapping => self.no_inode_mapping += 1,
+            OrphanWatermarkBlock::WatermarkNone => self.watermark_none += 1,
+            OrphanWatermarkBlock::WatermarkBehind { .. } => self.watermark_behind += 1,
+        }
+    }
+
+    /// Total entries blocked by orphan replay gating.
+    #[must_use]
+    pub const fn total(self) -> usize {
+        self.no_inode_mapping + self.watermark_none + self.watermark_behind
+    }
+
+    /// Returns true when at least one entry is waiting for orphan replay
+    /// evidence before reclaim can release storage.
+    #[must_use]
+    pub const fn is_waiting_for_orphan_replay(self) -> bool {
+        self.total() != 0
+    }
+}
+
+impl fmt::Display for OrphanWatermarkBlockSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "reclaim waiting for orphan replay: total={} watermark_none={} watermark_behind={} no_inode_mapping={}",
+            self.total(),
+            self.watermark_none,
+            self.watermark_behind,
+            self.no_inode_mapping
+        )
+    }
+}
+
 impl DeadObjectReclaimQueue {
     /// Create an empty dead-object reclaim queue.
     #[must_use]
@@ -454,24 +509,38 @@ impl DeadObjectReclaimQueue {
         watermark: Option<OrphanReplayWatermark>,
         inode_of: impl Fn(&DeadObjectEntry) -> Option<u64>,
     ) -> usize {
-        if watermark.is_none() {
-            return 0;
-        }
-        let wm = watermark.unwrap();
-        if wm.is_none() {
-            return self
-                .entries
-                .values()
-                .filter(|e| e.is_reclaimable(stable_committed_txg))
-                .count();
-        }
-        self.entries
+        self.orphan_watermark_block_summary(stable_committed_txg, watermark, inode_of)
+            .total()
+    }
+
+    /// Summarize entries that are eligible for txg-gated reclaim but blocked
+    /// by orphan replay cursor evidence.
+    ///
+    /// This is the operator-visible form of
+    /// [`Self::orphan_watermark_blocked_count`]: callers can distinguish a
+    /// missing watermark from a watermark that is simply behind, and from
+    /// entries that need an inode mapping before the gate can be evaluated.
+    #[must_use]
+    pub fn orphan_watermark_block_summary(
+        &self,
+        stable_committed_txg: u64,
+        watermark: Option<OrphanReplayWatermark>,
+        inode_of: impl Fn(&DeadObjectEntry) -> Option<u64>,
+    ) -> OrphanWatermarkBlockSummary {
+        let Some(wm) = watermark else {
+            return OrphanWatermarkBlockSummary::ZERO;
+        };
+        let mut summary = OrphanWatermarkBlockSummary::ZERO;
+        for entry in self
+            .entries
             .values()
-            .filter(|e| {
-                e.is_reclaimable(stable_committed_txg)
-                    && Self::check_orphan_watermark(Some(wm), e, &inode_of).is_err()
-            })
-            .count()
+            .filter(|e| e.is_reclaimable(stable_committed_txg))
+        {
+            if let Err(block) = Self::check_orphan_watermark(Some(wm), entry, &inode_of) {
+                summary.record(block);
+            }
+        }
+        summary
     }
 
     /// Publish a replacement/base placement receipt for a dead-object entry
@@ -1960,33 +2029,24 @@ mod watermark_tests {
     #[test]
     fn watermark_covers_inode_passes() {
         let entry = entry_for_watermark(100);
-        let result = DeadObjectReclaimQueue::check_orphan_watermark(
-            Some(wm(100)),
-            &entry,
-            inode_of_u8,
-        );
+        let result =
+            DeadObjectReclaimQueue::check_orphan_watermark(Some(wm(100)), &entry, inode_of_u8);
         assert_eq!(result, Ok(()));
     }
 
     #[test]
     fn watermark_covers_beyond_inode_passes() {
         let entry = entry_for_watermark(50);
-        let result = DeadObjectReclaimQueue::check_orphan_watermark(
-            Some(wm(100)),
-            &entry,
-            inode_of_u8,
-        );
+        let result =
+            DeadObjectReclaimQueue::check_orphan_watermark(Some(wm(100)), &entry, inode_of_u8);
         assert_eq!(result, Ok(()));
     }
 
     #[test]
     fn watermark_behind_inode_blocks() {
         let entry = entry_for_watermark(100);
-        let result = DeadObjectReclaimQueue::check_orphan_watermark(
-            Some(wm(50)),
-            &entry,
-            inode_of_u8,
-        );
+        let result =
+            DeadObjectReclaimQueue::check_orphan_watermark(Some(wm(50)), &entry, inode_of_u8);
         assert_eq!(
             result,
             Err(OrphanWatermarkBlock::WatermarkBehind {
@@ -1999,22 +2059,15 @@ mod watermark_tests {
     #[test]
     fn watermark_none_option_skips_gate() {
         let entry = entry_for_watermark(100);
-        let result = DeadObjectReclaimQueue::check_orphan_watermark(
-            None,
-            &entry,
-            inode_of_u8,
-        );
+        let result = DeadObjectReclaimQueue::check_orphan_watermark(None, &entry, inode_of_u8);
         assert_eq!(result, Ok(()));
     }
 
     #[test]
     fn no_inode_mapping_blocks() {
         let entry = entry_for_watermark(42);
-        let result = DeadObjectReclaimQueue::check_orphan_watermark(
-            Some(wm(100)),
-            &entry,
-            |_| None,
-        );
+        let result =
+            DeadObjectReclaimQueue::check_orphan_watermark(Some(wm(100)), &entry, |_| None);
         assert_eq!(result, Err(OrphanWatermarkBlock::NoInodeMapping));
     }
 
@@ -2043,8 +2096,8 @@ mod watermark_tests {
         let mut q = DeadObjectReclaimQueue::new();
         q.enqueue(entry_for_watermark(10));
         q.enqueue(entry_for_watermark(20));
-        let batch = q.dequeue_batch_with_orphan_watermark(
-            10, STABLE_TXG, Some(wm(30)), inode_of_u8);
+        let batch =
+            q.dequeue_batch_with_orphan_watermark(10, STABLE_TXG, Some(wm(30)), inode_of_u8);
         assert_eq!(batch.len(), 2);
     }
 
@@ -2053,8 +2106,8 @@ mod watermark_tests {
         let mut q = DeadObjectReclaimQueue::new();
         q.enqueue(entry_for_watermark(10));
         q.enqueue(entry_for_watermark(50));
-        let batch = q.dequeue_batch_with_orphan_watermark(
-            10, STABLE_TXG, Some(wm(30)), inode_of_u8);
+        let batch =
+            q.dequeue_batch_with_orphan_watermark(10, STABLE_TXG, Some(wm(30)), inode_of_u8);
         assert_eq!(batch.len(), 1);
     }
 
@@ -2063,8 +2116,7 @@ mod watermark_tests {
         let mut q = DeadObjectReclaimQueue::new();
         q.enqueue(entry_for_watermark(10));
         q.enqueue(entry_for_watermark(20));
-        let batch = q.dequeue_batch_with_orphan_watermark(
-            10, STABLE_TXG, None, inode_of_u8);
+        let batch = q.dequeue_batch_with_orphan_watermark(10, STABLE_TXG, None, inode_of_u8);
         assert_eq!(batch.len(), 2);
     }
 
@@ -2085,7 +2137,10 @@ mod watermark_tests {
         q.enqueue(entry_for_watermark(10));
         q.enqueue(entry_for_watermark(20));
         let blocked = q.orphan_watermark_blocked_count(
-            STABLE_TXG, Some(OrphanReplayWatermark::NONE), inode_of_u8);
+            STABLE_TXG,
+            Some(OrphanReplayWatermark::NONE),
+            inode_of_u8,
+        );
         assert_eq!(blocked, 2);
     }
 
@@ -2096,5 +2151,47 @@ mod watermark_tests {
         q.enqueue(entry_for_watermark(100));
         let blocked = q.orphan_watermark_blocked_count(STABLE_TXG, Some(wm(50)), inode_of_u8);
         assert_eq!(blocked, 1);
+    }
+
+    #[test]
+    fn watermark_block_summary_classifies_wait_reasons() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_for_watermark(10));
+        q.enqueue(entry_for_watermark(100));
+        q.enqueue(entry_for_watermark(200));
+
+        let summary = q.orphan_watermark_block_summary(STABLE_TXG, Some(wm(50)), |entry| {
+            let inode_id = u64::from(entry.object_id.0[0]);
+            if inode_id == 200 {
+                None
+            } else {
+                Some(inode_id)
+            }
+        });
+
+        assert_eq!(summary.total(), 2);
+        assert_eq!(summary.watermark_behind, 1);
+        assert_eq!(summary.no_inode_mapping, 1);
+        assert_eq!(summary.watermark_none, 0);
+        assert!(summary.is_waiting_for_orphan_replay());
+        assert!(format!("{summary}").contains("reclaim waiting for orphan replay"));
+    }
+
+    #[test]
+    fn watermark_block_summary_none_watermark_classifies_all_eligible() {
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry_for_watermark(10));
+        q.enqueue(DeadObjectEntry::new(oid(20), [0u8; 16], 50, true, 5));
+
+        let summary = q.orphan_watermark_block_summary(
+            STABLE_TXG,
+            Some(OrphanReplayWatermark::NONE),
+            inode_of_u8,
+        );
+
+        assert_eq!(summary.total(), 1);
+        assert_eq!(summary.watermark_none, 1);
+        assert_eq!(summary.watermark_behind, 0);
+        assert_eq!(summary.no_inode_mapping, 0);
     }
 }

@@ -305,6 +305,173 @@ impl fmt::Display for OrphanReplayWatermark {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OrphanLogRecoveryReport — operator-visible log replay classification
+// ---------------------------------------------------------------------------
+
+/// Classification for orphan-log recovery reporting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OrphanLogRecoveryClass {
+    /// Log replay found no corrupt records and no incomplete tail.
+    #[default]
+    Clean,
+    /// One or more complete records failed checksum verification.
+    CorruptOrphanLog,
+    /// The log ended before all header-declared records were replayed.
+    IncompleteReplay,
+    /// Both checksum corruption and an incomplete tail were observed.
+    CorruptAndIncomplete,
+}
+
+impl fmt::Display for OrphanLogRecoveryClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Clean => f.write_str("clean"),
+            Self::CorruptOrphanLog => f.write_str("corrupt orphan log"),
+            Self::IncompleteReplay => f.write_str("incomplete replay"),
+            Self::CorruptAndIncomplete => f.write_str("corrupt orphan log and incomplete replay"),
+        }
+    }
+}
+
+/// Tail evidence recorded when an orphan log ends before the entry count from
+/// its durable header has been fully replayed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrphanLogIncompleteTail {
+    /// Zero-based index of the first record that could not be fully replayed.
+    pub next_entry_index: usize,
+    /// Number of bytes present for the incomplete record.
+    pub bytes_available: usize,
+    /// Number of bytes required for one complete log record.
+    pub record_bytes: usize,
+    /// Number of header-declared entries that were not fully replayed.
+    pub missing_entries: usize,
+}
+
+impl OrphanLogIncompleteTail {
+    /// Build incomplete-tail evidence from a log scan position.
+    #[must_use]
+    pub const fn new(
+        next_entry_index: usize,
+        bytes_available: usize,
+        record_bytes: usize,
+        expected_entries: usize,
+    ) -> Self {
+        let missing_entries = expected_entries.saturating_sub(next_entry_index);
+        Self {
+            next_entry_index,
+            bytes_available,
+            record_bytes,
+            missing_entries,
+        }
+    }
+}
+
+impl fmt::Display for OrphanLogIncompleteTail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "entry_index={} bytes_available={} record_bytes={} missing_entries={}",
+            self.next_entry_index, self.bytes_available, self.record_bytes, self.missing_entries
+        )
+    }
+}
+
+/// Report returned by orphan-log replay for operator-visible recovery status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrphanLogRecoveryReport {
+    /// Number of records declared in the durable log header.
+    pub expected_entries: usize,
+    /// Number of records that were fully replayed into the recovered index.
+    pub replayed_entries: usize,
+    /// Inode IDs from complete records whose checksum verification failed.
+    pub corrupted_inodes: Vec<u64>,
+    /// Evidence for an incomplete tail, when crash interrupted log append.
+    pub incomplete_tail: Option<OrphanLogIncompleteTail>,
+    /// Durable replay watermark recovered from the log header.
+    pub watermark: OrphanReplayWatermark,
+}
+
+impl OrphanLogRecoveryReport {
+    /// Construct an empty report for a log with the given header state.
+    #[must_use]
+    pub fn new(expected_entries: usize, watermark: OrphanReplayWatermark) -> Self {
+        Self {
+            expected_entries,
+            replayed_entries: 0,
+            corrupted_inodes: Vec::new(),
+            incomplete_tail: None,
+            watermark,
+        }
+    }
+
+    /// Build a clean report.
+    #[must_use]
+    pub fn clean(
+        expected_entries: usize,
+        replayed_entries: usize,
+        watermark: OrphanReplayWatermark,
+    ) -> Self {
+        Self {
+            expected_entries,
+            replayed_entries,
+            corrupted_inodes: Vec::new(),
+            incomplete_tail: None,
+            watermark,
+        }
+    }
+
+    /// Return the operator-facing recovery classification.
+    #[must_use]
+    pub fn class(&self) -> OrphanLogRecoveryClass {
+        match (
+            self.corrupted_inodes.is_empty(),
+            self.incomplete_tail.is_none(),
+        ) {
+            (true, true) => OrphanLogRecoveryClass::Clean,
+            (false, true) => OrphanLogRecoveryClass::CorruptOrphanLog,
+            (true, false) => OrphanLogRecoveryClass::IncompleteReplay,
+            (false, false) => OrphanLogRecoveryClass::CorruptAndIncomplete,
+        }
+    }
+
+    /// Returns true when checksum failures were observed.
+    #[must_use]
+    pub fn has_corrupt_log(&self) -> bool {
+        !self.corrupted_inodes.is_empty()
+    }
+
+    /// Returns true when the header-declared log could not be fully replayed.
+    #[must_use]
+    pub const fn has_incomplete_replay(&self) -> bool {
+        self.incomplete_tail.is_some()
+    }
+
+    /// Returns true when the log replay has no operator-visible anomalies.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.class() == OrphanLogRecoveryClass::Clean
+    }
+}
+
+impl fmt::Display for OrphanLogRecoveryReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "orphan log recovery: class={} replayed={}/{} corrupted={} watermark={}",
+            self.class(),
+            self.replayed_entries,
+            self.expected_entries,
+            self.corrupted_inodes.len(),
+            self.watermark
+        )?;
+        if let Some(tail) = self.incomplete_tail {
+            write!(f, " incomplete_tail=[{tail}]")?;
+        }
+        Ok(())
+    }
+}
+
 // OrphanRecoveryStats — per-batch recovery statistics
 // ---------------------------------------------------------------------------
 
@@ -1407,6 +1574,47 @@ mod tests {
             format!("{}", OrphanReplayWatermark { position: 100 }),
             "watermark:inode:100"
         );
+    }
+
+    #[test]
+    fn orphan_log_recovery_report_classifies_clean() {
+        let report = OrphanLogRecoveryReport::clean(2, 2, OrphanReplayWatermark { position: 10 });
+        assert_eq!(report.class(), OrphanLogRecoveryClass::Clean);
+        assert!(report.is_clean());
+        assert!(!report.has_corrupt_log());
+        assert!(!report.has_incomplete_replay());
+    }
+
+    #[test]
+    fn orphan_log_recovery_report_classifies_corrupt_log() {
+        let mut report = OrphanLogRecoveryReport::new(2, OrphanReplayWatermark::NONE);
+        report.replayed_entries = 1;
+        report.corrupted_inodes.push(42);
+        assert_eq!(report.class(), OrphanLogRecoveryClass::CorruptOrphanLog);
+        assert!(report.has_corrupt_log());
+        assert!(!report.has_incomplete_replay());
+        assert!(format!("{report}").contains("corrupt orphan log"));
+    }
+
+    #[test]
+    fn orphan_log_recovery_report_classifies_incomplete_replay() {
+        let mut report = OrphanLogRecoveryReport::new(3, OrphanReplayWatermark::NONE);
+        report.replayed_entries = 1;
+        report.incomplete_tail = Some(OrphanLogIncompleteTail::new(1, 12, 56, 3));
+        assert_eq!(report.class(), OrphanLogRecoveryClass::IncompleteReplay);
+        assert_eq!(report.incomplete_tail.unwrap().missing_entries, 2);
+        assert!(report.has_incomplete_replay());
+        assert!(format!("{report}").contains("incomplete replay"));
+    }
+
+    #[test]
+    fn orphan_log_recovery_report_classifies_corrupt_and_incomplete() {
+        let mut report = OrphanLogRecoveryReport::new(3, OrphanReplayWatermark::NONE);
+        report.corrupted_inodes.push(7);
+        report.incomplete_tail = Some(OrphanLogIncompleteTail::new(2, 4, 56, 3));
+        assert_eq!(report.class(), OrphanLogRecoveryClass::CorruptAndIncomplete);
+        assert!(report.has_corrupt_log());
+        assert!(report.has_incomplete_replay());
     }
 
     #[test]
