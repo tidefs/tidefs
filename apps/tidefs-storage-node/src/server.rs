@@ -4791,11 +4791,10 @@ fn handle_frame_ctx(
                 }
                 StoreBackend::PoolBacked(pool) => {
                     match pool_put_named_with_receipt(pool, key, value) {
-                        Ok((_stored, receipt)) => {
-                            let shared = receipt.shared_receipt_ref()
-                                .map_err(|e| format!("receipt projection: {e}"))?;
-                            Ok(Some(shared))
-                        }
+                        Ok((_stored, receipt)) => match receipt.shared_receipt_ref() {
+                            Ok(receipt_ref) => Ok(Some(receipt_ref)),
+                            Err(e) => Err(format!("receipt projection: {e}")),
+                        },
                         Err(e) => Err(e),
                     }
                 }
@@ -5554,6 +5553,7 @@ fn handle_frame_ctx(
         | Frame::SnapshotRollbackResponse { .. }
         | Frame::SnapshotCloneResponse { .. }
         | Frame::SendChunkedResponse { .. }
+        | Frame::PutWithReceiptResponse { .. }
         | Frame::SendResumeResponse { .. } => None,
     }
 }
