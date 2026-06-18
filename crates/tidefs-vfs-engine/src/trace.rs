@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! VFS Engine boundary trace emission — lightweight in-process ring buffer.
 //!
 //! This module implements the core tracing primitives for VFS Engine

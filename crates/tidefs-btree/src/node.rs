@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persistent on-disk B+tree node format with BLAKE3-verified integrity.
 //!
 //! Each node (leaf or internal) is prefixed with a [`NodeHeader`] that

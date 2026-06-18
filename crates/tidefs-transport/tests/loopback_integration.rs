@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test: loopback backend with Transport stack.
 //!
 //! Validates that `LoopbackTransportBackend` and `LoopbackConnectionPair`

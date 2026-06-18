@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! VfsEngine contract test suite: validates trait invariants independent of
 //! any specific implementation.
 //!

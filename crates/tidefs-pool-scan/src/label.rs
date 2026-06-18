@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool device label reader with configurable label region offsets and
 //! explicit BLAKE3-256 checksum verification.
 //!

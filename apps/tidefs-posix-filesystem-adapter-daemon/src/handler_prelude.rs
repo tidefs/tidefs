@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE opcode classifier and handler prelude.
 //!
 //! Every `classify_*_request` function from the ingress classifier, plus the

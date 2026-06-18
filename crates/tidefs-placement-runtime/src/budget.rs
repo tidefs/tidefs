@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement budget tracker.
 //!
 //! Per-node capacity tracking with lease-protected reservations.

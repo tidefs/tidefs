@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transaction-group lifecycle types for kernel-mode committed-root advancement.
 //!
 //! This module defines the types used by the [`VfsEngine`] transaction-group

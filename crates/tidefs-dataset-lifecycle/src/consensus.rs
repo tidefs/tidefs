@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster consensus integration for dataset lifecycle state transitions.
 //!
 //! Implements Phase 7 of dataset lifecycle: when a dataset transitions

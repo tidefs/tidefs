@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Single-record compression with algorithm selection and threshold gating.
 //!
 //! These functions are the low-level encode entry points for per-record

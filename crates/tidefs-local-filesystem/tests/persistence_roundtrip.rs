@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persistence round-trip validation: inode attributes, directory entries,
 //! and metadata dirty/clean tracking across mount cycles.
 //!

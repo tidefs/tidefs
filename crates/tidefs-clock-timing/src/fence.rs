@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Freshness fence evaluation and epoch-timing attestation (P8-04 Sections 4-7).
 //!
 //! Provides the canonical freshness evaluation algorithms:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Backend disclosure type for the runtime authority spine.
 //!
 //! [`BackendDisclosure`] is the single type that declares which transport

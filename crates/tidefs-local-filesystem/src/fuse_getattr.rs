@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE getattr dispatch handler backed by [`LocalFileSystem`].
 //!
 //! Provides an engine-level function (`engine_getattr`) that resolves

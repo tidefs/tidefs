@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // BLAKE3-verified persistence for WitnessSetConfig.
 //
 // Witness configurations are serialized to a deterministic JSON form,

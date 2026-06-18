@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Production encryption bridge for the TideFS local filesystem.
 //!
 //! Wires `tidefs-encryption` (ChaCha20-Poly1305 AEAD, per-object key

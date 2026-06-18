@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch-bound transition gate for node drain.
 //!
 //! The [`EpochGate`] coordinates the membership epoch transition that excludes

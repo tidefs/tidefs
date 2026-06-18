@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Production [`MembershipVerificationOps`] implementation backed by the
 //! live membership runtime.
 //!

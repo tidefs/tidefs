@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Concrete ObjectEnumerator and ObjectMover implementations backed by
 //! [`tidefs_locator_table::LocatorTable`].
 //!

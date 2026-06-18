@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Device health state machine with sliding-window error tracking.
 //!
 //! Provides ONLINE → DEGRADED → FAULTED transitions driven by I/O error

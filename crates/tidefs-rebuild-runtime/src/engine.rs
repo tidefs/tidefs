@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! DataMovementEngine: BLAKE3-verified chunk transfer between replicas.
 //!
 //! Copies object data from a healthy source replica to a target placement,

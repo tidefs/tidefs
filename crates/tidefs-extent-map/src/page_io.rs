@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Page-level serialization with BLAKE3 checksums for V2/V3 B-tree extent maps.
 //!
 //! Each B-tree page is serialized as a 4096-byte unit:

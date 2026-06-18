@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P8-03 data_copy_0: replica placement target computation.
 //!
 //! This crate implements `compute_replica_target_set()`, the authoritative

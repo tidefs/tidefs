@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE crash-recovery integration tests for the POSIX filesystem adapter daemon.
 //!
 //! Exercises the real FUSE mount path: write -> fsync -> SIGKILL daemon ->

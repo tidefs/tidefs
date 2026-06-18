@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_checksum_tree::{
     hash_block, incremental_update, zero_digest, ChecksumTree, ChecksumTreeBuilder,
     ChecksumTreeVerifier, Digest, VerificationResult, DEFAULT_BLOCK_SIZE, DIGEST_SIZE, FANOUT,

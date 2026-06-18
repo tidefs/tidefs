@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // transaction.rs — explicit transaction guard with staged-root isolation
 //
 // §5 of the writeback/transaction/durability design spec (#1190).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Crash recovery and checksum integrity tests for `tidefs-local-object-store`.
 //!
 //! Validates that committed objects survive close+reopen, that bit-flip

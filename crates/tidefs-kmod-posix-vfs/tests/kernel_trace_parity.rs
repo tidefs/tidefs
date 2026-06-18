@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel trace oracle parity integration test.
 //!
 //! Validates that kernel VFS dispatch through `KmodPosixVfs` produces

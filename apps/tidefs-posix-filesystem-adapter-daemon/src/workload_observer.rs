@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Workload observer: wires live FUSE read/write/fsync operations into the
 //! `tidefs-workload` sliding-window classifier and periodically materializes
 //! a workload signature for adaptive subsystems.

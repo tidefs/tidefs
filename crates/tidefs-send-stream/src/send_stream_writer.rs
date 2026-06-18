@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Send-stream writer that reads objects from local-object-store and produces
 //! TransferStream chunk frames for multi-node state transfer.
 //!

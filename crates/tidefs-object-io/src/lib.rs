@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 
 //! Offset-based object I/O over TideFS extent maps and object storage.

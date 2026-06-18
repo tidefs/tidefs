@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Canonical commit ordering and multi-phase commit_group state machine.
 //!
 //! Implements the design specified in

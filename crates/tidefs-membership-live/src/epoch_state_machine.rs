@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch proposal/commit state machine with deterministic quorum consensus.
 //!
 //! Implements the leader-driven epoch proposal protocol from #5044:

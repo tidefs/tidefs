@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests: committed-root LSN-based checkpoint bounding.
 //!
 //! The committed-root LSN determines which records need replay after a crash.

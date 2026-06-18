@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Extent allocation dispatch for the kernel VFS adapter -- K7-24
 //! writeback extent-provisioning seam.
 //!

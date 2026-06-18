@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P6-04 profile 4: block_acceptance_profile_4.soak
 //!
 //! Sustained stress and leak/deadlock hunting.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reusable claim evidence artifact manifests.
 //!
 //! Claim-producing tools write these records next to the artifact they

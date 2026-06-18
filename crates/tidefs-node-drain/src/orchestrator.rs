@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Top-level drain orchestrator.
 //!
 //! [`drain_node()`] is the public entry point that composes the drain state

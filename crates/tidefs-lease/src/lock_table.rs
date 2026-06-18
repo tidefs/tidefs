@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! LockTable: the in-memory authoritative lock state on the lock service leader.
 //!
 //! Design spec §3.4: maintains active lease grants indexed by lease_id,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persistent xattr store backed by [`tidefs_local_object_store::LocalObjectStore`].
 //!
 //! Provides [`ObjXattrStore`], an [`XattrStore`]

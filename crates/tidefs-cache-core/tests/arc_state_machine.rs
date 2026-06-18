@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ARC state-machine, ghost-list transition, and deterministic eviction
 //! ordering tests for tidefs-cache-core.
 //!

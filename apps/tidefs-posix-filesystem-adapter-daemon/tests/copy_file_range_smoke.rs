@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mounted FUSE integration smoke for copy_file_range through the VFS adapter.
 
 use std::fs::{self, File, OpenOptions};

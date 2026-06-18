@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Peer admission control gated by membership epoch member set.
 //!
 //! [`AdmissionGate`] consults the current membership epoch member set

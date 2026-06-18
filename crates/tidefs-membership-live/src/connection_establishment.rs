@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Connection establishment bridge from membership epoch transitions to
 //! transport connection lifecycle.
 //!

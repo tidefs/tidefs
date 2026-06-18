@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests for tidefs-flow-commit-coordinator.
 //
 // These tests exercise the crate through its public API, complementing

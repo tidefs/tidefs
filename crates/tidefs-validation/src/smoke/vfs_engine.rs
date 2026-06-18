@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! VFS engine smoke: deterministic runtime checks through `VfsEngine`.
 //!
 //! Gated on `feature = "fuse"`.

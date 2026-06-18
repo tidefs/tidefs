@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Namespace entry lookup with path traversal and content-hash verification.
 //!
 //! [`lookup_entry`] traverses the namespace B-tree by path components,

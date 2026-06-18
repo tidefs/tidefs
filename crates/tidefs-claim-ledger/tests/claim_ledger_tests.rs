@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for tidefs-claim-ledger covering:
 //!   - Allocation/release round-trip with multiple claims
 //!   - Duplicate allocation behaviour (documents current API contract)

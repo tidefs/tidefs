@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Property-based tests (proptest) for tidefs-binary_schema-checksum.
 //!
 //! Randomized-input tests covering round-trip correctness, bit-flip

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test: coordinator-side JoinHandler + joining-side JoinInitiator
 //! two-node join handshake.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Property-based round-trip and malformed-input rejection tests for
 // tidefs-binary_schema-core serialization primitives.
 //

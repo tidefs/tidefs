@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Durable epoch-state persistence with restart recovery and chain integrity.
 //!
 //! [`EpochStateStore`] persists committed roster views to a pluggable

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::fs;

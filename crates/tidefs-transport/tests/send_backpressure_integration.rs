@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for send-side backpressure propagation.
 //!
 //! Tests cover:

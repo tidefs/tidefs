@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic started-export service-loop receipt fixture.
 //!
 //! The module models the uBLK daemon service loop that runs after a device is

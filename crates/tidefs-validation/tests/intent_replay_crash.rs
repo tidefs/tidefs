@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_intent_log::replay::{
     IntentReplayEngine, IntentReplayHandler, SegmentReplayOutcome, SkippedReason,
 };

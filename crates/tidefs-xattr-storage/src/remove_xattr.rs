@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified remove_xattr with intent-log crash safety.
 //!
 //! [`XattrRemoveStore`] provides persistent `remove_xattr` that:

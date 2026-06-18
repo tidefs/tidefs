@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement planning from DurabilityLayoutV1 and FailureDomainV1 descriptors.
 //!
 //! This module implements [`PlacementPlan`], which consumes a

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE integration smoke: exercises getxattr/setxattr/listxattr/removexattr,
 //! POSIX ACL get/set round-trip, and POSIX file locking (getlk/setlk) through
 //! a real FUSE mount.

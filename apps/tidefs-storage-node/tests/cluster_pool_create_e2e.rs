@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Multi-node cluster pool create, import, and restart E2E tests (#6604, #6660).
 //!
 //! Starts multiple storage-node TestServers, connects via live Transport,

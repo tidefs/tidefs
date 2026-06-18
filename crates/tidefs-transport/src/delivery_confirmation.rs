@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport message delivery confirmation with per-peer sequence
 //! acknowledgment, send-completion notification, and domain-separated
 //! acknowledgment-frame integrity via BLAKE3.

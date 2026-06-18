@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use crate::types::*;
 use rand::seq::SliceRandom;
 use rand::thread_rng;

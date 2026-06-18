@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integrated FUSE mount tests that exercise xattr, POSIX ACL, and POSIX
 //! file locking in a single unified suite through a real FUSE mount.
 //!

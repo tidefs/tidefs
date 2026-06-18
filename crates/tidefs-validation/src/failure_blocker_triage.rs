@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Failure-to-blocker triage: maps validation failure surfaces to the exact
 //! Forgejo blocker issues that own them.
 //!

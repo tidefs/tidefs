@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![deny(dead_code)]
 #![deny(unused_imports)]
 #![cfg_attr(all(feature = "kernel-storage", not(feature = "std")), no_std)]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Block-allocator free-space tracking and object-store data-integrity
 //! validation across write-delete-reallocate-write cycles.
 //!

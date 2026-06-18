@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TDMA transmit gate: optional per-session time-division transmit gating
 //! for the transport send path.
 //!

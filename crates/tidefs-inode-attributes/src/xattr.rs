@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Extended attribute store trait and types.
 //!
 //! Provides [`XattrKey`], [`XattrValue`], and the [`XattrStore`] trait for

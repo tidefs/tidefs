@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Determinism and cross-algorithm isolation tests for tidefs-compression.
 //!
 //! Determinism: same input + same config → identical framed output.

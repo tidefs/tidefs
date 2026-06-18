@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Local object-store format manifest and rejection gate.
 //!
 //! [`LocalObjectStoreFormatManifest`] is the single authoritative collection

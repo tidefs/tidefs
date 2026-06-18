@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Proptest-based segment encode/decode round-trip, fault-injection,
 //! and fuzz tests for `tidefs-local-object-store`.
 //!

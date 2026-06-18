@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Layout validator with failure-domain simulation.
 //!
 //! [`LayoutValidator`] takes a [`crate::DurabilityLayoutV1`] and a

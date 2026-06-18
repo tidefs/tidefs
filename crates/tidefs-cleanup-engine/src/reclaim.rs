@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Block reclamation: bulk-free batching for efficient block-allocator
 //! interaction across a TXG window.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -281,6 +282,9 @@ pub fn check_current_workspace() -> Result<(), WorkspacePolicyError> {
 }
 
 const TIDEFS_LICENSE: &str = "GPL-2.0-only WITH Linux-syscall-note";
+const TIDEFS_RUST_SPDX_HEADER: &str =
+    "// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note";
+const KERNEL_GPL2_SPDX_HEADER: &str = "// SPDX-License-Identifier: GPL-2.0";
 
 const EXCLUDED_FUZZ_MANIFESTS: &[&str] = &[
     "fuzz/Cargo.toml",
@@ -459,6 +463,8 @@ fn check_file_local_provenance_markers(root: &Path, violations: &mut Vec<String>
         }
     };
 
+    check_rust_file_spdx_headers(root, &files, violations);
+
     for rel_path in files {
         let path = root.join(&rel_path);
         let text = match fs::read_to_string(&path) {
@@ -483,6 +489,49 @@ fn check_file_local_provenance_markers(root: &Path, violations: &mut Vec<String>
             ));
         }
     }
+}
+
+fn check_rust_file_spdx_headers(root: &Path, files: &[String], violations: &mut Vec<String>) {
+    for rel_path in files.iter().filter(|path| path.ends_with(".rs")) {
+        let path = root.join(rel_path);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                violations.push(format!("cannot read Rust SPDX input {rel_path}: {err}"));
+                continue;
+            }
+        };
+        if let Some(violation) = rust_file_spdx_header_violation(rel_path, &text) {
+            violations.push(violation);
+        }
+    }
+}
+
+fn rust_file_spdx_header_violation(rel_path: &str, text: &str) -> Option<String> {
+    let expected_header = expected_rust_spdx_header(rel_path)?;
+    let first_line = text.lines().next().unwrap_or("");
+    if first_line == expected_header {
+        return None;
+    }
+
+    Some(format!(
+        "{rel_path}:1 must start with `{expected_header}`; vendored exceptions must stay documented in docs/LICENSING.md"
+    ))
+}
+
+fn expected_rust_spdx_header(rel_path: &str) -> Option<&'static str> {
+    if !rel_path.ends_with(".rs") || is_vendored_rust_source(rel_path) {
+        return None;
+    }
+    if KERNEL_GPL2_SPDX_FILES.contains(&rel_path) {
+        Some(KERNEL_GPL2_SPDX_HEADER)
+    } else {
+        Some(TIDEFS_RUST_SPDX_HEADER)
+    }
+}
+
+fn is_vendored_rust_source(rel_path: &str) -> bool {
+    rel_path.starts_with("crates/tidefs-fuser/")
 }
 
 fn check_required_provenance_doc_entries(root: &Path, violations: &mut Vec<String>) {
@@ -2982,6 +3031,55 @@ mod tests {
             "crates/tidefs-example/src/lib.rs",
             &markers[0],
         ));
+    }
+
+    #[test]
+    fn rust_spdx_header_requires_tidefs_license_for_owned_sources() {
+        let text = concat!(
+            "// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+",
+            "pub fn example() {}
+",
+        );
+
+        assert!(
+            rust_file_spdx_header_violation("crates/tidefs-example/src/lib.rs", text).is_none()
+        );
+    }
+
+    #[test]
+    fn rust_spdx_header_keeps_kernel_gpl2_exceptions() {
+        let text = concat!(
+            "// SPDX-License-Identifier: GPL-2.0
+",
+            "pub fn example() {}
+",
+        );
+
+        assert!(rust_file_spdx_header_violation(
+            "crates/tidefs-kmod-posix-vfs/src/kernel_intent_writer.rs",
+            text,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn rust_spdx_header_skips_vendored_fuser_sources() {
+        let text = "//! Upstream fuser source keeps original provenance.
+";
+
+        assert!(rust_file_spdx_header_violation("crates/tidefs-fuser/src/lib.rs", text).is_none());
+    }
+
+    #[test]
+    fn rust_spdx_header_reports_missing_owned_header() {
+        let text = "pub fn example() {}
+";
+        let violation = rust_file_spdx_header_violation("crates/tidefs-example/src/lib.rs", text)
+            .expect("missing SPDX violation");
+
+        assert!(violation.contains("crates/tidefs-example/src/lib.rs:1"));
+        assert!(violation.contains(TIDEFS_LICENSE));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Push-based health change notification interface.
 //!
 //! Defines the `ReplicaHealthChangeNotifier` trait that consumers

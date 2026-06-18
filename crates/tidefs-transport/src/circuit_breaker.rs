@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport circuit breaker with per-peer failure tracking, half-open
 //! probing, and domain-separated state-digest verification via BLAKE3.
 //!

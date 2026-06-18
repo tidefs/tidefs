@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Support bundle and diagnostics collection.
 //!
 //! Produces a redacted JSON bundle with system metadata, TideFS pool/dataset

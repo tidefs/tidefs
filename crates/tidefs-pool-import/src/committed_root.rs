@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Committed-root recovery: locate and BLAKE3-verify the latest committed
 //! transaction group root during pool import.
 //!

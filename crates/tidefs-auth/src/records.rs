@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use ed25519_dalek::{Keypair, Signer};
 use serde::{Deserialize, Serialize};
 

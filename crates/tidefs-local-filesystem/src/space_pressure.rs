@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // space_pressure.rs — Multi-level space pressure tracking and threshold configuration
 //
 // Provides SpacePressureLevel, SpacePressureConfig, and SpacePressure

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Networked shard placement dispatch with transport sessions and admission control.
 //!
 //! Phase 2 of erasure coding placement: dispatches shards to target nodes over

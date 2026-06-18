@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! NixOS VM integration test harness for TideFS FUSE mount validation.
 //!
 //! Invokes the `tidefsFuseVmTest` NixOS test derivation defined in the

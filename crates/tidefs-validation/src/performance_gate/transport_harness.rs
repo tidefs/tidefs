@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport budget harness for multi-node performance gate (REL-MN-011).
 //!
 //! Invokes the two-node harness transport budget measurement via `cargo test`

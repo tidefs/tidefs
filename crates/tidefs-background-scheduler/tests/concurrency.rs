@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Concurrency tests for tidefs-background-scheduler.
 //
 // Tests concurrent submission and draining through Arc<Mutex<BackgroundScheduler>>,

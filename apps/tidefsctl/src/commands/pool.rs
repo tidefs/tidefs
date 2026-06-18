@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Pool command: manage TideFS storage pools.
 //
 // This module implements the `tidefsctl pool` subcommand group, delegating

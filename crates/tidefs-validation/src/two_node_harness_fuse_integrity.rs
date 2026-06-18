@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Two-node harness FUSE integrity validation.
 //!
 //! Exercises the two-node-harness state-transfer pipeline with FUSE

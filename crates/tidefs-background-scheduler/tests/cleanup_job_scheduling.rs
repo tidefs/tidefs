@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests: CleanupJob as BackgroundService in the scheduler.
 // Covers: ticking in scheduler loop, budget enforcement, multi-service
 // concurrent scheduling, and CleanupJobStats observability.

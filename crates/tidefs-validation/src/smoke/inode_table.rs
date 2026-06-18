@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Inode-table smoke: deterministic lifecycle coverage for create, lookup,
 //! attribute updates, link count transitions, removal, slot reuse, and error
 //! paths against `InodeTable`.

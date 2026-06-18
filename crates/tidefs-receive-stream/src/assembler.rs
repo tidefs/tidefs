@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object assembler: buffer and reassemble ordered chunks into complete objects.
 //!
 //! Handles out-of-order arrival by storing chunks in a per-object buffer

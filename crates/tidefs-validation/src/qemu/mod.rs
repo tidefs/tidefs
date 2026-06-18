@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! QEMU smoke test entry points and RDMA carrier validation.
 //!
 //! Tests in this module drive TideFS NixOS VM tests defined in the

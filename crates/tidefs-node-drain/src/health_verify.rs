@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replication health verification for node drain.
 //!
 //! After data evacuation completes, the [`DrainHealthVerifier`] validates

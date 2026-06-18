@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Receive dispatch trait for consuming reassembled objects into local storage.
 //!
 //! Provides a trait-based abstraction so the receive-stream crate can

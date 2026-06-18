@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Storage node server: accept transport connections and serve
 //! put/get/delete/list/stats operations backed by a ReplicatedObjectStore,
 //! plus send/receive backed by a LocalFileSystem at a configured fs_root.

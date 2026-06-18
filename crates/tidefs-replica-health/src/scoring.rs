@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-replica health scoring from I/O success/failure rates and latency.
 //!
 //! Computes rolling success/failure counters, average latency windows,

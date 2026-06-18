@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lazy range-scan iterator over a B+tree.
 //!
 //! `RangeScan` yields `(&K, &V)` pairs in ascending key order within

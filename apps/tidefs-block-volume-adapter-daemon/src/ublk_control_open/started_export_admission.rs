@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::env;
 use std::fmt::Write as _;
 use std::fs;

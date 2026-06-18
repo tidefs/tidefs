@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transaction group manager for the local object store.
 //!
 //! Wires the `tidefs-commit_group` state machine into the object-store write

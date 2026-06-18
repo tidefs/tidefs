@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lease edge-case integration tests.
 //!
 //! Covers TTL boundaries, zero-TTL handling, duplicate-release safety,

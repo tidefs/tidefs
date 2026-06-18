@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool device scanner and integrity verification.
 //!
 //! This crate provides:

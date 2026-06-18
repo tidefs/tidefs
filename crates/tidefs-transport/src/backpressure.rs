@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-channel send-path backpressure enforcement with configurable depth
 //! limits and overflow rejection.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Membership roster-gated session establishment with epoch-version exchange.
 //!
 //! [`SessionEstablishment`] sits at the transport ingress edge after the

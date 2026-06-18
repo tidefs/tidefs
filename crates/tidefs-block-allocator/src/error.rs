@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Error types for the block allocator.
 //!
 //! Every public method on `BlockAllocator` that can fail returns

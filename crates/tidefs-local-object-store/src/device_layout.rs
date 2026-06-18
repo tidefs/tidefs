@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Device layout policies: adaptive segment sizing and device-class-aware write allocation.
 //!
 //! This module implements the device-class-aware policies described in

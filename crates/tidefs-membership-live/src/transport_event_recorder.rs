@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport event recorder for deterministic epoch-transition testing.
 //!
 //! Records `MembershipTransportEvent` instances into a thread-safe event log

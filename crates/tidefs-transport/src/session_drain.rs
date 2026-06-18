@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-session drain handle for membership-eviction teardown with in-flight
 //! message completion tracking.
 //!

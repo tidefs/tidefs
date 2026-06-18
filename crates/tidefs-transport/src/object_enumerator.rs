@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic object enumeration protocol for rebuild state transfer.
 //!
 //! Defines the [`PlacementMap`] -- a versioned, immutable snapshot of the

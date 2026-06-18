@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Roster change transport session lifecycle bridge.
 //!
 //! Bridges membership roster changes (peer addition and removal) to transport

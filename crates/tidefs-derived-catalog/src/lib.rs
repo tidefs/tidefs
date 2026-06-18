@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Derived catalog view builder: IncrementalJob that walks the authoritative
 //! directory B-tree, populates a ViewCache of directory entries, evicts cold
 //! entries, and serves cached lookups.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! RebuildAdmission: bridges membership loss detection to rebuild/backfill
 //! flow initiation.
 //!

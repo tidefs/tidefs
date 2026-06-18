@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};

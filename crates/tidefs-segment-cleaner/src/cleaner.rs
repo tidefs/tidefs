@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Segment cleaning decision engine: consumes [`SegmentLivenessQueue`]
 //! dead/live byte accounting, ranks sealed segments by reclaimable-byte
 //! yield, and emits an ordered [`CleaningCandidate`] schedule for

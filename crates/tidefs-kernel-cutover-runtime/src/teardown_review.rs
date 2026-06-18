@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Claims-gate review helpers for kernel teardown source-model evidence.
 
 pub const KERNEL_TEARDOWN_NO_WORK_AFTER_CLAIM_ID: &str = "kernel.teardown.no_work_after.v1";

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for DatasetLifecycle construction, accessors, and
 //! initial-state invariants. Exercises the public API surface from outside
 //! the crate.

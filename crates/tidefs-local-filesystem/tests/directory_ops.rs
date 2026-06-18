@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory-operation unit tests for the local-filesystem layer.
 //!
 //! Exercises namespace operations: create, lookup, readdir, unlink,

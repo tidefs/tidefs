@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Raw-byte decode, dispatch, and completion unit tests for
 // tidefs-block-volume-adapter-daemon.
 //

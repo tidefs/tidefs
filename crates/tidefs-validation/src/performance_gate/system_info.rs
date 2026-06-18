@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use super::gate_entry::{EnvironmentManifest, NoisePolicy};
 use std::process::Command;
 

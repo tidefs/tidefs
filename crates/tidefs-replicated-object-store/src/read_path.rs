@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic multi-node object read path over transport sessions.
 //!
 //! `ReplicatedObjectReader` fetches objects from any available replica

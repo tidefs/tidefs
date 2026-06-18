@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-object BLAKE3 integrity verification.
 //!
 //! [`IntegrityVerifier`] reads object data, recomputes the BLAKE3-256

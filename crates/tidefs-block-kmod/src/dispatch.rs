@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Bio request dispatch bridging Linux block layer to VfsEngine storage.
 //!
 //! This module implements the blk_mq Operations/GenDisk request-processing

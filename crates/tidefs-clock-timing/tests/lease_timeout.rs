@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Boundary and edge-case tests for lease-timeout arithmetic using
 //! LeaseDeadline. Covers zero-duration, 1 ns, large-duration (u64::MAX),
 //! saturating arithmetic, drift-slack scaling, and timeout comparison helpers.

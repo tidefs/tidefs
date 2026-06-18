@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Catch-up wire message types for epoch range-query protocol.
 //!
 //! Defines the request/response messages used by a lagging peer to

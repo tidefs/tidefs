@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration-level stress tests for the block allocator.
 //!
 //! Exercises 10,000-cycle alloc/free patterns, near-full-capacity loops,

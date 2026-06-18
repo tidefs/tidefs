@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Committed-root block reader with BLAKE3 integrity verification.
 //!
 //! # Overview

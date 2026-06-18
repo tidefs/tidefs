@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 // When built without the std feature (kernel mode), this crate is no_std.
 #![cfg_attr(not(feature = "std"), no_std)]

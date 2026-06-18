@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use super::*;
 
 pub fn run_ublk_data_queue_open_boundary() -> Result<UblkDataQueueOpenReport, AppError> {

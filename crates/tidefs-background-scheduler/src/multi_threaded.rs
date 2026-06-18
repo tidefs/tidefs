@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Multi-threaded background scheduler.
 //!
 //! This module provides `MultiThreadedScheduler`, which partitions

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport backend abstraction — the physical layer that creates and manages
 //! connections underlying P8-01 transport endpoints.
 //!

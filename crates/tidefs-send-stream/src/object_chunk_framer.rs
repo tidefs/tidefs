@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object-level chunk framer that reads objects from
 //! [`tidefs_local_object_store::ObjectStore`], splits them into fixed-size
 //! chunks with monotonic sequence numbers, computes BLAKE3-256 per-chunk

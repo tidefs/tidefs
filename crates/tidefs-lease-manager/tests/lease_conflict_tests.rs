@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lease conflict detection integration tests.
 //!
 //! Validate conflict semantics between contending leaseholders:

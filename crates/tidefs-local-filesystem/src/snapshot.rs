@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Snapshot lifecycle extensions: clones, bookmarks, and holds.
 //!
 //! ZFS snapshot management is richer than basic create/delete/rollback.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE mknod BLAKE3-verified validation harness.
 //!
 //! Exercises FIFO, socket, character device, and block device creation

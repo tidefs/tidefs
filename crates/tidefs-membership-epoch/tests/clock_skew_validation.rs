@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Multi-node clock skew injection validation for epoch monotonicity safety.
 //!
 //! Simulates clock skew across a multi-member epoch chain and validates that:

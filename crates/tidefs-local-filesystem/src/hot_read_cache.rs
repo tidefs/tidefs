@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Hot read cache — whole-file ARC for read_file/read_symlink.
 //!
 //! ## Authority Classification (per docs/cache-authority-model.md)

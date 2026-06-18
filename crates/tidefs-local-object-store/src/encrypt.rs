@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-object ChaCha20-Poly1305 AEAD encryption for the device I/O path.
 //!
 //! Every stored object carries a 12-byte random nonce followed by the

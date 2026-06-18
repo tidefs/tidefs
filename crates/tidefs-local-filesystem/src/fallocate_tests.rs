@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // fallocate_tests.rs -- unit tests for fallocate modes and sparse-file
 // semantics on LocalFileSystem.
 //

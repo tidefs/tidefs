@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport flow-control credit messaging with bounded receive window and
 //! domain-separated credit-value integrity via BLAKE3.
 //!

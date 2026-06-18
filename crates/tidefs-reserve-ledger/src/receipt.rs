@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reserve receipt conservation evidence.
 //!
 //! Receipts are the reserve ledger's authority evidence for admission

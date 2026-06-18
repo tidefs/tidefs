@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic object-to-node placement via BLAKE3 keyed hashing.
 //!
 //! [`NodePlacement`] maps an object ID to a stable, ordered set of node IDs

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! CommitGroupSync: fsync, fdatasync, and syncfs entry points.
 //!
 //! `CommitGroupSync` provides the durability barrier for individual inode fsync

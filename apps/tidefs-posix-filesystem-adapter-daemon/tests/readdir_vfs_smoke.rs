@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mounted FUSE integration tests for readdir/readdirplus through the VFS adapter.
 //!
 //! These tests mount a FuseVfsAdapter and exercise directory enumeration

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Heartbeat protocol for witness-set node failure detection.
 //
 // Tracks per-node heartbeat liveness with configurable intervals and

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 /// Segment-level GC compaction driver, segment reclaimer, checkpoint/resume,
 /// and intent-log integration for the TideFS compaction engine.
 ///

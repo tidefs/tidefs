@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #[cfg(feature = "tls")]
 mod tls_tests {
     use std::thread;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Crash/reopen validation for content-addressed chunk dedup (#5966).
 //!
 //! Verifies that dedup redirects resolve correctly after an unclean shutdown:

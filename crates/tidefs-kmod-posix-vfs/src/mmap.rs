@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! vm_operations_struct dispatch for the kernel VFS adapter.
 //!
 //! Source-model dispatch for the Linux 7.0 `vm_operations_struct` contract

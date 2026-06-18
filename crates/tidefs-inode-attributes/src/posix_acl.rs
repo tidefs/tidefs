@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! POSIX ACL types and serialization helpers.
 //!
 //! Re-exports the core POSIX.1e ACL entry and tag types from

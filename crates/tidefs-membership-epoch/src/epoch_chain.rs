@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch-chain verification with deterministic fork detection.
 //!
 //! [`EpochChainVerifier`] validates that an incoming epoch proposal forms

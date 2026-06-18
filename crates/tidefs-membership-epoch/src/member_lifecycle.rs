@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 
 //! Peer lifecycle state machine with monotonic transition enforcement.

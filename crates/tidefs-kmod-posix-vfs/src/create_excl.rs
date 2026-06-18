@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Exclusive file creation (O_EXCL|O_CREAT) for the kernel VFS adapter.
 //!
 //! Delegates atomic exclusive create to VfsEngine::create_excl, which

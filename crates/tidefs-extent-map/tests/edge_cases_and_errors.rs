@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Edge case and error-path validation tests.
 //!
 //! Exercises error returns, boundary rejection, and idempotent no-ops

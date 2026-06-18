@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! RDMA Reliable Connection (RC) transport backend using libibverbs.
 #![allow(unsafe_code)]
 //!

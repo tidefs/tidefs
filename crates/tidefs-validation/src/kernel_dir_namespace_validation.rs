@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel directory namespace validation module.
 //!
 //! Produces tier-classified validation output for kmod-posix-vfs inode_operations

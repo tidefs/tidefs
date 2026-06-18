@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! PartitionHealingProtocol: c2 joint config creation, receipt frontier
 //! exchange, divergence classification, and reconciliation strategy selection.
 

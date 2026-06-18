@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Periodic transaction group commit cycle wired into the FUSE daemon.
 //!
 //! Maintains a CommitGroupManager for write accumulation, a DurabilitySequence

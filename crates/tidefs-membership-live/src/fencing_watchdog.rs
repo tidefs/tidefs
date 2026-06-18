@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::BTreeMap;
 use tidefs_membership_epoch::{EpochId, HealthClass, MemberId};
 use tidefs_node_drain::{

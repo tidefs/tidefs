@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Repair trigger threshold tests — verify that divergence counts
 //! map to appropriate escalation levels: log-only, schedule-background,
 //! and immediate-repair based on ticketable-divergence thresholds.

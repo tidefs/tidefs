@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport connection state machine with lifecycle transition enforcement
 //! and subsystem notification hooks.
 //!

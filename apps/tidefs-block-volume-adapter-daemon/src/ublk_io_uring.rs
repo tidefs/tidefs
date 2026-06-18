@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // io_uring-based block I/O dispatch for ublk data-plane operations.
 //
 // When the --io-uring flag is set, this module provides an alternative

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! CommitGroupAccumulator: collects writes, metadata mutations, link/unlink operations
 //! for a single open transaction group.
 //!

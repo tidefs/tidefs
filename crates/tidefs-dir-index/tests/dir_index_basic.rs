@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // dir_index_basic.rs — Integration tests for DirIndex entry CRUD, lookup, and
 // empty-directory behavior.
 //

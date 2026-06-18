@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests: parameter-negotiation token exchange and
 //! ChaCha20-Poly1305 session cipher correctness over deterministic
 //! loopback transport.

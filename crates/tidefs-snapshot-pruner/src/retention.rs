@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Snapshot retention policy and time-bucketed evaluation helpers.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

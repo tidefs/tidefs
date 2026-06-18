@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE flush/fsync dispatch with PageCache writeback and dirty-extent commit.
 //!
 //! This module provides the FUSE flush and fsync dispatch handlers that drain

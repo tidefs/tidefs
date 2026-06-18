@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Live-data allocator cursor helpers for the mounted kernel VFS engine.
 //!
 //! The Kbuild-only `KernelEngine` stores file data in compact physical extents

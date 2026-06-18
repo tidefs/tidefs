@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport session binding for joined nodes.
 //!
 //! After a successful join handshake, the joining node needs transport

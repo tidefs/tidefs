@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replication class classification.
 //!
 //! A [`ReplicationClass`] classifies the replication strategy independently

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE inode metadata crash-consistency validation.
 //!
 //! Produces tier-classified validation output for FUSE userspace inode

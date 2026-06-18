@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic transport carrier selection from membership peer capability
 //! advertisements.
 //!

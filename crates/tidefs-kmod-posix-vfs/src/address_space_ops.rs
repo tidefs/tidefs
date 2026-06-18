@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Address space operations source model for the kernel VFS adapter.
 //!
 //! Models the Linux 7.0 kernel `address_space_operations` contract in Rust,

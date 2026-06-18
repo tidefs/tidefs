@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persistent directory index adapter bridging [`DirPageIndex`] to the
 //! [`tidefs_types_polymorphic_directory_index_core::DirMicroEntry`]-based
 //! API that [`tidefs_namespace::Namespace`] expects.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Weighted ARC (Adaptive Replacement Cache) with per-entry byte-weight tracking.
 //!
 //! Implements a 4-list ARC: T1 (recent, single-access), T2 (frequent, multi-access),

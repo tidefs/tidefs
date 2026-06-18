@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport outbound send coalescing: batches multiple outbound framed
 //! messages destined for the same session and priority class into fewer
 //! mpsc channel submissions, reducing per-frame syscall and scheduler

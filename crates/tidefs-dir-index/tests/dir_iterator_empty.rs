@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // dir_iterator_empty.rs — Integration tests for DirIterator trait on empty
 // DirIndex instances. Verifies that next_entry returns None immediately,
 // reset_cursor/seek_to_cursor are no-ops, and current_cursor reports START.

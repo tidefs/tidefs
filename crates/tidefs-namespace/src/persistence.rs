@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persistent store traits and in-memory implementations for bridging
 //! [`crate::Namespace`] to durable storage backends.
 

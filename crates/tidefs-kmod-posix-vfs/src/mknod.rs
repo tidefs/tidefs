@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! mknod mutation for the kernel VFS adapter -- K7-12 mutation seam.
 //!
 //! Creates device nodes (char/block), FIFOs, and Unix-domain sockets.

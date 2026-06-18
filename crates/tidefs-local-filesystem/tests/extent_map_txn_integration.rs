@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration validation tests for extent-map transaction persistence.
 //!
 //! Exercises the TransactionExtentMap manifest role (#7) and

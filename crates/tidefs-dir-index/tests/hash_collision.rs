@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // hash_collision.rs — Integration tests for B-tree hash-bucket behaviour and
 // integrity under the public API. Since the forced-hash helpers are crate-
 // internal (not public), these tests focus on verifying B-tree correctness

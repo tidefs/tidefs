@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // large_directory.rs — Large-directory stress tests for tidefs-dir-index.
 //
 // Coverage rationale:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![cfg(target_os = "linux")]
 
 //! Mounted FUSE integration tests for RENAME_EXCHANGE through the VFS adapter.

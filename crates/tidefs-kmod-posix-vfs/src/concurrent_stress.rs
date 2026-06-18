@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Concurrent operation safety stress tests for the kernel VFS adapter.
 //!
 //! Exercises concurrent create/write/rename/unlink/fsync through the

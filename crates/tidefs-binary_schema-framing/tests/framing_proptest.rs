@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests: property-based (proptest) fuzz coverage for the
 // FramingDecoder stream reader.
 //

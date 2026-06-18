@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Read-path validation: basic readback, multi-chunk read, pread offset,
 //! sparse-file read, read-beyond-EOF, short read, concurrent reads, and
 //! cross-file isolation.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool import: device activation, superblock verification, intent log
 //! replay, dataset mount readiness, and pool activation.
 //!

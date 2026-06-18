@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement-driven write and read dispatch.
 //!
 //! Bridges the placement planner's [`PlacementPlan`] keyed assignments into

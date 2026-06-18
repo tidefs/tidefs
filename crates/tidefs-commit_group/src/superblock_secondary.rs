@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Superblock secondary-copy write for committed-root durability.
 //!
 //! # Overview

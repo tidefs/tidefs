@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use serde::{Deserialize, Serialize};
 use std::fmt;
 pub use tidefs_auth::NodeIdentity;

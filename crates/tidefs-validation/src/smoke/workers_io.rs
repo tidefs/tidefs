@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Smoke test: workers-io live behavior passes basic checks.
 //!
 //! Covers write staging, content hashing, copy_file_range planning,

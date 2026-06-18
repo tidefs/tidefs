@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Write-path latency histograms and structured error attribution for
 //! the posix-filesystem-adapter-daemon tracing layer.
 //!

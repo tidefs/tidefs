@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transaction isolation tests for `tidefs-local-object-store`.
 //!
 //! Validates write visibility, durability across sessions (commit/abort

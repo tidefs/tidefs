@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Connection registry for tracking active transport connections.
 //!
 //! [`ConnectionRegistry`] is the central in-memory bookkeeping structure

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests: WitnessSet persistence and reload across simulated
 // crash/restart cycles, codec fidelity for wire transfer, and
 // WitnessSetConfig BLAKE3-verified integrity verification.

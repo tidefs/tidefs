@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rebuild planner: loss/suspect event rebuild flow orchestration — P8-03 data_copy_4.
 //!
 //! The rebuild planner is the recovery-side counterpart of the relocation

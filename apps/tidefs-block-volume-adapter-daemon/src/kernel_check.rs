@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel release version classification — inlined from tidefs-observe-core
 //! to eliminate the scaffolding crate dependency.
 //!

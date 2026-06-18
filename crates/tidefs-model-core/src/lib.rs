@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pure deterministic VFS model for TideFS trace and oracle work.
 //!
 //! This crate owns no runtime storage and never resolves host paths. It keeps

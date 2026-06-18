@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Two-node harness integration test for partition injection, split-brain
 //! detection, minority fencing, partition healing, and data convergence.
 //!

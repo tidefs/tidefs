@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mounted FUSE integration smoke for lseek (SEEK_SET, SEEK_CUR, SEEK_END, SEEK_DATA, SEEK_HOLE) through the VFS adapter.
 
 use std::fs::{self, File, OpenOptions};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P6-04 profile 2: block_acceptance_profile_2.quick_pressure
 //!
 //! Force block charter behavior under pressure and degraded conditions.

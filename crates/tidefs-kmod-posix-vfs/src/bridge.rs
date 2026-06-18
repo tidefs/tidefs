@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel bridge integration for the VFS adapter.
 //!
 //! Wires the kmod-posix-vfs leaf module (s3 / c7) to the kmod-bridge

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Roster-change notification broadcast to connected peers.
 //!
 //! When a new peer completes the join handshake and is added to the roster,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! End-to-end device removal integration test: 3-device mirror pool,
 //! data evacuation, label update, and BLAKE3 integrity verification.
 //!

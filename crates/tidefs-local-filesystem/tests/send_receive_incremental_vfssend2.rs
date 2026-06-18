@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for incremental VFSSEND2 send/receive.
 //!
 //! Exercises the full incremental snapshot stream lifecycle:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Symbolic link creation for the TideFS namespace.
 //!
 //! Implements POSIX `symlink(2)` semantics: allocates a new inode,

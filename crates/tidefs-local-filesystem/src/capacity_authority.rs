@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Production capacity authority: single source of truth for filesystem
 //! used/free/reserved/pending byte counters.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P6-04 profile 0: block_acceptance_profile_0.smoke
 //!
 //! Fastest viability proof — run on every serious integration loop.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool label initialization: writes fresh `PoolLabelV1` superblocks to
 //! block devices during pool creation. Counterpart to the pool-import
 

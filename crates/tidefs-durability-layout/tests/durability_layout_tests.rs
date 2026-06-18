@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for durability-layout validation against failure-domain topologies.
 //!
 //! Tests cover the full validation pipeline: topology construction, layout

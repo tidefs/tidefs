@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! DestroyWorker: IncrementalJob implementation for Phase 5 dataset destroy.
 //!
 //! Walks all allocated structures belonging to a dataset and produces

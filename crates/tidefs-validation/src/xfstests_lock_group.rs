@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! xfstests lock-test group runner backed by the NixOS VM test harness.
 //!
 //! Invokes the `tidefsXfstestsLockGroup` NixOS test derivation defined in

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Segment liveness scanner: computes per-segment live-byte ratios from a
 //! segment-index reference, ranks segments by compaction efficiency
 //! (highest dead-byte yield, lowest live-byte relocation cost), and

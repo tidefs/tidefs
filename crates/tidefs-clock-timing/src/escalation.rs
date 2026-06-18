@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Timeout escalation (P8-04 Sections 4, 7.1 `classify_deadline_miss_and_escalate`).
 //!
 //! Converts deadline misses into hold/degrade/failover/stop actions under

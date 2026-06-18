@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rebuild integration: wires RebuildAdmission and RebuildCompletion
 //! from tidefs-rebuild-runtime into the deterministic two-node harness.
 //!

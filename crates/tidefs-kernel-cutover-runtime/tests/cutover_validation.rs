@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified kernel cutover validation harness.
 //! Domain: tidefs-kernel-cutover-validation-v1
 //!

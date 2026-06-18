@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_membership_epoch::{EpochId, MemberId};
 
 /// Events from the cluster membership layer that the lease manager reacts to.

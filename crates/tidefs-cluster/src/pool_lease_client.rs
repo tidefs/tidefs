@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster pool lease client: synchronous request-response for acquiring
 //! a pool lease token from a cluster authority (storage-node).
 //!

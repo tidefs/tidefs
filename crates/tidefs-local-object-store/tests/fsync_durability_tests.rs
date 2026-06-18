@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Fsync durability validation tests for `tidefs-local-object-store`.
 //!
 //! Validates that `sync_all()` (the fsync primitive) commits data to durable

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Peer-connectivity health scoring engine.
 //!
 //! Consumes transport-derived per-peer metrics — round-trip latency, error

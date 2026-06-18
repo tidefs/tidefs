@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Resize smoke tests for tidefs-block-volume-adapter-daemon.
 //!
 //! Exercises BlockVolumeFileImage::resize_to() for grow and shrink,

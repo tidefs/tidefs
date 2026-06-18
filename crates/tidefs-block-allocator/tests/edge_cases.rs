@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests: edge cases.
 //!
 //! Zero-length rejection, ENOSPC, free of unallocated blocks,

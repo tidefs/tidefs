@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch transition error types for membership-gated epoch advances.
 //!
 //! This module provides [`EpochTransitionError`] which extends the existing

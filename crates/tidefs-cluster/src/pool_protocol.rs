@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster pool wire protocol: create, import, and lifecycle message types
 //! for multi-node pool operations.
 //!

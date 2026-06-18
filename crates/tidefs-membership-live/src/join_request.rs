@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Coordinator-side join-request validation and admission lifecycle management.
 //!
 //! When a peer sends a [`MembershipMessage::JoinRequest`] over transport, the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rewrite engine for segment compaction.
 //!
 //! Iterates over [`MergePlan`] groups, reads live extents from source

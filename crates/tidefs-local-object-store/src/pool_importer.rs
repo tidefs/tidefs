@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool import: device scan, pool_guid grouping, topology_generation
 //! validation, recovery commit_group selection, and cross-system portability.
 //!

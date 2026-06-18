@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Commit-group state machine with CommitGroupCoordinator anchoring and
 //! BLAKE3 chain-digest verification.
 //!

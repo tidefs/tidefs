@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Lease service wire protocol message types and codec.
 //!
 //! Implements the cluster lock service wire protocol so that TideFS nodes

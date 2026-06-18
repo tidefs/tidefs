@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Block-level checksum encoding and verification.
 //!
 //! This module provides a `BlockChecksum` trait for computing and verifying

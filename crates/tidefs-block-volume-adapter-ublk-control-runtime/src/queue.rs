@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ublk queue mapper: per-queue io_uring access over a shared data-queue.
 //!
 //! The [`UblkQueueMapper`] manages access to the ublk data-queue file

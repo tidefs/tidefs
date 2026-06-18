@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Block request timeout detection and reset recovery.
 //!
 //! This module provides inflight-request deadline tracking and a timeout

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Receive-stream integration scenario: validates the send→receive chunk-level
 //! pipeline through the deterministic two-node transport harness.
 //!

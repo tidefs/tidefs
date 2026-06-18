@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // auth_state_machine.rs — override ticket lifecycle (issue, consume,
 // dual-control, expiry, exhaustion), audit chain sealing and
 // integrity verification, session grant state transitions, and

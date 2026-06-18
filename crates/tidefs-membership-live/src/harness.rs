@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic in-process two-node membership harness.
 //!
 //! Provides a controlled environment for exercising epoch transitions,

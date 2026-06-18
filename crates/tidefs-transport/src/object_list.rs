@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object enumeration message types for rebuild/backfill state transfer.
 //!
 //! These types carry compact object entries (object_key, size, BLAKE3 root)

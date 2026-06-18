@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-boundary trait contracts (t0–t9).
 //!
 //! These traits define the typed seam between canonical userspace authority

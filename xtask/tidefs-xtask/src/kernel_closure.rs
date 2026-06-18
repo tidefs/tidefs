@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-portable dependency closure guard (#6174).
 //!
 //! Replaces the manifest-string "transitive guard" from

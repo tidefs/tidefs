@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport budget measurement for REL-MN-011 multi-node performance gate.
 //!
 //! Runs a deterministic two-node state transfer round-trip at multiple payload

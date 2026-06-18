@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for the ublk device lifecycle state machine.
 //!
 //! Exercises the full lifecycle boundary functions (add_dev, set_params,

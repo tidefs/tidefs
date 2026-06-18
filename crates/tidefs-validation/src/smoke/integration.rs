@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cross-crate integration smoke: wires multiple peer crates together
 //! and runs multi-step workflows.
 //!

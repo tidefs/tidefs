@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration bridge between local-filesystem scrub and scrub-core
 //! automatic repair engine.
 //!

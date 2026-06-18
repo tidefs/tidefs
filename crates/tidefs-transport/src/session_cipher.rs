@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-session ChaCha20-Poly1305 transport encryption with monotonic nonce
 //! protection.
 //!

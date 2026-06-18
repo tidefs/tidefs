@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Local-filesystem smoke: deterministic open/close and lifecycle operation
 //! recording against `LocalFileSystem`.
 //!

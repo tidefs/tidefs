@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport send-priority scheduler with per-class queuing and starvation
 //! prevention for the outbound send path.
 //!

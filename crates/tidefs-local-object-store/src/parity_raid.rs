@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! PARITY_RAID1 single-parity row layout and reconstruction.
 //!
 //! PARITY_RAID1 = N data columns + 1 parity column using XOR.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Global session concurrency limiter that bounds the total number of
 //! concurrently established transport sessions across all listeners and
 //! outbound connectors.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! PartitionRuntime: the main service coordinating partition detection,
 //! split-brain prevention, and partition healing.
 //!

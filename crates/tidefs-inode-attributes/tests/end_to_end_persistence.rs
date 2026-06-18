@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! End-to-end inode lifecycle tests exercising the full stack:
 //! AttrCache → TableAttributeStore → InodeTable → LocalObjectStore.
 //!

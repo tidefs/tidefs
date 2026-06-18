@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persisted cluster authority record: on-disk quorum and cluster-map
 //! authority state that nodes discover and validate during boot.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel VFS no-daemon residency contract.
 //!
 //! This module documents the residency invariant for the kernel POSIX VFS

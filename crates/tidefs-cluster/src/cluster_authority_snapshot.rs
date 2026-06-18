@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Typed operator-truth snapshot and boot-time authority discovery.
 //!
 //! [`ClusterAuthoritySnapshot`] exposes the current cluster authority state

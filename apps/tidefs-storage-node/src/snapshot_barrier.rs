@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Multi-node snapshot barrier protocol for cross-node consistency.
 //!
 //! ## Problem

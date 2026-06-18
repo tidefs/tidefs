@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool label update abstraction for node drain completion.
 //!
 //! After a node is drained and decommissioned, its devices must be removed

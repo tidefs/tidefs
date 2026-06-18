@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Edge-case and boundary-condition tests for tidefs-compression.
 //!
 //! Covers gaps not addressed by the inline unit tests or the property-based

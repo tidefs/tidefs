@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Atomic coordination strategy switching protocol with epoch fencing.
 //!
 //! Implements the 5-level contention-adaptive coordination strategy lifecycle:

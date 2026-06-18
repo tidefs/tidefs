@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Committed txg replay engine: roll-forward committed transaction groups
 //! during local-filesystem mount with BLAKE3-verified state integrity.
 //!

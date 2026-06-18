@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic eviction-ordering and concurrent-access stress tests
 //! for tidefs-cache-core ARC.
 //!

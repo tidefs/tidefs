@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Bounded send queue with backpressure for transport dispatch.
 //!
 //! [`SendQueue`] buffers framed chunks before they are handed to a

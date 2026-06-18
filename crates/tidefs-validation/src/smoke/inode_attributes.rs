@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Inode-attributes smoke: deterministic lifecycle coverage for attribute
 //! get/set, link-count tracking, stat translation, and error paths against
 //! `MemInodeAttributeStore` (the default `InodeAttributeStore` backend).

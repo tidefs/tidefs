@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement-aware object I/O dispatch for TransportReplicatedStore.
 //!
 //! [`PlacementDispatch`] composes [`NodePlacement`] and [`TransportSessionSet`]

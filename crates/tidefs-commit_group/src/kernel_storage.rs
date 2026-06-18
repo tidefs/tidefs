@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! KernelStorageIo committed-root persistence helpers.
 //!
 //! This module keeps the kernel path on the existing committed-root authority:

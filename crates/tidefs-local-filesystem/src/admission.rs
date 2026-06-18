@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Runtime write-admission integration for local filesystem dirty paths.
 //!
 //! Wraps [`tidefs_performance_contract::WriteAdmissionState`] with

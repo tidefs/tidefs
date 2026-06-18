@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Automatic journal segment cleaning.
 //!
 //! Idempotent cleaning of committed-and-obsolete journal segments

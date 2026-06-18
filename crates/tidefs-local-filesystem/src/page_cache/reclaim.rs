@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Page cache reclaim — LRU eviction of clean pages under memory pressure.
 //!
 //! PageCacheReclaimer walks the per-inode LRU lists in insertion order

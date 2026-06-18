@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE file-locking integration test: exercises POSIX advisory file locking
 //! (getlk / setlk / setlkw) through a real read-write FUSE mount.
 //!

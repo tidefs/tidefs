@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Committed-epoch push broadcast to connected peers over transport.
 //!
 //! [`EpochPushBroadcaster`] bridges the

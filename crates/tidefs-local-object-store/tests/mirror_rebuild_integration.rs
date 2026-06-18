@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mirror rebuild integration test: device-loss simulation and rebuild
 //! from surviving replica.
 //!

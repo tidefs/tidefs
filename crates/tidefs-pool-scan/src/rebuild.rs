@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rebuild scheduling from pool labels.
 //!
 //! When a pool is imported from device labels, missing or degraded

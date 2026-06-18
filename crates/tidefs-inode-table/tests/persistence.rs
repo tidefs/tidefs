@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![cfg(feature = "std")]
 //! Integration tests for inode-table persistence through the object store.
 //!

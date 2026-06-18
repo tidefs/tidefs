@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Chunk framer for send-stream: splits object data into transport-sized
 //! chunks with BLAKE3 domain-separated authentication tags, matching the
 //! receive-stream verification format.

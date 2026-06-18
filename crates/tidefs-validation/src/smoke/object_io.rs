@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object-I/O smoke: deterministic write/read/error checks over an
 //! `InlineExtentMap` and the `LocalObjectStore` adapter.
 //!

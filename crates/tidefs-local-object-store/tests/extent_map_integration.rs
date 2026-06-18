@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests bridging `tidefs-extent-map` and
 //! `tidefs-local-object-store`.
 //!

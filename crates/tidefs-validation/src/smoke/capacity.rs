@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Capacity smoke: deterministic runtime checks for the production
 //! [`tidefs_local_filesystem::capacity_authority::CapacityAuthority`].
 //!

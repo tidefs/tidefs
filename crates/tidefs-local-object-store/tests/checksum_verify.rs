@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Checksum-verification integration tests for `tidefs-local-object-store`.
 //!
 //! Validates that `get_verified` catches content-key mismatch,

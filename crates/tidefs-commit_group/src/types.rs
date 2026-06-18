@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Core types for the TideFS transaction group subsystem.
 //!
 //! Defines `CommitGroupId`, dirty-tracking primitives, accumulator operation

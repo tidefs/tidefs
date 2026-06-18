@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BackgroundCompaction — BackgroundService for B+tree compaction.
 //!
 //! Periodically compacts B+tree-backed data structures that experience

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Extended attribute operations for the kernel VFS adapter -- K7-18 xattr seam.
 //!
 //! Delegates getxattr, setxattr, listxattr, and removexattr to the VfsEngine

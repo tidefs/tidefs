@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! On-disk format constants for the local object store.
 //!
 //! This module defines every magic byte sequence, format version, record

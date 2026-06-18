@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for destroy lifecycle: transition_to_destroying,
 //! transition_to_tombstone, abort_destroy, destroy job tracking, and
 //! tombstone reaper integration. All tests use only the public API.

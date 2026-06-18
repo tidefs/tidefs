@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::should_implement_trait)]
 #![no_std]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Top-level chunk-shipper orchestrator.
 //!
 //! The [`ChunkShipper`] drives the full transfer lifecycle: session pairing,

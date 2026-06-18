@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Large-file sequential and sparse read/write FUSE integration tests.
 //!
 //! Exercises multi-block I/O, sparse-file hole semantics, block-unaligned

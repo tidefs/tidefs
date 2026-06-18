@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Ioctl dispatch for the block-kmod kernel driver.
 //!
 //! Translates Linux block-layer ioctl command numbers into backend

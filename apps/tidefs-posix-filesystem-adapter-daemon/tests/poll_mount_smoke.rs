@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mounted FUSE integration smoke for poll(2) through the VFS adapter.
 //!
 //! Covers POLLIN, POLLOUT, combined events, error paths (bad fd, bad mode),

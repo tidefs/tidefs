@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Async TCP I/O runtime bridging connection lifecycle to framed byte
 //! streams.
 //!

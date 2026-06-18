@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! POSIX FUSE request classification dispatch glue.
 //!
 //! This module provides FUSE request classification and reply-commit dispatch

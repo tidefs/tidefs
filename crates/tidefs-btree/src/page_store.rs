@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Page-level persistent storage for B+tree pages.
 //!
 //! The [`PageStore`] trait provides write and read operations on

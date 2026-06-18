@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Write-durability validation: mount, write, fsync, remount, verify.
 //!
 //! Exercises the FUSE fsync durability contract across three file-size

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Page-cache core for TideFS: page insert, lookup, LRU eviction,
 //! dirty tracking, and writeback coordination.
 //!

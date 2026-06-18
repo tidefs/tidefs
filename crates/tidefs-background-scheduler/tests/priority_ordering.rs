@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Priority ordering tests for tidefs-background-scheduler.
 //
 // Tests weighted round-robin dispatch across SchedulingLane priorities,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Background segment reclaim pipeline for TideFS local object store.
 //!
 //! Two complementary facilities:

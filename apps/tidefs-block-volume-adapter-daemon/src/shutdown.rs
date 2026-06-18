@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Block-volume adapter daemon graceful shutdown state machine.
 //!
 //! [`ShutdownHandle`] provides a signal-driven ordered teardown:

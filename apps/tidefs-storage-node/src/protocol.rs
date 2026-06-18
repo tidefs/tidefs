@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Binary request/response protocol for tidefs-storage-node.
 //!
 //! Frames are self-describing binary messages carried over

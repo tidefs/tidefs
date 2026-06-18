@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Dataset subcommands split imported-pool authority from offline access.
 //!
 //! Pool-name-only dataset commands must route through the runtime owner that

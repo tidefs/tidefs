@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory entry removal mutation for the kernel VFS adapter -- K7-10
 //! namespace mutation seam.
 //! nlink-driven inode drop to VfsEngine.

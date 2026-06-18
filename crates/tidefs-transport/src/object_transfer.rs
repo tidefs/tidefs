@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object payload transfer over transport sessions.
 //!
 //! ## Relationship to StateTransfer

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Trace I/O roundtrip tests.
 //!
 //! Verifies that trace files can be written and read back with identical

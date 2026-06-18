@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Property-based tests for HLC ordering, HlcValue serde round-trip,
 //! DriftEstimator skew-detection thresholds, wall-clock-to-HLC consistency,
 //! and HLC merge-chain causality invariants.

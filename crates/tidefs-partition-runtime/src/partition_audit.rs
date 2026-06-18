@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! PartitionAudit: records partition events for operator audit
 //! through the operator audit system (#898).
 

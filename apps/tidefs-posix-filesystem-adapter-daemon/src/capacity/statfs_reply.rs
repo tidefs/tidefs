@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE `statfs_out` reply layout and serialization.
 //!
 //! Mirrors the Linux `struct fuse_statfs_out` wire format:

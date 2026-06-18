@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use crate::coordinator_lease::{CoordinatorHeartbeatRequest, CoordinatorLease, LeaseStatus};
 use crate::epoch_coordinator::{EpochCommitSubscriber, EpochView};
 use crate::epoch_fence::MembershipEpochFence;

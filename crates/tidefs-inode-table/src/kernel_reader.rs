@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-mode inode table record reader.
 //!
 //! [`KernelInodeTableReader`] reads and decodes individual inode records

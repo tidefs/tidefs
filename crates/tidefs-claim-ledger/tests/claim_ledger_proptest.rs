@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Proptest fuzzing for tidefs-claim-ledger covering:
 //!   - Register/release random sequences with invariant checks
 //!   - Commit operations under random data

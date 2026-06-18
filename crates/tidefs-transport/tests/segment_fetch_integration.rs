@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test for remote segment fetch over real TCP transport.
 //!
 //! Spawns two Transport instances communicating over TCP loopback,

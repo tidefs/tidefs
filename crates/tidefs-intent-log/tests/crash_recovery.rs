@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests: crash recovery with simulated process death.
 //!
 //! These tests verify that committed intent-log records survive a simulated

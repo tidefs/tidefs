@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Crash-recovery integration tests for the orphan replay watermark pipeline.
 //!
 //! Exercises the full pipeline described in issue #435:

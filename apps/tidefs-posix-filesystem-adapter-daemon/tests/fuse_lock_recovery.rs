@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE lock recovery after daemon restart — integration tests.
 //!
 //! Validates the lock recovery/refusal contract: POSIX advisory byte-range

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TDMA bandwidth-scheduler configuration.
 
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;

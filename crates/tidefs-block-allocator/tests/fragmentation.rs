@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Fragmentation tests for tidefs-block-allocator.
 //!
 //! Executes randomized alloc/free workloads with a seeded RNG, measures

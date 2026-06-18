@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replication factor for mirrored data.
 //!
 //! A [`ReplicationFactor`] is a validated value object that constrains the

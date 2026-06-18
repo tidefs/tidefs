@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests: truncated-stream error recovery.
 // Verifies that the decoder rejects truncated or malformed input
 // with proper errors (never panics), and that empty/single-byte/

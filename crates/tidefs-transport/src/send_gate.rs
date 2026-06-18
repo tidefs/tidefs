@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Membership send gating trait for outbound transport messages.
 //!
 //! [`SendGate`] provides a roster-query interface that the transport

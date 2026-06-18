@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // proptest_roundtrip.rs — Property-based round-trip and invariant tests for
 // tidefs-dir-index insert, lookup, delete, and iteration.
 //

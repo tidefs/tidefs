@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for lease timeout computation and boundary conditions.
 //!
 //! Exercises LeaseGrant::is_expired, is_stale, should_renew, and renew with

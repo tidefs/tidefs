@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Shared runtime artifact source required for live-runtime tier Pass rows.
 //!
 //! MountedUserspace, QemuGuest, MultiProcessDistributed, MountedKernelVfs,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Divergence classification tests — replica state vector classification
 //! into clean, suspect, confirmed-divergent, and lost-quorum categories
 //! across varied replica counts and checksum outcomes.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement map and partition heal coordinator.
 //!
 //! The [`PlacementMap`] tracks which cluster members hold replicas of each

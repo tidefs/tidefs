@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! # Device Removal Authority Map
 //!
 //! This module anchors device removal in a committed root on the target

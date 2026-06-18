@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Intent-log segment compaction for bounded replay at startup.
 //!
 //! After multiple transaction groups commit, intent-log segments contain a

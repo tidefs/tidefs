@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel VFS mount option parsing and runtime configuration.
 //!
 //! Parses the comma-separated key=value mount option string passed by the

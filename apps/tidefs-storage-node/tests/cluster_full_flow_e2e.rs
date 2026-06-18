@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Multi-node clustered pool full-flow E2E tests (#6610).
 //!
 //! Exercises the full clustered pool operator path:

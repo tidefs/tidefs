@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Write-durability flush-path latency benchmarks.
 //!
 //! Measures the SegmentBuilder-driven write path introduced in #4160:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Write→read-back integration tests for the local-filesystem layer.
 //!
 //! Exercises the core data path: create → write → sync → reopen → verify

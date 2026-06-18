@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Hash-partitioned B+tree for concurrent multi-core metadata operations.
 //!
 //! Divides the key space into N partitions by hash prefix so that

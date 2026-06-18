@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Shared stress harness framework for `P6-04` block acceptance testing.
 #![allow(clippy::too_many_arguments)]
 //!

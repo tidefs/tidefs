@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport wire message codec: bridges [`MessageFamily`]-tagged payloads
 //! to length-delimited byte frames and back.
 //!

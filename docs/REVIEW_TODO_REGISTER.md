@@ -591,14 +591,18 @@ Important 2026-06-01 findings:
   comparison, repair authority, rollback, and recovery semantics. The active
   non-doc short-label inventory is now 71 files: 9 `apps/`, 57 `crates/`, and
   5 `xtask/`.
-- `TFR-014`: root Cargo metadata reports all workspace packages as
-  `GPL-2.0-only WITH Linux-syscall-note` except the vendored/patched `fuser`
-  package, which remains MIT with provenance documented in `docs/LICENSING.md`.
-  The five excluded cargo-fuzz harness manifests now declare
-  `GPL-2.0-only WITH Linux-syscall-note` explicitly, and the focused harness
-  roots scan found no file-local third-party notices. `check-workspace-policy`
-  now verifies those explicit excluded-harness license fields. TFR-014 remains
-  open for broader file-local notice and future third-party provenance audits.
+- `TFR-014`: issue #508 completes the current package-metadata and Rust
+  file-local notice audit. Root Cargo metadata reports all workspace packages
+  as `GPL-2.0-only WITH Linux-syscall-note` except the vendored/patched
+  `fuser` package, which remains MIT with provenance documented in
+  `docs/LICENSING.md`. The five excluded cargo-fuzz harness manifests declare
+  `GPL-2.0-only WITH Linux-syscall-note` explicitly. All tracked non-vendored
+  Rust source files now carry first-line SPDX headers; TideFS-owned files use
+  `GPL-2.0-only WITH Linux-syscall-note`, kernel module entry points keep their
+  documented Linux-style `GPL-2.0` markers, and `crates/tidefs-fuser` source
+  provenance is left untouched. `check-workspace-policy` now verifies these
+  manifest, provenance, and Rust-header gates so future third-party imports or
+  new exceptions must be documented before merge.
 - `TFR-014`/`TFR-019`: the active repo rename surface is clean at the literal
   source level: the focused legacy-name scan over `/root/tidefs` reports no
   active hits outside excluded build output, lockfiles, and the vendored

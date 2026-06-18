@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-inode extended attribute storage via the local object store.
 //!
 //! Provides [`XattrError`], flag constants, and four xattr methods on

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Intent-log replay: scans committed segment files on pool import,
 //! verifies BLAKE3 integrity via IntegrityTrailerV2, reconstructs
 //! committed-but-unapplied transactions, and applies them to the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! tidefs-storage-node library: re-exports for integration tests and
 //! programmatic use.
 

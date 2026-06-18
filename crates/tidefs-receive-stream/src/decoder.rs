@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Chunk decoder: parse wire-format chunk frames and verify BLAKE3
 //! domain-separated authentication tags.
 //!

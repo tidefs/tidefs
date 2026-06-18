@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Anti-regression guard for BLAKE3 attestation patterns in
 //! operation-dispatch source files.
 //!

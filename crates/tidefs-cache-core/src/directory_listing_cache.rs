@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory listing cache (CACHE-P3).
 //!
 //! A concrete cache that stores sorted directory entry lists for the

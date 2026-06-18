@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Hybrid Logical Clock (P8-04 Sections 5.2, 7.1, 8.3).
 //!
 //! HLC provides causal ordering across nodes without requiring synchronized

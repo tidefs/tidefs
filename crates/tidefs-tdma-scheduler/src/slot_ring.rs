@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! SlotRing: circular buffer of epoch-bound time slots with deterministic
 //! round-robin allocation and node-ID-to-slot mapping.
 //!

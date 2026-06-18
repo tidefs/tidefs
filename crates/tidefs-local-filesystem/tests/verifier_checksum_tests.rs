@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for the online verifier BLAKE3-256 checksum detection.
 //!
 //! Corruption is injected by modifying raw segment file bytes on disk

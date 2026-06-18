@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified ACL persistence: domain-separated hashing, sealed
 //! encode, and verified decode for POSIX ACL xattr blobs.
 //!

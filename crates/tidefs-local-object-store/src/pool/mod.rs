@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool abstraction over a collection of devices.
 //!
 //! A `Pool` is the top-level storage container in TideFS, analogous to a ZFS

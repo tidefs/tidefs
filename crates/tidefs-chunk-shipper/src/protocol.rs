@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Chunk-shipper wire protocol using canonical binary-schema framing.
 //!
 //! Defines ChunkShippingRequest and ChunkShippingResponse message types

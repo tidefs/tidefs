@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object-store-level intent-log record types with BLAKE3-verified binary
 //! encode/decode.
 //!

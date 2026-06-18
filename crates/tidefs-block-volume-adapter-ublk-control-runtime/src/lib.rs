@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ublk block-volume adapter control runtime.
 //!
 //! # Role in the TideFS block stack

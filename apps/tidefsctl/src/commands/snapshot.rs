@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Snapshot subcommands.
 //!
 //! Wires CLI arguments to `tidefs_local_filesystem::LocalFileSystem` to

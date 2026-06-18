@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reclaim smoke: deterministic scheduler, batch planning, and completion
 //! accounting checks over `tidefs-reclaim`.
 //!

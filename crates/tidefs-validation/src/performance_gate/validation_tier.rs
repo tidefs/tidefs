@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Validation tier for performance gate rows.
 //!
 //! Re-exported from the unified validation schema.

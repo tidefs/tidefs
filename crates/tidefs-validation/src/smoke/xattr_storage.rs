@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Xattr-storage smoke: deterministic POSIX xattr lifecycle checks over
 //! `XattrStore`.
 //!

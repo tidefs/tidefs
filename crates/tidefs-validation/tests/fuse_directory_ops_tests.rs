@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE directory operation integration tests: mkdir, rmdir, readdir, rename.
 //!
 //! Exercises directory namespace operations through a real FUSE RW mount,

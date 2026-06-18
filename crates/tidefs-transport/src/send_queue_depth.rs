@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-session-class send-queue depth governance with configurable
 //! capacity bounds and caller backpressure propagation.
 //!

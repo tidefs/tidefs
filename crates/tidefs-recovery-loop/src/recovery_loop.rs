@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Committed-root-validated crash recovery loop with BLAKE3 chain
 //! verification, intent-log record replay, and health-gated rebuild
 //! decisions.

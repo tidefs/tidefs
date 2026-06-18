@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! CommitGroup epoch state machine with BLAKE3-authenticated commit records.
 //!
 //! Each epoch transitions through Prepare → Commit → Committed (or Abort)

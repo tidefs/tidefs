@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Block allocator smoke: deterministic allocation, quota, statfs, and flush
 //! behavior checks over `tidefs-block-allocator`.
 //!

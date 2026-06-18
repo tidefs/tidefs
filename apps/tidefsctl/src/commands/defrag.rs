@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! `tidefs defrag` -- trigger online extent map defragmentation via
 //! the `TIDEFS_IOC_DEFRAG` ioctl.
 

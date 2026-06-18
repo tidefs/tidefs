@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ublk IO submission-completion ring handler.
 //!
 //! Parses ublk IO descriptors from the mmap'd submission ring buffer,

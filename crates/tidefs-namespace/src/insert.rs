@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Namespace entry insertion with intent-log crash safety.
 //!
 //! [`insert_entry`] inserts a directory entry into the namespace B-tree,

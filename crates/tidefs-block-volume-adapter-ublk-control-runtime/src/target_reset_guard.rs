@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Target-reset completion drain guard for ublk data-queue rings.
 //!
 //! [`TargetResetGuard`] enforces safe deallocation ordering during ublk device

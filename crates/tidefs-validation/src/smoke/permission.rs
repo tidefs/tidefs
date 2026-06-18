@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Permission smoke: deterministic DAC, ACL, traversal, sticky-directory,
 //! setgid-inheritance, and xattr namespace checks over `tidefs-permission`.
 //!

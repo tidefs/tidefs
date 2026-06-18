@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Job executor trait and concrete implementations for deferred cleanup work items.
 //!
 //! The [`JobExecutor`] trait abstracts execution of [`CleanupWorkItemV1`]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reply smoke: deterministic API coverage for
 //! `tidefs-posix-filesystem-adapter-daemon (reply module)`.
 //!

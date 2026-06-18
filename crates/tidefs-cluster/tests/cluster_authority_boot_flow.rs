@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test: full cluster authority boot flow end-to-end.
 //!
 //! Simulates the lifecycle described in issue #6669 acceptance:

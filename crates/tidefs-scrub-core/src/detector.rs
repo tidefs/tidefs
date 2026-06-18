@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Corruption event collector with per-object deduplication.
 //!
 //! [`CorruptionDetector`] ingests [`IntegrityOutcome`] entries from the

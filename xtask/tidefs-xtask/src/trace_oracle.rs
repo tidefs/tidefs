@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! check-trace-oracle gate for tidefs-xtask.
 //!
 //! Validates the `tidefs-trace-oracle` crate and the golden trace corpus by

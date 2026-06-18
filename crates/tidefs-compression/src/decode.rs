@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Single-record decompression with algorithm detection.
 //!
 //! Reads the 5-byte frame header to determine the compression algorithm and

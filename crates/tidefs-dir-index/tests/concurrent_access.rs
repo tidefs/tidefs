@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // concurrent_access.rs — Deterministic multi-threaded concurrent-access tests
 // for tidefs-dir-index. Covers:
 //

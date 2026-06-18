@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Writeback engine for dirty page-cache extents.
 //!
 //! Connects dirty page-cache extents to the object store so that FUSE

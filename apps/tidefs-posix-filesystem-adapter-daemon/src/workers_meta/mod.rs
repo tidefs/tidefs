@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P5-02 FUSE metadata worker pool (queue_class_1.meta_read).
 //!
 //! # Public API

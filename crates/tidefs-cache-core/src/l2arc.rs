@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Second-level Adaptive Replacement Cache (L2ARC / FlashTier).
 //!
 //! Provides a persistent second-level read cache on fast NVMe/SSD devices.

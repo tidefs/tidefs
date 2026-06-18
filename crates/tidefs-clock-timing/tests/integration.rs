@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Combined-scenario integration tests: simulate a lease-acquire -> timeout ->
 //! expire sequence using in-process time values. Verifies that clock sampling,
 //! health monitoring, lease deadlines, drift estimation, and timeout escalation

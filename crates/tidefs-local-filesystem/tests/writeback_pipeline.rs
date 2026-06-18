@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Writeback pipeline integration tests.
 //!
 //! Exercises the full writeback lifecycle across crate boundaries:

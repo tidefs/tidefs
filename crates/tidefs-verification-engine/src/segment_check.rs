@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Single-device segment integrity check.
 //!
 //! Wraps [`tidefs_local_object_store::SegmentIntegrityScrubber`] to verify

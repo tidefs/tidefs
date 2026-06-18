@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Shutdown and lifecycle edge-case tests for tidefs-background-scheduler.
 //
 // Covers: drop safety with pending work, service removal/re-registration,

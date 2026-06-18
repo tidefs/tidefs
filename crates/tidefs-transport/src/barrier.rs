@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Connection-level send-barrier for flush-completion synchronization.
 //!
 //! ## Purpose

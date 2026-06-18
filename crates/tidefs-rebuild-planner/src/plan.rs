@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! RebuildPlan with BLAKE3-verified sealed-header format.
 //!
 //! A [`RebuildPlan`] is an ordered list of [`ReconstructionTask`] entries.

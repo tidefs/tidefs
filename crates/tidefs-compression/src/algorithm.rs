@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_frame::CompressionAlgorithm;
 
 /// Outcome of a threshold-aware compression attempt.

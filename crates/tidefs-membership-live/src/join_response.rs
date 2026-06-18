@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Join-response dispatch and handling for membership handshake completion.
 //!
 //! When a peer's join request is processed by the membership epoch coordinator,

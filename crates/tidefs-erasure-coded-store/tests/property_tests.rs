@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use proptest::prelude::*;
 use std::fs;
 use std::path::PathBuf;

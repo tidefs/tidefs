@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport outbound connection pool with shared TCP connection reuse
 //! and idle eviction.
 //!

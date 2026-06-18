@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Witness set configuration: defines which nodes participate in distributed
 // quorum decisions, their voting weights, and the quorum threshold parameters.
 //

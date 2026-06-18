@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Directory iteration for the kernel VFS adapter -- K7-23.
 //!
 //! Provides handle_readdir() entry point for getdents(2)/readdir(3)

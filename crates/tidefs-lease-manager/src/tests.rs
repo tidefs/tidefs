@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #[cfg(test)]
 mod lease_manager_tests {
     use crate::manager::{LeaseManager, LeaseManagerConfig, LeaseManagerError};

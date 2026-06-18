@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Durability-layout-aware repair scheduler.
 //!
 //! [`RepairScheduler`] bridges scrub corruption findings to the repair

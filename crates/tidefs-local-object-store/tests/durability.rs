@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Durability and integrity validation tests for `tidefs-local-object-store`.
 //!
 //! Covers write-then-read roundtrip correctness at canonical block sizes

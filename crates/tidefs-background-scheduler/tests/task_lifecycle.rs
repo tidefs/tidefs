@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Task lifecycle tests for tidefs-background-scheduler.
 //
 // Covers task submission, execution, result propagation, error recovery,

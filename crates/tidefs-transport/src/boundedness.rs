@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 /// Transport boundedness: per-connection limits, per-tick delivery budgets,
 /// and frame-level accounting per CLUSTER_TRANSPORT_BOUNDNESS_DESIGN (#1210).
 ///

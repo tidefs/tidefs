@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster placement recorder: bridges mounted file I/O to the placement map.
 //!
 //! When the filesystem is mounted in cluster mode (--cluster), every file

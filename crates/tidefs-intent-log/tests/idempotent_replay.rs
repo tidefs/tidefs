@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests: idempotent replay.
 //!
 //! Replaying an already-recovered log segment must be a no-op.

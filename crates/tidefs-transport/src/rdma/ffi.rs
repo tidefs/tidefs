@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![allow(unsafe_code)]
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]

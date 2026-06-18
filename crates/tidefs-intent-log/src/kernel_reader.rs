@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-mode intent-log scan and replay through [`KernelStorageIo`].
 //!
 //! This module is the no_std read side for frames written by

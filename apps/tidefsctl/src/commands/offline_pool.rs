@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Helpers for explicit-device offline pool access.
 //!
 //! Offline access is deliberately separate from `/run/tidefs/pools`, which is

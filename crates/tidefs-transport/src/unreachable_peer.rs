@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Unreachable peer escalation callback.
 //!
 //! When transport exhausts session reconnection backoff for a peer,

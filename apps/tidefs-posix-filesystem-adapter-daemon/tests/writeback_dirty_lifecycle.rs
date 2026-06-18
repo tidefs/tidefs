@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Dirty-page lifecycle validation tests for the WritebackInodeCache.
 //!
 //! Covers clean-to-dirty marking, dirty-set queries, writeback-completion

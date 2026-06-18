@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! File advisory hints for the kernel VFS adapter -- K7-25.
 //!
 //! `posix_fadvise(2)` accepts WILLNEED, DONTNEED, NOREUSE, and NORMAL

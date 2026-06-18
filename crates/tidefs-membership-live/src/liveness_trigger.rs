@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Liveness-to-epoch trigger dispatch: bridges health-score-driven
 //! peer liveness state transitions to epoch-advance proposal generation.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! SlotGrant: slot assignment token.
 //!
 //! Each slot claim produces a [`SlotGrant`] carrying the slot index, epoch,

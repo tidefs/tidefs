@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Merge planning for segment compaction.
 //!
 //! Selects fragmented segments by live-data ratio, forms merge groups

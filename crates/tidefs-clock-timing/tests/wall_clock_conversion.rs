@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Round-trip and bounded-drift tests for wall-clock / monotonic conversion
 //! fidelity using ClockSampler. The crate samples all clock sources together;
 //! this module verifies that samples taken close together produce values within

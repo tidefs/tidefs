@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic trace oracle for cross-implementation semantic regression testing.
 //!
 //! Replays JSONL trace files against `LocalFileSystem`, tracking per-step cost

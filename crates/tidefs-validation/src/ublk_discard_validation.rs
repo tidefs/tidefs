@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // ublk block-volume discard / write-zeroes validation schema and artifact guard.
 //
 // This module defines the validation row types for ublk discard/write-zeroes

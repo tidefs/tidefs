@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Runtime authority spine: single source of truth for the active transport
 //! backend, wired through membership, placement, and replication.
 //!

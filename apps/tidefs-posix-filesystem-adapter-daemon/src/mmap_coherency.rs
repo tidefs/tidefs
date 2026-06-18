@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_imports)]
 //! Mmap cluster coherency: page invalidation on remote writes.

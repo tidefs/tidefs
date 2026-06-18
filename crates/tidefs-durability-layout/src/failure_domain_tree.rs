@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Failure-domain tree with BLAKE3-sealed integrity verification.
 //!
 //! A [`FailureDomainTree`] encodes the full device→node→rack→datacenter

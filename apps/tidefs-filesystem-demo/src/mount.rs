@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE mount harness backed by an in-memory LocalObjectStore.
 //!
 //! `TempMount` boots a `LocalFileSystem` over a `LocalObjectStore` with

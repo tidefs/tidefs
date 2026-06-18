@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Clean-unmount fsync/fdatasync durability integration tests.
 //!
 //! Each test follows: mount FUSE → write → fsync/fdatasync → clean unmount →

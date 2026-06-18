@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! CommitGroupWriter: BLAKE3-verified committed-root atomic write path.
 //!
 //! # Overview

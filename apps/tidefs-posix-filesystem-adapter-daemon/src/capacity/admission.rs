@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Capacity admission helpers for POSIX size growth and metadata reservations.
 
 use tidefs_block_allocator::AllocError;

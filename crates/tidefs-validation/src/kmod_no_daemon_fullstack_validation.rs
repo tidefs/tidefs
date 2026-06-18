@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! kmod-posix-vfs no-daemon full-stack mounted validation module.
 //!
 //! Produces tier-classified validation output for the full kmod-posix-vfs kernel

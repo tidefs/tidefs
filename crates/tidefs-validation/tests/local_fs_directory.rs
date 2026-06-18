@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![cfg(feature = "fuse")]
 
 //! Local-filesystem directory operation integration tests.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE `STATFS`, `OPENDIR`, `READDIR`, `RELEASEDIR`, `READ`, and `WRITE` request dispatch glue.
 
 use crate::fusewire::{classify_fuse_request, derive_shard_key_policy, opcode};

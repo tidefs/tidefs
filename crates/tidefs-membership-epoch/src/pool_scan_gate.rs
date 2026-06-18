@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool-scan evidence gate for membership epoch promotion.
 //!
 //! This module binds epoch promotion to a committed pool scan. Promotion only

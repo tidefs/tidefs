@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Error types for the local object store.
 //!
 //! The [`StoreError`] enum covers all failure modes in the store lifecycle:

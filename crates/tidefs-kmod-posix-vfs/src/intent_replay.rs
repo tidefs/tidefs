@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-side intent-log replay for mount-time crash recovery.
 #![allow(dead_code)]
 //!

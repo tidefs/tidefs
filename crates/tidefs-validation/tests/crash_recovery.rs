@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Local-filesystem crash-recovery integration tests.
 //!
 //! Exercises the drop → reopen → verify recovery loop directly against

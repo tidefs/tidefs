@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! `tidefsctl diag` -- support bundle and diagnostics command.
 //!
 //! Collects a redacted support bundle with source-qualified operator evidence.

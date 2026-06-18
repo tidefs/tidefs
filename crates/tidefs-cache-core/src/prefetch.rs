@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Sequential access detection for prefetch/readahead.
 //!
 //! Provides [`SequentialDetector`] — a per-handle offset tracker that

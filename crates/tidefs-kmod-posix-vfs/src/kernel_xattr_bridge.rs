@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-compatible xattr bridge -- K7-19 xattr-storage seam.
 //!
 //! Bridges kernel extended attribute operations to the canonical

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Property-based tests (proptest) for tidefs-btree.
 //!
 //! Validates BPlusTree invariants against std::collections::BTreeMap

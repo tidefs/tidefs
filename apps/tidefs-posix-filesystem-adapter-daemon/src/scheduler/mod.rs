@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P5-02 FUSE scheduler: queue shard creation, worker-pool sizing, backpressure initialization.
 //!
 //! Part of the P5-02 classified multipool topology for the userspace FUSE runtime.

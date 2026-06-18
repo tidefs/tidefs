@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration smoke test: object store → local filesystem → read-back → verify.
 use std::env;
 use std::fs;

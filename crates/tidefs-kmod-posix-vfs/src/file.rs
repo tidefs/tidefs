@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! File operations for the kernel VFS adapter --- clean-read seam.
 
 #[cfg(CONFIG_RUST)]

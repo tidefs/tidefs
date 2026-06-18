@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! End-to-end FUSE mount-path smoke test harness for committed dispatch
 //! surfaces.
 //!

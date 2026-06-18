@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool device (virtual device) types for the TideFS storage hierarchy.
 //!
 //! This module implements the device abstraction layer that sits between the

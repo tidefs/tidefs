@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for tidefs-incremental-job-core (#4090).
 
 use tidefs_incremental_job_core::{

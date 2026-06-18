@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Object-store smoke: deterministic sequence of put, get, delete, and list
 //! operations against `LocalObjectStore`.
 //!

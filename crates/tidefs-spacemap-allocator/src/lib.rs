@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic segment-level free-space allocator (G1 foundation).
 //!
 //! `SegmentFreeMap` provides a run-based in-memory free segment tracker

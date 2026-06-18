@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! P5-02 FUSE reply commit lanes (reply_class_0.small_reply, reply_class_1.bulk_reply)
 //! and directory-entry wire-format serialization (issue #2523).
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Crash injection integration tests.
 //!
 //! These tests exercise the fault injection hooks in the object store to

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Extent-map smoke: deterministic sequence of insert, lookup, sparse
 //! boundary, adjacency merge, split-overwrite, and validation operations
 //! against `InlineExtentMap`.

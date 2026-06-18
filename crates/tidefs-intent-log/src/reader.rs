@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Intent-log segment reader with crash-consistent replay.
 //!
 //! [`IntentLogReader`] reads an on-disk segment and extracts committed

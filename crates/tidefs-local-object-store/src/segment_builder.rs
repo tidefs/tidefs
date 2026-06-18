@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Segment builder for batching object writes into checksum-anchored segments.
 //!
 //! The [`SegmentBuilder`] accumulates pending writes until a configurable byte

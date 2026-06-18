@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Centralized Linux errno mapping contract for the kernel VFS adapter.
 //!
 //! This module defines the error categories that TideFS kernel operations

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TDMA slot types: state machine, slot descriptor, and allocation result.
 
 use serde::{Deserialize, Serialize};

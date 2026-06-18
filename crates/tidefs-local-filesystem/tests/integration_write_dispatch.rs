@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Write dispatch integration tests for the local-filesystem layer.
 //!
 //! Tests the write-dispatch pipeline end-to-end:

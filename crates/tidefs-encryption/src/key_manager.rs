@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Key manager integration for TideFS encryption-at-rest.
 //!
 //! Phase 2 of encryption-at-rest (#1246): persistent sealed-key storage

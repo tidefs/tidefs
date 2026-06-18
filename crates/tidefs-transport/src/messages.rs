@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! State transfer message types for deterministic node catch-up.
 //!
 //! These types carry object identifiers and payload data with BLAKE3

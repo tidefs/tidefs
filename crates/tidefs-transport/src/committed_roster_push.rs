@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Committed-roster push message type for passive-peer epoch synchronization.
 //!
 //! After an epoch agreement round concludes, the quorum participants know

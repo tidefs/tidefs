@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-address outbound connection-attempt tracking with duplicate-prevention
 //! and cooldown.
 //!

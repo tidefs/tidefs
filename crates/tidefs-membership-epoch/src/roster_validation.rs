@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Roster-change proposal validation rules for pre-quorum well-formedness checking.
 //!
 //! Before a roster-change proposal enters the epoch-advance coordinator's quorum

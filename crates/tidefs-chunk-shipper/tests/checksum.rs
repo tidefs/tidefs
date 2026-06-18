@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Checksum verification tests: digest derivation, correctness assertion,
 //! mismatch rejection at staging-area level, and mismatch propagation
 //! through the full pipeline.

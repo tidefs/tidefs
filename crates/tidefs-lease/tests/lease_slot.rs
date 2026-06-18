@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for concurrent lease slot allocation, deallocation,
 //! interval tree operations, and pending lock queue behaviour.
 //!

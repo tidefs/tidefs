@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mounted FUSE integration tests for mknod through the VFS-backed adapter.
 
 use std::ffi::CString;

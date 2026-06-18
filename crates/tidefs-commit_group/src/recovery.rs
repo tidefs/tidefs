@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! CommitGroupRecovery: mount-time journal replay.
 //!
 //! On mount, `CommitGroupRecovery` scans a [`CommitGroupStore`] for commit_group journal records,

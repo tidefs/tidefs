@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Narrow `posix_filesystem_adapter` runtime projection from `publication_pipeline` / `response_registry` outcomes into the first
 //! family-local wake receipt.
 #[cfg(feature = "receipt-demo")]

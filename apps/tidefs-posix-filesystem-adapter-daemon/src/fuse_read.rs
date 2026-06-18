@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE read dispatch with page-cache integration and extent-map data path.
 //!
 //! This module provides the direct data-path read dispatch that chains

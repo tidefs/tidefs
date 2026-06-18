@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Space accounting tests for tidefs-block-allocator.
 //!
 //! Verifies that free_count, block_count, statfs, and derived byte-level

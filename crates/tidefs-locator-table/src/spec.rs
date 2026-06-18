@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! On-disk layout specification for the V1 locator table.
 //!
 //! This module documents the binary format of locator table blobs

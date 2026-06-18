@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use super::*;
 
 pub fn run_ublk_control_open_preflight() -> Result<UblkControlOpenReport, AppError> {

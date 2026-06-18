@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Namespace entry removal with intent-log crash safety.
 //!
 //! [`remove_entry`] removes a directory entry from the namespace B-tree,

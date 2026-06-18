@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Collect a QEMU pin manifest for reproducible validation runs.
 //!
 //! The `collect-qemu-pin-manifest` subcommand gathers kernel, initrd, disk

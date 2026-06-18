@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! ublk block-volume write-request handler.
 //!
 //! Provides [`UblkWriteRequest`] as a typed representation of a ublk block

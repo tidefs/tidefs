@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! POSIX statvfs backing computation for [`LocalFileSystem`].
 //!
 //! Provides a self-contained [`statvfs`](LocalFileSystem::statvfs) method

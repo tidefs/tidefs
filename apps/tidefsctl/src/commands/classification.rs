@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Command classification authority for `tidefsctl`.
 //!
 //! This module is the single source of truth for the public/operator,

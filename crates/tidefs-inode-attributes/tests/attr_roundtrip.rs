@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Attribute get/set round-trip validation tests.
 //!
 //! Exercises every field independently and in combination through the

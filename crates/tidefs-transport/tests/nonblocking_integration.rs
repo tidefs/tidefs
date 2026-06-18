@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Non-blocking I/O integration tests for the Transport layer.
 //!
 //! These tests verify that the Transport correctly handles non-blocking I/O

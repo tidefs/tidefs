@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified protocol-level node-drain state machine.
 //!
 //! [`DrainProtocolMachine`] tracks the lifecycle of a graceful node drain at the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Shared test utilities for kmod-posix-vfs tests.
 
 #[cfg(CONFIG_RUST)]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Cluster authority on-disk store: persistence and scan for
 //! [`ClusterAuthorityRecord`]s on pool devices.
 //!

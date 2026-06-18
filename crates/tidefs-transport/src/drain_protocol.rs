@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport connection drain protocol: graceful in-flight completion and
 //! peer acknowledgement handshake bridging the ConnectionState
 //! `Draining -> Closed` transition.

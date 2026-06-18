@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Writeback and dirty-page persistence validation suite.
 //!
 //! Exercises the writeback path end-to-end through the public

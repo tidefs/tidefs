@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Background segment cleaner with operator-configurable throttles.
 //!
 //! Wraps the watermark-based [`CleanerScheduler`] from

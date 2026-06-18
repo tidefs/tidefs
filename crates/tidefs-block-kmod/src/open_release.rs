@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Block device open/release lifecycle with exclusive-open guard.
 //!
 //! This module implements the `block_device_operations::open` and `release`

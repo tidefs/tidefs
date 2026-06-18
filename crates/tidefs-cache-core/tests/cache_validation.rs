@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Comprehensive cache-core validation covering page states, dirty tracking,
 //! LRU ordering, eviction policy, pin lifecycle, and edge cases.
 //!

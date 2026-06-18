@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use crate::epoch_fence::MembershipEpochFence;
 use crate::failure_detector::*;
 use crate::types::*;

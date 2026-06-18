@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-mode root directory reader through KernelStorageIo.
 //!
 //! [`KernelRootDirReader`] reads the on-disk [`DirPage`] sequence for a

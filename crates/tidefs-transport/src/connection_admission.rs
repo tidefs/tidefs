@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Connection admission controller: validates inbound transport connections
 //! against the membership roster before allowing message exchange.
 //!

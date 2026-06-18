@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // dir_iterator_interleaved_mutation.rs — Integration tests for DirIterator
 // behaviour when DirIndex entries are inserted, deleted, replaced, or renamed
 // between next_entry() calls.

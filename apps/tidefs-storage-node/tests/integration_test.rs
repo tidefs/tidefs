@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration test: storage node server + client roundtrip.
 //!
 //! Starts a storage node on a random port in a background thread,

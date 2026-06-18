@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel readdir crash-consistency validation module.
 //!
 //! Produces tier-classified validation output for kmod-posix-vfs readdir (getdents64

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mount lifecycle state machine for the kernel VFS adapter.
 //!
 //! Tracks the mount/unmount lifecycle of a TideFS kernel filesystem

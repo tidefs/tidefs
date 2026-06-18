@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for transport session negotiation.
 //!
 //! These tests exercise the full session negotiation flow between two

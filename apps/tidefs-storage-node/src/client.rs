@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Storage node client: connect and issue put/get/delete/list/stats/send/receive commands.
 
 use std::net::SocketAddr;

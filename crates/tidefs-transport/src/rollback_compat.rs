@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rolling upgrade compatibility gate for multi-node protocol negotiation.
 //!
 //! ## Purpose

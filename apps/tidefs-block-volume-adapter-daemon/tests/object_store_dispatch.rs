@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests for ublk read/write dispatch through the
 // BlockVolumeObjectStoreBackend to the LocalObjectStore.
 //

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Compaction verification utilities.
 //!
 //! BLAKE3 domain-separated hashing ("TideFS compaction v1"), sealed-blob

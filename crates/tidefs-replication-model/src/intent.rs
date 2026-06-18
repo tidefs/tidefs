@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replication intent encoding.
 //!
 //! A [`ReplicationIntent`] defines the durability contract that a dataset,

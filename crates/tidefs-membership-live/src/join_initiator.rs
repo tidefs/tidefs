@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Joining-peer join request initiation and response handling state machine.
 //!
 //! Drives the joining peer's side of the membership join handshake. The

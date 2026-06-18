@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Block-device-backed object store.
 //!
 //! `BlockDeviceStore` stores objects directly on a byte-addressable block

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-peer bounded FIFO send queue with configurable backpressure.
 //!
 //! Provides a bounded FIFO send queue per connected peer so upper-layer

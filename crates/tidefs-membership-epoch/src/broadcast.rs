@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3-verified membership epoch configuration broadcast protocol.
 //!
 //! This module implements per-peer delivery of committed [`EpochConfig`]

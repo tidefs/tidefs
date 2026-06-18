@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! TCP listener bound to a [`TransportAddr`] that accepts framed transport
 //! connections.
 //!

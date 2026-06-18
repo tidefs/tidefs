@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![allow(dead_code)]
 //! Shared test helpers for tidefs-local-filesystem integration tests.
 //!

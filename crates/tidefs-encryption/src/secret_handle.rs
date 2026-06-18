@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Secret-handle/key-lease boundary for pool encryption keys (REL-SEC-003).
 //!
 //! This module implements the operator-visible secret-handle/key-lease

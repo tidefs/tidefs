@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! O_TMPFILE unnamed temporary file creation for the kernel VFS adapter.
 //!
 //! Delegates to VfsEngine::tmpfile, which creates an unnamed regular file

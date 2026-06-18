@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Failure domain hierarchy for replication intent.
 //!
 //! A [`FailureDomain`] defines the level at which replicas or erasure-coded

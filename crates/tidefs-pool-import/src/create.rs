@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool creation: initialize byte-addressable pool devices with TideFS labels,
 //! superblock data, and an initial committed root.
 //!

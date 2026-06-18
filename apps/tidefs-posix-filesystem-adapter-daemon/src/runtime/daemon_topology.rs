@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use core::convert::TryFrom;
 use tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterDecodeError;
 use tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterId128;

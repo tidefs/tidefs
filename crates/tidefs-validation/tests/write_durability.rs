@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE write-durability integration test.
 //!
 //! Exercises advancement criteria 1-3 of the `fuse-write-durability` focus

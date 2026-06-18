@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BackgroundOrphanReclamation — BackgroundService for orphan index recovery.
 //!
 //! Incrementally reclaims orphaned inodes from the persistent orphan index

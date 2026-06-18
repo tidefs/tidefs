@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Policy gates for parallel instance safety.
 //
 // Provides checks that validate:

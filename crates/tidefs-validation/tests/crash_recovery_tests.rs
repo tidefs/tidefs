@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE SIGKILL+remount crash-recovery integration tests.
 //!
 //! These tests exercise real process lifecycle: spawn the TideFS daemon,

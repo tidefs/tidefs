@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests: transaction ordering and interleaved group recovery.
 //!
 //! Validates that sequential transactions are replayed in commit order

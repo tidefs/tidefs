@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replication write-path: fanout writes to replica peers, collect
 //! per-replica acknowledgments, and signal quorum satisfaction or
 //! shortfall to the caller.

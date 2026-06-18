@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Separate intent LOG (LOG_DEVICE) device writer.
 //!
 //! A [`LogDeviceWriter`] manages a dedicated fast-device file for intent-log

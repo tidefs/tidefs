@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reusable FUSE mount harness for integration tests.
 //!
 //! Provides MountedVfs with mount/unmount/remount lifecycle, path helpers,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Message send-deadline enforcement for stale-message cancellation.
 //!
 //! Protocol callers bound message lifetimes with optional

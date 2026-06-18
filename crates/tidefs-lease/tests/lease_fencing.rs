@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for three-node lease expiry and fencing.
 //!
 //! Exercises the core correctness property for #6469 (NEXT-MN-014):

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Two-node harness integration test for deterministic membership lease
 //! transitions. Exercises the full lease lifecycle — acquire, renew,
 //! release — across two simulated nodes using the deterministic loopback

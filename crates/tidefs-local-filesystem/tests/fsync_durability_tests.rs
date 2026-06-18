@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Targeted fsync/fdatasync flush-to-object-store durability tests.
 //!
 //! These tests verify that the fsync flush path correctly persists buffered

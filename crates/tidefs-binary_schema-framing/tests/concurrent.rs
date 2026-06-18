@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests: concurrent encode safety.
 // Verifies that the encoding API can be called from multiple threads
 // without internal state corruption, and that interleaved encode

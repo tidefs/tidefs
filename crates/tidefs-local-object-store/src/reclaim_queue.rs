@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Persistent reclaim-queue storage backed by the local object store.
 //!
 //! Implements [`tidefs_reclaim_queue_core::ReclaimQueueStorage`] for

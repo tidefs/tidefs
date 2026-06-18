@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Connection teardown bridge from membership epoch transitions to
 //! transport connection lifecycle.
 //!

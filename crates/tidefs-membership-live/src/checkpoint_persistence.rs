@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Checkpoint persistence backed by [`tidefs_local_object_store::LocalObjectStore`].
 //!
 //! Implements the [`tidefs_membership_epoch::snapshot::EpochSnapshotStore`] trait

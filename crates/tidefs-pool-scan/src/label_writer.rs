@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool label writer: writes sealed, BLAKE3-checksummed pool labels to
 //! block devices at standard primary (offset 0) and backup
 //! (end-of-device) locations.

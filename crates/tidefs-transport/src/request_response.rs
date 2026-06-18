@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Request-response correlation table for in-flight request tracking, timeout
 // expiry, and response delivery over the existing send/receive dispatch paths.
 //

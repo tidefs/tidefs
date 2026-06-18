@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE basic-ops integration test: validates create/mkdir/rmdir/unlink/rename
 //! through a real FUSE mount, remount persistence, and the full basic-ops cycle.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // uid_gid_mapping.rs — principal mapping, role binding with scope,
 // scope coverage edge cases, authorization decision pipeline
 // (derive_authorization_decision_for_request), and boundary

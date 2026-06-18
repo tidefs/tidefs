@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Append-only write-ahead log for B+tree page-level crash safety.
 //!
 //! Every page mutation is recorded as a WAL entry before the page is

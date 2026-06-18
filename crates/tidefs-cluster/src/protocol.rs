@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Membership lease wire protocol: acquire, renew, release, and expire
 //! message types with BLAKE3-256 integrity per frame.
 //!

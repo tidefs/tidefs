@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Userspace validation support for TideFS.
 //!
 //! This crate keeps helpers that run product behavior directly or summarize

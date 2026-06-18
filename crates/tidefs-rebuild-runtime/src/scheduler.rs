@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BackfillScheduler: consumes degraded-replica reports, deduplicates
 //! tasks by (subject, target) key, and applies per-node transfer
 //! capacity limits to avoid overloading a single target.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests: length-delimited framing edge cases — bad magic,
 // checksum mismatches, alignment violations, truncated-input rejection,
 // invalid discriminants, payload bounds enforcement.

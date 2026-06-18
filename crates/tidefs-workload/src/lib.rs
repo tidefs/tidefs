@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Workload signature materialization for adaptive TideFS tuning.
 //!
 //! This crate provides a sliding-window IO pattern classifier that

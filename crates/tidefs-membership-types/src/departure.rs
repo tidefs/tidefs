@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Coordinated peer departure wire protocol types.
 //!
 //! Defines the wire types for the departure protocol:

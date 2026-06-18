@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Read-path unit tests for the local-filesystem layer.
 //!
 //! Exercises the read, getattr, and lookup entry points on regular files.

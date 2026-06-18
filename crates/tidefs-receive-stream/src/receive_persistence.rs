@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Receive persistence bridge: persist reassembled objects into a local
 //! object store with incremental base-root pin authority checks.
 //!

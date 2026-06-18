@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Round-trip and edge-case tests for BLAKE3-256 hash encoding/decoding
 //! in tidefs-binary_schema-checksum.
 //!

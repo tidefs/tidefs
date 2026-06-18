@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Peer drain coordinator: aggregates per-session drain completion across
 //! all sessions to a single peer and produces a single awaitable signal
 //! consumable by the membership departure protocol.

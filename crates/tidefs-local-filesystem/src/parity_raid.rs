@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Parity RAID stripe layout engine.
 //!
 //! `ParityRaid1` implements single-parity (XOR) striping: given N data blocks

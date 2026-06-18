@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Epoch-advance coordinator bridging peer liveness detection to committed
 //! epoch views.
 //!

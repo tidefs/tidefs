@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Multi-node performance degradation budget: compares single-node baseline
 //! KPIs against multi-node measurements and evaluates whether the overhead
 //! stays within the approved degradation budget.

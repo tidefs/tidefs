@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! 5-step renameat2 atomicity algorithm for namespace mutations.
 //!
 //! Implements the POSIX `renameat2` system call with `RENAME_NOREPLACE`

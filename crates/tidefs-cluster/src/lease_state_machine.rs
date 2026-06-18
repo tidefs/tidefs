@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic membership lease state machine with BLAKE3-verified state
 //! integrity.
 //!

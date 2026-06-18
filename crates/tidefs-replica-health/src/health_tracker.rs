@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! IO-error-driven per-replica health state machine with sliding-window
 //! degradation tracking.
 //!

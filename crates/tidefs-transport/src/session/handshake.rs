@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic parameter-negotiation protocol for transport sessions.
 //!
 //! Implements a 3-message protocol that exchanges node identities, nonces,

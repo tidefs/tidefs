@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Pool-level health report aggregation for segment integrity verification.
 
 use std::collections::BTreeMap;

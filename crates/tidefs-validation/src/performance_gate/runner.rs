@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use super::benchmark_harness::BenchmarkResult;
 use super::comparator_harness::{ComparatorHarness, ComparatorManifest, ComparatorRun};
 use super::consolidation::DegradationSummary;

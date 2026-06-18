@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Namespace smoke: deterministic namespace lifecycle operations.
 //!
 //! Gated on `feature = "fuse"`.

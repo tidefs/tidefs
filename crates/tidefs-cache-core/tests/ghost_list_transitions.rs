@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Ghost-list B1/B2 transition tests for tidefs-cache-core ARC.
 //!
 //! These integration tests verify ghost-list behaviour observable through

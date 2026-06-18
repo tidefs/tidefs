@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Staged corruption scenario tests for the crash recovery matrix.
 //!
 //! These tests deliberately corrupt specific on-disk records (segment headers,

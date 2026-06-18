@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE link/unlink BLAKE3-verified validation harness.
 //!
 //! Exercises hardlink creation and removal through a real FUSE mount,

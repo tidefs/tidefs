@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Replica lag tracking from receipt frontiers.
 //!
 //! Lag is computed as the difference between the primary's known-placed

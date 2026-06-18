@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for the commit_group (transaction group) pipeline.
 //!
 //! Verifies that writes accumulated in the commit_group produce a durable committed

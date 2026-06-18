@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE xattr integration tests for the POSIX filesystem adapter daemon.
 //!
 //! Complements the existing `fuse_xattr_smoke.rs` (16 tests covering basic

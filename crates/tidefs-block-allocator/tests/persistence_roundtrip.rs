@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests: persistence roundtrip.
 //!
 //! Serialize allocator state (flush_words), deserialize into a fresh

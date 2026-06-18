@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use super::gate_entry::{BudgetDecision, MeasuredKpi};
 use super::validation_tier::ValidationTier;
 use std::path::Path;

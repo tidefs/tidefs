@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Fsync and fsyncdir durability flush for the kernel VFS adapter --
 //! K7-15 durability flush seam.
 //! This module provides:

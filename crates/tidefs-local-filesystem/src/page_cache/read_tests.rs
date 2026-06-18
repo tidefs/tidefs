@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Page-cache read-path validation.
 //!
 //! Exercises the PageCache read surface through a simple read-through helper

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Connection initialization handshake: protocol version negotiation and peer
 //! identity exchange that runs after TCP accept/connect and before message
 //! dispatch.

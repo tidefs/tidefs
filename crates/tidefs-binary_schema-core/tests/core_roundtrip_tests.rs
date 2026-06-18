@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // Integration tests for tidefs-binary_schema-core serialization
 // primitives, exercising the public API from outside the crate.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport message dispatch registry keyed by [`MessageFamily`].
 //!
 //! ## Purpose

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Mounted FUSE data-integrity lifecycle smoke tests for the VFS-backed adapter.
 //!
 //! Validates that the complete write→flush→remount→read→verify chain

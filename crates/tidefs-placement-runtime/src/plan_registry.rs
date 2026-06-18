@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Placement plan registry.
 //!
 //! Distributed conflict detection and resolution for placement decisions.

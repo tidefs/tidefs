@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Block-level object lifecycle validation tests for `tidefs-local-object-store`.
 //!
 //! Covers write→read→checksum-verify round-trip, partial overwrite,

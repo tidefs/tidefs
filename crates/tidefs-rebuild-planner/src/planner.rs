@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reconstruction planning with durability-layout constraint satisfaction
 //! and failure-domain separation.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Property-based tests for `tidefs-local-object-store` using randomized
 //! inputs via the `rand` crate (already a workspace dependency).
 //!

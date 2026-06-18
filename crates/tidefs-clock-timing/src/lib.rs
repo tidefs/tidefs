@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 #![cfg_attr(not(test), no_std)]
 //! tidefs-clock-timing: HLC, clock health, drift estimation, lease/fence deadlines, freshness fences, epoch timing attestation, and timeout
 //! escalation (P8-04).

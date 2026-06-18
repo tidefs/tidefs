@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Fault injection hooks for crash injection testing.
 //!
 //! This module provides configurable fault injection that enables testing

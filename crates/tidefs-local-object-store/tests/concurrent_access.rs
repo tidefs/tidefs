@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Concurrent access tests for `tidefs-local-object-store`.
 //!
 //! Exercises concurrent put, get, delete, and scan operations through

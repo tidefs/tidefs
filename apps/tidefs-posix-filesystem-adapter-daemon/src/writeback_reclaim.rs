@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Writeback-aware inode cache with reclaim support for the POSIX
 //! filesystem adapter daemon.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Wire types for epoch proposal and acknowledgment messages with
 //! BLAKE3-verified integrity.
 //!

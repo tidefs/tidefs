@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Segment table enumeration for pool device scanning.
 //!
 //! Each TideFS device carries a *system area* (pointed to by the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-side mount initialization sequence.
 //!
 //! Orchestrates the full no-daemon mount(2) path by chaining:

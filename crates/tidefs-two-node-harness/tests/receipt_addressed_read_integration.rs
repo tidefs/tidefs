@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Two-node harness integration test for receipt-addressed reads and degraded
 //! read validation after simulated node loss.
 //!

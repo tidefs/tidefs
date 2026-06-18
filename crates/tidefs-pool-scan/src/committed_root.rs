@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Committed-root locator for pool device scanning.
 //!
 //! A *committed root* anchors the durable state of the filesystem at a

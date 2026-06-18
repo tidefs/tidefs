@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Open / release bridge — kernel file_operations open/release dispatch.
 //!
 //! Provides no_std-compatible bridge functions that translate kernel VFS

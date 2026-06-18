@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Framing / pipeline state-machine tests: verify that phase transitions
 //! through stage→stream→receive→complete are correct, session states
 //! advance properly, and failure/expiry paths leave the session in

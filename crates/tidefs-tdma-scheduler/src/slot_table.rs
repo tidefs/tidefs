@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Active-slot lifecycle table with insert, lookup, and epoch-gated expiry.
 //!
 //! Tracks currently-active TDMA slots keyed by `(node_id, write_txg)`. Slots

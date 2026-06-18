@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for the page-cache surface in tidefs-cache-core.
 //!
 //! These tests exercise the public [`PageCache`] API as an external consumer

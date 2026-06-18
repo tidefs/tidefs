@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! File creation mutation for the kernel VFS adapter -- K7-07 mutation seam.
 //! Provides create (regular file allocation in a directory) with
 

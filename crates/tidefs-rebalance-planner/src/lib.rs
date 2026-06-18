@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Rebalance planner: capacity redistribution orchestration — PC-010.4.
 //!
 //! The rebalance planner coordinates capacity-weighted, delta-based rebalancing

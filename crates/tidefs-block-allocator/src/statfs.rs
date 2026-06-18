@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! `Statfs` struct and accumulation helpers.
 //!
 //! Mirrors the Linux `struct statfs` / `statvfs` fields used by

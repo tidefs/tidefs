@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! POSIX timestamp maintenance: automatic atime/mtime/ctime update rules.
 //!
 //! Implements the POSIX timestamp transition rules for read (atime),

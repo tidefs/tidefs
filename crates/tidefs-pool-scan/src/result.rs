@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Consolidated pool scan result.
 //!
 //! [`PoolScanResult`] aggregates the output of a full pool device scan:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reproducible QEMU image and kernel pin manifest.
 //!
 //! Every QEMU validation run must record exactly what kernel, initrd, disk image,

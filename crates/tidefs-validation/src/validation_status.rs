@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Unified release validation outcome classification.
 //!
 //! Every release validation output must use one of these five statuses

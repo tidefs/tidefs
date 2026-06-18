@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! CommitGroup smoke: deterministic dirty tracking, accumulation, sync-gate, and
 //! journal payload checks over `tidefs-commit_group`.
 //!

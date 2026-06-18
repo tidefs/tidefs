@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Transport session lifecycle bridge from membership epoch transitions to
 //! transport session management.
 //!

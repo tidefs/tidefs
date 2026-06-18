@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Reassembly tests: out-of-order chunk insertion into the staging area,
 //! duplicate chunk detection, drain behaviors, and BTreeMap ordering.
 

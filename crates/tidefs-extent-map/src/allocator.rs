@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Extent allocator primitives.
 //!
 //! `ExtentAllocator` manages physical extent allocation for the local

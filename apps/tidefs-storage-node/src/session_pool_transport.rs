@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Live transport-backed `PoolTransport` implementation using
 //! established transport sessions.
 

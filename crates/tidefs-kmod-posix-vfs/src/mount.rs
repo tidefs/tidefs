@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Kernel-side pool import context and label validation.
 //!
 //! Provides the kernel-mode mount initialization path: pool label

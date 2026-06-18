@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE write/write_buf dispatch with page-cache dirty tracking and
 //! extent-map write-range resolution.
 //!

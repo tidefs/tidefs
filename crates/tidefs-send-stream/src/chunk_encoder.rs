@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! BLAKE3 domain-separated chunk encoder producing TransferStream wire format.
 //!
 //! Each chunk carries a domain-separated BLAKE3-256 authentication tag under

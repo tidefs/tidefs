@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Typed fault and corruption catalog (P10-02 Section 4).
 //!
 //! This module defines the canonical set of fault classes, hook bindings,

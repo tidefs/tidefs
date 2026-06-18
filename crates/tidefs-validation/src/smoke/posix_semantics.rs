@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! POSIX-semantics smoke: deterministic checks for pure permission,
 //! metadata, and name-validation helpers.
 //!

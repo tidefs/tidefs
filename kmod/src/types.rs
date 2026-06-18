@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Opaque kernel-object facades for the bridge stratum (s2 / c6).
 //!
 //! These are type-level placeholders that downstream leaf modules (s3) will

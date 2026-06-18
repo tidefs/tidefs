@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Deterministic property-like fuzz tests for tidefs-chunk-shipper.
 //!
 //! Exercises the same invariants as property-based testing would,

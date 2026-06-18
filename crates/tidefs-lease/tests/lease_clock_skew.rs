@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Clock skew injection tests for lease safety — #6480 (NEXT-MN-025).
 //!
 //! Validates that clock skew causes the lease system to fail closed:

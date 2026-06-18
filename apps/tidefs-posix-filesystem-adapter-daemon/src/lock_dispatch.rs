@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE advisory lock dispatch (getlk / setlk / setlkw / flock).
 //!
 //! Wires `tidefs-lock-service` LockService with lease-backed ownership TTLs

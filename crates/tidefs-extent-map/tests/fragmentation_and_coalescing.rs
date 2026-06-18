@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Fragmentation and coalescing validation tests.
 //!
 //! Exercises extent-map behavior under patterns that create fragmentation:

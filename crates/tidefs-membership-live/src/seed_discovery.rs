@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Seed-peer discovery for cold-start cluster bootstrap.
 //!
 //! Provides [`SeedDiscovery`] which accepts a configured list of seed

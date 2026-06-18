@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Per-peer-connection health score aggregation with multi-signal weighting.
 //!
 //! This module fuses keepalive round-trip latency, error-classification event

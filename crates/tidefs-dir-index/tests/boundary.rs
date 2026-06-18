@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 // boundary.rs — Boundary-condition integration tests for DirIndex:
 // maximum name length, zero-length names, single-entry directory,
 // 500-entry large directories, and edge-case cursor operations.

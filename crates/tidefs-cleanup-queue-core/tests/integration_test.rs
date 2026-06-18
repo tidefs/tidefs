@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Integration tests for the cleanup-queue ledger exercising the full
 //! pipeline: enqueue FreedExtents → verify_dead → reconcile_with
 //! (mock allocator free) → assert space tracking.
