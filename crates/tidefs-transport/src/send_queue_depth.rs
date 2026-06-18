@@ -38,6 +38,14 @@
 //! `SendQueueDepthConfig` carries per-lane-class `max_depth` values.
 //! A lane class with `max_depth == 0` is ungoverned (depth not tracked).
 //!
+//! ## Admission Evidence
+//!
+//! `SendQueueDepthEvidence` exposes this governor as compact source/adapter
+//! metadata for no-hidden-queue review. The evidence uses the canonical
+//! `tidefs-performance-contract` spellings for work classes, resource
+//! domains, and validation tiers. It is not a distributed runtime fairness,
+//! throughput, or RDMA readiness claim by itself.
+//!
 //! ## Integration
 //!
 //! - **Upstream**: `SendDispatcher::enqueue()` calls `try_reserve()` before
@@ -50,6 +58,25 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::lane_demux::LaneClass;
+
+/// Stable queue-root name for transport send depth admission metadata.
+pub const SEND_QUEUE_DEPTH_QUEUE_ROOT: &str = "transport.send_queue_depth";
+/// Queue-slot resource domain spelling from `tidefs-performance-contract`.
+pub const SEND_QUEUE_DEPTH_RESOURCE_DOMAIN: &str = "queue-slots";
+/// Source-level validation tier spelling from `tidefs-performance-contract`.
+pub const SEND_QUEUE_DEPTH_VALIDATION_TIER: &str = "source-model";
+
+/// Return the canonical `tidefs-performance-contract` work class for a lane.
+#[must_use]
+pub const fn send_queue_depth_work_class(lane: LaneClass) -> &'static str {
+    match lane {
+        LaneClass::Control => "control-plane",
+        LaneClass::Metadata => "metadata-mutation",
+        LaneClass::Demand => "foreground-read",
+        LaneClass::Speculative => "scrub",
+        LaneClass::Background => "compaction",
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SendQueueDepthConfig
@@ -188,6 +215,64 @@ impl fmt::Display for SendQueueDepthError {
 }
 
 // ---------------------------------------------------------------------------
+// SendQueueDepthEvidence
+// ---------------------------------------------------------------------------
+
+/// Compact source/adapter metadata for one bounded send queue lane.
+///
+/// This record names the queue root and lane, the configured queue-slot limit,
+/// the current depth at sampling time, and the canonical
+/// `tidefs-performance-contract` metadata labels. It intentionally carries
+/// `source-model` validation tier metadata; runtime performance or distributed
+/// fairness claims require separate runtime evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendQueueDepthEvidence {
+    /// Registered transport queue-root identifier.
+    pub queue_root: &'static str,
+    /// Stable lane queue name.
+    pub queue_name: &'static str,
+    /// Configured maximum queue-slot depth for this lane.
+    pub limit: usize,
+    /// Current reserved+queued depth for this lane.
+    pub current_depth: usize,
+    /// Canonical performance-contract work-class spelling.
+    pub work_class: &'static str,
+    /// Canonical performance-contract resource-domain spelling.
+    pub resource_domain: &'static str,
+    /// Canonical validation-tier spelling for this metadata.
+    pub validation_tier: &'static str,
+}
+
+/// Evidence validation failure for transport send queue depth metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendQueueDepthEvidenceError {
+    /// The caller requested evidence for a queue root this governor does not own.
+    UnknownQueueRoot { queue_root: String },
+    /// The lane exists but has no positive queue-slot bound to export.
+    UnboundedQueueRoot {
+        queue_root: &'static str,
+        queue_name: &'static str,
+    },
+}
+
+impl fmt::Display for SendQueueDepthEvidenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownQueueRoot { queue_root } => {
+                write!(f, "unknown send queue depth root `{queue_root}`")
+            }
+            Self::UnboundedQueueRoot {
+                queue_root,
+                queue_name,
+            } => write!(
+                f,
+                "send queue depth root `{queue_root}` lane `{queue_name}` is unbounded"
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SendQueueDepth
 // ---------------------------------------------------------------------------
 
@@ -239,6 +324,62 @@ impl SendQueueDepth {
     #[must_use]
     pub fn config(&self) -> &SendQueueDepthConfig {
         &self.config
+    }
+
+    /// Return compact source/adapter evidence for a bounded lane.
+    ///
+    /// This validates the built-in queue root and rejects lanes with a zero
+    /// queue-slot limit. It does not reserve or release queue slots.
+    pub fn evidence(
+        &self,
+        lane: LaneClass,
+    ) -> Result<SendQueueDepthEvidence, SendQueueDepthEvidenceError> {
+        self.evidence_for_root(SEND_QUEUE_DEPTH_QUEUE_ROOT, lane)
+    }
+
+    /// Return evidence for an explicitly named queue root.
+    ///
+    /// Unknown roots are rejected so callers cannot accidentally publish
+    /// send-depth metadata under an unreviewed queue-root name.
+    pub fn evidence_for_root(
+        &self,
+        queue_root: &str,
+        lane: LaneClass,
+    ) -> Result<SendQueueDepthEvidence, SendQueueDepthEvidenceError> {
+        if queue_root != SEND_QUEUE_DEPTH_QUEUE_ROOT {
+            return Err(SendQueueDepthEvidenceError::UnknownQueueRoot {
+                queue_root: queue_root.to_string(),
+            });
+        }
+
+        let limit = self.config.max_depth(lane);
+        if limit == 0 {
+            return Err(SendQueueDepthEvidenceError::UnboundedQueueRoot {
+                queue_root: SEND_QUEUE_DEPTH_QUEUE_ROOT,
+                queue_name: lane.as_str(),
+            });
+        }
+
+        Ok(SendQueueDepthEvidence {
+            queue_root: SEND_QUEUE_DEPTH_QUEUE_ROOT,
+            queue_name: lane.as_str(),
+            limit,
+            current_depth: self.depth(lane),
+            work_class: send_queue_depth_work_class(lane),
+            resource_domain: SEND_QUEUE_DEPTH_RESOURCE_DOMAIN,
+            validation_tier: SEND_QUEUE_DEPTH_VALIDATION_TIER,
+        })
+    }
+
+    /// Return evidence for every lane, rejecting configurations with an
+    /// unbounded lane.
+    pub fn evidence_snapshot(
+        &self,
+    ) -> Result<Vec<SendQueueDepthEvidence>, SendQueueDepthEvidenceError> {
+        LaneClass::all()
+            .into_iter()
+            .map(|lane| self.evidence(lane))
+            .collect()
     }
 
     /// Try to reserve a slot in the send queue for the given lane class.
@@ -596,6 +737,88 @@ mod tests {
         assert_eq!(find(LaneClass::Demand), 1);
         assert_eq!(find(LaneClass::Speculative), 0);
         assert_eq!(find(LaneClass::Background), 3);
+    }
+
+    #[test]
+    fn evidence_work_class_mapping_uses_performance_contract_spellings() {
+        let expected = [
+            (LaneClass::Control, "control-plane"),
+            (LaneClass::Metadata, "metadata-mutation"),
+            (LaneClass::Demand, "foreground-read"),
+            (LaneClass::Speculative, "scrub"),
+            (LaneClass::Background, "compaction"),
+        ];
+
+        for (lane, work_class) in expected {
+            assert_eq!(send_queue_depth_work_class(lane), work_class);
+        }
+    }
+
+    #[test]
+    fn evidence_record_reports_compact_bounded_metadata() {
+        let cfg = SendQueueDepthConfig::new([8; LaneClass::COUNT]).unwrap();
+        let gov = SendQueueDepth::new(cfg);
+
+        gov.try_reserve(LaneClass::Demand).unwrap();
+        gov.try_reserve(LaneClass::Demand).unwrap();
+
+        let evidence = gov.evidence(LaneClass::Demand).unwrap();
+        assert_eq!(evidence.queue_root, SEND_QUEUE_DEPTH_QUEUE_ROOT);
+        assert_eq!(evidence.queue_name, LaneClass::Demand.as_str());
+        assert_eq!(evidence.limit, 8);
+        assert_eq!(evidence.current_depth, 2);
+        assert_eq!(evidence.work_class, "foreground-read");
+        assert_eq!(evidence.resource_domain, SEND_QUEUE_DEPTH_RESOURCE_DOMAIN);
+        assert_eq!(evidence.validation_tier, SEND_QUEUE_DEPTH_VALIDATION_TIER);
+    }
+
+    #[test]
+    fn evidence_snapshot_requires_all_lanes_bounded() {
+        let cfg = SendQueueDepthConfig::new([3; LaneClass::COUNT]).unwrap();
+        let gov = SendQueueDepth::new(cfg);
+
+        gov.try_reserve(LaneClass::Control).unwrap();
+        let snapshot = gov.evidence_snapshot().unwrap();
+
+        assert_eq!(snapshot.len(), LaneClass::COUNT);
+        assert_eq!(snapshot[0].queue_name, LaneClass::Control.as_str());
+        assert_eq!(snapshot[0].current_depth, 1);
+        assert!(snapshot.iter().all(|record| {
+            record.queue_root == SEND_QUEUE_DEPTH_QUEUE_ROOT
+                && record.limit == 3
+                && record.resource_domain == SEND_QUEUE_DEPTH_RESOURCE_DOMAIN
+                && record.validation_tier == SEND_QUEUE_DEPTH_VALIDATION_TIER
+        }));
+    }
+
+    #[test]
+    fn evidence_rejects_unbounded_queue_root() {
+        let cfg = SendQueueDepthConfig::with_lanes(&[(LaneClass::Control, 5)]).unwrap();
+        let gov = SendQueueDepth::new(cfg);
+
+        let err = gov.evidence(LaneClass::Demand).unwrap_err();
+        assert_eq!(
+            err,
+            SendQueueDepthEvidenceError::UnboundedQueueRoot {
+                queue_root: SEND_QUEUE_DEPTH_QUEUE_ROOT,
+                queue_name: LaneClass::Demand.as_str()
+            }
+        );
+    }
+
+    #[test]
+    fn evidence_rejects_unknown_queue_root() {
+        let gov = SendQueueDepth::default();
+
+        let err = gov
+            .evidence_for_root("transport.unregistered_send_queue", LaneClass::Control)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SendQueueDepthEvidenceError::UnknownQueueRoot {
+                queue_root: "transport.unregistered_send_queue".to_string()
+            }
+        );
     }
 
     #[test]
