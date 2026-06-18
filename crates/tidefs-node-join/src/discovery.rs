@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 pub use tidefs_membership_epoch::NodeIdentity;
 use tidefs_membership_epoch::{EpochId, MemberClass, MemberId, MembershipConfigRecord};
 
+use tidefs_types_pool_label_core::PoolLabelFingerprint;
 use crate::JoinError;
 
 /// Wire protocol version for the discovery/handshake protocol.
@@ -2045,7 +2046,7 @@ mod tests {
                 evidence_hash: [0xAAu8; 32],
             })
             .with_label_agreement(crate::LabelAgreementFingerprint {
-                fingerprint: [0xBBu8; 32], is_committed: true,
+                fingerprint: PoolLabelFingerprint::from([0xBBu8; 32]), is_committed: true,
             })
             .with_placement_receipt(crate::PlacementReceiptEvidence {
                 intent_class: None, is_committed: true, placement_epoch: commit_result.epoch,
