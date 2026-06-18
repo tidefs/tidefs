@@ -105,10 +105,9 @@ impl CommitGroupReader {
 
     /// Read the committed-root block with secondary superblock fallback.
     ///
-    /// Attempts the primary copy first (via
-    /// [`read_root_block`][Self::read_root_block]). If the primary is
-    /// corrupt or missing, reads and verifies the BLAKE3-sealed secondary
-    /// copy (see
+    /// Reads the primary copy and any present BLAKE3-sealed secondary copy,
+    /// then accepts a root only when the available recovery evidence is
+    /// coherent (see
     /// [`read_superblock_with_fallback`][super::superblock_secondary::read_superblock_with_fallback]).
     ///
     /// The `last_known_sequence` parameter protects against rollback: if
@@ -119,8 +118,8 @@ impl CommitGroupReader {
     ///
     /// - `Ok(Some(block))` if a valid block was recovered from either copy.
     /// - `Ok(None)` if neither copy exists.
-    /// - `Err(msg)` if the primary was corrupt and the secondary fallback
-    ///   also failed.
+    /// - `Err(msg)` if available primary/secondary recovery evidence is
+    ///   corrupt, rolled back, malformed, or divergent.
     pub fn read_root_block_with_fallback<S: CommitGroupStore>(
         store: &S,
         commit_group_id: CommitGroupId,
