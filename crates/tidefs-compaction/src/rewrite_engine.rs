@@ -131,6 +131,45 @@ impl RewriteOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// RewriteCommitReport -- verified swap commit outcome
+// ---------------------------------------------------------------------------
+
+/// Result of committing a rewrite outcome after swap-manifest verification.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RewriteCommitReport {
+    /// Number of manifests that passed verification.
+    pub manifests_verified: usize,
+    /// Number of manifests that were blocked by verification.
+    pub manifests_blocked: usize,
+    /// Source segments actually committed for release.
+    pub freed_segments: Vec<u64>,
+    /// Target segments actually registered by the swap.
+    pub registered_segments: Vec<u64>,
+    /// Relocation entries included in the committed swap.
+    pub relocation_entries: Vec<RelocationEntry>,
+    /// Source segments retained because their manifest did not verify.
+    pub blocked_segments: Vec<u64>,
+    /// Bytes compared by successful manifest verification.
+    pub bytes_verified: u64,
+    /// Structured reasons for blocked manifests.
+    pub verification_errors: Vec<crate::verification::SwapVerificationError>,
+}
+
+impl RewriteCommitReport {
+    /// Number of source segments actually freed.
+    #[must_use]
+    pub fn segments_freed(&self) -> usize {
+        self.freed_segments.len()
+    }
+
+    /// Whether every non-empty manifest passed verification.
+    #[must_use]
+    pub fn verified(&self) -> bool {
+        self.manifests_blocked == 0 && self.verification_errors.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RewriteEngine -- drives compaction rewrite from a MergePlan
 // ---------------------------------------------------------------------------
 
@@ -355,16 +394,18 @@ impl<S: CompactionStore> RewriteEngine<S> {
     /// # Errors
     ///
     /// Returns an error if the swap commit fails.  Verification
-    /// failures are recorded but do not cause this method to return
-    /// an error; the unverified segments are simply not freed.
-    pub fn commit_outcome(&mut self, outcome: &RewriteOutcome) -> Result<(), CompactionError> {
-        if outcome.is_empty {
-            return Ok(());
-        }
+    /// failures are reported in [`RewriteCommitReport`] but do not
+    /// cause this method to return an error; the unverified segments
+    /// are simply not freed.
+    pub fn commit_outcome(
+        &mut self,
+        outcome: &RewriteOutcome,
+    ) -> Result<RewriteCommitReport, CompactionError> {
+        let mut report = RewriteCommitReport::default();
 
-        let mut verified_freed: Vec<u64> = Vec::new();
-        let mut verified_registered: Vec<u64> = Vec::new();
-        let mut verified_entries: Vec<RelocationEntry> = Vec::new();
+        if outcome.is_empty {
+            return Ok(report);
+        }
 
         for group in &outcome.groups {
             // Skip groups with no work.
@@ -376,6 +417,10 @@ impl<S: CompactionStore> RewriteEngine<S> {
 
             // Empty manifests cannot release segments.
             if manifest.is_empty() {
+                report.manifests_blocked = report.manifests_blocked.saturating_add(1);
+                report
+                    .verification_errors
+                    .push(crate::verification::SwapVerificationError::EmptyManifest);
                 continue;
             }
 
@@ -383,26 +428,41 @@ impl<S: CompactionStore> RewriteEngine<S> {
             let verification = crate::verification::verify_swap_manifest(&manifest, &self.store);
 
             if verification.verified {
-                verified_freed.extend(group.freed_segments.iter().copied());
+                report.manifests_verified = report.manifests_verified.saturating_add(1);
+                report
+                    .freed_segments
+                    .extend(group.freed_segments.iter().copied());
                 if group.target_segment != 0 {
-                    verified_registered.push(group.target_segment);
+                    report.registered_segments.push(group.target_segment);
                 }
-                verified_entries.extend(group.entries.iter().cloned());
+                report
+                    .relocation_entries
+                    .extend(group.entries.iter().cloned());
+                report.bytes_verified = report
+                    .bytes_verified
+                    .saturating_add(verification.bytes_compared);
+            } else {
+                report.manifests_blocked = report.manifests_blocked.saturating_add(1);
+                report
+                    .blocked_segments
+                    .extend(group.freed_segments.iter().copied());
+                report.verification_errors.extend(verification.errors);
             }
             // Verification failures: source segments are NOT freed.
         }
 
-        if verified_freed.is_empty() && verified_registered.is_empty() {
-            return Ok(());
+        if report.freed_segments.is_empty() && report.registered_segments.is_empty() {
+            return Ok(report);
         }
 
         let swap = CompactionSwap {
-            freed_segments: verified_freed,
-            registered_segments: verified_registered,
-            entries: verified_entries,
+            freed_segments: report.freed_segments.clone(),
+            registered_segments: report.registered_segments.clone(),
+            entries: report.relocation_entries.clone(),
         };
 
-        self.store.commit_swap(swap)
+        self.store.commit_swap(swap)?;
+        Ok(report)
     }
 
     /// Consume the engine and return the underlying store.
@@ -1067,7 +1127,11 @@ mod tests {
         assert!(outcome.verify());
 
         // Commit the outcome.
-        engine.commit_outcome(&outcome).unwrap();
+        let report = engine.commit_outcome(&outcome).unwrap();
+        assert!(report.verified());
+        assert_eq!(report.freed_segments, vec![10]);
+        assert_eq!(report.manifests_verified, 1);
+        assert!(report.verification_errors.is_empty());
 
         // After commit, segment 10 should be freed.
         let store = engine.into_store();
@@ -1079,7 +1143,8 @@ mod tests {
         let store = MockCompactionStore::new();
         let mut engine = RewriteEngine::new(store, default_config());
         let outcome = RewriteOutcome::empty();
-        assert!(engine.commit_outcome(&outcome).is_ok());
+        let report = engine.commit_outcome(&outcome).unwrap();
+        assert_eq!(report, RewriteCommitReport::default());
     }
 
     #[test]
@@ -1383,7 +1448,10 @@ mod tests {
         assert_eq!(outcome.total_segments_freed, 1);
 
         // Commit: this should verify the manifest and free segment 10.
-        engine.commit_outcome(&outcome).unwrap();
+        let report = engine.commit_outcome(&outcome).unwrap();
+        assert!(report.verified());
+        assert_eq!(report.freed_segments, vec![10]);
+        assert_eq!(report.manifests_verified, 1);
         let store = engine.into_store();
         assert!(store.freed.contains(&10));
     }
@@ -1422,7 +1490,14 @@ mod tests {
         engine.store.objects.insert(k1, vec![0xBBu8; 64]);
 
         // Commit should NOT free segment 10 because digest mismatch.
-        engine.commit_outcome(&outcome).unwrap();
+        let report = engine.commit_outcome(&outcome).unwrap();
+        assert!(!report.verified());
+        assert!(report.freed_segments.is_empty());
+        assert_eq!(report.blocked_segments, vec![10]);
+        assert!(report.verification_errors.iter().any(|err| matches!(
+            err,
+            crate::verification::SwapVerificationError::DigestMismatch { .. }
+        )));
         let store = engine.into_store();
         assert!(
             !store.freed.contains(&10),
@@ -1469,7 +1544,14 @@ mod tests {
         );
 
         // Commit should NOT free segment 10 because target read failed.
-        engine.commit_outcome(&outcome).unwrap();
+        let report = engine.commit_outcome(&outcome).unwrap();
+        assert!(!report.verified());
+        assert!(report.freed_segments.is_empty());
+        assert_eq!(report.blocked_segments, vec![10]);
+        assert!(report.verification_errors.iter().any(|err| matches!(
+            err,
+            crate::verification::SwapVerificationError::TargetReadFailed { .. }
+        )));
         let store = engine.into_store();
         assert!(
             !store.freed.contains(&10),
@@ -1485,7 +1567,8 @@ mod tests {
 
         let empty_outcome = RewriteOutcome::empty();
         // Commit of empty outcome should succeed and not touch store.
-        engine.commit_outcome(&empty_outcome).unwrap();
+        let report = engine.commit_outcome(&empty_outcome).unwrap();
+        assert_eq!(report, RewriteCommitReport::default());
         let store = engine.into_store();
         assert!(store.freed.is_empty());
     }
