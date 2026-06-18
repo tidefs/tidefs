@@ -1346,9 +1346,28 @@ impl BlockAllocator {
         {
             inner.pending_allocations.remove(&epoch_fence);
         }
+        let mut cancelled_frees = Vec::new();
         for block in &released {
             if inner.pending_allocation_blocks.get(block) == Some(&epoch_fence) {
                 inner.pending_allocation_blocks.remove(block);
+            }
+            if inner.pending_free_blocks.get(block) == Some(&epoch_fence) {
+                inner.pending_free_blocks.remove(block);
+                cancelled_frees.push(*block);
+            }
+        }
+        if !cancelled_frees.is_empty() {
+            if let Some(pending_frees) = inner.pending_frees.get_mut(&epoch_fence) {
+                for block in &cancelled_frees {
+                    pending_frees.remove(block);
+                }
+            }
+            if inner
+                .pending_frees
+                .get(&epoch_fence)
+                .is_some_and(BTreeSet::is_empty)
+            {
+                inner.pending_frees.remove(&epoch_fence);
             }
         }
         Self::mark_blocks_free_locked(&mut inner, &released);
@@ -1359,7 +1378,7 @@ impl BlockAllocator {
         );
         Ok(CommitGroupBlockDelta {
             allocations: released.len() as u64,
-            frees: 0,
+            frees: cancelled_frees.len() as u64,
         })
     }
 

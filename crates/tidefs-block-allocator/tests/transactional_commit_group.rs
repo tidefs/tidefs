@@ -175,3 +175,31 @@ fn pending_free_owner_blocks_other_commit_groups() {
     assert_eq!(delta.frees, 1);
     assert_eq!(ba.free_count(), 16);
 }
+
+#[test]
+fn release_allocation_cancels_matching_pending_free() {
+    let ba = BlockAllocator::new(8, 4096, region(8));
+    let epoch = fence(60);
+    let next_epoch = fence(61);
+
+    let reservation = ba.reserve_allocation(epoch, 1).unwrap();
+    let block = reservation.blocks()[0];
+    let pending_free = ba.free_on_commit(epoch, &[block]).unwrap();
+    assert_eq!(pending_free.len(), 1);
+    assert_eq!(ba.pending_allocation_count(), 1);
+    assert_eq!(ba.pending_free_count(), 1);
+
+    let delta = ba.release_allocation(reservation).unwrap();
+    assert_eq!(delta.allocations, 1);
+    assert_eq!(delta.frees, 1);
+    assert_eq!(ba.pending_allocation_count(), 0);
+    assert_eq!(ba.pending_free_count(), 0);
+    assert_eq!(ba.free_count(), 8);
+
+    let all_blocks = ba.reserve_allocation(next_epoch, 8).unwrap();
+    assert!(all_blocks.blocks().contains(&block));
+    let durable = ba.mark_commit_group_durable(epoch).unwrap();
+    assert_eq!(durable.allocations, 0);
+    assert_eq!(durable.frees, 0);
+    assert_eq!(ba.free_count(), 0);
+}
