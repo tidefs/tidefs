@@ -596,7 +596,7 @@ mod tests {
 
         let err = verify_runtime_report_json(&value.to_string()).unwrap_err();
         assert!(
-            matches!(err, RuntimeReportError::InvalidJson(message) if message.contains("injected_point")),
+            matches!(err, RuntimeReportError::InvalidJson(ref message) if message.contains("injected_point")),
             "expected injected_point parse error, got {err}"
         );
     }
