@@ -1024,6 +1024,9 @@ impl DatasetCatalog {
         {
             return Err(CatalogError::LineageNotSupported);
         }
+        if entry.published {
+            return Err(CatalogError::AlreadyPublished);
+        }
 
         let mut entry = entry.clone();
         entry.lineage_parent_id = Some(lineage_parent_id);
@@ -4237,6 +4240,24 @@ mod tests {
             cat.publish_root("pool/fs1"),
             Err(CatalogError::AlreadyPublished)
         );
+    }
+
+    #[test]
+    fn set_lineage_parent_rejects_published_root() {
+        let mut cat = DatasetCatalog::new();
+        make_filesystem(&mut cat, "pool", 0);
+        make_filesystem(&mut cat, "pool/fs1", 1);
+        make_snap(&mut cat, "pool/fs1@snap1", 10, did(1));
+
+        cat.publish_root("pool/fs1@snap1").unwrap();
+        let summary = cat.lineage_summary("pool/fs1@snap1").unwrap();
+
+        assert_eq!(
+            cat.set_lineage_parent("pool/fs1@snap1", did(0)),
+            Err(CatalogError::AlreadyPublished)
+        );
+        assert!(cat.is_published("pool/fs1@snap1").unwrap());
+        assert_eq!(cat.lineage_summary("pool/fs1@snap1").unwrap(), summary);
     }
 
     // --- lineage_summary pre-publish -----------------------------------------
