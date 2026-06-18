@@ -1467,6 +1467,9 @@ pub struct LocalFileSystem {
     writeback_range_tracker: Arc<Mutex<crate::dirty_page_tracker::DirtyPageTracker>>,
     writeback_handle: Option<crate::writeback_daemon::WritebackHandle>,
     lock_tracker: RefCell<LockTracker>,
+    /// Runtime dataset mount identifier for lock scoping (single-mount
+    /// context; default 0 for local-filesystem).
+    dataset_mount_id: u64,
     pool_uuid: u64,
     /// tidefs-queue-root: local_fs.write_buffers
     /// admission: AdmissionPermit  service_curve: ServiceCurve
@@ -2303,7 +2306,7 @@ impl LocalFileSystem {
     pub fn getlk(&self, inode: InodeId, requested: LockRange) -> Option<LockConflict> {
         self.lock_tracker
             .borrow()
-            .query_conflict(inode.get(), requested)
+            .query_conflict(self.dataset_mount_id, inode.get(), requested)
     }
 
     /// Acquire or release a byte-range advisory lock on an inode.
@@ -2318,14 +2321,14 @@ impl LocalFileSystem {
     ) -> std::result::Result<(), LockConflict> {
         self.lock_tracker
             .borrow_mut()
-            .acquire(inode.get(), requested)
+            .acquire(self.dataset_mount_id, inode.get(), requested)
     }
 
     /// Release all locks held by a given process across all inodes.
     ///
     /// Called on fd close or process exit to clean up held locks.
     pub fn release_locks_by_pid(&self, pid: u32) {
-        self.lock_tracker.borrow_mut().release_by_pid(pid);
+        self.lock_tracker.borrow_mut().release_by_pid(self.dataset_mount_id, pid);
     }
 
     /// Get the number of inodes with active locks.
@@ -2352,7 +2355,7 @@ impl LocalFileSystem {
         loop {
             let result = {
                 let mut tracker = self.lock_tracker.borrow_mut();
-                tracker.acquire(inode.get(), requested)
+                tracker.acquire(self.dataset_mount_id, inode.get(), requested)
             };
             match result {
                 Ok(()) => return Ok(()),
@@ -3163,6 +3166,7 @@ impl LocalFileSystem {
             )),
             writeback_handle: None,
             lock_tracker: RefCell::new(LockTracker::new()),
+            dataset_mount_id: 0,
             write_buffers: BTreeMap::new(),
             write_buffer_config: WriteBufferConfig::default(),
             pool_uuid: pool_uuid_from_path(&root_path),
