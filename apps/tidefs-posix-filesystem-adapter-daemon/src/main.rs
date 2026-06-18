@@ -2123,7 +2123,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     // Recreate mountpoint dir (umount may have removed it).
     fs::create_dir_all(mountpoint).map_err(|e| format!("recreate mount dir: {e}"))?;
 
-    child = spawn_and_mount(&exe, store_root, mountpoint)?;
+    child = spawn_and_mount(&exe, store_root, mountpoint, None)?;
 
     smoke_test!("phase3_remount_stat_root", {
         let md = fs::metadata(mountpoint).map_err(|e| format!("stat: {e}"))?;
@@ -2431,7 +2431,7 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
 
     fs::create_dir_all(mountpoint).map_err(|e| format!("recreate mount dir: {e}"))?;
 
-    child = spawn_and_mount(&exe, store_root, mountpoint)?;
+    child = spawn_and_mount(&exe, store_root, mountpoint, None)?;
 
     smoke_test!("phase5_remount_stat_root", {
         let md = fs::metadata(mountpoint).map_err(|e| format!("stat: {e}"))?;
