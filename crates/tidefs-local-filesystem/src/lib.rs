@@ -2998,9 +2998,15 @@ impl LocalFileSystem {
                 .committed_content_used_bytes(&state)
                 .unwrap_or(pool_stats.used_bytes)
                 .min(total_bytes);
-            CapacityAuthority::from_pool_stats(
+            let mut counters = *state.space_accounting.counters();
+            if counters.logical_used_bytes < used_bytes {
+                counters.logical_used_bytes = used_bytes;
+                state.space_accounting =
+                    SpaceAccounting::new(counters, state.space_accounting.domain_id());
+            }
+            CapacityAuthority::from_committed_accounting(
                 total_bytes,
-                used_bytes,
+                &state.space_accounting,
                 block_size,
                 root_reserve_bytes,
             )
@@ -4834,10 +4840,11 @@ impl LocalFileSystem {
         // (write/delete auto-updates, persistence). The statfs derivation
         // no longer queries SpaceBook; it uses the single capacity authority.
         self.store.update_space_book_pool_counters(phys);
-        // Refresh the capacity authority with current pool capacity so
-        // derive_statfs uses the live total rather than a stale ceiling.
+        // Refresh the mounted capacity facade from the committed
+        // tidefs-space-accounting authority. Statfs must not recompute
+        // free space from local capacity counters.
         self.capacity_authority
-            .set_total_bytes(phys.phys_total_bytes);
+            .refresh_committed_accounting(&self.state.space_accounting, phys);
 
         let mut report = self.allocator_report()?;
         let ancestors = self.quota_ancestor_chain_for_parts(&[]);
@@ -11178,10 +11185,12 @@ impl LocalFileSystem {
 
     /// Apply and persist the accumulated space delta.
     fn commit_space_delta(&mut self) -> Result<()> {
+        let phys = self.derive_pool_physical_counters();
         if !self.state.space_accounting.has_pending_delta() {
+            self.capacity_authority
+                .refresh_committed_accounting_after_commit(&self.state.space_accounting, phys);
             return Ok(());
         }
-        let phys = self.derive_pool_physical_counters();
         self.state
             .space_accounting
             .commit_pending(phys)
@@ -11202,6 +11211,13 @@ impl LocalFileSystem {
             counters.logical_used_bytes,
             counters.reserved_bytes,
         );
+
+        let refreshed_phys = self.derive_pool_physical_counters();
+        self.capacity_authority
+            .refresh_committed_accounting_after_commit(
+                &self.state.space_accounting,
+                refreshed_phys,
+            );
 
         Ok(())
     }
