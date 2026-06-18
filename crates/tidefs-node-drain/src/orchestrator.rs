@@ -368,6 +368,18 @@ pub fn drain_node(
         }
     };
 
+    if let Some(outcome) = &migration_outcome {
+        if !outcome.success {
+            return Err(DrainNodeError::MigrationFailed {
+                node_id: config.node_id,
+                reason: format!(
+                    "migration completed without clean relocation evidence: {} checksum failures",
+                    outcome.checksum_failures
+                ),
+            });
+        }
+    }
+
     // -------------------------------------------------------------------
     // Phase 2.1: Build evacuation receipt from migration result
     // -------------------------------------------------------------------
@@ -610,6 +622,9 @@ mod tests {
             Ok(1024)
         }
         fn verify_checksum(&self, _target: MemberId, _object_id: u64) -> Result<(), String> {
+            if _object_id == 999 {
+                return Err("checksum mismatch".to_string());
+            }
             Ok(())
         }
 
@@ -771,6 +786,46 @@ mod tests {
         assert!(outcome.success);
         assert_eq!(outcome.node_id, mid(5));
         assert!(outcome.evacuation_receipt.is_none());
+    }
+
+    #[test]
+    fn drain_node_rejects_unclean_migration_outcome() {
+        let config = NodeDrainConfig {
+            node_id: mid(1),
+            proposer: mid(2),
+            target_nodes: vec![mid(3)],
+            voter_members: vec![mid(2), mid(3), mid(4)],
+            drain_timeout_ms: 60_000,
+            quorum_timeout_ms: 10_000,
+            cohort_size: 3,
+            verify_checksums: true,
+            reason: "maintenance".to_string(),
+        };
+
+        let mut drain_ops = TestDrainOps;
+        let mut migration_ops = TestMigrationOps {
+            objects: vec![(999, 1024)],
+        };
+        let mut gate_ops = TestGateOps::new();
+        let health_verify_ops = crate::health_verify::NoOpHealthVerifyOps;
+        let mut verify_ops = TestVerifyOps::new(5);
+        verify_ops.add_member(mid(1), true);
+        verify_ops.add_member(mid(2), true);
+        verify_ops.add_member(mid(3), true);
+        verify_ops.add_member(mid(4), true);
+
+        let err = drain_node(
+            &config,
+            &mut drain_ops,
+            &mut migration_ops,
+            &health_verify_ops,
+            &mut gate_ops,
+            &verify_ops,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, DrainNodeError::MigrationFailed { .. }));
+        assert!(format!("{err}").contains("checksum failures"));
     }
 
     #[test]
