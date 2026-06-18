@@ -32,10 +32,11 @@ pub mod state_transfer;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use tidefs_types_pool_label_core::PoolLabelFingerprint;
 use tidefs_membership_epoch::{
-    EpochId, HealthClass, MemberId, MembershipConfigRecord, PlacementIntentClass,
+    pool_scan_gate::PoolScanEvidence, EpochId, HealthClass, MemberId, MembershipConfigRecord,
+    PlacementIntentClass,
 };
+use tidefs_types_pool_label_core::PoolLabelFingerprint;
 
 // ── Gate constant ───────────────────────────────────────────────────
 
@@ -81,7 +82,9 @@ pub enum JoinError {
     #[error("missing epoch evidence for operation: {0}")]
     MissingEpochEvidence(String),
 
-    #[error("stale epoch: session epoch {session_epoch:?}, current epoch {current_epoch:?}: {reason}")]
+    #[error(
+        "stale epoch: session epoch {session_epoch:?}, current epoch {current_epoch:?}: {reason}"
+    )]
     StaleEpoch {
         session_epoch: EpochId,
         current_epoch: EpochId,
@@ -101,18 +104,32 @@ pub enum JoinError {
         threshold: usize,
     },
 
-
     #[error("pool-scan evidence not committed for member {member_id:?}")]
     PoolScanNotCommitted { member_id: MemberId },
 
     #[error("pool-scan evidence missing for member {member_id:?}")]
     MissingPoolScanEvidence { member_id: MemberId },
 
+    #[error("pool-scan evidence does not include member {member_id:?}")]
+    PoolScanMemberNotFound { member_id: MemberId },
+
+    #[error(
+        "pool-scan evidence for member {member_id:?} targets epoch {got:?}, expected {expected:?}"
+    )]
+    PoolScanEpochMismatch {
+        member_id: MemberId,
+        expected: EpochId,
+        got: EpochId,
+    },
+
     #[error("label agreement not committed for member {member_id:?}")]
     LabelAgreementNotCommitted { member_id: MemberId },
 
     #[error("label agreement missing for member {member_id:?}")]
     MissingLabelAgreement { member_id: MemberId },
+
+    #[error("label agreement fingerprint does not match committed pool-scan evidence for member {member_id:?}")]
+    LabelAgreementMismatch { member_id: MemberId },
 
     #[error("placement receipt not committed for member {member_id:?}")]
     PlacementReceiptNotCommitted { member_id: MemberId },
@@ -144,8 +161,7 @@ impl QuorumEvidence {
     /// Whether this evidence demonstrates a valid quorum.
     #[must_use]
     pub fn is_quorum_reached(&self) -> bool {
-        self.quorum_approvals >= self.quorum_threshold
-            && self.quorum_threshold > 0
+        self.quorum_approvals >= self.quorum_threshold && self.quorum_threshold > 0
     }
 
     /// Required approvals for a simple-majority quorum of `n` members.
@@ -159,30 +175,6 @@ impl QuorumEvidence {
     }
 }
 
-// ── Committed pool-scan evidence ────────────────────────────────────
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CommittedPoolScanEvidence {
-    pub committed_root: u64,
-    pub commit_group: u64,
-    pub pool_id: u64,
-    pub is_committed: bool,
-    pub member_id_present: bool,
-    pub joining_member_id: MemberId,
-    pub evidence_hash: [u8; 32],
-}
-
-impl CommittedPoolScanEvidence {
-    #[must_use]
-    pub fn new(cr: u64, cg: u64, pid: u64, mid: MemberId, hash: [u8; 32]) -> Self {
-        Self { committed_root: cr, commit_group: cg, pool_id: pid, is_committed: true, member_id_present: true, joining_member_id: mid, evidence_hash: hash }
-    }
-    #[must_use]
-    pub fn is_valid_for(&self, expected: MemberId) -> bool {
-        self.is_committed && self.member_id_present && self.joining_member_id == expected
-    }
-}
-
 // ── Label agreement fingerprint ─────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -193,9 +185,16 @@ pub struct LabelAgreementFingerprint {
 
 impl LabelAgreementFingerprint {
     #[must_use]
-    pub fn committed(fp: PoolLabelFingerprint) -> Self { Self { fingerprint: fp, is_committed: true } }
+    pub fn committed(fp: PoolLabelFingerprint) -> Self {
+        Self {
+            fingerprint: fp,
+            is_committed: true,
+        }
+    }
     #[must_use]
-    pub fn is_ready(&self) -> bool { self.is_committed }
+    pub fn is_ready(&self) -> bool {
+        self.is_committed
+    }
 }
 
 // ── Placement-receipt evidence ──────────────────────────────────────
@@ -212,12 +211,19 @@ pub struct PlacementReceiptEvidence {
 impl PlacementReceiptEvidence {
     #[must_use]
     pub fn new(ic: PlacementIntentClass, epoch: EpochId, rid: u64, hash: [u8; 32]) -> Self {
-        Self { intent_class: Some(ic), is_committed: true, placement_epoch: epoch, receipt_id: rid, receipt_hash: hash }
+        Self {
+            intent_class: Some(ic),
+            is_committed: true,
+            placement_epoch: epoch,
+            receipt_id: rid,
+            receipt_hash: hash,
+        }
     }
     #[must_use]
-    pub fn is_ready(&self) -> bool { self.is_committed && self.intent_class.is_some() }
+    pub fn is_ready(&self) -> bool {
+        self.is_committed && self.intent_class.is_some()
+    }
 }
-
 
 // ── Join session epoch ──────────────────────────────────────────────
 
@@ -237,7 +243,7 @@ pub struct JoinSessionEpoch {
     pub quorum_evidence: Option<QuorumEvidence>,
     /// The member ID of the joining node.
     pub joining_member_id: MemberId,
-    pub pool_scan_evidence: Option<CommittedPoolScanEvidence>,
+    pub pool_scan_evidence: Option<PoolScanEvidence>,
     pub label_agreement: Option<LabelAgreementFingerprint>,
     pub placement_receipt: Option<PlacementReceiptEvidence>,
     /// Nonce unique to this join session.
@@ -247,11 +253,7 @@ pub struct JoinSessionEpoch {
 impl JoinSessionEpoch {
     /// Create a new session epoch binding.
     #[must_use]
-    pub fn new(
-        epoch: EpochId,
-        joining_member_id: MemberId,
-        session_nonce: u64,
-    ) -> Self {
+    pub fn new(epoch: EpochId, joining_member_id: MemberId, session_nonce: u64) -> Self {
         Self {
             epoch,
             quorum_evidence: None,
@@ -269,7 +271,7 @@ impl JoinSessionEpoch {
         self
     }
 
-    pub fn with_pool_scan_evidence(mut self, evidence: CommittedPoolScanEvidence) -> Self {
+    pub fn with_pool_scan_evidence(mut self, evidence: PoolScanEvidence) -> Self {
         self.pool_scan_evidence = Some(evidence);
         self
     }
@@ -287,18 +289,35 @@ impl JoinSessionEpoch {
     #[must_use]
     pub fn verify_pool_scan(&self) -> Result<(), JoinStatus> {
         match &self.pool_scan_evidence {
-            Some(ev) if ev.is_valid_for(self.joining_member_id) => Ok(()),
-            Some(_) => Err(JoinStatus::PoolScanNotCommitted),
+            Some(ev)
+                if ev.committed
+                    && ev.proposed_epoch_id == self.epoch.0
+                    && ev.label_fingerprint_for(self.joining_member_id.0).is_some() =>
+            {
+                Ok(())
+            }
+            Some(ev) if !ev.committed => Err(JoinStatus::PoolScanNotCommitted),
+            Some(ev) if ev.proposed_epoch_id != self.epoch.0 => {
+                Err(JoinStatus::PoolScanEpochMismatch)
+            }
+            Some(_) => Err(JoinStatus::PoolScanMemberNotFound),
             None => Err(JoinStatus::WaitingForPoolScan),
         }
     }
 
     #[must_use]
     pub fn verify_label_agreement(&self) -> Result<(), JoinStatus> {
-        match &self.label_agreement {
-            Some(la) if la.is_ready() => Ok(()),
-            Some(_) => Err(JoinStatus::LabelAgreementNotCommitted),
-            None => Err(JoinStatus::WaitingForLabelAgreement),
+        let scan_fingerprint = self
+            .pool_scan_evidence
+            .as_ref()
+            .and_then(|ev| ev.label_fingerprint_for(self.joining_member_id.0));
+
+        match (&self.label_agreement, scan_fingerprint) {
+            (Some(la), Some(expected)) if la.is_ready() && la.fingerprint == expected => Ok(()),
+            (Some(la), Some(_)) if !la.is_ready() => Err(JoinStatus::LabelAgreementNotCommitted),
+            (Some(_), Some(_)) => Err(JoinStatus::LabelAgreementMismatch),
+            (Some(_), None) => Err(JoinStatus::PoolScanMemberNotFound),
+            (None, _) => Err(JoinStatus::WaitingForLabelAgreement),
         }
     }
 
@@ -400,8 +419,10 @@ pub enum JoinStatus {
     WaitingForPoolScan,
     PoolScanNotCommitted,
     PoolScanMemberNotFound,
+    PoolScanEpochMismatch,
     WaitingForLabelAgreement,
     LabelAgreementNotCommitted,
+    LabelAgreementMismatch,
     WaitingForPlacementReceipt,
     PlacementReceiptNotCommitted,
 }
@@ -679,9 +700,7 @@ impl JoinProgress {
                 // Note: JoinPhase discriminants are NOT in linear
                 // progression order (p4=4, p2=2, p5=5), so we use
                 // explicit phase checks instead of >=.
-                if self.phase == JoinPhase::VoterSpread
-                    || self.phase == JoinPhase::ReplicaTarget
-                {
+                if self.phase == JoinPhase::VoterSpread || self.phase == JoinPhase::ReplicaTarget {
                     JoinStatus::TransferReady
                 } else {
                     JoinStatus::TransferInProgress
@@ -881,23 +900,82 @@ impl NodeJoinProtocol {
     }
 
     fn require_committed_pool_scan(&self) -> Result<(), JoinError> {
-        let session = self.session_epoch.as_ref().ok_or_else(|| JoinError::MissingPoolScanEvidence { member_id: self.member_id })?;
-        let ev = session.pool_scan_evidence.as_ref().ok_or_else(|| JoinError::MissingPoolScanEvidence { member_id: self.member_id })?;
-        if !ev.is_valid_for(self.member_id) { return Err(JoinError::PoolScanNotCommitted { member_id: self.member_id }); }
+        let session =
+            self.session_epoch
+                .as_ref()
+                .ok_or_else(|| JoinError::MissingPoolScanEvidence {
+                    member_id: self.member_id,
+                })?;
+        let ev = session.pool_scan_evidence.as_ref().ok_or_else(|| {
+            JoinError::MissingPoolScanEvidence {
+                member_id: self.member_id,
+            }
+        })?;
+        if !ev.committed {
+            return Err(JoinError::PoolScanNotCommitted {
+                member_id: self.member_id,
+            });
+        }
+        if ev.proposed_epoch_id != self.progress.epoch.0 {
+            return Err(JoinError::PoolScanEpochMismatch {
+                member_id: self.member_id,
+                expected: self.progress.epoch,
+                got: EpochId::new(ev.proposed_epoch_id),
+            });
+        }
+        if ev.label_fingerprint_for(self.member_id.0).is_none() {
+            return Err(JoinError::PoolScanMemberNotFound {
+                member_id: self.member_id,
+            });
+        }
         Ok(())
     }
 
     fn require_committed_label_agreement(&self) -> Result<(), JoinError> {
-        let session = self.session_epoch.as_ref().ok_or_else(|| JoinError::MissingLabelAgreement { member_id: self.member_id })?;
-        let la = session.label_agreement.as_ref().ok_or_else(|| JoinError::MissingLabelAgreement { member_id: self.member_id })?;
-        if !la.is_ready() { return Err(JoinError::LabelAgreementNotCommitted { member_id: self.member_id }); }
+        self.require_committed_pool_scan()?;
+        let session = self.session_epoch.as_ref().expect("checked above");
+        let expected = session
+            .pool_scan_evidence
+            .as_ref()
+            .and_then(|ev| ev.label_fingerprint_for(self.member_id.0))
+            .expect("checked above");
+        let la =
+            session
+                .label_agreement
+                .as_ref()
+                .ok_or_else(|| JoinError::MissingLabelAgreement {
+                    member_id: self.member_id,
+                })?;
+        if !la.is_ready() {
+            return Err(JoinError::LabelAgreementNotCommitted {
+                member_id: self.member_id,
+            });
+        }
+        if la.fingerprint != expected {
+            return Err(JoinError::LabelAgreementMismatch {
+                member_id: self.member_id,
+            });
+        }
         Ok(())
     }
 
     fn require_committed_placement_receipt(&self) -> Result<(), JoinError> {
-        let session = self.session_epoch.as_ref().ok_or_else(|| JoinError::MissingPlacementReceipt { member_id: self.member_id })?;
-        let pr = session.placement_receipt.as_ref().ok_or_else(|| JoinError::MissingPlacementReceipt { member_id: self.member_id })?;
-        if !pr.is_ready() { return Err(JoinError::PlacementReceiptNotCommitted { member_id: self.member_id }); }
+        let session =
+            self.session_epoch
+                .as_ref()
+                .ok_or_else(|| JoinError::MissingPlacementReceipt {
+                    member_id: self.member_id,
+                })?;
+        let pr = session.placement_receipt.as_ref().ok_or_else(|| {
+            JoinError::MissingPlacementReceipt {
+                member_id: self.member_id,
+            }
+        })?;
+        if !pr.is_ready() {
+            return Err(JoinError::PlacementReceiptNotCommitted {
+                member_id: self.member_id,
+            });
+        }
         Ok(())
     }
 
@@ -1142,7 +1220,7 @@ pub struct JoinCommitResult {
     pub epoch: EpochId,
     /// The pool ID.
     pub pool_id: u64,
-    pub pool_scan_evidence: Option<CommittedPoolScanEvidence>,
+    pub pool_scan_evidence: Option<PoolScanEvidence>,
     pub label_agreement: Option<LabelAgreementFingerprint>,
     pub placement_receipt: Option<PlacementReceiptEvidence>,
 }
@@ -1309,31 +1387,65 @@ impl NodeJoinProtocol {
     /// matching identity and a non-stale epoch.
     #[must_use]
     pub fn can_start_state_transfer(&self, current_epoch: EpochId) -> Result<(), JoinError> {
-        let session = self
-            .progress
-            .session_epoch
-            .as_ref()
-            .ok_or_else(|| JoinError::MissingEpochEvidence(
-                "no session epoch recorded".into(),
-            ))?;
+        let session =
+            self.progress.session_epoch.as_ref().ok_or_else(|| {
+                JoinError::MissingEpochEvidence("no session epoch recorded".into())
+            })?;
 
-        let _ = session.is_valid_for(self.member_id, current_epoch).map_err(|status| match status {
-            JoinStatus::WaitingForQuorum => JoinError::QuorumNotReached {
-                epoch: session.epoch,
-                approvals: session.quorum_evidence.as_ref().map_or(0, |qe| qe.quorum_approvals),
-                threshold: session.quorum_evidence.as_ref().map_or(1, |qe| qe.quorum_threshold),
-            },
-            JoinStatus::StaleEpoch { current_epoch, join_epoch } => JoinError::StaleEpoch {
-                session_epoch: join_epoch,
-                current_epoch,
-                reason: "state transfer blocked: stale epoch".into(),
-            },
-            JoinStatus::IdentityMismatch { expected, actual } => JoinError::IdentityMismatch {
-                session_member: expected,
-                caller_member: actual,
-            },
-            _ => JoinError::PreflightDenied(format!("state transfer blocked: {:?}", status)),
-        })?;
+        let _ = session
+            .is_valid_for(self.member_id, current_epoch)
+            .map_err(|status| match status {
+                JoinStatus::WaitingForQuorum => JoinError::QuorumNotReached {
+                    epoch: session.epoch,
+                    approvals: session
+                        .quorum_evidence
+                        .as_ref()
+                        .map_or(0, |qe| qe.quorum_approvals),
+                    threshold: session
+                        .quorum_evidence
+                        .as_ref()
+                        .map_or(1, |qe| qe.quorum_threshold),
+                },
+                JoinStatus::StaleEpoch {
+                    current_epoch,
+                    join_epoch,
+                } => JoinError::StaleEpoch {
+                    session_epoch: join_epoch,
+                    current_epoch,
+                    reason: "state transfer blocked: stale epoch".into(),
+                },
+                JoinStatus::IdentityMismatch { expected, actual } => JoinError::IdentityMismatch {
+                    session_member: expected,
+                    caller_member: actual,
+                },
+                JoinStatus::PoolScanNotCommitted => JoinError::PoolScanNotCommitted {
+                    member_id: self.member_id,
+                },
+                JoinStatus::PoolScanMemberNotFound => JoinError::PoolScanMemberNotFound {
+                    member_id: self.member_id,
+                },
+                JoinStatus::PoolScanEpochMismatch => JoinError::PoolScanEpochMismatch {
+                    member_id: self.member_id,
+                    expected: session.epoch,
+                    got: session
+                        .pool_scan_evidence
+                        .as_ref()
+                        .map_or(session.epoch, |ev| EpochId::new(ev.proposed_epoch_id)),
+                },
+                JoinStatus::WaitingForPoolScan => JoinError::MissingPoolScanEvidence {
+                    member_id: self.member_id,
+                },
+                JoinStatus::WaitingForLabelAgreement => JoinError::MissingLabelAgreement {
+                    member_id: self.member_id,
+                },
+                JoinStatus::LabelAgreementNotCommitted => JoinError::LabelAgreementNotCommitted {
+                    member_id: self.member_id,
+                },
+                JoinStatus::LabelAgreementMismatch => JoinError::LabelAgreementMismatch {
+                    member_id: self.member_id,
+                },
+                _ => JoinError::PreflightDenied(format!("state transfer blocked: {:?}", status)),
+            })?;
 
         Ok(())
     }
@@ -1377,7 +1489,50 @@ pub use session_binding::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_membership_epoch::{ConfigClass, ReceiptId};
+    use tidefs_membership_epoch::{
+        pool_scan_gate::EpochMemberLabelFingerprint, ConfigClass, ReceiptId,
+    };
+
+    fn label_fingerprint() -> PoolLabelFingerprint {
+        PoolLabelFingerprint::from([0xBBu8; 32])
+    }
+
+    fn different_label_fingerprint() -> PoolLabelFingerprint {
+        PoolLabelFingerprint::from([0xBCu8; 32])
+    }
+
+    fn committed_pool_scan_for_epoch(member_id: u64, epoch: u64) -> PoolScanEvidence {
+        PoolScanEvidence::committed(
+            epoch.saturating_sub(1),
+            epoch,
+            42,
+            1,
+            [EpochMemberLabelFingerprint::new(
+                member_id,
+                label_fingerprint(),
+            )],
+        )
+    }
+
+    fn committed_pool_scan(member_id: u64) -> PoolScanEvidence {
+        committed_pool_scan_for_epoch(member_id, 10)
+    }
+
+    fn pending_pool_scan(member_id: u64) -> PoolScanEvidence {
+        PoolScanEvidence::pending(
+            9,
+            10,
+            1,
+            [EpochMemberLabelFingerprint::new(
+                member_id,
+                label_fingerprint(),
+            )],
+        )
+    }
+
+    fn committed_pool_scan_without_member(epoch: u64) -> PoolScanEvidence {
+        PoolScanEvidence::committed(epoch.saturating_sub(1), epoch, 42, 1, [])
+    }
 
     fn make_config(epoch: u64) -> MembershipConfigRecord {
         MembershipConfigRecord {
@@ -1396,12 +1551,26 @@ mod tests {
 
     #[allow(dead_code)]
     fn make_minimal_session(member_id: u64) -> JoinSessionEpoch {
-        let qe = QuorumEvidence { epoch: EpochId::new(10), quorum_approvals: 2, quorum_threshold: 2, approving_members: vec![MemberId::new(1), MemberId::new(2)] };
-        JoinSessionEpoch::new(EpochId::new(10), MemberId::new(member_id), 100)
+        make_minimal_session_for_epoch(member_id, 10)
+    }
+
+    fn make_minimal_session_for_epoch(member_id: u64, epoch: u64) -> JoinSessionEpoch {
+        let qe = QuorumEvidence {
+            epoch: EpochId::new(epoch),
+            quorum_approvals: 2,
+            quorum_threshold: 2,
+            approving_members: vec![MemberId::new(1), MemberId::new(2)],
+        };
+        JoinSessionEpoch::new(EpochId::new(epoch), MemberId::new(member_id), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(member_id), [0xAAu8; 32]))
-            .with_label_agreement(LabelAgreementFingerprint::committed(PoolLabelFingerprint::from([0xBBu8; 32])))
-            .with_placement_receipt(PlacementReceiptEvidence::new(PlacementIntentClass::ReplicaTarget, EpochId::new(10), 1, [0xCCu8; 32]))
+            .with_pool_scan_evidence(committed_pool_scan_for_epoch(member_id, epoch))
+            .with_label_agreement(LabelAgreementFingerprint::committed(label_fingerprint()))
+            .with_placement_receipt(PlacementReceiptEvidence::new(
+                PlacementIntentClass::ReplicaTarget,
+                EpochId::new(epoch),
+                1,
+                [0xCCu8; 32],
+            ))
     }
 
     #[test]
@@ -1410,7 +1579,7 @@ mod tests {
         let config = make_config(1);
 
         // Start -> ShadowOnly(p4)
-        join.record_session_epoch(make_minimal_session(10));
+        join.record_session_epoch(make_minimal_session_for_epoch(10, 1));
         join.phase_shadow(&config, 2000).unwrap();
         assert_eq!(join.progress.phase, JoinPhase::ShadowOnly);
 
@@ -1443,7 +1612,7 @@ mod tests {
         let mut join = NodeJoinProtocol::new(MemberId::new(10), EpochId::new(1), 1, 1000);
         let config = make_config(1);
 
-        join.record_session_epoch(make_minimal_session(10));
+        join.record_session_epoch(make_minimal_session_for_epoch(10, 1));
         join.phase_shadow(&config, 2000).unwrap();
         join.evaluate_health_for_witness(HealthClass::Healthy, 3000)
             .unwrap();
@@ -1479,7 +1648,7 @@ mod tests {
         let mut join = NodeJoinProtocol::new(MemberId::new(10), EpochId::new(1), 1, 1000);
         let config = make_config(1);
 
-        join.record_session_epoch(make_minimal_session(10));
+        join.record_session_epoch(make_minimal_session_for_epoch(10, 1));
         join.phase_shadow(&config, 2000).unwrap();
 
         let err = join.complete(3000).unwrap_err();
@@ -1491,7 +1660,7 @@ mod tests {
         let mut join = NodeJoinProtocol::new(MemberId::new(10), EpochId::new(1), 1, 1000);
         let config = make_config(99); // Different epoch
 
-        join.record_session_epoch(make_minimal_session(10));
+        join.record_session_epoch(make_minimal_session_for_epoch(10, 1));
         let err = join.phase_shadow(&config, 2000).unwrap_err();
         assert!(matches!(err, JoinError::EpochMismatch { .. }));
     }
@@ -1730,7 +1899,7 @@ mod tests {
         let mut protocol = NodeJoinProtocol::new(MemberId::new(10), EpochId::new(1), 1, 1000);
         assert_eq!(protocol.progress.phase, JoinPhase::NotStarted);
 
-        protocol.record_session_epoch(make_minimal_session(10));
+        protocol.record_session_epoch(make_minimal_session_for_epoch(10, 1));
         protocol
             .start_from_join_commit(commit.result.as_ref().unwrap(), 2000)
             .unwrap();
@@ -2121,7 +2290,7 @@ mod tests {
     fn demote_from_shadow_only_stays_at_shadow() {
         let mut join = NodeJoinProtocol::new(MemberId::new(10), EpochId::new(1), 1, 1000);
         let config = make_config(1);
-        join.record_session_epoch(make_minimal_session(10));
+        join.record_session_epoch(make_minimal_session_for_epoch(10, 1));
         join.phase_shadow(&config, 2000).unwrap();
         assert_eq!(join.progress.phase, JoinPhase::ShadowOnly);
 
@@ -2147,7 +2316,7 @@ mod tests {
         let config = make_config(1);
 
         // Progress through all phases to completion
-        join.record_session_epoch(make_minimal_session(10));
+        join.record_session_epoch(make_minimal_session_for_epoch(10, 1));
         join.phase_shadow(&config, 2000).unwrap();
         join.evaluate_health_for_witness(HealthClass::Healthy, 3000)
             .unwrap();
@@ -2166,7 +2335,7 @@ mod tests {
     fn phase_shadow_when_already_started_errors() {
         let mut join = NodeJoinProtocol::new(MemberId::new(10), EpochId::new(1), 1, 1000);
         let config = make_config(1);
-        join.record_session_epoch(make_minimal_session(10));
+        join.record_session_epoch(make_minimal_session_for_epoch(10, 1));
         join.phase_shadow(&config, 2000).unwrap();
 
         let err = join.phase_shadow(&config, 3000).unwrap_err();
@@ -2511,7 +2680,7 @@ mod tests {
     fn protocol_eval_health_for_replica_wrong_phase() {
         let mut protocol = NodeJoinProtocol::new(MemberId::new(10), EpochId::new(1), 1, 1000);
         let config = make_config(1);
-        protocol.record_session_epoch(make_minimal_session(10));
+        protocol.record_session_epoch(make_minimal_session_for_epoch(10, 1));
         protocol.phase_shadow(&config, 2000).unwrap();
         // At ShadowOnly, can't directly eval for replica target
         let err = protocol
@@ -2524,7 +2693,7 @@ mod tests {
     fn protocol_complete_when_not_at_replica_target() {
         let mut protocol = NodeJoinProtocol::new(MemberId::new(10), EpochId::new(1), 1, 1000);
         let config = make_config(1);
-        protocol.record_session_epoch(make_minimal_session(10));
+        protocol.record_session_epoch(make_minimal_session_for_epoch(10, 1));
         protocol.phase_shadow(&config, 2000).unwrap();
         // Can't complete from ShadowOnly
         let err = protocol.complete(3000).unwrap_err();
@@ -2638,8 +2807,10 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
-        assert!(session.is_valid_for(MemberId::new(42), EpochId::new(10)).is_ok());
+            .with_pool_scan_evidence(committed_pool_scan(42));
+        assert!(session
+            .is_valid_for(MemberId::new(42), EpochId::new(10))
+            .is_ok());
     }
 
     #[test]
@@ -2652,7 +2823,7 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         let result = session.is_valid_for(MemberId::new(42), EpochId::new(11));
         assert!(matches!(result, Err(JoinStatus::StaleEpoch { .. })));
     }
@@ -2667,7 +2838,7 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         let result = session.is_valid_for(MemberId::new(99), EpochId::new(10));
         assert!(matches!(result, Err(JoinStatus::IdentityMismatch { .. })));
     }
@@ -2689,7 +2860,7 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         let result = session.is_valid_for(MemberId::new(42), EpochId::new(10));
         assert!(matches!(result, Err(JoinStatus::WaitingForQuorum)));
     }
@@ -2742,7 +2913,7 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         protocol.record_session_epoch(session);
 
         assert!(protocol.can_start_state_transfer(EpochId::new(10)).is_ok());
@@ -2776,7 +2947,7 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         protocol.record_session_epoch(session);
 
         // Check against a newer epoch
@@ -2800,7 +2971,7 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(99), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         protocol.record_session_epoch(session);
 
         let result = protocol.can_start_state_transfer(EpochId::new(10));
@@ -2823,7 +2994,7 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         protocol.record_session_epoch(session);
 
         let result = protocol.can_start_state_transfer(EpochId::new(10));
@@ -2860,7 +3031,7 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         protocol.record_session_epoch(session);
 
         let status = protocol.join_status(EpochId::new(10));
@@ -2883,7 +3054,7 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         protocol.record_session_epoch(session);
 
         let status = protocol.join_status(EpochId::new(15));
@@ -2926,7 +3097,7 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         receiver.session_epoch = Some(session);
 
         let offer = crate::state_transfer::SegmentOffer::new(1, [0u8; 32], 100);
@@ -2937,20 +3108,16 @@ mod tests {
 
     #[test]
     fn session_binding_cannot_bind_without_epoch_evidence() {
-        let mgr = crate::session_binding::SessionBindingManager::new(
-            MemberId::new(42),
-            EpochId::new(10),
-        );
+        let mgr =
+            crate::session_binding::SessionBindingManager::new(MemberId::new(42), EpochId::new(10));
         let result = mgr.can_bind_sessions(EpochId::new(10));
         assert!(matches!(result, Err(JoinError::MissingEpochEvidence(_))));
     }
 
     #[test]
     fn session_binding_can_bind_with_valid_epoch() {
-        let mut mgr = crate::session_binding::SessionBindingManager::new(
-            MemberId::new(42),
-            EpochId::new(10),
-        );
+        let mut mgr =
+            crate::session_binding::SessionBindingManager::new(MemberId::new(42), EpochId::new(10));
         let qe = QuorumEvidence {
             epoch: EpochId::new(10),
             quorum_approvals: 2,
@@ -2959,13 +3126,11 @@ mod tests {
         };
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
             .with_quorum(qe)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         mgr.set_session_epoch(session);
 
         assert!(mgr.can_bind_sessions(EpochId::new(10)).is_ok());
     }
-
-
 
     // ── Committed evidence admission tests ─────────────────────────
 
@@ -2981,13 +3146,21 @@ mod tests {
         assert_eq!(protocol.progress.phase, JoinPhase::ShadowOnly);
 
         // Health checks with label/placement evidence → VoterSpread
-        assert!(!protocol.evaluate_health_for_witness(HealthClass::Healthy, 3000).unwrap());
-        assert!(protocol.evaluate_health_for_witness(HealthClass::Healthy, 4000).unwrap());
+        assert!(!protocol
+            .evaluate_health_for_witness(HealthClass::Healthy, 3000)
+            .unwrap());
+        assert!(protocol
+            .evaluate_health_for_witness(HealthClass::Healthy, 4000)
+            .unwrap());
         assert_eq!(protocol.progress.phase, JoinPhase::VoterSpread);
 
         // Health checks → ReplicaTarget
-        assert!(!protocol.evaluate_health_for_replica_target(HealthClass::Healthy, 5000).unwrap());
-        assert!(protocol.evaluate_health_for_replica_target(HealthClass::Healthy, 6000).unwrap());
+        assert!(!protocol
+            .evaluate_health_for_replica_target(HealthClass::Healthy, 5000)
+            .unwrap());
+        assert!(protocol
+            .evaluate_health_for_replica_target(HealthClass::Healthy, 6000)
+            .unwrap());
         assert_eq!(protocol.progress.phase, JoinPhase::ReplicaTarget);
         assert!(protocol.can_accept_replicas());
     }
@@ -3000,19 +3173,14 @@ mod tests {
 
         // Session with uncommitted pool scan
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence {
-                committed_root: 0xBEEF,
-                commit_group: 42,
-                pool_id: 7,
-                is_committed: false,
-                member_id_present: false,
-                joining_member_id: MemberId::new(42),
-                evidence_hash: [0xAAu8; 32],
-            });
+            .with_pool_scan_evidence(pending_pool_scan(42));
         protocol.record_session_epoch(session);
 
         let result = protocol.phase_shadow(&config, 2000);
-        assert!(matches!(result, Err(JoinError::PoolScanNotCommitted { .. })));
+        assert!(matches!(
+            result,
+            Err(JoinError::PoolScanNotCommitted { .. })
+        ));
     }
 
     /// Join rejection when pool-scan evidence is completely missing.
@@ -3026,7 +3194,10 @@ mod tests {
         protocol.record_session_epoch(session);
 
         let result = protocol.phase_shadow(&config, 2000);
-        assert!(matches!(result, Err(JoinError::MissingPoolScanEvidence { .. })));
+        assert!(matches!(
+            result,
+            Err(JoinError::MissingPoolScanEvidence { .. })
+        ));
     }
 
     /// Join rejection when label agreement is not committed.
@@ -3037,13 +3208,40 @@ mod tests {
 
         // Valid pool scan but uncommitted label agreement
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]))
-            .with_label_agreement(LabelAgreementFingerprint { fingerprint: PoolLabelFingerprint::from([0xBBu8; 32]), is_committed: false });
+            .with_pool_scan_evidence(committed_pool_scan(42))
+            .with_label_agreement(LabelAgreementFingerprint {
+                fingerprint: label_fingerprint(),
+                is_committed: false,
+            });
         protocol.record_session_epoch(session);
         protocol.phase_shadow(&config, 2000).unwrap();
 
         let result = protocol.evaluate_health_for_witness(HealthClass::Healthy, 3000);
-        assert!(matches!(result, Err(JoinError::LabelAgreementNotCommitted { .. })));
+        assert!(matches!(
+            result,
+            Err(JoinError::LabelAgreementNotCommitted { .. })
+        ));
+    }
+
+    /// Join rejection when label agreement disagrees with committed scan evidence.
+    #[test]
+    fn join_rejected_label_disagreement() {
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+        let config = make_config(10);
+
+        let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
+            .with_pool_scan_evidence(committed_pool_scan(42))
+            .with_label_agreement(LabelAgreementFingerprint::committed(
+                different_label_fingerprint(),
+            ));
+        protocol.record_session_epoch(session);
+        protocol.phase_shadow(&config, 2000).unwrap();
+
+        let result = protocol.evaluate_health_for_witness(HealthClass::Healthy, 3000);
+        assert!(matches!(
+            result,
+            Err(JoinError::LabelAgreementMismatch { .. })
+        ));
     }
 
     /// Phase promotion gating: VoterSpread blocked without label agreement.
@@ -3054,12 +3252,15 @@ mod tests {
 
         // Only pool scan, no label
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]));
+            .with_pool_scan_evidence(committed_pool_scan(42));
         protocol.record_session_epoch(session);
         protocol.phase_shadow(&config, 2000).unwrap();
 
         let result = protocol.evaluate_health_for_witness(HealthClass::Healthy, 3000);
-        assert!(matches!(result, Err(JoinError::MissingLabelAgreement { .. })));
+        assert!(matches!(
+            result,
+            Err(JoinError::MissingLabelAgreement { .. })
+        ));
     }
 
     /// Phase promotion gating: ReplicaTarget blocked without placement receipt.
@@ -3070,15 +3271,25 @@ mod tests {
 
         // Pool scan + label, but no placement receipt
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]))
-            .with_label_agreement(LabelAgreementFingerprint::committed(PoolLabelFingerprint::from([0xBBu8; 32])));
+            .with_pool_scan_evidence(committed_pool_scan(42))
+            .with_label_agreement(LabelAgreementFingerprint::committed(label_fingerprint()));
         protocol.record_session_epoch(session);
         protocol.phase_shadow(&config, 2000).unwrap();
-        assert!(protocol.evaluate_health_for_witness(HealthClass::Healthy, 3000).unwrap() == false);
-        assert!(protocol.evaluate_health_for_witness(HealthClass::Healthy, 4000).unwrap());
+        assert!(
+            protocol
+                .evaluate_health_for_witness(HealthClass::Healthy, 3000)
+                .unwrap()
+                == false
+        );
+        assert!(protocol
+            .evaluate_health_for_witness(HealthClass::Healthy, 4000)
+            .unwrap());
 
         let result = protocol.evaluate_health_for_replica_target(HealthClass::Healthy, 5000);
-        assert!(matches!(result, Err(JoinError::MissingPlacementReceipt { .. })));
+        assert!(matches!(
+            result,
+            Err(JoinError::MissingPlacementReceipt { .. })
+        ));
     }
 
     /// Join lifecycle evidence persistence through full join.
@@ -3095,14 +3306,23 @@ mod tests {
         assert!(session.pool_scan_evidence.is_some());
         assert!(session.label_agreement.is_some());
         assert!(session.placement_receipt.is_some());
-        assert!(session.pool_scan_evidence.as_ref().unwrap().is_committed);
-        assert_eq!(session.pool_scan_evidence.as_ref().unwrap().joining_member_id, MemberId::new(77));
+        let scan = session.pool_scan_evidence.as_ref().unwrap();
+        assert!(scan.committed);
+        assert!(scan.label_fingerprint_for(77).is_some());
 
         // Promote through phases
-        protocol.evaluate_health_for_witness(HealthClass::Healthy, 3000).unwrap();
-        protocol.evaluate_health_for_witness(HealthClass::Healthy, 4000).unwrap();
-        protocol.evaluate_health_for_replica_target(HealthClass::Healthy, 5000).unwrap();
-        protocol.evaluate_health_for_replica_target(HealthClass::Healthy, 6000).unwrap();
+        protocol
+            .evaluate_health_for_witness(HealthClass::Healthy, 3000)
+            .unwrap();
+        protocol
+            .evaluate_health_for_witness(HealthClass::Healthy, 4000)
+            .unwrap();
+        protocol
+            .evaluate_health_for_replica_target(HealthClass::Healthy, 5000)
+            .unwrap();
+        protocol
+            .evaluate_health_for_replica_target(HealthClass::Healthy, 6000)
+            .unwrap();
         protocol.complete(7000).unwrap();
 
         // Evidence persists after completion
@@ -3120,19 +3340,14 @@ mod tests {
         let config = make_config(10);
 
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence {
-                committed_root: 0xBEEF,
-                commit_group: 42,
-                pool_id: 7,
-                is_committed: true,
-                member_id_present: false,
-                joining_member_id: MemberId::new(42),
-                evidence_hash: [0xAAu8; 32],
-            });
+            .with_pool_scan_evidence(committed_pool_scan_without_member(10));
         protocol.record_session_epoch(session);
 
         let result = protocol.phase_shadow(&config, 2000);
-        assert!(matches!(result, Err(JoinError::PoolScanNotCommitted { .. })));
+        assert!(matches!(
+            result,
+            Err(JoinError::PoolScanMemberNotFound { .. })
+        ));
     }
 
     /// Placement receipt uncommitted blocks replica target promotion.
@@ -3142,8 +3357,8 @@ mod tests {
         let config = make_config(10);
 
         let session = JoinSessionEpoch::new(EpochId::new(10), MemberId::new(42), 100)
-            .with_pool_scan_evidence(CommittedPoolScanEvidence::new(0xBEEF, 42, 7, MemberId::new(42), [0xAAu8; 32]))
-            .with_label_agreement(LabelAgreementFingerprint::committed(PoolLabelFingerprint::from([0xBBu8; 32])))
+            .with_pool_scan_evidence(committed_pool_scan(42))
+            .with_label_agreement(LabelAgreementFingerprint::committed(label_fingerprint()))
             .with_placement_receipt(PlacementReceiptEvidence {
                 intent_class: None,
                 is_committed: false,
@@ -3153,10 +3368,17 @@ mod tests {
             });
         protocol.record_session_epoch(session);
         protocol.phase_shadow(&config, 2000).unwrap();
-        assert!(!protocol.evaluate_health_for_witness(HealthClass::Healthy, 3000).unwrap());
-        assert!(protocol.evaluate_health_for_witness(HealthClass::Healthy, 4000).unwrap());
+        assert!(!protocol
+            .evaluate_health_for_witness(HealthClass::Healthy, 3000)
+            .unwrap());
+        assert!(protocol
+            .evaluate_health_for_witness(HealthClass::Healthy, 4000)
+            .unwrap());
 
         let result = protocol.evaluate_health_for_replica_target(HealthClass::Healthy, 5000);
-        assert!(matches!(result, Err(JoinError::PlacementReceiptNotCommitted { .. })));
+        assert!(matches!(
+            result,
+            Err(JoinError::PlacementReceiptNotCommitted { .. })
+        ));
     }
 }
