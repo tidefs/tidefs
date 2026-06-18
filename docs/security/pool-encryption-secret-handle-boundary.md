@@ -1,6 +1,6 @@
 # Pool Encryption Secret-Handle/Key-Lease Boundary (REL-SEC-003)
 
-Status: implemented (type boundary, 2026-05-22)
+Status: implemented (type boundary + mount-identity unit evidence, 2026-06-18)
 Crate: `tidefs-encryption` (`secret_handle` module)
 
 ## What this boundary is
@@ -12,42 +12,56 @@ rather than by a filesystem path to a `SealedPoolKeyEnvelope` file. Runtime
 access to the plaintext key flows through a short-lived `PoolEncryptionKeyLease`,
 not through an ambient long-lived key reference.
 
+Every handle is also bound to a committed dataset mount identity:
+`(dataset_id, mount_generation)`. Lease issuance requires the caller to
+present that same identity, so stale remount generations and foreign datasets
+fail closed before plaintext key access is granted.
+
 ## Key types
 
 | Type | Location | Role |
 |---|---|---|
 | `SecretHandleId` | `tidefs_encryption::secret_handle` | Stable 128-bit opaque handle for the pool encryption key |
 | `SecretHandleLifecycle` | `tidefs_encryption::secret_handle` | P9-04 lifecycle states: SealedInactive, Active, RotatingDualValid, Revoked, Quarantined, Retired |
-| `PoolEncryptionSecretHandleRecord` | `tidefs_encryption::secret_handle` | Durable record with handle identity, lifecycle, lineage |
+| `DatasetMountIdentity` | `tidefs_encryption::secret_handle` | Committed `(dataset_id, mount_generation)` token for mount-scoped key access |
+| `PoolEncryptionSecretHandleRecord` | `tidefs_encryption::secret_handle` | Durable record with handle identity, lifecycle, lineage, and mount identity binding |
 | `PoolEncryptionSecretHandle` | `tidefs_encryption::secret_handle` | Top-level handle bundling record + sealed envelope |
-| `PoolEncryptionKeyLease` | `tidefs_encryption::secret_handle` | Short-lived plaintext key access; zeroized on drop |
+| `PoolEncryptionKeyLease` | `tidefs_encryption::secret_handle` | Short-lived plaintext key access bound to the handle mount identity; zeroized on drop |
 | `LeaseUsageClass` | `tidefs_encryption::secret_handle` | PoolMount, PoolMaintenance, DatasetAccess |
 
 ## Integration chain
 
 ```text
-operator -> secret handle ID -> handle record -> sealed envelope
-                                                    |
-                                    wrapping key --> unseal
-                                                    |
-                                                    v
-                                              plaintext lease (time-bounded)
+operator -> secret handle ID -> handle record + dataset mount identity
+                                      |
+present matching mount identity ------+
+                                      v
+                               sealed envelope
+                                      |
+                      wrapping key -> unseal
+                                      |
+                                      v
+                         plaintext lease (time-bounded)
 ```
 
 `PoolEncryptionSecretHandle::mint()` generates a pool key, seals it in a
 VEKF-format `SealedPoolKeyEnvelope` under the `PoolWrappingKey`, and creates
-a handle record. The operator activates the handle before issuing leases.
+a handle record bound to a `DatasetMountIdentity`. The operator activates the
+handle before issuing leases.
 
-`PoolEncryptionSecretHandle::issue_lease()` unseals the envelope, returns a
-time-bounded `PoolEncryptionKeyLease`. Leases are clamped to
-`MAX_LEASE_DURATION` (1 hour). Revoked/quarantined/retired handles refuse
-lease issuance.
+`PoolEncryptionSecretHandle::issue_lease()` first requires the presented
+`DatasetMountIdentity` to match the handle binding. Only then does it unseal
+the envelope and return a time-bounded `PoolEncryptionKeyLease` carrying the
+same mount identity. Leases are clamped to `MAX_LEASE_DURATION` (1 hour).
+Wrong mount generation, foreign dataset, and revoked/quarantined/retired
+handles refuse lease issuance.
 
 ## Durable storage
 
 The sealed key envelope remains the existing `SealedPoolKeyEnvelope` (VEKF v1,
-84 bytes). The new `PoolEncryptionSecretHandleRecord` carries the handle
-identity, lifecycle state, SHA-256 envelope digest, and rotation lineage.
+84 bytes). `PoolEncryptionSecretHandleRecord` carries the handle identity,
+lifecycle state, committed dataset mount identity, SHA-256 envelope digest,
+and rotation lineage.
 
 ## P9-04 compliance
 
@@ -55,13 +69,21 @@ identity, lifecycle state, SHA-256 envelope digest, and rotation lineage.
   the key material is sealed inside the envelope and only exposed via lease.
 - Lease bounded lifetime (§5.1): `PoolEncryptionKeyLease` is time-bounded
   and zeroized on drop.
+- Mount-identity gate: every lease requires the committed dataset identity and
+  mount generation that minted the handle. Missing, unbound, stale-generation,
+  or foreign-dataset identity checks fail closed.
 - Lifecycle states (§6.5): all six P9-04 states implemented.
 - Handle stable across rotation: `key_generation` counter tracks rotation
   lineage.
 
 ## Current reachability
 
-The boundary types are defined and tested. The pool create/import/mount CLI
+The boundary types are defined and tested. The P9-04 runtime helper
+`validate_dataset_mount_identity_for_handle()` consumes policy-layer mount
+identity bindings and defaults stores that cannot prove a binding to
+fail-closed behavior. Mounted local-filesystem encryption remains blocked on
+the broader transform authority work; this document is not an end-to-end
+mounted encryption claim.
 
 ## A-register impact
 
@@ -73,7 +95,10 @@ Design Is Split Between Strong Laws And Weak Live Boundaries):
 
 ## Tests
 
-9 unit tests in `secret_handle::tests` covering: mint+lease roundtrip,
+17 unit tests in `secret_handle::tests` covering: mint+lease roundtrip,
 revoked-handle refusal, wrong wrapping key rejection, lease duration clamping,
 lease consumption, handle ID hex roundtrip, uniqueness, lifecycle transitions,
-and envelope integrity digest stability.
+envelope integrity digest stability, correct mount identity success, wrong
+generation rejection, foreign dataset rejection, encryption round-trip through
+the mount-identity gate, key rotation across remount, and mount identity
+display/matching helpers.
