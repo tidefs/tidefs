@@ -1825,13 +1825,19 @@ mod tests {
         // lease is dropped. Verify the consumed key matches the original.
         let salt = PoolWrappingKey::generate_salt();
         let wk = PoolWrappingKey::derive("lease test passphrase", &salt).unwrap();
-        let (mut handle, original_key) =
-            PoolEncryptionSecretHandle::mint("zero-test".into(), None, &wk, 1_700_000_000).unwrap();
+        let mount_id = DatasetMountIdentity::new("pool/zero-test".into(), 1);
+        let (mut handle, original_key) = PoolEncryptionSecretHandle::mint(
+            "zero-test".into(),
+            mount_id.clone(),
+            &wk,
+            1_700_000_000,
+        )
+        .unwrap();
         handle.activate(1_700_000_100);
 
         let lease = handle
             .issue_lease(
-                None,
+                &mount_id,
                 &wk,
                 std::time::Duration::from_secs(60),
                 LeaseUsageClass::PoolMount,
