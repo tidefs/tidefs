@@ -1,0 +1,179 @@
+name: Focused Claim Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: >-
+          Validation mode:
+          validate-claim (needs claim_id),
+          check-claims-gate (no extra args),
+          check-no-hidden-queues (no extra args),
+          validate-evidence-manifest (needs artifact_path),
+          validate-ublk-completion (needs artifact_path),
+          validate-ublk-started-export (needs artifact_path)
+        required: true
+        type: choice
+        options:
+          - validate-claim
+          - check-claims-gate
+          - check-no-hidden-queues
+          - validate-evidence-manifest
+          - validate-ublk-completion
+          - validate-ublk-started-export
+      claim_id:
+        description: Claim ID from validation/claims.toml (required for validate-claim)
+        required: false
+        type: string
+      artifact_path:
+        description: >-
+          Workspace-relative artifact path
+          (required for validate-evidence-manifest,
+          validate-ublk-completion,
+          validate-ublk-started-export)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    focused-claim-validation-${{ github.ref }}-${{ inputs.mode }}-
+    ${{ inputs.claim_id }}-${{ inputs.artifact_path }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate:
+    name: Focused claim validation
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare CI scratch
+        run: |
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+
+      - name: Validate inputs
+        id: inputs
+        run: |
+          MODE="${{ inputs.mode }}"
+          CLAIM_ID="${{ inputs.claim_id }}"
+          ARTIFACT_PATH="${{ inputs.artifact_path }}"
+
+          reject() {
+            echo "## Input validation failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Mode**: \`$MODE\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Reason**: $1" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$1"
+            exit 1
+          }
+
+          case "$MODE" in
+            validate-claim)
+              if [[ -z "$CLAIM_ID" ]]; then
+                reject "mode 'validate-claim' requires claim_id input"
+              fi
+              if [[ -n "$ARTIFACT_PATH" ]]; then
+                reject "mode 'validate-claim' does not accept artifact_path"
+              fi
+              ;;
+            validate-evidence-manifest|validate-ublk-completion|validate-ublk-started-export)
+              if [[ -z "$ARTIFACT_PATH" ]]; then
+                reject "mode '$MODE' requires artifact_path input"
+              fi
+              if [[ -n "$CLAIM_ID" ]]; then
+                reject "mode '$MODE' does not accept claim_id"
+              fi
+              ;;
+            check-claims-gate|check-no-hidden-queues)
+              if [[ -n "$CLAIM_ID" ]]; then
+                reject "mode '$MODE' does not accept claim_id"
+              fi
+              if [[ -n "$ARTIFACT_PATH" ]]; then
+                reject "mode '$MODE' does not accept artifact_path"
+              fi
+              ;;
+            *)
+              reject "unknown mode '$MODE'"
+              ;;
+          esac
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "claim_id=$CLAIM_ID" >> "$GITHUB_OUTPUT"
+          echo "artifact_path=$ARTIFACT_PATH" >> "$GITHUB_OUTPUT"
+
+          echo "## Input validation passed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Mode: \`$MODE\`" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$CLAIM_ID" ]]; then
+            echo "- Claim ID: \`$CLAIM_ID\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -n "$ARTIFACT_PATH" ]]; then
+            echo "- Artifact path: \`$ARTIFACT_PATH\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run validation
+        id: run
+        run: |
+          MODE="${{ steps.inputs.outputs.mode }}"
+          CLAIM_ID="${{ steps.inputs.outputs.claim_id }}"
+          ARTIFACT_PATH="${{ steps.inputs.outputs.artifact_path }}"
+
+          echo "## Validation run" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          case "$MODE" in
+            validate-claim)
+              echo "- Command: \`cargo run -p tidefs-xtask -- validate-claim '$CLAIM_ID'\`" >> "$GITHUB_STEP_SUMMARY"
+              nix develop .#ci --command cargo run -p tidefs-xtask -- validate-claim "$CLAIM_ID"
+              ;;
+            check-claims-gate)
+              echo "- Command: \`cargo run -p tidefs-xtask -- check-claims-gate\`" >> "$GITHUB_STEP_SUMMARY"
+              nix develop .#ci --command cargo run -p tidefs-xtask -- check-claims-gate
+              ;;
+            check-no-hidden-queues)
+              echo "- Command: \`cargo run -p tidefs-xtask -- check-no-hidden-queues\`" >> "$GITHUB_STEP_SUMMARY"
+              nix develop .#ci --command cargo run -p tidefs-xtask -- check-no-hidden-queues
+              ;;
+            validate-evidence-manifest)
+              echo "- Command: \`cargo run -p tidefs-xtask -- validate-evidence-manifest '$ARTIFACT_PATH'\`" >> "$GITHUB_STEP_SUMMARY"
+              nix develop .#ci --command cargo run -p tidefs-xtask -- validate-evidence-manifest "$ARTIFACT_PATH"
+              ;;
+            validate-ublk-completion)
+              echo "- Command: \`cargo run -p tidefs-xtask -- validate-ublk-completion-artifact '$ARTIFACT_PATH'\`" >> "$GITHUB_STEP_SUMMARY"
+              nix develop .#ci --command cargo run -p tidefs-xtask -- validate-ublk-completion-artifact "$ARTIFACT_PATH"
+              ;;
+            validate-ublk-started-export)
+              echo "- Command: \`cargo run -p tidefs-xtask -- validate-ublk-started-export-admission-artifact '$ARTIFACT_PATH'\`" >> "$GITHUB_STEP_SUMMARY"
+              nix develop .#ci --command cargo run -p tidefs-xtask -- validate-ublk-started-export-admission-artifact "$ARTIFACT_PATH"
+              ;;
+          esac
+        env:
+          TIDEFS_FOCUSED_CLAIM_VALIDATION_MODE: ${{ inputs.mode }}
+
+      - name: Report result
+        if: always()
+        run: |
+          if [[ "${{ steps.run.outcome }}" == "success" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Result**: passed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Result**: failed" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Clean cargo target
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"

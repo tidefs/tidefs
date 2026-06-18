@@ -37,6 +37,20 @@ may use non-secret repository variables for scheduling gates, such as
   JSON summary artifact, and per-run target cleanup as `Rust Fast`. It also
   self-tests on pull requests that modify the focused workflow or its runner
   helper so workflow changes get Actions coverage before merge.
+
+- `Focused Claim Validation` is a manual-only self-hosted workflow for
+  focused claim-receipt and evidence-artifact validation. Dispatch it
+  against a feature branch with a `mode` input and, depending on mode,
+  a `claim_id` or `artifact_path`. It uses the repo `.#ci` Nix development
+  shell and runs only the smallest relevant xtask subcommand:
+  `validate-claim`, `check-claims-gate`, `check-no-hidden-queues`,
+  `validate-evidence-manifest`, `validate-ublk-completion`, or
+  `validate-ublk-started-export`. Input validation rejects broad or
+  mismatched selections (for example, `claim_id` without
+  `validate-claim` mode). The workflow summary records the claim id,
+  artifact path, command executed, result, and any artifact upload
+  path. It does not expose or configure TideFS secrets and does not
+  trigger broad xfstests, RDMA, kernel, or release-candidate validation.
 - `Secret Policy` runs on the same self-hosted TideFS runner labels and keeps
   the GitHub secret boundary checked without spending hosted Actions minutes.
 - `Codex Nexus Relay` is a self-hosted event bridge for the local

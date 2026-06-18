@@ -805,6 +805,36 @@ fn main() {
                 }
             }
         }
+        Some("validate-evidence-manifest") => {
+            let artifact_path = match args.next() {
+                Some(path) => path,
+                None => {
+                    eprintln!("validate-evidence-manifest requires an artifact path");
+                    process::exit(2);
+                }
+            };
+            if let Some(extra) = args.next() {
+                eprintln!(
+                    "validate-evidence-manifest accepts one path, got extra argument `{extra}`"
+                );
+                process::exit(2);
+            }
+            match tidefs_validation::evidence_artifact_manifest::load_evidence_artifact_manifest_json_path(
+                &artifact_path,
+            ) {
+                Ok(manifest) => {
+                    println!(
+                        "evidence manifest validated: claim_id={} evidence_class={} source={} scope={}",
+                        manifest.claim_id, manifest.evidence_class, manifest.source, manifest.scope
+                    );
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    process::exit(1);
+                }
+            }
+        }
+
         Some("check-no-hidden-queues") => {
             if let Err(err) = no_hidden_queues::check_current_workspace() {
                 eprintln!("{err}");
@@ -2036,6 +2066,9 @@ fn print_help() {
         "  validate-ublk-started-export-admission-artifact <path> validate started uBLK export admission evidence"
     );
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
+    println!(
+        "  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON against schema"
+    );
     println!("  check-claim-gate        validate current worktree has a valid issue owner");
     println!("  check-worktree-claim    alias for check-claim-gate");
     println!("  check-stale-claims      scan Forgejo for stale codex:claimed issues");
