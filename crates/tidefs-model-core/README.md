@@ -13,3 +13,17 @@ model replay binds those tokens to validated model component names through
 
 The crate still exposes `ModelRequest` as a path-oriented helper for tests and
 callers that have not yet moved to canonical contract envelopes.
+
+## Model Run Receipts
+
+`ModelRunReceipt` records claim-scoped output from the pure model layer. A
+receipt names claim ids, the model backend version, request contract version,
+input digest, output fingerprint, covered operations, validation tier, and
+evidence scope. The canonical helper sorts set-like fields before JSON
+serialization so trace and crash callers can cite the same model evidence
+without depending on local runtime storage.
+
+A valid receipt is lower-tier model evidence only: validation rejects runtime
+tiers, runtime evidence scopes, empty claim ids, missing input digests, and
+empty or unknown operation coverage. Claims still need separate runtime
+artifacts before any model result can support runtime behavior.
