@@ -2802,6 +2802,7 @@ dependencies = [
  "serde_json",
  "tidefs-auth",
  "tidefs-membership-types",
+ "tidefs-types-pool-label-core",
 ]
 
 [[package]]
