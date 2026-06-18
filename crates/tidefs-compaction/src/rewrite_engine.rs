@@ -1667,6 +1667,42 @@ mod tests {
     }
 
     #[test]
+    fn verify_swap_manifest_rejects_missing_live_object_entry() {
+        let mut store = MockCompactionStore::new();
+        let k1 = make_key(1);
+        let k2 = make_key(2);
+        let d1 = vec![0xAAu8; 64];
+        let d2 = vec![0xBBu8; 32];
+
+        store.add_segment_with_objects(1, &[(k1, d1.clone()), (k2, d2)]);
+
+        let entry = RelocationEntry {
+            source_segment: 1,
+            object_key: k1,
+            target_offset: 0,
+            blake3_hash: blake3::hash(&d1).into(),
+        };
+        let manifest = SwapManifest {
+            source_segments: vec![1],
+            target_segment: 100,
+            relocation_entries: vec![entry.clone()],
+            total_bytes: d1.len() as u64,
+            manifest_hash: SwapManifest::compute_hash(&[1], 100, &[entry], d1.len() as u64),
+        };
+
+        let verification = crate::verification::verify_swap_manifest(&manifest, &store);
+        assert!(!verification.verified);
+        assert!(verification.errors.iter().any(|e| matches!(
+            e,
+            crate::verification::SwapVerificationError::EntryCountMismatch { .. }
+        )));
+        assert!(verification.errors.iter().any(|e| matches!(
+            e,
+            crate::verification::SwapVerificationError::MissingManifestData { .. }
+        )));
+    }
+
+    #[test]
     fn verify_swap_manifest_target_read_failure() {
         let mut store = MockCompactionStore::new();
         let k1 = make_key(1);
