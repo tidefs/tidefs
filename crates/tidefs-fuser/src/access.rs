@@ -409,7 +409,7 @@ mod tests {
     use super::*;
 
     const VALID_MOUNT: MountIdentity = MountIdentity::new([0x41; 16], 1);
-    const INVALID_MOUNT: MountIdentity = MountIdentity::new([0; 16], 1);
+    const INVALID_MOUNT: MountIdentity = MountIdentity::new([0x41; 16], 0);
 
     // -- fuse_access_requested_from_mask --
 
