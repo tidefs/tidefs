@@ -179,7 +179,7 @@ pub fn run_intent_log_crash_matrix() -> Vec<IntentLogCrashCase> {
         IntentLogCrashCase {
             id: "crash-near-end".into(),
             record_count: 10,
-            truncation: Some(IntentLogTruncation::TailBytes(128)),
+            truncation: Some(IntentLogTruncation::TailBytes(420)),
             expect_clean_checkpoint_match: false,
         },
         // ── Double-replay idempotency (no crash) ─────────────────
