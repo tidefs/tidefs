@@ -2369,10 +2369,11 @@ fn maybe_checkpoint(
     payload_bytes_since_checkpoint: u64,
     checkpoint_interval: u64,
 ) -> Result<(), SendStreamError> {
-    if checkpoint_interval == 0 || stats.records_sent == 0 {
+    let records_since_manifest = stats.records_sent.saturating_sub(1);
+    if checkpoint_interval == 0 || records_since_manifest == 0 {
         return Ok(());
     }
-    if !stats.records_sent.is_multiple_of(checkpoint_interval) {
+    if !records_since_manifest.is_multiple_of(checkpoint_interval) {
         return Ok(());
     }
     let digest = digest_records_until(records, records.len())?;
