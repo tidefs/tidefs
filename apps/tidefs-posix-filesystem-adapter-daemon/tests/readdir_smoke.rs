@@ -100,7 +100,7 @@ fn index_from_vfs_entries(
 }
 
 fn pack_readdir_page(index: &DirIndex, offset: u64, max_bytes: usize) -> (Vec<PackedEntry>, u64) {
-    let (entries, worker_next_offset) = handle_readdir(index, offset, usize::MAX);
+    let (entries, worker_next_offset) = handle_readdir(index, offset, usize::MAX).unwrap();
     let mut used = 0usize;
     let mut packed = Vec::new();
 
@@ -200,11 +200,17 @@ fn readdir_smoke_pages_ordered_vfs_entries_into_fuse_dirents() {
         let expected_name = format!("file_{:03}.txt", idx + 1);
         assert_eq!(entry.name, expected_name);
         assert_eq!(entry.ino, expected_inodes[expected_name.as_bytes()]);
-        assert_eq!(entry.off, (idx + 1) as u64);
+        assert!(tidefs_dir_index::format::dir_cookie_decode_version(entry.off).is_some());
+        assert_eq!(
+            tidefs_dir_index::format::dir_cookie_skip(entry.off),
+            idx + 1
+        );
         assert!(entry.wire_size <= 96);
     }
-    assert_eq!(off1, 2);
-    assert_eq!(off2, 4);
+    assert!(tidefs_dir_index::format::dir_cookie_decode_version(off1).is_some());
+    assert!(tidefs_dir_index::format::dir_cookie_decode_version(off2).is_some());
+    assert_eq!(tidefs_dir_index::format::dir_cookie_skip(off1), 2);
+    assert_eq!(tidefs_dir_index::format::dir_cookie_skip(off2), 4);
     assert_eq!(off3, 0);
 
     let empty = engine
