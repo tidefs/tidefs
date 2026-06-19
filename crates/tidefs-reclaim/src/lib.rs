@@ -839,7 +839,7 @@ impl ReclaimReceipt {
     /// # Errors
     ///
     /// Returns `ReclaimReceiptDecodeError` for truncated input, invalid
-    /// magic, unsupported version, count overflow, or checksum mismatch.
+    /// magic, unsupported version, trailing bytes, or checksum mismatch.
     pub fn decode(data: &[u8]) -> Result<Self, ReclaimReceiptDecodeError> {
         if data.len() < Self::HEADER_SIZE + 32 {
             return Err(ReclaimReceiptDecodeError::Truncated);
@@ -870,6 +870,9 @@ impl ReclaimReceipt {
         let expected_len = Self::HEADER_SIZE + count * Self::EXTENT_ENTRY_SIZE + 32;
         if data.len() < expected_len {
             return Err(ReclaimReceiptDecodeError::Truncated);
+        }
+        if data.len() > expected_len {
+            return Err(ReclaimReceiptDecodeError::TrailingBytes);
         }
 
         // Verify checksum
@@ -912,6 +915,8 @@ pub enum ReclaimReceiptDecodeError {
     InvalidMagic,
     /// Version field is not the current version.
     UnsupportedVersion { found: u32, expected: u32 },
+    /// Input contains bytes after the expected receipt frame.
+    TrailingBytes,
     /// Checksum verification failed (corruption or tampering).
     ChecksumMismatch,
 }
@@ -927,6 +932,7 @@ impl fmt::Display for ReclaimReceiptDecodeError {
                     "reclaim receipt unsupported version {found} (expected {expected})"
                 )
             }
+            Self::TrailingBytes => f.write_str("reclaim receipt has trailing bytes"),
             Self::ChecksumMismatch => f.write_str("reclaim receipt checksum mismatch"),
         }
     }
@@ -3552,6 +3558,17 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_receipt_decode_rejects_trailing_bytes() {
+        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 1, 1);
+        let mut encoded = receipt.encode();
+        encoded.extend_from_slice(b"extra");
+        assert_eq!(
+            ReclaimReceipt::decode(&encoded),
+            Err(ReclaimReceiptDecodeError::TrailingBytes)
+        );
+    }
+
+    #[test]
     fn reclaim_receipt_decode_error_display_non_empty() {
         let errors = [
             ReclaimReceiptDecodeError::Truncated,
@@ -3560,6 +3577,7 @@ mod tests {
                 found: 2,
                 expected: 1,
             },
+            ReclaimReceiptDecodeError::TrailingBytes,
             ReclaimReceiptDecodeError::ChecksumMismatch,
         ];
         for err in &errors {
