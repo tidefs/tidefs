@@ -52,7 +52,7 @@ use crate::reclaim_queue::{
     store_reclaim_receipts, store_snapshot_extent_pin_set,
 };
 use crate::segment_builder::{FlushResult, SegmentBuilder};
-use crate::txg_manager::{compute_committed_root_digest, CommitGroupManager};
+use crate::txg_manager::CommitGroupManager;
 use crate::*;
 use std::convert::Infallible;
 use tidefs_checksum_tree::{ChecksumTree, ChecksumTreeBuilder, DomainTag, ObjectDigest};
@@ -459,8 +459,11 @@ fn init_commit_group(root: &Path) -> CommitGroupManager {
 /// Initialize the CommitGroupCoordinator from the persisted committed root, matching
 /// the CommitGroupManager recovery path so both track the same lineage.
 fn init_txg_coordinator(root: &Path) -> tidefs_commit_group::CommitGroupCoordinator {
-    let recovered_root = load_committed_root(root).map(|(r, _)| r);
-    if let Some(recovered_root) = recovered_root {
+    if let Some((recovered_root, Some(digest))) = load_committed_root(root) {
+        tidefs_commit_group::CommitGroupCoordinator::resume_with_digest(
+            recovered_root, digest,
+        )
+    } else if let Some((recovered_root, _)) = load_committed_root(root) {
         tidefs_commit_group::CommitGroupCoordinator::resume(recovered_root)
     } else {
         tidefs_commit_group::CommitGroupCoordinator::new()
@@ -3455,23 +3458,21 @@ impl LocalObjectStore {
                     self.txg_coordinator.chain_digest(&commit_data)
                 };
 
-                // Compute the committed-root anchor digest for on-disk
-                // persistence so the validation path (validate_committed_root)
-                // uses the same digest scheme as txg_cycle.rs.
-                let committed_root_digest = compute_committed_root_digest(root);
-
-                // Persist the committed root with its anchor digest.
+                // Persist the committed root with the chain digest so the
+                // coordinator can resume the hash chain across reopen.
                 let root_payload =
-                    CommitGroupManager::encode_root_with_digest(root, committed_root_digest);
+                    CommitGroupManager::encode_root_with_digest(root, chain_digest);
+
+                // Store the segment-path copy in the index for idempotent
+                // recovery (get-able after sync_all).
+                let root_key =
+                    ObjectKey::from_name(crate::txg_manager::COMMITTED_ROOT_FILE.as_bytes());
+                let _ = self.put_direct(root_key, &root_payload)?;
 
                 // Plain-file persistence is only valid when the store root is
                 // a metadata directory. Raw block-device mode keeps the copy
                 // inside the append-only device log instead.
-                if sidecar_files_unavailable(&self.root) {
-                    let root_key =
-                        ObjectKey::from_name(crate::txg_manager::COMMITTED_ROOT_FILE.as_bytes());
-                    let _ = self.put_direct(root_key, &root_payload)?;
-                } else {
+                if !sidecar_files_unavailable(&self.root) {
                     let root_path = self.root.join(crate::txg_manager::COMMITTED_ROOT_FILE);
                     fs::write(&root_path, &root_payload)
                         .map_err(|source| io_error("write committed root", &root_path, source))?;
