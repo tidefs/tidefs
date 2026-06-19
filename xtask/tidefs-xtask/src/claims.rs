@@ -2164,21 +2164,23 @@ fn validate_registered_evidence_artifacts_for_claim(
                     continue;
                 }
             };
-            let modified = match metadata.modified() {
-                Ok(modified) => modified,
-                Err(err) => {
+            if !committed_evidence_tree_is_current(root, rel) {
+                let modified = match metadata.modified() {
+                    Ok(modified) => modified,
+                    Err(err) => {
+                        failures.push(format!(
+                            "claim `{}` could not read mtime for evidence artifact `{}`: {err}",
+                            claim.id, artifact.path
+                        ));
+                        continue;
+                    }
+                };
+                if modified < registry_modified {
                     failures.push(format!(
-                        "claim `{}` could not read mtime for evidence artifact `{}`: {err}",
-                        claim.id, artifact.path
+                        "claim `{}` has stale evidence artifact `{}` for class `{}`; artifact is older than `{CLAIM_REGISTRY_PATH}`",
+                        claim.id, artifact.path, artifact.class
                     ));
-                    continue;
                 }
-            };
-            if modified < registry_modified {
-                failures.push(format!(
-                    "claim `{}` has stale evidence artifact `{}` for class `{}`; artifact is older than `{CLAIM_REGISTRY_PATH}`",
-                    claim.id, artifact.path, artifact.class
-                ));
             }
             if artifact.class == UBLK_COMPLETION_ARTIFACT_EVIDENCE_CLASS {
                 failures.extend(validate_runtime_ublk_completion_artifact_content(
@@ -2614,6 +2616,7 @@ mod tests {
         CRASH_CLAIMS_GATE_REVIEW_SCOPE, CRASH_CLAIMS_GATE_REVIEW_SOURCE, CRASH_CLAIM_IDS,
         CRASH_MODEL_EVIDENCE_SCOPE, CRASH_MODEL_EVIDENCE_SOURCE, CRASH_MODEL_MATRIX_PATH,
         CRATE_INDEX_LIMITATION_MARKERS, LOCAL_VFS_RENAME_CRASH_CLAIM_ID,
+        LOCAL_VFS_WRITE_FSYNC_CRASH_CLAIM_ID,
         MODEL_CRASH_MATRIX_EVIDENCE_CLASS, REQUIRED_INITIAL_CLAIMS,
         RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS, RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS,
         STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
