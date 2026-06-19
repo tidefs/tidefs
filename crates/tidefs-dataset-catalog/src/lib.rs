@@ -466,6 +466,39 @@ fn replace_prefix(path: &str, old_prefix: &str, new_prefix: &str) -> String {
     format!("{new_prefix}{rest}")
 }
 
+fn pool_component(path: &str) -> &str {
+    path.split('/').next().unwrap_or("")
+}
+
+fn snapshot_base_path(path: &str) -> Option<&str> {
+    path.rsplit_once('@')
+        .map(|(base, _snapshot)| base)
+        .filter(|base| !base.is_empty())
+}
+
+fn path_is_snapshot_base_or_snapshot(path: &str, base_path: &str) -> bool {
+    path == base_path || snapshot_base_path(path) == Some(base_path)
+}
+
+fn lineage_parent_matches_dataset_authority(
+    child_path: &str,
+    child_entry: &CatalogEntry,
+    parent_path: &str,
+) -> bool {
+    if pool_component(child_path) != pool_component(parent_path) {
+        return false;
+    }
+
+    if child_entry.dataset_type == DatasetType::Snapshot {
+        let Some(base_path) = snapshot_base_path(child_path) else {
+            return false;
+        };
+        return path_is_snapshot_base_or_snapshot(parent_path, base_path);
+    }
+
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Catalog entry (stored as value in the B+tree)
 // ---------------------------------------------------------------------------
@@ -1208,6 +1241,8 @@ impl DatasetCatalog {
         let mut hasher = Hasher::new();
         let mut visited: Vec<DatasetId> = Vec::new();
         let mut current_parent = Some(start_parent);
+        let mut current_child_path = path.to_string();
+        let mut current_child_entry = entry.clone();
 
         // Include the root's own DatasetId in the summary.
         hasher.update(entry.dataset_id.as_bytes());
@@ -1233,11 +1268,11 @@ impl DatasetCatalog {
             let (parent_path, parent_entry) =
                 parent_path_and_entry.ok_or(CatalogError::LineageParentNotFound)?;
 
-            // Verify the parent is under the expected dataset authority:
-            // the parent must be in the same pool (first path component matches).
-            let root_pool = path.split('/').next().unwrap_or("");
-            let parent_pool = parent_path.split('/').next().unwrap_or("");
-            if root_pool != parent_pool {
+            if !lineage_parent_matches_dataset_authority(
+                &current_child_path,
+                &current_child_entry,
+                &parent_path,
+            ) {
                 return Err(CatalogError::LineageWrongDataset);
             }
 
@@ -1247,6 +1282,8 @@ impl DatasetCatalog {
 
             // Follow the chain
             current_parent = parent_entry.lineage_parent_id;
+            current_child_path = parent_path;
+            current_child_entry = parent_entry;
         }
 
         let mut digest = [0u8; 32];
@@ -1256,13 +1293,15 @@ impl DatasetCatalog {
 
     /// Return whether an already-published root depends on `dataset_id`.
     fn published_lineage_references(&self, dataset_id: DatasetId) -> Result<bool, CatalogError> {
-        for (_path, entry) in self.tree.entries() {
+        for (path, entry) in self.tree.entries() {
             if !entry.published {
                 continue;
             }
 
             let mut visited: Vec<DatasetId> = Vec::new();
             let mut current_parent = entry.lineage_parent_id;
+            let mut current_child_path = path;
+            let mut current_child_entry = entry;
             while let Some(parent_id) = current_parent {
                 if parent_id == dataset_id {
                     return Ok(true);
@@ -1274,16 +1313,25 @@ impl DatasetCatalog {
                     return Err(CatalogError::LineageCycle);
                 }
 
-                let parent_entry = self
+                let (parent_path, parent_entry) = self
                     .tree
                     .entries()
                     .into_iter()
                     .find(|(_, e)| e.dataset_id == parent_id)
-                    .map(|(_, e)| e)
                     .ok_or(CatalogError::LineageParentNotFound)?;
+
+                if !lineage_parent_matches_dataset_authority(
+                    &current_child_path,
+                    &current_child_entry,
+                    &parent_path,
+                ) {
+                    return Err(CatalogError::LineageWrongDataset);
+                }
 
                 visited.push(parent_id);
                 current_parent = parent_entry.lineage_parent_id;
+                current_child_path = parent_path;
+                current_child_entry = parent_entry;
             }
         }
 
@@ -4175,6 +4223,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn publish_rejects_same_pool_wrong_snapshot_base_lineage_parent() {
+        let mut cat = DatasetCatalog::new();
+        make_filesystem(&mut cat, "pool", 0);
+        make_filesystem(&mut cat, "pool/fs1", 1);
+        make_filesystem(&mut cat, "pool/fs2", 2);
+
+        cat.create(
+            "pool/fs1@cross_snap",
+            did(10),
+            DatasetType::Snapshot,
+            100,
+            empty_props(),
+            DatasetFlags::READONLY,
+            SyncGuarantee::default(),
+        )
+        .unwrap();
+        cat.set_lineage_parent("pool/fs1@cross_snap", did(2))
+            .unwrap();
+
+        assert_eq!(
+            cat.publish_root("pool/fs1@cross_snap"),
+            Err(CatalogError::LineageWrongDataset)
+        );
+    }
+
+    #[test]
+    fn publish_allows_snapshot_of_clone_to_follow_clone_origin() {
+        let mut cat = DatasetCatalog::new();
+        make_filesystem(&mut cat, "pool", 0);
+        make_filesystem(&mut cat, "pool/fs1", 1);
+        make_clone(&mut cat, "pool/clone1", 10, did(1));
+        make_snap(&mut cat, "pool/clone1@snap1", 11, did(10));
+
+        cat.publish_root("pool/clone1@snap1").unwrap();
+        assert!(cat.is_published("pool/clone1@snap1").unwrap());
+    }
+
     // --- Duplicate edge rejection ---------------------------------------------
 
     #[test]
@@ -4342,19 +4428,19 @@ mod tests {
         let mut cat1 = DatasetCatalog::new();
         make_filesystem(&mut cat1, "pool", 0);
         make_filesystem(&mut cat1, "pool/fs1", 1);
-        make_snap(&mut cat1, "pool/fs1@snap1", 10, did(1));
-        cat1.publish_root("pool/fs1@snap1").unwrap();
+        make_clone(&mut cat1, "pool/clone1", 10, did(1));
+        cat1.publish_root("pool/clone1").unwrap();
 
         let mut cat2 = DatasetCatalog::new();
         make_filesystem(&mut cat2, "pool", 0);
         make_filesystem(&mut cat2, "pool/fs1", 1);
         make_filesystem(&mut cat2, "pool/fs2", 2);
-        make_snap(&mut cat2, "pool/fs1@snap1", 10, did(2)); // different parent
-        cat2.publish_root("pool/fs1@snap1").unwrap();
+        make_clone(&mut cat2, "pool/clone1", 10, did(2));
+        cat2.publish_root("pool/clone1").unwrap();
 
         assert_ne!(
-            cat1.lineage_summary("pool/fs1@snap1").unwrap(),
-            cat2.lineage_summary("pool/fs1@snap1").unwrap()
+            cat1.lineage_summary("pool/clone1").unwrap(),
+            cat2.lineage_summary("pool/clone1").unwrap()
         );
     }
 
