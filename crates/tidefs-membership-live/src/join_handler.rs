@@ -32,6 +32,7 @@
 //!   retransmission.
 
 use tidefs_membership_epoch::incarnation::IncarnationTracker;
+use tidefs_membership_epoch::pool_scan_gate::PoolScanEvidence;
 use tidefs_membership_epoch::roster_constraints::{
     validate_add_peer, ConstraintValidationError, RosterConstraints,
 };
@@ -75,6 +76,32 @@ pub struct JoinProposal {
 }
 
 // ---------------------------------------------------------------------------
+// JoinAdmissionEvidence -- committed evidence required for join admission
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinLabelAgreementEvidence {
+    pub fingerprint: [u8; 32],
+    pub is_committed: bool,
+}
+
+impl JoinLabelAgreementEvidence {
+    #[must_use]
+    pub const fn committed(fingerprint: [u8; 32]) -> Self {
+        Self {
+            fingerprint,
+            is_committed: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinAdmissionEvidence<'a> {
+    pub pool_scan: &'a PoolScanEvidence,
+    pub label_agreement: JoinLabelAgreementEvidence,
+}
+
+// ---------------------------------------------------------------------------
 // JoinRejectionReason -- structured rejection reasons
 // ---------------------------------------------------------------------------
 
@@ -95,6 +122,13 @@ pub enum JoinRejectionReason {
     LabelAgreementNotCommitted,
     /// The pool-scan does not include the joining member's identity.
     MemberNotInPoolScan,
+    /// The pool-scan evidence targets a different join epoch.
+    PoolScanEpochMismatch {
+        expected_epoch: EpochId,
+        evidence_epoch: EpochId,
+    },
+    /// The committed label agreement disagrees with the committed pool scan.
+    LabelAgreementMismatch,
 }
 
 impl std::fmt::Display for JoinRejectionReason {
@@ -120,6 +154,16 @@ impl std::fmt::Display for JoinRejectionReason {
             }
             Self::MemberNotInPoolScan => {
                 write!(f, "member identity not found in committed pool scan")
+            }
+            Self::PoolScanEpochMismatch {
+                expected_epoch,
+                evidence_epoch,
+            } => write!(
+                f,
+                "pool-scan evidence targets epoch {evidence_epoch:?}, expected {expected_epoch:?}"
+            ),
+            Self::LabelAgreementMismatch => {
+                write!(f, "label agreement disagrees with committed pool scan")
             }
         }
     }
@@ -236,6 +280,26 @@ impl JoinHandler {
         msg_incarnation: Incarnation,
         join_epoch: EpochId,
     ) -> JoinHandlerResult {
+        self.handle_join_request_inner(joining_peer, msg_incarnation, join_epoch, None)
+    }
+
+    pub fn handle_join_request_with_evidence(
+        &mut self,
+        joining_peer: MemberId,
+        msg_incarnation: Incarnation,
+        join_epoch: EpochId,
+        evidence: JoinAdmissionEvidence<'_>,
+    ) -> JoinHandlerResult {
+        self.handle_join_request_inner(joining_peer, msg_incarnation, join_epoch, Some(evidence))
+    }
+
+    fn handle_join_request_inner(
+        &mut self,
+        joining_peer: MemberId,
+        msg_incarnation: Incarnation,
+        join_epoch: EpochId,
+        evidence: Option<JoinAdmissionEvidence<'_>>,
+    ) -> JoinHandlerResult {
         if joining_peer == MemberId::ZERO {
             return JoinHandlerResult::Rejected(JoinRejectionReason::InvalidMemberId);
         }
@@ -257,6 +321,13 @@ impl JoinHandler {
         if let Err(e) = validate_add_peer(&self.roster, joining_peer, &self.constraints) {
             return JoinHandlerResult::Rejected(JoinRejectionReason::ConstraintViolation(e));
         }
+        if let Some(evidence) = evidence {
+            if let Err(reason) =
+                Self::validate_admission_evidence(joining_peer, join_epoch, evidence)
+            {
+                return JoinHandlerResult::Rejected(reason);
+            }
+        }
         self.pending_joins.push(joining_peer);
         let idempotency_key = JoinIdempotencyKey::derive(joining_peer, join_epoch);
         let proposal = JoinProposal {
@@ -265,6 +336,32 @@ impl JoinHandler {
             idempotency_key,
         };
         JoinHandlerResult::Accepted(proposal)
+    }
+
+    fn validate_admission_evidence(
+        joining_peer: MemberId,
+        join_epoch: EpochId,
+        evidence: JoinAdmissionEvidence<'_>,
+    ) -> Result<(), JoinRejectionReason> {
+        if !evidence.pool_scan.committed {
+            return Err(JoinRejectionReason::UncommittedPoolScan);
+        }
+        if evidence.pool_scan.proposed_epoch_id != join_epoch.0 {
+            return Err(JoinRejectionReason::PoolScanEpochMismatch {
+                expected_epoch: join_epoch,
+                evidence_epoch: EpochId::new(evidence.pool_scan.proposed_epoch_id),
+            });
+        }
+        let Some(expected) = evidence.pool_scan.label_fingerprint_for(joining_peer.0) else {
+            return Err(JoinRejectionReason::MemberNotInPoolScan);
+        };
+        if !evidence.label_agreement.is_committed {
+            return Err(JoinRejectionReason::LabelAgreementNotCommitted);
+        }
+        if evidence.label_agreement.fingerprint != expected.into_inner() {
+            return Err(JoinRejectionReason::LabelAgreementMismatch);
+        }
+        Ok(())
     }
 
     pub fn handle_join_request_idempotent(
@@ -283,6 +380,24 @@ impl JoinHandler {
         }
         self.handle_join_request(joining_peer, msg_incarnation, join_epoch)
     }
+
+    pub fn handle_join_request_idempotent_with_evidence(
+        &mut self,
+        joining_peer: MemberId,
+        msg_incarnation: Incarnation,
+        join_epoch: EpochId,
+        evidence: JoinAdmissionEvidence<'_>,
+    ) -> JoinHandlerResult {
+        if self.pending_joins.contains(&joining_peer) {
+            let idempotency_key = JoinIdempotencyKey::derive(joining_peer, join_epoch);
+            return JoinHandlerResult::Accepted(JoinProposal {
+                joining_peer,
+                join_epoch,
+                idempotency_key,
+            });
+        }
+        self.handle_join_request_with_evidence(joining_peer, msg_incarnation, join_epoch, evidence)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +407,7 @@ impl JoinHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_membership_epoch::pool_scan_gate::EpochMemberLabelFingerprint;
 
     fn member(id: u64) -> MemberId {
         MemberId::new(id)
@@ -319,6 +435,23 @@ mod tests {
             default_constraints(),
             IncarnationTracker::genesis(),
         )
+    }
+
+    fn pool_scan(member_id: u64, epoch: u64, committed: bool) -> PoolScanEvidence {
+        let label = [0xAB; 32];
+        let members = [EpochMemberLabelFingerprint::new(member_id, label.into())];
+        if committed {
+            PoolScanEvidence::committed(epoch.saturating_sub(1), epoch, 7, 1, members)
+        } else {
+            PoolScanEvidence::pending(epoch.saturating_sub(1), epoch, 1, members)
+        }
+    }
+
+    fn admission_evidence(scan: &PoolScanEvidence, label: [u8; 32]) -> JoinAdmissionEvidence<'_> {
+        JoinAdmissionEvidence {
+            pool_scan: scan,
+            label_agreement: JoinLabelAgreementEvidence::committed(label),
+        }
     }
 
     // -- JoinIdempotencyKey --
@@ -385,6 +518,93 @@ mod tests {
         );
         let result = handler.handle_join_request(member(2), Incarnation(7), EpochId::new(0));
         assert!(result.is_accepted());
+    }
+
+    #[test]
+    fn committed_join_evidence_accepts_admission() {
+        let mut handler = coordinator_handler();
+        let scan = pool_scan(3, 5, true);
+        let result = handler.handle_join_request_with_evidence(
+            member(3),
+            Incarnation::ZERO,
+            EpochId::new(5),
+            admission_evidence(&scan, [0xAB; 32]),
+        );
+        assert!(result.is_accepted());
+    }
+
+    #[test]
+    fn uncommitted_pool_scan_rejects_admission() {
+        let mut handler = coordinator_handler();
+        let scan = pool_scan(3, 5, false);
+        let result = handler.handle_join_request_with_evidence(
+            member(3),
+            Incarnation::ZERO,
+            EpochId::new(5),
+            admission_evidence(&scan, [0xAB; 32]),
+        );
+        assert!(matches!(
+            result,
+            JoinHandlerResult::Rejected(JoinRejectionReason::UncommittedPoolScan)
+        ));
+        assert_eq!(handler.pending_count(), 0);
+    }
+
+    #[test]
+    fn pool_scan_without_member_rejects_admission() {
+        let mut handler = coordinator_handler();
+        let scan = pool_scan(4, 5, true);
+        let result = handler.handle_join_request_with_evidence(
+            member(3),
+            Incarnation::ZERO,
+            EpochId::new(5),
+            admission_evidence(&scan, [0xAB; 32]),
+        );
+        assert!(matches!(
+            result,
+            JoinHandlerResult::Rejected(JoinRejectionReason::MemberNotInPoolScan)
+        ));
+        assert_eq!(handler.pending_count(), 0);
+    }
+
+    #[test]
+    fn uncommitted_label_agreement_rejects_admission() {
+        let mut handler = coordinator_handler();
+        let scan = pool_scan(3, 5, true);
+        let result = handler.handle_join_request_with_evidence(
+            member(3),
+            Incarnation::ZERO,
+            EpochId::new(5),
+            JoinAdmissionEvidence {
+                pool_scan: &scan,
+                label_agreement: JoinLabelAgreementEvidence {
+                    fingerprint: [0xAB; 32],
+                    is_committed: false,
+                },
+            },
+        );
+        assert!(matches!(
+            result,
+            JoinHandlerResult::Rejected(JoinRejectionReason::LabelAgreementNotCommitted)
+        ));
+        assert_eq!(handler.pending_count(), 0);
+    }
+
+    #[test]
+    fn mismatched_label_agreement_rejects_admission() {
+        let mut handler = coordinator_handler();
+        let scan = pool_scan(3, 5, true);
+        let result = handler.handle_join_request_with_evidence(
+            member(3),
+            Incarnation::ZERO,
+            EpochId::new(5),
+            admission_evidence(&scan, [0xCD; 32]),
+        );
+        assert!(matches!(
+            result,
+            JoinHandlerResult::Rejected(JoinRejectionReason::LabelAgreementMismatch)
+        ));
+        assert_eq!(handler.pending_count(), 0);
     }
 
     // -- Rejection: not coordinator --
@@ -632,6 +852,29 @@ mod tests {
                 "stale incarnation",
             ),
             (JoinRejectionReason::InvalidMemberId, "invalid member id"),
+            (
+                JoinRejectionReason::UncommittedPoolScan,
+                "pool-scan evidence not committed",
+            ),
+            (
+                JoinRejectionReason::LabelAgreementNotCommitted,
+                "label agreement not committed",
+            ),
+            (
+                JoinRejectionReason::MemberNotInPoolScan,
+                "member identity not found",
+            ),
+            (
+                JoinRejectionReason::PoolScanEpochMismatch {
+                    expected_epoch: EpochId::new(3),
+                    evidence_epoch: EpochId::new(2),
+                },
+                "pool-scan evidence targets epoch",
+            ),
+            (
+                JoinRejectionReason::LabelAgreementMismatch,
+                "label agreement disagrees",
+            ),
         ];
         for (reason, expected_substr) in &reasons {
             let msg = reason.to_string();
