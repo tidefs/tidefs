@@ -42,10 +42,16 @@
 //! ## Admission Evidence
 //!
 //! `SendQueueDepthEvidence` exposes this governor as compact source/adapter
-//! metadata for no-hidden-queue review. The evidence uses the canonical
-//! `tidefs-performance-contract` spellings for work classes, resource
-//! domains, and validation tiers. It is not a distributed runtime fairness,
-//! throughput, or RDMA readiness claim by itself.
+//! metadata for no-hidden-queue review.
+//!
+//! tidefs-queue-root: transport.send_queue_depth
+//!
+//!
+//! Each lane is an `AdmissionPermit`-class resource tracked under a
+//! `ServiceCurve`-compatible queue-slots budget. The evidence uses the
+//! canonical `tidefs-performance-contract` spellings for work classes,
+//! resource domains, and validation tiers. It is not a distributed
+//! runtime fairness, throughput, or RDMA readiness claim by itself.
 //!
 //! ## Integration
 //!

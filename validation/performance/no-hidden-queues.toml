@@ -116,3 +116,21 @@ hard_caps = [
   "dirty-age",
   "queue-slots",
 ]
+
+[[queue_roots]]
+id = "transport.send_queue_depth"
+package = "tidefs-transport"
+path = "crates/tidefs-transport/src/send_queue_depth.rs"
+symbol = "SendQueueDepth"
+work_class = "foreground-read"
+resource_domains = [
+  "queue-slots",
+]
+admission = "AdmissionPermit"
+service_curve = "ServiceCurve"
+hard_caps = [
+  "dirty-bytes",
+  "dirty-operations",
+  "dirty-age",
+  "queue-slots",
+]

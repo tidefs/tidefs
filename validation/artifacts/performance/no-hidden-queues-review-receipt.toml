@@ -20,6 +20,7 @@ non_claims = [
   "This receipt records source and registry coverage only.",
   "This receipt does not satisfy queue-depth-runtime-artifact evidence.",
   "This receipt does not validate mounted runtime queue depth or dirty-debt exhaustion behavior.",
+  "This receipt does not validate distributed transport fairness or RDMA readiness.",
 ]
 
 [reviewer]
@@ -41,6 +42,12 @@ scan = "recursive-rust-source-review"
 name = "local-filesystem-src"
 package = "tidefs-local-filesystem"
 path = "crates/tidefs-local-filesystem/src"
+scan = "recursive-rust-source-review"
+
+[[scanned_roots]]
+name = "transport-src"
+package = "tidefs-transport"
+path = "crates/tidefs-transport/src"
 scan = "recursive-rust-source-review"
 
 [[queue_root_coverage]]
@@ -89,6 +96,14 @@ package = "tidefs-local-filesystem"
 path = "crates/tidefs-local-filesystem/src/page_cache/mod.rs"
 symbol = "lru"
 source_root = "crates/tidefs-local-filesystem/src"
+coverage = "registered-source-marker-present"
+
+[[queue_root_coverage]]
+id = "transport.send_queue_depth"
+package = "tidefs-transport"
+path = "crates/tidefs-transport/src/send_queue_depth.rs"
+symbol = "SendQueueDepth"
+source_root = "crates/tidefs-transport/src"
 coverage = "registered-source-marker-present"
 
 [[out_of_scope]]
