@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+
 //! Intent-log replay idempotency crash matrix.
 //!
 //! Tests replay behavior under crash-injection: create segments, truncate

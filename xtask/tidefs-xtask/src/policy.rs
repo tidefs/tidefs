@@ -383,8 +383,6 @@ const KERNEL_GPL2_SPDX_FILES: &[&str] = &[
     "kmod/smoke_module/rust_tidefs_smoke.rs",
 ];
 
-const STANDALONE_GPL2_ONLY_SPDX_FILES: &[&str] = &["nix/vm/tidefs-fsync-guest-helper.c"];
-
 const KERNEL_MODULE_LICENSE_FILES: &[&str] = &[
     "crates/tidefs-block-kmod/tidefs_block_kmod.rs",
     "crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_main.rs",
@@ -417,7 +415,10 @@ const REQUIRED_PROVENANCE_DOC_ENTRIES: &[(&str, &str)] = &[
         "GPL-2.0",
     ),
     ("kmod/smoke_module/rust_tidefs_smoke.rs", "GPL-2.0"),
-    ("nix/vm/tidefs-fsync-guest-helper.c", "GPL-2.0-only"),
+    (
+        "nix/vm/tidefs-fsync-guest-helper.c",
+        "GPL-2.0-only WITH Linux-syscall-note",
+    ),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -742,8 +743,6 @@ fn is_registered_provenance_marker(rel_path: &str, marker: &ProvenanceMarker) ->
         ProvenanceMarkerKind::SpdxLicense => {
             marker.value == TIDEFS_LICENSE
                 || (marker.value == "GPL-2.0" && KERNEL_GPL2_SPDX_FILES.contains(&rel_path))
-                || (marker.value == "GPL-2.0-only"
-                    && STANDALONE_GPL2_ONLY_SPDX_FILES.contains(&rel_path))
         }
         ProvenanceMarkerKind::ManifestLicense => {
             marker.value == TIDEFS_LICENSE
