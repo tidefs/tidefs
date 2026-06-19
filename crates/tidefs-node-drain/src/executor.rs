@@ -304,6 +304,9 @@ impl DrainExecutor {
         }
 
         let mut remaining = ops.object_count_for_node(node);
+        if remaining > 0 {
+            self.drain.mark_data_relocation_required();
+        }
 
         self.drain.update_progress(DrainProgress {
             objects_remaining: remaining,
@@ -546,8 +549,11 @@ mod tests {
         let (mut exec, _handle) = DrainExecutor::start(node_id(3));
 
         let result = exec.execute(&mut ops);
-        assert!(result.is_ok());
-        assert_eq!(exec.drain().stage(), DrainStage::Drained);
+        assert!(matches!(
+            result,
+            Err(DrainError::RequiresEvacuationReceipt { .. })
+        ));
+        assert_eq!(exec.drain().stage(), DrainStage::DrainingData);
         assert_eq!(ops.objects.get(&3), Some(&0));
     }
 
@@ -596,8 +602,26 @@ mod tests {
         // Advance through lease stage (no leases)
         exec.execute_lease_stage(&mut ops).unwrap();
         // Now in data stage
-        let progress = exec.execute_data_stage(&mut ops).unwrap();
+        let err = exec.execute_data_stage(&mut ops).unwrap_err();
+        assert!(matches!(err, DrainError::RequiresEvacuationReceipt { .. }));
+        assert_eq!(exec.drain().stage(), DrainStage::DrainingData);
+    }
+
+    #[test]
+    fn executor_data_stage_accepts_explicit_evacuation_receipt() {
+        let (mut exec, _handle) = DrainExecutor::start(node_id(11));
+        let mut receipt = crate::evacuation_receipt::EvacuationReceipt::new(
+            node_id(11),
+            tidefs_membership_epoch::EpochId::new(5),
+            "test".to_string(),
+        );
+        receipt.record_relocated_receipts([tidefs_replication_model::ReplicatedReceiptId(42)]);
+
+        let progress = exec
+            .complete_data_stage_with_evacuation(Some(receipt))
+            .unwrap();
         assert_eq!(progress.objects_remaining, 0);
+        assert_eq!(exec.drain().stage(), DrainStage::DrainingCache);
     }
 
     #[test]

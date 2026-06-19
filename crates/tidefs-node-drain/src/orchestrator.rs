@@ -7,7 +7,9 @@
 //! deterministic node drain pipeline.
 
 use crate::drain::{DrainError, DrainHandle, NodeDrain};
-use crate::drain_state::{DrainRequest, DrainStateMachine, MembershipVerificationOps};
+use crate::drain_state::{
+    DrainRequest, DrainStateMachine, MembershipVerificationOps, PlacementEvidenceVerifier,
+};
 use crate::epoch_gate::{EpochGate, EpochGateConfig, EpochGateOps, EpochGateResult};
 use crate::evacuation_receipt::EvacuationReceipt;
 use crate::executor::DrainExecutor;
@@ -15,6 +17,7 @@ use crate::health_verify::{DrainHealthVerifier, HealthVerifyOps, HealthVerifyRes
 use crate::migration::{MigrationDriver, MigrationOps, MigrationOutcome};
 use crate::pool_label::PoolLabelResult;
 use tidefs_membership_epoch::MemberId;
+use tidefs_replication_model::ReplicatedReceiptId;
 
 // ---------------------------------------------------------------------------
 // NodeDrainConfig
@@ -133,6 +136,11 @@ pub enum DrainNodeError {
     },
     /// BLAKE3-verified membership drain request validation failed.
     DrainRequestValidationFailed { node_id: MemberId, reason: String },
+    /// Placement receipts still reference the draining node at decommission.
+    PlacementReceiptsStillReferenceNode {
+        node_id: MemberId,
+        receipt_ids: Vec<ReplicatedReceiptId>,
+    },
 }
 
 impl std::fmt::Display for DrainNodeError {
@@ -193,6 +201,18 @@ impl std::fmt::Display for DrainNodeError {
                     f,
                     "node {} drain request validation failed: {}",
                     node_id.0, reason
+                )
+            }
+            Self::PlacementReceiptsStillReferenceNode {
+                node_id,
+                receipt_ids,
+            } => {
+                write!(
+                    f,
+                    "node {} decommission blocked by {} placement receipt(s): {:?}",
+                    node_id.0,
+                    receipt_ids.len(),
+                    receipt_ids.iter().map(|r| r.0).collect::<Vec<_>>(),
                 )
             }
         }
@@ -296,6 +316,7 @@ pub fn drain_node(
     health_verify_ops: &dyn HealthVerifyOps,
     gate_ops: &mut dyn EpochGateOps,
     verify_ops: &dyn MembershipVerificationOps,
+    placement_verifier: &dyn PlacementEvidenceVerifier,
 ) -> Result<DrainNodeOutcome, DrainNodeError> {
     config.validate().map_err(|e| DrainNodeError::ConfigError {
         node_id: config.node_id,
@@ -483,6 +504,14 @@ pub fn drain_node(
     // -------------------------------------------------------------------
     // Done: mark node as decommissioned
     // -------------------------------------------------------------------
+    let referencing_receipts = placement_verifier.receipts_referencing_node(config.node_id);
+    if !referencing_receipts.is_empty() {
+        return Err(DrainNodeError::PlacementReceiptsStillReferenceNode {
+            node_id: config.node_id,
+            receipt_ids: referencing_receipts,
+        });
+    }
+
     executor
         .execute_admin_stage(drain_ops)
         .map_err(|e| DrainNodeError::DrainFailed {
@@ -528,6 +557,7 @@ mod tests {
     use crate::drain_state::MembershipVerificationOps;
     use crate::executor::DrainOps;
     use std::collections::BTreeMap;
+    use tidefs_replication_model::ReplicatedReceiptId;
 
     fn mid(id: u64) -> MemberId {
         MemberId::new(id)
@@ -538,6 +568,7 @@ mod tests {
         live_nodes: Vec<MemberId>,
         members: Vec<MemberId>,
         epoch: tidefs_membership_epoch::EpochId,
+        placement_refs: Vec<ReplicatedReceiptId>,
     }
 
     impl TestVerifyOps {
@@ -546,6 +577,7 @@ mod tests {
                 live_nodes: Vec::new(),
                 members: Vec::new(),
                 epoch: tidefs_membership_epoch::EpochId(epoch),
+                placement_refs: Vec::new(),
             }
         }
         fn add_member(&mut self, id: MemberId, live: bool) {
@@ -553,6 +585,13 @@ mod tests {
             if live {
                 self.live_nodes.push(id);
             }
+        }
+    }
+
+    impl PlacementEvidenceVerifier for TestVerifyOps {
+        fn receipts_referencing_node(&self, node_id: MemberId) -> Vec<ReplicatedReceiptId> {
+            let _ = node_id;
+            self.placement_refs.clone()
         }
     }
 
@@ -726,6 +765,7 @@ mod tests {
             &health_verify_ops,
             &mut gate_ops,
             &verify_ops,
+            &verify_ops,
         )
         .unwrap();
 
@@ -780,12 +820,56 @@ mod tests {
             &health_verify_ops,
             &mut gate_ops,
             &verify_ops,
+            &verify_ops,
         )
         .unwrap();
 
         assert!(outcome.success);
         assert_eq!(outcome.node_id, mid(5));
         assert!(outcome.evacuation_receipt.is_none());
+    }
+
+    #[test]
+    fn drain_node_rejects_decommission_with_referencing_receipts() {
+        let config = NodeDrainConfig {
+            node_id: mid(5),
+            proposer: mid(6),
+            target_nodes: vec![mid(6)],
+            voter_members: vec![mid(6), mid(7), mid(8)],
+            drain_timeout_ms: 60_000,
+            quorum_timeout_ms: 10_000,
+            cohort_size: 3,
+            verify_checksums: true,
+            reason: "drain".to_string(),
+        };
+
+        let mut drain_ops = TestDrainOps;
+        let mut migration_ops = TestMigrationOps { objects: vec![] };
+        let mut gate_ops = TestGateOps::new();
+        let health_verify_ops = crate::health_verify::NoOpHealthVerifyOps;
+        let mut verify_ops = TestVerifyOps::new(5);
+        verify_ops.add_member(mid(5), true);
+        verify_ops.add_member(mid(6), true);
+        verify_ops.add_member(mid(7), true);
+        verify_ops.add_member(mid(8), true);
+        verify_ops.placement_refs = vec![ReplicatedReceiptId(77)];
+
+        let err = drain_node(
+            &config,
+            &mut drain_ops,
+            &mut migration_ops,
+            &health_verify_ops,
+            &mut gate_ops,
+            &verify_ops,
+            &verify_ops,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DrainNodeError::PlacementReceiptsStillReferenceNode { .. }
+        ));
+        assert!(format!("{err}").contains("77"));
     }
 
     #[test]
@@ -820,6 +904,7 @@ mod tests {
             &mut migration_ops,
             &health_verify_ops,
             &mut gate_ops,
+            &verify_ops,
             &verify_ops,
         )
         .unwrap_err();
@@ -933,6 +1018,7 @@ mod tests {
             &health_verify_ops,
             &mut gate_ops,
             &verify_ops,
+            &verify_ops,
         )
         .unwrap_err();
 
@@ -972,6 +1058,7 @@ mod tests {
             &mut migration_ops,
             &health_verify_ops,
             &mut gate_ops,
+            &verify_ops,
             &verify_ops,
         )
         .unwrap_err();
@@ -1013,6 +1100,7 @@ mod tests {
             &mut migration_ops,
             &health_verify_ops,
             &mut gate_ops,
+            &verify_ops,
             &verify_ops,
         )
         .unwrap_err();
@@ -1057,6 +1145,7 @@ mod tests {
             &health_verify_ops,
             &mut gate_ops,
             &verify_ops,
+            &verify_ops,
         )
         .unwrap_err();
 
@@ -1100,6 +1189,7 @@ mod tests {
             &mut migration_ops,
             &health_verify_ops,
             &mut gate_ops,
+            &verify_ops,
             &verify_ops,
         )
         .unwrap();

@@ -310,6 +310,9 @@ pub struct NodeDrain {
     elapsed_ms: u64,
     /// Configurable timeout for the entire drain operation.
     timeout_ms: u64,
+    /// Whether the data stage observed relocated data and therefore requires
+    /// a committed evacuation receipt before advancing.
+    data_relocation_required: bool,
     /// Committed evacuation receipt gating drain completion.
     evacuation_receipt: Option<EvacuationReceipt>,
 }
@@ -327,6 +330,7 @@ impl NodeDrain {
             operator_initiated,
             elapsed_ms: 0,
             timeout_ms: 0,
+            data_relocation_required: false,
             evacuation_receipt: None,
         }
     }
@@ -391,7 +395,15 @@ impl NodeDrain {
 
     /// Attach a committed evacuation receipt to this drain.
     pub fn set_evacuation_receipt(&mut self, receipt: EvacuationReceipt) {
+        if !receipt.is_empty() {
+            self.data_relocation_required = true;
+        }
         self.evacuation_receipt = Some(receipt);
+    }
+
+    /// Mark that the data stage relocated objects and must be receipt-gated.
+    pub fn mark_data_relocation_required(&mut self) {
+        self.data_relocation_required = true;
     }
 
     pub fn set_epoch(&mut self, epoch: u64) {
@@ -400,6 +412,9 @@ impl NodeDrain {
 
     /// Update progress counters for the current stage.
     pub fn update_progress(&mut self, progress: DrainProgress) {
+        if self.stage == DrainStage::DrainingData && progress.objects_remaining > 0 {
+            self.data_relocation_required = true;
+        }
         self.progress = progress;
     }
 
@@ -450,9 +465,15 @@ impl NodeDrain {
                         progress: self.progress,
                     });
                 }
-                // Data-to-cache transition requires a committed evacuation receipt
-                // when relocation receipts exist.  If no receipt is attached, the
-                // node had no data to migrate (vacuous satisfaction).
+                // Data-to-cache transition requires a committed evacuation
+                // receipt when this drain observed relocated data. Empty-node
+                // drains keep `data_relocation_required` false.
+                if self.data_relocation_required && self.evacuation_receipt.is_none() {
+                    return Err(DrainError::RequiresEvacuationReceipt {
+                        node_id: self.node_id,
+                        stage: self.stage,
+                    });
+                }
                 if let Some(receipt) = &self.evacuation_receipt {
                     if receipt.is_empty() {
                         return Err(DrainError::EvacuationReceiptInvalid {
@@ -539,6 +560,7 @@ impl NodeDrain {
         self.stage = DrainStage::Cancelled;
         self.state = NodeState::Active;
         self.progress = DrainProgress::ZERO;
+        self.data_relocation_required = false;
         Ok(self.stage)
     }
 
@@ -770,6 +792,31 @@ mod tests {
             err,
             DrainError::EvacuationReceiptInvalid {
                 error: EvacuationReceiptError::EmptyEvacuation { .. },
+                ..
+            }
+        ));
+        assert_eq!(drain.stage(), DrainStage::DrainingData);
+    }
+
+    #[test]
+    fn data_to_cache_requires_receipt_after_relocated_data() {
+        let (mut drain, _) = NodeDrain::drain(node_id(13));
+        drain.advance_stage().unwrap();
+        drain.update_progress(DrainProgress::ZERO);
+        drain.advance_stage().unwrap();
+        assert_eq!(drain.stage(), DrainStage::DrainingData);
+
+        drain.update_progress(DrainProgress {
+            objects_remaining: 2,
+            ..DrainProgress::ZERO
+        });
+        drain.update_progress(DrainProgress::ZERO);
+
+        let err = drain.advance_stage().unwrap_err();
+        assert!(matches!(
+            err,
+            DrainError::RequiresEvacuationReceipt {
+                stage: DrainStage::DrainingData,
                 ..
             }
         ));
