@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 /*
  * tidefs-fsync-guest-helper.c -- explicit fsync(2), fdatasync(2), and
  * syncfs(2) syscall exercise for TideFS kernel fsync runtime validation.

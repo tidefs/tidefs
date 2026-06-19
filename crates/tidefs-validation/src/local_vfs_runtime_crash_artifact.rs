@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::error::Error;

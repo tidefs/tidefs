@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_claim_ledger::{ClaimEncoding, ValidationReceiptLedger, ValidationReceiptLedgerError};
 use tidefs_types_claim_ledger_core::{
     ValidationArtifactDigest, ValidationReceiptDigest, ValidationReceiptProducer,
