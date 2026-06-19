@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
 use tidefs_validation::local_vfs_runtime_crash_artifact::{
     validate_local_vfs_runtime_crash_artifact_path,
@@ -148,7 +149,7 @@ const CRASH_MODEL_EVIDENCE_SCOPE: &str = "model-only";
 const CRASH_MODEL_EVIDENCE_SCOPE_WORDING: &str =
     "bounded model-only crash matrix; no local runtime crash injection";
 const CRASH_RUNTIME_CLAIM_BOUNDARY_WORDING: &str =
-    "local runtime write/fsync and rename claims stay planned/blocked until runtime evidence exists";
+    "model crash matrices remain model-only; local runtime crash claims require matching runtime artifacts before validation";
 const CRASH_MODEL_GENERATOR_PREFIX: &str = "tidefs-crash-oracle-rust-v";
 const CRASH_MODEL_BACKEND: &str = "tidefs-model-core";
 const CRASH_WRITE_FSYNC_MATRIX_ID: &str = "model.write_fsync_crash_matrix.v1";
@@ -1031,7 +1032,7 @@ fn validate_evidence_artifact_for_receipt(
     };
 
     let mut details = Vec::new();
-    if enforce_freshness {
+    if enforce_freshness && !committed_evidence_tree_is_current(root, rel) {
         match metadata.modified() {
             Ok(modified) if modified < registry_modified => details.push(format!(
                 "claim `{}` has stale evidence artifact `{}` for class `{}`; artifact is older than `{CLAIM_REGISTRY_PATH}`",
@@ -1054,6 +1055,49 @@ fn validate_evidence_artifact_for_receipt(
         EvidenceClassStatus::Stale
     };
     EvidenceArtifactReceiptDetails { status, details }
+}
+
+fn committed_evidence_tree_is_current(root: &Path, artifact_rel: &Path) -> bool {
+    let Some(artifact_rel) = artifact_rel.to_str() else {
+        return false;
+    };
+    git_path_tracked_and_clean(root, CLAIM_REGISTRY_PATH)
+        && git_path_tracked_and_clean(root, artifact_rel)
+}
+
+fn git_path_tracked_and_clean(root: &Path, rel: &str) -> bool {
+    let tracked = Command::new("git")
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["ls-files", "--error-unmatch", "--", rel])
+        .output();
+    if !matches!(tracked, Ok(output) if output.status.success()) {
+        return false;
+    }
+
+    for args in [
+        ["diff", "--quiet", "--exit-code", "HEAD", "--", rel],
+        [
+            "diff",
+            "--cached",
+            "--quiet",
+            "--exit-code",
+            "HEAD",
+            "--",
+            rel,
+        ],
+    ] {
+        let status = Command::new("git")
+            .current_dir(root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(args)
+            .status();
+        if !matches!(status, Ok(status) if status.success()) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn validate_claim_evidence_artifact_content(
@@ -2570,8 +2614,8 @@ mod tests {
         CRASH_MODEL_EVIDENCE_SCOPE, CRASH_MODEL_EVIDENCE_SOURCE, CRASH_MODEL_MATRIX_PATH,
         CRATE_INDEX_LIMITATION_MARKERS, LOCAL_VFS_RENAME_CRASH_CLAIM_ID,
         MODEL_CRASH_MATRIX_EVIDENCE_CLASS, REQUIRED_INITIAL_CLAIMS,
-        RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS,
-        RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS, STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
+        RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS, RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS,
+        STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
     };
 
     #[test]
@@ -2702,8 +2746,9 @@ mod tests {
         );
         assert_eq!(runtime.validation_tier, "mounted-userspace");
         assert_eq!(runtime.blocking_issues, vec!["#596".to_string()]);
-        assert!(runtime.details.iter().any(|detail| detail
-            .contains("no evidence_artifacts entry registers class `runtime-namespace-crash-artifact`")));
+        assert!(runtime.details.iter().any(|detail| detail.contains(
+            "no evidence_artifacts entry registers class `runtime-namespace-crash-artifact`"
+        )));
 
         let model = receipt
             .required_evidence
@@ -2716,6 +2761,47 @@ mod tests {
         assert!(summary.contains("status: BLOCKED"));
         assert!(summary.contains("class: runtime-namespace-crash-artifact"));
         assert!(summary.contains("blocking_issues: #596"));
+    }
+
+    #[test]
+    fn validate_claim_receipt_accepts_local_write_runtime_artifact() {
+        let root = workspace_root();
+        let registry = parse_claim_registry(include_str!("../../../validation/claims.toml"))
+            .expect("claim registry parses");
+        let claim = registry
+            .claims
+            .iter()
+            .find(|claim| claim.id == LOCAL_VFS_WRITE_FSYNC_CRASH_CLAIM_ID)
+            .expect("local VFS write/fsync crash claim registered");
+
+        let receipt = build_claim_validation_receipt(&root, SystemTime::UNIX_EPOCH, claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Pass);
+
+        let runtime = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS)
+            .expect("runtime crash evidence receipt");
+        assert_eq!(runtime.status, EvidenceClassStatus::Present);
+        assert_eq!(
+            runtime.artifact_path,
+            "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json"
+        );
+        assert_eq!(runtime.validation_tier, "mounted-userspace");
+        assert!(
+            runtime.blocking_issues.is_empty(),
+            "present runtime artifact should not keep #493 as a blocking issue"
+        );
+        assert!(
+            runtime.details.is_empty(),
+            "runtime artifact verifier should accept committed local VFS crash evidence: {:?}",
+            runtime.details
+        );
+
+        let summary = render_claim_validation_summary(&receipt);
+        assert!(summary.contains("status: PASS"));
+        assert!(summary.contains("class: runtime-crash-oracle"));
+        assert!(!summary.contains("blocking_issues: #493"));
     }
 
     #[test]

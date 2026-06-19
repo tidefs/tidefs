@@ -7,7 +7,7 @@ issue = 329
 model_artifact = "validation/artifacts/crash-oracle/model-crash-matrices.json"
 model_evidence_class = "model-crash-matrix"
 model_evidence_scope = "bounded model-only crash matrix; no local runtime crash injection"
-runtime_claim_boundary = "local runtime write/fsync and rename claims stay planned/blocked until runtime evidence exists"
+runtime_claim_boundary = "model crash matrices remain model-only; local runtime crash claims require matching runtime artifacts before validation"
 
 reviewed_claim_ids = [
   "storage.write_fsync.crash_safety.v1",
@@ -20,13 +20,13 @@ missing_runtime_evidence_classes = [
   "runtime-namespace-crash-artifact",
 ]
 runtime_evidence_status = "write-fsync-runtime-present-namespace-runtime-missing"
-decision = "planned-blocked-fail-closed"
+decision = "write-fsync-validated-rename-planned-blocked-fail-closed"
 
 boundary_review = [
   "The registered model-crash-matrix artifact is model-only evidence from tidefs-crash-oracle and does not satisfy runtime crash evidence classes.",
-  "The local VFS write/fsync runtime-crash-oracle artifact records OpFsyncBeforeFlush runtime evidence and remains bounded to the local VFS hook path.",
+  "The local VFS write/fsync runtime-crash-oracle artifact records OpFsyncBeforeFlush runtime evidence and satisfies local.vfs.write_fsync_crash.v1 only within the local VFS hook path.",
   "runtime-namespace-crash-artifact evidence must come from interrupted runtime namespace/rename artifacts, not from the model matrix.",
-  "The storage and local VFS crash claims remain planned or blocked and fail-closed until the registered runtime evidence, model evidence, dependency evidence, and claims-gate review are all fresh for the claimed scope.",
+  "The storage-wide write/fsync and local rename crash claims remain planned or blocked and fail-closed until their registered runtime evidence, model evidence, dependency evidence, and claims-gate review are all fresh for the claimed scope.",
 ]
 
 non_claims = [

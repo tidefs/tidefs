@@ -44,12 +44,12 @@
     {
       "issue": 443,
       "subject": "cache-coherency/writeback authority",
-      "status": "open dependency; this artifact does not close cache/writeback authority"
+      "status": "consumed as supporting cache/writeback authority evidence; this artifact remains scoped to the local VFS fsync hook"
     },
     {
       "issue": 445,
       "subject": "intent-log replay idempotency",
-      "status": "open dependency; this artifact does not close replay idempotency"
+      "status": "consumed as supporting replay-idempotency evidence; this artifact remains scoped to the local VFS fsync hook"
     }
   ],
   "non_claims": [

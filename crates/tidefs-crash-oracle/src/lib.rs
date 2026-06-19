@@ -525,7 +525,7 @@ pub fn run_model_crash_matrices() -> Result<CrashOracleReport, CrashOracleError>
         evidence_scope: "bounded model-only crash matrix; no local runtime crash injection"
             .to_string(),
         runtime_claim_boundary:
-            "local runtime write/fsync and rename claims stay planned/blocked until runtime evidence exists"
+            "model crash matrices remain model-only; local runtime crash claims require matching runtime artifacts before validation"
                 .to_string(),
         matrices: vec![write_fsync_matrix()?, rename_matrix()?, cache_dirty_page_matrix()?],
         injection_matrices: vec![define_local_vfs_crash_injection_matrix()],
@@ -534,9 +534,7 @@ pub fn run_model_crash_matrices() -> Result<CrashOracleReport, CrashOracleError>
                 claim_id: LOCAL_VFS_WRITE_FSYNC_CLAIM_ID.to_string(),
                 status: "blocked".to_string(),
                 classification: CrashClassification::UnsupportedFailClosed,
-                reason:
-                    "local runtime crash injection is intentionally outside the model-first slice"
-                        .to_string(),
+                reason: "model matrix is not runtime evidence; validate the local VFS write/fsync claim through the registered runtime-crash-oracle artifact".to_string(),
             },
             RuntimeClaimStatus {
                 claim_id: LOCAL_VFS_RENAME_CLAIM_ID.to_string(),
