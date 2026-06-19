@@ -1173,6 +1173,27 @@ impl BackgroundScheduler {
         )
     }
 
+    /// Register a reconstructed [`IncrementalJob`] against an existing
+    /// resumable dispatch record.
+    ///
+    /// Use this after loading a `Pending` or `InProgress` record from
+    /// [`load_resumable_records`](Self::load_resumable_records) and rebuilding
+    /// the concrete job from the record's checkpoint.
+    pub fn register_resumable_incremental_job<J>(
+        &mut self,
+        name: &'static str,
+        job: J,
+        dispatch_id: DispatchRecordId,
+    ) -> Result<DispatchRecordId, DispatchStoreError>
+    where
+        J: IncrementalJob + Send + 'static,
+    {
+        self.register_resumable_dispatch(
+            Box::new(IncrementalJobAdapter::new(name, job)),
+            dispatch_id,
+        )
+    }
+
     /// Register a service and persist its dispatch record.
     ///
     /// Creates a [`DispatchRecord`] in `Pending` state, persists it, then
@@ -1208,6 +1229,57 @@ impl BackgroundScheduler {
         if let Some(ref mut store) = self.dispatch_store {
             store.update_record(&record)?;
         }
+
+        self.services.push(service);
+        self.service_dispatch_ids.push(Some(dispatch_id));
+        Ok(dispatch_id)
+    }
+
+    /// Register a service against an existing resumable dispatch record.
+    ///
+    /// This is the restart/replay counterpart to [`register_dispatched`]:
+    /// it does not create a new record, and it does not treat the existing
+    /// stable job identity as a duplicate. Instead, it verifies that the
+    /// record is resumable and attaches the service to the original
+    /// [`DispatchRecordId`] so future ticks update the same durable record.
+    pub fn register_resumable_dispatch(
+        &mut self,
+        service: Box<dyn BackgroundService>,
+        dispatch_id: DispatchRecordId,
+    ) -> Result<DispatchRecordId, DispatchStoreError> {
+        let store = self
+            .dispatch_store
+            .as_mut()
+            .ok_or(DispatchStoreError::NotFound(dispatch_id))?;
+        let mut record = store
+            .load_record(dispatch_id)?
+            .ok_or(DispatchStoreError::NotFound(dispatch_id))?;
+
+        if !record.can_resume() {
+            return Err(DispatchStoreError::InvalidState {
+                dispatch_id,
+                expected: "Pending or InProgress",
+                actual: record.state,
+            });
+        }
+
+        let Some((job_id, job_kind)) = service.dispatch_identity() else {
+            return Err(DispatchStoreError::InvalidState {
+                dispatch_id,
+                expected: "service with dispatch identity",
+                actual: record.state,
+            });
+        };
+        if job_id != record.job_id || job_kind != record.job_kind {
+            return Err(DispatchStoreError::InvalidState {
+                dispatch_id,
+                expected: "matching dispatch identity",
+                actual: record.state,
+            });
+        }
+
+        record.mark_in_progress();
+        store.update_record(&record)?;
 
         self.services.push(service);
         self.service_dispatch_ids.push(Some(dispatch_id));

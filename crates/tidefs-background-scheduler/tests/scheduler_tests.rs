@@ -1651,6 +1651,87 @@ mod durable_dispatch_tests {
         assert_eq!(resumable[0].state, DispatchState::InProgress);
     }
 
+    #[test]
+    fn resumable_dispatch_reuses_existing_record_after_restart() {
+        let mut store = InMemoryDispatchStore::new();
+        store.store_epoch(SchedulerEpoch::INITIAL).unwrap();
+
+        let checkpoint = Checkpoint {
+            job_id: JobId(10),
+            job_kind: JobKind::Scrub,
+            epoch: 1,
+            cursor_state: tidefs_types_incremental_job_core::CursorState(
+                40u64.to_le_bytes().to_vec(),
+            ),
+            progress: JobProgress {
+                items_processed: 40,
+                items_total_estimate: 100,
+                bytes_processed: 40 * 1024,
+                bytes_total_estimate: 100 * 1024,
+                elapsed_ms: 10,
+            },
+        };
+        let mut record = DispatchRecord::new(
+            JobId(10),
+            JobKind::Scrub,
+            SchedulerEpoch::INITIAL,
+            DispatchRecordId(7),
+            0,
+        );
+        record.mark_in_progress();
+        record.update_checkpoint(checkpoint.clone());
+        store.store_record(&record).unwrap();
+
+        let mut restarted =
+            BackgroundScheduler::with_dispatch_store(ServiceBudget::SMALL_TICK, Box::new(store))
+                .unwrap();
+        let resumable = restarted.load_resumable_records().unwrap();
+        assert_eq!(resumable.len(), 1);
+
+        let resumed_job = MockJob::resume(
+            resumable[0]
+                .last_checkpoint
+                .clone()
+                .expect("resumable record must carry checkpoint"),
+        )
+        .unwrap();
+        let dispatch_id = restarted
+            .register_resumable_incremental_job(
+                "resumed-scrub",
+                resumed_job,
+                resumable[0].dispatch_id,
+            )
+            .unwrap();
+
+        assert_eq!(dispatch_id, DispatchRecordId(7));
+        assert_eq!(restarted.service_count(), 1);
+
+        let duplicate = restarted
+            .register_incremental_job("duplicate", MockJob::new(10, JobKind::Scrub, 100))
+            .unwrap_err();
+        assert!(matches!(
+            duplicate,
+            DispatchStoreError::DuplicateDispatch(DispatchRecordId(7))
+        ));
+
+        restarted.run_cycle();
+        let updated = restarted
+            .load_dispatch_record(dispatch_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.dispatch_id, DispatchRecordId(7));
+        assert_eq!(updated.state, DispatchState::InProgress);
+        assert_eq!(
+            updated
+                .last_checkpoint
+                .as_ref()
+                .expect("checkpoint should advance")
+                .progress
+                .items_processed,
+            60
+        );
+    }
+
     // ── Epoch advancement ─────────────────────────────────────────
 
     #[test]
