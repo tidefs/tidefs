@@ -11,6 +11,7 @@ use tidefs_types_pool_label_core::{PoolLabelFingerprint, PoolLabelV1, PoolState}
 
 use crate::committed_root::CommittedRoot;
 use crate::segment::SegmentTable;
+use crate::CompletedEvacuation;
 
 // ---------------------------------------------------------------------------
 // DeviceScanInfo
@@ -96,6 +97,9 @@ pub struct PoolScanResult {
     pub segments: SegmentTable,
     /// The latest valid committed root, if found.
     pub committed_root: Option<CommittedRoot>,
+    /// Completed device evacuations that belong to this scan's committed
+    /// member evidence.
+    pub completed_evacuations: Vec<CompletedEvacuation>,
     /// Non-fatal warnings accumulated during the scan (e.g. missing
     /// devices, corrupted but recoverable labels, checksum mismatches
     /// on secondary label copies).
@@ -114,6 +118,7 @@ impl PoolScanResult {
             devices: Vec::new(),
             segments: SegmentTable::new(),
             committed_root: None,
+            completed_evacuations: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -151,6 +156,12 @@ impl PoolScanResult {
     /// Append a warning message.
     pub fn warn(&mut self, msg: impl Into<String>) {
         self.warnings.push(msg.into());
+    }
+
+    /// Record a completed evacuation receipt in this scan's committed member
+    /// evidence.
+    pub fn record_completed_evacuation(&mut self, evacuation: CompletedEvacuation) {
+        self.completed_evacuations.push(evacuation);
     }
 
     /// Export this scan as membership-epoch promotion evidence.
@@ -206,6 +217,38 @@ impl PoolScanResult {
             )
         }
     }
+
+    /// Export committed member evidence together with completed evacuation
+    /// receipts observed for this scan.
+    #[must_use]
+    pub fn committed_member_evidence<F>(
+        &self,
+        prior_epoch_id: u64,
+        proposed_epoch_id: u64,
+        member_id_for_device: F,
+    ) -> CommittedMemberEvidence
+    where
+        F: FnMut(&DeviceScanInfo) -> Option<u64>,
+    {
+        CommittedMemberEvidence {
+            pool_scan: self.epoch_bound_scan_evidence(
+                prior_epoch_id,
+                proposed_epoch_id,
+                member_id_for_device,
+            ),
+            completed_evacuations: self.completed_evacuations.clone(),
+        }
+    }
+}
+
+/// Pool-scan member evidence plus completed device-evacuation receipts.
+#[derive(Clone, Debug)]
+pub struct CommittedMemberEvidence {
+    /// Epoch-bound member-label evidence derived from the pool scan.
+    pub pool_scan: tidefs_membership_epoch::pool_scan_gate::PoolScanEvidence,
+    /// Completed evacuations whose receipts were committed before device
+    /// removal.
+    pub completed_evacuations: Vec<CompletedEvacuation>,
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +429,7 @@ mod tests {
         assert!(!result.has_valid_devices());
         assert_eq!(result.live_segment_count(), 0);
         assert_eq!(result.committed_txg(), None);
+        assert!(result.completed_evacuations.is_empty());
     }
 
     #[test]
@@ -395,6 +439,23 @@ mod tests {
         result.committed_root = Some(root);
         assert!(result.has_committed_root());
         assert_eq!(result.committed_txg(), Some(42));
+    }
+
+    #[test]
+    fn committed_member_evidence_includes_completed_evacuations() {
+        let mut result = PoolScanResult::new([0x22u8; 16]);
+        result.device_count = 1;
+        let evacuation = CompletedEvacuation {
+            target_device_guid: [0xEEu8; 16],
+            topology_generation: 7,
+            receipt_digest: [0xD0u8; 32],
+            receipt_id: 9,
+        };
+        result.record_completed_evacuation(evacuation.clone());
+
+        let evidence = result.committed_member_evidence(4, 5, |_| None);
+
+        assert_eq!(evidence.completed_evacuations, vec![evacuation]);
     }
 
     // -- PoolScanner integration test: single device with segments + root --

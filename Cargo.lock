@@ -2992,6 +2992,7 @@ dependencies = [
  "blake3",
  "serde",
  "thiserror 2.0.18",
+ "tidefs-block-allocator",
  "tidefs-device-removal",
  "tidefs-durability-layout",
  "tidefs-flow-commit-coordinator",

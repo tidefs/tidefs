@@ -16,6 +16,7 @@
 //! Each phase is persisted so that an interrupted removal resumes via
 //! intentional replay rather than fsck.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -258,8 +259,9 @@ impl EvacuationReceipt {
 
     /// Create a [`tidefs_pool_scan::CompletedEvacuation`] record from this receipt.
     ///
-    /// The returned evidence can be stored in [`tidefs_pool_scan::PoolConfig`]
-    /// so that post-removal pool scans surface the committed evacuation receipt.
+    /// The returned evidence can be stored in
+    /// [`tidefs_pool_scan::PoolScanResult`] so that post-removal pool scans
+    /// surface the committed evacuation receipt.
     #[must_use]
     pub fn to_completed_evacuation(&self) -> tidefs_pool_scan::CompletedEvacuation {
         tidefs_pool_scan::CompletedEvacuation {
@@ -320,26 +322,67 @@ pub trait AllocationFence: std::fmt::Debug {
 // PlacementReceiptChecker
 // ---------------------------------------------------------------------------
 
-/// Trait for checking whether placement receipts reference a device.
+/// Committed placement receipt evidence for a device-removal gate.
+///
+/// The checker separates receipts that still reference the target device from
+/// receipts that prove evacuated extents were placed on surviving devices.
+/// Removal may proceed only when `still_referencing_target_refs` is empty and
+/// `committed_relocated_refs` covers every evacuated extent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DevicePlacementReceiptEvidence {
+    /// Placement receipt refs proving evacuated extents were relocated off the
+    /// target device and committed by placement authority.
+    pub committed_relocated_refs: Vec<PlacementReceiptRef>,
+
+    /// Placement receipt refs that still place evacuated extents on the target
+    /// device.
+    pub still_referencing_target_refs: Vec<PlacementReceiptRef>,
+}
+
+impl DevicePlacementReceiptEvidence {
+    /// Create new placement receipt evidence from relocated and stale refs.
+    #[must_use]
+    pub fn new(
+        committed_relocated_refs: Vec<PlacementReceiptRef>,
+        still_referencing_target_refs: Vec<PlacementReceiptRef>,
+    ) -> Self {
+        Self {
+            committed_relocated_refs,
+            still_referencing_target_refs,
+        }
+    }
+
+    /// Returns true when no committed placement receipt still references the
+    /// target device.
+    #[must_use]
+    pub fn target_is_clear(&self) -> bool {
+        self.still_referencing_target_refs.is_empty()
+    }
+}
+
+/// Trait for checking committed placement receipts during device removal.
 ///
 /// Implementations consult the placement runtime to determine whether
-/// any committed placement receipt still references the device being
-/// removed.  The removal gate uses this to fail closed when receipts
-/// still reference the device.
+/// committed placement receipts prove evacuated extents were relocated off the
+/// device being removed and whether any committed receipt still references the
+/// target device.  The removal gate fails closed when this evidence is missing
+/// or incomplete.
 pub trait PlacementReceiptChecker: std::fmt::Debug {
-    /// Return placement receipt refs that reference any of the given extents.
-    ///
-    /// An empty `Vec` means no placement receipts still reference the
-    /// device and the evacuation receipt can be committed.
-    fn receipts_referencing_extents(
+    /// Return committed placement receipt evidence for evacuated extents.
+    fn placement_receipt_evidence(
         &self,
+        target_device_id: DeviceId,
         extent_ids: &[ExtentId],
-    ) -> Result<Vec<PlacementReceiptRef>, DeviceRemovalError>;
+    ) -> Result<DevicePlacementReceiptEvidence, DeviceRemovalError>;
 
     /// Returns `true` if any placement receipt references the given extents.
-    fn has_receipts_referencing_extents(&self, extent_ids: &[ExtentId]) -> bool {
-        self.receipts_referencing_extents(extent_ids)
-            .map(|v| !v.is_empty())
+    fn has_receipts_referencing_target(
+        &self,
+        target_device_id: DeviceId,
+        extent_ids: &[ExtentId],
+    ) -> bool {
+        self.placement_receipt_evidence(target_device_id, extent_ids)
+            .map(|evidence| !evidence.target_is_clear())
             .unwrap_or(true) // fail closed
     }
 }
@@ -707,18 +750,7 @@ impl DeviceRemovalState {
             Some(EvacuationCompletionGeneration::from_state(self, set_digest));
     }
 
-    /// Record the committed evacuation receipt.
-    ///
-    /// Creates and stores an [`EvacuationReceipt`] that binds the evacuation
-    /// completion to the set of placement receipt refs that relocated data off
-    /// the target device.  Must be called after [`Self::record_evacuation_completion`]
-    /// and after the placement receipt checker confirms no live extent references
-    /// the device.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `record_evacuation_completion` has not been called first.
-    pub fn record_evacuation_receipt(
+    fn record_evacuation_receipt(
         &mut self,
         placement_receipt_refs: Vec<PlacementReceiptRef>,
         receipt_id: u64,
@@ -1139,18 +1171,19 @@ impl DeviceRemovalDriver {
         self.placement_receipt_checker = Some(checker);
     }
 
-    /// Record the committed evacuation receipt.
+    /// Commit the evacuation receipt from placement authority evidence.
     ///
-    /// Delegates to [`DeviceRemovalState::record_evacuation_receipt`].
-    /// Must be called after evacuation completes and the placement
-    /// receipt checker confirms no live extent references the device.
-    pub fn record_evacuation_receipt(
-        &mut self,
-        placement_receipt_refs: Vec<PlacementReceiptRef>,
-        receipt_id: u64,
-    ) {
-        self.state
-            .record_evacuation_receipt(placement_receipt_refs, receipt_id);
+    /// The receipt refs are derived from the attached
+    /// [`PlacementReceiptChecker`]; callers cannot hand-author the receipt set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceRemovalError::RemovalRefused`] when completion evidence
+    /// is missing, the checker is missing or fails, any placement receipt still
+    /// references the target device, or committed relocated receipt refs do not
+    /// cover every evacuated extent.
+    pub fn commit_evacuation_receipt(&mut self, receipt_id: u64) -> Result<(), DeviceRemovalError> {
+        self.ensure_committed_evacuation_receipt_with_id(receipt_id, "commit_evacuation_receipt")
     }
 
     // ── Phase transitions ──────────────────────────────────────────
@@ -1280,15 +1313,10 @@ impl DeviceRemovalDriver {
             return Err(self.transition_to_failed(evidence));
         }
 
-        // Verify that the evacuation receipt is recorded and placement receipts
-        // no longer reference the target device.
+        self.ensure_committed_evacuation_receipt("commit_vacated")?;
+
         let Some(ref evac_receipt) = self.state.evacuation_receipt else {
-            let evidence = DeviceRemovalRefusal::new(
-                DeviceRemovalRefusalClass::EvacuationCompletionNotDurable,
-                self.state.target_device.clone(),
-                "evacuation receipt is missing; commit requires committed placement receipt evidence",
-            );
-            return Err(self.transition_to_failed(evidence));
+            unreachable!("ensure_committed_evacuation_receipt stores the receipt on success");
         };
         if let Some(reason) = evac_receipt.verify(&self.state, set_digest) {
             let evidence = DeviceRemovalRefusal::new(
@@ -1298,7 +1326,7 @@ impl DeviceRemovalDriver {
             );
             return Err(self.transition_to_failed(evidence));
         }
-        self.require_no_placement_receipts_reference_target("commit_vacated")?;
+        self.require_committed_placement_receipt_evidence("commit_vacated")?;
 
         // Validate that the updated config no longer contains the target device.
         let updated_leaves = DeviceRemovalPlanner::flatten_leaves(&updated_pool_config.device_tree);
@@ -1345,8 +1373,6 @@ impl DeviceRemovalDriver {
     /// Returns an error if not in the Vacated phase.
     pub fn mark_removed(&mut self) -> Result<(), DeviceRemovalError> {
         self.require_phase(DeviceRemovalPhase::Vacated, "mark_removed")?;
-        self.alloc_fence
-            .unfence_device(DeviceId(self.state.target_device_id));
 
         // Verify durable evacuation completion before final removal.
         // The completion generation must be present and match the current state;
@@ -1388,10 +1414,13 @@ impl DeviceRemovalDriver {
             );
             return Err(self.transition_to_failed(evidence));
         }
-        self.require_no_placement_receipts_reference_target("mark_removed")?;
+        self.require_committed_placement_receipt_evidence("mark_removed")?;
 
         self.state
-            .advance_with_digest(&removed_digest_data(&self.state))
+            .advance_with_digest(&removed_digest_data(&self.state))?;
+        self.alloc_fence
+            .unfence_device(DeviceId(self.state.target_device_id));
+        Ok(())
     }
     /// Transition the removal to Failed.
     pub fn fail(&mut self, error: impl Into<String>) {
@@ -1646,39 +1675,186 @@ impl DeviceRemovalDriver {
         details.map(|details| DeviceRemovalRefusal::new(class, target, details))
     }
 
-    fn require_no_placement_receipts_reference_target(
+    fn next_evacuation_receipt_id(&self) -> u64 {
+        self.state.target_topology_generation
+    }
+
+    fn ensure_committed_evacuation_receipt(
         &mut self,
         operation: &str,
     ) -> Result<(), DeviceRemovalError> {
-        let details = match self.placement_receipt_checker.as_ref() {
-            Some(checker) => match self.placement_receipt_check_extent_ids() {
-                Ok(extent_ids) => match checker.receipts_referencing_extents(&extent_ids) {
-                    Ok(refs) if refs.is_empty() => return Ok(()),
-                    Ok(refs) => format!(
-                        "placement receipts still reference the target device: {} receipt ref(s)",
-                        refs.len()
-                    ),
-                    Err(err) => {
-                        format!("placement receipt checker failed during {operation}: {err}")
-                    }
-                },
-                Err(details) => details,
-            },
-            None => format!(
-                "placement receipt checker is missing; {operation} requires committed placement receipt verification"
-            ),
+        let receipt_id = self.next_evacuation_receipt_id();
+        self.ensure_committed_evacuation_receipt_with_id(receipt_id, operation)
+    }
+
+    fn ensure_committed_evacuation_receipt_with_id(
+        &mut self,
+        receipt_id: u64,
+        operation: &str,
+    ) -> Result<(), DeviceRemovalError> {
+        if self.state.evacuation_receipt.is_some() {
+            return Ok(());
+        }
+
+        let set_digest = evacuation_set_digest(&self.state);
+        let Some(ref completion) = self.state.evacuation_completion_generation else {
+            let evidence = DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::EvacuationCompletionNotDurable,
+                self.state.target_device.clone(),
+                format!(
+                    "evacuation completion generation is missing; {operation} requires durable evidence"
+                ),
+            );
+            return Err(self.transition_to_failed(evidence));
+        };
+        if let Some(reason) = completion.verify(&self.state, set_digest) {
+            let evidence = DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::EvacuationCompletionMismatch,
+                self.state.target_device.clone(),
+                reason,
+            );
+            return Err(self.transition_to_failed(evidence));
+        }
+
+        let evidence = self.require_committed_placement_receipt_evidence(operation)?;
+        self.state
+            .record_evacuation_receipt(evidence.committed_relocated_refs, receipt_id);
+        Ok(())
+    }
+
+    fn require_committed_placement_receipt_evidence(
+        &mut self,
+        operation: &str,
+    ) -> Result<DevicePlacementReceiptEvidence, DeviceRemovalError> {
+        let extent_ids = match self.placement_receipt_check_extent_ids() {
+            Ok(extent_ids) => extent_ids,
+            Err(details) => {
+                return Err(self.transition_to_failed(DeviceRemovalRefusal::new(
+                    DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
+                    self.state.target_device.clone(),
+                    details,
+                )));
+            }
         };
 
-        let evidence = DeviceRemovalRefusal::new(
-            DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
-            self.state.target_device.clone(),
-            details,
-        );
-        Err(self.transition_to_failed(evidence))
+        let Some(checker) = self.placement_receipt_checker.as_ref() else {
+            let details = format!(
+                "placement receipt checker is missing; {operation} requires committed placement receipt verification"
+            );
+            return Err(self.transition_to_failed(DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
+                self.state.target_device.clone(),
+                details,
+            )));
+        };
+
+        let evidence = match checker
+            .placement_receipt_evidence(DeviceId(self.state.target_device_id), &extent_ids)
+        {
+            Ok(evidence) => evidence,
+            Err(err) => {
+                let details = format!("placement receipt checker failed during {operation}: {err}");
+                return Err(self.transition_to_failed(DeviceRemovalRefusal::new(
+                    DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
+                    self.state.target_device.clone(),
+                    details,
+                )));
+            }
+        };
+
+        if !evidence.target_is_clear() {
+            let details = format!(
+                "placement receipts still reference the target device: {} receipt ref(s)",
+                evidence.still_referencing_target_refs.len()
+            );
+            return Err(self.transition_to_failed(DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
+                self.state.target_device.clone(),
+                details,
+            )));
+        }
+
+        if let Some(details) =
+            self.placement_receipt_coverage_refusal_details(&extent_ids, &evidence)
+        {
+            return Err(self.transition_to_failed(DeviceRemovalRefusal::new(
+                DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
+                self.state.target_device.clone(),
+                details,
+            )));
+        }
+
+        Ok(evidence)
+    }
+
+    fn placement_receipt_coverage_refusal_details(
+        &self,
+        extent_ids: &[ExtentId],
+        evidence: &DevicePlacementReceiptEvidence,
+    ) -> Option<String> {
+        if extent_ids.is_empty() {
+            if !evidence.committed_relocated_refs.is_empty() {
+                return Some(
+                    "committed relocated placement receipt evidence is non-empty for an empty evacuation set"
+                        .to_string(),
+                );
+            }
+            return None;
+        }
+
+        if evidence.committed_relocated_refs.is_empty() {
+            return Some(format!(
+                "committed relocated placement receipt evidence is empty for {} evacuated extent(s)",
+                extent_ids.len()
+            ));
+        }
+
+        let expected: BTreeSet<u64> = extent_ids.iter().map(|extent_id| extent_id.0).collect();
+        let observed: BTreeSet<u64> = evidence
+            .committed_relocated_refs
+            .iter()
+            .map(|receipt_ref| receipt_ref.object_id)
+            .collect();
+        let missing: Vec<u64> = expected.difference(&observed).copied().collect();
+        if !missing.is_empty() {
+            return Some(format!(
+                "committed relocated placement receipt evidence is missing {} evacuated extent(s)",
+                missing.len()
+            ));
+        }
+
+        let unexpected: Vec<u64> = observed.difference(&expected).copied().collect();
+        if !unexpected.is_empty() {
+            return Some(format!(
+                "committed relocated placement receipt evidence contains {} un-evacuated extent(s)",
+                unexpected.len()
+            ));
+        }
+
+        if let Some(receipt) = self.state.evacuation_receipt.as_ref() {
+            let mut expected_refs = receipt.placement_receipt_refs.clone();
+            let mut observed_refs = evidence.committed_relocated_refs.clone();
+            expected_refs.sort_unstable();
+            observed_refs.sort_unstable();
+            if observed_refs != expected_refs {
+                return Some(
+                    "committed relocated placement receipt evidence no longer matches the evacuation receipt"
+                        .to_string(),
+                );
+            }
+        }
+
+        None
     }
 
     fn placement_receipt_check_extent_ids(&self) -> Result<Vec<ExtentId>, String> {
         if !self.state.evacuated_extent_ids.is_empty() {
+            if self.state.evacuated_extent_ids.len() as u64 != self.state.objects_evacuated {
+                return Err(
+                    "evacuated extent identity is incomplete after replay; placement receipt verification cannot be proven"
+                        .to_string(),
+                );
+            }
             return Ok(self.state.evacuated_extent_ids.clone());
         }
 
@@ -1708,8 +1884,6 @@ impl DeviceRemovalDriver {
     }
 
     fn transition_to_failed(&mut self, evidence: DeviceRemovalRefusal) -> DeviceRemovalError {
-        self.alloc_fence
-            .unfence_device(DeviceId(self.state.target_device_id));
         let digest_data = refusal_digest_data(&evidence);
         self.state.chain_digest = compute_device_removal_chain_digest(
             &self.state.chain_digest,
@@ -2107,34 +2281,44 @@ mod tests {
         }
     }
 
-    /// Mock [`PlacementReceiptChecker`] that returns a fixed set of refs.
+    /// Mock [`PlacementReceiptChecker`] that returns fixed receipt evidence.
     #[derive(Debug)]
     struct MockPlacementReceiptChecker {
-        refs: Vec<PlacementReceiptRef>,
+        committed_relocated_refs: Vec<PlacementReceiptRef>,
+        still_referencing_target_refs: Vec<PlacementReceiptRef>,
     }
 
     impl PlacementReceiptChecker for MockPlacementReceiptChecker {
-        fn receipts_referencing_extents(
+        fn placement_receipt_evidence(
             &self,
+            _target_device_id: DeviceId,
             _extent_ids: &[ExtentId],
-        ) -> Result<Vec<PlacementReceiptRef>, DeviceRemovalError> {
-            Ok(self.refs.clone())
+        ) -> Result<DevicePlacementReceiptEvidence, DeviceRemovalError> {
+            Ok(DevicePlacementReceiptEvidence::new(
+                self.committed_relocated_refs.clone(),
+                self.still_referencing_target_refs.clone(),
+            ))
         }
     }
 
     #[derive(Debug)]
     struct ExpectingPlacementReceiptChecker {
         expected_extent_ids: Vec<ExtentId>,
-        refs: Vec<PlacementReceiptRef>,
+        committed_relocated_refs: Vec<PlacementReceiptRef>,
+        still_referencing_target_refs: Vec<PlacementReceiptRef>,
     }
 
     impl PlacementReceiptChecker for ExpectingPlacementReceiptChecker {
-        fn receipts_referencing_extents(
+        fn placement_receipt_evidence(
             &self,
+            _target_device_id: DeviceId,
             extent_ids: &[ExtentId],
-        ) -> Result<Vec<PlacementReceiptRef>, DeviceRemovalError> {
+        ) -> Result<DevicePlacementReceiptEvidence, DeviceRemovalError> {
             assert_eq!(extent_ids, self.expected_extent_ids.as_slice());
-            Ok(self.refs.clone())
+            Ok(DevicePlacementReceiptEvidence::new(
+                self.committed_relocated_refs.clone(),
+                self.still_referencing_target_refs.clone(),
+            ))
         }
     }
 
@@ -2154,8 +2338,20 @@ mod tests {
     }
 
     fn attach_empty_receipt_checker(driver: &mut DeviceRemovalDriver) {
-        driver
-            .set_placement_receipt_checker(Box::new(MockPlacementReceiptChecker { refs: vec![] }));
+        driver.set_placement_receipt_checker(Box::new(MockPlacementReceiptChecker {
+            committed_relocated_refs: vec![],
+            still_referencing_target_refs: vec![],
+        }));
+    }
+
+    fn attach_committed_receipt_checker(
+        driver: &mut DeviceRemovalDriver,
+        refs: Vec<PlacementReceiptRef>,
+    ) {
+        driver.set_placement_receipt_checker(Box::new(MockPlacementReceiptChecker {
+            committed_relocated_refs: refs,
+            still_referencing_target_refs: vec![],
+        }));
     }
 
     fn make_evacuating_driver(total_objects: u64) -> DeviceRemovalDriver {
@@ -2540,8 +2736,10 @@ mod tests {
 
         // Evacuating -> Evacuated
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
-        attach_empty_receipt_checker(&mut driver);
+        attach_committed_receipt_checker(
+            &mut driver,
+            vec![placement_receipt_ref(100), placement_receipt_ref(101)],
+        );
         assert_eq!(driver.state().phase, DeviceRemovalPhase::Evacuated);
 
         // Evacuated -> Vacated
@@ -2609,7 +2807,6 @@ mod tests {
 
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
         attach_empty_receipt_checker(&mut driver);
 
         // Pass a config that still has disk1
@@ -3294,7 +3491,6 @@ mod tests {
         let d1 = driver.state().chain_digest;
         assert_ne!(d1, [0u8; 32]);
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
         attach_empty_receipt_checker(&mut driver);
         let d2 = driver.state().chain_digest;
         assert_ne!(d2, d1);
@@ -3362,7 +3558,6 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
 
         // Manually clear the completion generation to simulate
         // a state that was deserialized without it (pre-this-issue data).
@@ -3401,7 +3596,6 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
         attach_empty_receipt_checker(&mut driver);
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
@@ -3434,7 +3628,6 @@ mod tests {
             .record_object_evacuated(ExtentId::from(1u64), 100)
             .unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
 
         // Tamper with the completion generation set digest.
         if let Some(ref mut completion) = driver.state.evacuation_completion_generation {
@@ -3472,7 +3665,6 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
         attach_empty_receipt_checker(&mut driver);
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
@@ -3520,8 +3712,7 @@ mod tests {
             .record_object_evacuated(ExtentId::from(1u64), 100)
             .unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
-        attach_empty_receipt_checker(&mut driver);
+        attach_committed_receipt_checker(&mut driver, vec![placement_receipt_ref(1)]);
         // Evacuated phase: not yet durable.
         assert_eq!(driver.status(), DeviceRemovalStatus::CompletionNotDurable);
 
@@ -3580,7 +3771,6 @@ mod tests {
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
         let mut updated = make_pool_config(vec![leaf0_after]);
         updated.topology_generation = 2;
-        resumed.record_evacuation_receipt(vec![], 0);
         attach_empty_receipt_checker(&mut resumed);
         resumed.commit_vacated(updated).unwrap();
         assert_eq!(resumed.state().phase, DeviceRemovalPhase::Vacated);
@@ -3607,6 +3797,8 @@ mod tests {
             .record_object_evacuated(ExtentId::from(42u64), 4096)
             .unwrap();
         driver.mark_evacuated().unwrap();
+        attach_committed_receipt_checker(&mut driver, vec![placement_receipt_ref(42)]);
+        driver.commit_evacuation_receipt(7).unwrap();
 
         let serialized = driver.serialize_state().unwrap();
         let recovered_state = DeviceRemovalDriver::deserialize_state(&serialized).unwrap();
@@ -3621,10 +3813,10 @@ mod tests {
             config,
             vec![DeviceId(0)],
         );
-        resumed.record_evacuation_receipt(vec![placement_receipt_ref(42)], 7);
         resumed.set_placement_receipt_checker(Box::new(ExpectingPlacementReceiptChecker {
             expected_extent_ids: vec![ExtentId::from(42u64)],
-            refs: vec![],
+            committed_relocated_refs: vec![placement_receipt_ref(42)],
+            still_referencing_target_refs: vec![],
         }));
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
@@ -3661,7 +3853,6 @@ mod tests {
             config,
             vec![DeviceId(0)],
         );
-        resumed.record_evacuation_receipt(vec![], 7);
         attach_empty_receipt_checker(&mut resumed);
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
@@ -3677,6 +3868,50 @@ mod tests {
                 .details
                 .contains("evacuated extent identity is missing after replay"),
             "details must mention missing replay extent identity"
+        );
+        assert_eq!(resumed.state().phase, DeviceRemovalPhase::Failed);
+    }
+
+    #[test]
+    fn checkpoint_replay_rejects_incomplete_extent_identity_at_receipt_commit() {
+        let mut driver = make_evacuating_driver(2);
+        driver
+            .record_object_evacuated(ExtentId::from(10u64), 1024)
+            .unwrap();
+        let checkpoint = driver.create_checkpoint(DeviceId(0));
+
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut resumed = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            2,
+        )
+        .unwrap();
+        resumed.begin_evacuation().unwrap();
+        resumed.apply_checkpoint(&checkpoint).unwrap();
+        resumed
+            .record_object_evacuated(ExtentId::from(11u64), 1024)
+            .unwrap();
+        resumed.mark_evacuated().unwrap();
+        attach_committed_receipt_checker(&mut resumed, vec![placement_receipt_ref(11)]);
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+        let err = resumed.commit_vacated(updated).unwrap_err();
+        let evidence = assert_refusal_class(
+            err,
+            DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
+        );
+        assert!(
+            evidence
+                .details
+                .contains("evacuated extent identity is incomplete after replay"),
+            "details must mention incomplete replay extent identity"
         );
         assert_eq!(resumed.state().phase, DeviceRemovalPhase::Failed);
     }
@@ -3734,7 +3969,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_vacated_rejects_missing_evacuation_receipt() {
+    fn commit_vacated_commits_evacuation_receipt_from_checker() {
         let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
         let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
         let config = make_pool_config(vec![leaf0, leaf1]);
@@ -3743,28 +3978,32 @@ mod tests {
             Path::new("/dev/disk1"),
             config,
             vec![DeviceId(0)],
-            0,
+            1,
         )
         .unwrap();
         driver.begin_evacuation().unwrap();
+        driver
+            .record_object_evacuated(ExtentId::from(11u64), 1024)
+            .unwrap();
         driver.mark_evacuated().unwrap();
-        // Completion generation is recorded by mark_evacuated, but we do NOT
-        // call record_evacuation_receipt — receipt is intentionally missing.
+        attach_committed_receipt_checker(&mut driver, vec![placement_receipt_ref(11)]);
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
         let mut updated = make_pool_config(vec![leaf0_after]);
         updated.topology_generation = 2;
 
-        let err = driver.commit_vacated(updated).unwrap_err();
-        let evidence = assert_refusal_class(
-            err,
-            DeviceRemovalRefusalClass::EvacuationCompletionNotDurable,
+        driver.commit_vacated(updated).unwrap();
+        let receipt = driver
+            .state()
+            .evacuation_receipt
+            .as_ref()
+            .expect("commit_vacated must store an evacuation receipt");
+        assert_eq!(
+            receipt.placement_receipt_refs,
+            vec![placement_receipt_ref(11)]
         );
-        assert!(
-            evidence.details.contains("evacuation receipt is missing"),
-            "details must mention missing evacuation receipt"
-        );
-        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+        assert!(receipt.verify_digest());
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Vacated);
     }
 
     #[test]
@@ -3782,7 +4021,6 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
         attach_empty_receipt_checker(&mut driver);
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
@@ -3820,7 +4058,6 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
         let mut updated = make_pool_config(vec![leaf0_after]);
@@ -3855,7 +4092,6 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
         attach_empty_receipt_checker(&mut driver);
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
@@ -3894,11 +4130,11 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
 
         // Install a checker that reports references still exist.
         driver.set_placement_receipt_checker(Box::new(MockPlacementReceiptChecker {
-            refs: vec![PlacementReceiptRef {
+            committed_relocated_refs: vec![],
+            still_referencing_target_refs: vec![PlacementReceiptRef {
                 object_id: 1,
                 object_key: [0x01u8; 32],
                 receipt_epoch: tidefs_membership_epoch::EpochId(0),
@@ -3931,6 +4167,45 @@ mod tests {
     }
 
     #[test]
+    fn commit_vacated_rejects_incomplete_relocated_receipt_coverage() {
+        let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
+        let config = make_pool_config(vec![leaf0, leaf1]);
+        let mut driver = DeviceRemovalDriver::prepare(
+            Box::new(NoopAllocationFence::new()),
+            Path::new("/dev/disk1"),
+            config,
+            vec![DeviceId(0)],
+            2,
+        )
+        .unwrap();
+        driver.begin_evacuation().unwrap();
+        driver
+            .record_object_evacuated(ExtentId::from(10u64), 1024)
+            .unwrap();
+        driver
+            .record_object_evacuated(ExtentId::from(11u64), 1024)
+            .unwrap();
+        driver.mark_evacuated().unwrap();
+        attach_committed_receipt_checker(&mut driver, vec![placement_receipt_ref(10)]);
+
+        let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
+        let mut updated = make_pool_config(vec![leaf0_after]);
+        updated.topology_generation = 2;
+
+        let err = driver.commit_vacated(updated).unwrap_err();
+        let evidence = assert_refusal_class(
+            err,
+            DeviceRemovalRefusalClass::PlacementReceiptsStillReferenceDevice,
+        );
+        assert!(
+            evidence.details.contains("missing 1 evacuated extent"),
+            "details must mention incomplete relocated receipt coverage"
+        );
+        assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+    }
+
+    #[test]
     fn placement_receipt_checker_blocks_mark_removed() {
         let leaf0 = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
         let leaf1 = make_leaf("/dev/disk1", 2, 1, 1024, DeviceHealth::Online);
@@ -3945,7 +4220,6 @@ mod tests {
         .unwrap();
         driver.begin_evacuation().unwrap();
         driver.mark_evacuated().unwrap();
-        driver.record_evacuation_receipt(vec![], 0);
         attach_empty_receipt_checker(&mut driver);
 
         let leaf0_after = make_leaf("/dev/disk0", 1, 0, 1024, DeviceHealth::Online);
@@ -3955,7 +4229,8 @@ mod tests {
 
         // Install a checker that reports references still exist.
         driver.set_placement_receipt_checker(Box::new(MockPlacementReceiptChecker {
-            refs: vec![PlacementReceiptRef {
+            committed_relocated_refs: vec![],
+            still_referencing_target_refs: vec![PlacementReceiptRef {
                 object_id: 1,
                 object_key: [0x01u8; 32],
                 receipt_epoch: tidefs_membership_epoch::EpochId(0),
@@ -3981,5 +4256,9 @@ mod tests {
             "details must mention placement receipts still referencing device"
         );
         assert_eq!(driver.state().phase, DeviceRemovalPhase::Failed);
+        assert!(
+            driver.alloc_fence.is_device_fenced(DeviceId(1)),
+            "target device must remain fenced when final removal fails closed"
+        );
     }
 }

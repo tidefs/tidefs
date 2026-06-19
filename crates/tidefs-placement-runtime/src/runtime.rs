@@ -761,30 +761,46 @@ fn policy_to_failure_domain(policy: &FailureDomainPlacementPolicy) -> FailureDom
 // PlacementReceiptChecker implementation for PlacementRuntime
 // ---------------------------------------------------------------------------
 
-use tidefs_device_removal::{DeviceRemovalError, PlacementReceiptChecker};
+use tidefs_block_allocator::DeviceId;
+use tidefs_device_removal::{
+    DevicePlacementReceiptEvidence, DeviceRemovalError, PlacementReceiptChecker,
+};
 use tidefs_locator_table::ExtentId;
 
 impl PlacementReceiptChecker for PlacementRuntime {
-    fn receipts_referencing_extents(
+    fn placement_receipt_evidence(
         &self,
+        target_device_id: DeviceId,
         extent_ids: &[ExtentId],
-    ) -> Result<Vec<tidefs_replication_model::PlacementReceiptRef>, DeviceRemovalError> {
-        let mut refs = Vec::new();
+    ) -> Result<DevicePlacementReceiptEvidence, DeviceRemovalError> {
+        let mut committed_relocated_refs = Vec::new();
+        let mut still_referencing_target_refs = Vec::new();
+        let target_member_id = MemberId::new(u64::from(target_device_id.0));
+
         for receipt in &self.plan_registry.placed_receipts {
             for subject_ref in &receipt.subject_refs {
                 // ExtentId(u64) maps to ReplicatedSubjectId(u64) with the
-                // same numeric value in the current TideFS model.
+                // same numeric value in the current TideFS model. DeviceId is
+                // likewise mapped to MemberId for this in-tree placement gate.
                 let subject_extent = ExtentId(subject_ref.0);
                 if extent_ids.contains(&subject_extent) {
-                    refs.extend(receipt.placement_receipt_refs.clone());
+                    if receipt.placed_on == target_member_id {
+                        still_referencing_target_refs
+                            .extend(receipt.placement_receipt_refs.clone());
+                    } else {
+                        committed_relocated_refs.extend(receipt.placement_receipt_refs.clone());
+                    }
                     break;
                 }
             }
         }
-        Ok(refs)
+
+        Ok(DevicePlacementReceiptEvidence::new(
+            committed_relocated_refs,
+            still_referencing_target_refs,
+        ))
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -794,6 +810,24 @@ mod tests {
         ConfigClass, EpochId, FailureDomainClass, FailureDomainPlacementPolicy,
         FailureDomainVector, HealthClass, MemberClass, MemberId, PlacementIntentClass, ReceiptId,
     };
+
+    fn placement_receipt_ref(
+        object_id: u64,
+        generation: u64,
+    ) -> tidefs_replication_model::PlacementReceiptRef {
+        tidefs_replication_model::PlacementReceiptRef {
+            object_id,
+            object_key: [object_id as u8; 32],
+            receipt_epoch: EpochId::new(1),
+            receipt_generation: generation,
+            redundancy_policy: tidefs_replication_model::ReceiptRedundancyPolicy::Replicated {
+                copies: 2,
+            },
+            payload_len: 4096,
+            payload_digest: [generation as u8; 32],
+            target_count: 1,
+        }
+    }
 
     #[test]
     fn test_placement_runtime_creation() {
@@ -985,6 +1019,45 @@ mod tests {
 
         let committed = rt.verify(&[receipt], &[decision]).expect("verify");
         assert_eq!(committed.len(), 1, "should commit one reservation");
+    }
+
+    #[test]
+    fn device_removal_receipt_evidence_splits_target_and_relocated_refs() {
+        let mut rt = PlacementRuntime::new(MemberId::new(1), EpochId::new(1));
+        let subject = ReplicatedSubjectId::new(42);
+        let stale_ref = placement_receipt_ref(42, 1);
+        let relocated_ref = placement_receipt_ref(42, 2);
+
+        rt.plan_registry.record_placement(ReplicaPlacementReceipt {
+            receipt_id: ReplicatedReceiptId(1),
+            verification_ref: ReplicatedReceiptId(0),
+            transfer_ref: ReplicatedReceiptId(0),
+            subject_refs: vec![subject],
+            placed_on: MemberId::new(1),
+            placement_epoch: EpochId::new(1),
+            subjects_placed: 1,
+            placement_receipt_refs: vec![stale_ref.clone()],
+        });
+        rt.plan_registry.record_placement(ReplicaPlacementReceipt {
+            receipt_id: ReplicatedReceiptId(2),
+            verification_ref: ReplicatedReceiptId(0),
+            transfer_ref: ReplicatedReceiptId(0),
+            subject_refs: vec![subject],
+            placed_on: MemberId::new(2),
+            placement_epoch: EpochId::new(1),
+            subjects_placed: 1,
+            placement_receipt_refs: vec![relocated_ref.clone()],
+        });
+
+        let evidence = PlacementReceiptChecker::placement_receipt_evidence(
+            &rt,
+            DeviceId(1),
+            &[ExtentId::from(42u64)],
+        )
+        .expect("receipt evidence");
+
+        assert_eq!(evidence.still_referencing_target_refs, vec![stale_ref]);
+        assert_eq!(evidence.committed_relocated_refs, vec![relocated_ref]);
     }
 
     #[test]

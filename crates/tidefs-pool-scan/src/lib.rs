@@ -37,7 +37,7 @@ pub use label::{
 };
 pub use label_writer::{LabelWriteError, PoolLabelWriter};
 pub use rebuild::{RebuildAction, RebuildKind, RebuildPlan, RebuildScheduler};
-pub use result::{DeviceScanInfo, PoolScanResult, PoolScanner};
+pub use result::{CommittedMemberEvidence, DeviceScanInfo, PoolScanResult, PoolScanner};
 pub use segment::{
     SegmentDescriptor, SegmentScanError, SegmentState, SegmentTable, SegmentTableReader,
 };
@@ -1287,7 +1287,6 @@ pub struct PoolConfig {
     pub missing_indices: Vec<u32>,
     /// Indices of devices currently being removed (allocation-fenced).
     pub removing_device_indices: Vec<u32>,
-
 }
 /// A borrowed reference to a leaf device's immutable fields,
 /// returned by [`DeviceType::find_leaf`].

@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use tidefs_block_allocator::DeviceId;
 use tidefs_device_removal::{
     locator_integration::{LocatorTableObjectEnumerator, LocatorTableObjectMover},
-    AllocationFence, DeviceRemovalDriver, DeviceRemovalError, DeviceRemovalPhase,
-    EvacuationCheckpoint, PlacementReceiptChecker,
+    AllocationFence, DevicePlacementReceiptEvidence, DeviceRemovalDriver, DeviceRemovalError,
+    DeviceRemovalPhase, EvacuationCheckpoint, PlacementReceiptChecker,
 };
 use tidefs_local_object_store::LocalObjectStore;
 use tidefs_locator_table::{ExtentId, LocatorEntry, LocatorTable, RelocationDataMover};
@@ -132,16 +132,57 @@ impl AllocationFence for TestAllocationFence {
 struct EmptyPlacementReceiptChecker;
 
 impl PlacementReceiptChecker for EmptyPlacementReceiptChecker {
-    fn receipts_referencing_extents(
+    fn placement_receipt_evidence(
         &self,
+        _target_device_id: DeviceId,
         _extent_ids: &[ExtentId],
-    ) -> Result<Vec<PlacementReceiptRef>, DeviceRemovalError> {
-        Ok(vec![])
+    ) -> Result<DevicePlacementReceiptEvidence, DeviceRemovalError> {
+        Ok(DevicePlacementReceiptEvidence::default())
+    }
+}
+
+#[derive(Debug)]
+struct CommittedPlacementReceiptChecker {
+    refs: Vec<PlacementReceiptRef>,
+}
+
+impl PlacementReceiptChecker for CommittedPlacementReceiptChecker {
+    fn placement_receipt_evidence(
+        &self,
+        _target_device_id: DeviceId,
+        _extent_ids: &[ExtentId],
+    ) -> Result<DevicePlacementReceiptEvidence, DeviceRemovalError> {
+        Ok(DevicePlacementReceiptEvidence::new(
+            self.refs.clone(),
+            vec![],
+        ))
     }
 }
 
 fn attach_empty_receipt_checker(driver: &mut DeviceRemovalDriver) {
     driver.set_placement_receipt_checker(Box::new(EmptyPlacementReceiptChecker));
+}
+
+fn attach_committed_receipt_checker(
+    driver: &mut DeviceRemovalDriver,
+    refs: Vec<PlacementReceiptRef>,
+) {
+    driver.set_placement_receipt_checker(Box::new(CommittedPlacementReceiptChecker { refs }));
+}
+
+fn placement_receipt_ref(object_id: u64) -> PlacementReceiptRef {
+    PlacementReceiptRef {
+        object_id,
+        object_key: [object_id as u8; 32],
+        receipt_epoch: tidefs_membership_epoch::EpochId(0),
+        receipt_generation: object_id.saturating_add(1),
+        redundancy_policy: tidefs_replication_model::ReceiptRedundancyPolicy::Replicated {
+            copies: 2,
+        },
+        payload_len: 0,
+        payload_digest: [0u8; 32],
+        target_count: 0,
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -233,8 +274,22 @@ fn full_3_device_removal_lifecycle() {
         removing_device_indices: vec![],
     };
 
-    driver.record_evacuation_receipt(vec![], 0);
-    attach_empty_receipt_checker(&mut driver);
+    attach_committed_receipt_checker(
+        &mut driver,
+        objects
+            .iter()
+            .map(|extent_id| placement_receipt_ref(extent_id.0))
+            .collect(),
+    );
+    driver.commit_evacuation_receipt(1).unwrap();
+    assert_eq!(
+        driver
+            .state()
+            .evacuation_receipt
+            .as_ref()
+            .map(|receipt| receipt.placement_receipt_refs.len()),
+        Some(objects.len())
+    );
     driver.commit_vacated(updated_config).unwrap();
     assert_eq!(driver.state().phase, DeviceRemovalPhase::Vacated);
 
@@ -410,7 +465,6 @@ fn removal_with_zero_objects_completes_cleanly() {
         missing_indices: vec![],
         removing_device_indices: vec![],
     };
-    driver.record_evacuation_receipt(vec![], 0);
     attach_empty_receipt_checker(&mut driver);
     driver.commit_vacated(updated_config).unwrap();
     driver.mark_removed().unwrap();
