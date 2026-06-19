@@ -1075,9 +1075,9 @@ fn git_path_tracked_and_clean(root: &Path, rel: &str) -> bool {
         return false;
     }
 
-    for args in [
-        ["diff", "--quiet", "--exit-code", "HEAD", "--", rel],
-        [
+    let clean_checks: &[&[&str]] = &[
+        &["diff", "--quiet", "--exit-code", "HEAD", "--", rel],
+        &[
             "diff",
             "--cached",
             "--quiet",
@@ -1086,11 +1086,12 @@ fn git_path_tracked_and_clean(root: &Path, rel: &str) -> bool {
             "--",
             rel,
         ],
-    ] {
+    ];
+    for args in clean_checks {
         let status = Command::new("git")
             .current_dir(root)
             .env("GIT_OPTIONAL_LOCKS", "0")
-            .args(args)
+            .args(args.iter().copied())
             .status();
         if !matches!(status, Ok(status) if status.success()) {
             return false;
