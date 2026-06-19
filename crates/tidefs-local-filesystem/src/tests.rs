@@ -1001,6 +1001,44 @@ fn unlink_last_link_after_fallocate_releases_reserved_space() {
 }
 
 #[test]
+fn overwrites_do_not_grow_committed_logical_space() {
+    let root = temp_root("overwrite-committed-logical-space");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.create_dir("/docs", 0o755).expect("create docs");
+    fs.create_file("/docs/data.bin", 0o600)
+        .expect("create file");
+
+    let first = b"committed logical bytes".to_vec();
+    fs.write_file("/docs/data.bin", 0, &first)
+        .expect("initial write");
+    fs.fsync_all().expect("commit initial write");
+    let committed_after_first = fs.space_counters().logical_used_bytes;
+    assert_eq!(committed_after_first, first.len() as u64);
+
+    let buffered_overwrite = b"rewritten logical bytes".to_vec();
+    assert_eq!(buffered_overwrite.len(), first.len());
+    fs.write_file("/docs/data.bin", 0, &buffered_overwrite)
+        .expect("buffered overwrite");
+    fs.fsync_all().expect("commit buffered overwrite");
+    assert_eq!(
+        fs.space_counters().logical_used_bytes,
+        committed_after_first
+    );
+
+    let direct_overwrite = b"direct path logical byt".to_vec();
+    assert_eq!(direct_overwrite.len(), first.len());
+    fs.write_file_ranges_direct("/docs/data.bin", vec![(0, direct_overwrite)])
+        .expect("direct overwrite");
+    fs.fsync_all().expect("commit direct overwrite");
+    assert_eq!(
+        fs.space_counters().logical_used_bytes,
+        committed_after_first
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn symlink_round_trips_target() {
     let root = temp_root("symlink");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
