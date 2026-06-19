@@ -1376,17 +1376,6 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         return "$?"
     }
 
-    tidefs_product_limitation() {
-        case "$1" in
-            generic/012)
-                echo "TideFS FUSE does not yet provide the fiemap/fallocate capability surface required by generic/012 in this smoke tranche"
-                ;;
-            *)
-                return 1
-                ;;
-        esac
-    }
-
     # Run each test individually with per-test timeout
     TESTS_RUN=0
     TESTS_PASS=0
@@ -1405,14 +1394,6 @@ if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
         # Bound each test so one stuck row cannot consume the whole VM run.
         # Run test with output visible on console for debugging
         echo "=== Running $test ==="
-        LIMITATION_DETAIL=""
-        if [ "$FOCUSED_TESTS" -eq 0 ]; then
-            LIMITATION_DETAIL=$(tidefs_product_limitation "$test" || true)
-        fi
-        if [ -n "$LIMITATION_DETAIL" ]; then
-            unsupported "xfstests_$test" "$LIMITATION_DETAIL"
-            continue
-        fi
         if ! run_cleanup_xfstests_test_bounded "pre-$test" "$test" "$RESULT_BASE" /dev/null; then
             fail "xfstests_$test" "pre-test cleanup timed out"
             TESTS_FAIL=$((TESTS_FAIL + 1))
