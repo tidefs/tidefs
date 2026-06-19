@@ -1311,24 +1311,22 @@ fn live_backend_frame_and_replication_protocol_share_store() {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-node distributed fan-out: Frame operations route through replica
-// quorum fan-out, proving remote receipt, readback, and delete propagation.
+// Multi-node distributed write boundary: receiptless Frame PUTs are refused
+// on the transport-backed primary instead of claiming clustered durability.
 // ---------------------------------------------------------------------------
 //
 // Starts two storage-node instances (different ports, isolated store paths).
 // The primary connects to the replica as a membership peer via
-// TransportReplicatedStore. Client Frame PUT/GET/DELETE issued to the primary
-// are fanned out to the replica. The test verifies remote receipt/readback and
-// delete propagation via Frame GET on the replica, then verifies quorum
-// accounting via STATS.
+// TransportReplicatedStore. A client Frame PUT issued to the primary is
+// rejected until the caller supplies placement receipt authority; the test then
+// verifies neither node accepted the object and that the live backend remains
+// observable via STATS.
 //
-// Key: the replica retains the data, proving the primary's fan-out path works
-// end-to-end through TransportReplicatedStore. This closes the gap where
-// Frame handlers used to call *_local for TransportBacked instead of
-// *_named fan-out methods.
+// Key: the primary no longer falls back to receiptless fan-out through
+// TransportReplicatedStore for ordinary client PUT.
 
 #[test]
-fn live_backend_frame_fanout_to_replica_readback_and_delete() {
+fn live_backend_frame_put_requires_receipt_authority() {
     use std::net::TcpListener;
 
     // ── Ports and paths ─────────────────────────────────────────────
@@ -1456,7 +1454,7 @@ fn live_backend_frame_fanout_to_replica_readback_and_delete() {
     // Give both nodes time to stabilise sessions
     thread::sleep(Duration::from_millis(200));
 
-    // ── PUT via Frame to primary, verify on replica ─────────────────
+    // ── Receiptless PUT via Frame is refused on transport-backed primary ───
     let key = b"fanout-key";
     let value = b"fanout-value-from-client";
 
@@ -1471,34 +1469,17 @@ fn live_backend_frame_fanout_to_replica_readback_and_delete() {
         false,
     )
     .expect("put request to primary");
-    assert!(
-        matches!(resp, Frame::Ok),
-        "primary PUT should return Ok (fan-out to replica), got {resp:?}"
-    );
-
-    // Give replication a moment to propagate
-    thread::sleep(Duration::from_millis(50));
-
-    // Read back from replica via Frame GET (proves fan-out worked)
-    let resp = client::request(
-        98,
-        20,
-        replica_addr,
-        Frame::Get { key: key.to_vec() },
-        false,
-    )
-    .expect("get request to replica");
     match resp {
-        Frame::GetResponse { value: got } => {
-            assert_eq!(got, value, "replica GET should return the fan-out value");
-        }
         Frame::Error { message } => {
-            panic!("replica GET returned error: {message}");
+            assert!(
+                message.contains("requires durable placement receipt authority"),
+                "primary PUT should require receipt authority, got {message}"
+            );
         }
-        other => panic!("expected GetResponse from replica, got {other:?}"),
+        other => panic!("expected receipt-authority error from primary, got {other:?}"),
     }
 
-    // ── GET via Frame to primary (local-primary path) ───────────────
+    // No local primary write should be visible after the rejected PUT.
     let resp = client::request(
         97,
         10,
@@ -1508,16 +1489,35 @@ fn live_backend_frame_fanout_to_replica_readback_and_delete() {
     )
     .expect("get request to primary");
     match resp {
-        Frame::GetResponse { value: got } => {
-            assert_eq!(got, value, "primary GET should return the local value");
-        }
         Frame::Error { message } => {
-            panic!("primary GET returned error: {message}");
+            assert!(
+                message.contains("not found"),
+                "primary GET after rejected PUT should return not found: {message}"
+            );
         }
-        other => panic!("expected GetResponse from primary, got {other:?}"),
+        other => panic!("expected Error from primary, got {other:?}"),
     }
 
-    // ── STATS on primary: verify quorum accounting ─────────────────
+    // No replica write should be visible either.
+    let resp = client::request(
+        98,
+        20,
+        replica_addr,
+        Frame::Get { key: key.to_vec() },
+        false,
+    )
+    .expect("get request to replica");
+    match resp {
+        Frame::Error { message } => {
+            assert!(
+                message.contains("not found"),
+                "replica GET after rejected PUT should return not found: {message}"
+            );
+        }
+        other => panic!("expected Error from replica, got {other:?}"),
+    }
+
+    // ── STATS on primary: verify backend disclosure ────────────────
     let resp = client::request(96, 10, primary_addr, Frame::Stats, false).expect("stats request");
     match resp {
         Frame::StatsResponse { json } => {
@@ -1536,57 +1536,13 @@ fn live_backend_frame_fanout_to_replica_readback_and_delete() {
                 "stats should have committed_writes"
             );
             let committed: i64 = stats["committed_writes"].as_i64().unwrap_or(-1);
-            assert!(
-                committed >= 1,
-                "should have at least 1 committed write, got {committed}: {json}"
+            assert_eq!(
+                committed, 0,
+                "receiptless rejected PUT should not commit writes: {json}"
             );
-            eprintln!("[fanout-test] primary stats (post-PUT): {json}");
+            eprintln!("[fanout-test] primary stats (receiptless PUT rejected): {json}");
         }
         other => panic!("expected StatsResponse from primary, got {other:?}"),
-    }
-
-    // ── DELETE via Frame to primary, verify on replica ─────────────
-    let resp = client::request(
-        99,
-        10,
-        primary_addr,
-        Frame::Delete { key: key.to_vec() },
-        false,
-    )
-    .expect("delete request to primary");
-    match resp {
-        Frame::DeleteResponse { existed } => {
-            assert!(existed, "primary DELETE should report existed=true");
-        }
-        Frame::Error { message } => {
-            panic!("primary DELETE returned error: {message}");
-        }
-        other => panic!("expected DeleteResponse from primary, got {other:?}"),
-    }
-
-    // Give delete time to propagate
-    thread::sleep(Duration::from_millis(50));
-
-    // Verify deletion on replica
-    let resp = client::request(
-        98,
-        20,
-        replica_addr,
-        Frame::Get { key: key.to_vec() },
-        false,
-    )
-    .expect("get request to replica after delete");
-    match resp {
-        Frame::GetResponse { .. } => {
-            panic!("replica GET after delete should not find the key");
-        }
-        Frame::Error { message } => {
-            assert!(
-                message.contains("not found"),
-                "replica GET after delete should return 'not found': {message}"
-            );
-        }
-        other => panic!("expected Error from replica after delete, got {other:?}"),
     }
 
     // ── STATS on replica: verify backend disclosure ─────────────────

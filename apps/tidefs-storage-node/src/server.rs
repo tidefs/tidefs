@@ -4735,6 +4735,12 @@ impl StorageNode {
 
 /// Frame-protocol handler for session handler threads. Uses SessionContext
 /// can access shared state without holding `&mut self` on the node.
+fn transport_primary_put_requires_receipt(store: &TransportReplicatedStore) -> bool {
+    store.configured_replica_count() > 1
+        || store.connected_replica_count() > 1
+        || store.has_placement_dispatch()
+}
+
 fn handle_frame_ctx(
     session_id: tidefs_transport::SessionId,
     frame: &Frame,
@@ -4747,22 +4753,42 @@ fn handle_frame_ctx(
             let result = match &mut *s {
                 StoreBackend::Local(rs) => rs
                     .put_named(key, value)
-                    .map(|_| ())
+                    .map(|_| Frame::Ok)
                     .map_err(|e| e.to_string()),
-                StoreBackend::TransportBacked(ts) => ts.put_named(key, value).and_then(|outcome| {
-                    if outcome.quorum_reached {
-                        Ok(())
+                StoreBackend::TransportBacked(ts) => {
+                    if transport_primary_put_requires_receipt(ts) {
+                        Err(
+                            "clustered transport-backed primary PUT requires durable placement receipt authority; use PutWithReceipt"
+                                .to_string(),
+                        )
                     } else {
-                        Err(format!(
-                            "write quorum not reached: {}/{} acknowledgements (need {})",
-                            outcome.acks, outcome.total_targets, outcome.quorum_size
-                        ))
+                        ts.put_named(key, value).and_then(|outcome| {
+                            if outcome.quorum_reached {
+                                Ok(Frame::Ok)
+                            } else {
+                                Err(format!(
+                                    "write quorum not reached: {}/{} acknowledgements (need {})",
+                                    outcome.acks, outcome.total_targets, outcome.quorum_size
+                                ))
+                            }
+                        })
                     }
-                }),
-                StoreBackend::PoolBacked(pool) => pool_put_named(pool, key, value),
+                }
+                StoreBackend::PoolBacked(pool) => {
+                    match pool_put_named_with_receipt(pool, key, value) {
+                        Ok((_stored, receipt)) => match receipt.shared_receipt_ref() {
+                            Ok(receipt_ref) => Ok(Frame::PutWithReceiptResponse {
+                                key: key.clone(),
+                                recorded_receipt_ref: Some(receipt_ref),
+                            }),
+                            Err(e) => Err(format!("receipt projection: {e}")),
+                        },
+                        Err(e) => Err(e),
+                    }
+                }
             };
             match result {
-                Ok(()) => Some(Frame::Ok),
+                Ok(frame) => Some(frame),
                 Err(e) => Some(Frame::Error { message: e }),
             }
         }
@@ -4771,6 +4797,10 @@ fn handle_frame_ctx(
             placement_receipt_ref,
             value,
         } => {
+            if let Err(e) = validate_transfer_receipt_for_name(key, value, *placement_receipt_ref) {
+                return Some(Frame::Error { message: e });
+            }
+
             let mut s = store.lock().unwrap();
             let result: Result<Option<PlacementReceiptRef>, String> = match &mut *s {
                 StoreBackend::Local(rs) => rs
@@ -5947,6 +5977,45 @@ mod cluster_pool_handler_tests {
             drain_timeout_secs: 30,
             membership_checkpoint_dir: None,
             cluster_lease_config: None,
+        }
+    }
+
+    fn frame_test_context(store: Arc<Mutex<StoreBackend>>) -> SessionContext {
+        let config = minimal_config();
+        let membership = Arc::new(Mutex::new(MembershipRuntime::new(
+            MembershipConfig::default(),
+            MemberId::new(config.node_id),
+            MemberClass::Voter,
+            config.node_id,
+        )));
+        let roster_session_registry =
+            Arc::new(std::sync::RwLock::new(RosterSessionRegistry::new()));
+        let session_acceptor = Arc::new(std::sync::RwLock::new(SessionAcceptor::new(Arc::clone(
+            &roster_session_registry,
+        ))));
+        let peer_join_handshake =
+            Arc::new(PeerJoinHandshake::new(Arc::clone(&roster_session_registry)));
+        let connection_acceptor = Arc::new(ConnectionAcceptor::new(Arc::clone(&session_acceptor)));
+
+        SessionContext {
+            transport: Arc::new(Mutex::new(Transport::new(config.node_id))),
+            store,
+            membership,
+            membership_transport: None,
+            authority: None,
+            config,
+            imported_pool: None,
+            start_time: Instant::now(),
+            pending_evictions: Arc::new(Mutex::new(Vec::new())),
+            roster_session_registry,
+            session_acceptor,
+            peer_join_handshake,
+            connection_acceptor,
+            placement_version_tracker: Arc::new(PlacementVersionTracker::new()),
+            active_barrier: Arc::new(Mutex::new(None)),
+            fence_validator: None,
+            lease_runtime: None,
+            split_brain_guard: None,
         }
     }
 
@@ -8230,6 +8299,152 @@ mod cluster_pool_handler_tests {
             assert!(pool_delete_named(pool, name).unwrap());
             assert!(pool_get_named(pool, name).unwrap().is_none());
             assert!(pool_list_logical_keys(pool).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn pool_backed_frame_put_returns_recorded_receipt_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let store = Arc::new(Mutex::new(StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ))));
+        let ctx = frame_test_context(Arc::clone(&store));
+        let name = b"pool-backed-frame-put".to_vec();
+        let payload = b"receipt-backed-payload".to_vec();
+
+        let response = handle_frame_ctx(
+            tidefs_transport::SessionId::new(77),
+            &Frame::Put {
+                key: name.clone(),
+                value: payload.clone(),
+            },
+            &store,
+            &ctx,
+        )
+        .expect("frame response");
+
+        let receipt = match response {
+            Frame::PutWithReceiptResponse {
+                key,
+                recorded_receipt_ref: Some(receipt),
+            } => {
+                assert_eq!(key, name);
+                receipt
+            }
+            other => panic!("expected receipt-bearing put response, got {other:?}"),
+        };
+        assert!(!receipt.is_synthetic());
+        assert_eq!(receipt.object_key, ObjectKey::from_name(&name).as_bytes32());
+        assert_eq!(receipt.payload_len, payload.len() as u64);
+        let expected_digest: [u8; 32] = blake3::hash(&payload).into();
+        assert_eq!(receipt.payload_digest, expected_digest);
+        assert_eq!(receipt.target_count, 2);
+        assert_eq!(
+            receipt.redundancy_policy,
+            tidefs_replication_model::ReceiptRedundancyPolicy::Replicated { copies: 2 }
+        );
+
+        let mut guard = store.lock().unwrap();
+        match &mut *guard {
+            StoreBackend::PoolBacked(pool) => {
+                assert_eq!(pool_get_named(pool, &name).unwrap(), Some(payload));
+            }
+            _ => panic!("expected pool backend"),
+        }
+    }
+
+    #[test]
+    fn transport_backed_frame_put_requires_receipt_authority() {
+        let (_tmp, transport_store) = transport_store_with_placement();
+        let store = Arc::new(Mutex::new(StoreBackend::TransportBacked(Box::new(
+            transport_store,
+        ))));
+        let ctx = frame_test_context(Arc::clone(&store));
+
+        let response = handle_frame_ctx(
+            tidefs_transport::SessionId::new(78),
+            &Frame::Put {
+                key: b"transport-frame-put".to_vec(),
+                value: b"payload".to_vec(),
+            },
+            &store,
+            &ctx,
+        )
+        .expect("frame response");
+
+        match response {
+            Frame::Error { message } => {
+                assert!(message.contains("requires durable placement receipt authority"));
+            }
+            other => panic!("expected receipt-authority error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_put_with_receipt_rejects_invalid_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let (imported, lock_dir, _devices) = imported_regular_file_pool(
+            &dir,
+            &["dev0.img", "dev1.img"],
+            RedundancyPolicy::replicated(2),
+        );
+        let store = Arc::new(Mutex::new(StoreBackend::PoolBacked(Box::new(
+            open_imported_pool_backend(&imported, &lock_dir).unwrap(),
+        ))));
+        let ctx = frame_test_context(Arc::clone(&store));
+        let name = b"synthetic-put-with-receipt".to_vec();
+
+        let response = handle_frame_ctx(
+            tidefs_transport::SessionId::new(79),
+            &Frame::PutWithReceipt {
+                key: name.clone(),
+                placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                    tidefs_replication_model::ReplicatedSubjectId::new(79),
+                ),
+                value: b"payload".to_vec(),
+            },
+            &store,
+            &ctx,
+        )
+        .expect("frame response");
+
+        match response {
+            Frame::Error { message } => assert!(message.contains("synthetic")),
+            other => panic!("expected synthetic receipt error, got {other:?}"),
+        }
+
+        let mismatched_name = b"mismatched-put-with-receipt".to_vec();
+        let response = handle_frame_ctx(
+            tidefs_transport::SessionId::new(80),
+            &Frame::PutWithReceipt {
+                key: mismatched_name.clone(),
+                placement_receipt_ref: receipt_ref(&mismatched_name, b"other-payload", 9),
+                value: b"payload".to_vec(),
+            },
+            &store,
+            &ctx,
+        )
+        .expect("frame response");
+
+        match response {
+            Frame::Error { message } => {
+                assert!(message.contains("payload length") || message.contains("payload digest"));
+            }
+            other => panic!("expected payload receipt error, got {other:?}"),
+        }
+
+        let mut guard = store.lock().unwrap();
+        match &mut *guard {
+            StoreBackend::PoolBacked(pool) => {
+                assert!(pool_get_named(pool, &name).unwrap().is_none());
+                assert!(pool_get_named(pool, &mismatched_name).unwrap().is_none());
+            }
+            _ => panic!("expected pool backend"),
         }
     }
 

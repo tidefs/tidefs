@@ -106,7 +106,7 @@ pub fn run_client(
                 rdma,
             )?;
             match resp {
-                Frame::Ok => println!("ok"),
+                Frame::Ok | Frame::PutWithReceiptResponse { .. } => println!("ok"),
                 Frame::Error { message } => return Err(format!("server error: {message}")),
                 other => return Err(format!("unexpected response: {other:?}")),
             }

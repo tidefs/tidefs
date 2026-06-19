@@ -3037,8 +3037,27 @@ impl TransportReplicatedStore {
     }
 
     /// Return the list of connected node IDs available for placement.
+    #[must_use]
     pub fn connected_node_ids(&self) -> Vec<u64> {
         self.replicas.iter().map(|r| r.node_id).collect()
+    }
+
+    /// Return the configured replica count, including the local primary.
+    #[must_use]
+    pub fn configured_replica_count(&self) -> usize {
+        self.config.total_replicas
+    }
+
+    /// Return the currently connected replica count, including the local primary.
+    #[must_use]
+    pub fn connected_replica_count(&self) -> usize {
+        1 + self.replicas.len()
+    }
+
+    /// Return whether placement-aware dispatch is installed.
+    #[must_use]
+    pub fn has_placement_dispatch(&self) -> bool {
+        self.placement.is_some()
     }
 
     pub fn verification_ctx_mut(&mut self) -> &mut VerificationContext {
