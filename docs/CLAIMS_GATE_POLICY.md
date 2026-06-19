@@ -64,7 +64,7 @@ Use the smallest tier whose artifact source and scope match the claim:
 | `qemu-module-load` | QEMU evidence that the kernel module can load and expose the expected control surface. | Module-load evidence classes. This tier does not satisfy mounted kernel VFS, block I/O, or full-kernel no-daemon classes by itself. |
 | `mounted-kernel-vfs` | Mounted kernel VFS runtime rows, usually from QEMU/kernel workflows with artifact output. | Runtime kernel VFS evidence classes whose claim scope is the mounted kernel filesystem path. |
 | `kernel-block-io` | Kernel block-device I/O runtime rows, including uBLK/kernel block interaction when the artifact scope names that path. | Runtime kernel block I/O evidence classes whose claim scope is block-device behavior. |
-| `full-kernel-no-daemon` | Mounted operation through the kernel-resident no-daemon path. | Full-kernel no-daemon evidence classes only when the artifact proves the specific claim scope. |
+| `full-kernel-no-daemon` | Mounted operation through the kernel-resident no-daemon path. | Not yet full-kernel no-daemon evidence; applies only when the artifact proves the specific claim scope. |
 | `multi-process-distributed` | Multi-process transport, cluster, or RDMA runtime rows with captured commands, topology, backend, and outputs. | Distributed or RDMA runtime evidence classes when the claim explicitly requires that class and the artifact scope matches the topology and transport. |
 
 `claims-gate-review` is an evidence class, not a runtime tier. A
@@ -177,6 +177,7 @@ The claims gate checks the exact registry/admission table below against
 | `snapshot send` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | export snapshot streams through owner authority or explicit offline devices |
 | `snapshot receive` | `public-operator` | `live-owner` | `local-only` | `visible` | receive snapshot streams through the live owner; offline receive is unsupported |
 | `device remove` | `public-operator` | `live-owner` | `local-only` | `visible` | route device evacuation/removal through live placement and refcount authority |
+| `device status` | `public-operator` | `live-owner` | `unguarded` | `visible` | query live device status through the live owner; fail closed when no live owner is reachable |
 | `defrag` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | request online extent-map defragmentation for a path |
 | `block attach` | `public-operator` | `live-owner` | `local-only` | `visible` | attach an imported pool as a ublk block device through owner authority |
 | `block detach` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | detach an existing ublk device by numeric id |
@@ -202,6 +203,7 @@ The claims gate checks the exact registry/admission table below against
 | `cluster pool create` | `prototype` | `prototype-only` | `unguarded` | `visible` | prototype clustered pool creation; not final distributed operator UAPI |
 | `cluster placement exercise` | `development-diagnostic` | `development-exercise` | `unguarded` | `visible` | development diagnostic exercise for placement-map code |
 | `cluster heal exercise` | `development-diagnostic` | `development-exercise` | `unguarded` | `visible` | development diagnostic exercise for placement-heal code |
+| `cluster status` | `public-operator` | `live-owner` | `unguarded` | `visible` | query live cluster status through the live owner; fail closed when no live owner is reachable |
 | `pool list` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | no authoritative pool registry exists; use pool scan --devices or pool status <pool> |
 | `device rebuild` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | offline directory object-store rebuild is retired; use live pool repair authority |
 | `directory-backed pool media` | `removed-or-unsupported` | `removed` | `unguarded` | `hidden` | directory object-store pool media is retired for operator pool commands |
