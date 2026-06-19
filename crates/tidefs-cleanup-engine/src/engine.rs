@@ -8,6 +8,10 @@ use tidefs_cleanup_job_core::{CleanupContext, JobOutcome};
 use tidefs_cleanup_queue_core::CleanupQueue;
 
 use crate::job_executor::JobExecutor;
+use crate::receipts::{
+    CleanupReplayDecision, CleanupReplayDecisionReceipt, CleanupReplayRequiredEvidence,
+    CleanupReplayValidationTier,
+};
 use std::fmt;
 
 use crate::progress::CleanupProgress;
@@ -150,6 +154,8 @@ pub struct CleanupEngine<E: JobExecutor> {
     /// Entry IDs that were retried or left incomplete; they will be
     /// re-attempted in future cycles rather than skipped.
     retry_ids: Vec<u64>,
+    /// Per-entry replay decisions observed by this engine instance.
+    replay_decision_receipts: Vec<CleanupReplayDecisionReceipt>,
 }
 
 impl<E: JobExecutor> fmt::Debug for CleanupEngine<E> {
@@ -160,6 +166,10 @@ impl<E: JobExecutor> fmt::Debug for CleanupEngine<E> {
             .field("batch_size", &self.batch_size)
             .field("progress", &self.progress)
             .field("retry_ids", &self.retry_ids.len())
+            .field(
+                "replay_decision_receipts",
+                &self.replay_decision_receipts.len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -179,6 +189,7 @@ impl<E: JobExecutor> CleanupEngine<E> {
             progress: CleanupProgress::new(),
             stats: EngineStats::ZERO,
             retry_ids: Vec::new(),
+            replay_decision_receipts: Vec::new(),
         }
     }
 
@@ -202,6 +213,7 @@ impl<E: JobExecutor> CleanupEngine<E> {
             progress,
             stats: EngineStats::ZERO,
             retry_ids: Vec::new(),
+            replay_decision_receipts: Vec::new(),
         })
     }
 
@@ -305,6 +317,24 @@ impl<E: JobExecutor> CleanupEngine<E> {
         self.progress.last_processed_entry_id
     }
 
+    /// Replay decision receipts recorded since engine creation or the last
+    /// explicit clear/take call.
+    #[must_use]
+    pub fn replay_decision_receipts(&self) -> &[CleanupReplayDecisionReceipt] {
+        &self.replay_decision_receipts
+    }
+
+    /// Clear accumulated replay decision receipts without changing engine
+    /// progress or statistics.
+    pub fn clear_replay_decision_receipts(&mut self) {
+        self.replay_decision_receipts.clear();
+    }
+
+    /// Drain accumulated replay decision receipts for external persistence.
+    pub fn take_replay_decision_receipts(&mut self) -> Vec<CleanupReplayDecisionReceipt> {
+        std::mem::take(&mut self.replay_decision_receipts)
+    }
+
     /// Process up to `batch_size` pending work items in one cycle.
     ///
     /// Returns `true` if the queue has been fully exhausted (no more
@@ -357,6 +387,15 @@ impl<E: JobExecutor> CleanupEngine<E> {
 
             // Skip already-completed items
             if item.is_complete() {
+                self.replay_decision_receipts
+                    .push(CleanupReplayDecisionReceipt::for_item(
+                        entry_id,
+                        &item,
+                        CleanupReplayDecision::Skipped,
+                        CleanupReplayRequiredEvidence::QueueCompletionFlag,
+                        "entry already marked complete in cleanup queue",
+                        CleanupReplayValidationTier::QueueEntry,
+                    ));
                 // Still advance progress past completed items
                 last_processed_id = entry_id;
                 continue;
@@ -365,6 +404,18 @@ impl<E: JobExecutor> CleanupEngine<E> {
             // Skip items at-or-before the progress cursor unless they're retries
             let is_retry = self.retry_ids.contains(&entry_id);
             if !is_retry && entry_id <= self.progress.last_processed_entry_id {
+                self.replay_decision_receipts
+                    .push(CleanupReplayDecisionReceipt::for_item(
+                        entry_id,
+                        &item,
+                        CleanupReplayDecision::Skipped,
+                        CleanupReplayRequiredEvidence::ProgressCursor,
+                        format!(
+                            "entry id {entry_id} covered by progress cursor {}",
+                            self.progress.last_processed_entry_id
+                        ),
+                        CleanupReplayValidationTier::EngineState,
+                    ));
                 continue;
             }
 
@@ -374,6 +425,7 @@ impl<E: JobExecutor> CleanupEngine<E> {
             }
 
             let ctx = CleanupContext::new(entry_id, 0);
+            let executor_name = self.executor.name().to_string();
             let outcome = self.executor.execute(&mut item, &ctx);
 
             self.stats.items_processed = self.stats.items_processed.saturating_add(1);
@@ -381,22 +433,64 @@ impl<E: JobExecutor> CleanupEngine<E> {
 
             match outcome {
                 JobOutcome::Completed => {
+                    self.replay_decision_receipts
+                        .push(CleanupReplayDecisionReceipt::for_item(
+                            entry_id,
+                            &item,
+                            CleanupReplayDecision::Executed,
+                            CleanupReplayRequiredEvidence::ExecutorCompleted,
+                            format!("executor {executor_name} completed cleanup item"),
+                            CleanupReplayValidationTier::ExecutorOutcome,
+                        ));
                     self.stats.items_completed = self.stats.items_completed.saturating_add(1);
                     self.queue.mark_complete(entry_id);
                     last_processed_id = entry_id;
                 }
                 JobOutcome::Incomplete => {
+                    self.replay_decision_receipts
+                        .push(CleanupReplayDecisionReceipt::for_item(
+                            entry_id,
+                            &item,
+                            CleanupReplayDecision::Deferred,
+                            CleanupReplayRequiredEvidence::ExecutorIncomplete,
+                            format!("executor {executor_name} left cleanup item incomplete"),
+                            CleanupReplayValidationTier::ExecutorOutcome,
+                        ));
                     self.stats.items_incomplete = self.stats.items_incomplete.saturating_add(1);
                     // Re-enqueue for next cycle
                     self.retry_ids.push(entry_id);
                     last_processed_id = entry_id;
                 }
-                JobOutcome::Retryable(_) => {
+                JobOutcome::Retryable(err) => {
+                    self.replay_decision_receipts
+                        .push(CleanupReplayDecisionReceipt::for_item(
+                            entry_id,
+                            &item,
+                            CleanupReplayDecision::Deferred,
+                            CleanupReplayRequiredEvidence::ExecutorRetryable,
+                            format!(
+                                "executor {executor_name} returned retryable {:?}: {}",
+                                err.phase, err.message
+                            ),
+                            CleanupReplayValidationTier::ExecutorOutcome,
+                        ));
                     self.stats.items_retryable = self.stats.items_retryable.saturating_add(1);
                     self.retry_ids.push(entry_id);
                     last_processed_id = entry_id;
                 }
-                JobOutcome::Fatal(_) => {
+                JobOutcome::Fatal(err) => {
+                    self.replay_decision_receipts
+                        .push(CleanupReplayDecisionReceipt::for_item(
+                            entry_id,
+                            &item,
+                            CleanupReplayDecision::Rejected,
+                            CleanupReplayRequiredEvidence::ExecutorFatal,
+                            format!(
+                                "executor {executor_name} returned fatal {:?}: {}",
+                                err.phase, err.message
+                            ),
+                            CleanupReplayValidationTier::ExecutorOutcome,
+                        ));
                     self.stats.items_fatal = self.stats.items_fatal.saturating_add(1);
                     // Mark complete to prevent blocking the queue
                     item.mark_complete();
@@ -616,6 +710,34 @@ mod tests {
         assert!(stats.items_processed >= 2);
     }
 
+    #[test]
+    fn run_cycle_records_executed_replay_receipt() {
+        let mut queue = CleanupQueue::new();
+        queue.enqueue(make_item(1, WorkItemKind::UnlinkFree, 1024));
+
+        let executor = MockExecutor::new();
+        let mut engine = CleanupEngine::new(queue, executor, 10);
+
+        engine.run_cycle();
+
+        let receipts = engine.replay_decision_receipts();
+        assert_eq!(receipts.len(), 1);
+        let receipt = &receipts[0];
+        assert_eq!(receipt.entry_id, 1);
+        assert_eq!(receipt.entry_generation, 1);
+        assert_eq!(receipt.work_kind, WorkItemKind::UnlinkFree);
+        assert_eq!(receipt.decision, CleanupReplayDecision::Executed);
+        assert_eq!(
+            receipt.required_evidence,
+            Some(CleanupReplayRequiredEvidence::ExecutorCompleted)
+        );
+        assert_eq!(
+            receipt.validation_tier,
+            CleanupReplayValidationTier::ExecutorOutcome
+        );
+        receipt.validate(1).unwrap();
+    }
+
     // ── Batch size control ───────────────────────────────────────────
 
     #[test]
@@ -709,6 +831,13 @@ mod tests {
         engine.run_cycle();
         assert_eq!(engine.stats().items_retryable, 1);
         assert!(!engine.retry_ids.is_empty());
+        let receipt = engine.replay_decision_receipts().last().unwrap();
+        assert_eq!(receipt.decision, CleanupReplayDecision::Deferred);
+        assert_eq!(
+            receipt.required_evidence,
+            Some(CleanupReplayRequiredEvidence::ExecutorRetryable)
+        );
+        receipt.validate(1).unwrap();
 
         // Cycle 2: retryable again (mock always returns retryable for item 1)
         engine.run_cycle();
@@ -726,6 +855,13 @@ mod tests {
         engine.run_cycle();
         assert_eq!(engine.stats().items_fatal, 1);
         assert_eq!(engine.stats().items_completed, 0);
+        let receipt = engine.replay_decision_receipts().last().unwrap();
+        assert_eq!(receipt.decision, CleanupReplayDecision::Rejected);
+        assert_eq!(
+            receipt.required_evidence,
+            Some(CleanupReplayRequiredEvidence::ExecutorFatal)
+        );
+        receipt.validate(1).unwrap();
 
         // The item should be marked complete in the queue
         assert_eq!(engine.queue().pending_count(), 0);
@@ -746,6 +882,13 @@ mod tests {
         engine.run_cycle();
         // No new items processed (they were already complete)
         assert_eq!(engine.stats().items_processed, 0);
+        let receipt = engine.replay_decision_receipts().last().unwrap();
+        assert_eq!(receipt.decision, CleanupReplayDecision::Skipped);
+        assert_eq!(
+            receipt.required_evidence,
+            Some(CleanupReplayRequiredEvidence::QueueCompletionFlag)
+        );
+        receipt.validate(1).unwrap();
     }
 
     // ── Empty queue ──────────────────────────────────────────────────
