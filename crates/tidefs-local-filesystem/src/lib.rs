@@ -6684,17 +6684,18 @@ impl LocalFileSystem {
         // the write, replacing the former check-then-record TOCTOU pattern.
         // The reservation handle is immediately consumed so the mutable borrow
         // on self is released before the write body.
-        let _admit_bytes = new_size.saturating_sub(record.size);
-        if _admit_bytes > 0 {
-            let handle = self.reserve_with_hierarchy(_admit_bytes).map_err(|_e| {
-                FileSystemError::NoSpace {
+        let physical_admit_bytes = bytes_len;
+        let logical_growth_bytes = new_size.saturating_sub(record.size);
+        if physical_admit_bytes > 0 {
+            let handle = self
+                .reserve_with_hierarchy(physical_admit_bytes)
+                .map_err(|_e| FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
-                    requested: _admit_bytes,
+                    requested: physical_admit_bytes,
                     available: self.capacity_authority.available_bytes(),
                     capacity: self.capacity_authority.total_bytes(),
                     allocated: self.capacity_authority.used_bytes(),
-                }
-            })?;
+                })?;
             // Immediately commit: reserved bytes become used bytes.
             // The handle is consumed here, releasing the immutable borrow on self.
             handle.commit();
@@ -6772,13 +6773,12 @@ impl LocalFileSystem {
                 .quota_table
                 .apply_delta(&inode_ancestors, delta_bytes, 0);
         }
-        // Accumulate the logical allocation delta admitted by the capacity
-        // authority. Overwrites still write physical bytes, but they must not
-        // grow committed logical usage.
-        if _admit_bytes > 0 {
+        // Capacity admission uses worst-case physical write pressure, while
+        // committed logical usage only grows when the file grows.
+        if logical_growth_bytes > 0 {
             self.state
                 .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(_admit_bytes));
+                .accumulate_delta(SpaceDelta::new_write(logical_growth_bytes));
         }
         if bytes_len > 0 {
             self.state.space_accounting.track_physical_write(bytes_len);
@@ -6857,17 +6857,18 @@ impl LocalFileSystem {
             }
         }
 
-        let admit_bytes = new_size.saturating_sub(effective_size);
-        if admit_bytes > 0 {
-            let handle = self.reserve_with_hierarchy(admit_bytes).map_err(|_e| {
-                FileSystemError::NoSpace {
+        let physical_admit_bytes = total_bytes;
+        let logical_growth_bytes = new_size.saturating_sub(effective_size);
+        if physical_admit_bytes > 0 {
+            let handle = self
+                .reserve_with_hierarchy(physical_admit_bytes)
+                .map_err(|_e| FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
-                    requested: admit_bytes,
+                    requested: physical_admit_bytes,
                     available: self.capacity_authority.available_bytes(),
                     capacity: self.capacity_authority.total_bytes(),
                     allocated: self.capacity_authority.used_bytes(),
-                }
-            })?;
+                })?;
             handle.commit();
         }
 
@@ -6927,10 +6928,10 @@ impl LocalFileSystem {
                 .quota_table
                 .apply_delta(&inode_ancestors, delta_bytes, 0);
         }
-        if admit_bytes > 0 {
+        if logical_growth_bytes > 0 {
             self.state
                 .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(admit_bytes));
+                .accumulate_delta(SpaceDelta::new_write(logical_growth_bytes));
         }
         self.state
             .space_accounting
