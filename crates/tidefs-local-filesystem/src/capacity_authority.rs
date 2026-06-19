@@ -408,7 +408,7 @@ impl CapacityAuthority {
         if requested_bytes == 0 {
             return Ok(());
         }
-        let held_bytes = self.reserved_bytes().saturating_add(self.pending_bytes());
+        let held_bytes = self.transient_held_bytes();
         let needed_bytes = requested_bytes.saturating_add(held_bytes);
         let accounting = self
             .committed_accounting
@@ -439,6 +439,17 @@ impl CapacityAuthority {
 
     // ── Statfs derivation ───────────────────────────────────────────
 
+    fn transient_held_bytes(&self) -> u64 {
+        self.reserved_bytes().saturating_add(self.pending_bytes())
+    }
+
+    fn blocks_after_transient_hold(blocks: u64, block_size: u64, held_bytes: u64) -> u64 {
+        if block_size == 0 {
+            return 0;
+        }
+        blocks.saturating_mul(block_size).saturating_sub(held_bytes) / block_size
+    }
+
     /// Derive filesystem block counters suitable for statfs/statvfs.
     #[must_use]
     pub fn derive_statfs(
@@ -453,6 +464,11 @@ impl CapacityAuthority {
             .expect("capacity committed accounting lock poisoned")
             .statfs();
         let block_size = u32::try_from(statfs.block_size).unwrap_or(u32::MAX);
+        let held_bytes = self.transient_held_bytes();
+        let free_blocks =
+            Self::blocks_after_transient_hold(statfs.blocks_free, statfs.block_size, held_bytes);
+        let avail_blocks =
+            Self::blocks_after_transient_hold(statfs.blocks_avail, statfs.block_size, held_bytes);
         let reserve_blocks = if statfs.block_size == 0 {
             0
         } else {
@@ -461,8 +477,8 @@ impl CapacityAuthority {
 
         CapacityStatfs {
             total_blocks: statfs.blocks,
-            free_blocks: statfs.blocks_free,
-            avail_blocks: statfs.blocks_avail.saturating_sub(reserve_blocks),
+            free_blocks,
+            avail_blocks: avail_blocks.saturating_sub(reserve_blocks),
             total_inodes: inode_total,
             free_inodes: inode_free,
             block_size,
@@ -504,7 +520,10 @@ impl CapacityAuthority {
             .read()
             .expect("capacity committed accounting lock poisoned")
             .statfs();
-        statfs.blocks_free.saturating_mul(statfs.block_size)
+        statfs
+            .blocks_free
+            .saturating_mul(statfs.block_size)
+            .saturating_sub(self.transient_held_bytes())
     }
 
     #[must_use]
@@ -517,6 +536,7 @@ impl CapacityAuthority {
         statfs
             .blocks_avail
             .saturating_mul(statfs.block_size)
+            .saturating_sub(self.transient_held_bytes())
             .saturating_sub(self.root_reserve_bytes())
     }
 
@@ -733,13 +753,13 @@ mod tests {
     }
 
     #[test]
-    fn record_allocation_tracks_pending_without_rederiving_free_bytes() {
+    fn record_allocation_tracks_pending_against_committed_free_bytes() {
         let a = authority(100, 0);
         assert_eq!(a.free_bytes(), 100 * 1024 * 1024);
         a.record_allocation(1024 * 1024);
         assert_eq!(a.used_bytes(), 1024 * 1024);
         assert_eq!(a.pending_bytes(), 1024 * 1024);
-        assert_eq!(a.free_bytes(), 100 * 1024 * 1024);
+        assert_eq!(a.free_bytes(), 99 * 1024 * 1024);
     }
 
     #[test]
@@ -775,7 +795,7 @@ mod tests {
         let h = a.reserve(4096).expect("reserve 1 block");
         assert_eq!(h.bytes(), 4096);
         assert_eq!(a.reserved_bytes(), 4096);
-        assert_eq!(a.free_bytes(), 100 * 1024 * 1024);
+        assert_eq!(a.free_bytes(), (100 * 1024 * 1024) - 4096);
         h.release();
         assert_eq!(a.reserved_bytes(), 0);
         assert_eq!(a.free_bytes(), 100 * 1024 * 1024);
@@ -791,7 +811,7 @@ mod tests {
         assert_eq!(a.reserved_bytes(), 0);
         assert_eq!(a.used_bytes(), 8192);
         assert_eq!(a.pending_bytes(), 8192);
-        assert_eq!(a.free_bytes(), 100 * 1024 * 1024);
+        assert_eq!(a.free_bytes(), (100 * 1024 * 1024) - 8192);
     }
 
     #[test]
@@ -916,8 +936,8 @@ mod tests {
         let s = a.derive_statfs(500, 400, 255);
         let bs = u64::from(a.block_size());
         assert_eq!(s.total_blocks, (100u64 * 1024 * 1024) / bs);
-        assert_eq!(s.free_blocks, (50u64 * 1024 * 1024) / bs);
-        assert_eq!(s.avail_blocks, (50u64 * 1024 * 1024) / bs);
+        assert_eq!(s.free_blocks, (40u64 * 1024 * 1024) / bs);
+        assert_eq!(s.avail_blocks, (40u64 * 1024 * 1024) / bs);
         assert_eq!(s.total_inodes, 500);
         assert_eq!(s.free_inodes, 400);
     }
@@ -1002,11 +1022,11 @@ mod tests {
     }
 
     #[test]
-    fn transient_reservations_do_not_change_committed_free_bytes() {
+    fn transient_reservations_reduce_visible_free_bytes() {
         let a = authority(100, 40);
         let free_before = a.free_bytes();
         let _h = a.reserve(10 * 1024 * 1024).expect("reserve");
-        assert_eq!(a.free_bytes(), free_before);
+        assert_eq!(a.free_bytes(), free_before - (10 * 1024 * 1024));
         assert!(a.check_enospc(50 * 1024 * 1024).is_ok());
         assert_eq!(a.check_enospc(51 * 1024 * 1024), Err(Errno(ENOSPC)));
     }
@@ -1065,11 +1085,11 @@ mod tests {
                                   // Hold all but one block in transient pending bytes.
         let h = a.reserve(10 * 1024 * 1024 - 4096).expect("fill nearly all");
         h.commit();
-        assert_eq!(a.free_bytes(), 10 * 1024 * 1024);
+        assert_eq!(a.free_bytes(), 4096);
         // Reserve the last block.
         let handle = a.reserve(4096).expect("last block reserve");
         assert_eq!(a.reserved_bytes(), 4096);
-        assert_eq!(a.available_bytes(), 10 * 1024 * 1024);
+        assert_eq!(a.available_bytes(), 0);
         // Additional reservation must fail.
         assert_eq!(a.reserve(4096).unwrap_err(), Errno(ENOSPC));
         // Commit the reservation — pool is now full.
@@ -1077,7 +1097,7 @@ mod tests {
         assert_eq!(a.used_bytes(), 10 * 1024 * 1024);
         assert_eq!(a.reserved_bytes(), 0);
         assert_eq!(a.pending_bytes(), 10 * 1024 * 1024);
-        assert_eq!(a.free_bytes(), 10 * 1024 * 1024);
+        assert_eq!(a.free_bytes(), 0);
     }
 
     #[test]
@@ -1088,7 +1108,7 @@ mod tests {
         // Reserve and commit 10 MiB.
         let handle = a.reserve(10 * 1024 * 1024).expect("reserve");
         handle.commit();
-        assert_eq!(a.available_bytes(), avail_before);
+        assert_eq!(a.available_bytes(), avail_before - 10 * 1024 * 1024);
 
         // Free the same amount — capacity returns.
         a.record_free(10 * 1024 * 1024);
@@ -1116,7 +1136,7 @@ mod tests {
         // Simulate a truncate that frees 20 MiB.
         a.record_allocation(20 * 1024 * 1024);
         assert_eq!(a.used_bytes(), 100 * 1024 * 1024);
-        assert_eq!(a.free_bytes(), 20 * 1024 * 1024);
+        assert_eq!(a.free_bytes(), 0);
 
         // Free 20 MiB — capacity returns exactly.
         a.record_free(20 * 1024 * 1024);
@@ -1145,7 +1165,7 @@ mod tests {
         // Simulate write: reserve + commit.
         let handle = a.reserve(10 * 1024 * 1024).expect("reserve");
         handle.commit();
-        assert_eq!(a.free_bytes(), free_before);
+        assert_eq!(a.free_bytes(), free_before - 10 * 1024 * 1024);
 
         // Simulate removal (unlink): free the bytes.
         a.record_free(10 * 1024 * 1024);
