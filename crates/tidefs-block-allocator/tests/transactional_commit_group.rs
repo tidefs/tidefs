@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Commit-group fenced allocation tests.
 
 use tidefs_block_allocator::{
