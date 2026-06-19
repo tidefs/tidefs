@@ -1287,6 +1287,9 @@ pub struct PoolConfig {
     pub missing_indices: Vec<u32>,
     /// Indices of devices currently being removed (allocation-fenced).
     pub removing_device_indices: Vec<u32>,
+    /// Completed evacuation receipts committed before device retirement.
+    #[serde(default)]
+    pub completed_evacuations: Vec<CompletedEvacuation>,
 }
 /// A borrowed reference to a leaf device's immutable fields,
 /// returned by [`DeviceType::find_leaf`].
@@ -2200,6 +2203,7 @@ impl PoolAssembler {
             device_count: ref_count,
             missing_indices: missing,
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         })
     }
 }
@@ -3051,7 +3055,32 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         }
+    }
+
+    #[test]
+    fn pool_config_completed_evacuations_serde_roundtrip_and_default() {
+        let mut config = make_single_device_config();
+        let evacuation = CompletedEvacuation {
+            target_device_guid: [0xEEu8; 16],
+            topology_generation: 2,
+            receipt_digest: [0xD0u8; 32],
+            receipt_id: 7,
+        };
+        config.completed_evacuations.push(evacuation.clone());
+
+        let encoded = serde_json::to_value(&config).unwrap();
+        let decoded: PoolConfig = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.completed_evacuations, vec![evacuation]);
+
+        let mut legacy_encoded = encoded;
+        legacy_encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("completed_evacuations");
+        let legacy_decoded: PoolConfig = serde_json::from_value(legacy_encoded).unwrap();
+        assert!(legacy_decoded.completed_evacuations.is_empty());
     }
 
     fn make_legacy_parity_config() -> PoolConfig {
@@ -3095,6 +3124,7 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         }
     }
 
@@ -3191,6 +3221,7 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         let (stats, trigger) =
@@ -3279,6 +3310,7 @@ mod tests {
             device_count: leaf_count,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         let result = PoolAddVdev::add_vdev(device_path, DeviceRole::PoolDataMember, &mut config);
@@ -3387,6 +3419,7 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         // 1. Generate labels from the config.
@@ -3485,6 +3518,7 @@ mod tests {
             device_count: 3,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         // Generate labels and write each to its corresponding device file.

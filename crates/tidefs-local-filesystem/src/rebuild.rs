@@ -397,6 +397,7 @@ mod tests {
             device_count: 2,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         let surviving = temp_root("healthy-surv");
@@ -438,6 +439,7 @@ mod tests {
             device_count: 3,          // three configured
             missing_indices: vec![2], // device 2 missing
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         let surviving = temp_root("mirror-surv");
@@ -494,6 +496,7 @@ mod tests {
             device_count: 2,
             missing_indices: vec![1],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         let new_gen = mark_device_rebuilt(&mut config, 1);
@@ -607,6 +610,7 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         let old_gen = config.topology_generation;

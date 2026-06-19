@@ -1148,6 +1148,24 @@ impl DeviceRemovalDriver {
         &self.pool_config_snapshot
     }
 
+    /// Return the completed evacuation evidence committed for this removal.
+    #[must_use]
+    pub fn completed_evacuation(&self) -> Option<tidefs_pool_scan::CompletedEvacuation> {
+        self.state
+            .evacuation_receipt
+            .as_ref()
+            .map(EvacuationReceipt::to_completed_evacuation)
+    }
+
+    /// Extract the completed evacuation evidence for storage in pool metadata.
+    ///
+    /// This returns a cloned evidence record and keeps the evacuation receipt in
+    /// removal state so [`Self::mark_removed`] can re-verify the final gate.
+    #[must_use]
+    pub fn take_completed_evacuation(&self) -> Option<tidefs_pool_scan::CompletedEvacuation> {
+        self.completed_evacuation()
+    }
+
     /// Access surviving device IDs.
     #[must_use]
     pub fn surviving_device_ids(&self) -> &[DeviceId] {
@@ -1290,7 +1308,7 @@ impl DeviceRemovalDriver {
     /// Returns an error if not in the Evacuated phase.
     pub fn commit_vacated(
         &mut self,
-        updated_pool_config: tidefs_pool_scan::PoolConfig,
+        mut updated_pool_config: tidefs_pool_scan::PoolConfig,
     ) -> Result<(), DeviceRemovalError> {
         self.require_phase(DeviceRemovalPhase::Evacuated, "commit_vacated")?;
 
@@ -1357,6 +1375,16 @@ impl DeviceRemovalDriver {
                 updated_pool_config.topology_generation,
             );
             return Err(self.transition_to_failed(evidence));
+        }
+
+        let completed_evacuation = evac_receipt.to_completed_evacuation();
+        if !updated_pool_config
+            .completed_evacuations
+            .contains(&completed_evacuation)
+        {
+            updated_pool_config
+                .completed_evacuations
+                .push(completed_evacuation);
         }
 
         let digest_data = committed_topology_digest_data(&self.state, &updated_pool_config);
@@ -2265,6 +2293,7 @@ mod tests {
             device_count: count,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         }
     }
 
@@ -4003,6 +4032,17 @@ mod tests {
             vec![placement_receipt_ref(11)]
         );
         assert!(receipt.verify_digest());
+        let completed = receipt.to_completed_evacuation();
+        assert_eq!(
+            driver.take_completed_evacuation(),
+            Some(completed.clone()),
+            "driver must expose completed evacuation evidence"
+        );
+        assert_eq!(
+            driver.pool_config().completed_evacuations,
+            vec![completed],
+            "committed pool config must carry the completed evacuation evidence"
+        );
         assert_eq!(driver.state().phase, DeviceRemovalPhase::Vacated);
     }
 

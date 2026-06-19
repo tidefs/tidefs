@@ -523,6 +523,7 @@ pub fn import_pool_config_from_store(
         device_count: ref_count,
         missing_indices: vec![],
         removing_device_indices: vec![],
+        completed_evacuations: vec![],
     }))
 }
 
@@ -724,6 +725,7 @@ mod tests {
             device_count: 3,
             missing_indices: vec![],
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         };
 
         // Remove disk1 (index 1).
@@ -1188,6 +1190,7 @@ fn imported_config_preserves_authoritative_fields_through_remove_device() {
         device_count: 3,
         missing_indices: vec![],
         removing_device_indices: vec![],
+        completed_evacuations: vec![],
     };
 
     // Persist original labels into the store.
