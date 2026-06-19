@@ -75,10 +75,10 @@ use tidefs_replication_model::{
 use tidefs_transport::carrier_selection::CarrierPolicy;
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
-    send_replication_msg, send_segment_fetch_response, PlacementMap as TransportPlacementMap,
-    PlacementMapRefusalReason, PlacementVersionTracker, ReplicationMessage, SegmentFetchRequest,
-    SegmentFetchResponse, SessionCloseReason, SyncEntry, Transport, TransportError,
-    SEGMENT_FETCH_REQUEST_MAGIC,
+    build_read_responses, send_replication_msg, send_segment_fetch_response, ObjectTransferMessage,
+    PlacementMap as TransportPlacementMap, PlacementMapRefusalReason, PlacementVersionTracker,
+    ReplicationMessage, SegmentFetchRequest, SegmentFetchResponse, SessionCloseReason, SyncEntry,
+    Transport, TransportError, MAX_CHUNK_PAYLOAD, SEGMENT_FETCH_REQUEST_MAGIC,
 };
 use tidefs_types_pool_label_core::PoolRedundancyPolicy as LabelPoolRedundancyPolicy;
 
@@ -4050,6 +4050,32 @@ fn serve_session(session_id: tidefs_transport::SessionId, ctx: SessionContext) {
             continue;
         }
 
+        if let Ok(ObjectTransferMessage::ReadRequest {
+            transfer_id,
+            object_key,
+            offset,
+            length,
+        }) = ObjectTransferMessage::decode(&raw)
+        {
+            match handle_object_transfer_read_request_ctx(
+                session_id,
+                transfer_id,
+                object_key,
+                offset,
+                length,
+                &ctx,
+            ) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!(
+                        "[storage-node] session {session_id}: object-transfer read error: {e}"
+                    );
+                    break;
+                }
+            }
+            continue;
+        }
+
         // -- ClusterPoolMessage handler: cluster pool create/import dispatch --
         if raw.len() >= 4 && raw[..4] == *CLUSTER_POOL_MESSAGE_MAGIC {
             let msg_bytes = &raw[4..];
@@ -5606,6 +5632,74 @@ fn handle_segment_fetch_ctx(
         .map_err(|e| format!("send segment fetch response: {e}"))?;
 
     Ok(obj_id)
+}
+
+/// Object-transfer read handler for TransportReplicatedStore data sessions.
+fn handle_object_transfer_read_request_ctx(
+    session_id: tidefs_transport::SessionId,
+    transfer_id: u64,
+    object_key: [u8; 32],
+    offset: u64,
+    length: u64,
+    ctx: &SessionContext,
+) -> Result<(), String> {
+    let key = ObjectKey::from_bytes32(object_key);
+    let full_payload = {
+        let store_guard = ctx.store.lock().map_err(|e| format!("lock: {e}"))?;
+        match &*store_guard {
+            StoreBackend::Local(rs) => rs
+                .get_key_local(key)
+                .map_err(|e| format!("local object-transfer read: {e}"))?,
+            StoreBackend::TransportBacked(ts) => ts
+                .get_key_local(key)
+                .map_err(|e| format!("transport object-transfer read: {e}"))?,
+            StoreBackend::PoolBacked(pool) => {
+                pool_get_key(pool, key).map_err(|e| format!("pool object-transfer read: {e}"))?
+            }
+        }
+    }
+    .ok_or_else(|| {
+        format!(
+            "object-transfer read key {} not found",
+            hex::encode(object_key)
+        )
+    })?;
+
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    let requested = usize::try_from(length).unwrap_or(usize::MAX);
+    let end = start.saturating_add(requested).min(full_payload.len());
+    let slice = if start < full_payload.len() {
+        &full_payload[start..end]
+    } else {
+        &[]
+    };
+
+    let mut responses = build_read_responses(
+        transfer_id,
+        full_payload.len() as u64,
+        slice,
+        MAX_CHUNK_PAYLOAD,
+    );
+    if responses.is_empty() {
+        responses.push(ObjectTransferMessage::read_response(
+            transfer_id,
+            0,
+            1,
+            full_payload.len() as u64,
+            Vec::new(),
+        ));
+    }
+
+    let mut t = ctx.transport.lock().map_err(|e| format!("lock: {e}"))?;
+    for response in responses {
+        let encoded = response
+            .encode()
+            .map_err(|e| format!("encode object-transfer response: {e}"))?;
+        t.send_message(session_id, &encoded)
+            .map_err(|e| format!("send object-transfer response: {e}"))?;
+    }
+
+    Ok(())
 }
 impl StorageNode {
     /// Return a clone of the `Arc<Mutex<MembershipRuntime>>` handle,
