@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Committed evacuation receipt for drain completion gating.
 //!
 //! [`EvacuationReceipt`] is a committed record proving that all placement
