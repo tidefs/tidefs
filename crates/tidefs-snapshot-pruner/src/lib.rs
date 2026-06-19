@@ -573,6 +573,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn destroy_snapshot_releases_extent_pins() {
+        let dir = std::env::temp_dir().join("tidefs-pruner-destroy-pin-release-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = LocalObjectStore::open(&dir).unwrap();
+        store
+            .put(
+                tidefs_local_object_store::ObjectKey::from_name(b"obj"),
+                b"data",
+            )
+            .unwrap();
+        store.create_snapshot("ds", "snap-pinned").unwrap();
+
+        let snapshot_id = "ds/snap-pinned";
+        let extent_key = tidefs_types_reclaim_queue_core::ObjectKey(
+            *tidefs_local_object_store::ObjectKey::from_name(b"pinned-extent").as_bytes(),
+        );
+        store.pin_snapshot_extent(snapshot_id, extent_key);
+
+        let mut pruner_pin_set = tidefs_gc_pin_set::SnapshotExtentPinSet::new();
+        pruner_pin_set.pin(snapshot_id, extent_key);
+        let mut pruner = SnapshotPruner::new(SnapshotRetentionPolicy::default());
+        pruner.set_extent_pin_set(pruner_pin_set);
+
+        assert!(store.snapshot_extent_pin_set().is_pinned(&extent_key));
+        let removed = pruner
+            .destroy_snapshot(&mut store, "ds", "snap-pinned")
+            .unwrap();
+        assert_eq!(removed.name, "snap-pinned");
+        assert!(!store.snapshot_extent_pin_set().is_pinned(&extent_key));
+
+        let pruner_pin_set = pruner.take_extent_pin_set().unwrap();
+        assert!(!pruner_pin_set.is_pinned(&extent_key));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -- Snapshot deletion tests ---------------------------------------
 
     #[test]
