@@ -53,7 +53,7 @@ use crate::reclaim_queue::{
     store_reclaim_receipts, store_snapshot_extent_pin_set,
 };
 use crate::segment_builder::{FlushResult, SegmentBuilder};
-use crate::txg_manager::{compute_committed_root_digest, CommitGroupManager};
+use crate::txg_manager::CommitGroupManager;
 use crate::*;
 use std::convert::Infallible;
 use tidefs_checksum_tree::{ChecksumTree, ChecksumTreeBuilder, DomainTag, ObjectDigest};
@@ -460,8 +460,9 @@ fn init_commit_group(root: &Path) -> CommitGroupManager {
 /// Initialize the CommitGroupCoordinator from the persisted committed root, matching
 /// the CommitGroupManager recovery path so both track the same lineage.
 fn init_txg_coordinator(root: &Path) -> tidefs_commit_group::CommitGroupCoordinator {
-    let recovered_root = load_committed_root(root).map(|(r, _)| r);
-    if let Some(recovered_root) = recovered_root {
+    if let Some((recovered_root, Some(digest))) = load_committed_root(root) {
+        tidefs_commit_group::CommitGroupCoordinator::resume_with_digest(recovered_root, digest)
+    } else if let Some((recovered_root, _)) = load_committed_root(root) {
         tidefs_commit_group::CommitGroupCoordinator::resume(recovered_root)
     } else {
         tidefs_commit_group::CommitGroupCoordinator::new()
@@ -574,7 +575,9 @@ impl LocalObjectStore {
                 }
             }
 
-            next_sequence = next_sequence.max(record.sequence + 1);
+            if !is_public_scan_internal_key(record.key) {
+                next_sequence = next_sequence.max(record.sequence + 1);
+            }
             cursor = record_range.end_offset;
 
             if cursor >= device_end {
@@ -2563,7 +2566,12 @@ impl LocalObjectStore {
         }
 
         let checksum = checksum64(payload);
-        let sequence = self.next_sequence;
+        let internal_metadata = key == committed_root_key();
+        let sequence = if internal_metadata {
+            0
+        } else {
+            self.next_sequence
+        };
         self.enospc_bytes_written = self.enospc_bytes_written.saturating_add(payload_len);
         let location = self.append_record(
             RecordKind::Put,
@@ -2574,20 +2582,24 @@ impl LocalObjectStore {
             compression_algorithm,
         )?;
         if self.index.contains_key(&key) {
-            self.tombstone_count = self.tombstone_count.saturating_add(1);
+            if !internal_metadata {
+                self.tombstone_count = self.tombstone_count.saturating_add(1);
+            }
             // Enqueue a reclaim entry for the old version of the object.
             if let Some(old_loc) = self.index.get(&key).copied() {
-                self.enqueue_reclaim_entry(key);
-                self.segment_liveness
-                    .record_overwrite(old_loc.segment_id, old_loc.payload_len);
-                if track_liveness {
+                if !internal_metadata {
+                    self.enqueue_reclaim_entry(key);
+                    self.segment_liveness
+                        .record_overwrite(old_loc.segment_id, old_loc.payload_len);
+                }
+                if track_liveness && !internal_metadata {
                     self.reclaim_consumer
                         .live_counts_mut()
                         .apply_delta(location.segment_id, 1);
                 }
 
                 // Auto-update space accounting: overwrite replaces old data.
-                if let Some(ds_id) = self.current_dataset_id {
+                if !internal_metadata && let Some(ds_id) = self.current_dataset_id {
                     if old_loc.payload_len > 0 {
                         let _ = self.space_book.record_delete(ds_id, old_loc.payload_len);
                     }
@@ -2596,7 +2608,7 @@ impl LocalObjectStore {
                     }
                 }
             }
-        } else if track_liveness {
+        } else if track_liveness && !internal_metadata {
             // Track new live object in the reclaim-queue consumer's
             // per-segment liveness tracker so the drain loop can
             // determine dead segments without re-scanning the index.
@@ -2613,7 +2625,9 @@ impl LocalObjectStore {
         }
         self.history.entry(key).or_default().push(location);
         self.index.insert(key, location);
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        if !internal_metadata {
+            self.next_sequence = self.next_sequence.saturating_add(1);
+        }
 
         // Fan out to all replica stores.
         let total_replicas = self.replicas.len();
@@ -2622,7 +2636,12 @@ impl LocalObjectStore {
         for (i, replica) in self.replicas.iter_mut().enumerate() {
             // Replicas receive the original payload (fault injection only
             // affects the primary write path, matching the original behavior).
-            if replica.put(key, payload).is_ok() {
+            let replica_result = if internal_metadata {
+                replica.put_direct(key, payload)
+            } else {
+                replica.put(key, payload)
+            };
+            if replica_result.is_ok() {
                 replica_acks = replica_acks.saturating_add(1);
                 if i < self.replica_healthy.len() && !self.replica_healthy[i] {
                     self.replica_healthy[i] = true;
@@ -3126,7 +3145,7 @@ impl LocalObjectStore {
     ) -> Result<StoreRetentionCompactionReport> {
         self.ensure_writable("compact_retaining")?;
         let segment_ids_before = discover_segment_ids(&self.segments_dir)?;
-        let live_objects_before = self.index.len();
+        let live_objects_before = stats_counted_index_len(&self.index);
         let initial_current_segment_id = self.current_segment_id;
         let protected_keys: BTreeSet<ObjectKey> = protected_keys.iter().copied().collect();
         let exact_location_keys: BTreeSet<ObjectKey> = protected_exact_locations
@@ -3162,12 +3181,12 @@ impl LocalObjectStore {
 
         let mut tombstone_keys = BTreeSet::new();
         for key in self.index.keys().copied() {
-            if !protected_keys.contains(&key) {
+            if !is_public_scan_internal_key(key) && !protected_keys.contains(&key) {
                 tombstone_keys.insert(key);
             }
         }
         for (key, locations) in &self.history {
-            if protected_keys.contains(key) {
+            if is_public_scan_internal_key(*key) || protected_keys.contains(key) {
                 continue;
             }
             if locations
@@ -3237,7 +3256,7 @@ impl LocalObjectStore {
             tombstoned_unprotected_keys,
             retired_segments,
             live_objects_before,
-            live_objects_after: self.index.len(),
+            live_objects_after: stats_counted_index_len(&self.index),
             segment_count_before: segment_ids_before.len(),
             segment_count_after: retained_segments.len(),
             retained_segments,
@@ -3456,23 +3475,20 @@ impl LocalObjectStore {
                     self.txg_coordinator.chain_digest(&commit_data)
                 };
 
-                // Compute the committed-root anchor digest for on-disk
-                // persistence so the validation path (validate_committed_root)
-                // uses the same digest scheme as txg_cycle.rs.
-                let committed_root_digest = compute_committed_root_digest(root);
+                // Persist the committed root with the chain digest so the
+                // coordinator can resume the hash chain across reopen.
+                let root_payload = CommitGroupManager::encode_root_with_digest(root, chain_digest);
 
-                // Persist the committed root with its anchor digest.
-                let root_payload =
-                    CommitGroupManager::encode_root_with_digest(root, committed_root_digest);
+                // Store the segment-path copy in the index for idempotent
+                // recovery (get-able after sync_all).
+                let root_key =
+                    ObjectKey::from_name(crate::txg_manager::COMMITTED_ROOT_FILE.as_bytes());
+                let _ = self.put_direct(root_key, &root_payload)?;
 
                 // Plain-file persistence is only valid when the store root is
                 // a metadata directory. Raw block-device mode keeps the copy
                 // inside the append-only device log instead.
-                if sidecar_files_unavailable(&self.root) {
-                    let root_key =
-                        ObjectKey::from_name(crate::txg_manager::COMMITTED_ROOT_FILE.as_bytes());
-                    let _ = self.put_direct(root_key, &root_payload)?;
-                } else {
+                if !sidecar_files_unavailable(&self.root) {
                     let root_path = self.root.join(crate::txg_manager::COMMITTED_ROOT_FILE);
                     fs::write(&root_path, &root_payload)
                         .map_err(|source| io_error("write committed root", &root_path, source))?;
@@ -4605,8 +4621,8 @@ fn replay_segment(request: ReplaySegmentRequest<'_>, state: ReplaySegmentState<'
 
         physical_records_seen = true;
         let internal_record = is_public_scan_internal_key(record.key);
-        replay.highest_sequence = replay.highest_sequence.max(record.sequence);
         if !internal_record {
+            replay.highest_sequence = replay.highest_sequence.max(record.sequence);
             replay.records_seen += 1;
             match record.format_version {
                 RECORD_FORMAT_VERSION_V1_NO_FOOTER => replay.v1_records_seen += 1,
@@ -4618,7 +4634,9 @@ fn replay_segment(request: ReplaySegmentRequest<'_>, state: ReplaySegmentState<'
                 _ => {}
             }
         }
-        *next_sequence = (*next_sequence).max(record.sequence.saturating_add(1));
+        if !internal_record {
+            *next_sequence = (*next_sequence).max(record.sequence.saturating_add(1));
+        }
         match record.kind {
             RecordKind::Put => {
                 if !internal_record {
