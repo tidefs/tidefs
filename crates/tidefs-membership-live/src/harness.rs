@@ -2805,7 +2805,10 @@ mod tests {
             .find(|o| o.device_id == secondary_device)
             .expect("must have outcome for secondary device");
         assert!(secondary_outcome.found);
-        assert_eq!(secondary_outcome.payload.as_deref(), Some(corrupted.as_slice()));
+        assert_eq!(
+            secondary_outcome.payload.as_deref(),
+            Some(corrupted.as_slice())
+        );
         // Cross-mirror inconsistency must be detected.
         assert!(
             !result.mirrors_consistent,
