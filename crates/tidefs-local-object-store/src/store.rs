@@ -48,7 +48,8 @@ use crate::compress::CompressionStats;
 use crate::io_scheduler::{IoScheduler, IoSchedulerConfig};
 use crate::reclaim_queue::{
     load_dead_object_reclaim_queue, load_reclaim_queue_entries, load_reclaim_receipts,
-    load_segment_liveness_queue, store_dead_object_reclaim_queue, store_reclaim_receipts,
+    load_segment_liveness_queue, load_snapshot_extent_pin_set, store_dead_object_reclaim_queue,
+    store_reclaim_receipts, store_snapshot_extent_pin_set,
 };
 use crate::segment_builder::{FlushResult, SegmentBuilder};
 use crate::txg_manager::{compute_committed_root_digest, CommitGroupManager};
@@ -327,6 +328,7 @@ pub struct LocalObjectStore {
     reclaim_receipts: Vec<ReclaimReceipt>,
     reclaim_receipts_dirty: bool,
     snapshot_extent_pin_set: SnapshotExtentPinSet,
+    snapshot_extent_pin_set_dirty: bool,
     segment_liveness: SegmentLivenessQueue,
     reclaim_consumer: ReclaimConsumerService,
     pub(crate) enospc_bytes_written: u64,
@@ -800,6 +802,7 @@ impl LocalObjectStore {
             reclaim_receipts: Vec::new(),
             reclaim_receipts_dirty: false,
             snapshot_extent_pin_set: SnapshotExtentPinSet::new(),
+            snapshot_extent_pin_set_dirty: false,
             segment_liveness: SegmentLivenessQueue::default(),
             reclaim_consumer: ReclaimConsumerService::new(
                 ReclaimConsumerConfig::default(),
@@ -1104,6 +1107,7 @@ impl LocalObjectStore {
             reclaim_receipts: Vec::new(),
             reclaim_receipts_dirty: false,
             snapshot_extent_pin_set: SnapshotExtentPinSet::new(),
+            snapshot_extent_pin_set_dirty: false,
             segment_liveness: SegmentLivenessQueue::new(),
             reclaim_consumer: ReclaimConsumerService::new(
                 ReclaimConsumerConfig::default(),
@@ -1139,6 +1143,9 @@ impl LocalObjectStore {
         store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store);
         // Restore committed reclaim receipt evidence.
         store.reclaim_receipts = load_reclaim_receipts(&store);
+        // Restore snapshot extent pins before any reclaim authority observes
+        // dead-object queue state.
+        store.snapshot_extent_pin_set = load_snapshot_extent_pin_set(&store)?;
         // Restore persisted segment-liveness queue.
         store.segment_liveness = match load_segment_liveness_queue(&store) {
             Ok(q) => q,
@@ -1149,8 +1156,9 @@ impl LocalObjectStore {
         };
 
         // Bootstrap dead-segment scan: identify fully-dead segments from
-        // before the last unmount and free them immediately, priming the
-        // reclaim pipeline with work on pool open.
+        // before the last unmount, but fail closed for physical free.
+        // Receipt-bound dead-object drains are the only release path that can
+        // consult committed clearance evidence and snapshot extent pins.
         {
             let scan_result = crate::dead_segment_scan::scan_dead_segments_on_open(
                 &store.segments_dir,
@@ -1164,25 +1172,11 @@ impl LocalObjectStore {
                 crate::dead_segment_scan::DeadSegmentScanResult::default()
             });
 
-            // Free fully-dead segments via the pool allocator.
             for &segment_id in &scan_result.dead_segment_ids {
-                // Do not free the current active write segment.
                 if segment_id == store.current_segment_id {
                     continue;
                 }
-                match store.free_map.add_free(segment_id) {
-                    Ok(()) => {
-                        store.reclaim_consumer.live_counts_mut().remove(segment_id);
-                        let seg_path = segment_path(&store.segments_dir, segment_id);
-                        let _ = std::fs::remove_file(&seg_path);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            segment_id = segment_id,
-                            "dead-segment bootstrap scan: failed to free segment: {e}"
-                        );
-                    }
-                }
+                store.reclaim_consumer.live_counts_mut().remove(segment_id);
             }
 
             // Log the bootstrap summary at trace level.
@@ -1205,12 +1199,8 @@ impl LocalObjectStore {
                 }
             }
 
-            // Persist the updated spacemap so freed segments remain free
-            // across subsequent pool opens.
-            if !scan_result.dead_segment_ids.is_empty() {
-                let _ = write_spacemap_checkpoint(&store.segments_dir, &store.free_map, false);
-                store.free_map.clear_dirty_segment_groups();
-            }
+            // No spacemap checkpoint is written here: this scan is inspection
+            // only and does not authorize physical reclaim.
         }
         // ── Intent-log replay ──────────────────────────────────────────
         // Replay committed-but-unapplied intent-log segments so no
@@ -2145,22 +2135,32 @@ impl LocalObjectStore {
     /// Mutable snapshot extent pins for callers that own committed snapshot
     /// lifecycle evidence.
     pub fn snapshot_extent_pin_set_mut(&mut self) -> &mut SnapshotExtentPinSet {
+        self.snapshot_extent_pin_set_dirty = true;
         &mut self.snapshot_extent_pin_set
     }
 
     /// Replace the snapshot extent pin set used by receipt-bound physical reclaim.
     pub fn set_snapshot_extent_pin_set(&mut self, pin_set: SnapshotExtentPinSet) {
         self.snapshot_extent_pin_set = pin_set;
+        self.snapshot_extent_pin_set_dirty = true;
     }
 
     /// Pin an extent for a live snapshot.
     pub fn pin_snapshot_extent(&mut self, snapshot_id: &str, extent_key: ReclaimObjectKey) {
+        let prior_epoch = self.snapshot_extent_pin_set.epoch();
         self.snapshot_extent_pin_set.pin(snapshot_id, extent_key);
+        if self.snapshot_extent_pin_set.epoch() != prior_epoch {
+            self.snapshot_extent_pin_set_dirty = true;
+        }
     }
 
     /// Release all extent pins for a destroyed snapshot.
     pub fn release_snapshot_extent_pins(&mut self, snapshot_id: &str) -> usize {
-        self.snapshot_extent_pin_set.release_snapshot(snapshot_id)
+        let removed = self.snapshot_extent_pin_set.release_snapshot(snapshot_id);
+        if removed > 0 {
+            self.snapshot_extent_pin_set_dirty = true;
+        }
+        removed
     }
 
     /// Enqueue one dead object whose old placement may be retired only after
@@ -3386,6 +3386,12 @@ impl LocalObjectStore {
             self.reclaim_receipts = receipts;
             result?;
             self.reclaim_receipts_dirty = false;
+        }
+
+        if self.snapshot_extent_pin_set_dirty {
+            let pin_set = self.snapshot_extent_pin_set.clone();
+            store_snapshot_extent_pin_set(&pin_set, self)?;
+            self.snapshot_extent_pin_set_dirty = false;
         }
 
         let path = segment_path(&self.segments_dir, self.current_segment_id);
@@ -7091,6 +7097,9 @@ mod reclaim_queue_production_tests {
         store.put(key, b"snapshot pinned payload").expect("put");
         let old_segment_id = store.index.get(&key).expect("location").segment_id;
         assert!(store.delete(key).expect("delete"));
+        store
+            .rotate_segment()
+            .expect("separate dead extent from persisted reclaim metadata");
 
         let reclaim_key = reclaim_key(key);
         let entry = dead_object_entry_for_key(reclaim_key, 0, true, 1);
@@ -7138,6 +7147,66 @@ mod reclaim_queue_production_tests {
         assert!(
             !segment_path(&store.segments_dir, old_segment_id).exists(),
             "released segment should be physically reclaimed"
+        );
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_preserves_snapshot_pin_across_reopen() {
+        let (mut store, dir) = temp_store();
+        let key = ObjectKey::from_name(b"receipt-bound/dead-object/snapshot-pin-reopen");
+        let snapshot_id = "dataset@snap-reopen";
+
+        store.put(key, b"snapshot pinned payload").expect("put");
+        let old_segment_id = store.index.get(&key).expect("location").segment_id;
+        assert!(store.delete(key).expect("delete"));
+
+        let reclaim_key = reclaim_key(key);
+        let entry = dead_object_entry_for_key(reclaim_key, 0, true, 1);
+        assert!(store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect("enqueue receipt-bound dead object"));
+        store.pin_snapshot_extent(snapshot_id, reclaim_key);
+        store.sync_all().expect("sync queued pin");
+        drop(store);
+
+        let mut reopened =
+            LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+                .expect("reopen store");
+        assert!(reopened.snapshot_extent_pin_set().is_pinned(&reclaim_key));
+
+        let held = reopened
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("snapshot-pinned drain after reopen");
+
+        assert_eq!(held.entries_processed, 1);
+        assert_eq!(held.segments_reclaimed, 0);
+        assert_eq!(held.gate_extents_denied, 1);
+        assert_eq!(held.gate_segments_skipped, 1);
+        assert_eq!(held.reclaim_queue_depth, 1);
+        assert_eq!(reopened.dead_object_reclaim_queue.len(), 1);
+        assert!(reopened.reclaim_receipts().is_empty());
+        assert!(
+            segment_path(&reopened.segments_dir, old_segment_id).exists(),
+            "reopened snapshot pin must keep segment allocated"
+        );
+
+        assert_eq!(reopened.release_snapshot_extent_pins(snapshot_id), 1);
+        let freed = reopened
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("released drain after reopen");
+
+        assert_eq!(freed.entries_processed, 1);
+        assert_eq!(freed.segments_reclaimed, 1);
+        assert_eq!(freed.reclaim_queue_depth, 0);
+        assert!(reopened.dead_object_reclaim_queue.is_empty());
+        assert_eq!(reopened.reclaim_receipts().len(), 1);
+        assert_eq!(
+            reopened.reclaim_receipts()[0].pin_clearance_epoch,
+            reopened.snapshot_extent_pin_set().epoch()
+        );
+        assert!(
+            !segment_path(&reopened.segments_dir, old_segment_id).exists(),
+            "released reopened pin should allow physical reclaim"
         );
     }
 

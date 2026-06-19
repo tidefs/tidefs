@@ -18,6 +18,7 @@ use tidefs_reclaim_queue_core::{
     BPlusTreeReclaimQueue, DeadObjectReclaimQueue, ReclaimQueueStorage,
     SegmentLivenessPersistError, SegmentLivenessQueue,
 };
+use tidefs_types_reclaim_queue_core::ObjectKey;
 
 use crate::error::StoreError;
 use crate::store::LocalObjectStore;
@@ -46,11 +47,19 @@ pub(crate) const DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME: &str = "tidefs-dead-obje
 
 /// Well-known name for committed reclaim-receipt evidence.
 pub(crate) const RECLAIM_RECEIPTS_OBJECT_NAME: &str = "tidefs-reclaim-receipts";
+/// Well-known name for snapshot extent pins consulted by physical reclaim.
+pub(crate) const SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME: &str = "tidefs-snapshot-extent-pins";
 
 const RECLAIM_RECEIPTS_MAGIC: &[u8; 4] = b"RCRL";
 const RECLAIM_RECEIPTS_VERSION: u32 = 1;
 const RECLAIM_RECEIPTS_HEADER_LEN: usize = 12;
 const RECLAIM_RECEIPTS_ENTRY_LEN_LEN: usize = 4;
+
+const SNAPSHOT_EXTENT_PIN_SET_MAGIC: &[u8; 4] = b"SEPS";
+const SNAPSHOT_EXTENT_PIN_SET_VERSION: u32 = 1;
+const SNAPSHOT_EXTENT_PIN_SET_HEADER_LEN: usize = 20;
+const SNAPSHOT_EXTENT_PIN_ENTRY_PREFIX_LEN: usize = 4;
+const SNAPSHOT_EXTENT_PIN_OBJECT_KEY_LEN: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ReclaimReceiptLogError {
@@ -74,6 +83,34 @@ impl std::fmt::Display for ReclaimReceiptLogError {
             Self::LengthOverflow => f.write_str("reclaim receipt log length overflow"),
             Self::Receipt(error) => write!(f, "reclaim receipt decode failed: {error}"),
             Self::TrailingBytes => f.write_str("reclaim receipt log has trailing bytes"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotExtentPinSetLogError {
+    Truncated,
+    InvalidMagic,
+    UnsupportedVersion { found: u32, expected: u32 },
+    LengthOverflow,
+    InvalidSnapshotId,
+    TrailingBytes,
+}
+
+impl std::fmt::Display for SnapshotExtentPinSetLogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => f.write_str("snapshot extent pin set log truncated"),
+            Self::InvalidMagic => f.write_str("snapshot extent pin set log invalid magic"),
+            Self::UnsupportedVersion { found, expected } => write!(
+                f,
+                "snapshot extent pin set log unsupported version {found} (expected {expected})"
+            ),
+            Self::LengthOverflow => f.write_str("snapshot extent pin set log length overflow"),
+            Self::InvalidSnapshotId => {
+                f.write_str("snapshot extent pin set log has non-utf8 snapshot id")
+            }
+            Self::TrailingBytes => f.write_str("snapshot extent pin set log has trailing bytes"),
         }
     }
 }
@@ -219,6 +256,135 @@ pub(crate) fn store_reclaim_receipts(
 ) -> Result<(), StoreError> {
     let bytes = encode_reclaim_receipts(receipts);
     store.put_named(RECLAIM_RECEIPTS_OBJECT_NAME, &bytes)?;
+    Ok(())
+}
+
+fn encode_snapshot_extent_pin_set(pin_set: &tidefs_gc_pin_set::SnapshotExtentPinSet) -> Vec<u8> {
+    let entries: Vec<(&str, ObjectKey)> = pin_set.pins().collect();
+    let mut bytes = Vec::with_capacity(
+        SNAPSHOT_EXTENT_PIN_SET_HEADER_LEN
+            + entries.len()
+                * (SNAPSHOT_EXTENT_PIN_ENTRY_PREFIX_LEN + SNAPSHOT_EXTENT_PIN_OBJECT_KEY_LEN),
+    );
+    bytes.extend_from_slice(SNAPSHOT_EXTENT_PIN_SET_MAGIC);
+    bytes.extend_from_slice(&SNAPSHOT_EXTENT_PIN_SET_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&pin_set.epoch().to_le_bytes());
+    bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (snapshot_id, extent_key) in entries {
+        let snapshot_bytes = snapshot_id.as_bytes();
+        bytes.extend_from_slice(&(snapshot_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(snapshot_bytes);
+        bytes.extend_from_slice(&extent_key.0);
+    }
+    bytes
+}
+
+fn decode_snapshot_extent_pin_set(
+    bytes: &[u8],
+) -> Result<tidefs_gc_pin_set::SnapshotExtentPinSet, SnapshotExtentPinSetLogError> {
+    if bytes.len() < SNAPSHOT_EXTENT_PIN_SET_HEADER_LEN {
+        return Err(SnapshotExtentPinSetLogError::Truncated);
+    }
+    if &bytes[..4] != SNAPSHOT_EXTENT_PIN_SET_MAGIC {
+        return Err(SnapshotExtentPinSetLogError::InvalidMagic);
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if version != SNAPSHOT_EXTENT_PIN_SET_VERSION {
+        return Err(SnapshotExtentPinSetLogError::UnsupportedVersion {
+            found: version,
+            expected: SNAPSHOT_EXTENT_PIN_SET_VERSION,
+        });
+    }
+    let epoch = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let mut off = SNAPSHOT_EXTENT_PIN_SET_HEADER_LEN;
+    let mut entries = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let len_end = off
+            .checked_add(SNAPSHOT_EXTENT_PIN_ENTRY_PREFIX_LEN)
+            .ok_or(SnapshotExtentPinSetLogError::LengthOverflow)?;
+        if len_end > bytes.len() {
+            return Err(SnapshotExtentPinSetLogError::Truncated);
+        }
+        let snapshot_len = u32::from_le_bytes(bytes[off..len_end].try_into().unwrap()) as usize;
+        off = len_end;
+
+        let snapshot_end = off
+            .checked_add(snapshot_len)
+            .ok_or(SnapshotExtentPinSetLogError::LengthOverflow)?;
+        if snapshot_end > bytes.len() {
+            return Err(SnapshotExtentPinSetLogError::Truncated);
+        }
+        let snapshot_id = std::str::from_utf8(&bytes[off..snapshot_end])
+            .map_err(|_| SnapshotExtentPinSetLogError::InvalidSnapshotId)?
+            .to_owned();
+        off = snapshot_end;
+
+        let key_end = off
+            .checked_add(SNAPSHOT_EXTENT_PIN_OBJECT_KEY_LEN)
+            .ok_or(SnapshotExtentPinSetLogError::LengthOverflow)?;
+        if key_end > bytes.len() {
+            return Err(SnapshotExtentPinSetLogError::Truncated);
+        }
+        let mut extent_key = [0u8; SNAPSHOT_EXTENT_PIN_OBJECT_KEY_LEN];
+        extent_key.copy_from_slice(&bytes[off..key_end]);
+        off = key_end;
+
+        entries.push((snapshot_id, ObjectKey(extent_key)));
+    }
+
+    if off != bytes.len() {
+        return Err(SnapshotExtentPinSetLogError::TrailingBytes);
+    }
+
+    Ok(tidefs_gc_pin_set::SnapshotExtentPinSet::from_persisted_pins(epoch, entries))
+}
+
+/// Load snapshot extent pins from the object store.
+///
+/// Corrupt bytes fail closed by failing store open instead of silently
+/// dropping pins that may still protect a snapshot-referenced extent.
+pub(crate) fn load_snapshot_extent_pin_set(
+    store: &LocalObjectStore,
+) -> Result<tidefs_gc_pin_set::SnapshotExtentPinSet, StoreError> {
+    match store.get_named(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME) {
+        Ok(Some(bytes)) => {
+            decode_snapshot_extent_pin_set(&bytes).map_err(|error| StoreError::InvalidOptions {
+                reason: match error {
+                    SnapshotExtentPinSetLogError::Truncated => {
+                        "snapshot extent pin set log truncated"
+                    }
+                    SnapshotExtentPinSetLogError::InvalidMagic => {
+                        "snapshot extent pin set log invalid magic"
+                    }
+                    SnapshotExtentPinSetLogError::UnsupportedVersion { .. } => {
+                        "snapshot extent pin set log unsupported version"
+                    }
+                    SnapshotExtentPinSetLogError::LengthOverflow => {
+                        "snapshot extent pin set log length overflow"
+                    }
+                    SnapshotExtentPinSetLogError::InvalidSnapshotId => {
+                        "snapshot extent pin set log invalid snapshot id"
+                    }
+                    SnapshotExtentPinSetLogError::TrailingBytes => {
+                        "snapshot extent pin set log trailing bytes"
+                    }
+                },
+            })
+        }
+        Ok(None) => Ok(tidefs_gc_pin_set::SnapshotExtentPinSet::new()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Persist snapshot extent pins consulted by receipt-bound physical reclaim.
+pub(crate) fn store_snapshot_extent_pin_set(
+    pin_set: &tidefs_gc_pin_set::SnapshotExtentPinSet,
+    store: &mut LocalObjectStore,
+) -> Result<(), StoreError> {
+    let bytes = encode_snapshot_extent_pin_set(pin_set);
+    store.put_named(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME, &bytes)?;
     Ok(())
 }
 
@@ -526,6 +692,40 @@ mod tests {
         let loaded = load_reclaim_receipts(&store);
 
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn snapshot_extent_pin_set_roundtrip_and_reopen() {
+        let (mut store, dir) = temp_store();
+        let mut pin_set = tidefs_gc_pin_set::SnapshotExtentPinSet::new();
+        pin_set.pin("dataset@snap-a", dead_object_key(0x41));
+        pin_set.pin("dataset@snap-a", dead_object_key(0x42));
+        pin_set.pin("dataset@snap-b", dead_object_key(0x41));
+
+        store_snapshot_extent_pin_set(&pin_set, &mut store).expect("store snapshot pins");
+        assert_eq!(
+            load_snapshot_extent_pin_set(&store).expect("load snapshot pins"),
+            pin_set
+        );
+        store.sync_all().expect("sync snapshot pins");
+        drop(store);
+
+        let reopened = LocalObjectStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            load_snapshot_extent_pin_set(&reopened).expect("reload snapshot pins"),
+            pin_set
+        );
+    }
+
+    #[test]
+    fn snapshot_extent_pin_set_corrupt_bytes_fail_closed() {
+        let (mut store, _dir) = temp_store();
+
+        store
+            .put_named(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME, b"not snapshot pins")
+            .expect("store corrupt bytes");
+
+        assert!(load_snapshot_extent_pin_set(&store).is_err());
     }
 
     #[test]

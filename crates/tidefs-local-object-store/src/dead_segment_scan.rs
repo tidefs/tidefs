@@ -9,7 +9,8 @@
 //! with the live object index, and classifies each segment as:
 //!
 //! - **Fully dead**: zero live objects, non-zero record count. The
-//!   segment ID is returned for immediate reclamation.
+//!   segment ID is returned to the caller, but open-time handling must
+//!   not physically reclaim it without receipt-bound clearance evidence.
 //! - **Partially live**: some live objects remain. A liveness summary
 //!   is recorded for future cleaning-priority decisions.
 //! - **Fully live**: all records still referenced. No action needed.
@@ -438,10 +439,10 @@ mod tests {
         assert!(result.partial_segments.is_empty());
     }
 
-    // ── Integration test: pool open frees dead segments ─────────────
+    // ── Integration test: pool open inspects dead segments ──────────
 
     #[test]
-    fn dead_segments_freed_on_pool_open() {
+    fn dead_segments_not_freed_on_pool_open_without_receipts() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Each record: 500+224 = 724 bytes. With max_segment_bytes=1024,
         // each object gets its own segment.
@@ -454,6 +455,7 @@ mod tests {
         };
 
         let seg1_path: std::path::PathBuf;
+        let seg0_id: u64;
 
         {
             let mut store =
@@ -462,7 +464,7 @@ mod tests {
             // Write alpha in segment 0.
             store.put_named("alpha", &[0xAAu8; 500]).expect("put alpha");
             store.flush_segment().expect("flush seg0");
-            let seg0_id = store.current_segment_id;
+            seg0_id = store.current_segment_id;
             seg1_path = segment_path(store.segments_dir(), seg0_id);
             assert!(seg1_path.exists(), "segment 0 file must exist");
 
@@ -482,23 +484,17 @@ mod tests {
         }
         // Store dropped — pool closed.
 
-        // Re-open: the bootstrap scan should free segment 0.
+        // Re-open: the bootstrap scan may classify segment 0 as fully dead,
+        // but physical reclaim requires receipt-bound clearance evidence.
         let store2 = LocalObjectStore::open_with_options(dir.path(), opts).expect("re-open store");
 
-        // The dead segment's file should be gone.
         assert!(
-            !seg1_path.exists(),
-            "segment 0 file should be deleted by bootstrap scan"
+            seg1_path.exists(),
+            "segment 0 file must remain until receipt-bound reclaim"
         );
-
-        // The free_map should have segment 0 marked as free.
-        // (PoolAllocator::is_free checks the spacemap bitmap.)
-        // We check via the free_count: after freeing, at least one
-        // segment should be free.
-        let free = store2.free_map.free_count();
         assert!(
-            free > 0,
-            "free_map should have at least one free segment, got {free}"
+            !store2.free_map.is_free(seg0_id),
+            "bootstrap scan must not mark segment 0 free without receipts"
         );
 
         drop(store2);

@@ -679,6 +679,39 @@ impl SnapshotExtentPinSet {
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Iterate over every persisted `(snapshot_id, extent_key)` pin pair.
+    pub fn pins(
+        &self,
+    ) -> impl Iterator<Item = (&str, tidefs_types_reclaim_queue_core::ObjectKey)> + '_ {
+        self.snapshot_index
+            .iter()
+            .flat_map(|(snapshot_id, extents)| {
+                extents
+                    .iter()
+                    .copied()
+                    .map(move |extent_key| (snapshot_id.as_str(), extent_key))
+            })
+    }
+
+    /// Restore a pin set from persisted pins and an already-committed epoch.
+    #[must_use]
+    pub fn from_persisted_pins<I>(epoch: u64, pins: I) -> Self
+    where
+        I: IntoIterator<
+            Item = (
+                alloc::string::String,
+                tidefs_types_reclaim_queue_core::ObjectKey,
+            ),
+        >,
+    {
+        let mut set = Self::new();
+        for (snapshot_id, extent_key) in pins {
+            set.pin(&snapshot_id, extent_key);
+        }
+        set.epoch = epoch;
+        set
+    }
 }
 // ---------------------------------------------------------------------------
 // Tests
@@ -1318,6 +1351,37 @@ mod tests {
         assert_eq!(cloned.snapshot_count(), set.snapshot_count());
         assert!(cloned.is_pinned(&extent_key(1)));
         assert!(cloned.is_pinned(&extent_key(2)));
+    }
+
+    #[test]
+    fn snapshot_pin_set_pins_iter_and_restore_preserve_epoch() {
+        let restored = SnapshotExtentPinSet::from_persisted_pins(
+            42,
+            vec![
+                ("snap-a".to_string(), extent_key(1)),
+                ("snap-a".to_string(), extent_key(2)),
+                ("snap-b".to_string(), extent_key(1)),
+            ],
+        );
+
+        assert_eq!(restored.epoch(), 42);
+        assert_eq!(restored.total_pin_entries(), 3);
+        assert_eq!(restored.snapshot_count(), 2);
+        assert!(restored.is_pinned(&extent_key(1)));
+        assert!(restored.is_pinned(&extent_key(2)));
+
+        let pins: Vec<_> = restored
+            .pins()
+            .map(|(snapshot_id, extent_key)| (snapshot_id.to_string(), extent_key))
+            .collect();
+        assert_eq!(
+            pins,
+            vec![
+                ("snap-a".to_string(), extent_key(1)),
+                ("snap-a".to_string(), extent_key(2)),
+                ("snap-b".to_string(), extent_key(1)),
+            ]
+        );
     }
 
     #[test]
