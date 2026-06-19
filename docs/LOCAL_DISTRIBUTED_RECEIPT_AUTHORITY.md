@@ -164,6 +164,17 @@ The replication transport carries receipts in key protocol messages:
 - `RepairObject { placement_receipt_ref, authoritative_payload }` and
   `RepairObjectAck { repaired_placement_receipt_ref }`.
 
+The storage-node client frame path now treats durable placement receipts as the
+primary write authority for clustered writes. Pool-backed `Frame::Put` writes
+through `Pool::put_with_receipt` and returns a `PutWithReceiptResponse` with
+the recorded `PlacementReceiptRef`. Transport-backed primaries refuse
+receiptless `Frame::Put` instead of acknowledging a write that cannot prove
+pool placement authority; callers must use `PutWithReceipt` or a pool-backed
+receipt-producing boundary. Client-facing `PutWithReceipt` frames validate the
+supplied receipt against the object name, payload length, payload digest,
+target width, policy shape, and synthetic-generation marker before any backend
+write is accepted.
+
 The segment-fetch protocol (`SegmentFetchRequest`/`SegmentFetchResponse`) carries
 receipt authority for cross-node byte-range reads over transport sessions:
 
@@ -227,8 +238,9 @@ Completed issue #18 split work merged so far:
 The merged split issues above do not close the full issue #18 acceptance
 criteria. Remaining implementation and validation work includes:
 
-- Wire primary distributed writes so the storage-node and pool-backed write
-  paths record durable receipts before transport fan-out;
+- Continue wiring primary distributed writes beyond the storage-node
+  pool-backed receipt publication boundary, including transport fan-out paths
+  that need a recorded pool receipt before acknowledgement;
 - Finish read, degraded-read, scrub, repair, and rebuild paths that still need
   to consume receipt authority outside the focused split APIs above;
 - Finish rebake/reclaim runtime paths that must trim only after durable
