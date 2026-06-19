@@ -198,9 +198,16 @@ fn collector_checksum_mismatch_rejected_integration() {
     ];
     let decision = collector.collect(&behaviors);
     match decision {
-        QuorumDecision::QuorumFailed { acks, required, .. } => {
-            assert_eq!(acks, 1);
+        QuorumDecision::QuorumFailed {
+            acks,
+            required,
+            failures,
+        } => {
             assert_eq!(required, 2);
+            assert!(acks < required);
+            assert_eq!(failures.len(), 2);
+            assert!(failures.contains(&NodeId::new(2)));
+            assert!(failures.contains(&NodeId::new(3)));
         }
         _ => panic!("expected QuorumFailed"),
     }
@@ -650,7 +657,7 @@ fn leader_idempotent_retry_success_after_replica_comes_online() {
     );
 
     // First round: 1 ack, 2 fail -> quorum not met yet (alive=2, w=2, still possible)
-    leader.record_ack(wid, NodeId::new(1), true);
+    leader.record_committed_ack(wid, NodeId::new(1), true);
     leader.record_failure(wid, NodeId::new(2));
     leader.record_failure(wid, NodeId::new(3));
 
@@ -689,8 +696,8 @@ fn leader_concurrent_writes_independent_resolution() {
     );
 
     // Ack write A to quorum
-    leader.record_ack(wa, NodeId::new(1), true);
-    leader.record_ack(wa, NodeId::new(2), true); // quorum for A
+    leader.record_committed_ack(wa, NodeId::new(1), true);
+    leader.record_committed_ack(wa, NodeId::new(2), true); // quorum for A
 
     // Write B hasn't reached quorum yet
     let res_a = leader.resolve(wa).unwrap();
@@ -701,9 +708,9 @@ fn leader_concurrent_writes_independent_resolution() {
     assert!(leader.resolve(wb).is_none());
 
     // Complete B
-    leader.record_ack(wb, NodeId::new(4), true);
-    leader.record_ack(wb, NodeId::new(5), true);
-    leader.record_ack(wb, NodeId::new(6), true);
+    leader.record_committed_ack(wb, NodeId::new(4), true);
+    leader.record_committed_ack(wb, NodeId::new(5), true);
+    leader.record_committed_ack(wb, NodeId::new(6), true);
     let res_b = leader.resolve(wb).unwrap();
     assert!(matches!(
         res_b,
@@ -1178,8 +1185,8 @@ fn leader_ack_and_failure_tracking_accurate() {
         tidefs_quorum_write_runtime::ReplicationChunkClass::ContentPayload,
         5,
     );
-    leader.record_ack(wid, NodeId::new(1), true);
-    leader.record_ack(wid, NodeId::new(2), true);
+    leader.record_committed_ack(wid, NodeId::new(1), true);
+    leader.record_committed_ack(wid, NodeId::new(2), true);
     leader.record_failure(wid, NodeId::new(3));
     leader.record_failure(wid, NodeId::new(4));
 
@@ -1191,7 +1198,7 @@ fn leader_ack_and_failure_tracking_accurate() {
     assert!(!h.quorum_impossible()); // 3 alive >= 3 needed
 
     // Third ack should meet quorum
-    leader.record_ack(wid, NodeId::new(5), true);
+    leader.record_committed_ack(wid, NodeId::new(5), true);
     let h = leader.handle(wid).unwrap();
     assert!(h.quorum_met());
 }

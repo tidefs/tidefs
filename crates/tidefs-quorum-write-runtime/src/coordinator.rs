@@ -235,7 +235,7 @@ impl QuorumWriteRuntime {
         for target in &targets {
             // In production, each replica would be contacted via transport;
             // here we assume synchronous dispatch and record the ack.
-            let (outcome, _proto_result) = leader.record_ack(wid, *target, true);
+            let (outcome, _proto_result) = leader.record_committed_ack(wid, *target, true);
             match outcome {
                 QuorumAckOutcome::AckReceived | QuorumAckOutcome::QuorumReached => {
                     total_acks += 1;
@@ -399,7 +399,7 @@ impl QuorumWriteRuntime {
         // counts toward quorum.
         let mut total_acks: usize = 0;
         for target in &targets {
-            let (outcome, _proto_result) = leader.record_ack(wid, *target, true);
+            let (outcome, _proto_result) = leader.record_committed_ack(wid, *target, true);
             match outcome {
                 QuorumAckOutcome::AckReceived | QuorumAckOutcome::QuorumReached => {
                     total_acks += 1;
@@ -475,7 +475,7 @@ impl QuorumWriteRuntime {
         let failures: Vec<NodeId> = Vec::new();
 
         for target in &request.target_replicas {
-            let (outcome, _proto_result) = leader.record_ack(wid, *target, true);
+            let (outcome, _proto_result) = leader.record_committed_ack(wid, *target, true);
             match outcome {
                 QuorumAckOutcome::AckReceived | QuorumAckOutcome::QuorumReached => {
                     total_acks += 1;
@@ -626,8 +626,21 @@ impl QuorumWriteLeader {
     /// Records the ack in both the `QuorumWriteHandle` and the
     /// `ReplicationProtocol`. Returns the handle's `QuorumAckOutcome` to
     /// inform the caller whether quorum was reached, and the protocol-level
-    /// `WriteResult` if the protocol independently completed.
+    /// `WriteResult` if the protocol independently completed. This raw ACK
+    /// path does not carry committed receipt evidence, so it cannot advance
+    /// the quorum handle to durable completion by itself.
     pub fn record_ack(
+        &mut self,
+        write_id: WriteId,
+        replica: NodeId,
+        digest_ok: bool,
+    ) -> (QuorumAckOutcome, Option<WriteResult>) {
+        self.record_ack_with_receipt(write_id, replica, digest_ok, None)
+    }
+
+    /// Record an acknowledgement whose placement receipt is committed by the
+    /// in-process runtime authority.
+    pub fn record_committed_ack(
         &mut self,
         write_id: WriteId,
         replica: NodeId,
@@ -960,7 +973,7 @@ pub fn simulate_leader_write(
             } else if b.fail {
                 leader.record_failure(wid, b.node_id);
             } else if b.ack {
-                leader.record_ack(wid, b.node_id, true);
+                leader.record_committed_ack(wid, b.node_id, true);
             }
             // else: silent (no response) — neither ack nor fail
         }
@@ -1101,10 +1114,10 @@ mod tests {
         let mut leader = QuorumWriteLeader::new(cfg_n3_w2(), EpochId::new(0), phase, total, 2);
         let wid = leader.dispatch(ReplicationChunkClass::ContentPayload, 3);
 
-        let (out1, _) = leader.record_ack(wid, NodeId::new(1), true);
+        let (out1, _) = leader.record_committed_ack(wid, NodeId::new(1), true);
         assert_eq!(out1, QuorumAckOutcome::AckReceived);
 
-        let (out2, _) = leader.record_ack(wid, NodeId::new(2), true);
+        let (out2, _) = leader.record_committed_ack(wid, NodeId::new(2), true);
         assert_eq!(out2, QuorumAckOutcome::QuorumReached);
 
         let res = leader.resolve(wid).unwrap();
@@ -1115,13 +1128,29 @@ mod tests {
     }
 
     #[test]
+    fn leader_raw_ack_without_receipt_does_not_reach_quorum() {
+        let (phase, total) = default_timeouts();
+        let mut leader = QuorumWriteLeader::new(cfg_n3_w2(), EpochId::new(0), phase, total, 2);
+        let wid = leader.dispatch(ReplicationChunkClass::ContentPayload, 3);
+
+        let (out1, _) = leader.record_ack(wid, NodeId::new(1), true);
+        let (out2, _) = leader.record_ack(wid, NodeId::new(2), true);
+
+        assert_eq!(out1, QuorumAckOutcome::AckReceived);
+        assert_eq!(out2, QuorumAckOutcome::AckReceived);
+        assert_eq!(leader.handle(wid).unwrap().ack_count(), 0);
+        assert!(leader.resolve(wid).is_none());
+        assert!(leader.commit(wid).is_none());
+    }
+
+    #[test]
     fn leader_duplicate_ack_is_idempotent() {
         let (phase, total) = default_timeouts();
         let mut leader = QuorumWriteLeader::new(cfg_n3_w2(), EpochId::new(0), phase, total, 2);
         let wid = leader.dispatch(ReplicationChunkClass::ContentPayload, 3);
 
-        leader.record_ack(wid, NodeId::new(1), true);
-        let (out, _) = leader.record_ack(wid, NodeId::new(1), true);
+        leader.record_committed_ack(wid, NodeId::new(1), true);
+        let (out, _) = leader.record_committed_ack(wid, NodeId::new(1), true);
         assert_eq!(out, QuorumAckOutcome::DuplicateAck);
         assert_eq!(leader.handle(wid).unwrap().ack_count(), 1);
     }
@@ -1132,9 +1161,9 @@ mod tests {
         let mut leader = QuorumWriteLeader::new(cfg_n3_w2(), EpochId::new(0), phase, total, 2);
         let wid = leader.dispatch(ReplicationChunkClass::ContentPayload, 3);
 
-        leader.record_ack(wid, NodeId::new(1), true);
-        leader.record_ack(wid, NodeId::new(2), true); // quorum met
-        let (out, _) = leader.record_ack(wid, NodeId::new(3), true);
+        leader.record_committed_ack(wid, NodeId::new(1), true);
+        leader.record_committed_ack(wid, NodeId::new(2), true); // quorum met
+        let (out, _) = leader.record_committed_ack(wid, NodeId::new(3), true);
         assert_eq!(out, QuorumAckOutcome::AlreadyResolved);
     }
 
@@ -1162,8 +1191,8 @@ mod tests {
         let mut leader = QuorumWriteLeader::new(cfg_n3_w2(), EpochId::new(0), phase, total, 2);
         let wid = leader.dispatch(ReplicationChunkClass::ContentPayload, 3);
 
-        leader.record_ack(wid, NodeId::new(1), true);
-        leader.record_ack(wid, NodeId::new(2), true);
+        leader.record_committed_ack(wid, NodeId::new(1), true);
+        leader.record_committed_ack(wid, NodeId::new(2), true);
 
         let receipt = leader.commit(wid).unwrap();
         assert_eq!(receipt.write_id, wid);
