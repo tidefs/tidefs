@@ -597,8 +597,8 @@ impl ReclaimConsumerStats {
 pub struct ReceiptBoundDeadObjectDrain {
     /// Segment reclaim accounting for this drain.
     pub stats: ReclaimConsumerStats,
-    /// Exact dead-object ids whose segment liveness delta was applied and may
-    /// be acknowledged after queue persistence succeeds.
+    /// Exact dead-object ids whose segment was reclaimed and may be
+    /// acknowledged after queue persistence succeeds.
     pub ack_object_ids: Vec<ObjectKey>,
     /// Exact segment ids returned to the free pool by this drain.
     pub reclaimed_segment_ids: Vec<u64>,
@@ -1231,9 +1231,12 @@ where
 /// selects candidates through
 /// [`DeadObjectReclaimQueue::dequeue_receipt_bound_batch_with_stable_generation`]
 /// so legacy, synthetic, malformed, under-width, ineligible, or
-/// generation-unstable entries remain queued. Each fully-dead segment is then
-/// checked through `gate`; denied segments remain queued with their liveness
-/// deltas rolled back. The caller owns source-queue mutation and should
+/// generation-unstable entries remain queued. A selected segment is only
+/// eligible for liveness mutation when the current batch covers enough extents
+/// to reclaim the whole segment; partial segment batches stay queued so a
+/// later free cannot bypass clearance checks for extents acknowledged earlier.
+/// Each eligible fully-dead segment is then checked through `gate`; denied
+/// segments remain queued. The caller owns source-queue mutation and should
 /// acknowledge only the returned object ids after any queue persistence
 /// succeeds.
 pub fn drain_receipt_bound_dead_objects<R, F>(
@@ -1281,8 +1284,18 @@ where
     }
 
     let mut segment_entries: HashMap<u64, Vec<ObjectKey>> = HashMap::new();
-    let mut segment_prior_counts: HashMap<u64, u64> = HashMap::new();
-    let mut ack_object_ids = Vec::with_capacity(entries.len());
+    let mut queued_segment_entries: HashMap<u64, usize> = HashMap::new();
+
+    for entry in queue.all_entries() {
+        let key = entry.object_id;
+        let Some(segment_id) = resolver
+            .resolve(&key)
+            .map_err(|error| DrainError::ResolveError { key, error })?
+        else {
+            continue;
+        };
+        *queued_segment_entries.entry(segment_id).or_default() += 1;
+    }
 
     for entry in &entries {
         let key = entry.object_id;
@@ -1293,23 +1306,27 @@ where
             continue;
         };
 
-        segment_prior_counts
-            .entry(segment_id)
-            .or_insert_with(|| live_counts.live_count(segment_id));
-        live_counts.apply_delta(segment_id, -1);
         segment_entries.entry(segment_id).or_default().push(key);
-        ack_object_ids.push(key);
         stats.entries_processed += 1;
     }
 
     let dead_segments: Vec<u64> = segment_entries
-        .keys()
-        .copied()
-        .filter(|sid| live_counts.is_dead(*sid))
+        .iter()
+        .filter_map(|(segment_id, extents)| {
+            let live_count = live_counts.live_count(*segment_id);
+            let selected_entries = extents.len();
+            let queued_entries = queued_segment_entries
+                .get(segment_id)
+                .copied()
+                .unwrap_or(selected_entries);
+            let covers_liveness = live_count == 0 || live_count <= selected_entries as u64;
+            (covers_liveness && selected_entries == queued_entries).then_some(*segment_id)
+        })
         .collect();
 
     let mut freed_extents = Vec::new();
     let mut reclaimed_segment_ids = Vec::new();
+    let mut ack_object_ids = Vec::new();
     let mut clearance_deadlist_txg: Option<u64> = None;
     let mut clearance_pin_epoch: Option<u64> = None;
 
@@ -1337,10 +1354,6 @@ where
             }
 
             if !segment_allowed {
-                if let Some(previous) = segment_prior_counts.get(&segment_id) {
-                    live_counts.set_live_count(segment_id, *previous);
-                }
-                ack_object_ids.retain(|object_key| !extent_entries.contains(object_key));
                 stats.gate_segments_skipped += 1;
                 continue;
             }
@@ -1349,6 +1362,7 @@ where
                 .free_segment(segment_id)
                 .map_err(|error| DrainError::FreeError { segment_id, error })?;
             live_counts.remove(segment_id);
+            ack_object_ids.extend(extent_entries.iter().copied());
             reclaimed_segment_ids.push(segment_id);
             stats.segments_reclaimed += 1;
             stats.blocks_freed += extent_entries.len() as u64;
@@ -2594,7 +2608,7 @@ mod tests {
         let mut resolver = MockResolver::new();
         resolver.set(1, 100);
         resolver.set(2, 100);
-        resolver.set(3, 100);
+        resolver.set(3, 101);
 
         let mut live_counts = SegmentLiveCounts::new();
         live_counts.set_live_count(100, 2);
@@ -2670,6 +2684,70 @@ mod tests {
         assert_eq!(drain.stats.gate_extents_denied, 1);
         assert_eq!(drain.stats.reclaim_queue_depth, 2);
         assert!(drain.receipt.is_none());
+        assert_eq!(live_counts.live_count(100), 2);
+        assert!(freer.freed_segments().is_empty());
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_keeps_partial_segment_entries_queued() {
+        let mut queue = DeadObjectReclaimQueue::new();
+        queue.enqueue(dead_entry(1, 5, true, Some(10)));
+        queue.enqueue(dead_entry(2, 5, true, Some(11)));
+
+        let mut resolver = MockResolver::new();
+        resolver.set(1, 100);
+        resolver.set(2, 100);
+
+        let mut live_counts = SegmentLiveCounts::new();
+        live_counts.set_live_count(100, 2);
+        let mut freer = MockFreer::new();
+        let config = ReclaimConsumerConfig::default();
+
+        let partial = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            11,
+            1,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+            &AllowAllGate,
+        )
+        .expect("receipt-bound partial drain");
+
+        assert!(partial.ack_object_ids.is_empty());
+        assert_eq!(partial.stats.entries_processed, 1);
+        assert_eq!(partial.stats.segments_reclaimed, 0);
+        assert_eq!(partial.stats.reclaim_queue_depth, 2);
+        assert!(partial.receipt.is_none());
+        assert_eq!(live_counts.live_count(100), 2);
+        assert!(freer.freed_segments().is_empty());
+
+        let gate = DenySetGate {
+            deny_keys: vec![1],
+            reason: GateDenyReason::SnapshotPinned,
+        };
+        let denied = drain_receipt_bound_dead_objects(
+            &queue,
+            6,
+            11,
+            16,
+            &resolver,
+            &mut freer,
+            &mut live_counts,
+            &config,
+            &gate,
+        )
+        .expect("receipt-bound denied full drain");
+
+        assert!(denied.ack_object_ids.is_empty());
+        assert_eq!(denied.stats.entries_processed, 2);
+        assert_eq!(denied.stats.segments_reclaimed, 0);
+        assert_eq!(denied.stats.gate_segments_skipped, 1);
+        assert_eq!(denied.stats.gate_extents_denied, 1);
+        assert_eq!(denied.stats.reclaim_queue_depth, 2);
+        assert!(denied.receipt.is_none());
         assert_eq!(live_counts.live_count(100), 2);
         assert!(freer.freed_segments().is_empty());
     }
