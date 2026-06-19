@@ -2599,12 +2599,14 @@ impl LocalObjectStore {
                 }
 
                 // Auto-update space accounting: overwrite replaces old data.
-                if !internal_metadata && let Some(ds_id) = self.current_dataset_id {
-                    if old_loc.payload_len > 0 {
-                        let _ = self.space_book.record_delete(ds_id, old_loc.payload_len);
-                    }
-                    if payload_len > 0 {
-                        let _ = self.space_book.record_write(ds_id, payload_len);
+                if !internal_metadata {
+                    if let Some(ds_id) = self.current_dataset_id {
+                        if old_loc.payload_len > 0 {
+                            let _ = self.space_book.record_delete(ds_id, old_loc.payload_len);
+                        }
+                        if payload_len > 0 {
+                            let _ = self.space_book.record_write(ds_id, payload_len);
+                        }
                     }
                 }
             }
