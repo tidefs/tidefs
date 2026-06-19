@@ -98,13 +98,36 @@ pub struct IntentLogCrashCase {
     pub id: String,
     /// Number of records in the segment.
     pub record_count: usize,
-    /// Byte offset at which to truncate the segment (None = no truncation, clean run).
-    pub truncate_at: Option<usize>,
+    /// Segment truncation applied before crash replay.
+    pub truncation: Option<IntentLogTruncation>,
     /// Whether the clean-run and truncated-replay checkpoints should match.
     pub expect_clean_checkpoint_match: bool,
 }
 
+/// Where a crash-injection case truncates the encoded segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntentLogTruncation {
+    /// Truncate at an absolute byte offset.
+    At(usize),
+    /// Truncate this many bytes from the tail of the encoded segment.
+    TailBytes(usize),
+}
+
 impl IntentLogCrashCase {
+    fn truncate_segment(&self, segment: &mut Vec<u8>) {
+        let Some(truncation) = self.truncation else {
+            return;
+        };
+
+        let offset = match truncation {
+            IntentLogTruncation::At(offset) => offset,
+            IntentLogTruncation::TailBytes(bytes) => segment.len().saturating_sub(bytes),
+        };
+        if offset < segment.len() {
+            segment.truncate(offset);
+        }
+    }
+
     /// Run this crash case and return whether the expected checkpoint relation held.
     pub fn run(&self) -> Result<bool, String> {
         let frames: Vec<_> = (0..self.record_count)
@@ -116,11 +139,7 @@ impl IntentLogCrashCase {
         let clean_checkpoint = replay_and_checkpoint(&segment, 0);
 
         // Apply crash truncation
-        if let Some(offset) = self.truncate_at {
-            if offset < segment.len() {
-                segment.truncate(offset);
-            }
-        }
+        self.truncate_segment(&mut segment);
 
         // Crash-replay checkpoint
         let crash_checkpoint = replay_and_checkpoint(&segment, 0);
@@ -140,34 +159,34 @@ pub fn run_intent_log_crash_matrix() -> Vec<IntentLogCrashCase> {
         IntentLogCrashCase {
             id: "crash-at-start-header-only".into(),
             record_count: 5,
-            truncate_at: Some(64),                // only header, no records
+            truncation: Some(IntentLogTruncation::At(64)), // only header, no records
             expect_clean_checkpoint_match: false, // no records survived, so checkpoint differs
         },
         IntentLogCrashCase {
             id: "crash-after-one-record".into(),
             record_count: 5,
-            truncate_at: Some(200), // header + partial first record
+            truncation: Some(IntentLogTruncation::At(200)), // header + partial first record
             expect_clean_checkpoint_match: false,
         },
         // ── Crash mid-segment ────────────────────────────────────
         IntentLogCrashCase {
             id: "crash-mid-segment".into(),
             record_count: 8,
-            truncate_at: Some(512), // some records survive
+            truncation: Some(IntentLogTruncation::At(512)), // some records survive
             expect_clean_checkpoint_match: false,
         },
         // ── Crash near end (most records survive) ────────────────
         IntentLogCrashCase {
             id: "crash-near-end".into(),
             record_count: 10,
-            truncate_at: None, // will be set dynamically below
+            truncation: Some(IntentLogTruncation::TailBytes(128)),
             expect_clean_checkpoint_match: false,
         },
         // ── Double-replay idempotency (no crash) ─────────────────
         IntentLogCrashCase {
             id: "double-replay-idempotent".into(),
             record_count: 5,
-            truncate_at: None, // no truncation — test pure double-replay
+            truncation: None, // no truncation — test pure double-replay
             expect_clean_checkpoint_match: true,
         },
     ]
@@ -186,29 +205,12 @@ mod tests {
         assert!(!cases.is_empty());
 
         for case in &cases {
-            if case.id == "crash-near-end" {
-                // Dynamic truncation: cut off the last few records' data
-                let frames: Vec<_> = (0..case.record_count)
-                    .map(|i| make_write_frame(i as u64, 100 + i as u64))
-                    .collect();
-                let segment = make_segment(&frames);
-                // Truncate at ~85% of segment to lose trailing records
-                let cut = segment.len() * 50 / 100;
-                let mut truncated = segment.clone();
-                truncated.truncate(cut);
-
-                let clean = replay_and_checkpoint(&segment, 0);
-                let crash = replay_and_checkpoint(&truncated, 0);
-                // Truncated segment replays fewer records → different checkpoint
-                assert_ne!(clean, crash, "crash-near-end should differ from clean");
-            } else {
-                let result = case.run().unwrap_or_else(|e| panic!("{e}"));
-                assert!(
-                    result,
-                    "case {}: expected clean_checkpoint_match={}",
-                    case.id, case.expect_clean_checkpoint_match
-                );
-            }
+            let result = case.run().unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                result,
+                "case {}: expected clean_checkpoint_match={}",
+                case.id, case.expect_clean_checkpoint_match
+            );
         }
     }
 
