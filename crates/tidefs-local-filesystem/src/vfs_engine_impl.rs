@@ -1630,6 +1630,7 @@ impl VfsLocalFileSystem {
     }
 
     fn live_dataset_create(&self, pool: &str, args: &Value, wants_json: bool) -> Vec<u8> {
+        let name = match live_admin_arg(args, "name") {
             Ok(value) => value,
             Err(err) => return live_admin_error(2, err),
         };
