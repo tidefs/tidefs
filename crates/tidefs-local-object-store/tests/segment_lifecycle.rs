@@ -329,6 +329,11 @@ fn test_truncated_segment_yields_empty_store() {
         file.set_len(0).expect("truncate to zero");
     }
 
+    // Delete the intent-log directory so no committed transactions
+    // survive the simulated catastrophic segment loss.
+    let ilog = root.join("intent_log");
+    let _ = fs::remove_dir_all(&ilog);
+
     // Reopen: must not panic. Store may be empty or reject the segment.
     let result = LocalObjectStore::open_with_options(&root, small_segment_opts(4096));
     match result {
