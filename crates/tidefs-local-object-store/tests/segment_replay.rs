@@ -406,6 +406,11 @@ fn empty_segment_file_is_tolerated_on_replay() {
     assert!(fs::metadata(&seg_path).expect("metadata").len() > 0);
     truncate_to(&seg_path, 0);
 
+    // Delete the intent-log directory so no committed transactions
+    // survive the simulated catastrophic segment loss.
+    let ilog = root.join("intent_log");
+    let _ = fs::remove_dir_all(&ilog);
+
     // Reopen: empty segment must not cause panic.
     let store = LocalObjectStore::open_with_options(&root, fast_opts());
     match store {
