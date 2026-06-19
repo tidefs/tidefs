@@ -1,0 +1,50 @@
+artifact_version = 1
+evidence_class = "claims-gate-review"
+source = "claims-gate"
+scope = "ublk-model-runtime-boundary-review"
+issue = 564
+
+claim_id = "ublk.qid_tag.exactly_once_completion.v1"
+reviewed_claim_ids = [
+  "ublk.qid_tag.exactly_once_completion.v1",
+]
+
+validation_tier = "source-model claims-gate review"
+model_evidence_present = true
+runtime_evidence_present = true
+runtime_evidence_status = "bounded-qemu-ublk-smoke-present"
+decision = "planned-until-broader-runtime-evidence"
+
+[[source_artifacts]]
+path = "validation/artifacts/ublk/qid-tag-state-model.json"
+evidence_class = "qid-tag-state-model"
+digest_algorithm = "sha256"
+digest = "5afdab9a727214a1699d07a00e8ebbec8344dc1d962a38faf4969cdd9c44b43a"
+
+[[source_artifacts]]
+path = "validation/artifacts/ublk/qid-tag-completion-runtime.json"
+evidence_class = "runtime-ublk-completion-artifact"
+digest_algorithm = "sha256"
+digest = "39bd837250d2c55fec2bd72e6727d60ebe477d105cccd696bfe947a02797140f"
+
+reviewed_invariants = [
+  "each qid/tag generation has at most one terminal TideFS completion",
+  "successful uBLK completion emits a matching TideCompletion for the current request token",
+  "abort emits one cancelled TideCompletion and rejects later uBLK completion commands",
+  "timeout emits one timed-out TideCompletion and stale completions after reissue fail closed",
+  "duplicate completion, stale generation, wrong qid, wrong tag, and completion after abort do not mutate the slot into a second terminal completion",
+]
+
+boundary_review = [
+  "The qid-tag-state-model artifact records bounded pure-model evidence for the uBLK qid/tag request lifecycle; it does not exercise the uBLK daemon, ioctl, or product block I/O runtime.",
+  "The qid-tag-completion-runtime artifact records a focused qemu-ublk-smoke runtime trace with 1 hw queue, queue depth 2, and 5 completed requests through read/write/flush/discard lifecycle transitions.",
+  "The runtime trace shows exactly-one terminal completion per (qid, tag, generation_token) tuple across all observed events; no duplicate, stale, or post-abort completion is present.",
+  "This review does not validate fio workload breadth, mkfs/mount acceptance, online resize, crash safety, block-device production readiness, or broader uBLK ABI behavior.",
+]
+
+non_claims = [
+  "This review does not validate uBLK daemon production behavior, fio, mkfs, mount, online resize, or crash safety.",
+  "This review does not validate production block-device readiness or broader uBLK ABI semantics.",
+  "This review does not move ublk.qid_tag.exactly_once_completion.v1 to validated status.",
+  "This review is bounded to the qemu-ublk-smoke evidence scope; additional runtime coverage (queue-depth scaling, multi-queue, error-injection, and broader operation mix) would be required before product wording can strengthen.",
+]
