@@ -15,7 +15,7 @@
 //!                         ├─ filter: lsn > applied_txg
 //!                         ├─ filter: lsn not in applied_lsns (dedup)
 //!                         ├─ dispatch: handler.handle_record()
-//!                         ├─ update: ReplayState counters + applied_lsns
+//!                         ├─ update: ReplayState counters + covered LSNs
 //!                         └─ checkpoint: BLAKE3 domain-separated digest
 //! ```
 //!
@@ -43,8 +43,10 @@
 //!    `applied_lsns` set are skipped even when `applied_txg` has not
 //!    yet advanced. This prevents duplicate dispatch inside one replay
 //!    engine instance, for example when segments overlap or a caller
-//!    retries a segment in the same process. It is not persistent crash
-//!    state.
+//!    retries a segment in the same process. Replay-safe no-op records
+//!    are also marked here so checkpoint gating can prove the LSN range
+//!    is covered without dispatching a durable mutation. It is not
+//!    persistent crash state.
 //!
 //! ## Per-Record-Kind Idempotency Contract
 //!
@@ -131,10 +133,11 @@ pub trait IntentReplayHandler {
 
 /// Tracks replay progress across the replay run.
 ///
-/// The `applied_lsns` field records every LSN that has been successfully
-/// dispatched during the current replay run. This enables within-run
-/// deduplication and checkpoint verification, but it is not durable
-/// post-crash replay state.
+/// The `applied_lsns` field records every LSN that has been safely covered
+/// during the current replay run, either by successful replay dispatch or by
+/// recognizing a replay-safe no-op record. This enables within-run
+/// deduplication and checkpoint verification, but it is not durable post-crash
+/// replay state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplayState {
     /// Last fully-applied transaction group ID.
@@ -153,9 +156,8 @@ pub struct ReplayState {
     /// Highest LSN encountered across all replayed segments.
     pub highest_lsn_seen: u64,
 
-    /// LSNs that have been successfully applied during this replay run.
-    /// Stored in monotonic order; used for within-run dedup and checkpoint
-    /// verification.
+    /// LSNs that have been safely covered during this replay run. Stored in
+    /// monotonic order; used for within-run dedup and checkpoint verification.
     pub applied_lsns: Vec<u64>,
 }
 
@@ -185,7 +187,7 @@ impl ReplayState {
         self.applied_lsns.binary_search(&lsn).is_ok()
     }
 
-    /// Record that an LSN has been successfully applied.
+    /// Record that an LSN has been safely covered by replay.
     ///
     /// # Panics
     ///
@@ -486,8 +488,10 @@ impl IntentReplayEngine {
                 continue;
             }
 
-            // Skip non-replayable record types.
+            // Replay-safe no-op records still cover their LSN for checkpoint
+            // gating, even though they do not dispatch a durable mutation.
             if !is_replayable_record_type(&seg_rec.record) {
+                self.state.mark_lsn_applied(seg_rec.lsn);
                 self.state.entries_skipped += 1;
                 segment_skipped += 1;
                 continue;
@@ -1532,6 +1536,51 @@ mod tests {
 
         // LSNs 1,2,3,4 applied. LSN 0 covered by applied_txg=0.
         assert!(engine.is_checkpointable_up_to(4));
+    }
+
+    #[test]
+    fn skipped_noop_records_cover_lsns_for_checkpoint_gating() {
+        let records = vec![
+            IntentLogRecord::Write {
+                ino: 10,
+                offset: 0,
+                length: 4096,
+                data_hash: [0x11; 32],
+            },
+            IntentLogRecord::Flush {
+                ino: 10,
+                fh: 1,
+                lock_owner: 0,
+            },
+            IntentLogRecord::Write {
+                ino: 10,
+                offset: 4096,
+                length: 4096,
+                data_hash: [0x22; 32],
+            },
+            IntentLogRecord::Fsync {
+                ino: 10,
+                fh: 1,
+                mode: 0,
+            },
+            IntentLogRecord::Write {
+                ino: 10,
+                offset: 8192,
+                length: 4096,
+                data_hash: [0x33; 32],
+            },
+        ];
+        let segment = make_record_segment(&records, 1);
+
+        let mut engine = IntentReplayEngine::new(0);
+        let mut handler = RecordingHandler::default();
+        engine.replay_segment(&segment, &mut handler).unwrap();
+
+        assert_eq!(handler.records.len(), 3);
+        assert_eq!(engine.state.entries_replayed, 3);
+        assert_eq!(engine.state.entries_skipped, 2);
+        assert_eq!(engine.state.applied_lsns, vec![1, 2, 3, 4, 5]);
+        assert!(engine.is_checkpointable_up_to(engine.state.highest_lsn_seen));
     }
 
     #[test]
