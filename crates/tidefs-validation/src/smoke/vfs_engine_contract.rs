@@ -91,7 +91,7 @@ impl ContractTestEngine {
         !state.entries.keys().any(|(parent, _)| *parent == inode)
     }
 
-    fn next_timestamp(attr: &InodeAttr) -> u64 {
+    fn next_timestamp(attr: &InodeAttr) -> i64 {
         attr.posix
             .atime_ns
             .max(attr.posix.mtime_ns)

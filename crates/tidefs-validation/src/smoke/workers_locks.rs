@@ -15,6 +15,9 @@ use tidefs_types_posix_filesystem_adapter_core::{
     PosixFilesystemAdapterShardKeyPolicy,
 };
 
+/// Test dataset mount id for LockTracker smoke.
+const TEST_MOUNT: u64 = 1;
+
 /// Run the full workers-locks smoke sequence and return the harness.
 #[must_use]
 pub fn run_workers_locks_smoke() -> SmokeHarness {
@@ -94,7 +97,7 @@ fn smoke_lock_tracker_conflict_and_release(h: &mut SmokeHarness) {
     record_lock_op(h, 7, "workers_locks.acquire", b"write");
     let mut tracker = LockTracker::new();
     let existing = LockRange::write(0, 100, 100);
-    tracker.acquire(7, existing).expect("initial write lock");
+    tracker.acquire(TEST_MOUNT, 7, existing).expect("initial write lock");
     h.assert_eq_ev(
         "tracker has one inode after acquire",
         tracker.inode_count(),
@@ -102,20 +105,20 @@ fn smoke_lock_tracker_conflict_and_release(h: &mut SmokeHarness) {
     );
     h.assert_eq_ev(
         "tracker stores initial range",
-        tracker.locks_for_inode(7).expect("inode lock list").locks(),
+        tracker.locks_for_mount_inode(TEST_MOUNT, 7).expect("inode lock list").locks(),
         &[existing],
     );
 
     record_lock_op(h, 7, "workers_locks.query_conflict", b"read");
     let requested = LockRange::read(50, 10, 200);
     let conflict = tracker
-        .query_conflict(7, requested)
+        .query_conflict(TEST_MOUNT, 7, requested)
         .expect("read should conflict with write");
     h.assert_eq_ev("conflict requested range", conflict.requested, requested);
     h.assert_eq_ev("conflict existing range", conflict.existing, existing);
 
     let acquire_conflict = tracker
-        .acquire(7, requested)
+        .acquire(TEST_MOUNT, 7, requested)
         .expect_err("acquire should return conflict");
     h.assert_eq_ev(
         "acquire conflict matches query conflict",
@@ -124,40 +127,40 @@ fn smoke_lock_tracker_conflict_and_release(h: &mut SmokeHarness) {
     );
     h.assert_eq_ev(
         "failed acquire leaves existing lock intact",
-        tracker.locks_for_inode(7).expect("inode lock list").locks(),
+        tracker.locks_for_mount_inode(TEST_MOUNT, 7).expect("inode lock list").locks(),
         &[existing],
     );
 
     record_lock_op(h, 7, "workers_locks.compatible_read", b"same-range");
     tracker
-        .acquire(8, LockRange::read(0, 50, 300))
+        .acquire(TEST_MOUNT, 8, LockRange::read(0, 50, 300))
         .expect("first read lock");
     tracker
-        .acquire(8, LockRange::read(25, 50, 400))
+        .acquire(TEST_MOUNT, 8, LockRange::read(25, 50, 400))
         .expect("compatible read lock");
     h.assert_eq_ev(
         "read locks from different pids are compatible",
-        tracker.locks_for_inode(8).expect("read lock list").len(),
+        tracker.locks_for_mount_inode(TEST_MOUNT, 8).expect("read lock list").len(),
         2,
     );
 
     record_lock_op(h, 7, "workers_locks.release", b"all");
-    tracker.release(7, LockRange::unlock(0, 100, 100));
+    tracker.release(TEST_MOUNT, 7, LockRange::unlock(0, 100, 100));
     h.assert_ev(
         "released inode lock list is removed",
-        tracker.locks_for_inode(7).is_none(),
+        tracker.locks_for_mount_inode(TEST_MOUNT, 7).is_none(),
     );
 
-    tracker.release_by_pid(300);
+    tracker.release_by_pid(TEST_MOUNT, 300);
     h.assert_eq_ev(
         "release_by_pid preserves other pid",
         tracker
-            .locks_for_inode(8)
+            .locks_for_mount_inode(TEST_MOUNT, 8)
             .expect("remaining lock list")
             .locks(),
         &[LockRange::read(25, 50, 400)],
     );
-    tracker.release_by_pid(400);
+    tracker.release_by_pid(TEST_MOUNT, 400);
     h.assert_ev("release_by_pid clears final lock", tracker.is_empty());
 }
 
