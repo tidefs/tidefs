@@ -63,7 +63,7 @@ validation.
 
 | Path | File-local marker | Provenance |
 | --- | --- | --- |
-| `nix/vm/tidefs-fsync-guest-helper.c` | `GPL-2.0-only` | QEMU guest helper used by TideFS fsync runtime validation. |
+| `nix/vm/tidefs-fsync-guest-helper.c` | `GPL-2.0-only WITH Linux-syscall-note` | QEMU guest helper used by TideFS fsync runtime validation. |
 
 All other packages reported by root `cargo metadata --no-deps --locked` use
 `GPL-2.0-only WITH Linux-syscall-note` through workspace package metadata.
