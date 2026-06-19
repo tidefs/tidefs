@@ -378,56 +378,39 @@ fn abort_then_write_produces_valid_root() {
     clean(&root);
 }
 
-// ---------------------------------------------------------------------------
-// Segment-path committed root is durable and verifiable after reopen
-// ---------------------------------------------------------------------------
-
 #[test]
-fn segment_path_committed_root_persisted_and_verifiable() {
-    let root = temp_dir("segpath-root");
+fn directory_committed_root_uses_sidecar_without_segment_object() {
+    let root = temp_dir("sidecar-root");
     let mut store = open_test_store(&root);
 
-    store.put_content_addressed(b"segpath-data").unwrap();
+    store.put_content_addressed(b"sidecar-data").unwrap();
     store.sync_all().unwrap();
 
     let committed = store.txg_manager().committed_root();
     assert!(committed.is_valid());
 
-    // The segment-path copy should be retrievable via get().
+    let root_path = root.join(txg_manager::COMMITTED_ROOT_FILE);
+    let sidecar_copy = std::fs::read(&root_path).unwrap();
+    let (decoded, digest) =
+        txg_manager::CommitGroupManager::decode_root_with_digest(&sidecar_copy).unwrap();
+    assert_eq!(decoded, committed);
+    assert!(
+        digest.is_some(),
+        "sidecar committed root must persist the chain digest"
+    );
+
+    // Directory-backed stores keep the committed root in the sidecar file.
+    // The segment-path object is reserved for sidecar-unavailable modes so
+    // ordinary segment layout and replay counters stay user-data-only.
     let root_key = tidefs_local_object_store::ObjectKey::from_name(
         tidefs_local_object_store::txg_manager::COMMITTED_ROOT_FILE.as_bytes(),
     );
-    let segment_copy = store.get(root_key).unwrap();
-    assert!(
-        segment_copy.is_some(),
-        "segment-path committed root must exist after sync_all"
-    );
+    assert_eq!(store.get(root_key).unwrap(), None);
 
-    // Decode the segment-path copy and compare.
-    let decoded = tidefs_local_object_store::txg_manager::CommitGroupManager::decode_root(
-        &segment_copy.unwrap(),
-    )
-    .unwrap();
-    assert_eq!(decoded, committed);
-
-    // Reopen: verify_committed_root_consistency runs during open.
     drop(store);
     let store2 = open_test_store(&root);
-
-    // After reopen, the segment-path copy should still be retrievable.
-    let segment_copy2 = store2.get(root_key).unwrap();
-    assert!(
-        segment_copy2.is_some(),
-        "segment-path copy must survive reopen"
-    );
-
-    let decoded2 = tidefs_local_object_store::txg_manager::CommitGroupManager::decode_root(
-        &segment_copy2.unwrap(),
-    )
-    .unwrap();
-    assert_eq!(decoded2, committed);
-
     assert_eq!(store2.txg_manager().committed_root(), committed);
+    assert_eq!(store2.get(root_key).unwrap(), None);
 
     clean(&root);
 }

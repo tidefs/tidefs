@@ -50,7 +50,9 @@ use crate::io_scheduler::{IoScheduler, IoSchedulerConfig};
 use crate::reclaim_queue::{
     load_dead_object_reclaim_queue, load_reclaim_queue_entries, load_reclaim_receipts,
     load_segment_liveness_queue, load_snapshot_extent_pin_set, store_dead_object_reclaim_queue,
-    store_reclaim_receipts, store_snapshot_extent_pin_set,
+    store_reclaim_receipts, store_snapshot_extent_pin_set, DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME,
+    RECLAIM_QUEUE_ENTRIES_OBJECT_NAME, RECLAIM_QUEUE_OBJECT_NAME, RECLAIM_RECEIPTS_OBJECT_NAME,
+    SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME,
 };
 use crate::segment_builder::{FlushResult, SegmentBuilder};
 use crate::txg_manager::CommitGroupManager;
@@ -476,12 +478,33 @@ fn committed_root_key() -> ObjectKey {
         .get_or_init(|| ObjectKey::from_name(crate::txg_manager::COMMITTED_ROOT_FILE.as_bytes()))
 }
 
+fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 5] {
+    static KEYS: OnceLock<[ObjectKey; 5]> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        [
+            ObjectKey::from_name(RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
+            ObjectKey::from_name(RECLAIM_QUEUE_ENTRIES_OBJECT_NAME.as_bytes()),
+            ObjectKey::from_name(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
+            ObjectKey::from_name(RECLAIM_RECEIPTS_OBJECT_NAME.as_bytes()),
+            ObjectKey::from_name(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME.as_bytes()),
+        ]
+    })
+}
+
+fn is_persistent_reclaim_metadata_key(key: ObjectKey) -> bool {
+    persistent_reclaim_metadata_keys().contains(&key)
+}
+
 fn is_stats_internal_key(key: ObjectKey) -> bool {
-    key == committed_root_key() || crate::is_pool_placement_receipt_key(key)
+    key == committed_root_key()
+        || is_persistent_reclaim_metadata_key(key)
+        || crate::is_pool_placement_receipt_key(key)
 }
 
 fn is_public_scan_internal_key(key: ObjectKey) -> bool {
-    key == committed_root_key() || crate::is_pool_placement_scan_internal_key(key)
+    key == committed_root_key()
+        || is_persistent_reclaim_metadata_key(key)
+        || crate::is_pool_placement_scan_internal_key(key)
 }
 
 fn stats_counted_index_len(index: &BTreeMap<ObjectKey, ObjectLocation>) -> usize {
@@ -2566,7 +2589,7 @@ impl LocalObjectStore {
         }
 
         let checksum = checksum64(payload);
-        let internal_metadata = key == committed_root_key();
+        let internal_metadata = is_public_scan_internal_key(key);
         let sequence = if internal_metadata {
             0
         } else {
@@ -3481,16 +3504,12 @@ impl LocalObjectStore {
                 // coordinator can resume the hash chain across reopen.
                 let root_payload = CommitGroupManager::encode_root_with_digest(root, chain_digest);
 
-                // Store the segment-path copy in the index for idempotent
-                // recovery (get-able after sync_all).
-                let root_key =
-                    ObjectKey::from_name(crate::txg_manager::COMMITTED_ROOT_FILE.as_bytes());
-                let _ = self.put_direct(root_key, &root_payload)?;
-
                 // Plain-file persistence is only valid when the store root is
                 // a metadata directory. Raw block-device mode keeps the copy
                 // inside the append-only device log instead.
-                if !sidecar_files_unavailable(&self.root) {
+                if sidecar_files_unavailable(&self.root) {
+                    let _ = self.put_direct(committed_root_key(), &root_payload)?;
+                } else {
                     let root_path = self.root.join(crate::txg_manager::COMMITTED_ROOT_FILE);
                     fs::write(&root_path, &root_payload)
                         .map_err(|source| io_error("write committed root", &root_path, source))?;
@@ -7180,7 +7199,9 @@ mod reclaim_queue_production_tests {
         store.put(key, b"snapshot pinned payload").expect("put");
         let old_segment_id = store.index.get(&key).expect("location").segment_id;
         assert!(store.delete(key).expect("delete"));
-        store.rotate_segment().expect("separate dead extent for reopen drain resolve");
+        store
+            .rotate_segment()
+            .expect("separate dead extent for reopen drain resolve");
 
         let reclaim_key = reclaim_key(key);
         let entry = dead_object_entry_for_key(reclaim_key, 0, true, 1);
