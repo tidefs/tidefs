@@ -1142,7 +1142,7 @@ impl LocalObjectStore {
         // Restore persisted receipt-bound dead-object reclaim entries.
         store.dead_object_reclaim_queue = load_dead_object_reclaim_queue(&store);
         // Restore committed reclaim receipt evidence.
-        store.reclaim_receipts = load_reclaim_receipts(&store);
+        store.reclaim_receipts = load_reclaim_receipts(&store)?;
         // Restore snapshot extent pins before any reclaim authority observes
         // dead-object queue state.
         store.snapshot_extent_pin_set = load_snapshot_extent_pin_set(&store)?;
