@@ -1363,6 +1363,12 @@ impl SnapshotPruner {
             .map_err(|e| SnapshotPrunerError::Store(format!("{e}")))?
             .ok_or(SnapshotPrunerError::SnapshotNotFound)?;
 
+        let snapshot_id = format!("{dataset_name}/{snapshot_name}");
+        if let Some(ref mut pin_set) = self.extent_pin_set {
+            pin_set.release_snapshot(&snapshot_id);
+        }
+        store.release_snapshot_extent_pins(&snapshot_id);
+
         // Record outcome for stats
         let info = SnapshotInfo {
             name: entry.name.clone(),
