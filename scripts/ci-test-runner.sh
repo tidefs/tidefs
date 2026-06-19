@@ -63,7 +63,7 @@ parse_test_summary() {
 
     # Match the last "test result:" line (aggregate, not per-target)
     local summary
-    summary="$(echo "$output" | grep '^test result:' | tail -1)" || return 1
+    summary="$(grep '^test result:' <<< "$output" | tail -1)" || return 1
 
     # Parse: "test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
     # or:    "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out"
@@ -88,13 +88,13 @@ parse_test_summary() {
 # Determine if a test run produced a "test result:" line (had test targets).
 has_test_results() {
     local output="$1"
-    echo "$output" | grep -q '^test result:'
+    grep -q '^test result:' <<< "$output"
 }
 
 # Determine if output contains a compile error.
 has_compile_error() {
     local output="$1"
-    echo "$output" | grep -q '^error: could not compile'
+    grep -q '^error: could not compile' <<< "$output"
 }
 
 # ---- per-crate test execution ------------------------------------------
