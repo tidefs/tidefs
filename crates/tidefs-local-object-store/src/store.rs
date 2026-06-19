@@ -2313,8 +2313,10 @@ impl LocalObjectStore {
         let mut eligible_object_ids = BTreeSet::new();
         let mut segment_refdrops: std::collections::HashMap<u64, u64> =
             std::collections::HashMap::new();
+        let mut segment_queued_entries: std::collections::HashMap<u64, u64> =
+            std::collections::HashMap::new();
 
-        for entry in entries {
+        for entry in self.dead_object_reclaim_queue.all_entries() {
             let Ok(Some(segment_id)) =
                 <LocalObjectStore as tidefs_reclaim::SegmentResolver>::resolve(
                     self,
@@ -2324,6 +2326,13 @@ impl LocalObjectStore {
                 continue;
             };
             resolver.segments.insert(entry.object_id, segment_id);
+            *segment_queued_entries.entry(segment_id).or_default() += 1;
+        }
+
+        for entry in entries {
+            let Some(segment_id) = resolver.segments.get(&entry.object_id).copied() else {
+                continue;
+            };
             eligible_object_ids.insert(entry.object_id);
             *segment_refdrops.entry(segment_id).or_default() += 1;
         }
@@ -2332,7 +2341,11 @@ impl LocalObjectStore {
             .into_iter()
             .filter_map(|(segment_id, refdrops)| {
                 let live_count = self.reclaim_consumer.live_counts().live_count(segment_id);
-                (live_count <= refdrops).then_some(segment_id)
+                let queued_entries = segment_queued_entries
+                    .get(&segment_id)
+                    .copied()
+                    .unwrap_or(refdrops);
+                (live_count <= refdrops && queued_entries == refdrops).then_some(segment_id)
             })
             .collect();
 
@@ -7250,6 +7263,89 @@ mod reclaim_queue_production_tests {
         assert!(
             !segment_path(&reopened.segments_dir, old_segment_id).exists(),
             "released reopened pin should allow physical reclaim"
+        );
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_keeps_partial_snapshot_pins_queued() {
+        let (mut store, _dir) = temp_store();
+        let key_a = ObjectKey::from_name(b"receipt-bound/dead-object/partial/a");
+        let key_b = ObjectKey::from_name(b"receipt-bound/dead-object/partial/b");
+        let snapshot_id = "dataset@snap-partial";
+
+        store.put(key_a, b"first pinned payload").expect("put a");
+        let segment_id = store.index.get(&key_a).expect("location a").segment_id;
+        store.put(key_b, b"second pinned payload").expect("put b");
+        assert_eq!(
+            store.index.get(&key_b).expect("location b").segment_id,
+            segment_id,
+            "test fixture expects both dead objects in one segment"
+        );
+
+        assert!(store.delete(key_a).expect("delete a"));
+        assert!(store.delete(key_b).expect("delete b"));
+
+        let reclaim_key_a = reclaim_key(key_a);
+        let reclaim_key_b = reclaim_key(key_b);
+        for reclaim_key in [reclaim_key_a, reclaim_key_b] {
+            let entry = dead_object_entry_for_key(reclaim_key, 0, true, 1);
+            assert!(store
+                .enqueue_receipt_bound_dead_object(entry)
+                .expect("enqueue receipt-bound dead object"));
+            store.pin_snapshot_extent(snapshot_id, reclaim_key);
+        }
+
+        let partial = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 1)
+            .expect("partial receipt-bound drain");
+        assert_eq!(partial.entries_processed, 1);
+        assert_eq!(partial.segments_reclaimed, 0);
+        assert_eq!(partial.gate_extents_denied, 0);
+        assert_eq!(partial.reclaim_queue_depth, 2);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 2);
+        assert!(store.reclaim_receipts().is_empty());
+        assert!(
+            segment_path(&store.segments_dir, segment_id).exists(),
+            "partial drain must not free the segment"
+        );
+
+        let held = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("full pinned drain");
+        assert_eq!(held.entries_processed, 2);
+        assert_eq!(held.segments_reclaimed, 0);
+        assert_eq!(held.gate_extents_denied, 1);
+        assert_eq!(held.gate_segments_skipped, 1);
+        assert_eq!(held.reclaim_queue_depth, 2);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 2);
+        assert!(store.reclaim_receipts().is_empty());
+        assert!(
+            segment_path(&store.segments_dir, segment_id).exists(),
+            "snapshot pins must keep the full segment allocated"
+        );
+
+        assert_eq!(store.release_snapshot_extent_pins(snapshot_id), 2);
+        let freed = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("released full drain");
+        assert_eq!(freed.entries_processed, 2);
+        assert_eq!(freed.segments_reclaimed, 1);
+        assert_eq!(freed.blocks_freed, 2);
+        assert_eq!(freed.reclaim_queue_depth, 0);
+        assert!(store.dead_object_reclaim_queue.is_empty());
+        assert_eq!(store.reclaim_receipts().len(), 1);
+        let freed_extents: std::collections::BTreeSet<_> = store.reclaim_receipts()[0]
+            .freed_extents
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            freed_extents,
+            [reclaim_key_a, reclaim_key_b].into_iter().collect()
+        );
+        assert!(
+            !segment_path(&store.segments_dir, segment_id).exists(),
+            "released pins should allow the segment to be physically reclaimed"
         );
     }
 
