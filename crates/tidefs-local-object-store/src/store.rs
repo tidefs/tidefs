@@ -7180,6 +7180,7 @@ mod reclaim_queue_production_tests {
         store.put(key, b"snapshot pinned payload").expect("put");
         let old_segment_id = store.index.get(&key).expect("location").segment_id;
         assert!(store.delete(key).expect("delete"));
+        store.rotate_segment().expect("separate dead extent for reopen drain resolve");
 
         let reclaim_key = reclaim_key(key);
         let entry = dead_object_entry_for_key(reclaim_key, 0, true, 1);
