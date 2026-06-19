@@ -232,21 +232,35 @@ fn decode_reclaim_receipts(bytes: &[u8]) -> Result<Vec<ReclaimReceipt>, ReclaimR
     Ok(receipts)
 }
 
+fn reclaim_receipt_log_store_error(error: ReclaimReceiptLogError) -> StoreError {
+    StoreError::InvalidOptions {
+        reason: match error {
+            ReclaimReceiptLogError::Truncated => "reclaim receipt log truncated",
+            ReclaimReceiptLogError::InvalidMagic => "reclaim receipt log invalid magic",
+            ReclaimReceiptLogError::UnsupportedVersion { .. } => {
+                "reclaim receipt log unsupported version"
+            }
+            ReclaimReceiptLogError::LengthOverflow => "reclaim receipt log length overflow",
+            ReclaimReceiptLogError::Receipt(_) => "reclaim receipt decode failed",
+            ReclaimReceiptLogError::TrailingBytes => "reclaim receipt log trailing bytes",
+        },
+    }
+}
+
 /// Load committed reclaim receipt evidence from the object store.
-pub(crate) fn load_reclaim_receipts(store: &LocalObjectStore) -> Vec<ReclaimReceipt> {
+///
+/// Corrupt bytes fail closed by failing store open instead of silently
+/// dropping evidence for extents that may already have been physically freed.
+pub(crate) fn load_reclaim_receipts(
+    store: &LocalObjectStore,
+) -> Result<Vec<ReclaimReceipt>, StoreError> {
     match store.get_named(RECLAIM_RECEIPTS_OBJECT_NAME) {
         Ok(Some(bytes)) => match decode_reclaim_receipts(&bytes) {
-            Ok(receipts) => receipts,
-            Err(error) => {
-                eprintln!("tidefs: reclaim receipt log decode error: {error}");
-                Vec::new()
-            }
+            Ok(receipts) => Ok(receipts),
+            Err(error) => Err(reclaim_receipt_log_store_error(error)),
         },
-        Ok(None) => Vec::new(),
-        Err(error) => {
-            eprintln!("tidefs: reclaim receipt log load error: {error}");
-            Vec::new()
-        }
+        Ok(None) => Ok(Vec::new()),
+        Err(error) => Err(error),
     }
 }
 
@@ -675,24 +689,36 @@ mod tests {
         ];
 
         store_reclaim_receipts(&receipts, &mut store).expect("store reclaim receipts");
-        assert_eq!(load_reclaim_receipts(&store), receipts);
+        assert_eq!(
+            load_reclaim_receipts(&store).expect("load receipts"),
+            receipts
+        );
         store.sync_all().expect("sync reclaim receipts");
         drop(store);
 
         let reopened = LocalObjectStore::open(dir.path()).expect("reopen");
-        assert_eq!(load_reclaim_receipts(&reopened), receipts);
+        assert_eq!(
+            load_reclaim_receipts(&reopened).expect("reload receipts"),
+            receipts
+        );
     }
 
     #[test]
-    fn reclaim_receipts_corrupt_bytes_load_empty() {
-        let (mut store, _dir) = temp_store();
+    fn reclaim_receipts_corrupt_bytes_fail_closed() {
+        let (mut store, dir) = temp_store();
 
         store
             .put_named(RECLAIM_RECEIPTS_OBJECT_NAME, b"not reclaim receipts")
             .expect("store corrupt bytes");
-        let loaded = load_reclaim_receipts(&store);
 
-        assert!(loaded.is_empty());
+        assert!(load_reclaim_receipts(&store).is_err());
+        store.sync_all().expect("sync corrupt receipts");
+        drop(store);
+
+        assert!(
+            LocalObjectStore::open(dir.path()).is_err(),
+            "corrupt reclaim receipts must fail store open closed"
+        );
     }
 
     #[test]
