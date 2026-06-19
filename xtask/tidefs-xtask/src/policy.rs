@@ -379,7 +379,7 @@ const KERNEL_GPL2_SPDX_FILES: &[&str] = &[
     "kmod/smoke_module/rust_tidefs_smoke.rs",
 ];
 
-const STANDALONE_GPL2_ONLY_SPDX_FILES: &[&str] = ["nix/vm/tidefs-fsync-guest-helper.c"];
+const STANDALONE_GPL2_ONLY_SPDX_FILES: &[&str] = &["nix/vm/tidefs-fsync-guest-helper.c"];
 
 const KERNEL_MODULE_LICENSE_FILES: &[&str] = &[
     "crates/tidefs-block-kmod/tidefs_block_kmod.rs",
