@@ -16,6 +16,8 @@
 //!   `DeferredFreeExtentExecutor`, `CompositeJobExecutor`).
 //! - [`progress`] — `CleanupProgress` with BLAKE3-verified sealed-blob
 //!   format `[hash:32][entry_id:8]` for crash-safe resume.
+//! - [`receipts`] — per-entry replay decision receipts for engine-local
+//!   execute/skip/defer/reject evidence.
 //!
 //! ## Crash-safety contract
 //!
@@ -29,6 +31,7 @@ pub mod engine;
 pub mod job_executor;
 pub mod orphan;
 pub mod progress;
+pub mod receipts;
 pub mod reclaim;
 
 pub use engine::{CleanupEngine, EngineStats};
@@ -38,3 +41,7 @@ pub use job_executor::{
     OrphanIndexAccess, SpaceAccess,
 };
 pub use progress::{CleanupProgress, ProgressError, SEALED_BLOB_SIZE};
+pub use receipts::{
+    CleanupReplayDecision, CleanupReplayDecisionReceipt, CleanupReplayReceiptError,
+    CleanupReplayRequiredEvidence, CleanupReplayValidationTier, CLEANUP_REPLAY_ARTIFACT_DIGEST_LEN,
+};
