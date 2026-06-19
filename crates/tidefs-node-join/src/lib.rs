@@ -1375,6 +1375,50 @@ impl NodeJoinProtocol {
         self.progress.session_epoch = Some(session);
     }
 
+    fn session_with_commit_evidence(
+        &self,
+        commit: &JoinCommitResult,
+        at_ns: u64,
+    ) -> Result<JoinSessionEpoch, JoinError> {
+        if commit.member_id != self.member_id {
+            return Err(JoinError::IdentityMismatch {
+                session_member: commit.member_id,
+                caller_member: self.member_id,
+            });
+        }
+
+        let mut session = match &self.session_epoch {
+            Some(existing) => {
+                if existing.joining_member_id != self.member_id {
+                    return Err(JoinError::IdentityMismatch {
+                        session_member: existing.joining_member_id,
+                        caller_member: self.member_id,
+                    });
+                }
+                if existing.epoch != commit.epoch {
+                    return Err(JoinError::EpochMismatch {
+                        expected: existing.epoch,
+                        got: commit.epoch,
+                    });
+                }
+                existing.clone()
+            }
+            None => JoinSessionEpoch::new(commit.epoch, self.member_id, at_ns),
+        };
+
+        if let Some(ref ev) = commit.pool_scan_evidence {
+            session.pool_scan_evidence = Some(ev.clone());
+        }
+        if let Some(ref la) = commit.label_agreement {
+            session.label_agreement = Some(*la);
+        }
+        if let Some(ref pr) = commit.placement_receipt {
+            session.placement_receipt = Some(pr.clone());
+        }
+
+        Ok(session)
+    }
+
     /// Operator-visible join status for this node.
     #[must_use]
     pub fn join_status(&self, current_epoch: EpochId) -> JoinStatus {
@@ -1459,6 +1503,8 @@ impl NodeJoinProtocol {
         commit: &JoinCommitResult,
         at_ns: u64,
     ) -> Result<(), JoinError> {
+        let session = self.session_with_commit_evidence(commit, at_ns)?;
+        self.record_session_epoch(session);
         self.phase_shadow(&commit.membership_config, at_ns)
     }
 }
@@ -1571,6 +1617,24 @@ mod tests {
                 1,
                 [0xCCu8; 32],
             ))
+    }
+
+    fn commit_result_with_evidence(member_id: u64, epoch: u64) -> JoinCommitResult {
+        JoinCommitResult {
+            member_id: MemberId::new(member_id),
+            membership_config: make_config(epoch),
+            committed_root: 0xABCD,
+            epoch: EpochId::new(epoch),
+            pool_id: 42,
+            pool_scan_evidence: Some(committed_pool_scan_for_epoch(member_id, epoch)),
+            label_agreement: Some(LabelAgreementFingerprint::committed(label_fingerprint())),
+            placement_receipt: Some(PlacementReceiptEvidence::new(
+                PlacementIntentClass::ReplicaTarget,
+                EpochId::new(epoch),
+                7,
+                [0xCCu8; 32],
+            )),
+        }
     }
 
     #[test]
@@ -3163,6 +3227,39 @@ mod tests {
             .unwrap());
         assert_eq!(protocol.progress.phase, JoinPhase::ReplicaTarget);
         assert!(protocol.can_accept_replicas());
+    }
+
+    #[test]
+    fn start_from_join_commit_records_commit_evidence_before_shadow() {
+        let commit = commit_result_with_evidence(42, 10);
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+
+        protocol.start_from_join_commit(&commit, 2000).unwrap();
+
+        assert_eq!(protocol.progress.phase, JoinPhase::ShadowOnly);
+        let session = protocol.session_epoch.as_ref().unwrap();
+        assert!(session.pool_scan_evidence.as_ref().unwrap().committed);
+        assert_eq!(
+            session.label_agreement.unwrap().fingerprint,
+            label_fingerprint()
+        );
+        assert_eq!(session.placement_receipt.as_ref().unwrap().receipt_id, 7);
+    }
+
+    #[test]
+    fn pipeline_promote_uses_commit_evidence() {
+        let mut pipeline = JoinPipeline::new();
+        pipeline.member_id = Some(MemberId::new(42));
+        pipeline.commit_result = Some(commit_result_with_evidence(42, 10));
+        pipeline.phase = JoinPipelinePhase::Promoting;
+
+        let mut protocol = NodeJoinProtocol::new(MemberId::new(42), EpochId::new(10), 1, 1000);
+
+        pipeline.promote(&mut protocol, 2000).unwrap();
+
+        assert_eq!(pipeline.phase, JoinPipelinePhase::CatchingUp);
+        assert_eq!(protocol.progress.phase, JoinPhase::ShadowOnly);
+        assert!(protocol.session_epoch.is_some());
     }
 
     /// Join rejection when pool-scan is uncommitted.
