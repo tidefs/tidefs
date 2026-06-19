@@ -108,6 +108,7 @@ fn three_device_mirror_remove_middle_device_with_blake3_verification() {
         device_count: 3,
         missing_indices: vec![],
         removing_device_indices: vec![],
+        completed_evacuations: vec![],
     };
 
     // Build object placements: all objects currently on disk1.
@@ -357,6 +358,7 @@ fn removal_with_zero_objects_on_target_device() {
         device_count: 2,
         missing_indices: vec![],
         removing_device_indices: vec![],
+        completed_evacuations: vec![],
     };
 
     // No objects on disk1 to evacuate.
@@ -394,6 +396,7 @@ fn last_device_removal_refused() {
         device_count: 1,
         missing_indices: vec![],
         removing_device_indices: vec![],
+        completed_evacuations: vec![],
     };
 
     let result = config.remove_device(std::path::Path::new("/dev/solo"));
@@ -465,6 +468,7 @@ fn pool_label_writer_raw_device_roundtrip_after_removal() {
         device_count: 3,
         missing_indices: vec![],
         removing_device_indices: vec![],
+        completed_evacuations: vec![],
     };
 
     // Remove disk1 via PoolConfig::remove_device.

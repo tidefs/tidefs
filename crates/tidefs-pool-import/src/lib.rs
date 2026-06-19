@@ -1953,6 +1953,7 @@ mod tests {
             device_count: 1,
             missing_indices: Vec::new(),
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         }
     }
 
@@ -2001,6 +2002,7 @@ mod tests {
             device_count: 2,
             missing_indices: Vec::new(),
             removing_device_indices: vec![],
+            completed_evacuations: vec![],
         }
     }
 

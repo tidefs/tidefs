@@ -55,6 +55,7 @@ fn make_3_device_config() -> tidefs_pool_scan::PoolConfig {
         device_count: 3,
         missing_indices: vec![],
         removing_device_indices: vec![],
+        completed_evacuations: vec![],
     }
 }
 
@@ -272,6 +273,7 @@ fn full_3_device_removal_lifecycle() {
         device_count: 2,
         missing_indices: vec![],
         removing_device_indices: vec![],
+        completed_evacuations: vec![],
     };
 
     attach_committed_receipt_checker(
@@ -464,6 +466,7 @@ fn removal_with_zero_objects_completes_cleanly() {
         device_count: 2,
         missing_indices: vec![],
         removing_device_indices: vec![],
+        completed_evacuations: vec![],
     };
     attach_empty_receipt_checker(&mut driver);
     driver.commit_vacated(updated_config).unwrap();
