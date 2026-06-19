@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Append-only integrity ledger for validation claim receipts.
 
 use std::fmt;

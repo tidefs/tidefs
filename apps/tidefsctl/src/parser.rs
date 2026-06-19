@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Shared TideFS CLI value parsers.
 
 use tidefs_dataset_properties::{
