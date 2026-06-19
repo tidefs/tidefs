@@ -109,7 +109,8 @@ pub const fn errno_for_alloc_error(error: AllocError) -> Errno {
         | AllocError::MixedDeviceTopology
         | AllocError::DeviceNotRegistered
         | AllocError::DeviceAlreadyRegistered
-        | AllocError::AlignmentImpossible => Errno::EIO,
+        | AllocError::AlignmentImpossible
+        | AllocError::CommitGroupConflict => Errno::EIO,
     }
 }
 
@@ -509,6 +510,10 @@ mod tests {
             errno_for_alloc_error(AllocError::AlignmentImpossible),
             Errno::EIO
         );
+        assert_eq!(
+            errno_for_alloc_error(AllocError::CommitGroupConflict),
+            Errno::EIO
+        );
     }
 
     #[test]
@@ -668,6 +673,10 @@ mod tests {
         );
         assert_eq!(
             errno_for_alloc_error(AllocError::AlignmentImpossible),
+            Errno::EIO
+        );
+        assert_eq!(
+            errno_for_alloc_error(AllocError::CommitGroupConflict),
             Errno::EIO
         );
     }
