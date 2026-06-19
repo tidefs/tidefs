@@ -346,8 +346,7 @@ impl<E: JobExecutor> CleanupEngine<E> {
         // Auto-start from Idle; explicit start() still available for
         // state-machine control. When the queue is empty, mark exhausted.
         if self.state == CleanupEngineState::Idle {
-            let pending = self.queue.pending_count();
-            if pending == 0 {
+            if self.queue.is_empty() {
                 self.stats.queue_exhausted = true;
                 return true;
             }
