@@ -2874,11 +2874,11 @@ mod tests {
         )
         .expect("receipt-bound drain");
 
-        assert_eq!(drain.ack_object_ids, vec![obj_key(1), obj_key(2)]);
+        assert!(drain.ack_object_ids.is_empty());
         assert_eq!(drain.stats.entries_processed, 2);
         assert_eq!(drain.stats.segments_reclaimed, 0);
-        assert_eq!(drain.stats.reclaim_queue_depth, 2);
-        assert_eq!(live_counts.live_count(200), 2);
+        assert_eq!(drain.stats.reclaim_queue_depth, 4);
+        assert_eq!(live_counts.live_count(200), 4);
         assert!(freer.freed_segments().is_empty());
     }
 
@@ -2915,7 +2915,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_bound_dead_object_drain_authorizes_erasure_receipts() {
+    fn receipt_bound_dead_object_drain_keeps_erasure_partial_segment_queued() {
         let mut queue = DeadObjectReclaimQueue::new();
         queue.enqueue(dead_erasure_entry(1, 4, true, Some(10), 3, 2));
         queue.enqueue(dead_erasure_entry(2, 4, true, Some(11), 3, 2));
@@ -2944,11 +2944,14 @@ mod tests {
         )
         .expect("receipt-bound erasure drain");
 
-        assert_eq!(drain.ack_object_ids, vec![obj_key(1), obj_key(2)]);
+        assert!(drain.ack_object_ids.is_empty());
         assert_eq!(drain.stats.entries_processed, 2);
         assert_eq!(drain.stats.segments_reclaimed, 0);
+        assert_eq!(drain.stats.reclaim_queue_depth, 3);
+        assert!(drain.receipt.is_none());
+        assert!(freer.freed_segments().is_empty());
         assert!(!live_counts.is_dead(100));
-        assert_eq!(live_counts.live_count(100), 1);
+        assert_eq!(live_counts.live_count(100), 3);
     }
 
     #[test]
