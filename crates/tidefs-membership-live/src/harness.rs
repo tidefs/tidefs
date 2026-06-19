@@ -2770,8 +2770,10 @@ mod tests {
         let mut h = TwoNodeHarness::new(500);
         h.join_peer();
 
-        // Write via placement dispatch to both nodes.
-        let object_id = 33u64;
+        // Write via placement dispatch to both nodes. Object 55 is covered by
+        // read_dispatch_placement_aware_routing as a device-1-primary key, so
+        // corrupting node B below exercises the secondary mirror path.
+        let object_id = 55u64;
         let correct = b"correct data".to_vec();
         h.dispatch_object_write(object_id, correct.clone());
 
