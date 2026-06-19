@@ -8450,6 +8450,7 @@ impl LocalFileSystem {
             }
         } else {
             // ── Plain rename / RENAME_NOREPLACE ────────────────────
+            let mut replaced_last_link_inode_id = None;
 
             // Handle overwritten destination
             if let Some(target) = new_entry {
@@ -8485,6 +8486,26 @@ impl LocalFileSystem {
                 } else {
                     // Last link — remove the inode entirely.
                     self.invalidate_hot_read_cache_for_inode(target.inode_id);
+                    if target_record.size > 0 {
+                        let (data_bytes, reserved_bytes) =
+                            self.accounted_extent_bytes(target.inode_id, 0, target_record.size);
+                        let projected = self
+                            .state
+                            .space_accounting
+                            .projected_counters_after_pending();
+                        let logical_free = data_bytes.min(projected.logical_used_bytes);
+                        let reserved_free = reserved_bytes.min(projected.reserved_bytes);
+                        if logical_free > 0 || reserved_free > 0 {
+                            self.state.space_accounting.accumulate_delta(
+                                SpaceDelta::new_punch_hole(logical_free, reserved_free),
+                            );
+                        }
+                        let physical_free = data_bytes.saturating_add(reserved_bytes);
+                        if physical_free > 0 {
+                            self.state.space_accounting.track_physical_free(physical_free);
+                            self.capacity_authority.record_free(physical_free);
+                        }
+                    }
                     // Record nlink=0 in state so record_reclaim_delta can iterate
                     // chunk keys for dedup refcount decrement (#6167).
                     if let Some(stored) =
@@ -8493,6 +8514,7 @@ impl LocalFileSystem {
                         stored.nlink = 0;
                     }
                     self.record_reclaim_delta(target.inode_id, target_record.size);
+                    replaced_last_link_inode_id = Some(target.inode_id);
                     // Clear xattrs before removing the overwritten file inode.
                     if let Some(stored) =
                         Arc::make_mut(&mut self.state.inodes).get_mut(&target.inode_id)
@@ -8525,6 +8547,9 @@ impl LocalFileSystem {
             if old_parent_id != new_parent_id && moving_is_directory {
                 self.update_parent_metadata_for_subdir_remove(old_parent_id, tick);
                 self.update_parent_metadata_for_subdir_add(new_parent_id, tick);
+            }
+            if let Some(inode_id) = replaced_last_link_inode_id {
+                self.obligation_ledger.release_claims_for_inode(inode_id);
             }
         }
 
