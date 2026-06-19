@@ -3463,6 +3463,7 @@ dependencies = [
  "blake3",
  "tidefs-gc-pin-set",
  "tidefs-local-object-store",
+ "tidefs-types-reclaim-queue-core",
 ]
 
 [[package]]
