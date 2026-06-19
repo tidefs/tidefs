@@ -1338,6 +1338,70 @@ fn extending_writeback_batch_preserves_sparse_manifest_once() {
 }
 
 #[test]
+fn single_extending_writeback_flush_preserves_sparse_manifest() {
+    let (mut fs, root) = wb_open_temp("single-extending-writeback");
+    let chunk = content_chunk_size() as usize;
+    fs.set_write_buffer_config(WriteBufferConfig {
+        flush_threshold_bytes: chunk * 8,
+        flush_threshold_age: Duration::from_millis(60_000),
+    });
+    fs.set_auto_commit(false);
+    fs.set_max_uncommitted_mutations(1_000_000);
+
+    let record = fs.create_file("/single.bin", 0o644).expect("create");
+    let prefix: Vec<u8> = (0..chunk / 2).map(|idx| (idx % 251) as u8).collect();
+    fs.write_file("/single.bin", 0, &prefix)
+        .expect("write prefix");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush prefix");
+    let base_record = fs.stat("/single.bin").expect("stat prefix");
+    let base_manifest = wd_current_content_manifest(&fs, "/single.bin");
+    assert_eq!(base_manifest.chunks.len(), 1);
+    assert_eq!(base_manifest.chunks[0].len as usize, prefix.len());
+
+    let patch_offset = chunk * 3 + 123;
+    let patch = vec![0x7d_u8; 128];
+    fs.write_file("/single.bin", patch_offset as u64, &patch)
+        .expect("write extending patch");
+
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush extending patch");
+    let patched_record = fs.stat("/single.bin").expect("stat patched");
+    let patched_manifest = wd_current_content_manifest(&fs, "/single.bin");
+    assert_eq!(
+        patched_record.data_version,
+        base_record.data_version + 1,
+        "single extending writeback should publish one content version"
+    );
+
+    let by_index: BTreeMap<u64, _> = patched_manifest
+        .chunks
+        .iter()
+        .map(|chunk_ref| (chunk_ref.chunk_index, chunk_ref))
+        .collect();
+    assert_eq!(by_index.len(), 2);
+    assert_eq!(
+        by_index[&0].data_version, patched_record.data_version,
+        "old EOF chunk must be re-emitted with the extended manifest length"
+    );
+    assert_eq!(by_index[&0].len as usize, chunk);
+    assert!(
+        !by_index.contains_key(&1) && !by_index.contains_key(&2),
+        "untouched sparse gap between prefix and patch must stay a hole"
+    );
+    assert_eq!(by_index[&3].data_version, patched_record.data_version);
+
+    let final_len = patch_offset + patch.len();
+    let mut expected = vec![0_u8; final_len];
+    expected[..prefix.len()].copy_from_slice(&prefix);
+    expected[patch_offset..patch_offset + patch.len()].copy_from_slice(&patch);
+    assert_eq!(fs.read_file("/single.bin").expect("read final"), expected);
+
+    drop(fs);
+    wd_cleanup(&root);
+}
+
+#[test]
 fn holetest_style_mixed_writeback_flushes_one_coalesced_image() {
     let (mut fs, root) = wb_open_temp("mixed-writeback-coalesced");
     fs.set_write_buffer_config(WriteBufferConfig {
