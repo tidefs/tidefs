@@ -12,6 +12,7 @@ description = "Placement runtime engine: executes deterministic placement plans 
 serde = { version = "1", features = ["derive"] }
 blake3 = "1"
 thiserror = "2"
+tidefs-block-allocator = { path = "../tidefs-block-allocator" }
 tidefs-lease = { path = "../tidefs-lease" }
 tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
 tidefs-placement-planner = { path = "../tidefs-placement-planner" }
