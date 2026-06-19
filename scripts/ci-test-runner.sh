@@ -97,6 +97,26 @@ has_compile_error() {
     grep -q '^error: could not compile' <<< "$output"
 }
 
+failure_excerpt_json() {
+    local output="$1"
+    local max_lines="${CI_TEST_FAILURE_LINES:-160}"
+    local excerpt
+
+    if [[ ! "$max_lines" =~ ^[0-9]+$ ]] || [[ "$max_lines" -lt 1 ]]; then
+        max_lines=160
+    fi
+
+    if grep -Eq '(^---- .* stdout ----|^failures:|test result: FAILED|panicked at|error: test failed|[0-9]+ targets failed|FAILED)' <<< "$output"; then
+        excerpt="$(grep -E -B4 -A28 '(^---- .* stdout ----|^failures:|test result: FAILED|panicked at|error: test failed|[0-9]+ targets failed|FAILED)' <<< "$output" | tail -n "$max_lines")"
+    elif grep -q 'error' <<< "$output"; then
+        excerpt="$(grep -n -C8 'error' <<< "$output" | tail -n "$max_lines")"
+    else
+        excerpt="$(tail -n "$max_lines" <<< "$output")"
+    fi
+
+    jq -Rs . <<< "$excerpt"
+}
+
 # ---- per-crate test execution ------------------------------------------
 
 # Run cargo test for a single crate and capture results.
@@ -141,19 +161,9 @@ run_crate_test() {
         CRATE_STATUS="pass"
     fi
 
-    # Capture the last 4 meaningful lines of output for failure detail
     CRATE_FAILURE_DETAIL=""
     if [[ "$CRATE_STATUS" != "pass" ]]; then
-        # Grab up to the last error line + a few lines of context
-        local err_section
-        err_section="$(echo "$output" | grep -n '^error' | tail -1 | cut -d: -f1)" || true
-        if [[ -n "$err_section" ]]; then
-            local start_line
-            start_line="$(( err_section > 1 ? err_section - 1 : 1 ))"
-            CRATE_FAILURE_DETAIL="$(echo "$output" | tail -n +"$start_line" | tail -20 | jq -Rs .)"
-        else
-            CRATE_FAILURE_DETAIL="$(echo "$output" | tail -20 | jq -Rs .)"
-        fi
+        CRATE_FAILURE_DETAIL="$(failure_excerpt_json "$output")"
     fi
 
     return 0
@@ -346,11 +356,21 @@ main() {
             local label
             case "$status" in
                 pass)          label="PASS" ;;
-                fail)          label="FAIL ($TEST_FAILED failed)" ;;
+                fail)
+                    if [[ "$TEST_FAILED" -gt 0 ]]; then
+                        label="FAIL ($TEST_FAILED failed)"
+                    else
+                        label="FAIL"
+                    fi
+                    ;;
                 compile_error) label="COMPILE ERROR" ;;
                 *)             label="$status" ;;
             esac
             printf "%-30s %s\n" "$label" "${duration}ms"
+            if [[ "$status" != "pass" && -n "$CRATE_FAILURE_DETAIL" ]]; then
+                echo "Failure excerpt for $crate:"
+                jq -r . <<< "$CRATE_FAILURE_DETAIL" | sed 's/^/  /'
+            fi
         fi
 
         # Build JSON
