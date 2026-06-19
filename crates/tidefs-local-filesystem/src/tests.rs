@@ -5177,6 +5177,51 @@ fn claim_ledger_releases_on_overwrite() {
 }
 
 #[test]
+fn rename_overwrite_releases_replaced_file_capacity() {
+    let root = temp_root("rename-overwrite-capacity");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let data_len = crate::constants::content_chunk_size() as usize;
+    let capacity = data_len as u64 * 2;
+    let mut fs = crate::LocalFileSystem::open_with_capacity(
+        &root,
+        tidefs_local_object_store::StoreOptions::test_fast(),
+        capacity,
+    )
+    .unwrap();
+
+    fs.create_file("/src", crate::constants::DEFAULT_FILE_PERMISSIONS)
+        .unwrap();
+    fs.create_file("/dst", crate::constants::DEFAULT_FILE_PERMISSIONS)
+        .unwrap();
+    fs.create_file("/next", crate::constants::DEFAULT_FILE_PERMISSIONS)
+        .unwrap();
+
+    let src_data = vec![0x41_u8; data_len];
+    let dst_data = vec![0x42_u8; data_len];
+    let next_data = vec![0x43_u8; data_len];
+    fs.write_file("/src", 0, &src_data).unwrap();
+    fs.write_file("/dst", 0, &dst_data).unwrap();
+    fs.do_commit().unwrap();
+
+    assert!(matches!(
+        fs.write_file("/next", 0, &next_data),
+        Err(crate::FileSystemError::NoSpace { .. })
+    ));
+
+    fs.rename("/src", "/dst", false).unwrap();
+    fs.write_file("/next", 0, &next_data).unwrap();
+
+    assert!(fs.stat("/src").is_err());
+    assert_eq!(fs.read_file("/dst").unwrap(), src_data);
+    assert_eq!(fs.read_file("/next").unwrap(), next_data);
+
+    fs.sync_all().unwrap();
+    drop(fs);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn claim_ledger_reports_non_authoritative() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
