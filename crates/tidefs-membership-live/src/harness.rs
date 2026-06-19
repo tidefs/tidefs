@@ -2770,25 +2770,42 @@ mod tests {
         let mut h = TwoNodeHarness::new(500);
         h.join_peer();
 
-        // Write via placement dispatch to both nodes. Object 55 is covered by
-        // read_dispatch_placement_aware_routing as a device-1-primary key, so
-        // corrupting node B below exercises the secondary mirror path.
+        // Write via placement dispatch to both nodes.
         let object_id = 55u64;
         let correct = b"correct data".to_vec();
         h.dispatch_object_write(object_id, correct.clone());
 
-        // Corrupt node B's copy directly (simulating silent corruption).
-        h.node_b
-            .put_object(object_id, b"CORRUPTED DATA!!!".to_vec());
+        // Read once to determine which device is the primary mirror
+        // so we can corrupt the secondary.
+        let probe = h.dispatch_object_read(object_id);
+        assert!(probe.payload.is_some(), "probe read must find the object");
+        let secondary_device = if probe.primary_device == 1 { 2 } else { 1 };
+
+        // Corrupt the secondary mirror's copy directly.
+        let corrupted = b"CORRUPTED DATA!!!".to_vec();
+        match secondary_device {
+            1 => {
+                h.node_a.put_object(object_id, corrupted.clone());
+            }
+            2 => {
+                h.node_b.put_object(object_id, corrupted.clone());
+            }
+            _ => unreachable!("only two devices in harness"),
+        }
 
         let result = h.dispatch_object_read(object_id);
 
-        // At least one mirror returned data.
+        // Primary should still return correct data.
         assert!(result.payload.is_some());
-        // Both mirrors returned data (no NotFound on either shard).
-        for outcome in &result.outcomes {
-            assert!(outcome.found, "both mirrors must have the object");
-        }
+        assert_eq!(result.payload.as_deref(), Some(correct.as_slice()));
+        // The secondary mirror must report the corrupted content.
+        let secondary_outcome = result
+            .outcomes
+            .iter()
+            .find(|o| o.device_id == secondary_device)
+            .expect("must have outcome for secondary device");
+        assert!(secondary_outcome.found);
+        assert_eq!(secondary_outcome.payload.as_deref(), Some(corrupted.as_slice()));
         // Cross-mirror inconsistency must be detected.
         assert!(
             !result.mirrors_consistent,
