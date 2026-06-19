@@ -317,13 +317,18 @@ impl DrainProtocolMachine {
     /// Produce a BLAKE3-attested snapshot of the current state.
     #[must_use]
     pub fn snapshot(&self) -> DrainProtocolSnapshot {
-        DrainProtocolSnapshot::new(
+        let mut snap = DrainProtocolSnapshot::new(
             self.state,
             self.draining_node_id,
             self.epoch_id,
             self.acks_received,
             self.acks_expected,
-        )
+        );
+        if let Some(ref receipt) = self.evacuation_receipt {
+            snap.evacuation_receipt_id = Some(receipt.receipt_id);
+            snap.evacuation_receipt_committed = receipt.is_committed();
+        }
+        snap
     }
 
     // ---- transitions ----
