@@ -55,6 +55,16 @@ than the workspace package license string.
 | `crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_shim.c` | `GPL-2.0` | TideFS POSIX VFS C registration shim. |
 | `kmod/smoke_module/rust_tidefs_smoke.rs` | `GPL-2.0` / `GPL` | TideFS Rust-for-Linux smoke fixture. |
 
+## VM Runtime Helper Notices
+
+TideFS-owned standalone VM helper binaries may use precise file-local SPDX
+markers when they are built outside Cargo package metadata for guest-runtime
+validation.
+
+| Path | File-local marker | Provenance |
+| --- | --- | --- |
+| `nix/vm/tidefs-fsync-guest-helper.c` | `GPL-2.0-only` | QEMU guest helper used by TideFS fsync runtime validation. |
+
 All other packages reported by root `cargo metadata --no-deps --locked` use
 `GPL-2.0-only WITH Linux-syscall-note` through workspace package metadata.
 The five excluded cargo-fuzz harness manifests are standalone non-published
