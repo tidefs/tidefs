@@ -744,8 +744,10 @@ pub trait ReclaimGate {
 /// A durable receipt recording a batch of freed extents together with the
 /// deadlist and snapshot-pin clearance evidence at time of free.
 ///
-/// Receipts are persisted and replayed during crash recovery so that the
-/// allocator does not double-free space.
+/// Receipts are persisted and loaded during store open as committed evidence
+/// for extents that were physically freed after deadlist and snapshot-pin
+/// clearance. Corrupt receipt logs must fail closed at open so recovery does
+/// not silently lose that clearance evidence.
 ///
 /// # Wire format
 ///
