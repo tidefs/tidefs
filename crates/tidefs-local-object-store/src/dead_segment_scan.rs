@@ -19,7 +19,7 @@
 //! Corrupt or unparseable footers are logged at warn level and the
 //! segment is skipped without failing the pool open.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::constants::RECORD_OVERHEAD_BYTES;
@@ -81,10 +81,14 @@ pub fn scan_dead_segments_on_open(
         entry.0 = entry.0.saturating_add(1);
         entry.1 = entry.1.saturating_add(loc.payload_len);
     }
+    let mut counted_history_locations = BTreeSet::new();
     for (key, locations) in history.iter() {
         // Only count history for keys not in the live index.
         if !index.contains_key(key) {
             for loc in locations {
+                if !counted_history_locations.insert(*loc) {
+                    continue;
+                }
                 let entry = per_segment_live.entry(loc.segment_id).or_default();
                 entry.0 = entry.0.saturating_add(1);
                 entry.1 = entry.1.saturating_add(loc.payload_len);
@@ -338,6 +342,51 @@ mod tests {
         assert!(seg_c_summary.live_bytes > 0);
         assert!(seg_c_summary.dead_bytes > 0);
     }
+
+    #[test]
+    fn duplicate_history_locations_count_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let segments_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&segments_dir).expect("create segments dir");
+
+        let key = ObjectKey::from_name(b"duplicate-history-location");
+        let segment_id = 7;
+        let location = ObjectLocation {
+            key,
+            segment_id,
+            record_offset: 0,
+            payload_offset: crate::constants::RECORD_HEADER_LEN_U64,
+            payload_len: 256,
+            sequence: 1,
+            payload_checksum: Default::default(),
+        };
+        let mut history = BTreeMap::new();
+        history.insert(key, vec![location, location]);
+
+        let mut segment_bytes = vec![0_u8; RECORD_OVERHEAD_BYTES as usize * 2 + 512];
+        let footer = SegmentIntegrityFooter {
+            segment_id,
+            record_count: 2,
+            total_payload_bytes: 512,
+            segment_digest: crate::ProductionIntegrityDigest::ZERO,
+            previous_segment_digest: crate::ProductionIntegrityDigest::ZERO,
+        };
+        segment_bytes.extend_from_slice(&crate::store::encode_segment_integrity_footer(&footer));
+        std::fs::write(segment_path(&segments_dir, segment_id), segment_bytes)
+            .expect("write segment footer");
+
+        let result = scan_dead_segments_on_open(&segments_dir, &BTreeMap::new(), &history)
+            .expect("scan with duplicate history");
+
+        let summary = result
+            .partial_segments
+            .iter()
+            .find(|summary| summary.segment_id == segment_id)
+            .expect("segment should remain partial with one deduplicated history location");
+        assert_eq!(summary.live_object_count, 1);
+        assert_eq!(summary.live_bytes, 256);
+    }
+
     #[test]
     fn empty_pool_no_panic() {
         let dir = tempfile::tempdir().expect("tempdir");
