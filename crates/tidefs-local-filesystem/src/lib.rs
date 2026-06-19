@@ -6135,7 +6135,7 @@ impl LocalFileSystem {
                     })?;
             Ok::<u64, FileSystemError>(size.max(patch_end))
         })?;
-        if patches.len() > 1 {
+        if !patches.is_empty() {
             match self.rewrite_content_with_patch_batch(
                 inode_id,
                 base_record.clone(),
