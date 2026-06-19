@@ -292,6 +292,9 @@ impl<S: CompactionStore> RewriteEngine<S> {
                 }
             }
         }
+        all_keys.sort_by(|(key_a, seg_a), (key_b, seg_b)| {
+            seg_a.cmp(seg_b).then_with(|| key_a.cmp(key_b))
+        });
 
         if all_keys.is_empty() {
             // All segments are empty or errored; mark them eligible for freeing.
@@ -370,6 +373,7 @@ impl<S: CompactionStore> RewriteEngine<S> {
                 eligible_segments.push(seg_id);
             }
         }
+        eligible_segments.sort_unstable();
 
         let objects_relocated = entries.len() as u64;
 
@@ -506,16 +510,25 @@ impl SwapManifest {
     /// Create a manifest from a single group''s rewrite outcome.
     #[must_use]
     pub fn from_group_outcome(outcome: &RewriteGroupOutcome) -> Self {
+        let mut source_segments = outcome.freed_segments.clone();
+        source_segments.sort_unstable();
+        let mut entries = outcome.entries.clone();
+        entries.sort_by(|a, b| {
+            a.target_offset
+                .cmp(&b.target_offset)
+                .then_with(|| a.source_segment.cmp(&b.source_segment))
+                .then_with(|| a.object_key.cmp(&b.object_key))
+        });
         let hash = Self::compute_hash(
-            &outcome.freed_segments,
+            &source_segments,
             outcome.target_segment,
-            &outcome.entries,
+            &entries,
             outcome.bytes_written,
         );
         Self {
-            source_segments: outcome.freed_segments.clone(),
+            source_segments,
             target_segment: outcome.target_segment,
-            relocation_entries: outcome.entries.clone(),
+            relocation_entries: entries,
             total_bytes: outcome.bytes_written,
             manifest_hash: hash,
         }
@@ -1376,6 +1389,46 @@ mod tests {
         let m2 = SwapManifest::from_group_outcome(&outcome);
         assert_eq!(m1.manifest_hash, m2.manifest_hash);
         assert_eq!(m1, m2);
+    }
+
+    #[test]
+    fn swap_manifest_canonicalizes_source_and_entry_order() {
+        let first = RelocationEntry {
+            source_segment: 10,
+            object_key: make_key(1),
+            target_offset: 0,
+            blake3_hash: [0xAAu8; 32],
+        };
+        let second = RelocationEntry {
+            source_segment: 20,
+            object_key: make_key(2),
+            target_offset: 64,
+            blake3_hash: [0xBBu8; 32],
+        };
+        let unordered = RewriteGroupOutcome {
+            group_index: 0,
+            freed_segments: vec![20, 10],
+            target_segment: 100,
+            objects_relocated: 2,
+            bytes_written: 192,
+            entries: vec![second.clone(), first.clone()],
+        };
+        let ordered = RewriteGroupOutcome {
+            group_index: 0,
+            freed_segments: vec![10, 20],
+            target_segment: 100,
+            objects_relocated: 2,
+            bytes_written: 192,
+            entries: vec![first.clone(), second.clone()],
+        };
+
+        let manifest = SwapManifest::from_group_outcome(&unordered);
+        let expected = SwapManifest::from_group_outcome(&ordered);
+
+        assert_eq!(manifest.source_segments, vec![10, 20]);
+        assert_eq!(manifest.relocation_entries, vec![first, second]);
+        assert_eq!(manifest, expected);
+        assert!(manifest.verify_self());
     }
 
     #[test]
