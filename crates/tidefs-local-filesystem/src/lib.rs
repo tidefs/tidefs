@@ -6771,11 +6771,15 @@ impl LocalFileSystem {
                 .quota_table
                 .apply_delta(&inode_ancestors, delta_bytes, 0);
         }
-        // Accumulate space delta for logical write
-        if bytes_len > 0 {
+        // Accumulate the logical allocation delta admitted by the capacity
+        // authority. Overwrites still write physical bytes, but they must not
+        // grow committed logical usage.
+        if _admit_bytes > 0 {
             self.state
                 .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(bytes_len));
+                .accumulate_delta(SpaceDelta::new_write(_admit_bytes));
+        }
+        if bytes_len > 0 {
             self.state.space_accounting.track_physical_write(bytes_len);
         }
         // Track extent allocation for the writeback layer.
@@ -6922,9 +6926,11 @@ impl LocalFileSystem {
                 .quota_table
                 .apply_delta(&inode_ancestors, delta_bytes, 0);
         }
-        self.state
-            .space_accounting
-            .accumulate_delta(SpaceDelta::new_write(total_bytes));
+        if admit_bytes > 0 {
+            self.state
+                .space_accounting
+                .accumulate_delta(SpaceDelta::new_write(admit_bytes));
+        }
         self.state
             .space_accounting
             .track_physical_write(total_bytes);
