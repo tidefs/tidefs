@@ -154,6 +154,11 @@ pub enum ReconnectStatePushOutcome {
     TargetNotInRoster { target_peer_id: u64 },
     /// The state push's epoch is behind the current known epoch.
     StaleEpoch { push_epoch: u64, current_epoch: u64 },
+    /// The local committed evidence is behind the state push's epoch.
+    LaggedEvidence {
+        evidence_epoch: u64,
+        push_epoch: u64,
+    },
     /// The state push's target peer is not in the current roster
     /// (peer has departed since the push was generated).
     PeerDeparted { target_peer_id: u64 },
@@ -175,6 +180,7 @@ impl ReconnectStatePushOutcome {
             Self::Accepted => "accepted",
             Self::TargetNotInRoster { .. } => "target_not_in_roster",
             Self::StaleEpoch { .. } => "stale_epoch",
+            Self::LaggedEvidence { .. } => "lagged_committed_epoch",
             Self::PeerDeparted { .. } => "peer_departed",
             Self::EvidenceUnavailable => "committed_epoch_unavailable",
         }
@@ -206,6 +212,12 @@ impl ReconnectStatePushMessage {
             return ReconnectStatePushOutcome::StaleEpoch {
                 push_epoch,
                 current_epoch,
+            };
+        }
+        if push_epoch > current_epoch {
+            return ReconnectStatePushOutcome::LaggedEvidence {
+                evidence_epoch: current_epoch,
+                push_epoch,
             };
         }
         // Membership check: target must still be in the current roster
@@ -396,6 +408,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_lagged_committed_evidence() {
+        let r = mk(6, vec![1, 2, 3]);
+        let m = ReconnectStatePushMessage::new(0, r, 2, 6);
+        let evidence = CommittedEpochSnapshot::new(5, [1, 2, 3]);
+
+        let outcome = m.validate_with_evidence(&evidence);
+
+        assert_eq!(
+            outcome,
+            ReconnectStatePushOutcome::LaggedEvidence {
+                evidence_epoch: 5,
+                push_epoch: 6,
+            }
+        );
+        assert!(!outcome.is_accepted());
+    }
+
+    #[test]
     fn validate_rejects_departed_peer() {
         let r = mk(4, vec![1, 2, 3]);
         let m = ReconnectStatePushMessage::new(0, r, 3, 4);
@@ -434,6 +464,14 @@ mod tests {
             }
             .as_str(),
             "stale_epoch"
+        );
+        assert_eq!(
+            ReconnectStatePushOutcome::LaggedEvidence {
+                evidence_epoch: 1,
+                push_epoch: 2
+            }
+            .as_str(),
+            "lagged_committed_epoch"
         );
         assert_eq!(
             ReconnectStatePushOutcome::PeerDeparted { target_peer_id: 1 }.as_str(),
