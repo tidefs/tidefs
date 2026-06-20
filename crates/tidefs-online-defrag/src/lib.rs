@@ -1087,7 +1087,7 @@ mod tests {
         assert_eq!(svc.job_id(), JobId(1));
         assert_eq!(svc.job_kind(), JobKind::Defrag);
 
-        let result = svc.step(WorkBudget::UNBOUNDED).unwrap();
+        let result = svc.step(WorkBudget::UNBOUNDED);
         assert!(result.is_complete);
 
         let stats = svc.stats();
@@ -1116,20 +1116,20 @@ mod tests {
             max_bytes: 0,
             max_ms: 0,
         };
-        let r1 = svc.step(budget).unwrap();
+        let r1 = svc.step(budget);
         assert!(!r1.is_complete);
         assert_eq!(svc.stats().inodes_scanned, 5);
         assert_eq!(svc.stats().inodes_defragmented, 5);
 
-        let r2 = svc.step(budget).unwrap();
+        let r2 = svc.step(budget);
         assert!(!r2.is_complete);
         assert_eq!(svc.stats().inodes_scanned, 10);
 
-        let r3 = svc.step(budget).unwrap();
+        let r3 = svc.step(budget);
         assert!(!r3.is_complete);
         assert_eq!(svc.stats().inodes_scanned, 15);
 
-        let r4 = svc.step(budget).unwrap();
+        let r4 = svc.step(budget);
         assert!(r4.is_complete);
         assert_eq!(svc.stats().inodes_scanned, 20);
     }
@@ -1138,7 +1138,7 @@ mod tests {
     fn service_empty_inode_list_completes_immediately() {
         let store = Box::new(MockStore::new(vec![], HashMap::new()));
         let mut svc = OnlineDefragService::new(JobId(3), store, 4096);
-        let result = svc.step(WorkBudget::UNBOUNDED).unwrap();
+        let result = svc.step(WorkBudget::UNBOUNDED);
         assert!(result.is_complete);
         assert_eq!(svc.stats().inodes_scanned, 0);
     }
@@ -1151,7 +1151,7 @@ mod tests {
         let store = Box::new(MockStore::new(inodes.clone(), maps));
 
         let mut svc = OnlineDefragService::new(JobId(4), store, 4096);
-        let result = svc.step(WorkBudget::UNBOUNDED).unwrap();
+        let result = svc.step(WorkBudget::UNBOUNDED);
         assert!(result.is_complete);
         assert_eq!(svc.stats().inodes_scanned, 3);
         assert_eq!(svc.stats().inodes_defragmented, 1);
@@ -1199,7 +1199,7 @@ mod tests {
             max_bytes: 0,
             max_ms: 0,
         };
-        let r = svc.step(budget).unwrap();
+        let r = svc.step(budget);
         assert!(!r.is_complete);
         assert_eq!(svc.stats().inodes_scanned, 3);
     }
@@ -1212,17 +1212,16 @@ mod tests {
         let store = Box::new(MockStore::new(inodes, maps));
 
         let mut svc = OnlineDefragService::new(JobId(5), store, 4096);
-        let result = svc.step(WorkBudget::PAUSED).unwrap();
+        let result = svc.step(WorkBudget::PAUSED);
         assert!(result.is_complete);
     }
-
     #[test]
-    fn service_step_after_complete_errors() {
+    fn service_step_after_complete_returns_complete() {
         let store = Box::new(MockStore::new(vec![], HashMap::new()));
         let mut svc = OnlineDefragService::new(JobId(6), store, 4096);
-        svc.step(WorkBudget::UNBOUNDED).unwrap();
-        let err = svc.step(WorkBudget::UNBOUNDED).unwrap_err();
-        assert!(matches!(err, JobError::JobAlreadyComplete { .. }));
+        svc.step(WorkBudget::UNBOUNDED);
+        let result = svc.step(WorkBudget::UNBOUNDED);
+        assert!(result.is_complete);
     }
 
     #[test]
@@ -1456,7 +1455,7 @@ mod tests {
 
         let mut svc = ObjectRelocator::new(JobId(100), Box::new(store), reloc_store);
 
-        let result = svc.step(WorkBudget::UNBOUNDED).unwrap();
+        let result = svc.step(WorkBudget::UNBOUNDED);
         assert!(result.is_complete);
 
         let stats = svc.stats();
@@ -1481,7 +1480,7 @@ mod tests {
 
         let mut svc = ObjectRelocator::new(JobId(101), store, reloc_store);
 
-        let result = svc.step(WorkBudget::UNBOUNDED).unwrap();
+        let result = svc.step(WorkBudget::UNBOUNDED);
         assert!(result.is_complete);
 
         let stats = svc.stats();
@@ -1510,7 +1509,7 @@ mod tests {
 
         let mut svc = ObjectRelocator::new(JobId(102), store, reloc_store);
 
-        let result = svc.step(WorkBudget::UNBOUNDED).unwrap();
+        let result = svc.step(WorkBudget::UNBOUNDED);
         assert!(result.is_complete);
 
         let stats = svc.stats();
@@ -1546,17 +1545,17 @@ mod tests {
             max_bytes: 3000,
             max_ms: 0,
         };
-        let r1 = svc.step(budget).unwrap();
+        let r1 = svc.step(budget);
         assert!(!r1.is_complete);
         assert_eq!(svc.stats().objects_relocated, 1);
 
         // Tick 2: budget 3000 bytes — inode 2 fits, but inode 3 would exceed.
-        let r2 = svc.step(budget).unwrap();
+        let r2 = svc.step(budget);
         assert!(!r2.is_complete);
         assert_eq!(svc.stats().objects_relocated, 2);
 
         // Tick 3: budget 3000 bytes — inode 3 fits, completes.
-        let r3 = svc.step(budget).unwrap();
+        let r3 = svc.step(budget);
         assert!(r3.is_complete);
         assert_eq!(svc.stats().objects_relocated, 3);
     }
@@ -1567,7 +1566,7 @@ mod tests {
         let reloc_store = Box::new(MockRelocationStore::new(4096));
 
         let mut svc = ObjectRelocator::new(JobId(104), store, reloc_store);
-        let result = svc.step(WorkBudget::UNBOUNDED).unwrap();
+        let result = svc.step(WorkBudget::UNBOUNDED);
         assert!(result.is_complete);
         assert_eq!(svc.stats().objects_scanned, 0);
     }
@@ -1585,20 +1584,20 @@ mod tests {
         let reloc_store = Box::new(reloc);
 
         let mut svc = ObjectRelocator::new(JobId(105), store, reloc_store);
-        let result = svc.step(WorkBudget::UNBOUNDED).unwrap();
+        let result = svc.step(WorkBudget::UNBOUNDED);
         assert!(result.is_complete);
         assert_eq!(svc.stats().objects_scanned, 1);
         assert_eq!(svc.stats().objects_relocated, 1);
     }
 
     #[test]
-    fn reloc_step_after_complete_errors() {
+    fn reloc_step_after_complete_returns_complete() {
         let store = Box::new(MockStore::new(vec![], HashMap::new()));
         let reloc_store = Box::new(MockRelocationStore::new(4096));
         let mut svc = ObjectRelocator::new(JobId(106), store, reloc_store);
-        svc.step(WorkBudget::UNBOUNDED).unwrap();
-        let err = svc.step(WorkBudget::UNBOUNDED).unwrap_err();
-        assert!(matches!(err, JobError::JobAlreadyComplete { .. }));
+        svc.step(WorkBudget::UNBOUNDED);
+        let result = svc.step(WorkBudget::UNBOUNDED);
+        assert!(result.is_complete);
     }
 
     #[test]
@@ -1617,7 +1616,7 @@ mod tests {
         let reloc_store = Box::new(reloc);
 
         let mut svc = ObjectRelocator::new(JobId(107), store, reloc_store);
-        let result = svc.step(WorkBudget::UNBOUNDED).unwrap();
+        let result = svc.step(WorkBudget::UNBOUNDED);
         assert!(result.is_complete);
 
         assert_eq!(svc.stats().objects_relocated, 1);
@@ -1641,7 +1640,7 @@ mod tests {
         let reloc_store = Box::new(reloc);
 
         let mut svc = ObjectRelocator::new(JobId(108), store, reloc_store);
-        let result = svc.step(WorkBudget::PAUSED).unwrap();
+        let result = svc.step(WorkBudget::PAUSED);
         assert!(result.is_complete);
         // With max_bytes=0 and budget_bytes=0, effective budget is 0
         // but the budget check is max_bytes > 0 && ... so 0 means unbounded.
@@ -1673,11 +1672,11 @@ mod tests {
             max_bytes: 0,
             max_ms: 0,
         };
-        let r1 = svc.step(budget).unwrap();
+        let r1 = svc.step(budget);
         assert!(!r1.is_complete);
         assert_eq!(svc.stats().objects_relocated, 3);
 
-        let r2 = svc.step(budget).unwrap();
+        let r2 = svc.step(budget);
         assert!(r2.is_complete);
         assert_eq!(svc.stats().objects_relocated, 5);
     }

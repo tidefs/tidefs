@@ -413,7 +413,7 @@ use tidefs_types_vfs_core::{LockConflict, LockRange, LockTracker};
 
 use background_orphan_reclamation::BackgroundOrphanReclamation;
 use extent_map_store_adapter::FilesystemExtentMapStore;
-use tidefs_online_defrag::{OnlineDefragService, DefragStats};
+use tidefs_online_defrag::OnlineDefragService;
 use tidefs_types_incremental_job_core::JobId;
 use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
 pub use tidefs_recovery_loop::RecoveryPolicy;
@@ -3300,7 +3300,7 @@ impl LocalFileSystem {
         // state.extent_maps / state.inodes so the defrag service can
         // operate on them without blocking the main filesystem.
         let extent_maps_shared = Arc::new(Mutex::new(state.extent_maps.clone()));
-        let inodes_shared = Arc::clone(&state.inodes);
+        let inodes_shared = Arc::new(Mutex::new((*state.inodes).clone()));
 
         let mut fs = Self {
             store,
