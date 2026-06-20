@@ -462,6 +462,7 @@ pub fn flush_segment_liveness_queue(
 mod tests {
     use super::*;
     use crate::store::LocalObjectStore;
+    use tidefs_reclaim::ReclaimReceiptExtent;
     use tidefs_types_reclaim_queue_core::{
         DeadObjectEntry, DeadObjectReplacementReceipt, ObjectKey,
     };
@@ -684,8 +685,19 @@ mod tests {
     fn reclaim_receipts_roundtrip_and_reopen() {
         let (mut store, dir) = temp_store();
         let receipts = vec![
-            ReclaimReceipt::new(vec![dead_object_key(0x31)], 7, 11),
-            ReclaimReceipt::new(vec![dead_object_key(0x32), dead_object_key(0x33)], 8, 12),
+            ReclaimReceipt::new(
+                vec![ReclaimReceiptExtent::new(31, dead_object_key(0x31))],
+                7,
+                11,
+            ),
+            ReclaimReceipt::new(
+                vec![
+                    ReclaimReceiptExtent::new(32, dead_object_key(0x32)),
+                    ReclaimReceiptExtent::new(33, dead_object_key(0x33)),
+                ],
+                8,
+                12,
+            ),
         ];
 
         store_reclaim_receipts(&receipts, &mut store).expect("store reclaim receipts");
@@ -718,6 +730,32 @@ mod tests {
         assert!(
             LocalObjectStore::open(dir.path()).is_err(),
             "corrupt reclaim receipts must fail store open closed"
+        );
+    }
+
+    #[test]
+    fn reclaim_receipts_unsupported_receipt_version_fail_closed() {
+        let (mut store, dir) = temp_store();
+        let receipt = ReclaimReceipt::new(
+            vec![ReclaimReceiptExtent::new(31, dead_object_key(0x31))],
+            7,
+            11,
+        );
+        let mut bytes = encode_reclaim_receipts(&[receipt]);
+        let receipt_frame_start = RECLAIM_RECEIPTS_HEADER_LEN + RECLAIM_RECEIPTS_ENTRY_LEN_LEN;
+        bytes[receipt_frame_start + 4..receipt_frame_start + 8]
+            .copy_from_slice(&1u32.to_le_bytes());
+
+        store
+            .put_named(RECLAIM_RECEIPTS_OBJECT_NAME, &bytes)
+            .expect("store unsupported receipt version");
+        assert!(load_reclaim_receipts(&store).is_err());
+        store.sync_all().expect("sync unsupported receipt log");
+        drop(store);
+
+        assert!(
+            LocalObjectStore::open(dir.path()).is_err(),
+            "unsupported reclaim receipt frames must fail store open closed"
         );
     }
 

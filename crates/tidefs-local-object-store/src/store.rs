@@ -64,8 +64,8 @@ use tidefs_gc_pin_set::SnapshotExtentPinSet;
 use tidefs_pool_allocator::{PoolAllocator, PoolAllocatorError, SpacePressureEvent};
 use tidefs_reclaim::{
     ClearanceEvidence, DrainError, GateDecision, GateDenyReason, ReclaimConfig,
-    ReclaimConsumerConfig, ReclaimConsumerService, ReclaimGate, ReclaimReceipt, ReclaimScheduler,
-    SegmentLiveCounts,
+    ReclaimConsumerConfig, ReclaimConsumerService, ReclaimGate, ReclaimReceipt,
+    ReclaimScheduler, SegmentLiveCounts,
 };
 use tidefs_reclaim_queue_core::{
     BPlusTreeReclaimQueue, DeadObjectReclaimQueue, SegmentLivenessQueue,
@@ -201,6 +201,17 @@ impl From<DrainError<Infallible, PoolAllocatorError>> for ReceiptBoundDeadObject
 impl From<StoreError> for ReceiptBoundDeadObjectDrainError {
     fn from(value: StoreError) -> Self {
         Self::Store(value)
+    }
+}
+
+fn reclaim_receipt_replay_allocator_error(error: PoolAllocatorError) -> StoreError {
+    match error {
+        PoolAllocatorError::SegmentOutOfRange(_) => StoreError::InvalidOptions {
+            reason: "reclaim receipt references segment outside configured pool",
+        },
+        _ => StoreError::InvalidOptions {
+            reason: "reclaim receipt allocator replay failed",
+        },
     }
 }
 
@@ -1177,6 +1188,9 @@ impl LocalObjectStore {
         // Restore snapshot extent pins before any reclaim authority observes
         // dead-object queue state.
         store.snapshot_extent_pin_set = load_snapshot_extent_pin_set(&store)?;
+        // Reapply committed physical-reclaim receipts before open accepts the
+        // allocator/free-map state reconstructed from stale checkpoints.
+        store.replay_reclaim_receipts_on_open()?;
         // Restore persisted segment-liveness queue.
         store.segment_liveness = match load_segment_liveness_queue(&store) {
             Ok(q) => q,
@@ -2155,6 +2169,76 @@ impl LocalObjectStore {
     #[must_use]
     pub fn reclaim_receipts(&self) -> &[ReclaimReceipt] {
         &self.reclaim_receipts
+    }
+
+    fn replay_reclaim_receipts_on_open(&mut self) -> Result<()> {
+        if self.block_device_mode || sidecar_files_unavailable(&self.segments_dir) {
+            return Ok(());
+        }
+
+        let mut receipt_extents_by_segment: BTreeMap<u64, BTreeSet<ReclaimObjectKey>> =
+            BTreeMap::new();
+        for receipt in &self.reclaim_receipts {
+            for extent in &receipt.freed_segment_extents {
+                receipt_extents_by_segment
+                    .entry(extent.segment_id)
+                    .or_default()
+                    .insert(extent.extent_key);
+            }
+        }
+
+        for (segment_id, extent_keys) in receipt_extents_by_segment {
+            if segment_id == self.current_segment_id
+                || self
+                    .index
+                    .values()
+                    .any(|location| location.segment_id == segment_id)
+            {
+                continue;
+            }
+
+            let seg_path = segment_path(&self.segments_dir, segment_id);
+            if seg_path.exists() {
+                if !self.receipt_replay_extents_match_dead_history(segment_id, &extent_keys) {
+                    continue;
+                }
+                if self.read_only {
+                    continue;
+                }
+                fs::remove_file(&seg_path).map_err(|source| {
+                    io_error("remove reclaim receipt segment", &seg_path, source)
+                })?;
+                sync_directory(&self.segments_dir)?;
+            }
+
+            if !self.free_map.is_free(segment_id) {
+                self.free_map
+                    .add_free(segment_id)
+                    .map_err(reclaim_receipt_replay_allocator_error)?;
+                self.free_segment_counter.freed();
+            }
+            self.reclaim_consumer.live_counts_mut().remove(segment_id);
+        }
+
+        Ok(())
+    }
+
+    fn receipt_replay_extents_match_dead_history(
+        &self,
+        segment_id: u64,
+        extent_keys: &BTreeSet<ReclaimObjectKey>,
+    ) -> bool {
+        extent_keys.iter().all(|extent_key| {
+            let store_key = ObjectKey::from_bytes(extent_key.0);
+            let live_location = self.index.get(&store_key).copied();
+            self.history
+                .get(&store_key)
+                .is_some_and(|locations| {
+                    locations.iter().any(|location| {
+                        location.segment_id == segment_id && Some(*location) != live_location
+                    })
+                })
+        })
     }
 
     /// Snapshot extent pins consulted by receipt-bound physical reclaim.
@@ -7390,6 +7474,7 @@ mod checksum_read_verify_tests {
 #[cfg(test)]
 mod reclaim_queue_production_tests {
     use super::*;
+    use tidefs_reclaim::ReclaimReceiptExtent;
 
     fn temp_store() -> (LocalObjectStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7439,6 +7524,12 @@ mod reclaim_queue_production_tests {
             death_commit_group,
         )
         .with_replacement_receipt(dead_object_receipt(key, receipt_generation))
+    }
+
+    fn receipt_replay_options() -> StoreOptions {
+        let mut options = StoreOptions::test_fast();
+        options.max_segment_bytes = 2048;
+        options
     }
 
     #[test]
@@ -7583,6 +7674,10 @@ mod reclaim_queue_production_tests {
         assert_eq!(store.reclaim_receipts().len(), 1);
         let receipt = store.reclaim_receipts()[0].clone();
         assert_eq!(receipt.freed_extents, vec![reclaim_key]);
+        assert_eq!(
+            receipt.freed_segment_extents,
+            vec![ReclaimReceiptExtent::new(old_segment_id, reclaim_key)]
+        );
         assert_eq!(receipt.deadlist_committed_txg, 1);
         assert_eq!(receipt.pin_clearance_epoch, 0);
         assert!(!store.reclaim_receipts_dirty);
@@ -7650,6 +7745,10 @@ mod reclaim_queue_production_tests {
         assert_eq!(store.reclaim_receipts().len(), 1);
         let receipt = &store.reclaim_receipts()[0];
         assert_eq!(receipt.freed_extents, vec![reclaim_key]);
+        assert_eq!(
+            receipt.freed_segment_extents,
+            vec![ReclaimReceiptExtent::new(old_segment_id, reclaim_key)]
+        );
         assert_eq!(receipt.deadlist_committed_txg, 1);
         assert_eq!(
             receipt.pin_clearance_epoch,
@@ -7797,9 +7896,23 @@ mod reclaim_queue_production_tests {
             .iter()
             .copied()
             .collect();
+        let freed_segment_extents: std::collections::BTreeSet<_> = store.reclaim_receipts()[0]
+            .freed_segment_extents
+            .iter()
+            .copied()
+            .collect();
         assert_eq!(
             freed_extents,
             [reclaim_key_a, reclaim_key_b].into_iter().collect()
+        );
+        assert_eq!(
+            freed_segment_extents,
+            [
+                ReclaimReceiptExtent::new(segment_id, reclaim_key_a),
+                ReclaimReceiptExtent::new(segment_id, reclaim_key_b),
+            ]
+            .into_iter()
+            .collect()
         );
         assert!(
             !segment_path(&store.segments_dir, segment_id).exists(),
@@ -7810,10 +7923,8 @@ mod reclaim_queue_production_tests {
     #[test]
     fn receipt_bound_dead_object_drain_resolves_overwrite_history() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut options = StoreOptions::test_fast();
-        options.max_segment_bytes = 2048;
-        let mut store =
-            LocalObjectStore::open_with_options(dir.path(), options).expect("open store");
+        let mut store = LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+            .expect("open store");
         let key = ObjectKey::from_name(b"receipt-bound/dead-object/overwrite-history");
         let old_payload = vec![0xA5; 1536];
         let new_payload = vec![0x5A; 1536];
@@ -7849,6 +7960,115 @@ mod reclaim_queue_production_tests {
             "replacement segment must stay present"
         );
         assert_eq!(store.get(key).unwrap(), Some(new_payload));
+    }
+
+    #[test]
+    fn reclaim_receipt_replay_removes_retained_segment_file_before_open_accepts_spacemap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = ObjectKey::from_name(b"receipt-bound/replay/retained-segment");
+        let old_payload = vec![0xA5; 1536];
+        let new_payload = vec![0x5A; 1536];
+        let reclaim_key = reclaim_key(key);
+
+        let (segments_dir, old_segment_id, replacement_segment_id, free_before_replay) = {
+            let mut store =
+                LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+                    .expect("open store");
+            store.put(key, &old_payload).expect("old put");
+            let old_segment_id = store.index.get(&key).expect("old location").segment_id;
+            store.put(key, &new_payload).expect("replacement put");
+            let replacement_segment_id = store
+                .index
+                .get(&key)
+                .expect("replacement location")
+                .segment_id;
+            assert_ne!(old_segment_id, replacement_segment_id);
+
+            store.reclaim_receipts.push(ReclaimReceipt::new(
+                vec![ReclaimReceiptExtent::new(old_segment_id, reclaim_key)],
+                6,
+                0,
+            ));
+            store.reclaim_receipts_dirty = true;
+            store.sync_all().expect("persist committed reclaim receipt");
+            assert!(segment_path(&store.segments_dir, old_segment_id).exists());
+            assert!(!store.free_map.is_free(old_segment_id));
+            (
+                store.segments_dir.clone(),
+                old_segment_id,
+                replacement_segment_id,
+                store.free_segment_count(),
+            )
+        };
+
+        let reopened = LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+            .expect("reopen replays retained receipt segment");
+        assert!(reopened.free_map.is_free(old_segment_id));
+        assert_eq!(reopened.free_segment_count(), free_before_replay + 1);
+        assert!(!segment_path(&segments_dir, old_segment_id).exists());
+        assert!(segment_path(&segments_dir, replacement_segment_id).exists());
+        assert_eq!(reopened.get(key).unwrap(), Some(new_payload));
+    }
+
+    #[test]
+    fn reclaim_receipt_replay_repairs_missing_segment_file_with_stale_spacemap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = ObjectKey::from_name(b"receipt-bound/replay/missing-segment");
+        let old_payload = vec![0xA5; 1536];
+        let new_payload = vec![0x5A; 1536];
+        let reclaim_key = reclaim_key(key);
+
+        let (segments_dir, old_segment_id, replacement_segment_id, free_before_replay) = {
+            let mut store =
+                LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+                    .expect("open store");
+            store.put(key, &old_payload).expect("old put");
+            let old_segment_id = store.index.get(&key).expect("old location").segment_id;
+            store.put(key, &new_payload).expect("replacement put");
+            let replacement_segment_id = store
+                .index
+                .get(&key)
+                .expect("replacement location")
+                .segment_id;
+            assert_ne!(old_segment_id, replacement_segment_id);
+
+            store.reclaim_receipts.push(ReclaimReceipt::new(
+                vec![ReclaimReceiptExtent::new(old_segment_id, reclaim_key)],
+                6,
+                0,
+            ));
+            store.reclaim_receipts_dirty = true;
+            store.sync_all().expect("persist committed reclaim receipt");
+            assert!(segment_path(&store.segments_dir, old_segment_id).exists());
+            assert!(!store.free_map.is_free(old_segment_id));
+            (
+                store.segments_dir.clone(),
+                old_segment_id,
+                replacement_segment_id,
+                store.free_segment_count(),
+            )
+        };
+
+        std::fs::remove_file(segment_path(&segments_dir, old_segment_id))
+            .expect("simulate crash after segment-file removal");
+
+        {
+            let reopened =
+                LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+                    .expect("reopen replays missing receipt segment");
+            assert!(reopened.free_map.is_free(old_segment_id));
+            assert_eq!(reopened.free_segment_count(), free_before_replay + 1);
+            assert!(!segment_path(&segments_dir, old_segment_id).exists());
+            assert!(segment_path(&segments_dir, replacement_segment_id).exists());
+            assert_eq!(reopened.get(key).unwrap(), Some(new_payload.clone()));
+        }
+
+        let reopened_again = LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+            .expect("repeated reopen replays receipt idempotently");
+        assert!(reopened_again.free_map.is_free(old_segment_id));
+        assert!(!segment_path(&segments_dir, old_segment_id).exists());
+        assert!(segment_path(&segments_dir, replacement_segment_id).exists());
+        assert_eq!(reopened_again.get(key).unwrap(), Some(new_payload));
     }
 
     #[test]
