@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 pub const XFSTESTS_EVIDENCE_MANIFEST_VERSION: u32 = 1;
 
@@ -175,16 +175,8 @@ impl XfstestsEvidenceManifest {
             }
         }
 
-        for p in &self.artifact_paths {
-            if p.trim().is_empty() {
-                failures.push("artifact_paths must not contain empty entries".to_string());
-                break;
-            }
-            if Path::new(p).is_absolute() {
-                failures.push(format!(
-                    "artifact_paths must be relative, found `{p}`"
-                ));
-            }
+        for path in &self.artifact_paths {
+            validate_relative_artifact_path(path, &mut failures);
         }
 
         XfstestsEvidenceManifestError::from_failures(failures)
@@ -195,6 +187,36 @@ impl XfstestsEvidenceManifest {
         serde_json::to_string_pretty(self).map_err(|error| {
             XfstestsEvidenceManifestError::single(format!("serialize manifest JSON: {error}"))
         })
+    }
+}
+
+fn validate_relative_artifact_path(path: &str, failures: &mut Vec<String>) {
+    if path.trim().is_empty() {
+        failures.push("artifact_paths must not contain empty entries".to_string());
+        return;
+    }
+
+    let parsed = Path::new(path);
+    if parsed.is_absolute() {
+        failures.push(format!("artifact_paths must be relative, found `{path}`"));
+    }
+
+    let mut has_normal = false;
+    for component in parsed.components() {
+        match component {
+            Component::Normal(_) => has_normal = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                failures.push(format!("artifact_paths must not contain `..`, found `{path}`"));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                failures.push(format!("artifact_paths must be relative, found `{path}`"));
+            }
+        }
+    }
+
+    if !has_normal {
+        failures.push(format!("artifact_paths must name files, found `{path}`"));
     }
 }
 

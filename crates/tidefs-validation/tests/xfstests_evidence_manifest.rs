@@ -150,6 +150,56 @@ fn rejects_empty_test_name() {
 }
 
 #[test]
+fn rejects_empty_artifact_path() {
+    let mut manifest = valid_focused_manifest();
+    manifest.artifact_paths = vec!["validation.json".to_string(), " ".to_string()];
+    let err = manifest.validate().unwrap_err();
+    assert!(
+        err.failures()
+            .iter()
+            .any(|f| f.contains("artifact_paths")),
+        "{:?}",
+        err.failures()
+    );
+}
+
+#[test]
+fn rejects_absolute_artifact_path() {
+    let mut manifest = valid_focused_manifest();
+    manifest.artifact_paths = vec!["/tmp/validation.json".to_string()];
+    let err = manifest.validate().unwrap_err();
+    assert!(
+        err.failures().iter().any(|f| f.contains("relative")),
+        "{:?}",
+        err.failures()
+    );
+}
+
+#[test]
+fn rejects_parent_artifact_path_component() {
+    let mut manifest = valid_focused_manifest();
+    manifest.artifact_paths = vec!["../validation.json".to_string()];
+    let err = manifest.validate().unwrap_err();
+    assert!(
+        err.failures().iter().any(|f| f.contains("..")),
+        "{:?}",
+        err.failures()
+    );
+}
+
+#[test]
+fn rejects_artifact_path_without_file_name() {
+    let mut manifest = valid_focused_manifest();
+    manifest.artifact_paths = vec![".".to_string()];
+    let err = manifest.validate().unwrap_err();
+    assert!(
+        err.failures().iter().any(|f| f.contains("name files")),
+        "{:?}",
+        err.failures()
+    );
+}
+
+#[test]
 fn accepts_broad_without_tests() {
     let manifest = valid_broad_manifest();
     manifest.validate().unwrap();
