@@ -3188,6 +3188,10 @@ impl LocalObjectStore {
         protected_exact_locations: &[ObjectLocation],
     ) -> Result<StoreRetentionCompactionReport> {
         self.ensure_writable("compact_retaining")?;
+        if self.block_device_mode {
+            return self.compact_block_device_retaining(protected_keys, protected_exact_locations);
+        }
+
         let segment_ids_before = discover_segment_ids(&self.segments_dir)?;
         let live_objects_before = stats_counted_index_len(&self.index);
         let initial_current_segment_id = self.current_segment_id;
@@ -3304,6 +3308,67 @@ impl LocalObjectStore {
             segment_count_before: segment_ids_before.len(),
             segment_count_after: retained_segments.len(),
             retained_segments,
+            exact_locations_preserved: true,
+            production_fsck_required: false,
+        })
+    }
+
+    fn compact_block_device_retaining(
+        &mut self,
+        protected_keys: &[ObjectKey],
+        protected_exact_locations: &[ObjectLocation],
+    ) -> Result<StoreRetentionCompactionReport> {
+        debug_assert!(self.block_device_mode);
+        self.ensure_writable("compact_block_device_retaining")?;
+
+        let live_objects_before = stats_counted_index_len(&self.index);
+        let protected_keys: BTreeSet<ObjectKey> = protected_keys.iter().copied().collect();
+        if !protected_exact_locations.is_empty() {
+            for location in protected_exact_locations {
+                self.read_location(*location)?;
+            }
+            return Ok(StoreRetentionCompactionReport {
+                protected_key_count: protected_keys.len(),
+                protected_exact_location_count: protected_exact_locations.len(),
+                live_objects_before,
+                live_objects_after: live_objects_before,
+                segment_count_before: 1,
+                segment_count_after: 1,
+                retained_segments: vec![0],
+                exact_locations_preserved: true,
+                production_fsck_required: false,
+                ..Default::default()
+            });
+        }
+
+        let retained_locations: Vec<(ObjectKey, ObjectLocation)> = self
+            .index
+            .iter()
+            .filter_map(|(key, loc)| {
+                (protected_keys.contains(key) || is_public_scan_internal_key(*key))
+                    .then_some((*key, *loc))
+            })
+            .collect();
+        let tombstoned_unprotected_keys = self
+            .index
+            .keys()
+            .copied()
+            .filter(|key| !is_public_scan_internal_key(*key) && !protected_keys.contains(key))
+            .count();
+        self.compact_block_device_locations(retained_locations)?;
+        let live_objects_after = stats_counted_index_len(&self.index);
+
+        Ok(StoreRetentionCompactionReport {
+            protected_key_count: protected_keys.len(),
+            protected_exact_location_count: 0,
+            copied_protected_objects: live_objects_after,
+            tombstoned_unprotected_keys,
+            retired_segments: Vec::new(),
+            retained_segments: vec![0],
+            live_objects_before,
+            live_objects_after,
+            segment_count_before: 1,
+            segment_count_after: 1,
             exact_locations_preserved: true,
             production_fsck_required: false,
         })
@@ -3935,11 +4000,29 @@ impl LocalObjectStore {
 
     fn compact_block_device_live_records(&mut self) -> Result<()> {
         debug_assert!(self.block_device_mode);
-        self.ensure_writable("compact_block_device_live_records")?;
-
-        let mut live_locations: Vec<(ObjectKey, ObjectLocation)> =
+        let live_locations: Vec<(ObjectKey, ObjectLocation)> =
             self.index.iter().map(|(key, loc)| (*key, *loc)).collect();
-        live_locations.sort_by_key(|(key, loc)| (loc.record_offset, *key));
+        self.compact_block_device_locations(live_locations)
+    }
+
+    fn compact_block_device_locations(
+        &mut self,
+        mut retained_locations: Vec<(ObjectKey, ObjectLocation)>,
+    ) -> Result<()> {
+        debug_assert!(self.block_device_mode);
+        self.ensure_writable("compact_block_device_locations")?;
+        retained_locations.sort_by_key(|(key, loc)| (loc.record_offset, *key));
+
+        let retained_records: Vec<(ObjectKey, ObjectLocation, Vec<u8>, u8)> = retained_locations
+            .into_iter()
+            .map(|(key, old_location)| {
+                self.read_location_stored_payload(old_location).map(
+                    |(payload, compression_algorithm)| {
+                        (key, old_location, payload, compression_algorithm)
+                    },
+                )
+            })
+            .collect::<Result<_>>()?;
 
         let data_start = Self::block_device_data_start();
         self.current_file
@@ -3956,9 +4039,7 @@ impl LocalObjectStore {
         let mut compacted_history: BTreeMap<ObjectKey, Vec<ObjectLocation>> = BTreeMap::new();
 
         let compact_result = (|| -> Result<()> {
-            for (key, old_location) in live_locations {
-                let (payload, compression_algorithm) =
-                    self.read_location_stored_payload(old_location)?;
+            for (key, old_location, payload, compression_algorithm) in retained_records {
                 let new_location = self.append_record_once(
                     RecordKind::Put,
                     key,
@@ -6686,6 +6767,84 @@ mod block_device_open_tests {
         for key in live_keys {
             assert!(reopened.get(key).expect("get reopened live").is_some());
         }
+    }
+
+    #[test]
+    fn block_device_compact_retaining_rewrites_image_without_segment_dir() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let record_bytes = 80 * 1024;
+        let options = block_options(record_bytes);
+        let payload_len = options.max_object_bytes() as usize;
+        let mut store =
+            LocalObjectStore::open_block_device(&image, options).expect("open block image");
+        let dead = ObjectKey::from_name(b"block-device/compact-retaining/dead");
+        let live_a = ObjectKey::from_name(b"block-device/compact-retaining/live-a");
+        let live_b = ObjectKey::from_name(b"block-device/compact-retaining/live-b");
+        let live_a_payload = vec![0xa1; payload_len];
+        let live_b_payload = vec![0xb2; payload_len];
+        let mut internal_key_bytes = [0x5a; 32];
+        internal_key_bytes[..8].copy_from_slice(&crate::POOL_PLACEMENT_RECEIPT_KEY_PREFIX);
+        let internal_key = ObjectKey(internal_key_bytes);
+        let internal_payload = b"committed-root-metadata";
+
+        store.put(dead, &vec![0xdd; payload_len]).expect("put dead");
+        store.put(live_a, &live_a_payload).expect("put live a");
+        store.put(live_b, &live_b_payload).expect("put live b");
+        store
+            .put_direct(internal_key, internal_payload)
+            .expect("put hidden metadata");
+        assert!(store.delete(dead).expect("delete dead"));
+
+        let live_keys = store.list_keys();
+        assert!(
+            is_public_scan_internal_key(internal_key) && !live_keys.contains(&internal_key),
+            "public live-key scan must hide internal metadata"
+        );
+        let report = store
+            .compact_retaining(&live_keys, &[])
+            .expect("compact block image");
+
+        assert_eq!(report.retired_segments, Vec::<u64>::new());
+        assert_eq!(report.retained_segments, vec![0]);
+        assert_eq!(report.live_objects_after, live_keys.len());
+        assert!(
+            store.current_offset <= LocalObjectStore::block_device_data_start() + 3 * record_bytes,
+            "compact_retaining should move live records into the image prefix"
+        );
+        assert_eq!(store.get(dead).expect("get dead"), None);
+        assert_eq!(
+            store.get(live_a).expect("get live a"),
+            Some(live_a_payload.clone())
+        );
+        assert_eq!(
+            store.get(live_b).expect("get live b"),
+            Some(live_b_payload.clone())
+        );
+        assert_eq!(
+            store.get(internal_key).expect("get hidden metadata"),
+            Some(internal_payload.to_vec())
+        );
+        store.sync_all().expect("sync compacted block image");
+        drop(store);
+
+        let reopened = LocalObjectStore::open_block_device(&image, block_options(record_bytes))
+            .expect("reopen block image");
+        assert_eq!(reopened.get(dead).expect("get reopened dead"), None);
+        assert_eq!(
+            reopened.get(live_a).expect("get reopened live a"),
+            Some(live_a_payload)
+        );
+        assert_eq!(
+            reopened.get(live_b).expect("get reopened live b"),
+            Some(live_b_payload)
+        );
+        assert_eq!(
+            reopened
+                .get(internal_key)
+                .expect("get reopened hidden metadata"),
+            Some(internal_payload.to_vec())
+        );
     }
 
     #[test]
