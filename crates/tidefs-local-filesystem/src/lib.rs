@@ -3828,9 +3828,11 @@ impl LocalFileSystem {
     /// object index entry and enqueues object-store reclaim entries. Physical
     /// segment freeing requires receipt-bound dead-object clearance evidence.
     ///
-    /// Budget: at most 256 entries per call to bound reclaim latency.
+    /// Budget: at most 1024 entries per call, matching the object-store
+    /// reclaim consumer's normal batch size and the background-service
+    /// DEFAULT_TICK item budget.
     pub fn drain_local_reclaim_queue_into_store(&mut self) -> ReclaimDrainStats {
-        const MAX_RECLAIM_PER_TICK: usize = 256;
+        const MAX_RECLAIM_PER_TICK: usize = 1024;
 
         // Receipt durability pre-check: identify which batch keys have a
         // durable placement receipt so that entries without durable receipts
@@ -3948,7 +3950,7 @@ impl LocalFileSystem {
     }
 
     fn drain_receipt_bound_reclaim_for_committed_state(&mut self) {
-        const MAX_RECEIPT_BOUND_RECLAIM_PER_TICK: usize = 256;
+        const MAX_RECEIPT_BOUND_RECLAIM_PER_TICK: usize = 1024;
 
         if self.is_state_dirty() {
             return;
@@ -12748,6 +12750,50 @@ mod orphan_index_integration_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn committed_burst_unlinks_drain_local_reclaim_in_one_tick() {
+        let (_root, mut fs) = make_test_fs("reclaim_burst_commit_tick").expect("open");
+        fs.set_auto_commit(false);
+        fs.set_max_uncommitted_mutations(1_000);
+
+        for i in 0..180_u64 {
+            let path = format!("/drop_{i}");
+            fs.create_file(&path, 0o644).expect("create_file");
+            fs.write_file(&path, 0, &[i as u8; 1024])
+                .expect("write_file");
+        }
+        fs.do_commit().expect("initial commit");
+        assert_eq!(
+            fs.reclaim_queue_depth(),
+            0,
+            "initial create/write commit must not leave reclaim work queued"
+        );
+
+        fs.set_auto_commit(false);
+        for i in 0..180_u64 {
+            let path = format!("/drop_{i}");
+            fs.unlink(&path).expect("unlink");
+        }
+
+        let queued_before_commit = fs.reclaim_queue_depth();
+        assert!(
+            queued_before_commit > 256,
+            "burst unlink should exceed the old per-tick drain cap, got {queued_before_commit}"
+        );
+        assert!(
+            queued_before_commit <= 1024,
+            "test setup must stay inside the normal background-service tick budget, got {queued_before_commit}"
+        );
+
+        fs.do_commit().expect("unlink commit");
+
+        assert_eq!(
+            fs.reclaim_queue_depth(),
+            0,
+            "one committed background tick must drain a bounded burst of local reclaim entries"
+        );
     }
 
     #[test]
