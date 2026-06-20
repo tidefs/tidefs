@@ -48,6 +48,10 @@ impl DatasetMountId {
     }
 }
 
+fn committed_mount_identity(identity: DatasetMountIdentity) -> bool {
+    identity.dataset_id != 0 && identity.mount_id != 0 && identity.committed_epoch != 0
+}
+
 const DEFAULT_PENDING_TIMEOUT_MILLIS: u64 = 30_000;
 
 /// Direction class for a LOCK frame payload.
@@ -160,6 +164,16 @@ impl LeaseTarget {
                 start: *start,
                 end: range_end(*start, *len),
             },
+        }
+    }
+
+    pub fn dataset_id(&self) -> Option<u64> {
+        match self {
+            Self::Dataset { dataset_id }
+            | Self::Directory { dataset_id, .. }
+            | Self::Inode { dataset_id, .. }
+            | Self::ByteRange { dataset_id, .. } => Some(*dataset_id),
+            Self::Pool { .. } => None,
         }
     }
 
@@ -333,6 +347,15 @@ pub struct GetlkRequest {
 }
 
 impl GetlkRequest {
+    fn target(&self) -> LeaseTarget {
+        LeaseTarget::ByteRange {
+            dataset_id: self.dataset_id,
+            ino: self.ino,
+            start: self.start,
+            len: self.len,
+        }
+    }
+
     fn domain(&self) -> LeaseDomain {
         LeaseDomain::ByteRange {
             dataset_id: self.dataset_id,
@@ -834,6 +857,20 @@ impl LockServiceLeader {
                 conflict_lease_id: None,
             };
         }
+        if !self.matches_configured_mount(&request.target, request.dataset_mount_id) {
+            return AcquireAck {
+                status: LockStatus::DeniedFenced,
+                lease_id: 0,
+                dataset_mount_id: request.dataset_mount_id,
+                target: request.target,
+                mode: request.mode,
+                term: self.table.current_term(),
+                epoch: self.table.current_epoch(),
+                expires_at_millis: 0,
+                conflict_holder: None,
+                conflict_lease_id: None,
+            };
+        }
 
         let domain = request.target.to_domain();
         let lease_class = request.mode.to_lease_class();
@@ -981,7 +1018,11 @@ impl LockServiceLeader {
                 status: LockServiceStatus::NotFound,
             };
         };
-        if grant.holder_id != request.owner.node_id || grant.epoch != request.epoch {
+        if grant.holder_id != request.owner.node_id
+            || grant.epoch != request.epoch
+            || grant.dataset_mount_id != request.dataset_mount_id.0
+            || !self.matches_configured_grant_mount(grant)
+        {
             return ReleaseAck {
                 lease_id: request.lease_id,
                 status: LockServiceStatus::DeniedFenced,
@@ -999,6 +1040,13 @@ impl LockServiceLeader {
 
     pub fn getlk(&self, request: GetlkRequest) -> GetlkAck {
         if !self.table.validate_fencing(request.term, request.epoch) {
+            return GetlkAck {
+                status: LockServiceStatus::DeniedFenced,
+                conflict: None,
+            };
+        }
+        let target = request.target();
+        if !self.matches_configured_mount(&target, request.dataset_mount_id) {
             return GetlkAck {
                 status: LockServiceStatus::DeniedFenced,
                 conflict: None,
@@ -1102,27 +1150,82 @@ impl LockServiceLeader {
             mode: mode_from_class(grant.lease_class),
         })
     }
+
+    fn matches_configured_mount(
+        &self,
+        target: &LeaseTarget,
+        dataset_mount_id: DatasetMountId,
+    ) -> bool {
+        let identity = self.config.current_mount_identity;
+        if !committed_mount_identity(identity) {
+            return true;
+        }
+        dataset_mount_id.0 == identity.mount_id && target.dataset_id() == Some(identity.dataset_id)
+    }
+
+    fn matches_configured_grant_mount(&self, grant: &LeaseGrant) -> bool {
+        let identity = self.config.current_mount_identity;
+        if !committed_mount_identity(identity) {
+            return true;
+        }
+        grant.dataset_mount_id == identity.mount_id && grant.mount_identity == identity
+    }
 }
 
-/// Local client-side handle used by FUSE/VFS frontends.
+/// Client-side handle used by clustered POSIX frontends.
 #[derive(Clone, Debug)]
 pub struct LockServiceHandle {
     owner: LockOwner,
+    mount_identity: DatasetMountIdentity,
     next_op_id: u64,
     held: BTreeMap<u64, LeaseGrant>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockServiceHandleError {
+    UncommittedMountIdentity(DatasetMountIdentity),
+    GrantMountMismatch {
+        expected: DatasetMountIdentity,
+        actual: DatasetMountIdentity,
+    },
+    AckMountMismatch {
+        expected: DatasetMountId,
+        actual: DatasetMountId,
+    },
+    AckEpochBeforeMount {
+        committed_epoch: u64,
+        ack_epoch: EpochId,
+    },
+}
+
 impl LockServiceHandle {
-    pub fn new(owner: LockOwner) -> Self {
-        Self {
+    pub fn new(
+        owner: LockOwner,
+        mount_identity: DatasetMountIdentity,
+    ) -> Result<Self, LockServiceHandleError> {
+        if !committed_mount_identity(mount_identity) {
+            return Err(LockServiceHandleError::UncommittedMountIdentity(
+                mount_identity,
+            ));
+        }
+        Ok(Self {
             owner,
+            mount_identity,
             next_op_id: 1,
             held: BTreeMap::new(),
-        }
+        })
     }
 
     pub fn owner(&self) -> LockOwner {
         self.owner
+    }
+
+    pub fn mount_identity(&self) -> DatasetMountIdentity {
+        self.mount_identity
+    }
+
+    pub fn dataset_mount_id(&self) -> DatasetMountId {
+        DatasetMountId(self.mount_identity.mount_id)
     }
 
     pub fn build_acquire(
@@ -1135,7 +1238,14 @@ impl LockServiceHandle {
         let op_id = self.next_op_id();
         LockFrame::new(
             op_id,
-            LockPayload::Acquire(AcquireRequest::new(target, mode, self.owner, DatasetMountId(0), term, epoch)),
+            LockPayload::Acquire(AcquireRequest::new(
+                target,
+                mode,
+                self.owner,
+                self.dataset_mount_id(),
+                term,
+                epoch,
+            )),
         )
     }
 
@@ -1146,19 +1256,44 @@ impl LockServiceHandle {
             LockPayload::Release(ReleaseRequest {
                 lease_id,
                 owner: self.owner,
-                dataset_mount_id: DatasetMountId(0),
+                dataset_mount_id: self.dataset_mount_id(),
                 epoch,
             }),
         )
     }
 
-    pub fn accept_grant(&mut self, grant: LeaseGrant) {
+    pub fn accept_grant(&mut self, grant: LeaseGrant) -> Result<(), LockServiceHandleError> {
+        if grant.mount_identity != self.mount_identity
+            || grant.dataset_mount_id != self.mount_identity.mount_id
+        {
+            return Err(LockServiceHandleError::GrantMountMismatch {
+                expected: self.mount_identity,
+                actual: grant.mount_identity,
+            });
+        }
         self.held.insert(grant.lease_id, grant);
+        Ok(())
     }
 
-    pub fn accept_acquire_ack(&mut self, ack: &AcquireAck, now_millis: u64) {
+    pub fn accept_acquire_ack(
+        &mut self,
+        ack: &AcquireAck,
+        now_millis: u64,
+    ) -> Result<(), LockServiceHandleError> {
         if ack.status != LockStatus::Granted || ack.lease_id == 0 {
-            return;
+            return Ok(());
+        }
+        if ack.dataset_mount_id != self.dataset_mount_id() {
+            return Err(LockServiceHandleError::AckMountMismatch {
+                expected: self.dataset_mount_id(),
+                actual: ack.dataset_mount_id,
+            });
+        }
+        if ack.epoch.0 < self.mount_identity.committed_epoch {
+            return Err(LockServiceHandleError::AckEpochBeforeMount {
+                committed_epoch: self.mount_identity.committed_epoch,
+                ack_epoch: ack.epoch,
+            });
         }
         let grant = LeaseGrant::request(
             ack.lease_id,
@@ -1169,12 +1304,13 @@ impl LockServiceHandle {
             ack.expires_at_millis.saturating_sub(now_millis),
             now_millis,
             ack.epoch,
-            DatasetMountIdentity::ZERO,
+            self.mount_identity,
             0,
             1,
             1,
         );
         self.held.insert(ack.lease_id, grant);
+        Ok(())
     }
 
     pub fn accept_release_ack(&mut self, ack: &ReleaseAck) {
@@ -1282,8 +1418,24 @@ mod tests {
         LockOwner::new(MemberId::new(node), pid, key)
     }
 
+    fn mount_identity(dataset_id: u64, mount_id: u64, epoch: u64) -> DatasetMountIdentity {
+        DatasetMountIdentity::new(dataset_id, mount_id, epoch)
+    }
+
     fn leader() -> LockServiceLeader {
         LockServiceLeader::new(LockServiceConfig::default())
+    }
+
+    fn configured_leader(
+        dataset_id: u64,
+        mount_id: u64,
+        epoch: u64,
+    ) -> LockServiceLeader {
+        LockServiceLeader::new(LockServiceConfig {
+            current_mount_identity: mount_identity(dataset_id, mount_id, epoch),
+            current_epoch: EpochId::new(epoch),
+            ..LockServiceConfig::default()
+        })
     }
 
     fn sample_payloads() -> Vec<LockPayload> {
@@ -1662,7 +1814,8 @@ mod tests {
     #[test]
     fn handle_builds_monotonic_requests_and_tracks_grants() {
         let owner = owner(4, 123, 456);
-        let mut handle = LockServiceHandle::new(owner);
+        let mount_identity = mount_identity(3, 1, 1);
+        let mut handle = LockServiceHandle::new(owner, mount_identity).expect("mount identity");
         let first = handle.build_acquire(
             LeaseTarget::Inode {
                 dataset_id: 3,
@@ -1676,6 +1829,18 @@ mod tests {
         let second = handle.build_release(1, EpochId::new(1));
         assert_eq!(first.op_id, 1);
         assert_eq!(second.op_id, 2);
+        match &first.payload {
+            LockPayload::Acquire(request) => {
+                assert_eq!(request.dataset_mount_id, DatasetMountId(1));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+        match &second.payload {
+            LockPayload::Release(request) => {
+                assert_eq!(request.dataset_mount_id, DatasetMountId(1));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
 
         handle.accept_acquire_ack(
             &AcquireAck {
@@ -1695,12 +1860,98 @@ mod tests {
                 conflict_lease_id: None,
             },
             1_000,
-        );
+        )
+        .expect("matching acquire ack");
         assert_eq!(handle.held_lease_ids(), vec![1]);
+        assert_eq!(
+            handle
+                .held
+                .get(&1)
+                .expect("held grant")
+                .mount_identity,
+            mount_identity
+        );
         handle.accept_release_ack(&ReleaseAck {
             lease_id: 1,
             status: LockServiceStatus::Released,
         });
+        assert!(handle.held_lease_ids().is_empty());
+    }
+
+    #[test]
+    fn clustered_handles_preserve_distinct_mount_scopes_for_same_inode_owner() {
+        let owner = owner(4, 123, 456);
+        let target = LeaseTarget::Inode {
+            dataset_id: 3,
+            ino: 44,
+            parent_lease_id: 0,
+        };
+        let mut first =
+            LockServiceHandle::new(owner, mount_identity(3, 11, 1)).expect("first handle");
+        let mut second =
+            LockServiceHandle::new(owner, mount_identity(3, 22, 1)).expect("second handle");
+
+        let first_acquire =
+            first.build_acquire(target.clone(), LockMode::Exclusive, 1, EpochId::new(1));
+        let second_acquire = second.build_acquire(target, LockMode::Exclusive, 1, EpochId::new(1));
+        match (&first_acquire.payload, &second_acquire.payload) {
+            (LockPayload::Acquire(first_request), LockPayload::Acquire(second_request)) => {
+                assert_eq!(first_request.dataset_mount_id, DatasetMountId(11));
+                assert_eq!(second_request.dataset_mount_id, DatasetMountId(22));
+                assert_eq!(first_request.target, second_request.target);
+                assert_eq!(first_request.owner, second_request.owner);
+            }
+            other => panic!("unexpected payloads: {other:?}"),
+        }
+
+        let first_release = first.build_release(7, EpochId::new(1));
+        let second_release = second.build_release(7, EpochId::new(1));
+        match (&first_release.payload, &second_release.payload) {
+            (LockPayload::Release(first_request), LockPayload::Release(second_request)) => {
+                assert_eq!(first_request.dataset_mount_id, DatasetMountId(11));
+                assert_eq!(second_request.dataset_mount_id, DatasetMountId(22));
+            }
+            other => panic!("unexpected payloads: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_rejects_zero_and_mismatched_mount_identity() {
+        let owner = owner(4, 123, 456);
+        assert!(matches!(
+            LockServiceHandle::new(owner, DatasetMountIdentity::ZERO),
+            Err(LockServiceHandleError::UncommittedMountIdentity(
+                DatasetMountIdentity::ZERO
+            ))
+        ));
+        let mut handle =
+            LockServiceHandle::new(owner, mount_identity(3, 11, 1)).expect("handle");
+        let mismatch = handle.accept_acquire_ack(
+            &AcquireAck {
+                status: LockStatus::Granted,
+                lease_id: 1,
+                dataset_mount_id: DatasetMountId(22),
+                target: LeaseTarget::Inode {
+                    dataset_id: 3,
+                    ino: 44,
+                    parent_lease_id: 0,
+                },
+                mode: LockMode::Shared,
+                term: 1,
+                epoch: EpochId::new(1),
+                expires_at_millis: 31_000,
+                conflict_holder: None,
+                conflict_lease_id: None,
+            },
+            1_000,
+        );
+        assert_eq!(
+            mismatch,
+            Err(LockServiceHandleError::AckMountMismatch {
+                expected: DatasetMountId(11),
+                actual: DatasetMountId(22),
+            })
+        );
         assert!(handle.held_lease_ids().is_empty());
     }
 
@@ -1738,6 +1989,70 @@ mod tests {
             10,
         );
         assert_eq!(ack.status, LockStatus::DeniedFenced);
+        assert_eq!(leader.table().grant_count(), 0);
+    }
+
+    #[test]
+    fn configured_leader_rejects_mismatched_acquire_mount_identity() {
+        let mut leader = configured_leader(3, 11, 1);
+        let ack = leader.acquire(
+            1,
+            AcquireRequest::new(
+                LeaseTarget::Inode {
+                    dataset_id: 3,
+                    ino: 44,
+                    parent_lease_id: 0,
+                },
+                LockMode::Exclusive,
+                owner(4, 123, 456),
+                DatasetMountId(22),
+                1,
+                EpochId::new(1),
+            ),
+            10,
+        );
+        assert_eq!(ack.status, LockStatus::DeniedFenced);
+        assert_eq!(leader.table().grant_count(), 0);
+    }
+
+    #[test]
+    fn configured_leader_rejects_mismatched_release_mount_identity() {
+        let owner = owner(4, 123, 456);
+        let mut leader = configured_leader(3, 11, 1);
+        let ack = leader.acquire(
+            1,
+            AcquireRequest::new(
+                LeaseTarget::Inode {
+                    dataset_id: 3,
+                    ino: 44,
+                    parent_lease_id: 0,
+                },
+                LockMode::Exclusive,
+                owner,
+                DatasetMountId(11),
+                1,
+                EpochId::new(1),
+            ),
+            10,
+        );
+        assert_eq!(ack.status, LockStatus::Granted);
+
+        let release = leader.release(ReleaseRequest {
+            lease_id: ack.lease_id,
+            owner,
+            dataset_mount_id: DatasetMountId(22),
+            epoch: EpochId::new(1),
+        });
+        assert_eq!(release.status, LockServiceStatus::DeniedFenced);
+        assert_eq!(leader.table().grant_count(), 1);
+
+        let release = leader.release(ReleaseRequest {
+            lease_id: ack.lease_id,
+            owner,
+            dataset_mount_id: DatasetMountId(11),
+            epoch: EpochId::new(1),
+        });
+        assert_eq!(release.status, LockServiceStatus::Released);
         assert_eq!(leader.table().grant_count(), 0);
     }
 }
