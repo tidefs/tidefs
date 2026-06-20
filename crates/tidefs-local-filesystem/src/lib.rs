@@ -1516,6 +1516,7 @@ pub struct LocalFileSystem {
 struct RewriteTrimPlan {
     trimmable: Vec<ObjectKey>,
     deferred: Vec<(ObjectKey, ObjectKey)>,
+    replaced_data_bytes: u64,
 }
 
 /// Configuration for authenticated filesystem open paths.
@@ -3974,6 +3975,16 @@ impl LocalFileSystem {
         self.deferred_rewrite_trims.extend(plan.deferred);
     }
 
+    fn account_rewrite_replaced_data(&mut self, replaced_data_bytes: u64) {
+        if replaced_data_bytes == 0 {
+            return;
+        }
+        self.state
+            .space_accounting
+            .track_physical_free(replaced_data_bytes);
+        self.capacity_authority.record_free(replaced_data_bytes);
+    }
+
     /// Process deferred rewrite extent trims, promoting old extent keys
     ///
     /// For each `(old_key, new_key)` pair recorded during a rewrite,
@@ -5966,6 +5977,55 @@ impl LocalFileSystem {
             .collect()
     }
 
+    fn coalesced_patch_ranges(
+        &self,
+        patches: &[CoalescedBufferedWritePatch<'_>],
+    ) -> Result<Vec<(u64, u64)>> {
+        let mut ranges = Vec::with_capacity(patches.len());
+        for patch in patches {
+            if patch.bytes.is_empty() {
+                continue;
+            }
+            let len =
+                u64::try_from(patch.bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            let end = patch
+                .offset
+                .checked_add(len)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            ranges.push((patch.offset, end));
+        }
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        ranges.sort_by_key(|(start, _)| *start);
+
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some((_, merged_end)) if start <= *merged_end => {
+                    *merged_end = (*merged_end).max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+
+        merged
+            .into_iter()
+            .map(|(start, end)| {
+                let len = end
+                    .checked_sub(start)
+                    .ok_or(FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    })?;
+                Ok((start, len))
+            })
+            .collect()
+    }
+
     fn restore_drained_write_segments(&mut self, inode_id: InodeId, segments: &[(u64, Vec<u8>)]) {
         self.snapshot_write_buffers_for_rollback();
         let wb = self
@@ -6039,6 +6099,9 @@ impl LocalFileSystem {
         let allocation_bytes = allocation_bytes(&planned_entries).unwrap_or(0);
         let dirty_allocation_bytes = dirty_patch_batch_allocation_bytes(new_size, patches)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
+        let patch_ranges = self.coalesced_patch_ranges(patches)?;
+        let replaced_data_bytes =
+            self.materialized_content_bytes_in_ranges(inode_id, &old_record, &patch_ranges)?;
         if allocation_bytes > old_allocation_bytes {
             self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(inode_id))?;
             self.ensure_content_capacity_with_planned_inode(
@@ -6073,6 +6136,21 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
+        let mut rewrite_trim_plan = match read_content_layout_from_store(
+            self.store.raw_primary_store(),
+            inode_id,
+            &old_record,
+            true,
+        )
+        .and_then(|old_layout| self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record))
+        {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.rollback_mutation_delta();
+                return Err(err);
+            }
+        };
+        rewrite_trim_plan.replaced_data_bytes = replaced_data_bytes;
         if dirty_allocation_bytes > 0 {
             self.dirty_set
                 .record_data_write(inode_id, dirty_allocation_bytes);
@@ -6114,7 +6192,10 @@ impl LocalFileSystem {
         self.inode_cache.borrow_mut().invalidate(inode_id);
         self.mark_inode_content_dirty(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
-        self.commit_mutation(record)
+        self.account_rewrite_replaced_data(rewrite_trim_plan.replaced_data_bytes);
+        let committed = self.commit_mutation(record)?;
+        self.apply_rewrite_trim_plan(rewrite_trim_plan);
+        Ok(committed)
     }
 
     fn flush_drained_write_segments(
@@ -8502,7 +8583,9 @@ impl LocalFileSystem {
                         }
                         let physical_free = data_bytes.saturating_add(reserved_bytes);
                         if physical_free > 0 {
-                            self.state.space_accounting.track_physical_free(physical_free);
+                            self.state
+                                .space_accounting
+                                .track_physical_free(physical_free);
                             self.capacity_authority.record_free(physical_free);
                         }
                     }
@@ -9445,6 +9528,19 @@ impl LocalFileSystem {
         let dirty_allocation_bytes =
             dirty_overlay_allocation_bytes(new_size, overlay_offset, overlay_bytes)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
+        let replaced_data_bytes = if overlay_bytes.is_empty() {
+            0
+        } else {
+            let overlay_len =
+                u64::try_from(overlay_bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            self.materialized_content_bytes_in_ranges(
+                inode_id,
+                &old_record,
+                &[(overlay_offset, overlay_len)],
+            )?
+        };
         if allocation_bytes > old_allocation_bytes {
             self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(inode_id))?;
             self.ensure_content_capacity_with_planned_inode(
@@ -9486,7 +9582,7 @@ impl LocalFileSystem {
         // plan is applied only after commit_mutation succeeds so rollback
         // paths do not leave stale reclaim work for still-live extents.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
-        let rewrite_trim_plan = match read_content_layout_from_store(
+        let mut rewrite_trim_plan = match read_content_layout_from_store(
             self.store.raw_primary_store(),
             inode_id,
             &old_record,
@@ -9500,6 +9596,7 @@ impl LocalFileSystem {
                 return Err(err);
             }
         };
+        rewrite_trim_plan.replaced_data_bytes = replaced_data_bytes;
 
         if dirty_allocation_bytes > 0 {
             self.dirty_set
@@ -9546,6 +9643,7 @@ impl LocalFileSystem {
         self.inode_cache.borrow_mut().invalidate(inode_id);
         self.mark_inode_content_dirty(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
+        self.account_rewrite_replaced_data(rewrite_trim_plan.replaced_data_bytes);
         let committed = self.commit_mutation(record)?;
         self.apply_rewrite_trim_plan(rewrite_trim_plan);
         Ok(committed)
