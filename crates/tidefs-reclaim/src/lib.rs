@@ -808,10 +808,11 @@ impl ReclaimReceipt {
     /// Create a new receipt with the given clearance evidence.
     #[must_use]
     pub fn new(
-        freed_segment_extents: Vec<ReclaimReceiptExtent>,
+        mut freed_segment_extents: Vec<ReclaimReceiptExtent>,
         deadlist_committed_txg: u64,
         pin_clearance_epoch: u64,
     ) -> Self {
+        freed_segment_extents.sort();
         let freed_extents = freed_segment_extents
             .iter()
             .map(|extent| extent.extent_key)
@@ -1031,11 +1032,12 @@ where
     }
 
     // Phase 2: collect fully-dead segments.
-    let dead_segments: Vec<u64> = segment_entries
+    let mut dead_segments: Vec<u64> = segment_entries
         .keys()
         .copied()
         .filter(|sid| live_counts.is_dead(*sid))
         .collect();
+    dead_segments.sort_unstable();
 
     if dead_segments.is_empty() {
         return Ok(stats);
@@ -1174,11 +1176,12 @@ where
     }
 
     // Phase 2: collect fully-dead segments.
-    let dead_segments: Vec<u64> = segment_entries
+    let mut dead_segments: Vec<u64> = segment_entries
         .keys()
         .copied()
         .filter(|sid| live_counts.is_dead(*sid))
         .collect();
+    dead_segments.sort_unstable();
 
     if dead_segments.is_empty() {
         return Ok(GatedDrainResult {
@@ -1344,7 +1347,7 @@ where
         stats.entries_processed += 1;
     }
 
-    let dead_segments: Vec<u64> = segment_entries
+    let mut dead_segments: Vec<u64> = segment_entries
         .iter()
         .filter_map(|(segment_id, extents)| {
             let live_count = live_counts.live_count(*segment_id);
@@ -1357,6 +1360,7 @@ where
             (covers_liveness && selected_entries == queued_entries).then_some(*segment_id)
         })
         .collect();
+    dead_segments.sort_unstable();
 
     let mut freed_extents = Vec::new();
     let mut reclaimed_segment_ids = Vec::new();
