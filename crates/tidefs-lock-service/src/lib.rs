@@ -1338,6 +1338,12 @@ pub enum LockServiceError {
     PayloadMismatch { reason: String },
     #[error("LOCK bincode error: {0}")]
     Bincode(#[from] bincode::Error),
+    #[error("LOCK transport peer {peer:?} is unavailable: {reason}")]
+    TransportPeerUnavailable { peer: MemberId, reason: String },
+    #[error("LOCK transport send queue for peer {peer:?} is full: {reason}")]
+    TransportQueueFull { peer: MemberId, reason: String },
+    #[error("LOCK transport send path for peer {peer:?} is closed: {reason}")]
+    TransportClosed { peer: MemberId, reason: String },
     #[error("lock queue is full")]
     QueueFull,
     #[error("lock not found")]

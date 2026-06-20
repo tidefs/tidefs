@@ -274,6 +274,7 @@ pub mod lane_demux;
 pub mod lease_dispatch;
 pub mod listener;
 pub mod listener_overload;
+pub mod lock_service_control;
 #[cfg(feature = "loopback")]
 pub mod loopback_v2;
 pub mod membership_guard;
@@ -492,6 +493,10 @@ pub use listener::{TransportConnection, TransportListener};
 pub use listener_overload::{
     AcceptRateLimiter, ConnectionRejectedEvent, ConnectionRejectedReason, ListenerOverloadConfig,
     OverloadEventSubscriber, OverloadGuard, PendingAcceptCounter,
+};
+pub use lock_service_control::{
+    ControlLockFrameSink, LOCK_CONTROL_ENDPOINT_FAMILY, LOCK_CONTROL_LANE,
+    LOCK_CONTROL_MESSAGE_FAMILY,
 };
 pub use membership_guard::{
     MembershipSessionGuard, MembershipSessionGuardRuntime, TeardownOutcome, TeardownReason,

@@ -36,6 +36,7 @@ tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
 tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
 tidefs-binary_schema-framing = { path = "../tidefs-binary_schema-framing" }
 tidefs-lease = { path = "../tidefs-lease" }
+tidefs-lock-service = { path = "../tidefs-lock-service" }
 tidefs-cluster = { path = "../tidefs-cluster" }
 tidefs-replication-model = { path = "../tidefs-replication-model" }
 tidefs-placement-planner = { path = "../tidefs-placement-planner" }
