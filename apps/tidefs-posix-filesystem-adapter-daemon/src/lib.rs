@@ -338,6 +338,7 @@ pub mod xfstests_harness;
 
 pub mod capacity;
 pub mod clustered_mount;
+pub mod clustered_lock_forwarder;
 pub mod fusewire;
 pub mod ingress;
 pub mod maintenance;
