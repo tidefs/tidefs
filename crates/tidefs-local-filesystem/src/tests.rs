@@ -10,7 +10,7 @@ use tidefs_local_object_store::CompressionAlgorithm;
 use tidefs_local_object_store::{checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey};
 use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_types_vfs_core::S_IFDIR;
-use tidefs_types_vfs_core::{LockRange, LockType};
+use tidefs_types_vfs_core::{LockRange, LockTracker, LockType};
 
 fn temp_root(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -9260,6 +9260,118 @@ fn lock_release_by_pid_clears_all_locks() {
         fs.getlk(ino_a, LockRange::write(0, 10, 300)).is_none(),
         "ino_a is now empty"
     );
+
+    cleanup(&root);
+}
+
+#[test]
+fn lock_paths_use_nonzero_local_mount_identity() {
+    let root = temp_root("lock-nonzero-mount-id");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.create_file("/f", 0o644).expect("create file");
+    let inode = fs.lookup("/f").expect("lookup f");
+    let mount_id = fs.dataset_mount_id();
+
+    assert_ne!(
+        mount_id, 0,
+        "normal local filesystem opens must not use mount id 0"
+    );
+
+    fs.setlk(inode, LockRange::write(0, 10, 100))
+        .expect("acquire lock");
+
+    let tracker = fs.lock_tracker.borrow();
+    assert!(
+        tracker
+            .locks_for_mount_inode(mount_id, inode.get())
+            .is_some(),
+        "local lock path must store locks under the committed mount id"
+    );
+    assert!(
+        tracker.locks_for_mount_inode(0, inode.get()).is_none(),
+        "normal local lock path must not store locks under mount id 0"
+    );
+    drop(tracker);
+
+    cleanup(&root);
+}
+
+#[test]
+fn lock_tracker_scopes_same_inode_range_by_local_mount_identity() {
+    let root_a = temp_root("lock-mount-scope-a");
+    let root_b = temp_root("lock-mount-scope-b");
+    let fs_a = LocalFileSystem::open_with_options(&root_a, options()).expect("open fs a");
+    let fs_b = LocalFileSystem::open_with_options(&root_b, options()).expect("open fs b");
+    let mount_a = fs_a.dataset_mount_id();
+    let mount_b = fs_b.dataset_mount_id();
+
+    assert_ne!(mount_a, 0);
+    assert_ne!(mount_b, 0);
+    assert_ne!(mount_a, mount_b, "local mount sessions need distinct ids");
+
+    let mut tracker = LockTracker::new();
+    let inode = 42;
+    let first = LockRange::write(0, 100, 100);
+    let same_range_other_pid = LockRange::write(0, 100, 200);
+
+    tracker
+        .acquire(mount_a, inode, first)
+        .expect("first mount lock");
+    tracker
+        .acquire(mount_b, inode, same_range_other_pid)
+        .expect("different mount id must not conflict");
+    let conflict = tracker
+        .acquire(mount_a, inode, same_range_other_pid)
+        .expect_err("same mount id still conflicts");
+    assert_eq!(conflict.existing, first);
+
+    cleanup(&root_a);
+    cleanup(&root_b);
+}
+
+#[test]
+fn lock_mount_cleanup_preserves_other_mount_identity() {
+    let root = temp_root("lock-mount-cleanup");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.create_file("/f", 0o644).expect("create file");
+    let inode = fs.lookup("/f").expect("lookup f");
+    let mount_id = fs.dataset_mount_id();
+    let other_mount_id = if mount_id == u64::MAX {
+        mount_id - 1
+    } else {
+        mount_id + 1
+    };
+
+    {
+        let mut tracker = fs.lock_tracker.borrow_mut();
+        tracker
+            .acquire(mount_id, inode.get(), LockRange::write(0, 10, 100))
+            .expect("current mount lock");
+        tracker
+            .acquire(other_mount_id, inode.get(), LockRange::write(0, 10, 200))
+            .expect("other mount lock");
+    }
+
+    assert_eq!(fs.lock_inode_count(), 2);
+    assert_eq!(
+        fs.release_all_locks_for_mount(),
+        1,
+        "forced cleanup should release only this mount"
+    );
+
+    let tracker = fs.lock_tracker.borrow();
+    assert!(
+        tracker
+            .locks_for_mount_inode(mount_id, inode.get())
+            .is_none()
+    );
+    assert!(
+        tracker
+            .locks_for_mount_inode(other_mount_id, inode.get())
+            .is_some(),
+        "other mount locks must survive current mount cleanup"
+    );
+    drop(tracker);
 
     cleanup(&root);
 }

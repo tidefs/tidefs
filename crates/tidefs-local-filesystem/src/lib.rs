@@ -364,6 +364,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+static NEXT_LOCAL_DATASET_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
+
 use tidefs_intent_log::XattrNamespace;
 
 use tidefs_background_scheduler::{
@@ -1478,8 +1480,8 @@ pub struct LocalFileSystem {
     writeback_range_tracker: Arc<Mutex<crate::dirty_page_tracker::DirtyPageTracker>>,
     writeback_handle: Option<crate::writeback_daemon::WritebackHandle>,
     lock_tracker: RefCell<LockTracker>,
-    /// Runtime dataset mount identifier for lock scoping (single-mount
-    /// context; default 0 for local-filesystem).
+    /// Runtime dataset mount/session identifier for local advisory-lock
+    /// scoping. Normal mounted operation receives a committed non-zero value.
     dataset_mount_id: u64,
     pool_uuid: u64,
     /// tidefs-queue-root: local_fs.write_buffers
@@ -2333,6 +2335,12 @@ impl LocalFileSystem {
 
     // ── POSIX advisory lock operations ──────────────────────────────────
 
+    /// Return the committed local mount/session identity used for advisory locks.
+    #[must_use]
+    pub fn dataset_mount_id(&self) -> u64 {
+        self.dataset_mount_id
+    }
+
     /// Query whether a conflicting lock exists on an inode for a given range.
     ///
     /// Returns `Some(LockConflict)` if a conflicting lock is held by another
@@ -2366,6 +2374,13 @@ impl LocalFileSystem {
         self.lock_tracker
             .borrow_mut()
             .release_by_pid(self.dataset_mount_id, pid);
+    }
+
+    /// Release every advisory lock scoped to this local mount/session.
+    pub fn release_all_locks_for_mount(&self) -> usize {
+        self.lock_tracker
+            .borrow_mut()
+            .release_all_for_mount(self.dataset_mount_id)
     }
 
     /// Get the number of inodes with active locks.
@@ -2483,6 +2498,19 @@ fn pool_uuid_from_path(root: &std::path::Path) -> u64 {
     root.hash(&mut hasher);
     hasher.finish()
 }
+
+fn allocate_local_dataset_mount_id(pool_uuid: u64) -> u64 {
+    let sequence = NEXT_LOCAL_DATASET_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = DefaultHasher::new();
+    pool_uuid.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    sequence.hash(&mut hasher);
+    match hasher.finish() {
+        0 => sequence.max(1),
+        id => id,
+    }
+}
+
 impl LocalFileSystem {
     /// Stop the background scheduler runtime on unmount to avoid leaking threads.
     fn stop_background_scheduler(&mut self) {
@@ -3216,6 +3244,9 @@ impl LocalFileSystem {
             let _ = store.sync_all();
         }
 
+        let pool_uuid = pool_uuid_from_path(&root_path);
+        let dataset_mount_id = allocate_local_dataset_mount_id(pool_uuid);
+
         let mut fs = Self {
             store,
             quorum_store: None,
@@ -3284,10 +3315,10 @@ impl LocalFileSystem {
             )),
             writeback_handle: None,
             lock_tracker: RefCell::new(LockTracker::new()),
-            dataset_mount_id: 0,
+            dataset_mount_id,
             write_buffers: BTreeMap::new(),
             write_buffer_config: WriteBufferConfig::default(),
-            pool_uuid: pool_uuid_from_path(&root_path),
+            pool_uuid,
             fsync_stats: FsyncStats::default(),
             sync_gate: SyncGate::new(),
             recovery_policy,
@@ -12265,6 +12296,8 @@ impl LocalFileSystem {
 }
 impl Drop for LocalFileSystem {
     fn drop(&mut self) {
+        let _released_locks = self.release_all_locks_for_mount();
+
         // Stop background services first so they release shared locks
         // (orphan_index, reclaim_queue, etc.) before do_commit needs them.
         self.stop_background_scheduler();
