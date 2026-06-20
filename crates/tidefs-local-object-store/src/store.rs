@@ -523,6 +523,10 @@ fn stats_counted_index_bytes(index: &BTreeMap<ObjectKey, ObjectLocation>) -> u64
 }
 
 impl LocalObjectStore {
+    const fn block_device_data_start() -> u64 {
+        BLOCK_DEVICE_DATA_REGION_OFFSET + BLOCK_DATA_FORMAT_HEADER_SIZE
+    }
+
     fn scan_block_device_for_index(
         file: &mut File,
         data_start: u64,
@@ -768,7 +772,7 @@ impl LocalObjectStore {
         })?;
 
         let format_start: u64 = BLOCK_DEVICE_DATA_REGION_OFFSET;
-        let data_start: u64 = format_start + BLOCK_DATA_FORMAT_HEADER_SIZE;
+        let data_start: u64 = Self::block_device_data_start();
         // Minimum usable capacity: label 0 + commit region + format header + label 1
         let min_capacity = POOL_LABEL_SIZE as u64 + data_start + POOL_LABEL_SIZE as u64;
         if capacity < min_capacity {
@@ -2282,9 +2286,11 @@ impl LocalObjectStore {
             self.dead_object_reclaim_queue_dirty = true;
         }
 
-        for segment_id in &drain.reclaimed_segment_ids {
-            let seg_path = segment_path(&self.segments_dir, *segment_id);
-            let _ = std::fs::remove_file(&seg_path);
+        if !self.block_device_mode {
+            for segment_id in &drain.reclaimed_segment_ids {
+                let seg_path = segment_path(&self.segments_dir, *segment_id);
+                let _ = std::fs::remove_file(&seg_path);
+            }
         }
 
         self.sync_all()?;
@@ -3838,6 +3844,38 @@ impl LocalObjectStore {
         sequence: u64,
         compression_algorithm: u8,
     ) -> Result<ObjectLocation> {
+        match self.append_record_once(
+            kind,
+            key,
+            payload,
+            payload_checksum,
+            sequence,
+            compression_algorithm,
+        ) {
+            Err(StoreError::NoSpace) if self.block_device_mode => {
+                self.compact_block_device_live_records()?;
+                self.append_record_once(
+                    kind,
+                    key,
+                    payload,
+                    payload_checksum,
+                    sequence,
+                    compression_algorithm,
+                )
+            }
+            result => result,
+        }
+    }
+
+    fn append_record_once(
+        &mut self,
+        kind: RecordKind,
+        key: ObjectKey,
+        payload: &[u8],
+        payload_checksum: IntegrityDigest64,
+        sequence: u64,
+        compression_algorithm: u8,
+    ) -> Result<ObjectLocation> {
         let payload_len = payload_len_u64(payload.len(), self.options.max_object_bytes())?;
         let record = RecordHeader {
             format_version: RECORD_FORMAT_VERSION,
@@ -3895,6 +3933,98 @@ impl LocalObjectStore {
         })
     }
 
+    fn compact_block_device_live_records(&mut self) -> Result<()> {
+        debug_assert!(self.block_device_mode);
+        self.ensure_writable("compact_block_device_live_records")?;
+
+        let mut live_locations: Vec<(ObjectKey, ObjectLocation)> =
+            self.index.iter().map(|(key, loc)| (*key, *loc)).collect();
+        live_locations.sort_by_key(|(key, loc)| (loc.record_offset, *key));
+
+        let data_start = Self::block_device_data_start();
+        self.current_file
+            .seek(SeekFrom::Start(data_start))
+            .map_err(|source| io_error("block_device_compact_seek_start", &self.root, source))?;
+        self.current_offset = data_start;
+        self.segment_write_count = 0;
+        self.segment_record_digests.clear();
+
+        let sync_on_write = self.options.sync_on_write;
+        self.options.sync_on_write = false;
+
+        let mut compacted_index: BTreeMap<ObjectKey, ObjectLocation> = BTreeMap::new();
+        let mut compacted_history: BTreeMap<ObjectKey, Vec<ObjectLocation>> = BTreeMap::new();
+
+        let compact_result = (|| -> Result<()> {
+            for (key, old_location) in live_locations {
+                let (payload, compression_algorithm) =
+                    self.read_location_stored_payload(old_location)?;
+                let new_location = self.append_record_once(
+                    RecordKind::Put,
+                    key,
+                    &payload,
+                    old_location.payload_checksum,
+                    old_location.sequence,
+                    compression_algorithm,
+                )?;
+                compacted_history.entry(key).or_default().push(new_location);
+                compacted_index.insert(key, new_location);
+            }
+            Ok(())
+        })();
+        self.options.sync_on_write = sync_on_write;
+        compact_result?;
+
+        self.clear_block_device_compacted_tail()?;
+        self.current_file
+            .sync_all()
+            .map_err(|source| io_error("block_device_compact_sync_all", &self.root, source))?;
+
+        self.index = compacted_index;
+        self.history = compacted_history;
+        self.reclaim_queue.clear();
+        self.segment_liveness.clear();
+        if !self.dead_object_reclaim_queue.is_empty() {
+            self.dead_object_reclaim_queue.clear();
+            self.dead_object_reclaim_queue_dirty = true;
+        }
+
+        let live_count = self.index.len() as u64;
+        self.reclaim_consumer.live_counts_mut().remove(0);
+        if live_count > 0 {
+            self.reclaim_consumer
+                .live_counts_mut()
+                .set_live_count(0, live_count);
+        }
+
+        Ok(())
+    }
+
+    fn clear_block_device_compacted_tail(&mut self) -> Result<()> {
+        let usable_end = self.block_device_usable_end()?;
+        if self.current_offset >= usable_end {
+            return Ok(());
+        }
+
+        let clear_len = (usable_end - self.current_offset).min(RECORD_HEADER_LEN_U64);
+        if clear_len == 0 {
+            return Ok(());
+        }
+
+        let clear_len = usize::try_from(clear_len).map_err(|_| StoreError::PayloadTooLarge {
+            len: clear_len,
+            max: usize::MAX as u64,
+        })?;
+        let zeros = vec![0_u8; clear_len];
+        self.current_file
+            .seek(SeekFrom::Start(self.current_offset))
+            .map_err(|source| io_error("block_device_compact_seek_tail", &self.root, source))?;
+        self.current_file
+            .write_all(&zeros)
+            .map_err(|source| io_error("block_device_compact_clear_tail", &self.root, source))?;
+        Ok(())
+    }
+
     /// Compute total record length from payload_len
     /// (header + payload + footer + trailer).
     fn checked_record_total_len_u64(payload_len: u64) -> u64 {
@@ -3908,12 +4038,7 @@ impl LocalObjectStore {
         // Block-device mode: skip segment-rotation logic. Only check
         // whether the record fits in the remaining device capacity.
         if self.block_device_mode {
-            // Usable region: after pool label, before trailing label.
-            let capacity = self
-                .current_file
-                .seek(SeekFrom::End(0))
-                .map_err(|source| io_error("block_device_seek_end", &self.root, source))?;
-            let usable_end = capacity.saturating_sub(POOL_LABEL_SIZE as u64);
+            let usable_end = self.block_device_usable_end()?;
             if self.current_offset + record_len > usable_end {
                 return Err(StoreError::NoSpace);
             }
@@ -3949,6 +4074,14 @@ impl LocalObjectStore {
             return Ok(());
         }
         self.rotate_segment()
+    }
+
+    fn block_device_usable_end(&mut self) -> Result<u64> {
+        let capacity = self
+            .current_file
+            .seek(SeekFrom::End(0))
+            .map_err(|source| io_error("block_device_seek_end", &self.root, source))?;
+        Ok(capacity.saturating_sub(POOL_LABEL_SIZE as u64))
     }
 
     /// Rotate the current segment if time or write-count thresholds
@@ -4115,7 +4248,7 @@ impl LocalObjectStore {
         Ok(())
     }
 
-    fn read_location(&self, location: ObjectLocation) -> Result<Vec<u8>> {
+    fn read_location_stored_payload(&self, location: ObjectLocation) -> Result<(Vec<u8>, u8)> {
         let path = if self.block_device_mode {
             self.root.clone()
         } else {
@@ -4213,8 +4346,13 @@ impl LocalObjectStore {
                 actual,
             });
         }
+        Ok((payload, record.compression_algorithm))
+    }
+
+    fn read_location(&self, location: ObjectLocation) -> Result<Vec<u8>> {
+        let (payload, compression_algorithm) = self.read_location_stored_payload(location)?;
         // Decompress inline if the record was stored with compression.
-        if record.compression_algorithm != 0 {
+        if compression_algorithm != 0 {
             tidefs_frame::decompress_frame(&payload).map_err(|_e| StoreError::CorruptHeader {
                 segment_id: location.segment_id,
                 offset: location.record_offset,
@@ -6406,12 +6544,39 @@ mod block_device_open_tests {
     use super::*;
     use tempfile::tempdir;
 
+    const BLOCK_IMAGE_BYTES: u64 = 1024 * 1024;
+
+    fn create_block_image(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let image = dir.path().join("pool.img");
+        let file = File::create(&image).expect("create image");
+        file.set_len(BLOCK_IMAGE_BYTES).expect("size image");
+        image
+    }
+
+    fn block_options(record_bytes: u64) -> StoreOptions {
+        let mut options = StoreOptions::test_fast();
+        options.max_segment_bytes = record_bytes;
+        options
+    }
+
+    fn reclaim_key(key: ObjectKey) -> ReclaimObjectKey {
+        ReclaimObjectKey(*key.as_bytes())
+    }
+
+    fn dead_object_receipt(
+        key: ReclaimObjectKey,
+    ) -> tidefs_types_reclaim_queue_core::DeadObjectReplacementReceipt {
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&key.0);
+        tidefs_types_reclaim_queue_core::DeadObjectReplacementReceipt::replicated(
+            key, 7, 1, 2, 4096, digest,
+        )
+    }
+
     #[test]
     fn open_block_device_accepts_regular_file_dev_backing() {
         let dir = tempdir().expect("tempdir");
-        let image = dir.path().join("pool.img");
-        let file = File::create(&image).expect("create image");
-        file.set_len(2 * 1024 * 1024).expect("size image");
+        let image = create_block_image(&dir);
 
         let store = LocalObjectStore::open_block_device(&image, StoreOptions::test_fast())
             .expect("open regular file backing");
@@ -6432,6 +6597,131 @@ mod block_device_open_tests {
             err,
             StoreError::InvalidOptions { reason } if reason.contains("directory")
         ));
+    }
+
+    #[test]
+    fn block_device_compacts_live_records_on_append_full() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let record_bytes = 128 * 1024;
+        let options = block_options(record_bytes);
+        let payload_len = options.max_object_bytes() as usize;
+        let mut store =
+            LocalObjectStore::open_block_device(&image, options).expect("open block image");
+        let key = ObjectKey::from_name(b"block-device/overwrite");
+        let mut latest = Vec::new();
+
+        for i in 0..8_u8 {
+            latest = vec![i; payload_len];
+            store.put(key, &latest).expect("overwrite");
+        }
+
+        assert_eq!(store.get(key).expect("get latest"), Some(latest.clone()));
+        assert!(
+            store.current_offset <= LocalObjectStore::block_device_data_start() + 3 * record_bytes,
+            "append cursor should be back near the live prefix after compaction"
+        );
+        store.sync_all().expect("sync compacted block image");
+        drop(store);
+
+        let reopened = LocalObjectStore::open_block_device(&image, block_options(record_bytes))
+            .expect("reopen block image");
+        assert_eq!(reopened.get(key).expect("get reopened"), Some(latest));
+    }
+
+    #[test]
+    fn block_device_delete_churn_reuses_append_space() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let record_bytes = 80 * 1024;
+        let options = block_options(record_bytes);
+        let payload_len = options.max_object_bytes() as usize;
+        let mut store =
+            LocalObjectStore::open_block_device(&image, options).expect("open block image");
+        let deleted_a = ObjectKey::from_name(b"block-device/delete/a");
+        let deleted_b = ObjectKey::from_name(b"block-device/delete/b");
+        let live_keys = [
+            ObjectKey::from_name(b"block-device/live/c"),
+            ObjectKey::from_name(b"block-device/live/d"),
+            ObjectKey::from_name(b"block-device/live/e"),
+            ObjectKey::from_name(b"block-device/live/f"),
+            ObjectKey::from_name(b"block-device/live/g"),
+        ];
+
+        store
+            .put(deleted_a, &vec![0xa0; payload_len])
+            .expect("put deleted a");
+        store
+            .put(deleted_b, &vec![0xb0; payload_len])
+            .expect("put deleted b");
+        for (idx, key) in live_keys[..2].iter().enumerate() {
+            store
+                .put(*key, &vec![idx as u8; payload_len])
+                .expect("put initial live");
+        }
+        assert!(store.delete(deleted_a).expect("delete a"));
+        assert!(store.delete(deleted_b).expect("delete b"));
+        for (idx, key) in live_keys[2..].iter().enumerate() {
+            store
+                .put(*key, &vec![0xc0 + idx as u8; payload_len])
+                .expect("put post-delete live");
+        }
+
+        assert_eq!(store.get(deleted_a).expect("get deleted a"), None);
+        assert_eq!(store.get(deleted_b).expect("get deleted b"), None);
+        for key in live_keys {
+            assert!(store.get(key).expect("get live").is_some());
+        }
+        assert!(
+            store.current_offset <= LocalObjectStore::block_device_data_start() + 5 * record_bytes,
+            "delete churn should compact away obsolete records"
+        );
+        store.sync_all().expect("sync compacted block image");
+        drop(store);
+
+        let reopened = LocalObjectStore::open_block_device(&image, block_options(record_bytes))
+            .expect("reopen block image");
+        assert_eq!(reopened.get(deleted_a).expect("get reopened a"), None);
+        assert_eq!(reopened.get(deleted_b).expect("get reopened b"), None);
+        for key in live_keys {
+            assert!(reopened.get(key).expect("get reopened live").is_some());
+        }
+    }
+
+    #[test]
+    fn block_device_receipt_bound_drain_keeps_backing_image() {
+        let dir = tempdir().expect("tempdir");
+        let image = create_block_image(&dir);
+        let mut store = LocalObjectStore::open_block_device(&image, block_options(80 * 1024))
+            .expect("open block image");
+        let key = ObjectKey::from_name(b"block-device/receipt-bound/delete");
+        let reclaim_key = reclaim_key(key);
+        let entry = tidefs_types_reclaim_queue_core::DeadObjectEntry::new(
+            reclaim_key,
+            [0x5a; 16],
+            1,
+            true,
+            1,
+        )
+        .with_replacement_receipt(dead_object_receipt(reclaim_key));
+
+        store.put(key, b"receipt-bound payload").expect("put");
+        assert!(store.delete(key).expect("delete"));
+        assert!(store
+            .enqueue_receipt_bound_dead_object(entry)
+            .expect("enqueue receipt-bound dead object"));
+
+        let stats = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(2, 1, 16)
+            .expect("drain receipt-bound dead object");
+
+        assert_eq!(stats.reclaim_queue_depth, 0);
+        assert!(image.exists(), "block backing image must not be unlinked");
+        drop(store);
+
+        let reopened = LocalObjectStore::open_block_device(&image, block_options(80 * 1024))
+            .expect("reopen block image");
+        assert_eq!(reopened.get(key).expect("get reopened deleted"), None);
     }
 }
 
