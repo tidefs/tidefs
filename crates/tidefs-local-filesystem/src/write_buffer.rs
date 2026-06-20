@@ -74,11 +74,12 @@ impl WriteBuffer {
     /// Contiguous or overlapping writes are merged into sorted dirty segments.
     /// Newer bytes overwrite older buffered bytes in the overlapping range.
     /// Zero-length writes are ignored.
-    pub fn ingest(&mut self, buf: &[u8], offset: u64) {
+    pub fn ingest(&mut self, buf: &[u8], offset: u64) -> usize {
         if buf.is_empty() {
-            return;
+            return 0;
         }
 
+        let before_total = self.total_bytes;
         let write_end = offset.saturating_add(buf.len() as u64);
         let scan_start = self.first_segment_start_ending_at_or_after(offset);
         let mut merged_start = offset;
@@ -108,7 +109,7 @@ impl WriteBuffer {
         if candidate_starts.is_empty() {
             self.segments.insert(offset, buf.to_vec());
             self.total_bytes = self.total_bytes.saturating_add(buf.len());
-            return;
+            return self.total_bytes.saturating_sub(before_total);
         }
 
         if candidate_starts.len() == 1 {
@@ -127,7 +128,7 @@ impl WriteBuffer {
                             data.extend_from_slice(tail);
                             self.total_bytes = self.total_bytes.saturating_add(tail.len());
                         }
-                        return;
+                        return self.total_bytes.saturating_sub(before_total);
                     }
                 }
             }
@@ -150,6 +151,41 @@ impl WriteBuffer {
         merged[write_dst..write_dst + buf.len()].copy_from_slice(buf);
         self.total_bytes = self.total_bytes.saturating_add(merged.len());
         self.segments.insert(merged_start, merged);
+        self.total_bytes.saturating_sub(before_total)
+    }
+
+    /// Return subranges of `[offset, offset + length)` not already dirty.
+    pub(crate) fn unbuffered_ranges(&self, offset: u64, length: u64) -> Vec<(u64, u64)> {
+        if length == 0 {
+            return Vec::new();
+        }
+
+        let end = offset.saturating_add(length);
+        let mut cursor = offset;
+        let mut ranges = Vec::new();
+        let start = self.first_segment_start_ending_after(offset);
+
+        for (&segment_start, data) in self.segments.range(start..) {
+            if cursor >= end || segment_start >= end {
+                break;
+            }
+            let segment_end = Self::segment_end(segment_start, data);
+            if segment_end <= cursor {
+                continue;
+            }
+
+            if segment_start > cursor {
+                let gap_end = segment_start.min(end);
+                ranges.push((cursor, gap_end - cursor));
+                cursor = gap_end;
+            }
+            cursor = cursor.max(segment_end.min(end));
+        }
+
+        if cursor < end {
+            ranges.push((cursor, end - cursor));
+        }
+        ranges
     }
 
     /// Returns `true` when the foreground byte-count threshold is crossed.
@@ -236,7 +272,8 @@ impl WriteBuffer {
     /// Removes segments whose offset is beyond `size`, and truncates any
     /// segment that straddles the size boundary.  Used by setattr(size)
     /// to prevent fsync from restoring data past a truncation point.
-    pub fn truncate(&mut self, size: u64) {
+    pub fn truncate(&mut self, size: u64) -> usize {
+        let before_total = self.total_bytes;
         self.segments.retain(|&offset, data| {
             if offset >= size {
                 return false;
@@ -249,6 +286,7 @@ impl WriteBuffer {
             true
         });
         self.total_bytes = self.segments.values().map(Vec::len).sum();
+        before_total.saturating_sub(self.total_bytes)
     }
 
     /// Clear dirty bytes in `[offset, offset + length)`, preserving dirty

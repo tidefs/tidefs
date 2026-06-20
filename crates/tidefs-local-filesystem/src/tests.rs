@@ -1130,6 +1130,109 @@ fn full_capacity_committed_overwrites_are_admitted() {
 }
 
 #[test]
+fn buffered_overwrites_charge_unique_dirty_bytes_only() {
+    let root = temp_root("buffered-overwrite-unique-dirty");
+    let data_len = content_chunk_size() as usize;
+    let mut fs =
+        LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), data_len as u64)
+            .expect("open fs");
+    fs.create_file("/docs.bin", 0o600).expect("create file");
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(data_len * 8);
+
+    fs.write_file("/docs.bin", 0, &vec![0x11; data_len])
+        .expect("initial dirty write fills capacity");
+    let used_after_first = fs.capacity_authority().used_bytes();
+    let pending_after_first = fs.capacity_authority().pending_bytes();
+    assert_eq!(used_after_first, data_len as u64);
+    assert_eq!(pending_after_first, data_len as u64);
+
+    for byte in [0x22, 0x33, 0x44] {
+        fs.write_file("/docs.bin", 0, &vec![byte; data_len])
+            .expect("same dirty range overwrite should not require more capacity");
+        assert_eq!(
+            fs.capacity_authority().used_bytes(),
+            used_after_first,
+            "same dirty range overwrite must not grow used capacity",
+        );
+        assert_eq!(
+            fs.capacity_authority().pending_bytes(),
+            pending_after_first,
+            "same dirty range overwrite must not grow pending capacity",
+        );
+    }
+
+    fs.fsync_all().expect("commit final dirty overwrite");
+    assert_eq!(
+        fs.read_file("/docs.bin").expect("read final content"),
+        vec![0x44; data_len]
+    );
+    assert_eq!(fs.capacity_authority().used_bytes(), data_len as u64);
+
+    cleanup(&root);
+}
+
+#[test]
+fn buffered_extension_beyond_dirty_range_still_checks_capacity() {
+    let root = temp_root("buffered-extension-capacity");
+    let data_len = content_chunk_size() as usize;
+    let mut fs =
+        LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), data_len as u64)
+            .expect("open fs");
+    fs.create_file("/docs.bin", 0o600).expect("create file");
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(data_len * 8);
+
+    fs.write_file("/docs.bin", 0, &vec![0x11; data_len])
+        .expect("initial dirty write fills capacity");
+
+    let err = fs
+        .write_file("/docs.bin", (data_len / 2) as u64, &vec![0x22; data_len])
+        .expect_err("extension beyond dirty range must still fail at full capacity");
+    assert!(
+        matches!(err, FileSystemError::NoSpace { .. }),
+        "expected content-capacity ENOSPC, got {err}",
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn direct_write_superseding_buffered_dirty_bytes_releases_dirty_charge() {
+    let root = temp_root("direct-supersedes-buffered-dirty");
+    let data_len = content_chunk_size() as usize;
+    let mut fs = LocalFileSystem::open_with_capacity(
+        &root,
+        StoreOptions::test_fast(),
+        (data_len as u64) * 2,
+    )
+    .expect("open fs");
+    fs.create_file("/docs.bin", 0o600).expect("create file");
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(data_len * 8);
+
+    fs.write_file("/docs.bin", 0, &vec![0x11; data_len])
+        .expect("initial dirty write");
+    assert_eq!(fs.capacity_authority().used_bytes(), data_len as u64);
+
+    fs.write_file_ranges_direct("/docs.bin", vec![(0, vec![0x22; data_len])])
+        .expect("direct write replaces buffered dirty bytes");
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        data_len as u64,
+        "direct replacement should not leave both buffered and direct charges held",
+    );
+
+    fs.fsync_all().expect("commit direct write");
+    assert_eq!(
+        fs.read_file("/docs.bin").expect("read final content"),
+        vec![0x22; data_len]
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn symlink_round_trips_target() {
     let root = temp_root("symlink");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
