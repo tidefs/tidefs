@@ -75,6 +75,11 @@ pool's physical capacity: `max(0, phys_capacity - logical_alloc_bytes - slop)`.
 would push `logical_alloc_bytes` beyond the quota/slop ceiling, it is refused
 with ENOSPC.
 
+`pinned_snapshot_bytes` is not an additional `logical_alloc_bytes` addend. It is
+an O(1) classification of bytes already covered by `logical_used_bytes` because
+they remain reachable from a live snapshot root. Counting it again would
+double-count snapshot-held bytes in quota and POSIX statfs projections.
+
 ### 3.3 SpaceDelta accumulator
 
 Each mutating operation produces a `SpaceDelta` that is accumulated during the
@@ -283,9 +288,39 @@ few blocks (common for frequent small-change snapshots), destroy is near-instant
 
 ### 7.3 statfs interaction
 
-`pinned_snapshot_bytes` does NOT reduce `statfs`'s `f_bfree` or `f_bavail`.
-Snapshots do not consume the user's quota — they pin physical space, which is
-tracked separately through physical counters and the cleaner's watermarks.
+Issue #638 decision: `pinned_snapshot_bytes` affects neither POSIX
+`statfs.f_bfree` nor POSIX `statfs.f_bavail`. It is visible through separate
+dataset/operator views such as `DatasetSpaceView`, per-snapshot deadlist
+counters, and metrics, not by subtracting it from mounted `df` output.
+
+Rationale:
+
+- `logical_used_bytes` is "unique live bytes reachable from any live root";
+  a snapshot root is a live root. `pinned_snapshot_bytes` classifies the subset
+  held only by snapshot deadlists, so adding it to POSIX statfs consumption would
+  double-count those bytes.
+- POSIX `statfs` for a mounted dataset should answer the user-visible question:
+  how much space remains for ordinary writes in this quota/domain after active
+  logical allocations, reservations, orphan bytes, slop, root reserve, and
+  transient holds. Retaining snapshots should not make `df` shrink a second time
+  for bytes already included in `logical_used_bytes`.
+- `snapshot_reserve_bytes` is a policy reservation, not a second statfs
+  subtraction for pinned bytes. User writes are admitted against the configured
+  reserve boundary; if snapshot pinning grows past that soft reserve, TideFS
+  records the pin for correctness and emits pressure/pruning signals instead of
+  refusing to preserve a required snapshot extent.
+- Cleaner watermarks remain physical-pool authority. Snapshot-pinned bytes can
+  reduce immediately reclaimable physical space and can push
+  `phys_free_segments` below target/min watermarks, causing cleaner activation
+  or write throttling even while POSIX `f_bfree`/`f_bavail` still report logical
+  quota/domain availability.
+- Quota availability is derived from `logical_alloc_bytes` plus slop and any
+  explicit reservation policies. `pinned_snapshot_bytes` remains separately
+  reportable for operators and retention policy but is not extra quota
+  consumption.
+
+Implementation note: GitHub issue #649 tracks cleanup of runtime helpers and
+tests that still include `pinned_snapshot_bytes` in POSIX statfs consumption.
 
 ## 8. Cleaner Scheduling with Watermarks
 
@@ -411,7 +446,8 @@ Key tidefs advantages:
 - Define `SnapshotSpaceRecord` with `deadlist_bytes`.
 - Implement refcount-1->0 deadlist movement when live snapshots exist.
 - Implement snapshot destroy with deadlist walk and counter reclamation.
-- Unit tests: O(1) deadlist tracking, snapshot destroy O(m), counter consistency.
+- Unit tests: O(1) deadlist tracking, snapshot destroy O(m), operator counter
+  consistency.
 
 ### Phase 5: Physical counters and cleaner watermarks
 - Define `PoolPhysicalCountersV1` with `refresh_physical_counters()`.
@@ -421,8 +457,11 @@ Key tidefs advantages:
 
 ### Phase 6: statfs implementation
 - Implement full statfs contract: logical quota, avail, stable 4096 block size.
-- Wire domain-scoped counters into per-mount statfs responses.
-- Integration test: create domain -> write -> snapshot -> verify statfs -> destroy.
+- Wire domain-scoped counters into per-mount statfs responses without subtracting
+  `pinned_snapshot_bytes` from `f_bfree` or `f_bavail`.
+- Integration test: create domain -> write -> snapshot -> verify statfs remains
+  governed by logical quota/domain availability while operator views show pinned
+  snapshot bytes -> destroy.
 
 ### Phase 7: Obligation ledger consistency
 - Verify write-path consistency: obligation ledger and space counters commit in same commit_group.
