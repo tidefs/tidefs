@@ -1333,17 +1333,20 @@ impl DeviceRemovalDriver {
 
         self.ensure_committed_evacuation_receipt("commit_vacated")?;
 
-        let Some(ref evac_receipt) = self.state.evacuation_receipt else {
-            unreachable!("ensure_committed_evacuation_receipt stores the receipt on success");
+        let completed_evacuation = {
+            let Some(evac_receipt) = self.state.evacuation_receipt.as_ref() else {
+                unreachable!("ensure_committed_evacuation_receipt stores the receipt on success");
+            };
+            if let Some(reason) = evac_receipt.verify(&self.state, set_digest) {
+                let evidence = DeviceRemovalRefusal::new(
+                    DeviceRemovalRefusalClass::EvacuationCompletionMismatch,
+                    self.state.target_device.clone(),
+                    reason,
+                );
+                return Err(self.transition_to_failed(evidence));
+            }
+            evac_receipt.to_completed_evacuation()
         };
-        if let Some(reason) = evac_receipt.verify(&self.state, set_digest) {
-            let evidence = DeviceRemovalRefusal::new(
-                DeviceRemovalRefusalClass::EvacuationCompletionMismatch,
-                self.state.target_device.clone(),
-                reason,
-            );
-            return Err(self.transition_to_failed(evidence));
-        }
         self.require_committed_placement_receipt_evidence("commit_vacated")?;
 
         // Validate that the updated config no longer contains the target device.
@@ -1377,7 +1380,6 @@ impl DeviceRemovalDriver {
             return Err(self.transition_to_failed(evidence));
         }
 
-        let completed_evacuation = evac_receipt.to_completed_evacuation();
         if !updated_pool_config
             .completed_evacuations
             .contains(&completed_evacuation)
