@@ -3287,14 +3287,12 @@ impl LocalObjectStore {
 
         let segment_ids_before = discover_segment_ids(&self.segments_dir)?;
         let live_objects_before = stats_counted_index_len(&self.index);
-        let initial_current_segment_id = self.current_segment_id;
         let protected_keys: BTreeSet<ObjectKey> = protected_keys.iter().copied().collect();
         let exact_location_keys: BTreeSet<ObjectKey> = protected_exact_locations
             .iter()
             .map(|location| location.key)
             .collect();
         let mut retained_segments: BTreeSet<u64> = BTreeSet::new();
-        retained_segments.insert(initial_current_segment_id);
 
         for location in protected_exact_locations {
             self.read_location(*location)?;
@@ -7529,6 +7527,7 @@ mod reclaim_queue_production_tests {
     fn receipt_replay_options() -> StoreOptions {
         let mut options = StoreOptions::test_fast();
         options.max_segment_bytes = 2048;
+        options.segment_count = tidefs_spacemap_allocator::DEFAULT_SEGMENT_GROUP_SEGMENTS;
         options
     }
 
