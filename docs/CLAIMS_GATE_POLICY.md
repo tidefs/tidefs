@@ -238,6 +238,17 @@ package counts, area tables, and capability summaries must defer to the
 checked workspace package classification rather than acting as separate
 package authority or release proof.
 
+
+`docs/OPERATOR_UAPI_AUTHORITY.md` is not in the direct claims-gate scanned
+set (issue #658). It is a design-decision artifact that defines operator
+UAPI authority boundaries; it is not a publishing-facing capability
+statement. The command classification/admission table it defines as source
+of truth is already consumed by this policy document and by
+`docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`, both of which remain scanned.
+The authority document preserves all non-claims for production UAPI/ABI
+freeze, kernelspace readiness, final distributed operator UAPI, and
+runtime-fed policy authority that the claims gate enforces.
+
 ## Work-State Boundary
 
 GitHub issue and pull request state is the active work-state authority for
