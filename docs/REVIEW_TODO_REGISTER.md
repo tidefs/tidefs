@@ -789,9 +789,15 @@ Important 2026-06-01 findings:
   the storage-node object-store backend does not itself expose pool placement
   receipts. This is still not a full cross-replica inventory authority with digest
   comparison, epochs, membership/fencing, or repair selection.
-  Multi-node scrub responses are still logged but not compared. Repair source
-  selection, recovery closure, and live TCP/RDMA runtime proof remain
-  incomplete. Cluster
+  Multi-node scrub responses are still logged but not compared. Issue #738
+  records the design decision in
+  `docs/CROSS_REPLICA_SCRUB_COMPARISON_DESIGN.md`: repair writeback must be
+  gated on receipt-bound, epoch-bound cross-replica comparison evidence, and
+  unreconciled disagreements must fail closed as
+  `ScrubRepairOutcome::CrossReplicaDisagreement`. The implementation split is
+  #756 for transport exchange, #757 for deterministic comparison, and #758 for
+  repair-dispatch gating. Repair source selection, recovery closure, and live
+  TCP/RDMA runtime proof remain incomplete. Cluster
   pool docs and CLI also disagree: the orchestrator source still says live
   dispatch is not wired into the orchestrator, while `tidefsctl cluster pool
   create` has a TCP transport adapter and the placement/heal exercise commands
