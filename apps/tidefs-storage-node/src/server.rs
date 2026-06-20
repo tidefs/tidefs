@@ -4762,9 +4762,7 @@ impl StorageNode {
 /// Frame-protocol handler for session handler threads. Uses SessionContext
 /// can access shared state without holding `&mut self` on the node.
 fn transport_primary_put_requires_receipt(store: &TransportReplicatedStore) -> bool {
-    store.configured_replica_count() > 1
-        || store.connected_replica_count() > 1
-        || store.has_placement_dispatch()
+    store.configured_replica_count() > 1 || store.connected_replica_count() > 1
 }
 
 fn handle_frame_ctx(
@@ -6365,7 +6363,9 @@ mod cluster_pool_handler_tests {
         )
     }
 
-    fn transport_store_with_placement() -> (tempfile::TempDir, TransportReplicatedStore) {
+    fn transport_store_with_placement_config(
+        config: TransportReplicatedStoreConfig,
+    ) -> (tempfile::TempDir, TransportReplicatedStore) {
         let tmp = tempfile::TempDir::with_prefix("storage-node-read-map-").unwrap();
         let layout = DurabilityLayoutV1::mirror(2).unwrap();
         let failure_domain = tidefs_durability_layout::FailureDomainV1::new(
@@ -6376,15 +6376,15 @@ mod cluster_pool_handler_tests {
         let sessions = tidefs_transport::TransportSessionSet::new();
         let dispatch =
             tidefs_transport::PlacementDispatch::new(layout, failure_domain, 0, sessions);
-        let store = TransportReplicatedStore::open(
-            tmp.path(),
-            1u64,
-            TransportReplicatedStoreConfig::default(),
-        )
-        .unwrap()
-        .with_placement(dispatch);
+        let store = TransportReplicatedStore::open(tmp.path(), 1u64, config)
+            .unwrap()
+            .with_placement(dispatch);
 
         (tmp, store)
+    }
+
+    fn transport_store_with_placement() -> (tempfile::TempDir, TransportReplicatedStore) {
+        transport_store_with_placement_config(TransportReplicatedStoreConfig::default())
     }
 
     fn accepted_relocation_read_map_publication(
@@ -8453,15 +8453,52 @@ mod cluster_pool_handler_tests {
     }
 
     #[test]
-    fn transport_backed_frame_put_requires_receipt_authority() {
+    fn transport_backed_rf1_frame_put_preserves_live_behavior() {
         let (_tmp, transport_store) = transport_store_with_placement();
+        let store = Arc::new(Mutex::new(StoreBackend::TransportBacked(Box::new(
+            transport_store,
+        ))));
+        let ctx = frame_test_context(Arc::clone(&store));
+        let key = b"transport-rf1-frame-put".to_vec();
+        let value = b"payload".to_vec();
+
+        let response = handle_frame_ctx(
+            tidefs_transport::SessionId::new(78),
+            &Frame::Put {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            &store,
+            &ctx,
+        )
+        .expect("frame response");
+
+        assert!(matches!(response, Frame::Ok), "rf=1 PUT got {response:?}");
+
+        let mut guard = store.lock().unwrap();
+        match &mut *guard {
+            StoreBackend::TransportBacked(transport_store) => {
+                assert_eq!(transport_store.get_named(&key).unwrap(), Some(value));
+            }
+            _ => panic!("expected transport backend"),
+        }
+    }
+
+    #[test]
+    fn transport_backed_frame_put_requires_receipt_authority() {
+        let (_tmp, transport_store) =
+            transport_store_with_placement_config(TransportReplicatedStoreConfig {
+                write_quorum: 2,
+                total_replicas: 2,
+                ..TransportReplicatedStoreConfig::default()
+            });
         let store = Arc::new(Mutex::new(StoreBackend::TransportBacked(Box::new(
             transport_store,
         ))));
         let ctx = frame_test_context(Arc::clone(&store));
 
         let response = handle_frame_ctx(
-            tidefs_transport::SessionId::new(78),
+            tidefs_transport::SessionId::new(79),
             &Frame::Put {
                 key: b"transport-frame-put".to_vec(),
                 value: b"payload".to_vec(),
