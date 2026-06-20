@@ -5,6 +5,7 @@
 
 mod capacity;
 mod coherency_profile;
+mod clustered_mount;
 mod dispatch_helpers;
 mod fsync_handler;
 mod fuse_create_unlink_dispatch;
