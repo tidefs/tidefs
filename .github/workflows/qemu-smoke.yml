@@ -96,9 +96,13 @@ jobs:
           SCOPE_BASE="kernel-fsync-syncfs-durability-across-qemu-power-loss-cycle"
 
           LATEST_SUMMARY="$(find "$SUMMARY_DIR" -name summary.env -type f 2>/dev/null | sort | tail -1 || true)"
+          LOG_PATHS="$(find "$SUMMARY_DIR" -name '*.log' -type f -printf '%P\n' 2>/dev/null | sort | paste -sd ',' - || true)"
+          if [[ -z "$LOG_PATHS" ]]; then
+            LOG_PATHS="none"
+          fi
 
           if [[ -n "$LATEST_SUMMARY" && -f "$LATEST_SUMMARY" ]]; then
-            ARTIFACT_PATH="summary.env"
+            ARTIFACT_PATH="$(realpath --relative-to="$SUMMARY_DIR" "$LATEST_SUMMARY" 2>/dev/null || echo summary.env)"
             DIGEST="$(nix shell nixpkgs#b3sum --command b3sum "$LATEST_SUMMARY" | awk '{print $1}')"
             CONTENT_DIGEST="blake3:${DIGEST}"
           else
@@ -107,7 +111,7 @@ jobs:
             echo "## Evidence manifest: no summary.env found" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          SCOPE="${SCOPE_BASE} source=qemu-smoke (claims-gate authority is standalone kernel-fsync-validation workflow) run=${RUN_ID} ref=${SOURCE_REF}"
+          SCOPE="${SCOPE_BASE} source=qemu-smoke (claims-gate authority is standalone kernel-fsync-validation workflow) run=${RUN_ID} ref=${SOURCE_REF} summary_path=${ARTIFACT_PATH} log_paths=${LOG_PATHS}"
 
           cat > "$MANIFEST_PATH" << MANIFESTEOF
           {

@@ -72,25 +72,42 @@ jobs:
 
           # Locate the latest summary.env
           LATEST_SUMMARY="$(find "$SUMMARY_DIR" -name summary.env -type f 2>/dev/null | sort | tail -1 || true)"
+          LOG_PATHS="$(find "$SUMMARY_DIR" -name '*.log' -type f -printf '%P\n' 2>/dev/null | sort | paste -sd ',' - || true)"
+          if [[ -z "$LOG_PATHS" ]]; then
+            LOG_PATHS="none"
+          fi
 
           if [[ -n "$LATEST_SUMMARY" && -f "$LATEST_SUMMARY" ]]; then
-            # Parse pass/fail/blocked counts from summary.env
-            PASSED="$(grep -oP 'TIDEFS_FSYNC_PASSED=\K\d+' "$LATEST_SUMMARY" 2>/dev/null || echo 0)"
-            FAILED="$(grep -oP 'TIDEFS_FSYNC_FAILED=\K\d+' "$LATEST_SUMMARY" 2>/dev/null || echo 0)"
-            BLOCKED="$(grep -oP 'TIDEFS_FSYNC_BLOCKED=\K\d+' "$LATEST_SUMMARY" 2>/dev/null || echo 0)"
-            STATUS="$(grep -oP 'TIDEFS_FSYNC_STATUS=\K\w+' "$LATEST_SUMMARY" 2>/dev/null || echo UNKNOWN)"
+            read_summary_value() {
+              local key="$1"
+              local default="$2"
+              awk -F= -v key="$key" -v default="$default" '
+                $1 == key { print $2; found = 1; exit }
+                END { if (!found) print default }
+              ' "$LATEST_SUMMARY"
+            }
 
-            if [[ "$FAILED" -gt 0 ]]; then
+            # Parse pass/fail/blocked counts from summary.env
+            PASSED="$(read_summary_value TIDEFS_FSYNC_PASSED 0)"
+            FAILED="$(read_summary_value TIDEFS_FSYNC_FAILED 0)"
+            BLOCKED="$(read_summary_value TIDEFS_FSYNC_BLOCKED 0)"
+            STATUS="$(read_summary_value TIDEFS_FSYNC_STATUS UNKNOWN)"
+
+            [[ "$PASSED" =~ ^[0-9]+$ ]] || PASSED=0
+            [[ "$FAILED" =~ ^[0-9]+$ ]] || FAILED=0
+            [[ "$BLOCKED" =~ ^[0-9]+$ ]] || BLOCKED=0
+
+            if [[ "$FAILED" -gt 0 || "$STATUS" == "FAIL" ]]; then
               STATUS_LABEL="fail"
-            elif [[ "$BLOCKED" -gt 0 ]]; then
+            elif [[ "$BLOCKED" -gt 0 || "$STATUS" == "BLOCKED" ]]; then
               STATUS_LABEL="blocked"
-            elif [[ "$PASSED" -gt 0 ]]; then
+            elif [[ "$PASSED" -gt 0 || "$STATUS" == "PASS" ]]; then
               STATUS_LABEL="pass"
             else
               STATUS_LABEL="no-result"
             fi
 
-            ARTIFACT_PATH="summary.env"
+            ARTIFACT_PATH="$(realpath --relative-to="$SUMMARY_DIR" "$LATEST_SUMMARY" 2>/dev/null || echo summary.env)"
             DIGEST="$(nix shell nixpkgs#b3sum --command b3sum "$LATEST_SUMMARY" | awk '{print $1}')"
             CONTENT_DIGEST="blake3:${DIGEST}"
           else
@@ -104,7 +121,7 @@ jobs:
             echo "## Evidence manifest: no summary.env found" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          SCOPE="${SCOPE_BASE} status=${STATUS_LABEL} passed=${PASSED} failed=${FAILED} blocked=${BLOCKED} run=${RUN_ID} source=${SOURCE_REF} timeout=${TIMEOUT}s pool=${POOL_SIZE}MB"
+          SCOPE="${SCOPE_BASE} status=${STATUS_LABEL} passed=${PASSED} failed=${FAILED} blocked=${BLOCKED} run=${RUN_ID} source=${SOURCE_REF} timeout=${TIMEOUT}s pool=${POOL_SIZE}MB summary_path=${ARTIFACT_PATH} log_paths=${LOG_PATHS}"
 
           cat > "$MANIFEST_PATH" << MANIFESTEOF
           {
