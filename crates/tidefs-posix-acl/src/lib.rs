@@ -240,6 +240,8 @@ pub enum PosixAclStructureError {
     DuplicateNamedUser,
     /// More than one named-group entry used the same gid.
     DuplicateNamedGroup,
+    /// Entries are not in canonical POSIX ACL order.
+    InvalidEntryOrder,
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +281,18 @@ fn special_acl_entry_id_is_valid(id: u32) -> bool {
 
 fn named_acl_entry_id_is_valid(id: u32) -> bool {
     id != ACL_UNDEFINED_ID
+}
+
+fn acl_entry_order_rank(tag: u16) -> Option<u8> {
+    match tag {
+        ACL_USER_OBJ => Some(0),
+        ACL_USER => Some(1),
+        ACL_GROUP_OBJ => Some(2),
+        ACL_GROUP => Some(3),
+        ACL_MASK => Some(4),
+        ACL_OTHER => Some(5),
+        _ => None,
+    }
 }
 
 /// Decode a Linux binary POSIX ACL xattr payload into a `PosixAcl`.
@@ -916,11 +930,21 @@ pub fn validate_posix_acl_access_structure(
     let mut mask_count = 0usize;
     let mut other_count = 0usize;
     let mut has_named_entry = false;
+    let mut last_order_rank: Option<u8> = None;
 
     for entry in acl {
         if entry.perm > 0x7 {
             return Err(PosixAclStructureError::InvalidPerm);
         }
+
+        let order_rank =
+            acl_entry_order_rank(entry.tag).ok_or(PosixAclStructureError::InvalidTag)?;
+        if let Some(previous_rank) = last_order_rank {
+            if order_rank < previous_rank {
+                return Err(PosixAclStructureError::InvalidEntryOrder);
+            }
+        }
+        last_order_rank = Some(order_rank);
 
         match entry.tag {
             ACL_USER_OBJ => {
@@ -959,7 +983,7 @@ pub fn validate_posix_acl_access_structure(
                 }
                 other_count += 1;
             }
-            _ => return Err(PosixAclStructureError::InvalidTag),
+            _ => unreachable!("ACL tag was validated before structure matching"),
         }
     }
 
@@ -1250,7 +1274,7 @@ pub fn plan_default_acl_inheritance_for_parent(
 ///
 /// Returns a `Vec` of `(xattr_name, encoded_value)` pairs ready to insert
 /// into the new inode's xattr map.  Returns an empty `Vec` when the parent
-/// has no default ACL or decoding fails (caller should check the parent
+/// has no default ACL or validation fails (caller should check the parent
 /// for the xattr before calling this function).
 #[must_use]
 pub fn default_acl_inheritance_for_parent(
@@ -1258,24 +1282,8 @@ pub fn default_acl_inheritance_for_parent(
     new_mode: u32,
     is_directory: bool,
 ) -> Vec<PosixAclXattrPair> {
-    let mut xattrs = Vec::new();
-
-    if parent_default_acl.is_empty() {
-        return xattrs;
-    }
-
-    let access_acl = access_acl_from_default_acl(parent_default_acl, new_mode);
-    xattrs.push((
-        b"system.posix_acl_access" as &[u8],
-        encode_posix_acl_xattr(&access_acl),
-    ));
-
-    if is_directory {
-        let default_encoded = encode_posix_acl_xattr(parent_default_acl);
-        xattrs.push((b"system.posix_acl_default" as &[u8], default_encoded));
-    }
-
-    xattrs
+    plan_default_acl_inheritance_for_parent(parent_default_acl, new_mode, is_directory)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -2505,6 +2513,42 @@ mod phase2_tests {
     }
 
     #[test]
+    fn validate_access_structure_rejects_noncanonical_entry_order() {
+        let acl = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 4,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_USER,
+                perm: 5,
+                id: 1001,
+            },
+            PosixAclEntry {
+                tag: ACL_MASK,
+                perm: 5,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_OTHER,
+                perm: 0,
+                id: 0,
+            },
+        ];
+
+        assert_eq!(
+            validate_posix_acl_access_structure(&acl),
+            Err(PosixAclStructureError::InvalidEntryOrder)
+        );
+    }
+
+    #[test]
     fn validate_access_structure_rejects_nonzero_special_entry_id() {
         let acl = vec![
             PosixAclEntry {
@@ -3592,6 +3636,47 @@ mod phase2_tests {
     }
 
     #[test]
+    fn planned_default_acl_inheritance_rejects_misordered_parent_default_acl() {
+        let parent_default = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 5,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_USER,
+                perm: 6,
+                id: 1000,
+            },
+            PosixAclEntry {
+                tag: ACL_MASK,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_OTHER,
+                perm: 0,
+                id: 0,
+            },
+        ];
+
+        assert_eq!(
+            plan_posix_acl_default_inheritance(&parent_default, 0o755, true),
+            Err(PosixAclStructureError::InvalidEntryOrder)
+        );
+        assert_eq!(
+            plan_default_acl_inheritance_for_parent(&parent_default, 0o755, true),
+            Err(PosixAclStructureError::InvalidEntryOrder)
+        );
+        assert!(default_acl_inheritance_for_parent(&parent_default, 0o755, true).is_empty());
+    }
+
+    #[test]
     fn planned_default_acl_inheritance_file_gets_access_only() {
         let parent_default = vec![
             PosixAclEntry {
@@ -4076,14 +4161,14 @@ mod phase2_tests {
                 id: 0,
             },
             PosixAclEntry {
-                tag: ACL_GROUP,
-                perm: 3,
-                id: 500,
-            },
-            PosixAclEntry {
                 tag: ACL_GROUP_OBJ,
                 perm: 0,
                 id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP,
+                perm: 3,
+                id: 500,
             },
             PosixAclEntry {
                 tag: ACL_MASK,
@@ -4407,14 +4492,14 @@ mod phase2_tests {
                 id: 0,
             },
             PosixAclEntry {
-                tag: ACL_GROUP_OBJ,
-                perm: 7,
-                id: 0,
-            },
-            PosixAclEntry {
                 tag: ACL_USER,
                 perm: 5,
                 id: 1000,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 7,
+                id: 0,
             },
             PosixAclEntry {
                 tag: ACL_MASK,

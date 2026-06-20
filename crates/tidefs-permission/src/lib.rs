@@ -1168,6 +1168,133 @@ pub const POSIX_ACL_ACCESS_XATTR: &[u8] = b"system.posix_acl_access";
 
 /// Xattr name for the POSIX default ACL (`system.posix_acl_default`).
 pub const POSIX_ACL_DEFAULT_XATTR: &[u8] = b"system.posix_acl_default";
+
+/// Error returned by mount-bound default ACL inheritance planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDefaultAclInheritanceError {
+    /// The parent directory mount identity is invalid.
+    InvalidParentMount {
+        /// Mount identity validation error.
+        source: MountIdentityError,
+    },
+    /// The child inode mount identity is invalid.
+    InvalidChildMount {
+        /// Mount identity validation error.
+        source: MountIdentityError,
+    },
+    /// Parent and child are not part of the same committed dataset mount.
+    CrossMountInheritance {
+        /// Parent directory mount identity.
+        parent: MountIdentity,
+        /// Child inode mount identity.
+        child: MountIdentity,
+    },
+    /// The supplied parent default ACL is malformed.
+    InvalidAcl {
+        /// POSIX ACL structural validation error.
+        source: PosixAclStructureError,
+    },
+}
+
+impl core::fmt::Display for PermissionDefaultAclInheritanceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidParentMount { .. } => {
+                write!(f, "invalid parent mount identity for default ACL inheritance")
+            }
+            Self::InvalidChildMount { .. } => {
+                write!(f, "invalid child mount identity for default ACL inheritance")
+            }
+            Self::CrossMountInheritance { .. } => {
+                write!(f, "cross-mount default ACL inheritance is forbidden")
+            }
+            Self::InvalidAcl { .. } => write!(f, "invalid parent default POSIX ACL"),
+        }
+    }
+}
+
+/// Mount-bound default ACL inheritance plan for mkdir/create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDefaultAclInheritancePlan {
+    /// Parent directory mount identity used for the inheritance decision.
+    pub parent_mount_identity: MountIdentity,
+    /// Child inode mount identity used for the inheritance decision.
+    pub child_mount_identity: MountIdentity,
+    /// POSIX ACL inheritance plan returned by the canonical ACL authority.
+    pub acl_plan: PosixAclDefaultInheritancePlan,
+}
+
+impl PermissionDefaultAclInheritancePlan {
+    /// Whether this plan installs at least one inherited ACL.
+    #[must_use]
+    pub const fn is_inheriting(&self) -> bool {
+        self.acl_plan.is_inheriting()
+    }
+}
+
+/// Plan default ACL inheritance after proving parent and child share one mount.
+///
+/// This is the permission-layer entry point for mkdir/create ACL inheritance.
+/// It delegates the ACL transformation to `tidefs-posix-acl` and adds the
+/// mount-identity boundary so a parent default ACL cannot be copied into a
+/// child that belongs to another dataset mount.
+pub fn plan_permission_default_acl_inheritance(
+    parent_default_acl: &[PosixAclEntry],
+    new_mode: u32,
+    is_directory: bool,
+    parent_mount_identity: &MountIdentity,
+    child_mount_identity: &MountIdentity,
+) -> Result<PermissionDefaultAclInheritancePlan, PermissionDefaultAclInheritanceError> {
+    validate_mount_identity(parent_mount_identity).map_err(|source| {
+        PermissionDefaultAclInheritanceError::InvalidParentMount { source }
+    })?;
+    validate_mount_identity(child_mount_identity)
+        .map_err(|source| PermissionDefaultAclInheritanceError::InvalidChildMount { source })?;
+
+    if parent_mount_identity != child_mount_identity {
+        return Err(PermissionDefaultAclInheritanceError::CrossMountInheritance {
+            parent: *parent_mount_identity,
+            child: *child_mount_identity,
+        });
+    }
+
+    let acl_plan = plan_posix_acl_default_inheritance(parent_default_acl, new_mode, is_directory)
+        .map_err(|source| PermissionDefaultAclInheritanceError::InvalidAcl { source })?;
+
+    Ok(PermissionDefaultAclInheritancePlan {
+        parent_mount_identity: *parent_mount_identity,
+        child_mount_identity: *child_mount_identity,
+        acl_plan,
+    })
+}
+
+/// Plan encoded inherited ACL xattrs after the mount-bound inheritance check.
+pub fn plan_permission_default_acl_xattrs(
+    parent_default_acl: &[PosixAclEntry],
+    new_mode: u32,
+    is_directory: bool,
+    parent_mount_identity: &MountIdentity,
+    child_mount_identity: &MountIdentity,
+) -> Result<Vec<PosixAclXattrPair>, PermissionDefaultAclInheritanceError> {
+    let plan = plan_permission_default_acl_inheritance(
+        parent_default_acl,
+        new_mode,
+        is_directory,
+        parent_mount_identity,
+        child_mount_identity,
+    )?;
+    let mut xattrs = Vec::new();
+
+    if let Some(access_acl) = plan.acl_plan.child_access_acl {
+        xattrs.push((POSIX_ACL_ACCESS_XATTR, encode_posix_acl_xattr(&access_acl)));
+    }
+    if let Some(default_acl) = plan.acl_plan.child_default_acl {
+        xattrs.push((POSIX_ACL_DEFAULT_XATTR, encode_posix_acl_xattr(&default_acl)));
+    }
+
+    Ok(xattrs)
+}
+
 // ---------------------------------------------------------------------------
 // POSIX ACL xattr and mode synchronisation helpers
 // ---------------------------------------------------------------------------
@@ -2554,6 +2681,147 @@ mod tests {
         ];
 
         assert_eq!(recalc_mode_from_acl(&acl), 0o641);
+    }
+
+    #[test]
+    fn permission_default_acl_inheritance_empty_parent_is_noop() {
+        let plan = plan_permission_default_acl_inheritance(
+            &[],
+            0o755,
+            true,
+            &VALID_MOUNT,
+            &VALID_MOUNT,
+        )
+        .expect("empty parent ACL is a valid no-op");
+
+        assert_eq!(plan.parent_mount_identity, VALID_MOUNT);
+        assert_eq!(plan.child_mount_identity, VALID_MOUNT);
+        assert!(!plan.is_inheriting());
+
+        let xattrs =
+            plan_permission_default_acl_xattrs(&[], 0o755, true, &VALID_MOUNT, &VALID_MOUNT)
+                .expect("empty parent ACL encodes no xattrs");
+        assert!(xattrs.is_empty());
+    }
+
+    #[test]
+    fn permission_default_acl_inheritance_same_mount_encodes_access_and_default() {
+        let parent_default = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_USER,
+                perm: 6,
+                id: 2000,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_MASK,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_OTHER,
+                perm: 5,
+                id: 0,
+            },
+        ];
+
+        let plan = plan_permission_default_acl_inheritance(
+            &parent_default,
+            0o750,
+            true,
+            &VALID_MOUNT,
+            &VALID_MOUNT,
+        )
+        .expect("same mount can inherit default ACL");
+        assert!(plan.is_inheriting());
+        assert_eq!(
+            find_posix_acl_entry(plan.acl_plan.child_access_acl.as_ref().unwrap(), ACL_MASK)
+                .unwrap()
+                .perm,
+            5
+        );
+        assert_eq!(
+            plan.acl_plan.child_default_acl.as_ref().unwrap(),
+            &parent_default
+        );
+
+        let xattrs = plan_permission_default_acl_xattrs(
+            &parent_default,
+            0o750,
+            true,
+            &VALID_MOUNT,
+            &VALID_MOUNT,
+        )
+        .expect("same mount can encode inherited ACL xattrs");
+        assert_eq!(xattrs.len(), 2);
+        assert_eq!(xattrs[0].0, POSIX_ACL_ACCESS_XATTR);
+        assert_eq!(xattrs[1].0, POSIX_ACL_DEFAULT_XATTR);
+
+        let child_access = decode_posix_acl_xattr(&xattrs[0].1).unwrap();
+        assert_eq!(
+            find_posix_acl_entry(&child_access, ACL_MASK).unwrap().perm,
+            5
+        );
+        let child_default = decode_posix_acl_xattr(&xattrs[1].1).unwrap();
+        assert_eq!(child_default, parent_default);
+    }
+
+    #[test]
+    fn permission_default_acl_inheritance_rejects_cross_mount_copy() {
+        let child_mount = MountIdentity::new([0x22u8; 16], 1);
+        let parent_default = minimal_access_acl_from_mode(0o750);
+
+        assert_eq!(
+            plan_permission_default_acl_inheritance(
+                &parent_default,
+                0o755,
+                true,
+                &VALID_MOUNT,
+                &child_mount,
+            ),
+            Err(PermissionDefaultAclInheritanceError::CrossMountInheritance {
+                parent: VALID_MOUNT,
+                child: child_mount,
+            })
+        );
+    }
+
+    #[test]
+    fn permission_default_acl_inheritance_rejects_invalid_parent_acl() {
+        let parent_default = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 5,
+                id: 0,
+            },
+        ];
+
+        assert_eq!(
+            plan_permission_default_acl_inheritance(
+                &parent_default,
+                0o755,
+                true,
+                &VALID_MOUNT,
+                &VALID_MOUNT,
+            ),
+            Err(PermissionDefaultAclInheritanceError::InvalidAcl {
+                source: PosixAclStructureError::MissingOther,
+            })
+        );
     }
 
     // =====================================================================
