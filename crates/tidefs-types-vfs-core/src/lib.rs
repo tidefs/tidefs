@@ -1692,7 +1692,7 @@ impl PosixAttrs {
         let mode_type = self.mode & S_IFMT;
         match mode_type {
             S_IFREG | S_IFDIR | S_IFLNK | S_IFBLK | S_IFCHR | S_IFIFO | S_IFSOCK => Ok(()),
-            _ => Err(PosixAttrsValidateError { mode }),
+            _ => Err(PosixAttrsValidateError { mode: self.mode }),
         }
     }
 }
