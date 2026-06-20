@@ -128,12 +128,13 @@ Implementation is split so the write sets do not overlap:
 | #652 | Require transform-aware scrub evidence before repair dispatch can write or mark mounted content. | `crates/tidefs-local-filesystem/src/scrub_repair_integration.rs`, `crates/tidefs-local-filesystem/src/repair.rs`, and scrub-core evidence/result types only if needed. |
 
 Issue #591 remains the active stale-generation repair gate. Issue #18 remains
-the placement receipt, rebuild, and source-selection gate. None of #637, #650,
-#651, or #652 does either of the following while any production `blocked` row
-remains in this inventory:
+the placement receipt, rebuild, and source-selection gate. The scrub/repair
+identity work in #637, #650, #651, and #652 is deliberately non-enabling for
+mounted device-level transforms while any production `blocked` row remains in
+this inventory. In that state:
 
-- It does not enable mounted device-level compression.
-- It does not enable mounted device-level encryption.
+- mounted device-level compression remains blocked.
+- mounted device-level encryption remains blocked.
 
 ## Current Mounted Transform Claim
 
