@@ -8,7 +8,7 @@ OpenZFS/Ceph-class claims.
 | --- | --- | --- | --- |
 | TFR-002 | Workspace authority | Product code, harness code, historical scaffolding, and non-workspace packages are still interleaved. | Classify every package as product, harness, third-party, or delete candidate; remove ambiguous scaffolding. |
 | TFR-003 | Todo hygiene | Debt was previously scattered through docs, comments, and issue-era markers. | Keep all durable debt here; convert inline notes to register pointers only. |
-| TFR-004 | Dataset/inode authority | Dataset/mount identity and inode ownership need deep review; earlier audit suspected root-level inode list behavior. | Prove or redesign inode indexing so namespace, dataset, snapshots, and mount identity have explicit authority boundaries. |
+| TFR-004 | Dataset/inode authority | Dataset/mount identity and inode ownership need deep review; earlier audit suspected root-level inode list behavior. | Use `docs/INODE_NAMESPACE_AUTHORITY.md`: a dedicated dataset-scoped inode authority owns allocation, persisted IDs, root identity, and recovery seeding while namespace, FUSE lookup state, and inode-table registries remain projections. Implement the non-overlapping follow-ups #664, #665, #666, and #667 before closing this item. |
 | TFR-005 | Timestamp/revision/on-disk format | POSIX timestamps, storage version fields, content object keys, scrub identity, replay ticks, rename metadata stamps, and serialized format fields are coupled. | Specify one authority model for POSIX time, generation, txg, object-version, and on-disk compatibility before changing behavior. |
 | TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Consolidate transform ordering, checksums, key handling, and raw-store visibility. |
 | TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Define one capacity authority and make all adapters consume it. |
@@ -231,6 +231,17 @@ Important 2026-06-01 findings:
   insertion still has no device-number authority for replayed special-node
   `rdev`, the delegated store update sequence is not a crash-consistency proof,
   is still required for runtime mknod/rename claims.
+- `TFR-004`: issue #655 adds `docs/INODE_NAMESPACE_AUTHORITY.md` as the
+  design decision artifact for dataset-scoped inode identity. The decision
+  selects a dedicated per-dataset inode authority, rejects namespace-owned
+  durable allocation and the current global `LocalFileSystem` allocator as
+  final owner models, keeps FUSE lookup/forget state as adapter reference
+  projection only, and keeps old pre-release catalog mismatches fail-closed by
+  default under `docs/UNRELEASED_AUTHORITY_POLICY.md`. Follow-up implementation
+  is split into #664 for allocator ownership, #665 for FUSE lookup-reference
+  projection, #666 for old catalog fail-closed policy refinement, and #667 for
+  special-node `rdev` replay. This documentation slice does not implement
+  runtime inode behavior and does not close TFR-004.
 - `TFR-005`: POSIX timestamp paths write through `metadata_version` and
   `data_version`, and `InodeRecord::to_inode_attr()` projects those same
   persisted fields back as POSIX atime/mtime/ctime/btime. `data_version` is
