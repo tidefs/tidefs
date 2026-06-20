@@ -358,6 +358,7 @@ mod tests {
             device_write_errors: None,
             device_checksum_errors: None,
             redundancy_policy: None,
+            completed_evacuations: vec![],
         };
 
         let (summary, availability) = pool_summary_from_label_group(pool_guid, &[entry]);

@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use clap::Subcommand;
+use tidefs_device_removal::admission::DEVICE_REMOVAL_AUTHORITY_KIND;
 
 /// Device management subcommands.
 #[derive(Subcommand, Debug)]
@@ -57,7 +58,6 @@ pub enum DeviceCommand {
         #[arg(long)]
         force: bool,
     },
-
 
     /// Query live device status with source classification.
     ///
@@ -160,12 +160,7 @@ fn handle_remove(
     failure_domain: &str,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let live_args = serde_json::json!({
-        "device_path": device_path.to_string_lossy(),
-        "replication_factor": replication_factor,
-        "failure_domain": failure_domain,
-        "force": force,
-    });
+    let live_args = device_remove_live_args(device_path, replication_factor, failure_domain, force);
 
     if let Some(backing_dir) = backing_dir {
         return Err(format!(
@@ -189,26 +184,32 @@ fn handle_remove(
 
     super::live_owner::route_if_owner_exists_with_args("device", "remove", pool_name, live_args);
     Err(format!(
-        "pool-name device removal for '{pool_name}' requires a reachable live owner; route through the kernel UAPI or userspace daemon owner. Directory-backed offline device removal is retired."
+        "pool-name device removal for '{pool_name}' requires a reachable live owner to provide committed evacuation receipt authority for device '{}'; route through the kernel UAPI or userspace daemon owner. Directory-backed offline device removal is retired.",
+        device_path.display()
     )
     .into())
 }
 
+fn device_remove_live_args(
+    device_path: &PathBuf,
+    replication_factor: u8,
+    failure_domain: &str,
+    force: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "device_path": device_path.to_string_lossy(),
+        "replication_factor": replication_factor,
+        "failure_domain": failure_domain,
+        "force": force,
+        "required_authority": DEVICE_REMOVAL_AUTHORITY_KIND,
+    })
+}
 
 /// Query live device status through the live owner, or fail closed
-
 /// with source-classified refusal when no live owner is reachable.
-
 fn handle_device_status(pool_name: String, json: bool) {
-
-    // Try the live owner first; exits if reachable.
-
     super::live_owner::route_status_if_owner_exists("device", "status", &pool_name, json);
-
-    // No live owner reachable; fail closed with source classification.
-
     super::live_owner::refuse_no_live_status_evidence("device", "status", &pool_name, json);
-
 }
 
 #[cfg(test)]
@@ -233,7 +234,8 @@ mod tests {
         );
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("requires a reachable live owner"),
+            msg.contains("requires a reachable live owner")
+                && msg.contains("committed evacuation receipt authority"),
             "expected live-owner refusal, got {msg}"
         );
     }
@@ -351,7 +353,10 @@ mod tests {
             cmd: super::DeviceCommand,
         }
         let args = TestCli::try_parse_from(["test", "status"]);
-        assert!(args.is_err(), "device status without pool name must be rejected");
+        assert!(
+            args.is_err(),
+            "device status without pool name must be rejected"
+        );
     }
 
     #[test]
@@ -370,5 +375,21 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("requires a reachable live owner"));
+        assert!(msg.contains("committed evacuation receipt authority"));
+    }
+
+    #[test]
+    fn device_remove_live_args_request_receipt_authority() {
+        let args = device_remove_live_args(&PathBuf::from("/dev/disk0"), 2, "device", false);
+
+        assert_eq!(
+            args.get("required_authority")
+                .and_then(serde_json::Value::as_str),
+            Some(DEVICE_REMOVAL_AUTHORITY_KIND)
+        );
+        assert_eq!(
+            args.get("device_path").and_then(serde_json::Value::as_str),
+            Some("/dev/disk0")
+        );
     }
 }

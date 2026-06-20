@@ -29,6 +29,7 @@ use tidefs_pool_scan::{
 
 use tidefs_replication_model::PlacementReceiptRef;
 
+pub mod admission;
 pub mod locator_integration;
 
 // ---------------------------------------------------------------------------

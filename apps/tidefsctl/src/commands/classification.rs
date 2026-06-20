@@ -89,7 +89,6 @@ impl fmt::Display for RoutingSemantics {
     }
 }
 
-
 /// Authority source for a reported status fact.
 ///
 /// Every status fact emitted by `tidefsctl cluster status` or
@@ -102,6 +101,11 @@ pub(crate) enum StatusSource {
     /// Fact obtained directly from a reachable live owner (kernel,
     /// FUSE daemon, or ublk runtime).
     LiveOwner,
+    /// Live-owner status was required, but no reachable owner could provide
+    /// current evidence.
+    UnavailableLiveOwner,
+    /// Local or offline status mode is explicitly unsupported for this command.
+    UnsupportedLocalMode,
     /// Fact read from a kernel UAPI control surface.
     KernelUapi,
     /// Fact obtained from a running userspace daemon endpoint.
@@ -126,6 +130,8 @@ impl StatusSource {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::LiveOwner => "source:live-owner",
+            Self::UnavailableLiveOwner => "source:unavailable-live-owner",
+            Self::UnsupportedLocalMode => "source:unsupported-local-mode",
             Self::KernelUapi => "source:kernel-uapi",
             Self::UserspaceDaemon => "source:userspace-daemon",
             Self::CachedLocalMetadata => "source:cached-local-metadata",
@@ -728,19 +734,44 @@ mod tests {
         use super::StatusSource;
         let sources = [
             (StatusSource::LiveOwner, "source:live-owner"),
+            (
+                StatusSource::UnavailableLiveOwner,
+                "source:unavailable-live-owner",
+            ),
+            (
+                StatusSource::UnsupportedLocalMode,
+                "source:unsupported-local-mode",
+            ),
             (StatusSource::KernelUapi, "source:kernel-uapi"),
             (StatusSource::UserspaceDaemon, "source:userspace-daemon"),
-            (StatusSource::CachedLocalMetadata, "source:cached-local-metadata"),
+            (
+                StatusSource::CachedLocalMetadata,
+                "source:cached-local-metadata",
+            ),
             (StatusSource::CommandLineParse, "source:command-line-parse"),
-            (StatusSource::StaticConfiguration, "source:static-configuration"),
-            (StatusSource::UnsupportedOrOffline, "source:unsupported-or-offline"),
+            (
+                StatusSource::StaticConfiguration,
+                "source:static-configuration",
+            ),
+            (
+                StatusSource::UnsupportedOrOffline,
+                "source:unsupported-or-offline",
+            ),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for (source, label) in &sources {
             assert_eq!(source.label(), *label, "StatusSource label mismatch");
-            assert!(seen.insert(*label), "duplicate StatusSource label: {}", label);
+            assert!(
+                seen.insert(*label),
+                "duplicate StatusSource label: {}",
+                label
+            );
         }
-        assert_eq!(seen.len(), sources.len(), "all StatusSource labels must be covered");
+        assert_eq!(
+            seen.len(),
+            sources.len(),
+            "all StatusSource labels must be covered"
+        );
     }
 
     #[test]
@@ -748,12 +779,20 @@ mod tests {
         for path in ["cluster status", "device status"] {
             let surface = super::find_surface(path)
                 .unwrap_or_else(|| panic!("classified command surface for {path}"));
-            assert_eq!(surface.class, super::CommandClass::PublicOperator,
-                "{path} must be public-operator");
-            assert_eq!(surface.routing, super::RoutingSemantics::LiveOwner,
-                "{path} must route through live owner");
-            assert!(surface.summary.contains("fail closed"),
-                "{path} summary must state fail-closed behavior");
+            assert_eq!(
+                surface.class,
+                super::CommandClass::PublicOperator,
+                "{path} must be public-operator"
+            );
+            assert_eq!(
+                surface.routing,
+                super::RoutingSemantics::LiveOwner,
+                "{path} must route through live owner"
+            );
+            assert!(
+                surface.summary.contains("fail closed"),
+                "{path} summary must state fail-closed behavior"
+            );
         }
     }
 
@@ -761,9 +800,10 @@ mod tests {
     fn status_commands_appear_in_root_help() {
         let help = super::root_long_about();
         for path in ["cluster status", "device status"] {
-            assert!(help.contains(path),
-                "root help must include classified command {path}");
+            assert!(
+                help.contains(path),
+                "root help must include classified command {path}"
+            );
         }
     }
-
 }
