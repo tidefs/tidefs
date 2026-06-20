@@ -5882,14 +5882,14 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         if self.find_inode(ino).is_none() {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOENT);
         }
-        // Persist the committed root via the txg barrier.  When a
-        // committed root is set (from mount or writeback), this writes
-        // VRBT/VCRP/VCRL through the pool core I/O context.  When no
-        // committed root is set (bootstrap/dev mode), the barrier is
-        // a no-op.  The C shim already persists inode-table state
-        // through tidefs_kernel_pool_persist_state; this complements
-        // it with committed-root durability.
-        self.txg_commit_barrier()
+        // File fsync is a per-inode wait barrier.  The whole-namespace
+        // txg barrier persists every live inode, dirent, extent, and xattr
+        // under the mounted-engine lock; fsstress can issue enough file
+        // fsyncs to starve unrelated open/write/setattr calls.  Directory
+        // fsync, syncfs, and unmount remain the whole-mount publication
+        // boundaries.
+        self.flush_live_write_buffer_to_storage(Some(fh.inode_id), 0, u64::MAX)?;
+        self.mounted_pool_io_ctx()?.flush()
     }
     /// Engine-backed fallocate: space reservation, hole punch, and zero-range
     /// through the in-memory inode table with block-count adjustment.
@@ -6574,7 +6574,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         self.committed_root.set(Some(root));
     }
 
-    /// Route fsync/syncfs through the shared KernelPoolCore txg barrier.
+    /// Route syncfs and unmount through the shared KernelPoolCore txg barrier.
     ///
     /// Gates on Mounted pool state. Takes the current committed root and
     /// attempts to persist it via write_committed_root. When the pool is
