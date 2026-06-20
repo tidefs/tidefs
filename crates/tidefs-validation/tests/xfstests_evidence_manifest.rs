@@ -138,9 +138,33 @@ fn rejects_focused_without_tests() {
 }
 
 #[test]
+fn rejects_empty_test_name() {
+    let mut manifest = valid_focused_manifest();
+    manifest.tests = vec!["generic/001".to_string(), " ".to_string()];
+    let err = manifest.validate().unwrap_err();
+    assert!(
+        err.failures().iter().any(|f| f.contains("tests")),
+        "{:?}",
+        err.failures()
+    );
+}
+
+#[test]
 fn accepts_broad_without_tests() {
     let manifest = valid_broad_manifest();
     manifest.validate().unwrap();
+}
+
+#[test]
+fn rejects_broad_with_tests() {
+    let mut manifest = valid_broad_manifest();
+    manifest.tests = vec!["generic/001".to_string()];
+    let err = manifest.validate().unwrap_err();
+    assert!(
+        err.failures().iter().any(|f| f.contains("broad")),
+        "{:?}",
+        err.failures()
+    );
 }
 
 #[test]

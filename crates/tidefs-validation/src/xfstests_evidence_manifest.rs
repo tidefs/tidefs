@@ -158,10 +158,21 @@ impl XfstestsEvidenceManifest {
             ));
         }
 
-        if self.evidence_scope == "focused" && self.tests.is_empty() {
-            failures.push(
+        match self.evidence_scope.as_str() {
+            "focused" if self.tests.is_empty() => failures.push(
                 "evidence_scope=focused requires a non-empty tests list".to_string(),
-            );
+            ),
+            "broad" if !self.tests.is_empty() => {
+                failures.push("evidence_scope=broad requires an empty tests list".to_string());
+            }
+            _ => {}
+        }
+
+        for test in &self.tests {
+            if test.trim().is_empty() {
+                failures.push("tests must not contain empty entries".to_string());
+                break;
+            }
         }
 
         for p in &self.artifact_paths {
