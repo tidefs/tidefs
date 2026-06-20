@@ -342,12 +342,14 @@ mod tests {
     use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
 
     use crate::types::{ContentCompressionPolicy, InodeRecord, NamespaceEntry};
-    use crate::FileSystemState;
+    use crate::{DatasetInodeAuthority, FileSystemState, ROOT_DATASET_ID};
 
     fn make_cleanup_state() -> FileSystemState {
+        let inode_authority = DatasetInodeAuthority::fresh_root(ROOT_DATASET_ID);
+        let root_inode_id = inode_authority.root_inode_id();
         let root = InodeRecord {
             rdev: 0,
-            inode_id: ROOT_INODE_ID,
+            inode_id: root_inode_id,
             generation: Generation::new(1),
             facets: NodeKind::Dir.to_facets(),
             mode: 0o755,
@@ -364,11 +366,11 @@ mod tests {
             dir_rev: 0,
         };
         let mut inodes = BTreeMap::new();
-        inodes.insert(ROOT_INODE_ID, root);
+        inodes.insert(root_inode_id, root);
         let mut directories = BTreeMap::new();
-        directories.insert(ROOT_INODE_ID, BTreeMap::new());
+        directories.insert(root_inode_id, BTreeMap::new());
         FileSystemState {
-            next_inode_id: ROOT_INODE_ID.get().saturating_add(1),
+            inode_authority,
             generation: 1,
             inodes: StdArc::new(inodes),
             directories: StdArc::new(directories),
@@ -382,7 +384,7 @@ mod tests {
             last_dir_write_tx: BTreeMap::new(),
             known_inode_ids: {
                 let mut ids = std::collections::BTreeSet::new();
-                ids.insert(ROOT_INODE_ID);
+                ids.insert(root_inode_id);
                 ids
             },
             corrupted_inodes: Default::default(),
@@ -461,6 +463,7 @@ mod tests {
             dir_rev: 0,
         };
         Arc::make_mut(&mut state.inodes).insert(orphan_inode_id, orphan_inode);
+        state.observe_explicit_inode_id(orphan_inode_id);
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();
@@ -505,6 +508,7 @@ mod tests {
             dir_rev: 0,
         };
         Arc::make_mut(&mut state.inodes).insert(orphan_inode_id, orphan_inode);
+        state.observe_explicit_inode_id(orphan_inode_id);
         Arc::make_mut(&mut state.directories)
             .get_mut(&ROOT_INODE_ID)
             .unwrap()
@@ -568,6 +572,7 @@ mod tests {
             .unwrap()
             .nlink = 3;
         Arc::make_mut(&mut state.inodes).insert(orphan_inode_id, orphan_inode);
+        state.observe_explicit_inode_id(orphan_inode_id);
         Arc::make_mut(&mut state.directories).insert(orphan_inode_id, BTreeMap::new());
         Arc::make_mut(&mut state.directories)
             .get_mut(&ROOT_INODE_ID)
@@ -625,6 +630,7 @@ mod tests {
             dir_rev: 0,
         };
         Arc::make_mut(&mut state.inodes).insert(orphan_inode_id, orphan_inode);
+        state.observe_explicit_inode_id(orphan_inode_id);
 
         let orphan_index = Arc::new(Mutex::new({
             let mut idx = OrphanIndex::new();

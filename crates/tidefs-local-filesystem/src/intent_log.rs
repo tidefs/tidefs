@@ -1493,7 +1493,7 @@ pub(crate) fn replay_entry(
             }
             // Track affected inodes.
             for id in affected_inode_ids {
-                state.known_inode_ids.insert(*id);
+                state.observe_explicit_inode_id(*id);
             }
         }
     }
@@ -2809,7 +2809,7 @@ mod tests {
             dir_rev: 0,
         };
         Arc::make_mut(&mut state.inodes).insert(inode_id, record);
-        state.known_inode_ids.insert(inode_id);
+        state.observe_explicit_inode_id(inode_id);
     }
 
     #[test]
@@ -2994,7 +2994,7 @@ mod tests {
             dir_rev: 0,
         };
         Arc::make_mut(&mut state.inodes).insert(dir_id, dir_record);
-        state.known_inode_ids.insert(dir_id);
+        state.observe_explicit_inode_id(dir_id);
 
         // Set up children
         make_test_inode(&mut state, child1, 0);

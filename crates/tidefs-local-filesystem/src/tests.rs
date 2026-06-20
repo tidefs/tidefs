@@ -47,6 +47,46 @@ fn cleanup(root: &Path) {
     let _ = fs::remove_dir_all(root);
 }
 
+fn explicit_test_file_record(inode_id: InodeId, generation: Generation) -> InodeRecord {
+    InodeRecord {
+        rdev: 0,
+        inode_id,
+        generation,
+        facets: NodeKind::File.to_facets(),
+        mode: mode_for_kind(NodeKind::File, DEFAULT_FILE_PERMISSIONS),
+        uid: 0,
+        gid: 0,
+        nlink: 1,
+        size: 0,
+        data_version: generation.get(),
+        metadata_version: generation.get(),
+        posix_time: crate::types::PosixTimeRecord::now(),
+        xattrs: BTreeMap::new(),
+        dir_storage_kind: 0,
+        xattr_storage_kind: 0,
+        dir_rev: 0,
+    }
+}
+
+fn insert_explicit_test_file(fs: &mut LocalFileSystem, name: &[u8], inode_id: InodeId) {
+    let generation = Generation::new(fs.generation().saturating_add(1).max(1));
+    let mode = mode_for_kind(NodeKind::File, DEFAULT_FILE_PERMISSIONS);
+    let record = explicit_test_file_record(inode_id, generation);
+    fs.insert_inode_at(inode_id, record);
+    fs.insert_dir_entry(
+        ROOT_INODE_ID,
+        name.to_vec(),
+        NamespaceEntry {
+            name: name.to_vec(),
+            inode_id,
+            generation,
+            facets: NodeKind::File.to_facets(),
+            mode,
+        },
+    )
+    .expect("insert explicit test file");
+}
+
 #[test]
 fn block_device_pool_accepts_regular_file_dev_backing() {
     let root = temp_root("regular-file-dev-pool");
@@ -228,8 +268,7 @@ fn stage_probe_file_state(
     let mut staged = fs.state.clone();
     let tick = staged.generation.saturating_add(1).max(1);
     staged.generation = tick;
-    let inode_id = InodeId::new(staged.next_inode_id);
-    staged.next_inode_id = staged.next_inode_id.saturating_add(1);
+    let inode_id = staged.allocate_inode_id();
     let record = InodeRecord {
         rdev: 0,
         inode_id,
@@ -343,14 +382,14 @@ fn root_for_staged_state(
     transaction_id: u64,
 ) -> (RootCommitRecord, Vec<u8>) {
     let inode_count = staged.inodes.len() as u64;
-    let bitmap_words = staged.next_inode_id.div_ceil(64) as usize;
+    let bitmap_words = staged.next_inode_id_raw().div_ceil(64) as usize;
     let mut inode_allocation_bitmap = vec![0u64; bitmap_words];
     for inode_id in staged.inodes.keys() {
         let idx = (inode_id.get() - 1) as usize;
         inode_allocation_bitmap[idx / 64] |= 1u64 << (idx % 64);
     }
     let superblock = SuperblockRecord {
-        next_inode_id: staged.next_inode_id,
+        next_inode_id: staged.next_inode_id_raw(),
         generation: staged.generation,
         inode_count,
         inode_allocation_bitmap,
@@ -363,7 +402,7 @@ fn root_for_staged_state(
         slot: root_slot_for_transaction(transaction_id),
         transaction_id,
         generation: staged.generation,
-        next_inode_id: staged.next_inode_id,
+        next_inode_id: staged.next_inode_id_raw(),
         inode_count: superblock.inode_count,
         superblock_checksum: checksum64(&superblock_bytes),
         manifest_checksum: IntegrityDigest64::ZERO,
@@ -664,6 +703,110 @@ fn create_write_reopen_read_file() {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, b"hello.txt".to_vec());
     }
+    cleanup(&root);
+}
+
+#[test]
+fn inode_authority_allocates_fresh_ids_from_dataset_cursor() {
+    let root = temp_root("inode-authority-fresh-allocation");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+
+    let first_expected = fs.next_inode_id();
+    let first = fs
+        .create_file("/first.txt", DEFAULT_FILE_PERMISSIONS)
+        .expect("create first");
+    assert_eq!(first.inode_id, first_expected);
+
+    let second_expected = InodeId::new(first_expected.get().saturating_add(1));
+    assert_eq!(fs.next_inode_id(), second_expected);
+    let second = fs
+        .create_file("/second.txt", DEFAULT_FILE_PERMISSIONS)
+        .expect("create second");
+    assert_eq!(second.inode_id, second_expected);
+    assert_eq!(
+        fs.next_inode_id(),
+        InodeId::new(second_expected.get().saturating_add(1))
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn inode_authority_advances_on_explicit_inode_insert() {
+    let root = temp_root("inode-authority-explicit-insert");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let explicit = InodeId::new(64);
+
+    insert_explicit_test_file(&mut fs, b"explicit.txt", explicit);
+    assert_eq!(
+        fs.stat("/explicit.txt").expect("stat explicit").inode_id,
+        explicit
+    );
+    assert_eq!(fs.next_inode_id(), InodeId::new(65));
+
+    let allocated = fs
+        .create_file("/after-explicit.txt", DEFAULT_FILE_PERMISSIONS)
+        .expect("create after explicit");
+    assert_eq!(allocated.inode_id, InodeId::new(65));
+
+    cleanup(&root);
+}
+
+#[test]
+fn inode_authority_rebuilds_cursor_from_reopened_explicit_inode() {
+    let root = temp_root("inode-authority-reopen-explicit");
+    let explicit = InodeId::new(90);
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        insert_explicit_test_file(&mut fs, b"persisted.txt", explicit);
+        fs.sync_all().expect("sync explicit file");
+    }
+
+    let mut reopened = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    assert_eq!(
+        reopened
+            .stat("/persisted.txt")
+            .expect("stat persisted explicit")
+            .inode_id,
+        explicit
+    );
+    assert_eq!(reopened.next_inode_id(), InodeId::new(91));
+
+    let allocated = reopened
+        .create_file("/after-reopen.txt", DEFAULT_FILE_PERMISSIONS)
+        .expect("create after reopen");
+    assert_eq!(allocated.inode_id, InodeId::new(91));
+
+    cleanup(&root);
+}
+
+#[test]
+fn inode_authority_preserves_live_cursor_after_snapshot_rollback() {
+    let root = temp_root("inode-authority-snapshot-rollback");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    fs.create_file("/baseline.txt", DEFAULT_FILE_PERMISSIONS)
+        .expect("create baseline");
+    fs.sync_all().expect("sync baseline");
+    fs.create_snapshot("baseline").expect("snapshot baseline");
+
+    let post_snapshot = fs
+        .create_file("/post-snapshot.txt", DEFAULT_FILE_PERMISSIONS)
+        .expect("create post snapshot");
+    let next_before_rollback = fs.next_inode_id();
+
+    fs.rollback_to_snapshot("baseline").expect("rollback");
+    assert!(matches!(
+        fs.stat("/post-snapshot.txt"),
+        Err(FileSystemError::NotFound { .. })
+    ));
+    assert_eq!(fs.next_inode_id(), next_before_rollback);
+
+    let after_rollback = fs
+        .create_file("/after-rollback.txt", DEFAULT_FILE_PERMISSIONS)
+        .expect("create after rollback");
+    assert_eq!(after_rollback.inode_id, next_before_rollback);
+    assert_ne!(after_rollback.inode_id, post_snapshot.inode_id);
+
     cleanup(&root);
 }
 
@@ -3476,8 +3619,7 @@ fn uncommitted_transaction_objects_are_ignored_on_reopen() {
     let mut staged = fs.state.clone();
     let tick = staged.generation.saturating_add(1);
     staged.generation = tick;
-    let inode_id = InodeId::new(staged.next_inode_id);
-    staged.next_inode_id = staged.next_inode_id.saturating_add(1);
+    let inode_id = staged.allocate_inode_id();
     let record = InodeRecord {
         rdev: 0,
         inode_id,
@@ -4320,8 +4462,7 @@ fn unreachable_inode_committed_root_is_skipped_before_mount_without_fsck() {
     let mut bad = fs.state.clone();
     bad.generation = committed_generation.saturating_add(1);
     let bad_generation = bad.generation;
-    let orphan_id = InodeId::new(bad.next_inode_id);
-    bad.next_inode_id = bad.next_inode_id.saturating_add(1);
+    let orphan_id = bad.allocate_inode_id();
     Arc::make_mut(&mut bad.inodes).insert(
         orphan_id,
         InodeRecord {

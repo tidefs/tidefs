@@ -508,7 +508,9 @@ mod tests {
     }
 
     fn insert_inode(state: &mut crate::FileSystemState, inode: crate::types::InodeRecord) {
+        let inode_id = inode.inode_id;
         std::sync::Arc::make_mut(&mut state.inodes).insert(inode.inode_id, inode);
+        state.observe_explicit_inode_id(inode_id);
     }
 
     fn temp_store() -> tidefs_local_object_store::LocalObjectStore {

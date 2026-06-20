@@ -464,13 +464,12 @@ mod tests {
             xattrs: BTreeMap::new(),
             dir_rev: 0,
         };
-        state.known_inode_ids.insert(orphan_id);
+        state.observe_explicit_inode_id(orphan_id);
         state.inodes = Arc::new({
             let mut m = (*state.inodes).clone();
             m.insert(orphan_id, orphan_rec);
             m
         });
-        state.next_inode_id = 11;
 
         // No orphan index was written to the store.
         let mut report = FsckReport::empty();
@@ -516,13 +515,12 @@ mod tests {
             xattrs: BTreeMap::new(),
             dir_rev: 0,
         };
-        state.known_inode_ids.insert(live_id);
+        state.observe_explicit_inode_id(live_id);
         state.inodes = Arc::new({
             let mut m = (*state.inodes).clone();
             m.insert(live_id, live_rec);
             m
         });
-        state.next_inode_id = 6;
 
         // Write an orphan index that includes the live inode.
         let mut orphan = OrphanIndex::new();
