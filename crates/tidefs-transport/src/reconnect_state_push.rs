@@ -21,6 +21,7 @@
 //! [M+8..]  peer_roster_epoch u64 LE -- epoch when this peer was first rostered
 //! ```
 
+use crate::epoch_fence::{CommittedEpochEvidence, CommittedEpochSnapshot};
 use tidefs_membership_epoch::epoch_commit_subscriber::CommittedRoster;
 use tidefs_membership_epoch::EpochId;
 
@@ -150,19 +151,14 @@ pub enum ReconnectStatePushOutcome {
     /// the epoch is current.
     Accepted,
     /// The target peer is not present in the push's own roster.
-    TargetNotInRoster {
-        target_peer_id: u64,
-    },
+    TargetNotInRoster { target_peer_id: u64 },
     /// The state push's epoch is behind the current known epoch.
-    StaleEpoch {
-        push_epoch: u64,
-        current_epoch: u64,
-    },
+    StaleEpoch { push_epoch: u64, current_epoch: u64 },
     /// The state push's target peer is not in the current roster
     /// (peer has departed since the push was generated).
-    PeerDeparted {
-        target_peer_id: u64,
-    },
+    PeerDeparted { target_peer_id: u64 },
+    /// No committed epoch evidence was available to validate the push.
+    EvidenceUnavailable,
 }
 
 impl ReconnectStatePushOutcome {
@@ -180,6 +176,7 @@ impl ReconnectStatePushOutcome {
             Self::TargetNotInRoster { .. } => "target_not_in_roster",
             Self::StaleEpoch { .. } => "stale_epoch",
             Self::PeerDeparted { .. } => "peer_departed",
+            Self::EvidenceUnavailable => "committed_epoch_unavailable",
         }
     }
 }
@@ -218,6 +215,29 @@ impl ReconnectStatePushMessage {
             };
         }
         ReconnectStatePushOutcome::Accepted
+    }
+
+    /// Validate this state push against a committed epoch snapshot.
+    #[must_use]
+    pub fn validate_with_evidence(
+        &self,
+        evidence: &CommittedEpochSnapshot,
+    ) -> ReconnectStatePushOutcome {
+        self.validate(&evidence.member_ids(), evidence.epoch)
+    }
+
+    /// Validate this state push against the shared committed evidence cell.
+    ///
+    /// Missing evidence fails closed with an operator-visible outcome.
+    #[must_use]
+    pub fn validate_against_evidence(
+        &self,
+        evidence: &CommittedEpochEvidence,
+    ) -> ReconnectStatePushOutcome {
+        match evidence.snapshot() {
+            Some(snapshot) => self.validate_with_evidence(&snapshot),
+            None => ReconnectStatePushOutcome::EvidenceUnavailable,
+        }
     }
 }
 
@@ -408,12 +428,42 @@ mod tests {
             "target_not_in_roster"
         );
         assert_eq!(
-            ReconnectStatePushOutcome::StaleEpoch { push_epoch: 1, current_epoch: 2 }.as_str(),
+            ReconnectStatePushOutcome::StaleEpoch {
+                push_epoch: 1,
+                current_epoch: 2
+            }
+            .as_str(),
             "stale_epoch"
         );
         assert_eq!(
             ReconnectStatePushOutcome::PeerDeparted { target_peer_id: 1 }.as_str(),
             "peer_departed"
+        );
+        assert_eq!(
+            ReconnectStatePushOutcome::EvidenceUnavailable.as_str(),
+            "committed_epoch_unavailable"
+        );
+    }
+
+    #[test]
+    fn validate_with_committed_evidence_accepts_current_peer() {
+        let r = mk(5, vec![1, 2, 3]);
+        let m = ReconnectStatePushMessage::new(0, r, 2, 5);
+        let evidence = CommittedEpochSnapshot::new(5, [1, 2, 3]);
+        assert_eq!(
+            m.validate_with_evidence(&evidence),
+            ReconnectStatePushOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn validate_against_missing_committed_evidence_fails_closed() {
+        let r = mk(5, vec![1, 2, 3]);
+        let m = ReconnectStatePushMessage::new(0, r, 2, 5);
+        let evidence = CommittedEpochEvidence::new();
+        assert_eq!(
+            m.validate_against_evidence(&evidence),
+            ReconnectStatePushOutcome::EvidenceUnavailable
         );
     }
 }

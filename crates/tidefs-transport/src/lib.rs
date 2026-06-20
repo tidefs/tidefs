@@ -405,7 +405,8 @@ pub use reconnect::{
     SessionResumeRequest, SessionResumeResponse,
 };
 pub use reconnect_state_push::{
-    ReconnectStatePushDispatcher, ReconnectStatePushHandler, ReconnectStatePushMessage, ReconnectStatePushOutcome,
+    ReconnectStatePushDispatcher, ReconnectStatePushHandler, ReconnectStatePushMessage,
+    ReconnectStatePushOutcome,
 };
 pub use replication::{
     recv_replication_msg, send_replication_msg, PlacementMapRefusalReason, ReplicationMessage,
@@ -427,6 +428,7 @@ pub use session_reconnector::{
     PermanentFailureReason, ReconnectAction, SessionReconnectConfig, SessionReconnector,
 };
 pub use tcp::TcpTransport;
+pub use tidefs_types_transport_session::EndpointFamily;
 #[cfg(feature = "tls")]
 pub use tls::{generate_self_signed_cert, TlsTransport};
 pub use transport::{ConnectionPool, Transport};
@@ -475,12 +477,17 @@ pub use cross_session_scheduler::{
 };
 pub use dedup_filter::{DedupFilter, DedupFilterConfig, DedupFilterStats, DeliveryVerdict};
 pub use delivery_confirmation::{
-    AcknowledgmentFrame, DeliveryConfirmationEngine, DeliveryOutcome, DeliverySequence,
-    DeliveryTracker,
+    AcknowledgmentFrame, DeliveryConfirmationAdmissionError, DeliveryConfirmationEngine,
+    DeliveryOutcome, DeliverySequence, DeliveryTracker,
 };
 pub use dispatch::{DecodedMessage, MessageDispatch};
 pub use epoch_bridge::{EpochEventBridge, PeerStateDelta, TransportEpochSubscriber};
-pub use epoch_fence::{check_reconnect_admission, EpochFence, EpochFenceRuntime, EpochTransition, FenceOutcome, FenceSummary, ReconnectAdmission};
+pub use epoch_fence::{
+    check_reconnect_admission, check_reconnect_admission_with_evidence,
+    check_reconnect_admission_with_snapshot, CommittedEpochEvidence, CommittedEpochSnapshot,
+    EpochFence, EpochFenceRuntime, EpochTransition, FenceOutcome, FenceSummary, ReconnectAdmission,
+    ReconnectEvidenceFailure,
+};
 pub use listener::{TransportConnection, TransportListener};
 pub use listener_overload::{
     AcceptRateLimiter, ConnectionRejectedEvent, ConnectionRejectedReason, ListenerOverloadConfig,

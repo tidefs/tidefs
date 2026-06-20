@@ -80,6 +80,15 @@ impl TransportSessionSet {
     /// was previously bound to a different node, that old binding is also
     /// cleaned up.
     pub fn add_binding(&mut self, node_id: u64, session_id: SessionId) {
+        self.add_binding_with_epoch(node_id, session_id, 0);
+    }
+
+    /// Add or update a binding and record the committed membership epoch.
+    ///
+    /// Runtime membership wiring should use this method once committed
+    /// epoch evidence is available so session tracking does not default to
+    /// epoch 0 on live paths.
+    pub fn add_binding_with_epoch(&mut self, node_id: u64, session_id: SessionId, epoch: u64) {
         // Clean up old session-to-node binding if this session was
         // previously bound to a different node.
         if let Some(&old_node) = self.session_to_node.get(&session_id) {
@@ -101,7 +110,7 @@ impl TransportSessionSet {
             SessionBinding {
                 session_id,
                 health: SessionHealth::Unknown,
-                epoch: 0,
+                epoch,
             },
         );
         self.session_to_node.insert(session_id, node_id);
@@ -253,6 +262,15 @@ mod tests {
         set.add_binding(1, sid(100));
         assert_eq!(set.get_session(1), Some(sid(100)));
         assert_eq!(set.get_session(2), None);
+    }
+
+    #[test]
+    fn add_binding_with_epoch_tracks_committed_epoch() {
+        let mut set = TransportSessionSet::new();
+        set.add_binding_with_epoch(1, sid(100), 7);
+        assert_eq!(set.get_session(1), Some(sid(100)));
+        assert_eq!(set.get_epoch(sid(100)), Some(7));
+        assert_eq!(set.get_epoch_for_node(1), Some(7));
     }
 
     #[test]

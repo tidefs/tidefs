@@ -1042,10 +1042,11 @@ impl Session {
     #[must_use]
     pub fn create_reconnect_driver(&self) -> Option<ReconnectDriver> {
         let key = self.session_key?;
-        Some(ReconnectDriver::new(
+        Some(ReconnectDriver::with_epoch(
             self.session_id.0,
             key,
             self.reconnect_config.clone(),
+            self.current_epoch,
         ))
     }
 

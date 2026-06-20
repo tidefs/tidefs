@@ -36,14 +36,8 @@
 //! advances. [`EpochFenceRuntime::run`] is spawned as a tokio task that
 //! awaits transitions on the broadcast receiver and applies fencing.
 //!
-//! # Follow-on
-//!
-//! Wiring [`tidefs_cluster::ClusterLeaseRuntime`] to publish
-//! [`EpochTransition`] events into this module's broadcast channel is a
-//! Review debt TFR-017.
-
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tidefs_membership_epoch::EpochMemberSet;
 use tidefs_membership_types::NodeIdentity;
@@ -78,6 +72,159 @@ impl EpochTransition {
             member_set,
             timestamp: Instant::now(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CommittedEpochSnapshot
+// ---------------------------------------------------------------------------
+
+/// A committed membership epoch and its current transport-admitted roster.
+///
+/// This is the runtime evidence reconnect admission consumes. Unlike helper
+/// tests that pass a raw `(roster, epoch)` pair, a snapshot is published only
+/// by the membership commit path and can be shared across reconnect, state
+/// push, placement/read-map, and delivery-confirmation gates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedEpochSnapshot {
+    /// The committed membership epoch.
+    pub epoch: u64,
+    /// The sorted set of members admitted for data-path traffic.
+    pub roster: BTreeSet<u64>,
+}
+
+impl CommittedEpochSnapshot {
+    /// Build a committed snapshot from the epoch and member ids.
+    #[must_use]
+    pub fn new(epoch: u64, roster: impl IntoIterator<Item = u64>) -> Self {
+        Self {
+            epoch,
+            roster: roster.into_iter().collect(),
+        }
+    }
+
+    /// Convert a transport fence transition into reconnect admission evidence.
+    #[must_use]
+    pub fn from_transition(transition: &EpochTransition) -> Self {
+        Self::new(
+            transition.epoch,
+            transition.member_set.iter().map(|node| node.node_id),
+        )
+    }
+
+    /// Convert this snapshot into an [`EpochTransition`] for the fence channel.
+    #[must_use]
+    pub fn to_transition(&self) -> EpochTransition {
+        EpochTransition::new(
+            self.epoch,
+            EpochMemberSet::new(self.roster.iter().copied().map(NodeIdentity::new)),
+        )
+    }
+
+    /// Return true if `peer_id` is in the committed member set.
+    #[must_use]
+    pub fn contains(&self, peer_id: u64) -> bool {
+        self.roster.contains(&peer_id)
+    }
+
+    /// Return the committed roster as a sorted vector.
+    #[must_use]
+    pub fn member_ids(&self) -> Vec<u64> {
+        self.roster.iter().copied().collect()
+    }
+}
+
+/// Shared committed-epoch evidence cell for runtime reconnect admission.
+///
+/// The membership layer publishes each committed view here before reconnect
+/// and session recovery paths accept peer data-path frames. When an
+/// [`EpochFence::sender`] is attached, every publication also emits the same
+/// [`EpochTransition`] into the departed-peer fence path.
+#[derive(Clone, Default)]
+pub struct CommittedEpochEvidence {
+    snapshot: Arc<RwLock<Option<CommittedEpochSnapshot>>>,
+    fence_sender: Arc<RwLock<Option<broadcast::Sender<EpochTransition>>>>,
+}
+
+impl CommittedEpochEvidence {
+    /// Create an empty evidence cell. Admission fails closed until a
+    /// committed epoch is published.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create an evidence cell that also publishes to an epoch fence sender.
+    #[must_use]
+    pub fn with_fence_sender(sender: broadcast::Sender<EpochTransition>) -> Self {
+        let evidence = Self::new();
+        evidence.set_fence_sender(sender);
+        evidence
+    }
+
+    /// Attach or replace the fence sender used for transition publication.
+    pub fn set_fence_sender(&self, sender: broadcast::Sender<EpochTransition>) {
+        *self.fence_sender.write().unwrap() = Some(sender);
+    }
+
+    /// Publish a committed epoch and member set.
+    ///
+    /// The snapshot is stored before the fence event is broadcast so callers
+    /// observing transition callbacks can already consult current evidence.
+    pub fn publish(
+        &self,
+        epoch: u64,
+        roster: impl IntoIterator<Item = u64>,
+    ) -> CommittedEpochSnapshot {
+        let snapshot = CommittedEpochSnapshot::new(epoch, roster);
+        self.publish_snapshot(snapshot)
+    }
+
+    /// Publish an already-built snapshot.
+    pub fn publish_snapshot(&self, snapshot: CommittedEpochSnapshot) -> CommittedEpochSnapshot {
+        *self.snapshot.write().unwrap() = Some(snapshot.clone());
+        if let Some(sender) = self.fence_sender.read().unwrap().clone() {
+            let _ = sender.send(snapshot.to_transition());
+        }
+        snapshot
+    }
+
+    /// Publish the exact transition received from the membership bridge.
+    pub fn publish_transition(&self, transition: EpochTransition) -> CommittedEpochSnapshot {
+        let snapshot = CommittedEpochSnapshot::from_transition(&transition);
+        *self.snapshot.write().unwrap() = Some(snapshot.clone());
+        if let Some(sender) = self.fence_sender.read().unwrap().clone() {
+            let _ = sender.send(transition);
+        }
+        snapshot
+    }
+
+    /// Return the most recent committed snapshot, if one exists.
+    #[must_use]
+    pub fn snapshot(&self) -> Option<CommittedEpochSnapshot> {
+        self.snapshot.read().unwrap().clone()
+    }
+
+    /// Check reconnect admission against the current committed evidence.
+    #[must_use]
+    pub fn check_reconnect_admission(
+        &self,
+        peer_id: u64,
+        claimed_epoch: u64,
+    ) -> ReconnectAdmission {
+        check_reconnect_admission_with_evidence(self, peer_id, claimed_epoch)
+    }
+}
+
+impl std::fmt::Debug for CommittedEpochEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommittedEpochEvidence")
+            .field("snapshot", &self.snapshot())
+            .field(
+                "has_fence_sender",
+                &self.fence_sender.read().unwrap().is_some(),
+            )
+            .finish()
     }
 }
 
@@ -475,6 +622,58 @@ pub enum ReconnectAdmission {
         /// The unknown peer's node identifier.
         peer_id: u64,
     },
+    /// Committed epoch evidence is missing, lagged, or otherwise
+    /// unavailable. Admission fails closed until the membership path
+    /// publishes current evidence.
+    EvidenceUnavailable {
+        /// The operator-visible reason evidence could not admit the peer.
+        reason: ReconnectEvidenceFailure,
+    },
+}
+
+/// Reason committed membership evidence could not be used for reconnect
+/// admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconnectEvidenceFailure {
+    /// No committed membership epoch has been published yet.
+    Missing,
+    /// The best local evidence is behind the reconnecting peer's claim.
+    Lagged {
+        /// The local committed evidence epoch.
+        evidence_epoch: u64,
+        /// The reconnecting peer's claimed epoch.
+        claimed_epoch: u64,
+    },
+    /// A caller determined the evidence source is unavailable.
+    Unavailable,
+}
+
+impl ReconnectEvidenceFailure {
+    /// Human-readable outcome label for operator visibility.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing_committed_epoch",
+            Self::Lagged { .. } => "lagged_committed_epoch",
+            Self::Unavailable => "committed_epoch_unavailable",
+        }
+    }
+}
+
+impl core::fmt::Display for ReconnectEvidenceFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("missing committed membership epoch evidence"),
+            Self::Lagged {
+                evidence_epoch,
+                claimed_epoch,
+            } => write!(
+                f,
+                "committed membership epoch evidence lagged: evidence {evidence_epoch} < claimed {claimed_epoch}"
+            ),
+            Self::Unavailable => f.write_str("committed membership epoch evidence unavailable"),
+        }
+    }
 }
 
 impl ReconnectAdmission {
@@ -492,6 +691,7 @@ impl ReconnectAdmission {
             Self::StaleEpoch { .. } => "stale_epoch",
             Self::PeerDeparted { .. } => "peer_departed",
             Self::NotInRoster { .. } => "not_in_roster",
+            Self::EvidenceUnavailable { reason } => reason.as_str(),
         }
     }
 }
@@ -500,14 +700,23 @@ impl core::fmt::Display for ReconnectAdmission {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Admitted => f.write_str("reconnect admitted"),
-            Self::StaleEpoch { claimed_epoch, current_epoch } => {
-                write!(f, "reconnect stale epoch: claimed {claimed_epoch} < current {current_epoch}")
+            Self::StaleEpoch {
+                claimed_epoch,
+                current_epoch,
+            } => {
+                write!(
+                    f,
+                    "reconnect stale epoch: claimed {claimed_epoch} < current {current_epoch}"
+                )
             }
             Self::PeerDeparted { peer_id } => {
                 write!(f, "reconnect rejected: peer {peer_id} has departed")
             }
             Self::NotInRoster { peer_id } => {
                 write!(f, "reconnect rejected: peer {peer_id} not in roster")
+            }
+            Self::EvidenceUnavailable { reason } => {
+                write!(f, "reconnect rejected: {reason}")
             }
         }
     }
@@ -549,6 +758,54 @@ pub fn check_reconnect_admission(
     ReconnectAdmission::Admitted
 }
 
+/// Check reconnect admission against a committed membership snapshot.
+///
+/// This is the runtime-facing gate: missing or lagged committed evidence
+/// never admits reconnect. A peer absent from the committed snapshot is
+/// treated as departed because the snapshot represents the current member
+/// set, not a helper-provided arbitrary roster.
+#[must_use]
+pub fn check_reconnect_admission_with_snapshot(
+    snapshot: &CommittedEpochSnapshot,
+    peer_id: u64,
+    claimed_epoch: u64,
+) -> ReconnectAdmission {
+    if !snapshot.contains(peer_id) {
+        return ReconnectAdmission::PeerDeparted { peer_id };
+    }
+    if claimed_epoch < snapshot.epoch {
+        return ReconnectAdmission::StaleEpoch {
+            claimed_epoch,
+            current_epoch: snapshot.epoch,
+        };
+    }
+    if claimed_epoch > snapshot.epoch {
+        return ReconnectAdmission::EvidenceUnavailable {
+            reason: ReconnectEvidenceFailure::Lagged {
+                evidence_epoch: snapshot.epoch,
+                claimed_epoch,
+            },
+        };
+    }
+    ReconnectAdmission::Admitted
+}
+
+/// Check reconnect admission against the shared committed evidence cell.
+#[must_use]
+pub fn check_reconnect_admission_with_evidence(
+    evidence: &CommittedEpochEvidence,
+    peer_id: u64,
+    claimed_epoch: u64,
+) -> ReconnectAdmission {
+    match evidence.snapshot() {
+        Some(snapshot) => {
+            check_reconnect_admission_with_snapshot(&snapshot, peer_id, claimed_epoch)
+        }
+        None => ReconnectAdmission::EvidenceUnavailable {
+            reason: ReconnectEvidenceFailure::Missing,
+        },
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1037,10 +1294,7 @@ mod tests {
     fn reconnect_not_in_roster_when_peer_unknown() {
         let roster: BTreeSet<u64> = [1, 2].into();
         let result = check_reconnect_admission(&roster, 1, 99, 1);
-        assert_eq!(
-            result,
-            ReconnectAdmission::NotInRoster { peer_id: 99 }
-        );
+        assert_eq!(result, ReconnectAdmission::NotInRoster { peer_id: 99 });
         assert!(!result.is_admitted());
         assert_eq!(result.as_str(), "not_in_roster");
     }
@@ -1050,10 +1304,7 @@ mod tests {
         // Peer not in roster should be rejected even if epoch is also stale
         let roster: BTreeSet<u64> = [1, 2].into();
         let result = check_reconnect_admission(&roster, 10, 99, 1);
-        assert_eq!(
-            result,
-            ReconnectAdmission::NotInRoster { peer_id: 99 }
-        );
+        assert_eq!(result, ReconnectAdmission::NotInRoster { peer_id: 99 });
     }
 
     #[test]
@@ -1075,15 +1326,83 @@ mod tests {
 
         let not_in = ReconnectAdmission::NotInRoster { peer_id: 42 };
         assert!(format!("{not_in}").contains("not in roster"));
+
+        let unavailable = ReconnectAdmission::EvidenceUnavailable {
+            reason: ReconnectEvidenceFailure::Missing,
+        };
+        assert!(format!("{unavailable}").contains("missing committed"));
+        assert_eq!(unavailable.as_str(), "missing_committed_epoch");
     }
 
     #[test]
     fn reconnect_admission_empty_roster_rejects_all() {
         let roster: BTreeSet<u64> = BTreeSet::new();
         let result = check_reconnect_admission(&roster, 1, 1, 1);
+        assert_eq!(result, ReconnectAdmission::NotInRoster { peer_id: 1 });
+    }
+
+    #[test]
+    fn committed_snapshot_reconnect_admits_current_peer() {
+        let snapshot = CommittedEpochSnapshot::new(7, [1, 2, 3]);
+        let result = check_reconnect_admission_with_snapshot(&snapshot, 2, 7);
+        assert_eq!(result, ReconnectAdmission::Admitted);
+    }
+
+    #[test]
+    fn committed_snapshot_reconnect_rejects_departed_peer() {
+        let snapshot = CommittedEpochSnapshot::new(7, [1, 3]);
+        let result = check_reconnect_admission_with_snapshot(&snapshot, 2, 7);
+        assert_eq!(result, ReconnectAdmission::PeerDeparted { peer_id: 2 });
+        assert_eq!(result.as_str(), "peer_departed");
+    }
+
+    #[test]
+    fn committed_snapshot_reconnect_rejects_lagged_evidence() {
+        let snapshot = CommittedEpochSnapshot::new(7, [1, 2, 3]);
+        let result = check_reconnect_admission_with_snapshot(&snapshot, 2, 9);
         assert_eq!(
             result,
-            ReconnectAdmission::NotInRoster { peer_id: 1 }
+            ReconnectAdmission::EvidenceUnavailable {
+                reason: ReconnectEvidenceFailure::Lagged {
+                    evidence_epoch: 7,
+                    claimed_epoch: 9,
+                },
+            }
         );
+        assert_eq!(result.as_str(), "lagged_committed_epoch");
+    }
+
+    #[test]
+    fn committed_evidence_missing_rejects_reconnect() {
+        let evidence = CommittedEpochEvidence::new();
+        let result = evidence.check_reconnect_admission(2, 1);
+        assert_eq!(
+            result,
+            ReconnectAdmission::EvidenceUnavailable {
+                reason: ReconnectEvidenceFailure::Missing,
+            }
+        );
+    }
+
+    #[test]
+    fn committed_evidence_publish_updates_snapshot() {
+        let evidence = CommittedEpochEvidence::new();
+        let published = evidence.publish(11, [5, 7]);
+        assert_eq!(published.epoch, 11);
+        assert_eq!(published.member_ids(), vec![5, 7]);
+        assert_eq!(evidence.snapshot(), Some(published));
+    }
+
+    #[test]
+    fn committed_evidence_publishes_epoch_transition_to_fence_sender() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let evidence = CommittedEpochEvidence::with_fence_sender(tx);
+
+        evidence.publish(12, [2, 4]);
+
+        let transition = rx.try_recv().expect("transition should be published");
+        assert_eq!(transition.epoch, 12);
+        assert!(transition.member_set.contains(&NodeIdentity::new(2)));
+        assert!(transition.member_set.contains(&NodeIdentity::new(4)));
     }
 }
