@@ -1,0 +1,34 @@
+artifact_version = 1
+evidence_class = "claims-gate-review"
+source = "claims-gate"
+scope = "performance-runtime-boundary-review"
+issue = 498
+reviewed_at = "2026-06-20"
+
+reviewed_claim_ids = [
+  "perf.local.no_unbounded_dirty_debt.v1",
+]
+
+validation_tier = "source-model claims-gate review"
+admission_budget_model = "validation/performance/no-hidden-queues.toml"
+no_hidden_queue_gate = "cargo run -p tidefs-xtask -- check-no-hidden-queues"
+runtime_artifact = "validation/artifacts/performance/queue-depth-runtime.json"
+runtime_artifact_source = "QEMU Smoke target=fuse-vm-test"
+runtime_artifact_run = "https://github.com/tidefs/tidefs/actions/runs/27857392701"
+runtime_evidence_status = "bounded-mounted-fuse-queue-depth-runtime-present"
+decision = "local-dirty-write-claim-validated-only"
+
+boundary_review = [
+  "The admission-budget-model and no-hidden-queue-gate evidence stays bounded to the queue roots registered in validation/performance/no-hidden-queues.toml and checked by tidefs-xtask.",
+  "The queue-depth runtime artifact records the mounted FUSE smoke-mount quick workload through the outside-sandbox QEMU fuse-vm-test runner.",
+  "The runtime artifact records dirty-write admission peaks of 67 dirty bytes, 4 dirty operations, and 4 outstanding permits, all within the configured hard and effective caps.",
+  "The committed artifact satisfies the queue-depth-runtime-artifact class for perf.local.no_unbounded_dirty_debt.v1 only within the local mounted FUSE smoke-mount quick workload.",
+  "scheduler.dirty_debt.no_hidden.v1, scrub/read isolation claims, crash recovery claims, distributed transport fairness, and production performance claims remain outside this review.",
+]
+
+non_claims = [
+  "This review does not validate foreground/background scheduler dirty-debt coverage.",
+  "This review does not validate scrub foreground-read isolation.",
+  "This review does not validate crash recovery, fsync durability, mmap/writeback coherency, RDMA, distributed behavior, or production performance readiness.",
+  "This review does not add queue roots, admission classes, or local-filesystem write-path rewrites.",
+]

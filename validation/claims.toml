@@ -141,7 +141,7 @@ evidence_artifacts = []
 
 [[claims]]
 id = "perf.local.no_unbounded_dirty_debt.v1"
-status = "blocked"
+status = "validated"
 scope = "local dirty write admission and budgeted queue accounting"
 required_evidence_classes = [
   "admission-budget-model",
@@ -155,11 +155,14 @@ evidence_requirements = [
   { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#498"] },
   { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#498"] },
 ]
-blockers = [
-  "GitHub issue #308 wired AdmissionPermit into local-filesystem write path and registered queue roots; a focused runtime queue-depth artifact must still be captured via CI.",
+blockers = []
+generated_doc = "Validated bounded local no-unbounded-dirty-debt claim. TideFS has admission-budget model evidence, no-hidden-queue gate evidence, mounted FUSE queue-depth runtime evidence, and claims-gate review evidence for the local smoke-mount quick workload. This does not validate scheduler-wide dirty-debt coverage, scrub/read isolation, crash recovery, or production performance readiness."
+evidence_artifacts = [
+  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", source = "tidefs-performance-contract", scope = "source-model" },
+  { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", source = "tidefs-xtask", scope = "cargo-unit" },
+  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", source = "qemu-smoke-fuse-vm-test", scope = "mounted-userspace" },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", source = "claims-gate", scope = "performance-runtime-boundary-review" },
 ]
-generated_doc = "Blocked local no-unbounded-dirty-debt claim. TideFS has wired admission into the local-filesystem runtime write path (issue #308). A runtime queue-depth artifact on a mounted path is still required before this claim can move to validated."
-evidence_artifacts = []
 
 [[claims]]
 id = "perf.local.foreground_read_not_blocked_by_scrub.v1"
