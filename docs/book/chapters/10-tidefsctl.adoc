@@ -4,6 +4,13 @@
 operator path without pretending that every bring-up tool is final product
 surface.
 
+The operator UAPI authority decision is recorded in
+`docs/OPERATOR_UAPI_AUTHORITY.md`. This chapter consumes the checked
+command-classification and admission table that decision references; it does
+not turn harnesses, passive kernel probes, ublk/FUSE preview hooks, or cluster
+prototypes into a production ABI, a kernel-module ABI freeze,
+kernelspace-readiness evidence, or final distributed operator UAPI.
+
 === Starting Points
 
 Most operator sessions should start with one of these groups:
@@ -249,7 +256,8 @@ byte-for-byte with source:
 
 The command classes are part of the CLI contract. Help text, parser tests, and
 book text must change together when a command moves between classes. Cluster
-placement/heal exercises and `cluster pool create` are not final distributed operator UAPI.
+placement/heal exercises and `cluster pool create` are not final distributed
+operator UAPI.
 
 === Output Rules
 

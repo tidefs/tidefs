@@ -5,6 +5,12 @@
 > named below. It is not a production Linux ioctl/statx/ublk ABI freeze and
 > not kernelspace-readiness evidence.
 
+See `docs/OPERATOR_UAPI_AUTHORITY.md` for the operator UAPI decision that
+relates this checked table to live-owner routing, local-only admission,
+diagnostics, prototype cluster commands, and the non-release VFS/ublk/kernel
+preview boundary. That decision does not widen this document's current-spec
+scope.
+
 This document describes historical tracker item 202 by documenting the
 vfs_boundary_mirror terminology and preview UAPI/ABI surfaces. It is not a
 production Linux ioctl/statx/ublk ABI freeze and does not claim TideFS is
@@ -30,10 +36,12 @@ exercised by `cargo test -p tidefs-schema-codec-vfs --all-targets`.
 ## Non-Claims
 
 This document is not proof that TideFS is kernelspace-ready. It does not freeze
-a production Linux ioctl, statx, or ublk ABI. The preview boundary mirrors are
-development scaffolding that will change before any production release.
-Production UAPI/ABI freeze requires a separate tracked GitHub issue with
-implementation proof and an explicit freeze decision.
+a production Linux ioctl, statx, or ublk ABI, and it is not a kernel-module ABI
+freeze. The preview boundary mirrors are development scaffolding that will
+change before any production release. This document also does not define the
+final distributed operator UAPI; cluster prototypes and development diagnostics
+remain non-release surfaces. Production UAPI/ABI freeze requires a separate
+tracked GitHub issue with implementation proof and an explicit freeze decision.
 
 ## tidefsctl command classification contract
 

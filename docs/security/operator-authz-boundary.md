@@ -27,6 +27,14 @@ authorization. The table is checked byte-for-byte against
 `apps/tidefsctl/src/commands/classification.rs` and
 `apps/tidefsctl/src/commands/authz.rs`.
 
+`docs/OPERATOR_UAPI_AUTHORITY.md` records the operator UAPI authority decision
+that relates this admission table to live-owner routing, diagnostics,
+prototype cluster commands, and preview kernel/FUSE/ublk surfaces. That
+decision does not freeze production Linux ioctl/statx/ublk ABI, kernel-module
+ABI, kernelspace readiness, or final distributed operator UAPI; this document
+keeps the current privileged-action boundary local-only until remote authz is
+product-grade.
+
 | Command | Class | Routing | Admission | Help | Summary |
 |---|---|---|---|---|---|
 | `pool create` | `public-operator` | `offline-discovery-or-import-input` | `local-only` | `visible` | create an exported pool from explicit byte-addressable devices |
@@ -169,6 +177,8 @@ to any CLI/API privileged action paths. Wiring it requires:
 
 ## Related Documents
 
+- `docs/OPERATOR_UAPI_AUTHORITY.md` — operator UAPI authority decision and
+  preserved non-claims for preview ABI/UAPI scope
 - `docs/security/unified-storage-encryption-threat-model.md` — encryption claims
 - `docs/security/security-release-matrix.md` — signoff verdict and threat-claim
   alignment
