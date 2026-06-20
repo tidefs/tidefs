@@ -125,10 +125,11 @@ EOF
     FOCUSED_TESTS=0
     JSON_OUT=""
     TRACE_XFSTESTS=0
+    TIMEOUT_EXPLICIT=0
 
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        --timeout) TIMEOUT_SEC="$2"; shift 2 ;;
+        --timeout) TIMEOUT_SEC="$2"; TIMEOUT_EXPLICIT=1; shift 2 ;;
         --keep-tmp) KEEP_TMP=1; shift ;;
         --tests) TEST_LIST="$2"; FOCUSED_TESTS=1; shift 2 ;;
         --output) JSON_OUT="$2"; shift 2 ;;
@@ -144,6 +145,60 @@ EOF
       TEST_SCOPE="$FIRST_TEST"
     else
       TEST_SCOPE="$FIRST_TEST-$LAST_TEST"
+    fi
+
+    case "$TIMEOUT_SEC" in
+      ""|*[!0-9]*)
+        echo "invalid --timeout/TIDEFS_FUSE_XFSTESTS_TIMEOUT: $TIMEOUT_SEC" >&2
+        exit 2
+        ;;
+    esac
+    if [ "$TIMEOUT_SEC" -le 0 ]; then
+      echo "--timeout/TIDEFS_FUSE_XFSTESTS_TIMEOUT must be > 0" >&2
+      exit 2
+    fi
+    case "$PER_TEST_TIMEOUT_SEC" in
+      ""|*[!0-9]*)
+        echo "invalid TIDEFS_FUSE_XFSTESTS_PER_TEST_TIMEOUT: $PER_TEST_TIMEOUT_SEC" >&2
+        exit 2
+        ;;
+    esac
+    if [ "$PER_TEST_TIMEOUT_SEC" -le 0 ]; then
+      echo "TIDEFS_FUSE_XFSTESTS_PER_TEST_TIMEOUT must be > 0" >&2
+      exit 2
+    fi
+    case "$GENERIC_013_TIMEOUT_SEC" in
+      ""|*[!0-9]*)
+        echo "invalid TIDEFS_FUSE_XFSTESTS_GENERIC_013_TIMEOUT: $GENERIC_013_TIMEOUT_SEC" >&2
+        exit 2
+        ;;
+    esac
+    if [ "$GENERIC_013_TIMEOUT_SEC" -le 0 ]; then
+      echo "TIDEFS_FUSE_XFSTESTS_GENERIC_013_TIMEOUT must be > 0" >&2
+      exit 2
+    fi
+
+    xfstests_timeout_for_host() {
+      case "$1" in
+        generic/013)
+          echo "$GENERIC_013_TIMEOUT_SEC"
+          ;;
+        *)
+          echo "$PER_TEST_TIMEOUT_SEC"
+          ;;
+      esac
+    }
+
+    if [ "$TIMEOUT_EXPLICIT" -eq 0 ]; then
+      min_timeout_sec=600
+      for requested_test in $TEST_LIST; do
+        row_timeout_sec=$(xfstests_timeout_for_host "$requested_test")
+        min_timeout_sec=$((min_timeout_sec + row_timeout_sec + 30))
+      done
+      if [ "$TIMEOUT_SEC" -lt "$min_timeout_sec" ]; then
+        echo "  Auto-expanding QEMU timeout from $TIMEOUT_SEC to ''${min_timeout_sec}s for requested row budgets"
+        TIMEOUT_SEC="$min_timeout_sec"
+      fi
     fi
 
     case "$QEMU_MEMORY_MB" in
