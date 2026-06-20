@@ -1233,9 +1233,9 @@ fn snapshot_backing_path(
         ),
         (None, Some(pool_name), None) => super::live_owner::route_with_args(
             "snapshot",
-            "send",
+            operation,
             pool_name,
-            serde_json::Value::Null,
+            live_args,
         ),
         (None, None, None) => {
             eprintln!("tidefsctl snapshot send: POOL required");
