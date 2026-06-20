@@ -12,6 +12,7 @@ tidefs-local-object-store = { path = "../tidefs-local-object-store" }
 blake3 = "=1.5.5"
 
 [dev-dependencies]
+tidefs-gc-pin-set = { path = "../tidefs-gc-pin-set" }
 tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
 
 [lib]

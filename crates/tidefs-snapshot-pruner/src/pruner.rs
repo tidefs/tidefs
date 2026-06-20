@@ -310,6 +310,11 @@ impl SnapshotPinEvidenceIndex {
         self.entries.insert(snapshot_id.into(), evidence)
     }
 
+    /// Remove all evidence for a snapshot, returning it if it existed.
+    pub fn remove(&mut self, snapshot_id: &str) -> Option<SnapshotPinEvidence> {
+        self.entries.remove(snapshot_id)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -1368,6 +1373,12 @@ impl SnapshotPruner {
             pin_set.release_snapshot(&snapshot_id);
         }
         store.release_snapshot_extent_pins(&snapshot_id);
+
+        if let Some(mut index) = SnapshotPinEvidenceIndex::load(store)? {
+            if index.remove(&snapshot_id).is_some() {
+                index.save(store)?;
+            }
+        }
 
         // Record outcome for stats
         let info = SnapshotInfo {
