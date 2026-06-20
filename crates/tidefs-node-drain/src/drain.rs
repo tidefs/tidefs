@@ -406,6 +406,14 @@ impl NodeDrain {
         self.data_relocation_required = true;
     }
 
+    /// Explicitly clear the evacuation receipt evidence. This is the only
+    /// path that removes receipt evidence; unrelated stage transitions
+    /// must not clear the receipt as a side effect.
+    pub fn clear_evacuation_receipt(&mut self) {
+        self.evacuation_receipt = None;
+        self.data_relocation_required = false;
+    }
+
     pub fn set_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
     }
@@ -486,6 +494,18 @@ impl NodeDrain {
                     if !receipt.is_committed() {
                         return Err(DrainError::EvacuationReceiptNotCommitted {
                             node_id: self.node_id,
+                        });
+                    }
+                    // Verify the receipt is bound to this draining node.
+                    // A receipt created for a different node is stale or
+                    // misrouted and must be rejected.
+                    if receipt.draining_node != self.node_id {
+                        return Err(DrainError::EvacuationReceiptInvalid {
+                            node_id: self.node_id,
+                            error: EvacuationReceiptError::ReceiptNodeMismatch {
+                                receipt_node: receipt.draining_node,
+                                draining_node: self.node_id,
+                            },
                         });
                     }
                 }
@@ -959,5 +979,94 @@ mod tests {
         // Handle is a snapshot, doesn't change when drain does
         drain.advance_stage().unwrap();
         assert_eq!(handle.stage(), DrainStage::DrainingLeases);
+    }
+
+    // --- Receipt authority and clearing tests ---
+
+    #[test]
+    fn data_to_cache_rejects_receipt_bound_to_different_node() {
+        let (mut drain, _) = NodeDrain::drain(node_id(100));
+        drain.advance_stage().unwrap();
+        drain.update_progress(DrainProgress::ZERO);
+        drain.advance_stage().unwrap();
+        assert_eq!(drain.stage(), DrainStage::DrainingData);
+
+        // Attach a receipt bound to a *different* node
+        let mut receipt = EvacuationReceipt::new(
+            node_id(999), // different node!
+            tidefs_membership_epoch::EpochId::new(5),
+            "stale-receipt".to_string(),
+        );
+        receipt.record_relocated_receipts([tidefs_replication_model::ReplicatedReceiptId(1)]);
+        drain.set_evacuation_receipt(receipt);
+        drain.update_progress(DrainProgress::ZERO);
+
+        let err = drain.advance_stage().unwrap_err();
+        assert!(matches!(
+            err,
+            DrainError::EvacuationReceiptInvalid {
+                error: EvacuationReceiptError::ReceiptNodeMismatch { .. },
+                ..
+            }
+        ));
+        assert_eq!(drain.stage(), DrainStage::DrainingData);
+    }
+
+    #[test]
+    fn explicit_clear_evacuation_receipt_resets_evidence() {
+        let (mut drain, _) = NodeDrain::drain(node_id(200));
+        drain.advance_stage().unwrap();
+        drain.update_progress(DrainProgress::ZERO);
+        drain.advance_stage().unwrap();
+
+        let mut receipt = EvacuationReceipt::new(
+            node_id(200),
+            tidefs_membership_epoch::EpochId::new(5),
+            "test".to_string(),
+        );
+        receipt.record_relocated_receipts([tidefs_replication_model::ReplicatedReceiptId(1)]);
+        drain.set_evacuation_receipt(receipt);
+        assert!(drain.evacuation_receipt().is_some());
+        assert!(drain.data_relocation_required);
+
+        // Explicit clear
+        drain.clear_evacuation_receipt();
+        assert!(drain.evacuation_receipt().is_none());
+        assert!(!drain.data_relocation_required);
+    }
+
+    #[test]
+    fn clear_evacuation_receipt_allows_no_relocation_path() {
+        let (mut drain, _) = NodeDrain::drain(node_id(201));
+        drain.advance_stage().unwrap();
+        drain.update_progress(DrainProgress::ZERO);
+        drain.advance_stage().unwrap();
+
+        // Attach and then clear receipt
+        let mut receipt = EvacuationReceipt::new(
+            node_id(201),
+            tidefs_membership_epoch::EpochId::new(5),
+            "test".to_string(),
+        );
+        receipt.record_relocated_receipts([tidefs_replication_model::ReplicatedReceiptId(1)]);
+        drain.set_evacuation_receipt(receipt);
+        drain.clear_evacuation_receipt();
+
+        // After clearing, drain should proceed without receipt (no-relocation path)
+        drain.update_progress(DrainProgress::ZERO);
+        let stage = drain.advance_stage().unwrap();
+        assert_eq!(stage, DrainStage::DrainingCache);
+    }
+
+    #[test]
+    fn no_relocation_drain_does_not_fabricate_receipt() {
+        let (mut drain, _) = NodeDrain::drain(node_id(300));
+        // Advance through all stages without setting any receipt
+        for _ in 0..5 {
+            drain.update_progress(DrainProgress::ZERO);
+            drain.advance_stage().unwrap();
+        }
+        assert_eq!(drain.stage(), DrainStage::Drained);
+        assert!(drain.evacuation_receipt().is_none());
     }
 }

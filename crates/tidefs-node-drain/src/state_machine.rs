@@ -198,6 +198,13 @@ pub struct DrainProtocolSnapshot {
     pub evacuation_receipt_id: Option<EvacuationReceiptId>,
     /// Whether the evacuation receipt is committed.
     pub evacuation_receipt_committed: bool,
+    /// The draining node recorded in the evacuation receipt (for authority
+    /// verification after checkpoint/recovery).
+    pub evacuation_receipt_draining_node: Option<MemberId>,
+    /// The epoch recorded in the evacuation receipt.
+    pub evacuation_receipt_epoch: Option<EpochId>,
+    /// The committed epoch boundary recorded in the evacuation receipt.
+    pub evacuation_receipt_epoch_boundary: Option<EpochId>,
 }
 
 impl DrainProtocolSnapshot {
@@ -220,6 +227,9 @@ impl DrainProtocolSnapshot {
             blake3_digest: digest,
             evacuation_receipt_id: None,
             evacuation_receipt_committed: false,
+            evacuation_receipt_draining_node: None,
+            evacuation_receipt_epoch: None,
+            evacuation_receipt_epoch_boundary: None,
         }
     }
 
@@ -237,6 +247,27 @@ impl DrainProtocolSnapshot {
         self.evacuation_receipt_id.is_some()
     }
 
+    /// Returns true if the evacuation receipt has a committed epoch boundary.
+    #[must_use]
+    pub fn has_committed_epoch_boundary(&self) -> bool {
+        self.evacuation_receipt_epoch_boundary.is_some()
+    }
+
+    /// Returns true if the receipt authority fields match the given node and
+    /// epoch. Used to verify receipt evidence after checkpoint/recovery.
+    #[must_use]
+    pub fn receipt_matches_node_and_epoch(&self, node_id: MemberId, epoch_id: EpochId) -> bool {
+        if let (Some(receipt_node), Some(receipt_epoch)) =
+            (self.evacuation_receipt_draining_node, self.evacuation_receipt_epoch)
+        {
+            receipt_node == node_id && receipt_epoch == epoch_id
+        } else {
+            // No receipt evidence present — no mismatch to detect.
+            true
+        }
+    }
+
+    /// Returns true if all expected acks have been received.
     pub fn all_acks_received(&self) -> bool {
         self.acks_received >= self.acks_expected
     }
@@ -327,8 +358,47 @@ impl DrainProtocolMachine {
         if let Some(ref receipt) = self.evacuation_receipt {
             snap.evacuation_receipt_id = Some(receipt.receipt_id);
             snap.evacuation_receipt_committed = receipt.is_committed();
+            snap.evacuation_receipt_draining_node = Some(receipt.draining_node);
+            snap.evacuation_receipt_epoch = Some(receipt.epoch);
+            snap.evacuation_receipt_epoch_boundary = receipt.committed_epoch_boundary;
         }
         snap
+    }
+
+    /// Restore the machine from a previously produced snapshot (checkpoint/
+    /// recovery). Receipt evidence is restored fully; a receipt-required
+    /// stage is not downgraded into an in-memory-only success.
+    pub fn restore_from_snapshot(&mut self, snap: &DrainProtocolSnapshot) {
+        self.state = snap.state;
+        self.draining_node_id = snap.node_id;
+        self.epoch_id = snap.epoch_id;
+        self.acks_received = snap.acks_received;
+        self.acks_expected = snap.acks_expected;
+        self.failure_reason = None;
+
+        // Restore evacuation receipt evidence when the snapshot carries
+        // enough authority fields to reconstruct a minimal receipt.
+        if let (Some(rid), Some(draining_node), Some(epoch)) = (
+            snap.evacuation_receipt_id,
+            snap.evacuation_receipt_draining_node,
+            snap.evacuation_receipt_epoch,
+        ) {
+            let mut receipt = EvacuationReceipt::new(
+                draining_node,
+                epoch,
+                "restored-from-snapshot".to_string(),
+            )
+            .with_id(rid);
+            if snap.evacuation_receipt_committed {
+                receipt.all_committed = true;
+            }
+            if let Some(boundary) = snap.evacuation_receipt_epoch_boundary {
+                receipt.set_committed_epoch_boundary(boundary);
+            }
+            self.evacuation_receipt = Some(receipt);
+        } else {
+            self.evacuation_receipt = None;
+        }
     }
 
     // ---- transitions ----
@@ -413,6 +483,12 @@ impl DrainProtocolMachine {
         &mut self,
         receipt: EvacuationReceipt,
     ) -> Result<DrainProtocolSnapshot, DrainProtocolError> {
+        if self.state != DrainProtocolState::Draining {
+            return Err(DrainProtocolError::WrongState {
+                expected: DrainProtocolState::Draining,
+                actual: self.state,
+            });
+        }
         self.state = self
             .state
             .transition_to(DrainProtocolState::DrainComplete)?;
@@ -849,6 +925,24 @@ mod tests {
     }
 
     #[test]
+    fn complete_draining_with_evacuation_rejects_wrong_state_without_receipt_side_effect() {
+        let mut m = DrainProtocolMachine::new();
+        let receipt = EvacuationReceipt::new(mid(1), EpochId::new(1), "test".to_string());
+
+        let err = m.complete_draining_with_evacuation(receipt).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DrainProtocolError::WrongState {
+                expected: DrainProtocolState::Draining,
+                actual: DrainProtocolState::Idle,
+            }
+        ));
+        assert_eq!(m.state(), DrainProtocolState::Idle);
+        assert!(m.snapshot().evacuation_receipt_id.is_none());
+    }
+
+    #[test]
     fn full_happy_path() {
         let mut m = DrainProtocolMachine::new();
 
@@ -897,5 +991,134 @@ mod tests {
         let s = format!("{e}");
         assert!(s.contains("drain_announced"));
         assert!(s.contains("idle"));
+    }
+
+    // --- Snapshot receipt evidence and recovery tests ---
+
+    #[test]
+    fn snapshot_carries_receipt_authority_fields() {
+        let mut m = DrainProtocolMachine::new();
+        m.announce_drain(mid(42), EpochId::new(7), 3).unwrap();
+        m.record_ack().unwrap();
+        m.record_ack().unwrap();
+        m.record_ack().unwrap();
+        m.start_draining().unwrap();
+
+        let mut receipt = EvacuationReceipt::new(mid(42), EpochId::new(7), "maintenance".to_string());
+        receipt.record_relocated_receipts([tidefs_replication_model::ReplicatedReceiptId(100)]);
+        m.complete_draining_with_evacuation(receipt).unwrap();
+
+        let snap = m.snapshot();
+        assert_eq!(snap.evacuation_receipt_id.unwrap(), EvacuationReceiptId::ZERO);
+        assert!(snap.evacuation_receipt_committed);
+        assert_eq!(snap.evacuation_receipt_draining_node, Some(mid(42)));
+        assert_eq!(snap.evacuation_receipt_epoch, Some(EpochId::new(7)));
+        // No epoch boundary set yet
+        assert!(snap.evacuation_receipt_epoch_boundary.is_none());
+    }
+
+    #[test]
+    fn snapshot_receipt_epoch_boundary_propagated() {
+        let mut m = DrainProtocolMachine::new();
+        m.announce_drain(mid(10), EpochId::new(3), 1).unwrap();
+        m.record_ack().unwrap();
+        m.start_draining().unwrap();
+
+        let mut receipt = EvacuationReceipt::new(mid(10), EpochId::new(3), "test".to_string());
+        receipt.record_relocated_receipts([tidefs_replication_model::ReplicatedReceiptId(1)]);
+        receipt.set_committed_epoch_boundary(EpochId::new(4));
+        m.complete_draining_with_evacuation(receipt).unwrap();
+
+        let snap = m.snapshot();
+        assert_eq!(snap.evacuation_receipt_epoch_boundary, Some(EpochId::new(4)));
+    }
+
+    #[test]
+    fn restore_from_snapshot_preserves_receipt_evidence() {
+        let mut m = DrainProtocolMachine::new();
+        m.announce_drain(mid(55), EpochId::new(9), 2).unwrap();
+        m.record_ack().unwrap();
+        m.record_ack().unwrap();
+        m.start_draining().unwrap();
+
+        let mut receipt = EvacuationReceipt::new(mid(55), EpochId::new(9), "test".to_string());
+        receipt.record_relocated_receipts([tidefs_replication_model::ReplicatedReceiptId(7)]);
+        receipt.set_committed_epoch_boundary(EpochId::new(10));
+        m.complete_draining_with_evacuation(receipt).unwrap();
+
+        let snap = m.snapshot();
+
+        // Restore into a fresh machine
+        let mut m2 = DrainProtocolMachine::new();
+        m2.restore_from_snapshot(&snap);
+
+        assert_eq!(m2.state(), DrainProtocolState::DrainComplete);
+        assert_eq!(m2.draining_node_id(), mid(55));
+        assert_eq!(m2.epoch_id(), EpochId::new(9));
+
+        let snap2 = m2.snapshot();
+        assert_eq!(snap2.evacuation_receipt_id, snap.evacuation_receipt_id);
+        assert_eq!(snap2.evacuation_receipt_committed, snap.evacuation_receipt_committed);
+        assert_eq!(snap2.evacuation_receipt_draining_node, snap.evacuation_receipt_draining_node);
+        assert_eq!(snap2.evacuation_receipt_epoch, snap.evacuation_receipt_epoch);
+        assert_eq!(snap2.evacuation_receipt_epoch_boundary, snap.evacuation_receipt_epoch_boundary);
+    }
+
+    #[test]
+    fn restore_from_snapshot_without_receipt_clears_evidence() {
+        let mut m = DrainProtocolMachine::new();
+        m.announce_drain(mid(77), EpochId::new(1), 1).unwrap();
+        m.record_ack().unwrap();
+        m.start_draining().unwrap();
+        // No evacuation receipt — no-relocation path
+        m.complete_draining().unwrap();
+        let snap = m.snapshot();
+
+        assert!(snap.evacuation_receipt_id.is_none());
+
+        let mut m2 = DrainProtocolMachine::new();
+        m2.restore_from_snapshot(&snap);
+        assert_eq!(m2.state(), DrainProtocolState::DrainComplete);
+        // Snapshot from restored machine should also have no receipt
+        let snap2 = m2.snapshot();
+        assert!(snap2.evacuation_receipt_id.is_none());
+    }
+
+    #[test]
+    fn receipt_matches_node_and_epoch_helper() {
+        let snap = DrainProtocolSnapshot::new(
+            DrainProtocolState::DrainComplete,
+            mid(42),
+            EpochId::new(7),
+            3,
+            3,
+        );
+        // No receipt evidence → no mismatch
+        assert!(snap.receipt_matches_node_and_epoch(mid(42), EpochId::new(7)));
+        assert!(snap.receipt_matches_node_and_epoch(mid(99), EpochId::new(7)));
+
+        // With receipt evidence that matches
+        let mut snap2 = snap.clone();
+        snap2.evacuation_receipt_draining_node = Some(mid(42));
+        snap2.evacuation_receipt_epoch = Some(EpochId::new(7));
+        assert!(snap2.receipt_matches_node_and_epoch(mid(42), EpochId::new(7)));
+        assert!(!snap2.receipt_matches_node_and_epoch(mid(99), EpochId::new(7)));
+        assert!(!snap2.receipt_matches_node_and_epoch(mid(42), EpochId::new(8)));
+    }
+
+    #[test]
+    fn has_committed_epoch_boundary_helper() {
+        let snap = DrainProtocolSnapshot::new(
+            DrainProtocolState::DrainComplete,
+            mid(1),
+            EpochId::new(1),
+            1,
+            1,
+        );
+        assert!(!snap.has_committed_epoch_boundary());
+
+        let mut snap2 = snap.clone();
+        snap2.evacuation_receipt_epoch_boundary = Some(EpochId::new(2));
+        assert!(snap2.has_committed_epoch_boundary());
     }
 }
