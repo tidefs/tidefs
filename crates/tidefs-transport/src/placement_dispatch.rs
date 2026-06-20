@@ -18,6 +18,7 @@
 //! - Select read replicas from the versioned placement map when one records
 //!   the object, otherwise from computed placement.
 
+use crate::epoch_fence::CommittedEpochSnapshot;
 use crate::object_enumerator::PlacementMap;
 use crate::transport_session_set::{SessionHealth, TransportSessionSet};
 use crate::types::SessionId;
@@ -46,6 +47,15 @@ pub enum PlacementDispatchError {
     /// Write rejected: fence token is stale (prior lease holder).
     #[error("stale write fence: {0}")]
     StaleFence(#[from] ClusterStaleFence),
+    /// Placement map epoch does not match committed membership evidence.
+    #[error("placement map epoch {map_epoch:?} does not match committed epoch {evidence_epoch}")]
+    PlacementMapEpochMismatch {
+        map_epoch: EpochId,
+        evidence_epoch: u64,
+    },
+    /// Placement map references a member outside the committed roster.
+    #[error("placement map member {member_id} not in committed roster at epoch {epoch}")]
+    PlacementMapMemberNotInRoster { member_id: u64, epoch: u64 },
 }
 
 /// Result of resolving placement for an object key.
@@ -153,6 +163,41 @@ impl PlacementDispatch {
             );
         }
         self.placement_map = Some(map);
+    }
+
+    /// Set the current placement map after validating it against committed
+    /// membership evidence.
+    ///
+    /// Read-map publication must use the same committed epoch/member set as
+    /// reconnect admission. A map for a stale epoch or a map that references
+    /// a departed/not-yet-committed member is rejected before publication.
+    pub fn set_placement_map_with_evidence(
+        &mut self,
+        map: PlacementMap,
+        evidence: &CommittedEpochSnapshot,
+    ) -> Result<(), PlacementDispatchError> {
+        if map.epoch.0 != evidence.epoch {
+            return Err(PlacementDispatchError::PlacementMapEpochMismatch {
+                map_epoch: map.epoch,
+                evidence_epoch: evidence.epoch,
+            });
+        }
+
+        for member_id in map
+            .mapping()
+            .values()
+            .flat_map(|members| members.iter().map(|member| member.0))
+        {
+            if !evidence.contains(member_id) {
+                return Err(PlacementDispatchError::PlacementMapMemberNotInRoster {
+                    member_id,
+                    epoch: evidence.epoch,
+                });
+            }
+        }
+
+        self.set_placement_map(map);
+        Ok(())
     }
 
     /// Return the current placement version, if a map has been set.
@@ -669,6 +714,65 @@ mod tests {
         assert_eq!(dispatch.placement_version(), Some(1));
         assert_eq!(dispatch.placement_epoch(), Some(EpochId(7)));
         assert!(dispatch.placement_map().is_some());
+    }
+
+    #[test]
+    fn set_placement_map_with_evidence_accepts_matching_epoch_and_members() {
+        let (mut dispatch, _) = make_dispatch(2);
+        let mut mapping = BTreeMap::new();
+        mapping.insert(
+            1,
+            [1u64, 2]
+                .into_iter()
+                .map(tidefs_membership_epoch::MemberId)
+                .collect(),
+        );
+        let evidence = CommittedEpochSnapshot::new(7, [1, 2, 3]);
+        let map = PlacementMap::new(1, EpochId(7), mapping);
+
+        dispatch
+            .set_placement_map_with_evidence(map, &evidence)
+            .unwrap();
+
+        assert_eq!(dispatch.placement_epoch(), Some(EpochId(7)));
+    }
+
+    #[test]
+    fn set_placement_map_with_evidence_rejects_epoch_mismatch() {
+        let (mut dispatch, _) = make_dispatch(2);
+        let evidence = CommittedEpochSnapshot::new(8, [1, 2, 3]);
+        let map = PlacementMap::new(1, EpochId(7), BTreeMap::new());
+
+        assert_eq!(
+            dispatch.set_placement_map_with_evidence(map, &evidence),
+            Err(PlacementDispatchError::PlacementMapEpochMismatch {
+                map_epoch: EpochId(7),
+                evidence_epoch: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn set_placement_map_with_evidence_rejects_departed_member() {
+        let (mut dispatch, _) = make_dispatch(2);
+        let mut mapping = BTreeMap::new();
+        mapping.insert(
+            1,
+            [1u64, 9]
+                .into_iter()
+                .map(tidefs_membership_epoch::MemberId)
+                .collect(),
+        );
+        let evidence = CommittedEpochSnapshot::new(7, [1, 2, 3]);
+        let map = PlacementMap::new(1, EpochId(7), mapping);
+
+        assert_eq!(
+            dispatch.set_placement_map_with_evidence(map, &evidence),
+            Err(PlacementDispatchError::PlacementMapMemberNotInRoster {
+                member_id: 9,
+                epoch: 7,
+            })
+        );
     }
 
     #[test]

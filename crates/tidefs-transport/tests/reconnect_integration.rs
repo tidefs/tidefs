@@ -572,6 +572,18 @@ fn reconnect_driver_new_defaults_to_epoch_zero() {
 }
 
 #[test]
+fn session_reconnect_driver_uses_bound_committed_epoch() {
+    let mut session = make_established_session();
+    session.bind_epoch(9).unwrap();
+
+    let driver = session.create_reconnect_driver().unwrap();
+    let req = driver.build_resume_request(MessageSequenceNumber(0));
+
+    assert_eq!(driver.epoch, 9);
+    assert_eq!(req.epoch, 9);
+}
+
+#[test]
 fn check_reconnect_admission_current_epoch() {
     use std::collections::BTreeSet;
     use tidefs_transport::epoch_fence::{check_reconnect_admission, ReconnectAdmission};
@@ -637,4 +649,95 @@ fn reconnect_admission_peer_departed_during_reconnect() {
     let roster: BTreeSet<u64> = [2, 3].into();
     let result = check_reconnect_admission(&roster, 4, 1, 2);
     assert_eq!(result, ReconnectAdmission::NotInRoster { peer_id: 1 });
+}
+
+#[test]
+fn committed_evidence_publication_reaches_fence_sender() {
+    use tidefs_transport::epoch_fence::{
+        check_reconnect_admission_with_evidence, CommittedEpochEvidence, ReconnectAdmission,
+    };
+
+    let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+    let evidence = CommittedEpochEvidence::with_fence_sender(tx);
+
+    let snapshot = evidence.publish(6, [1, 2, 3]);
+
+    assert_eq!(snapshot.epoch, 6);
+    assert_eq!(snapshot.member_ids(), vec![1, 2, 3]);
+    assert_eq!(
+        check_reconnect_admission_with_evidence(&evidence, 2, 6),
+        ReconnectAdmission::Admitted
+    );
+
+    let transition = rx.try_recv().expect("committed transition");
+    assert_eq!(transition.epoch, 6);
+    assert!(transition
+        .member_set
+        .contains(&tidefs_membership_types::NodeIdentity::new(2)));
+}
+
+#[test]
+fn committed_evidence_rejects_stale_reconnect_after_epoch_advance() {
+    use tidefs_transport::epoch_fence::{CommittedEpochEvidence, ReconnectAdmission};
+
+    let evidence = CommittedEpochEvidence::new();
+    evidence.publish(4, [1, 2, 3]);
+
+    assert_eq!(
+        evidence.check_reconnect_admission(1, 2),
+        ReconnectAdmission::StaleEpoch {
+            claimed_epoch: 2,
+            current_epoch: 4,
+        }
+    );
+}
+
+#[test]
+fn committed_evidence_rejects_departed_peer_reconnect() {
+    use tidefs_transport::epoch_fence::{CommittedEpochEvidence, ReconnectAdmission};
+
+    let evidence = CommittedEpochEvidence::new();
+    evidence.publish(4, [2, 3]);
+
+    assert_eq!(
+        evidence.check_reconnect_admission(1, 4),
+        ReconnectAdmission::PeerDeparted { peer_id: 1 }
+    );
+}
+
+#[test]
+fn committed_evidence_rechecks_epoch_when_reconnect_is_in_flight() {
+    use tidefs_transport::epoch_fence::{CommittedEpochEvidence, ReconnectAdmission};
+
+    let evidence = CommittedEpochEvidence::new();
+    evidence.publish(2, [1, 2, 3]);
+    assert_eq!(
+        evidence.check_reconnect_admission(1, 2),
+        ReconnectAdmission::Admitted
+    );
+
+    evidence.publish(4, [1, 2, 3]);
+    assert_eq!(
+        evidence.check_reconnect_admission(1, 2),
+        ReconnectAdmission::StaleEpoch {
+            claimed_epoch: 2,
+            current_epoch: 4,
+        }
+    );
+}
+
+#[test]
+fn committed_evidence_missing_fails_closed() {
+    use tidefs_transport::epoch_fence::{
+        CommittedEpochEvidence, ReconnectAdmission, ReconnectEvidenceFailure,
+    };
+
+    let evidence = CommittedEpochEvidence::new();
+
+    assert_eq!(
+        evidence.check_reconnect_admission(1, 1),
+        ReconnectAdmission::EvidenceUnavailable {
+            reason: ReconnectEvidenceFailure::Missing,
+        }
+    );
 }

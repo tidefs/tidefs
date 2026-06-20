@@ -85,6 +85,8 @@ use tidefs_binary_schema_core::{
     BinarySchemaError, DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion,
 };
 
+use crate::epoch_fence::CommittedEpochSnapshot;
+
 // ---------------------------------------------------------------------------
 // Wire constants
 // ---------------------------------------------------------------------------
@@ -456,6 +458,32 @@ pub struct DeliveryConfirmationEngine {
     trackers: Mutex<HashMap<[u8; 32], Arc<DeliveryTracker>>>,
 }
 
+/// Reasons a delivery confirmation was rejected by committed membership
+/// evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryConfirmationAdmissionError {
+    /// No committed members are available for this epoch.
+    EmptyRoster { epoch: u64 },
+    /// The peer is not in the committed member set.
+    PeerNotInRoster { peer_id: u64, epoch: u64 },
+}
+
+impl std::fmt::Display for DeliveryConfirmationAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyRoster { epoch } => {
+                write!(f, "delivery confirmation roster empty at epoch {epoch}")
+            }
+            Self::PeerNotInRoster { peer_id, epoch } => write!(
+                f,
+                "delivery confirmation peer {peer_id} not in committed roster at epoch {epoch}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeliveryConfirmationAdmissionError {}
+
 impl DeliveryConfirmationEngine {
     /// Create a new delivery confirmation engine.
     pub fn new() -> Self {
@@ -493,6 +521,22 @@ impl DeliveryConfirmationEngine {
         Some(AcknowledgmentFrame::new(receiver_peer_id, delivery_seq.0))
     }
 
+    /// Build an acknowledgment frame only if the receiver node is still in
+    /// the committed member set.
+    ///
+    /// This keeps delivery confirmations on the same membership-driven epoch
+    /// evidence as reconnect admission.
+    pub fn build_ack_frame_with_evidence(
+        &self,
+        receiver_peer_id: [u8; 32],
+        receiver_node_id: u64,
+        delivery_seq: DeliverySequence,
+        evidence: &CommittedEpochSnapshot,
+    ) -> Result<Option<AcknowledgmentFrame>, DeliveryConfirmationAdmissionError> {
+        Self::check_peer_evidence(receiver_node_id, evidence)?;
+        Ok(self.build_ack_frame(receiver_peer_id, delivery_seq))
+    }
+
     /// Process an inbound acknowledgment frame.
     ///
     /// Looks up the tracker for the peer that sent the ack and resolves
@@ -511,6 +555,36 @@ impl DeliveryConfirmationEngine {
             Some(t) => t.record_ack(DeliverySequence(frame.ack_seq)),
             None => false,
         }
+    }
+
+    /// Process an inbound acknowledgment only if the sending peer is in the
+    /// committed member set.
+    pub fn process_inbound_ack_with_evidence(
+        &self,
+        frame: &AcknowledgmentFrame,
+        ack_peer_node_id: u64,
+        evidence: &CommittedEpochSnapshot,
+    ) -> Result<bool, DeliveryConfirmationAdmissionError> {
+        Self::check_peer_evidence(ack_peer_node_id, evidence)?;
+        Ok(self.process_inbound_ack(frame))
+    }
+
+    fn check_peer_evidence(
+        peer_node_id: u64,
+        evidence: &CommittedEpochSnapshot,
+    ) -> Result<(), DeliveryConfirmationAdmissionError> {
+        if evidence.roster.is_empty() {
+            return Err(DeliveryConfirmationAdmissionError::EmptyRoster {
+                epoch: evidence.epoch,
+            });
+        }
+        if !evidence.contains(peer_node_id) {
+            return Err(DeliveryConfirmationAdmissionError::PeerNotInRoster {
+                peer_id: peer_node_id,
+                epoch: evidence.epoch,
+            });
+        }
+        Ok(())
     }
 
     /// Remove and cancel all trackers for a specific peer (e.g., on
@@ -847,6 +921,50 @@ mod tests {
         let _tracker = engine.get_or_create_tracker(peer_id);
         let ack_frame = AcknowledgmentFrame::new(peer_id, 999);
         assert!(!engine.process_inbound_ack(&ack_frame));
+    }
+
+    #[test]
+    fn engine_process_inbound_ack_with_evidence_resolves_member_ack() {
+        let engine = DeliveryConfirmationEngine::new();
+        let peer_id = [0x45u8; 32];
+        let tracker = engine.get_or_create_tracker(peer_id);
+        let seq = DeliverySequence(11);
+        let mut rx = tracker.register(seq);
+        let evidence = CommittedEpochSnapshot::new(5, [1, 2]);
+        let ack_frame = AcknowledgmentFrame::new(peer_id, seq.0);
+
+        assert_eq!(
+            engine.process_inbound_ack_with_evidence(&ack_frame, 2, &evidence),
+            Ok(true)
+        );
+        assert_eq!(rx.try_recv().unwrap(), DeliveryOutcome::Delivered);
+    }
+
+    #[test]
+    fn engine_process_inbound_ack_with_evidence_rejects_departed_peer() {
+        let engine = DeliveryConfirmationEngine::new();
+        let peer_id = [0x46u8; 32];
+        let evidence = CommittedEpochSnapshot::new(5, [1, 2]);
+        let ack_frame = AcknowledgmentFrame::new(peer_id, 1);
+
+        assert_eq!(
+            engine.process_inbound_ack_with_evidence(&ack_frame, 3, &evidence),
+            Err(DeliveryConfirmationAdmissionError::PeerNotInRoster {
+                peer_id: 3,
+                epoch: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn engine_build_ack_frame_with_evidence_rejects_empty_roster() {
+        let engine = DeliveryConfirmationEngine::new();
+        let evidence = CommittedEpochSnapshot::new(5, []);
+
+        assert_eq!(
+            engine.build_ack_frame_with_evidence([0x47u8; 32], 1, DeliverySequence(1), &evidence),
+            Err(DeliveryConfirmationAdmissionError::EmptyRoster { epoch: 5 })
+        );
     }
 
     #[test]

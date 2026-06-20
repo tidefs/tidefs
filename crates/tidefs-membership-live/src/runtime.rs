@@ -30,6 +30,7 @@ use tidefs_membership_epoch::{ConfigClass, EpochId, HealthClass, MemberClass, Me
 use tidefs_membership_types::Incarnation;
 use tidefs_membership_types::PeerHealthConfig;
 use tidefs_transport::addr::TransportAddr;
+use tidefs_transport::epoch_fence::CommittedEpochEvidence;
 use tidefs_transport::peer_manager::{self, MembershipEventSink};
 use tidefs_transport::send_dispatch::SendDispatcher;
 
@@ -47,6 +48,19 @@ use tidefs_membership_epoch::roster_constraints::RosterConstraints;
 use tidefs_membership_types::departure::DepartureResponse;
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::Transport;
+
+struct TransportEpochEvidenceSubscriber {
+    evidence: CommittedEpochEvidence,
+}
+
+impl EpochCommitSubscriber for TransportEpochEvidenceSubscriber {
+    fn on_epoch_committed(&self, view: &EpochView) {
+        self.evidence.publish(
+            view.epoch_number.0,
+            view.member_set.iter().map(|member| member.0),
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MembershipRuntime: the live membership service
@@ -127,6 +141,9 @@ pub struct MembershipRuntime {
     /// Callers attach it to a Transport via set_send_gate so every
     /// outbound send is checked against the committed roster.
     pub send_gate: Option<Arc<MembershipSendGate>>,
+    /// Committed epoch evidence publisher shared with transport reconnect
+    /// admission and the transport epoch fence.
+    pub transport_epoch_evidence: Option<CommittedEpochEvidence>,
     /// Coordinator transition journal for crash-recovery replay.
     ///
     /// Records in-flight join and leave transitions with prepare-commit
@@ -285,6 +302,7 @@ impl MembershipRuntime {
             send_gate: Some(Arc::new(MembershipSendGate::new(Arc::new(
                 std::sync::RwLock::new(std::collections::BTreeSet::new()),
             )))),
+            transport_epoch_evidence: None,
             gossip_batcher: GossipBatcher::new(
                 GossipBatcherConfig::default(),
                 Box::new(now_millis),
@@ -455,6 +473,7 @@ impl MembershipRuntime {
             send_gate: Some(Arc::new(MembershipSendGate::new(Arc::new(
                 std::sync::RwLock::new(std::collections::BTreeSet::new()),
             )))),
+            transport_epoch_evidence: None,
             gossip_batcher: GossipBatcher::new(
                 GossipBatcherConfig::default(),
                 Box::new(now_millis),
@@ -601,6 +620,12 @@ impl MembershipRuntime {
             }));
         }
 
+        if let Some(ref evidence) = self.transport_epoch_evidence {
+            coordinator.subscribe(Box::new(TransportEpochEvidenceSubscriber {
+                evidence: evidence.clone(),
+            }));
+        }
+
         self.epoch_coordinator = Some(coordinator);
     }
 
@@ -613,6 +638,22 @@ impl MembershipRuntime {
     #[must_use]
     pub fn send_gate(&self) -> Option<Arc<MembershipSendGate>> {
         self.send_gate.clone()
+    }
+
+    /// Share committed epoch evidence with the transport reconnect gate.
+    pub fn set_transport_epoch_evidence(&mut self, evidence: CommittedEpochEvidence) {
+        if let Some(ref mut coordinator) = self.epoch_coordinator {
+            coordinator.subscribe(Box::new(TransportEpochEvidenceSubscriber {
+                evidence: evidence.clone(),
+            }));
+        }
+        self.transport_epoch_evidence = Some(evidence);
+    }
+
+    /// Return a clone of the transport committed epoch evidence cell.
+    #[must_use]
+    pub fn transport_epoch_evidence(&self) -> Option<CommittedEpochEvidence> {
+        self.transport_epoch_evidence.clone()
     }
 
     /// Whether the eviction executor has been wired into this runtime.
@@ -1504,6 +1545,8 @@ impl MembershipRuntime {
     }
 
     fn fire_transition_callbacks(&mut self, transition: &AppliedTransition) {
+        self.publish_committed_transport_epoch(transition);
+
         for cb in &self.transition_callbacks {
             cb(transition);
         }
@@ -1544,6 +1587,47 @@ impl MembershipRuntime {
                 .collect();
             let _ = mgr.create_checkpoint(transition.to_epoch, coordinator, incarnation, roster);
         }
+    }
+
+    fn publish_committed_transport_epoch(&mut self, transition: &AppliedTransition) {
+        let members = self.committed_members_after_transition(transition);
+
+        if let Some(ref gate) = self.send_gate {
+            gate.replace_member_set(members.iter().copied());
+        }
+
+        if let Some(ref fence) = self.epoch_fence {
+            let view = EpochView::new(
+                transition.to_epoch,
+                members.iter().copied().collect(),
+                transition.committed_at_millis,
+            );
+            fence.update_from_view(&view);
+        }
+
+        if let Some(ref evidence) = self.transport_epoch_evidence {
+            evidence.publish(transition.to_epoch.0, members.iter().map(|member| member.0));
+        }
+    }
+
+    fn committed_members_after_transition(
+        &self,
+        transition: &AppliedTransition,
+    ) -> BTreeSet<MemberId> {
+        let mut members: BTreeSet<MemberId> = self
+            .roster
+            .snapshot()
+            .iter()
+            .filter(|(_, state)| *state == RosterState::Active)
+            .map(|(id, _)| *id)
+            .collect();
+
+        members.extend(transition.members_added.iter().copied());
+        for member_id in &transition.members_removed {
+            members.remove(member_id);
+        }
+
+        members
     }
 
     /// Get the current epoch.
@@ -2647,6 +2731,80 @@ mod tests {
         let gate = rt.send_gate().unwrap();
         // No epoch committed yet -- roster is empty, gate rejects all.
         assert!(gate.check(1).is_err());
+    }
+
+    #[test]
+    fn committed_transport_epoch_publishes_evidence_before_transition_callbacks() {
+        let mut rt = make_runtime(1, MemberClass::Voter);
+        rt.add_peer(MemberId::new(2), MemberClass::Voter, 2);
+        rt.add_peer(MemberId::new(3), MemberClass::Voter, 3);
+
+        let evidence = CommittedEpochEvidence::new();
+        rt.set_transport_epoch_evidence(evidence.clone());
+
+        let observed = Arc::new(Mutex::new(None));
+        let observed_for_callback = Arc::clone(&observed);
+        let evidence_for_callback = evidence.clone();
+        rt.on_transition(move |transition| {
+            *observed_for_callback.lock().unwrap() =
+                Some((transition.to_epoch, evidence_for_callback.snapshot()));
+        });
+
+        let transition = AppliedTransition {
+            from_epoch: EpochId::new(1),
+            to_epoch: EpochId::new(2),
+            reason: TransitionReason::FailureDetected,
+            members_added: vec![],
+            members_removed: vec![MemberId::new(2)],
+            committed_at_millis: 1234,
+        };
+
+        rt.fire_transition_callbacks(&transition);
+
+        let snapshot = evidence.snapshot().expect("committed evidence");
+        assert_eq!(snapshot.epoch, 2);
+        assert_eq!(snapshot.member_ids(), vec![1, 3]);
+
+        let observed = observed.lock().unwrap();
+        let (callback_epoch, callback_snapshot) =
+            observed.as_ref().expect("transition callback should run");
+        assert_eq!(*callback_epoch, EpochId::new(2));
+        assert_eq!(callback_snapshot.as_ref(), Some(&snapshot));
+    }
+
+    #[test]
+    fn committed_transport_epoch_updates_send_gate_and_epoch_fence() {
+        let mut rt = make_runtime(1, MemberClass::Voter);
+        rt.add_peer(MemberId::new(2), MemberClass::Voter, 2);
+        rt.add_peer(MemberId::new(3), MemberClass::Voter, 3);
+
+        let fence = Arc::new(MembershipEpochFence::new());
+        rt.epoch_fence = Some(Arc::clone(&fence));
+        rt.set_transport_epoch_evidence(CommittedEpochEvidence::new());
+
+        let transition = AppliedTransition {
+            from_epoch: EpochId::new(4),
+            to_epoch: EpochId::new(5),
+            reason: TransitionReason::FailureDetected,
+            members_added: vec![],
+            members_removed: vec![MemberId::new(2)],
+            committed_at_millis: 5678,
+        };
+
+        rt.fire_transition_callbacks(&transition);
+
+        let gate = rt.send_gate().expect("send gate");
+        assert_eq!(
+            gate.member_set_snapshot(),
+            [MemberId::new(1), MemberId::new(3)].into()
+        );
+        assert!(gate.check(1).is_ok());
+        assert!(gate.check(2).is_err());
+
+        assert_eq!(fence.current_epoch(), EpochId::new(5));
+        assert_eq!(fence.member_ids(), vec![MemberId::new(1), MemberId::new(3)]);
+        assert!(fence.check(MemberId::new(3), Some(5)).is_ok());
+        assert!(fence.check(MemberId::new(2), Some(5)).is_err());
     }
 
     // ------------------------------------------------------------------

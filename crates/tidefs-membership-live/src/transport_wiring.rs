@@ -22,6 +22,10 @@ use std::net::SocketAddr;
 use bincode;
 use serde::{Deserialize, Serialize};
 use tidefs_membership_epoch::MemberId;
+use tidefs_transport::epoch_fence::{
+    CommittedEpochEvidence, CommittedEpochSnapshot, EpochTransition, ReconnectAdmission,
+    ReconnectEvidenceFailure,
+};
 use tidefs_transport::{NodeInfo, SessionCloseReason, SessionId, Transport, TransportError};
 
 use crate::gossip::GossipMessage;
@@ -117,6 +121,9 @@ pub struct MembershipTransport {
     pub transport: Transport,
     /// Peer sessions: `member_id → session_id`.
     pub peer_sessions: BTreeMap<MemberId, SessionId>,
+    /// Shared committed membership epoch evidence used by reconnect and
+    /// session-recovery admission.
+    pub committed_epoch_evidence: Option<CommittedEpochEvidence>,
 }
 
 impl MembershipTransport {
@@ -134,12 +141,64 @@ impl MembershipTransport {
         self.transport.set_send_gate(gate);
     }
 
+    /// Attach committed epoch evidence shared with reconnect admission.
+    pub fn set_committed_epoch_evidence(&mut self, evidence: CommittedEpochEvidence) {
+        self.committed_epoch_evidence = Some(evidence);
+    }
+
+    /// Attach an epoch-fence sender to the committed evidence publisher.
+    ///
+    /// If no evidence cell exists yet, one is created so future committed
+    /// publications reach both reconnect admission and [`EpochFence`].
+    pub fn set_epoch_fence_sender(
+        &mut self,
+        sender: tokio::sync::broadcast::Sender<EpochTransition>,
+    ) {
+        let evidence = self
+            .committed_epoch_evidence
+            .get_or_insert_with(CommittedEpochEvidence::new);
+        evidence.set_fence_sender(sender);
+    }
+
+    /// Return a clone of the committed epoch evidence cell, if configured.
+    #[must_use]
+    pub fn committed_epoch_evidence(&self) -> Option<CommittedEpochEvidence> {
+        self.committed_epoch_evidence.clone()
+    }
+
+    /// Publish a committed membership epoch into reconnect admission and the
+    /// optional transport epoch fence sender.
+    ///
+    /// The underlying transport's advertised handshake epoch is moved to the
+    /// committed epoch before new sessions are accepted or dialed.
+    pub fn publish_committed_epoch_view<I>(
+        &mut self,
+        epoch: u64,
+        members: I,
+    ) -> Result<CommittedEpochSnapshot, TransportError>
+    where
+        I: IntoIterator<Item = MemberId>,
+    {
+        let evidence = self.committed_epoch_evidence.as_ref().ok_or_else(|| {
+            Self::admission_error(
+                0,
+                ReconnectAdmission::EvidenceUnavailable {
+                    reason: ReconnectEvidenceFailure::Missing,
+                },
+            )
+        })?;
+        let snapshot = evidence.publish(epoch, members.into_iter().map(|member| member.0));
+        self.transport.epoch = snapshot.epoch;
+        Ok(snapshot)
+    }
+
     /// Create a new membership transport for a node.
     #[must_use]
     pub fn new(local_node_id: u64) -> Self {
         Self {
             transport: Transport::new(local_node_id),
             peer_sessions: BTreeMap::new(),
+            committed_epoch_evidence: None,
         }
     }
 
@@ -187,6 +246,30 @@ impl MembershipTransport {
         Ok(session_id)
     }
 
+    /// Connect to a peer admitted by the current committed epoch evidence.
+    ///
+    /// Missing, lagged, stale, or departed evidence rejects before the
+    /// session is exposed as a usable membership transport session.
+    pub fn connect_to_peer_at_committed_epoch(
+        &mut self,
+        peer_node_id: u64,
+        addr: SocketAddr,
+    ) -> Result<SessionId, TransportError> {
+        let snapshot = self.require_peer_admitted_for_new_session(peer_node_id)?;
+        self.transport.epoch = snapshot.epoch;
+
+        let session_id = self.connect_to_peer(peer_node_id, addr)?;
+        if let Err(err) = self.bind_peer_session_to_committed_epoch(peer_node_id, session_id) {
+            self.peer_sessions.remove(&MemberId::new(peer_node_id));
+            let _ = self
+                .transport
+                .close_session(session_id, SessionCloseReason::LocalShutdown);
+            return Err(err);
+        }
+
+        Ok(session_id)
+    }
+
     /// Accept an incoming connection, handshake, and return the peer's node ID.
     ///
     /// # Errors
@@ -208,6 +291,23 @@ impl MembershipTransport {
 
         self.peer_sessions
             .insert(MemberId::new(peer_node_id), session_id);
+
+        Ok((peer_node_id, session_id))
+    }
+
+    /// Accept an incoming peer only if committed epoch evidence admits it.
+    pub fn accept_peer_at_committed_epoch(&mut self) -> Result<(u64, SessionId), TransportError> {
+        let snapshot = self.current_committed_snapshot()?;
+        self.transport.epoch = snapshot.epoch;
+
+        let (peer_node_id, session_id) = self.accept_peer()?;
+        if let Err(err) = self.bind_peer_session_to_committed_epoch(peer_node_id, session_id) {
+            self.peer_sessions.remove(&MemberId::new(peer_node_id));
+            let _ = self
+                .transport
+                .close_session(session_id, SessionCloseReason::LocalShutdown);
+            return Err(err);
+        }
 
         Ok((peer_node_id, session_id))
     }
@@ -243,6 +343,70 @@ impl MembershipTransport {
             Err(TransportError::Generic(msg)) if msg.contains("no pending") => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Poll for an incoming connection and admit it against committed epoch
+    /// evidence if one is ready.
+    pub fn try_accept_peer_at_committed_epoch(
+        &mut self,
+    ) -> Result<Option<(u64, SessionId)>, TransportError> {
+        let snapshot = self.current_committed_snapshot()?;
+        self.transport.epoch = snapshot.epoch;
+
+        match self.try_accept_peer()? {
+            Some((peer_node_id, session_id)) => {
+                if let Err(err) =
+                    self.bind_peer_session_to_committed_epoch(peer_node_id, session_id)
+                {
+                    self.peer_sessions.remove(&MemberId::new(peer_node_id));
+                    let _ = self
+                        .transport
+                        .close_session(session_id, SessionCloseReason::LocalShutdown);
+                    return Err(err);
+                }
+                Ok(Some((peer_node_id, session_id)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Bind an existing transport session to the current committed epoch.
+    pub fn bind_peer_session_to_committed_epoch(
+        &mut self,
+        peer_node_id: u64,
+        session_id: SessionId,
+    ) -> Result<(), TransportError> {
+        let evidence = self.committed_epoch_evidence.as_ref().ok_or_else(|| {
+            Self::admission_error(
+                peer_node_id,
+                ReconnectAdmission::EvidenceUnavailable {
+                    reason: ReconnectEvidenceFailure::Missing,
+                },
+            )
+        })?;
+        let snapshot = evidence.snapshot().ok_or_else(|| {
+            Self::admission_error(
+                peer_node_id,
+                ReconnectAdmission::EvidenceUnavailable {
+                    reason: ReconnectEvidenceFailure::Missing,
+                },
+            )
+        })?;
+        let session_epoch = self.session_epoch(session_id)?;
+        let claimed_epoch = if session_epoch == 0 {
+            snapshot.epoch
+        } else {
+            session_epoch
+        };
+        let admission = evidence.check_reconnect_admission(peer_node_id, claimed_epoch);
+        if !admission.is_admitted() {
+            return Err(Self::admission_error(peer_node_id, admission));
+        }
+
+        self.bind_session_epoch(session_id, snapshot.epoch)?;
+        self.peer_sessions
+            .insert(MemberId::new(peer_node_id), session_id);
+        Ok(())
     }
 
     /// Send a SWIM ping to a peer.
@@ -432,6 +596,72 @@ impl MembershipTransport {
             .copied()
             .ok_or(TransportError::PeerNotFound { peer: member_id.0 })
     }
+
+    fn current_committed_snapshot(&self) -> Result<CommittedEpochSnapshot, TransportError> {
+        let evidence = self.committed_epoch_evidence.as_ref().ok_or_else(|| {
+            Self::admission_error(
+                0,
+                ReconnectAdmission::EvidenceUnavailable {
+                    reason: ReconnectEvidenceFailure::Missing,
+                },
+            )
+        })?;
+        evidence.snapshot().ok_or_else(|| {
+            Self::admission_error(
+                0,
+                ReconnectAdmission::EvidenceUnavailable {
+                    reason: ReconnectEvidenceFailure::Missing,
+                },
+            )
+        })
+    }
+
+    fn require_peer_admitted_for_new_session(
+        &self,
+        peer_node_id: u64,
+    ) -> Result<CommittedEpochSnapshot, TransportError> {
+        let snapshot = self.current_committed_snapshot()?;
+        let evidence = self.committed_epoch_evidence.as_ref().unwrap();
+        let admission = evidence.check_reconnect_admission(peer_node_id, snapshot.epoch);
+        if admission.is_admitted() {
+            Ok(snapshot)
+        } else {
+            Err(Self::admission_error(peer_node_id, admission))
+        }
+    }
+
+    fn session_epoch(&self, session_id: SessionId) -> Result<u64, TransportError> {
+        let session = self
+            .transport
+            .sessions
+            .get(&session_id)
+            .ok_or(TransportError::SessionNotFound { session_id })?;
+        let session = session
+            .lock()
+            .map_err(|err| TransportError::Generic(format!("session lock poisoned: {err}")))?;
+        Ok(session.current_epoch)
+    }
+
+    fn bind_session_epoch(&self, session_id: SessionId, epoch: u64) -> Result<(), TransportError> {
+        let session = self
+            .transport
+            .sessions
+            .get(&session_id)
+            .ok_or(TransportError::SessionNotFound { session_id })?;
+        let mut session = session
+            .lock()
+            .map_err(|err| TransportError::Generic(format!("session lock poisoned: {err}")))?;
+        session
+            .bind_epoch(epoch)
+            .map_err(|err| TransportError::Generic(err.to_string()))
+    }
+
+    fn admission_error(peer_node_id: u64, admission: ReconnectAdmission) -> TransportError {
+        TransportError::AdmissionRejected {
+            peer_id: peer_node_id,
+            reason: admission.to_string(),
+        }
+    }
 }
 
 impl Drop for MembershipTransport {
@@ -444,8 +674,11 @@ impl Drop for MembershipTransport {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+    use tidefs_transport::backend::TransportBackendKind;
+    use tidefs_transport::{EndpointFamily, Session, TransportAddr};
 
     // -----------------------------------------------------------------------
     // Serde round-trip tests
@@ -569,6 +802,124 @@ mod tests {
             let decoded: MembershipWireMessage =
                 bincode::deserialize(&encoded).expect("deserialize");
             assert_eq!(*msg, decoded);
+        }
+    }
+
+    fn insert_test_session(transport: &mut MembershipTransport, sid: SessionId, peer_node: u64) {
+        let peer_addr = TransportAddr::Tcp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            9001,
+        ));
+        let session = Session::new(
+            sid,
+            transport.transport.local_node_id,
+            peer_node,
+            peer_addr,
+            EndpointFamily::Data,
+            TransportBackendKind::Tcp,
+        );
+        transport
+            .transport
+            .sessions
+            .insert(sid, Arc::new(Mutex::new(session)));
+    }
+
+    #[test]
+    fn publish_committed_epoch_view_updates_evidence_and_fence_sender() {
+        let mut membership_transport = MembershipTransport::new(1);
+        let evidence = CommittedEpochEvidence::new();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        membership_transport.set_committed_epoch_evidence(evidence.clone());
+        membership_transport.set_epoch_fence_sender(tx);
+
+        let snapshot = membership_transport
+            .publish_committed_epoch_view(7, [MemberId::new(1), MemberId::new(2)])
+            .expect("publish committed epoch");
+
+        assert_eq!(snapshot.epoch, 7);
+        assert_eq!(snapshot.member_ids(), vec![1, 2]);
+        assert_eq!(membership_transport.transport.epoch, 7);
+        assert_eq!(evidence.snapshot(), Some(snapshot));
+
+        let transition = rx.try_recv().expect("epoch transition");
+        assert_eq!(transition.epoch, 7);
+    }
+
+    #[test]
+    fn bind_peer_session_to_committed_epoch_binds_session_epoch() {
+        let mut membership_transport = MembershipTransport::new(1);
+        let evidence = CommittedEpochEvidence::new();
+        evidence.publish(6, [1, 2]);
+        membership_transport.set_committed_epoch_evidence(evidence);
+        let sid = SessionId::new(55);
+        insert_test_session(&mut membership_transport, sid, 2);
+
+        membership_transport
+            .bind_peer_session_to_committed_epoch(2, sid)
+            .expect("bind committed epoch");
+
+        assert_eq!(
+            membership_transport.peer_sessions.get(&MemberId::new(2)),
+            Some(&sid)
+        );
+        let epoch = membership_transport
+            .transport
+            .sessions
+            .get(&sid)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .current_epoch;
+        assert_eq!(epoch, 6);
+    }
+
+    #[test]
+    fn bind_peer_session_to_committed_epoch_rejects_missing_evidence() {
+        let mut membership_transport = MembershipTransport::new(1);
+        let sid = SessionId::new(56);
+
+        let err = membership_transport
+            .bind_peer_session_to_committed_epoch(2, sid)
+            .expect_err("missing evidence rejects");
+
+        match err {
+            TransportError::AdmissionRejected { peer_id, reason } => {
+                assert_eq!(peer_id, 2);
+                assert!(reason.contains("missing committed"));
+            }
+            other => panic!("expected AdmissionRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_peer_session_to_committed_epoch_rejects_lagged_evidence() {
+        let mut membership_transport = MembershipTransport::new(1);
+        let evidence = CommittedEpochEvidence::new();
+        evidence.publish(4, [1, 2]);
+        membership_transport.set_committed_epoch_evidence(evidence);
+        let sid = SessionId::new(57);
+        insert_test_session(&mut membership_transport, sid, 2);
+        {
+            let mut session = membership_transport
+                .transport
+                .sessions
+                .get(&sid)
+                .unwrap()
+                .lock()
+                .unwrap();
+            session.bind_epoch(5).unwrap();
+        }
+
+        let err = membership_transport
+            .bind_peer_session_to_committed_epoch(2, sid)
+            .expect_err("lagged evidence rejects");
+
+        match err {
+            TransportError::AdmissionRejected { peer_id, reason } => {
+                assert_eq!(peer_id, 2);
+                assert!(reason.contains("lagged"));
+            }
+            other => panic!("expected AdmissionRejected, got {other:?}"),
         }
     }
 

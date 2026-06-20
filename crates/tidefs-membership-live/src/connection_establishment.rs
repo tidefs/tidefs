@@ -20,9 +20,9 @@
 //!      (idempotency guard).
 //!   3. Invokes the caller-provided `EstablishCallback` with the
 //!      member ID.
-//! - A `sync_roster` method diffs the cached known-peer set against a
-//!   new committed roster and triggers establishment for every newly
-//!   added peer.
+//! - A `sync_roster_at_epoch` method diffs the cached known-peer set against
+//!   a new committed roster and triggers establishment for every newly added
+//!   peer with the committed epoch evidence.
 //!
 //! # Integration
 //!
@@ -35,14 +35,15 @@
 //! };
 //!
 //! let handle = tokio::runtime::Handle::current();
-//! let sub = ConnectionEstablishmentSubscriber::new(
+//! let sub = ConnectionEstablishmentSubscriber::new_with_epoch_callback(
 //!     ConnectionEstablishmentConfig::default(),
 //!     connection_registry,
-//!     Box::new(move |member_id| {
+//!     Box::new(move |request| {
 //!         let mgr = conn_manager.clone();
-//!         let addr = resolve_peer_address(member_id);
+//!         let addr = resolve_peer_address(request.member_id);
+//!         let epoch = request.epoch;
 //!         handle.spawn(async move {
-//!             let _ = mgr.connect(addr).await;
+//!             let _ = mgr.connect_at_epoch(addr, epoch).await;
 //!         });
 //!     }),
 //!     BTreeSet::new(),
@@ -104,13 +105,37 @@ impl ConnectionEstablishmentConfig {
 /// Callback invoked when a new peer should have a transport connection
 /// established.
 ///
-/// The callback receives the peer's `MemberId`. Implementations are
-/// responsible for resolving the member ID to a network endpoint and
-/// initiating the transport connect.
+/// The legacy callback receives only the peer's `MemberId`. It remains for
+/// tests and lower-level callers that already bind committed epoch evidence
+/// elsewhere. Live committed roster paths should use [`EpochEstablishCallback`].
+pub type EstablishCallback = Box<dyn Fn(MemberId) + Send + Sync>;
+
+/// Connection-establishment request carrying the committed membership epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionEstablishmentRequest {
+    /// Peer that should be connected.
+    pub member_id: MemberId,
+    /// Committed epoch whose roster introduced or retained the peer.
+    pub epoch: u64,
+}
+
+impl ConnectionEstablishmentRequest {
+    /// Create a request for `member_id` at committed `epoch`.
+    #[must_use]
+    pub fn new(member_id: MemberId, epoch: u64) -> Self {
+        Self { member_id, epoch }
+    }
+}
+
+/// Callback invoked when committed epoch evidence is available for a new
+/// peer connection.
+///
+/// Implementations are responsible for resolving the member ID to a network
+/// endpoint and initiating the transport connect with the provided epoch.
 ///
 /// Implementations must be non-blocking and fast; spawn async work if
 /// the underlying connect requires I/O.
-pub type EstablishCallback = Box<dyn Fn(MemberId) + Send + Sync>;
+pub type EpochEstablishCallback = Box<dyn Fn(ConnectionEstablishmentRequest) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // ConnectionEstablishmentSubscriber
@@ -130,6 +155,9 @@ pub struct ConnectionEstablishmentSubscriber {
     connection_registry: Arc<ConnectionRegistry>,
     /// Callback that triggers the actual transport connect.
     establish: EstablishCallback,
+    /// Callback that triggers the actual transport connect with committed
+    /// epoch evidence.
+    establish_at_epoch: Option<EpochEstablishCallback>,
     /// Cached set of peer IDs currently known to the subscriber, used
     /// for deduplication and to detect newly-added peers on roster
     /// sync.
@@ -156,6 +184,24 @@ impl ConnectionEstablishmentSubscriber {
             config,
             connection_registry,
             establish,
+            establish_at_epoch: None,
+            known_peers: Mutex::new(initial_peers),
+        }
+    }
+
+    /// Create a subscriber whose callback receives committed epoch evidence.
+    #[must_use]
+    pub fn new_with_epoch_callback(
+        config: ConnectionEstablishmentConfig,
+        connection_registry: Arc<ConnectionRegistry>,
+        establish: EpochEstablishCallback,
+        initial_peers: BTreeSet<MemberId>,
+    ) -> Self {
+        Self {
+            config,
+            connection_registry,
+            establish: Box::new(|_| {}),
+            establish_at_epoch: Some(establish),
             known_peers: Mutex::new(initial_peers),
         }
     }
@@ -176,7 +222,7 @@ impl ConnectionEstablishmentSubscriber {
     ///
     /// Returns `true` if establishment was triggered, `false` if
     /// the peer was already connected (idempotent no-op).
-    fn establish_peer(&self, peer_id: MemberId) -> bool {
+    fn establish_peer_at_epoch(&self, peer_id: MemberId, epoch: u64) -> bool {
         // Idempotency check: if the peer already has a connection entry,
         // skip establishment.
         if self.connection_registry.get(peer_id.0).is_some() {
@@ -190,9 +236,17 @@ impl ConnectionEstablishmentSubscriber {
         }
 
         // Invoke the callback.
-        (self.establish)(peer_id);
+        if let Some(ref establish_at_epoch) = self.establish_at_epoch {
+            establish_at_epoch(ConnectionEstablishmentRequest::new(peer_id, epoch));
+        } else {
+            (self.establish)(peer_id);
+        }
 
         true
+    }
+
+    fn establish_peer(&self, peer_id: MemberId) -> bool {
+        self.establish_peer_at_epoch(peer_id, 0)
     }
 
     /// Synchronize the cached known-peer set against a new committed
@@ -210,13 +264,19 @@ impl ConnectionEstablishmentSubscriber {
     /// triggered. Peers with existing connections (already in the
     /// registry) are not counted.
     pub fn sync_roster(&self, new_roster: &BTreeSet<MemberId>) -> usize {
+        self.sync_roster_at_epoch(0, new_roster)
+    }
+
+    /// Synchronize against a committed roster and pass its epoch to each
+    /// connection-establishment callback.
+    pub fn sync_roster_at_epoch(&self, epoch: u64, new_roster: &BTreeSet<MemberId>) -> usize {
         let known = self.known_peers.lock().unwrap();
         let new_peers: Vec<MemberId> = new_roster.difference(&known).copied().collect();
         drop(known);
 
         let mut count = 0;
         for peer_id in &new_peers {
-            if self.establish_peer(*peer_id) {
+            if self.establish_peer_at_epoch(*peer_id, epoch) {
                 count += 1;
             }
         }
@@ -498,6 +558,36 @@ mod tests {
         let count = sub.sync_roster(&new_roster);
         assert_eq!(count, 3);
         assert_eq!(calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn sync_roster_at_epoch_passes_committed_epoch_to_callback() {
+        let registry = Arc::new(ConnectionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = Arc::clone(&calls);
+        let sub = ConnectionEstablishmentSubscriber::new_with_epoch_callback(
+            ConnectionEstablishmentConfig::default(),
+            registry,
+            Box::new(move |request| {
+                calls_clone.lock().unwrap().push(request);
+            }),
+            BTreeSet::new(),
+        );
+
+        let new_roster: BTreeSet<MemberId> = [MemberId::new(10), MemberId::new(20)].into();
+
+        let count = sub.sync_roster_at_epoch(7, &new_roster);
+
+        assert_eq!(count, 2);
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.iter().all(|request| request.epoch == 7));
+        assert!(recorded
+            .iter()
+            .any(|request| request.member_id == MemberId::new(10)));
+        assert!(recorded
+            .iter()
+            .any(|request| request.member_id == MemberId::new(20)));
     }
 
     // ------------------------------------------------------------------
