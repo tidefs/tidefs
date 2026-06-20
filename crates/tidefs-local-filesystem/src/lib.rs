@@ -304,6 +304,7 @@ mod dedup;
 mod dedup_refcount;
 pub mod dirty_page_tracker;
 mod encoding;
+mod extent_map_store_adapter;
 mod error;
 mod fsck;
 pub mod fuse_fsync;
@@ -411,6 +412,9 @@ use tidefs_types_vfs_core::{
 use tidefs_types_vfs_core::{LockConflict, LockRange, LockTracker};
 
 use background_orphan_reclamation::BackgroundOrphanReclamation;
+use extent_map_store_adapter::FilesystemExtentMapStore;
+use tidefs_online_defrag::{OnlineDefragService, DefragStats};
+use tidefs_types_incremental_job_core::JobId;
 use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
 pub use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_types_reclaim_queue_core::ObjectKey as ReclaimObjectKey;
@@ -1477,6 +1481,12 @@ pub struct LocalFileSystem {
     space_pressure: SpacePressure,
     background_cleaner: BackgroundCleaner,
     orphan_index: Arc<Mutex<OrphanIndex>>,
+    /// Shared extent maps for background defrag service. Initialised at open
+    /// as a clone of [`FileSystemState::extent_maps`], then kept in sync on
+    /// commit. The defrag service obtains a clone of this handle.
+    extent_maps_shared: Option<Arc<Mutex<BTreeMap<InodeId, tidefs_extent_map::ExtentMap>>>>,
+    /// Shared inode records (for file_size lookups by the defrag adapter).
+    inodes_shared: Option<Arc<Mutex<BTreeMap<InodeId, InodeRecord>>>>,
     feature_flags: FeatureFlags,
     content_compression_policy: ContentCompressionPolicy,
     /// Tracks where the effective compression policy was resolved from.
@@ -3285,6 +3295,13 @@ impl LocalFileSystem {
         let pool_uuid = pool_uuid_from_path(&root_path);
         let dataset_mount_id = allocate_local_dataset_mount_id(pool_uuid);
 
+        // Clone extent maps and inode records into shared handles for
+        // the background online-defrag service. These are separate from
+        // state.extent_maps / state.inodes so the defrag service can
+        // operate on them without blocking the main filesystem.
+        let extent_maps_shared = Arc::new(Mutex::new(state.extent_maps.clone()));
+        let inodes_shared = Arc::clone(&state.inodes);
+
         let mut fs = Self {
             store,
             quorum_store: None,
@@ -3337,6 +3354,8 @@ impl LocalFileSystem {
             feature_flags: FeatureFlags::new(),
             content_compression_policy: ContentCompressionPolicy::default(),
             pending_orphan_deletions: Arc::new(Mutex::new(Vec::new())),
+            extent_maps_shared: Some(extent_maps_shared),
+            inodes_shared: Some(inodes_shared),
             background_scheduler: None,
             scrub_repair_schedule: None,
             scrub_corruption_detected: None,
@@ -3430,6 +3449,27 @@ impl LocalFileSystem {
                 Arc::clone(&fs.pending_orphan_deletions),
             );
             scheduler.register(Box::new(orphan_reclamation));
+
+            // Online extent-map defragmentation runs at BestEffort priority
+            // (mapped from JobKind::Defrag). It never starves critical,
+            // latency-sensitive, or throughput-priority lanes.
+            if let (Some(ref em_shared), Some(ref inodes_shared)) =
+                (&fs.extent_maps_shared, &fs.inodes_shared)
+            {
+                let defrag_store = FilesystemExtentMapStore::new(
+                    Arc::clone(inodes_shared),
+                    Arc::clone(em_shared),
+                );
+                let defrag_svc = OnlineDefragService::new(
+                    JobId(200),
+                    Box::new(defrag_store),
+                    4096, // min_extent_size: 4 KiB
+                );
+                let _ = scheduler.register_incremental_job(
+                    "online-defrag",
+                    defrag_svc,
+                );
+            }
 
             let scrub_interval_secs = options.background_scrub_interval_secs;
             if scrub_interval_secs > 0 {
