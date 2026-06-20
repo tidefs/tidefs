@@ -1,8 +1,9 @@
 # Mounted Transform Authority Raw-Store Inventory
 
 Maturity: current guardrail for TFR-006 and GitHub issue #218.
-Issue #637 records the scrub/repair identity boundary without unblocking
-mounted device-level compression or encryption.
+Issue #637 records the scrub/repair identity boundary.
+Mounted device-level compression remains blocked.
+Mounted device-level encryption remains blocked.
 
 The mounted `LocalFileSystem` must not claim device-level compression or
 encryption until every production raw-store path below is removed, routed
@@ -128,8 +129,11 @@ Implementation is split so the write sets do not overlap:
 
 Issue #591 remains the active stale-generation repair gate. Issue #18 remains
 the placement receipt, rebuild, and source-selection gate. None of #637, #650,
-#651, or #652 enables mounted device-level compression or encryption while any
-production `blocked` row remains in this inventory.
+#651, or #652 does either of the following while any production `blocked` row
+remains in this inventory:
+
+- It does not enable mounted device-level compression.
+- It does not enable mounted device-level encryption.
 
 ## Current Mounted Transform Claim
 
