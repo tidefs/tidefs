@@ -49,4 +49,5 @@ pub mod write_durability;
 pub mod xattr_durability;
 pub mod xfstests_lock_group;
 pub mod xfstests_scoreboard;
+pub mod xfstests_evidence_manifest;
 pub mod xfstests_tiering;

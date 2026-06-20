@@ -115,6 +115,81 @@ jobs:
               ;;
           esac
 
+      - name: Write xfstests evidence manifest
+        if: ${{ always() && (github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target) }}
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/tidefs-xfstests-artifacts/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.target }}
+          EVIDENCE_WORKFLOW: ${{ github.workflow }}
+          EVIDENCE_RUN_ID: ${{ github.run_id }}
+          EVIDENCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          EVIDENCE_SOURCE_REF: ${{ github.ref }}
+          EVIDENCE_SOURCE_SHA: ${{ github.sha }}
+          EVIDENCE_TARGET: ${{ matrix.target }}
+          EVIDENCE_TESTS_INPUT: ${{ inputs.tests || '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_ROOT"
+          finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Evidence scope: focused when tests are supplied, broad otherwise.
+          if [ -n "${EVIDENCE_TESTS_INPUT:-}" ]; then
+            evidence_scope="focused"
+          else
+            evidence_scope="broad"
+          fi
+
+          # Write manifest via jq when available, else fall back to a minimal valid manifest.
+          if command -v jq >/dev/null 2>&1; then
+            tests_json="$(printf '%s' "${EVIDENCE_TESTS_INPUT:-}" | jq -R 'split(" ") | map(select(. != ""))')"
+            artifact_paths_json="[]"
+            if [ -d "$ARTIFACT_ROOT" ]; then
+              artifact_paths_json="$(cd "$ARTIFACT_ROOT" && find . -type f -not -name 'evidence-manifest.json' | sed 's|^\./||' | sort | jq -R -s 'split("\n") | map(select(. != ""))')"
+            fi
+            jq -n \
+              --arg manifest_version "1" \
+              --arg workflow "$EVIDENCE_WORKFLOW" \
+              --arg run_id "$EVIDENCE_RUN_ID" \
+              --arg run_attempt "$EVIDENCE_RUN_ATTEMPT" \
+              --arg source_ref "$EVIDENCE_SOURCE_REF" \
+              --arg source_sha "$EVIDENCE_SOURCE_SHA" \
+              --arg target "$EVIDENCE_TARGET" \
+              --arg evidence_scope "$evidence_scope" \
+              --argjson tests "$tests_json" \
+              --argjson artifact_paths "$artifact_paths_json" \
+              --arg finished_at "$finished_at" \
+              '{
+                manifest_version: ($manifest_version | tonumber),
+                workflow: $workflow,
+                run_id: $run_id,
+                run_attempt: $run_attempt,
+                source_ref: $source_ref,
+                source_sha: $source_sha,
+                target: $target,
+                evidence_scope: $evidence_scope,
+                tests: $tests,
+                artifact_paths: $artifact_paths,
+                finished_at: $finished_at
+              } | if .tests == [] then del(.tests) else . end | if .artifact_paths == [] then del(.artifact_paths) else . end' \
+              > "$ARTIFACT_ROOT/evidence-manifest.json"
+          else
+            cat > "$ARTIFACT_ROOT/evidence-manifest.json" << MANIFEST_EOF
+          {
+            "manifest_version": 1,
+            "workflow": "${EVIDENCE_WORKFLOW}",
+            "run_id": "${EVIDENCE_RUN_ID}",
+            "run_attempt": "${EVIDENCE_RUN_ATTEMPT}",
+            "source_ref": "${EVIDENCE_SOURCE_REF}",
+            "source_sha": "${EVIDENCE_SOURCE_SHA}",
+            "target": "${EVIDENCE_TARGET}",
+            "evidence_scope": "${evidence_scope}",
+            "tests": [],
+            "artifact_paths": [],
+            "finished_at": "${finished_at}"
+          }
+          MANIFEST_EOF
+          fi
+
+
       - name: Upload xfstests output
         if: ${{ always() && (github.event_name == 'schedule' || inputs.target == 'all' || inputs.target == matrix.target) }}
         uses: actions/upload-artifact@v7
