@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use tidefs_types_pool_label_core::{
     decode_label, DeviceClass, LabelError, PoolLabelV1, PoolRedundancyPolicy, PoolState,
-    POOL_LABEL_MAGIC,
+    POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
 };
 
 pub mod device_removal;
@@ -65,6 +65,125 @@ pub use device_removal::{
     EvacuationEntry, EvacuationPlanOutcome, NoopDeviceRemovalHooks, ObjectPlacement,
     PostDrainVerificationError, VdevRemoveStats,
 };
+
+const COMPLETED_EVACUATIONS_EXTENSION_MAGIC: [u8; 8] = *b"TFSEVAC1";
+const COMPLETED_EVACUATIONS_EXTENSION_VERSION: u32 = 1;
+const COMPLETED_EVACUATIONS_EXTENSION_HEADER_SIZE: usize = 48;
+const COMPLETED_EVACUATION_RECORD_SIZE: usize = 64;
+
+pub(crate) fn encode_completed_evacuations_label_extension(
+    completed_evacuations: &[CompletedEvacuation],
+    label_area_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if label_area_bytes < POOL_LABEL_V1_EXT_WIRE_SIZE {
+        return Err(format!(
+            "label area {label_area_bytes} bytes is smaller than base label {POOL_LABEL_V1_EXT_WIRE_SIZE}"
+        ));
+    }
+    let extension_len = label_area_bytes - POOL_LABEL_V1_EXT_WIRE_SIZE;
+    let mut extension = vec![0u8; extension_len];
+    if completed_evacuations.is_empty() {
+        return Ok(extension);
+    }
+
+    let record_bytes = completed_evacuations
+        .len()
+        .checked_mul(COMPLETED_EVACUATION_RECORD_SIZE)
+        .ok_or_else(|| "completed evacuation evidence size overflow".to_string())?;
+    let needed = COMPLETED_EVACUATIONS_EXTENSION_HEADER_SIZE
+        .checked_add(record_bytes)
+        .ok_or_else(|| "completed evacuation evidence size overflow".to_string())?;
+    if needed > extension_len {
+        return Err(format!(
+            "{} completed evacuation receipts require {needed} extension bytes, but label area has {extension_len}",
+            completed_evacuations.len()
+        ));
+    }
+
+    extension[0..8].copy_from_slice(&COMPLETED_EVACUATIONS_EXTENSION_MAGIC);
+    extension[8..12].copy_from_slice(&COMPLETED_EVACUATIONS_EXTENSION_VERSION.to_le_bytes());
+    extension[12..16].copy_from_slice(&(completed_evacuations.len() as u32).to_le_bytes());
+
+    let mut offset = COMPLETED_EVACUATIONS_EXTENSION_HEADER_SIZE;
+    for evacuation in completed_evacuations {
+        extension[offset..offset + 16].copy_from_slice(&evacuation.target_device_guid);
+        offset += 16;
+        extension[offset..offset + 8]
+            .copy_from_slice(&evacuation.topology_generation.to_le_bytes());
+        offset += 8;
+        extension[offset..offset + 32].copy_from_slice(&evacuation.receipt_digest);
+        offset += 32;
+        extension[offset..offset + 8].copy_from_slice(&evacuation.receipt_id.to_le_bytes());
+        offset += 8;
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&extension[0..16]);
+    hasher.update(&extension[COMPLETED_EVACUATIONS_EXTENSION_HEADER_SIZE..needed]);
+    extension[16..48].copy_from_slice(hasher.finalize().as_bytes());
+    Ok(extension)
+}
+
+pub(crate) fn decode_completed_evacuations_label_extension(
+    extension: &[u8],
+) -> Result<Vec<CompletedEvacuation>, String> {
+    if extension.len() < COMPLETED_EVACUATIONS_EXTENSION_HEADER_SIZE
+        || extension[0..8] != COMPLETED_EVACUATIONS_EXTENSION_MAGIC
+    {
+        return Ok(Vec::new());
+    }
+
+    let version = u32::from_le_bytes(extension[8..12].try_into().unwrap());
+    if version != COMPLETED_EVACUATIONS_EXTENSION_VERSION {
+        return Err(format!(
+            "unsupported completed evacuation extension version {version}"
+        ));
+    }
+
+    let count = u32::from_le_bytes(extension[12..16].try_into().unwrap()) as usize;
+    let record_bytes = count
+        .checked_mul(COMPLETED_EVACUATION_RECORD_SIZE)
+        .ok_or_else(|| "completed evacuation extension size overflow".to_string())?;
+    let needed = COMPLETED_EVACUATIONS_EXTENSION_HEADER_SIZE
+        .checked_add(record_bytes)
+        .ok_or_else(|| "completed evacuation extension size overflow".to_string())?;
+    if needed > extension.len() {
+        return Err(format!(
+            "completed evacuation extension is truncated: need {needed} bytes, have {}",
+            extension.len()
+        ));
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&extension[0..16]);
+    hasher.update(&extension[COMPLETED_EVACUATIONS_EXTENSION_HEADER_SIZE..needed]);
+    let computed = hasher.finalize();
+    if computed.as_bytes() != &extension[16..48] {
+        return Err("completed evacuation extension checksum mismatch".to_string());
+    }
+
+    let mut evacuations = Vec::with_capacity(count);
+    let mut offset = COMPLETED_EVACUATIONS_EXTENSION_HEADER_SIZE;
+    for _ in 0..count {
+        let target_device_guid = extension[offset..offset + 16].try_into().unwrap();
+        offset += 16;
+        let topology_generation =
+            u64::from_le_bytes(extension[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let receipt_digest = extension[offset..offset + 32].try_into().unwrap();
+        offset += 32;
+        let receipt_id = u64::from_le_bytes(extension[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        evacuations.push(CompletedEvacuation {
+            target_device_guid,
+            topology_generation,
+            receipt_digest,
+            receipt_id,
+        });
+    }
+
+    Ok(evacuations)
+}
 // ---------------------------------------------------------------------------
 // DeviceKind — runtime device classification (not the on-disk enum)
 // ---------------------------------------------------------------------------
@@ -301,6 +420,9 @@ pub struct DeviceScanEntry {
     pub device_checksum_errors: Option<u64>,
     /// Pool-wide redundancy policy from the label.
     pub redundancy_policy: Option<PoolRedundancyPolicy>,
+    /// Completed evacuation receipts persisted in the label area.
+    #[serde(default)]
+    pub completed_evacuations: Vec<CompletedEvacuation>,
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +739,14 @@ impl PoolLabelReader {
     /// Returns `Ok(Some(label))` if a valid label is found, `Ok(None)` if
     /// no TideFS label is present, and `Err` for I/O errors.
     pub fn read_label(device_path: &Path) -> Result<Option<PoolLabelV1>, ScanError> {
+        Ok(Self::read_label_with_completed_evacuations(device_path)?
+            .map(|(label, _completed_evacuations)| label))
+    }
+
+    /// Read and parse a pool label plus completed evacuation evidence.
+    pub fn read_label_with_completed_evacuations(
+        device_path: &Path,
+    ) -> Result<Option<(PoolLabelV1, Vec<CompletedEvacuation>)>, ScanError> {
         let mut file = std::fs::File::open(device_path).map_err(|e| ScanError::Io {
             path: device_path.to_path_buf(),
             msg: format!("open: {e}"),
@@ -647,14 +777,14 @@ impl PoolLabelReader {
     fn try_read_at(
         file: &mut std::fs::File,
         offset: u64,
-    ) -> Result<Option<PoolLabelV1>, ScanError> {
+    ) -> Result<Option<(PoolLabelV1, Vec<CompletedEvacuation>)>, ScanError> {
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| ScanError::Io {
                 path: PathBuf::from("<file>"),
                 msg: format!("seek: {e}"),
             })?;
 
-        let mut buf = [0u8; tidefs_types_pool_label_core::POOL_LABEL_V1_EXT_WIRE_SIZE];
+        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         if file.read_exact(&mut buf).is_err() {
             return Ok(None);
         }
@@ -666,7 +796,24 @@ impl PoolLabelReader {
         }
 
         match decode_label(&buf) {
-            Ok(label) => Ok(Some(label)),
+            Ok(label) => {
+                let mut extension = Vec::new();
+                let extension_len = POOL_LABEL_SIZE.saturating_sub(POOL_LABEL_V1_EXT_WIRE_SIZE);
+                file.take(extension_len as u64)
+                    .read_to_end(&mut extension)
+                    .map_err(|e| ScanError::Io {
+                        path: PathBuf::from("<file>"),
+                        msg: format!("read completed evacuation extension: {e}"),
+                    })?;
+                let completed_evacuations =
+                    decode_completed_evacuations_label_extension(&extension).map_err(|msg| {
+                        ScanError::LabelEvidence {
+                            path: PathBuf::from("<file>"),
+                            msg,
+                        }
+                    })?;
+                Ok(Some((label, completed_evacuations)))
+            }
             Err(_) => Ok(None),
         }
     }
@@ -696,10 +843,11 @@ impl PoolLabelReader {
             device_write_errors: None,
             device_checksum_errors: None,
             redundancy_policy: None,
+            completed_evacuations: vec![],
         };
 
-        match Self::read_label(&info.device_path) {
-            Ok(Some(label)) => {
+        match Self::read_label_with_completed_evacuations(&info.device_path) {
+            Ok(Some((label, completed_evacuations))) => {
                 entry.has_tidefs_label = true;
                 entry.label_valid = true;
                 entry.pool_guid = Some(label.pool_guid);
@@ -716,6 +864,7 @@ impl PoolLabelReader {
                 entry.device_write_errors = Some(label.device_write_errors);
                 entry.device_checksum_errors = Some(label.device_checksum_errors);
                 entry.redundancy_policy = Some(label.redundancy_policy);
+                entry.completed_evacuations = completed_evacuations;
                 entry.label_status =
                     format!("pool={} state={}", label.pool_name_str(), label.pool_state);
             }
@@ -854,6 +1003,13 @@ pub enum ScanError {
     },
     /// A label decode/validation error.
     Label(LabelError),
+    /// Completed evacuation evidence was malformed.
+    LabelEvidence {
+        /// Path that caused the error.
+        path: PathBuf,
+        /// Human-readable message.
+        msg: String,
+    },
 }
 
 impl std::fmt::Display for ScanError {
@@ -861,6 +1017,11 @@ impl std::fmt::Display for ScanError {
         match self {
             Self::Io { path, msg } => write!(f, "I/O error on {}: {msg}", path.display()),
             Self::Label(e) => write!(f, "label error: {e}"),
+            Self::LabelEvidence { path, msg } => write!(
+                f,
+                "completed evacuation label evidence on {}: {msg}",
+                path.display()
+            ),
         }
     }
 }
@@ -2095,6 +2256,7 @@ impl PoolAssembler {
         let ref_gen = first.topology_generation.unwrap_or(0);
         let ref_count = first.device_count.unwrap_or(candidates.len() as u32);
         let ref_policy = first.redundancy_policy.unwrap_or_default();
+        let mut completed_evacuations = Vec::new();
 
         // Check pool state.
         if first.pool_state == Some(PoolState::Destroyed) {
@@ -2130,6 +2292,12 @@ impl PoolAssembler {
                     expected: ref_policy,
                     found: found_policy,
                 });
+            }
+
+            for evacuation in &entry.completed_evacuations {
+                if !completed_evacuations.contains(evacuation) {
+                    completed_evacuations.push(evacuation.clone());
+                }
             }
 
             seen_indices.push(index);
@@ -2203,7 +2371,7 @@ impl PoolAssembler {
             device_count: ref_count,
             missing_indices: missing,
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
+            completed_evacuations,
         })
     }
 }
@@ -2582,6 +2750,7 @@ mod tests {
             device_write_errors: Some(0),
             device_checksum_errors: Some(0),
             redundancy_policy: Some(PoolRedundancyPolicy::replicated(1)),
+            completed_evacuations: vec![],
         }
     }
 
@@ -2918,6 +3087,7 @@ mod tests {
             device_write_errors: None,
             device_checksum_errors: None,
             redundancy_policy: None,
+            completed_evacuations: vec![],
         }];
 
         let result = PoolAssembler::assemble(&entries, None);
@@ -3405,6 +3575,12 @@ mod tests {
             write_errors: 0,
             checksum_errors: 0,
         };
+        let evacuation = CompletedEvacuation {
+            target_device_guid: [0xEEu8; 16],
+            topology_generation: 7,
+            receipt_digest: [0x5Au8; 32],
+            receipt_id: 41,
+        };
         let original = PoolConfig {
             pool_uuid: [0xABu8; 16],
             pool_name: "roundtrip".to_string(),
@@ -3419,7 +3595,7 @@ mod tests {
             device_count: 1,
             missing_indices: vec![],
             removing_device_indices: vec![],
-            completed_evacuations: vec![],
+            completed_evacuations: vec![evacuation.clone()],
         };
 
         // 1. Generate labels from the config.
@@ -3430,13 +3606,17 @@ mod tests {
         assert_eq!(labels[0].pool_state, PoolState::Exported);
         assert_eq!(labels[0].topology_generation, 7);
 
-        // 2. Seal each label and write to device file.
-        for label in &labels {
-            let sealed = seal_label(label.clone()).unwrap();
-            let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-            encode_label(&sealed, &mut buf).unwrap();
-            std::fs::write(&dev_path, buf).unwrap();
-        }
+        // 2. Write the label through the pool-scan writer so completed
+        // evacuation evidence is persisted in the label extension.
+        let file_size = (POOL_LABEL_SIZE * 2) as u64;
+        let f = std::fs::File::create(&dev_path).unwrap();
+        f.set_len(file_size).unwrap();
+        let scan_cfg = PoolScanConfig::new(vec![dev_path.clone()]);
+        let mut sizes = BTreeMap::new();
+        sizes.insert(0, file_size);
+        PoolLabelWriter::new(scan_cfg)
+            .write_pool_labels(&original, Some(&sizes))
+            .unwrap();
 
         // 3. Scan labels from device files.
         let entries = scan_labels(&[dev_path.clone()]).unwrap();
@@ -3444,6 +3624,7 @@ mod tests {
         assert!(entries[0].has_tidefs_label);
         assert!(entries[0].label_valid);
         assert_eq!(entries[0].pool_guid, Some([0xABu8; 16]));
+        assert_eq!(entries[0].completed_evacuations, vec![evacuation.clone()]);
 
         // 4. Reconstruct PoolConfig.
         let reconstructed = PoolAssembler::assemble(&entries, None).unwrap();
@@ -3459,6 +3640,7 @@ mod tests {
             original.topology_generation
         );
         assert!(reconstructed.missing_indices.is_empty());
+        assert_eq!(reconstructed.completed_evacuations, vec![evacuation]);
     }
 
     #[test]

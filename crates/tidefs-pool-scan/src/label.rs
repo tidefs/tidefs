@@ -14,6 +14,8 @@ use tidefs_types_pool_label_core::{
     POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
 };
 
+use crate::{decode_completed_evacuations_label_extension, CompletedEvacuation};
+
 // ---------------------------------------------------------------------------
 // PoolScanConfig
 // ---------------------------------------------------------------------------
@@ -279,6 +281,40 @@ impl LabelReader {
             .collect()
     }
 
+    /// Read completed evacuation evidence from the same label copy selected by
+    /// [`Self::read_label`].
+    pub fn read_completed_evacuations(
+        &self,
+        device_path: &Path,
+    ) -> Result<Vec<CompletedEvacuation>, String> {
+        let mut file =
+            std::fs::File::open(device_path).map_err(|e| format!("cannot open device: {e}"))?;
+        let size = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| format!("seek to end failed: {e}"))?;
+
+        if let Some(evacuations) =
+            self.try_read_completed_evacuations_at(&mut file, self.config.label0_offset)?
+        {
+            return Ok(evacuations);
+        }
+
+        let label1_offset = self
+            .config
+            .label1_offset
+            .unwrap_or_else(|| size.saturating_sub(self.config.label_area_bytes));
+
+        if label1_offset > 0 && label1_offset != self.config.label0_offset {
+            if let Some(evacuations) =
+                self.try_read_completed_evacuations_at(&mut file, label1_offset)?
+            {
+                return Ok(evacuations);
+            }
+        }
+
+        Ok(Vec::new())
+    }
+
     // ------------------------------------------------------------------
     // Explicit BLAKE3 checksum validation
     // ------------------------------------------------------------------
@@ -393,6 +429,38 @@ impl LabelReader {
                 LabelReadOutcome::Corrupted { reason, error_kind }
             }
         }
+    }
+
+    fn try_read_completed_evacuations_at(
+        &self,
+        file: &mut std::fs::File,
+        offset: u64,
+    ) -> Result<Option<Vec<CompletedEvacuation>>, String> {
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return Ok(None);
+        }
+
+        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
+        if file.read_exact(&mut buf).is_err() {
+            return Ok(None);
+        }
+
+        let magic: [u8; 4] = match buf[0..4].try_into() {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        if magic != POOL_LABEL_MAGIC {
+            return Ok(None);
+        }
+        decode_label(&buf).map_err(|e| format!("label decode failed: {e}"))?;
+
+        let extension_len =
+            (self.config.label_area_bytes as usize).saturating_sub(POOL_LABEL_V1_EXT_WIRE_SIZE);
+        let mut extension = Vec::new();
+        file.take(extension_len as u64)
+            .read_to_end(&mut extension)
+            .map_err(|e| format!("read completed evacuation extension: {e}"))?;
+        decode_completed_evacuations_label_extension(&extension).map(Some)
     }
 }
 
@@ -619,8 +687,7 @@ fn canonicalize_or_identity(path: &Path) -> PathBuf {
 /// canonical device path (i.e. the same identity was seen on at least
 /// two different physical devices).
 fn distinct_canonical_paths(observations: &[(PathBuf, String)]) -> bool {
-    let paths: std::collections::BTreeSet<&PathBuf> =
-        observations.iter().map(|(p, _)| p).collect();
+    let paths: std::collections::BTreeSet<&PathBuf> = observations.iter().map(|(p, _)| p).collect();
     paths.len() > 1
 }
 
