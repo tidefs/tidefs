@@ -630,8 +630,15 @@ impl ReplicatedObjectStore {
                 )
             });
 
-        let write_class = quorum_result.write_class;
-        let needs_repair = quorum_result.needs_repair;
+        let min_quorum = self.config.min_target_count as u64;
+        let write_class = if acks >= total_targets {
+            WriteClass::Committed
+        } else if acks >= min_quorum {
+            WriteClass::DegradedCommitted
+        } else {
+            WriteClass::RefusedNoQuorum
+        };
+        let needs_repair = write_class == WriteClass::DegradedCommitted;
 
         // Update stats
         match write_class {
