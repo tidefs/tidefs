@@ -5,11 +5,11 @@
 //! writes an object into a LocalObjectStore on "node A", sends a
 //! SegmentFetchRequest from "node B" via send_segment_fetch, processes
 //! the request on node A, sends back a SegmentFetchResponse, and
-//! verifies BLAKE3 integrity and byte equality on node B.
+//! verifies structural response integrity and byte equality on node B.
 //!
 //! This exercises the full segment fetch message dispatch pipeline:
 //!   encode (magic SF01) → send → recv → decode → store lookup →
-//!   encode (magic SF02, bound digest) → send → recv → decode → verify
+//!   encode (magic SF02) -> send -> recv -> decode -> verify
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::thread;
@@ -125,7 +125,7 @@ fn segment_fetch_request_response_over_transport() {
         let segment = full[start..slice_end].to_vec();
         let actual_len = segment.len() as u64;
 
-        // Build and send SegmentFetchResponse with BLAKE3 integrity
+        // Build and send SegmentFetchResponse with structural integrity
         let response = SegmentFetchResponse::new(
             request.object_id,
             request.segment_offset,
@@ -151,7 +151,7 @@ fn segment_fetch_request_response_over_transport() {
     let request = SegmentFetchRequest::new(object_id, segment_offset, segment_length);
     send_segment_fetch(&mut node_b, sid, &request).expect("client send segment fetch request");
 
-    // Receive the response with BLAKE3 verification
+    // Receive the response with structural verification
     let response =
         recv_segment_fetch_response(&mut node_b, sid).expect("client recv segment fetch response");
 
@@ -284,9 +284,9 @@ fn segment_fetch_empty_payload() {
     server_handle.join().expect("server");
 }
 
-/// BLAKE3 digest rejection: tamper with the payload in-flight.
+/// Response-shape rejection: tamper with the payload length in-flight.
 #[test]
-fn segment_fetch_digest_mismatch_rejected() {
+fn segment_fetch_length_mismatch_rejected() {
     let (mut node_a, addr_a) = listening_transport(5);
     let (_dir_a, mut store_a) = temp_store();
     let mut node_b = Transport::new(6);
@@ -300,16 +300,16 @@ fn segment_fetch_digest_mismatch_rejected() {
         .put(ObjectKey::from_name(object_id.to_le_bytes()), &full_payload)
         .expect("put");
 
-    // Server builds a valid response, but the client simulates corruption
-    // by manually building a tampered response and sending it back.
+    // Server builds a valid response, but simulates a wire peer sending a
+    // tampered payload that no longer matches the encoded segment length.
     let server_handle = thread::spawn(move || {
         let sid = blocking_accept(&mut node_a);
         node_a.perform_handshake(sid).expect("server handshake");
 
         let request = recv_segment_fetch(&mut node_a, sid).expect("server recv");
 
-        // Build a correct response, then tamper with the payload
-        // before encoding so the digest won't match.
+        // Build a correct response, then tamper with the payload before
+        // encoding so the response shape no longer matches.
         let mut response = SegmentFetchResponse::new(
             request.object_id,
             request.segment_offset,
@@ -317,11 +317,9 @@ fn segment_fetch_digest_mismatch_rejected() {
             b"valid".to_vec(),
         );
 
-        // Tamper with the payload after digest computation
-        response.payload = b"BAD!!".to_vec();
+        // Tamper with the payload after constructor validation.
+        response.payload = b"BAD!".to_vec();
         // NOTE: segment_length still says 5 but payload is now 4 bytes.
-        // Transport session provides per-message integrity
-        // as well as the length mismatch.
 
         // Encode and send the tampered response anyway
         send_segment_fetch_response(&mut node_a, sid, &response).expect("send tampered response");
@@ -339,12 +337,12 @@ fn segment_fetch_digest_mismatch_rejected() {
     let request = SegmentFetchRequest::new(object_id, 0, 5);
     send_segment_fetch(&mut node_b, sid, &request).expect("send");
 
-    // The response should fail BLAKE3 verification
+    // The response should fail structural verification.
     let result = recv_segment_fetch_response(&mut node_b, sid);
     assert!(result.is_err(), "tampered response must be rejected");
     assert!(
-        result.unwrap_err().to_string().contains("digest"),
-        "error should mention digest mismatch"
+        result.unwrap_err().to_string().contains("length mismatch"),
+        "error should mention length mismatch"
     );
 
     node_b

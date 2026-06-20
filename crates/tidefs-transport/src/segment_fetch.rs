@@ -211,7 +211,9 @@ impl SegmentFetchResponse {
                 &bytes[..4]
             ))));
         }
-        bincode::deserialize(&bytes[4..])
+        let response: Self = bincode::deserialize(&bytes[4..])?;
+        response.validate_wire_shape()?;
+        Ok(response)
     }
 
     /// Check whether `bytes` starts with the segment fetch response magic.
@@ -220,6 +222,29 @@ impl SegmentFetchResponse {
     /// full decode.
     pub fn has_magic_prefix(bytes: &[u8]) -> bool {
         bytes.len() >= 4 && bytes[..4] == SEGMENT_FETCH_RESPONSE_MAGIC
+    }
+
+    fn validate_wire_shape(&self) -> Result<(), bincode::Error> {
+        let payload_len = self.payload.len() as u64;
+        if self.segment_length != payload_len {
+            return Err(bincode::Error::new(bincode::ErrorKind::Custom(format!(
+                "segment fetch response length mismatch: segment_length {} != payload.len() {}",
+                self.segment_length, payload_len
+            ))));
+        }
+
+        if self
+            .segment_offset
+            .checked_add(self.segment_length)
+            .is_none()
+        {
+            return Err(bincode::Error::new(bincode::ErrorKind::Custom(format!(
+                "segment fetch response range overflow: segment_offset {} + segment_length {}",
+                self.segment_offset, self.segment_length
+            ))));
+        }
+
+        Ok(())
     }
 }
 

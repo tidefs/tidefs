@@ -33,6 +33,14 @@ fn listening_transport(node_id: u64) -> (Transport, tidefs_transport::TransportA
     (transport, bound_addr)
 }
 
+fn configure_attestation_for_family(transport: &mut Transport, family: EndpointFamily) {
+    if !matches!(family, EndpointFamily::LocalEmbed) {
+        transport
+            .configure_generated_attestation(true)
+            .expect("configure generated attestation");
+    }
+}
+
 /// Block until a connection arrives, retrying with small delays.
 fn blocking_accept(transport: &mut Transport) -> SessionId {
     for _ in 0..50 {
@@ -292,6 +300,8 @@ fn session_negotiation_endpoint_family_propagation() {
     // Use Control endpoint family (e1)
     client.endpoint_family = EndpointFamily::Control;
     server.endpoint_family = EndpointFamily::Control;
+    configure_attestation_for_family(&mut client, EndpointFamily::Control);
+    configure_attestation_for_family(&mut server, EndpointFamily::Control);
 
     server.add_node(NodeInfo::new(2, vec![server_addr.clone()], 0));
     client.add_node(NodeInfo::new(1, vec![server_addr], 0));
@@ -351,6 +361,8 @@ fn session_negotiation_all_endpoint_families() {
 
         server.endpoint_family = family;
         client.endpoint_family = family;
+        configure_attestation_for_family(&mut server, family);
+        configure_attestation_for_family(&mut client, family);
 
         server.add_node(NodeInfo::new(2, vec![server_addr.clone()], 0));
         client.add_node(NodeInfo::new(1, vec![server_addr], 0));

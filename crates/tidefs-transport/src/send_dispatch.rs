@@ -1668,9 +1668,7 @@ mod tests {
     #[test]
     fn dispatcher_per_connection_limiter_isolation() {
         // Each peer gets its own independent limiter.
-        // Concurrent enqueues on the same peer compete, but enqueues on
-        // different peers do not interfere.
-        use std::sync::Barrier;
+        // A saturated limiter for one peer must not affect another peer.
         let config = SendQueueConfig::new(16, 1024 * 1024).unwrap();
         let dispatcher = Arc::new(
             SendDispatcher::new(config, ErrorClassifier::new(), None).with_max_inflight(1),
@@ -1685,33 +1683,23 @@ mod tests {
         assert!(dispatcher.limiter(peer_a).is_some(), "peer A has a limiter");
         assert!(dispatcher.limiter(peer_b).is_some(), "peer B has a limiter");
 
-        // Concurrently enqueue on peer_a and peer_b.
-        let barrier = Arc::new(Barrier::new(3));
-        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peer_a_limiter = dispatcher.limiter(peer_a).unwrap();
+        let _held_peer_a = peer_a_limiter.try_acquire().unwrap();
 
-        for (tid, peer) in [(0, peer_a), (1, peer_b)] {
-            let d = Arc::clone(&dispatcher);
-            let b = Arc::clone(&barrier);
-            let r = Arc::clone(&results);
-            std::thread::spawn(move || {
-                b.wait();
-                let res = d.enqueue(peer, make_msg(format!("t{tid}").as_bytes()));
-                r.lock().unwrap().push((peer, res));
-            });
-        }
+        let peer_a_result = dispatcher.enqueue(peer_a, make_msg(b"blocked"));
+        assert!(matches!(
+            peer_a_result,
+            Err(SendError::SendConcurrencyLimitExceeded {
+                conn_id: id,
+                max: 1,
+                ..
+            }) if id == peer_a
+        ));
 
-        barrier.wait();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let final_results = results.lock().unwrap();
-
-        // Peer B must succeed (independent limiter from peer A).
-        // Peer A may get Shutdown from transient lock contention
-        // on the shared limiters HashMap; the important property
-        // is that peer B's limiter is independent.
-        let b_ok = final_results.iter().any(|(p, r)| *p == peer_b && r.is_ok());
+        let peer_b_result = dispatcher.enqueue(peer_b, make_msg(b"independent"));
         assert!(
-            b_ok,
-            "peer B should succeed with independent limiter: {final_results:?}"
+            peer_b_result.is_ok(),
+            "peer B should succeed with an independent limiter: {peer_b_result:?}"
         );
     }
 

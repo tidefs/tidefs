@@ -636,10 +636,9 @@ mod tests {
         while limiter.check() {}
         assert_eq!(limiter.available_tokens(), 0);
         thread::sleep(Duration::from_millis(50));
-        let available = limiter.available_tokens();
         assert!(
-            available > 0,
-            "should have refilled after 50ms, got {available}"
+            limiter.check(),
+            "should accept after the refill interval elapsed"
         );
     }
 
