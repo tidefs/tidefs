@@ -120,6 +120,210 @@ mod tests {
     }
 }
 
+// ── Placement admission snapshots ──────────────────────────────────
+// Issue #641: Public typed snapshot for placement/rebuild callers
+// with degradation evidence and conservative stale handling.
+
+/// Stale evidence: explains why a replica is considered stale.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum StaleEvidence {
+    /// No I/O has ever been recorded for this replica.
+    NeverSeen,
+    /// Last I/O exceeds the stale timeout.
+    TimedOut { last_io_ns: u64, age_ns: u64, timeout_ns: u64 },
+}
+
+/// Coarse health class derived from the 0–100 score.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
+pub enum HealthClass {
+    /// Score 90–100: excellent health.
+    Excellent,
+    /// Score 70–89: good health, minor issues.
+    Good,
+    /// Score 40–69: degraded, elevated failures.
+    Degraded,
+    /// Score 1–39: critical, approaching exclusion.
+    Critical,
+    /// Score 0: dead or checksum-corrupted.
+    Dead,
+}
+
+impl HealthClass {
+    /// Classify a 0–100 health score.
+    pub fn from_score(score: u32) -> Self {
+        match score {
+            0 => HealthClass::Dead,
+            1..=39 => HealthClass::Critical,
+            40..=69 => HealthClass::Degraded,
+            70..=89 => HealthClass::Good,
+            _ => HealthClass::Excellent,
+        }
+    }
+}
+
+/// Checksum mismatch severity relative to the maximum tolerated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ChecksumClass {
+    /// No mismatches recorded.
+    None,
+    /// Minor: 1 up to half the max-tolerated threshold.
+    Minor,
+    /// Severe: above half the threshold but still below the hard limit.
+    Severe,
+    /// Exceeded: at or above the max-tolerated threshold (immediate Dead).
+    Exceeded,
+}
+
+impl ChecksumClass {
+    /// Classify a mismatch count against a `max_checksum_mismatches` ceiling.
+    pub fn classify(mismatches: u32, max_allowed: u32) -> Self {
+        if mismatches == 0 {
+            ChecksumClass::None
+        } else if mismatches >= max_allowed {
+            ChecksumClass::Exceeded
+        } else if mismatches > max_allowed / 2 {
+            ChecksumClass::Severe
+        } else {
+            ChecksumClass::Minor
+        }
+    }
+}
+
+/// Admission snapshot: a stable, serializable view of whether a replica
+/// is eligible for placement, rebuild-source reads, degraded reads, or
+/// exclusion, with the evidence used to make that decision.
+///
+/// Unlike `ReplicaHealthMetrics`, this type is designed for handoff to
+/// placement and rebuild planners without exposing internal
+/// transition-engine counters. Stale replicas are explicitly identified
+/// with evidence and a conservative admission decision.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AdmissionSnapshot {
+    /// The replica's node identifier.
+    pub node_id: NodeId,
+    /// Current degradation state.
+    pub degradation_state: state_machine::DegradationState,
+    /// Health score (0–100).
+    pub health_score: u32,
+    /// Health class derived from the score.
+    pub health_class: HealthClass,
+    /// Timestamp (ns) of the last recorded I/O, if any.
+    pub last_io_ns: Option<u64>,
+    /// Age (ns) since the last recorded I/O at snapshot time, if any.
+    pub last_io_age_ns: Option<u64>,
+    /// Whether the replica is stale (no I/O within the stale timeout).
+    pub is_stale: bool,
+    /// BLAKE3 checksum mismatch count.
+    pub checksum_mismatches: u32,
+    /// Checksum mismatch severity classification.
+    pub checksum_class: ChecksumClass,
+    /// Eligible for new placement.
+    pub eligible_for_placement: bool,
+    /// Eligible as a source for rebuild reads.
+    pub eligible_for_rebuild_source: bool,
+    /// Eligible to serve degraded reads.
+    pub eligible_for_degraded_reads: bool,
+    /// Excluded from all I/O (placement, rebuild, reads).
+    pub is_excluded: bool,
+    /// When stale, evidence explaining why.
+    pub stale_evidence: Option<StaleEvidence>,
+}
+
+impl AdmissionSnapshot {
+    /// Create an admission snapshot for a tracked replica.
+    ///
+    /// If the scorer exists, its current score is used; otherwise a
+    /// zero-filled score is substituted. Staleness is determined by
+    /// comparing the last-I/O age against `stale_timeout_ns`.
+    pub(crate) fn snapshot(
+        node_id: NodeId,
+        engine: &state_machine::DegradationTransitionEngine,
+        scorer: Option<&scoring::ReplicaHealthScorer>,
+        last_io_ns: Option<u64>,
+        now_ns: u64,
+        stale_timeout_ns: u64,
+        max_checksum_mismatches: u32,
+    ) -> Self {
+        let degradation_state = engine.state();
+        let (health_score, checksum_mismatches) = if let Some(s) = scorer {
+            let sc = s.compute_score(now_ns);
+            (sc.score, sc.checksum_mismatches)
+        } else {
+            (100, 0)
+        };
+        let health_class = HealthClass::from_score(health_score);
+        let checksum_class = ChecksumClass::classify(checksum_mismatches, max_checksum_mismatches);
+        let last_io_age_ns = last_io_ns.map(|ts| now_ns.saturating_sub(ts));
+
+        // Staleness: a replica is stale if it has never been seen, or
+        // if its last I/O is older than the stale timeout.
+        let is_stale = match last_io_ns {
+            None => true,
+            Some(ts) => now_ns.saturating_sub(ts) > stale_timeout_ns,
+        };
+
+        let stale_evidence = if is_stale {
+            match last_io_ns {
+                None => Some(StaleEvidence::NeverSeen),
+                Some(ts) => Some(StaleEvidence::TimedOut {
+                    last_io_ns: ts,
+                    age_ns: now_ns.saturating_sub(ts),
+                    timeout_ns: stale_timeout_ns,
+                }),
+            }
+        } else {
+            None
+        };
+
+        // Admission decisions: stale and dead replicas are excluded
+        // from all I/O. Healthy, Degraded, and Recovering replicas have
+        // per-state eligibility.
+        let (eligible_for_placement, eligible_for_rebuild_source,
+             eligible_for_degraded_reads, is_excluded) = if is_stale {
+            (false, false, false, true)
+        } else {
+            match degradation_state {
+                state_machine::DegradationState::Healthy => {
+                    (true, true, true, false)
+                }
+                state_machine::DegradationState::Degraded => {
+                    // Degraded replicas can still receive placement,
+                    // serve rebuild reads, and handle degraded reads,
+                    // but callers should deprioritize based on score.
+                    (true, true, true, false)
+                }
+                state_machine::DegradationState::Recovering => {
+                    // Recovering replicas should not receive new
+                    // placement (they are still rebuilding internal
+                    // state), but can serve reads.
+                    (false, true, true, false)
+                }
+                state_machine::DegradationState::Dead => {
+                    (false, false, false, true)
+                }
+            }
+        };
+
+        AdmissionSnapshot {
+            node_id,
+            degradation_state,
+            health_score,
+            health_class,
+            last_io_ns,
+            last_io_age_ns,
+            is_stale,
+            checksum_mismatches,
+            checksum_class,
+            eligible_for_placement,
+            eligible_for_rebuild_source,
+            eligible_for_degraded_reads,
+            is_excluded,
+            stale_evidence,
+        }
+    }
+}
+
+
 // ── Per-replica degradation tracking ───────────────────────────────
 // Issue #5165: Replica-level degradation state machine driven by I/O
 // success/failure, latency, and BLAKE3 checksum mismatches.
@@ -301,6 +505,55 @@ impl ReplicaDegradationTracker {
         self.last_io_ns.get(&replica_id).copied()
     }
 
+    /// Produce an admission snapshot for a single replica.
+    ///
+    /// Returns `None` if the replica is not tracked (no transition
+    /// engine exists). Staleness is evaluated at `now_ns` against the
+    /// configured `stale_timeout_ns`.
+    pub fn snapshot_admission(
+        &self,
+        replica_id: NodeId,
+        now_ns: u64,
+    ) -> Option<AdmissionSnapshot> {
+        let engine = self.engines.get(&replica_id)?;
+        let scorer = self.scorers.get(&replica_id);
+        let last_io = self.last_io_ns.get(&replica_id).copied();
+        Some(AdmissionSnapshot::snapshot(
+            replica_id,
+            engine,
+            scorer,
+            last_io,
+            now_ns,
+            self.stale_timeout_ns,
+            self.degradation_config.max_checksum_mismatches,
+        ))
+    }
+
+    /// Produce admission snapshots for all tracked replicas.
+    ///
+    /// Includes replicas that have never recorded I/O (these will
+    /// appear as stale with `StaleEvidence::NeverSeen`).
+    pub fn snapshot_all_admissions(&self, now_ns: u64) -> Vec<AdmissionSnapshot> {
+        self.engines
+            .keys()
+            .map(|&replica_id| {
+                let engine = &self.engines[&replica_id];
+                let scorer = self.scorers.get(&replica_id);
+                let last_io = self.last_io_ns.get(&replica_id).copied();
+                AdmissionSnapshot::snapshot(
+                    replica_id,
+                    engine,
+                    scorer,
+                    last_io,
+                    now_ns,
+                    self.stale_timeout_ns,
+                    self.degradation_config.max_checksum_mismatches,
+                )
+            })
+            .collect()
+    }
+
+
     /// Check all tracked replicas for staleness and transition
     /// silent replicas past their timeout to Dead.
     ///
@@ -377,6 +630,476 @@ impl ReplicaDegradationTracker {
         )
     }
 }
+
+
+#[cfg(test)]
+mod admission_snapshot_tests {
+    use super::*;
+    use state_machine::DegradationState;
+
+    fn tracker() -> ReplicaDegradationTracker {
+        ReplicaDegradationTracker::new(
+            scoring::ScoreConfig::default(),
+            state_machine::DegradationConfig::default(),
+        )
+    }
+
+    fn tracker_stale_timeout(timeout_ns: u64) -> ReplicaDegradationTracker {
+        ReplicaDegradationTracker::with_stale_timeout(
+            scoring::ScoreConfig::default(),
+            state_machine::DegradationConfig::default(),
+            timeout_ns,
+        )
+    }
+
+    // ── Health class classification ─────────────────────────────────
+
+    #[test]
+    fn health_class_from_score_boundaries() {
+        assert_eq!(HealthClass::from_score(0), HealthClass::Dead);
+        assert_eq!(HealthClass::from_score(1), HealthClass::Critical);
+        assert_eq!(HealthClass::from_score(39), HealthClass::Critical);
+        assert_eq!(HealthClass::from_score(40), HealthClass::Degraded);
+        assert_eq!(HealthClass::from_score(69), HealthClass::Degraded);
+        assert_eq!(HealthClass::from_score(70), HealthClass::Good);
+        assert_eq!(HealthClass::from_score(89), HealthClass::Good);
+        assert_eq!(HealthClass::from_score(90), HealthClass::Excellent);
+        assert_eq!(HealthClass::from_score(100), HealthClass::Excellent);
+    }
+
+    // ── Checksum class classification ───────────────────────────────
+
+    #[test]
+    fn checksum_class_none() {
+        assert_eq!(ChecksumClass::classify(0, 3), ChecksumClass::None);
+    }
+
+    #[test]
+    fn checksum_class_minor() {
+        // max=3, half=1, so 1 is Minor
+        assert_eq!(ChecksumClass::classify(1, 3), ChecksumClass::Minor);
+    }
+
+    #[test]
+    fn checksum_class_severe() {
+        // max=5, half=2, so 3 and 4 are Severe
+        assert_eq!(ChecksumClass::classify(3, 5), ChecksumClass::Severe);
+        assert_eq!(ChecksumClass::classify(4, 5), ChecksumClass::Severe);
+    }
+
+    #[test]
+    fn checksum_class_exceeded() {
+        // At threshold exactly
+        assert_eq!(ChecksumClass::classify(3, 3), ChecksumClass::Exceeded);
+        // Above threshold
+        assert_eq!(ChecksumClass::classify(5, 3), ChecksumClass::Exceeded);
+    }
+
+    // ── Healthy replica snapshot ─────────────────────────────────────
+
+    #[test]
+    fn healthy_replica_admission() {
+        let mut t = tracker();
+        let node = NodeId::new(1);
+        t.record_success(node, 1_000_000_000, 100);
+
+        let snap = t.snapshot_admission(node, 2_000_000_000).unwrap();
+        assert_eq!(snap.node_id, node);
+        assert_eq!(snap.degradation_state, DegradationState::Healthy);
+        assert!(snap.health_score >= 90);
+        assert_eq!(snap.health_class, HealthClass::Excellent);
+        assert_eq!(snap.last_io_ns, Some(1_000_000_000));
+        assert_eq!(snap.last_io_age_ns, Some(1_000_000_000));
+        assert!(!snap.is_stale);
+        assert_eq!(snap.checksum_mismatches, 0);
+        assert_eq!(snap.checksum_class, ChecksumClass::None);
+        assert!(snap.eligible_for_placement);
+        assert!(snap.eligible_for_rebuild_source);
+        assert!(snap.eligible_for_degraded_reads);
+        assert!(!snap.is_excluded);
+        assert!(snap.stale_evidence.is_none());
+    }
+
+    // ── Degraded replica snapshot ────────────────────────────────────
+
+    #[test]
+    fn degraded_replica_admission() {
+        let mut t = tracker();
+        let node = NodeId::new(1);
+
+        // 5 failures → Degraded
+        for _ in 0..5 {
+            t.record_failure(node, 1_000_000_000, 5000, false);
+        }
+        assert_eq!(t.degradation_state(node), DegradationState::Degraded);
+
+        let snap = t.snapshot_admission(node, 2_000_000_000).unwrap();
+        assert_eq!(snap.degradation_state, DegradationState::Degraded);
+        assert!(snap.health_score < 70); // Degraded health score
+        assert!(!snap.is_stale);
+        // Degraded replicas are still placeable but deprioritized
+        assert!(snap.eligible_for_placement);
+        assert!(snap.eligible_for_rebuild_source);
+        assert!(snap.eligible_for_degraded_reads);
+        assert!(!snap.is_excluded);
+        assert!(snap.stale_evidence.is_none());
+    }
+
+    // ── Dead replica snapshot ────────────────────────────────────────
+
+    #[test]
+    fn dead_replica_admission() {
+        let mut t = tracker();
+        let node = NodeId::new(1);
+
+        // Unrecoverable → immediate Dead
+        t.record_failure(node, 1_000_000_000, 0, true);
+        assert_eq!(t.degradation_state(node), DegradationState::Dead);
+
+        let snap = t.snapshot_admission(node, 2_000_000_000).unwrap();
+        assert_eq!(snap.degradation_state, DegradationState::Dead);
+        assert!(!snap.eligible_for_placement);
+        assert!(!snap.eligible_for_rebuild_source);
+        assert!(!snap.eligible_for_degraded_reads);
+        assert!(snap.is_excluded);
+        assert!(!snap.is_stale); // Dead is not the same as stale
+        assert!(snap.stale_evidence.is_none());
+    }
+
+    // ── Recovering replica snapshot ──────────────────────────────────
+
+    #[test]
+    fn recovering_replica_admission() {
+        let mut t = tracker();
+        let node = NodeId::new(1);
+
+        t.force_state(node, DegradationState::Dead, 1_000_000_000);
+        // One success → Recovering
+        t.record_success(node, 2_000_000_000, 100);
+        assert_eq!(t.degradation_state(node), DegradationState::Recovering);
+
+        let snap = t.snapshot_admission(node, 3_000_000_000).unwrap();
+        assert_eq!(snap.degradation_state, DegradationState::Recovering);
+        // Recovering: no new placement, but reads allowed
+        assert!(!snap.eligible_for_placement);
+        assert!(snap.eligible_for_rebuild_source);
+        assert!(snap.eligible_for_degraded_reads);
+        assert!(!snap.is_excluded);
+        assert!(!snap.is_stale);
+        assert!(snap.stale_evidence.is_none());
+    }
+
+    // ── Stale replica (timed out) ────────────────────────────────────
+
+    #[test]
+    fn stale_timed_out_admission() {
+        let mut t = tracker_stale_timeout(5_000_000_000); // 5s timeout
+        let node = NodeId::new(1);
+
+        // Record I/O at t=1s
+        t.record_success(node, 1_000_000_000, 100);
+        assert_eq!(t.degradation_state(node), DegradationState::Healthy);
+
+        // Snapshot at t=7s (past 5s timeout) → stale
+        let snap = t.snapshot_admission(node, 7_000_000_000).unwrap();
+        assert_eq!(snap.degradation_state, DegradationState::Healthy); // not yet forced dead
+        assert!(snap.is_stale);
+        assert!(!snap.eligible_for_placement);
+        assert!(!snap.eligible_for_rebuild_source);
+        assert!(!snap.eligible_for_degraded_reads);
+        assert!(snap.is_excluded);
+
+        // Stale evidence should be TimedOut
+        match snap.stale_evidence.unwrap() {
+            StaleEvidence::TimedOut { last_io_ns, age_ns, timeout_ns } => {
+                assert_eq!(last_io_ns, 1_000_000_000);
+                assert_eq!(age_ns, 6_000_000_000);
+                assert_eq!(timeout_ns, 5_000_000_000);
+            }
+            _ => panic!("expected TimedOut"),
+        }
+    }
+
+    // ── Stale replica (never seen) ───────────────────────────────────
+
+    #[test]
+    fn stale_never_seen_admission() {
+        // A replica with no I/O ever recorded produces NeverSeen evidence.
+        // This can occur via direct AdmissionSnapshot construction for
+        // replicas discovered through membership without I/O history.
+        let snap = AdmissionSnapshot::snapshot(
+            NodeId::new(99),
+            &state_machine::DegradationTransitionEngine::new(
+                state_machine::DegradationConfig::default(),
+            ),
+            None,           // no scorer
+            None,           // no last I/O timestamp
+            1_000_000_000,  // now_ns
+            30_000_000_000, // stale_timeout_ns
+            1,              // max_checksum_mismatches
+        );
+        assert!(snap.is_stale);
+        assert!(!snap.eligible_for_placement);
+        assert!(snap.is_excluded);
+        match snap.stale_evidence.unwrap() {
+            StaleEvidence::NeverSeen => {}
+            _ => panic!("expected NeverSeen"),
+        }
+    }
+
+    // ── Snapshot for untracked replica ───────────────────────────────
+
+    #[test]
+    fn snapshot_untracked_returns_none() {
+        let t = tracker();
+        assert!(t.snapshot_admission(NodeId::new(99), 0).is_none());
+    }
+
+    // ── Batch snapshot for all replicas ──────────────────────────────
+
+    #[test]
+    fn snapshot_all_includes_all_tracked() {
+        let mut t = tracker();
+        t.record_success(NodeId::new(1), 1_000_000_000, 100);
+        t.record_failure(NodeId::new(2), 1_000_000_000, 5000, false);
+
+        let snaps = t.snapshot_all_admissions(2_000_000_000);
+        assert_eq!(snaps.len(), 2);
+        let ids: Vec<u64> = snaps.iter().map(|s| s.node_id.0).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+    }
+
+    // ── Checksum mismatches reflected in snapshot ────────────────────
+
+    #[test]
+    fn checksum_mismatch_class_in_snapshot() {
+        let node = NodeId::new(1);
+
+        // Use a custom config with higher mismatch threshold so we can
+        // observe Minor → Severe → Exceeded → (Dead) progression.
+        // Note: ChecksumClass uses >= max for Exceeded; the state
+        // machine requires strict > max for the Dead transition.
+        let config = state_machine::DegradationConfig {
+            max_checksum_mismatches: 5,
+            failure_threshold: 10,
+            ..state_machine::DegradationConfig::default()
+        };
+        let mut t = ReplicaDegradationTracker::new(
+            scoring::ScoreConfig::default(),
+            config,
+        );
+        t.record_success(node, 1_000_000_000, 100);
+
+        // One mismatch: Minor (1 <= 5/2=2)
+        t.record_checksum_mismatch(node, 2_000_000_000, 200);
+        let snap = t.snapshot_admission(node, 3_000_000_000).unwrap();
+        assert_eq!(snap.checksum_mismatches, 1);
+        assert_eq!(snap.checksum_class, ChecksumClass::Minor);
+        assert_eq!(snap.degradation_state, DegradationState::Healthy);
+
+        // Three mismatches: Severe (3 > 2, but < 5)
+        t.record_checksum_mismatch(node, 4_000_000_000, 200);
+        t.record_checksum_mismatch(node, 5_000_000_000, 200);
+        let snap = t.snapshot_admission(node, 6_000_000_000).unwrap();
+        assert_eq!(snap.checksum_mismatches, 3);
+        assert_eq!(snap.checksum_class, ChecksumClass::Severe);
+
+        // Five mismatches: Exceeded (5 >= max=5) but state is still
+        // Healthy because the state machine requires > max.
+        t.record_checksum_mismatch(node, 7_000_000_000, 200);
+        t.record_checksum_mismatch(node, 8_000_000_000, 200);
+        let snap = t.snapshot_admission(node, 9_000_000_000).unwrap();
+        assert_eq!(snap.checksum_mismatches, 5);
+        assert_eq!(snap.checksum_class, ChecksumClass::Exceeded);
+        assert_eq!(snap.degradation_state, DegradationState::Healthy);
+
+        // Sixth mismatch: > max → Dead; counter resets on transition
+        t.record_checksum_mismatch(node, 10_000_000_000, 200);
+        assert_eq!(t.degradation_state(node), DegradationState::Dead);
+        let snap = t.snapshot_admission(node, 11_000_000_000).unwrap();
+        // Counters reset on state transition, so current window is zero.
+        assert_eq!(snap.checksum_mismatches, 0);
+        assert_eq!(snap.checksum_class, ChecksumClass::None);
+        assert_eq!(snap.degradation_state, DegradationState::Dead);
+        assert!(!snap.eligible_for_placement);
+        assert!(snap.is_excluded);
+    }
+
+    // ── Transition: Recovering → Healthy admission ───────────────────
+
+    #[test]
+    fn recovering_back_to_healthy_snapshot() {
+        let mut t = tracker();
+        let node = NodeId::new(1);
+
+        t.force_state(node, DegradationState::Dead, 1_000_000_000);
+        t.record_success(node, 2_000_000_000, 100);
+        assert_eq!(t.degradation_state(node), DegradationState::Recovering);
+
+        // 10 consecutive successes → Healthy
+        for _ in 0..10 {
+            t.record_success(node, 3_000_000_000, 100);
+        }
+        assert_eq!(t.degradation_state(node), DegradationState::Healthy);
+
+        let snap = t.snapshot_admission(node, 4_000_000_000).unwrap();
+        assert_eq!(snap.degradation_state, DegradationState::Healthy);
+        assert!(snap.eligible_for_placement);
+        assert!(snap.eligible_for_rebuild_source);
+        assert!(!snap.is_stale);
+        assert!(!snap.is_excluded);
+    }
+
+    // ── Serialization roundtrip ──────────────────────────────────────
+
+    #[test]
+    fn admission_snapshot_serialization_roundtrip() {
+        let mut t = tracker();
+        let node = NodeId::new(42);
+        t.record_success(node, 1_000_000_000, 50);
+        t.record_checksum_mismatch(node, 1_500_000_000, 200);
+
+        let snap = t.snapshot_admission(node, 2_000_000_000).unwrap();
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let deserialized: AdmissionSnapshot = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.node_id, snap.node_id);
+        assert_eq!(deserialized.degradation_state, snap.degradation_state);
+        assert_eq!(deserialized.health_score, snap.health_score);
+        assert_eq!(deserialized.health_class, snap.health_class);
+        assert_eq!(deserialized.last_io_ns, snap.last_io_ns);
+        assert_eq!(deserialized.last_io_age_ns, snap.last_io_age_ns);
+        assert_eq!(deserialized.is_stale, snap.is_stale);
+        assert_eq!(deserialized.checksum_mismatches, snap.checksum_mismatches);
+        assert_eq!(deserialized.checksum_class, snap.checksum_class);
+        assert_eq!(deserialized.eligible_for_placement, snap.eligible_for_placement);
+        assert_eq!(deserialized.eligible_for_rebuild_source, snap.eligible_for_rebuild_source);
+        assert_eq!(deserialized.eligible_for_degraded_reads, snap.eligible_for_degraded_reads);
+        assert_eq!(deserialized.is_excluded, snap.is_excluded);
+        // StaleEvidence roundtrip
+        assert_eq!(deserialized.stale_evidence.is_some(), snap.stale_evidence.is_some());
+    }
+
+    // ── StaleEvidence serialization roundtrip ────────────────────────
+
+    #[test]
+    fn stale_evidence_serialization() {
+        let never = StaleEvidence::NeverSeen;
+        let json = serde_json::to_string(&never).unwrap();
+        let back: StaleEvidence = serde_json::from_str(&json).unwrap();
+        match back {
+            StaleEvidence::NeverSeen => {}
+            _ => panic!("expected NeverSeen"),
+        }
+
+        let timed_out = StaleEvidence::TimedOut {
+            last_io_ns: 1000,
+            age_ns: 5000,
+            timeout_ns: 3000,
+        };
+        let json = serde_json::to_string(&timed_out).unwrap();
+        let back: StaleEvidence = serde_json::from_str(&json).unwrap();
+        match back {
+            StaleEvidence::TimedOut { last_io_ns, age_ns, timeout_ns } => {
+                assert_eq!(last_io_ns, 1000);
+                assert_eq!(age_ns, 5000);
+                assert_eq!(timeout_ns, 3000);
+            }
+            _ => panic!("expected TimedOut"),
+        }
+    }
+
+    // ── Staleness does not change degradation state ──────────────────
+
+    #[test]
+    fn stale_snapshot_preserves_underlying_state() {
+        let mut t = tracker_stale_timeout(5_000_000_000);
+        let node = NodeId::new(1);
+
+        // Record I/O at t=1s → Healthy
+        t.record_success(node, 1_000_000_000, 100);
+        assert_eq!(t.degradation_state(node), DegradationState::Healthy);
+
+        // Snapshot at t=10s: snapshot reports stale, but state unchanged
+        let snap = t.snapshot_admission(node, 10_000_000_000).unwrap();
+        assert_eq!(snap.degradation_state, DegradationState::Healthy);
+        assert!(snap.is_stale);
+        // State machine still reports Healthy (stale check not run yet)
+        assert_eq!(t.degradation_state(node), DegradationState::Healthy);
+    }
+
+    // ── Within-timeout replica is not stale ──────────────────────────
+
+    #[test]
+    fn within_timeout_not_stale() {
+        let mut t = tracker_stale_timeout(30_000_000_000); // 30s
+        let node = NodeId::new(1);
+
+        t.record_success(node, 1_000_000_000, 100);
+        // At t=20s (within 30s timeout)
+        let snap = t.snapshot_admission(node, 20_000_000_000).unwrap();
+        assert!(!snap.is_stale);
+        assert!(snap.eligible_for_placement);
+        assert!(snap.stale_evidence.is_none());
+        assert!(!snap.is_excluded);
+    }
+
+    // ── Existing state-machine methods remain unchanged ──────────────
+
+    #[test]
+    fn is_placeable_unchanged() {
+        let mut t = tracker();
+        let node = NodeId::new(1);
+        assert!(t.is_placeable(node)); // Healthy → placeable
+        // Degraded → still placeable
+        for _ in 0..5 {
+            t.record_failure(node, 1_000_000_000, 5000, false);
+        }
+        assert!(t.is_placeable(node));
+        // Dead → not placeable
+        for _ in 0..3 {
+            t.record_failure(node, 2_000_000_000, 5000, false);
+        }
+        assert!(!t.is_placeable(node));
+    }
+
+    #[test]
+    fn is_excluded_unchanged() {
+        let mut t = tracker();
+        let node = NodeId::new(1);
+        assert!(!t.is_excluded(node));
+        // Direct Dead → excluded
+        t.force_state(node, DegradationState::Dead, 1_000_000_000);
+        assert!(t.is_excluded(node));
+    }
+
+    // ── Degradation scoring still works through snapshot ─────────────
+
+    #[test]
+    fn snapshot_health_score_reflects_failures() {
+        let mut t = tracker();
+        let node = NodeId::new(1);
+
+        // 100 successes → score near 100
+        for _ in 0..100 {
+            t.record_success(node, 1_000_000_000, 10);
+        }
+        let snap = t.snapshot_admission(node, 2_000_000_000).unwrap();
+        assert!(snap.health_score >= 95);
+
+        // Reset and add failures
+        let mut t2 = tracker();
+        t2.force_state(NodeId::new(2), DegradationState::Healthy, 0);
+        for _ in 0..50 {
+            t2.record_failure(NodeId::new(2), 1_000_000_000, 10000, false);
+        }
+        let snap2 = t2.snapshot_admission(NodeId::new(2), 2_000_000_000).unwrap();
+        assert!(snap2.health_score < 70, "expected low score, got {}", snap2.health_score);
+    }
+}
+
 
 #[cfg(test)]
 mod degradation_tests {

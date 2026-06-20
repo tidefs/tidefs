@@ -3295,6 +3295,7 @@ dependencies = [
  "blake3",
  "getrandom 0.2.17",
  "serde",
+ "serde_json",
  "tidefs-membership-epoch",
  "tidefs-replication-model",
  "tokio",
