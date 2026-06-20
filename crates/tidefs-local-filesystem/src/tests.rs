@@ -1268,6 +1268,45 @@ fn unlink_of_buffered_dirty_file_releases_dirty_capacity() {
 }
 
 #[test]
+fn unlink_of_foreground_flushed_dirty_file_releases_capacity() {
+    let root = temp_root("unlink-flushed-dirty-capacity");
+    let data_len = content_chunk_size() as usize;
+    let mut fs =
+        LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), data_len as u64)
+            .expect("open fs");
+    fs.create_file("/dirty.bin", 0o600).expect("create dirty");
+    fs.create_file("/next.bin", 0o600).expect("create next");
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(data_len);
+
+    fs.write_file("/dirty.bin", 0, &vec![0x11; data_len])
+        .expect("dirty write should foreground flush");
+    assert!(
+        fs.write_buffers.is_empty(),
+        "test setup should leave no unflushed write-buffer bytes"
+    );
+    assert_eq!(fs.capacity_authority().used_bytes(), data_len as u64);
+    assert_eq!(fs.capacity_authority().pending_bytes(), data_len as u64);
+    assert!(matches!(
+        fs.write_file("/next.bin", 0, &vec![0x22; data_len]),
+        Err(FileSystemError::NoSpace { .. })
+    ));
+
+    fs.unlink("/dirty.bin")
+        .expect("unlink should discard flushed uncommitted dirty content");
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        0,
+        "unlink must release the foreground-flushed dirty charge",
+    );
+    assert_eq!(fs.capacity_authority().pending_bytes(), 0);
+    fs.write_file("/next.bin", 0, &vec![0x33; data_len])
+        .expect("released flushed capacity admits next write");
+
+    cleanup(&root);
+}
+
+#[test]
 fn rename_overwrite_of_buffered_dirty_file_releases_dirty_capacity() {
     let root = temp_root("rename-overwrite-buffered-dirty-capacity");
     let data_len = content_chunk_size() as usize;
@@ -6093,6 +6132,37 @@ fn reflink_file_same_content() {
     assert_eq!(src_content, source);
     assert_eq!(dst_content, source);
     assert_eq!(src_content, dst_content);
+
+    cleanup(&root);
+}
+
+#[test]
+fn reflink_file_accounts_destination_capacity() {
+    let root = temp_root("reflink-capacity");
+    let data_len = content_chunk_size() as usize;
+    let mut fs = LocalFileSystem::open_with_capacity(
+        &root,
+        StoreOptions::test_fast(),
+        (data_len as u64) * 2,
+    )
+    .expect("open fs");
+    let payload = vec![0x35; data_len];
+
+    fs.create_file("/source.txt", 0o644).expect("create source");
+    fs.write_file("/source.txt", 0, &payload)
+        .expect("write source");
+    fs.fsync_all().expect("commit source");
+    assert_eq!(fs.capacity_authority().used_bytes(), data_len as u64);
+
+    fs.reflink_file("/source.txt", "/dest.txt")
+        .expect("reflink");
+
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        (data_len as u64) * 2,
+        "reflink destination must consume mounted capacity until shared-extent accounting exists",
+    );
+    assert_eq!(fs.read_file("/dest.txt").expect("read dest"), payload);
 
     cleanup(&root);
 }

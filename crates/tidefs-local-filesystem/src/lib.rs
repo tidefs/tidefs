@@ -677,6 +677,7 @@ struct MutationDelta {
     old_quota_table: QuotaTable,
     old_space_accounting: SpaceAccounting,
     old_capacity_authority: CapacityAuthoritySnapshot,
+    old_obligation_ledger: Box<ObligationLedger>,
     old_dirty_pages: BTreeMap<InodeId, Vec<DirtyRange>>,
     old_extent_allocator: ExtentAllocator,
     old_reclaim_queue: BPlusTreeReclaimQueue,
@@ -5786,6 +5787,9 @@ impl LocalFileSystem {
         };
 
         let planned_entries = planned_chunk_allocation_entries_for_full_content(&dest_record)?;
+        let allocation_bytes = allocation_bytes(&planned_entries)?;
+        let new_blocks = allocation_bytes / content_chunk_size() as u64;
+        self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(planned_inode_id))?;
         self.ensure_content_capacity_with_planned_inode(None, planned_entries)?;
 
         self.begin_mutation(); // was: let previous_state = self.state.clone()
@@ -5800,6 +5804,12 @@ impl LocalFileSystem {
         let inode_id = self.allocate_inode_id();
         debug_assert_eq!(tick, planned_tick);
         debug_assert_eq!(inode_id, planned_inode_id);
+        if let Err(err) =
+            self.account_new_file_content(inode_id, dest_record.size, allocation_bytes, tick)
+        {
+            self.rollback_mutation_delta();
+            return Err(err);
+        }
 
         // Zero-copy reflink: store dedup redirects at destination chunk keys.
         let result = {
@@ -6635,6 +6645,64 @@ impl LocalFileSystem {
                     requested: u64::MAX,
                 })
         })
+    }
+
+    fn account_new_file_content(
+        &mut self,
+        inode_id: InodeId,
+        logical_bytes: u64,
+        allocation_bytes: u64,
+        tick: u64,
+    ) -> Result<()> {
+        if logical_bytes > 0 {
+            let handle = self.reserve_with_hierarchy(logical_bytes).map_err(|_e| {
+                FileSystemError::NoSpace {
+                    resource: LocalStorageResource::ContentBytes,
+                    requested: logical_bytes,
+                    available: self.capacity_authority.available_bytes(),
+                    capacity: self.capacity_authority.total_bytes(),
+                    allocated: self.capacity_authority.used_bytes(),
+                }
+            })?;
+            handle.commit();
+            self.state
+                .space_accounting
+                .accumulate_delta(SpaceDelta::new_write(logical_bytes));
+            self.state
+                .space_accounting
+                .track_physical_write(logical_bytes);
+        }
+
+        let new_blocks = allocation_bytes / content_chunk_size() as u64;
+        self.obligation_ledger.release_claims_for_inode(inode_id);
+        if new_blocks > 0 {
+            self.obligation_ledger
+                .claim(ClaimEntry {
+                    claim_id: ClaimId::new(),
+                    budget_domain: BudgetDomainId::from_str("staging_dirty"),
+                    blocks: new_blocks,
+                    inode_id,
+                    reason: ClaimReason::Write,
+                    authorized_by: StorageAuthorityToken::ABSENT,
+                    generation: tick,
+                })
+                .ok();
+        }
+        let _ = self.budget_domain.admit_claim(ClaimEntryRecord {
+            claim_id: ClaimId::new(),
+            claimant_ref: ClaimantRef::Service {
+                service_name: "staging_dirty".into(),
+            },
+            claim_class: ClaimClass::Product,
+            claimed_bytes: new_blocks * content_chunk_size() as u64,
+            committed_bytes: 0,
+            inode_id: Some(inode_id),
+            freshness_fence_ref: None,
+            claim_receipt_ref: StorageAuthorityToken::ABSENT,
+            expiration_deadline: None,
+        });
+
+        Ok(())
     }
 
     fn record_dirty_buffer_free(&mut self, bytes: u64) {
@@ -10962,6 +11030,7 @@ impl LocalFileSystem {
         self.state.last_extent_map_write_tx.remove(&inode_id);
         self.state.extent_maps.remove(&inode_id);
         self.state.known_inode_ids.remove(&inode_id);
+        self.obligation_ledger.release_claims_for_inode(inode_id);
         self.dirty_set.forget_inode(inode_id);
         self.inode_cache.borrow_mut().invalidate(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
@@ -11001,6 +11070,7 @@ impl LocalFileSystem {
                 old_quota_table: self.state.quota_table.clone(),
                 old_space_accounting: self.state.space_accounting.clone(),
                 old_capacity_authority: self.capacity_authority.snapshot_for_rollback(),
+                old_obligation_ledger: self.obligation_ledger.clone(),
                 old_dirty_pages,
                 old_extent_allocator: self.extent_allocator.clone(),
                 old_reclaim_queue: self.reclaim_queue.lock().unwrap().clone(),
@@ -11068,6 +11138,7 @@ impl LocalFileSystem {
             self.state.space_accounting = delta.old_space_accounting;
             self.capacity_authority
                 .restore_from_snapshot(&delta.old_capacity_authority);
+            self.obligation_ledger = delta.old_obligation_ledger;
             self.extent_allocator = delta.old_extent_allocator;
             // Restore dirty-page tracker ranges.
             if let Ok(mut tracker) = self.writeback_range_tracker.lock() {

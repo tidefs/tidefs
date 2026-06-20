@@ -3694,6 +3694,12 @@ impl VfsLocalFileSystem {
         debug_assert_eq!(tick, planned_tick);
         dest_record.data_version = tick;
         dest_record.metadata_version = tick;
+        if let Err(err) =
+            fs.account_new_file_content(dest_fh.inode_id, source_size, allocation_bytes, tick)
+        {
+            fs.rollback_mutation_delta();
+            return Err(map_errno(&err));
+        }
         let result = {
             let fs = &mut *fs;
             let dedup_enabled = fs.dedup_enabled;
@@ -9427,6 +9433,50 @@ mod tests {
         assert_eq!(
             engine
                 .read(&dest_create, 0, copy_len as u32, &ctx())
+                .unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn copy_file_range_whole_file_accounts_destination_capacity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_len = crate::constants::content_chunk_size() as usize;
+        let local_fs = LocalFileSystem::open_with_capacity(
+            dir.path(),
+            tidefs_local_object_store::StoreOptions::test_fast(),
+            (data_len as u64) * 2,
+        )
+        .expect("open local filesystem");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(root, b"copy-capacity-source.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(root, b"copy-capacity-dest.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let payload = vec![0x5a; data_len];
+
+        engine.write(&source_create, 0, &payload, &ctx()).unwrap();
+        assert_eq!(
+            engine.fs.borrow().capacity_authority().used_bytes(),
+            data_len as u64
+        );
+
+        let copied = engine
+            .copy_file_range(&source_create, 0, &dest_create, 0, data_len as u64, &ctx())
+            .unwrap();
+
+        assert_eq!(copied, data_len as u32);
+        assert_eq!(
+            engine.fs.borrow().capacity_authority().used_bytes(),
+            (data_len as u64) * 2,
+            "whole-file copy fast path must charge the destination bytes"
+        );
+        assert_eq!(
+            engine
+                .read(&dest_create, 0, data_len as u32, &ctx())
                 .unwrap(),
             payload
         );
