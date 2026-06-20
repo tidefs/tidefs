@@ -137,6 +137,12 @@ local and clustered paths only when the local path remains in-process and
 validated as non-regressing for local latency, throughput, and POSIX/block
 semantics.
 
+The clustered POSIX LOCK forwarding boundary is specified in
+`docs/design/clustered-posix-lock-forwarding-boundary.md`. It names the mounted
+clustered owner that supplies committed dataset mount identity, membership
+epoch, term, and LOCK transport while keeping the existing local FUSE/VFS lock
+dispatch in-process.
+
 ## Data Flow
 
 ### Read Path
