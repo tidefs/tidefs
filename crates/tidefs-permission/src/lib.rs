@@ -292,6 +292,112 @@ impl AccessMode {
 }
 
 // ---------------------------------------------------------------------------
+// Typed permission access planning
+// ---------------------------------------------------------------------------
+
+/// Error returned by typed permission access planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionAccessError {
+    /// The requested access mask contains unsupported bits.
+    InvalidRequest {
+        /// Request validation error.
+        source: AccessRequestError,
+    },
+    /// The committed dataset mount identity is invalid.
+    InvalidMountIdentity {
+        /// Mount identity validation error.
+        source: MountIdentityError,
+    },
+    /// The supplied POSIX access ACL is malformed.
+    InvalidAcl {
+        /// POSIX ACL structural validation error.
+        source: PosixAclStructureError,
+    },
+}
+
+impl From<AccessRequestError> for PermissionAccessError {
+    fn from(source: AccessRequestError) -> Self {
+        Self::InvalidRequest { source }
+    }
+}
+
+impl From<MountIdentityError> for PermissionAccessError {
+    fn from(source: MountIdentityError) -> Self {
+        Self::InvalidMountIdentity { source }
+    }
+}
+
+impl From<PosixAclStructureError> for PermissionAccessError {
+    fn from(source: PosixAclStructureError) -> Self {
+        Self::InvalidAcl { source }
+    }
+}
+
+impl core::fmt::Display for PermissionAccessError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidRequest { .. } => write!(f, "invalid permission access request"),
+            Self::InvalidMountIdentity { .. } => write!(f, "invalid permission mount identity"),
+            Self::InvalidAcl { .. } => write!(f, "invalid POSIX access ACL"),
+        }
+    }
+}
+
+/// Authority path that supplied a permission access decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionAccessAuthority {
+    /// Empty request after inode resolution, equivalent to an `F_OK` check.
+    Existence,
+    /// Root DAC override path, including the POSIX execute restriction.
+    RootOverride {
+        /// Effective rwx bits exposed by the root override path.
+        effective_perm: u8,
+    },
+    /// Classic inode mode bits supplied the decision.
+    ModeBits {
+        /// Effective rwx bits selected for the caller.
+        effective_perm: u8,
+    },
+    /// A validated POSIX access ACL supplied the decision.
+    PosixAcl {
+        /// Typed decision returned by `tidefs-posix-acl`.
+        decision: PosixAclAccessDecision,
+    },
+}
+
+/// Typed permission access decision bound to a committed mount identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionAccessDecision {
+    /// Mount identity used for the permission evaluation.
+    pub mount_identity: MountIdentity,
+    /// Original requested access mask.
+    pub requested: u8,
+    /// Final allow/deny result after validation and DAC evaluation.
+    pub allowed: bool,
+    /// Authority path that supplied the decision.
+    pub authority: PermissionAccessAuthority,
+}
+
+impl PermissionAccessDecision {
+    /// Return `true` when the requested access is allowed.
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        self.allowed
+    }
+
+    /// Effective rwx permission bits selected by the authority path.
+    #[must_use]
+    pub const fn effective_perm(self) -> u8 {
+        match self.authority {
+            PermissionAccessAuthority::Existence => ACCESS_NONE,
+            PermissionAccessAuthority::RootOverride { effective_perm }
+            | PermissionAccessAuthority::ModeBits { effective_perm } => effective_perm,
+            PermissionAccessAuthority::PosixAcl { decision } => decision.plan.effective_perm,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Result-returning access check (wired into FUSE handlers)
 // ---------------------------------------------------------------------------
 
@@ -482,16 +588,92 @@ fn mode_permission_bits(
     }
 }
 
+/// Return the effective root override bits for a requested inode.
+fn root_override_perm_bits(attrs: &dyn InodeAttr) -> u8 {
+    let mut perm = ACCESS_READ | ACCESS_WRITE;
+    if (attrs.mode() & S_IFMT) != S_IFREG || (attrs.mode() & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0 {
+        perm |= ACCESS_EXECUTE;
+    }
+    perm
+}
+
+/// Plan a validated discretionary access decision.
+///
+/// `None` or an empty ACL slice means no access ACL is present and the decision
+/// falls back to classic mode bits. A non-empty ACL is structurally validated
+/// and evaluated through [`decide_validated_posix_acl_access`].
+pub fn plan_permission_access(
+    attrs: &dyn InodeAttr,
+    acl: Option<&[PosixAclEntry]>,
+    uid: u32,
+    gid: u32,
+    groups: &[u32],
+    requested: u8,
+    mount_identity: &MountIdentity,
+) -> Result<PermissionAccessDecision, PermissionAccessError> {
+    validate_mount_identity(mount_identity)?;
+    validate_access_request(requested)?;
+
+    if requested == ACCESS_NONE {
+        return Ok(PermissionAccessDecision {
+            mount_identity: *mount_identity,
+            requested,
+            allowed: true,
+            authority: PermissionAccessAuthority::Existence,
+        });
+    }
+
+    if uid == 0 {
+        let effective_perm = root_override_perm_bits(attrs);
+        return Ok(PermissionAccessDecision {
+            mount_identity: *mount_identity,
+            requested,
+            allowed: (effective_perm & requested) == requested,
+            authority: PermissionAccessAuthority::RootOverride { effective_perm },
+        });
+    }
+
+    match acl {
+        Some(entries) if !entries.is_empty() => {
+            let decision = decide_validated_posix_acl_access(
+                entries,
+                attrs.uid(),
+                attrs.gid(),
+                uid,
+                gid,
+                groups,
+                attrs.mode(),
+                AccessMask::new(requested),
+            )?;
+            Ok(PermissionAccessDecision {
+                mount_identity: *mount_identity,
+                requested,
+                allowed: decision.is_allowed(),
+                authority: PermissionAccessAuthority::PosixAcl { decision },
+            })
+        }
+        _ => {
+            let effective_perm = mode_permission_bits(attrs.mode(), attrs, uid, gid, groups);
+            Ok(PermissionAccessDecision {
+                mount_identity: *mount_identity,
+                requested,
+                allowed: (effective_perm & requested) == requested,
+                authority: PermissionAccessAuthority::ModeBits { effective_perm },
+            })
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unified access check – ACL-first, mode-fallback
 // ---------------------------------------------------------------------------
 
 /// Unified discretionary access check.
 ///
-/// When `acl` is `Some` and non-empty, delegates to
-/// [`posix_acl_perm_bits_for_caller`] from `tidefs-posix-acl` and then
-/// checks the resulting bits against `requested`.  When `acl` is `None`
-/// or empty, falls back to [`check_mode_access`].
+/// When `acl` is `Some` and non-empty, delegates through
+/// [`plan_permission_access`] and the validated POSIX ACL decision path from
+/// `tidefs-posix-acl`.  When `acl` is `None` or empty, falls back to classic
+/// mode bits.
 ///
 /// # Parameters
 ///
@@ -511,39 +693,9 @@ pub fn check_access(
     requested: u8,
     mount_identity: &MountIdentity,
 ) -> bool {
-    // Fail closed on invalid mount identity
-    if !mount_identity.is_valid() {
-        return false;
-    }
-
-    // Root (uid 0) bypasses most DAC checks, but may not execute a regular
-    // file that has no execute bits set for anyone (POSIX rule).  This
-    // applies regardless of whether an ACL is present.
-    if uid == 0 {
-        if (requested & ACCESS_EXECUTE) != 0
-            && (attrs.mode() & S_IFMT) == S_IFREG
-            && (attrs.mode() & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0
-        {
-            return false;
-        }
-        return true;
-    }
-
-    match acl {
-        Some(entries) if !entries.is_empty() => {
-            let perm = posix_acl_perm_bits_for_caller(
-                entries,
-                attrs.uid(),
-                attrs.gid(),
-                uid,
-                gid,
-                groups,
-                attrs.mode(),
-            );
-            (perm & requested) == requested
-        }
-        _ => check_mode_access(attrs, uid, gid, groups, requested, mount_identity),
-    }
+    plan_permission_access(attrs, acl, uid, gid, groups, requested, mount_identity)
+        .map(PermissionAccessDecision::is_allowed)
+        .unwrap_or(false)
 }
 
 /// Validated discretionary access check.
@@ -561,25 +713,14 @@ pub fn check_validated_access(
     requested: u8,
     mount_identity: &MountIdentity,
 ) -> Result<bool, AccessRequestError> {
-    // Fail closed on invalid mount identity
-    if !mount_identity.is_valid() {
-        return Ok(false);
+    match plan_permission_access(attrs, acl, uid, gid, groups, requested, mount_identity) {
+        Ok(decision) => Ok(decision.is_allowed()),
+        Err(PermissionAccessError::InvalidRequest { source }) => Err(source),
+        Err(
+            PermissionAccessError::InvalidMountIdentity { .. }
+            | PermissionAccessError::InvalidAcl { .. },
+        ) => Ok(false),
     }
-
-    validate_access_request(requested)?;
-    if requested == ACCESS_NONE {
-        return Ok(true);
-    }
-
-    Ok(check_access(
-        attrs,
-        acl,
-        uid,
-        gid,
-        groups,
-        requested,
-        mount_identity,
-    ))
 }
 
 /// Structured report for a validated permission check.
@@ -1136,7 +1277,39 @@ impl From<XattrNamespaceError> for XattrMapError {
     }
 }
 
-/// A simple in-memory extended-attribute store keyed by `(InodeId, xattr name)`.
+/// Dataset identity used to scope permission xattr storage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct XattrDatasetId([u8; 16]);
+
+impl XattrDatasetId {
+    /// Create a dataset xattr identity from raw dataset bytes.
+    #[must_use]
+    pub const fn new(dataset_id: [u8; 16]) -> Self {
+        Self(dataset_id)
+    }
+
+    /// Return the single-dataset helper scope used by legacy xattr APIs.
+    #[must_use]
+    pub const fn single_dataset() -> Self {
+        Self([0u8; 16])
+    }
+
+    /// Create a dataset xattr identity from a committed mount identity.
+    #[must_use]
+    pub const fn from_mount_identity(mount_identity: &MountIdentity) -> Self {
+        Self(mount_identity.dataset_id)
+    }
+
+    /// Borrow the raw 16-byte dataset id.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+/// A simple in-memory extended-attribute store keyed by dataset, inode, and
+/// xattr name.
 ///
 /// All mutation operations validate the xattr name against the recognised
 /// namespace prefixes (`user.`, `system.`, `security.`, `trusted.`).
@@ -1146,7 +1319,7 @@ impl From<XattrNamespaceError> for XattrMapError {
 /// `tidefs_xattr_storage::XattrStore`.
 #[derive(Clone, Debug, Default)]
 pub struct XattrMap {
-    entries: BTreeMap<(InodeId, Vec<u8>), Vec<u8>>,
+    entries: BTreeMap<(XattrDatasetId, InodeId, Vec<u8>), Vec<u8>>,
 }
 
 impl XattrMap {
@@ -1177,15 +1350,30 @@ impl XattrMap {
     /// Set or replace the value of an extended attribute.
     ///
     /// The name is validated against recognised namespace prefixes before
-    /// the write proceeds.
+    /// the write proceeds. This helper uses the single-dataset scope.
     pub fn setxattr(
         &mut self,
         inode: InodeId,
         name: &[u8],
         value: &[u8],
     ) -> Result<(), XattrMapError> {
+        self.setxattr_for_dataset(XattrDatasetId::single_dataset(), inode, name, value)
+    }
+
+    /// Set or replace the value of an extended attribute for `dataset_id`.
+    ///
+    /// The name is validated against recognised namespace prefixes before
+    /// the write proceeds.
+    pub fn setxattr_for_dataset(
+        &mut self,
+        dataset_id: XattrDatasetId,
+        inode: InodeId,
+        name: &[u8],
+        value: &[u8],
+    ) -> Result<(), XattrMapError> {
         validate_xattr_namespace(name)?;
-        self.entries.insert((inode, name.to_vec()), value.to_vec());
+        self.entries
+            .insert((dataset_id, inode, name.to_vec()), value.to_vec());
         Ok(())
     }
 
@@ -1193,31 +1381,74 @@ impl XattrMap {
     ///
     /// Returns `None` when the attribute does not exist.  Does *not*
     /// validate the name – callers that want namespace filtering should
-    /// call [`validate_xattr_namespace`] separately.
+    /// call [`validate_xattr_namespace`] separately. This helper uses the
+    /// single-dataset scope.
     #[must_use]
     pub fn getxattr(&self, inode: InodeId, name: &[u8]) -> Option<Vec<u8>> {
-        self.entries.get(&(inode, name.to_vec())).cloned()
+        self.getxattr_for_dataset(XattrDatasetId::single_dataset(), inode, name)
+    }
+
+    /// Retrieve the value of an extended attribute for `dataset_id`.
+    ///
+    /// Returns `None` when the attribute does not exist. Does *not* validate
+    /// the name.
+    #[must_use]
+    pub fn getxattr_for_dataset(
+        &self,
+        dataset_id: XattrDatasetId,
+        inode: InodeId,
+        name: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.entries
+            .get(&(dataset_id, inode, name.to_vec()))
+            .cloned()
     }
 
     /// List all xattr names attached to `inode`.
     ///
     /// The returned names include the namespace prefix (e.g. `user.myattr`).
+    /// This helper uses the single-dataset scope.
     #[must_use]
     pub fn listxattr(&self, inode: InodeId) -> Vec<Vec<u8>> {
+        self.listxattr_for_dataset(XattrDatasetId::single_dataset(), inode)
+    }
+
+    /// List all xattr names attached to `inode` for `dataset_id`.
+    ///
+    /// The returned names include the namespace prefix (e.g. `user.myattr`).
+    #[must_use]
+    pub fn listxattr_for_dataset(
+        &self,
+        dataset_id: XattrDatasetId,
+        inode: InodeId,
+    ) -> Vec<Vec<u8>> {
         self.entries
-            .range((inode, Vec::new())..)
-            .take_while(|((ino, _), _)| *ino == inode)
-            .map(|((_, name), _)| name.clone())
+            .range((dataset_id, inode, Vec::new())..)
+            .take_while(|((dataset, ino, _), _)| *dataset == dataset_id && *ino == inode)
+            .map(|((_, _, name), _)| name.clone())
             .collect()
     }
 
     /// Remove an extended attribute.
     ///
     /// Returns `Err(XattrMapError::NotFound)` when the attribute does not
-    /// exist for the given inode.
+    /// exist for the given inode. This helper uses the single-dataset scope.
     pub fn removexattr(&mut self, inode: InodeId, name: &[u8]) -> Result<(), XattrMapError> {
+        self.removexattr_for_dataset(XattrDatasetId::single_dataset(), inode, name)
+    }
+
+    /// Remove an extended attribute for `dataset_id`.
+    ///
+    /// Returns `Err(XattrMapError::NotFound)` when the attribute does not
+    /// exist for the given inode.
+    pub fn removexattr_for_dataset(
+        &mut self,
+        dataset_id: XattrDatasetId,
+        inode: InodeId,
+        name: &[u8],
+    ) -> Result<(), XattrMapError> {
         validate_xattr_namespace(name)?;
-        let key = (inode, name.to_vec());
+        let key = (dataset_id, inode, name.to_vec());
         if self.entries.remove(&key).is_some() {
             Ok(())
         } else {
@@ -1227,15 +1458,23 @@ impl XattrMap {
 
     /// Remove all xattrs associated with `inode` (bulk cleanup on unlink).
     ///
-    /// Returns the number of entries removed.
+    /// Returns the number of entries removed. This helper uses the
+    /// single-dataset scope.
     pub fn remove_all(&mut self, inode: InodeId) -> usize {
+        self.remove_all_for_dataset(XattrDatasetId::single_dataset(), inode)
+    }
+
+    /// Remove all xattrs associated with `inode` in `dataset_id`.
+    ///
+    /// Returns the number of entries removed.
+    pub fn remove_all_for_dataset(&mut self, dataset_id: XattrDatasetId, inode: InodeId) -> usize {
         let before = self.entries.len();
 
         // Collect keys for the given inode, then remove them.
-        let keys: Vec<(InodeId, Vec<u8>)> = self
+        let keys: Vec<(XattrDatasetId, InodeId, Vec<u8>)> = self
             .entries
-            .range((inode, Vec::new())..)
-            .take_while(|((ino, _), _)| *ino == inode)
+            .range((dataset_id, inode, Vec::new())..)
+            .take_while(|((dataset, ino, _), _)| *dataset == dataset_id && *ino == inode)
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -1249,9 +1488,24 @@ impl XattrMap {
     /// Bulk-load xattrs from an iterator of `(name, value)` pairs.
     ///
     /// Each name is validated; the entire operation fails on the first
-    /// invalid name without making partial changes.
+    /// invalid name without making partial changes. This helper uses the
+    /// single-dataset scope.
     pub fn bulk_set(
         &mut self,
+        inode: InodeId,
+        iter: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), XattrMapError> {
+        self.bulk_set_for_dataset(XattrDatasetId::single_dataset(), inode, iter)
+    }
+
+    /// Bulk-load xattrs for `dataset_id` from an iterator of `(name, value)`
+    /// pairs.
+    ///
+    /// Each name is validated; the entire operation fails on the first invalid
+    /// name without making partial changes.
+    pub fn bulk_set_for_dataset(
+        &mut self,
+        dataset_id: XattrDatasetId,
         inode: InodeId,
         iter: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
     ) -> Result<(), XattrMapError> {
@@ -1261,7 +1515,7 @@ impl XattrMap {
             validate_xattr_namespace(name)?;
         }
         for (name, value) in pairs {
-            self.entries.insert((inode, name), value);
+            self.entries.insert((dataset_id, inode, name), value);
         }
         Ok(())
     }
@@ -1809,6 +2063,136 @@ mod tests {
     }
 
     #[test]
+    fn permission_access_empty_acl_uses_mode_bits() {
+        let ino = TestInode::new(1000, 100, 0o400);
+        let decision =
+            plan_permission_access(&ino, Some(&[]), 1000, 100, &[], ACCESS_READ, &VALID_MOUNT)
+                .expect("empty ACL falls back to mode bits");
+
+        assert!(decision.is_allowed());
+        assert_eq!(
+            decision.authority,
+            PermissionAccessAuthority::ModeBits {
+                effective_perm: ACCESS_READ
+            }
+        );
+    }
+
+    #[test]
+    fn permission_access_minimal_acl_uses_validated_acl_decision() {
+        let acl = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 6,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 0,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_OTHER,
+                perm: 0,
+                id: 0,
+            },
+        ];
+        let ino = TestInode::new(1000, 100, 0o000);
+        let decision = plan_permission_access(
+            &ino,
+            Some(&acl),
+            1000,
+            200,
+            &[],
+            ACCESS_READ | ACCESS_WRITE,
+            &VALID_MOUNT,
+        )
+        .expect("minimal ACL is structurally valid");
+
+        assert!(decision.is_allowed());
+        match decision.authority {
+            PermissionAccessAuthority::PosixAcl { decision } => {
+                assert_eq!(decision.plan.class, PosixAclPermissionClass::Owner);
+                assert_eq!(decision.plan.effective_perm, ACCESS_READ | ACCESS_WRITE);
+            }
+            other => panic!("unexpected authority: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permission_access_named_user_deny_precedes_group_grant() {
+        let acl = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_USER,
+                perm: 0,
+                id: 2000,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 0,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP,
+                perm: 4,
+                id: 500,
+            },
+            PosixAclEntry {
+                tag: ACL_MASK,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_OTHER,
+                perm: 0,
+                id: 0,
+            },
+        ];
+        let ino = TestInode::new(1000, 100, 0o000);
+        let decision =
+            plan_permission_access(&ino, Some(&acl), 2000, 500, &[], ACCESS_READ, &VALID_MOUNT)
+                .expect("ACL is structurally valid");
+
+        assert!(!decision.is_allowed());
+        match decision.authority {
+            PermissionAccessAuthority::PosixAcl { decision } => {
+                assert_eq!(decision.plan.class, PosixAclPermissionClass::NamedUser);
+                assert_eq!(decision.plan.effective_perm, ACCESS_NONE);
+            }
+            other => panic!("unexpected authority: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permission_access_rejects_invalid_acl() {
+        let acl = vec![
+            PosixAclEntry {
+                tag: ACL_USER_OBJ,
+                perm: 7,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_GROUP_OBJ,
+                perm: 7,
+                id: 0,
+            },
+        ];
+        let ino = TestInode::new(1000, 100, 0o777);
+
+        assert_eq!(
+            plan_permission_access(&ino, Some(&acl), 2000, 200, &[], ACCESS_READ, &VALID_MOUNT),
+            Err(PermissionAccessError::InvalidAcl {
+                source: PosixAclStructureError::MissingOther
+            })
+        );
+    }
+
+    #[test]
     fn validated_access_preserves_root_read_write_and_execute_override() {
         let ino = TestInode::new(1000, 100, 0o000);
 
@@ -1999,6 +2383,11 @@ mod tests {
             PosixAclEntry {
                 tag: ACL_GROUP_OBJ,
                 perm: 0,
+                id: 0,
+            },
+            PosixAclEntry {
+                tag: ACL_MASK,
+                perm: 7,
                 id: 0,
             },
             PosixAclEntry {
@@ -2851,6 +3240,42 @@ mod tests {
         let removed = store.remove_all(1);
         assert_eq!(removed, 0);
         assert_eq!(store.listxattr(2).len(), 1);
+    }
+
+    #[test]
+    fn xattr_dataset_scope_isolates_same_inode_and_name() {
+        let mut store = XattrMap::new();
+        let dataset_a = XattrDatasetId::new([0x0a; 16]);
+        let dataset_b = XattrDatasetId::new([0x0b; 16]);
+
+        store
+            .setxattr_for_dataset(dataset_a, 1, b"user.shared", b"a")
+            .unwrap();
+        store
+            .setxattr_for_dataset(dataset_b, 1, b"user.shared", b"b")
+            .unwrap();
+
+        assert_eq!(
+            store.getxattr_for_dataset(dataset_a, 1, b"user.shared"),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            store.getxattr_for_dataset(dataset_b, 1, b"user.shared"),
+            Some(b"b".to_vec())
+        );
+        assert_eq!(store.getxattr(1, b"user.shared"), None);
+        assert_eq!(store.listxattr_for_dataset(dataset_a, 1).len(), 1);
+        assert_eq!(store.listxattr_for_dataset(dataset_b, 1).len(), 1);
+
+        assert_eq!(store.remove_all_for_dataset(dataset_a, 1), 1);
+        assert_eq!(
+            store.getxattr_for_dataset(dataset_a, 1, b"user.shared"),
+            None
+        );
+        assert_eq!(
+            store.getxattr_for_dataset(dataset_b, 1, b"user.shared"),
+            Some(b"b".to_vec())
+        );
     }
 
     #[test]
