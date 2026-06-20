@@ -29,8 +29,19 @@ pub enum RepairOutcome {
     MarkedCorrupt,
     /// Reconstructed from erasure-coding parity and durably written back to the object store.
     Reconstructed { bytes_written: usize },
+    /// Candidate no longer matches the current local filesystem authority.
+    AuthorityMismatch { reason: RepairAuthorityMismatch },
     /// Repair was not possible; no action taken.
     Skipped,
+}
+
+/// Why a scheduled repair candidate was rejected before writeback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepairAuthorityMismatch {
+    MissingInode,
+    DataVersionStale { candidate: u64, current: u64 },
+    BlockKindMismatch,
+    CurrentAuthorityUnavailable,
 }
 
 /// Log of repairs applied during a resolver pass.

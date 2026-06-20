@@ -187,6 +187,61 @@ impl core::fmt::Display for RepairEscalation {
 }
 
 // ---------------------------------------------------------------------------
+// RepairCandidateIdentity — local scrub authority carried into repair
+// ---------------------------------------------------------------------------
+
+/// Typed block kind carried from the scrub identity boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairBlockKind {
+    InlineContent,
+    ContentManifest,
+    ContentChunk { chunk_index: u64 },
+}
+
+/// Local scrub candidate identity consumed by repair scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairCandidateIdentity {
+    pub inode_id: u64,
+    pub data_version: u64,
+    pub kind: RepairBlockKind,
+}
+
+impl RepairCandidateIdentity {
+    #[must_use]
+    pub const fn new(inode_id: u64, data_version: u64, kind: RepairBlockKind) -> Self {
+        Self {
+            inode_id,
+            data_version,
+            kind,
+        }
+    }
+
+    #[must_use]
+    pub fn from_suspect_entry(entry: &SuspectEntry) -> Self {
+        let kind = if entry.offset == 0 {
+            RepairBlockKind::InlineContent
+        } else {
+            RepairBlockKind::ContentChunk {
+                chunk_index: entry.offset,
+            }
+        };
+        Self::new(entry.locator_id, entry.segment_id, kind)
+    }
+
+    #[must_use]
+    pub fn matches_suspect_entry(self, entry: &SuspectEntry) -> bool {
+        if self.inode_id != entry.locator_id || self.data_version != entry.segment_id {
+            return false;
+        }
+
+        match self.kind {
+            RepairBlockKind::InlineContent | RepairBlockKind::ContentManifest => entry.offset == 0,
+            RepairBlockKind::ContentChunk { chunk_index } => entry.offset == chunk_index,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RepairEvidence — placement authority required before scheduling repair
 // ---------------------------------------------------------------------------
 
@@ -211,6 +266,8 @@ impl RepairEvidenceClass {
 /// Reason a finding was not admitted into repair or rebake queues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairEvidenceRejection {
+    /// The typed scrub identity does not match the candidate entry.
+    CandidateIdentityMismatch,
     /// The finding has only a receiptless suspect record.
     MissingReceipt,
     /// The supplied receipt is synthetic, malformed, or for another object.
@@ -221,6 +278,7 @@ impl RepairEvidenceRejection {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::CandidateIdentityMismatch => "candidate-identity-mismatch",
             Self::MissingReceipt => "missing-receipt",
             Self::StaleReceipt => "stale-receipt",
         }
@@ -279,6 +337,7 @@ impl RepairEvidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RepairAdmissionInput {
     pub entry: SuspectEntry,
+    pub candidate_identity: RepairCandidateIdentity,
     pub placement_receipt_ref: Option<PlacementReceiptRef>,
     pub degraded_read_active: bool,
 }
@@ -286,8 +345,18 @@ pub struct RepairAdmissionInput {
 impl RepairAdmissionInput {
     #[must_use]
     pub fn missing_receipt(entry: SuspectEntry) -> Self {
+        let candidate_identity = RepairCandidateIdentity::from_suspect_entry(&entry);
+        Self::missing_receipt_with_identity(entry, candidate_identity)
+    }
+
+    #[must_use]
+    pub fn missing_receipt_with_identity(
+        entry: SuspectEntry,
+        candidate_identity: RepairCandidateIdentity,
+    ) -> Self {
         Self {
             entry,
+            candidate_identity,
             placement_receipt_ref: None,
             degraded_read_active: false,
         }
@@ -295,8 +364,19 @@ impl RepairAdmissionInput {
 
     #[must_use]
     pub fn with_receipt(entry: SuspectEntry, receipt: PlacementReceiptRef) -> Self {
+        let candidate_identity = RepairCandidateIdentity::from_suspect_entry(&entry);
+        Self::with_receipt_and_identity(entry, receipt, candidate_identity)
+    }
+
+    #[must_use]
+    pub fn with_receipt_and_identity(
+        entry: SuspectEntry,
+        receipt: PlacementReceiptRef,
+        candidate_identity: RepairCandidateIdentity,
+    ) -> Self {
         Self {
             entry,
+            candidate_identity,
             placement_receipt_ref: Some(receipt),
             degraded_read_active: false,
         }
@@ -343,6 +423,8 @@ pub enum RepairAdmissionSkip {
 pub struct RepairJob {
     /// The suspect entry to repair.
     pub entry: SuspectEntry,
+    /// Typed scrub identity that authorized this candidate.
+    pub candidate_identity: RepairCandidateIdentity,
     /// Durable evidence that admitted this repair job.
     pub evidence: RepairEvidence,
     /// Current escalation level.
@@ -367,6 +449,23 @@ impl RepairJob {
         Self::new_with_degraded_read(entry, evidence, replicas_remaining, false)
     }
 
+    /// Create a new repair job from a receipt-backed typed scrub candidate.
+    #[must_use]
+    pub fn new_with_identity(
+        entry: SuspectEntry,
+        evidence: RepairEvidence,
+        candidate_identity: RepairCandidateIdentity,
+        replicas_remaining: u32,
+    ) -> Self {
+        Self::new_with_identity_and_degraded_read(
+            entry,
+            evidence,
+            candidate_identity,
+            replicas_remaining,
+            false,
+        )
+    }
+
     /// Create a new repair job and mark whether it came from an active
     /// degraded-read signal.
     #[must_use]
@@ -376,10 +475,31 @@ impl RepairJob {
         replicas_remaining: u32,
         degraded_read_active: bool,
     ) -> Self {
+        let candidate_identity = RepairCandidateIdentity::from_suspect_entry(&entry);
+        Self::new_with_identity_and_degraded_read(
+            entry,
+            evidence,
+            candidate_identity,
+            replicas_remaining,
+            degraded_read_active,
+        )
+    }
+
+    /// Create a new typed repair job and mark whether it came from an active
+    /// degraded-read signal.
+    #[must_use]
+    pub fn new_with_identity_and_degraded_read(
+        entry: SuspectEntry,
+        evidence: RepairEvidence,
+        candidate_identity: RepairCandidateIdentity,
+        replicas_remaining: u32,
+        degraded_read_active: bool,
+    ) -> Self {
         let escalation =
             RepairEscalation::classify(&entry, 0, replicas_remaining, degraded_read_active);
         Self {
             entry,
+            candidate_identity,
             evidence,
             escalation,
             failed_attempts: 0,
@@ -471,12 +591,16 @@ pub struct RepairAuditEntry {
 pub struct BridgeStats {
     /// Total suspect entries ingested.
     pub entries_ingested: u64,
+    /// Entries blocked because the carried scrub identity mismatched the entry.
+    pub entries_blocked_identity_mismatch: u64,
     /// Entries admitted with receipt-backed evidence.
     pub entries_admitted_with_receipt: u64,
     /// Entries blocked because no placement receipt was supplied.
     pub entries_blocked_missing_receipt: u64,
     /// Entries blocked because the supplied receipt was stale or malformed.
     pub entries_blocked_stale_receipt: u64,
+    /// Entries rejected at dispatch because current local authority advanced.
+    pub entries_blocked_authority_mismatch: u64,
     /// Entries dispatched to repair (mirror or EC).
     pub entries_dispatched_repair: u64,
     /// Entries routed to rebake (EC parity recomputation).
@@ -497,7 +621,9 @@ pub struct BridgeStats {
 impl BridgeStats {
     #[must_use]
     pub const fn entries_blocked_by_evidence(&self) -> u64 {
-        self.entries_blocked_missing_receipt + self.entries_blocked_stale_receipt
+        self.entries_blocked_identity_mismatch
+            + self.entries_blocked_missing_receipt
+            + self.entries_blocked_stale_receipt
     }
 }
 
@@ -584,6 +710,13 @@ impl ScrubToRepairBridge {
                 continue;
             }
 
+            if !input.candidate_identity.matches_suspect_entry(&entry) {
+                let reason = RepairEvidenceRejection::CandidateIdentityMismatch;
+                self.record_evidence_block(locator_id, reason);
+                admissions.push(RepairAdmission::Blocked { locator_id, reason });
+                continue;
+            }
+
             let evidence = match input.placement_receipt_ref {
                 Some(receipt) => match RepairEvidence::from_placement_receipt(&entry, receipt) {
                     Ok(evidence) => evidence,
@@ -617,9 +750,10 @@ impl ScrubToRepairBridge {
                     reason: RepairAdmissionSkip::UpdatedExisting,
                 });
             } else {
-                let job = RepairJob::new_with_degraded_read(
+                let job = RepairJob::new_with_identity_and_degraded_read(
                     entry,
                     evidence,
+                    input.candidate_identity,
                     replicas_remaining,
                     input.degraded_read_active,
                 );
@@ -646,6 +780,9 @@ impl ScrubToRepairBridge {
 
     fn record_evidence_block(&mut self, locator_id: u64, reason: RepairEvidenceRejection) {
         match reason {
+            RepairEvidenceRejection::CandidateIdentityMismatch => {
+                self.stats.entries_blocked_identity_mismatch += 1;
+            }
             RepairEvidenceRejection::MissingReceipt => {
                 self.stats.entries_blocked_missing_receipt += 1;
             }
@@ -808,6 +945,39 @@ impl ScrubToRepairBridge {
             });
         }
     }
+
+    /// Fail closed on a candidate that no longer matches local authority.
+    pub fn mark_authority_mismatch(&mut self, locator_id: u64) {
+        if self.exhausted_set.contains(&locator_id) {
+            self.stats.idempotent_noops += 1;
+            self.audit_trace.push(RepairAuditEntry {
+                locator_id,
+                operation: "mark_authority_mismatch",
+                result: "noop_already_exhausted",
+                seq: self.audit_trace.len() as u64,
+            });
+            return;
+        }
+
+        if self.jobs.remove(&locator_id).is_some() {
+            self.stats.entries_blocked_authority_mismatch += 1;
+            self.exhausted_set.insert(locator_id);
+            self.audit_trace.push(RepairAuditEntry {
+                locator_id,
+                operation: "mark_authority_mismatch",
+                result: "authority_mismatch",
+                seq: self.audit_trace.len() as u64,
+            });
+        } else {
+            self.exhausted_set.insert(locator_id);
+            self.audit_trace.push(RepairAuditEntry {
+                locator_id,
+                operation: "mark_authority_mismatch",
+                result: "noop_not_found_absorbed",
+                seq: self.audit_trace.len() as u64,
+            });
+        }
+    }
 }
 
 impl Default for ScrubToRepairBridge {
@@ -838,6 +1008,8 @@ pub struct RebakeSchedulingBridge {
     entries_by_evidence_class: [u64; RepairEvidenceClass::LEVEL_COUNT],
     /// Entries blocked because no placement receipt was supplied.
     entries_blocked_missing_receipt: u64,
+    /// Entries blocked because the carried scrub identity mismatched the entry.
+    entries_blocked_identity_mismatch: u64,
     /// Entries blocked because the supplied receipt was stale or malformed.
     entries_blocked_stale_receipt: u64,
     /// Set of (locator_id, segment_id, offset) tuples already generated.
@@ -855,6 +1027,7 @@ impl RebakeSchedulingBridge {
             entries_generated: 0,
             entries_by_evidence_class: [0; RepairEvidenceClass::LEVEL_COUNT],
             entries_blocked_missing_receipt: 0,
+            entries_blocked_identity_mismatch: 0,
             entries_blocked_stale_receipt: 0,
             generated_entry_ids: std::collections::HashSet::new(),
         }
@@ -906,6 +1079,11 @@ impl RebakeSchedulingBridge {
                 continue;
             }
 
+            if !input.candidate_identity.matches_suspect_entry(suspect) {
+                self.record_evidence_block(RepairEvidenceRejection::CandidateIdentityMismatch);
+                continue;
+            }
+
             let evidence = match input.placement_receipt_ref {
                 Some(receipt) => match RepairEvidence::from_placement_receipt(suspect, receipt) {
                     Ok(evidence) => evidence,
@@ -947,6 +1125,9 @@ impl RebakeSchedulingBridge {
             RepairEvidenceRejection::MissingReceipt => {
                 self.entries_blocked_missing_receipt += 1;
             }
+            RepairEvidenceRejection::CandidateIdentityMismatch => {
+                self.entries_blocked_identity_mismatch += 1;
+            }
             RepairEvidenceRejection::StaleReceipt => {
                 self.entries_blocked_stale_receipt += 1;
             }
@@ -972,6 +1153,11 @@ impl RebakeSchedulingBridge {
     #[must_use]
     pub fn entries_blocked_missing_receipt(&self) -> u64 {
         self.entries_blocked_missing_receipt
+    }
+
+    #[must_use]
+    pub fn entries_blocked_identity_mismatch(&self) -> u64 {
+        self.entries_blocked_identity_mismatch
     }
 
     #[must_use]
@@ -1061,7 +1247,8 @@ mod tests {
     }
 
     fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
-        RepairAdmissionInput::with_receipt(entry, receipt_for_entry(&entry))
+        let receipt = receipt_for_entry(&entry);
+        RepairAdmissionInput::with_receipt(entry, receipt)
     }
 
     fn inputs_with_receipts(entries: &[SuspectEntry]) -> Vec<RepairAdmissionInput> {
@@ -1074,7 +1261,8 @@ mod tests {
     }
 
     fn make_job(entry: SuspectEntry, replicas_remaining: u32) -> RepairJob {
-        RepairJob::new(entry, evidence_for_entry(&entry), replicas_remaining)
+        let evidence = evidence_for_entry(&entry);
+        RepairJob::new(entry, evidence, replicas_remaining)
     }
 
     fn ingest_receipt_backed(

@@ -13,8 +13,8 @@ use std::sync::Mutex;
 use tidefs_local_object_store::SuspectEntry;
 use tidefs_replication_model::PlacementReceiptRef;
 use tidefs_scrub::repair_scheduling::{
-    RepairAdmission, RepairAdmissionInput, RepairEscalation, RepairEvidenceClass,
-    RepairEvidenceRejection, ScrubToRepairBridge,
+    RepairAdmission, RepairAdmissionInput, RepairBlockKind, RepairCandidateIdentity,
+    RepairEscalation, RepairEvidenceClass, RepairEvidenceRejection, ScrubToRepairBridge,
 };
 use tidefs_scrub::scrub_repair::{BlockReconstructor, ScrubRepairEngine, ScrubRepairLedger};
 
@@ -117,7 +117,20 @@ fn receipt_for_entry(entry: &SuspectEntry) -> PlacementReceiptRef {
 }
 
 fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
-    RepairAdmissionInput::with_receipt(entry, receipt_for_entry(&entry))
+    let receipt = receipt_for_entry(&entry);
+    let identity = identity_for_entry(&entry);
+    RepairAdmissionInput::with_receipt_and_identity(entry, receipt, identity)
+}
+
+fn identity_for_entry(entry: &SuspectEntry) -> RepairCandidateIdentity {
+    let kind = if entry.offset == 0 {
+        RepairBlockKind::InlineContent
+    } else {
+        RepairBlockKind::ContentChunk {
+            chunk_index: entry.offset,
+        }
+    };
+    RepairCandidateIdentity::new(entry.locator_id, entry.segment_id, kind)
 }
 
 // 1. Single-block corruption repaired
@@ -310,6 +323,7 @@ fn receipt_backed_repair_admission_records_evidence() {
     let jobs = bridge.prioritized_jobs();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].entry.locator_id, 700);
+    assert_eq!(jobs[0].candidate_identity, identity_for_entry(&entry));
     assert_eq!(
         jobs[0].evidence.class,
         RepairEvidenceClass::PlacementReceipt
@@ -376,6 +390,32 @@ fn stale_receipt_payload_digest_blocks_queueing() {
     );
     assert_eq!(bridge.pending_count(), 0);
     assert_eq!(bridge.stats().entries_blocked_stale_receipt, 1);
+}
+
+#[test]
+fn mismatched_candidate_identity_blocks_queueing() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(706);
+    let mismatched_identity = RepairCandidateIdentity::new(
+        entry.locator_id,
+        entry.segment_id + 1,
+        RepairBlockKind::InlineContent,
+    );
+    let receipt = receipt_for_entry(&entry);
+    let input =
+        RepairAdmissionInput::with_receipt_and_identity(entry, receipt, mismatched_identity);
+
+    let admissions = bridge.ingest_with_evidence(&[input], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Blocked {
+            locator_id: 706,
+            reason: RepairEvidenceRejection::CandidateIdentityMismatch,
+        }]
+    );
+    assert_eq!(bridge.pending_count(), 0);
+    assert_eq!(bridge.stats().entries_blocked_identity_mismatch, 1);
 }
 
 #[test]
