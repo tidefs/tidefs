@@ -39,6 +39,7 @@ pub const BLOCK_VOLUME_FILE_IMAGE_BACKING_GATE_OW_301N: &str =
     "OW-301N block-volume file-backed image surface binds block-volume image requests to durable userspace backing files without live ublk";
 
 pub mod boundary;
+pub mod clustered_admission;
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BlockVolumeId(pub u64);
 
