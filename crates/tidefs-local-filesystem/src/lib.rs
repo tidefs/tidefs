@@ -384,7 +384,7 @@ use tidefs_local_object_store::{
     device_layout::DeviceMediaClass, CompressionConfig, CrashInjectionPoint, DeviceBacking,
     DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, EncryptionConfig, IntegrityDigest64,
     IoClass, LocalObjectStore, ObjectKey, ObjectLocation, Pool, PoolConfig, PoolProperties,
-    StoreEncryptionKey, StoreError, StoreOptions,
+    StoreEncryptionKey, StoreError, StoreOptions, DEFAULT_MAX_SEGMENT_BYTES, RECORD_OVERHEAD_BYTES,
 };
 use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
 use tidefs_performance_contract::AdmissionPermit;
@@ -738,6 +738,7 @@ const ROOT_DATASET_ID: [u8; 16] = [0u8; 16];
 const DEFAULT_DEVELOPMENT_DEVICE_DIR: &str = ".tidefs-devices";
 const DEFAULT_DEVELOPMENT_DEVICE_IMAGE: &str = "data0.img";
 pub const DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+const DEVELOPMENT_DEVICE_CHURN_SLACK_DIVISOR: u64 = 4;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FileSystemState {
@@ -2518,11 +2519,35 @@ impl LocalFileSystem {
     fn hidden_regular_file_dev_image_bytes_for_content_capacity(
         content_capacity_bytes: u64,
     ) -> Result<u64> {
-        content_capacity_bytes
-            .checked_add(tidefs_types_pool_label_core::POOL_LABEL_SIZE as u64)
+        let chunk_size = u64::from(content_chunk_size());
+        let content_chunk_count = content_capacity_bytes
+            .checked_add(chunk_size.saturating_sub(1))
             .ok_or(FileSystemError::SizeOverflow {
                 requested: u64::MAX,
-            })
+            })?
+            / chunk_size;
+        let record_overhead_bytes = content_chunk_count
+            .checked_mul(RECORD_OVERHEAD_BYTES)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+        let pool_label_bytes = (tidefs_types_pool_label_core::POOL_LABEL_SIZE as u64)
+            .checked_mul(2)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })?;
+        let churn_slack_bytes = (content_capacity_bytes / DEVELOPMENT_DEVICE_CHURN_SLACK_DIVISOR)
+            .max(DEFAULT_MAX_SEGMENT_BYTES);
+
+        let mut total = content_capacity_bytes;
+        for component in [pool_label_bytes, record_overhead_bytes, churn_slack_bytes] {
+            total = total
+                .checked_add(component)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+        }
+        Ok(total)
     }
 
     #[must_use]
