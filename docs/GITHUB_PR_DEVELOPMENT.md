@@ -32,6 +32,49 @@ source changes. This policy supersedes direct implementation on the root
   worktrees, update or close the issue, and delete the local and remote feature
   branch unless a documented follow-up needs it preserved.
 
+## Linear Merge Enforcement
+
+- The `tidefs/tidefs` repository merge-button configuration must keep
+  `allow_merge_commit` disabled and at least one linear method,
+  `allow_squash_merge` or `allow_rebase_merge`, enabled. Branch protection or
+  repository rulesets may also require linear history when available, but they
+  do not replace disabling merge commits in the repository merge settings.
+- Integration workers must map the selected integration strategy to
+  `gh pr merge --squash` or `gh pr merge --rebase`. Do not use
+  `gh pr merge --merge` or REST `merge_method=merge` for PRs targeting
+  `master`.
+- Before treating a PR as merge-ready, capture a read-only repository merge
+  configuration snapshot:
+
+```sh
+gh api repos/tidefs/tidefs \
+  --jq '{default_branch,allow_merge_commit,allow_squash_merge,allow_rebase_merge}'
+```
+
+  The expected `master` integration state is `allow_merge_commit: false` with
+  `allow_squash_merge` or `allow_rebase_merge` still true.
+- After a PR closed event reports a merge into `master`, audit the recorded
+  merge SHA before considering integration complete:
+
+```sh
+pr=<number>
+merge_sha="$(gh api "repos/tidefs/tidefs/pulls/$pr" --jq '.merge_commit_sha')"
+gh api "repos/tidefs/tidefs/git/commits/$merge_sha" \
+  --jq '{sha:.sha,parent_count:(.parents | length),parents:[.parents[].sha]}'
+```
+
+  A linear squash or rebase integration reports `parent_count: 1`. A closed PR
+  with any other parent count is a process regression: record the event in a
+  GitHub issue or PR triage note and do not mark integration complete until the
+  repository setting, merge command, or integration tooling has been repaired.
+  Leave already-published `master` history intact unless the operator
+  explicitly authorizes a separate rewrite.
+- PR #420 is the historical regression that motivated this guard: its merge
+  commit `3b6f60b2ce7d64faec1cc972f8b3b39334a71e7b` has two parents
+  (`217e9b0f7deba985a519c1199d8ccefb822652fc` and
+  `0c3cceecce81424176020d7e33deee1c7676b4d3`). It remains published history
+  and must not be rewritten as part of process enforcement work.
+
 ## Multi-Codex Rules
 
 - Each Codex must use its own `codexN` identity, branch, worktree, Cargo target
