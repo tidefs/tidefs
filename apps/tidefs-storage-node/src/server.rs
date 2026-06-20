@@ -4832,11 +4832,13 @@ fn handle_frame_ctx(
                     .map(|_| None)
                     .map_err(|e| e.to_string()),
                 StoreBackend::TransportBacked(ts) => {
-                    // TransportReplicatedPutResult does not carry a receipt;
-                    // receipt validation is performed internally by the
-                    // put_named_with_receipt method against replica acks.
+                    // The receipt was validated internally by
+                    // put_named_with_receipt and is now carried through
+                    // the transport result.
                     match ts.put_named_with_receipt(key, value, *placement_receipt_ref) {
-                        Ok(outcome) if outcome.quorum_reached => Ok(None),
+                        Ok(outcome) if outcome.quorum_reached => {
+                            Ok(outcome.recorded_receipt_ref)
+                        }
                         Ok(outcome) => Err(format!(
                             "write quorum not reached: {}/{} acknowledgements (need {})",
                             outcome.acks, outcome.total_targets, outcome.quorum_size

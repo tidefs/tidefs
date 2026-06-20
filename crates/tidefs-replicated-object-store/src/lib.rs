@@ -1414,6 +1414,10 @@ pub struct TransportReplicatedPutResult {
     pub quorum_reached: bool,
     /// Whether the write was fully committed (all replicas acked).
     pub fully_committed: bool,
+    /// Durable placement receipt recorded by the primary.
+    /// Present only when routed through put_named_with_receipt
+    /// and at least one pool-backed store produced a receipt.
+    pub recorded_receipt_ref: Option<PlacementReceiptRef>,
 }
 
 /// Successful peer placement read-map installation over a replica control session.
@@ -2021,6 +2025,7 @@ impl TransportReplicatedStore {
             acks,
             total_targets,
             quorum_size: self.config.write_quorum,
+            recorded_receipt_ref: None,
             quorum_reached,
             fully_committed,
         })
@@ -2202,6 +2207,7 @@ impl TransportReplicatedStore {
             total_targets,
             quorum_size: self.config.write_quorum,
             quorum_reached,
+            recorded_receipt_ref: Some(placement_receipt_ref),
             fully_committed,
         })
     }
@@ -2617,6 +2623,7 @@ impl TransportReplicatedStore {
             quorum_size: plan.quorum_required,
             quorum_reached,
             fully_committed,
+            recorded_receipt_ref: None,
         })
     }
 
