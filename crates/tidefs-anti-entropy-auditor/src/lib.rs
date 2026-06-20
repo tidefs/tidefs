@@ -37,7 +37,7 @@ pub mod comparator;
 pub mod merkle_exchange;
 pub mod scan_scheduler;
 
-use ae_state::{AntiEntropyState, DivergenceClass, DivergenceRecord};
+use ae_state::{AntiEntropyState, DivergenceClass, DivergenceRecord, RepairTriggerReceipt};
 use comparator::{ComparisonInput, ComparisonResult, DigestComparator};
 use merkle_exchange::{
     MerkleExchange, MerkleExchangeResult, MerkleExchangeStatus, MerkleLeafRange,
@@ -146,6 +146,9 @@ pub struct AntiEntropyAuditor {
     pub divergence_history: Vec<DivergenceRecord>,
     /// Tickets created in the current cycle.
     pub tickets_created: Vec<u64>,
+    /// Whether repair-trigger receipts have been emitted for the current
+    /// divergence set (idempotency gate).
+    pub receipts_emitted: bool,
     /// Epoch context for the current cycle.
     pub epoch: u64,
     /// Total subjects known in the system.
@@ -171,6 +174,7 @@ impl AntiEntropyAuditor {
             current_divergences: Vec::new(),
             divergence_history: Vec::new(),
             tickets_created: Vec::new(),
+            receipts_emitted: false,
             epoch,
             total_subjects: 0,
             audit_sequence: 0,
@@ -356,6 +360,7 @@ impl AntiEntropyAuditor {
 
         self.current_divergences.clear();
         self.tickets_created.clear();
+        self.receipts_emitted = false;
         self.audit_sequence += 1;
 
         Some(batch.subjects)
@@ -453,6 +458,40 @@ impl AntiEntropyAuditor {
             }
         }
         count
+    }
+
+    // ── Repair-trigger receipt emission ─────────────────────────────
+
+    /// Emit [`RepairTriggerReceipt`] records for all ticketable divergences
+    /// in the current cycle.
+    ///
+    /// Lag-only divergences never produce receipts. Witness disagreements
+    /// require explicit authority classification outside this method and
+    /// are excluded from automatic receipt emission.
+    ///
+    /// Emission is idempotent: repeated calls within the same scan cycle
+    /// (i.e., after `begin_scan` and before the next `begin_scan`) return
+    /// an empty vector. This prevents duplicate repair admission from the
+    /// same divergence set.
+    pub fn emit_repair_receipts(&mut self, reason: &str) -> Vec<RepairTriggerReceipt> {
+        if self.receipts_emitted {
+            return Vec::new();
+        }
+
+        let receipts: Vec<RepairTriggerReceipt> = self
+            .current_divergences
+            .iter()
+            .filter_map(|d| RepairTriggerReceipt::from_divergence(d, reason))
+            .collect();
+
+        self.receipts_emitted = true;
+        receipts
+    }
+
+    /// Whether receipts have been emitted for the current divergence set.
+    #[must_use]
+    pub fn has_emitted_receipts(&self) -> bool {
+        self.receipts_emitted
     }
 
     // ── Scrub trigger integration ─────────────────────────────────────
