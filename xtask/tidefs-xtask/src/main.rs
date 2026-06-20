@@ -891,6 +891,41 @@ fn main() {
             }
         }
 
+        Some("validate-xfstests-evidence-manifest") => {
+            let artifact_path = match args.next() {
+                Some(path) => path,
+                None => {
+                    eprintln!("validate-xfstests-evidence-manifest requires an artifact path");
+                    process::exit(2);
+                }
+            };
+            if let Some(extra) = args.next() {
+                eprintln!(
+                    "validate-xfstests-evidence-manifest accepts one path, got extra argument `{extra}`"
+                );
+                process::exit(2);
+            }
+            match tidefs_validation::xfstests_evidence_manifest::load_xfstests_evidence_manifest_json_path(
+                &artifact_path,
+            ) {
+                Ok(manifest) => {
+                    let scope_label = if manifest.evidence_scope == "focused" {
+                        format!("focused({})", manifest.tests.len())
+                    } else {
+                        "broad".to_string()
+                    };
+                    println!(
+                        "xfstests evidence manifest validated: workflow={} run_id={} target={} scope={}",
+                        manifest.workflow, manifest.run_id, manifest.target, scope_label
+                    );
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    process::exit(1);
+                }
+            }
+        }
+
         Some("check-no-hidden-queues") => {
             if let Err(err) = no_hidden_queues::check_current_workspace() {
                 eprintln!("{err}");
@@ -2175,6 +2210,9 @@ fn print_help() {
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
     println!(
         "  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON against schema"
+    println!(
+        "  validate-xfstests-evidence-manifest <path> validate an xfstests evidence manifest JSON against schema"
+    );
     );
     println!(
         "  validate-no-hidden-queues-receipt <path> validate a source/registry queue review receipt"
