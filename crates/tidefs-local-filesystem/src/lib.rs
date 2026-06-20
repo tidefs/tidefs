@@ -4750,6 +4750,69 @@ impl LocalFileSystem {
         Ok(bytes)
     }
 
+    fn reflink_clone_content_plan(
+        &self,
+        source_inode_id: InodeId,
+        source_record: &InodeRecord,
+        dest_record: &InodeRecord,
+    ) -> Result<(BTreeMap<ObjectKey, u64>, u64, u64)> {
+        let source_layout = read_content_layout_from_store(
+            self.store.raw_primary_store(),
+            source_inode_id,
+            source_record,
+            true,
+        )?;
+        let planned_entries =
+            planned_reflink_allocation_entries_for_source_layout(dest_record, &source_layout)?;
+        let allocation_bytes = allocation_bytes(&planned_entries)?;
+        let materialized_bytes = materialized_content_bytes_for_layout(&source_layout)?;
+        Ok((planned_entries, allocation_bytes, materialized_bytes))
+    }
+
+    fn record_file_content_extents_from_layout(
+        &mut self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+    ) -> Result<()> {
+        let layout =
+            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        let mut recorded = false;
+        match layout {
+            ContentLayout::Inline(content) => {
+                let len = u64::try_from(content.bytes.len()).map_err(|_| {
+                    FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    }
+                })?;
+                if len > 0 {
+                    let _ = self
+                        .extent_allocator
+                        .allocate_extent(inode_id.0, 0, len, None);
+                    recorded = true;
+                }
+            }
+            ContentLayout::Chunked(manifest) => {
+                for chunk_ref in manifest.chunks {
+                    if chunk_ref.is_hole() {
+                        continue;
+                    }
+                    let offset = content_chunk_start(chunk_ref.chunk_index)?;
+                    let len = u64::from(chunk_ref.len);
+                    if len > 0 {
+                        let _ = self
+                            .extent_allocator
+                            .allocate_extent(inode_id.0, offset, len, None);
+                        recorded = true;
+                    }
+                }
+            }
+        }
+        if recorded {
+            self.state.dirty_extent_maps.insert(inode_id);
+        }
+        Ok(())
+    }
+
     /// Return a reference to the internal extent allocator (for tests).
     #[must_use]
     pub fn extent_allocator(&self) -> &ExtentAllocator {
@@ -5823,8 +5886,8 @@ impl LocalFileSystem {
             dir_rev: 0,
         };
 
-        let planned_entries = planned_chunk_allocation_entries_for_full_content(&dest_record)?;
-        let allocation_bytes = allocation_bytes(&planned_entries)?;
+        let (planned_entries, allocation_bytes, materialized_bytes) =
+            self.reflink_clone_content_plan(source_inode_id, &source_record, &dest_record)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
         self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(planned_inode_id))?;
         self.ensure_content_capacity_with_planned_inode(None, planned_entries)?;
@@ -5842,7 +5905,7 @@ impl LocalFileSystem {
         debug_assert_eq!(tick, planned_tick);
         debug_assert_eq!(inode_id, planned_inode_id);
         if let Err(err) =
-            self.account_new_file_content(inode_id, dest_record.size, allocation_bytes, tick)
+            self.account_new_file_content(inode_id, materialized_bytes, allocation_bytes, tick)
         {
             self.rollback_mutation_delta();
             return Err(err);
@@ -5866,7 +5929,10 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
-        self.record_new_file_content_extents(inode_id, dest_record.size);
+        if let Err(err) = self.record_file_content_extents_from_layout(inode_id, &dest_record) {
+            self.rollback_mutation_delta();
+            return Err(err);
+        }
 
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, dest_record.clone());
         self.inode_cache.borrow_mut().invalidate(inode_id);
@@ -6688,15 +6754,15 @@ impl LocalFileSystem {
     fn account_new_file_content(
         &mut self,
         inode_id: InodeId,
-        logical_bytes: u64,
+        content_bytes: u64,
         allocation_bytes: u64,
         tick: u64,
     ) -> Result<()> {
-        if logical_bytes > 0 {
-            let handle = self.reserve_with_hierarchy(logical_bytes).map_err(|_e| {
+        if content_bytes > 0 {
+            let handle = self.reserve_with_hierarchy(content_bytes).map_err(|_e| {
                 FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
-                    requested: logical_bytes,
+                    requested: content_bytes,
                     available: self.capacity_authority.available_bytes(),
                     capacity: self.capacity_authority.total_bytes(),
                     allocated: self.capacity_authority.used_bytes(),
@@ -6705,10 +6771,10 @@ impl LocalFileSystem {
             handle.commit();
             self.state
                 .space_accounting
-                .accumulate_delta(SpaceDelta::new_write(logical_bytes));
+                .accumulate_delta(SpaceDelta::new_write(content_bytes));
             self.state
                 .space_accounting
-                .track_physical_write(logical_bytes);
+                .track_physical_write(content_bytes);
         }
 
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
@@ -6741,16 +6807,6 @@ impl LocalFileSystem {
         });
 
         Ok(())
-    }
-
-    fn record_new_file_content_extents(&mut self, inode_id: InodeId, logical_bytes: u64) {
-        if logical_bytes == 0 {
-            return;
-        }
-        let _ = self
-            .extent_allocator
-            .allocate_extent(inode_id.0, 0, logical_bytes, None);
-        self.state.dirty_extent_maps.insert(inode_id);
     }
 
     fn record_dirty_buffer_free(&mut self, bytes: u64) {
@@ -9582,8 +9638,8 @@ impl LocalFileSystem {
         dest_record.data_version = planned_tick;
         dest_record.metadata_version = planned_tick;
 
-        let planned_entries = planned_chunk_allocation_entries_for_full_content(&dest_record)?;
-        let allocation_bytes = allocation_bytes(&planned_entries).unwrap_or(0);
+        let (planned_entries, allocation_bytes, _materialized_bytes) =
+            self.reflink_clone_content_plan(source_inode_id, &source_record, &dest_record)?;
         let new_blocks = allocation_bytes / content_chunk_size() as u64;
         self.ensure_obligation_capacity("staging_dirty", new_blocks, Some(dest_inode_id))?;
         self.ensure_content_capacity_with_planned_inode(

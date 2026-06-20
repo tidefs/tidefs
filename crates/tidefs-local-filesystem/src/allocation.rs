@@ -111,6 +111,67 @@ pub(crate) fn planned_chunk_allocation_entries_for_full_content(
     Ok(entries)
 }
 
+pub(crate) fn planned_reflink_allocation_entries_for_source_layout(
+    dest_record: &InodeRecord,
+    source_layout: &ContentLayout,
+) -> Result<BTreeMap<ObjectKey, u64>> {
+    let mut entries = BTreeMap::new();
+    match source_layout {
+        ContentLayout::Inline(content) => {
+            let len =
+                u64::try_from(content.bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            let grains = allocation_grains_for_len(len)?;
+            if grains > 0 {
+                entries.insert(
+                    content_object_key_for_version(dest_record.inode_id, dest_record.data_version),
+                    grains,
+                );
+            }
+        }
+        ContentLayout::Chunked(manifest) => {
+            for chunk_ref in &manifest.chunks {
+                if chunk_ref.is_hole() {
+                    continue;
+                }
+                let grains = allocation_grains_for_len(u64::from(chunk_ref.len))?;
+                if grains > 0 {
+                    entries.insert(
+                        content_chunk_object_key_for_version(
+                            dest_record.inode_id,
+                            dest_record.data_version,
+                            chunk_ref.chunk_index,
+                        ),
+                        grains,
+                    );
+                }
+            }
+        }
+    }
+    Ok(entries)
+}
+
+pub(crate) fn materialized_content_bytes_for_layout(layout: &ContentLayout) -> Result<u64> {
+    match layout {
+        ContentLayout::Inline(content) => {
+            u64::try_from(content.bytes.len()).map_err(|_| FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })
+        }
+        ContentLayout::Chunked(manifest) => manifest
+            .chunks
+            .iter()
+            .filter(|chunk_ref| !chunk_ref.is_hole())
+            .try_fold(0_u64, |sum, chunk_ref| {
+                sum.checked_add(u64::from(chunk_ref.len))
+                    .ok_or(FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    })
+            }),
+    }
+}
+
 pub(crate) fn planned_chunk_allocation_entries_for_overlay(
     store: &LocalObjectStore,
     old_record: &InodeRecord,
@@ -675,11 +736,9 @@ pub(crate) fn obsolete_extent_keys_for_full_replace(
     new_data_version: u64,
 ) -> (Vec<ObjectKey>, Vec<(ObjectKey, ObjectKey)>) {
     // For a full replace, the old manifest key is always obsolete.
-    let old_manifest_key =
-        content_object_key_for_version(inode_id, old_manifest.data_version);
+    let old_manifest_key = content_object_key_for_version(inode_id, old_manifest.data_version);
 
-    let new_manifest_key =
-        content_object_key_for_version(inode_id, new_data_version);
+    let new_manifest_key = content_object_key_for_version(inode_id, new_data_version);
 
     let (mut trimmable, mut deferred) =
         obsolete_extent_keys_for_chunked_rewrite(pool, inode_id, old_manifest, new_chunks);

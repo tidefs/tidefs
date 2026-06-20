@@ -3679,10 +3679,9 @@ impl VfsLocalFileSystem {
         dest_record.data_version = planned_tick;
         dest_record.metadata_version = planned_tick;
 
-        let planned_entries =
-            crate::allocation::planned_chunk_allocation_entries_for_full_content(&dest_record)
-                .map_err(|e| map_errno(&e))?;
-        let allocation_bytes = crate::allocation::allocation_bytes(&planned_entries).unwrap_or(0);
+        let (planned_entries, allocation_bytes, materialized_bytes) = fs
+            .reflink_clone_content_plan(source_fh.inode_id, &source_record, &dest_record)
+            .map_err(|e| map_errno(&e))?;
         let new_blocks = allocation_bytes / u64::from(crate::constants::content_chunk_size());
         fs.ensure_obligation_capacity("staging_dirty", new_blocks, Some(dest_fh.inode_id))
             .map_err(|e| map_errno(&e))?;
@@ -3694,9 +3693,12 @@ impl VfsLocalFileSystem {
         debug_assert_eq!(tick, planned_tick);
         dest_record.data_version = tick;
         dest_record.metadata_version = tick;
-        if let Err(err) =
-            fs.account_new_file_content(dest_fh.inode_id, source_size, allocation_bytes, tick)
-        {
+        if let Err(err) = fs.account_new_file_content(
+            dest_fh.inode_id,
+            materialized_bytes,
+            allocation_bytes,
+            tick,
+        ) {
             fs.rollback_mutation_delta();
             return Err(map_errno(&err));
         }
@@ -3720,7 +3722,11 @@ impl VfsLocalFileSystem {
             fs.rollback_mutation_delta();
             return Err(map_errno(&err));
         }
-        fs.record_new_file_content_extents(dest_fh.inode_id, source_size);
+        if let Err(err) = fs.record_file_content_extents_from_layout(dest_fh.inode_id, &dest_record)
+        {
+            fs.rollback_mutation_delta();
+            return Err(map_errno(&err));
+        }
         fs.mark_inode_metadata_dirty(dest_fh.inode_id);
         Arc::make_mut(&mut fs.state.inodes).insert(dest_fh.inode_id, dest_record.clone());
         fs.inode_cache.borrow_mut().invalidate(dest_fh.inode_id);
@@ -9490,6 +9496,79 @@ mod tests {
             engine.fs.borrow().capacity_authority().used_bytes(),
             data_len as u64,
             "unlink of whole-file copy destination must release its charged capacity"
+        );
+    }
+
+    #[test]
+    fn copy_file_range_whole_file_charges_sparse_source_materialized_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunk = crate::constants::content_chunk_size() as usize;
+        let local_fs = LocalFileSystem::open_with_capacity(
+            dir.path(),
+            tidefs_local_object_store::StoreOptions::test_fast(),
+            (chunk as u64) * 5,
+        )
+        .expect("open local filesystem");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(root, b"copy-sparse-source.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(root, b"copy-sparse-dest.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let payload = vec![0x5a; chunk * 3];
+
+        engine.write(&source_create, 0, &payload, &ctx()).unwrap();
+        {
+            let mut fs = engine.fs.borrow_mut();
+            fs.flush_write_buffer(source_create.inode_id)
+                .expect("flush source");
+            fs.punch_hole("/copy-sparse-source.txt", chunk as u64, chunk as u64)
+                .expect("punch source hole");
+        }
+        assert_eq!(
+            engine.fs.borrow().capacity_authority().used_bytes(),
+            (chunk as u64) * 2,
+            "sparse source setup should charge only materialized chunks"
+        );
+
+        let copied = engine
+            .copy_file_range(
+                &source_create,
+                0,
+                &dest_create,
+                0,
+                (chunk as u64) * 3,
+                &ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(copied, (chunk * 3) as u32);
+        assert_eq!(
+            engine.fs.borrow().capacity_authority().used_bytes(),
+            (chunk as u64) * 4,
+            "whole-file sparse copy must charge only source materialized bytes"
+        );
+        assert_eq!(
+            engine
+                .data_ranges(&dest_create, 0, (chunk as u64) * 3, &ctx())
+                .unwrap(),
+            vec![
+                LseekDataRange::new(0, chunk as u64),
+                LseekDataRange::new((chunk as u64) * 2, (chunk as u64) * 3),
+            ],
+            "whole-file copy should preserve sparse source holes"
+        );
+
+        engine.release(&dest_create).unwrap();
+        engine
+            .unlink(root, b"copy-sparse-dest.txt", &ctx())
+            .unwrap();
+        assert_eq!(
+            engine.fs.borrow().capacity_authority().used_bytes(),
+            (chunk as u64) * 2,
+            "unlink of sparse copy destination must release only materialized clone bytes"
         );
     }
 
