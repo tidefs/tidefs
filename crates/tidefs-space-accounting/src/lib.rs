@@ -331,10 +331,12 @@ impl SpaceAccounting {
     /// Derive statfs(2) fields from committed counters via the unified
     /// capacity authority.
     ///
-    /// Uses [`total_consumed_bytes`] (logical_used + reserved + orphan +
-    /// pinned_snapshot) as the consumption baseline, matching
-    /// [`admission_check`] so that statfs never advertises bytes that
-    /// `check_enospc` would reject.
+    /// Uses [`total_consumed_bytes`] (logical_used + reserved + orphan) as
+    /// the consumption baseline, matching [`admission_check`] so that statfs
+    /// never advertises bytes that `check_enospc` would reject.
+    /// `pinned_snapshot_bytes` is intentionally excluded — it is a subset
+    /// of `logical_used_bytes` (#638, #649) and must not reduce POSIX
+    /// `f_bfree` / `f_bavail`.
     ///
     /// Distinguishes operator-visible free space (`blocks_free` / `f_bfree`)
     /// from allocation-admissible free space (`blocks_avail` / `f_bavail`):
@@ -6608,25 +6610,34 @@ mod tests {
     // -- Snapshot-pinned bytes through unified authority --
 
     #[test]
-    fn check_enospc_rejects_when_pinned_snapshot_consumes_quota() {
+    fn pinned_snapshot_bytes_do_not_block_enospc() {
+        // pinned_snapshot_bytes is a subset of logical_used_bytes (#638, #649)
+        // and must not consume quota or gate ENOSPC.
         let mut counters = test_counters();
         counters.pinned_snapshot_bytes = TEST_QUOTA_BYTES;
         let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
-        assert!(sa.check_enospc(1));
+        // Admission must allow writes even when pinned_snapshot equals
+        // the entire quota, because it is already counted in logical_used.
+        assert!(!sa.check_enospc(1));
     }
 
     #[test]
-    fn statfs_and_check_enospc_agree_on_pinned_snapshot_bytes() {
+    fn pinned_snapshot_bytes_do_not_reduce_statfs_or_block_enospc() {
+        // pinned_snapshot_bytes is a subset of logical_used_bytes (#638, #649).
+        // Setting it alone (without logical_used_bytes) must not reduce statfs
+        // free blocks or gate ENOSPC — the counters treat logical_used=0,
+        // so the full quota remains available.
         let mut counters = test_counters();
-        // Use a block-aligned value so free_blocks * block_size == actual free.
         counters.pinned_snapshot_bytes = 4096 * 100; // 409_600
         let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
         let s = sa.statfs();
         let free_blocks = s.blocks_free;
         let free_bytes = free_blocks * 4096;
-        // check_enospc should admit writes up to free_bytes.
+        // Full quota should still be free (pinned_snapshot excluded from
+        // total_consumed_bytes).
+        assert_eq!(free_bytes, TEST_QUOTA_BYTES);
+        // Admission must allow writes up to the full quota.
         assert!(!sa.check_enospc(free_bytes));
-        // But refuse one block more.
         assert!(sa.check_enospc(free_bytes + 4096));
     }
 
@@ -6689,17 +6700,21 @@ mod tests {
             .unwrap();
         sa.commit_delta(SpaceDelta::new_orphan_acquire(50_000))
             .unwrap();
-        // Also set pinned_snapshot.
+        // Set pinned_snapshot but it must not affect statfs consumption
+        // (it is a subset of logical_used, #638, #649).
         let snap = SnapshotSpaceRecord {
             state: SnapshotState::Active,
             deadlist_bytes: 30_000,
             ..Default::default()
         };
         sa.update_snapshot_pinned(&[snap]);
-        let total_consumed = 100_000 + 200_000 + 50_000 + 30_000;
+        // total_consumed = logical_used + reserved + orphan (excludes pinned).
+        let total_consumed = 100_000 + 200_000 + 50_000;
         let expected_free = (TEST_QUOTA_BYTES - total_consumed) / 4096;
         let s = sa.statfs();
         assert_eq!(s.blocks_free, expected_free);
+        // Verify pinned_snapshot_bytes is still tracked for operator views.
+        assert_eq!(sa.counters().pinned_snapshot_bytes, 30_000);
     }
 
     #[test]
@@ -6715,7 +6730,8 @@ mod tests {
             deadlist_bytes: 30_000,
             ..Default::default()
         }]);
-        let total_consumed = 100_000 + 200_000 + 50_000 + 30_000;
+        // total_consumed excludes pinned_snapshot (#638, #649).
+        let total_consumed = 100_000 + 200_000 + 50_000;
         let avail = TEST_QUOTA_BYTES - total_consumed;
         assert!(!sa.check_enospc(avail));
         assert!(sa.check_enospc(avail + 1));

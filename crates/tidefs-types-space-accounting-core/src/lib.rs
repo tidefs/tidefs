@@ -130,13 +130,14 @@ impl DatasetSpaceCountersV1 {
 
     /// Total bytes consumed by this dataset for admission and statfs.
     ///
-    /// Sums logical_used, reserved, orphan, and pinned_snapshot_bytes.
-    /// This is the unified authority consumption formula used by both
-    /// [`admission_check`] and [`SpaceAccounting::statfs`].
+    /// Returns `logical_used_bytes + reserved_bytes + orphan_bytes`.
+    /// Does **not** include `pinned_snapshot_bytes` — snapshot-pinned
+    /// bytes are a subset of `logical_used_bytes` already and must not
+    /// reduce POSIX statfs `f_bfree` / `f_bavail` or gate ENOSPC.
+    /// See issues #638 and #649.
     #[must_use]
     pub const fn total_consumed_bytes(self) -> u64 {
         self.logical_alloc_bytes()
-            .saturating_add(self.pinned_snapshot_bytes)
     }
 
     /// Available logical bytes considering quota and slop.
@@ -939,16 +940,19 @@ pub fn apply_space_delta(
     let projected_logical_alloc = projected_logical_used
         .saturating_add(projected_reserved)
         .saturating_add(projected_orphan);
-    let projected_total_consumed = projected_logical_alloc
-        .saturating_add(projected_pinned_snapshot);
+    // pinned_snapshot_bytes is a subset of logical_used_bytes (#638, #649);
+    // do not include it in projected_total_consumed for quota/ENOSPC gating.
+    let projected_total_consumed = projected_logical_alloc;
 
     // Check quota ceiling (projected). Pure frees must be allowed even when
     // the current counters are already over a ceiling; otherwise cleanup cannot
     // recover an overcommitted dataset.
+    // needed bytes for quota/capacity gating: pinned_snapshot_delta is
+    // excluded because snapshot-pinned bytes are a subset of logical_used
+    // and must not gate ENOSPC (#638, #649).
     let needed = delta.logical_used_delta.max(0) as u64
         + delta.reserved_delta.max(0) as u64
-        + delta.orphan_delta.max(0) as u64
-        + delta.pinned_snapshot_delta.max(0) as u64;
+        + delta.orphan_delta.max(0) as u64;
     if needed > 0 && counters.quota_bytes > 0 {
         let ceiling = counters.quota_bytes.saturating_sub(counters.slop_bytes);
         if projected_total_consumed > ceiling {

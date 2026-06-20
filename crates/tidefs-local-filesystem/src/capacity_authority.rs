@@ -982,6 +982,8 @@ mod tests {
             logical_used_bytes: 10 * 1024 * 1024,
             reserved_bytes: 5 * 1024 * 1024,
             orphan_bytes: 3 * 1024 * 1024,
+            // pinned_snapshot_bytes is a subset of logical_used (#638, #649)
+            // and is excluded from total_consumed_bytes.
             pinned_snapshot_bytes: 2 * 1024 * 1024,
             quota_bytes: total,
             ..DatasetSpaceCountersV1::default()
@@ -991,7 +993,8 @@ mod tests {
 
         let s = a.derive_statfs(1000, 900, 255);
 
-        let consumed = 20 * 1024 * 1024;
+        // consumed = logical_used + reserved + orphan (excludes pinned_snapshot).
+        let consumed = 18 * 1024 * 1024;
         assert_eq!(s.free_blocks, (total - consumed) / u64::from(block_size));
         assert!(a.check_enospc(total - consumed).is_ok());
         assert_eq!(a.check_enospc(total - consumed + 1), Err(Errno(ENOSPC)));
