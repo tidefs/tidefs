@@ -118,6 +118,11 @@ fn open_with_capacity_sizes_hidden_regular_file_dev_backing() {
     let image = LocalFileSystem::default_development_device_path(&root);
     let requested_capacity = DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES * 2;
     let expected_image_len =
+        LocalFileSystem::hidden_regular_file_dev_image_bytes_for_content_capacity(
+            requested_capacity,
+        )
+        .expect("expected hidden image capacity");
+    let bare_content_and_tail_label =
         requested_capacity + tidefs_types_pool_label_core::POOL_LABEL_SIZE as u64;
 
     {
@@ -131,8 +136,12 @@ fn open_with_capacity_sizes_hidden_regular_file_dev_backing() {
         .expect("hidden device image metadata")
         .len();
     assert!(
+        expected_image_len > bare_content_and_tail_label,
+        "hidden device image sizing must reserve append-log overhead beyond content bytes"
+    );
+    assert!(
         image_len >= expected_image_len,
-        "hidden device image length {image_len} must cover requested capacity {requested_capacity} plus pool label reserve"
+        "hidden device image length {image_len} must cover requested capacity {requested_capacity} plus append-log overhead"
     );
 
     cleanup(&root);
