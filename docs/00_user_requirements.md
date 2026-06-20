@@ -16,6 +16,11 @@ Build TideFS as a human-understandable, safe, production-grade storage system th
 - Durable debt belongs in `docs/REVIEW_TODO_REGISTER.md`; anonymous inline debt markers are not allowed.
 - Work must land as clean, scoped, bisectable commits on `master`.
 - Whole-repo authority review comes before narrow hotfix-style behavior changes.
+- TideFS must preserve explicit local and clustered runtime modes for both
+  POSIX filesystem access and block-volume export. Local modes are product
+  modes, not temporary cluster bring-up shortcuts, and must not place cluster
+  lock, lease, or membership services on local hot paths without proof of no
+  local-mode regression.
 
 ## Current judgement
 

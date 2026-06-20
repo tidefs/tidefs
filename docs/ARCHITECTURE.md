@@ -117,6 +117,26 @@ Kernel Bridge Layer (product)
 
 ```
 
+## Runtime Mode Authority
+
+ADR-0007 defines TideFS runtime modes for Linux-facing access surfaces. The
+mode boundary is an architectural contract, not a current implementation claim:
+local and clustered deployments are both intended product modes, and cluster
+coordination must be scoped to the clustered modes that require it.
+
+| Surface | Mode | Coordination authority |
+|---|---|---|
+| POSIX filesystem | local | In-process mount/session state, local advisory locks, local COMMIT_GROUP and cache coordination |
+| POSIX filesystem | clustered | MEMBERSHIP, lease, and LOCK services plus per-node local locks under cluster leases |
+| Block-volume export | local | Local export admission, local flush/exactness receipts, one admitted writable export authority by default |
+| Block-volume export | clustered | MEMBERSHIP, lease/authority-domain fencing, placement receipts, reserve escrow, and explicit failover or multi-writer admission |
+
+The cluster LOCK service is therefore not the default local POSIX or local
+block hot-path authority. A future implementation may share code between
+local and clustered paths only when the local path remains in-process and
+validated as non-regressing for local latency, throughput, and POSIX/block
+semantics.
+
 ## Data Flow
 
 ### Read Path
