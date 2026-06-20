@@ -13,7 +13,6 @@ use crate::evidence_artifact_manifest::{
     content_digest_for_bytes, EvidenceArtifactManifest, EVIDENCE_ARTIFACT_MANIFEST_VERSION,
 };
 use crate::validation_schema::ValidationTier;
-use std::path::Path;
 
 /// Claim identity for kernel fsync/syncfs durability rows.
 pub const KERNEL_FSYNC_EVIDENCE_CLAIM_ID: &str = "kernel.fsync.durability.v1";
