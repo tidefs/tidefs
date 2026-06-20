@@ -2208,12 +2208,8 @@ fn print_help() {
         "  validate-ublk-started-export-admission-artifact <path> validate started uBLK export admission evidence"
     );
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
-    println!(
-        "  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON against schema"
-    println!(
-        "  validate-xfstests-evidence-manifest <path> validate an xfstests evidence manifest JSON against schema"
-    );
-    );
+    println!("  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON against schema");
+    println!("  validate-xfstests-evidence-manifest <path> validate an xfstests evidence manifest JSON against schema");
     println!(
         "  validate-no-hidden-queues-receipt <path> validate a source/registry queue review receipt"
     );

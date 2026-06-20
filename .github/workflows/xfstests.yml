@@ -129,10 +129,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$ARTIFACT_ROOT"
+          started_at=""
+          if [ -f "$ARTIFACT_ROOT/artifact-root.env" ]; then
+            started_at="$(awk -F= '$1 == "utc" {print substr($0, 5); exit}' "$ARTIFACT_ROOT/artifact-root.env")"
+          fi
           finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
           # Evidence scope: focused when tests are supplied, broad otherwise.
-          if [ -n "${EVIDENCE_TESTS_INPUT:-}" ]; then
+          tests_input_without_space="${EVIDENCE_TESTS_INPUT//[[:space:]]/}"
+          if [ -n "$tests_input_without_space" ]; then
             evidence_scope="focused"
           else
             evidence_scope="broad"
@@ -156,6 +161,7 @@ jobs:
               --arg evidence_scope "$evidence_scope" \
               --argjson tests "$tests_json" \
               --argjson artifact_paths "$artifact_paths_json" \
+              --arg started_at "$started_at" \
               --arg finished_at "$finished_at" \
               '{
                 manifest_version: ($manifest_version | tonumber),
@@ -169,22 +175,70 @@ jobs:
               }
               + if $tests != [] then {tests: $tests} else {} end
               + if $artifact_paths != [] then {artifact_paths: $artifact_paths} else {} end
+              + if $started_at != "" then {started_at: $started_at} else {} end
               + {finished_at: $finished_at}' \
               > "$ARTIFACT_ROOT/evidence-manifest.json"
           else
+            json_string() {
+              local escaped
+              escaped="$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+              printf '"%s"' "$escaped"
+            }
+
+            json_array_from_words() {
+              local first=1
+              local item
+              printf '['
+              for item in $1; do
+                if [ "$first" -eq 1 ]; then
+                  first=0
+                else
+                  printf ','
+                fi
+                json_string "$item"
+              done
+              printf ']'
+            }
+
+            json_array_from_lines() {
+              local first=1
+              local item
+              printf '['
+              while IFS= read -r item; do
+                [ -n "$item" ] || continue
+                if [ "$first" -eq 1 ]; then
+                  first=0
+                else
+                  printf ','
+                fi
+                json_string "$item"
+              done
+              printf ']'
+            }
+
+            tests_json="$(json_array_from_words "${EVIDENCE_TESTS_INPUT:-}")"
+            artifact_paths_json="[]"
+            if [ -d "$ARTIFACT_ROOT" ]; then
+              artifact_paths_json="$(cd "$ARTIFACT_ROOT" && find . -type f -not -name 'evidence-manifest.json' | sed 's|^\./||' | sort | json_array_from_lines)"
+            fi
+            started_at_field=""
+            if [ -n "$started_at" ]; then
+              started_at_field="\"started_at\": $(json_string "$started_at"),"
+            fi
             cat > "$ARTIFACT_ROOT/evidence-manifest.json" << MANIFEST_EOF
           {
             "manifest_version": 1,
-            "workflow": "${EVIDENCE_WORKFLOW}",
-            "run_id": "${EVIDENCE_RUN_ID}",
-            "run_attempt": "${EVIDENCE_RUN_ATTEMPT}",
-            "source_ref": "${EVIDENCE_SOURCE_REF}",
-            "source_sha": "${EVIDENCE_SOURCE_SHA}",
-            "target": "${EVIDENCE_TARGET}",
-            "evidence_scope": "${evidence_scope}",
-            "tests": [],
-            "artifact_paths": [],
-            "finished_at": "${finished_at}"
+            "workflow": $(json_string "$EVIDENCE_WORKFLOW"),
+            "run_id": $(json_string "$EVIDENCE_RUN_ID"),
+            "run_attempt": $(json_string "$EVIDENCE_RUN_ATTEMPT"),
+            "source_ref": $(json_string "$EVIDENCE_SOURCE_REF"),
+            "source_sha": $(json_string "$EVIDENCE_SOURCE_SHA"),
+            "target": $(json_string "$EVIDENCE_TARGET"),
+            "evidence_scope": $(json_string "$evidence_scope"),
+            "tests": ${tests_json},
+            "artifact_paths": ${artifact_paths_json},
+            ${started_at_field}
+            "finished_at": $(json_string "$finished_at")
           }
           MANIFEST_EOF
           fi
