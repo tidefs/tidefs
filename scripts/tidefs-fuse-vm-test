@@ -1,10 +1,99 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: tidefs-fuse-vm-test [RUNNER OPTIONS...]
+
+Build the Nix artifacts for the FUSE VM test, then launch QEMU outside the
+Nix build sandbox.
+
+Runner options passed through to the built runner include:
+  --timeout SECONDS
+  --validation-dir DIR
+  --queue-depth-artifact PATH
+  --keep-tmp
+
+Build options consumed by this launcher:
+  --system SYSTEM
+  --max-jobs N
+  --cores N
+  --root-dir DIR
+  --build-dir DIR
+  --nofile-limit N
+  --build-timeout SECONDS
+  --no-warm-kernel
+  --launcher-help
+EOF
+}
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="${TIDEFS_REPO:-$(cd -- "$script_dir/.." && pwd)}"
-exec bash "$script_dir/tidefs-nix-qemu-build" \
+system="${TIDEFS_NIX_SYSTEM:-x86_64-linux}"
+home_dir="${HOME:-/root}"
+state_home="${XDG_STATE_HOME:-$home_dir/.local/state}"
+root_dir="${TIDEFS_NIX_QEMU_ROOT_DIR:-$state_home/tidefs/nix-qemu-roots}"
+build_args=()
+runner_args=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --launcher-help)
+      usage
+      exit 0
+      ;;
+    --system)
+      [[ $# -ge 2 ]] || { echo "--system requires an argument" >&2; exit 2; }
+      system="$2"
+      shift 2
+      ;;
+    --max-jobs|--cores|--build-dir|--nofile-limit)
+      [[ $# -ge 2 ]] || { echo "$1 requires an argument" >&2; exit 2; }
+      build_args+=("$1" "$2")
+      shift 2
+      ;;
+    --root-dir)
+      [[ $# -ge 2 ]] || { echo "--root-dir requires an argument" >&2; exit 2; }
+      root_dir="$2"
+      build_args+=("$1" "$2")
+      shift 2
+      ;;
+    --build-timeout)
+      [[ $# -ge 2 ]] || { echo "--build-timeout requires an argument" >&2; exit 2; }
+      build_args+=("--timeout" "$2")
+      shift 2
+      ;;
+    --no-warm-kernel)
+      build_args+=("$1")
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      runner_args+=("$@")
+      break
+      ;;
+    *)
+      runner_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+bash "$script_dir/tidefs-nix-qemu-build" \
   --target tidefsFuseVmTest \
   --name tidefs-fuse-vm-test \
   --repo "$repo" \
-  "$@"
+  --system "$system" \
+  "${build_args[@]}"
+
+runner="$root_dir/tidefs-fuse-vm-test/bin/tidefs-fuse-vm-test-runner"
+if [[ ! -x "$runner" ]]; then
+  echo "tidefs-fuse-vm-test: built runner not found: $runner" >&2
+  exit 2
+fi
+
+exec "$runner" "${runner_args[@]}"

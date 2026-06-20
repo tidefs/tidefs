@@ -200,7 +200,7 @@ done
 [[ "$nofile_limit" =~ ^[0-9]+$ ]] || die "--nofile-limit must be numeric"
 
 case "$target" in
-  qemuSmoke|tidefsFuseVmTest|tidefsFuseFioBenchmark|tidefsFuseFioBenchmarkNixOSTestDeprecated|qemuXfstestsLockSymlinkFallocate|tidefsXfstestsLockGroup|qemuUblkSmoke|qemuUblkExt4Smoke|qemuUblkMultiDevicePlacement|qemuUblkCrashConsistency|qemuUblkFsMatrix|rdmaCarrierTwoNodeTest|multiNodeCluster|kernel7Validation|clusterE2EValidation|rdmaTwoNodeValidation)
+  qemuSmoke|tidefsFuseFioBenchmark|tidefsFuseFioBenchmarkNixOSTestDeprecated|qemuXfstestsLockSymlinkFallocate|tidefsXfstestsLockGroup|qemuUblkSmoke|qemuUblkExt4Smoke|qemuUblkMultiDevicePlacement|qemuUblkCrashConsistency|qemuUblkFsMatrix|rdmaCarrierTwoNodeTest|multiNodeCluster|kernel7Validation|clusterE2EValidation|rdmaTwoNodeValidation)
     die "target $target is a legacy runNixOSTest/sandbox-runtime target; port it to a Nix-built outside-sandbox QEMU runner before using it for autonomous validation"
     ;;
 esac

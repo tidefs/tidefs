@@ -14,6 +14,7 @@ on:
           - kmod-xfstests-smoke
           - kernel-fsync-validation
           - kernel-mmap-validation
+          - fuse-vm-test
           - qemu-ublk-smoke
           - all
 
@@ -46,6 +47,10 @@ jobs:
             name: kernel-mmap-validation
             command: nix run .#kernel-mmap-validation -- --timeout 900
             output_dir: /tmp/tidefs-validation/kernel-mmap-validation
+          - id: fuse-vm-test
+            name: fuse-vm-test
+            command: nix run .#fuse-vm-test -- --timeout 900 --validation-dir /tmp/tidefs-validation/fuse-vm-test --queue-depth-artifact /tmp/tidefs-validation/fuse-vm-test/performance/queue-depth-runtime.json
+            output_dir: /tmp/tidefs-validation/fuse-vm-test
           - id: qemu-ublk-smoke
             name: qemu-ublk-smoke
             command: nix run .#qemu-ublk-smoke -- --timeout 3600
