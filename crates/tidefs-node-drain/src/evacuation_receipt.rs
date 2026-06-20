@@ -232,6 +232,12 @@ pub enum EvacuationReceiptError {
     EmptyEvacuation { draining_node: MemberId },
     /// The epoch boundary has not been committed.
     EpochBoundaryNotCommitted { draining_node: MemberId },
+    /// The evacuation receipt is bound to a different draining node than
+    /// the one currently being drained.
+    ReceiptNodeMismatch {
+        receipt_node: MemberId,
+        draining_node: MemberId,
+    },
 }
 
 impl fmt::Display for EvacuationReceiptError {
@@ -264,6 +270,17 @@ impl fmt::Display for EvacuationReceiptError {
                 write!(
                     f,
                     "epoch boundary not committed for node {} drain",
+                    draining_node.0,
+                )
+            }
+            Self::ReceiptNodeMismatch {
+                receipt_node,
+                draining_node,
+            } => {
+                write!(
+                    f,
+                    "evacuation receipt bound to node {} but drain targets node {}",
+                    receipt_node.0,
                     draining_node.0,
                 )
             }

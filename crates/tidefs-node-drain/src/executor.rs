@@ -161,6 +161,12 @@ impl DrainExecutor {
         self.drain.set_evacuation_receipt(receipt);
     }
 
+    /// Explicitly clear the evacuation receipt evidence from the underlying
+    /// drain. This is the only supported path for removing receipt evidence.
+    pub fn clear_evacuation_receipt(&mut self) {
+        self.drain.clear_evacuation_receipt();
+    }
+
     /// Mark the data stage complete after external migration has produced
     /// evacuation evidence.
     pub fn complete_data_stage_with_evacuation(
