@@ -1827,9 +1827,12 @@ mod tests {
         let salt = PoolWrappingKey::generate_salt();
         let wk = PoolWrappingKey::derive("lease test passphrase", &salt).unwrap();
         let mount_id = DatasetMountIdentity::new("pool/zero-test".into(), 1);
+        let mount_authority =
+            DatasetMountAuthorityKey::from_bytes(&[0x33; DATASET_MOUNT_AUTHORITY_KEY_LEN]).unwrap();
+        let mount_token = CommittedDatasetMountToken::mint(mount_id, &mount_authority);
         let (mut handle, original_key) = PoolEncryptionSecretHandle::mint(
             "zero-test".into(),
-            mount_id.clone(),
+            mount_token.clone(),
             &wk,
             1_700_000_000,
         )
@@ -1838,7 +1841,7 @@ mod tests {
 
         let lease = handle
             .issue_lease(
-                &mount_id,
+                &mount_token,
                 &wk,
                 std::time::Duration::from_secs(60),
                 LeaseUsageClass::PoolMount,

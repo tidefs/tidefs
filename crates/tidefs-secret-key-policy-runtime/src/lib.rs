@@ -148,6 +148,47 @@ pub enum SealProviderErrorKind {
     ProviderUnreachable,
 }
 
+pub const DATASET_MOUNT_COMMITMENT_LEN: usize = 32;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedDatasetMountEvidence {
+    dataset_id: String,
+    mount_generation: u64,
+    commitment: [u8; DATASET_MOUNT_COMMITMENT_LEN],
+}
+
+impl CommittedDatasetMountEvidence {
+    pub fn new(
+        dataset_id: String,
+        mount_generation: u64,
+        commitment: [u8; DATASET_MOUNT_COMMITMENT_LEN],
+    ) -> Self {
+        Self {
+            dataset_id,
+            mount_generation,
+            commitment,
+        }
+    }
+
+    pub fn dataset_id(&self) -> &str {
+        &self.dataset_id
+    }
+
+    pub fn mount_generation(&self) -> u64 {
+        self.mount_generation
+    }
+
+    pub fn commitment(&self) -> &[u8; DATASET_MOUNT_COMMITMENT_LEN] {
+        &self.commitment
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.dataset_id == other.dataset_id
+            && self.mount_generation == other.mount_generation
+            && constant_time_commitment_eq(&self.commitment, &other.commitment)
+    }
+}
+
 impl From<SecretKeyPolicyDecodeError> for SecretKeyPolicyRuntimeError {
     fn from(e: SecretKeyPolicyDecodeError) -> Self {
         SecretKeyPolicyRuntimeError::Decode(e)
@@ -241,17 +282,16 @@ pub trait HandleStore {
         &mut self,
         receipt: &SecretRevocationReceipt,
     ) -> Result<(), SecretKeyPolicyRuntimeError>;
-    /// Look up the dataset mount identity binding for a handle.
+    /// Look up the committed dataset mount evidence binding for a handle.
     ///
-    /// Returns `Ok(Some((dataset_id, mount_generation)))` when the handle is
-    /// bound to a specific committed dataset mount. `Ok(None)` means the store
-    /// cannot prove a binding, and
-    /// [`validate_dataset_mount_identity_for_handle`] will refuse the lease
-    /// fail-closed.
-    fn lookup_dataset_mount_identity(
+    /// Returns `Ok(Some(evidence))` when the handle is bound to a committed
+    /// dataset mount token. `Ok(None)` means the store cannot prove a binding,
+    /// and [`validate_committed_dataset_mount_token_for_handle`] will refuse
+    /// the lease fail-closed.
+    fn lookup_committed_dataset_mount_token(
         &self,
         _handle_id: SecretKeyPolicyId128,
-    ) -> Result<Option<(String, u64)>, SecretKeyPolicyRuntimeError> {
+    ) -> Result<Option<CommittedDatasetMountEvidence>, SecretKeyPolicyRuntimeError> {
         Ok(None)
     }
 }
@@ -435,25 +475,24 @@ pub fn issue_bounded_secret_lease_for_runtime_use<S: SealProvider>(
 
 // ── Mount-identity gate for secret-handle lease issuance ────────────────────
 
-/// Validate that a dataset mount identity matches the binding on a handle.
+/// Validate that committed dataset mount evidence matches a handle binding.
 ///
-/// When a handle was minted with a mount identity binding, every lease
-/// issuance must present a matching dataset identity and mount generation.
-/// This function fails closed: missing, unbound, or mismatched mount identity
-/// causes lease refusal.
+/// When a handle was minted with committed mount evidence, every lease
+/// issuance must present the same committed dataset identity and commitment.
+/// This function fails closed: missing, unbound, or mismatched evidence causes
+/// lease refusal.
 ///
 /// Callers should invoke this before or during lease issuance to gate
 /// key-handle dispensation on the active committed dataset mount.
-pub fn validate_dataset_mount_identity_for_handle(
+pub fn validate_committed_dataset_mount_token_for_handle(
     store: &dyn HandleStore,
     handle_id: SecretKeyPolicyId128,
-    presented_dataset_id: Option<&str>,
-    presented_mount_generation: u64,
+    presented_token: Option<&CommittedDatasetMountEvidence>,
 ) -> Result<(), SecretKeyPolicyRuntimeError> {
-    let binding = store.lookup_dataset_mount_identity(handle_id)?;
-    match (binding, presented_dataset_id) {
-        (Some((ref bound_dataset, bound_gen)), Some(presented_dataset)) => {
-            if bound_dataset == presented_dataset && bound_gen == presented_mount_generation {
+    let binding = store.lookup_committed_dataset_mount_token(handle_id)?;
+    match (binding, presented_token) {
+        (Some(bound), Some(presented)) => {
+            if bound.matches(presented) {
                 Ok(())
             } else {
                 Err(SecretKeyPolicyRuntimeError::HandleNotActive {
@@ -463,15 +502,15 @@ pub fn validate_dataset_mount_identity_for_handle(
             }
         }
         (Some(_), None) => {
-            // Handle requires a mount identity but none was presented.
+            // Handle requires committed mount evidence but none was presented.
             Err(SecretKeyPolicyRuntimeError::HandleNotActive {
                 handle_id,
                 actual: SecretLifecycleState::default(),
             })
         }
         (None, _) => {
-            // No binding on handle: refuse. Every key handle must carry a
-            // committed dataset mount identity per the current encryption
+            // No binding on handle: refuse. Every key handle must carry
+            // committed dataset mount evidence per the current encryption
             // authority.
             Err(SecretKeyPolicyRuntimeError::HandleNotActive {
                 handle_id,
@@ -479,6 +518,17 @@ pub fn validate_dataset_mount_identity_for_handle(
             })
         }
     }
+}
+
+fn constant_time_commitment_eq(
+    left: &[u8; DATASET_MOUNT_COMMITMENT_LEN],
+    right: &[u8; DATASET_MOUNT_COMMITMENT_LEN],
+) -> bool {
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 // ── Algorithm 4: assemble_policy_store_manifest ─────────────────────────────
@@ -2647,7 +2697,19 @@ mod tests {
     // ── Mount identity validation tests ──────────────────────────────────
 
     struct MockMountStore {
-        binding: Option<(String, u64)>,
+        binding: Option<CommittedDatasetMountEvidence>,
+    }
+
+    fn mount_evidence(
+        dataset_id: &str,
+        mount_generation: u64,
+        commitment_byte: u8,
+    ) -> CommittedDatasetMountEvidence {
+        CommittedDatasetMountEvidence::new(
+            dataset_id.into(),
+            mount_generation,
+            [commitment_byte; DATASET_MOUNT_COMMITMENT_LEN],
+        )
     }
 
     impl HandleStore for MockMountStore {
@@ -2737,86 +2799,109 @@ mod tests {
         ) -> Result<(), SecretKeyPolicyRuntimeError> {
             Ok(())
         }
-        fn lookup_dataset_mount_identity(
+        fn lookup_committed_dataset_mount_token(
             &self,
             _id: SecretKeyPolicyId128,
-        ) -> Result<Option<(String, u64)>, SecretKeyPolicyRuntimeError> {
+        ) -> Result<Option<CommittedDatasetMountEvidence>, SecretKeyPolicyRuntimeError> {
             Ok(self.binding.clone())
         }
     }
 
     #[test]
-    fn validate_mount_identity_succeeds_when_binding_matches() {
+    fn validate_committed_mount_token_succeeds_when_binding_matches() {
+        let token = mount_evidence("pool/ds1", 5, 0x11);
         let store = MockMountStore {
-            binding: Some(("pool/ds1".into(), 5)),
+            binding: Some(token.clone()),
         };
-        let result = validate_dataset_mount_identity_for_handle(
+        let result = validate_committed_dataset_mount_token_for_handle(
             &store,
             SecretKeyPolicyId128::ZERO,
-            Some("pool/ds1"),
-            5,
+            Some(&token),
         );
         assert!(result.is_ok());
     }
 
     #[test]
-    fn validate_mount_identity_fails_when_generation_differs() {
+    fn validate_committed_mount_token_fails_when_generation_differs() {
+        let token = mount_evidence("pool/ds1", 5, 0x11);
+        let stale_token = mount_evidence("pool/ds1", 6, 0x11);
         let store = MockMountStore {
-            binding: Some(("pool/ds1".into(), 5)),
+            binding: Some(token),
         };
-        let result = validate_dataset_mount_identity_for_handle(
+        let result = validate_committed_dataset_mount_token_for_handle(
             &store,
             SecretKeyPolicyId128::ZERO,
-            Some("pool/ds1"),
-            6,
+            Some(&stale_token),
         );
         assert!(result.is_err());
     }
 
     #[test]
-    fn validate_mount_identity_fails_when_dataset_differs() {
+    fn validate_committed_mount_token_fails_when_dataset_differs() {
+        let token = mount_evidence("pool/ds1", 5, 0x11);
+        let foreign_token = mount_evidence("pool/ds2", 5, 0x11);
         let store = MockMountStore {
-            binding: Some(("pool/ds1".into(), 5)),
+            binding: Some(token),
         };
-        let result = validate_dataset_mount_identity_for_handle(
+        let result = validate_committed_dataset_mount_token_for_handle(
             &store,
             SecretKeyPolicyId128::ZERO,
-            Some("pool/ds2"),
-            5,
+            Some(&foreign_token),
         );
         assert!(result.is_err());
     }
 
     #[test]
-    fn validate_mount_identity_fails_when_required_but_none_presented() {
+    fn validate_committed_mount_token_fails_when_commitment_differs() {
+        let token = mount_evidence("pool/ds1", 5, 0x11);
+        let forged_token = mount_evidence("pool/ds1", 5, 0x22);
         let store = MockMountStore {
-            binding: Some(("pool/ds1".into(), 5)),
+            binding: Some(token),
         };
-        let result =
-            validate_dataset_mount_identity_for_handle(&store, SecretKeyPolicyId128::ZERO, None, 0);
+        let result = validate_committed_dataset_mount_token_for_handle(
+            &store,
+            SecretKeyPolicyId128::ZERO,
+            Some(&forged_token),
+        );
         assert!(result.is_err());
     }
 
     #[test]
-    fn validate_mount_identity_fails_when_no_binding() {
+    fn validate_committed_mount_token_fails_when_required_but_none_presented() {
+        let store = MockMountStore {
+            binding: Some(mount_evidence("pool/ds1", 5, 0x11)),
+        };
+        let result = validate_committed_dataset_mount_token_for_handle(
+            &store,
+            SecretKeyPolicyId128::ZERO,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_committed_mount_token_fails_when_no_binding() {
         let store = MockMountStore { binding: None };
         // Unbound handle: must be refused per current encryption authority.
-        let result = validate_dataset_mount_identity_for_handle(
+        let token = mount_evidence("pool/any", 99, 0x11);
+        let result = validate_committed_dataset_mount_token_for_handle(
             &store,
             SecretKeyPolicyId128::ZERO,
-            Some("pool/any"),
-            99,
+            Some(&token),
         );
         assert!(result.is_err());
 
-        let result =
-            validate_dataset_mount_identity_for_handle(&store, SecretKeyPolicyId128::ZERO, None, 0);
+        let result = validate_committed_dataset_mount_token_for_handle(
+            &store,
+            SecretKeyPolicyId128::ZERO,
+            None,
+        );
         assert!(result.is_err());
     }
 
     #[test]
-    fn validate_mount_identity_default_implementation_fails_closed() {
-        // Default HandleStore::lookup_dataset_mount_identity returns Ok(None).
+    fn validate_committed_mount_token_default_implementation_fails_closed() {
+        // Default HandleStore::lookup_committed_dataset_mount_token returns Ok(None).
         // Since unbound handles are refused, the default implementation must
         // cause validation to fail closed.
         struct DefaultStore;
@@ -2909,11 +2994,11 @@ mod tests {
             }
         }
         let store = DefaultStore;
-        let result = validate_dataset_mount_identity_for_handle(
+        let token = mount_evidence("any", 1, 0x11);
+        let result = validate_committed_dataset_mount_token_for_handle(
             &store,
             SecretKeyPolicyId128::ZERO,
-            Some("any"),
-            1,
+            Some(&token),
         );
         assert!(result.is_err());
     }
