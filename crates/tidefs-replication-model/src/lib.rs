@@ -187,6 +187,13 @@ impl ReceiptRedundancyPolicy {
             } => data_shards > 0 && parity_shards > 0,
         }
     }
+
+    /// True when a receipt's recorded physical target count exactly satisfies
+    /// this redundancy policy.
+    #[must_use]
+    pub const fn target_count_satisfies(self, target_count: u16) -> bool {
+        self.is_well_formed() && target_count == self.target_width()
+    }
 }
 
 /// Shared reference to durable source placement authority.
@@ -320,9 +327,17 @@ impl PlacementReceiptRef {
         self.receipt_generation == 0
     }
 
+    /// True when the receipt's target count satisfies its recorded redundancy
+    /// policy.
+    #[must_use]
+    pub const fn is_policy_satisfying(self) -> bool {
+        self.redundancy_policy
+            .target_count_satisfies(self.target_count)
+    }
+
     #[must_use]
     pub const fn is_committed_authority(self) -> bool {
-        !self.is_synthetic() && self.redundancy_policy.is_well_formed() && self.target_count > 0
+        !self.is_synthetic() && self.is_policy_satisfying()
     }
 }
 
@@ -3047,6 +3062,8 @@ mod tests {
             ReceiptRedundancyPolicy::Replicated { copies: 3 }
         );
         assert!(replicated.redundancy_policy.is_well_formed());
+        assert!(replicated.is_policy_satisfying());
+        assert!(replicated.is_committed_authority());
         assert!(!replicated.is_synthetic());
 
         let erasure = PlacementReceiptRef::erasure(
@@ -3067,6 +3084,8 @@ mod tests {
                 parity_shards: 2,
             }
         );
+        assert!(erasure.is_policy_satisfying());
+        assert!(erasure.is_committed_authority());
     }
 
     #[test]
@@ -3075,6 +3094,55 @@ mod tests {
         assert_eq!(receipt.object_id, 77);
         assert_eq!(receipt.receipt_generation, 0);
         assert!(receipt.is_synthetic());
+        assert!(!receipt.is_committed_authority());
+    }
+
+    #[test]
+    fn placement_receipt_ref_rejects_policy_target_count_mismatch() {
+        let under_width = PlacementReceiptRef::new(
+            42,
+            receipt_key(42),
+            EpochId::new(7),
+            9,
+            ReceiptRedundancyPolicy::Replicated { copies: 3 },
+            4096,
+            receipt_digest(42, 9),
+            2,
+        );
+        assert!(!under_width.is_policy_satisfying());
+        assert!(!under_width.is_committed_authority());
+
+        let over_width = PlacementReceiptRef::new(
+            43,
+            receipt_key(43),
+            EpochId::new(7),
+            10,
+            ReceiptRedundancyPolicy::Erasure {
+                data_shards: 4,
+                parity_shards: 2,
+            },
+            8192,
+            receipt_digest(43, 10),
+            7,
+        );
+        assert!(!over_width.is_policy_satisfying());
+        assert!(!over_width.is_committed_authority());
+
+        let malformed = PlacementReceiptRef::new(
+            44,
+            receipt_key(44),
+            EpochId::new(7),
+            11,
+            ReceiptRedundancyPolicy::Erasure {
+                data_shards: 4,
+                parity_shards: 0,
+            },
+            8192,
+            receipt_digest(44, 11),
+            4,
+        );
+        assert!(!malformed.is_policy_satisfying());
+        assert!(!malformed.is_committed_authority());
     }
 
     fn committed_identity(
@@ -3124,6 +3192,27 @@ mod tests {
             ReplicatedReceiptId::new(1),
             PlacementReceiptRef::synthetic_for_subject(ReplicatedSubjectId::new(1)),
         );
+
+        assert!(matches!(
+            QuorumDurabilityToken::new(55, EpochId::new(1), 1, 1, vec![identity]),
+            Err(QuorumDurabilityTokenError::InvalidReceiptIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn quorum_durability_token_rejects_under_width_receipts() {
+        let receipt = PlacementReceiptRef::new(
+            88,
+            receipt_key(88),
+            EpochId::new(1),
+            1,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            4096,
+            receipt_digest(88, 1),
+            1,
+        );
+        let identity =
+            CommittedReceiptIdentity::new(MemberId::new(10), ReplicatedReceiptId::new(1), receipt);
 
         assert!(matches!(
             QuorumDurabilityToken::new(55, EpochId::new(1), 1, 1, vec![identity]),

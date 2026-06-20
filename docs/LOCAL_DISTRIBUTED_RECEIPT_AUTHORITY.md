@@ -84,6 +84,16 @@ pub struct PlacementReceiptRef {
 }
 ```
 
+`ReceiptRedundancyPolicy::target_count_satisfies` is the shared policy-width
+gate. It requires the policy to be well-formed and the recorded `target_count`
+to equal the policy width: replicated receipts must record exactly `copies`
+targets, and erasure receipts must record exactly `data_shards + parity_shards`
+targets. `PlacementReceiptRef::is_policy_satisfying` applies that gate to a
+receipt reference, and `PlacementReceiptRef::is_committed_authority` additionally
+requires the reference to be non-synthetic. Consumers must reject synthetic,
+under-width, over-width, and malformed-policy receipt references as placement
+authority.
+
 ## Write And Repair Flow
 
 1. A caller writes through `Pool::put_with_receipt` or
@@ -236,21 +246,18 @@ Completed issue #18 split work merged so far:
 ### Remaining
 
 The merged split issues above do not close the full issue #18 acceptance
-criteria. Remaining implementation and validation work includes:
+criteria. Remaining implementation and validation work is split into
+non-overlapping GitHub issues:
 
-- Continue wiring primary distributed writes beyond the storage-node
-  pool-backed receipt publication boundary, including transport fan-out paths
-  that need a recorded pool receipt before acknowledgement;
-- Finish read, degraded-read, scrub, repair, and rebuild paths that still need
-  to consume receipt authority outside the focused split APIs above;
-- Finish rebake/reclaim runtime paths that must trim only after durable
-  replacement receipt evidence is available;
-- Complete distributed state-transfer paths that move receipt-addressed extents
-  and preserve read availability during node/device loss within the configured
-  redundancy policy;
-- Add two-node/distributed storage-node integration tests plus runtime rows for
-  two-node receipt transfer, degraded-read availability, rebuild after
-  replacement, and reclaim under sustained write pressure.
+- #674 owns distributed primary write and transport fan-out paths:
+  `apps/tidefs-storage-node`, `crates/tidefs-replicated-object-store`, and
+  `crates/tidefs-transport`;
+- #675 owns local read, degraded-read, scrub, repair, and rebuild consumers:
+  `crates/tidefs-local-filesystem`, `crates/tidefs-scrub-core`,
+  `apps/tidefs-scrub`, and `crates/tidefs-rebuild-planner`;
+- #676 owns rebake/reclaim trim gating and replay:
+  `crates/tidefs-local-object-store`, `crates/tidefs-reclaim`, and
+  `crates/tidefs-reclaim-queue-core`.
 
 Runtime rows remain milestone-gate validation, not first-edit implementation.
 RDMA and broad release-candidate runs are further milestone gates (see issue
@@ -262,6 +269,9 @@ RDMA and broad release-candidate runs are further milestone gates (see issue
 - Issue #344: local-filesystem receipt-ref extent IO
 - Issue #345: distributed receipt-addressed extent transfer
 - Issue #346: receipt-driven rebake/reclaim durability gating
+- Issue #674: distributed primary receipt fan-out
+- Issue #675: local read/scrub/repair/rebuild receipt consumers
+- Issue #676: rebake/reclaim policy-satisfying receipt gate
 - Issue #17: pool-wide redundancy placement
 - Issue #16: media substrate
 - `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md`
