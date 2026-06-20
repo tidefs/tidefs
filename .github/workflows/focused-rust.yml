@@ -54,14 +54,93 @@ jobs:
           mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
       - name: Run focused crate tests
+        id: focused-tests
+        continue-on-error: true
         run: nix develop .#ci --command bash -c './scripts/ci-test-runner.sh --crates "$TIDEFS_FOCUSED_CRATES" --json ci-test-summary.json'
+
+      - name: Write evidence manifest
+        if: always()
+        env:
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          SOURCE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          FOCUSED_CRATES: ${{ env.TIDEFS_FOCUSED_CRATES }}
+          CARGO_TEST_ARGS: ${{ env.CARGO_TEST_FLAGS }}
+        run: |
+          set -euo pipefail
+
+          SUMMARY_FILE=ci-test-summary.json
+          MANIFEST_FILE=ci-test-summary-evidence-manifest.json
+          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          STEP_OUTCOME="${{ steps.focused-tests.outcome }}"
+          SUMMARY_STATUS=missing
+
+          if [[ -f "$SUMMARY_FILE" ]]; then
+            SUMMARY_STATUS=present
+          fi
+
+          # Determine result status. A missing summary is never a pass claim.
+          if [[ "$SUMMARY_STATUS" == "missing" ]]; then
+            RESULT="fail"
+          elif [[ "$STEP_OUTCOME" == "success" ]]; then
+            RESULT="pass"
+          elif [[ "$STEP_OUTCOME" == "failure" ]]; then
+            RESULT="fail"
+          else
+            RESULT="$STEP_OUTCOME"
+          fi
+
+          # Compute content digest or use sentinel when summary is missing
+          if [[ -f "$SUMMARY_FILE" ]]; then
+            DIGEST="$(nix shell nixpkgs#b3sum -c b3sum --no-names "$SUMMARY_FILE" | awk '{print $1}')"
+            CONTENT_DIGEST="blake3:${DIGEST}"
+          else
+            CONTENT_DIGEST="blake3:0000000000000000000000000000000000000000000000000000000000000000"
+          fi
+
+          # Build scope string
+          TRIGGER="$EVENT_NAME"
+          if [[ -n "$PR_NUMBER" ]]; then
+            TRIGGER="${EVENT_NAME}#${PR_NUMBER}"
+          fi
+          SCOPE="workflow=${WORKFLOW_NAME} run_id=${RUN_ID} run_attempt=${RUN_ATTEMPT} source_ref=${SOURCE_REF} crates=${FOCUSED_CRATES} cargo_test_args=${CARGO_TEST_ARGS} result=${RESULT} step_outcome=${STEP_OUTCOME} summary=${SUMMARY_STATUS} trigger=${TRIGGER}"
+
+          nix develop .#ci --command jq -n \
+            --arg manifest_version 1 \
+            --arg claim_id "focused-rust.crate-tests.v1" \
+            --arg evidence_class "focused-rust-crate-tests" \
+            --arg validation_tier "cargo-unit" \
+            --arg source "$SOURCE_SHA" \
+            --argjson scope "$(printf '%s' "$SCOPE" | jq -Rs .)" \
+            --arg artifact_path "$SUMMARY_FILE" \
+            --arg content_digest "$CONTENT_DIGEST" \
+            --arg generated_at "$NOW" \
+            '{manifest_version: ($manifest_version | tonumber), claim_id: $claim_id, evidence_class: $evidence_class, validation_tier: $validation_tier, source: $source, scope: $scope, artifact_path: $artifact_path, content_digest: $content_digest, generated_at: $generated_at}' \
+            > "$MANIFEST_FILE"
+
+          echo "Evidence manifest written to $MANIFEST_FILE"
+
+      - name: Validate evidence manifest
+        if: always()
+        run: |
+          if [[ ! -f ci-test-summary-evidence-manifest.json ]]; then
+            echo "::error::Evidence manifest was not produced"
+            exit 1
+          fi
+          nix develop .#ci --command cargo run -p tidefs-xtask -- validate-evidence-manifest ci-test-summary-evidence-manifest.json
 
       - name: Upload test summary
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: focused-rust-summary
-          path: ci-test-summary.json
+          path: |
+            ci-test-summary.json
+            ci-test-summary-evidence-manifest.json
           if-no-files-found: ignore
           retention-days: 7
 
@@ -70,13 +149,26 @@ jobs:
         run: |
           if [[ -f ci-test-summary.json ]]; then
             echo '## Focused Rust Results' >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Evidence manifest: `ci-test-summary-evidence-manifest.json`' >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
             echo '```json' >> "$GITHUB_STEP_SUMMARY"
             nix develop .#ci --command jq -c '.[] | {crate, status, tests}' ci-test-summary.json >> "$GITHUB_STEP_SUMMARY" || true
             echo '```' >> "$GITHUB_STEP_SUMMARY"
 
             failed=$(nix develop .#ci --command jq '[.[] | select(.status != "pass")] | length' ci-test-summary.json)
             echo "**$failed crate(s) did not pass**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '## Focused Rust Results' >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo 'No test summary produced. See evidence manifest in uploaded artifact for run details.' >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Propagate focused crate test result
+        if: ${{ always() && steps.focused-tests.outcome != 'success' }}
+        run: |
+          echo "::error::Focused crate tests completed with outcome '${{ steps.focused-tests.outcome }}'"
+          exit 1
 
       - name: Clean cargo target
         if: always()
