@@ -1,0 +1,98 @@
+{
+  "report_version": 1,
+  "generated_by": "tidefs-block-volume-adapter-daemon",
+  "claim_ids": [
+    "ublk.started_export.live_service_loop.v1",
+    "ublk.qid_tag.exactly_once_completion.v1"
+  ],
+  "evidence_class": "runtime-ublk-started-export-admission-artifact",
+  "evidence_scope": "bounded started uBLK export admission and daemon-owned data-queue service-loop trace",
+  "scenario": "qemu-ublk-smoke",
+  "queue_geometry": {
+    "nr_hw_queues": 1,
+    "queue_depth": 64
+  },
+  "host_preflight": {
+    "kernel_release": "7.0.0",
+    "host_preflight_admitted": true,
+    "control_open_attempted": true,
+    "control_opened": true,
+    "control_open_error_class": null
+  },
+  "control_chain": {
+    "feature_probe_attempted": true,
+    "feature_probe_completed": true,
+    "feature_mask": 458751,
+    "required_features_available": true,
+    "add_dev_attempted": true,
+    "add_dev_completed": true,
+    "add_dev_dev_id": 0,
+    "set_params_attempted": true,
+    "set_params_completed": true,
+    "set_params_block_size_bytes": 4096,
+    "set_params_block_count": 128,
+    "set_params_dev_sectors": 1024,
+    "set_params_errno": null
+  },
+  "data_queue": {
+    "open_attempted": true,
+    "opened": true,
+    "path": "/dev/ublkc0",
+    "runtime_live_at_start": true,
+    "open_errno": null
+  },
+  "fetch_req_coverage": {
+    "submission_attempted": true,
+    "submission_completed": true,
+    "required_commands": 64,
+    "submitted_commands": 64,
+    "all_queue_tag_slots_covered": true,
+    "first_qid": 0,
+    "first_tag": 0,
+    "last_qid": 0,
+    "last_tag": 63
+  },
+  "start_dev": {
+    "attempted": true,
+    "succeeded": true,
+    "state": "succeeded",
+    "refusal_class": null,
+    "errno": null
+  },
+  "service_loop": {
+    "owned": true,
+    "attempted": true,
+    "completed_iterations": 37,
+    "cqes_processed": 21,
+    "first_request_observation": "serviced_request",
+    "first_request_serviced": true,
+    "bounded_no_request_observed": false,
+    "commit_and_fetch_submitted": 21
+  },
+  "completion_authority": {
+    "claim_id": "ublk.qid_tag.exactly_once_completion.v1",
+    "evidence_class": "runtime-ublk-completion-artifact",
+    "verifier": "tidefs-xtask validate-ublk-completion-artifact"
+  },
+  "cleanup": {
+    "shutdown_graceful": true,
+    "drain_cqes_processed": 0,
+    "drain_iterations": 1,
+    "drain_timed_out": false,
+    "drain_hung_io_count": 0,
+    "final_flush_completed": true,
+    "stop_dev_attempted": true,
+    "stop_dev_succeeded": true,
+    "del_dev_attempted": true,
+    "del_dev_succeeded": true,
+    "del_dev_errno": null
+  },
+  "admission_verifier": {
+    "verifier": "tidefs-xtask validate-ublk-started-export-admission-artifact",
+    "claim_state": "started_request_serviced",
+    "failure_class": null,
+    "start_dev_preconditions_satisfied": true,
+    "request_observation_satisfied": true,
+    "cleanup_succeeded": true
+  }
+}

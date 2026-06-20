@@ -2,18 +2,18 @@ artifact_version = 1
 evidence_class = "claims-gate-review"
 source = "claims-gate"
 scope = "ublk-model-runtime-boundary-review"
-issue = 564
+issue = 614
 
-claim_id = "ublk.qid_tag.exactly_once_completion.v1"
 reviewed_claim_ids = [
   "ublk.qid_tag.exactly_once_completion.v1",
+  "ublk.started_export.live_service_loop.v1",
 ]
 
 validation_tier = "source-model claims-gate review"
 model_evidence_present = true
 runtime_evidence_present = true
 runtime_evidence_status = "bounded-qemu-ublk-smoke-present"
-decision = "planned-until-broader-runtime-evidence"
+decision = "qid-tag-validated-started-export-planned-until-broader-runtime-evidence"
 
 [[source_artifacts]]
 path = "validation/artifacts/ublk/qid-tag-state-model.json"
@@ -27,12 +27,26 @@ evidence_class = "runtime-ublk-completion-artifact"
 digest_algorithm = "sha256"
 digest = "39bd837250d2c55fec2bd72e6727d60ebe477d105cccd696bfe947a02797140f"
 
+[[source_artifacts]]
+path = "validation/artifacts/ublk/started-export-service-loop-model.json"
+evidence_class = "started-export-service-loop-model"
+digest_algorithm = "sha256"
+digest = "b72c7616904032e61095dfca4611ed68d7d9a177a1363475ec67fe27640bf88c"
+
+[[source_artifacts]]
+path = "validation/artifacts/ublk/started-export-admission-runtime.json"
+evidence_class = "runtime-ublk-started-export-admission-artifact"
+digest_algorithm = "sha256"
+digest = "c915d4e2294957e1a994c91467018e97748d735ce3ea12521a484580ddcc8a5b"
+
 reviewed_invariants = [
   "each qid/tag generation has at most one terminal TideFS completion",
   "successful uBLK completion emits a matching TideCompletion for the current request token",
   "abort emits one cancelled TideCompletion and rejects later uBLK completion commands",
   "timeout emits one timed-out TideCompletion and stale completions after reissue fail closed",
   "duplicate completion, stale generation, wrong qid, wrong tag, and completion after abort do not mutate the slot into a second terminal completion",
+  "ublk.started_export.live_service_loop.v1 completion handling ties back to the existing qid/tag exactly-once completion authority; duplicate, stale, wrong-qid, wrong-tag, post-abort, and post-release completion cases remain fail-closed evidence, not a second completion authority",
+  "ublk.started_export.live_service_loop.v1 host preflight, control open, ADD_DEV, SET_PARAMS, data-queue open, FETCH_REQ queue/tag coverage, START_DEV, daemon service-loop ownership, and DEL_DEV/shutdown cleanup are observed",
 ]
 
 boundary_review = [
@@ -40,11 +54,18 @@ boundary_review = [
   "The qid-tag-completion-runtime artifact records a focused qemu-ublk-smoke runtime trace with 1 hw queue, queue depth 2, and 5 completed requests through read/write/flush/discard lifecycle transitions.",
   "The runtime trace shows exactly-one terminal completion per (qid, tag, generation_token) tuple across all observed events; no duplicate, stale, or post-abort completion is present.",
   "This review does not validate fio workload breadth, mkfs/mount acceptance, online resize, crash safety, block-device production readiness, or broader uBLK ABI behavior.",
+  "The started-export-service-loop-model artifact records bounded pure-model evidence for the uBLK started-export lifecycle; it exercises 2 hw queues, queue depth 3, and 109 events through submit/timeout/reissue/complete/release/abort/unsupported_opcode/queue_bound transitions but does not exercise the uBLK daemon, ioctl, or product block I/O runtime.",
+  "The started-export-admission-runtime artifact records a focused qemu-ublk-smoke runtime admission trace including host preflight, control open, ADD_DEV, SET_PARAMS, data-queue open, FETCH_REQ queue/tag coverage, START_DEV, daemon service-loop ownership, first serviced request, and DEL_DEV/shutdown cleanup.",
+  "The started-export-admission-runtime artifact completion handling delegates to the existing qid/tag exactly-once completion authority; it does not introduce a second completion path.",
+  "This review does not validate fio workload breadth, mkfs/mount acceptance, online resize, crash durability, or production block-device readiness through the started-export evidence path.",
 ]
 
 non_claims = [
   "This review does not validate uBLK daemon production behavior, fio, mkfs, mount, online resize, or crash safety.",
   "This review does not validate production block-device readiness or broader uBLK ABI semantics.",
-  "This review does not move ublk.qid_tag.exactly_once_completion.v1 to validated status.",
+  "This review does not move ublk.qid_tag.exactly_once_completion.v1 to validated status (already validated).",
   "This review is bounded to the qemu-ublk-smoke evidence scope; additional runtime coverage (queue-depth scaling, multi-queue, error-injection, and broader operation mix) would be required before product wording can strengthen.",
+  "This review does not move ublk.started_export.live_service_loop.v1 to validated status.",
+  "This review does not validate fio, mkfs/mount, online resize, crash durability, or production block-device readiness for ublk.started_export.live_service_loop.v1.",
+  "This review does not claim that the started-export admission runtime artifact covers multi-queue scaling, capacity sizing, persistent device identity across restarts, or user-space recovery.",
 ]
