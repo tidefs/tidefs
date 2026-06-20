@@ -4840,12 +4840,47 @@ impl LocalFileSystem {
     }
 
     pub fn allocator_report(&mut self) -> Result<LocalStorageAllocatorReport> {
-        allocator_report_for_state(
+        let mut report = allocator_report_for_state(
             self.store.raw_primary_store_mut(),
             &self.state,
             self.allocator_policy,
             self.root_authentication_key,
-        )
+        )?;
+        let dirty_bytes = self.dirty_write_buffer_bytes()?;
+        if dirty_bytes > 0 {
+            report.current_namespace_allocated_bytes = report
+                .current_namespace_allocated_bytes
+                .checked_add(dirty_bytes)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            report.allocator_reserved_bytes = report
+                .allocator_reserved_bytes
+                .checked_add(dirty_bytes)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            report.pending_free_bytes = report
+                .allocator_reserved_bytes
+                .saturating_sub(report.current_namespace_allocated_bytes);
+            report.reusable_free_bytes = report
+                .policy
+                .content_capacity_bytes
+                .saturating_sub(report.allocator_reserved_bytes);
+        }
+        Ok(report)
+    }
+
+    fn dirty_write_buffer_bytes(&self) -> Result<u64> {
+        self.write_buffers.values().try_fold(0_u64, |sum, wb| {
+            let bytes =
+                u64::try_from(wb.buffered_bytes()).map_err(|_| FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+            sum.checked_add(bytes).ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })
+        })
     }
 
     pub fn claim_ledger_report(&self) -> ClaimLedgerReport {
@@ -6726,6 +6761,21 @@ impl LocalFileSystem {
         self.capacity_authority.record_free(bytes);
     }
 
+    fn ensure_content_write_not_over_capacity(&self, requested: u64) -> Result<()> {
+        let allocated = self.capacity_authority.used_bytes();
+        let capacity = self.capacity_authority.total_bytes();
+        if requested > 0 && allocated > capacity {
+            return Err(FileSystemError::NoSpace {
+                resource: LocalStorageResource::ContentBytes,
+                requested,
+                available: self.capacity_authority.available_bytes(),
+                capacity,
+                allocated,
+            });
+        }
+        Ok(())
+    }
+
     fn truncate_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) -> u64 {
         self.snapshot_write_buffers_for_rollback();
         let mut freed = 0_u64;
@@ -6928,6 +6978,7 @@ impl LocalFileSystem {
         {
             return Ok(record);
         }
+        self.ensure_content_write_not_over_capacity(bytes_len)?;
         // Quota: check byte grain delta for write
         let old_grains = crate::quota::allocation_grains_for_len(record.size);
         let new_grains = crate::quota::allocation_grains_for_len(new_size);
@@ -7124,6 +7175,7 @@ impl LocalFileSystem {
                     })?;
             new_size = new_size.max(end);
         }
+        self.ensure_content_write_not_over_capacity(total_bytes)?;
         let old_grains = crate::quota::allocation_grains_for_len(effective_size);
         let new_grains = crate::quota::allocation_grains_for_len(new_size);
         let delta_bytes = new_grains.saturating_sub(old_grains);
