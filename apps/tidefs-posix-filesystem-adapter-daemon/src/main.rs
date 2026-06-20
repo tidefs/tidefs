@@ -1334,9 +1334,11 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
         mountpoint: &str,
         queue_depth_artifact: Option<&std::path::Path>,
     ) -> Result<std::process::Child, String> {
+        use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
+        use std::sync::mpsc::TryRecvError;
         use std::thread;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let mut command = Command::new(exe);
         command
@@ -1350,15 +1352,47 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                 "TIDEFS_ROOT_AUTHENTICATION_KEY_HEX",
                 "4141414141414141414141414141414141414141414141414141414141414141",
             )
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
         if let Some(path) = queue_depth_artifact {
             command.arg("--queue-depth-artifact").arg(path);
         }
         let mut child = command.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "capture daemon stderr".to_string())?;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let _stderr_forwarder = thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            let mut ready_sent = false;
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        eprintln!("{line}");
+                        if !ready_sent && line.contains("Mounted TideFS (VFS engine) at ") {
+                            let _ = ready_tx.send(Ok(()));
+                            ready_sent = true;
+                        }
+                    }
+                    Err(err) => {
+                        if !ready_sent {
+                            let _ = ready_tx.send(Err(format!("read daemon stderr: {err}")));
+                        }
+                        return;
+                    }
+                }
+            }
+            if !ready_sent {
+                let _ = ready_tx.send(Err(
+                    "daemon exited before reporting mounted-ready state".to_string()
+                ));
+            }
+        });
 
-        let mut mounted = false;
-        for _ in 0..60 {
-            thread::sleep(Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut mountpoint_ready = false;
+        let mut daemon_ready = false;
+        while Instant::now() < deadline {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     return Err(format!("daemon exited early with status {status}"));
@@ -1366,20 +1400,32 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                 Ok(None) => {}
                 Err(e) => return Err(format!("wait daemon: {e}")),
             }
-            let check = Command::new("mountpoint")
-                .arg("-q")
-                .arg(mountpoint)
-                .status();
-            if check.is_ok_and(|s| s.success()) {
-                mounted = true;
+            if !mountpoint_ready {
+                let check = Command::new("mountpoint")
+                    .arg("-q")
+                    .arg(mountpoint)
+                    .status();
+                if check.is_ok_and(|s| s.success()) {
+                    mountpoint_ready = true;
+                }
+            }
+            if !daemon_ready {
+                match ready_rx.try_recv() {
+                    Ok(Ok(())) => daemon_ready = true,
+                    Ok(Err(err)) => return Err(err),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        return Err("daemon readiness channel closed before mounted-ready state"
+                            .to_string())
+                    }
+                }
+            }
+            if mountpoint_ready && daemon_ready {
                 break;
             }
+            thread::sleep(Duration::from_millis(100));
         }
-        if !mounted {
-            let mut stderr_out = String::new();
-            if let Some(ref mut stderr) = child.stderr {
-                let _ = std::io::Read::read_to_string(stderr, &mut stderr_out);
-            }
+        if !mountpoint_ready || !daemon_ready {
             let _ = child.kill();
             for _ in 0..50 {
                 match child.try_wait() {
@@ -1387,11 +1433,9 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
                     Ok(None) => thread::sleep(Duration::from_millis(100)),
                 }
             }
-            let mut msg = String::from("mountpoint did not become ready within 60s");
-            if !stderr_out.is_empty() {
-                msg.push_str(&format!("; daemon stderr: {stderr_out}"));
-            }
-            return Err(msg);
+            return Err(format!(
+                "mountpoint did not become ready within 60s (mountpoint_ready={mountpoint_ready}, daemon_ready={daemon_ready})"
+            ));
         }
         // Post-mount liveness check.
         match child.try_wait() {
