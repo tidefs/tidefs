@@ -3287,6 +3287,7 @@ impl LocalObjectStore {
 
         let segment_ids_before = discover_segment_ids(&self.segments_dir)?;
         let live_objects_before = stats_counted_index_len(&self.index);
+        let compaction_start_segment_id = self.current_segment_id;
         let protected_keys: BTreeSet<ObjectKey> = protected_keys.iter().copied().collect();
         let exact_location_keys: BTreeSet<ObjectKey> = protected_exact_locations
             .iter()
@@ -3337,13 +3338,21 @@ impl LocalObjectStore {
         }
 
         let tombstoned_unprotected_keys = tombstone_keys.len();
+        let compaction_emitted_records =
+            copied_protected_objects > 0 || tombstoned_unprotected_keys > 0;
         for key in tombstone_keys {
             self.delete(key)?;
         }
 
         self.sync_all()?;
+        // Segment retirement can remove the history that suppresses
+        // already-applied intent-log writes during replay.
+        self.mark_committed_intent_log_segments_replayed_for_compaction()?;
 
         let segment_ids_after_writes = discover_segment_ids(&self.segments_dir)?;
+        if compaction_emitted_records {
+            retained_segments.insert(compaction_start_segment_id);
+        }
         for segment_id in &segment_ids_after_writes {
             if !segment_ids_before.contains(segment_id) {
                 retained_segments.insert(*segment_id);
@@ -3463,6 +3472,34 @@ impl LocalObjectStore {
             exact_locations_preserved: true,
             production_fsck_required: false,
         })
+    }
+
+    fn mark_committed_intent_log_segments_replayed_for_compaction(&self) -> Result<()> {
+        if self.block_device_mode || sidecar_files_unavailable(&self.root) {
+            return Ok(());
+        }
+
+        let ilog_dir = self.root.join("intent_log");
+        if !ilog_dir.is_dir() {
+            return Ok(());
+        }
+
+        for segment_id in discover_segment_ids(&ilog_dir)? {
+            let path = segment_path(&ilog_dir, segment_id);
+            let mut replayed_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(StoreError::InvalidOptions {
+                    reason: "intent-log segment path has non-UTF-8 file name",
+                })?
+                .to_owned();
+            replayed_name.push_str(".replayed");
+            let replayed_path = ilog_dir.join(replayed_name);
+            fs::rename(&path, &replayed_path)
+                .map_err(|source| io_error("rename intent-log segment", &path, source))?;
+        }
+        sync_directory(&ilog_dir)?;
+        Ok(())
     }
 
     /// Verify the segment integrity hash chain across all segment files.
