@@ -39,6 +39,59 @@ stale-task prevention, and comprehensive observability.
 | #1254 Pool topology management | Resilver schedules placement across new topology |
 | #1180 Refcount delta cleanup | Data cleaner may trigger scrub verification on unlinked blocks |
 
+### Mounted Transform Identity Authority
+
+GitHub issue #637 is the current design authority for scrub and repair identity
+under mounted device transforms. The issue reviewed
+`docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`, this design,
+`crates/tidefs-local-filesystem/src/scrub.rs`,
+`crates/tidefs-local-filesystem/src/repair.rs`, active stale-generation repair
+issue #591, and placement/rebuild issue #18.
+
+Evidence from the current implementation:
+
+- `scrub.rs` reads inline and chunk content through `LocalObjectStore::get`,
+  computes `FastBlockChecksum` over encoded chunk bytes, verifies inline
+  checksum suffixes, and reports `ScrubBlockId { inode_id, data_version,
+  kind }`.
+- `repair.rs` consumes those `ScrubBlockId` values, reads the same raw content
+  keys for truncation/reconstruction decisions, and can write reconstructed
+  bytes through `LocalObjectStore::put`.
+- `scrub_repair_integration.rs` maps scrub findings into `SuspectEntry`
+  fields and already records missing/stale receipt evidence as blocked
+  scheduling state, but the byte identity is still inherited from the raw
+  local object path.
+- Issue #591 owns stale-generation repair candidate rejection and remains an
+  active implementation gate. Issue #18 owns placement receipts, rebuild, and
+  repair source selection.
+
+The mounted repair identity is **plaintext content identity**: the logical
+mounted file or extent bytes identified by the local filesystem
+`ScrubBlockId` and current `data_version`, as produced by a transform-aware
+content scrub/read authority. Checksum-layer evidence remains mandatory, but it
+is evidence over the exact bytes owned by the checked layer, not the identity
+that authorizes mounted repair writeback.
+
+| Candidate identity | Fit for mounted scrub/repair | Decision |
+|--------------------|------------------------------|----------|
+| Plaintext identity | Matches the user-visible content repair must preserve; stable across compression and encryption implementation details when bound to `ScrubBlockId` and `data_version`. | Chosen mounted product boundary. |
+| Compression frame | Useful to diagnose a content-encoding or lower-store compression frame, but frame bytes vary by algorithm, level, and encoder policy and are not the logical content repair must preserve. | Lower-layer evidence only. |
+| Encryption frame | Useful to validate authenticated ciphertext at the encryption layer, but nonce/tag/ciphertext identity belongs below mounted content and cannot drive truncation, mark-corrupt, or reconstruction semantics. | Lower-layer evidence only. |
+| Checksum-layer identity | Required to prove which layer detected corruption; current chunk checksums are over encoded chunk bytes and inline suffixes cover encoded inline bodies. | Mandatory evidence, not standalone repair identity. |
+| Raw media bytes | Useful for media diagnostics and object-store validation, but raw bytes bypass transform ordering and can select whichever raw-store path is convenient. | Not a mounted repair identity. |
+
+The required follow-up implementation mapping is:
+
+| Issue | Slice | Non-overlap boundary |
+|-------|-------|----------------------|
+| #650 | Add a transform-aware mounted content scrub/read authority. | Content reader/helper types only; no scrub or repair dispatch behavior. |
+| #651 | Route local scrub through the #650 authority and report plaintext identity plus checksum-layer evidence. | `scrub.rs` and scrub tests only; no repair writeback or stale-generation behavior. |
+| #652 | Gate repair scheduling/dispatch on transform-aware scrub evidence. | Repair integration/writeback consumers only; depends on #591 and must not take #18 placement source selection. |
+
+Mounted device-level compression and encryption remain blocked until those
+slices and every other production blocked row in
+`docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md` are resolved.
+
 ## 2. Design Overview
 
 The framework introduces these new abstractions:
@@ -825,6 +878,12 @@ pub enum ResilverError {
 - [#1254] Pool import/export and topology management — resilver placement
 - [#1180] Refcount delta cleanup queues — data cleaner interaction
 - [#827] Structural observability — counter emission
+- GitHub #637 — mounted transform scrub/repair identity decision
+- GitHub #650 — mounted content scrub/read authority implementation slice
+- GitHub #651 — local scrub transform-aware identity consumer
+- GitHub #652 — repair dispatch transform-aware evidence gate
+- GitHub #591 — stale-generation repair candidate rejection
+- GitHub #18 — placement receipts, rebuild, and repair source selection
 - `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md`
 - `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`
 - `docs/ERASURE_CODING_PLACEMENT_DESIGN.md`
