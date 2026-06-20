@@ -1,6 +1,7 @@
 # Timestamp and Generation Authority
 
 Maturity: design authority for TFR-005; produced under GitHub issue #499.
+Recovery-generation drift contract narrowed under GitHub issue #694.
 Supersedes the guardrail version from issue #325.
 
 This document specifies one authority model for POSIX wall-clock timestamps,
@@ -74,14 +75,19 @@ Callers that consume a concept must go through the defining crate's public API.
 ### 2.2 VFS Inode Generation (`Generation`)
 
 - **Domain**: `u64`.
-- **Monotonicity**: Strictly monotonic per inode. Each inode mutation that
-  changes identity (content write, link/unlink, rename, attribute mutation
-  that affects filehandle validity) must advance `generation`.
+- **Monotonicity**: Strictly monotonic for file-handle identity changes on a
+  given inode id. A new or reconstructed VFS identity must not reuse the same
+  `(inode_id, generation)` pair for a different inode lifetime. Ordinary
+  content writes, POSIX timestamp updates, link-count changes, xattr changes,
+  and namespace mutations that keep the same VFS file-handle identity do not
+  use `generation` as their freshness token; they advance `data_version` and/or
+  `metadata_version` instead.
 - **Wraparound**: `checked_next()` returns `None` at `u64::MAX`. In practice,
   wraparound is not reached within the lifetime of a single mount.
-- **Epoch**: No epoch. `Generation::ZERO` (0) is the initial value for a
-  newly created inode. A generation of 0 means the inode has never been
-  mutated.
+- **Epoch**: No epoch. `Generation::ZERO` (0) is the sentinel value before a
+  durable VFS file-handle identity generation is assigned. Persisted
+  local-filesystem records normally use a nonzero generation when the inode is
+  created or reconstructed.
 - **Authority boundary**: `Generation::new()` and
   `Generation::from_vfs_generation()` in `tidefs-types-vfs-core` are the
   only valid constructors.
@@ -203,8 +209,8 @@ POSIX inode timestamps (atime_ns, mtime_ns, ctime_ns, btime_ns)
 │    │  -- serialized in -->  InodeRecord             │
 │    │                                                │
 │  Generation (VFS inode gen)                         │
-│    │  -- written alongside -->  data_version         │
-│    │       (both use same tick during recovery)     │
+│    │  -- may share -->  recovery initialization tick │
+│    │       with data_version / metadata_version     │
 │    │  -- serialized in -->  InodeRecord,            │
 │    │       DirEntry, InodeAttr                      │
 │    │                                                │
@@ -238,16 +244,65 @@ identify which version of a content block is being checked.
 namespace revision semantics. A separate namespace-revision authority slice
 is needed to decouple these (see section 9.1).
 
-**Generation alongside data_version (during recovery)**: Crash recovery sets
-`generation`, `data_version`, and `metadata_version` to the same recovery
-tick. After recovery, normal write paths advance only `data_version` (for
-content) or `metadata_version` (for metadata), leaving `generation` at the
-last identity-changing value.
+**Generation alongside data_version / metadata_version (during recovery)**:
+Crash recovery may initialize `generation`, `data_version`, and
+`metadata_version` from the same recovery tick when it materializes one
+accepted inode record from one replay boundary. That shared tick is only a
+common recovery provenance fence. It does not make the three fields the same
+authority after mount. See section 3.2 for the drift contract.
 
 **Format version to all records**: Every serialized record (inode, content
 manifest, content chunk, dedup redirect, changed-record export) carries
 `FILESYSTEM_FORMAT_VERSION` in its header. Decode refuses records with
 versions outside `FORMAT_COMPAT_WINDOW_MIN..=FILESYSTEM_FORMAT_VERSION`.
+
+### 3.2 Recovery-Generation Drift Contract
+
+Recovery, intent-log replay, and commit-group replay may rebuild a complete
+inode record at a single accepted replay boundary. When they do, they may stamp
+the same fresh recovery tick into all three local fields:
+
+- `generation` is the VFS file-handle identity generation. It protects the
+  `(inode_id, generation)` identity observed through directory entries,
+  `InodeAttr`, and file handles. It is not a content freshness counter, a POSIX
+  timestamp, or a scrub row id.
+- `data_version` is the content-object version. It selects the stored content
+  identity through `content_object_key_for_version()` and the content chunk /
+  manifest records. Scrub consumes this value through `ScrubBlockId`.
+- `metadata_version` is the local metadata storage version. It orders durable
+  inode metadata changes and currently remains the source for the
+  `subtree_rev` / `dir_rev` projection debt tracked in section 9.1.
+
+Using one recovery tick for all three fields is allowed only while recovery is
+materializing or replaying one coherent inode state. The tick is a recovery
+initialization fence: it says the accepted content bytes, metadata record, and
+VFS identity were rebuilt from the same replay decision. It is not an invariant
+that must continue to hold after the next mounted operation.
+
+Post-recovery drift is intentional:
+
+- The next normal content write must allocate a fresh `data_version` for the
+  new content object. It may also advance `metadata_version` when the write
+  changes metadata such as size or POSIX timestamps. It must not rely on
+  `generation == data_version` for content freshness.
+- The next metadata-only mutation must advance `metadata_version` and leave
+  `data_version` unchanged unless the operation also creates a new content or
+  directory object version. It must not rely on `generation ==
+  metadata_version` for metadata freshness.
+- `generation` advances only when a VFS file-handle identity is newly created
+  or deliberately reconstructed. Recovery-created equality between
+  `generation`, `data_version`, and `metadata_version` must not be repaired or
+  re-established merely because later storage versions drifted.
+- Scrub must identify content by the inode's current `data_version` (or by a
+  chunk reference's current `data_version` for chunked content). Scrub must
+  tolerate `generation`, `data_version`, and `metadata_version` being unequal
+  and must not rewrite version fields simply to restore equality.
+
+This contract does not reopen the POSIX timestamp projection work completed by
+issues #325, #330, #331, #348, and #499. POSIX `atime_ns`, `mtime_ns`,
+`ctime_ns`, and `btime_ns` remain wall-clock fields and must not be
+reconstructed from recovery ticks, content object versions, metadata versions,
+or VFS generations.
 
 ## 4. On-Disk Format Compatibility Rules
 
@@ -421,10 +476,12 @@ projection slice:
   storage identity fields.  The encode path (`encode_inode`) always writes
   explicit POSIX timestamps at format version 6.
 
-## 9. Remaining TFR-005 Implementation Blockers
+## 9. Remaining TFR-005 Runtime Sites
 
-These runtime projection sites still need owned issues, implementation, and
-validation before TFR-005 can close:
+These runtime projection sites still need owned issues, implementation and
+validation where source behavior must change, or an explicit decision record
+where the current behavior is already the intended authority contract, before
+TFR-005 can close:
 
 1. **`metadata_version` to `subtree_rev` / `dir_rev` coupling**.
    `InodeRecord::to_inode_attr()` projects `metadata_version` into both VFS
@@ -441,12 +498,17 @@ validation before TFR-005 can close:
      from `InodeRecord::to_inode_attr()`.
 
 2. **Intent-log replay and commit-group recovery**.
-   Recovery paths (`crash_recovery.rs`, `txg_replay.rs`) rebuild content
-   under fresh generation ticks and store those ticks into `data_version`,
-   `metadata_version`, and `generation` simultaneously. After recovery,
-   `generation` may drift from `data_version`/`metadata_version` on subsequent
-   writes — this drift is intentional but must be explicitly specified as part
-   of the recovery contract.
+   Section 3.2 now specifies the recovery-generation drift contract: recovery
+   paths (`crash_recovery.rs`, `txg_replay.rs`) may initialize `generation`,
+   `data_version`, and `metadata_version` from one accepted recovery tick, and
+   later mounted writes intentionally let those identities diverge. No recovery
+   source change is required merely to preserve or restore equality among those
+   fields. A future implementation issue is needed only if executable coverage
+   or runtime guards are added for this contract; its expected write set should
+   be limited to focused local-filesystem recovery/write/scrub tests and any
+   minimal helper adjustments they require, and it must not edit
+   `crash_recovery.rs` while issue #692 or another live recovery/runtime owner
+   holds that path.
 
 3. **Scrub and repair identity**.
    `ScrubBlockId` uses `(inode_id, data_version)` as block identity. Scrub
