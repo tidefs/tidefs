@@ -6,7 +6,7 @@ registry_path = "validation/performance/no-hidden-queues.toml"
 registry_schema_version = 1
 source_coverage_kind = "recursive-source-registry-review"
 runtime_artifact_boundary = "source-registry-review-only-does-not-satisfy-queue-depth-runtime-artifact"
-decision = "local-runtime-artifact-registered-scheduler-remains-blocked"
+decision = "claims-remain-blocked"
 reviewed_at = "2026-06-20"
 affected_claim_ids = [
   "scheduler.dirty_debt.no_hidden.v1",
