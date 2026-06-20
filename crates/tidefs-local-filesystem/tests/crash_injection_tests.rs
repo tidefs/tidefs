@@ -1054,6 +1054,84 @@ fn local_vfs_write_fsync_runtime_crash_oracle_artifact() {
     cleanup(&root);
 }
 
+#[test]
+fn runtime_rename_crash_oracle_child_workload() {
+    let root_str = match std::env::var("TIDEFS_RUNTIME_RENAME_CRASH_ORACLE_ROOT") {
+        Ok(root) => root,
+        Err(_) => return,
+    };
+
+    set_test_key();
+
+    let root = std::path::PathBuf::from(root_str);
+    let mut fs =
+        LocalFileSystem::open_with_options(&root, StoreOptions::test_fast()).expect("child open");
+    fs.rename("/dir/source", "/dir/dest", true)
+        .expect("child rename oracle file");
+    fs.fsync_file("/dir/dest")
+        .expect("child fsync renamed oracle");
+    let content = fs
+        .read_file("/dir/dest")
+        .expect("child read renamed oracle");
+    assert_eq!(content, b"rename-atomicity-test");
+
+    std::process::exit(99);
+}
+
+#[test]
+fn local_vfs_rename_runtime_crash_oracle_artifact() {
+    set_test_key();
+
+    let root = temp_root("ch-local-vfs-rename-oracle");
+
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open fs");
+        fs.create_dir("/dir", 0o755).expect("create oracle dir");
+        fs.create_file("/dir/source", 0o644)
+            .expect("create oracle source");
+        fs.write_file("/dir/source", 0, b"rename-atomicity-test")
+            .expect("write oracle source");
+        fs.fsync_file("/dir/source").expect("fsync oracle source");
+        let content = fs.read_file("/dir/source").expect("read oracle source");
+        assert_eq!(content, b"rename-atomicity-test");
+        drop(fs);
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current exe"))
+        .env("TIDEFS_ROOT_AUTHENTICATION_KEY_HEX", "A".repeat(64))
+        .env(
+            "TIDEFS_RUNTIME_RENAME_CRASH_ORACLE_ROOT",
+            root.to_str().expect("root utf8"),
+        )
+        .arg("--exact")
+        .arg("runtime_rename_crash_oracle_child_workload")
+        .output()
+        .expect("spawn rename runtime crash oracle child");
+    assert_eq!(
+        output.status.code(),
+        Some(99),
+        "child must exit with PowerLoss code after rename/fsync/read"
+    );
+
+    {
+        let fs = LocalFileSystem::open_with_options(&root, opts()).expect("reopen fs");
+        assert!(
+            fs.stat("/dir/source").is_err(),
+            "old source path must not reappear after recovered rename"
+        );
+        let content = fs
+            .read_file("/dir/dest")
+            .expect("read recovered renamed file");
+        assert_eq!(
+            content, b"rename-atomicity-test",
+            "renamed fsynced payload must survive process crash"
+        );
+        drop(fs);
+    }
+
+    cleanup(&root);
+}
+
 // ---------------------------------------------------------------------------
 // Test: All 18 injection points iterate without panic when disarmed
 // ---------------------------------------------------------------------------
