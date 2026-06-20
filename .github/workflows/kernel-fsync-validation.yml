@@ -107,18 +107,18 @@ jobs:
           SCOPE="${SCOPE_BASE} status=${STATUS_LABEL} passed=${PASSED} failed=${FAILED} blocked=${BLOCKED} run=${RUN_ID} source=${SOURCE_REF} timeout=${TIMEOUT}s pool=${POOL_SIZE}MB"
 
           cat > "$MANIFEST_PATH" << MANIFESTEOF
-{
-  "manifest_version": 1,
-  "claim_id": "${CLAIM_ID}",
-  "evidence_class": "${EVIDENCE_CLASS}",
-  "validation_tier": "full-kernel-no-daemon",
-  "source": "${SOURCE_LABEL}",
-  "scope": "${SCOPE}",
-  "artifact_path": "${ARTIFACT_PATH}",
-  "content_digest": "${CONTENT_DIGEST}",
-  "generated_at": "${GENERATED_AT}"
-}
-MANIFESTEOF
+          {
+            "manifest_version": 1,
+            "claim_id": "${CLAIM_ID}",
+            "evidence_class": "${EVIDENCE_CLASS}",
+            "validation_tier": "full-kernel-no-daemon",
+            "source": "${SOURCE_LABEL}",
+            "scope": "${SCOPE}",
+            "artifact_path": "${ARTIFACT_PATH}",
+            "content_digest": "${CONTENT_DIGEST}",
+            "generated_at": "${GENERATED_AT}"
+          }
+          MANIFESTEOF
 
           echo "## Evidence manifest written" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
