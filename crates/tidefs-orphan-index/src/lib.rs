@@ -231,6 +231,11 @@ impl OrphanEntry {
 // OrphanIndex
 // ---------------------------------------------------------------------------
 
+/// tidefs-queue-root: orphan_index.persistent_index
+/// admission: AdmissionPermit  service_curve: ServiceCurve
+///
+/// Queue root for the persistent orphan index. All insert/remove/recover
+/// mutations that modify the durable orphan log must route through this index.
 /// Persistent orphan index backed by a key-only B+tree.
 ///
 /// The in-memory B+tree stores `(OrphanKey, OrphanEntry)` pairs for fast

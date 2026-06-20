@@ -42,7 +42,7 @@ evidence_requirements = [
 blockers = [
   "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
   "Runtime evidence for interrupted rename sequences is not recorded (#596).",
-  "Rename directory-entry and orphan-index no-hidden-queue evidence is tracked separately (#597).",
+  "Rename directory-entry and orphan-index no-hidden-queue source/registry review receipt recorded (#597); mounted runtime queue-depth evidence remains pending (#498).",
 ]
 generated_doc = "Planned rename atomicity claim for local namespace operations. TideFS must keep rename wording aspirational until model and runtime crash evidence covers the claimed scope."
 evidence_artifacts = [
@@ -89,7 +89,7 @@ evidence_requirements = [
 blockers = [
   "Model-only issue #286 evidence is not local runtime crash evidence.",
   "Local runtime rename crash injection remains blocked until #596 records the runtime crash artifact.",
-  "Rename directory-entry and orphan-index no-hidden-queue evidence is tracked separately in #597.",
+  "Rename directory-entry and orphan-index no-hidden-queue source/registry review receipt recorded (#597); mounted runtime queue-depth evidence remains pending (#498).",
 ]
 generated_doc = "Blocked local VFS rename crash claim. TideFS must keep rename crash-safety wording behind model and runtime evidence."
 evidence_artifacts = [
