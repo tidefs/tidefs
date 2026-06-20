@@ -1,17 +1,28 @@
 # On-Disk Format Versioning and Compatibility Policy
 
-Maturity: **release policy** -- public compatibility contract for operators.
-Issue: [#6518](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/6518).
+Maturity: current pre-alpha policy boundary; not a public compatibility
+contract.
 
-This document is the operator-facing compatibility contract for TideFS on-disk
-formats. It names every supported format family, its current version, the
-upgrade rules that govern format evolution, and the refusal behavior when an
-incompatible format is encountered. Implementation-level details live in the
-referenced sub-documents; this document is the integration point.
+TideFS is a private pre-alpha repository and has not had a public release. This
+document records the current on-disk format version authorities used for
+development and review. It is not an operator-facing release compatibility
+contract, and it does not promise migration, downgrade, or fallback support for
+unreleased internal data.
+
+Follow [UNRELEASED_AUTHORITY_POLICY.md](UNRELEASED_AUTHORITY_POLICY.md) first:
+internal formats, fixtures, design artifacts, and command sketches in this
+repository are not compatibility commitments unless a current GitHub issue or
+current policy document names a real external ABI, protocol, or operator-owned
+data boundary. Without that named boundary, TideFS chooses the current
+authority, removes or refuses stale paths, and does not add migration or
+fallback debt for old pre-release data.
 
 ## 1. Supported Format Families
 
-TideFS on-disk state is organized into four format families. Each family is
+TideFS on-disk state is currently described through four format families. Each
+family below names the current development authority and the version fields
+that govern refusal behavior. A listed internal version is not a public
+compatibility promise.
 
 ### 1.1 Local Object Store (Segment Log)
 
@@ -24,14 +35,14 @@ data, metadata records, and integrity trailers.
 | Field | Current version | Meaning |
 |---|---|---|
 | `manifest_version` | 1 | Format manifest struct version |
-| `record_format_version` | 1-3 | Record header+footer+trailer layout. v3 (current writer) adds BLAKE3-256 production-integrity trailers. v1/v2 are read-only compatibility. |
+| `record_format_version` | 1-3 | Record header+footer+trailer layout. v3 is the current writer. v1/v2 are accepted development inputs only where the current manifest gate permits them; they are not public compatibility commitments. |
 | `index_base_format_version` | 1 | Object index (B-tree root pointer) layout |
 | `spacemap_base_format_version` | 1 | Spacemap checkpoint layout |
 | `suspect_log_format_version` | 1 | Suspect-log record layout |
 | `integrity_trailer_digest_suite_id` | 2 (BLAKE3-256) | Digest algorithm for production-integrity trailers |
 
 A format manifest blob (20 bytes, binary) is written into every object store
-source of truth for format compatibility.
+source of truth and validated before replay.
 
 ### 1.2 Pool Labels
 
@@ -68,8 +79,9 @@ explicitly as capabilities are needed.
 **Spec:** [TORN_COMMIT_RECOVERY_CONTRACT.md](TORN_COMMIT_RECOVERY_CONTRACT.md)
 
 Committed-root entries and intent-log records carry their own version
-discriminants. The current format is V1. Replay accepts only the exact
-version written by the same TideFS release.
+discriminants. The current documented format is V1. Replay accepts only
+versions explicitly handled by the current import/recovery authority; unknown
+versions must fail closed rather than being guessed or silently replayed.
 
 ## 2. Versioning Discipline
 
@@ -108,62 +120,69 @@ A pool label or dataset may carry feature flags unknown to the current code;
 the import/open path checks the class and acts accordingly. A format version
 outside the supported range is an immediate refusal -- there is no fallback.
 
-## 3. Upgrade Rules
+## 3. Pre-Release Upgrade Boundary
 
-### 3.1 Supported upgrade paths
+### 3.1 Current allowed paths
 
-TideFS is pre-release. No production data migration paths exist today. The
-following rules will govern upgrades when the first release ships:
+TideFS is pre-release. No public or production data migration paths exist
+today. Current allowed paths are deliberately narrow:
 
-- **Same-version open:** A store, pool, or dataset created by the same release
-  opens read-write. This is the normal operating mode.
-- **Minor version forward (U1 -- lazy re-encode on touch):** When the code
-  accepts an older minor version within the same major line, it opens the store
-  read-write. Existing records remain in their original format. New writes
-  emit the current format. This is the intended upgrade path for record format
-  evolution within a compatibility window.
+- **Current-authority open:** A store, pool, or dataset created by the current
+  authority opens only when its recorded versions and features are accepted by
+  the current code.
+- **Accepted internal range:** An older internal record version may be read
+  only when the current manifest, parser, and tests explicitly support that
+  range. That support is a development replay input, not a public compatibility
+  promise.
 - **Feature-gated forward:** A dataset with feature flags unknown to the
   current code is opened subject to the feature class: `incompat` refuses,
   `ro_compat` opens read-only, `compat` opens read-write.
-- **Explicit upgrade:** Features are enabled via `tidefsctl dataset upgrade
-  feature flag, and commits the change as a txg. Some features may require
-  data migration (format rewrite); those requirements are listed per-feature
-  in the feature registry.
+- **Dataset feature upgrade:** `tidefsctl dataset upgrade <pool> <dataset>`
+  enables supported dataset feature flags from the current
+  `SupportedFeaturesV1` table. It is not a general on-disk migration tool.
 
-### 3.2 Unsupported paths
+Any future migration, downgrade, fallback, send/receive format conversion, or
+offline upgrade behavior for unreleased TideFS data needs either a named
+external/operator boundary or a separate prepared GitHub issue with owner,
+scope, validation, and retirement or graduation criteria.
 
-- **Major version jump:** Moving between incompatible major versions (e.g.,
-  V1 to V2 with struct layout changes) requires an explicit offline upgrade
-  tool or send/receive into a new pool. It is not an online operation.
+### 3.2 Unsupported or not promised paths
+
+- **Major version jump:** There is no default online or offline major-version
+  conversion path.
 - **Downgrade:** TideFS does not support downgrade. A store written by newer
   code will refuse to open under older code. There is no "best effort"
   downgrade path.
-- **Cross-pool format migration:** Moving data between pools of different
-  format versions uses `tidefsctl send | receive`, not in-place conversion.
+- **Cross-pool format migration:** This document does not promise in-place
+  conversion or send/receive conversion between incompatible format versions.
+- **Fallback replay:** TideFS must not silently skip, reinterpret, or
+  best-effort replay an incompatible internal artifact.
 
 ### 3.3 Pre-release note
 
-TideFS has not shipped a public release. Internal v0.x format artifacts
-(record versions 1 and 2, early pool label layouts, pre-V1 committed-root
-entries) are compatibility replay inputs for development only. They are not
-production format commitments. The first public release will freeze the V1
-format surface; all pre-release internal formats are subject to removal or
-redesign without a migration path.
+Internal format artifacts, including old record versions, early pool label
+layouts, and pre-current committed-root entries, are development evidence only.
+They are subject to removal or redesign without a migration path unless a
+current GitHub issue or current policy document names the real external or
+operator-owned boundary being preserved.
 
 ## 4. Refusal Behavior
 
 ### 4.1 Object store open refusal
 
-manifest, the store open returns an error with the first mismatched field,
-the stored value, and the current expected value. Example:
+When a stored `LocalObjectStoreFormatManifest` is not compatible with
+`CURRENT_FORMAT_MANIFEST`, the store open fails before replay or reads begin.
+The error identifies the mismatched field, the stored value, and the current
+expected value. Example:
 
 ```text
 format manifest incompatible: field=record_format_version_max, stored=5, current=3
 ```
 
 The store does not enter an undefined state. No replay or read occurs on an
-incompatible store. The error is surfaced to the operator through the daemon
-log and the `tidefsctl pool import` output.
+incompatible store. A path that cannot surface an equivalent explicit refusal
+must fail closed and needs implementation work before it can be documented as
+operator behavior.
 
 ### 4.2 Pool import refusal
 
@@ -205,16 +224,15 @@ dataset opened read-only: feature org.tidefs:future_checksum (ro_compat) not sup
 
 ### 4.4 Committed-root refusal
 
-A committed-root entry with an unknown version discriminant is quarantined
-rather than replayed:
+A committed-root entry with an unknown version discriminant must halt replay or
+be quarantined by an explicitly documented recovery path rather than replayed:
 
 ```text
 committed root version 2 unsupported; replay halted at txg N
 ```
 
-The pool remains importable, but the dataset state is frozen at the last
-committed root with a supported version. The operator must upgrade the TideFS
-binary to advance past that txg.
+If a current import path cannot safely preserve a partially imported/frozen
+state, it must return an explicit error rather than claiming recovery behavior.
 
 ### 4.5 No silent fallback
 
@@ -225,26 +243,37 @@ hard gate.
 
 ## 5. Operator Commands
 
-### 5.1 Inspect format versions
+The current command surface can inspect pool and dataset state through the live
+owner or explicit offline devices. It does not provide a general
+format-compatibility preflight command or a data migration command.
+
+### 5.1 Inspect pool state
 
 ```sh
-tidefsctl pool info <pool>     # shows pool label version and feature bits
-tidefsctl dataset list <pool>  # shows per-dataset feature flags
+tidefsctl pool scan --devices /dev/sdb /dev/sdc --json
+tidefsctl pool status <pool> --json
+tidefsctl pool status <pool> --devices /dev/sdb /dev/sdc --json
 ```
 
-### 5.2 Enable a feature
+### 5.2 Inspect and change dataset feature flags
 
 ```sh
-tidefsctl dataset set-strategy <pool> <dataset> --enable org.tidefs:posix_acl
+tidefsctl dataset list --pool <pool> --json
+tidefsctl dataset set-strategy <pool> <dataset> --list
+tidefsctl dataset set-strategy <pool> <dataset> --enable org.tidefs:posix_acl --class compat
+tidefsctl dataset upgrade <pool> <dataset>
 ```
 
-### 5.3 Check compatibility before upgrade
-
-```sh
-```
+`dataset upgrade` enables supported dataset feature flags for the current code.
+It is not a promise to rewrite old on-disk formats or to bridge incompatible
+pre-release data. A future compatibility probe, offline upgrade tool,
+downgrade path, fallback reader, or format migration workflow must be tracked
+by a separate prepared issue unless it is tied to a named external/operator
+boundary in current policy.
 
 ## 6. Referenced Documents
 
+- [UNRELEASED_AUTHORITY_POLICY.md](UNRELEASED_AUTHORITY_POLICY.md) -- pre-release compatibility, migration, downgrade, and fallback boundary
 - [FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md](FORMAT_IDENTITY_UPGRADE_REPLAY_CONTINUITY_LAW_P2-04.md) -- design-level format identity, upgrade, and replay continuity law
 - [LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md](LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md) -- local object store on-disk format specification
 - [DATASET_FEATURE_FLAGS_DESIGN.md](DATASET_FEATURE_FLAGS_DESIGN.md) -- per-dataset feature flag architecture
