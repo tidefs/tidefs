@@ -11,6 +11,9 @@ use tidefs_extent_map::ExtentMap;
 use tidefs_local_object_store::{
     checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey, StoreError, StoreOptions,
 };
+use tidefs_receive_stream::receive_persistence::{
+    validate_receive_contract, BaseRootPinLookup, ReceiveContract, ReceivePersistenceError,
+};
 use tidefs_types_vfs_core::{InodeId, NodeKind};
 
 use crate::constants::*;
@@ -508,36 +511,178 @@ fn committed_root_incremental_base_identity_matches(
         && candidate.superblock_digest == expected.superblock_digest
 }
 
+fn receive_base_root_identity(root: &CommittedRootSummary) -> [u8; 32] {
+    *blake3::hash(&encode_root_commit(&root_commit_from_summary(root))).as_bytes()
+}
+
+fn receive_dataset_lineage_identity(
+    existing: &LocalFileSystem,
+    record: &SnapshotRecord,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tidefs.local.receive.dataset-lineage.v1");
+    hasher.update(&existing.mounted_dataset_id());
+    hasher.update(crate::snapshot::snapshot_record_catalog_name(record).as_bytes());
+    hasher.update(crate::snapshot::snapshot_record_dataset_id(record).as_bytes());
+    hasher.update(&record.root.transaction_id.to_le_bytes());
+    hasher.update(&record.root.generation.to_le_bytes());
+    hasher.update(&record.root.superblock_checksum.0.to_le_bytes());
+    hasher.update(&record.root.manifest_checksum.0.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+struct LocalReceiveBaseRootPinLookup<'a> {
+    existing: &'a LocalFileSystem,
+    authorized_base: &'a CommittedRootSummary,
+    completed_generation: Option<u64>,
+}
+
+impl LocalReceiveBaseRootPinLookup<'_> {
+    fn authorized_record_for_identity(
+        &self,
+        base_root_identity: &[u8; 32],
+    ) -> Option<&SnapshotRecord> {
+        if *base_root_identity != receive_base_root_identity(self.authorized_base) {
+            return None;
+        }
+        if self
+            .existing
+            .ensure_snapshot_authority_consistent()
+            .is_err()
+        {
+            return None;
+        }
+        self.existing.state.snapshots.values().find(|record| {
+            crate::snapshot::snapshot_record_retains_data(record)
+                && committed_root_incremental_base_identity_matches(
+                    &record.root,
+                    self.authorized_base,
+                )
+                && self
+                    .existing
+                    .ensure_snapshot_record_authority(record)
+                    .is_ok()
+        })
+    }
+}
+
+impl BaseRootPinLookup for LocalReceiveBaseRootPinLookup<'_> {
+    fn is_base_root_pinned(&self, base_root_identity: &[u8; 32]) -> bool {
+        self.authorized_record_for_identity(base_root_identity)
+            .is_some()
+    }
+
+    fn dataset_lineage_for_base_root(&self, base_root_identity: &[u8; 32]) -> Option<[u8; 32]> {
+        self.authorized_record_for_identity(base_root_identity)
+            .map(|record| receive_dataset_lineage_identity(self.existing, record))
+    }
+
+    fn latest_completed_receive_generation(
+        &self,
+        base_root_identity: &[u8; 32],
+        dataset_lineage_identity: &[u8; 32],
+    ) -> Option<u64> {
+        let actual_lineage = self.dataset_lineage_for_base_root(base_root_identity)?;
+        if &actual_lineage == dataset_lineage_identity {
+            self.completed_generation
+        } else {
+            None
+        }
+    }
+}
+
+fn receive_contract_error(error: ReceivePersistenceError) -> FileSystemError {
+    match error {
+        ReceivePersistenceError::BaseRootNotPinned { .. } => FileSystemError::Unsupported {
+            operation: "incremental receive",
+            reason: "receive contract base root is not pinned",
+        },
+        ReceivePersistenceError::DatasetLineageUnavailable { .. } => FileSystemError::Unsupported {
+            operation: "incremental receive",
+            reason: "receive contract dataset lineage is unavailable",
+        },
+        ReceivePersistenceError::DatasetLineageMismatch { .. } => FileSystemError::Unsupported {
+            operation: "incremental receive",
+            reason: "receive contract dataset lineage does not match local authority",
+        },
+        ReceivePersistenceError::ReceiveGenerationReplayed { .. } => FileSystemError::Unsupported {
+            operation: "incremental receive",
+            reason: "receive contract generation was already completed",
+        },
+        ReceivePersistenceError::ContractRequired => FileSystemError::Unsupported {
+            operation: "incremental receive",
+            reason: "receive contract is required",
+        },
+        ReceivePersistenceError::ContractNotValidated => FileSystemError::Unsupported {
+            operation: "incremental receive",
+            reason: "receive contract was not validated",
+        },
+        ReceivePersistenceError::Store(_) => FileSystemError::CorruptState {
+            reason: "receive contract validation unexpectedly reached object-store persistence",
+        },
+    }
+}
+
+fn validate_local_incremental_receive_contract(
+    existing: &LocalFileSystem,
+    audit: &RecoveryAuditReport,
+    authorized_base: &CommittedRootSummary,
+    export: &ChangedRecordExport,
+) -> Result<()> {
+    let pin_lookup = LocalReceiveBaseRootPinLookup {
+        existing,
+        authorized_base,
+        completed_generation: audit
+            .selected_root
+            .as_ref()
+            .map(|selected| selected.transaction_id),
+    };
+    let base_root_identity = receive_base_root_identity(authorized_base);
+    let dataset_lineage_identity = pin_lookup
+        .dataset_lineage_for_base_root(&base_root_identity)
+        .ok_or_else(|| {
+            receive_contract_error(ReceivePersistenceError::DatasetLineageUnavailable {
+                base_root_identity,
+            })
+        })?;
+    let contract = ReceiveContract {
+        base_root_identity,
+        dataset_lineage_identity,
+        receive_generation: export.current_root.transaction_id,
+    };
+    validate_receive_contract(contract, &pin_lookup).map_err(receive_contract_error)
+}
+
 fn verify_incremental_base_root_authority(
     existing: &LocalFileSystem,
     audit: &RecoveryAuditReport,
     from_root: &CommittedRootSummary,
 ) -> Result<CommittedRootSummary> {
-    let Some(audited_base) = audit
-        .valid_committed_roots
-        .iter()
-        .find(|candidate| committed_root_incremental_base_identity_matches(candidate, from_root))
-    else {
-        return Err(FileSystemError::Unsupported {
-            operation: "incremental receive",
-            reason: "target recovery audit does not contain the incremental base root identity",
-        });
-    };
-
     existing.ensure_snapshot_authority_consistent()?;
     for record in existing.state.snapshots.values() {
         if !crate::snapshot::snapshot_record_retains_data(record) {
             continue;
         }
-        if committed_root_incremental_base_identity_matches(&record.root, audited_base) {
+        if committed_root_incremental_base_identity_matches(&record.root, from_root) {
             existing.ensure_snapshot_record_authority(record)?;
             return Ok(record.root.clone());
         }
     }
 
+    if audit
+        .valid_committed_roots
+        .iter()
+        .any(|candidate| committed_root_incremental_base_identity_matches(candidate, from_root))
+    {
+        return Err(FileSystemError::Unsupported {
+            operation: "incremental receive",
+            reason: "incremental base root is not protected by a data-retaining snapshot or clone",
+        });
+    }
+
     Err(FileSystemError::Unsupported {
         operation: "incremental receive",
-        reason: "incremental base root is not protected by a data-retaining snapshot or clone",
+        reason: "target recovery audit does not contain the incremental base root identity",
     })
 }
 
@@ -1489,11 +1634,12 @@ pub(crate) fn receive_incremental_changed_records(
 
     let prepared = validate_changed_record_export(export, true)?;
 
-    let preflight_store = LocalObjectStore::open_with_options(root, options.clone())?;
-    if target_has_incremental_base_root_slot(&preflight_store, from_root)? {
-        validate_incremental_omitted_content_objects(&preflight_store, &prepared)?;
+    let mut preflight_pool = LocalFileSystem::default_development_pool(root, &options, None, None)?;
+    let preflight_store = preflight_pool.raw_primary_store_mut();
+    if target_has_incremental_base_root_slot(preflight_store, from_root)? {
+        validate_incremental_omitted_content_objects(preflight_store, &prepared)?;
     }
-    drop(preflight_store);
+    drop(preflight_pool);
 
     // Verify the base root exists in the target filesystem and is protected
     // by the local snapshot/catalog/lifecycle-pin authority.
@@ -1504,6 +1650,7 @@ pub(crate) fn receive_incremental_changed_records(
     )?;
     let audit = existing.recovery_audit()?;
     let authorized_base = verify_incremental_base_root_authority(&existing, &audit, from_root)?;
+    validate_local_incremental_receive_contract(&existing, &audit, &authorized_base, export)?;
     let placement_verified_stable = incremental_receive_placement_verified_stable(
         existing.placement_epoch,
         export.placement_epoch,
@@ -1512,9 +1659,10 @@ pub(crate) fn receive_incremental_changed_records(
 
     // Prove base content first, then apply changed content and prove every
     // incoming manifest content reference before publishing a new root slot.
-    let mut store = LocalObjectStore::open_with_options(root, options.clone())?;
+    let mut pool = LocalFileSystem::default_development_pool(root, &options, None, None)?;
+    let store = pool.raw_primary_store_mut();
     let base_root = root_commit_from_summary(&authorized_base);
-    let _base_state = load_state_from_transaction(&mut store, &base_root, root_authentication_key)?;
+    let _base_state = load_state_from_transaction(store, &base_root, root_authentication_key)?;
     for root_rec in &prepared.roots {
         for record in root_rec.records.values() {
             if matches!(
@@ -1526,7 +1674,7 @@ pub(crate) fn receive_incremental_changed_records(
             }
         }
     }
-    validate_incremental_target_content_objects(&store, &prepared)?;
+    validate_incremental_target_content_objects(store, &prepared)?;
 
     // Persist all roots (re-signing with the target's authentication key).
     let mut roots = prepared.roots.clone();
@@ -1544,7 +1692,7 @@ pub(crate) fn receive_incremental_changed_records(
             identity == prepared.current_identity,
         )?;
         let unsigned_root =
-            persist_transaction_objects(&mut store, &state, root_rec.source_root.transaction_id)?;
+            persist_transaction_objects(store, &state, root_rec.source_root.transaction_id)?;
         let signed_root = sign_root_commit(&unsigned_root, root_authentication_key)?;
         store.put(
             root_slot_object_key(signed_root.slot),
@@ -1558,14 +1706,9 @@ pub(crate) fn receive_incremental_changed_records(
         imported_summaries.insert(identity, summary);
     }
     store.sync_all()?;
-    drop(store);
+    let final_audit = crate::recovery::audit_recovery_store(store, root_authentication_key)?;
+    drop(pool);
 
-    let mut received = LocalFileSystem::open_with_root_authentication_key(
-        root,
-        options.clone(),
-        root_authentication_key,
-    )?;
-    let final_audit = received.recovery_audit()?;
     let selected = selected_summary.ok_or(FileSystemError::CorruptState {
         reason: "incremental receive did not publish the selected root",
     })?;
@@ -1574,7 +1717,6 @@ pub(crate) fn receive_incremental_changed_records(
             reason: "incremental receive selected a root other than the received current root",
         });
     }
-    drop(received);
 
     Ok(ChangedRecordImportReport {
         spec: SEND_RECEIVE_CHANGED_RECORD_SPEC,
@@ -1799,8 +1941,9 @@ fn try_load_checkpoint_for_resume(
     options: &StoreOptions,
     expected_export_id: IntegrityDigest64,
 ) -> Result<Option<ReceiveCheckpoint>> {
-    let mut store = LocalObjectStore::open_with_options(staging_root, options.clone())?;
-    match load_receive_checkpoint(&mut store)? {
+    let mut pool = LocalFileSystem::default_development_pool(staging_root, options, None, None)?;
+    let store = pool.raw_primary_store_mut();
+    match load_receive_checkpoint(store)? {
         Some(cp) if cp.export_identity == expected_export_id => Ok(Some(cp)),
         _ => Ok(None),
     }
@@ -1829,12 +1972,13 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
     root_authentication_key: RootAuthenticationKey,
     skip_keys: &BTreeSet<ObjectKey>,
 ) -> Result<(ChangedRecordImportReport, BTreeSet<ObjectKey>)> {
-    let mut store = LocalObjectStore::open_with_options(staging_root, options.clone())?;
+    let mut pool = LocalFileSystem::default_development_pool(staging_root, &options, None, None)?;
+    let store = pool.raw_primary_store_mut();
     let export_identity = compute_export_identity_from_prepared(&prepared);
 
     // Load any existing checkpoint and merge with caller-provided skip set.
     let mut completed = skip_keys.clone();
-    if let Some(existing_cp) = load_receive_checkpoint(&mut store)? {
+    if let Some(existing_cp) = load_receive_checkpoint(store)? {
         if existing_cp.export_identity == export_identity {
             completed.extend(existing_cp.completed_keys);
         }
@@ -1863,7 +2007,7 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
         total_records: prepared.total_records,
         completed_keys: completed.clone(),
     };
-    write_receive_checkpoint(&mut store, &checkpoint)?;
+    write_receive_checkpoint(store, &checkpoint)?;
 
     // Phase 2: persist transaction objects and roots.
     let mut roots = prepared.roots.clone();
@@ -1881,7 +2025,7 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
             identity == prepared.current_identity,
         )?;
         let unsigned_root =
-            persist_transaction_objects(&mut store, &state, root.source_root.transaction_id)?;
+            persist_transaction_objects(store, &state, root.source_root.transaction_id)?;
         let signed_root = sign_root_commit(&unsigned_root, root_authentication_key)?;
         store.put(
             root_slot_object_key(signed_root.slot),
@@ -1897,15 +2041,10 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
     store.sync_all()?;
 
     // Remove the checkpoint now that all roots are persisted.
-    let _ = remove_receive_checkpoint(&mut store);
-    drop(store);
+    let _ = remove_receive_checkpoint(store);
+    let audit = crate::recovery::audit_recovery_store(store, root_authentication_key)?;
+    drop(pool);
 
-    let mut received = LocalFileSystem::open_with_root_authentication_key(
-        staging_root,
-        options.clone(),
-        root_authentication_key,
-    )?;
-    let audit = received.recovery_audit()?;
     let selected = selected_summary.ok_or(FileSystemError::CorruptState {
         reason: "send/receive import did not publish the selected root",
     })?;
@@ -1914,7 +2053,6 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
             reason: "send/receive import selected a root other than the received current root",
         });
     }
-    drop(received);
 
     if target_root.exists() {
         return Err(FileSystemError::Unsupported {
@@ -2201,7 +2339,9 @@ mod tests {
             source: std::io::Error::from(std::io::ErrorKind::Interrupted),
         });
         assert!(is_receive_error_retryable(&io_error));
-        assert!(is_receive_error_retryable(&FileSystemError::Store(StoreError::NoSpace)));
+        assert!(is_receive_error_retryable(&FileSystemError::Store(
+            StoreError::NoSpace
+        )));
         assert!(is_receive_error_retryable(&FileSystemError::Store(
             StoreError::PressureRefused {
                 class: IoClass::Metadata,

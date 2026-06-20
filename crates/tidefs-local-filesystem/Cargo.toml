@@ -42,6 +42,7 @@ tidefs-cleanup-engine = { path = "../tidefs-cleanup-engine" }
 tidefs-intent-log = { path = "../tidefs-intent-log" }
 tidefs-recovery-loop = { path = "../tidefs-recovery-loop" }
 tidefs-send-stream = { path = "../tidefs-send-stream" }
+tidefs-receive-stream = { path = "../tidefs-receive-stream" }
 
 tidefs-background-scheduler = { path = "../tidefs-background-scheduler" }
 tidefs-scrub-core = { path = "../tidefs-scrub-core" }

@@ -109,6 +109,37 @@ impl ReceiveStreamScenario {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_local_object_store::{LocalObjectStore, ObjectKey};
+    use tidefs_receive_stream::receive_persistence::{BaseRootPinLookup, ReceiveContract};
+    use tidefs_receive_stream::ReceivePersistenceBridge;
+
+    struct HarnessPinLookup {
+        base_root_identity: [u8; 32],
+        dataset_lineage_identity: [u8; 32],
+        completed_generation: Option<u64>,
+    }
+
+    impl BaseRootPinLookup for HarnessPinLookup {
+        fn is_base_root_pinned(&self, base_root_identity: &[u8; 32]) -> bool {
+            *base_root_identity == self.base_root_identity
+        }
+
+        fn dataset_lineage_for_base_root(&self, base_root_identity: &[u8; 32]) -> Option<[u8; 32]> {
+            self.is_base_root_pinned(base_root_identity)
+                .then_some(self.dataset_lineage_identity)
+        }
+
+        fn latest_completed_receive_generation(
+            &self,
+            base_root_identity: &[u8; 32],
+            dataset_lineage_identity: &[u8; 32],
+        ) -> Option<u64> {
+            (self.is_base_root_pinned(base_root_identity)
+                && *dataset_lineage_identity == self.dataset_lineage_identity)
+                .then_some(self.completed_generation)
+                .flatten()
+        }
+    }
 
     #[test]
     fn single_object_round_trip() {
@@ -128,6 +159,63 @@ mod tests {
         assert_eq!(d.objects_received[0].object_id, obj_id(0xA1));
         assert_eq!(d.total_bytes_received, 25);
         assert_eq!(d.total_chunks_processed, 1);
+    }
+
+    #[test]
+    fn two_node_receive_persists_with_validated_contract() {
+        let mut h = TwoNodeHarness::new(566);
+        h.establish_session().expect("establish");
+
+        let payload = b"two-node durable receive contract payload".to_vec();
+        let object_id = ObjectKey::from_content(&payload).as_bytes32();
+        let mut framer = ChunkFramer::new(object_id, payload.clone(), 16);
+        let mut wire_bytes = Vec::new();
+        while let Some(chunk) = framer.next_chunk() {
+            wire_bytes.extend_from_slice(&send_chunk_to_wire(&chunk));
+        }
+
+        let state_obj = crate::StateObject {
+            object_key: 0,
+            payload: wire_bytes.clone(),
+        };
+        h.state_transfer_a_to_b(&[state_obj])
+            .expect("state transfer");
+
+        let base_root_identity = [0x56; 32];
+        let dataset_lineage_identity = [0x66; 32];
+        let contract = ReceiveContract {
+            base_root_identity,
+            dataset_lineage_identity,
+            receive_generation: 2,
+        };
+        let pin_lookup = HarnessPinLookup {
+            base_root_identity,
+            dataset_lineage_identity,
+            completed_generation: Some(1),
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = LocalObjectStore::open(dir.path()).expect("open store");
+        {
+            let mut bridge =
+                ReceivePersistenceBridge::new(&mut store).with_incremental_contract(contract);
+            assert_eq!(bridge.contract(), Some(&contract));
+            bridge
+                .validate_base_root_pin(&pin_lookup)
+                .expect("contract validates");
+            assert!(bridge.has_validated_contract());
+
+            let (objects, bytes) =
+                receive_object(&wire_bytes, 0, &mut bridge).expect("receive persist");
+            assert_eq!(objects, 1);
+            assert_eq!(bytes, payload.len() as u64);
+            assert_eq!(bridge.objects_persisted(), 1);
+            assert_eq!(bridge.bytes_persisted(), payload.len() as u64);
+        }
+
+        let key = ObjectKey::from_content(&payload);
+        let stored = store.get(key).expect("get").expect("object present");
+        assert_eq!(stored, payload);
     }
 
     #[test]

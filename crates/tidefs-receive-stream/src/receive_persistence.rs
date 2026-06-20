@@ -87,14 +87,22 @@ pub trait BaseRootPinLookup {
 
     /// Return the dataset lineage identity for a pinned base root, if known.
     ///
-    /// Returns `None` when the lineage is not available (e.g., the pin
-    /// authority does not track lineage) or when the base root is not pinned.
-    /// A `None` return does not automatically fail validation; callers
-    /// decide whether missing lineage is acceptable.
-    fn dataset_lineage_for_base_root(
+    /// Returns `None` when the lineage is not available or when the base root
+    /// is not pinned. Incremental receive validation treats missing lineage as
+    /// a fail-closed condition.
+    fn dataset_lineage_for_base_root(&self, base_root_identity: &[u8; 32]) -> Option<[u8; 32]>;
+
+    /// Return the newest completed receive generation for this base/dataset
+    /// pair, if one is already durable.
+    ///
+    /// Implementations return `None` only when local authority has no completed
+    /// receive record for this lineage. Validation rejects contracts whose
+    /// advertised generation is less than or equal to the returned value.
+    fn latest_completed_receive_generation(
         &self,
         base_root_identity: &[u8; 32],
-    ) -> Option<[u8; 32]>;
+        dataset_lineage_identity: &[u8; 32],
+    ) -> Option<u64>;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +130,22 @@ pub enum ReceivePersistenceError {
         expected: [u8; 32],
         /// Lineage identity returned by the pin authority.
         actual: [u8; 32],
+    },
+
+    /// The pin authority could not provide dataset lineage for a pinned base
+    /// root, so the receiver cannot prove the stream targets the right dataset.
+    DatasetLineageUnavailable {
+        /// The base root identity from the receive contract.
+        base_root_identity: [u8; 32],
+    },
+
+    /// The receive generation has already completed for this base/dataset
+    /// lineage and must not be replayed as a new durable receive.
+    ReceiveGenerationReplayed {
+        /// Generation advertised by the receive contract.
+        receive_generation: u64,
+        /// Newest completed generation recorded locally.
+        completed_generation: u64,
     },
 
     /// The receive contract has not been validated before objects were
@@ -160,6 +184,22 @@ impl std::fmt::Display for ReceivePersistenceError {
                     &actual[..8]
                 )
             }
+            Self::DatasetLineageUnavailable { base_root_identity } => {
+                write!(
+                    f,
+                    "incremental receive base root {:02x?} has no dataset lineage authority",
+                    &base_root_identity[..8]
+                )
+            }
+            Self::ReceiveGenerationReplayed {
+                receive_generation,
+                completed_generation,
+            } => {
+                write!(
+                    f,
+                    "incremental receive generation {receive_generation} was already completed at generation {completed_generation}"
+                )
+            }
             Self::ContractNotValidated => {
                 write!(
                     f,
@@ -167,7 +207,10 @@ impl std::fmt::Display for ReceivePersistenceError {
                 )
             }
             Self::ContractRequired => {
-                write!(f, "incremental receive contract is required but none was provided")
+                write!(
+                    f,
+                    "incremental receive contract is required but none was provided"
+                )
             }
             Self::Store(e) => write!(f, "object store error: {e}"),
         }
@@ -299,8 +342,10 @@ impl<'a, S: ObjectStore> ReceivePersistenceBridge<'a, S> {
     ///
     /// Checks:
     /// 1. The base root identity from the contract is pinned in `pin_lookup`.
-    /// 2. If the pin authority provides a lineage identity, it matches the
+    /// 2. The pin authority provides a lineage identity and it matches the
     ///    contract's `dataset_lineage_identity`.
+    /// 3. The contract receive generation has not already completed for this
+    ///    base/dataset lineage.
     ///
     /// On success, marks the contract as validated and permits subsequent
     /// `store_object` calls. On failure, returns a classified
@@ -314,6 +359,10 @@ impl<'a, S: ObjectStore> ReceivePersistenceBridge<'a, S> {
     ///   not pinned.
     /// - [`ReceivePersistenceError::DatasetLineageMismatch`] if the lineage
     ///   does not match.
+    /// - [`ReceivePersistenceError::DatasetLineageUnavailable`] if the pin
+    ///   authority cannot prove lineage for the pinned base root.
+    /// - [`ReceivePersistenceError::ReceiveGenerationReplayed`] if the receive
+    ///   generation is already durable for this base/dataset lineage.
     pub fn validate_base_root_pin(
         &mut self,
         pin_lookup: &dyn BaseRootPinLookup,
@@ -323,22 +372,7 @@ impl<'a, S: ObjectStore> ReceivePersistenceBridge<'a, S> {
             .as_ref()
             .ok_or(ReceivePersistenceError::ContractRequired)?;
 
-        if !pin_lookup.is_base_root_pinned(&contract.base_root_identity) {
-            return Err(ReceivePersistenceError::BaseRootNotPinned {
-                base_root_identity: contract.base_root_identity,
-            });
-        }
-
-        if let Some(actual_lineage) =
-            pin_lookup.dataset_lineage_for_base_root(&contract.base_root_identity)
-        {
-            if actual_lineage != contract.dataset_lineage_identity {
-                return Err(ReceivePersistenceError::DatasetLineageMismatch {
-                    expected: contract.dataset_lineage_identity,
-                    actual: actual_lineage,
-                });
-            }
-        }
+        validate_receive_contract(*contract, pin_lookup)?;
 
         self.contract_validated = true;
         Ok(())
@@ -373,6 +407,53 @@ impl<'a, S: ObjectStore> ReceivePersistenceBridge<'a, S> {
     pub fn chunks_received(&self) -> u64 {
         self.chunks_received
     }
+}
+
+/// Validate an incremental receive contract against local pin authority.
+///
+/// This exposes the same fail-closed contract check used by
+/// [`ReceivePersistenceBridge::validate_base_root_pin`] for receive callers
+/// that need to validate before constructing their final persistence bridge.
+///
+/// # Errors
+///
+/// Returns a classified [`ReceivePersistenceError`] for missing pins, missing
+/// lineage, lineage mismatch, or replayed receive generations.
+pub fn validate_receive_contract(
+    contract: ReceiveContract,
+    pin_lookup: &dyn BaseRootPinLookup,
+) -> Result<(), ReceivePersistenceError> {
+    if !pin_lookup.is_base_root_pinned(&contract.base_root_identity) {
+        return Err(ReceivePersistenceError::BaseRootNotPinned {
+            base_root_identity: contract.base_root_identity,
+        });
+    }
+
+    let actual_lineage = pin_lookup
+        .dataset_lineage_for_base_root(&contract.base_root_identity)
+        .ok_or(ReceivePersistenceError::DatasetLineageUnavailable {
+            base_root_identity: contract.base_root_identity,
+        })?;
+    if actual_lineage != contract.dataset_lineage_identity {
+        return Err(ReceivePersistenceError::DatasetLineageMismatch {
+            expected: contract.dataset_lineage_identity,
+            actual: actual_lineage,
+        });
+    }
+
+    if let Some(completed_generation) = pin_lookup.latest_completed_receive_generation(
+        &contract.base_root_identity,
+        &contract.dataset_lineage_identity,
+    ) {
+        if contract.receive_generation <= completed_generation {
+            return Err(ReceivePersistenceError::ReceiveGenerationReplayed {
+                receive_generation: contract.receive_generation,
+                completed_generation,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 impl<S: ObjectStore> ReceiveDispatch for ReceivePersistenceBridge<'_, S> {
@@ -429,7 +510,9 @@ mod tests {
     use blake3::hash;
     use std::collections::HashMap;
     use std::time::SystemTime;
-    use tidefs_local_object_store::{ObjectAttr, ObjectKey, ObjectReadError, ObjectStore, StoreError};
+    use tidefs_local_object_store::{
+        ObjectAttr, ObjectKey, ObjectReadError, ObjectStore, StoreError,
+    };
 
     // ── Test helpers ──────────────────────────────────────────────────
 
@@ -491,10 +574,7 @@ mod tests {
             self.objects.keys().copied().collect::<Vec<_>>().into_iter()
         }
 
-        fn get_attr(
-            &self,
-            key: &ObjectKey,
-        ) -> std::result::Result<ObjectAttr, ObjectReadError> {
+        fn get_attr(&self, key: &ObjectKey) -> std::result::Result<ObjectAttr, ObjectReadError> {
             match self.objects.get(key) {
                 Some(payload) => Ok(ObjectAttr {
                     size: payload.len() as u64,
@@ -510,17 +590,29 @@ mod tests {
     /// optional lineage mappings.
     struct TestPinLookup {
         pinned: HashMap<[u8; 32], Option<[u8; 32]>>,
+        completed: HashMap<([u8; 32], [u8; 32]), u64>,
     }
 
     impl TestPinLookup {
         fn new() -> Self {
             Self {
                 pinned: HashMap::new(),
+                completed: HashMap::new(),
             }
         }
 
         fn insert(&mut self, identity: [u8; 32], lineage: Option<[u8; 32]>) {
             self.pinned.insert(identity, lineage);
+        }
+
+        fn insert_completed(
+            &mut self,
+            identity: [u8; 32],
+            lineage: [u8; 32],
+            receive_generation: u64,
+        ) {
+            self.completed
+                .insert((identity, lineage), receive_generation);
         }
     }
 
@@ -529,11 +621,18 @@ mod tests {
             self.pinned.contains_key(base_root_identity)
         }
 
-        fn dataset_lineage_for_base_root(
+        fn dataset_lineage_for_base_root(&self, base_root_identity: &[u8; 32]) -> Option<[u8; 32]> {
+            self.pinned.get(base_root_identity).and_then(|v| *v)
+        }
+
+        fn latest_completed_receive_generation(
             &self,
             base_root_identity: &[u8; 32],
-        ) -> Option<[u8; 32]> {
-            self.pinned.get(base_root_identity).and_then(|v| *v)
+            dataset_lineage_identity: &[u8; 32],
+        ) -> Option<u64> {
+            self.completed
+                .get(&(*base_root_identity, *dataset_lineage_identity))
+                .copied()
         }
     }
 
@@ -555,7 +654,10 @@ mod tests {
     fn validate_base_root_pinned_succeeds() {
         let mut pin_lookup = TestPinLookup::new();
         let contract = test_contract(0x01);
-        pin_lookup.insert(contract.base_root_identity, None);
+        pin_lookup.insert(
+            contract.base_root_identity,
+            Some(contract.dataset_lineage_identity),
+        );
 
         let mut mock = MockStore::new();
         let mut bridge =
@@ -583,9 +685,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_lineage_mismatch_fails() {
+    fn validate_missing_lineage_fails_closed() {
         let mut pin_lookup = TestPinLookup::new();
         let contract = test_contract(0x03);
+        pin_lookup.insert(contract.base_root_identity, None);
+
+        let mut mock = MockStore::new();
+        let mut bridge =
+            ReceivePersistenceBridge::new(&mut mock).with_incremental_contract(contract);
+
+        let err = bridge.validate_base_root_pin(&pin_lookup).unwrap_err();
+        assert!(matches!(
+            err,
+            ReceivePersistenceError::DatasetLineageUnavailable { .. }
+        ));
+        assert!(!bridge.has_validated_contract());
+    }
+
+    #[test]
+    fn validate_lineage_mismatch_fails() {
+        let mut pin_lookup = TestPinLookup::new();
+        let contract = test_contract(0x04);
         let mut wrong_lineage = [0u8; 32];
         wrong_lineage[0] = 0xFF;
         pin_lookup.insert(contract.base_root_identity, Some(wrong_lineage));
@@ -605,7 +725,7 @@ mod tests {
     #[test]
     fn validate_with_lineage_match_succeeds() {
         let mut pin_lookup = TestPinLookup::new();
-        let contract = test_contract(0x04);
+        let contract = test_contract(0x05);
         pin_lookup.insert(
             contract.base_root_identity,
             Some(contract.dataset_lineage_identity),
@@ -617,6 +737,36 @@ mod tests {
 
         bridge.validate_base_root_pin(&pin_lookup).unwrap();
         assert!(bridge.has_validated_contract());
+    }
+
+    #[test]
+    fn validate_replayed_generation_fails() {
+        let mut pin_lookup = TestPinLookup::new();
+        let mut contract = test_contract(0x06);
+        contract.receive_generation = 8;
+        pin_lookup.insert(
+            contract.base_root_identity,
+            Some(contract.dataset_lineage_identity),
+        );
+        pin_lookup.insert_completed(
+            contract.base_root_identity,
+            contract.dataset_lineage_identity,
+            8,
+        );
+
+        let mut mock = MockStore::new();
+        let mut bridge =
+            ReceivePersistenceBridge::new(&mut mock).with_incremental_contract(contract);
+
+        let err = bridge.validate_base_root_pin(&pin_lookup).unwrap_err();
+        assert!(matches!(
+            err,
+            ReceivePersistenceError::ReceiveGenerationReplayed {
+                receive_generation: 8,
+                completed_generation: 8
+            }
+        ));
+        assert!(!bridge.has_validated_contract());
     }
 
     #[test]
@@ -634,16 +784,13 @@ mod tests {
     #[test]
     fn store_object_blocked_when_contract_not_validated() {
         let mut mock = MockStore::new();
-        let contract = test_contract(0x05);
+        let contract = test_contract(0x07);
         let mut bridge =
             ReceivePersistenceBridge::new(&mut mock).with_incremental_contract(contract);
 
         let obj = make_object(0xAA, b"blocked", 1);
         let err = bridge.store_object(obj).unwrap_err();
-        assert!(matches!(
-            err,
-            ReceivePersistenceError::ContractNotValidated
-        ));
+        assert!(matches!(err, ReceivePersistenceError::ContractNotValidated));
         assert_eq!(bridge.objects_persisted(), 0);
         assert_eq!(mock.object_count(), 0);
     }
@@ -651,8 +798,11 @@ mod tests {
     #[test]
     fn store_object_succeeds_after_contract_validated() {
         let mut pin_lookup = TestPinLookup::new();
-        let contract = test_contract(0x06);
-        pin_lookup.insert(contract.base_root_identity, None);
+        let contract = test_contract(0x08);
+        pin_lookup.insert(
+            contract.base_root_identity,
+            Some(contract.dataset_lineage_identity),
+        );
 
         let mut mock = MockStore::new();
         let mut bridge =
@@ -680,7 +830,7 @@ mod tests {
     #[test]
     fn store_object_blocked_after_failed_validation() {
         let mut pin_lookup = TestPinLookup::new();
-        let contract = test_contract(0x07);
+        let contract = test_contract(0x09);
         // Don't insert the base root — it will fail validation
         pin_lookup.insert([0xFF; 32], None); // some other root
 
@@ -710,8 +860,11 @@ mod tests {
     #[test]
     fn key_mismatch_with_contract_validated() {
         let mut pin_lookup = TestPinLookup::new();
-        let contract = test_contract(0x08);
-        pin_lookup.insert(contract.base_root_identity, None);
+        let contract = test_contract(0x0A);
+        pin_lookup.insert(
+            contract.base_root_identity,
+            Some(contract.dataset_lineage_identity),
+        );
 
         let mut mock = MockStore::new();
         let mut bridge =
@@ -742,22 +895,16 @@ mod tests {
     #[test]
     fn error_display_formats() {
         let base = [0xAB; 32];
-        assert!(
-            format!(
-                "{}",
-                ReceivePersistenceError::BaseRootNotPinned {
-                    base_root_identity: base
-                }
-            )
-            .contains("not pinned")
-        );
-        assert!(
-            format!("{}", ReceivePersistenceError::ContractNotValidated)
-                .contains("not been validated")
-        );
-        assert!(
-            format!("{}", ReceivePersistenceError::ContractRequired).contains("required")
-        );
+        assert!(format!(
+            "{}",
+            ReceivePersistenceError::BaseRootNotPinned {
+                base_root_identity: base
+            }
+        )
+        .contains("not pinned"));
+        assert!(format!("{}", ReceivePersistenceError::ContractNotValidated)
+            .contains("not been validated"));
+        assert!(format!("{}", ReceivePersistenceError::ContractRequired).contains("required"));
         let lineage_err = format!(
             "{}",
             ReceivePersistenceError::DatasetLineageMismatch {
@@ -786,9 +933,8 @@ mod tests {
     #[test]
     fn contract_accessor_returns_set_contract() {
         let mut mock = MockStore::new();
-        let contract = test_contract(0x09);
-        let bridge =
-            ReceivePersistenceBridge::new(&mut mock).with_incremental_contract(contract);
+        let contract = test_contract(0x0B);
+        let bridge = ReceivePersistenceBridge::new(&mut mock).with_incremental_contract(contract);
 
         assert_eq!(bridge.contract(), Some(&contract));
         assert!(!bridge.has_validated_contract());
