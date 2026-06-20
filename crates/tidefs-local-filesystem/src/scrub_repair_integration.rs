@@ -153,24 +153,17 @@ pub fn run_scrub_repair_scheduling(report: &ScrubReport) -> ScrubRepairSchedule 
 }
 
 // ---------------------------------------------------------------------------
-// convert_violations_to_suspect_entries
+// convert_violations_to_repair_inputs
 // ---------------------------------------------------------------------------
 
-/// Convert [`ScrubReport`] violations into [`SuspectEntry`] format for
-/// ingestion by the scheduling bridges.
+/// Convert [`ScrubReport`] violations into identity-bearing repair admission
+/// inputs for ingestion by the scheduling bridges.
 ///
-/// Mapping rules:
+/// `SuspectEntry` mapping rules:
 /// - `locator_id` ← `inode_id`
 /// - `segment_id` ← `data_version`
 /// - `offset` ← `chunk_index` for chunk corruption, 0 otherwise
 /// - `record_type` = 1 for payload corruption, 3 for unreadable
-fn convert_violations_to_suspect_entries(report: &ScrubReport) -> Vec<SuspectEntry> {
-    convert_violations_to_repair_inputs(report)
-        .into_iter()
-        .map(|input| input.entry)
-        .collect()
-}
-
 fn convert_violations_to_repair_inputs(report: &ScrubReport) -> Vec<RepairAdmissionInput> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -851,7 +844,14 @@ mod tests {
         assert_eq!(bridge.stats().entries_blocked_authority_mismatch, 1);
     }
 
-    // ── convert_violations_to_suspect_entries tests ─────────────────
+    // ── convert_violations_to_repair_inputs tests ─────────────────
+
+    fn repair_input_entries(report: &ScrubReport) -> Vec<SuspectEntry> {
+        convert_violations_to_repair_inputs(report)
+            .into_iter()
+            .map(|input| input.entry)
+            .collect()
+    }
 
     #[test]
     fn convert_corrupt_violation_to_suspect_entry() {
@@ -869,7 +869,7 @@ mod tests {
             },
         });
 
-        let entries = convert_violations_to_suspect_entries(&report);
+        let entries = repair_input_entries(&report);
         assert_eq!(entries.len(), 1);
 
         let e = &entries[0];
@@ -894,7 +894,7 @@ mod tests {
             outcome: ScrubBlockOutcome::Unreadable("disk sector bad".into()),
         });
 
-        let entries = convert_violations_to_suspect_entries(&report);
+        let entries = repair_input_entries(&report);
         assert_eq!(entries.len(), 1);
 
         let e = &entries[0];
@@ -907,7 +907,7 @@ mod tests {
     #[test]
     fn convert_empty_report_returns_no_entries() {
         let report = ScrubReport::empty();
-        let entries = convert_violations_to_suspect_entries(&report);
+        let entries = repair_input_entries(&report);
         assert!(entries.is_empty());
     }
 
