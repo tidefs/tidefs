@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 use tidefs_validation::local_vfs_runtime_crash_artifact::{
-    validate_local_vfs_runtime_crash_artifact_path,
+    validate_local_vfs_rename_runtime_crash_artifact_path,
+    validate_local_vfs_runtime_crash_artifact_path, LOCAL_VFS_RENAME_RUNTIME_CRASH_EVIDENCE_CLASS,
     LOCAL_VFS_WRITE_FSYNC_RUNTIME_CRASH_EVIDENCE_CLASS,
 };
 use tidefs_validation::ublk_completion_artifact::{
@@ -1765,6 +1766,24 @@ fn validate_runtime_crash_artifact_content(
             ));
         }
     }
+    if artifact.class == LOCAL_VFS_RENAME_RUNTIME_CRASH_EVIDENCE_CLASS
+        && claim.id == LOCAL_VFS_RENAME_CRASH_CLAIM_ID
+    {
+        let rel = match workspace_relative_path(claim, artifact) {
+            Ok(rel) => rel,
+            Err(err) => {
+                failures.push(err);
+                return failures;
+            }
+        };
+        let artifact_path = root.join(&rel);
+        if let Err(error) = validate_local_vfs_rename_runtime_crash_artifact_path(&artifact_path) {
+            failures.push(format!(
+                "claim `{}` local VFS rename runtime crash artifact `{}` failed verifier: {error}",
+                claim.id, artifact.path
+            ));
+        }
+    }
 
     failures
 }
@@ -2613,10 +2632,9 @@ mod tests {
         CRASH_CLAIMS_GATE_REVIEW_SCOPE, CRASH_CLAIMS_GATE_REVIEW_SOURCE, CRASH_CLAIM_IDS,
         CRASH_MODEL_EVIDENCE_SCOPE, CRASH_MODEL_EVIDENCE_SOURCE, CRASH_MODEL_MATRIX_PATH,
         CRATE_INDEX_LIMITATION_MARKERS, LOCAL_VFS_RENAME_CRASH_CLAIM_ID,
-        LOCAL_VFS_WRITE_FSYNC_CRASH_CLAIM_ID,
-        MODEL_CRASH_MATRIX_EVIDENCE_CLASS, REQUIRED_INITIAL_CLAIMS,
-        RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS, RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS,
-        STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
+        LOCAL_VFS_WRITE_FSYNC_CRASH_CLAIM_ID, MODEL_CRASH_MATRIX_EVIDENCE_CLASS,
+        REQUIRED_INITIAL_CLAIMS, RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS,
+        RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS, STORAGE_WRITE_FSYNC_CRASH_CLAIM_ID,
     };
 
     #[test]
@@ -2722,7 +2740,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_claim_receipt_names_missing_runtime_evidence() {
+    fn validate_claim_receipt_names_missing_no_hidden_queue_evidence() {
         let root = workspace_root();
         let registry = parse_claim_registry(include_str!("../../../validation/claims.toml"))
             .expect("claim registry parses");
@@ -2740,16 +2758,33 @@ mod tests {
             .iter()
             .find(|evidence| evidence.class == RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS)
             .expect("runtime crash evidence receipt");
-        assert_eq!(runtime.status, EvidenceClassStatus::Missing);
+        assert_eq!(runtime.status, EvidenceClassStatus::Present);
         assert_eq!(
             runtime.artifact_path,
             "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json"
         );
         assert_eq!(runtime.validation_tier, "mounted-userspace");
-        assert_eq!(runtime.blocking_issues, vec!["#596".to_string()]);
-        assert!(runtime.details.iter().any(|detail| detail.contains(
-            "no evidence_artifacts entry registers class `runtime-namespace-crash-artifact`"
-        )));
+        assert!(runtime.blocking_issues.is_empty());
+        assert!(
+            runtime.details.is_empty(),
+            "runtime artifact verifier should accept committed local VFS rename crash evidence: {:?}",
+            runtime.details
+        );
+
+        let no_hidden = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "no-hidden-queue-gate")
+            .expect("rename no-hidden queue evidence receipt");
+        assert_eq!(no_hidden.status, EvidenceClassStatus::Missing);
+        assert_eq!(
+            no_hidden.artifact_path,
+            "validation/performance/no-hidden-queues.toml"
+        );
+        assert_eq!(no_hidden.validation_tier, "cargo-unit");
+        assert_eq!(no_hidden.blocking_issues, vec!["#597".to_string()]);
+        assert!(no_hidden.details.iter().any(|detail| detail
+            .contains("no evidence_artifacts entry registers class `no-hidden-queue-gate`")));
 
         let model = receipt
             .required_evidence
@@ -2761,7 +2796,9 @@ mod tests {
         let summary = render_claim_validation_summary(&receipt);
         assert!(summary.contains("status: BLOCKED"));
         assert!(summary.contains("class: runtime-namespace-crash-artifact"));
-        assert!(summary.contains("blocking_issues: #596"));
+        assert!(summary.contains("class: no-hidden-queue-gate"));
+        assert!(summary.contains("blocking_issues: #597"));
+        assert!(!summary.contains("blocking_issues: #596"));
     }
 
     #[test]
@@ -2826,11 +2863,23 @@ mod tests {
             .iter()
             .find(|entry| entry["class"] == RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS)
             .expect("runtime crash evidence entry");
-        assert_eq!(runtime["status"], "MISSING");
+        assert_eq!(runtime["status"], "PRESENT");
         assert_eq!(runtime["validation_tier"], "mounted-userspace");
         assert_eq!(
             runtime["artifact_path"],
             "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json"
+        );
+        let no_hidden = json["required_evidence"]
+            .as_array()
+            .expect("required evidence array")
+            .iter()
+            .find(|entry| entry["class"] == "no-hidden-queue-gate")
+            .expect("no-hidden queue evidence entry");
+        assert_eq!(no_hidden["status"], "MISSING");
+        assert_eq!(no_hidden["validation_tier"], "cargo-unit");
+        assert_eq!(
+            no_hidden["artifact_path"],
+            "validation/performance/no-hidden-queues.toml"
         );
     }
 

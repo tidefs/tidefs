@@ -79,21 +79,22 @@ scope = "local VFS rename crash recovery"
 required_evidence_classes = [
   "model-crash-matrix",
   "runtime-namespace-crash-artifact",
+  "no-hidden-queue-gate",
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = ["#286"] },
-  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#596"] },
-  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = [] },
+  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = [] },
+  { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", validation_tier = "cargo-unit", blocking_issues = ["#720"] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]
 blockers = [
-  "Model-only issue #286 evidence is not local runtime crash evidence.",
-  "Local runtime rename crash injection remains blocked until #596 records the runtime crash artifact.",
-  "Rename directory-entry and orphan-index no-hidden-queue source/registry review receipt recorded (#597); active rename/orphan-index runtime admission proof remains pending (#720).",
+  "Rename directory-entry and orphan-index no-hidden-queue source/registry review receipt is recorded (#597), but active rename/orphan-index runtime admission proof remains pending (#720).",
 ]
-generated_doc = "Blocked local VFS rename crash claim. TideFS must keep rename crash-safety wording behind model and runtime evidence."
+generated_doc = "Blocked local VFS rename crash claim. TideFS has model evidence and a bounded local runtime rename -> fsync -> read -> crash/recover artifact, but active rename/orphan-index no-hidden-queue runtime admission proof remains pending in #720."
 evidence_artifacts = [
   { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", source = "tidefs-crash-oracle", scope = "model-only" },
+  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", source = "tidefs-local-filesystem", scope = "local-vfs-runtime-rename-fsync-crash" },
   { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", source = "claims-gate", scope = "model-runtime-boundary-review" },
 ]
 
