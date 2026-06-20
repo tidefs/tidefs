@@ -6,20 +6,19 @@ registry_path = "validation/performance/no-hidden-queues.toml"
 registry_schema_version = 1
 source_coverage_kind = "recursive-source-registry-review"
 runtime_artifact_boundary = "source-registry-review-only-does-not-satisfy-queue-depth-runtime-artifact"
-decision = "claims-remain-blocked"
-reviewed_at = "2026-06-18"
+decision = "local-runtime-artifact-registered-scheduler-remains-blocked"
+reviewed_at = "2026-06-20"
 affected_claim_ids = [
   "scheduler.dirty_debt.no_hidden.v1",
   "perf.local.no_unbounded_dirty_debt.v1",
 ]
 blocked_claim_ids = [
   "scheduler.dirty_debt.no_hidden.v1",
-  "perf.local.no_unbounded_dirty_debt.v1",
 ]
 non_claims = [
   "This receipt records source and registry coverage only.",
-  "This receipt does not satisfy queue-depth-runtime-artifact evidence.",
-  "This receipt does not validate mounted runtime queue depth or dirty-debt exhaustion behavior.",
+  "This receipt does not by itself satisfy queue-depth-runtime-artifact evidence.",
+  "Mounted runtime queue-depth evidence for perf.local.no_unbounded_dirty_debt.v1 is recorded separately in validation/artifacts/performance/queue-depth-runtime.json.",
   "This receipt does not validate distributed transport fairness or RDMA readiness.",
 ]
 
@@ -108,7 +107,7 @@ coverage = "registered-source-marker-present"
 
 [[out_of_scope]]
 root = "mounted-runtime-queue-depth"
-reason = "GitHub issue #498 owns mounted runtime queue-depth artifact evidence; this receipt is source/registry review evidence only."
+reason = "Mounted runtime queue-depth artifact evidence is recorded separately; this receipt is source/registry review evidence only."
 owner_issue = 498
 claim_ids = [
   "scheduler.dirty_debt.no_hidden.v1",
