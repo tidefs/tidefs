@@ -17,8 +17,8 @@
 //!   pre-barrier data survived.
 //! - `partial_page_read_modify_write` — write a sub-page range,
 //!   verify the write persists correctly.
-//! - `writeback_daemon_starts_on_mount` — verify daemon is active
-//!   after filesystem open.
+//! - `writeback_daemon_not_started_on_mount` — verify daemon is intentionally not started (#5940)
+//!   after filesystem open (#5940).
 //! - `repeated_remount_persistence` — write, commit, remount, verify
 //!   data survives multiple mount cycles.
 //! - `empty_file_no_writeback_panic` — verify empty writes and
@@ -32,6 +32,7 @@ use std::env;
 use std::fs;
 
 use tidefs_local_filesystem::{FileSystemError, LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
+use tidefs_local_object_store::IntegrityDigest64;
 
 // ── helpers ───────────────────────────────────────────────────────
 
@@ -57,13 +58,13 @@ fn open_fs(dir: &std::path::Path) -> LocalFileSystem {
 // ── tests ─────────────────────────────────────────────────────────
 
 #[test]
-fn writeback_daemon_starts_on_mount() {
+fn writeback_daemon_not_started_on_mount() {
     set_test_key();
-    let dir = temp_dir("daemon_starts");
+    let dir = temp_dir("daemon_not_started");
     let fs = open_fs(&dir);
     assert!(
-        fs.has_writeback_daemon(),
-        "writeback daemon should be running after mount"
+        !fs.has_writeback_daemon(),
+        "writeback daemon must NOT be started on production mount (#5940)"
     );
     drop(fs);
 }
@@ -439,7 +440,7 @@ fn daemon_survives_metadata_operations() {
 
     {
         let mut fs = open_fs(&dir);
-        assert!(fs.has_writeback_daemon());
+        assert!(!fs.has_writeback_daemon(), "daemon must not be started (#5940)");
 
         // Create a file with data.
         fs.create_file("/file", DEFAULT_FILE_PERMISSIONS)
@@ -450,7 +451,7 @@ fn daemon_survives_metadata_operations() {
         let _stat = fs.stat("/file").expect("stat");
 
         // Daemon should still be running.
-        assert!(fs.has_writeback_daemon());
+        assert!(!fs.has_writeback_daemon(), "daemon must not be started (#5940)");
     }
     // Drop triggers daemon shutdown — should not panic.
 }
@@ -618,8 +619,8 @@ fn writeback_daemon_survives_uncommitted_inode_read_error() {
     {
         let mut fs = open_fs(&dir);
         assert!(
-            fs.has_writeback_daemon(),
-            "daemon must be running to exercise the gap"
+            !fs.has_writeback_daemon(),
+            "daemon must not be started (#5940)"
         );
 
         fs.create_file("/gap", DEFAULT_FILE_PERMISSIONS)
@@ -678,22 +679,24 @@ fn repeated_open_write_close_cycle_no_state_leak() {
 fn fsync_fast_path_preserves_intent_log_entries() {
     set_test_key();
     let dir = temp_dir("fsync_keep_intents");
-    let payload: Vec<u8> = b"fsync-fast-path-keep-intents-test-data-01".to_vec();
+    let payload: Vec<u8> = b"fsync-fast-path-keep-intents-test-data-01-sync-intent".to_vec();
     {
         let mut fs = open_fs(&dir);
-        fs.create_file("/keep", DEFAULT_FILE_PERMISSIONS)
+        let rec = fs.create_file("/keep", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
-        fs.set_auto_commit(false);
-        fs.write_file("/keep", 0, &payload).expect("write file");
+        let digest = IntegrityDigest64(0);
+        fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
+            .expect("sync_write_intent");
         assert!(
             fs.intent_log_entry_count() > 0,
-            "write with auto-commit disabled must produce intent-log entries"
+            "sync_write_intent must produce intent-log entries"
         );
         fs.fsync_file("/keep").expect("fsync file");
         assert!(
             fs.intent_log_entry_count() > 0,
             "intent-log entries must NOT be cleared by fsync fast path"
         );
+        fs.commit().expect("commit after fsync");
     }
 }
 
@@ -703,17 +706,17 @@ fn fsync_fast_path_preserves_intent_log_entries() {
 fn fdatasync_fast_path_preserves_intent_log_entries() {
     set_test_key();
     let dir = temp_dir("fdatasync_keep_intents");
-    let payload: Vec<u8> = b"fdatasync-fast-path-keep-intents-test-data-01".to_vec();
+    let payload: Vec<u8> = b"fdatasync-fast-path-keep-intents-test-data-01-sync-intent".to_vec();
     {
         let mut fs = open_fs(&dir);
-        fs.create_file("/fdatakeep", DEFAULT_FILE_PERMISSIONS)
+        let rec = fs.create_file("/fdatakeep", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
-        fs.set_auto_commit(false);
-        fs.write_file("/fdatakeep", 0, &payload)
-            .expect("write file");
+        let digest = IntegrityDigest64(0);
+        fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
+            .expect("sync_write_intent");
         assert!(
             fs.intent_log_entry_count() > 0,
-            "write with auto-commit disabled must produce intent-log entries"
+            "sync_write_intent must produce intent-log entries"
         );
         fs.fsync_data_only_file("/fdatakeep")
             .expect("fsync_data_only_file");
@@ -721,6 +724,7 @@ fn fdatasync_fast_path_preserves_intent_log_entries() {
             fs.intent_log_entry_count() > 0,
             "intent-log entries must NOT be cleared by fdatasync fast path"
         );
+        fs.commit().expect("commit after fdatasync");
     }
 }
 
@@ -732,18 +736,19 @@ fn fdatasync_fast_path_preserves_intent_log_entries() {
 fn fsync_fast_path_data_survives_crash_reopen() {
     set_test_key();
     let dir = temp_dir("fsync_crash_reopen");
-    let payload: Vec<u8> = b"FSYNC_FAST_PATH_SHOULD_SURVIVE_CRASH_AND_REPLAY".to_vec();
+    let payload: Vec<u8> = b"FSYNC_FAST_PATH_SURVIVES_CRASH_AND_REPLAY_SYNC_INTENT".to_vec();
 
-    // Session 1: write, fsync, drop without commit.
+    // Session 1: sync_write_intent, fsync, drop without commit.
     {
         let mut fs = open_fs(&dir);
-        fs.create_file("/crashsave", DEFAULT_FILE_PERMISSIONS)
+        let rec = fs.create_file("/crashsave", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
-        fs.set_auto_commit(false);
-        fs.write_file("/crashsave", 0, &payload).expect("write");
+        let digest = IntegrityDigest64(0);
+        fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
+            .expect("sync_write_intent");
         assert!(
             fs.intent_log_entry_count() > 0,
-            "intent log must have entries before fsync"
+            "sync_write_intent must produce intent-log entries"
         );
         fs.fsync_file("/crashsave").expect("fsync fast path");
         // Drop without do_commit — the intent log carries the
@@ -752,7 +757,7 @@ fn fsync_fast_path_data_survives_crash_reopen() {
 
     // Session 2: reopen — the data must be recovered.
     {
-        let fs = open_fs(&dir);
+        let mut fs = open_fs(&dir);
         let data = fs.read_file("/crashsave").expect("read after reopen");
         assert_eq!(
             data, payload,
@@ -769,16 +774,17 @@ fn fsync_fast_path_data_survives_crash_reopen() {
 fn intent_log_cleared_after_full_commit() {
     set_test_key();
     let dir = temp_dir("intent_cleared_on_commit");
-    let payload: Vec<u8> = b"commit-clears-intent-log-test-data-01".to_vec();
+    let payload: Vec<u8> = b"commit-clears-intent-log-test-data-01-sync-intent".to_vec();
     {
         let mut fs = open_fs(&dir);
-        fs.create_file("/commitme", DEFAULT_FILE_PERMISSIONS)
+        let rec = fs.create_file("/commitme", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
-        fs.set_auto_commit(false);
-        fs.write_file("/commitme", 0, &payload).expect("write");
+        let digest = IntegrityDigest64(0);
+        fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
+            .expect("sync_write_intent");
         assert!(
             fs.intent_log_entry_count() > 0,
-            "write must produce intent-log entries"
+            "sync_write_intent must produce intent-log entries"
         );
         // take the fast path first — entries must survive
         fs.fsync_file("/commitme").expect("fsync fast path");
