@@ -23,6 +23,8 @@
 //!
 //! An inode is considered fragmented when `score > 1.5`.
 
+use std::sync::{Arc, Mutex};
+
 use tidefs_extent_map::InlineExtentMap;
 use tidefs_types_incremental_job_core::IncrementalJob;
 use tidefs_types_extent_map_core::{ExtentMapEntryV2, ExtentMapError, LocatorId};
@@ -158,8 +160,8 @@ pub fn is_fragmented(map: &InlineExtentMap, min_extent_size: u64) -> bool {
 // Defragmentation logic
 // ---------------------------------------------------------------------------
 
-/// Merge adjacent extents with the same locator and contiguous logical
-/// ranges. Returns the compacted entry list.
+/// Merge adjacent extents with the same locator, checksum, and contiguous
+/// logical ranges. Returns the compacted entry list.
 #[must_use]
 pub fn defrag_extent_map(entries: &[ExtentMapEntryV2]) -> Vec<ExtentMapEntryV2> {
     if entries.is_empty() {
@@ -173,6 +175,7 @@ pub fn defrag_extent_map(entries: &[ExtentMapEntryV2]) -> Vec<ExtentMapEntryV2> 
         let last = merged.last_mut().unwrap();
         if last.locator_id == entry.locator_id
             && last.extent_kind == entry.extent_kind
+            && last.checksum == entry.checksum
             && last.end_offset() == entry.logical_offset
         {
             last.length += entry.length;
@@ -234,6 +237,7 @@ pub struct OnlineDefragService {
     inodes: Vec<u64>,
     cursor: DefragCursor,
     stats: DefragStats,
+    stats_sink: Option<Arc<Mutex<DefragStats>>>,
     min_extent_size: u64,
     complete_flag: bool,
 }
@@ -253,15 +257,32 @@ impl OnlineDefragService {
             inodes: sorted,
             cursor: DefragCursor::default(),
             stats: DefragStats::default(),
+            stats_sink: None,
             min_extent_size,
             complete_flag: false,
         }
+    }
+
+    /// Publish accumulated stats into a shared sink after each tick.
+    #[must_use]
+    pub fn with_stats_sink(mut self, stats_sink: Arc<Mutex<DefragStats>>) -> Self {
+        self.stats_sink = Some(stats_sink);
+        self.publish_stats();
+        self
     }
 
     /// Return a reference to the accumulated statistics.
     #[must_use]
     pub fn stats(&self) -> &DefragStats {
         &self.stats
+    }
+
+    fn publish_stats(&self) {
+        if let Some(stats_sink) = &self.stats_sink {
+            if let Ok(mut stats) = stats_sink.lock() {
+                *stats = self.stats.clone();
+            }
+        }
     }
 }
 
@@ -311,6 +332,7 @@ impl IncrementalJob for OnlineDefragService {
                 self.stats.inodes_defragmented += defragged;
                 self.stats.extents_before += extents_before;
                 self.stats.extents_after += extents_after;
+                self.publish_stats();
                 let cursor_state = CursorState(self.cursor.to_bytes().to_vec());
                 let progress = JobProgress {
                     items_processed: self.stats.inodes_scanned,
@@ -358,6 +380,7 @@ impl IncrementalJob for OnlineDefragService {
         self.stats.inodes_defragmented += defragged;
         self.stats.extents_before += extents_before;
         self.stats.extents_after += extents_after;
+        self.publish_stats();
 
         self.complete_flag = true;
         self.cursor.inode_index = self.inodes.len() as u64;
@@ -956,17 +979,27 @@ mod tests {
     }
 
     #[test]
-    fn defrag_merges_adjacent_same_locator() {
+    fn defrag_merges_adjacent_same_locator_and_checksum() {
         let entries = vec![
             ExtentMapEntryV2::new_data(0, 4096, LocatorId(1), [0xAB; 32], 1),
-            ExtentMapEntryV2::new_data(4096, 4096, LocatorId(1), [0xCD; 32], 1),
-            ExtentMapEntryV2::new_data(8192, 4096, LocatorId(1), [0xEF; 32], 1),
+            ExtentMapEntryV2::new_data(4096, 4096, LocatorId(1), [0xAB; 32], 1),
+            ExtentMapEntryV2::new_data(8192, 4096, LocatorId(1), [0xAB; 32], 1),
         ];
         let result = defrag_extent_map(&entries);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].logical_offset, 0);
         assert_eq!(result[0].length, 12288);
         assert_eq!(result[0].locator_id, LocatorId(1));
+    }
+
+    #[test]
+    fn defrag_does_not_merge_different_checksums() {
+        let entries = vec![
+            ExtentMapEntryV2::new_data(0, 4096, LocatorId(1), [0xAB; 32], 1),
+            ExtentMapEntryV2::new_data(4096, 4096, LocatorId(1), [0xCD; 32], 1),
+        ];
+        let result = defrag_extent_map(&entries);
+        assert_eq!(result.len(), 2);
     }
 
     #[test]

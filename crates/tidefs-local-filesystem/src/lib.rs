@@ -413,9 +413,9 @@ use tidefs_types_vfs_core::{LockConflict, LockRange, LockTracker};
 
 use background_orphan_reclamation::BackgroundOrphanReclamation;
 use extent_map_store_adapter::FilesystemExtentMapStore;
-use tidefs_online_defrag::OnlineDefragService;
-use tidefs_types_incremental_job_core::JobId;
+use tidefs_online_defrag::{DefragStats, OnlineDefragService};
 use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
+use tidefs_types_incremental_job_core::JobId;
 pub use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_types_reclaim_queue_core::ObjectKey as ReclaimObjectKey;
 use tidefs_types_reclaim_queue_core::QueueFamily as ReclaimQueueFamily;
@@ -1487,6 +1487,8 @@ pub struct LocalFileSystem {
     extent_maps_shared: Option<Arc<Mutex<BTreeMap<InodeId, tidefs_extent_map::ExtentMap>>>>,
     /// Shared inode records (for file_size lookups by the defrag adapter).
     inodes_shared: Option<Arc<Mutex<BTreeMap<InodeId, InodeRecord>>>>,
+    /// Shared statistics published by the online defrag job after each tick.
+    online_defrag_stats: Option<Arc<Mutex<DefragStats>>>,
     feature_flags: FeatureFlags,
     content_compression_policy: ContentCompressionPolicy,
     /// Tracks where the effective compression policy was resolved from.
@@ -3301,6 +3303,7 @@ impl LocalFileSystem {
         // operate on them without blocking the main filesystem.
         let extent_maps_shared = Arc::new(Mutex::new(state.extent_maps.clone()));
         let inodes_shared = Arc::new(Mutex::new((*state.inodes).clone()));
+        let online_defrag_stats = Arc::new(Mutex::new(DefragStats::default()));
 
         let mut fs = Self {
             store,
@@ -3356,6 +3359,7 @@ impl LocalFileSystem {
             pending_orphan_deletions: Arc::new(Mutex::new(Vec::new())),
             extent_maps_shared: Some(extent_maps_shared),
             inodes_shared: Some(inodes_shared),
+            online_defrag_stats: Some(Arc::clone(&online_defrag_stats)),
             background_scheduler: None,
             scrub_repair_schedule: None,
             scrub_corruption_detected: None,
@@ -3464,11 +3468,9 @@ impl LocalFileSystem {
                     JobId(200),
                     Box::new(defrag_store),
                     4096, // min_extent_size: 4 KiB
-                );
-                let _ = scheduler.register_incremental_job(
-                    "online-defrag",
-                    defrag_svc,
-                );
+                )
+                .with_stats_sink(Arc::clone(&online_defrag_stats));
+                let _ = scheduler.register_incremental_job("online-defrag", defrag_svc);
             }
 
             let scrub_interval_secs = options.background_scrub_interval_secs;
@@ -3965,6 +3967,13 @@ impl LocalFileSystem {
     /// Return background cleaner statistics for observability.
     pub fn background_cleaner_stats(&self) -> &crate::background_cleaner::BackgroundCleanerStats {
         self.background_cleaner.stats()
+    }
+
+    /// Return the latest online defrag counters published by the background job.
+    pub fn online_defrag_stats(&self) -> Option<DefragStats> {
+        self.online_defrag_stats
+            .as_ref()
+            .and_then(|stats| stats.lock().ok().map(|stats| stats.clone()))
     }
 
     /// Access the page cache (interior mutability via RefCell).
@@ -12784,6 +12793,65 @@ mod orphan_index_integration_tests {
                 fs.background_scheduler.is_some(),
                 "background scheduler runtime should be started on open"
             );
+        }
+
+        #[test]
+        fn online_defrag_stats_are_exposed_on_open() {
+            let root = std::env::temp_dir().join("bs_test_online_defrag_stats");
+            if root.exists() {
+                let _ = std::fs::remove_dir_all(&root);
+            }
+            let fs = LocalFileSystem::open(&root).expect("open");
+            assert_eq!(fs.online_defrag_stats(), Some(DefragStats::default()));
+        }
+
+        #[test]
+        fn online_defrag_scheduler_tick_scans_shared_extent_map_and_stats() {
+            let inode = InodeId::new(42);
+            let mut extent_map = tidefs_extent_map::ExtentMap::new();
+            extent_map.allocate(0, 4096).expect("first extent");
+            extent_map.allocate(8192, 4096).expect("second extent");
+
+            let inodes = Arc::new(Mutex::new(BTreeMap::new()));
+            let extent_maps = Arc::new(Mutex::new(BTreeMap::from([(inode, extent_map)])));
+            let stats = Arc::new(Mutex::new(DefragStats::default()));
+            let store =
+                FilesystemExtentMapStore::new(Arc::clone(&inodes), Arc::clone(&extent_maps));
+            let defrag_svc = OnlineDefragService::new(JobId(200), Box::new(store), 4096)
+                .with_stats_sink(Arc::clone(&stats));
+
+            let mut scheduler = BackgroundScheduler::new(ServiceBudget::UNBOUNDED);
+            scheduler
+                .register_incremental_job("online-defrag", defrag_svc)
+                .expect("register online defrag");
+
+            let report = scheduler.run_cycle();
+            assert!(
+                report
+                    .per_service
+                    .iter()
+                    .any(|(name, _tick)| *name == "online-defrag"),
+                "scheduler report should include online-defrag"
+            );
+
+            let entries_after = extent_maps
+                .lock()
+                .unwrap()
+                .get(&inode)
+                .expect("extent map")
+                .lookup_range(0, 12288)
+                .expect("lookup scanned extents");
+            assert_eq!(
+                entries_after.len(),
+                2,
+                "non-contiguous extents should remain separate"
+            );
+
+            let stats = stats.lock().unwrap().clone();
+            assert_eq!(stats.inodes_scanned, 1);
+            assert_eq!(stats.inodes_defragmented, 0);
+            assert_eq!(stats.extents_before, 2);
+            assert_eq!(stats.extents_after, 2);
         }
 
         #[test]

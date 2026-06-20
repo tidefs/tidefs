@@ -121,7 +121,7 @@ impl ExtentMapStore for FilesystemExtentMapStore {
             .get_mut(&InodeId::new(ino))
             .ok_or(ExtentMapError::NotFound)?;
 
-        em.defrag();
+        let _ = em.defrag();
         Ok(())
     }
 }
