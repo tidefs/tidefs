@@ -78,9 +78,9 @@
 //!
 //! The production reclaim chain:
 //! 1. `record_reclaim_delta()` records entries in the local B+tree queue
-//! 2. `tick_background_services()` Duty 2 drains the queue and calls
-//!    `LocalObjectStore::delete()` for each entry
-//! 3. `delete()` feeds the object-store legacy reclaim queue
+//! 2. `tick_background_services()` Duty 2 drains the queue through
+//!    `Pool::delete()` for each entry
+//! 3. `delete()` feeds the object-store reclaim queues
 //! 4. receipt-bound dead-object drains free segments only after committed
 //!    clearance evidence authorizes the object ids.
 //!
@@ -3820,13 +3820,12 @@ impl LocalFileSystem {
     }
 
     /// Drain entries from the local B+tree reclaim queue and hand them off
-    /// to the object-store legacy reclaim queue via `store.delete()`.
+    /// to the object-store reclaim queues via `Pool::delete()`.
     ///
     /// This is the production reclaim handoff: each entry is removed from the
-    /// local queue and passed to `LocalObjectStore::delete()`, which removes
-    /// the in-memory object index entry and enqueues a legacy object-store
-    /// reclaim entry. Physical segment freeing requires receipt-bound
-    /// dead-object clearance evidence.
+    /// local queue and passed to `Pool::delete()`, which removes the in-memory
+    /// object index entry and enqueues object-store reclaim entries. Physical
+    /// segment freeing requires receipt-bound dead-object clearance evidence.
     ///
     /// Budget: at most 256 entries per call to bound reclaim latency.
     pub fn drain_local_reclaim_queue_into_store(&mut self) -> ReclaimDrainStats {
@@ -3865,7 +3864,6 @@ impl LocalFileSystem {
                 .collect();
 
         if !batch.is_empty() {
-            let store = self.store.raw_primary_store_mut();
             let mut dedup_index = self.dedup_index.borrow_mut();
 
             for (object_key, _delta) in &batch {
@@ -3880,28 +3878,35 @@ impl LocalFileSystem {
                 // a dedup redirect.  If the redirect is the last reference to a
                 // canonical dedup object, decrement the durable refcount and
                 // queue the canonical data object for reclaim (#6326).
-                if let Ok(Some(payload)) = store.get(local_key) {
-                    if crate::encoding::is_dedup_redirect(&payload) {
-                        if let Ok(canonical_key) = crate::encoding::decode_dedup_redirect(&payload)
-                        {
-                            if let Ok(Some(canon_data)) = store.get(canonical_key) {
-                                if let Ok(chunk) =
-                                    crate::encoding::decode_content_chunk(&canon_data)
-                                {
-                                    let fp =
-                                        crate::encoding::compute_content_fingerprint(&chunk.bytes);
-                                    if let Ok(true) =
-                                        crate::dedup_refcount::DedupRefCount::decrement(store, &fp)
+                {
+                    let store = self.store.raw_primary_store_mut();
+                    if let Ok(Some(payload)) = store.get(local_key) {
+                        if crate::encoding::is_dedup_redirect(&payload) {
+                            if let Ok(canonical_key) =
+                                crate::encoding::decode_dedup_redirect(&payload)
+                            {
+                                if let Ok(Some(canon_data)) = store.get(canonical_key) {
+                                    if let Ok(chunk) =
+                                        crate::encoding::decode_content_chunk(&canon_data)
                                     {
-                                        let canon_data_key =
-                                            crate::object_keys::content_dedup_object_key(&fp);
-                                        let rq_entry = ReclaimQueueEntry::new(
-                                            ReclaimObjectKey(*canon_data_key.as_bytes()),
-                                            -1,
-                                            QueueFamily::Extent,
+                                        let fp = crate::encoding::compute_content_fingerprint(
+                                            &chunk.bytes,
                                         );
-                                        self.reclaim_queue.lock().unwrap().insert(rq_entry);
-                                        dedup_index.remove(&fp);
+                                        if let Ok(true) =
+                                            crate::dedup_refcount::DedupRefCount::decrement(
+                                                store, &fp,
+                                            )
+                                        {
+                                            let canon_data_key =
+                                                crate::object_keys::content_dedup_object_key(&fp);
+                                            let rq_entry = ReclaimQueueEntry::new(
+                                                ReclaimObjectKey(*canon_data_key.as_bytes()),
+                                                -1,
+                                                QueueFamily::Extent,
+                                            );
+                                            self.reclaim_queue.lock().unwrap().insert(rq_entry);
+                                            dedup_index.remove(&fp);
+                                        }
                                     }
                                 }
                             }
@@ -3917,7 +3922,7 @@ impl LocalFileSystem {
                     continue;
                 }
 
-                let _ = store.delete(local_key);
+                let _ = self.store.delete(DeviceIoClass::Data, local_key);
             }
             // Remove processed entries from the queue.
             // Entries whose receipt is not yet durable are re-enqueued
@@ -3939,6 +3944,26 @@ impl LocalFileSystem {
         }
 
         ReclaimDrainStats { entries_drained }
+    }
+
+    fn drain_receipt_bound_reclaim_for_committed_state(&mut self) {
+        const MAX_RECEIPT_BOUND_RECLAIM_PER_TICK: usize = 256;
+
+        if self.is_state_dirty() {
+            return;
+        }
+
+        if let Err(error) = self
+            .store
+            .drain_receipt_bound_dead_objects_at_stable_generation(
+                DeviceIoClass::Data,
+                u64::MAX,
+                u64::MAX,
+                MAX_RECEIPT_BOUND_RECLAIM_PER_TICK,
+            )
+        {
+            eprintln!("background-services: receipt-bound reclaim drain failed: {error}");
+        }
     }
     /// Build a deferred extent trim plan for a content rewrite.
     ///
@@ -4414,16 +4439,16 @@ impl LocalFileSystem {
             }
         }
 
-        // --- Duty 2: drain reclaim queue into object-store authority ---
-        // Hands off local B+tree reclaim queue entries to the object-store
-        // legacy reclaim queue via store.delete(). Physical segment freeing is
-        // reserved for receipt-bound dead-object drains.
-        let _drain_stats = self.drain_local_reclaim_queue_into_store();
-
         // Process deferred rewrite extent trims: promote old extent keys to
         // the reclaim queue once their replacement receipt is durable.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
         self.process_deferred_rewrite_trims();
+
+        // --- Duty 2: drain reclaim queue into object-store authority ---
+        // Hands off local B+tree reclaim queue entries through Pool::delete().
+        // Physical segment freeing is reserved for the receipt-bound drain below.
+        let _drain_stats = self.drain_local_reclaim_queue_into_store();
+        self.drain_receipt_bound_reclaim_for_committed_state();
 
         // --- Duty 3: dispatch pending scrub-triggered repairs ---
         // The background scrubber sets scrub_corruption_detected when it finds

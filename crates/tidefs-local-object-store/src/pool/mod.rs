@@ -2184,6 +2184,18 @@ impl Pool {
         old_receipt: &PlacementReceipt,
         replacement_receipt: &PlacementReceipt,
     ) -> Result<()> {
+        self.enqueue_obsolete_placement_with_clearance(old_receipt, replacement_receipt)
+    }
+
+    fn enqueue_committed_deleted_placement(&mut self, receipt: &PlacementReceipt) -> Result<()> {
+        self.enqueue_obsolete_placement_with_clearance(receipt, receipt)
+    }
+
+    fn enqueue_obsolete_placement_with_clearance(
+        &mut self,
+        old_receipt: &PlacementReceipt,
+        replacement_receipt: &PlacementReceipt,
+    ) -> Result<()> {
         match old_receipt.policy {
             PoolRedundancyPolicy::Replicated { .. } => {
                 let mut queued_indices = BTreeSet::new();
@@ -2530,6 +2542,9 @@ impl Pool {
 
         if let Some(receipt) = self.load_placement_receipt(&indices, key)? {
             let deleted = self.delete_with_receipt(&receipt, &indices)?;
+            if deleted {
+                self.enqueue_committed_deleted_placement(&receipt)?;
+            }
             self.health = compute_health(&self.devices);
             self.record_health_transitions();
             return Ok(deleted);
@@ -5194,7 +5209,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_delete_without_replacement_receipt_does_not_enqueue_dead_objects() {
+    fn pool_delete_enqueues_receipt_bound_dead_objects() {
         let root = temp_dir("receipt-bound-delete-no-synthetic");
         let _ = std::fs::remove_dir_all(&root);
         let config = multi_data_device_config(&root, 3);
@@ -5225,7 +5240,7 @@ mod tests {
                 .store_mut()
                 .drain_receipt_bound_dead_objects_at_stable_generation(u64::MAX, u64::MAX, 16)
                 .expect("delete drain");
-            assert_eq!(stats.entries_processed, 0);
+            assert_eq!(stats.entries_processed, 1);
             assert_eq!(stats.reclaim_queue_depth, 0);
         }
 
