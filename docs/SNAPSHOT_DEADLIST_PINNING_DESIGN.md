@@ -284,7 +284,7 @@ receives its own copy of the snapshot's deadlist. Not in scope for this design.
 DatasetSpaceView {
     logical_used_bytes: u64,       // total bytes logically in use (active + pinned)
     physical_used_bytes: u64,      // total bytes physically allocated (after CoW, compression)
-    pinned_snapshot_bytes: u64,    // sum of all snapshot deadlist_bytes
+    pinned_snapshot_bytes: u64,    // sum of all snapshot deadlist_bytes; operator view only
     snapshot_count: u32,
     reclaimable_bytes: u64,        // bytes in DESTROYING deadlists being drained
 }
@@ -301,7 +301,20 @@ SnapshotSpaceView {
 }
 ```
 
-### 6.3 Transactional consistency
+### 6.3 POSIX statfs boundary
+
+Issue #638 decision: `pinned_snapshot_bytes` is exposed through
+`DatasetSpaceView`, `SnapshotSpaceView`, and operator metrics. It does not reduce
+POSIX `statfs.f_bfree` or POSIX `statfs.f_bavail`.
+
+The deadlist counter is a classification of `logical_used_bytes`, which already
+covers bytes reachable from any live root, including snapshots. Snapshot reserve
+policy and cleaner pressure use the counter for admission, pruning, and physical
+watermark decisions, but mounted `df` remains governed by logical quota/domain
+availability, root/slop reserves, transient reservations, and physical
+backpressure rather than by subtracting pinned bytes a second time.
+
+### 6.4 Transactional consistency
 
 All counters are part of the committed state within a commit_group. After a crash,
 mount by the recovery path.
@@ -335,7 +348,9 @@ This is a **spec-draft**. Implementation is deferred to a continuation issue.
 4. **Phase D — Snapshot destroy:** Implement two-phase freeze + incremental
    move-or-free with cursor-driven resumption.
 5. **Phase E — Space observability:** Wire `pinned_snapshot_bytes` into
-   `statfs`/`DatasetSpaceView` reports.
+   `DatasetSpaceView`, `SnapshotSpaceView`, and operator reports. Do not wire
+   it into POSIX `statfs.f_bfree` or `statfs.f_bavail`; GitHub issue #649 tracks
+   the runtime/test cleanup for stale statfs assertions.
 6. **Phase F — Crash tests:** Add deadlist consistency and destroy-job
    resumption tests to the crash harness (#1230).
 
