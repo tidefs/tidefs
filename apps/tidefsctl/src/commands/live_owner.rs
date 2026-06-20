@@ -345,6 +345,7 @@ fn refuse_active_without_owner(
             "pool_uuid": pool_uuid_hex,
             "state": "ACTIVE",
             "owner_required": true,
+            "source:status": super::classification::StatusSource::UnsupportedOrOffline.label(),
             "error": "devices identify an imported pool but no live owner interface is reachable",
             "recovery": "repair or restart the kernel UAPI or userspace daemon owner before operating on live state; do not open cached imported-pool state directly",
         });
@@ -352,6 +353,9 @@ fn refuse_active_without_owner(
     } else {
         eprintln!(
             "tidefsctl {command} {operation}: devices identify imported pool '{pool}' uuid {pool_uuid_hex}, but no live owner interface is reachable"
+        );
+        eprintln!(
+            "tidefsctl {command} {operation}: [source:unsupported-or-offline] no reachable live owner; device labels report ACTIVE state"
         );
         eprintln!(
             "tidefsctl {command} {operation}: imported pool state is cached and must be owned by the kernel UAPI or userspace daemon"
@@ -394,6 +398,7 @@ fn cached_without_owner_json(
         "pool_name": pool,
         "cached_import_state": true,
         "owner_required": true,
+        "source:status": super::classification::StatusSource::CachedLocalMetadata.label(),
         "error": "cached imported-pool state exists but no live owner interface is reachable",
         "recovery": "start or repair the kernel UAPI or userspace daemon that owns this imported pool; do not open the cached state directly",
     });
@@ -413,6 +418,9 @@ fn cached_without_owner_lines(
     let mut lines = vec![format!(
         "tidefsctl {command} {operation}: cached imported-pool state exists for '{pool}', but no live owner interface is reachable"
     )];
+    lines.push(format!(
+        "tidefsctl {command} {operation}: [source:cached-local-metadata] cached owner record exists but no reachable live owner interface"
+    ));
     if let Some(pool_uuid) = pool_uuid {
         lines.push(format!(
             "tidefsctl {command} {operation}: cached pool uuid {}",
@@ -450,6 +458,9 @@ fn refuse_foreign_imported_backing_dir(
         owner.pool_uuid_hex(),
     );
     eprintln!(
+        "tidefsctl {command} {operation}: [source:cached-local-metadata] backing dir belongs to a different pool; refusing to use as exported/offline storage"
+    );
+    eprintln!(
         "tidefsctl {command} {operation}: live state must be handled by the kernel UAPI or userspace daemon that owns pool '{}'",
         owner.pool
     );
@@ -470,6 +481,7 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
             "operation": operation,
             "pool_name": pool,
             "owner_required": true,
+            "source:status": super::classification::StatusSource::UnsupportedOrOffline.label(),
             "error": format!("cannot use a live-owner interface for imported pool '{pool}': {lookup_error}"),
             "recovery": "repair or restart the kernel UAPI or userspace daemon owner before operating on live state; do not open cached imported-pool state directly",
         });
@@ -482,6 +494,9 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
     }
     eprintln!(
         "tidefsctl {command} {operation}: cannot use a live-owner interface for imported pool '{pool}': {lookup_error}"
+    );
+    eprintln!(
+        "tidefsctl {command} {operation}: [source:unsupported-or-offline] no reachable live owner interface"
     );
     if let Some(pool_uuid) = route.pool_uuid {
         eprintln!(
@@ -1480,6 +1495,11 @@ mod tests {
         let json = cached_without_owner_json("device", "remove", "tank", None);
 
         assert_eq!(
+            json.get("source:status")
+                .and_then(serde_json::Value::as_str),
+            Some(super::super::classification::StatusSource::CachedLocalMetadata.label())
+        );
+        assert_eq!(
             json.get("required_authority")
                 .and_then(serde_json::Value::as_str),
             Some(DEVICE_REMOVAL_AUTHORITY_KIND)
@@ -1492,6 +1512,9 @@ mod tests {
         );
 
         let lines = cached_without_owner_lines("device", "remove", "tank", None);
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("[source:cached-local-metadata]")));
         assert!(lines
             .iter()
             .any(|line| line.contains("committed evacuation receipt authority")));
