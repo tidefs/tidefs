@@ -234,7 +234,7 @@ evidence_artifacts = [
 
 [[claims]]
 id = "ublk.started_export.live_service_loop.v1"
-status = "planned"
+status = "blocked"
 scope = "uBLK started export admission and daemon-owned live data-queue service loop"
 required_evidence_classes = [
   "runtime-ublk-started-export-admission-artifact",
@@ -242,19 +242,18 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "runtime-ublk-started-export-admission-artifact", path = "validation/artifacts/ublk/started-export-admission-runtime.json", validation_tier = "qemu-guest", blocking_issues = ["#341"] },
-  { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json", validation_tier = "qemu-guest", blocking_issues = ["#312", "#341"] },
-  { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#341"] },
+  { class = "runtime-ublk-started-export-admission-artifact", path = "validation/artifacts/ublk/started-export-admission-runtime.json", validation_tier = "qemu-guest", blocking_issues = ["#614"] },
+  { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json", validation_tier = "qemu-guest", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]
 blockers = [
-  "The focused qemu-ublk-smoke started-export artifact is bounded service-loop evidence, not fio workload breadth, mkfs/mount acceptance, online resize acceptance, crash durability, or production block-device readiness.",
-  "The started-export artifact must remain paired with the qid/tag completion artifact verifier before completion handling can be treated as runtime evidence.",
-  "No claims-gate-review artifact is recorded for this claim.",
+  "Runtime started-export admission artifact is pending from focused GitHub Actions uBLK runtime row; workflow run https://github.com/tidefs/tidefs/actions/runs/27884260194 must complete and the artifact must pass validate-ublk-started-export-admission-artifact before the claim can move to validated.",
 ]
-generated_doc = "Planned uBLK started-export live service-loop claim. TideFS may treat a verified artifact as bounded runtime evidence for started-export admission only; it is not fio, mkfs/mount, online resize, crash durability, or production block-device readiness."
-evidence_artifacts = []
-
-[[claims]]
+generated_doc = "Blocked uBLK started-export live service-loop claim. TideFS has started-export-service-loop-model, qid-tag-completion runtime, and claims-gate review evidence. The runtime started-export admission artifact is pending from a focused GitHub Actions uBLK runtime row. This is not fio workload breadth, mkfs/mount acceptance, online resize, crash durability, or production block-device readiness."
+evidence_artifacts = [
+  { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json", source = "qemu-ublk-smoke", scope = "qid-tag-completion" },
+  { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", source = "claims-gate", scope = "ublk-model-runtime-boundary-review" },
+]
 id = "kernel.teardown.no_work_after.v1"
 status = "blocked"
 scope = "kernel teardown and post-teardown work exclusion"
