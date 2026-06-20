@@ -231,6 +231,74 @@ impl DivergenceRecord {
     }
 }
 
+
+// ── Repair-trigger receipt ───────────────────────────────────────────
+
+/// Durable repair-trigger receipt emitted for ticketable divergences.
+///
+/// A `RepairTriggerReceipt` is the authority boundary between divergence
+/// detection and repair admission. It carries complete evidence so repair
+/// scheduling, scrub integration, and later observability can prove why a
+/// repair was admitted.  Only ticketable divergence classes produce
+/// receipts; lag-only and witness-disagreement records are kept separate
+/// from repair admission.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct RepairTriggerReceipt {
+    /// Subject (chunk/object) id.
+    pub subject_ref: u64,
+    /// Target node where the divergence was detected.
+    pub target_node: u64,
+    /// Divergence class — always ticketable (DigestMismatch, MissingReplica,
+    /// or ReplicaUnhealthy).
+    pub divergence_class: DivergenceClass,
+    /// Expected digest prefix.
+    pub expected_digest: u64,
+    /// Actual (divergent) digest prefix.
+    pub actual_digest: u64,
+    /// Full expected digest if available.
+    pub expected_hash: Option<Digest>,
+    /// Full actual digest if available.
+    pub actual_hash: Option<Digest>,
+    /// Epoch in which the divergence was detected.
+    pub epoch: u64,
+    /// Monotonic nanosecond timestamp of detection.
+    pub detected_at_ns: u64,
+    /// Human-readable trigger reason.
+    pub trigger_reason: String,
+}
+
+impl RepairTriggerReceipt {
+    /// Create a receipt from a divergence record.
+    ///
+    /// Returns `None` for non-ticketable classes (lag-only, witness
+    /// disagreement) so callers never accidentally emit repair receipts
+    /// for those classes.
+    #[must_use]
+    pub fn from_divergence(rec: &DivergenceRecord, reason: &str) -> Option<Self> {
+        if !rec.requires_ticket() {
+            return None;
+        }
+        Some(RepairTriggerReceipt {
+            subject_ref: rec.subject_ref,
+            target_node: rec.target_node,
+            divergence_class: rec.class,
+            expected_digest: rec.expected_digest,
+            actual_digest: rec.actual_digest,
+            expected_hash: rec.expected_hash,
+            actual_hash: rec.actual_hash,
+            epoch: rec.epoch,
+            detected_at_ns: rec.detected_at_ns,
+            trigger_reason: reason.to_string(),
+        })
+    }
+
+    /// Whether this receipt carries full hash evidence.
+    #[must_use]
+    pub fn has_full_hashes(&self) -> bool {
+        self.expected_hash.is_some() && self.actual_hash.is_some()
+    }
+}
+
 fn digest_prefix_u64(digest: &Digest) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
@@ -337,4 +405,44 @@ mod tests {
         assert_eq!(record.expected_digest, 9);
         assert_eq!(record.actual_digest, 7);
     }
+    // ── RepairTriggerReceipt tests ─────────────────────────────────
+
+    #[test]
+    fn receipt_from_ticketable_divergence() {
+        let rec = DivergenceRecord::new(
+            42, 3, DivergenceClass::DigestMismatch, 0xAAAA, 0xBBBB, 7, 9_000_000,
+        );
+        let receipt = RepairTriggerReceipt::from_divergence(&rec, "test");
+        assert!(receipt.is_some());
+        let r = receipt.unwrap();
+        assert_eq!(r.subject_ref, 42);
+        assert_eq!(r.target_node, 3);
+        assert_eq!(r.divergence_class, DivergenceClass::DigestMismatch);
+        assert_eq!(r.expected_digest, 0xAAAA);
+        assert_eq!(r.actual_digest, 0xBBBB);
+        assert_eq!(r.epoch, 7);
+        assert_eq!(r.detected_at_ns, 9_000_000);
+        assert_eq!(r.trigger_reason, "test");
+    }
+
+    #[test]
+    fn receipt_rejected_for_lag_only() {
+        let rec = DivergenceRecord::new(1, 2, DivergenceClass::LagBehind, 100, 90, 1, 1000);
+        assert!(RepairTriggerReceipt::from_divergence(&rec, "test").is_none());
+    }
+
+    #[test]
+    fn receipt_rejected_for_witness_disagreement() {
+        let rec = DivergenceRecord::new(
+            1, 2, DivergenceClass::WitnessDisagreement, 100, 200, 1, 1000,
+        );
+        assert!(RepairTriggerReceipt::from_divergence(&rec, "test").is_none());
+    }
+
+    #[test]
+    fn receipt_from_missing_replica() {
+        let rec = DivergenceRecord::new(5, 1, DivergenceClass::MissingReplica, 0xDEAD, 0, 1, 1000);
+        assert!(RepairTriggerReceipt::from_divergence(&rec, "missing").is_some());
+    }
+
 }
