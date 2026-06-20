@@ -373,6 +373,28 @@ impl CapacityAuthority {
         })
     }
 
+    /// Reserve `bytes` for a rewrite that will replace already materialized
+    /// content. Admission checks only the net new bytes, while the full
+    /// reservation stays held until the rewrite commits and releases the
+    /// replaced content.
+    pub fn reserve_with_replacement_credit(
+        &self,
+        bytes: u64,
+        replacement_credit_bytes: u64,
+    ) -> Result<CapacityReservationHandle, Errno> {
+        if bytes == 0 {
+            return self.reserve(0);
+        }
+        let net_new_bytes = bytes.saturating_sub(replacement_credit_bytes);
+        self.check_enospc(net_new_bytes)?;
+        self.reserved_bytes.fetch_add(bytes, Ordering::Release);
+        Ok(CapacityReservationHandle {
+            authority: self,
+            bytes,
+            resolved: false,
+        })
+    }
+
     fn commit_reservation(&self, bytes: u64) {
         if bytes == 0 {
             return;

@@ -1082,6 +1082,54 @@ fn committed_overwrites_do_not_grow_capacity_authority_usage() {
 }
 
 #[test]
+fn full_capacity_committed_overwrites_are_admitted() {
+    let root = temp_root("full-capacity-overwrite-admission");
+    let data_len = content_chunk_size() as usize;
+    let mut fs = LocalFileSystem::open_with_capacity(
+        &root,
+        StoreOptions::test_fast(),
+        content_chunk_size() as u64,
+    )
+    .expect("open fs");
+    fs.create_file("/docs.bin", 0o600).expect("create file");
+
+    fs.write_file("/docs.bin", 0, &vec![0x11; data_len])
+        .expect("initial write fills capacity");
+    fs.fsync_all().expect("commit initial write");
+    let used_after_initial = fs.capacity_authority().used_bytes();
+    assert_eq!(
+        used_after_initial,
+        content_chunk_size() as u64,
+        "test setup should fill configured content capacity",
+    );
+
+    fs.write_file("/docs.bin", 0, &vec![0x22; data_len])
+        .expect("buffered overwrite should use replacement credit");
+    fs.fsync_all().expect("commit buffered overwrite");
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        used_after_initial,
+        "buffered overwrite at full capacity must not consume extra capacity",
+    );
+
+    fs.write_file_ranges_direct("/docs.bin", vec![(0, vec![0x33; data_len])])
+        .expect("direct overwrite should use replacement credit");
+    fs.fsync_all().expect("commit direct overwrite");
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        used_after_initial,
+        "direct overwrite at full capacity must not consume extra capacity",
+    );
+
+    assert_eq!(
+        fs.read_file("/docs.bin").expect("read final content"),
+        vec![0x33; data_len]
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn symlink_round_trips_target() {
     let root = temp_root("symlink");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
