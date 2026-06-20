@@ -17,6 +17,7 @@ tidefs-pool-scan = { path = "../../crates/tidefs-pool-scan" }
 tidefs-validation = { path = "../../crates/tidefs-validation" }
 tidefs-recovery-loop = { path = "../../crates/tidefs-recovery-loop" }
 tidefs-replication-model = { path = "../../crates/tidefs-replication-model" }
+tidefs-device-removal = { path = "../../crates/tidefs-device-removal" }
 tidefs-types-pool-label-core = { path = "../../crates/tidefs-types-pool-label-core" }
 tidefs-local-object-store = { path = "../../crates/tidefs-local-object-store" }
 tidefs-local-filesystem = { path = "../../crates/tidefs-local-filesystem" }

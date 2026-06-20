@@ -3904,6 +3904,7 @@ dependencies = [
  "tidefs-dataset-feature-flags",
  "tidefs-dataset-lifecycle",
  "tidefs-dataset-properties",
+ "tidefs-device-removal",
  "tidefs-encryption",
  "tidefs-local-filesystem",
  "tidefs-local-object-store",

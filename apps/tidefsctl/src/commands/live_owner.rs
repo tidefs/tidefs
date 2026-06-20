@@ -14,6 +14,10 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process;
 
+use tidefs_device_removal::admission::{
+    validate_live_owner_response, DeviceRemovalAdmissionRequest, DEVICE_REMOVAL_AUTHORITY_KIND,
+};
+
 #[derive(Debug, Clone)]
 pub(crate) struct LivePoolRoute<'a> {
     pub(crate) command: &'a str,
@@ -248,7 +252,6 @@ pub(crate) fn route_imported_with_format_and_args(
     })
 }
 
-
 /// Route a status command to the live owner if reachable. Returns true
 /// if the request was routed (the process exits inside the route),
 /// returns false if no live owner was found so the caller can produce
@@ -276,31 +279,53 @@ pub(crate) fn refuse_no_live_status_evidence(
     json: bool,
 ) -> ! {
     if json {
-        let out = serde_json::json!({
-            "ok": false,
-            "command": command,
-            "operation": operation,
-            "pool_name": pool,
-            "source:status": super::classification::StatusSource::UnsupportedOrOffline.label(),
-            "error": "no live status evidence obtained; cached local metadata is non-authoritative for live cluster/device state",
-            "recovery": "start or repair the kernel UAPI or userspace daemon that owns this pool; do not treat cached metadata as live truth",
-        });
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&no_live_status_refusal_json(command, operation, pool))
+                .unwrap()
+        );
     } else {
-        eprintln!(
-            "tidefsctl {command} {operation}: no live status evidence obtained for pool '{pool}'"
-        );
-        eprintln!(
-            "tidefsctl {command} {operation}: [source:unsupported-or-offline] no reachable live owner"
-        );
-        eprintln!(
-            "tidefsctl {command} {operation}: cached local metadata, command-line parse results, and static configuration are non-authoritative for live cluster/device state"
-        );
-        eprintln!(
-            "tidefsctl {command} {operation}: refusing to present cached data as live status truth"
-        );
+        for line in no_live_status_refusal_lines(command, operation, pool) {
+            eprintln!("{line}");
+        }
     }
     process::exit(1);
+}
+
+fn no_live_status_refusal_json(command: &str, operation: &str, pool: &str) -> serde_json::Value {
+    let unavailable = super::classification::StatusSource::UnavailableLiveOwner.label();
+    let unsupported = super::classification::StatusSource::UnsupportedLocalMode.label();
+    serde_json::json!({
+        "ok": false,
+        "command": command,
+        "operation": operation,
+        "pool_name": pool,
+        "source_classification": unavailable,
+        "source:status": unavailable,
+        "local_mode_classification": unsupported,
+        "error": "no live status evidence obtained; cached local metadata is non-authoritative for live cluster/device state",
+        "recovery": "start or repair the kernel UAPI or userspace daemon that owns this pool; do not treat cached metadata as live truth",
+    })
+}
+
+fn no_live_status_refusal_lines(command: &str, operation: &str, pool: &str) -> Vec<String> {
+    vec![
+        format!("tidefsctl {command} {operation}: no live status evidence obtained for pool '{pool}'"),
+        format!(
+            "tidefsctl {command} {operation}: [{}] no reachable live owner",
+            super::classification::StatusSource::UnavailableLiveOwner.label()
+        ),
+        format!(
+            "tidefsctl {command} {operation}: [{}] local/offline status mode is unsupported for live cluster/device state",
+            super::classification::StatusSource::UnsupportedLocalMode.label()
+        ),
+        format!(
+            "tidefsctl {command} {operation}: cached local metadata, command-line parse results, and static configuration are non-authoritative for live cluster/device state"
+        ),
+        format!(
+            "tidefsctl {command} {operation}: refusing to present cached data as live status truth"
+        ),
+    ]
 }
 fn refuse_active_without_owner(
     command: &str,
@@ -346,38 +371,64 @@ fn refuse_cached_without_owner(
     json: bool,
 ) -> ! {
     if json {
-        let mut out = serde_json::json!({
-            "ok": false,
-            "command": command,
-            "operation": operation,
-            "pool_name": pool,
-            "cached_import_state": true,
-            "owner_required": true,
-            "error": "cached imported-pool state exists but no live owner interface is reachable",
-            "recovery": "start or repair the kernel UAPI or userspace daemon that owns this imported pool; do not open the cached state directly",
-        });
-        if let Some(pool_uuid) = pool_uuid {
-            out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
-        }
+        let out = cached_without_owner_json(command, operation, pool, pool_uuid);
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
     } else {
-        eprintln!(
-            "tidefsctl {command} {operation}: cached imported-pool state exists for '{pool}', but no live owner interface is reachable"
-        );
-        if let Some(pool_uuid) = pool_uuid {
-            eprintln!(
-                "tidefsctl {command} {operation}: cached pool uuid {}",
-                hex_uuid(&pool_uuid)
-            );
+        for line in cached_without_owner_lines(command, operation, pool, pool_uuid) {
+            eprintln!("{line}");
         }
-        eprintln!(
-            "tidefsctl {command} {operation}: live state must be handled by the kernel UAPI or userspace daemon that owns the import"
-        );
-        eprintln!(
-            "tidefsctl {command} {operation}: refusing direct access to cached imported-pool state"
-        );
     }
     process::exit(1);
+}
+
+fn cached_without_owner_json(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: Option<[u8; 16]>,
+) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "ok": false,
+        "command": command,
+        "operation": operation,
+        "pool_name": pool,
+        "cached_import_state": true,
+        "owner_required": true,
+        "error": "cached imported-pool state exists but no live owner interface is reachable",
+        "recovery": "start or repair the kernel UAPI or userspace daemon that owns this imported pool; do not open the cached state directly",
+    });
+    if let Some(pool_uuid) = pool_uuid {
+        out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
+    }
+    annotate_device_removal_authority_json(command, operation, &mut out);
+    out
+}
+
+fn cached_without_owner_lines(
+    command: &str,
+    operation: &str,
+    pool: &str,
+    pool_uuid: Option<[u8; 16]>,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "tidefsctl {command} {operation}: cached imported-pool state exists for '{pool}', but no live owner interface is reachable"
+    )];
+    if let Some(pool_uuid) = pool_uuid {
+        lines.push(format!(
+            "tidefsctl {command} {operation}: cached pool uuid {}",
+            hex_uuid(&pool_uuid)
+        ));
+    }
+    if let Some(line) = device_removal_authority_line(command, operation, None) {
+        lines.push(line);
+    }
+    lines.push(format!(
+        "tidefsctl {command} {operation}: live state must be handled by the kernel UAPI or userspace daemon that owns the import"
+    ));
+    lines.push(format!(
+        "tidefsctl {command} {operation}: refusing direct access to cached imported-pool state"
+    ));
+    lines
 }
 
 fn refuse_foreign_imported_backing_dir(
@@ -425,6 +476,7 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
         if let Some(pool_uuid) = route.pool_uuid {
             out["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
         }
+        annotate_device_removal_authority_json(command, operation, &mut out);
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         process::exit(1);
     }
@@ -436,6 +488,11 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
             "tidefsctl {command} {operation}: request identified pool uuid {}",
             hex_uuid(&pool_uuid)
         );
+    }
+    if let Some(line) =
+        device_removal_authority_line(command, operation, route_device_path(&route))
+    {
+        eprintln!("{line}");
     }
     eprintln!(
         "tidefsctl {command} {operation}: cached imported-pool state is evidence, not an authority interface"
@@ -479,7 +536,14 @@ fn exit_owner_error(route: LivePoolRoute<'_>, exit_code: i32, message: &str) -> 
 }
 
 fn send_live_owner_request(route: &LivePoolRoute<'_>) -> Result<(), LiveOwnerRequestError> {
-    let manifest = find_live_owner_manifest(route)?;
+    send_live_owner_request_at(&pool_runtime_root(), route)
+}
+
+fn send_live_owner_request_at(
+    root: &Path,
+    route: &LivePoolRoute<'_>,
+) -> Result<(), LiveOwnerRequestError> {
+    let manifest = find_live_owner_manifest_at(root, route)?;
     let socket_path = manifest_socket_endpoint(&manifest, route)?;
     let mut stream = UnixStream::connect(&socket_path).map_err(|err| {
         LiveOwnerRequestError::Unavailable(format!("connect {}: {err}", socket_path.display()))
@@ -515,11 +579,14 @@ fn send_live_owner_request(route: &LivePoolRoute<'_>) -> Result<(), LiveOwnerReq
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if ok {
+        validate_required_owner_evidence(route, &response)?;
         if route.json {
             if let Some(value) = response.get("json") {
+                let mut value = value.clone();
+                annotate_live_owner_status_json(route, &mut value);
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(value).map_err(|err| {
+                    serde_json::to_string_pretty(&value).map_err(|err| {
                         LiveOwnerRequestError::Owner {
                             exit_code: 2,
                             message: format!("format live-owner JSON: {err}"),
@@ -527,20 +594,43 @@ fn send_live_owner_request(route: &LivePoolRoute<'_>) -> Result<(), LiveOwnerReq
                     })?
                 );
             } else if let Some(text) = response.get("text").and_then(serde_json::Value::as_str) {
-                println!("{text}");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&live_owner_status_text_json(route, text))
+                        .map_err(|err| LiveOwnerRequestError::Owner {
+                            exit_code: 2,
+                            message: format!("format live-owner JSON: {err}"),
+                        })?
+                );
+            } else if is_status_route(route) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&live_owner_status_text_json(route, "")).map_err(
+                        |err| LiveOwnerRequestError::Owner {
+                            exit_code: 2,
+                            message: format!("format live-owner JSON: {err}"),
+                        }
+                    )?
+                );
             }
         } else if let Some(text) = response.get("text").and_then(serde_json::Value::as_str) {
+            print_live_owner_status_classification(route);
             println!("{text}");
         } else if let Some(value) = response.get("json") {
+            let mut value = value.clone();
+            annotate_live_owner_status_json(route, &mut value);
+            print_live_owner_status_classification(route);
             println!(
                 "{}",
-                serde_json::to_string_pretty(value).map_err(|err| {
+                serde_json::to_string_pretty(&value).map_err(|err| {
                     LiveOwnerRequestError::Owner {
                         exit_code: 2,
                         message: format!("format live-owner JSON: {err}"),
                     }
                 })?
             );
+        } else {
+            print_live_owner_status_classification(route);
         }
         Ok(())
     } else {
@@ -560,6 +650,139 @@ fn send_live_owner_request(route: &LivePoolRoute<'_>) -> Result<(), LiveOwnerReq
     }
 }
 
+fn validate_required_owner_evidence(
+    route: &LivePoolRoute<'_>,
+    response: &serde_json::Value,
+) -> Result<(), LiveOwnerRequestError> {
+    let Some(request) = device_removal_admission_request(route) else {
+        return Ok(());
+    };
+    validate_live_owner_response(&request, response)
+        .map(|_| ())
+        .map_err(|err| LiveOwnerRequestError::Owner {
+            exit_code: 1,
+            message: err.to_string(),
+        })
+}
+
+fn device_removal_admission_request(
+    route: &LivePoolRoute<'_>,
+) -> Option<DeviceRemovalAdmissionRequest> {
+    if route.command != "device" || route.operation != "remove" {
+        return None;
+    }
+    let device_path = route
+        .args
+        .get("device_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    Some(DeviceRemovalAdmissionRequest::new(route.pool, device_path))
+}
+
+fn is_device_removal_route(command: &str, operation: &str) -> bool {
+    command == "device" && operation == "remove"
+}
+
+fn route_device_path<'route>(
+    route: &'route LivePoolRoute<'_>,
+) -> Option<&'route str> {
+    route
+        .args
+        .get("device_path")
+        .and_then(serde_json::Value::as_str)
+}
+
+fn annotate_device_removal_authority_json(
+    command: &str,
+    operation: &str,
+    out: &mut serde_json::Value,
+) {
+    if !is_device_removal_route(command, operation) {
+        return;
+    }
+    out["required_authority"] =
+        serde_json::Value::String(DEVICE_REMOVAL_AUTHORITY_KIND.to_string());
+    out["authority_error"] = serde_json::Value::String(
+        "device removal requires committed evacuation receipt authority from a reachable live owner"
+            .to_string(),
+    );
+}
+
+fn device_removal_authority_line(
+    command: &str,
+    operation: &str,
+    device_path: Option<&str>,
+) -> Option<String> {
+    if !is_device_removal_route(command, operation) {
+        return None;
+    }
+    let target = device_path
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" for device '{value}'"))
+        .unwrap_or_default();
+    Some(format!(
+        "tidefsctl {command} {operation}: missing committed evacuation receipt authority{target}; cached imported-pool state is not removal authority"
+    ))
+}
+
+fn is_status_route(route: &LivePoolRoute<'_>) -> bool {
+    route.operation == "status" && matches!(route.command, "cluster" | "device")
+}
+
+fn annotate_live_owner_status_json(route: &LivePoolRoute<'_>, value: &mut serde_json::Value) {
+    if !is_status_route(route) {
+        return;
+    }
+
+    let source = super::classification::StatusSource::LiveOwner.label();
+    match value {
+        serde_json::Value::Object(map) => {
+            map.entry("source_classification")
+                .or_insert_with(|| serde_json::Value::String(source.to_string()));
+            map.entry("source:status")
+                .or_insert_with(|| serde_json::Value::String(source.to_string()));
+        }
+        _ => {
+            let original = std::mem::take(value);
+            *value = serde_json::json!({
+                "ok": true,
+                "source_classification": source,
+                "source:status": source,
+                "value": original,
+            });
+        }
+    }
+}
+
+fn live_owner_status_text_json(route: &LivePoolRoute<'_>, text: &str) -> serde_json::Value {
+    if is_status_route(route) {
+        let source = super::classification::StatusSource::LiveOwner.label();
+        serde_json::json!({
+            "ok": true,
+            "command": route.command,
+            "operation": route.operation,
+            "pool_name": route.pool,
+            "source_classification": source,
+            "source:status": source,
+            "text": text,
+        })
+    } else {
+        serde_json::json!({
+            "ok": true,
+            "text": text,
+        })
+    }
+}
+
+fn print_live_owner_status_classification(route: &LivePoolRoute<'_>) {
+    if is_status_route(route) {
+        println!(
+            "source_classification: {}",
+            super::classification::StatusSource::LiveOwner.label()
+        );
+    }
+}
+
 fn live_owner_request_json(route: &LivePoolRoute<'_>) -> serde_json::Value {
     let mut request = serde_json::json!({
         "command": route.command,
@@ -572,12 +795,6 @@ fn live_owner_request_json(route: &LivePoolRoute<'_>) -> serde_json::Value {
         request["pool_uuid"] = serde_json::Value::String(hex_uuid(&pool_uuid));
     }
     request
-}
-
-fn find_live_owner_manifest(
-    route: &LivePoolRoute<'_>,
-) -> Result<serde_json::Value, LiveOwnerRequestError> {
-    find_live_owner_manifest_at(&pool_runtime_root(), route)
 }
 
 fn find_live_owner_manifest_at(
@@ -1099,7 +1316,81 @@ fn hex_uuid(uuid: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    use tidefs_device_removal::admission::{
+        DeviceRemovalAdmissionEvidence, DEVICE_REMOVAL_AUTHORITY_FIELD,
+        DEVICE_REMOVAL_AUTHORITY_KIND,
+    };
+    use tidefs_device_removal::{EvacuationCompletionGeneration, EvacuationReceipt};
+
+    fn write_owner_manifest(root: &Path, socket_path: &Path) {
+        let uuid = [0x42; 16];
+        let manifest_path = owner_manifest_path(root, &uuid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "pool_name": "tank",
+                "pool_uuid": "42424242424242424242424242424242",
+                "socket_path": socket_path,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn test_receipt(device_guid: [u8; 16], topology_generation: u64) -> EvacuationReceipt {
+        EvacuationReceipt::new(
+            EvacuationCompletionGeneration {
+                target_device_guid: device_guid,
+                target_topology_generation: topology_generation,
+                evacuation_set_digest: [0x55; 32],
+                removal_chain_digest: [0x66; 32],
+            },
+            vec![],
+            9,
+        )
+    }
+
+    fn spawn_owner_response(
+        listener: UnixListener,
+        response: serde_json::Value,
+    ) -> thread::JoinHandle<serde_json::Value> {
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                stream.write_all(response.to_string().as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+                return request;
+            }
+            panic!("live-owner test did not receive request");
+        })
+    }
+
+    fn device_remove_route() -> LivePoolRoute<'static> {
+        LivePoolRoute {
+            command: "device",
+            operation: "remove",
+            pool: "tank",
+            pool_uuid: None,
+            json: false,
+            args: serde_json::json!({
+                "device_path": "/dev/disk2",
+                "required_authority": DEVICE_REMOVAL_AUTHORITY_KIND,
+            }),
+        }
+    }
 
     #[test]
     fn owner_interface_requires_decodable_manifest_and_reachable_socket() {
@@ -1123,6 +1414,139 @@ mod tests {
         .unwrap();
 
         assert!(!owner_interface_reachable_by_uuid_at(dir.path(), &uuid));
+    }
+
+    #[test]
+    fn device_remove_live_owner_response_requires_committed_receipt_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let handle =
+            spawn_owner_response(listener, serde_json::json!({"ok": true, "text": "removed"}));
+        let route = device_remove_route();
+
+        let err = send_live_owner_request_at(dir.path(), &route).unwrap_err();
+        let request = handle.join().unwrap();
+
+        assert_eq!(
+            request
+                .pointer("/args/required_authority")
+                .and_then(serde_json::Value::as_str),
+            Some(DEVICE_REMOVAL_AUTHORITY_KIND)
+        );
+        match err {
+            LiveOwnerRequestError::Owner { message, .. } => {
+                assert!(message.contains("committed evacuation receipt authority"));
+            }
+            LiveOwnerRequestError::Unavailable(message) => {
+                panic!("missing authority should be an owner refusal, got {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn device_remove_live_owner_accepts_receipt_shaped_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_owner_manifest(dir.path(), &socket_path);
+        let receipt = test_receipt([0x42; 16], 11);
+        let authority =
+            DeviceRemovalAdmissionEvidence::committed("tank", "/dev/disk2", 11, receipt);
+        let mut response = serde_json::json!({
+            "ok": true,
+            "text": "removed",
+        });
+        response[DEVICE_REMOVAL_AUTHORITY_FIELD] = serde_json::to_value(authority).unwrap();
+        let handle = spawn_owner_response(listener, response);
+        let route = device_remove_route();
+
+        send_live_owner_request_at(dir.path(), &route).unwrap();
+        let request = handle.join().unwrap();
+
+        assert_eq!(
+            request.get("command").and_then(serde_json::Value::as_str),
+            Some("device")
+        );
+        assert_eq!(
+            request.get("operation").and_then(serde_json::Value::as_str),
+            Some("remove")
+        );
+    }
+
+    #[test]
+    fn device_remove_cached_owner_refusal_names_receipt_authority() {
+        let json = cached_without_owner_json("device", "remove", "tank", None);
+
+        assert_eq!(
+            json.get("required_authority")
+                .and_then(serde_json::Value::as_str),
+            Some(DEVICE_REMOVAL_AUTHORITY_KIND)
+        );
+        assert!(
+            json.get("authority_error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .contains("committed evacuation receipt authority")
+        );
+
+        let lines = cached_without_owner_lines("device", "remove", "tank", None);
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("committed evacuation receipt authority")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("cached imported-pool state is not removal authority")));
+    }
+
+    #[test]
+    fn device_remove_unavailable_owner_refusal_names_target_device_authority() {
+        let line = device_removal_authority_line("device", "remove", Some("/dev/disk2"))
+            .expect("device removal should require receipt authority");
+
+        assert!(line.contains("committed evacuation receipt authority"));
+        assert!(line.contains("/dev/disk2"));
+        assert!(device_removal_authority_line("device", "status", Some("/dev/disk2"))
+            .is_none());
+    }
+
+    #[test]
+    fn status_json_refusal_names_unavailable_owner_and_unsupported_local_mode() {
+        let json = no_live_status_refusal_json("device", "status", "tank");
+
+        assert_eq!(
+            json.get("source_classification")
+                .and_then(serde_json::Value::as_str),
+            Some(super::super::classification::StatusSource::UnavailableLiveOwner.label())
+        );
+        assert_eq!(
+            json.get("local_mode_classification")
+                .and_then(serde_json::Value::as_str),
+            Some(super::super::classification::StatusSource::UnsupportedLocalMode.label())
+        );
+    }
+
+    #[test]
+    fn live_owner_status_json_is_annotated_when_owner_omits_source() {
+        let route = LivePoolRoute {
+            command: "device",
+            operation: "status",
+            pool: "tank",
+            pool_uuid: None,
+            json: true,
+            args: serde_json::Value::Null,
+        };
+        let mut value = serde_json::json!({"ok": true, "devices": []});
+
+        annotate_live_owner_status_json(&route, &mut value);
+
+        assert_eq!(
+            value
+                .get("source_classification")
+                .and_then(serde_json::Value::as_str),
+            Some(super::super::classification::StatusSource::LiveOwner.label())
+        );
     }
 
     #[test]
