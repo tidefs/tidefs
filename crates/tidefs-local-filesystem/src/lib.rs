@@ -8732,8 +8732,6 @@ impl LocalFileSystem {
             }
         } else {
             // ── Plain rename / RENAME_NOREPLACE ────────────────────
-            let mut replaced_last_link_inode_id = None;
-
             // Handle overwritten destination
             if let Some(target) = new_entry {
                 let target_record = self.inode(target.inode_id)?.clone();
@@ -8755,8 +8753,7 @@ impl LocalFileSystem {
                     }
                     Arc::make_mut(&mut self.state.directories).remove(&target.inode_id);
                     Arc::make_mut(&mut self.state.inodes).remove(&target.inode_id);
-                    self.state.last_inode_write_tx.remove(&target.inode_id);
-                    self.state.last_dir_write_tx.remove(&target.inode_id);
+                    self.forget_removed_inode_state(target.inode_id);
                 } else if target_record.nlink > 1 {
                     // Still has other links — decrement nlink.
                     let mut updated = target_record;
@@ -8798,7 +8795,7 @@ impl LocalFileSystem {
                         stored.nlink = 0;
                     }
                     self.record_reclaim_delta(target.inode_id, target_record.size);
-                    replaced_last_link_inode_id = Some(target.inode_id);
+                    self.record_inode_tombstone(target.inode_id);
                     // Clear xattrs before removing the overwritten file inode.
                     if let Some(stored) =
                         Arc::make_mut(&mut self.state.inodes).get_mut(&target.inode_id)
@@ -8806,8 +8803,7 @@ impl LocalFileSystem {
                         stored.xattrs.clear();
                     }
                     Arc::make_mut(&mut self.state.inodes).remove(&target.inode_id);
-                    self.state.last_inode_write_tx.remove(&target.inode_id);
-                    self.state.last_dir_write_tx.remove(&target.inode_id);
+                    self.forget_removed_inode_state(target.inode_id);
                 }
             }
 
@@ -8831,9 +8827,6 @@ impl LocalFileSystem {
             if old_parent_id != new_parent_id && moving_is_directory {
                 self.update_parent_metadata_for_subdir_remove(old_parent_id, tick);
                 self.update_parent_metadata_for_subdir_add(new_parent_id, tick);
-            }
-            if let Some(inode_id) = replaced_last_link_inode_id {
-                self.obligation_ledger.release_claims_for_inode(inode_id);
             }
         }
 
@@ -11039,6 +11032,7 @@ impl LocalFileSystem {
         self.state.last_inode_write_tx.remove(&inode_id);
         self.state.last_dir_write_tx.remove(&inode_id);
         self.state.last_extent_map_write_tx.remove(&inode_id);
+        self.extent_allocator.remove_inode(inode_id.get());
         self.state.extent_maps.remove(&inode_id);
         self.state.known_inode_ids.remove(&inode_id);
         self.obligation_ledger.release_claims_for_inode(inode_id);
@@ -12940,6 +12934,70 @@ mod orphan_index_integration_tests {
         assert!(fs.lookup("/old").is_err());
         assert_eq!(fs.lookup("/new").expect("lookup new"), old_file.inode_id);
         assert_eq!(fs.read_file("/new").expect("read new"), b"old-data");
+    }
+
+    #[test]
+    fn renameat2_plain_overwrite_forgets_replaced_inode_state() {
+        let (_root, mut fs) = make_test_fs("rat2_plain_overwrite_forgets_inode").expect("open");
+        let source = fs
+            .create_file("/old", DEFAULT_FILE_PERMISSIONS)
+            .expect("create old");
+        fs.write_file("/old", 0, b"old-data").expect("write old");
+        let replaced = fs
+            .create_file("/new", DEFAULT_FILE_PERMISSIONS)
+            .expect("create new");
+        let chunk_len = crate::constants::content_chunk_size() as usize;
+        fs.write_file("/new", 0, &vec![0x5a; chunk_len])
+            .expect("write replaced file");
+        fs.do_commit().expect("commit setup");
+
+        assert!(
+            fs.state.extent_maps.contains_key(&replaced.inode_id),
+            "setup should persist the replaced inode extent map"
+        );
+        assert!(
+            !fs.extent_allocator()
+                .lookup_extents(replaced.inode_id.get(), 0, chunk_len as u64)
+                .is_empty(),
+            "setup should retain a live extent map for the replaced inode"
+        );
+        assert!(fs.inode(replaced.inode_id).is_ok());
+
+        fs.set_auto_commit(false);
+        fs.renameat2(
+            "/old",
+            "/new",
+            crate::namespace::rename::RenameAt2Flags::EMPTY,
+        )
+        .expect("renameat2 overwrite");
+
+        assert!(fs.lookup("/old").is_err());
+        assert_eq!(fs.lookup("/new").expect("lookup new"), source.inode_id);
+        assert!(
+            !fs.state.inodes.contains_key(&replaced.inode_id),
+            "overwritten inode record must be removed from live state"
+        );
+        assert!(
+            !fs.state.extent_maps.contains_key(&replaced.inode_id),
+            "overwritten inode extent map must be removed from committed state"
+        );
+        assert!(
+            fs.extent_allocator()
+                .lookup_extents(replaced.inode_id.get(), 0, chunk_len as u64)
+                .is_empty(),
+            "overwritten inode must not retain live extent allocator entries"
+        );
+        assert!(matches!(
+            fs.inode(replaced.inode_id),
+            Err(FileSystemError::CorruptState { .. })
+        ));
+        let entries = fs.reclaim_queue.lock().unwrap().entries();
+        assert!(
+            entries
+                .iter()
+                .any(|(_, entry)| entry.family == ReclaimQueueFamily::InodeTombstone),
+            "rename-overwrite of a last-link inode must queue an inode tombstone"
+        );
     }
 
     #[test]
