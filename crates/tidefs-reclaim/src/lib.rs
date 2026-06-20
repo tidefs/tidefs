@@ -753,16 +753,42 @@ pub trait ReclaimGate {
 ///
 /// ```text
 /// MAGIC:     4 bytes  "RCRP"
-/// VERSION:   4 bytes  LE u32 = 1
+/// VERSION:   4 bytes  LE u32 = 2
 /// COUNT:     4 bytes  LE u32 (number of extents)
 /// EVIDENCE:  16 bytes (deadlist_txg: u64 LE, pin_epoch: u64 LE)
-/// EXTENTS:   COUNT * 32 bytes ([u8; 32] each, ObjectKey)
+/// EXTENTS:   COUNT * 40 bytes (segment_id: u64 LE, ObjectKey: [u8; 32])
 /// CHECKSUM:  32 bytes BLAKE3-256 over MAGIC..EXTENTS
-/// ```text
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReclaimReceiptExtent {
+    /// Exact segment id that held the freed extent at reclaim time.
+    pub segment_id: u64,
+    /// Exact extent key freed from `segment_id`.
+    pub extent_key: tidefs_types_reclaim_queue_core::ObjectKey,
+}
+
+impl ReclaimReceiptExtent {
+    /// Create a segment-scoped receipt extent record.
+    #[must_use]
+    pub const fn new(
+        segment_id: u64,
+        extent_key: tidefs_types_reclaim_queue_core::ObjectKey,
+    ) -> Self {
+        Self {
+            segment_id,
+            extent_key,
+        }
+    }
+}
+
+/// Durable reclaim evidence for one committed physical-reclaim batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReclaimReceipt {
-    /// Extent keys freed in this batch.
+    /// Extent keys freed in this batch, derived from
+    /// [`freed_segment_extents`](Self::freed_segment_extents).
     pub freed_extents: Vec<tidefs_types_reclaim_queue_core::ObjectKey>,
+    /// Exact segment/extent pairs freed in this batch.
+    pub freed_segment_extents: Vec<ReclaimReceiptExtent>,
     /// Committed deadlist txg at time of clearance.
     pub deadlist_committed_txg: u64,
     /// Snapshot pin-set epoch at time of clearance.
@@ -773,21 +799,26 @@ impl ReclaimReceipt {
     /// Magic bytes for the reclaim receipt wire format.
     pub const MAGIC: &[u8; 4] = b"RCRP";
     /// Current wire format version.
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
     /// Size of the fixed header (magic + version + count + evidence).
     pub const HEADER_SIZE: usize = 28;
     /// Size of one extent entry in the wire format.
-    pub const EXTENT_ENTRY_SIZE: usize = 32;
+    pub const EXTENT_ENTRY_SIZE: usize = 40;
 
     /// Create a new receipt with the given clearance evidence.
     #[must_use]
     pub fn new(
-        freed_extents: Vec<tidefs_types_reclaim_queue_core::ObjectKey>,
+        freed_segment_extents: Vec<ReclaimReceiptExtent>,
         deadlist_committed_txg: u64,
         pin_clearance_epoch: u64,
     ) -> Self {
+        let freed_extents = freed_segment_extents
+            .iter()
+            .map(|extent| extent.extent_key)
+            .collect();
         Self {
             freed_extents,
+            freed_segment_extents,
             deadlist_committed_txg,
             pin_clearance_epoch,
         }
@@ -796,13 +827,13 @@ impl ReclaimReceipt {
     /// Whether the receipt records any freed extents.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.freed_extents.is_empty()
+        self.freed_segment_extents.is_empty()
     }
 
     /// Number of freed extents recorded.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.freed_extents.len()
+        self.freed_segment_extents.len()
     }
 
     /// Encode the receipt to its wire format including the BLAKE3
@@ -826,8 +857,9 @@ impl ReclaimReceipt {
         buf.extend_from_slice(&self.deadlist_committed_txg.to_le_bytes());
         buf.extend_from_slice(&self.pin_clearance_epoch.to_le_bytes());
         // Extents
-        for ek in &self.freed_extents {
-            buf.extend_from_slice(&ek.0);
+        for extent in &self.freed_segment_extents {
+            buf.extend_from_slice(&extent.segment_id.to_le_bytes());
+            buf.extend_from_slice(&extent.extent_key.0);
         }
 
         // BLAKE3-256 integrity checksum
@@ -887,19 +919,21 @@ impl ReclaimReceipt {
         }
 
         // Decode extents
-        let mut freed_extents = Vec::with_capacity(count);
+        let mut freed_segment_extents = Vec::with_capacity(count);
         for i in 0..count {
             let start = Self::HEADER_SIZE + i * Self::EXTENT_ENTRY_SIZE;
             let end = start + Self::EXTENT_ENTRY_SIZE;
-            let key_bytes: [u8; 32] = data[start..end].try_into().unwrap();
-            freed_extents.push(tidefs_types_reclaim_queue_core::ObjectKey(key_bytes));
+            let segment_id = u64::from_le_bytes(data[start..start + 8].try_into().unwrap());
+            let key_bytes: [u8; 32] = data[start + 8..end].try_into().unwrap();
+            let extent_key = tidefs_types_reclaim_queue_core::ObjectKey(key_bytes);
+            freed_segment_extents.push(ReclaimReceiptExtent::new(segment_id, extent_key));
         }
 
-        Ok(Self {
-            freed_extents,
+        Ok(Self::new(
+            freed_segment_extents,
             deadlist_committed_txg,
             pin_clearance_epoch,
-        })
+        ))
     }
 
     /// Predicted encoded length for a receipt with `count` extents.
@@ -1154,7 +1188,7 @@ where
     }
 
     // Phase 3: gate each dead segment before freeing.
-    let mut freed_extents: Vec<ObjectKey> = Vec::new();
+    let mut freed_extents: Vec<ReclaimReceiptExtent> = Vec::new();
     let mut clearance_deadlist_txg: Option<u64> = None;
     let mut clearance_pin_epoch: Option<u64> = None;
 
@@ -1205,7 +1239,7 @@ where
                 stats.blocks_freed += obj_count;
                 for (object_key, delta) in extent_entries {
                     if *delta < 0 {
-                        freed_extents.push(*object_key);
+                        freed_extents.push(ReclaimReceiptExtent::new(segment_id, *object_key));
                     }
                 }
             }
@@ -1366,7 +1400,12 @@ where
             reclaimed_segment_ids.push(segment_id);
             stats.segments_reclaimed += 1;
             stats.blocks_freed += extent_entries.len() as u64;
-            freed_extents.extend(extent_entries.iter().copied());
+            freed_extents.extend(
+                extent_entries
+                    .iter()
+                    .copied()
+                    .map(|extent_key| ReclaimReceiptExtent::new(segment_id, extent_key)),
+            );
         }
         stats.checkpoint_batches += 1;
     }
@@ -2636,10 +2675,19 @@ mod tests {
         assert_eq!(
             drain.receipt.as_ref().map(|receipt| (
                 receipt.freed_extents.clone(),
+                receipt.freed_segment_extents.clone(),
                 receipt.deadlist_committed_txg,
                 receipt.pin_clearance_epoch,
             )),
-            Some((vec![obj_key(1), obj_key(2)], 100, 10))
+            Some((
+                vec![obj_key(1), obj_key(2)],
+                vec![
+                    ReclaimReceiptExtent::new(100, obj_key(1)),
+                    ReclaimReceiptExtent::new(100, obj_key(2)),
+                ],
+                100,
+                10,
+            ))
         );
         assert_eq!(freer.freed_segments(), vec![100]);
         assert!(live_counts.is_dead(100));
@@ -3562,6 +3610,10 @@ mod tests {
         ObjectKey(k)
     }
 
+    fn receipt_extent(segment_id: u64, id: u8) -> ReclaimReceiptExtent {
+        ReclaimReceiptExtent::new(segment_id, receipt_extent_key(id))
+    }
+
     #[test]
     fn reclaim_receipt_encode_decode_roundtrip_empty() {
         let receipt = ReclaimReceipt::new(Vec::new(), 100, 5);
@@ -3573,28 +3625,34 @@ mod tests {
 
     #[test]
     fn reclaim_receipt_encode_decode_roundtrip_single_extent() {
-        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 42, 7);
+        let receipt = ReclaimReceipt::new(vec![receipt_extent(9, 1)], 42, 7);
         let encoded = receipt.encode();
         assert_eq!(encoded.len(), ReclaimReceipt::encoded_len(1));
         let decoded = ReclaimReceipt::decode(&encoded).unwrap();
         assert_eq!(decoded, receipt);
         assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded.freed_extents, vec![receipt_extent_key(1)]);
+        assert_eq!(decoded.freed_segment_extents, vec![receipt_extent(9, 1)]);
     }
 
     #[test]
     fn reclaim_receipt_encode_decode_roundtrip_many_extents() {
-        let extents: Vec<ObjectKey> = (0u8..128).map(receipt_extent_key).collect();
+        let extents: Vec<ReclaimReceiptExtent> = (0u8..128)
+            .map(|id| receipt_extent(u64::from(id) + 10, id))
+            .collect();
+        let extent_keys: Vec<ObjectKey> = extents.iter().map(|extent| extent.extent_key).collect();
         let receipt = ReclaimReceipt::new(extents.clone(), u64::MAX, u64::MAX);
         let encoded = receipt.encode();
         let decoded = ReclaimReceipt::decode(&encoded).unwrap();
-        assert_eq!(decoded.freed_extents, extents);
+        assert_eq!(decoded.freed_extents, extent_keys);
+        assert_eq!(decoded.freed_segment_extents, extents);
         assert_eq!(decoded.deadlist_committed_txg, u64::MAX);
         assert_eq!(decoded.pin_clearance_epoch, u64::MAX);
     }
 
     #[test]
     fn reclaim_receipt_decode_rejects_truncated() {
-        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 1, 1);
+        let receipt = ReclaimReceipt::new(vec![receipt_extent(1, 1)], 1, 1);
         let encoded = receipt.encode();
         let truncated = &encoded[..10];
         assert_eq!(
@@ -3605,7 +3663,7 @@ mod tests {
 
     #[test]
     fn reclaim_receipt_decode_rejects_invalid_magic() {
-        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 1, 1);
+        let receipt = ReclaimReceipt::new(vec![receipt_extent(1, 1)], 1, 1);
         let mut encoded = receipt.encode();
         encoded[0] = b'X';
         assert_eq!(
@@ -3616,21 +3674,21 @@ mod tests {
 
     #[test]
     fn reclaim_receipt_decode_rejects_unsupported_version() {
-        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 1, 1);
+        let receipt = ReclaimReceipt::new(vec![receipt_extent(1, 1)], 1, 1);
         let mut encoded = receipt.encode();
         encoded[4..8].copy_from_slice(&99u32.to_le_bytes());
         assert_eq!(
             ReclaimReceipt::decode(&encoded),
             Err(ReclaimReceiptDecodeError::UnsupportedVersion {
                 found: 99,
-                expected: 1,
+                expected: ReclaimReceipt::VERSION,
             })
         );
     }
 
     #[test]
     fn reclaim_receipt_decode_rejects_checksum_mismatch() {
-        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 1, 1);
+        let receipt = ReclaimReceipt::new(vec![receipt_extent(1, 1)], 1, 1);
         let mut encoded = receipt.encode();
         // Flip a byte in the extents area
         let flip_idx = encoded.len() - 33;
@@ -3643,7 +3701,7 @@ mod tests {
 
     #[test]
     fn reclaim_receipt_decode_rejects_trailing_bytes() {
-        let receipt = ReclaimReceipt::new(vec![receipt_extent_key(1)], 1, 1);
+        let receipt = ReclaimReceipt::new(vec![receipt_extent(1, 1)], 1, 1);
         let mut encoded = receipt.encode();
         encoded.extend_from_slice(b"extra");
         assert_eq!(
@@ -3659,7 +3717,7 @@ mod tests {
             ReclaimReceiptDecodeError::InvalidMagic,
             ReclaimReceiptDecodeError::UnsupportedVersion {
                 found: 2,
-                expected: 1,
+                expected: ReclaimReceipt::VERSION,
             },
             ReclaimReceiptDecodeError::TrailingBytes,
             ReclaimReceiptDecodeError::ChecksumMismatch,
@@ -3737,6 +3795,13 @@ mod tests {
         assert!(result.receipt.is_some());
         let receipt = result.receipt.unwrap();
         assert_eq!(receipt.freed_extents.len(), 2);
+        assert_eq!(
+            receipt.freed_segment_extents,
+            vec![
+                ReclaimReceiptExtent::new(1, receipt_extent_key(1)),
+                ReclaimReceiptExtent::new(2, receipt_extent_key(2)),
+            ]
+        );
         assert_eq!(receipt.deadlist_committed_txg, 100);
         assert_eq!(receipt.pin_clearance_epoch, 10);
     }
