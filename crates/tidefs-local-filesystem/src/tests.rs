@@ -1233,6 +1233,118 @@ fn direct_write_superseding_buffered_dirty_bytes_releases_dirty_charge() {
 }
 
 #[test]
+fn unlink_of_buffered_dirty_file_releases_dirty_capacity() {
+    let root = temp_root("unlink-buffered-dirty-capacity");
+    let data_len = content_chunk_size() as usize;
+    let mut fs =
+        LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), data_len as u64)
+            .expect("open fs");
+    fs.create_file("/dirty.bin", 0o600).expect("create dirty");
+    fs.create_file("/next.bin", 0o600).expect("create next");
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(data_len * 8);
+
+    fs.write_file("/dirty.bin", 0, &vec![0x11; data_len])
+        .expect("dirty write fills capacity");
+    assert_eq!(fs.capacity_authority().used_bytes(), data_len as u64);
+    assert_eq!(fs.capacity_authority().pending_bytes(), data_len as u64);
+    assert!(matches!(
+        fs.write_file("/next.bin", 0, &vec![0x22; data_len]),
+        Err(FileSystemError::NoSpace { .. })
+    ));
+
+    fs.unlink("/dirty.bin")
+        .expect("unlink should discard uncommitted dirty buffer");
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        0,
+        "unlink must release the discarded dirty-buffer charge",
+    );
+    assert_eq!(fs.capacity_authority().pending_bytes(), 0);
+    fs.write_file("/next.bin", 0, &vec![0x33; data_len])
+        .expect("released dirty capacity admits next write");
+
+    cleanup(&root);
+}
+
+#[test]
+fn rename_overwrite_of_buffered_dirty_file_releases_dirty_capacity() {
+    let root = temp_root("rename-overwrite-buffered-dirty-capacity");
+    let data_len = content_chunk_size() as usize;
+    let mut fs = LocalFileSystem::open_with_capacity(
+        &root,
+        StoreOptions::test_fast(),
+        (data_len as u64) * 2,
+    )
+    .expect("open fs");
+    fs.create_file("/src.bin", 0o600).expect("create src");
+    fs.create_file("/dst.bin", 0o600).expect("create dst");
+    fs.create_file("/next.bin", 0o600).expect("create next");
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(data_len * 8);
+
+    fs.write_file("/src.bin", 0, &vec![0x11; data_len])
+        .expect("dirty source write");
+    fs.write_file("/dst.bin", 0, &vec![0x22; data_len])
+        .expect("dirty destination write fills remaining capacity");
+    assert_eq!(fs.capacity_authority().used_bytes(), (data_len as u64) * 2);
+    assert!(matches!(
+        fs.write_file("/next.bin", 0, &vec![0x33; data_len]),
+        Err(FileSystemError::NoSpace { .. })
+    ));
+
+    fs.rename("/src.bin", "/dst.bin", false)
+        .expect("rename overwrite should discard old destination");
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        data_len as u64,
+        "overwritten dirty destination must release its dirty-buffer charge",
+    );
+    assert_eq!(fs.capacity_authority().pending_bytes(), data_len as u64);
+    fs.write_file("/next.bin", 0, &vec![0x44; data_len])
+        .expect("released overwrite destination capacity admits next write");
+    assert_eq!(
+        fs.read_file("/dst.bin").expect("read renamed source"),
+        vec![0x11; data_len]
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn truncate_of_buffered_dirty_file_releases_dirty_capacity() {
+    let root = temp_root("truncate-buffered-dirty-capacity");
+    let data_len = content_chunk_size() as usize;
+    let mut fs =
+        LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), data_len as u64)
+            .expect("open fs");
+    fs.create_file("/dirty.bin", 0o600).expect("create dirty");
+    fs.create_file("/next.bin", 0o600).expect("create next");
+    fs.set_auto_commit(false);
+    fs.set_write_buffer_flush_threshold_bytes(data_len * 8);
+
+    fs.write_file("/dirty.bin", 0, &vec![0x11; data_len])
+        .expect("dirty write fills capacity");
+    assert!(matches!(
+        fs.write_file("/next.bin", 0, &vec![0x22; data_len]),
+        Err(FileSystemError::NoSpace { .. })
+    ));
+
+    fs.truncate_file("/dirty.bin", 0)
+        .expect("truncate should discard dirty buffer");
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        0,
+        "truncate must release the discarded dirty-buffer charge",
+    );
+    assert_eq!(fs.capacity_authority().pending_bytes(), 0);
+    fs.write_file("/next.bin", 0, &vec![0x33; data_len])
+        .expect("released truncate capacity admits next write");
+
+    cleanup(&root);
+}
+
+#[test]
 fn symlink_round_trips_target() {
     let root = temp_root("symlink");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
@@ -5298,6 +5410,7 @@ fn claim_ledger_tracks_write_allocations() {
         .unwrap();
     let data = vec![0x42_u8; 4096];
     fs.write_file("/test.txt", 0, &data).unwrap();
+    fs.fsync_all().unwrap();
 
     let report = fs.claim_ledger_report();
     assert!(
@@ -5348,12 +5461,14 @@ fn claim_ledger_releases_on_overwrite() {
 
     // First write
     fs.write_file("/file.txt", 0, &[0x41_u8; 2048]).unwrap();
+    fs.fsync_all().unwrap();
     let after_first = fs.claim_ledger_report();
     let _first_claims = after_first.claim_count;
     let first_blocks = after_first.allocated_blocks;
 
     // Overwrite (same size)
     fs.write_file("/file.txt", 0, &[0x42_u8; 2048]).unwrap();
+    fs.fsync_all().unwrap();
     let after_overwrite = fs.claim_ledger_report();
 
     // Claims should be re-registered (release old, claim new)
@@ -5618,6 +5733,7 @@ fn obligation_ledger_total_blocks_matches_policy_capacity() {
     fs.create_file("/data.bin", crate::constants::DEFAULT_FILE_PERMISSIONS)
         .unwrap();
     fs.write_file("/data.bin", 0, &[0xAA_u8; 1024]).unwrap();
+    fs.fsync_all().unwrap();
 
     let report = fs.claim_ledger_report();
     assert!(report.allocated_blocks > 0);

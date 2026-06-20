@@ -6645,11 +6645,12 @@ impl LocalFileSystem {
         self.capacity_authority.record_free(bytes);
     }
 
-    fn truncate_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) {
+    fn truncate_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) -> u64 {
         self.snapshot_write_buffers_for_rollback();
+        let mut freed = 0_u64;
         let remove = match self.write_buffers.get_mut(&inode_id) {
             Some(wb) => {
-                wb.truncate(size);
+                freed = wb.truncate(size) as u64;
                 wb.is_empty()
             }
             None => false,
@@ -6657,10 +6658,7 @@ impl LocalFileSystem {
         if remove {
             self.write_buffers.remove(&inode_id);
         }
-    }
-
-    fn clear_write_buffer_range(&mut self, inode_id: InodeId, offset: u64, length: u64) {
-        self.clear_write_buffer_ranges(inode_id, &[(offset, length)]);
+        freed
     }
 
     fn clear_write_buffer_ranges(&mut self, inode_id: InodeId, ranges: &[(u64, u64)]) -> u64 {
@@ -6682,6 +6680,20 @@ impl LocalFileSystem {
             self.write_buffers.remove(&inode_id);
         }
         cleared
+    }
+
+    fn discard_dirty_write_buffer_ranges(&mut self, inode_id: InodeId, ranges: &[(u64, u64)]) {
+        let cleared = self.clear_write_buffer_ranges(inode_id, ranges);
+        self.record_dirty_buffer_free(cleared);
+    }
+
+    fn discard_dirty_write_buffer_range(&mut self, inode_id: InodeId, offset: u64, length: u64) {
+        self.discard_dirty_write_buffer_ranges(inode_id, &[(offset, length)]);
+    }
+
+    fn truncate_dirty_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) {
+        let freed = self.truncate_write_buffer_for_inode(inode_id, size);
+        self.record_dirty_buffer_free(freed);
     }
 
     fn clear_writeback_ranges_from(&self, inode_id: InodeId, offset: u64) {
@@ -7461,7 +7473,7 @@ impl LocalFileSystem {
             usize::try_from(size).map_err(|_| FileSystemError::SizeOverflow { requested: size })?;
         let old_effective_size = self.effective_file_size(inode_id);
         if size < old_effective_size {
-            self.truncate_write_buffer_for_inode(inode_id, size);
+            self.truncate_dirty_write_buffer_for_inode(inode_id, size);
             self.clear_writeback_ranges_from(inode_id, size);
         }
         let record = self.committed_inode_record(inode_id)?;
@@ -7523,7 +7535,7 @@ impl LocalFileSystem {
         } else {
             result
         };
-        self.truncate_write_buffer_for_inode(inode_id, size);
+        self.truncate_dirty_write_buffer_for_inode(inode_id, size);
         // ── Intent-log: record truncate for crash recovery replay ──
         // Record the truncate after all extent and write-buffer mutations
         // are applied so that a crash before the next txg commit will replay
@@ -7729,7 +7741,7 @@ impl LocalFileSystem {
         self.inode_cache.borrow_mut().invalidate(inode_id);
         self.mark_inode_content_dirty(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
-        self.clear_write_buffer_range(inode_id, offset, effective_length);
+        self.discard_dirty_write_buffer_range(inode_id, offset, effective_length);
         self.writeback_range_tracker
             .lock()
             .expect("locked")
@@ -7935,7 +7947,7 @@ impl LocalFileSystem {
                     .accumulate_delta(SpaceDelta::new_reservation(newly_allocated_bytes));
                 self.state.dirty_extent_maps.insert(inode_id);
             }
-            self.clear_write_buffer_range(inode_id, offset, effective_length);
+            self.discard_dirty_write_buffer_range(inode_id, offset, effective_length);
             self.writeback_range_tracker
                 .lock()
                 .expect("locked")
@@ -7977,7 +7989,7 @@ impl LocalFileSystem {
             None,
             birth_txg,
         );
-        self.clear_write_buffer_range(inode_id, offset, effective_length);
+        self.discard_dirty_write_buffer_range(inode_id, offset, effective_length);
         self.writeback_range_tracker
             .lock()
             .expect("locked")
@@ -10936,7 +10948,12 @@ impl LocalFileSystem {
 
     fn forget_removed_inode_state(&mut self, inode_id: InodeId) {
         self.snapshot_write_buffers_for_rollback();
-        self.write_buffers.remove(&inode_id);
+        let freed = self
+            .write_buffers
+            .remove(&inode_id)
+            .map(|wb| wb.buffered_bytes() as u64)
+            .unwrap_or(0);
+        self.record_dirty_buffer_free(freed);
         self.state.dirty_content.remove(&inode_id);
         self.state.dirty_inodes.remove(&inode_id);
         self.state.dirty_extent_maps.remove(&inode_id);
