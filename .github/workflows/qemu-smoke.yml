@@ -79,6 +79,56 @@ jobs:
           TIDEFS_FSYNC_SUMMARY_DIR: ${{ matrix.output_dir }}
         run: timeout --foreground 7200s bash -lc '${{ matrix.command }}'
 
+      - name: Write kernel-fsync evidence manifest (smoke)
+        if: ${{ always() && matrix.id == 'kernel-fsync-validation' && ((github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke')) }}
+        run: |
+          set -euo pipefail
+
+          SUMMARY_DIR="${{ matrix.output_dir }}"
+          MANIFEST_PATH="$SUMMARY_DIR/evidence-manifest.json"
+          GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          RUN_ID="${{ github.run_id }}"
+          SOURCE_REF="${{ github.sha }}"
+
+          CLAIM_ID="kernel.fsync.durability.v1"
+          EVIDENCE_CLASS="runtime-kernel-fsync-validation"
+          SOURCE_LABEL="qemu-smoke-kernel-fsync-validation"
+          SCOPE_BASE="kernel-fsync-syncfs-durability-across-qemu-power-loss-cycle"
+
+          LATEST_SUMMARY="$(find "$SUMMARY_DIR" -name summary.env -type f 2>/dev/null | sort | tail -1 || true)"
+
+          if [[ -n "$LATEST_SUMMARY" && -f "$LATEST_SUMMARY" ]]; then
+            ARTIFACT_PATH="summary.env"
+            DIGEST="$(nix shell nixpkgs#b3sum --command b3sum "$LATEST_SUMMARY" | awk '{print $1}')"
+            CONTENT_DIGEST="blake3:${DIGEST}"
+          else
+            ARTIFACT_PATH="summary.env.missing"
+            CONTENT_DIGEST="blake3:0000000000000000000000000000000000000000000000000000000000000000"
+            echo "## Evidence manifest: no summary.env found" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          SCOPE="${SCOPE_BASE} source=qemu-smoke (claims-gate authority is standalone kernel-fsync-validation workflow) run=${RUN_ID} ref=${SOURCE_REF}"
+
+          cat > "$MANIFEST_PATH" << MANIFESTEOF
+{
+  "manifest_version": 1,
+  "claim_id": "${CLAIM_ID}",
+  "evidence_class": "${EVIDENCE_CLASS}",
+  "validation_tier": "full-kernel-no-daemon",
+  "source": "${SOURCE_LABEL}",
+  "scope": "${SCOPE}",
+  "artifact_path": "${ARTIFACT_PATH}",
+  "content_digest": "${CONTENT_DIGEST}",
+  "generated_at": "${GENERATED_AT}"
+}
+MANIFESTEOF
+
+          echo "## Evidence manifest written (qemu-smoke, claims-gate authority is standalone workflow)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat "$MANIFEST_PATH" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload runtime output
         if: ${{ always() && ((github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke')) }}
         uses: actions/upload-artifact@v7
