@@ -808,6 +808,7 @@ impl Transport {
     ) -> Self {
         self.attestation_key = Some(keypair);
         self.attestation_identity = Some(identity.clone());
+        self.local_identity = Some(identity.clone());
         // Register our own identity so the peer can verify us.
         let _ = self.known_identities.register(identity);
         self
@@ -829,6 +830,7 @@ impl Transport {
             .map_err(|e| TransportError::Generic(format!("generate attestation identity: {e}")))?;
         self.attestation_key = Some(keypair);
         self.attestation_identity = Some(identity.clone());
+        self.local_identity = Some(identity.clone());
         self.known_identities
             .register(identity)
             .map_err(|e| TransportError::Generic(format!("register local identity: {e}")))?;
