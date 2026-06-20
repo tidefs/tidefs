@@ -290,3 +290,11 @@ Issue (D) is a design issue with the same validation tier as this one.
 - Export sessions that survive operator disconnect (daemon-mode export) are
   not designed here; the initial export command is synchronous and
   session-scoped.
+
+## Issue References
+
+- Design decision issue: [#699](https://github.com/tidefs/tidefs/issues/699)
+- Follow-up (A) snapshot-export-cli: [#764](https://github.com/tidefs/tidefs/issues/764)
+- Follow-up (B) snapshot-export-session: [#765](https://github.com/tidefs/tidefs/issues/765)
+- Follow-up (C) snapshot-export-hold: [#766](https://github.com/tidefs/tidefs/issues/766)
+- Follow-up (D) snapshot-browse-transparent-design: [#768](https://github.com/tidefs/tidefs/issues/768)
