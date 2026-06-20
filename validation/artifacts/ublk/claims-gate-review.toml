@@ -37,7 +37,7 @@ digest = "b72c7616904032e61095dfca4611ed68d7d9a177a1363475ec67fe27640bf88c"
 path = "validation/artifacts/ublk/started-export-admission-runtime.json"
 evidence_class = "runtime-ublk-started-export-admission-artifact"
 digest_algorithm = "sha256"
-digest = "PLACEHOLDER_RUNTIME_DIGEST"
+digest = "c915d4e2294957e1a994c91467018e97748d735ce3ea12521a484580ddcc8a5b"
 
 reviewed_invariants = [
   "each qid/tag generation has at most one terminal TideFS completion",
