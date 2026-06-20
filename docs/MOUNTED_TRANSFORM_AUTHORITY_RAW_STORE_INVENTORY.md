@@ -1,6 +1,8 @@
 # Mounted Transform Authority Raw-Store Inventory
 
 Maturity: current guardrail for TFR-006 and GitHub issue #218.
+Issue #637 records the scrub/repair identity boundary without unblocking
+mounted device-level compression or encryption.
 
 The mounted `LocalFileSystem` must not claim device-level compression or
 encryption until every production raw-store path below is removed, routed
@@ -74,7 +76,7 @@ branch can pass the guard.
 | Recovery probe, audit, online verifier, root retention, and selected committed-root summary | `MountedCommittedRootRepairAuthority` behind `probe_recovery*`, `recovery_audit`, `online_verifier_report`, `root_retention_plan`, `safe_root_retention_plan`, `reclaim_unprotected_objects`, and `selected_current_root_summary` in `src/lib.rs` | metadata/raw-only through transform-aware authority | These operator repair/probe paths inspect committed-root slots, transaction manifests, protected root-slot locations, and storage metadata through `MetadataRawOnlyNoDeviceTransforms`. The authority names `plaintext identity -> compression frame -> encryption frame -> checksum -> raw media bytes`, deliberately handles no mounted file plaintext, compression frame, encryption frame, or content checksum state, and remains a non-claim for mounted device-level compression/encryption while any production `blocked` row remains. |
 | Public/raw internal store exposure | `object_store`, `store_ref` in `src/lib.rs` | blocked | These expose the bypass directly to mounted callers and tests, so they cannot coexist with mounted device-transform claims. |
 | Reclaim and snapshot-protection key scans | `record_reclaim_delta`, `collect_snapshot_protected_content_keys`, `drain_local_reclaim_queue_into_store`, `reclaim_unprotected_objects`, `commit_space_delta`, and journal cleaner key scans | metadata/raw-only for keys; blocked for content-layout reads | Reclaim identity is an object-key/locator lifetime concern, but several scans still read mounted content layouts through the raw store. |
-| Scrub and repair | `schedule_scrub_repairs`, `scrub_repair_pass`, `dispatch_scheduled_repairs` | blocked | Scrub must know whether it is checking plaintext identity, compression frame, encryption frame, checksum, or raw media bytes before mounted device transforms can be enabled. |
+| Scrub and repair | `schedule_scrub_repairs`, `scrub_repair_pass`, `dispatch_scheduled_repairs` | blocked; identity decision recorded | Mounted scrub and repair must consume plaintext content identity from a transform-aware content scrub/read authority, with checksum-layer evidence attached to the finding. Compression frames, encryption frames, checksum bytes, and raw media bytes are lower-layer evidence or diagnostics; they must not be the product repair identity for mounted content. The row remains blocked until the follow-up implementation issues below are complete and no production blocked row remains. |
 | File content reads, writes, sparse operations, reflink, copy-file-range, truncate, punch-hole, zero-range, read overlay, content inspection | `create_file_like`, `replace_content`, `rewrite_content_*`, `read_content*`, `reflink_*`, `truncate_file`, `free_extent_range`, `punch_hole`, `zero_range`, `inspect_filesystem_content_objects`, and related helpers in `src/lib.rs` plus anonymous tmpfile reads and whole-file copy fast paths in `vfs_engine_impl.rs` | transform-aware for mounted content compression, plaintext dedup, and receipt-producing content writes; blocked for remaining device-level compression/encryption reads and raw paths | The main content-write population paths now route durable chunk writes through `PoolStoreMut::put_with_receipt`, but mounted content still has raw read, layout, reclaim, sparse, commit, recovery, whole-file copy, and content-inspection raw paths before device-level transforms can become a product claim. |
 | Snapshot export/import and send/receive | `rollback_to_snapshot`, `export_changed_records`, `export_incremental_changed_records` | blocked | Export/import currently serializes raw mounted records and is not yet one ordered transform contract. |
 | Intent log, fsync, commit, rollback | `sync_write_intent`, `flush_intent_log_if_needed`, `fsync_*`, `sync_*`, `fdatasync_inode`, `do_commit`, `rollback_mutation_delta`, `selected_current_root_summary` | blocked | Durability barriers and replay anchors still write and clear raw state/log objects. |
@@ -82,6 +84,52 @@ branch can pass the guard.
 | Live dataset key administration | `live_dataset_seal_key`, `live_dataset_rotate_key` in `vfs_engine_impl.rs` | metadata/raw-only | These paths store sealed key records rather than file payloads, but the format still needs transform-authority review before it becomes a product encryption claim. |
 | Crash-matrix boundary staging | `src/crash_recovery.rs` | blocked validation fixture | This is not a mounted product write path, but it proves raw state construction is still required by validation. |
 | Placement, locator, rebuild, and default pool-media writes | #17, #18, #91 surfaces | later receipt/placement issue | This issue deliberately does not edit those write paths. |
+
+## Scrub/Repair Identity Boundary
+
+Issue #637 reviewed this inventory, `docs/SCRUB_REPAIR_RESILVER_DESIGN.md`,
+`crates/tidefs-local-filesystem/src/scrub.rs`,
+`crates/tidefs-local-filesystem/src/repair.rs`, active stale-generation repair
+issue #591, and placement/rebuild issue #18.
+
+The current local scrub source reads inline and chunk objects through
+`LocalObjectStore::get`, verifies `ContentChunkRef.checksum` with
+`FastBlockChecksum`, and verifies inline checksum suffixes before decoding the
+content object. The current repair source reconstructs repair jobs from that
+scrub evidence, then dispatches truncate/mark-corrupt/reconstruct behavior
+against the same raw content keys. The bridge already records missing or stale
+receipt evidence as blocked scheduling state, but the byte identity consumed
+by scrub and repair is still the raw content object path rather than a named
+mounted transform authority.
+
+The mounted product boundary is:
+
+```text
+ScrubBlockId + current data_version + plaintext content identity
+  + checksum-layer evidence
+  + placement/receipt evidence status
+```
+
+Plaintext content identity is the logical mounted file/extent bytes after the
+content reader has applied every mounted content and device transform needed to
+interpret the committed object. Checksum-layer evidence remains attached to the
+exact encoded or transformed bytes owned by that layer; it is evidence for the
+finding, not the repair identity. Raw media bytes, compression frames, and
+encryption frames may be lower-device diagnostics, but they cannot authorize a
+mounted content repair.
+
+Implementation is split so the write sets do not overlap:
+
+| Issue | Slice | Expected write set |
+|---|---|---|
+| #650 | Add the transform-aware mounted content scrub/read authority. | `crates/tidefs-local-filesystem/src/content.rs`, a local helper/type module if needed, and focused local-filesystem tests. |
+| #651 | Route local scrub through that authority and keep findings non-writeback. | `crates/tidefs-local-filesystem/src/scrub.rs` and focused scrub tests. |
+| #652 | Require transform-aware scrub evidence before repair dispatch can write or mark mounted content. | `crates/tidefs-local-filesystem/src/scrub_repair_integration.rs`, `crates/tidefs-local-filesystem/src/repair.rs`, and scrub-core evidence/result types only if needed. |
+
+Issue #591 remains the active stale-generation repair gate. Issue #18 remains
+the placement receipt, rebuild, and source-selection gate. None of #637, #650,
+#651, or #652 enables mounted device-level compression or encryption while any
+production `blocked` row remains in this inventory.
 
 ## Current Mounted Transform Claim
 
