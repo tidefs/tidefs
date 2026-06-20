@@ -145,8 +145,7 @@ pub(crate) fn stage_crash_matrix_file_state(
     let mut staged = fs.state.clone();
     let tick = staged.generation.saturating_add(1).max(1);
     staged.generation = tick;
-    let inode_id = InodeId::new(staged.next_inode_id);
-    staged.next_inode_id = staged.next_inode_id.saturating_add(1);
+    let inode_id = staged.allocate_inode_id();
     let record = InodeRecord {
         rdev: 0,
         inode_id,
@@ -406,14 +405,14 @@ pub(crate) fn crash_matrix_root_for_staged_state(
     transaction_id: u64,
 ) -> (RootCommitRecord, Vec<u8>) {
     let inode_count = staged.inodes.len() as u64;
-    let bitmap_words = staged.next_inode_id.div_ceil(64) as usize;
+    let bitmap_words = staged.next_inode_id_raw().div_ceil(64) as usize;
     let mut inode_allocation_bitmap = vec![0u64; bitmap_words];
     for inode_id in staged.inodes.keys() {
         let idx = (inode_id.get() - 1) as usize;
         inode_allocation_bitmap[idx / 64] |= 1u64 << (idx % 64);
     }
     let superblock = SuperblockRecord {
-        next_inode_id: staged.next_inode_id,
+        next_inode_id: staged.next_inode_id_raw(),
         generation: staged.generation,
         inode_count,
         inode_allocation_bitmap,
@@ -425,7 +424,7 @@ pub(crate) fn crash_matrix_root_for_staged_state(
         slot: root_slot_for_transaction(transaction_id),
         transaction_id,
         generation: staged.generation,
-        next_inode_id: staged.next_inode_id,
+        next_inode_id: staged.next_inode_id_raw(),
         inode_count: superblock.inode_count,
         superblock_checksum: checksum64(&superblock_bytes),
         manifest_checksum: IntegrityDigest64::ZERO,
@@ -486,6 +485,8 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    use crate::{DatasetInodeAuthority, ROOT_DATASET_ID};
 
     // ── prepare_empty_crash_matrix_root ──────────────────────────────
 
@@ -574,7 +575,7 @@ mod tests {
         assert!(!superblock_bytes.is_empty(), "superblock must not be empty");
         assert_eq!(root.transaction_id, transaction_id);
         assert_eq!(root.generation, staged.generation);
-        assert_eq!(root.next_inode_id, staged.next_inode_id);
+        assert_eq!(root.next_inode_id, staged.next_inode_id_raw());
         assert_eq!(root.inode_count, 0);
         assert_eq!(root.manifest_entry_count, 0);
         // Root slot must be valid (depends on transaction_id).
@@ -593,7 +594,10 @@ mod tests {
     fn crash_matrix_root_preserves_inode_bitmap() {
         let mut staged = FileSystemState {
             generation: 42,
-            next_inode_id: 10,
+            inode_authority: DatasetInodeAuthority::from_recovered_next_inode_id(
+                ROOT_DATASET_ID,
+                10,
+            ),
             ..FileSystemState::default()
         };
         // Insert two inodes (ids 1 and 3).
@@ -665,7 +669,10 @@ mod tests {
     fn crash_matrix_root_is_deterministic() {
         let mut staged = FileSystemState {
             generation: 5,
-            next_inode_id: 8,
+            inode_authority: DatasetInodeAuthority::from_recovered_next_inode_id(
+                ROOT_DATASET_ID,
+                8,
+            ),
             ..FileSystemState::default()
         };
         let inode = InodeRecord {
@@ -706,7 +713,10 @@ mod tests {
         let _staged = FileSystemState::default();
         // next_inode_id=0 is fine (default); also try a large value.
         let large_staged = FileSystemState {
-            next_inode_id: 1_000_000,
+            inode_authority: DatasetInodeAuthority::from_recovered_next_inode_id(
+                ROOT_DATASET_ID,
+                1_000_000,
+            ),
             generation: 1234,
             ..FileSystemState::default()
         };

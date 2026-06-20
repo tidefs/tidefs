@@ -312,6 +312,7 @@ mod fuse_setattr;
 mod fuse_statfs;
 mod helpers;
 mod hot_read_cache;
+mod inode_authority;
 mod inode_cache;
 mod intent_log;
 mod journal_cleaner;
@@ -439,6 +440,7 @@ use crate::dedup::DedupIndex;
 pub(crate) use crate::encoding::*;
 use crate::helpers::*;
 use crate::hot_read_cache::*;
+pub(crate) use crate::inode_authority::DatasetInodeAuthority;
 use crate::inode_cache::*;
 // PC-008 intent-log module (types used via glob re-export)
 // PC-008 intent-log module (re-exported for future use)
@@ -671,7 +673,7 @@ struct MutationDelta {
     old_directories: BTreeMap<InodeId, BTreeMap<Vec<u8>, NamespaceEntry>>,
     old_snapshots: BTreeMap<Vec<u8>, SnapshotRecord>,
     old_generation: u64,
-    old_next_inode_id: u64,
+    old_inode_authority: DatasetInodeAuthority,
     // Side-ledger snapshots for full transaction rollback (#5980).
     // Buffered payload snapshots are lazy so metadata-only mutations do not
     // clone dirty writeback buffers.
@@ -748,7 +750,7 @@ pub(crate) struct FileSystemState {
     // Review debt TFR-004: these inode, directory, and extent maps are global
     // to the mounted LocalFileSystem, while the architecture requires explicit
     // dataset-scoped ownership before TideFS can make storage authority claims.
-    next_inode_id: u64,
+    inode_authority: DatasetInodeAuthority,
     generation: u64,
     inodes: Arc<BTreeMap<InodeId, InodeRecord>>,
     directories: Arc<BTreeMap<InodeId, BTreeMap<Vec<u8>, NamespaceEntry>>>,
@@ -775,6 +777,41 @@ pub(crate) struct FileSystemState {
     pub(crate) last_extent_map_write_tx: BTreeMap<InodeId, u64>,
     /// Compression policy governing content writes during persistence.
     pub(crate) content_compression_policy: ContentCompressionPolicy,
+}
+
+impl FileSystemState {
+    pub(crate) fn next_inode_id(&self) -> InodeId {
+        self.inode_authority.next_inode_id()
+    }
+
+    pub(crate) fn next_inode_id_raw(&self) -> u64 {
+        self.inode_authority.next_inode_id_raw()
+    }
+
+    pub(crate) fn set_inode_authority_dataset_id(&mut self, dataset_id: [u8; 16]) {
+        self.inode_authority = self.inode_authority.with_dataset_id(dataset_id);
+    }
+
+    pub(crate) fn set_inode_authority_next_inode_id(&mut self, next_inode_id: u64) {
+        self.inode_authority = DatasetInodeAuthority::from_recovered_inode_ids(
+            self.inode_authority.dataset_id(),
+            next_inode_id,
+            self.known_inode_ids.iter().copied(),
+        );
+    }
+
+    pub(crate) fn allocate_inode_id(&mut self) -> InodeId {
+        let inode_id = self.inode_authority.allocate();
+        self.known_inode_ids.insert(inode_id);
+        inode_id
+    }
+
+    pub(crate) fn observe_explicit_inode_id(&mut self, inode_id: InodeId) {
+        self.inode_authority.observe_explicit_inode(inode_id);
+        if inode_id.get() != 0 {
+            self.known_inode_ids.insert(inode_id);
+        }
+    }
 }
 
 /// Resolve content compression policy from dataset feature flags.
@@ -1926,6 +1963,7 @@ impl LocalFileSystem {
     /// during statfs derivation and ENOSPC gating.
     pub fn set_mounted_dataset_id(&mut self, id: [u8; 16]) {
         self.mounted_dataset_id = id;
+        self.state.set_inode_authority_dataset_id(id);
     }
 
     /// Set the current placement epoch for send/receive stream attribution.
@@ -4681,7 +4719,7 @@ impl LocalFileSystem {
             file_count,
             symlink_count,
             snapshot_count: self.state.snapshots.len(),
-            next_inode_id: self.state.next_inode_id,
+            next_inode_id: self.state.next_inode_id_raw(),
             filesystem_generation: self.state.generation,
             object_store: self.store.store_stats(),
         }
@@ -5331,7 +5369,11 @@ impl LocalFileSystem {
             &previous_state,
         )?;
         restored.snapshots = previous_state.snapshots.clone();
-        restored.next_inode_id = restored.next_inode_id.max(previous_state.next_inode_id);
+        restored.set_inode_authority_next_inode_id(
+            restored
+                .next_inode_id_raw()
+                .max(previous_state.next_inode_id_raw()),
+        );
         restored.generation = next_generation_after(previous_state.generation);
         let report = SnapshotRollbackReport {
             spec: LOCAL_SNAPSHOT_ROLLBACK_SPEC,
@@ -5547,7 +5589,7 @@ impl LocalFileSystem {
 
     /// Return the next inode ID that will be allocated.
     pub fn next_inode_id(&self) -> InodeId {
-        InodeId(self.state.next_inode_id)
+        self.state.next_inode_id()
     }
 
     /// Return the current filesystem generation.
@@ -5587,10 +5629,7 @@ impl LocalFileSystem {
     /// Insert an inode record at a specific ID (without allocating).
     /// Used by the namespace persistence bridge.
     pub fn insert_inode_at(&mut self, id: InodeId, record: InodeRecord) {
-        // Review debt TFR-004: this bridge can advance the global allocator
-        // from namespace-loaded records; dataset-scoped allocation authority
-        // must replace it before multi-dataset identity is trusted.
-        self.state.next_inode_id = self.state.next_inode_id.max(id.get().saturating_add(1));
+        self.state.observe_explicit_inode_id(id);
         Arc::make_mut(&mut self.state.inodes).insert(id, record);
         self.mark_inode_metadata_dirty(id);
     }
@@ -11315,7 +11354,7 @@ impl LocalFileSystem {
                 old_directories: BTreeMap::new(),
                 old_snapshots: self.state.snapshots.clone(),
                 old_generation: self.state.generation,
-                old_next_inode_id: self.state.next_inode_id,
+                old_inode_authority: self.state.inode_authority,
                 old_write_buffers: None,
                 old_quota_table: self.state.quota_table.clone(),
                 old_space_accounting: self.state.space_accounting.clone(),
@@ -11373,7 +11412,7 @@ impl LocalFileSystem {
             }
             self.state.snapshots = delta.old_snapshots;
             self.state.generation = delta.old_generation;
-            self.state.next_inode_id = delta.old_next_inode_id;
+            self.state.inode_authority = delta.old_inode_authority;
             self.state.dirty_content.clear();
             self.state.dirty_inodes.clear();
             self.state.dirty_dirs.clear();
@@ -12130,12 +12169,7 @@ impl LocalFileSystem {
     }
 
     fn allocate_inode_id(&mut self) -> InodeId {
-        let id = self
-            .state
-            .next_inode_id
-            .max(ROOT_INODE_ID.get().saturating_add(1));
-        self.state.next_inode_id = id.saturating_add(1);
-        InodeId::new(id)
+        self.state.allocate_inode_id()
     }
 
     fn bump_generation(&mut self) -> u64 {

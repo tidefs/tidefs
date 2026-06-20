@@ -137,9 +137,10 @@ Important 2026-06-01 findings:
   package roots, zero unclassified roots, zero disputed roots, and zero
   delete-classified roots; each package row keeps its machine-checked role and
   one-line disposition as the per-package justification.
-- `TFR-004`: `LocalFileSystem` still has global inode and directory maps plus
-  global `next_inode_id`; namespace and inode-table crates maintain separate
-  inode allocation authorities. The fresh root dataset catalog path now uses
+- `TFR-004`: `LocalFileSystem` still has global inode and directory maps;
+  before the #664 allocator slice it also carried a global `next_inode_id`.
+  Namespace and inode-table crates maintain separate inode allocation
+  authorities. The fresh root dataset catalog path now uses
   the same `ROOT_DATASET_ID = [0u8; 16]` as the mounted filesystem and
   SpaceBook bridge, and the FUSE mount path now pushes a resolved catalog
   `DatasetId` into `LocalFileSystem::mounted_dataset_id()` before wrapping the
@@ -263,6 +264,17 @@ Important 2026-06-01 findings:
   required by `docs/UNRELEASED_AUTHORITY_POLICY.md`. This does not implement
   dataset-scoped allocator extraction, FUSE lookup-reference ownership, or
   special-node `rdev` replay.
+- `TFR-004`: issue #664 extracts the first runtime allocator boundary.
+  `LocalFileSystem` now stores a dataset-scoped `DatasetInodeAuthority` instead
+  of a bare global `next_inode_id`, uses it for fresh allocation, explicit
+  `insert_inode_at()` IDs, root identity, persisted cursor emission, recovery
+  seeding, changed-record import seeding, and snapshot rollback cursor
+  preservation. Focused local-filesystem tests cover fresh allocation, explicit
+  ID advancement, reopen cursor reconstruction, and snapshot rollback reuse
+  prevention. This narrows allocator ownership but does not close TFR-004:
+  local inode/directory maps remain filesystem-global, and FUSE lookup
+  references, inode-table projection policy, and generic special-node `rdev`
+  replay stay in the non-overlapping follow-up slices.
 - `TFR-005`: POSIX timestamp paths write through `metadata_version` and
   `data_version`, and `InodeRecord::to_inode_attr()` projects those same
   persisted fields back as POSIX atime/mtime/ctime/btime. `data_version` is

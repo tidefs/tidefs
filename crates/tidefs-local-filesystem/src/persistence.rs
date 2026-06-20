@@ -346,7 +346,7 @@ pub(crate) fn persist_transaction_objects(
         }
     }
     let inode_count = state.inodes.len() as u64;
-    let bitmap_words = state.next_inode_id.div_ceil(64) as usize;
+    let bitmap_words = state.next_inode_id_raw().div_ceil(64) as usize;
     let mut inode_allocation_bitmap = vec![0u64; bitmap_words];
     for inode_id in state.inodes.keys() {
         let idx = (inode_id.get() - 1) as usize;
@@ -378,7 +378,7 @@ pub(crate) fn persist_transaction_objects(
     }
 
     let superblock = SuperblockRecord {
-        next_inode_id: state.next_inode_id,
+        next_inode_id: state.next_inode_id_raw(),
         generation: state.generation,
         inode_count,
         inode_allocation_bitmap,
@@ -425,7 +425,7 @@ pub(crate) fn persist_transaction_objects(
         slot: root_slot_for_transaction(transaction_id),
         transaction_id,
         generation: state.generation,
-        next_inode_id: state.next_inode_id,
+        next_inode_id: state.next_inode_id_raw(),
         inode_count: superblock.inode_count,
         superblock_checksum,
         manifest_checksum,

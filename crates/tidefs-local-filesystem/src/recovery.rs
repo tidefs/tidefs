@@ -23,13 +23,15 @@ use crate::records::*;
 use crate::transaction_manifest_entries_for_existing_content;
 use crate::types::*;
 use crate::{is_skippable_recovery_error, is_skippable_store_error};
-use crate::{FileSystemState, QuotaTable, Result};
+use crate::{DatasetInodeAuthority, FileSystemState, QuotaTable, Result, ROOT_DATASET_ID};
 use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_space_accounting::SpaceAccounting;
 pub(crate) fn initial_state() -> FileSystemState {
+    let inode_authority = DatasetInodeAuthority::fresh_root(ROOT_DATASET_ID);
+    let root_inode_id = inode_authority.root_inode_id();
     let root = InodeRecord {
         rdev: 0,
-        inode_id: ROOT_INODE_ID,
+        inode_id: root_inode_id,
         generation: Generation::new(1),
         facets: NodeKind::Dir.to_facets(),
         mode: mode_for_kind(NodeKind::Dir, DEFAULT_DIRECTORY_PERMISSIONS),
@@ -46,11 +48,11 @@ pub(crate) fn initial_state() -> FileSystemState {
         dir_rev: 0,
     };
     let mut inodes = BTreeMap::new();
-    inodes.insert(ROOT_INODE_ID, root);
+    inodes.insert(root_inode_id, root);
     let mut directories = BTreeMap::new();
-    directories.insert(ROOT_INODE_ID, BTreeMap::new());
+    directories.insert(root_inode_id, BTreeMap::new());
     FileSystemState {
-        next_inode_id: ROOT_INODE_ID.get().saturating_add(1),
+        inode_authority,
         generation: 1,
         inodes: Arc::new(inodes),
         directories: Arc::new(directories),
@@ -64,7 +66,7 @@ pub(crate) fn initial_state() -> FileSystemState {
         last_dir_write_tx: BTreeMap::new(),
         known_inode_ids: {
             let mut ids = BTreeSet::new();
-            ids.insert(ROOT_INODE_ID);
+            ids.insert(root_inode_id);
             ids
         },
         corrupted_inodes: BTreeSet::new(),
@@ -1430,9 +1432,11 @@ pub(crate) fn load_state_from_superblock(
         }
     }
     Ok(FileSystemState {
-        next_inode_id: superblock
-            .next_inode_id
-            .max(ROOT_INODE_ID.get().saturating_add(1)),
+        inode_authority: DatasetInodeAuthority::from_recovered_inode_ids(
+            ROOT_DATASET_ID,
+            superblock.next_inode_id,
+            known_inode_ids.iter().copied(),
+        ),
         generation: superblock.generation.max(1),
         inodes: Arc::new(inodes),
         directories: Arc::new(directories),
@@ -1623,9 +1627,11 @@ pub(crate) fn load_state_from_superblock_incremental(
         }
     }
     Ok(FileSystemState {
-        next_inode_id: superblock
-            .next_inode_id
-            .max(ROOT_INODE_ID.get().saturating_add(1)),
+        inode_authority: DatasetInodeAuthority::from_recovered_inode_ids(
+            ROOT_DATASET_ID,
+            superblock.next_inode_id,
+            known_inode_ids.iter().copied(),
+        ),
         generation: superblock.generation.max(1),
         inodes: Arc::new(inodes),
         directories: Arc::new(directories),

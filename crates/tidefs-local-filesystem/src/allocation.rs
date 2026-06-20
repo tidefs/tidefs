@@ -539,7 +539,7 @@ pub(crate) fn next_generation_after(generation: u64) -> u64 {
 
 pub(crate) fn next_allocated_inode_id(state: &FileSystemState) -> u64 {
     state
-        .next_inode_id
+        .next_inode_id_raw()
         .max(ROOT_INODE_ID.get().saturating_add(1))
 }
 

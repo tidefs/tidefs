@@ -11,7 +11,7 @@ use tidefs_extent_map::ExtentMap;
 use tidefs_local_object_store::{
     checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey, StoreError, StoreOptions,
 };
-use tidefs_types_vfs_core::{InodeId, NodeKind, ROOT_INODE_ID};
+use tidefs_types_vfs_core::{InodeId, NodeKind};
 
 use crate::constants::*;
 use crate::content::*;
@@ -27,7 +27,9 @@ use crate::root_commit_from_summary;
 use crate::roots_with_snapshot_roots;
 use crate::types::*;
 use crate::validate_namespace_invariants;
-use crate::{FileSystemState, LocalFileSystem, QuotaTable, Result};
+use crate::{
+    DatasetInodeAuthority, FileSystemState, LocalFileSystem, QuotaTable, Result, ROOT_DATASET_ID,
+};
 use tidefs_space_accounting::SpaceAccounting;
 
 type LoadedStateWithObjectMaps = (
@@ -860,9 +862,11 @@ pub(crate) fn load_state_from_superblock_changed_records(
     }
     let known_inode_ids: BTreeSet<InodeId> = inodes.keys().cloned().collect();
     let state = FileSystemState {
-        next_inode_id: superblock
-            .next_inode_id
-            .max(ROOT_INODE_ID.get().saturating_add(1)),
+        inode_authority: DatasetInodeAuthority::from_recovered_inode_ids(
+            ROOT_DATASET_ID,
+            superblock.next_inode_id,
+            known_inode_ids.iter().copied(),
+        ),
         generation: superblock.generation.max(1),
         inodes: Arc::new(inodes),
         directories: Arc::new(directories),
