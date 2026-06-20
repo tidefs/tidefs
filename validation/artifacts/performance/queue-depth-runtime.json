@@ -1,0 +1,69 @@
+{
+  "admission": {
+    "current_dirty_bytes": 67,
+    "current_dirty_ops": 4,
+    "current_outstanding_permits": 4,
+    "current_tick": 1,
+    "peak_dirty_bytes": 67,
+    "peak_dirty_ops": 4,
+    "peak_outstanding_permits": 4
+  },
+  "artifact_path": "/tmp/tidefs-validation/fuse-vm-test/performance/queue-depth-runtime.json",
+  "claim_ids": [
+    "perf.local.no_unbounded_dirty_debt.v1"
+  ],
+  "determinism": {
+    "admission_state": "single mounted local filesystem with default hard caps",
+    "tolerance": {
+      "peak_dirty_bytes": 0,
+      "peak_dirty_ops": 0,
+      "peak_outstanding_permits": 0
+    },
+    "workload": "fixed smoke-mount quick workload"
+  },
+  "effective_caps": {
+    "dirty_age_ticks": 300,
+    "dirty_bytes": 268435456,
+    "dirty_ops": 4096,
+    "permits": 2048
+  },
+  "evidence_class": "queue-depth-runtime-artifact",
+  "evidence_scope": "bounded mounted FUSE runtime dirty-write admission queue-depth snapshot",
+  "hard_caps": {
+    "dirty_age_ticks": 300,
+    "dirty_bytes": 268435456,
+    "dirty_ops": 4096,
+    "permits": 2048
+  },
+  "invariant_checks": {
+    "current_dirty_bytes_within_effective_cap": true,
+    "current_dirty_ops_within_effective_cap": true,
+    "current_outstanding_permits_within_hard_cap": true,
+    "peak_dirty_bytes_within_effective_cap": true,
+    "peak_dirty_ops_within_effective_cap": true,
+    "peak_outstanding_permits_within_hard_cap": true
+  },
+  "mount_adapter": "fuse",
+  "no_hidden_queue_gate": {
+    "command": "cargo run -p tidefs-xtask -- check-no-hidden-queues",
+    "registered_queue_roots": [
+      "performance_contract.budgeted_queue",
+      "local_fs.write_admission",
+      "local_fs.write_buffers",
+      "local_fs.dirty_set",
+      "local_fs.dirty_page_tracker",
+      "local_fs.page_cache_lru"
+    ],
+    "registry_path": "validation/performance/no-hidden-queues.toml"
+  },
+  "non_claims": [
+    "does not validate crash recovery",
+    "does not validate scrub/read isolation",
+    "does not move perf.local.no_unbounded_dirty_debt.v1 out of blocked status"
+  ],
+  "pool": "root",
+  "runtime_claim_boundary": "runtime queue-depth evidence only; claim validation still requires the no-hidden queue gate, admission budget model, and claims-gate review before status can move from blocked",
+  "schema_version": 1,
+  "source": "tidefs-posix-filesystem-adapter-daemon smoke-mount",
+  "workload": "fuse-smoke-mount-quick"
+}
