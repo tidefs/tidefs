@@ -165,11 +165,11 @@ jobs:
                 source_ref: $source_ref,
                 source_sha: $source_sha,
                 target: $target,
-                evidence_scope: $evidence_scope,
-                tests: $tests,
-                artifact_paths: $artifact_paths,
-                finished_at: $finished_at
-              } | if .tests == [] then del(.tests) else . end | if .artifact_paths == [] then del(.artifact_paths) else . end' \
+                evidence_scope: $evidence_scope
+              }
+              + if $tests != [] then {tests: $tests} else {} end
+              + if $artifact_paths != [] then {artifact_paths: $artifact_paths} else {} end
+              + {finished_at: $finished_at}' \
               > "$ARTIFACT_ROOT/evidence-manifest.json"
           else
             cat > "$ARTIFACT_ROOT/evidence-manifest.json" << MANIFEST_EOF
