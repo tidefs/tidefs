@@ -639,7 +639,7 @@ impl IncrementalJob for ObjectRelocator {
                 epoch: 1,
                 cursor_state: CursorState(self.cursor.to_bytes().to_vec()),
                 progress: JobProgress {
-                    items_processed: self.stats.inodes_scanned,
+                    items_processed: self.stats.objects_scanned,
                     items_total_estimate: self.inodes.len() as u64,
                     bytes_processed: 0,
                     bytes_total_estimate: 0,
@@ -769,7 +769,7 @@ impl IncrementalJob for ObjectRelocator {
             epoch: 1,
             cursor_state: CursorState(self.cursor.to_bytes().to_vec()),
             progress: JobProgress {
-                items_processed: self.stats.inodes_scanned,
+                items_processed: self.stats.objects_scanned,
                 items_total_estimate: self.inodes.len() as u64,
                 bytes_processed: 0,
                 bytes_total_estimate: 0,
