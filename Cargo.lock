@@ -3585,6 +3585,7 @@ dependencies = [
  "tidefs-durability-layout",
  "tidefs-lease",
  "tidefs-local-object-store",
+ "tidefs-lock-service",
  "tidefs-membership-epoch",
  "tidefs-membership-types",
  "tidefs-placement-planner",
