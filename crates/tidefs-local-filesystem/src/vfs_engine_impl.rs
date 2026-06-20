@@ -3704,11 +3704,11 @@ impl VfsLocalFileSystem {
             let fs = &mut *fs;
             let dedup_enabled = fs.dedup_enabled;
             let compression_policy = fs.content_compression_policy.clone();
-            let store = fs.store.raw_primary_store_mut();
+            let mut pool_store = fs.store.pool_store_mut();
             let mut dedup = fs.dedup_index.borrow_mut();
             reflink_chunked_content(
                 dedup_enabled,
-                store,
+                &mut pool_store,
                 source_fh.inode_id,
                 &source_record,
                 &dest_record,
@@ -9490,6 +9490,63 @@ mod tests {
             engine.fs.borrow().capacity_authority().used_bytes(),
             data_len as u64,
             "unlink of whole-file copy destination must release its charged capacity"
+        );
+    }
+
+    #[test]
+    fn copy_file_range_whole_file_publishes_pool_receipts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_len = crate::constants::content_chunk_size() as usize;
+        let local_fs = LocalFileSystem::open_with_capacity(
+            dir.path(),
+            tidefs_local_object_store::StoreOptions::test_fast(),
+            (data_len as u64) * 3,
+        )
+        .expect("open local filesystem");
+        let engine = VfsLocalFileSystem::new(local_fs);
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(root, b"copy-receipt-source.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(root, b"copy-receipt-dest.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let payload = vec![0x31; data_len];
+
+        engine.write(&source_create, 0, &payload, &ctx()).unwrap();
+        let copied = engine
+            .copy_file_range(&source_create, 0, &dest_create, 0, data_len as u64, &ctx())
+            .unwrap();
+
+        assert_eq!(copied, data_len as u32);
+        let fs = engine.fs.borrow();
+        let dest_record = fs.inode(dest_create.inode_id).unwrap();
+        let layout = read_content_layout_from_store(
+            fs.object_store(),
+            dest_create.inode_id,
+            &dest_record,
+            true,
+        )
+        .unwrap();
+        let ContentLayout::Chunked(manifest) = layout else {
+            panic!("whole-file copy should publish chunked destination content");
+        };
+        let materialized_chunks = manifest
+            .chunks
+            .iter()
+            .filter(|chunk| !chunk.is_hole())
+            .count();
+        assert!(
+            materialized_chunks > 0,
+            "whole-file copy should materialize destination chunks"
+        );
+        assert!(
+            manifest
+                .chunks
+                .iter()
+                .filter(|chunk| !chunk.is_hole())
+                .all(|chunk| chunk.placement_receipt_generation > 0),
+            "whole-file copy chunks must carry durable pool receipt generations"
         );
     }
 
