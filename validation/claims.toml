@@ -253,6 +253,8 @@ evidence_artifacts = [
   { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", source = "claims-gate", scope = "ublk-model-runtime-boundary-review" },
   { class = "runtime-ublk-started-export-admission-artifact", path = "validation/artifacts/ublk/started-export-admission-runtime.json", source = "qemu-ublk-smoke", scope = "started-export-admission" },
 ]
+
+[[claims]]
 id = "kernel.teardown.no_work_after.v1"
 status = "blocked"
 scope = "kernel teardown and post-teardown work exclusion"
