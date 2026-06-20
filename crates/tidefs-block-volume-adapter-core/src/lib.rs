@@ -543,13 +543,64 @@ pub enum BlockVolumeExportTransitionOutcomeClass {
     RefusedDrainIncomplete,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockVolumeExportRuntimeModeClass {
+    Local,
+    Clustered,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockVolumeLocalExportAuthorityClass {
+    ReadOnly,
+    Writable,
+    MultiWriter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockVolumeLocalExportAdmissionClass {
+    Admitted,
+    RefusedConflictingWritableAuthority,
+    RefusedUnsupportedMultiWriterClass,
+    RefusedReadOnlyFreshnessFence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockVolumeLocalExportExactnessClass {
+    BlockExactWithinAdmittedExport,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockVolumeLocalExportFreshnessClass {
+    LocalMutableAuthority,
+    ReadOnlyFreshnessFence,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockVolumeLocalExportAdmissionRecord {
+    pub admission_id: BlockVolumeReceiptId,
+    pub runtime_mode_class: BlockVolumeExportRuntimeModeClass,
+    pub authority_class: BlockVolumeLocalExportAuthorityClass,
+    pub admission_class: BlockVolumeLocalExportAdmissionClass,
+    pub projection_ref: BlockVolumeReceiptId,
+    pub requested_authority_ref: BlockVolumeReceiptId,
+    pub admitted_writable_authority_ref: Option<BlockVolumeReceiptId>,
+    pub conflicting_writable_authority_ref: Option<BlockVolumeReceiptId>,
+    pub freshness_fence_ref: Option<BlockVolumeReceiptId>,
+    pub exactness_class: BlockVolumeLocalExportExactnessClass,
+    pub freshness_class: BlockVolumeLocalExportFreshnessClass,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockVolumeExportRuntimeRecord {
     pub export_runtime_id: BlockVolumeReceiptId,
     pub volume_id: BlockVolumeId,
+    pub runtime_mode_class: BlockVolumeExportRuntimeModeClass,
     pub export_phase_class: BlockVolumeExportPhaseClass,
     pub queue_set_refs: Vec<BlockVolumeReceiptId>,
     pub authority_anchor_ref: BlockVolumeReceiptId,
+    pub local_export_admission_ref: BlockVolumeReceiptId,
     pub fence_epoch_ref: BlockVolumeReceiptId,
     pub lifecycle_generation: u64,
 }
@@ -771,6 +822,7 @@ pub struct BlockVolumeQueueRuntime {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockVolumeExportLifecycleRuntime {
     pub export_runtime: BlockVolumeExportRuntimeRecord,
+    pub local_export_admission: BlockVolumeLocalExportAdmissionRecord,
     pub queue_runtime: BlockVolumeQueueRuntime,
     pub transition_records: Vec<BlockVolumeExportLifecycleTransitionRecord>,
     next_lifecycle_counter: u64,
@@ -1162,6 +1214,143 @@ pub struct BlockVolumeAdapterTransitionReceiptEmitter {
     pub receipt_records: Vec<BlockVolumeAdapterTransitionReceiptRecord>,
     pub is_durable: bool,
     next_emitter_counter: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockVolumeLocalExportAdmissionRuntime {
+    pub volume_id: BlockVolumeId,
+    pub projection_ref: BlockVolumeReceiptId,
+    pub active_writable_authority_ref: Option<BlockVolumeReceiptId>,
+    pub admission_records: Vec<BlockVolumeLocalExportAdmissionRecord>,
+    next_admission_counter: u64,
+}
+
+impl BlockVolumeLocalExportAdmissionRuntime {
+    #[must_use]
+    pub fn open(volume_id: BlockVolumeId, projection_ref: BlockVolumeReceiptId) -> Self {
+        Self {
+            volume_id,
+            projection_ref,
+            active_writable_authority_ref: None,
+            admission_records: Vec::new(),
+            next_admission_counter: 1,
+        }
+    }
+
+    pub fn admit_local_export(
+        &mut self,
+        authority_class: BlockVolumeLocalExportAuthorityClass,
+        requested_authority_ref: BlockVolumeReceiptId,
+        freshness_fence_ref: Option<BlockVolumeReceiptId>,
+    ) -> BlockVolumeLocalExportAdmissionRecord {
+        let record = match authority_class {
+            BlockVolumeLocalExportAuthorityClass::Writable => {
+                match self.active_writable_authority_ref {
+                    None => {
+                        self.active_writable_authority_ref = Some(requested_authority_ref);
+                        self.admitted_record(
+                            authority_class,
+                            requested_authority_ref,
+                            Some(requested_authority_ref),
+                            None,
+                            BlockVolumeLocalExportFreshnessClass::LocalMutableAuthority,
+                        )
+                    }
+                    Some(active) if active == requested_authority_ref => self.admitted_record(
+                        authority_class,
+                        requested_authority_ref,
+                        Some(active),
+                        None,
+                        BlockVolumeLocalExportFreshnessClass::LocalMutableAuthority,
+                    ),
+                    Some(active) => self.refused_record(
+                        authority_class,
+                        BlockVolumeLocalExportAdmissionClass::RefusedConflictingWritableAuthority,
+                        requested_authority_ref,
+                        Some(active),
+                        None,
+                    ),
+                }
+            }
+            BlockVolumeLocalExportAuthorityClass::ReadOnly => match freshness_fence_ref {
+                Some(fence_ref) => self.admitted_record(
+                    authority_class,
+                    requested_authority_ref,
+                    None,
+                    Some(fence_ref),
+                    BlockVolumeLocalExportFreshnessClass::ReadOnlyFreshnessFence,
+                ),
+                None => self.refused_record(
+                    authority_class,
+                    BlockVolumeLocalExportAdmissionClass::RefusedReadOnlyFreshnessFence,
+                    requested_authority_ref,
+                    None,
+                    None,
+                ),
+            },
+            BlockVolumeLocalExportAuthorityClass::MultiWriter => self.refused_record(
+                authority_class,
+                BlockVolumeLocalExportAdmissionClass::RefusedUnsupportedMultiWriterClass,
+                requested_authority_ref,
+                None,
+                None,
+            ),
+        };
+        self.admission_records.push(record.clone());
+        record
+    }
+
+    fn admitted_record(
+        &mut self,
+        authority_class: BlockVolumeLocalExportAuthorityClass,
+        requested_authority_ref: BlockVolumeReceiptId,
+        admitted_writable_authority_ref: Option<BlockVolumeReceiptId>,
+        freshness_fence_ref: Option<BlockVolumeReceiptId>,
+        freshness_class: BlockVolumeLocalExportFreshnessClass,
+    ) -> BlockVolumeLocalExportAdmissionRecord {
+        BlockVolumeLocalExportAdmissionRecord {
+            admission_id: self.next_admission_receipt(0x620),
+            runtime_mode_class: BlockVolumeExportRuntimeModeClass::Local,
+            authority_class,
+            admission_class: BlockVolumeLocalExportAdmissionClass::Admitted,
+            projection_ref: self.projection_ref,
+            requested_authority_ref,
+            admitted_writable_authority_ref,
+            conflicting_writable_authority_ref: None,
+            freshness_fence_ref,
+            exactness_class: BlockVolumeLocalExportExactnessClass::BlockExactWithinAdmittedExport,
+            freshness_class,
+        }
+    }
+
+    fn refused_record(
+        &mut self,
+        authority_class: BlockVolumeLocalExportAuthorityClass,
+        admission_class: BlockVolumeLocalExportAdmissionClass,
+        requested_authority_ref: BlockVolumeReceiptId,
+        conflicting_writable_authority_ref: Option<BlockVolumeReceiptId>,
+        freshness_fence_ref: Option<BlockVolumeReceiptId>,
+    ) -> BlockVolumeLocalExportAdmissionRecord {
+        BlockVolumeLocalExportAdmissionRecord {
+            admission_id: self.next_admission_receipt(0x621),
+            runtime_mode_class: BlockVolumeExportRuntimeModeClass::Local,
+            authority_class,
+            admission_class,
+            projection_ref: self.projection_ref,
+            requested_authority_ref,
+            admitted_writable_authority_ref: None,
+            conflicting_writable_authority_ref,
+            freshness_fence_ref,
+            exactness_class: BlockVolumeLocalExportExactnessClass::Unsupported,
+            freshness_class: BlockVolumeLocalExportFreshnessClass::Unsupported,
+        }
+    }
+
+    fn next_admission_receipt(&mut self, salt: u64) -> BlockVolumeReceiptId {
+        let receipt = receipt_for_volume(self.volume_id, self.next_admission_counter, salt);
+        self.next_admission_counter = self.next_admission_counter.wrapping_add(1);
+        receipt
+    }
 }
 
 impl BlockVolumeQueueRuntime {
@@ -1678,17 +1867,30 @@ impl BlockVolumeExportLifecycleRuntime {
             vec![queue_runtime.queue_set.queue_set_id];
         queue_runtime.export_fence.issue_receipt_ref =
             Some(receipt_for_volume(geometry.volume_id, 4, 0x301D));
+        let authority_anchor_ref = receipt_for_volume(geometry.volume_id, 2, 0x301D);
+        let mut local_export_admission_runtime = BlockVolumeLocalExportAdmissionRuntime::open(
+            geometry.volume_id,
+            receipt_for_volume(geometry.volume_id, 1, 0x620),
+        );
+        let local_export_admission = local_export_admission_runtime.admit_local_export(
+            BlockVolumeLocalExportAuthorityClass::Writable,
+            authority_anchor_ref,
+            None,
+        );
 
         Some(Self {
             export_runtime: BlockVolumeExportRuntimeRecord {
                 export_runtime_id: receipt_for_volume(geometry.volume_id, 1, 0x301D),
                 volume_id: geometry.volume_id,
+                runtime_mode_class: BlockVolumeExportRuntimeModeClass::Local,
                 export_phase_class: BlockVolumeExportPhaseClass::Bootstrap,
                 queue_set_refs: vec![queue_runtime.queue_set.queue_set_id],
-                authority_anchor_ref: receipt_for_volume(geometry.volume_id, 2, 0x301D),
+                authority_anchor_ref,
+                local_export_admission_ref: local_export_admission.admission_id,
                 fence_epoch_ref: receipt_for_volume(geometry.volume_id, 3, 0x301D),
                 lifecycle_generation: 0,
             },
+            local_export_admission,
             queue_runtime,
             transition_records: Vec::new(),
             next_lifecycle_counter: 10,
@@ -5704,6 +5906,167 @@ mod tests {
             .begin_quiesce(BlockVolumeExportTransitionClass::ResizeQuiesce);
         runtime.lifecycle_runtime.fence_after_drain();
         runtime
+    }
+
+    #[test]
+    fn local_export_lifecycle_bootstrap_records_local_writable_authority() {
+        let runtime = lifecycle_runtime();
+        let admission = &runtime.local_export_admission;
+
+        assert_eq!(
+            runtime.export_runtime.runtime_mode_class,
+            BlockVolumeExportRuntimeModeClass::Local
+        );
+        assert_eq!(
+            runtime.export_runtime.local_export_admission_ref,
+            admission.admission_id
+        );
+        assert_eq!(
+            admission.runtime_mode_class,
+            BlockVolumeExportRuntimeModeClass::Local
+        );
+        assert_eq!(
+            admission.authority_class,
+            BlockVolumeLocalExportAuthorityClass::Writable
+        );
+        assert_eq!(
+            admission.admission_class,
+            BlockVolumeLocalExportAdmissionClass::Admitted
+        );
+        assert_eq!(
+            admission.requested_authority_ref,
+            runtime.export_runtime.authority_anchor_ref
+        );
+        assert_eq!(
+            admission.admitted_writable_authority_ref,
+            Some(runtime.export_runtime.authority_anchor_ref)
+        );
+        assert_eq!(
+            admission.exactness_class,
+            BlockVolumeLocalExportExactnessClass::BlockExactWithinAdmittedExport
+        );
+        assert_eq!(
+            admission.freshness_class,
+            BlockVolumeLocalExportFreshnessClass::LocalMutableAuthority
+        );
+    }
+
+    #[test]
+    fn local_export_admission_refuses_second_writable_authority_for_projection() {
+        let mut admission = BlockVolumeLocalExportAdmissionRuntime::open(
+            BlockVolumeId::new(620),
+            BlockVolumeReceiptId(0xA620),
+        );
+        let first_authority = BlockVolumeReceiptId(0xF17A);
+        let conflicting_authority = BlockVolumeReceiptId(0xBAD);
+
+        let first = admission.admit_local_export(
+            BlockVolumeLocalExportAuthorityClass::Writable,
+            first_authority,
+            None,
+        );
+        let idempotent = admission.admit_local_export(
+            BlockVolumeLocalExportAuthorityClass::Writable,
+            first_authority,
+            None,
+        );
+        let conflict = admission.admit_local_export(
+            BlockVolumeLocalExportAuthorityClass::Writable,
+            conflicting_authority,
+            None,
+        );
+
+        assert_eq!(
+            first.admission_class,
+            BlockVolumeLocalExportAdmissionClass::Admitted
+        );
+        assert_eq!(
+            idempotent.admission_class,
+            BlockVolumeLocalExportAdmissionClass::Admitted
+        );
+        assert_eq!(
+            conflict.admission_class,
+            BlockVolumeLocalExportAdmissionClass::RefusedConflictingWritableAuthority
+        );
+        assert_eq!(conflict.requested_authority_ref, conflicting_authority);
+        assert_eq!(
+            conflict.conflicting_writable_authority_ref,
+            Some(first_authority)
+        );
+        assert_eq!(
+            admission.active_writable_authority_ref,
+            Some(first_authority)
+        );
+        assert_eq!(admission.admission_records.len(), 3);
+    }
+
+    #[test]
+    fn local_export_admission_refuses_unsupported_multi_writer_class() {
+        let mut admission = BlockVolumeLocalExportAdmissionRuntime::open(
+            BlockVolumeId::new(621),
+            BlockVolumeReceiptId(0xA621),
+        );
+
+        let refused = admission.admit_local_export(
+            BlockVolumeLocalExportAuthorityClass::MultiWriter,
+            BlockVolumeReceiptId(0x51A4),
+            None,
+        );
+
+        assert_eq!(
+            refused.admission_class,
+            BlockVolumeLocalExportAdmissionClass::RefusedUnsupportedMultiWriterClass
+        );
+        assert_eq!(
+            refused.exactness_class,
+            BlockVolumeLocalExportExactnessClass::Unsupported
+        );
+        assert_eq!(
+            refused.freshness_class,
+            BlockVolumeLocalExportFreshnessClass::Unsupported
+        );
+        assert_eq!(admission.active_writable_authority_ref, None);
+    }
+
+    #[test]
+    fn local_read_only_export_requires_freshness_fence_without_publication_authority() {
+        let mut admission = BlockVolumeLocalExportAdmissionRuntime::open(
+            BlockVolumeId::new(622),
+            BlockVolumeReceiptId(0xA622),
+        );
+        let reader_authority = BlockVolumeReceiptId(0xC0FFEE);
+        let freshness_fence = BlockVolumeReceiptId(0xFEE1);
+
+        let missing_fence = admission.admit_local_export(
+            BlockVolumeLocalExportAuthorityClass::ReadOnly,
+            reader_authority,
+            None,
+        );
+        let admitted = admission.admit_local_export(
+            BlockVolumeLocalExportAuthorityClass::ReadOnly,
+            reader_authority,
+            Some(freshness_fence),
+        );
+
+        assert_eq!(
+            missing_fence.admission_class,
+            BlockVolumeLocalExportAdmissionClass::RefusedReadOnlyFreshnessFence
+        );
+        assert_eq!(
+            admitted.admission_class,
+            BlockVolumeLocalExportAdmissionClass::Admitted
+        );
+        assert_eq!(admitted.admitted_writable_authority_ref, None);
+        assert_eq!(admitted.freshness_fence_ref, Some(freshness_fence));
+        assert_eq!(
+            admitted.exactness_class,
+            BlockVolumeLocalExportExactnessClass::BlockExactWithinAdmittedExport
+        );
+        assert_eq!(
+            admitted.freshness_class,
+            BlockVolumeLocalExportFreshnessClass::ReadOnlyFreshnessFence
+        );
+        assert_eq!(admission.active_writable_authority_ref, None);
     }
 
     #[test]
