@@ -3,8 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tidefs_local_object_store::{
-    checksum64, pool::Pool, CrashInjectionPoint, LocalObjectStore, ObjectKey,
-    ObjectLocation,
+    checksum64, pool::Pool, CrashInjectionPoint, LocalObjectStore, ObjectKey, ObjectLocation,
 };
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
 
@@ -854,8 +853,7 @@ pub(crate) fn allocator_report_for_state(
     let current_entries = content_allocation_entries_for_state(store, state)?;
     let unique_current_content_objects = current_entries.len() as u64;
     let current_namespace_allocated_bytes = allocation_bytes(&current_entries)?;
-    let audit = audit_recovery_store(store, root_authentication_key)?;
-    let protected_roots = roots_with_snapshot_roots(audit.valid_committed_roots.clone(), state);
+    let protected_roots = snapshot_retained_roots(state);
     let mut protected_entries = BTreeMap::new();
     for summary in &protected_roots {
         let root = root_commit_from_summary(summary);
@@ -899,8 +897,7 @@ pub(crate) fn protected_committed_content_entries(
     root_authentication_key: RootAuthenticationKey,
     state: &FileSystemState,
 ) -> Result<BTreeMap<ObjectKey, u64>> {
-    let audit = audit_recovery_store(store, root_authentication_key)?;
-    let protected_roots = roots_with_snapshot_roots(audit.valid_committed_roots, state);
+    let protected_roots = snapshot_retained_roots(state);
     let mut entries = BTreeMap::new();
     for summary in &protected_roots {
         let root = root_commit_from_summary(summary);
@@ -912,15 +909,28 @@ pub(crate) fn protected_committed_content_entries(
     Ok(entries)
 }
 
-pub(crate) fn roots_with_snapshot_roots(
-    mut roots: Vec<CommittedRootSummary>,
-    state: &FileSystemState,
-) -> Vec<CommittedRootSummary> {
+pub(crate) fn snapshot_retained_roots(state: &FileSystemState) -> Vec<CommittedRootSummary> {
+    // Ordinary root-slot fallback roots are protected by retention/GC policy.
+    // Logical content-capacity admission only reserves roots that a live
+    // snapshot or clone keeps user-addressable.
+    let mut roots = Vec::new();
     for snapshot in state.snapshots.values() {
         if crate::snapshot::snapshot_record_retains_data(snapshot)
             && !roots.contains(&snapshot.root)
         {
             roots.push(snapshot.root.clone());
+        }
+    }
+    roots
+}
+
+pub(crate) fn roots_with_snapshot_roots(
+    mut roots: Vec<CommittedRootSummary>,
+    state: &FileSystemState,
+) -> Vec<CommittedRootSummary> {
+    for snapshot_root in snapshot_retained_roots(state) {
+        if !roots.contains(&snapshot_root) {
+            roots.push(snapshot_root);
         }
     }
     roots
@@ -2341,8 +2351,8 @@ mod receipt_validation_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tidefs_local_object_store::pool::Pool;
     use tidefs_local_object_store::{
-        DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, IntegrityDigest64, LocalObjectStore,
-        PoolConfig, PoolProperties, StoreOptions,
+        DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, IntegrityDigest64,
+        LocalObjectStore, PoolConfig, PoolProperties, StoreOptions,
     };
     use tidefs_types_vfs_core::S_IFREG;
 
