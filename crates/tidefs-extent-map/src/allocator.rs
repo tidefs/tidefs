@@ -311,6 +311,15 @@ impl ExtentAllocator {
         Ok(())
     }
 
+    /// Remove all extent mappings for `inode`.
+    ///
+    /// Full-inode namespace removal has already accounted the released bytes;
+    /// this drops the live per-inode map so later lookups cannot observe stale
+    /// extents for an inode that no longer exists.
+    pub fn remove_inode(&mut self, inode: u64) -> bool {
+        self.maps.remove(&inode).is_some()
+    }
+
     /// Resize an extent by freeing the old range and allocating a new one.
     ///
     /// This is a naive resize that frees the old range and allocates a new
