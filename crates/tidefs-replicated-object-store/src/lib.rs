@@ -1414,6 +1414,12 @@ pub struct TransportReplicatedPutResult {
     pub quorum_reached: bool,
     /// Whether the write was fully committed (all replicas acked).
     pub fully_committed: bool,
+    /// Durable placement receipt authority for a receipt-authorized write.
+    /// Present only when put_named_with_receipt reaches quorum.
+    /// For multi-node writes this is the validated receipt returned by a
+    /// receipt-bearing replica ack; primary-only quorum retains the supplied
+    /// pool-backed receipt authority.
+    pub recorded_receipt_ref: Option<PlacementReceiptRef>,
 }
 
 /// Successful peer placement read-map installation over a replica control session.
@@ -2021,6 +2027,7 @@ impl TransportReplicatedStore {
             acks,
             total_targets,
             quorum_size: self.config.write_quorum,
+            recorded_receipt_ref: None,
             quorum_reached,
             fully_committed,
         })
@@ -2087,6 +2094,7 @@ impl TransportReplicatedStore {
         let total_targets = 1 + target_replicas.len();
         let mut acks: usize = 1; // primary counts
         let mut acked_replicas: Vec<(u64, SessionId)> = Vec::new();
+        let mut recorded_receipt_ref: Option<PlacementReceiptRef> = None;
 
         // Fan out to targeted replicas over Control (e1) session using
         // PutWithReceipt to carry durable placement authority.
@@ -2105,17 +2113,18 @@ impl TransportReplicatedStore {
                     ) {
                         Ok(ReplicationMessage::PutWithReceiptAck {
                             success: true,
-                            recorded_receipt_ref: Some(recorded_receipt_ref),
+                            recorded_receipt_ref: Some(replica_receipt_ref),
                             ..
                         }) => {
                             match validate_recorded_put_receipt_authority(
                                 placement_receipt_ref,
-                                recorded_receipt_ref,
+                                replica_receipt_ref,
                             ) {
                                 Ok(()) => {
                                     acks += 1;
                                     acked_replicas
                                         .push((replica.node_id, replica.control_session_id));
+                                    recorded_receipt_ref = Some(replica_receipt_ref);
                                 }
                                 Err(error) => {
                                     tracing::warn!(
@@ -2202,6 +2211,11 @@ impl TransportReplicatedStore {
             total_targets,
             quorum_size: self.config.write_quorum,
             quorum_reached,
+            recorded_receipt_ref: if quorum_reached {
+                recorded_receipt_ref.or(Some(placement_receipt_ref))
+            } else {
+                None
+            },
             fully_committed,
         })
     }
@@ -2617,6 +2631,7 @@ impl TransportReplicatedStore {
             quorum_size: plan.quorum_required,
             quorum_reached,
             fully_committed,
+            recorded_receipt_ref: None,
         })
     }
 
@@ -7224,6 +7239,7 @@ mod tests {
             assert!(result.fully_committed);
             assert_eq!(result.acks, 1);
             assert_eq!(result.total_targets, 1);
+            assert_eq!(result.recorded_receipt_ref, Some(receipt));
 
             // Verify data was stored locally
             let read_back = store
@@ -7322,6 +7338,12 @@ mod tests {
                 assert_eq!(name, "two-node-receipt");
                 assert_eq!(received_payload, payload_clone);
                 assert_eq!(received_receipt.object_id, receipt_clone.object_id);
+                let replica_receipt_ref = placement_receipt_ref(
+                    received_receipt.object_id,
+                    &tidefs_local_object_store::ObjectKey::from_name(name.as_bytes()),
+                    &received_payload,
+                    received_receipt.receipt_generation + 1,
+                );
 
                 // Store the payload locally
                 replica
@@ -7331,7 +7353,7 @@ mod tests {
                 let resp = ReplicationMessage::PutWithReceiptAck {
                     key_hash: name.clone(),
                     success: true,
-                    recorded_receipt_ref: Some(received_receipt),
+                    recorded_receipt_ref: Some(replica_receipt_ref),
                 };
                 send_replication_msg(&mut replica.transport, server_sid, &resp)
                     .expect("replica should send ack");
@@ -7346,6 +7368,10 @@ mod tests {
             assert!(result.fully_committed);
             assert_eq!(result.acks, 2);
             assert_eq!(result.total_targets, 2);
+            assert_eq!(
+                result.recorded_receipt_ref,
+                Some(placement_receipt_ref(100, &key, payload, 4))
+            );
 
             replica_handle.join().unwrap();
             assert!(
@@ -7425,6 +7451,7 @@ mod tests {
             assert!(!result.fully_committed);
             assert_eq!(result.acks, 1); // only primary
             assert_eq!(result.total_targets, 2);
+            assert_eq!(result.recorded_receipt_ref, None);
 
             replica_handle.join().unwrap();
             rx.recv().unwrap();
@@ -7499,6 +7526,7 @@ mod tests {
                 "receiptless ack must not reach quorum"
             );
             assert_eq!(result.acks, 1);
+            assert_eq!(result.recorded_receipt_ref, None);
 
             replica_handle.join().unwrap();
             rx.recv().unwrap();
