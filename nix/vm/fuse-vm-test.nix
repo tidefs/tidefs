@@ -349,9 +349,19 @@ INITSCRIPT
     local start="$1"
     local end="$2"
     awk -v start="$start" -v end="$end" '
+      { sub(/\r$/, "") }
       $0 == start { capture = 1; next }
       $0 == end { capture = 0; next }
       capture { print }
+    ' "$VAL_LOG"
+  }
+
+  count_serial_lines() {
+    local pattern="$1"
+    awk -v pattern="$pattern" '
+      { sub(/\r$/, "") }
+      $0 ~ pattern { count++ }
+      END { print count + 0 }
     ' "$VAL_LOG"
   }
 
@@ -362,11 +372,14 @@ INITSCRIPT
     cp "$queue_tmp" "$QUEUE_DEPTH_ARTIFACT"
   fi
 
-  PASSC=$(grep -c '^PASS:' "$VAL_LOG" 2>/dev/null || true)
-  FAILC=$(grep -c '^FAIL:' "$VAL_LOG" 2>/dev/null || true)
-  REFUSALC=$(grep -c '^REFUSAL:' "$VAL_LOG" 2>/dev/null || true)
-  DONEC=$(grep -c '^TIDEFS_FUSE_VM_TEST_DONE$' "$VAL_LOG" 2>/dev/null || true)
-  KERNEL_VERSION=$(sed -n 's/^kernel_version=//p' "$VAL_LOG" | head -1)
+  PASSC=$(count_serial_lines '^PASS:')
+  FAILC=$(count_serial_lines '^FAIL:')
+  REFUSALC=$(count_serial_lines '^REFUSAL:')
+  DONEC=$(count_serial_lines '^TIDEFS_FUSE_VM_TEST_DONE$')
+  KERNEL_VERSION=$(awk '
+    { sub(/\r$/, "") }
+    /^kernel_version=/ { sub(/^kernel_version=/, ""); print; exit }
+  ' "$VAL_LOG")
   [ -n "$KERNEL_VERSION" ] || KERNEL_VERSION="unknown"
   QUEUE_PRESENT=false
   [ -s "$queue_tmp" ] && QUEUE_PRESENT=true
