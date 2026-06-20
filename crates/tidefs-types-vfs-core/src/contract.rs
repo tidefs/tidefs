@@ -19,6 +19,12 @@ const VFS_NAME_TOKEN_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 pub struct ContractVersion(pub u16);
 
 impl ContractVersion {
+    /// The single supported contract version (v1).
+    pub const V1: Self = Self(1);
+
+    /// Highest known version number. Versions above this are unsupported.
+    pub const MAX_KNOWN: u16 = 1;
+
     #[must_use]
     pub const fn new(value: u16) -> Self {
         Self(value)
@@ -28,6 +34,27 @@ impl ContractVersion {
     pub const fn raw(self) -> u16 {
         self.0
     }
+
+    /// Reject unsupported contract versions.
+    ///
+    /// Only v1 is currently defined.  Future versions that arrive before
+    /// this crate is upgraded must be rejected so that the caller can
+    /// return an explicit unsupported-version error instead of treating
+    /// the record as valid evidence.
+    #[must_use]
+    pub const fn validate(self) -> Result<(), ContractVersionValidateError> {
+        if self.0 == 0 || self.0 > Self::MAX_KNOWN {
+            return Err(ContractVersionValidateError { version: self.0 });
+        }
+        Ok(())
+    }
+}
+
+/// Error returned when `ContractVersion` is unsupported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContractVersionValidateError {
+    /// The raw version value that triggered rejection.
+    pub version: u16,
 }
 
 #[repr(transparent)]
@@ -1033,6 +1060,32 @@ impl RequestEnvelope {
             payload_flags: 0,
         }
     }
+
+    /// Reject non-zero reserved `payload_flags`.
+    ///
+    /// `payload_flags` is reserved for future use and must be zero.
+    /// Non-zero values indicate a future-format record that this version
+    /// of the crate must not interpret as valid evidence.
+    #[must_use]
+    pub fn validate(&self) -> Result<(), RequestEnvelopeValidateError> {
+        if self.payload_flags != 0 {
+            return Err(RequestEnvelopeValidateError {
+                payload_flags: self.payload_flags,
+            });
+        }
+        self.version.validate().map_err(|e| RequestEnvelopeValidateError {
+            payload_flags: e.version as u32,
+        })?;
+        Ok(())
+    }
+}
+
+/// Error returned when `RequestEnvelope` carries unsupported version or
+/// reserved flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestEnvelopeValidateError {
+    /// Non-zero reserved `payload_flags` value.
+    pub payload_flags: u32,
 }
 
 #[repr(u16)]
@@ -1127,6 +1180,32 @@ impl TideCompletion {
             result_flags: 0,
         }
     }
+
+    /// Reject unsupported version and non-zero reserved `result_flags`.
+    ///
+    /// `result_flags` is reserved for future use and must be zero.
+    /// Non-zero values indicate a future-format record that this version
+    /// of the crate must not interpret as valid evidence.
+    #[must_use]
+    pub fn validate(&self) -> Result<(), TideCompletionValidateError> {
+        if self.result_flags != 0 {
+            return Err(TideCompletionValidateError {
+                result_flags: self.result_flags,
+            });
+        }
+        self.version.validate().map_err(|e| TideCompletionValidateError {
+            result_flags: e.version as u32,
+        })?;
+        Ok(())
+    }
+}
+
+/// Error returned when `TideCompletion` carries an unsupported version or
+/// reserved flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TideCompletionValidateError {
+    /// Non-zero reserved `result_flags` value, or version encoded as flags.
+    pub result_flags: u32,
 }
 
 #[cfg(test)]

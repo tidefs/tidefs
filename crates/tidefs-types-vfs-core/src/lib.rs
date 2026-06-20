@@ -926,6 +926,10 @@ pub const FATTR_MTIME_NOW: u32 = 1 << 8;
 pub const FATTR_LOCKOWNER: u32 = 1 << 9;
 pub const FATTR_CTIME: u32 = 1 << 10;
 
+/// Bitwise OR of all known FATTR bits. Bits outside this mask are reserved
+/// and must be rejected at the boundary.
+pub const FATTR_VALID_MASK: u32 = FATTR_MODE | FATTR_UID | FATTR_GID | FATTR_SIZE | FATTR_ATIME | FATTR_MTIME | FATTR_FH | FATTR_ATIME_NOW | FATTR_MTIME_NOW | FATTR_LOCKOWNER | FATTR_CTIME;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SetAttr {
@@ -1005,6 +1009,33 @@ impl SetAttr {
         self.valid |= FATTR_CTIME;
         self.ctime_ns = timestamp.as_unix_nanos();
     }
+
+    /// Reject `valid` bits outside the known FATTR set.
+    ///
+    /// Unknown bits in `valid` indicate either a bug or a future-format
+    /// record that this version of the crate must not interpret as valid
+    /// evidence. Callers at the VFS boundary should validate before using
+    /// the request for dispatch or attribute projection.
+    #[must_use]
+    pub fn validate(&self) -> Result<(), SetAttrValidateError> {
+        if self.valid & !FATTR_VALID_MASK != 0 {
+            return Err(SetAttrValidateError {
+                valid: self.valid,
+                unknown_bits: self.valid & !FATTR_VALID_MASK,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Error returned when `SetAttr.valid` contains bits outside the known
+/// `FATTR_VALID_MASK`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetAttrValidateError {
+    /// The full `valid` field value that triggered rejection.
+    pub valid: u32,
+    /// The subset of bits that are unknown/reserved.
+    pub unknown_bits: u32,
 }
 
 /// Advisory lock type constants for LockSpec.typ.
@@ -1038,6 +1069,36 @@ impl LockSpec {
             pid,
         }
     }
+
+    /// Reject unknown lock type and whence values.
+    ///
+    /// `typ` must be one of `F_RDLCK` (0), `F_WRLCK` (1), or `F_UNLCK` (2).
+    /// `whence` must be one of `SEEK_SET` (0), `SEEK_CUR` (1), or
+    /// `SEEK_END` (2).  Future-version records that carry new type or
+    /// whence constants must be rejected at the boundary.
+    #[must_use]
+    pub fn validate(&self) -> Result<(), LockSpecValidateError> {
+        let typ_ok = self.typ == F_RDLCK || self.typ == F_WRLCK || self.typ == F_UNLCK;
+        let whence_ok = self.whence == SEEK_SET || self.whence == SEEK_CUR || self.whence == SEEK_END;
+        if typ_ok && whence_ok {
+            Ok(())
+        } else {
+            Err(LockSpecValidateError {
+                typ: self.typ,
+                whence: self.whence,
+            })
+        }
+    }
+}
+
+/// Error returned when `LockSpec` carries an unknown `typ` or `whence`
+/// value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LockSpecValidateError {
+    /// The raw `typ` value that triggered rejection.
+    pub typ: u32,
+    /// The raw `whence` value that triggered rejection.
+    pub whence: u32,
 }
 
 // ── POSIX advisory byte-range lock types ─────────────────────────────────
@@ -1620,6 +1681,27 @@ impl PosixAttrs {
     pub const fn btime_timestamp(&self) -> PosixTimestampNs {
         PosixTimestampNs::from_unix_nanos(self.btime_ns)
     }
+
+    /// Reject unknown POSIX inode type in the `mode` field.
+    ///
+    /// `mode & S_IFMT` must be one of `S_IFREG`, `S_IFDIR`, `S_IFLNK`,
+    /// `S_IFBLK`, `S_IFCHR`, `S_IFIFO`, or `S_IFSOCK`.  Any other value
+    /// is reserved and must be rejected at the boundary.
+    #[must_use]
+    pub fn validate(&self) -> Result<(), PosixAttrsValidateError> {
+        let mode_type = self.mode & S_IFMT;
+        match mode_type {
+            S_IFREG | S_IFDIR | S_IFLNK | S_IFBLK | S_IFCHR | S_IFIFO | S_IFSOCK => Ok(()),
+            _ => Err(PosixAttrsValidateError { mode }),
+        }
+    }
+}
+
+/// Error returned when `PosixAttrs.mode` carries an unknown `S_IFMT` type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PosixAttrsValidateError {
+    /// The full `mode` field value that triggered rejection.
+    pub mode: u32,
 }
 
 #[repr(C)]
@@ -1654,7 +1736,15 @@ impl InodeFlags {
     /// POSIX inode flag bit constants matching Linux FS_IOC_GETFLAGS/FS_IOC_SETFLAGS.
     pub const FLAG_IMMUTABLE: u32 = 0x00000010;
     pub const FLAG_APPEND_ONLY: u32 = 0x00000020;
+    pub const FLAG_NODUMP: u32 = 0x00000040;
     pub const FLAG_NOATIME: u32 = 0x00000080;
+
+    /// Bitwise OR of all known inode flag bits. Bits outside this mask
+    /// are reserved and must be rejected.
+    pub const FLAG_VALID_MASK: u32 = Self::FLAG_IMMUTABLE
+        | Self::FLAG_APPEND_ONLY
+        | Self::FLAG_NODUMP
+        | Self::FLAG_NOATIME;
 
     /// Encode the flag fields into a raw `u32` suitable for
     /// `tidefs_posix_semantics` enforcement predicates.
@@ -1667,11 +1757,49 @@ impl InodeFlags {
         if self.append_only {
             raw |= Self::FLAG_APPEND_ONLY;
         }
+        if self.nodump {
+            raw |= Self::FLAG_NODUMP;
+        }
         if self.noatime {
             raw |= Self::FLAG_NOATIME;
         }
         raw
     }
+
+    /// Decode raw `u32` flags from `FS_IOC_GETFLAGS` into `InodeFlags`,
+    /// rejecting bits outside the known mask.
+    #[must_use]
+    pub const fn from_raw_flags(raw: u32) -> Result<Self, InodeFlagsValidateError> {
+        if raw & !Self::FLAG_VALID_MASK != 0 {
+            return Err(InodeFlagsValidateError {
+                raw,
+                unknown_bits: raw & !Self::FLAG_VALID_MASK,
+            });
+        }
+        Ok(Self {
+            immutable: raw & Self::FLAG_IMMUTABLE != 0,
+            append_only: raw & Self::FLAG_APPEND_ONLY != 0,
+            nodump: raw & Self::FLAG_NODUMP != 0,
+            noatime: raw & Self::FLAG_NOATIME != 0,
+        })
+    }
+
+    /// Reject unknown flag bits; convenience alias for
+    /// [`Self::from_raw_flags`].
+    #[must_use]
+    pub fn validate_raw_flags(raw: u32) -> Result<(), InodeFlagsValidateError> {
+        Self::from_raw_flags(raw).map(|_| ())
+    }
+}
+
+/// Error returned when `InodeFlags` raw bits contain unknown/reserved
+/// flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InodeFlagsValidateError {
+    /// The full raw flags value that triggered rejection.
+    pub raw: u32,
+    /// The subset of bits that are unknown/reserved.
+    pub unknown_bits: u32,
 }
 
 #[repr(C)]
@@ -8466,5 +8594,293 @@ mod dir_entry_tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DirEntry>();
 
+    }
+}
+
+#[cfg(test)]
+mod setattr_validate_tests {
+    use super::*;
+
+    #[test]
+    fn valid_with_all_known_bits_passes() {
+        let sa = SetAttr {
+            valid: FATTR_MODE | FATTR_UID | FATTR_GID | FATTR_SIZE
+                | FATTR_ATIME | FATTR_MTIME | FATTR_FH
+                | FATTR_ATIME_NOW | FATTR_MTIME_NOW
+                | FATTR_LOCKOWNER | FATTR_CTIME,
+            ..SetAttr::default()
+        };
+        assert!(sa.validate().is_ok());
+    }
+
+    #[test]
+    fn valid_with_no_bits_passes() {
+        let sa = SetAttr::default();
+        assert!(sa.validate().is_ok());
+    }
+
+    #[test]
+    fn valid_rejects_unknown_bit() {
+        let sa = SetAttr {
+            valid: FATTR_VALID_MASK | (1 << 15),
+            ..SetAttr::default()
+        };
+        let err = sa.validate().expect_err("unknown bit should reject");
+        assert_eq!(err.unknown_bits, 1 << 15);
+        assert_eq!(err.valid, FATTR_VALID_MASK | (1 << 15));
+    }
+
+    #[test]
+    fn valid_rejects_all_unknown() {
+        let sa = SetAttr {
+            valid: 0xFFFF_0000,
+            ..SetAttr::default()
+        };
+        let err = sa.validate().expect_err("all-unknown should reject");
+        assert_eq!(err.unknown_bits, 0xFFFF_0000 & !FATTR_VALID_MASK);
+    }
+
+    #[test]
+    fn fattr_valid_mask_covers_every_known_bit() {
+        assert_eq!(FATTR_VALID_MASK, (1 << 11) - 1); // bits 0-10
+    }
+}
+
+#[cfg(test)]
+mod posix_attrs_validate_tests {
+    use super::*;
+
+    #[test]
+    fn valid_mode_types_pass() {
+        for mt in [S_IFREG, S_IFDIR, S_IFLNK, S_IFBLK, S_IFCHR, S_IFIFO, S_IFSOCK] {
+            let pa = PosixAttrs {
+                mode: mt | 0o755,
+                ..PosixAttrs::default()
+            };
+            assert!(pa.validate().is_ok(), "mode type {mt:#o} should pass");
+        }
+    }
+
+    #[test]
+    fn zero_mode_type_rejects() {
+        let pa = PosixAttrs {
+            mode: 0o755, // no S_IFMT bits set
+            ..PosixAttrs::default()
+        };
+        let err = pa.validate().expect_err("zero mode type should reject");
+        assert_eq!(err.mode, 0o755);
+    }
+
+    #[test]
+    fn unknown_mode_type_rejects() {
+        let pa = PosixAttrs {
+            mode: 0o030_000 | 0o644, // reserved S_IFMT bits
+            ..PosixAttrs::default()
+        };
+        let err = pa.validate().expect_err("unknown mode type should reject");
+        assert_eq!(err.mode, 0o030_000 | 0o644);
+    }
+
+    #[test]
+    fn default_posix_attrs_rejects() {
+        let pa = PosixAttrs::default();
+        let err = pa.validate().expect_err("default has no mode type");
+        assert_eq!(err.mode, 0);
+    }
+}
+
+#[cfg(test)]
+mod inode_flags_validate_tests {
+    use super::*;
+
+    #[test]
+    fn from_raw_flags_roundtrips_immutable() {
+        let raw = InodeFlags::FLAG_IMMUTABLE;
+        let flags = InodeFlags::from_raw_flags(raw).expect("valid");
+        assert!(flags.immutable);
+        assert!(!flags.append_only);
+        assert!(!flags.nodump);
+        assert!(!flags.noatime);
+    }
+
+    #[test]
+    fn from_raw_flags_roundtrips_all_known() {
+        let raw = InodeFlags::FLAG_IMMUTABLE
+            | InodeFlags::FLAG_APPEND_ONLY
+            | InodeFlags::FLAG_NODUMP
+            | InodeFlags::FLAG_NOATIME;
+        let flags = InodeFlags::from_raw_flags(raw).expect("all known");
+        assert_eq!(flags.to_raw_flags(), raw);
+        assert!(flags.immutable);
+        assert!(flags.append_only);
+        assert!(flags.nodump);
+        assert!(flags.noatime);
+    }
+
+    #[test]
+    fn from_raw_flags_zero_roundtrips() {
+        let flags = InodeFlags::from_raw_flags(0).expect("zero");
+        assert_eq!(flags.to_raw_flags(), 0);
+        assert!(!flags.immutable);
+        assert!(!flags.append_only);
+        assert!(!flags.nodump);
+        assert!(!flags.noatime);
+    }
+
+    #[test]
+    fn from_raw_flags_rejects_unknown_bits() {
+        let err = InodeFlags::from_raw_flags(0x1).expect_err("bit 0 unknown");
+        assert_eq!(err.unknown_bits, 0x1);
+
+        let err = InodeFlags::from_raw_flags(InodeFlags::FLAG_VALID_MASK | 0x100).expect_err("bit 8 unknown");
+        assert_eq!(err.unknown_bits, 0x100);
+    }
+
+    #[test]
+    fn raw_flags_include_nodump() {
+        let f = InodeFlags {
+            nodump: true,
+            ..InodeFlags::default()
+        };
+        assert_eq!(f.to_raw_flags(), InodeFlags::FLAG_NODUMP);
+    }
+}
+
+#[cfg(test)]
+mod lock_spec_validate_tests {
+    use super::*;
+
+    #[test]
+    fn valid_typ_whence_combinations_pass() {
+        for typ in [F_RDLCK, F_WRLCK, F_UNLCK] {
+            for whence in [SEEK_SET, SEEK_CUR, SEEK_END] {
+                let ls = LockSpec {
+                    typ,
+                    whence,
+                    ..LockSpec::default()
+                };
+                assert!(ls.validate().is_ok(), "typ={typ} whence={whence}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_typ_rejects() {
+        let ls = LockSpec {
+            typ: 99,
+            whence: SEEK_SET,
+            ..LockSpec::default()
+        };
+        let err = ls.validate().expect_err("unknown typ");
+        assert_eq!(err.typ, 99);
+        assert_eq!(err.whence, SEEK_SET);
+    }
+
+    #[test]
+    fn unknown_whence_rejects() {
+        let ls = LockSpec {
+            typ: F_WRLCK,
+            whence: 99,
+            ..LockSpec::default()
+        };
+        let err = ls.validate().expect_err("unknown whence");
+        assert_eq!(err.typ, F_WRLCK);
+        assert_eq!(err.whence, 99);
+    }
+
+    #[test]
+    fn both_unknown_rejects() {
+        let ls = LockSpec {
+            typ: 99,
+            whence: 99,
+            ..LockSpec::default()
+        };
+        let err = ls.validate().expect_err("both unknown");
+        assert_eq!(err.typ, 99);
+        assert_eq!(err.whence, 99);
+    }
+
+    #[test]
+    fn default_lock_spec_passes() {
+        let ls = LockSpec::default();
+        assert!(ls.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod contract_version_validate_tests {
+    use crate::contract::*;
+
+    #[test]
+    fn v1_passes_validation() {
+        assert!(TIDE_CONTRACT_VERSION_V1.validate().is_ok());
+        assert!(ContractVersion::new(1).validate().is_ok());
+    }
+
+    #[test]
+    fn version_zero_rejects() {
+        let err = ContractVersion::new(0).validate().expect_err("zero");
+        assert_eq!(err.version, 0);
+    }
+
+    #[test]
+    fn version_above_max_rejects() {
+        let err = ContractVersion::new(2).validate().expect_err("above max");
+        assert_eq!(err.version, 2);
+
+        let err = ContractVersion::new(255).validate().expect_err("far above");
+        assert_eq!(err.version, 255);
+    }
+}
+
+#[cfg(test)]
+mod request_envelope_validate_tests {
+    use crate::contract::*;
+
+    #[test]
+    fn zero_payload_flags_passes() {
+        let envelope = RequestEnvelope::new(
+            RequestMetadata::new(RequestId::ZERO, ContractEpoch::new(1), TraceId::ZERO),
+            TideRequest::default(),
+        );
+        assert!(envelope.validate().is_ok());
+    }
+
+    #[test]
+    fn non_zero_payload_flags_rejects() {
+        let mut envelope = RequestEnvelope::new(
+            RequestMetadata::new(RequestId::ZERO, ContractEpoch::new(1), TraceId::ZERO),
+            TideRequest::default(),
+        );
+        envelope.payload_flags = 1;
+        let err = envelope.validate().expect_err("non-zero flags");
+        assert_eq!(err.payload_flags, 1);
+    }
+}
+
+#[cfg(test)]
+mod tide_completion_validate_tests {
+    use crate::contract::*;
+
+    #[test]
+    fn zero_result_flags_passes() {
+        let tc = TideCompletion::success(
+            RequestId::ZERO,
+            TraceId::ZERO,
+            ContractEpoch::new(1),
+        );
+        assert!(tc.validate().is_ok());
+    }
+
+    #[test]
+    fn non_zero_result_flags_rejects() {
+        let mut tc = TideCompletion::success(
+            RequestId::ZERO,
+            TraceId::ZERO,
+            ContractEpoch::new(1),
+        );
+        tc.result_flags = 0xDEAD;
+        let err = tc.validate().expect_err("non-zero flags");
+        assert_eq!(err.result_flags, 0xDEAD);
     }
 }
