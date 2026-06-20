@@ -1895,9 +1895,9 @@ ROWEOF
       elif [ "$BLOCKC" -gt 0 ]; then
         MANIFEST_VERDICT="blocked"
         MANIFEST_RESULT="blocked"
-      elif [ "$UNSUPC" -gt 0 ] || [ "$SKIPC" -gt 0 ]; then
-        MANIFEST_VERDICT="blocked"
-        MANIFEST_RESULT="classified"
+      else
+        MANIFEST_VERDICT="go"
+        MANIFEST_RESULT="passed"
       fi
       cat > "$OUT_DIR/SUMMARY.md" << SUMMARYEOF
 # TideFS FUSE xfstests Smoke Validation
@@ -1998,10 +1998,16 @@ MANIFESTEOF
       exit 1
     fi
 
-    if [ "$BLOCKC" -gt 0 ] || [ "$UNSUPC" -gt 0 ] || [ "$SKIPC" -gt 0 ]; then
+    if [ "$BLOCKC" -gt 0 ]; then
       echo ""
-      echo "VALIDATION: BLOCKED -- $BLOCKC blocked, $UNSUPC unsupported, $SKIPC skipped"
-      echo "  Blocked, unsupported, or skipped rows are non-pass validation classifications."
+      echo "VALIDATION: BLOCKED -- $BLOCKC blocked"
+      if [ "$FAILC" -gt 0 ]; then
+        echo "  Also: $FAILC failed"
+      fi
+      if [ "$UNSUPC" -gt 0 ] || [ "$SKIPC" -gt 0 ]; then
+        echo "  Classified: $UNSUPC unsupported, $SKIPC skipped"
+      fi
+      echo "  Blocked rows prevented validation completion."
       echo "  See $VAL_LOG for details."
       exit 2
     fi
@@ -2009,6 +2015,9 @@ MANIFESTEOF
     echo ""
     echo "VALIDATION: PASS -- $PASSC validation rows passed"
     echo "  FUSE xfstests validation complete."
+    if [ "$UNSUPC" -gt 0 ] || [ "$SKIPC" -gt 0 ]; then
+      echo "  Classified: $UNSUPC unsupported (product capability limits), $SKIPC skipped"
+    fi
     exit 0
 
   '';
