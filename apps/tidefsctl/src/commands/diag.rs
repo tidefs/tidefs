@@ -39,6 +39,11 @@ pub fn handle_diag(output_dir: Option<PathBuf>, device_paths: &[PathBuf], json: 
     match support_bundle::write_bundle_json(&bundle, &output_path) {
         Ok(()) => {
             eprintln!(
+                "tidefsctl diag: registry={} digest={}",
+                super::classification::COMMAND_CLASSIFICATION_DOC_MARKER,
+                bundle.command_surface.registry_digest,
+            );
+            eprintln!(
                 "tidefsctl diag: source={} maturity={} redacted={}",
                 bundle.report_source.source.label(),
                 bundle.maturity.label,
@@ -93,6 +98,7 @@ fn build_command_surface_section() -> CommandSurfaceSection {
         source: EvidenceSource::CommandClassificationRegistry,
         registry_marker: super::classification::COMMAND_CLASSIFICATION_DOC_MARKER.to_string(),
         registry_source_path: super::classification::COMMAND_CLASSIFICATION_SOURCE_PATH.to_string(),
+        registry_digest: super::classification::compute_command_registry_digest(),
         entries,
     }
 }
@@ -369,6 +375,64 @@ mod tests {
         assert!(summary.live_owner_required);
         assert_eq!(summary.committed_root_count, 0);
         assert_eq!(summary.latest_txg, None);
+    }
+
+
+    #[test]
+    fn command_registry_digest_is_stable_across_calls() {
+        let digest_a = super::super::classification::compute_command_registry_digest();
+        let digest_b = super::super::classification::compute_command_registry_digest();
+
+        assert_eq!(digest_a, digest_b,
+            "registry digest must be deterministic across repeated calls");
+        assert!(!digest_a.is_empty(), "registry digest must be non-empty");
+        // blake3 hex output is always 64 chars (32 bytes)
+        assert_eq!(digest_a.len(), 64,
+            "registry digest must be a blake3 hex digest (64 hex chars)");
+    }
+
+    #[test]
+    fn json_bundle_contains_registry_digest_field() {
+        let bundle = build_diag_bundle(&[]);
+        let json = serde_json::to_value(&bundle)
+            .expect("support bundle must serialize to JSON");
+
+        let digest = json["command_surface"]["registry_digest"]
+            .as_str()
+            .expect("command_surface.registry_digest must be a JSON string field");
+        assert!(!digest.is_empty(), "registry_digest must be non-empty in JSON");
+    }
+
+    #[test]
+    fn registry_digest_is_independent_of_entry_iteration_order() {
+        let digest = super::super::classification::compute_command_registry_digest();
+
+        use super::super::classification::CommandSurface;
+        let surfaces = super::super::classification::COMMAND_SURFACES;
+        let mut reversed: Vec<&CommandSurface> = surfaces.iter().collect();
+        reversed.reverse();
+
+        let mut sorted: std::collections::BTreeMap<&str, &&CommandSurface> =
+            std::collections::BTreeMap::new();
+        for surface in &reversed {
+            sorted.insert(surface.path, surface);
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        for surface in sorted.values() {
+            let admission = crate::commands::authz::command_admission(surface.path)
+                .expect("classified command surface admission");
+            let visibility = if surface.visible_in_root_help() { "visible" } else { "hidden" };
+            hasher.update(surface.path.as_bytes());
+            hasher.update(surface.class.label().as_bytes());
+            hasher.update(surface.routing.label().as_bytes());
+            hasher.update(admission.label().as_bytes());
+            hasher.update(visibility.as_bytes());
+            hasher.update(surface.summary.as_bytes());
+        }
+        let reversed_digest = hasher.finalize().to_hex().to_string();
+        assert_eq!(digest, reversed_digest,
+            "registry digest must be independent of source-file entry order");
     }
 
     #[test]
