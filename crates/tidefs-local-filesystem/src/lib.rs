@@ -4687,7 +4687,7 @@ impl LocalFileSystem {
         record: &InodeRecord,
         ranges: &[(u64, u64)],
     ) -> Result<u64> {
-        if ranges.is_empty() {
+        if ranges.is_empty() || record.size == 0 {
             return Ok(0);
         }
         let layout =
@@ -6610,6 +6610,41 @@ impl LocalFileSystem {
         Ok(record)
     }
 
+    fn write_buffer_uncovered_ranges(
+        &self,
+        inode_id: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Vec<(u64, u64)> {
+        self.write_buffers
+            .get(&inode_id)
+            .map(|wb| wb.unbuffered_ranges(offset, length))
+            .unwrap_or_else(|| {
+                if length == 0 {
+                    Vec::new()
+                } else {
+                    vec![(offset, length)]
+                }
+            })
+    }
+
+    fn range_bytes(ranges: &[(u64, u64)]) -> Result<u64> {
+        ranges.iter().try_fold(0_u64, |sum, (_, length)| {
+            sum.checked_add(*length)
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })
+        })
+    }
+
+    fn record_dirty_buffer_free(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.state.space_accounting.track_physical_free(bytes);
+        self.capacity_authority.record_free(bytes);
+    }
+
     fn truncate_write_buffer_for_inode(&mut self, inode_id: InodeId, size: u64) {
         self.snapshot_write_buffers_for_rollback();
         let remove = match self.write_buffers.get_mut(&inode_id) {
@@ -6628,15 +6663,16 @@ impl LocalFileSystem {
         self.clear_write_buffer_ranges(inode_id, &[(offset, length)]);
     }
 
-    fn clear_write_buffer_ranges(&mut self, inode_id: InodeId, ranges: &[(u64, u64)]) {
+    fn clear_write_buffer_ranges(&mut self, inode_id: InodeId, ranges: &[(u64, u64)]) -> u64 {
         if ranges.is_empty() || !self.write_buffers.contains_key(&inode_id) {
-            return;
+            return 0;
         }
         self.snapshot_write_buffers_for_rollback();
+        let mut cleared = 0_u64;
         let remove = match self.write_buffers.get_mut(&inode_id) {
             Some(wb) => {
                 for (offset, length) in ranges {
-                    wb.clear_range(*offset, *length);
+                    cleared = cleared.saturating_add(wb.clear_range(*offset, *length) as u64);
                 }
                 wb.is_empty()
             }
@@ -6645,6 +6681,7 @@ impl LocalFileSystem {
         if remove {
             self.write_buffers.remove(&inode_id);
         }
+        cleared
     }
 
     fn clear_writeback_ranges_from(&self, inode_id: InodeId, offset: u64) {
@@ -6813,13 +6850,17 @@ impl LocalFileSystem {
                 return Err(FileSystemError::from(decision));
             }
         }
-        // Capacity reservation: atomically reserve and commit bytes before
-        // the write, replacing the former check-then-record TOCTOU pattern.
-        // The reservation handle is immediately consumed so the mutable borrow
-        // on self is released before the write body.
-        let physical_admit_bytes = bytes_len;
-        let replacement_credit_bytes =
-            self.materialized_content_bytes_in_ranges(inode_id, &record, &[(offset, bytes_len)])?;
+        // Capacity reservation follows unique dirty-buffer growth. Rewrites of
+        // bytes already buffered for this inode replace in-memory data, not
+        // another future physical allocation.
+        let dirty_charge_ranges = self.write_buffer_uncovered_ranges(inode_id, offset, bytes_len);
+        let physical_admit_bytes = Self::range_bytes(&dirty_charge_ranges)?;
+        let committed_record = self.committed_inode_record(inode_id)?;
+        let replacement_credit_bytes = self.materialized_content_bytes_in_ranges(
+            inode_id,
+            &committed_record,
+            &dirty_charge_ranges,
+        )?;
         let logical_growth_bytes = new_size.saturating_sub(record.size);
         if physical_admit_bytes > 0 {
             let handle = self
@@ -6834,7 +6875,8 @@ impl LocalFileSystem {
                     capacity: self.capacity_authority.total_bytes(),
                     allocated: self.capacity_authority.used_bytes(),
                 })?;
-            // Immediately commit: reserved bytes become used bytes.
+            // Immediately commit: reserved bytes become transient used bytes
+            // until the dirty buffer either flushes or is discarded.
             // The handle is consumed here, releasing the immutable borrow on self.
             handle.commit();
         }
@@ -6845,8 +6887,11 @@ impl LocalFileSystem {
         let may_flush_after_ingest = self
             .write_buffers
             .get(&inode_id)
-            .map(|wb| wb.buffered_bytes().saturating_add(bytes.len()))
-            .unwrap_or(bytes.len())
+            .map(|wb| {
+                wb.buffered_bytes()
+                    .saturating_add(physical_admit_bytes as usize)
+            })
+            .unwrap_or(physical_admit_bytes as usize)
             >= self.write_buffer_config.flush_threshold_bytes;
         let foreground_flush_rollback = if may_flush_after_ingest {
             let old_write_buffer = self.write_buffers.get(&inode_id).cloned();
@@ -6869,13 +6914,17 @@ impl LocalFileSystem {
         // Acquire a write-admission permit before dirty bytes enter
         // any tracked buffer.  The permit conserves dirty-byte and
         // dirty-op budget until the commit group SYNC releases it.
-        self.try_admit_write(bytes_len, 1)?;
+        if let Err(err) = self.try_admit_write(physical_admit_bytes, 1) {
+            self.capacity_authority.record_free(physical_admit_bytes);
+            return Err(err);
+        }
         let should_flush = {
             let wb = self
                 .write_buffers
                 .entry(inode_id)
                 .or_insert_with(|| WriteBuffer::new(self.write_buffer_config.clone()));
-            wb.ingest(bytes, offset);
+            let newly_buffered = wb.ingest(bytes, offset);
+            debug_assert_eq!(newly_buffered as u64, physical_admit_bytes);
             wb.should_flush()
         };
         if should_flush {
@@ -6919,7 +6968,9 @@ impl LocalFileSystem {
                 .accumulate_delta(SpaceDelta::new_write(logical_growth_bytes));
         }
         if bytes_len > 0 {
-            self.state.space_accounting.track_physical_write(bytes_len);
+            self.state
+                .space_accounting
+                .track_physical_write(physical_admit_bytes);
         }
         // Track extent allocation for the writeback layer.
         let _ = self
@@ -6997,8 +7048,9 @@ impl LocalFileSystem {
 
         let written_ranges = self.coalesced_write_segment_ranges(&segments)?;
         let physical_admit_bytes = total_bytes;
+        let base_record = self.committed_inode_record(inode_id)?;
         let replacement_credit_bytes =
-            self.materialized_content_bytes_in_ranges(inode_id, &adjusted_record, &written_ranges)?;
+            self.materialized_content_bytes_in_ranges(inode_id, &base_record, &written_ranges)?;
         let logical_growth_bytes = new_size.saturating_sub(effective_size);
         if physical_admit_bytes > 0 {
             let handle = self
@@ -7019,7 +7071,6 @@ impl LocalFileSystem {
         check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
         self.invalidate_hot_read_cache_for_inode(inode_id);
 
-        let base_record = self.committed_inode_record(inode_id)?;
         let patches = self.coalesced_write_buffer_patches(&segments)?;
         let was_auto_commit = self.auto_commit;
         let was_in_transaction = self.in_transaction;
@@ -7098,7 +7149,8 @@ impl LocalFileSystem {
             );
         }
         self.state.dirty_extent_maps.insert(inode_id);
-        self.clear_write_buffer_ranges(inode_id, &written_ranges);
+        let cleared_dirty_bytes = self.clear_write_buffer_ranges(inode_id, &written_ranges);
+        self.record_dirty_buffer_free(cleared_dirty_bytes);
         if !written_ranges.is_empty() {
             let mut tracker = self.writeback_range_tracker.lock().expect("locked");
             for (offset, length) in &written_ranges {
