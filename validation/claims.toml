@@ -36,17 +36,18 @@ required_evidence_classes = [
 ]
 evidence_requirements = [
   { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = ["#286"] },
-  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#596"] },
+  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = [] },
   { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
 ]
 blockers = [
   "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
-  "Runtime evidence for interrupted rename sequences is not recorded (#596).",
-  "Rename directory-entry and orphan-index no-hidden-queue source/registry review receipt recorded (#597); active rename/orphan-index runtime admission proof remains pending (#720).",
+  "The #596 local VFS runtime artifact is bounded to the local VFS rename/fsync/read crash path and does not close the broader namespace claim by itself.",
+  "Rename directory-entry and orphan-index no-hidden-queue source/registry review receipt is recorded (#597), but active rename/orphan-index runtime admission proof remains pending (#720).",
 ]
-generated_doc = "Planned rename atomicity claim for local namespace operations. TideFS must keep rename wording aspirational until model and runtime crash evidence covers the claimed scope."
+generated_doc = "Planned rename atomicity claim for local namespace operations. TideFS has a bounded local VFS rename runtime artifact, but namespace-wide rename wording remains aspirational until model scope and active rename/orphan-index no-hidden-queue runtime admission proof cover the claimed scope."
 evidence_artifacts = [
   { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", source = "tidefs-crash-oracle", scope = "model-only" },
+  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", source = "tidefs-local-filesystem", scope = "local-vfs-runtime-rename-fsync-crash" },
   { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", source = "claims-gate", scope = "model-runtime-boundary-review" },
 ]
 

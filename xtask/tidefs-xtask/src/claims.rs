@@ -1937,7 +1937,7 @@ fn validate_crash_claims_gate_review_artifact_content(
 }
 
 fn expected_missing_runtime_evidence_classes() -> &'static [&'static str] {
-    &[RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS]
+    &[]
 }
 
 fn validate_crash_artifact_source_scope(
@@ -2782,7 +2782,7 @@ mod tests {
             "validation/performance/no-hidden-queues.toml"
         );
         assert_eq!(no_hidden.validation_tier, "cargo-unit");
-        assert_eq!(no_hidden.blocking_issues, vec!["#597".to_string()]);
+        assert_eq!(no_hidden.blocking_issues, vec!["#720".to_string()]);
         assert!(no_hidden.details.iter().any(|detail| detail
             .contains("no evidence_artifacts entry registers class `no-hidden-queue-gate`")));
 
@@ -2797,7 +2797,7 @@ mod tests {
         assert!(summary.contains("status: BLOCKED"));
         assert!(summary.contains("class: runtime-namespace-crash-artifact"));
         assert!(summary.contains("class: no-hidden-queue-gate"));
-        assert!(summary.contains("blocking_issues: #597"));
+        assert!(summary.contains("blocking_issues: #720"));
         assert!(!summary.contains("blocking_issues: #596"));
     }
 
