@@ -19,9 +19,13 @@ use tidefs_scrub::scrub_repair::ScrubRepairLedger;
 use std::collections::BTreeMap;
 
 use tidefs_local_object_store::SuspectEntry;
-use tidefs_scrub::repair_scheduling::{RebakeSchedulingBridge, ScrubToRepairBridge};
+use tidefs_scrub::repair_scheduling::{
+    RebakeSchedulingBridge, RepairAdmissionInput, RepairBlockKind, RepairCandidateIdentity,
+    ScrubToRepairBridge,
+};
 
-use crate::scrub::{ScrubBlockOutcome, ScrubReport, ScrubViolation};
+use crate::repair::RepairAuthorityMismatch;
+use crate::scrub::{ScrubBlockId, ScrubBlockKind, ScrubBlockOutcome, ScrubReport, ScrubViolation};
 
 // ---------------------------------------------------------------------------
 // run_scrub_repair_pass
@@ -131,14 +135,15 @@ pub fn run_scrub_repair_scheduling(report: &ScrubReport) -> ScrubRepairSchedule 
     let mut bridge = ScrubToRepairBridge::new();
     let mut rebake = RebakeSchedulingBridge::new();
 
-    let suspect_entries = convert_violations_to_suspect_entries(report);
+    let repair_inputs = convert_violations_to_repair_inputs(report);
+    let suspect_entries = repair_inputs.iter().map(|input| input.entry).collect();
 
     // Single-copy local filesystem: 0 replicas remaining.
-    bridge.ingest(&suspect_entries, 0);
+    bridge.ingest_with_evidence(&repair_inputs, 0);
 
     // Generate rebake entries for payload corruption needing EC parity
     // recomputation. In single-copy mode this produces no entries.
-    let _rebake_entries = rebake.generate_rebake_entries(&suspect_entries);
+    let _rebake_entries = rebake.generate_rebake_entries_with_evidence(&repair_inputs);
 
     ScrubRepairSchedule {
         bridge,
@@ -160,6 +165,13 @@ pub fn run_scrub_repair_scheduling(report: &ScrubReport) -> ScrubRepairSchedule 
 /// - `offset` ← `chunk_index` for chunk corruption, 0 otherwise
 /// - `record_type` = 1 for payload corruption, 3 for unreadable
 fn convert_violations_to_suspect_entries(report: &ScrubReport) -> Vec<SuspectEntry> {
+    convert_violations_to_repair_inputs(report)
+        .into_iter()
+        .map(|input| input.entry)
+        .collect()
+}
+
+fn convert_violations_to_repair_inputs(report: &ScrubReport) -> Vec<RepairAdmissionInput> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -189,7 +201,7 @@ fn convert_violations_to_suspect_entries(report: &ScrubReport) -> Vec<SuspectEnt
                 _ => 0,
             };
 
-            SuspectEntry {
+            let entry = SuspectEntry {
                 entry_id: i as u64,
                 locator_id: v.block_id.inode_id,
                 segment_id: v.block_id.data_version,
@@ -202,9 +214,31 @@ fn convert_violations_to_suspect_entries(report: &ScrubReport) -> Vec<SuspectEnt
                 resolved: false,
                 commit_group: 0,
                 timestamp_secs: timestamp,
-            }
+            };
+            RepairAdmissionInput::missing_receipt_with_identity(
+                entry,
+                repair_identity_from_scrub_block_id(&v.block_id),
+            )
         })
         .collect()
+}
+
+fn repair_identity_from_scrub_block_id(block_id: &ScrubBlockId) -> RepairCandidateIdentity {
+    RepairCandidateIdentity::new(
+        block_id.inode_id,
+        block_id.data_version,
+        repair_kind_from_scrub_kind(block_id.kind),
+    )
+}
+
+fn repair_kind_from_scrub_kind(kind: ScrubBlockKind) -> RepairBlockKind {
+    match kind {
+        ScrubBlockKind::InlineContent => RepairBlockKind::InlineContent,
+        ScrubBlockKind::ContentManifest => RepairBlockKind::ContentManifest,
+        ScrubBlockKind::ContentChunk { chunk_index } => {
+            RepairBlockKind::ContentChunk { chunk_index }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +294,19 @@ pub fn dispatch_repair_from_bridge(
             outcome: crate::repair::RepairOutcome::Skipped,
         };
 
+        if let Err(reason) =
+            verify_current_repair_authority(&entry.block_id, state, store, content_layout_cache)
+        {
+            let outcome = crate::repair::RepairOutcome::AuthorityMismatch { reason };
+            applied_log.record(crate::repair::RepairEntry {
+                block_id: entry.block_id,
+                strategy: entry.strategy,
+                outcome,
+            });
+            bridge.mark_authority_mismatch(locator_id);
+            continue;
+        }
+
         let outcome = crate::repair::apply_one_repair(&entry, state, store, content_layout_cache);
 
         applied_log.record(crate::repair::RepairEntry {
@@ -277,6 +324,9 @@ pub fn dispatch_repair_from_bridge(
             | crate::repair::RepairOutcome::Truncated { .. } => {
                 bridge.mark_repaired(locator_id);
             }
+            crate::repair::RepairOutcome::AuthorityMismatch { .. } => {
+                bridge.mark_authority_mismatch(locator_id);
+            }
             crate::repair::RepairOutcome::MarkedCorrupt | crate::repair::RepairOutcome::Skipped => {
                 bridge.mark_failed(locator_id);
             }
@@ -290,17 +340,11 @@ pub fn dispatch_repair_from_bridge(
 /// repair resolution pipeline can consume it.
 fn repair_job_to_violation(job: &tidefs_scrub::repair_scheduling::RepairJob) -> ScrubViolation {
     let entry = &job.entry;
-    let kind = if entry.offset > 0 || entry.segment_id > 1 {
-        crate::scrub::ScrubBlockKind::ContentChunk {
-            chunk_index: entry.offset,
-        }
-    } else {
-        crate::scrub::ScrubBlockKind::InlineContent
-    };
+    let kind = scrub_kind_from_repair_kind(job.candidate_identity.kind);
 
     let block_id = crate::scrub::ScrubBlockId {
-        inode_id: entry.locator_id,
-        data_version: entry.segment_id,
+        inode_id: job.candidate_identity.inode_id,
+        data_version: job.candidate_identity.data_version,
         kind,
     };
 
@@ -338,6 +382,106 @@ fn repair_job_to_violation(job: &tidefs_scrub::repair_scheduling::RepairJob) -> 
     }
 }
 
+fn scrub_kind_from_repair_kind(kind: RepairBlockKind) -> ScrubBlockKind {
+    match kind {
+        RepairBlockKind::InlineContent => ScrubBlockKind::InlineContent,
+        RepairBlockKind::ContentManifest => ScrubBlockKind::ContentManifest,
+        RepairBlockKind::ContentChunk { chunk_index } => {
+            ScrubBlockKind::ContentChunk { chunk_index }
+        }
+    }
+}
+
+fn verify_current_repair_authority(
+    block_id: &ScrubBlockId,
+    state: &crate::FileSystemState,
+    store: &tidefs_local_object_store::LocalObjectStore,
+    content_layout_cache: &mut BTreeMap<
+        tidefs_types_vfs_core::InodeId,
+        crate::records::ContentLayout,
+    >,
+) -> Result<(), RepairAuthorityMismatch> {
+    let inode_id = tidefs_types_vfs_core::InodeId::new(block_id.inode_id);
+    let record = state
+        .inodes
+        .get(&inode_id)
+        .ok_or(RepairAuthorityMismatch::MissingInode)?;
+    if !record.is_file_like() {
+        return Err(RepairAuthorityMismatch::BlockKindMismatch);
+    }
+
+    match block_id.kind {
+        ScrubBlockKind::InlineContent => {
+            if record.data_version != block_id.data_version {
+                return Err(RepairAuthorityMismatch::DataVersionStale {
+                    candidate: block_id.data_version,
+                    current: record.data_version,
+                });
+            }
+            Ok(())
+        }
+        ScrubBlockKind::ContentManifest => {
+            if record.data_version != block_id.data_version {
+                return Err(RepairAuthorityMismatch::DataVersionStale {
+                    candidate: block_id.data_version,
+                    current: record.data_version,
+                });
+            }
+            match current_content_layout(inode_id, record, store, content_layout_cache)? {
+                crate::records::ContentLayout::Chunked(_) => Ok(()),
+                crate::records::ContentLayout::Inline(_) => {
+                    Err(RepairAuthorityMismatch::BlockKindMismatch)
+                }
+            }
+        }
+        ScrubBlockKind::ContentChunk { chunk_index } => {
+            match current_content_layout(inode_id, record, store, content_layout_cache)? {
+                crate::records::ContentLayout::Chunked(manifest) => {
+                    let Some(chunk_ref) = manifest
+                        .chunks
+                        .iter()
+                        .find(|chunk| chunk.chunk_index == chunk_index)
+                    else {
+                        return Err(RepairAuthorityMismatch::BlockKindMismatch);
+                    };
+                    if chunk_ref.is_hole() {
+                        return Err(RepairAuthorityMismatch::BlockKindMismatch);
+                    }
+                    if chunk_ref.data_version != block_id.data_version {
+                        return Err(RepairAuthorityMismatch::DataVersionStale {
+                            candidate: block_id.data_version,
+                            current: chunk_ref.data_version,
+                        });
+                    }
+                    Ok(())
+                }
+                crate::records::ContentLayout::Inline(_) => {
+                    Err(RepairAuthorityMismatch::BlockKindMismatch)
+                }
+            }
+        }
+    }
+}
+
+fn current_content_layout(
+    inode_id: tidefs_types_vfs_core::InodeId,
+    record: &crate::types::InodeRecord,
+    store: &tidefs_local_object_store::LocalObjectStore,
+    content_layout_cache: &mut BTreeMap<
+        tidefs_types_vfs_core::InodeId,
+        crate::records::ContentLayout,
+    >,
+) -> Result<crate::records::ContentLayout, RepairAuthorityMismatch> {
+    if let Some(layout) = content_layout_cache.get(&inode_id) {
+        return Ok(layout.clone());
+    }
+
+    let layout = crate::content::read_content_layout_from_store(store, inode_id, record, true)
+        .map_err(|_| RepairAuthorityMismatch::CurrentAuthorityUnavailable)?;
+    content_layout_cache.insert(inode_id, layout.clone());
+    Ok(layout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +489,118 @@ mod tests {
         ScrubBlockId, ScrubBlockKind, ScrubBlockOutcome, ScrubReport, ScrubViolation,
     };
     use tidefs_local_object_store::IntegrityDigest64;
+    use tidefs_replication_model::PlacementReceiptRef;
+    use tidefs_scrub::repair_scheduling::{RepairBlockKind, RepairCandidateIdentity};
+    use tidefs_types_vfs_core::{Generation, InodeId, NodeKind};
+
+    fn make_file_inode(inode_id: u64, data_version: u64, size: u64) -> crate::types::InodeRecord {
+        crate::types::InodeRecord {
+            rdev: 0,
+            inode_id: InodeId::new(inode_id),
+            generation: Generation(data_version),
+            facets: NodeKind::File.to_facets(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size,
+            data_version,
+            metadata_version: data_version,
+            posix_time: crate::types::PosixTimeRecord::now(),
+            xattrs: Default::default(),
+            dir_storage_kind: 0,
+            xattr_storage_kind: 0,
+            dir_rev: 0,
+        }
+    }
+
+    fn insert_inode(state: &mut crate::FileSystemState, inode: crate::types::InodeRecord) {
+        std::sync::Arc::make_mut(&mut state.inodes).insert(inode.inode_id, inode);
+    }
+
+    fn temp_store() -> tidefs_local_object_store::LocalObjectStore {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "tidefs-scrub-repair-integration-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test store dir");
+        tidefs_local_object_store::LocalObjectStore::open(&dir).expect("open test store")
+    }
+
+    fn make_suspect_entry(
+        inode_id: u64,
+        data_version: u64,
+        offset: u64,
+    ) -> tidefs_local_object_store::SuspectEntry {
+        tidefs_local_object_store::SuspectEntry {
+            entry_id: inode_id,
+            locator_id: inode_id,
+            segment_id: data_version,
+            offset,
+            record_type: 1,
+            expected_hash: [0xAA; 32],
+            actual_hash: [0xBB; 32],
+            repair_attempts: 0,
+            last_repair_attempt: 0,
+            resolved: false,
+            commit_group: data_version.max(1),
+            timestamp_secs: 1,
+        }
+    }
+
+    fn receipt_for_entry(entry: &tidefs_local_object_store::SuspectEntry) -> PlacementReceiptRef {
+        let mut object_key = [0u8; 32];
+        object_key[..8].copy_from_slice(&entry.locator_id.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            entry.locator_id,
+            object_key,
+            Default::default(),
+            entry.commit_group.max(1),
+            2,
+            4096,
+            entry.expected_hash,
+        )
+    }
+
+    fn input_for_identity(
+        inode_id: u64,
+        data_version: u64,
+        kind: RepairBlockKind,
+    ) -> RepairAdmissionInput {
+        let offset = match kind {
+            RepairBlockKind::ContentChunk { chunk_index } => chunk_index,
+            RepairBlockKind::InlineContent | RepairBlockKind::ContentManifest => 0,
+        };
+        let entry = make_suspect_entry(inode_id, data_version, offset);
+        let receipt = receipt_for_entry(&entry);
+        RepairAdmissionInput::with_receipt_and_identity(
+            entry,
+            receipt,
+            RepairCandidateIdentity::new(inode_id, data_version, kind),
+        )
+    }
+
+    fn encoded_reconstructable_object() -> (Vec<u8>, Vec<u8>) {
+        let config = tidefs_erasure_coding::StripeConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 8,
+        };
+        let payload: Vec<u8> = (0..16).collect();
+        let encoded = tidefs_erasure_coding::encode(&config, &payload).expect("encode");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(config.stripe_width() as u16).to_le_bytes());
+        raw.extend_from_slice(&(config.data_shards as u16).to_le_bytes());
+        raw.push(config.parity_shards as u8);
+        raw.extend_from_slice(&(config.shard_len as u32).to_le_bytes());
+        for shard in &encoded.shards {
+            raw.extend_from_slice(&shard.bytes);
+        }
+        (raw, payload)
+    }
 
     #[test]
     fn clean_report_returns_empty_ledger() {
@@ -510,6 +766,91 @@ mod tests {
         assert_eq!(schedule.rebake.entries_blocked_missing_receipt(), 2);
     }
 
+    #[test]
+    fn dispatch_fresh_generation_reconstructs_current_object() {
+        let inode_id = 510;
+        let data_version = 1;
+        let mut state = crate::recovery::initial_state();
+        insert_inode(&mut state, make_file_inode(inode_id, data_version, 16));
+        let mut store = temp_store();
+        let key = crate::object_keys::content_object_key_for_version(
+            InodeId::new(inode_id),
+            data_version,
+        );
+        let (raw, payload) = encoded_reconstructable_object();
+        store.put(key, &raw).expect("store corrupt EC object");
+
+        let mut bridge = ScrubToRepairBridge::new();
+        let input = input_for_identity(inode_id, data_version, RepairBlockKind::InlineContent);
+        let admissions = bridge.ingest_with_evidence(&[input], 1);
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(bridge.pending_count(), 1);
+
+        let applied =
+            dispatch_repair_from_bridge(&mut bridge, &mut state, &mut store, &mut BTreeMap::new());
+
+        assert_eq!(applied.len(), 1);
+        assert_eq!(
+            applied.entries[0].outcome,
+            crate::repair::RepairOutcome::Reconstructed { bytes_written: 16 }
+        );
+        assert_eq!(store.get(key).expect("read key").expect("stored"), payload);
+        assert_eq!(bridge.repaired_count(), 1);
+        assert_eq!(bridge.stats().entries_blocked_authority_mismatch, 0);
+    }
+
+    #[test]
+    fn dispatch_stale_generation_refuses_writeback_to_newer_object() {
+        let inode_id = 511;
+        let candidate_version = 1;
+        let current_version = 2;
+        let mut state = crate::recovery::initial_state();
+        insert_inode(&mut state, make_file_inode(inode_id, current_version, 16));
+        let mut store = temp_store();
+        let old_key = crate::object_keys::content_object_key_for_version(
+            InodeId::new(inode_id),
+            candidate_version,
+        );
+        let current_key = crate::object_keys::content_object_key_for_version(
+            InodeId::new(inode_id),
+            current_version,
+        );
+        let (raw, _) = encoded_reconstructable_object();
+        let newer_bytes = b"newer-content-authority".to_vec();
+        store.put(old_key, &raw).expect("store stale EC object");
+        store
+            .put(current_key, &newer_bytes)
+            .expect("store current content object");
+
+        let mut bridge = ScrubToRepairBridge::new();
+        let input = input_for_identity(inode_id, candidate_version, RepairBlockKind::InlineContent);
+        bridge.ingest_with_evidence(&[input], 1);
+
+        let applied =
+            dispatch_repair_from_bridge(&mut bridge, &mut state, &mut store, &mut BTreeMap::new());
+
+        assert_eq!(applied.len(), 1);
+        assert_eq!(
+            applied.entries[0].outcome,
+            crate::repair::RepairOutcome::AuthorityMismatch {
+                reason: RepairAuthorityMismatch::DataVersionStale {
+                    candidate: candidate_version,
+                    current: current_version,
+                },
+            }
+        );
+        assert_eq!(
+            store
+                .get(current_key)
+                .expect("read current key")
+                .expect("current object"),
+            newer_bytes
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.repaired_count(), 0);
+        assert_eq!(bridge.stats().entries_blocked_authority_mismatch, 1);
+    }
+
     // ── convert_violations_to_suspect_entries tests ─────────────────
 
     #[test]
@@ -599,23 +940,19 @@ mod tests {
             timestamp_secs: 0,
         };
 
-        use tidefs_replication_model::PlacementReceiptRef;
         use tidefs_scrub::repair_scheduling::{RepairEvidence, RepairJob};
 
-        let mut object_key = [0u8; 32];
-        object_key[..8].copy_from_slice(&suspect.locator_id.to_le_bytes());
-        let receipt = PlacementReceiptRef::replicated(
-            suspect.locator_id,
-            object_key,
-            Default::default(),
-            suspect.commit_group.max(1),
-            2,
-            4096,
-            suspect.expected_hash,
-        );
+        let receipt = receipt_for_entry(&suspect);
         let evidence = RepairEvidence::from_placement_receipt(&suspect, receipt)
             .expect("test receipt should admit repair job");
-        let job = RepairJob::new(suspect, evidence, 0);
+        let identity = RepairCandidateIdentity::new(
+            suspect.locator_id,
+            suspect.segment_id,
+            RepairBlockKind::ContentChunk {
+                chunk_index: suspect.offset,
+            },
+        );
+        let job = RepairJob::new_with_identity(suspect, evidence, identity, 0);
 
         let violation = repair_job_to_violation(&job);
         assert_eq!(violation.block_id.inode_id, 77);

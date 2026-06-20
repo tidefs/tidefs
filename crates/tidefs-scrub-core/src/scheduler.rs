@@ -194,6 +194,8 @@ pub struct RepairSchedulerStats {
     pub dispatched: u64,
     /// Entries blocked because no placement receipt was supplied.
     pub blocked_missing_receipt: u64,
+    /// Entries blocked because the carried scrub identity mismatched the entry.
+    pub blocked_identity_mismatch: u64,
     /// Entries blocked because the supplied receipt was stale or malformed.
     pub blocked_stale_receipt: u64,
     /// Entries where policy is unknown (no layout available).
@@ -325,6 +327,12 @@ impl<D: DurabilityQuery> RepairScheduler<D> {
                     self.stats.dispatched += 1;
                 }
                 RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::CandidateIdentityMismatch,
+                    ..
+                } => {
+                    self.stats.blocked_identity_mismatch += 1;
+                }
+                RepairAdmission::Blocked {
                     reason: RepairEvidenceRejection::MissingReceipt,
                     ..
                 } => {
@@ -437,7 +445,8 @@ mod tests {
     }
 
     fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
-        RepairAdmissionInput::with_receipt(entry, receipt_for_entry(&entry))
+        let receipt = receipt_for_entry(&entry);
+        RepairAdmissionInput::with_receipt(entry, receipt)
     }
 
     fn inputs_with_receipts(entries: &[SuspectEntry]) -> Vec<RepairAdmissionInput> {
@@ -681,6 +690,7 @@ mod tests {
         assert_eq!(stats.unsurvivable, 0);
         assert_eq!(stats.dispatched, 0);
         assert_eq!(stats.blocked_missing_receipt, 0);
+        assert_eq!(stats.blocked_identity_mismatch, 0);
         assert_eq!(stats.blocked_stale_receipt, 0);
         assert_eq!(stats.unknown_policy, 0);
     }
