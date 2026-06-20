@@ -219,8 +219,8 @@ mod tests {
             "dataset list-props",
             "pool integrity-check",
             "kernel status",
-    "cluster status",
-    "device status",
+            "cluster status",
+            "device status",
             "diag",
             "cluster pool create",
             "cluster placement exercise",
@@ -253,17 +253,44 @@ mod tests {
         }
     }
 
+    /// Return true when `path` names a command that mutates pool, device,
+    /// dataset, snapshot, block, or cluster state.
+    ///
+    /// Matches on individual space-separated words so that read-only
+    /// variants (e.g. "snapshot holds" vs the mutation "snapshot hold")
+    /// are not misclassified.
+    #[cfg(test)]
+    fn is_mutating_command_path(path: &str) -> bool {
+        const MUTATION_VERBS: &[&str] = &[
+            "create", "destroy", "delete", "set", "remove", "attach",
+            "detach", "send", "receive", "rollback", "prune", "defrag",
+            "rename", "seal-key", "rotate-key", "upgrade", "promote",
+            "hold", "release", "import", "export",
+        ];
+        path.split_whitespace().any(|word| MUTATION_VERBS.contains(&word))
+    }
+
     #[test]
     fn public_operator_mutations_are_not_silent_unguarded_entries() {
         for surface in COMMAND_SURFACES
             .iter()
             .filter(|surface| surface.class == CommandClass::PublicOperator)
         {
-            assert!(
-                command_admission(surface.path).is_some(),
-                "public operator command {} lacks admission metadata",
-                surface.path
-            );
+            let admission = command_admission(surface.path)
+                .unwrap_or_else(|| panic!(
+                    "public operator command {} lacks admission metadata",
+                    surface.path
+                ));
+            // Mutating public-operator commands must not be Unguarded.
+            if is_mutating_command_path(surface.path) {
+                assert!(
+                    admission.requires_local_only(),
+                    "mutating public operator command `{}` is silently unguarded \
+                     (admission: {}); privileged mutation must require local-only",
+                    surface.path,
+                    admission.label()
+                );
+            }
         }
     }
 
