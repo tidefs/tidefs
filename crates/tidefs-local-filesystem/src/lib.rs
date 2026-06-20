@@ -2041,6 +2041,29 @@ impl LocalFileSystem {
         self.capacity_authority.reserve(requested_bytes)
     }
 
+    fn reserve_with_hierarchy_replacement_credit(
+        &self,
+        requested_bytes: u64,
+        replacement_credit_bytes: u64,
+    ) -> std::result::Result<CapacityReservationHandle<'_>, Errno> {
+        if requested_bytes == 0 {
+            return self.capacity_authority.reserve(0);
+        }
+        let net_new_bytes = requested_bytes.saturating_sub(replacement_credit_bytes);
+        if let Some(ref hierarchy) = self.quota_hierarchy {
+            let pool_free = self.capacity_authority.free_bytes();
+            let decision =
+                hierarchy.check_delta(self.mounted_dataset_id, net_new_bytes, 0, pool_free, |id| {
+                    self.quota_parent_of(id)
+                });
+            if decision.is_refusal() {
+                return Err(Errno::ENOSPC);
+            }
+        }
+        self.capacity_authority
+            .reserve_with_replacement_credit(requested_bytes, replacement_credit_bytes)
+    }
+
     /// Compute the effective capacity ceiling for the mounted dataset,
     /// considering the quota hierarchy (if configured) and current pool
     /// capacity.
@@ -6770,10 +6793,15 @@ impl LocalFileSystem {
         // The reservation handle is immediately consumed so the mutable borrow
         // on self is released before the write body.
         let physical_admit_bytes = bytes_len;
+        let replacement_credit_bytes =
+            self.materialized_content_bytes_in_ranges(inode_id, &record, &[(offset, bytes_len)])?;
         let logical_growth_bytes = new_size.saturating_sub(record.size);
         if physical_admit_bytes > 0 {
             let handle = self
-                .reserve_with_hierarchy(physical_admit_bytes)
+                .reserve_with_hierarchy_replacement_credit(
+                    physical_admit_bytes,
+                    replacement_credit_bytes,
+                )
                 .map_err(|_e| FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
                     requested: physical_admit_bytes,
@@ -6942,11 +6970,17 @@ impl LocalFileSystem {
             }
         }
 
+        let written_ranges = self.coalesced_write_segment_ranges(&segments)?;
         let physical_admit_bytes = total_bytes;
+        let replacement_credit_bytes =
+            self.materialized_content_bytes_in_ranges(inode_id, &adjusted_record, &written_ranges)?;
         let logical_growth_bytes = new_size.saturating_sub(effective_size);
         if physical_admit_bytes > 0 {
             let handle = self
-                .reserve_with_hierarchy(physical_admit_bytes)
+                .reserve_with_hierarchy_replacement_credit(
+                    physical_admit_bytes,
+                    replacement_credit_bytes,
+                )
                 .map_err(|_e| FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
                     requested: physical_admit_bytes,
@@ -6962,7 +6996,6 @@ impl LocalFileSystem {
 
         let base_record = self.committed_inode_record(inode_id)?;
         let patches = self.coalesced_write_buffer_patches(&segments)?;
-        let written_ranges = self.coalesced_write_segment_ranges(&segments)?;
         let was_auto_commit = self.auto_commit;
         let was_in_transaction = self.in_transaction;
         let was_max_uncommitted_mutations = self.max_uncommitted_mutations;
