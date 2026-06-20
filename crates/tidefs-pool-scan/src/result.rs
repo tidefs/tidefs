@@ -287,6 +287,21 @@ impl PoolScanner {
             match outcome {
                 crate::label::LabelReadOutcome::Valid(label) => {
                     info.apply_label(label);
+                    match reader.read_completed_evacuations(device_path) {
+                        Ok(evacuations) => {
+                            for evacuation in evacuations {
+                                if !result.completed_evacuations.contains(&evacuation) {
+                                    result.record_completed_evacuation(evacuation);
+                                }
+                            }
+                        }
+                        Err(reason) => {
+                            result.warn(format!(
+                                "completed evacuation evidence on {}: {reason}",
+                                device_path.display()
+                            ));
+                        }
+                    }
                     // Use the first valid label for pool-wide fields.
                     if result.pool_name.is_empty() {
                         result.pool_name = label.pool_name_str().to_string();
@@ -371,7 +386,8 @@ mod tests {
     use std::io::{Seek, Write};
 
     use tidefs_types_pool_label_core::{
-        encode_label, seal_label, PoolLabelFingerprint, PoolLabelV1, POOL_LABEL_V1_EXT_WIRE_SIZE,
+        encode_label, seal_label, PoolLabelFingerprint, PoolLabelV1, POOL_LABEL_SIZE,
+        POOL_LABEL_V1_EXT_WIRE_SIZE,
     };
 
     use crate::committed_root::write_committed_root_entry;
@@ -416,6 +432,27 @@ mod tests {
         }
 
         path
+    }
+
+    fn write_completed_evacuations_extension(
+        path: &PathBuf,
+        completed_evacuations: &[CompletedEvacuation],
+    ) {
+        let extension = crate::encode_completed_evacuations_label_extension(
+            completed_evacuations,
+            POOL_LABEL_SIZE,
+        )
+        .unwrap();
+        let bytes_to_write = if completed_evacuations.is_empty() {
+            0
+        } else {
+            48 + completed_evacuations.len() * 64
+        };
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(std::io::SeekFrom::Start(POOL_LABEL_V1_EXT_WIRE_SIZE as u64))
+            .unwrap();
+        file.write_all(&extension[..bytes_to_write]).unwrap();
     }
 
     // -- PoolScanResult tests --
@@ -483,6 +520,12 @@ mod tests {
             0x100000,
         );
 
+        let evacuation = CompletedEvacuation {
+            target_device_guid: [0xEEu8; 16],
+            topology_generation: 9,
+            receipt_digest: [0xA5u8; 32],
+            receipt_id: 77,
+        };
         let dev = write_labelled_device(
             &dir,
             LabelledDeviceSpec {
@@ -496,6 +539,7 @@ mod tests {
                 sys_buf: Some(&sys_buf),
             },
         );
+        write_completed_evacuations_extension(&dev, std::slice::from_ref(&evacuation));
 
         let cfg = crate::label::PoolScanConfig::new(vec![dev]);
         let result = PoolScanner::scan(&cfg).unwrap();
@@ -509,6 +553,13 @@ mod tests {
         assert_eq!(result.live_segment_count(), 2);
         assert!(result.has_committed_root());
         assert_eq!(result.committed_txg(), Some(99));
+        assert_eq!(result.completed_evacuations, vec![evacuation.clone()]);
+        assert_eq!(
+            result
+                .committed_member_evidence(4, 5, |device| device.device_index.map(u64::from))
+                .completed_evacuations,
+            vec![evacuation]
+        );
         assert!(result.warnings.is_empty());
     }
 

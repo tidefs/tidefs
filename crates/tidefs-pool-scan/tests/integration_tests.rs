@@ -628,7 +628,10 @@ fn validate_membership_duplicate_device_guid_rejected() {
             identity_value,
             observations,
         } => {
-            assert!(matches!(kind, tidefs_pool_scan::label::DuplicateIdentityKind::DeviceGuid));
+            assert!(matches!(
+                kind,
+                tidefs_pool_scan::label::DuplicateIdentityKind::DeviceGuid
+            ));
             assert_eq!(identity_value, "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1");
             assert_eq!(observations.len(), 2);
         }
@@ -692,13 +695,20 @@ fn validate_membership_duplicate_device_index_rejected() {
             identity_value,
             observations,
         } => {
-            assert!(matches!(kind, tidefs_pool_scan::label::DuplicateIdentityKind::DeviceIndex));
+            assert!(matches!(
+                kind,
+                tidefs_pool_scan::label::DuplicateIdentityKind::DeviceIndex
+            ));
             assert_eq!(identity_value, "0");
             assert_eq!(observations.len(), 2);
             // Observations mention different device GUIDs.
             let details: Vec<&str> = observations.iter().map(|(_, d)| d.as_str()).collect();
-            assert!(details.iter().any(|d| d.contains("01010101010101010101010101010101")));
-            assert!(details.iter().any(|d| d.contains("02020202020202020202020202020202")));
+            assert!(details
+                .iter()
+                .any(|d| d.contains("01010101010101010101010101010101")));
+            assert!(details
+                .iter()
+                .any(|d| d.contains("02020202020202020202020202020202")));
         }
         other => panic!("expected DuplicateMemberIdentity, got {other:?}"),
     }
@@ -889,6 +899,7 @@ fn device_scan_entry_construction() {
         device_read_errors: Some(0),
         device_write_errors: Some(0),
         device_checksum_errors: Some(0),
+        completed_evacuations: vec![],
     };
 
     assert_eq!(entry.device_count, Some(4));

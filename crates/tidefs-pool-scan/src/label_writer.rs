@@ -15,7 +15,9 @@ use tidefs_types_pool_label_core::{
     encode_label, seal_label, PoolLabelV1, POOL_LABEL_V1_EXT_WIRE_SIZE,
 };
 
+use crate::encode_completed_evacuations_label_extension;
 use crate::label::PoolScanConfig;
+use crate::CompletedEvacuation;
 use crate::DeviceType;
 use crate::PoolConfig;
 
@@ -214,11 +216,48 @@ impl PoolLabelWriter {
         label: &PoolLabelV1,
         device_size: Option<u64>,
     ) -> Result<(), LabelWriteError> {
-        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-        encode_label(label, &mut buf).map_err(|e| LabelWriteError::EncodeFailed {
-            device_index: label.device_index,
-            reason: format!("{e:?}"),
+        self.write_label_with_completed_evacuations(device_path, label, &[], device_size)
+    }
+
+    fn write_label_with_completed_evacuations(
+        &self,
+        device_path: &Path,
+        label: &PoolLabelV1,
+        completed_evacuations: &[CompletedEvacuation],
+        device_size: Option<u64>,
+    ) -> Result<(), LabelWriteError> {
+        let label_area_bytes = usize::try_from(self.config.label_area_bytes).map_err(|_| {
+            LabelWriteError::EncodeFailed {
+                device_index: label.device_index,
+                reason: format!(
+                    "label area {} does not fit in usize",
+                    self.config.label_area_bytes
+                ),
+            }
         })?;
+        if label_area_bytes < POOL_LABEL_V1_EXT_WIRE_SIZE {
+            return Err(LabelWriteError::EncodeFailed {
+                device_index: label.device_index,
+                reason: format!(
+                    "label area {label_area_bytes} bytes is smaller than base label {POOL_LABEL_V1_EXT_WIRE_SIZE}"
+                ),
+            });
+        }
+
+        let mut buf = vec![0u8; label_area_bytes];
+        encode_label(label, &mut buf[..POOL_LABEL_V1_EXT_WIRE_SIZE]).map_err(|e| {
+            LabelWriteError::EncodeFailed {
+                device_index: label.device_index,
+                reason: format!("{e:?}"),
+            }
+        })?;
+        let extension =
+            encode_completed_evacuations_label_extension(completed_evacuations, label_area_bytes)
+                .map_err(|reason| LabelWriteError::EncodeFailed {
+                device_index: label.device_index,
+                reason,
+            })?;
+        buf[POOL_LABEL_V1_EXT_WIRE_SIZE..].copy_from_slice(&extension);
 
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -351,7 +390,12 @@ impl PoolLabelWriter {
             })?;
 
             let size = device_sizes.and_then(|m| m.get(&label.device_index).copied());
-            self.write_label(device_path, label, size)?;
+            self.write_label_with_completed_evacuations(
+                device_path,
+                label,
+                &config.completed_evacuations,
+                size,
+            )?;
         }
 
         Ok(())
