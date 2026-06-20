@@ -3720,6 +3720,7 @@ impl VfsLocalFileSystem {
             fs.rollback_mutation_delta();
             return Err(map_errno(&err));
         }
+        fs.record_new_file_content_extents(dest_fh.inode_id, source_size);
         fs.mark_inode_metadata_dirty(dest_fh.inode_id);
         Arc::make_mut(&mut fs.state.inodes).insert(dest_fh.inode_id, dest_record.clone());
         fs.inode_cache.borrow_mut().invalidate(dest_fh.inode_id);
@@ -9439,7 +9440,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_file_range_whole_file_accounts_destination_capacity() {
+    fn copy_file_range_whole_file_accounts_and_releases_destination_capacity() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_len = crate::constants::content_chunk_size() as usize;
         let local_fs = LocalFileSystem::open_with_capacity(
@@ -9479,6 +9480,16 @@ mod tests {
                 .read(&dest_create, 0, data_len as u32, &ctx())
                 .unwrap(),
             payload
+        );
+
+        engine.release(&dest_create).unwrap();
+        engine
+            .unlink(root, b"copy-capacity-dest.txt", &ctx())
+            .unwrap();
+        assert_eq!(
+            engine.fs.borrow().capacity_authority().used_bytes(),
+            data_len as u64,
+            "unlink of whole-file copy destination must release its charged capacity"
         );
     }
 

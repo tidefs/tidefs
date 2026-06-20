@@ -6137,7 +6137,7 @@ fn reflink_file_same_content() {
 }
 
 #[test]
-fn reflink_file_accounts_destination_capacity() {
+fn reflink_file_accounts_and_releases_destination_capacity() {
     let root = temp_root("reflink-capacity");
     let data_len = content_chunk_size() as usize;
     let mut fs = LocalFileSystem::open_with_capacity(
@@ -6163,6 +6163,14 @@ fn reflink_file_accounts_destination_capacity() {
         "reflink destination must consume mounted capacity until shared-extent accounting exists",
     );
     assert_eq!(fs.read_file("/dest.txt").expect("read dest"), payload);
+
+    fs.unlink("/dest.txt")
+        .expect("unlink reflink destination should release capacity");
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        data_len as u64,
+        "unlink of reflink destination must release its charged capacity",
+    );
 
     cleanup(&root);
 }

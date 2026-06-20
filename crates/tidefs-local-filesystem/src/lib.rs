@@ -5829,6 +5829,7 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
+        self.record_new_file_content_extents(inode_id, dest_record.size);
 
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, dest_record.clone());
         self.inode_cache.borrow_mut().invalidate(inode_id);
@@ -6703,6 +6704,16 @@ impl LocalFileSystem {
         });
 
         Ok(())
+    }
+
+    fn record_new_file_content_extents(&mut self, inode_id: InodeId, logical_bytes: u64) {
+        if logical_bytes == 0 {
+            return;
+        }
+        let _ = self
+            .extent_allocator
+            .allocate_extent(inode_id.0, 0, logical_bytes, None);
+        self.state.dirty_extent_maps.insert(inode_id);
     }
 
     fn record_dirty_buffer_free(&mut self, bytes: u64) {
