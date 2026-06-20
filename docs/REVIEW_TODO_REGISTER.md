@@ -474,9 +474,14 @@ Important 2026-06-01 findings:
   validated `PoolLeaseToken` into daemon admission. Issue #278 gates the
   preview UAPI doc, tidefsctl book chapter, operator-authz boundary, and
   claims-gate policy against the exact command classification/admission table.
-  TFR-011 remains open until the operator surface, live-owner routing, cluster
-  diagnostics/authorization, and kernel UAPI authority are one reviewed
-  boundary.
+  Issue #656 chooses the current pre-alpha operator boundary: the `tidefsctl`
+  command registry is the command-surface authority, admission stays in the
+  privileged-admission registry, live-owner routes must fail closed without live
+  evidence, and cluster prototypes/development diagnostics must not inherit
+  final operator-UAPI wording. TFR-011 remains open for the mapped follow-ups:
+  command-registry enforcement, live-owner routing audit, preview-UAPI
+  cross-references, cluster diagnostic/prototype separation, runtime validation,
+  and any future production UAPI or ABI freeze.
 - `TFR-012`: Device lifecycle and media privacy remain incomplete. Pool-member
   backing must be one byte-addressable media model: block devices for
   production and regular files for hidden development mode. Directory
@@ -1054,6 +1059,16 @@ Important 2026-06-01 findings:
   scopes. This reduces TFR-011/TFR-019 drift but does not close full-kernel,
   broader operator UAPI, kernel residency, storage authority, block-volume,
   xfstests, crash-recovery, distributed, or documentation drift debt.
+- `TFR-011`/`TFR-019`: GitHub issue #661 classifies
+  `docs/OPERATOR_UAPI_AUTHORITY.md` as current spec for the issue #656
+  pre-alpha operator UAPI boundary decision. The decision makes
+  `COMMAND_SURFACES` and `command_admission` the current command-surface and
+  privileged-admission authorities, keeps diagnostics and prototypes scoped by
+  their weaker classes/routing, and preserves non-claims for production ABI
+  freeze, kernelspace readiness, distributed operator maturity, remote policy
+  authority, and release readiness. This reduces TFR-011/TFR-019 drift but does
+  not close the follow-up implementation, cross-reference, claims-gate, runtime
+  validation, or broad documentation-authority debt.
 - `TFR-019`: GitHub issue #512 extends documentation-authority coverage across
   the remaining high-impact imported design surface not covered by the #497
   slice: architecture/local-format references, block-volume and ublk adapter

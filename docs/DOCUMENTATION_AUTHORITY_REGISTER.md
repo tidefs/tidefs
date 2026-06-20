@@ -77,6 +77,19 @@ this set.
 | `docs/KERNEL_MODULE_FAMILY_MATRIX_ROLLOUT_ORDER_P7-01.md` | Current spec | Binding only for kernel-family rollout order, first-seam scope, and anti-regression constraints. It does not prove current full-kernel residency, no-daemon parity, block-volume behavior, xfstests coverage, crash recovery, distributed behavior, or production readiness. |
 | `docs/KERNEL_LOCKING_RCU_PINNING_WORKQUEUE_MODEL_P7-03.md` | Current spec | Binding only for the source-level locking, RCU, pin, workqueue, and acceptance-row model that later kernel work must consume. It is not a kernel implementation gate and not runtime proof until issue-scoped Kbuild/QEMU/fault evidence maps to the rows. |
 
+### Operator UAPI Authority Decision
+
+Classified for TFR-011 / TFR-019 / GitHub issue #661 on 2026-06-20 after
+reviewing the landed issue #656 decision, TFR-011/TFR-019 register notes, the
+checked `tidefsctl` command registry/admission evidence referenced by the
+decision, and the current claims-gate scanned surface. This slice does not
+change command behavior or claims-gate scanned documents; issue #658 owns any
+claims-gate coverage change for this decision artifact.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/OPERATOR_UAPI_AUTHORITY.md` | Current spec | Binding only as the current pre-alpha operator UAPI boundary decision: `COMMAND_SURFACES` remains the `tidefsctl` command-surface authority, `command_admission` remains the privileged-admission authority, diagnostics/prototypes must keep weaker class and routing claims, and imported documents still require this register for authority. It is not a production Linux ioctl/statx/ublk/FUSE/kernel ABI freeze, kernelspace readiness evidence, distributed operator maturity evidence, runtime-fed remote policy authority, or release-readiness claim. |
+
 ### Initial Classification Slice (TFR-019 / #497)
 
 Classified for TFR-019 / GitHub issue #497 on 2026-06-17. Documents were
