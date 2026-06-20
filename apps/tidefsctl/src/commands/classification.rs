@@ -93,6 +93,7 @@ impl fmt::Display for RoutingSemantics {
     }
 }
 
+
 /// Authority source for a reported status fact.
 ///
 /// Every status fact emitted by `tidefsctl cluster status` or
@@ -966,34 +967,17 @@ mod tests {
             ),
             (StatusSource::KernelUapi, "source:kernel-uapi"),
             (StatusSource::UserspaceDaemon, "source:userspace-daemon"),
-            (
-                StatusSource::CachedLocalMetadata,
-                "source:cached-local-metadata",
-            ),
+            (StatusSource::CachedLocalMetadata, "source:cached-local-metadata"),
             (StatusSource::CommandLineParse, "source:command-line-parse"),
-            (
-                StatusSource::StaticConfiguration,
-                "source:static-configuration",
-            ),
-            (
-                StatusSource::UnsupportedOrOffline,
-                "source:unsupported-or-offline",
-            ),
+            (StatusSource::StaticConfiguration, "source:static-configuration"),
+            (StatusSource::UnsupportedOrOffline, "source:unsupported-or-offline"),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for (source, label) in &sources {
             assert_eq!(source.label(), *label, "StatusSource label mismatch");
-            assert!(
-                seen.insert(*label),
-                "duplicate StatusSource label: {}",
-                label
-            );
+            assert!(seen.insert(*label), "duplicate StatusSource label: {}", label);
         }
-        assert_eq!(
-            seen.len(),
-            sources.len(),
-            "all StatusSource labels must be covered"
-        );
+        assert_eq!(seen.len(), sources.len(), "all StatusSource labels must be covered");
     }
 
     #[test]
@@ -1028,4 +1012,95 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn help_command_paths_are_all_registered() {
+        let help = super::root_long_about();
+        let extracted = extract_help_command_paths(&help);
+        for path in &extracted {
+            assert!(
+                super::find_surface(path).is_some(),
+                "help lists command `{path}` that is missing from COMMAND_SURFACES"
+            );
+        }
+        // Sanity: the help must mention at least the non-removed surfaces.
+        assert!(
+            extracted.len() >= super::COMMAND_SURFACES
+                .iter()
+                .filter(|s| s.visible_in_root_help())
+                .count(),
+            "help extracted {} paths, expected at least {} visible surfaces",
+            extracted.len(),
+            super::COMMAND_SURFACES
+                .iter()
+                .filter(|s| s.visible_in_root_help())
+                .count()
+        );
+    }
+
+    #[test]
+    fn prototype_devdiag_removed_surfaces_dont_inherit_public_operator_wording() {
+        let forbidden_claim_words = [
+            "production operator",
+            "final operator",
+            "production uapi",
+            "final uapi",
+            "release-ready",
+        ];
+        for surface in super::COMMAND_SURFACES.iter().filter(|s| {
+            matches!(
+                s.class,
+                super::CommandClass::Prototype
+                    | super::CommandClass::DevelopmentDiagnostic
+                    | super::CommandClass::RemovedOrUnsupported
+            )
+        }) {
+            let summary_lower = surface.summary.to_lowercase();
+            for word in &forbidden_claim_words {
+                assert!(
+                    !summary_lower.contains(word),
+                    "{} surface `{}` summary claims `{word}`",
+                    surface.class.label(),
+                    surface.path,
+                );
+            }
+            // Prototype summaries must carry a "not final" qualifier.
+            if surface.class == super::CommandClass::Prototype {
+                assert!(
+                    summary_lower.contains("not final") || summary_lower.contains("prototype"),
+                    "prototype surface `{}` summary does not state prototype/not-final status: {}",
+                    surface.path,
+                    surface.summary
+                );
+            }
+            // Development-diagnostic summaries must stay diagnostic.
+            if surface.class == super::CommandClass::DevelopmentDiagnostic {
+                assert!(
+                    summary_lower.contains("development") || summary_lower.contains("diagnostic"),
+                    "development-diagnostic surface `{}` summary does not state diagnostic scope: {}",
+                    surface.path,
+                    surface.summary
+                );
+            }
+        }
+    }
+}
+
+
+/// Extract command paths from `root_long_about()` help text.
+/// Command lines match the pattern `  <path> [<routing>] - <summary>`.
+#[cfg(test)]
+fn extract_help_command_paths(help: &str) -> Vec<&str> {
+    let mut paths = Vec::new();
+    for line in help.lines() {
+        if let Some(rest) = line.strip_prefix("  ") {
+            if let Some(idx) = rest.find(" [") {
+                let candidate = &rest[..idx];
+                if rest[idx..].contains("] - ") {
+                    paths.push(candidate);
+                }
+            }
+        }
+    }
+    paths
 }
