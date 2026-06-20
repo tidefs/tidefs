@@ -935,7 +935,7 @@ pub fn apply_space_delta(
         apply_counter(counters.logical_used_bytes, delta.logical_used_delta);
     let projected_reserved = apply_counter(counters.reserved_bytes, delta.reserved_delta);
     let projected_orphan = apply_counter(counters.orphan_bytes, delta.orphan_delta);
-    let projected_pinned_snapshot =
+    let _projected_pinned_snapshot =
         apply_counter(counters.pinned_snapshot_bytes, delta.pinned_snapshot_delta);
     let projected_logical_alloc = projected_logical_used
         .saturating_add(projected_reserved)
