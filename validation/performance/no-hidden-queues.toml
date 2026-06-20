@@ -134,3 +134,22 @@ hard_caps = [
   "dirty-age",
   "queue-slots",
 ]
+
+[[queue_roots]]
+id = "orphan_index.persistent_index"
+package = "tidefs-orphan-index"
+path = "crates/tidefs-orphan-index/src/lib.rs"
+symbol = "OrphanIndex"
+work_class = "metadata-mutation"
+resource_domains = [
+  "metadata",
+  "queue-slots",
+]
+admission = "AdmissionPermit"
+service_curve = "ServiceCurve"
+hard_caps = [
+  "dirty-bytes",
+  "dirty-operations",
+  "dirty-age",
+  "queue-slots",
+]
