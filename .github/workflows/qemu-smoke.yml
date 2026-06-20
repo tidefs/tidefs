@@ -80,7 +80,7 @@ jobs:
         run: timeout --foreground 7200s bash -lc '${{ matrix.command }}'
 
       - name: Write kernel-fsync evidence manifest (smoke)
-        if: ${{ always() && matrix.id == 'kernel-fsync-validation' && ((github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke')) }}
+        if: ${{ always() && matrix.id == 'kernel-fsync-validation' && github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == 'kernel-fsync-validation') }}
         run: |
           set -euo pipefail
 
