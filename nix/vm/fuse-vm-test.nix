@@ -1,0 +1,418 @@
+# TideFS FUSE VM smoke validation.
+#
+# Nix builds the Linux 7.0 kernel, TideFS workspace binaries, and this runner
+# script. The runner constructs a tiny initrd and launches QEMU from the caller,
+# outside the Nix build sandbox.
+{
+  pkgs,
+  linuxKernel_7_0,
+  tidefsPackage,
+}:
+
+pkgs.writeShellScriptBin "tidefs-fuse-vm-test-runner" ''
+  set -euo pipefail
+
+  export PATH="${pkgs.coreutils}/bin:${pkgs.gnugrep}/bin:${pkgs.gnused}/bin:${pkgs.gawk}/bin:${pkgs.findutils}/bin:${pkgs.glibc.bin}/bin:${pkgs.cpio}/bin:${pkgs.xz}/bin:${pkgs.qemu}/bin:$PATH"
+
+  QEMU_BIN="${pkgs.qemu}/bin/qemu-system-x86_64"
+  BUSYBOX="${pkgs.busybox}/bin/busybox"
+  CPIO="${pkgs.cpio}/bin/cpio"
+  XZ_BIN="${pkgs.xz}/bin/xz"
+  KERNEL_IMG="${linuxKernel_7_0}/bzImage"
+  MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
+  TIDEFS_XTASK="${tidefsPackage}/bin/tidefs-xtask"
+  TIDEFS_STORE_DEMO="${tidefsPackage}/bin/tidefs-store-demo"
+  FUSE_DAEMON="${tidefsPackage}/bin/tidefs-posix-filesystem-adapter-daemon"
+
+  TMPDIR="''${TIDEFS_FUSE_VM_TEST_TMPDIR:-/tmp/tidefs-fuse-vm-test}"
+  TIMEOUT_SEC="''${TIDEFS_FUSE_VM_TEST_TIMEOUT:-900}"
+  VALIDATION_DIR="''${TIDEFS_FUSE_VM_TEST_VALIDATION_DIR:-/tmp/tidefs-validation/fuse-vm-test}"
+  QUEUE_DEPTH_ARTIFACT="''${TIDEFS_FUSE_VM_TEST_QUEUE_DEPTH_ARTIFACT:-}"
+  KEEP_TMP=0
+
+  usage() {
+    cat <<'EOF'
+Usage: tidefs-fuse-vm-test-runner [OPTIONS]
+
+Build a tiny Linux 7.0 initrd from Nix-built artifacts and launch QEMU outside
+the Nix sandbox. The guest runs the legacy tidefsFuseVmTest validation sequence:
+kernel check, /dev/fuse check, tidefs-xtask summary, tidefs-store-demo, and
+smoke-mount with queue-depth artifact capture.
+
+Options:
+  --timeout SECONDS              QEMU runtime timeout (default: 900)
+  --validation-dir DIR           Host directory for qemu-boot.log and summary
+  --queue-depth-artifact PATH    Host artifact path for queue-depth JSON
+  --keep-tmp                     Keep generated initrd/run directory
+  --help, -h                     Show this help
+EOF
+  }
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --timeout)
+        TIMEOUT_SEC="$2"
+        shift 2
+        ;;
+      --validation-dir)
+        VALIDATION_DIR="$2"
+        shift 2
+        ;;
+      --queue-depth-artifact)
+        QUEUE_DEPTH_ARTIFACT="$2"
+        shift 2
+        ;;
+      --queue-depth-artifact=*)
+        QUEUE_DEPTH_ARTIFACT="''${1#--queue-depth-artifact=}"
+        shift
+        ;;
+      --keep-tmp)
+        KEEP_TMP=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "ERROR: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if [ -z "$QUEUE_DEPTH_ARTIFACT" ]; then
+    QUEUE_DEPTH_ARTIFACT="$VALIDATION_DIR/performance/queue-depth-runtime.json"
+  fi
+
+  if [ ! -e /dev/kvm ]; then
+    echo "ENVIRONMENT REFUSAL: /dev/kvm not available" >&2
+    exit 2
+  fi
+
+  for dep in "$QEMU_BIN" "$BUSYBOX" "$CPIO" "$XZ_BIN" "$KERNEL_IMG" "$TIDEFS_XTASK" "$TIDEFS_STORE_DEMO" "$FUSE_DAEMON"; do
+    if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
+      echo "ERROR: dependency not found: $dep" >&2
+      exit 2
+    fi
+  done
+
+  echo "=== TideFS FUSE VM Test ==="
+  echo "  Kernel:          $KERNEL_IMG"
+  echo "  Module dir:      $MODULE_DIR"
+  echo "  QEMU:            $QEMU_BIN"
+  echo "  TideFS xtask:    $TIDEFS_XTASK"
+  echo "  TideFS demo:     $TIDEFS_STORE_DEMO"
+  echo "  TideFS daemon:   $FUSE_DAEMON"
+  echo "  Validation dir:  $VALIDATION_DIR"
+  echo "  Queue artifact:  $QUEUE_DEPTH_ARTIFACT"
+  echo "  Timeout:         ''${TIMEOUT_SEC}s"
+
+  RUN_DIR="$TMPDIR/run-$$"
+  mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib,lib64,lib/modules,usr/lib,nix/store}
+  cleanup() {
+    if [ "$KEEP_TMP" -eq 1 ]; then
+      echo "  Keeping temp directory: $RUN_DIR"
+    else
+      rm -rf "$RUN_DIR"
+    fi
+  }
+  trap cleanup EXIT
+
+  copy_binary() {
+    local src="$1"
+    local dst="$2"
+    cp -L "$src" "$dst"
+    chmod +x "$dst"
+  }
+
+  copy_runtime_deps() {
+    local bin lib lib_base dst
+    for bin in "$@"; do
+      ldd "$bin" 2>/dev/null \
+        | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) { sub(/\(.*/, "", $i); print $i } }' \
+        | sort -u \
+        | while IFS= read -r lib; do
+          [ -f "$lib" ] || continue
+          lib_base="$(basename "$lib")"
+          dst="$RUN_DIR$lib"
+          mkdir -p "$(dirname "$dst")" "$RUN_DIR/usr/lib" "$RUN_DIR/lib" "$RUN_DIR/lib64"
+          cp -L "$lib" "$dst" 2>/dev/null || true
+          cp -L "$lib" "$RUN_DIR/usr/lib/$lib_base" 2>/dev/null || true
+          cp -L "$lib" "$RUN_DIR/lib/$lib_base" 2>/dev/null || true
+          cp -L "$lib" "$RUN_DIR/lib64/$lib_base" 2>/dev/null || true
+          chmod +x "$dst" "$RUN_DIR/usr/lib/$lib_base" "$RUN_DIR/lib/$lib_base" "$RUN_DIR/lib64/$lib_base" 2>/dev/null || true
+          case "$lib_base" in
+            ld-linux-*.so.*)
+              mkdir -p "$RUN_DIR/lib64"
+              cp -L "$lib" "$RUN_DIR/lib64/ld-linux-x86-64.so.2" 2>/dev/null || true
+              chmod +x "$RUN_DIR/lib64/ld-linux-x86-64.so.2" 2>/dev/null || true
+              ;;
+          esac
+        done
+    done
+  }
+
+  copy_binary "$BUSYBOX" "$RUN_DIR/bin/busybox"
+  for applet in sh ls cat echo mount umount grep dmesg sleep poweroff reboot mknod mkdir rmdir dd stat cp mv rm touch find wc sync expr head tail cut kill ps test seq date uname tr sed tee true false env printf basename dirname readlink chmod insmod; do
+    ln -sf busybox "$RUN_DIR/bin/$applet"
+  done
+
+  cat > "$RUN_DIR/bin/mountpoint" <<'EOF'
+#!/bin/sh
+quiet=0
+if [ "''${1:-}" = "-q" ]; then
+    quiet=1
+    shift
+fi
+target="''${1:-}"
+if [ -n "$target" ] && grep -qs " $target " /proc/mounts; then
+    exit 0
+fi
+[ "$quiet" -eq 1 ] || echo "$target is not a mountpoint"
+exit 1
+EOF
+  chmod +x "$RUN_DIR/bin/mountpoint"
+
+  cat > "$RUN_DIR/bin/fusermount" <<'EOF'
+#!/bin/sh
+if [ "''${1:-}" = "-u" ]; then
+    shift
+fi
+exec umount "$@"
+EOF
+  chmod +x "$RUN_DIR/bin/fusermount"
+
+  copy_binary "$TIDEFS_XTASK" "$RUN_DIR/bin/tidefs-xtask"
+  copy_binary "$TIDEFS_STORE_DEMO" "$RUN_DIR/bin/tidefs-store-demo"
+  copy_binary "$FUSE_DAEMON" "$RUN_DIR/bin/tidefs-posix-filesystem-adapter-daemon"
+  copy_runtime_deps "$BUSYBOX" "$TIDEFS_XTASK" "$TIDEFS_STORE_DEMO" "$FUSE_DAEMON"
+
+  FUSE_KO=""
+  for candidate in \
+    "$MODULE_DIR/kernel/fs/fuse/fuse.ko" \
+    "$MODULE_DIR/kernel/fs/fuse/fuse.ko.xz" \
+    "$MODULE_DIR/extra/fuse.ko" \
+    "$MODULE_DIR/fuse.ko"; do
+    if [ -f "$candidate" ]; then
+      FUSE_KO="$candidate"
+      break
+    fi
+  done
+  if [ -n "$FUSE_KO" ]; then
+    case "$FUSE_KO" in
+      *.xz)
+        "$XZ_BIN" -dc "$FUSE_KO" > "$RUN_DIR/lib/modules/fuse.ko"
+        ;;
+      *)
+        cp -L "$FUSE_KO" "$RUN_DIR/lib/modules/fuse.ko"
+        ;;
+    esac
+  fi
+
+  cat > "$RUN_DIR/init" <<'INITSCRIPT'
+#!/bin/sh
+export PATH=/bin
+export LD_LIBRARY_PATH=/usr/lib:/lib:/lib64
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /tmp/tidefs-validation/performance
+
+echo "=== TideFS FUSE VM Test Guest ==="
+echo "kernel_version=$(uname -r)"
+echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+PASSED=0
+FAILED=0
+REFUSED=0
+pass() { echo "PASS: $1"; PASSED=$((PASSED + 1)); }
+fail() { echo "FAIL: $1 -- $2"; FAILED=$((FAILED + 1)); }
+refuse() { echo "REFUSAL: $1 -- $2"; REFUSED=$((REFUSED + 1)); }
+
+finish() {
+    echo "validation_summary: passed=$PASSED failed=$FAILED refused=$REFUSED"
+    echo "TIDEFS_FUSE_VM_TEST_DONE"
+    sync
+    poweroff -f
+}
+
+kernel_ver=$(uname -r)
+case "$kernel_ver" in
+    7.*) pass "linux_7_0_kernel" ;;
+    *)
+        refuse "linux_7_0_kernel" "expected Linux 7.0 guest kernel, got $kernel_ver"
+        finish
+        ;;
+esac
+
+if [ -f /lib/modules/fuse.ko ]; then
+    insmod /lib/modules/fuse.ko 2>/tmp/fuse-insmod.err || true
+fi
+if [ ! -e /dev/fuse ]; then
+    mknod /dev/fuse c 10 229 2>/dev/null || true
+fi
+if [ -e /dev/fuse ]; then
+    chmod 666 /dev/fuse 2>/dev/null || true
+    pass "fuse_device"
+else
+    refuse "fuse_device" "/dev/fuse is not available"
+    finish
+fi
+
+if tidefs-xtask summary >/tmp/xtask-summary.out 2>&1; then
+    cat /tmp/xtask-summary.out
+    pass "xtask_summary"
+else
+    cat /tmp/xtask-summary.out
+    fail "xtask_summary" "tidefs-xtask summary exited nonzero"
+fi
+
+if tidefs-store-demo >/tmp/store-demo.out 2>&1; then
+    cat /tmp/store-demo.out
+    pass "store_demo"
+else
+    cat /tmp/store-demo.out
+    fail "store_demo" "tidefs-store-demo exited nonzero"
+fi
+
+QUEUE_DEPTH_ARTIFACT="__QUEUE_DEPTH_ARTIFACT__"
+mkdir -p "$(dirname "$QUEUE_DEPTH_ARTIFACT")"
+TIDEFS_ROOT_AUTHENTICATION_KEY_HEX=4141414141414141414141414141414141414141414141414141414141414141 \
+  tidefs-posix-filesystem-adapter-daemon smoke-mount \
+  --profile quick \
+  --queue-depth-artifact "$QUEUE_DEPTH_ARTIFACT" \
+  >/tmp/smoke-mount-output.txt 2>&1
+SMOKE_RC=$?
+cat /tmp/smoke-mount-output.txt
+
+SMOKE_SUMMARY=$(sed -n 's/.*smoke-mount:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*passed,[[:space:]]*\([0-9][0-9]*\)[[:space:]]*failed.*/\1 \2/p' /tmp/smoke-mount-output.txt | tail -1)
+SMOKE_FAILED=1
+if [ -n "$SMOKE_SUMMARY" ]; then
+    SMOKE_FAILED=$(echo "$SMOKE_SUMMARY" | cut -d' ' -f2)
+fi
+
+if [ "$SMOKE_RC" -eq 0 ] && [ "$SMOKE_FAILED" -eq 0 ]; then
+    pass "smoke_mount"
+else
+    fail "smoke_mount" "rc=$SMOKE_RC failed=$SMOKE_FAILED"
+fi
+
+echo "--- dmesg tail ---"
+dmesg | tail -80 2>/dev/null || true
+echo "--- end dmesg tail ---"
+
+if [ -s "$QUEUE_DEPTH_ARTIFACT" ]; then
+    pass "queue_depth_runtime_artifact"
+    echo "TIDEFS_QUEUE_DEPTH_ARTIFACT_BEGIN"
+    cat "$QUEUE_DEPTH_ARTIFACT"
+    echo
+    echo "TIDEFS_QUEUE_DEPTH_ARTIFACT_END"
+else
+    fail "queue_depth_runtime_artifact" "missing $QUEUE_DEPTH_ARTIFACT"
+fi
+
+umount -l /tmp/tidefs-smoke-mount-point 2>/dev/null || true
+finish
+INITSCRIPT
+
+  escaped_queue_path="$(printf '%s' "$QUEUE_DEPTH_ARTIFACT" | sed 's/[&|\\]/\\&/g')"
+  sed -i "s|__QUEUE_DEPTH_ARTIFACT__|$escaped_queue_path|g" "$RUN_DIR/init"
+  chmod +x "$RUN_DIR/init"
+
+  (cd "$RUN_DIR" && find . -path ./initrd.img -prune -o -print | "$CPIO" -o -H newc 2>/dev/null) > "$RUN_DIR/initrd.img"
+  echo "  Initrd prepared: $(du -h "$RUN_DIR/initrd.img" | cut -f1)"
+
+  mkdir -p "$VALIDATION_DIR"
+  VAL_LOG="$RUN_DIR/qemu-boot.log"
+  echo "  Booting QEMU VM..."
+  set +e
+  timeout --foreground "$TIMEOUT_SEC" "$QEMU_BIN" \
+    -machine pc,accel=kvm \
+    -kernel "$KERNEL_IMG" \
+    -initrd "$RUN_DIR/initrd.img" \
+    -append "console=ttyS0 quiet panic=10 panic_on_oops=1" \
+    -m 1024M \
+    -smp 2 \
+    -nographic \
+    -no-reboot \
+    > "$VAL_LOG" 2>&1
+  QEMU_STATUS=$?
+  set -e
+
+  cp "$VAL_LOG" "$VALIDATION_DIR/qemu-boot.log"
+  cp "$RUN_DIR/init" "$VALIDATION_DIR/init-script"
+
+  extract_between() {
+    local start="$1"
+    local end="$2"
+    awk -v start="$start" -v end="$end" '
+      $0 == start { capture = 1; next }
+      $0 == end { capture = 0; next }
+      capture { print }
+    ' "$VAL_LOG"
+  }
+
+  queue_tmp="$RUN_DIR/queue-depth-runtime.json"
+  extract_between "TIDEFS_QUEUE_DEPTH_ARTIFACT_BEGIN" "TIDEFS_QUEUE_DEPTH_ARTIFACT_END" > "$queue_tmp" || true
+  if [ -s "$queue_tmp" ]; then
+    mkdir -p "$(dirname "$QUEUE_DEPTH_ARTIFACT")"
+    cp "$queue_tmp" "$QUEUE_DEPTH_ARTIFACT"
+  fi
+
+  PASSC=$(grep -c '^PASS:' "$VAL_LOG" 2>/dev/null || true)
+  FAILC=$(grep -c '^FAIL:' "$VAL_LOG" 2>/dev/null || true)
+  REFUSALC=$(grep -c '^REFUSAL:' "$VAL_LOG" 2>/dev/null || true)
+  DONEC=$(grep -c '^TIDEFS_FUSE_VM_TEST_DONE$' "$VAL_LOG" 2>/dev/null || true)
+  KERNEL_VERSION=$(sed -n 's/^kernel_version=//p' "$VAL_LOG" | head -1)
+  [ -n "$KERNEL_VERSION" ] || KERNEL_VERSION="unknown"
+  QUEUE_PRESENT=false
+  [ -s "$queue_tmp" ] && QUEUE_PRESENT=true
+
+  cat > "$VALIDATION_DIR/fuse-vm-test.json" <<JSON
+{
+  "test": "tidefs-fuse-vm-test",
+  "version": 3,
+  "tier": "outside-sandbox-qemu-guest",
+  "kernel_version": "$KERNEL_VERSION",
+  "kernel_package": "linuxKernel_7_0",
+  "qemu_status": $QEMU_STATUS,
+  "done_marker_seen": $DONEC,
+  "passed": $PASSC,
+  "product_failures": $FAILC,
+  "environment_refusals": $REFUSALC,
+  "queue_depth_artifact": "$QUEUE_DEPTH_ARTIFACT",
+  "queue_depth_artifact_present": $QUEUE_PRESENT
+}
+JSON
+
+  echo "=== TideFS FUSE VM Test Results ==="
+  grep -E '^(PASS|FAIL|REFUSAL):' "$VAL_LOG" 2>/dev/null || true
+  echo "Validation: $PASSC passed, $FAILC failed, $REFUSALC refused"
+  echo "Validation log: $VALIDATION_DIR/qemu-boot.log"
+  echo "Validation JSON: $VALIDATION_DIR/fuse-vm-test.json"
+  if [ "$QUEUE_PRESENT" = true ]; then
+    echo "Queue-depth artifact: $QUEUE_DEPTH_ARTIFACT"
+  fi
+
+  if [ "$QEMU_STATUS" -eq 124 ]; then
+    echo "VALIDATION: FAIL -- QEMU timed out after ''${TIMEOUT_SEC}s" >&2
+    exit 1
+  fi
+  if [ "$DONEC" -eq 0 ]; then
+    echo "VALIDATION: FAIL -- guest did not emit completion marker" >&2
+    exit 1
+  fi
+  if [ "$REFUSALC" -gt 0 ]; then
+    echo "VALIDATION: REFUSAL -- $REFUSALC environment refusal(s)" >&2
+    exit 2
+  fi
+  if [ "$FAILC" -gt 0 ]; then
+    echo "VALIDATION: FAIL -- $FAILC validation row(s) failed" >&2
+    exit 1
+  fi
+
+  echo "VALIDATION: PASS"
+''
