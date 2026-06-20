@@ -185,19 +185,16 @@ The immediate implementation mapping is:
 - #574 remains closed as an over-broad pre-decision implementation slice.
   Its lock-service handle plumbing belongs only to clustered POSIX, after the
   clustered mode issue states the required membership and lease prerequisites.
-- Local POSIX needs a focused follow-up to replace the local
+- #618 is the local POSIX follow-up to replace the local
   `dataset_mount_id = 0` placeholder with a committed mount/session identity
   for the in-process `LockTracker`, without routing local locks through the
   cluster LOCK service.
-- Clustered POSIX needs a focused follow-up to plumb committed mount identity
+- #619 is the clustered POSIX follow-up to plumb committed mount identity
   into `LockServiceHandle` and clustered FUSE/VFS lock forwarding, explicitly
   scoped to clustered mode.
-- Local block export needs a focused follow-up to make local export admission
+- #620 is the local block export follow-up to make local export admission
   and local single-writer authority explicit in the ublk/block adapter path,
   with no membership or distributed lease requirement.
-- Clustered block export needs a focused follow-up to add the membership,
+- #621 is the clustered block export follow-up to add the membership,
   lease/authority-domain, reserve escrow, failover/handoff, and receipt
   continuity gates for cluster block exports.
-
-The exact GitHub follow-up issue numbers are recorded in #615 and in the PR
-that adds this ADR.
