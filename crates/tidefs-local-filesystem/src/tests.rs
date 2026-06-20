@@ -1039,6 +1039,49 @@ fn overwrites_do_not_grow_committed_logical_space() {
 }
 
 #[test]
+fn committed_overwrites_do_not_grow_capacity_authority_usage() {
+    let root = temp_root("overwrite-capacity-authority");
+    let data_len = content_chunk_size() as usize;
+    let mut fs = LocalFileSystem::open_with_capacity(
+        &root,
+        StoreOptions::test_fast(),
+        content_chunk_size() as u64 * 4,
+    )
+    .expect("open fs");
+    fs.create_file("/docs.bin", 0o600).expect("create file");
+
+    fs.write_file("/docs.bin", 0, &vec![0x11; data_len])
+        .expect("initial write");
+    fs.fsync_all().expect("commit initial write");
+    let used_after_initial = fs.capacity_authority().used_bytes();
+
+    fs.write_file("/docs.bin", 0, &vec![0x22; data_len])
+        .expect("buffered overwrite");
+    fs.fsync_all().expect("commit buffered overwrite");
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        used_after_initial,
+        "buffered overwrite must release replaced data capacity",
+    );
+
+    fs.write_file_ranges_direct("/docs.bin", vec![(0, vec![0x33; data_len])])
+        .expect("direct overwrite");
+    fs.fsync_all().expect("commit direct overwrite");
+    assert_eq!(
+        fs.capacity_authority().used_bytes(),
+        used_after_initial,
+        "direct overwrite must release replaced data capacity",
+    );
+
+    assert_eq!(
+        fs.read_file("/docs.bin").expect("read final content"),
+        vec![0x33; data_len]
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn symlink_round_trips_target() {
     let root = temp_root("symlink");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
