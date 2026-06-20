@@ -113,6 +113,32 @@ fn default_open_uses_hidden_regular_file_dev_backing() {
 }
 
 #[test]
+fn open_with_capacity_sizes_hidden_regular_file_dev_backing() {
+    let root = temp_root("default-hidden-file-dev-capacity");
+    let image = LocalFileSystem::default_development_device_path(&root);
+    let requested_capacity = DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES * 2;
+    let expected_image_len =
+        requested_capacity + tidefs_types_pool_label_core::POOL_LABEL_SIZE as u64;
+
+    {
+        let mut fs = LocalFileSystem::open_with_capacity(&root, options(), requested_capacity)
+            .expect("open fs with requested capacity");
+        let statfs = fs.statfs().expect("statfs");
+        assert_eq!(statfs.blocks, requested_capacity / u64::from(statfs.frsize));
+    }
+
+    let image_len = fs::metadata(&image)
+        .expect("hidden device image metadata")
+        .len();
+    assert!(
+        image_len >= expected_image_len,
+        "hidden device image length {image_len} must cover requested capacity {requested_capacity} plus pool label reserve"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn local_filesystem_round_trips_on_explicit_regular_file_dev() {
     let root = temp_root("explicit-regular-file-dev");
     fs::create_dir_all(&root).unwrap();

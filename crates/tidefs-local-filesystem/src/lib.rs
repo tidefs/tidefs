@@ -2493,9 +2493,36 @@ impl LocalFileSystem {
         encryption: Option<EncryptionConfig>,
         compression: Option<CompressionConfig>,
     ) -> Result<Pool> {
-        let device_path = Self::ensure_default_development_device_image(root)?;
+        Self::default_development_pool_with_min_image_bytes(
+            root,
+            options,
+            encryption,
+            compression,
+            DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES,
+        )
+    }
+
+    fn default_development_pool_with_min_image_bytes(
+        root: &std::path::Path,
+        options: &StoreOptions,
+        encryption: Option<EncryptionConfig>,
+        compression: Option<CompressionConfig>,
+        min_image_bytes: u64,
+    ) -> Result<Pool> {
+        let device_path =
+            Self::ensure_default_development_device_image_with_min_bytes(root, min_image_bytes)?;
         let devices = [device_path];
         Self::block_device_pool(root, &devices, encryption, compression, options)
+    }
+
+    fn hidden_regular_file_dev_image_bytes_for_content_capacity(
+        content_capacity_bytes: u64,
+    ) -> Result<u64> {
+        content_capacity_bytes
+            .checked_add(tidefs_types_pool_label_core::POOL_LABEL_SIZE as u64)
+            .ok_or(FileSystemError::SizeOverflow {
+                requested: u64::MAX,
+            })
     }
 
     #[must_use]
@@ -2507,6 +2534,16 @@ impl LocalFileSystem {
 
     pub fn ensure_default_development_device_image(
         root: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        Self::ensure_default_development_device_image_with_min_bytes(
+            root,
+            DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES,
+        )
+    }
+
+    fn ensure_default_development_device_image_with_min_bytes(
+        root: &std::path::Path,
+        min_image_bytes: u64,
     ) -> Result<std::path::PathBuf> {
         fs::create_dir_all(root).map_err(|source| {
             FileSystemError::Store(StoreError::Io {
@@ -2546,15 +2583,16 @@ impl LocalFileSystem {
                 source,
             })
         })?;
-        if len.len() < DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES {
-            file.set_len(DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES)
-                .map_err(|source| {
-                    FileSystemError::Store(StoreError::Io {
-                        operation: "size_default_development_device_image",
-                        path: device_path.clone(),
-                        source,
-                    })
-                })?;
+        let target_len =
+            min_image_bytes.max(DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES);
+        if len.len() < target_len {
+            file.set_len(target_len).map_err(|source| {
+                FileSystemError::Store(StoreError::Io {
+                    operation: "size_default_development_device_image",
+                    path: device_path.clone(),
+                    source,
+                })
+            })?;
         }
         Ok(device_path)
     }
@@ -2923,7 +2961,16 @@ impl LocalFileSystem {
                 &options,
             )?
         } else {
-            Self::default_development_pool(&root_path, &options, encryption, compression)?
+            let min_image_bytes = Self::hidden_regular_file_dev_image_bytes_for_content_capacity(
+                allocator_policy.content_capacity_bytes,
+            )?;
+            Self::default_development_pool_with_min_image_bytes(
+                &root_path,
+                &options,
+                encryption,
+                compression,
+                min_image_bytes,
+            )?
         };
         // Check locked-dataset condition: import an encrypted pool without
         // a key and refuse all I/O until the operator supplies one.
