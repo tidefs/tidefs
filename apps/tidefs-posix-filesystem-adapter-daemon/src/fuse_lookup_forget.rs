@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! FUSE lookup/forget dispatch batch with dir-index name resolution and
-//! inode-table reference-count lifecycle integration.
+//! adapter-local kernel lookup-reference accounting.
 //!
 //! This module implements the FUSE `lookup` and `forget` operations as a
 //! coherent dispatch batch.  `dispatch_lookup` resolves a path component
-//! through [`tidefs_dir_index::DirIndex`], retrieves inode attributes
-//! from [`tidefs_inode_table::InodeTable`], and increments the kernel
-//! reference count via [`InodeTable::link`].  `dispatch_forget` releases
-//! kernel references via [`InodeTable::unlink`]; when nlink reaches zero
-//! the inode table auto-removes the inode, which the background reclaim
-//! path may further process per existing reclaim-crate policy.
+//! through [`tidefs_dir_index::DirIndex`] and retrieves inode attributes
+//! from the current inode-table projection.  The successful lookup is then
+//! recorded in [`LookupReferenceProjection`], which is adapter/kernel state
+//! only.  `dispatch_forget` releases those projected kernel references; it
+//! never calls inode-table link/unlink and never decides durable inode
+//! allocation, existence, reuse, or reclamation.
+//!
+//! This legacy batch remains a #665 adapter-projection bridge around the
+//! dataset-scoped inode authority selected by #655 and allocator ownership
+//! extracted by #664.  The inode table is an attribute projection here, not
+//! the owner of mounted dataset inode lifetime.
 //!
 //! # Batch dispatcher
 //!
@@ -17,13 +22,15 @@
 //! opcode-dispatching entry point, `handle_lookup_forget`, that routes
 //! FUSE lookup (opcode 1) and forget (opcode 2) requests to the
 //! appropriate handler.  It accepts the dir-index via the
-//! [`DirIndexResolver`] trait, keeping the batch stateless across calls.
+//! [`DirIndexResolver`] trait while keeping lookup references in explicit
+//! adapter projection state.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use libc;
 use tidefs_dir_index::DirIndex;
-use tidefs_inode_table::{Ino, InodeAttributes, InodeTable, InodeTableError};
+use tidefs_inode_table::{Ino, InodeAttributes, InodeTable};
 use tidefs_types_vfs_core::Errno;
 
 // ── FUSE opcode constants ─────────────────────────────────────────────────
@@ -32,6 +39,7 @@ use tidefs_types_vfs_core::Errno;
 pub const FUSE_LOOKUP: u32 = 1;
 /// FUSE opcode for forget (kernel releases lookup references).
 pub const FUSE_FORGET: u32 = 2;
+const FUSE_ROOT_INO: u64 = 1;
 
 // ── LookupResult ──────────────────────────────────────────────────────────
 
@@ -60,30 +68,130 @@ pub trait DirIndexResolver {
     fn resolve(&self, parent_ino: u64) -> Option<&DirIndex>;
 }
 
+// ── LookupReferenceProjection ────────────────────────────────────────────
+
+/// Adapter-local projection of kernel lookup references.
+///
+/// This state mirrors references the FUSE kernel client has acquired through
+/// successful lookup replies.  It is intentionally separate from the
+/// inode-table attribute projection and from the durable dataset inode
+/// authority selected by #655.  Reaching zero here only means the adapter has
+/// no remaining kernel lookup references for this inode.
+#[derive(Debug, Default)]
+pub struct LookupReferenceProjection {
+    refs: Mutex<BTreeMap<u64, u64>>,
+}
+
+/// Result of applying a FUSE forget decrement to lookup-reference projection
+/// state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForgetProjection {
+    /// Reference count before applying this forget.
+    pub previous: u64,
+    /// Reference count after applying this forget.
+    pub remaining: u64,
+    /// True when a tracked non-root inode reached zero references.
+    pub reached_zero: bool,
+    /// True when the kernel released more references than were tracked.
+    pub underflow: bool,
+}
+
+impl LookupReferenceProjection {
+    /// Create empty lookup-reference projection state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one successful FUSE lookup reply for `ino`.
+    pub fn record_lookup(&self, ino: u64) {
+        if ino == FUSE_ROOT_INO {
+            return;
+        }
+        let mut refs = self.refs.lock().unwrap();
+        let entry = refs.entry(ino).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    /// Apply a FUSE forget decrement to `ino`.
+    pub fn forget(&self, ino: u64, nlookup: u64) -> ForgetProjection {
+        if ino == FUSE_ROOT_INO {
+            return ForgetProjection {
+                previous: 0,
+                remaining: 0,
+                reached_zero: false,
+                underflow: false,
+            };
+        }
+
+        let mut refs = self.refs.lock().unwrap();
+        let Some(count) = refs.get_mut(&ino) else {
+            return ForgetProjection {
+                previous: 0,
+                remaining: 0,
+                reached_zero: false,
+                underflow: nlookup > 0,
+            };
+        };
+
+        let previous = *count;
+        let remaining = previous.saturating_sub(nlookup);
+        let underflow = nlookup > previous;
+        if remaining == 0 {
+            refs.remove(&ino);
+        } else {
+            *count = remaining;
+        }
+
+        ForgetProjection {
+            previous,
+            remaining,
+            reached_zero: previous > 0 && remaining == 0,
+            underflow,
+        }
+    }
+
+    /// Return the projected kernel lookup-reference count for `ino`.
+    #[must_use]
+    pub fn refcount(&self, ino: u64) -> u64 {
+        self.refs.lock().unwrap().get(&ino).copied().unwrap_or(0)
+    }
+}
+
 // ── FuseLookupForgetBatch ─────────────────────────────────────────────────
 
 /// Opcode-dispatching batch handler for FUSE lookup and forget.
 ///
-/// Wraps a shared [`InodeTable`] and routes FUSE opcodes 1 (lookup) and
-/// 2 (forget) to the appropriate dispatch function.  The dir-index is
-/// provided at call time via a [`DirIndexResolver`], keeping the batch
-/// handler stateless across calls.
+/// Wraps a shared inode-table attribute projection plus adapter-local lookup
+/// references, then routes FUSE opcodes 1 (lookup) and 2 (forget) to the
+/// appropriate dispatch function.  The dir-index is provided at call time via
+/// a [`DirIndexResolver`].
 #[derive(Clone)]
 pub struct FuseLookupForgetBatch {
     inode_table: Arc<InodeTable>,
+    lookup_refs: Arc<LookupReferenceProjection>,
 }
 
 impl FuseLookupForgetBatch {
     /// Create a new batch dispatcher wrapping `inode_table`.
     #[must_use]
     pub fn new(inode_table: Arc<InodeTable>) -> Self {
-        Self { inode_table }
+        Self {
+            inode_table,
+            lookup_refs: Arc::new(LookupReferenceProjection::new()),
+        }
     }
 
     /// Return a reference to the wrapped inode table.
     #[must_use]
     pub fn inode_table(&self) -> &InodeTable {
-        &self.inode_table
+        self.inode_table.as_ref()
+    }
+
+    /// Return the adapter-local lookup-reference projection.
+    #[must_use]
+    pub fn lookup_refs(&self) -> &LookupReferenceProjection {
+        self.lookup_refs.as_ref()
     }
 
     /// Dispatch a FUSE lookup or forget request by opcode.
@@ -116,9 +224,16 @@ impl FuseLookupForgetBatch {
                 let dir = resolver
                     .resolve(parent_ino)
                     .ok_or(Errno(libc::ENOENT as u16))?;
-                dispatch_lookup(&self.inode_table, dir, parent_ino, name).map(Some)
+                dispatch_lookup(
+                    self.inode_table.as_ref(),
+                    self.lookup_refs.as_ref(),
+                    dir,
+                    parent_ino,
+                    name,
+                )
+                .map(Some)
             }
-            FUSE_FORGET => dispatch_forget(&self.inode_table, ino, nlookup).map(|()| None),
+            FUSE_FORGET => dispatch_forget(self.lookup_refs.as_ref(), ino, nlookup).map(|_| None),
             _ => Err(Errno(libc::ENOSYS as u16)),
         }
     }
@@ -129,8 +244,8 @@ impl FuseLookupForgetBatch {
 /// Dispatch a FUSE `lookup` request.
 ///
 /// Resolves `name` within `parent_ino` via `dir_index`, retrieves the
-/// corresponding inode attributes from `inode_table`, and bumps the
-/// kernel reference count via [`InodeTable::link`].  Returns
+/// corresponding inode attributes from the inode-table projection, and records
+/// one adapter-local kernel lookup reference in `lookup_refs`.  Returns
 /// [`LookupResult`] on success or an appropriate errno on failure.
 ///
 /// # Errors
@@ -142,6 +257,7 @@ impl FuseLookupForgetBatch {
 /// | `EIO`     | The resolved inode is absent from `inode_table` (integrity). |
 pub fn dispatch_lookup(
     inode_table: &InodeTable,
+    lookup_refs: &LookupReferenceProjection,
     dir_index: &DirIndex,
     parent_ino: u64,
     name: &[u8],
@@ -164,10 +280,8 @@ pub fn dispatch_lookup(
 
     let generation = attrs.generation;
 
-    // 4. Bump the kernel reference count so forget can later release it.
-    //    Ignore errors (e.g. InodeNotFound shouldn't happen since we just
-    //    retrieved the inode) — the kernel still gets valid attrs.
-    let _ = inode_table.link(ino);
+    // 4. Record the kernel lookup reference in adapter projection state.
+    lookup_refs.record_lookup(ino.0);
 
     Ok(LookupResult {
         ino: ino.0,
@@ -180,41 +294,19 @@ pub fn dispatch_lookup(
 
 /// Dispatch a FUSE `forget` request.
 ///
-/// Releases `nlookup` kernel references on `ino` via [`InodeTable::unlink`].
-/// When nlink reaches zero the inode table auto-removes the inode entry;
-/// the background reclaim path may further process the freed slot per
-/// existing reclaim-crate policy.
+/// Releases `nlookup` kernel references on `ino` from
+/// [`LookupReferenceProjection`].  This operation never mutates the inode
+/// table; durable inode lifetime remains owned by the mounted dataset
+/// authority.
 ///
-/// # Errors
-///
-/// | errno     | condition                                                    |
-/// |-----------|--------------------------------------------------------------|
-/// | `ENOENT`  | The inode is not in the table (already freed or never alloc).|
-/// | `EINVAL`  | `nlookup` is zero.                                           |
-/// | `EIO`     | An underlying table error occurred.                          |
-pub fn dispatch_forget(inode_table: &InodeTable, ino: u64, nlookup: u64) -> Result<(), Errno> {
-    if nlookup == 0 {
-        return Err(Errno(libc::EINVAL as u16));
-    }
-
-    // Validate the inode exists before we start unlinking.
-    let _attrs = inode_table
-        .lookup(Ino(ino))
-        .ok_or(Errno(libc::ENOENT as u16))?;
-
-    for _ in 0..nlookup {
-        match inode_table.unlink(Ino(ino)) {
-            Ok(()) => {}
-            Err(InodeTableError::InodeNotFound) => {
-                // Already removed by a prior unlink in this loop;
-                // remaining releases are no-ops.
-                return Ok(());
-            }
-            Err(_) => return Err(Errno(libc::EIO as u16)),
-        }
-    }
-
-    Ok(())
+/// A zero `nlookup` is a no-op: it records no underflow and leaves any
+/// existing projected reference count unchanged.
+pub fn dispatch_forget(
+    lookup_refs: &LookupReferenceProjection,
+    ino: u64,
+    nlookup: u64,
+) -> Result<ForgetProjection, Errno> {
+    Ok(lookup_refs.forget(ino, nlookup))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -293,17 +385,16 @@ mod tests {
         let mut dir = make_dir_index(parent);
         insert_entry(&mut dir, b"hello.txt", child, child_gen, libc::S_IFREG);
 
-        let result = dispatch_lookup(&tbl, &dir, parent, b"hello.txt").unwrap();
+        let refs = LookupReferenceProjection::new();
+        let result = dispatch_lookup(&tbl, &refs, &dir, parent, b"hello.txt").unwrap();
         assert_eq!(result.ino, child);
         assert_eq!(result.generation, child_gen);
         assert_eq!(result.attrs.mode, 0o644);
         assert_eq!(result.attrs.uid, 1000);
         assert_eq!(result.attrs.gid, 1000);
         assert_eq!(result.attrs.kind, InodeKind::File);
-
-        // Kernel refcount was bumped: nlink should be 2 (1 from create + 1 from lookup)
-        let updated = tbl.lookup(Ino(child)).unwrap();
-        assert_eq!(updated.nlink, 2);
+        assert_eq!(refs.refcount(child), 1);
+        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, child_attrs.nlink);
     }
 
     #[test]
@@ -317,10 +408,12 @@ mod tests {
         let mut dir = make_dir_index(parent);
         insert_entry(&mut dir, b"mydir", subdir, subdir_gen, libc::S_IFDIR);
 
-        let result = dispatch_lookup(&tbl, &dir, parent, b"mydir").unwrap();
+        let refs = LookupReferenceProjection::new();
+        let result = dispatch_lookup(&tbl, &refs, &dir, parent, b"mydir").unwrap();
         assert_eq!(result.ino, subdir);
         assert_eq!(result.attrs.kind, InodeKind::Directory);
         assert_eq!(result.attrs.mode, 0o700);
+        assert_eq!(refs.refcount(subdir), 1);
     }
 
     // ── ENOENT: missing name ─────────────────────────────────────────
@@ -331,8 +424,10 @@ mod tests {
         let parent = make_dir(&tbl, 0o755, 0, 0);
         let dir = make_dir_index(parent);
 
-        let result = dispatch_lookup(&tbl, &dir, parent, b"nope");
+        let refs = LookupReferenceProjection::new();
+        let result = dispatch_lookup(&tbl, &refs, &dir, parent, b"nope");
         assert_eq!(result, Err(Errno(libc::ENOENT as u16)));
+        assert_eq!(refs.refcount(parent), 0);
     }
 
     // ── ENOTDIR: parent is not a directory ───────────────────────────
@@ -343,7 +438,8 @@ mod tests {
         let file_ino = make_file(&tbl, 0o644, 0, 0);
         let dir = make_dir_index(file_ino);
 
-        let result = dispatch_lookup(&tbl, &dir, file_ino, b"anything");
+        let refs = LookupReferenceProjection::new();
+        let result = dispatch_lookup(&tbl, &refs, &dir, file_ino, b"anything");
         assert_eq!(result, Err(Errno(libc::ENOTDIR as u16)));
     }
 
@@ -355,14 +451,15 @@ mod tests {
         // parent 999 was never allocated
         let dir = make_dir_index(999);
 
-        let result = dispatch_lookup(&tbl, &dir, 999, b"anything");
+        let refs = LookupReferenceProjection::new();
+        let result = dispatch_lookup(&tbl, &refs, &dir, 999, b"anything");
         assert_eq!(result, Err(Errno(libc::ENOENT as u16)));
     }
 
-    // ── lookup bumps nlink by 1 ──────────────────────────────────────
+    // ── lookup records projected kernel refs ─────────────────────────
 
     #[test]
-    fn lookup_bumps_nlink() {
+    fn lookup_records_projected_refcount_without_mutating_nlink() {
         let tbl = make_inode_table();
         let parent = make_dir(&tbl, 0o755, 0, 0);
         let child = make_file(&tbl, 0o644, 0, 0);
@@ -374,47 +471,55 @@ mod tests {
         let before = tbl.lookup(Ino(child)).unwrap().nlink;
         assert_eq!(before, 1); // only the create link
 
-        dispatch_lookup(&tbl, &dir, parent, b"f").unwrap();
+        let refs = LookupReferenceProjection::new();
+        dispatch_lookup(&tbl, &refs, &dir, parent, b"f").unwrap();
         let after = tbl.lookup(Ino(child)).unwrap().nlink;
-        assert_eq!(after, 2);
+        assert_eq!(after, before);
+        assert_eq!(refs.refcount(child), 1);
 
-        // Second lookup bumps again
-        dispatch_lookup(&tbl, &dir, parent, b"f").unwrap();
+        dispatch_lookup(&tbl, &refs, &dir, parent, b"f").unwrap();
         let after2 = tbl.lookup(Ino(child)).unwrap().nlink;
-        assert_eq!(after2, 3);
+        assert_eq!(after2, before);
+        assert_eq!(refs.refcount(child), 2);
     }
 
     // ── forget decrement to non-zero ─────────────────────────────────
 
     #[test]
-    fn forget_decrements_nlink_to_nonzero() {
+    fn forget_decrements_projected_refs_to_nonzero() {
         let tbl = make_inode_table();
+        let _parent = make_dir(&tbl, 0o755, 0, 0);
         let child = make_file(&tbl, 0o644, 0, 0);
         let before = tbl.lookup(Ino(child)).unwrap().nlink;
         assert_eq!(before, 1);
 
-        // Bump twice so we can decrement by 1 without hitting zero.
-        tbl.link(Ino(child)).unwrap();
-        tbl.link(Ino(child)).unwrap();
-        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 3);
+        let refs = LookupReferenceProjection::new();
+        refs.record_lookup(child);
+        refs.record_lookup(child);
 
-        dispatch_forget(&tbl, child, 1).unwrap();
+        let projection = dispatch_forget(&refs, child, 1).unwrap();
+        assert_eq!(projection.remaining, 1);
+        assert!(!projection.reached_zero);
         let after = tbl.lookup(Ino(child)).unwrap().nlink;
-        assert_eq!(after, 2);
+        assert_eq!(after, before);
     }
 
     // ── forget decrement to zero ─────────────────────────────────────
 
     #[test]
-    fn forget_decrements_to_zero_auto_removes() {
+    fn forget_decrements_projected_refs_to_zero_without_removing_inode() {
         let tbl = make_inode_table();
+        let _parent = make_dir(&tbl, 0o755, 0, 0);
         let child = make_file(&tbl, 0o644, 0, 0);
         assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 1);
 
-        dispatch_forget(&tbl, child, 1).unwrap();
+        let refs = LookupReferenceProjection::new();
+        refs.record_lookup(child);
+        let projection = dispatch_forget(&refs, child, 1).unwrap();
 
-        // Inode should be auto-removed when nlink hits zero.
-        assert!(tbl.lookup(Ino(child)).is_none());
+        assert!(projection.reached_zero);
+        assert_eq!(refs.refcount(child), 0);
+        assert!(tbl.lookup(Ino(child)).is_some());
     }
 
     // ── forget with nlookup > 1 ──────────────────────────────────────
@@ -422,50 +527,72 @@ mod tests {
     #[test]
     fn forget_with_nlookup_gt_1() {
         let tbl = make_inode_table();
+        let _parent = make_dir(&tbl, 0o755, 0, 0);
         let child = make_file(&tbl, 0o644, 0, 0);
 
-        // Bump to nlink=4 so nlookup=3 won't hit zero.
-        tbl.link(Ino(child)).unwrap();
-        tbl.link(Ino(child)).unwrap();
-        tbl.link(Ino(child)).unwrap();
-        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 4);
+        let refs = LookupReferenceProjection::new();
+        refs.record_lookup(child);
+        refs.record_lookup(child);
+        refs.record_lookup(child);
+        assert_eq!(refs.refcount(child), 3);
 
-        dispatch_forget(&tbl, child, 3).unwrap();
+        let projection = dispatch_forget(&refs, child, 3).unwrap();
+        assert!(projection.reached_zero);
+        assert_eq!(refs.refcount(child), 0);
         assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 1);
     }
 
     #[test]
-    fn forget_nlookup_gt_nlink_auto_removes() {
+    fn forget_nlookup_gt_refcount_reports_underflow_without_removing_inode() {
         let tbl = make_inode_table();
+        let _parent = make_dir(&tbl, 0o755, 0, 0);
         let child = make_file(&tbl, 0o644, 0, 0);
         assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 1);
 
-        // nlookup > nlink: first unlink removes, subsequent unlinks are
-        // no-ops (InodeNotFound -> Ok).
-        dispatch_forget(&tbl, child, 5).unwrap();
+        let refs = LookupReferenceProjection::new();
+        refs.record_lookup(child);
+        let projection = dispatch_forget(&refs, child, 5).unwrap();
 
-        assert!(tbl.lookup(Ino(child)).is_none());
+        assert!(projection.reached_zero);
+        assert!(projection.underflow);
+        assert!(tbl.lookup(Ino(child)).is_some());
     }
 
-    // ── forget nlookup=0 is invalid ──────────────────────────────────
+    // ── forget nlookup=0 is a no-op ──────────────────────────────────
 
     #[test]
-    fn forget_nlookup_zero_returns_einval() {
-        let tbl = make_inode_table();
-        let child = make_file(&tbl, 0o644, 0, 0);
+    fn forget_nlookup_zero_is_noop() {
+        let refs = LookupReferenceProjection::new();
+        refs.record_lookup(2);
 
-        let result = dispatch_forget(&tbl, child, 0);
-        assert_eq!(result, Err(Errno(libc::EINVAL as u16)));
+        let result = dispatch_forget(&refs, 2, 0).unwrap();
+        assert_eq!(
+            result,
+            ForgetProjection {
+                previous: 1,
+                remaining: 1,
+                reached_zero: false,
+                underflow: false,
+            }
+        );
+        assert_eq!(refs.refcount(2), 1);
     }
 
     // ── forget missing inode ─────────────────────────────────────────
 
     #[test]
-    fn forget_missing_inode_returns_enoent() {
-        let tbl = make_inode_table();
-        // Never allocated ino 999.
-        let result = dispatch_forget(&tbl, 999, 1);
-        assert_eq!(result, Err(Errno(libc::ENOENT as u16)));
+    fn forget_unknown_projection_is_noop_underflow() {
+        let refs = LookupReferenceProjection::new();
+        let result = dispatch_forget(&refs, 999, 1).unwrap();
+        assert_eq!(
+            result,
+            ForgetProjection {
+                previous: 0,
+                remaining: 0,
+                reached_zero: false,
+                underflow: true,
+            }
+        );
     }
 
     // ── Lookup-then-forget round-trip ────────────────────────────────
@@ -480,21 +607,21 @@ mod tests {
         let mut dir = make_dir_index(parent);
         insert_entry(&mut dir, b"roundtrip.txt", child, child_gen, libc::S_IFREG);
 
-        // Initial state: nlink=1 from create
-        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 1);
-
-        // Lookup bumps to 2
-        let result = dispatch_lookup(&tbl, &dir, parent, b"roundtrip.txt").unwrap();
+        let initial_nlink = tbl.lookup(Ino(child)).unwrap().nlink;
+        let refs = LookupReferenceProjection::new();
+        let result = dispatch_lookup(&tbl, &refs, &dir, parent, b"roundtrip.txt").unwrap();
         assert_eq!(result.ino, child);
-        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 2);
+        assert_eq!(refs.refcount(child), 1);
+        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, initial_nlink);
 
-        // Forget back to 1
-        dispatch_forget(&tbl, child, 1).unwrap();
-        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 1);
+        let projection = dispatch_forget(&refs, child, 1).unwrap();
+        assert!(projection.reached_zero);
+        assert_eq!(refs.refcount(child), 0);
+        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, initial_nlink);
 
-        // Second forget removes
-        dispatch_forget(&tbl, child, 1).unwrap();
-        assert!(tbl.lookup(Ino(child)).is_none());
+        let projection = dispatch_forget(&refs, child, 1).unwrap();
+        assert!(projection.underflow);
+        assert!(tbl.lookup(Ino(child)).is_some());
     }
 
     // ── Multiple lookups balanced by single forget ───────────────────
@@ -509,15 +636,18 @@ mod tests {
         let mut dir = make_dir_index(parent);
         insert_entry(&mut dir, b"multi", child, child_gen, libc::S_IFREG);
 
-        // Three lookups: nlink 1->4
-        dispatch_lookup(&tbl, &dir, parent, b"multi").unwrap();
-        dispatch_lookup(&tbl, &dir, parent, b"multi").unwrap();
-        dispatch_lookup(&tbl, &dir, parent, b"multi").unwrap();
-        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 4);
+        let initial_nlink = tbl.lookup(Ino(child)).unwrap().nlink;
+        let refs = LookupReferenceProjection::new();
+        dispatch_lookup(&tbl, &refs, &dir, parent, b"multi").unwrap();
+        dispatch_lookup(&tbl, &refs, &dir, parent, b"multi").unwrap();
+        dispatch_lookup(&tbl, &refs, &dir, parent, b"multi").unwrap();
+        assert_eq!(refs.refcount(child), 3);
+        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, initial_nlink);
 
-        // Single forget with nlookup=3 balances all three
-        dispatch_forget(&tbl, child, 3).unwrap();
-        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 1);
+        let projection = dispatch_forget(&refs, child, 3).unwrap();
+        assert!(projection.reached_zero);
+        assert_eq!(refs.refcount(child), 0);
+        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, initial_nlink);
     }
 
     // ── Lookup on empty directory ────────────────────────────────────
@@ -527,9 +657,10 @@ mod tests {
         let tbl = make_inode_table();
         let parent = make_dir(&tbl, 0o755, 0, 0);
         let dir = make_dir_index(parent);
+        let refs = LookupReferenceProjection::new();
 
         assert_eq!(
-            dispatch_lookup(&tbl, &dir, parent, b"anything"),
+            dispatch_lookup(&tbl, &refs, &dir, parent, b"anything"),
             Err(Errno(libc::ENOENT as u16))
         );
     }
@@ -557,6 +688,7 @@ mod tests {
 
         assert_eq!(result.ino, child);
         assert_eq!(result.attrs.mode, 0o644);
+        assert_eq!(batch.lookup_refs().refcount(child), 1);
     }
 
     #[test]
@@ -577,16 +709,20 @@ mod tests {
     #[test]
     fn batch_handle_lookup_forget_forget_success() {
         let tbl = make_inode_table();
+        let _parent = make_dir(&tbl, 0o755, 0, 0);
         let child = make_file(&tbl, 0o644, 0, 0);
-        // Bump nlink so forget doesn't remove
-        tbl.link(Ino(child)).unwrap();
-        assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 2);
+        let initial_nlink = tbl.lookup(Ino(child)).unwrap().nlink;
 
         let resolver = MapResolver::new();
         let batch = FuseLookupForgetBatch::new(Arc::new(tbl));
+        batch.lookup_refs().record_lookup(child);
         let result = batch.handle_lookup_forget(FUSE_FORGET, &resolver, 0, b"", child, 1);
         assert_eq!(result, Ok(None));
-        assert_eq!(batch.inode_table().lookup(Ino(child)).unwrap().nlink, 1);
+        assert_eq!(batch.lookup_refs().refcount(child), 0);
+        assert_eq!(
+            batch.inode_table().lookup(Ino(child)).unwrap().nlink,
+            initial_nlink
+        );
     }
 
     #[test]
@@ -621,17 +757,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(lookup_result.ino, child);
-        assert_eq!(batch.inode_table().lookup(Ino(child)).unwrap().nlink, 2);
+        let initial_nlink = batch.inode_table().lookup(Ino(child)).unwrap().nlink;
+        assert_eq!(batch.lookup_refs().refcount(child), 1);
 
         // Phase 2: kernel releases the reference via forget
         let forget_result = batch.handle_lookup_forget(FUSE_FORGET, &resolver, 0, b"", child, 1);
         assert_eq!(forget_result, Ok(None));
-        assert_eq!(batch.inode_table().lookup(Ino(child)).unwrap().nlink, 1);
+        assert_eq!(batch.lookup_refs().refcount(child), 0);
+        assert_eq!(
+            batch.inode_table().lookup(Ino(child)).unwrap().nlink,
+            initial_nlink
+        );
 
-        // Phase 3: kernel's last forget removes the inode
+        // Phase 3: an extra kernel forget only underflows adapter refs.
         let forget2 = batch.handle_lookup_forget(FUSE_FORGET, &resolver, 0, b"", child, 1);
         assert_eq!(forget2, Ok(None));
-        assert!(batch.inode_table().lookup(Ino(child)).is_none());
+        assert!(batch.inode_table().lookup(Ino(child)).is_some());
     }
 
     #[test]
@@ -677,10 +818,9 @@ mod tests {
             .unwrap();
         assert_eq!(rc.ino, child_c);
 
-        // All have nlink=2 (1 create + 1 lookup)
-        assert_eq!(batch.inode_table().lookup(Ino(child_a)).unwrap().nlink, 2);
-        assert_eq!(batch.inode_table().lookup(Ino(child_b)).unwrap().nlink, 2);
-        assert_eq!(batch.inode_table().lookup(Ino(child_c)).unwrap().nlink, 2);
+        assert_eq!(batch.lookup_refs().refcount(child_a), 1);
+        assert_eq!(batch.lookup_refs().refcount(child_b), 1);
+        assert_eq!(batch.lookup_refs().refcount(child_c), 1);
 
         // Forget a and c, keeping b
         batch
@@ -690,21 +830,23 @@ mod tests {
             .handle_lookup_forget(FUSE_FORGET, &resolver, 0, b"", child_c, 1)
             .unwrap();
 
-        assert_eq!(batch.inode_table().lookup(Ino(child_a)).unwrap().nlink, 1);
-        assert_eq!(batch.inode_table().lookup(Ino(child_b)).unwrap().nlink, 2);
-        assert_eq!(batch.inode_table().lookup(Ino(child_c)).unwrap().nlink, 1);
+        assert_eq!(batch.lookup_refs().refcount(child_a), 0);
+        assert_eq!(batch.lookup_refs().refcount(child_b), 1);
+        assert_eq!(batch.lookup_refs().refcount(child_c), 0);
+        assert!(batch.inode_table().lookup(Ino(child_a)).is_some());
+        assert!(batch.inode_table().lookup(Ino(child_c)).is_some());
 
-        // Forget b (back to 1)
+        // Forget b.
         batch
             .handle_lookup_forget(FUSE_FORGET, &resolver, 0, b"", child_b, 1)
             .unwrap();
-        assert_eq!(batch.inode_table().lookup(Ino(child_b)).unwrap().nlink, 1);
+        assert_eq!(batch.lookup_refs().refcount(child_b), 0);
 
-        // Final forget on a removes it
+        // Extra forget on a leaves durable inode projection untouched.
         batch
             .handle_lookup_forget(FUSE_FORGET, &resolver, 0, b"", child_a, 1)
             .unwrap();
-        assert!(batch.inode_table().lookup(Ino(child_a)).is_none());
+        assert!(batch.inode_table().lookup(Ino(child_a)).is_some());
     }
 }
 
@@ -775,9 +917,8 @@ impl FuseLookupForgetSession {
 
     /// Release `nlookup` kernel references on `ino`.
     ///
-    /// Returns `Ok(())` on success or `Err(Errno)` on failure
-    /// (EINVAL, ENOENT, EIO).  When `nlink` reaches zero the inode
-    /// table auto-removes the entry.
+    /// Zero-count forget is a no-op. Durable inode lifetime is not changed
+    /// by this adapter projection.
     pub fn forget(&self, ino: u64, nlookup: u64) -> Result<(), Errno> {
         self.batch
             .handle_lookup_forget(FUSE_FORGET, &NullResolver, 0, b"", ino, nlookup)
@@ -897,6 +1038,7 @@ mod session_tests {
             .unwrap();
         assert_eq!(result.ino, child);
         assert_eq!(result.attrs.mode, 0o644);
+        assert_eq!(session.batch().lookup_refs().refcount(child), 1);
     }
 
     #[test]
@@ -930,15 +1072,19 @@ mod session_tests {
     // ── Session: forget ─────────────────────────────────────────────
 
     #[test]
-    fn session_forget_decrements_nlink() {
+    fn session_forget_decrements_projected_refcount() {
         let tbl = make_table();
+        let _parent = make_dir(&tbl, 0o755);
         let child = make_file(&tbl, 0o644);
-        tbl.link(Ino(child)).unwrap(); // nlink: 1->2
+        let initial_nlink = tbl.lookup(Ino(child)).unwrap().nlink;
 
         let batch = FuseLookupForgetBatch::new(Arc::new(tbl));
         let session = FuseLookupForgetSession::new(batch);
+        session.batch().lookup_refs().record_lookup(child);
+        session.batch().lookup_refs().record_lookup(child);
 
         session.forget(child, 1).unwrap();
+        assert_eq!(session.batch().lookup_refs().refcount(child), 1);
         assert_eq!(
             session
                 .batch()
@@ -946,33 +1092,48 @@ mod session_tests {
                 .lookup(Ino(child))
                 .unwrap()
                 .nlink,
-            1
+            initial_nlink
         );
     }
 
     #[test]
-    fn session_forget_to_zero_auto_removes() {
+    fn session_forget_to_zero_keeps_inode_projection() {
         let tbl = make_table();
+        let _parent = make_dir(&tbl, 0o755);
         let child = make_file(&tbl, 0o644);
         assert_eq!(tbl.lookup(Ino(child)).unwrap().nlink, 1);
 
         let batch = FuseLookupForgetBatch::new(Arc::new(tbl));
         let session = FuseLookupForgetSession::new(batch);
+        session.batch().lookup_refs().record_lookup(child);
 
         session.forget(child, 1).unwrap();
-        assert!(session.batch().inode_table().lookup(Ino(child)).is_none());
+        assert_eq!(session.batch().lookup_refs().refcount(child), 0);
+        assert!(session.batch().inode_table().lookup(Ino(child)).is_some());
     }
 
     #[test]
-    fn session_forget_zero_nlookup_is_invalid() {
+    fn session_forget_zero_nlookup_is_noop() {
         let tbl = make_table();
+        let _parent = make_dir(&tbl, 0o755);
         let child = make_file(&tbl, 0o644);
+        let initial_nlink = tbl.lookup(Ino(child)).unwrap().nlink;
 
         let batch = FuseLookupForgetBatch::new(Arc::new(tbl));
         let session = FuseLookupForgetSession::new(batch);
+        session.batch().lookup_refs().record_lookup(child);
 
-        let result = session.forget(child, 0);
-        assert_eq!(result, Err(Errno(libc::EINVAL as u16)));
+        session.forget(child, 0).unwrap();
+        assert_eq!(session.batch().lookup_refs().refcount(child), 1);
+        assert_eq!(
+            session
+                .batch()
+                .inode_table()
+                .lookup(Ino(child))
+                .unwrap()
+                .nlink,
+            initial_nlink
+        );
     }
 
     // ── Session: full lifecycle ─────────────────────────────────────
@@ -1002,6 +1163,13 @@ mod session_tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.ino, child);
+        let initial_nlink = session
+            .batch()
+            .inode_table()
+            .lookup(Ino(child))
+            .unwrap()
+            .nlink;
+        assert_eq!(session.batch().lookup_refs().refcount(child), 1);
         assert_eq!(
             session
                 .batch()
@@ -1009,11 +1177,12 @@ mod session_tests {
                 .lookup(Ino(child))
                 .unwrap()
                 .nlink,
-            2
+            initial_nlink
         );
 
         // Phase 2: kernel releases reference
         session.forget(child, 1).unwrap();
+        assert_eq!(session.batch().lookup_refs().refcount(child), 0);
         assert_eq!(
             session
                 .batch()
@@ -1021,12 +1190,12 @@ mod session_tests {
                 .lookup(Ino(child))
                 .unwrap()
                 .nlink,
-            1
+            initial_nlink
         );
 
-        // Phase 3: kernel drops last reference
+        // Phase 3: an extra forget underflows only adapter projection.
         session.forget(child, 1).unwrap();
-        assert!(session.batch().inode_table().lookup(Ino(child)).is_none());
+        assert!(session.batch().inode_table().lookup(Ino(child)).is_some());
     }
 
     #[test]
@@ -1045,6 +1214,13 @@ mod session_tests {
         session.lookup(&resolver, parent, b"multi").unwrap();
         session.lookup(&resolver, parent, b"multi").unwrap();
         session.lookup(&resolver, parent, b"multi").unwrap();
+        let initial_nlink = session
+            .batch()
+            .inode_table()
+            .lookup(Ino(child))
+            .unwrap()
+            .nlink;
+        assert_eq!(session.batch().lookup_refs().refcount(child), 3);
         assert_eq!(
             session
                 .batch()
@@ -1052,11 +1228,12 @@ mod session_tests {
                 .lookup(Ino(child))
                 .unwrap()
                 .nlink,
-            4
+            initial_nlink
         );
 
         // One forget with nlookup=3
         session.forget(child, 3).unwrap();
+        assert_eq!(session.batch().lookup_refs().refcount(child), 0);
         assert_eq!(
             session
                 .batch()
@@ -1064,7 +1241,7 @@ mod session_tests {
                 .lookup(Ino(child))
                 .unwrap()
                 .nlink,
-            1
+            initial_nlink
         );
     }
 
@@ -1087,88 +1264,26 @@ mod session_tests {
         session.lookup(&resolver, parent, b"b").unwrap();
         session.lookup(&resolver, parent, b"c").unwrap();
 
-        assert_eq!(
-            session
-                .batch()
-                .inode_table()
-                .lookup(Ino(child_a))
-                .unwrap()
-                .nlink,
-            2
-        );
-        assert_eq!(
-            session
-                .batch()
-                .inode_table()
-                .lookup(Ino(child_b))
-                .unwrap()
-                .nlink,
-            2
-        );
-        assert_eq!(
-            session
-                .batch()
-                .inode_table()
-                .lookup(Ino(child_c))
-                .unwrap()
-                .nlink,
-            2
-        );
+        assert_eq!(session.batch().lookup_refs().refcount(child_a), 1);
+        assert_eq!(session.batch().lookup_refs().refcount(child_b), 1);
+        assert_eq!(session.batch().lookup_refs().refcount(child_c), 1);
 
         // Forget a and c
         session.forget(child_a, 1).unwrap();
         session.forget(child_c, 1).unwrap();
 
-        assert_eq!(
-            session
-                .batch()
-                .inode_table()
-                .lookup(Ino(child_a))
-                .unwrap()
-                .nlink,
-            1
-        );
-        assert_eq!(
-            session
-                .batch()
-                .inode_table()
-                .lookup(Ino(child_b))
-                .unwrap()
-                .nlink,
-            2
-        );
-        assert_eq!(
-            session
-                .batch()
-                .inode_table()
-                .lookup(Ino(child_c))
-                .unwrap()
-                .nlink,
-            1
-        );
+        assert_eq!(session.batch().lookup_refs().refcount(child_a), 0);
+        assert_eq!(session.batch().lookup_refs().refcount(child_b), 1);
+        assert_eq!(session.batch().lookup_refs().refcount(child_c), 0);
+        assert!(session.batch().inode_table().lookup(Ino(child_a)).is_some());
+        assert!(session.batch().inode_table().lookup(Ino(child_c)).is_some());
 
-        // Forget b then final forget a
+        // Forget b then send an extra forget for a.
         session.forget(child_b, 1).unwrap();
         session.forget(child_a, 1).unwrap();
 
-        assert!(session.batch().inode_table().lookup(Ino(child_a)).is_none());
-        assert_eq!(
-            session
-                .batch()
-                .inode_table()
-                .lookup(Ino(child_b))
-                .unwrap()
-                .nlink,
-            1
-        );
-        assert_eq!(
-            session
-                .batch()
-                .inode_table()
-                .lookup(Ino(child_c))
-                .unwrap()
-                .nlink,
-            1
-        );
+        assert!(session.batch().inode_table().lookup(Ino(child_a)).is_some());
+        assert_eq!(session.batch().lookup_refs().refcount(child_b), 0);
+        assert_eq!(session.batch().lookup_refs().refcount(child_c), 0);
     }
 }

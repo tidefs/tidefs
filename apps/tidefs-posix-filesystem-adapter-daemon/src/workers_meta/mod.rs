@@ -62,7 +62,7 @@
 //!
 //! | Parameter | Trait | Provides |
 //! |-----------|-------|----------|
-//! | `I` | `InodeTable` | Inode existence checks, kind queries (`is_dir`, `is_symlink`), permission lookups. |
+//! | `I` | `InodeTable` | Mounted inode projection checks, kind queries (`is_dir`, `is_symlink`), permission lookups. |
 //! | `D` | `DirIndex` | Directory entry iteration (`read_dir`, `lookup_entry`). Only needed by directory and lookup ops. |
 //! | `A` | `AttrStore` | Attribute reads/writes (`getattr`, `setattr`). |
 //! | `R` | `MetaReplySink` | Reply emission (`reply_entry`, `reply_attr`, `reply_readlink`, `reply_statfs`, `reply_statx`, `reply_xattr`, `reply_empty`, `reply_error`). |
@@ -1653,11 +1653,13 @@ pub fn fuse_attr_out(ino: u64, posix: &PosixAttrs, kind: NodeKind) -> FuseAttrOu
 
 // ── InodeTable trait ────────────────────────────────────────────────────────
 
-/// Minimal inode-table interface consumed by the meta worker.
+/// Minimal mounted inode projection consumed by the meta worker.
 ///
-/// This is a local projection of what #2507 (IN-001) will deliver as
-/// `InodeTable`. When the full trait lands, this can be replaced by
-/// the canonical version without changing the worker logic.
+/// For the #655/#665 inode-authority boundary this trait is adapter-visible
+/// metadata projection only. It must not allocate inode numbers, decide
+/// durable mounted dataset existence, or preserve inode lifetime; the
+/// dataset-scoped authority selected by #655 and tracked by #664 owns that
+/// allocator state.
 pub trait InodeTable {
     /// Check whether `ino` exists.
     fn lookup(&self, ino: u64) -> bool;
@@ -2464,7 +2466,9 @@ pub fn dispatch_statx<I: InodeTable, A: AttrStore, R: MetaReplySink>(
 ///
 /// Resolves `child_name` within `parent_ino` via the [`DirIndex`] and
 /// replies with a full [`FuseEntryOut`] carrying the child's inode,
-/// generation, attributes, and cache timeout values.
+/// generation, attributes, and cache timeout values. Successful replies are
+/// projections of mounted dataset inode identity; kernel lookup-reference
+/// counting is adapter state outside this metadata worker.
 ///
 /// Returns `Err(MetaError::InoNotFound)` when the parent does not exist,
 /// `Err(MetaError::Io)` when the parent is not a directory or the name
@@ -6580,6 +6584,49 @@ mod tests {
                 assert_eq!(entry_out.nodeid, child_ino);
                 assert_eq!(entry_out.generation, 1);
                 assert_eq!(entry_out.entry_valid, cfg.entry_ttl_secs);
+            }
+            other => panic!("expected Entry reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_lookup_uses_child_attr_projection_not_child_table_lifetime() {
+        let mut table = MockInodeTable::new();
+        let mut store = MockAttrStore::new();
+        let mut dir_index = MockDirIndex::new();
+        let mut sink = MockReplySink::new();
+
+        let parent_ino = 2u64;
+        let child_ino = 101u64;
+        let child_name = b"projected_file";
+
+        table.insert(make_dir_attr(parent_ino));
+        store.insert(make_dir_attr(parent_ino));
+        store.insert(make_file_attr(child_ino));
+        dir_index.insert(
+            parent_ino,
+            child_name,
+            child_ino,
+            7,
+            NodeKind::File.as_u32(),
+        );
+
+        assert!(
+            !table.lookup(child_ino),
+            "child lifetime is not owned by the metadata-worker table"
+        );
+
+        let ctx = make_test_ctx(10_665, parent_ino);
+        let cfg = LookupConfig::DEFAULT;
+
+        let result = dispatch_lookup(&ctx, child_name, cfg, &table, &dir_index, &store, &mut sink);
+        assert!(result.is_ok());
+
+        match sink.last_reply() {
+            Some(CapturedReply::Entry { unique, entry_out }) => {
+                assert_eq!(*unique, 10_665);
+                assert_eq!(entry_out.nodeid, child_ino);
+                assert_eq!(entry_out.generation, 7);
             }
             other => panic!("expected Entry reply, got {other:?}"),
         }
