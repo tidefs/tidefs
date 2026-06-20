@@ -1851,8 +1851,8 @@ fn truncate_rewrites_boundary_chunk_and_drops_tail_refs() {
 }
 
 #[test]
-fn allocator_counts_protected_chunk_refs_before_reuse() {
-    let root = temp_root("allocator-protected-chunks");
+fn allocator_does_not_charge_unpinned_fallback_roots_against_live_capacity() {
+    let root = temp_root("allocator-unpinned-fallback-roots");
     let policy = LocalStorageAllocatorPolicy::new(
         content_chunk_size() as u64 * 3,
         DEFAULT_LOCAL_FILESYSTEM_INODE_CAPACITY,
@@ -1872,34 +1872,32 @@ fn allocator_counts_protected_chunk_refs_before_reuse() {
         report.current_namespace_allocated_bytes,
         content_chunk_size() as u64 * 2
     );
+    assert_eq!(report.protected_committed_roots, 0);
+    assert_eq!(report.protected_committed_root_allocated_bytes, 0);
     assert_eq!(
         report.allocator_reserved_bytes,
-        content_chunk_size() as u64 * 3
+        content_chunk_size() as u64 * 2
     );
-    assert_eq!(report.pending_free_bytes, content_chunk_size() as u64);
-    assert_eq!(report.reusable_free_bytes, 0);
+    assert_eq!(report.pending_free_bytes, 0);
+    assert_eq!(report.reusable_free_bytes, content_chunk_size() as u64);
     assert!(report.enospc_enforced);
     assert!(report.statfs_capacity_reporting);
 
-    let generation = fs.stats().filesystem_generation;
-    let err = fs
-        .write_file("/allocated.bin", 1, b"X")
-        .expect_err("rewriting the retained chunk would exceed protected-root capacity");
-    assert!(matches!(
-        err,
-        FileSystemError::NoSpace {
-            resource: LocalStorageResource::ContentBytes,
-            requested,
-            capacity,
-            ..
-        } if requested == content_chunk_size() as u64 * 4
-            && capacity == content_chunk_size() as u64 * 3
-    ));
-    assert_eq!(fs.stats().filesystem_generation, generation);
+    fs.write_file("/allocated.bin", 1, b"X")
+        .expect("ordinary fallback roots must not shrink live logical capacity");
+    fs.fsync_all().expect("commit rewrite");
     assert_eq!(
-        fs.read_file("/allocated.bin").expect("content unchanged"),
+        fs.allocator_report()
+            .expect("allocator report after rewrite")
+            .allocator_reserved_bytes,
+        content_chunk_size() as u64 * 2
+    );
+    assert_eq!(
+        fs.read_file("/allocated.bin")
+            .expect("content after rewrite"),
         {
             let mut expected = bytes;
+            expected[1] = b'X';
             expected[content_chunk_size() as usize + 11..content_chunk_size() as usize + 16]
                 .copy_from_slice(b"patch");
             expected
@@ -1912,7 +1910,7 @@ fn allocator_counts_protected_chunk_refs_before_reuse() {
 fn allocator_counts_snapshot_roots_hidden_behind_newer_slots() {
     let root = temp_root("allocator-snapshot-hidden-root");
     let policy = LocalStorageAllocatorPolicy::new(
-        content_chunk_size() as u64 * 5,
+        content_chunk_size() as u64 * 2,
         DEFAULT_LOCAL_FILESYSTEM_INODE_CAPACITY,
     );
     let mut fs =
@@ -1940,19 +1938,21 @@ fn allocator_counts_snapshot_roots_hidden_behind_newer_slots() {
     );
 
     let report = fs.allocator_report().expect("allocator report");
+    assert_eq!(report.protected_committed_roots, 1);
     assert_eq!(
-        report.protected_committed_roots as usize,
-        audit.valid_committed_roots.len() + 1
+        report.protected_committed_root_allocated_bytes,
+        content_chunk_size() as u64
     );
     assert_eq!(
         report.allocator_reserved_bytes,
-        content_chunk_size() as u64 * 5
+        content_chunk_size() as u64 * 2
     );
     assert_eq!(report.reusable_free_bytes, 0);
 
     let generation = fs.stats().filesystem_generation;
+    let oversized_successor = vec![0x51; content_chunk_size() as usize + 1];
     let err = fs
-        .replace_file("/snap.bin", b"would exceed snapshot reserve")
+        .replace_file("/snap.bin", &oversized_successor)
         .expect_err("hidden snapshot root must still consume allocator reserve");
     assert!(matches!(
         err,
@@ -1961,8 +1961,8 @@ fn allocator_counts_snapshot_roots_hidden_behind_newer_slots() {
             requested,
             capacity,
             ..
-        } if requested == content_chunk_size() as u64 * 6
-            && capacity == content_chunk_size() as u64 * 5
+        } if requested == content_chunk_size() as u64 * 3
+            && capacity == content_chunk_size() as u64 * 2
     ));
     assert_eq!(fs.stats().filesystem_generation, generation);
 
