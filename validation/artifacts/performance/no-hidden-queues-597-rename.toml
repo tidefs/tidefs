@@ -19,9 +19,9 @@ blocked_claim_ids = [
 non_claims = [
   "This receipt records source and registry coverage for rename namespace and orphan-index paths.",
   "This receipt does not by itself satisfy queue-depth-runtime-artifact evidence.",
-  "Mounted runtime queue-depth evidence for rename dirty-directory-entry and orphan-index replay paths is owned by issue #498.",
+  "Existing issue #498 queue-depth evidence is bounded dirty-write smoke evidence only; it is not rename/orphan-index runtime admission proof.",
   "Rename namespace modules (link, unlink, rename) are currently #[allow(dead_code)] and not wired into active FUSE dispatch.",
-  "Active rename path in local-filesystem lib.rs routes through begin_mutation() rollback snapshots without admission-permit gating; this gap is tracked as out-of-scope.",
+  "Active rename path in local-filesystem lib.rs routes through begin_mutation() rollback snapshots without admission-permit gating; this gap is tracked by issue #720.",
   "This receipt does not validate distributed transport fairness or RDMA readiness.",
 ]
 
@@ -141,9 +141,9 @@ does_not_satisfy_evidence_classes = [
 ]
 
 [[out_of_scope]]
-root = "local-fs-rename-admission-gap"
-reason = "Active rename path in lib.rs (renameat2/rename/rename_exchange) routes through begin_mutation() rollback snapshots without acquiring an AdmissionPermit through write_admission. Directory-entry mutations are not currently gated by any queue root admission."
-owner_issue = 597
+root = "active-rename-orphan-runtime-admission-gap"
+reason = "Active rename path in lib.rs (renameat2/rename/rename_exchange) routes through begin_mutation() rollback snapshots without acquiring an AdmissionPermit through write_admission, and orphan-index insert/remove/recover mutations are registry-only in this slice. Runtime admission proof or fixes are owned by issue #720."
+owner_issue = 720
 claim_ids = [
   "namespace.rename.atomicity.v1",
   "local.vfs.rename_atomic_crash.v1",
@@ -154,8 +154,8 @@ does_not_satisfy_evidence_classes = [
 ]
 
 [[out_of_scope]]
-root = "mounted-runtime-queue-depth"
-reason = "Mounted runtime queue-depth evidence (queue-depth-runtime-artifact) for rename and orphan-index paths is owned by issue #498."
+root = "existing-dirty-write-queue-depth-boundary"
+reason = "Issue #498 records bounded dirty-write smoke queue-depth evidence; it does not exercise rename/orphan-index metadata mutations and does not satisfy this receipt's rename/orphan runtime admission boundary."
 owner_issue = 498
 claim_ids = [
   "namespace.rename.atomicity.v1",
