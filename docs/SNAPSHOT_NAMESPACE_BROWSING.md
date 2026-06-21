@@ -12,6 +12,10 @@ permission/ACL evaluation, mutation refusal, rollback interaction, and snapshot
 deletion races, and maps the decision to non-overlapping follow-up
 implementation issues.
 
+ZFS references in this document are user-expectation and prior-art inputs only.
+They do not claim TideFS parity with ZFS `.snapshot` behavior or validated
+snapshot browsing support.
+
 ## Evidence Reviewed
 
 - `docs/LOCAL_SNAPSHOTS_OW108.md` — snapshot catalog, rollback, reclamation,

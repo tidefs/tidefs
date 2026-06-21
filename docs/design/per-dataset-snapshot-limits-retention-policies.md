@@ -26,11 +26,17 @@ cluster-wide snapshot coordination (#1258).
 
 ### 1.1 Anti-patterns addressed
 
-| System | Failure mode | TideFS design response |
+The comparison rows below are design-pressure notes, not validated superiority
+claims. They preserve lifecycle lessons from ZFS, CephFS, and sanoid while
+leaving current product-facing retention, performance, durability, and
+operational-safety claims blocked behind #875 and #928/#930 comparator
+evidence.
+
+| System | Prior-art pressure | TideFS design response target |
 |---|---|---|
-| ZFS | No built-in snapshot limit. Thousands of snapshots silently degrade performance. Requires external tooling (sanoid) with no atomic enforcement. | Transactional enforcement at create time: `snapshot create` checks `max_snapshots` BEFORE creating. Declarative retention replaces cron-dependent external scripting. |
-| CephFS | No snapshot lifecycle management at all. | Per-dataset retention policies with budgeted BACKGROUND-lane auto-prune. |
-| ZFS sanoid | Post-hoc reactive pruning: creates snapshot, then deletes oldest if over limit. Non-atomic — a crash between create and delete leaves the dataset over limit. | Pre-check at create time: if `snapshot_count >= max_snapshots` and no expired snapshot is immediately reclaimable, create fails atomically with `ENOSPC` (snapshot quota). |
+| ZFS | Snapshot limit and retention workflows often depend on external policy tooling. | Transactional enforcement at create time: `snapshot create` checks `max_snapshots` BEFORE creating. Declarative retention is evaluated by the storage system. |
+| CephFS | Snapshot lifecycle policy is a separate operator concern. | Per-dataset retention policies with budgeted BACKGROUND-lane auto-prune. |
+| ZFS sanoid | Post-hoc reactive pruning can create then delete to enforce a limit. | Pre-check at create time: if `snapshot_count >= max_snapshots` and no expired snapshot is immediately reclaimable, create fails atomically with `ENOSPC` (snapshot quota). |
 
 ### 1.2 Why per-dataset
 
@@ -770,9 +776,9 @@ This is a **design-spec**. Implementation is deferred to a continuation issue.
 
 ### 10.1 Why pre-check at create time, not post-hoc
 
-ZFS sanoid creates the snapshot first, then checks limits and deletes. If
-the system crashes between create and delete, the dataset is permanently
-over limit. The create-time pre-check avoids this: if `snapshot_count >=
+Reactive external retention tools such as sanoid are the prior-art pressure
+for this decision. The create-time pre-check target avoids a create-then-delete
+window: if `snapshot_count >=
 max_snapshots`, either (a) an expired snapshot is pruned within the same
 commit_group to make room, or (b) create fails with ENOSPC. Either outcome is
 atomic with respect to the creation commit_group.
@@ -788,11 +794,10 @@ load.
 
 ### 10.3 Why declarative retention, not cron-like scheduling
 
-Cron-based retention (ZFS sanoid) depends on external scheduling and has
-no atomic enforcement. If the cron job fails to run, snapshots accumulate
-unboundedly. Declarative retention is evaluated within the storage system
-itself: the auto-pruner runs on every background tick and the policy is
-always enforced. There is no external dependency for correctness.
+Cron-based retention tools are a design-pressure input because their schedule
+is outside the storage transaction boundary. Declarative retention is evaluated
+within the storage system itself: the auto-pruner runs on every background tick
+and the policy target is enforced without relying on an external scheduler.
 
 ### 10.4 Why granularity at create time, not evaluation time
 

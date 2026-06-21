@@ -15,9 +15,11 @@ incremental binary stream format for transferring dataset state between pools an
 a resume-after-interrupt mechanism using checkpoint cursors; cross-cluster compatibility
 negotiation via feature flags; incremental send optimization through the snapshot deadlist;
 
-ZFS send/recv is the gold standard for dataset migration and backup. tidefs must match
-and exceed it with cross-cluster operation, true resumability, block-level dedup
-awareness, and integration with tidefs's cluster architecture.
+ZFS send/recv is a major prior-art reference for dataset migration and backup.
+The TideFS target is a cross-cluster stream with resumability, block-level dedup
+awareness, and integration with the cluster architecture. That is design intent,
+not a current compatibility, maturity, or better-than-ZFS claim; product-facing
+comparisons remain gated by #875 and #928/#930 comparator evidence.
 
 ---
 
@@ -337,10 +339,10 @@ per record payload, (3) CRC32C + BLAKE3-256 of entire stream in trailer,
 
 ### 3.1 Design Principles
 
-ZFS send/recv has no built-in resume. If a pipeline is interrupted, the entire
-transfer must restart. For multi-terabyte datasets over WAN links this is
-catastrophic. tidefs implements resume through the IncrementalJob trait (#1239),
-making the send operation a cursor-driven, crash-resumable background job.
+Interrupted send/receive pipelines are the design pressure for this section,
+especially when transfers are large or cross slow links. TideFS targets resume
+through the IncrementalJob trait (#1239), making the send operation a
+cursor-driven, crash-resumable background job once implemented and validated.
 
 ### 3.2 SendCursor
 

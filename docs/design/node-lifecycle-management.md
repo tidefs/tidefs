@@ -10,11 +10,14 @@
 
 ## 1. Motivation and Scope
 
-### 1.1 Why this matters for beating ZFS and Ceph
+### 1.1 Prior-Art Pressures
 
-ZFS has no node lifecycle (single system). Ceph has OSD drain/decommission but it's operationally complex (reweight, wait for backfill, mark out, wait again). Ceph's node drain is essentially manual orchestration of per-OSD operations.
+ZFS and Ceph are prior-art inputs for this node lifecycle design, not evidence
+for a current TideFS operational-superiority claim. ZFS is single-system, while
+Ceph has OSD drain/decommission workflows with multiple operator-visible steps
+such as reweighting, waiting for backfill, and marking OSDs out.
 
-tidefs can do better with a unified node lifecycle that:
+The TideFS design target is a unified node lifecycle that:
 - Is a single `tidefsctl node drain <node>` command
 - Supports cancellation and progress reporting
 - Integrates with the resource governor to throttle impact

@@ -215,11 +215,11 @@ function resolve_labels(l0, l1):
     return {label: l1, location: L1}
 ```
 
-**Tradeoff: scan vs config-file import**. ZFS supports `zpool import -d /dev/disk/by-id`
-(directory scan) and `zpool import -c cachefile` (pre-cached config). TideFS
-starts with directory scan only. A config-file cache is a performance
-optimization, not a correctness requirement — the labels are the source of
-truth. Config-file caching is deferred to a continuation wire-up issue.
+**Tradeoff: scan vs config-file import**. ZFS `zpool import` modes are
+prior-art input, not a TideFS import-performance claim. TideFS starts with
+directory scan only. A config-file cache is a performance optimization, not a
+correctness requirement — the labels are the source of truth. Config-file
+caching is deferred to a continuation wire-up issue.
 
 **Tradeoff: majority vote vs strict consistency for topology_generation**.
 During a partial label write (crash mid-commit_group), different devices may show
@@ -585,19 +585,21 @@ function activate_spare(pool, faulted_device):
     )
 ```
 
-**Tradeoff: error rate threshold vs single-error fault**. ZFS uses a single
-I/O error to fault a device in most configurations (`failmode=wait`).
-This design uses an error rate window (e.g., 3 errors in 60 seconds) to
+**Tradeoff: error rate threshold vs single-error fault**. The ZFS fault model is
+prior-art context for this choice, not evidence that TideFS failure handling is
+more available or safer today. This design uses an error rate window (e.g.,
+3 errors in 60 seconds) to
 avoid transient faults from cable pulls or controller resets. The threshold
 is tunable per pool. Single-error fault is available as `failmode=panic` for
 high-integrity deployments.
 
-**Tradeoff: built-in spare policy vs external orchestration**. ZFS relies on
-the external ZED (ZFS Event Daemon) to activate spares. This design embeds
-spare activation in the DeviceManager because: (1) it eliminates an external
-dependency, (2) spare activation is tightly coupled to the failure state
-machine, and (3) the observability pipeline already emits events for external
-orchestrators that want to override the built-in policy.
+**Tradeoff: built-in spare policy vs external orchestration**. ZED-style spare
+activation is prior-art context for a design target, not a claim that TideFS has
+production-ready hot-spare behavior. This design embeds spare activation in the
+DeviceManager because: (1) it keeps the target policy inside the failure state
+machine, (2) spare activation is tightly coupled to that state machine, and
+(3) the observability pipeline can still emit events for external orchestrators
+that want to override the built-in policy.
 
 
 ```rust

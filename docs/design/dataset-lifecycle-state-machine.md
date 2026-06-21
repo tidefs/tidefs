@@ -78,17 +78,18 @@ dataset destruction is unsafe on multiple axes:
   a dataset no longer exists. The state machine provides the authoritative
   anchor for this consensus.
 
-ZFS handles destroy as an immediate operation: `zfs destroy` removes the dataset
-and all snapshots inline, blocking writer access through the DMU's commit_group commit
-ordering. This works but has scaling problems — large dataset destroys can block
-the commit_group pipeline for seconds. Ceph's approach (RADOS pool deletion with
-`mon_allow_pool_delete`) is even less structured: it relies on monitor
+ZFS and Ceph are prior-art inputs for the destroy lifecycle problem, not
+evidence for a current TideFS product claim. ZFS handles destroy as an
+immediate operation: `zfs destroy` removes the dataset and all snapshots inline,
+blocking writer access through the DMU's commit_group commit ordering. Ceph's
+approach (RADOS pool deletion with `mon_allow_pool_delete`) relies on monitor
 configuration flags.
 
-tidefs takes a different approach: destroy is a first-class state transition
-with explicit fencing, GC-safe traversal roots, and a tombstone phase for
-cluster consensus. This provides ZFS-level safety with better concurrency and
-observability.
+tidefs takes a different design direction: destroy is a first-class state
+transition with explicit fencing, GC-safe traversal roots, and a tombstone phase
+for cluster consensus. This is a design target for safer concurrency and
+observability; validated successor, performance, availability, or operational
+cost claims remain blocked behind #875 and #928/#930 comparator evidence.
 
 ## 2. Relationship to Existing Designs
 
@@ -580,9 +581,15 @@ If a network partition occurs during DESTROYING:
 - A peer that was partitioned during the ENTIRE destroy (DESTROYING through
   TOMBSTONE and reaping) will receive the dataset deletion from the
 
-## 11. ZFS Comparison
+## 11. ZFS Prior-Art Comparison
 
-| Dimension | ZFS | tidefs (this design) |
+The table below records design lessons and target behavior. It is not evidence
+that the current TideFS implementation has parity with or superiority over ZFS,
+nor that the async destroy, tombstone, abort, cluster consensus, or crash-resume
+paths are production-ready. Any current product-facing comparison must route
+through #875 claim ids and #928/#930 comparator evidence.
+
+| Dimension | ZFS prior art | TideFS design target |
 |---|---|---|
 | Destroy model | Immediate: `zfs destroy` removes dataset inline during commit_group commit | Async with state machine: ACTIVE → DESTROYING → TOMBSTONE → reaped |
 | Mount safety | DMU commit_group ordering prevents concurrent mount+destroy; dataset removal is immediate | Explicit state check on mount; DESTROYING/TOMBSTONE refuse mount with `ENOENT` |
@@ -594,12 +601,14 @@ If a network partition occurs during DESTROYING:
 | Clone interaction | `zfs destroy` refuses if clones exist (`EBUSY`) | Same; future promote planned |
 | Crash safety | ZIL replay ensures commit_group consistency; destroy is atomic within a commit_group | DestroyJobRecordV1 and pinned roots survive crashes; destroy worker resumes from last pinned root |
 
-Key tidefs advantages:
-- **Async destroy** avoids blocking the commit_group commit pipeline on large dataset
-  destroys (ZFS can stall commit_group sync for seconds during large destroys).
-- **Tombstone phase** provides cluster-wide observability that ZFS cannot offer.
-- **Abort capability** gives operators a recovery window that ZFS lacks (ZFS
-  destroy is immediate and irreversible).
+Design lessons carried forward:
+- **Async destroy target**: keep large destroy work out of the foreground
+  commit_group path by recording resumable state and processing reclamation in
+  bounded background steps.
+- **Tombstone target**: preserve a dataset record long enough for cluster
+  acknowledgment and operator-visible reclamation accounting.
+- **Abort target**: define an admin-mediated recovery window before physical
+  reclamation makes the operation irreversible.
 
 ## 12. Implementation Plan
 

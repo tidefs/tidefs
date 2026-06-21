@@ -31,9 +31,14 @@ a production-grade algorithm with the following properties:
   reported separately from `logical_used_bytes` and is consistent across
   crashes.
 
-### 1.1 ZFS anti-patterns avoided
+### 1.1 ZFS prior-art pressures
 
-| ZFS issue | TideFS design response |
+This table records design pressures from ZFS-like snapshot deadlist behavior.
+It does not claim current TideFS destroy latency, recovery, or operational
+superiority; such claims remain gated by #875 and #928/#930 comparator
+evidence.
+
+| ZFS issue | TideFS design response target |
 |---|---|
 | Single AVL-tree deadlist per snapshot; destroy must scan entire deadlist synchronously | Per-snapshot B-tree with cursor-driven, resumable processing |
 | Snapshot destroy stalls for seconds with hundreds of snapshots | Bounded by `(max_ids, max_bytes, max_ms)` per commit_group; only one destroy job RUNNING per dataset |
@@ -394,8 +399,9 @@ maintaining a separate mapping with consistency guarantees.
 ### 10.3 Why cursor-driven, not batch-committed
 
 Batch-committing the entire deadlist on destroy would block the commit_group for
-unbounded time (ZFS anti-pattern). Cursor-driven processing with per-commit_group
-bounds ensures forward progress without stalling the system.
+unbounded time. The prior-art pressure is to avoid a foreground destroy path
+that grows with deadlist size. Cursor-driven processing with per-commit_group
+bounds is the design target for bounded forward progress.
 
 ### 10.4 Why skip DESTROYING snapshots in pinning rule
 

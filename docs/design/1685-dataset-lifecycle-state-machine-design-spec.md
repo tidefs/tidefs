@@ -237,8 +237,8 @@ fuse_session_on_poison(notification):
 
 | Tradeoff | Decision | Rationale |
 |---|---|---|
-| Blocking COMMIT_GROUP pipeline | Async (tidefs) over immediate (ZFS-style) | Large dataset destroys can stall ZFS commit_group sync for seconds; async avoids this |
-| Implementation complexity | Higher with async | Worth it for predictable COMMIT_GROUP commit latency under operational destroy |
+| Blocking COMMIT_GROUP pipeline | Async design target over immediate prior-art coupling | Large dataset destroys are a latency pressure in ZFS-style commit_group flows; async destroy targets predictable COMMIT_GROUP commit latency under operational destroy |
+| Implementation complexity | Higher with async | Accepted for the design target of predictable COMMIT_GROUP commit latency under operational destroy |
 | Crash recovery surface | Larger with async | DestroyJobRecordV1 checkpoints make it crash-safe; acceptable cost |
 
 ### 4.2 Tombstone Phase Retention

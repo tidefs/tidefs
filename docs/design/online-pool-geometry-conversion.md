@@ -23,11 +23,14 @@ classes.
 
 ### Comparison to existing systems
 
+This table records design targets against prior-art pressure. It is not a
+current online conversion, cost, availability, or superiority claim.
+
 | System | Mirror↔EC | EC family change | Per-volume scope | Lazy conversion | Budget control |
 |--------|-----------|-----------------|------------------|-----------------|-----------------|
 | **ZFS** | No (destroy+recreate) | No | N/A | N/A | N/A |
 | **Ceph** | Via CRUSH rule change (mass migration) | Via CRUSH rule change (mass migration) | No (pool-wide) | No | Bluestore deferred only |
-| **tidefs** | Yes | Yes | Yes | Yes | Yes |
+| **tidefs target** | Target: yes | Target: yes | Target: yes | Target: yes | Target: yes |
 
 ---
 
@@ -60,9 +63,9 @@ File extent map                Locator table
 
 **Key property**: The extent map is NOT dirtied by geometry conversion.
 Only the locator entry for the affected extent_id changes. This is a
-single-level update with no cascading changes to upper layers — impossible
-in ZFS's indirect-block architecture and fundamentally different from
-Ceph's CRUSH-rule approach.
+single-level design target with no cascading changes to upper layers. It is a
+different architecture from ZFS indirect blocks and Ceph CRUSH-rule changes,
+not proof of current TideFS online-conversion capability.
 
 ### 1.2 What Geometry Conversion Means
 
@@ -591,8 +594,9 @@ foreground IO, cancelling leaves a clean mixed-policy state.
 **Con lazy**: Mixed policies exist during conversion (reads resolve correctly
 but performance may vary). Space overhead of old+new shards during conversion.
 
-**Decision**: Lazy. Eager conversion would require freeze + rewrite, which
-violates the online requirement and is no better than ZFS send/recv.
+**Decision**: Lazy. Eager conversion would require freeze + rewrite, which does
+not satisfy the design target for online conversion and resembles a full
+external migration workflow.
 
 ### 11.2 Why Extent-Level Instead of Object-Level?
 
@@ -615,10 +619,10 @@ base rewrite:
 | Aspect | Rebake | Defrag | Geometry Conversion |
 |--------|--------|--------|---------------------|
 | Domain | Ingest→Base | Base→Base | Base→Base |
-| Policy change | No | No | **Yes** |
-| Re-encode | Simple write | Simple write | **GF(2^8) Reed-Solomon** |
+| Policy change | No | No | Target: yes |
+| Re-encode | Simple write | Simple write | Target: GF(2^8) Reed-Solomon |
 | Locator swap | Yes | Yes | Yes |
-| Shard count change | Possible | Possible | **Expected** |
+| Shard count change | Possible | Possible | Target: expected |
 
 Geometry conversion reuses the locator swap protocol, cursor machinery, and
 background scheduling from rebake/defrag. The new logic is in the re-encoding
