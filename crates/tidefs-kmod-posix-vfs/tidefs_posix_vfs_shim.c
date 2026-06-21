@@ -3626,15 +3626,29 @@ static ssize_t tidefs_posix_vfs_file_read_iter(struct kiocb *iocb,
 			ssize_t read_ret;
 
 			if (requested > 0) {
+				u64 fence_generation;
+
+				fence_generation =
+					tidefs_posix_vfs_pagecache_fence_snapshot(
+						inode, pos, requested);
 				filemap_invalidate_lock(inode->i_mapping);
 				ret = tidefs_posix_vfs_drop_fenced_pagecache_range(
 					inode, pos, requested,
 					"cached-read-fence-drop-failed");
-				if (!ret)
-					read_ret = generic_file_read_iter(iocb, to);
 				filemap_invalidate_unlock(inode->i_mapping);
 				if (ret)
 					return ret;
+
+				filemap_invalidate_lock_shared(inode->i_mapping);
+				if (!tidefs_posix_vfs_pagecache_fence_still_current(
+					    inode, pos, requested,
+					    fence_generation)) {
+					filemap_invalidate_unlock_shared(
+						inode->i_mapping);
+					return -EAGAIN;
+				}
+				read_ret = generic_file_read_iter(iocb, to);
+				filemap_invalidate_unlock_shared(inode->i_mapping);
 			} else {
 				read_ret = generic_file_read_iter(iocb, to);
 			}
