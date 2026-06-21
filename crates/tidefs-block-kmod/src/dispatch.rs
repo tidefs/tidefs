@@ -35,6 +35,10 @@ use crate::tidefs_kmod_bridge::kernel_types::ByteSliceExt;
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge::{BridgeError, BridgeResult};
 use crate::{BlockBio, BlockQueueLimits};
+#[cfg(CONFIG_RUST)]
+use crate::tidefs_kmod_bridge::kernel_types::blake3;
+#[cfg(not(CONFIG_RUST))]
+use blake3;
 #[cfg(not(CONFIG_RUST))]
 use tidefs_kmod_bridge::{BridgeError, BridgeResult};
 
@@ -1142,7 +1146,10 @@ impl<B: BlockBackend> DispatchEngine<B> {
     // ── BLAKE3 digest computation ──────────────────────────────────────
 
     /// Compute a BLAKE3-256 domain-separated digest for a lifecycle event.
-    #[cfg(not(CONFIG_RUST))]
+    ///
+    /// BLAKE3-256 is always available: the kmod bridge provides a
+    /// self-contained software implementation under Kbuild, and the
+    /// external blake3 crate is used under Cargo.
     fn compute_lifecycle_digest(&self, event: &str) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new_derive_key(DOMAIN);
         hasher.update(b"lifecycle:");
@@ -1152,14 +1159,11 @@ impl<B: BlockBackend> DispatchEngine<B> {
         hasher.update(&self.bytes_written.to_le_bytes());
         hasher.finalize().into()
     }
-
-    /// Compute a BLAKE3-256 domain-separated digest for a lifecycle event (Kbuild stub).
-    #[cfg(CONFIG_RUST)]
-    fn compute_lifecycle_digest(&self, _event: &str) -> [u8; 32] {
-        [0u8; 32]
-    }
     /// Compute a BLAKE3-256 domain-separated digest for a bio dispatch.
-    #[cfg(not(CONFIG_RUST))]
+    ///
+    /// BLAKE3-256 is always available: the kmod bridge provides a
+    /// self-contained software implementation under Kbuild, and the
+    /// external blake3 crate is used under Cargo.
     fn compute_dispatch_digest(
         &self,
         op: BioOp,
@@ -1186,17 +1190,6 @@ impl<B: BlockBackend> DispatchEngine<B> {
         hasher.update(&self.bytes_read.to_le_bytes());
         hasher.update(&self.bytes_written.to_le_bytes());
         hasher.finalize().into()
-    }
-
-    /// Compute a BLAKE3-256 domain-separated dispatch digest (Kbuild stub).
-    #[cfg(CONFIG_RUST)]
-    fn compute_dispatch_digest(
-        &self,
-        _op: BioOp,
-        _bio: &BlockBio,
-        _result: &DispatchResult,
-    ) -> [u8; 32] {
-        [0u8; 32]
     }
 }
 
