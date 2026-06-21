@@ -328,8 +328,9 @@ fn check_extent_reference_integrity(
     state: &crate::FileSystemState,
     report: &mut FsckReport,
 ) -> Result<()> {
+    let extent_maps = state.extent_maps.lock().unwrap();
     for (&inode_id, rec) in state.inodes.iter() {
-        if rec.size == 0 && !state.extent_maps.contains_key(&inode_id) {
+        if rec.size == 0 && !extent_maps.contains_key(&inode_id) {
             continue;
         }
 
@@ -338,7 +339,7 @@ fn check_extent_reference_integrity(
 
         if !store.contains_key(content_key)
             && !store.contains_key(versioned_key)
-            && (rec.size > 0 || state.extent_maps.contains_key(&inode_id))
+            && (rec.size > 0 || extent_maps.contains_key(&inode_id))
         {
             report.add_finding(FsckFinding {
                 category: FsckCategory::ExtentReferenceIntegrity,
@@ -353,7 +354,7 @@ fn check_extent_reference_integrity(
         }
     }
 
-    for &inode_id in state.extent_maps.keys() {
+    for &inode_id in extent_maps.keys() {
         let ext_key = transaction_extent_map_object_key(state.generation, inode_id);
         if !store.contains_key(ext_key) {
             report.add_finding(FsckFinding {

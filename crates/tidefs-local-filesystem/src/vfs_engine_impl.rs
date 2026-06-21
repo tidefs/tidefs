@@ -5313,7 +5313,8 @@ impl VfsEngine for VfsLocalFileSystem {
         }
         let fs = self.fs.borrow();
         // Prefer the authoritative extent map when it exists (fallocate-managed).
-        if let Some(extent_map) = fs.state.extent_maps.get(&fh.inode_id) {
+        let extent_maps = fs.state.extent_maps.lock().unwrap();
+        if let Some(extent_map) = extent_maps.get(&fh.inode_id) {
             let mut extents = extent_map
                 .inner()
                 .fiemap(offset, length)
@@ -5326,6 +5327,7 @@ impl VfsEngine for VfsLocalFileSystem {
             }
             return Ok(extents);
         }
+        drop(extent_maps);
         drop(fs);
         // Fallback: when no explicit extent map exists, report a single
         // dense extent covering the queried range up to the file size.

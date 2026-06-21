@@ -353,6 +353,7 @@ pub(crate) fn persist_transaction_objects(
         inode_allocation_bitmap[idx / 64] |= 1u64 << (idx % 64);
     }
     // Persist dirty extent maps for file-like inodes.
+    let extent_maps = state.extent_maps.lock().unwrap();
     for inode_id in &state.dirty_extent_maps {
         let Some(inode) = state.inodes.get(inode_id) else {
             continue;
@@ -360,7 +361,7 @@ pub(crate) fn persist_transaction_objects(
         if !inode.is_file_like() {
             continue;
         }
-        if let Some(extent_map) = state.extent_maps.get(inode_id) {
+        if let Some(extent_map) = extent_maps.get(inode_id) {
             let ext_key = transaction_extent_map_object_key(transaction_id, *inode_id);
             let mut ext_bytes = Vec::new();
             extent_map

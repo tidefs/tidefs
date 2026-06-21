@@ -5068,11 +5068,8 @@ impl LocalFileSystem {
         &mut self,
         ino: InodeId,
     ) -> std::result::Result<(u64, u64), FilesystemError> {
-        let em = self
-            .state
-            .extent_maps
-            .lock()
-            .unwrap()
+        let mut extent_maps = self.state.extent_maps.lock().unwrap();
+        let em = extent_maps
             .get_mut(&ino)
             .ok_or(FilesystemError::NotFound {
                 path: format!("inode:{}", ino.get()),
@@ -5098,11 +5095,8 @@ impl LocalFileSystem {
         ino: InodeId,
         offset: u64,
     ) -> std::result::Result<u64, FilesystemError> {
-        let em = self
-            .state
-            .extent_maps
-            .lock()
-            .unwrap()
+        let extent_maps = self.state.extent_maps.lock().unwrap();
+        let em = extent_maps
             .get(&ino)
             .ok_or_else(|| FilesystemError::NotFound {
                 path: format!("inode:{}", ino.get()),
@@ -5131,11 +5125,8 @@ impl LocalFileSystem {
         ino: InodeId,
         offset: u64,
     ) -> std::result::Result<u64, FilesystemError> {
-        let em = self
-            .state
-            .extent_maps
-            .lock()
-            .unwrap()
+        let extent_maps = self.state.extent_maps.lock().unwrap();
+        let em = extent_maps
             .get(&ino)
             .ok_or_else(|| FilesystemError::NotFound {
                 path: format!("inode:{}", ino.get()),
