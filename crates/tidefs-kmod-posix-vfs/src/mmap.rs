@@ -185,6 +185,9 @@ impl<'a, E: VfsEngine> KmodVfsVmOps<'a, E> {
         ctx: &RequestCtx,
     ) -> Result<(Vec<u8>, VmFaultResult), Errno> {
         let page_idx = page_index(offset);
+        let generation = self
+            .page_authority
+            .generation_snapshot(fh.inode_id, page_idx);
         // Acquire read ownership before reading page data.
         // Transitions EngineOwned->Shared if the engine held the copy.
         let guard = self.page_authority.acquire(
@@ -208,6 +211,9 @@ impl<'a, E: VfsEngine> KmodVfsVmOps<'a, E> {
         };
         if let Ok(g) = guard {
             g.commit();
+        }
+        if self.page_authority.check_generation(generation).is_err() {
+            return Ok((Vec::new(), VmFaultResult::Retry));
         }
         Ok((data, result))
     }

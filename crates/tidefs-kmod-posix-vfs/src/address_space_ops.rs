@@ -58,7 +58,7 @@ use crate::readahead::KmodPageCacheTracker;
 use tidefs_kmod_bridge::kernel_types::{EngineFileHandle, Errno, InodeId, RequestCtx};
 use tidefs_kmod_bridge::kernel_types::{VfsEngine, WritebackOutcome, WritebackRange};
 
-use crate::page_authority::{page_index, PageAuthorityTable};
+use crate::page_authority::{page_index, PageAuthorityTable, PageGenerationSnapshot};
 use crate::writeback::{DirtyFolioTracker, DirtyRange};
 #[cfg(CONFIG_RUST)]
 use tidefs_kmod_bridge::kernel_types::PageOwnershipMode;
@@ -178,6 +178,9 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         ctx: &RequestCtx,
     ) -> Result<Vec<u8>, Errno> {
         let page_idx = page_index(offset);
+        let generation = self
+            .page_authority
+            .generation_snapshot(fh.inode_id, page_idx);
         // Acquire read ownership: transitions EngineOwned->Shared if needed.
         let guard = self.page_authority.acquire(
             self.engine,
@@ -199,6 +202,9 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         if let Ok(g) = guard {
             g.commit();
         }
+        self.page_authority
+            .check_generation(generation)
+            .map_err(|c| c.to_errno())?;
         Ok(data)
     }
 
@@ -225,6 +231,9 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         self.page_cache.record_prefetch();
 
         let page_idx = page_index(offset);
+        let generation = self
+            .page_authority
+            .generation_snapshot(fh.inode_id, page_idx);
         // Acquire read ownership for the affected page: this is a
         // clean read, so we target Shared ownership without ever
         // transitioning to KernelOwned (no dirty marking).
@@ -260,6 +269,9 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         // (never KernelOwned/dirty from a readahead path).
         if let Ok(g) = guard {
             g.commit();
+        }
+        if self.page_authority.check_generation(generation).is_err() {
+            self.page_cache.record_miss();
         }
     }
 
@@ -446,6 +458,17 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
                 offset: plan.range.offset,
                 length: plan.usable_len,
             };
+            let mut generation_snapshots: crate::TideVec<PageGenerationSnapshot> =
+                crate::TideVec::new();
+            let sp = page_index(wb_range.offset);
+            let ep = page_index(
+                wb_range
+                    .offset
+                    .saturating_add(wb_range.length.saturating_sub(1)),
+            );
+            for pg in sp..=ep {
+                generation_snapshots.push(self.page_authority.generation_snapshot(inode, pg));
+            }
 
             let outcome = match self.engine.writeback_folios(inode, fh, wb_range, ctx) {
                 Ok(o) => o,
@@ -464,15 +487,34 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
 
             total_written = total_written.saturating_add(outcome.bytes_written);
 
+            let stale_generation = generation_snapshots
+                .iter()
+                .any(|snapshot| self.page_authority.check_generation(*snapshot).is_err());
+            if stale_generation {
+                self.dirty_tracker
+                    .add(inode, plan.range.offset, plan.range.length);
+                if first_error.is_none() {
+                    first_error = Some(Errno::EIO);
+                }
+                writeback_errors.push((plan.range, Errno::EIO));
+                continue;
+            }
+
             // Transfer ownership back to engine for successfully written pages.
-            let sp = page_index(wb_range.offset);
-            let ep = page_index(
-                wb_range
-                    .offset
-                    .saturating_add(outcome.bytes_written.saturating_sub(1)),
-            );
-            for pg in sp..=ep {
-                self.page_authority.transfer_to_engine(inode, pg);
+            if outcome.bytes_written > 0 {
+                let written_last = page_index(
+                    wb_range
+                        .offset
+                        .saturating_add(outcome.bytes_written.saturating_sub(1)),
+                );
+                for snapshot in generation_snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.page_idx() <= written_last)
+                {
+                    self.page_authority
+                        .transfer_to_engine_if_current(*snapshot)
+                        .map_err(|c| c.to_errno())?;
+                }
             }
 
             // Re-dirty any tail that writeback could not persist.
@@ -555,16 +597,42 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
             offset,
             length: usable_len,
         };
+        let mut generation_snapshots: crate::TideVec<PageGenerationSnapshot> =
+            crate::TideVec::new();
+        let sp = page_index(range.offset);
+        let ep = page_index(
+            range
+                .offset
+                .saturating_add(range.length.saturating_sub(1)),
+        );
+        for pg in sp..=ep {
+            generation_snapshots.push(self.page_authority.generation_snapshot(inode, pg));
+        }
         // Record write-intent before committing the dirty page for crash-safety.
         let entry = encode_write_intent(inode, range.offset, range.length as u32);
         record_intent(self.engine, &entry).map_err(|_| Errno::EIO)?;
         let outcome = self.engine.writeback_folios(inode, fh, range, ctx)?;
 
+        if generation_snapshots
+            .iter()
+            .any(|snapshot| self.page_authority.check_generation(*snapshot).is_err())
+        {
+            self.dirty_tracker.try_add(inode, offset, length)?;
+            return Err(Errno::EIO);
+        }
+
         // Transfer ownership back to engine on successful writeback.
-        let sp = page_index(offset);
-        let ep = page_index(offset.saturating_add(outcome.bytes_written.saturating_sub(1)));
-        for pg in sp..=ep {
-            self.page_authority.transfer_to_engine(inode, pg);
+        if outcome.bytes_written > 0 {
+            let written_last =
+                page_index(offset.saturating_add(outcome.bytes_written.saturating_sub(1)));
+            for snapshot in generation_snapshots
+                .iter()
+                .filter(|snapshot| snapshot.page_idx() <= written_last)
+            {
+                self.page_authority
+                    .transfer_to_engine_if_current(*snapshot)
+                    .map_err(|c| c.to_errno())?;
+            }
         }
         Ok(outcome)
     }
@@ -617,6 +685,8 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         length: u32,
     ) -> Result<(), Errno> {
         self.page_cache.record_evict();
+        self.page_authority
+            .raise_range_fence(self.engine, inode, offset, length as u64);
         // Remove dirty-tracker entries that overlap the invalidated range
         // so writeback does not attempt to persist discarded pages.
         self.dirty_tracker.remove_range(inode, offset, length);
@@ -1457,11 +1527,22 @@ mod tests {
         let mut dt = make_dirty_tracker();
         let mut pa = make_page_authority();
         let mut aops = AddressSpaceOps::new(&e, &mut tracker, &mut dt, &mut pa);
+        let before = aops
+            .page_authority
+            .generation_snapshot(InodeId::new(1), 0);
 
         // Default engine implementation returns Ok(())
         assert_eq!(aops.invalidate_folio(InodeId::new(1), &fh, 0, 8192), Ok(()));
         let stats = aops.page_cache_stats();
         assert_eq!(stats.evict, 1);
+        assert_eq!(
+            aops.page_authority.get(InodeId::new(1), 0),
+            crate::page_authority::PageOwnership::Fenced
+        );
+        assert_eq!(
+            aops.page_authority.check_generation(before),
+            Err(crate::page_authority::OwnershipConflict::StaleGeneration)
+        );
     }
 
     #[test]

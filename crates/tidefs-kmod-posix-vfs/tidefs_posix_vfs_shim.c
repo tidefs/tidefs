@@ -49,6 +49,7 @@
 #include <linux/highmem.h>
 #include <linux/uio.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/limits.h>
 #include <linux/math64.h>
 /* ilog2 computed inline; no linux/log2.h include needed */
@@ -683,6 +684,15 @@ struct tidefs_kernel_pool_state_record {
  * source, and teardown path so later clean-read operations have real VFS
  * objects to attach to.
  */
+#define TIDEFS_POSIX_VFS_PAGECACHE_FENCE_SLOTS 128
+
+struct tidefs_posix_vfs_pagecache_fence {
+	unsigned long ino;
+	loff_t start;
+	loff_t end;
+	u64 generation;
+};
+
 struct tidefs_posix_vfs_mount {
 	bool bootstrap_only;
 	bool engine_backed;
@@ -717,6 +727,11 @@ struct tidefs_posix_vfs_mount {
 	u32 write_end_calls;
 	u32 dirty_folio_calls;
 	u32 writepages_calls;
+	spinlock_t pagecache_fence_lock;
+	u64 pagecache_fence_generation;
+	u32 pagecache_fence_cursor;
+	struct tidefs_posix_vfs_pagecache_fence
+		pagecache_fences[TIDEFS_POSIX_VFS_PAGECACHE_FENCE_SLOTS];
 	struct tidefs_posix_vfs_kernel_pool_core pool;
 	char *cluster_node_id;
 	char *transport_carrier;
@@ -773,6 +788,21 @@ static const struct file_operations tidefs_posix_vfs_dir_file_operations;
 static const struct inode_operations tidefs_posix_vfs_file_inode_operations;
 static const struct file_operations tidefs_posix_vfs_file_operations;
 static const struct address_space_operations tidefs_posix_vfs_aops;
+static int tidefs_posix_vfs_drop_fenced_pagecache_range(struct inode *inode,
+							loff_t pos,
+							size_t len,
+							const char *reason);
+
+static void tidefs_posix_vfs_pagecache_fences_init(
+	struct tidefs_posix_vfs_mount *ctx)
+{
+	if (!ctx)
+		return;
+
+	spin_lock_init(&ctx->pagecache_fence_lock);
+	ctx->pagecache_fence_generation = 1;
+	ctx->pagecache_fence_cursor = 0;
+}
 
 static void tidefs_posix_vfs_mount_free(struct tidefs_posix_vfs_mount *ctx)
 {
@@ -822,6 +852,7 @@ static struct tidefs_posix_vfs_mount *tidefs_posix_vfs_mount_new_engine(
 	if (!ctx)
 		return NULL;
 
+	tidefs_posix_vfs_pagecache_fences_init(ctx);
 	ctx->bootstrap_only = false;
 	ctx->engine_backed = true;
 	ctx->root_ino = mo->root_ino;
@@ -874,6 +905,7 @@ static struct tidefs_posix_vfs_mount *tidefs_posix_vfs_mount_new_engine_replay(
 	if (!ctx)
 		return NULL;
 
+	tidefs_posix_vfs_pagecache_fences_init(ctx);
 	ctx->bootstrap_only = false;
 	ctx->engine_backed = true;
 	ctx->root_ino = mo->root_ino;
@@ -3591,8 +3623,21 @@ static ssize_t tidefs_posix_vfs_file_read_iter(struct kiocb *iocb,
 		}
 
 		if (!(iocb->ki_flags & IOCB_DIRECT)) {
-			ssize_t read_ret = generic_file_read_iter(iocb, to);
+			ssize_t read_ret;
 
+			if (requested > 0) {
+				filemap_invalidate_lock(inode->i_mapping);
+				ret = tidefs_posix_vfs_drop_fenced_pagecache_range(
+					inode, pos, requested,
+					"cached-read-fence-drop-failed");
+				if (!ret)
+					read_ret = generic_file_read_iter(iocb, to);
+				filemap_invalidate_unlock(inode->i_mapping);
+				if (ret)
+					return ret;
+			} else {
+				read_ret = generic_file_read_iter(iocb, to);
+			}
 			if (read_ret > 0) {
 				struct timespec64 new_atime;
 
@@ -3705,6 +3750,164 @@ static ssize_t tidefs_posix_vfs_file_read_iter(struct kiocb *iocb,
 	return total;
 }
 
+static loff_t tidefs_posix_vfs_pagecache_range_end(loff_t pos, size_t len)
+{
+	if (len == 0 || pos < 0)
+		return pos;
+	if ((loff_t)len < 0 || pos > LLONG_MAX - (loff_t)len)
+		return LLONG_MAX;
+	return pos + (loff_t)len;
+}
+
+static bool tidefs_posix_vfs_pagecache_ranges_overlap(loff_t a_start,
+						      loff_t a_end,
+						      loff_t b_start,
+						      loff_t b_end)
+{
+	return a_start < b_end && b_start < a_end;
+}
+
+static u64 tidefs_posix_vfs_pagecache_raise_fence(struct inode *inode,
+						  loff_t pos,
+						  size_t len,
+						  const char *reason)
+{
+	struct tidefs_posix_vfs_mount *ctx;
+	struct tidefs_posix_vfs_pagecache_fence *fence;
+	unsigned long flags;
+	loff_t start;
+	loff_t end;
+	u32 slot;
+	u64 generation;
+
+	if (!inode || !inode->i_sb || len == 0 || pos < 0)
+		return 0;
+
+	ctx = inode->i_sb->s_fs_info;
+	if (!ctx)
+		return 0;
+
+	start = round_down(pos, PAGE_SIZE);
+	end = tidefs_posix_vfs_pagecache_range_end(pos, len);
+	if (end > LLONG_MAX - (PAGE_SIZE - 1))
+		end = LLONG_MAX;
+	else
+		end = round_up(end, PAGE_SIZE);
+	if (end <= start)
+		return 0;
+
+	spin_lock_irqsave(&ctx->pagecache_fence_lock, flags);
+	generation = ++ctx->pagecache_fence_generation;
+	if (generation == 0)
+		generation = ++ctx->pagecache_fence_generation;
+	slot = ctx->pagecache_fence_cursor++ %
+		TIDEFS_POSIX_VFS_PAGECACHE_FENCE_SLOTS;
+	fence = &ctx->pagecache_fences[slot];
+	fence->ino = inode->i_ino;
+	fence->start = start;
+	fence->end = end;
+	fence->generation = generation;
+	spin_unlock_irqrestore(&ctx->pagecache_fence_lock, flags);
+
+	pr_debug("tidefs_posix_vfs: pagecache fence ino=%lu start=%lld end=%lld gen=%llu reason=%s\n",
+		 inode->i_ino, start, end, generation, reason ? reason : "unknown");
+	return generation;
+}
+
+static u64 tidefs_posix_vfs_pagecache_fence_snapshot(struct inode *inode,
+						     loff_t pos,
+						     size_t len)
+{
+	struct tidefs_posix_vfs_mount *ctx;
+	unsigned long flags;
+	loff_t start;
+	loff_t end;
+	u64 generation = 0;
+	int i;
+
+	if (!inode || !inode->i_sb || len == 0 || pos < 0)
+		return 0;
+
+	ctx = inode->i_sb->s_fs_info;
+	if (!ctx)
+		return 0;
+
+	start = round_down(pos, PAGE_SIZE);
+	end = tidefs_posix_vfs_pagecache_range_end(pos, len);
+	if (end > LLONG_MAX - (PAGE_SIZE - 1))
+		end = LLONG_MAX;
+	else
+		end = round_up(end, PAGE_SIZE);
+	if (end <= start)
+		return 0;
+
+	spin_lock_irqsave(&ctx->pagecache_fence_lock, flags);
+	for (i = 0; i < TIDEFS_POSIX_VFS_PAGECACHE_FENCE_SLOTS; i++) {
+		const struct tidefs_posix_vfs_pagecache_fence *fence =
+			&ctx->pagecache_fences[i];
+
+		if (fence->generation == 0 || fence->ino != inode->i_ino)
+			continue;
+		if (!tidefs_posix_vfs_pagecache_ranges_overlap(
+			    start, end, fence->start, fence->end))
+			continue;
+		generation = max(generation, fence->generation);
+	}
+	spin_unlock_irqrestore(&ctx->pagecache_fence_lock, flags);
+
+	return generation;
+}
+
+static bool tidefs_posix_vfs_pagecache_fence_still_current(struct inode *inode,
+							   loff_t pos,
+							   size_t len,
+							   u64 snapshot)
+{
+	return tidefs_posix_vfs_pagecache_fence_snapshot(inode, pos, len) ==
+	       snapshot;
+}
+
+static int tidefs_posix_vfs_drop_fenced_pagecache_range(struct inode *inode,
+							loff_t pos,
+							size_t len,
+							const char *reason)
+{
+	struct address_space *mapping;
+	loff_t start;
+	loff_t end;
+	loff_t invalidate_end;
+	int ret;
+
+	if (!inode || len == 0 || pos < 0)
+		return 0;
+	if (!tidefs_posix_vfs_pagecache_fence_snapshot(inode, pos, len))
+		return 0;
+
+	mapping = inode->i_mapping;
+	if (!mapping)
+		return 0;
+
+	start = round_down(pos, PAGE_SIZE);
+	end = tidefs_posix_vfs_pagecache_range_end(pos, len);
+	if (end > LLONG_MAX - (PAGE_SIZE - 1))
+		invalidate_end = LLONG_MAX;
+	else
+		invalidate_end = round_up(end, PAGE_SIZE) - 1;
+	if (invalidate_end < start)
+		return 0;
+
+	unmap_mapping_range(mapping, start,
+			    invalidate_end == LLONG_MAX ? 0 :
+			    invalidate_end - start + 1, 0);
+	ret = invalidate_inode_pages2_range(mapping,
+					    start >> PAGE_SHIFT,
+					    invalidate_end >> PAGE_SHIFT);
+	if (ret)
+		tidefs_posix_vfs_pagecache_raise_fence(
+			inode, pos, len, reason);
+	return ret;
+}
+
 static int tidefs_posix_vfs_flush_invalidate_pagecache_range(
 	struct inode *inode,
 	loff_t pos,
@@ -3735,15 +3938,22 @@ static int tidefs_posix_vfs_flush_invalidate_pagecache_range(
 		flush_end = round_up(end + 1, PAGE_SIZE) - 1;
 
 	ret = filemap_write_and_wait_range(mapping, flush_start, flush_end);
-	if (ret)
+	if (ret) {
+		tidefs_posix_vfs_pagecache_raise_fence(
+			inode, pos, len, "write-and-wait-failed");
 		return ret;
+	}
 
 	unmap_mapping_range(mapping, flush_start,
 			    flush_end == LLONG_MAX ? 0 :
 			    flush_end - flush_start + 1, 0);
-	return invalidate_inode_pages2_range(mapping,
-					     flush_start >> PAGE_SHIFT,
-					     flush_end >> PAGE_SHIFT);
+	ret = invalidate_inode_pages2_range(mapping,
+					    flush_start >> PAGE_SHIFT,
+					    flush_end >> PAGE_SHIFT);
+	if (ret)
+		tidefs_posix_vfs_pagecache_raise_fence(
+			inode, pos, len, "invalidate-failed");
+	return ret;
 }
 
 static int tidefs_posix_vfs_invalidate_pagecache_range(
@@ -3777,9 +3987,16 @@ static int tidefs_posix_vfs_invalidate_pagecache_range(
 	unmap_mapping_range(mapping, start,
 			    invalidate_end == LLONG_MAX ? 0 :
 			    invalidate_end - start + 1, 0);
-	return invalidate_inode_pages2_range(mapping,
-					     start >> PAGE_SHIFT,
-					     invalidate_end >> PAGE_SHIFT);
+	{
+		int ret = invalidate_inode_pages2_range(mapping,
+							start >> PAGE_SHIFT,
+							invalidate_end >> PAGE_SHIFT);
+		tidefs_posix_vfs_pagecache_raise_fence(
+			inode, pos, len,
+			ret ? "post-mutation-invalidate-failed" :
+			      "post-mutation-invalidate");
+		return ret;
+	}
 }
 
 static int tidefs_posix_vfs_prepare_truncate_pagecache(
@@ -3891,6 +4108,8 @@ static ssize_t tidefs_posix_vfs_file_direct_engine_write(
 		iov_iter_revert(from, copied - (size_t)ret);
 
 	written = ret;
+	tidefs_posix_vfs_pagecache_raise_fence(
+		inode, (loff_t)write_pos, (size_t)written, "direct-write");
 	write_pos += ret;
 	iocb->ki_pos = write_pos;
 	i_size_write(inode, max_t(u64, i_size_read(inode), write_pos));
@@ -4422,6 +4641,16 @@ static int tidefs_posix_vfs_setattr(struct mnt_idmap *idmap,
 		if (iattr->ia_valid & ATTR_SIZE) {
 			truncate_setsize(inode, out_size);
 			inode->i_blocks = out_blocks;
+			if (size_update && out_size != old_size) {
+				loff_t fence_start = min_t(loff_t, old_size, out_size);
+				loff_t fence_end = max_t(loff_t, old_size, out_size);
+
+				if (fence_end > fence_start)
+					tidefs_posix_vfs_pagecache_raise_fence(
+						inode, fence_start,
+						(size_t)(fence_end - fence_start),
+						"truncate-size");
+			}
 			iattr->ia_valid &= ~ATTR_SIZE;
 		}
 
@@ -4620,6 +4849,8 @@ static ssize_t tidefs_posix_vfs_file_copy_file_range(struct file *file_in,
 			ret = -EFBIG;
 			goto out_copy_unlock;
 		}
+		tidefs_posix_vfs_pagecache_raise_fence(
+			inode_out, pos_out, copied, "copy-file-range-dest");
 		end_pos = pos_out + (loff_t)copied;
 		if (end_pos > i_size_read(inode_out))
 			i_size_write(inode_out, end_pos);
@@ -5317,6 +5548,7 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
 	size_t read_len;
 	int ret;
 	u64 fh_ino, fh_id;
+	u64 fence_generation;
 
 	if (!ctx)
 		return -EIO;
@@ -5338,15 +5570,19 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
 	ofs = file ? file->private_data : NULL;
 	fh_ino = ofs ? ofs->fh_ino : inode->i_ino;
 	fh_id = ofs ? ofs->fh_id : inode->i_ino;
-
-	if (folio_test_uptodate(folio)) {
-		*foliop = folio;
-		*fsdata = NULL;
-		return 0;
-	}
-
 	folio_file_pos = folio_pos(folio);
 	fsize = folio_size(folio);
+
+	if (folio_test_uptodate(folio)) {
+		if (!tidefs_posix_vfs_pagecache_fence_snapshot(
+			    inode, folio_file_pos, fsize)) {
+			*foliop = folio;
+			*fsdata = NULL;
+			return 0;
+		}
+		folio_clear_uptodate(folio);
+	}
+
 	isize = i_size_read(inode);
 	if ((loff_t)len > LLONG_MAX - pos) {
 		folio_unlock(folio);
@@ -5378,6 +5614,8 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
 	}
 
 	read_len = min_t(loff_t, (loff_t)fsize, isize - folio_file_pos);
+	fence_generation = tidefs_posix_vfs_pagecache_fence_snapshot(
+		inode, folio_file_pos, read_len);
 	kbuf = kmalloc(read_len, GFP_KERNEL);
 	if (!kbuf) {
 		folio_unlock(folio);
@@ -5396,6 +5634,16 @@ static int tidefs_posix_vfs_write_begin(const struct kiocb *iocb,
 		folio_put(folio);
 		*fsdata = NULL;
 		return ret;
+	}
+
+	if (!tidefs_posix_vfs_pagecache_fence_still_current(
+		    inode, folio_file_pos, read_len, fence_generation)) {
+		kfree(kbuf);
+		folio_clear_uptodate(folio);
+		folio_unlock(folio);
+		folio_put(folio);
+		*fsdata = NULL;
+		return -EAGAIN;
 	}
 
 	if (ret > 0 || fsize > 0) {
@@ -5634,6 +5882,7 @@ static int tidefs_posix_vfs_writepages(struct address_space *mapping,
 		size_t len;
 		void *kbuf;
 		void *addr;
+		u64 fence_generation;
 		int ret;
 
 		if (pos < 0 || pos >= isize) {
@@ -5646,6 +5895,8 @@ static int tidefs_posix_vfs_writepages(struct address_space *mapping,
 			folio_unlock(folio);
 			continue;
 		}
+		fence_generation = tidefs_posix_vfs_pagecache_fence_snapshot(
+			inode, pos, len);
 
 		kbuf = kmalloc(len, GFP_NOFS);
 		if (!kbuf) {
@@ -5678,6 +5929,16 @@ static int tidefs_posix_vfs_writepages(struct address_space *mapping,
 			error = -EIO;
 		} else {
 			wrote_any = true;
+		}
+
+		if (ret >= 0 &&
+		    !tidefs_posix_vfs_pagecache_fence_still_current(
+			    inode, pos, len, fence_generation)) {
+			pr_err("tidefs_posix_vfs: writepages stale generation ino=%lu pos=%lld len=%zu\n",
+			       inode->i_ino, pos, len);
+			mapping_set_error(mapping, -EIO);
+			folio_redirty_for_writepage(wbc, folio);
+			error = -EIO;
 		}
 
 		folio_unlock(folio);
@@ -5731,6 +5992,7 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
 	void *kbuf;
 	int ret;
 	u64 fh_ino, fh_id;
+	u64 fence_generation;
 
 	if (!ctx)
 		return -EIO;
@@ -5753,6 +6015,8 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
 	}
 
 	read_len = min_t(loff_t, (loff_t)fsize, isize - pos);
+	fence_generation = tidefs_posix_vfs_pagecache_fence_snapshot(
+		inode, pos, read_len);
 	kbuf = kmalloc(read_len, GFP_KERNEL);
 	if (!kbuf) {
 		folio_unlock(folio);
@@ -5781,6 +6045,14 @@ static int tidefs_posix_vfs_read_folio(struct file *file, struct folio *folio)
 	} else {
 		/* Zero-length read: the entire folio represents a hole. */
 		folio_zero_range(folio, 0, fsize);
+	}
+
+	if (!tidefs_posix_vfs_pagecache_fence_still_current(
+		    inode, pos, read_len, fence_generation)) {
+		kfree(kbuf);
+		folio_clear_uptodate(folio);
+		folio_unlock(folio);
+		return -EAGAIN;
 	}
 
 	kfree(kbuf);
@@ -5824,6 +6096,7 @@ static void tidefs_posix_vfs_readahead(struct readahead_control *rac)
 		size_t fsize = folio_size(folio);
 		size_t read_len;
 		void *kbuf;
+		u64 fence_generation;
 		int ret;
 		u64 fh_ino;
 
@@ -5847,6 +6120,8 @@ static void tidefs_posix_vfs_readahead(struct readahead_control *rac)
 		}
 
 		read_len = min_t(loff_t, (loff_t)fsize, isize - pos);
+		fence_generation = tidefs_posix_vfs_pagecache_fence_snapshot(
+			inode, pos, read_len);
 		kbuf = kmalloc(read_len, GFP_KERNEL);
 		if (!kbuf) {
 			/* Advisory: skip this folio on transient alloc
@@ -5879,6 +6154,13 @@ static void tidefs_posix_vfs_readahead(struct readahead_control *rac)
 			 * non-uptodate so demand read_folio resolves the
 			 * range through engine authority later.
 			 */
+			folio_unlock(folio);
+			continue;
+		}
+
+		if (!tidefs_posix_vfs_pagecache_fence_still_current(
+			    inode, pos, read_len, fence_generation)) {
+			kfree(kbuf);
 			folio_unlock(folio);
 			continue;
 		}

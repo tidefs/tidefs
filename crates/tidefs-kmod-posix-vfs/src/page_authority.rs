@@ -77,6 +77,10 @@ pub enum PageOwnership {
     /// Both hold equivalent clean copies; either may read.
     /// Neither may modify until ownership is acquired.
     Shared,
+    /// A newer dataset/inode/range generation superseded this page.
+    /// The kernel page cache must not serve or clean this entry until
+    /// the page is refilled or the dirty/writeback owner reconciles it.
+    Fenced,
 }
 
 impl PageOwnership {
@@ -88,6 +92,54 @@ impl PageOwnership {
     /// Whether this state permits the kernel to write the page.
     pub const fn kernel_can_write(self) -> bool {
         matches!(self, PageOwnership::KernelOwned)
+    }
+}
+
+/// Generation tuple for one kernel page-cache authority entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageGeneration {
+    /// File-size generation that was current when the page was populated.
+    pub file_size_generation: u64,
+    /// Byte-range generation that was current when the page was populated.
+    pub range_generation: u64,
+    /// Local lease epoch that authorized the cached access.
+    pub lease_epoch: u64,
+}
+
+impl PageGeneration {
+    /// Construct a generation tuple whose file-size and range generations
+    /// advance together for a destructive byte-range mutation.
+    pub const fn range_fence(generation: u64) -> Self {
+        Self {
+            file_size_generation: generation,
+            range_generation: generation,
+            lease_epoch: 0,
+        }
+    }
+}
+
+/// Generation snapshot taken when a read, mmap fault, or writeback starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageGenerationSnapshot {
+    inode: InodeId,
+    page_idx: u64,
+    generation: PageGeneration,
+}
+
+impl PageGenerationSnapshot {
+    /// Inode covered by this snapshot.
+    pub const fn inode(self) -> InodeId {
+        self.inode
+    }
+
+    /// Page index covered by this snapshot.
+    pub const fn page_idx(self) -> u64 {
+        self.page_idx
+    }
+
+    /// Generation captured by this snapshot.
+    pub const fn generation(self) -> PageGeneration {
+        self.generation
     }
 }
 
@@ -104,6 +156,8 @@ pub enum OwnershipConflict {
     InvalidationRace,
     /// The page index does not exist (out of range for the inode).
     OutOfRange,
+    /// A generation fence superseded the cached page while it was in use.
+    StaleGeneration,
     /// Requested mode upgrade (Shared→Write) failed because another
     /// thread holds a conflicting read lock (simplified model).
     UpgradeConflict,
@@ -114,6 +168,7 @@ impl OwnershipConflict {
     pub const fn to_errno(self) -> Errno {
         match self {
             OwnershipConflict::StaleWrite
+            | OwnershipConflict::StaleGeneration
             | OwnershipConflict::DoubleDirty
             | OwnershipConflict::InvalidationRace
             | OwnershipConflict::OutOfRange => Errno::EIO,
@@ -222,7 +277,7 @@ impl<'a, E: VfsEngine> OwnershipGuard<'a, E> {
                     self.engine
                         .page_ownership_transferred(self.inode, self.page_idx);
                 }
-                PageOwnership::KernelOwned => {
+                PageOwnership::KernelOwned | PageOwnership::Fenced => {
                     // Already kernel-owned; no signal needed.
                 }
             }
@@ -240,12 +295,14 @@ struct PageAuthorityEntry {
     inode: InodeId,
     page_idx: u64,
     state: PageOwnership,
+    generation: PageGeneration,
 }
 
 #[derive(Clone, Debug)]
 pub struct PageAuthorityTable {
     entries: crate::TideVec<PageAuthorityEntry>,
     max_entries: usize,
+    next_generation: u64,
 }
 
 impl PageAuthorityTable {
@@ -259,6 +316,7 @@ impl PageAuthorityTable {
         Self {
             entries: crate::TideVec::new(),
             max_entries,
+            next_generation: 1,
         }
     }
 
@@ -291,14 +349,35 @@ impl PageAuthorityTable {
             .unwrap_or(PageOwnership::EngineOwned)
     }
 
+    /// Look up the generation tuple for (inode, page_idx).
+    pub fn generation(&self, inode: InodeId, page_idx: u64) -> PageGeneration {
+        self.entries
+            .iter()
+            .find(|entry| entry.inode == inode && entry.page_idx == page_idx)
+            .map(|entry| entry.generation)
+            .unwrap_or_default()
+    }
+
     /// Insert (or update) an ownership entry.
     pub(crate) fn insert(&mut self, inode: InodeId, page_idx: u64, state: PageOwnership) {
+        let generation = self.generation(inode, page_idx);
+        self.insert_with_generation(inode, page_idx, state, generation);
+    }
+
+    fn insert_with_generation(
+        &mut self,
+        inode: InodeId,
+        page_idx: u64,
+        state: PageOwnership,
+        generation: PageGeneration,
+    ) {
         if let Some(entry) = self
             .entries
             .iter_mut()
             .find(|entry| entry.inode == inode && entry.page_idx == page_idx)
         {
             entry.state = state;
+            entry.generation = generation;
             return;
         }
         if self.max_entries == 0 {
@@ -317,6 +396,7 @@ impl PageAuthorityTable {
             inode,
             page_idx,
             state,
+            generation,
         });
     }
 
@@ -343,6 +423,72 @@ impl PageAuthorityTable {
         self.entries
             .iter()
             .map(|entry| (entry.inode, entry.page_idx, entry.state))
+    }
+
+    /// Iterate over all tracked entries with their generation tuple.
+    pub fn iter_with_generation(
+        &self,
+    ) -> impl Iterator<Item = (InodeId, u64, PageOwnership, PageGeneration)> + '_ {
+        self.entries
+            .iter()
+            .map(|entry| (entry.inode, entry.page_idx, entry.state, entry.generation))
+    }
+
+    /// Take the generation snapshot that a read, mmap fault, or writeback
+    /// must prove before publishing its page-cache result.
+    pub fn generation_snapshot(
+        &self,
+        inode: InodeId,
+        page_idx: u64,
+    ) -> PageGenerationSnapshot {
+        PageGenerationSnapshot {
+            inode,
+            page_idx,
+            generation: self.generation(inode, page_idx),
+        }
+    }
+
+    /// Check that a snapshot still matches the current page generation.
+    pub fn check_generation(
+        &self,
+        snapshot: PageGenerationSnapshot,
+    ) -> Result<(), OwnershipConflict> {
+        if self.generation(snapshot.inode, snapshot.page_idx) == snapshot.generation {
+            Ok(())
+        } else {
+            Err(OwnershipConflict::StaleGeneration)
+        }
+    }
+
+    /// Raise a generation fence over a byte range.
+    ///
+    /// Clean shared entries become fenced so they cannot satisfy later reads
+    /// without a refill. Dirty/kernel-owned entries are also fenced; writeback
+    /// completion must prove a pre-fence snapshot before it can mark them
+    /// clean. The engine is notified for every affected page, but notification
+    /// delivery is advisory: the generation tuple owns correctness.
+    pub fn raise_range_fence(
+        &mut self,
+        engine: &impl VfsEngine,
+        inode: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Option<PageGeneration> {
+        if length == 0 {
+            return None;
+        }
+
+        let first = page_index(offset);
+        let last = page_index(offset.saturating_add(length.saturating_sub(1)));
+        let generation = PageGeneration::range_fence(self.next_generation);
+        self.next_generation = self.next_generation.saturating_add(1).max(1);
+
+        for page_idx in first..=last {
+            engine.page_invalidation_needed(inode, page_idx);
+            self.insert_with_generation(inode, page_idx, PageOwnership::Fenced, generation);
+        }
+
+        Some(generation)
     }
 
     // ── Ownership protocol methods ──────────────────────────────────
@@ -386,8 +532,8 @@ impl PageAuthorityTable {
                 engine, self, inode, page_idx, current, current, mode,
             )),
 
-            // EngineOwned → Shared (read): kernel uses engine copy.
-            (PageOwnership::EngineOwned, PageOwnershipMode::Read) => {
+            // EngineOwned/Fenced → Shared (read): kernel refills from engine.
+            (PageOwnership::EngineOwned | PageOwnership::Fenced, PageOwnershipMode::Read) => {
                 self.insert(inode, page_idx, PageOwnership::Shared);
                 Ok(OwnershipGuard::new(
                     engine,
@@ -395,13 +541,13 @@ impl PageAuthorityTable {
                     inode,
                     page_idx,
                     PageOwnership::Shared,
-                    PageOwnership::EngineOwned,
+                    current,
                     mode,
                 ))
             }
 
-            // EngineOwned → KernelOwned (write): must invalidate engine copy.
-            (PageOwnership::EngineOwned, PageOwnershipMode::Write) => {
+            // EngineOwned/Fenced → KernelOwned (write): must invalidate engine copy.
+            (PageOwnership::EngineOwned | PageOwnership::Fenced, PageOwnershipMode::Write) => {
                 engine.page_invalidation_needed(inode, page_idx);
                 self.insert(inode, page_idx, PageOwnership::KernelOwned);
                 engine.page_ownership_acquired(inode, page_idx, mode);
@@ -411,7 +557,7 @@ impl PageAuthorityTable {
                     inode,
                     page_idx,
                     PageOwnership::KernelOwned,
-                    PageOwnership::EngineOwned,
+                    current,
                     mode,
                 ))
             }
@@ -450,6 +596,17 @@ impl PageAuthorityTable {
             return;
         }
         self.insert(inode, page_idx, PageOwnership::EngineOwned);
+    }
+
+    /// Transfer ownership back to the engine only if the writeback-start
+    /// generation is still current.
+    pub fn transfer_to_engine_if_current(
+        &mut self,
+        snapshot: PageGenerationSnapshot,
+    ) -> Result<(), OwnershipConflict> {
+        self.check_generation(snapshot)?;
+        self.transfer_to_engine(snapshot.inode, snapshot.page_idx);
+        Ok(())
     }
 
     /// Remove source-model page-authority entries for all pages at or beyond
@@ -504,6 +661,7 @@ impl PageAuthorityTable {
                 // but signal invalidation anyway for safety.
                 engine.page_invalidation_needed(inode, page_idx);
             }
+            PageOwnership::Fenced => {}
         }
     }
 
@@ -520,6 +678,7 @@ impl PageAuthorityTable {
             (PageOwnership::KernelOwned, _) => Ok(()),
             (PageOwnership::Shared, PageOwnershipMode::Read) => Ok(()),
             (PageOwnership::EngineOwned, PageOwnershipMode::Read) => Ok(()),
+            (PageOwnership::Fenced, _) => Err(OwnershipConflict::StaleGeneration),
             (PageOwnership::EngineOwned, PageOwnershipMode::Write) => {
                 Err(OwnershipConflict::StaleWrite)
             }
@@ -602,6 +761,7 @@ mod tests {
         assert_ne!(PageOwnership::EngineOwned, PageOwnership::KernelOwned);
         assert_ne!(PageOwnership::KernelOwned, PageOwnership::Shared);
         assert_ne!(PageOwnership::Shared, PageOwnership::EngineOwned);
+        assert_ne!(PageOwnership::Fenced, PageOwnership::Shared);
     }
 
     // ── OwnershipConflict tests ──────────────────────────────────────
@@ -609,6 +769,7 @@ mod tests {
     #[test]
     fn conflict_to_errno() {
         assert_eq!(OwnershipConflict::StaleWrite.to_errno(), Errno::EIO);
+        assert_eq!(OwnershipConflict::StaleGeneration.to_errno(), Errno::EIO);
         assert_eq!(OwnershipConflict::DoubleDirty.to_errno(), Errno::EIO);
         assert_eq!(OwnershipConflict::UpgradeConflict.to_errno(), Errno::EAGAIN);
     }
@@ -837,6 +998,78 @@ mod tests {
         assert_eq!(t.get(ino(1), 42), PageOwnership::EngineOwned);
     }
 
+    // ── Generation fence tests ──────────────────────────────────────
+
+    #[test]
+    fn range_fence_marks_clean_cache_stale() {
+        let e = MockEngine::new();
+        let mut t = make_table();
+        t.insert(ino(1), 0, PageOwnership::Shared);
+
+        let before = t.generation_snapshot(ino(1), 0);
+        let generation = t.raise_range_fence(&e, ino(1), 0, PAGE_SIZE).unwrap();
+
+        assert_eq!(t.get(ino(1), 0), PageOwnership::Fenced);
+        assert_eq!(t.generation(ino(1), 0), generation);
+        assert_eq!(
+            t.check_generation(before),
+            Err(OwnershipConflict::StaleGeneration)
+        );
+    }
+
+    #[test]
+    fn fence_refill_read_records_current_generation() {
+        let e = MockEngine::new();
+        let mut t = make_table();
+        let generation = t.raise_range_fence(&e, ino(1), 0, PAGE_SIZE).unwrap();
+
+        let guard = t.acquire(&e, ino(1), 0, PageOwnershipMode::Read).unwrap();
+        assert_eq!(guard.ownership(), PageOwnership::Shared);
+        guard.commit();
+
+        assert_eq!(t.get(ino(1), 0), PageOwnership::Shared);
+        assert_eq!(t.generation(ino(1), 0), generation);
+    }
+
+    #[test]
+    fn aborting_fenced_read_restores_fence() {
+        let e = MockEngine::new();
+        let mut t = make_table();
+        t.raise_range_fence(&e, ino(1), 0, PAGE_SIZE).unwrap();
+
+        let guard = t.acquire(&e, ino(1), 0, PageOwnershipMode::Read).unwrap();
+        guard.abort();
+
+        assert_eq!(t.get(ino(1), 0), PageOwnership::Fenced);
+    }
+
+    #[test]
+    fn writeback_completion_refuses_superseded_generation() {
+        let e = MockEngine::new();
+        let mut t = make_table();
+        t.insert(ino(1), 0, PageOwnership::KernelOwned);
+        let writeback_started = t.generation_snapshot(ino(1), 0);
+
+        t.raise_range_fence(&e, ino(1), 0, PAGE_SIZE).unwrap();
+
+        assert_eq!(
+            t.transfer_to_engine_if_current(writeback_started),
+            Err(OwnershipConflict::StaleGeneration)
+        );
+        assert_ne!(t.get(ino(1), 0), PageOwnership::EngineOwned);
+    }
+
+    #[test]
+    fn writeback_completion_marks_clean_when_generation_matches() {
+        let mut t = make_table();
+        t.insert(ino(1), 0, PageOwnership::KernelOwned);
+        let writeback_started = t.generation_snapshot(ino(1), 0);
+
+        t.transfer_to_engine_if_current(writeback_started).unwrap();
+
+        assert_eq!(t.get(ino(1), 0), PageOwnership::EngineOwned);
+    }
+
     // ── Check access tests ───────────────────────────────────────────
 
     #[test]
@@ -865,6 +1098,16 @@ mod tests {
         assert_eq!(
             t.check_access(ino(1), 0, PageOwnershipMode::Write),
             Err(OwnershipConflict::UpgradeConflict)
+        );
+    }
+
+    #[test]
+    fn check_access_fenced_refuses_cached_read() {
+        let mut t = make_table();
+        t.insert(ino(1), 0, PageOwnership::Fenced);
+        assert_eq!(
+            t.check_access(ino(1), 0, PageOwnershipMode::Read),
+            Err(OwnershipConflict::StaleGeneration)
         );
     }
 
