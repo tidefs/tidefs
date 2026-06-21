@@ -279,3 +279,26 @@ evidence_artifacts = [
   { class = "teardown-race-proof-artifact", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json" },
   { class = "claims-gate-review", path = "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.toml", source = "tidefs-kernel-cutover-runtime", scope = "kernel-teardown-source-model-boundary-review" },
 ]
+
+[[claims]]
+id = "local.vfs.page_cache_writeback_authority.v1"
+status = "blocked"
+scope = "local VFS page-cache writeback authority boundary"
+required_evidence_classes = [
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
+]
+blockers = [
+  "Page-cache writeback authority is a specification and vocabulary boundary, not a validated product claim.",
+  "Mounted writeback, mmap page-cache coherency, and broader durability remain non-claims per the claims-gate-review artifact.",
+  "No-hidden-queue evidence for writeback paths is not yet recorded.",
+  "Mounted FUSE and kernel writeback runtime evidence is not yet recorded.",
+  "Closed issues #443 (cache-coherency proof) and #445 (intent-log replay idempotency) provide focused-unit evidence but do not satisfy the mounted-runtime or no-hidden-queue gates.",
+  "Closed issue #486 (local VFS write/fsync crash evidence) is bounded to the OpFsyncBeforeFlush hook and does not validate mounted writeback durability.",
+]
+generated_doc = "Blocked page-cache writeback authority claim. TideFS has the authority document and supporting focused-unit evidence from #443, #445, and #486, but mounted writeback, mmap, page-cache coherency, no-hidden-queue, and broader runtime durability evidence are still required before the claim can validate."
+evidence_artifacts = [
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", source = "claims-gate", scope = "model-runtime-boundary-review" },
+]
