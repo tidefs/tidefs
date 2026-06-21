@@ -3287,7 +3287,6 @@ impl LocalObjectStore {
 
         let segment_ids_before = discover_segment_ids(&self.segments_dir)?;
         let live_objects_before = stats_counted_index_len(&self.index);
-        let compaction_start_segment_id = self.current_segment_id;
         let protected_keys: BTreeSet<ObjectKey> = protected_keys.iter().copied().collect();
         let exact_location_keys: BTreeSet<ObjectKey> = protected_exact_locations
             .iter()
@@ -3298,6 +3297,10 @@ impl LocalObjectStore {
         for location in protected_exact_locations {
             self.read_location(*location)?;
             retained_segments.insert(location.segment_id);
+        }
+
+        if self.current_offset > 0 {
+            self.rotate_segment()?;
         }
 
         let mut protected_copies = Vec::new();
@@ -3338,8 +3341,6 @@ impl LocalObjectStore {
         }
 
         let tombstoned_unprotected_keys = tombstone_keys.len();
-        let compaction_emitted_records =
-            copied_protected_objects > 0 || tombstoned_unprotected_keys > 0;
         for key in tombstone_keys {
             self.delete(key)?;
         }
@@ -3350,9 +3351,6 @@ impl LocalObjectStore {
         self.mark_committed_intent_log_segments_replayed_for_compaction()?;
 
         let segment_ids_after_writes = discover_segment_ids(&self.segments_dir)?;
-        if compaction_emitted_records {
-            retained_segments.insert(compaction_start_segment_id);
-        }
         for segment_id in &segment_ids_after_writes {
             if !segment_ids_before.contains(segment_id) {
                 retained_segments.insert(*segment_id);
