@@ -884,6 +884,35 @@ Reference points for these lessons:
   that the upstream community advises against new deployments:
   <https://docs.ceph.com/en/latest/rados/operations/cache-tiering/>
 
+## Implementation Staircase
+
+The child issues are a dependency ladder, not independent inventions of local
+policy. Each stage may land narrow scaffolding, but it must name the temporary
+adapter and the later issue that removes it. No runtime path may grow a second
+storage-intent language beside the shared records and compiled policy snapshot.
+
+| Stage | Graduation gate | Issues |
+| --- | --- | --- |
+| Records | Shared spellings and versioned records exist for policies, receipts, roles, proximity, media, workload, cost, wear, and relocation reasons. | #841 |
+| Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
+| Evidence feeds | Local ack paths, path evidence, media/wear cost, non-wear cost, and workload vectors can publish read-only evidence without making final placement decisions. | #842, #844, #845, #846, #856 |
+| Planning and admission | Hard constraints reject illegal candidates before scoring, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #843, #862 |
+| Authority extensions | RAM authority and relocation/defrag/rebake/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #847, #848 |
+| Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, and refusal story, and every implementation claim maps to performance and fault rows. | #849, #850, #863 |
+
+Interface gates between stages are explicit:
+
+- Consumers take `StorageIntentPolicy` snapshots and receipt/evidence records,
+  not raw caller hints, ad hoc dataset properties, or device labels.
+- Planners may score only candidates that already passed guarantee,
+  failure-domain, capacity, wear, transport, and degradation-law filters.
+- Schedulers may delay, throttle, or refuse work, but they may not convert one
+  acknowledgment class into another after admission.
+- Relocation workers may write speculative replacements, but they may not
+  retire source receipts until replacement receipts satisfy the target policy.
+- Validation rows are not an afterthought: each stage must either add the
+  relevant #850/#863 row binding or state which later issue owns that proof.
+
 ## Follow-Up Implementation Map
 
 The follow-up issues should be non-overlapping slices. They should not edit
