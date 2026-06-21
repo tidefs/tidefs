@@ -1976,8 +1976,12 @@ impl SpaceDomainRegistry {
         self.domains.get(domain_id)
     }
 
-    /// Compute `statfs` for a domain, aggregating across all datasets in the
-    /// clone family.
+    /// Compute POSIX `statfs` for a domain, aggregating across all datasets in
+    /// the clone family.
+    ///
+    /// `pinned_snapshot_bytes` remains available on [`SpaceDomainCounters`] for
+    /// dataset/operator views, but it is a subset of logical used bytes and is
+    /// not a second POSIX statfs consumption term.
     ///
     /// Returns `None` if the domain does not exist.
     #[must_use]
@@ -1986,9 +1990,7 @@ impl SpaceDomainRegistry {
         let block_size = StatfsResult::DEFAULT_BLOCK_SIZE;
         let total_blocks = counters.domain_quota_bytes / block_size;
 
-        let consumed = counters
-            .domain_logical_used_bytes
-            .saturating_add(counters.domain_pinned_snapshot_bytes);
+        let consumed = counters.domain_alloc_bytes();
         let free_bytes = counters.domain_quota_bytes.saturating_sub(consumed);
         let free_blocks = free_bytes / block_size;
 
@@ -3882,6 +3884,8 @@ mod tests {
         let mut counters = test_domain_counters();
         counters.domain_quota_bytes = 1_000_000;
         counters.domain_logical_used_bytes = 200_000;
+        counters.domain_reserved_bytes = 75_000;
+        counters.domain_orphan_bytes = 25_000;
         counters.domain_pinned_snapshot_bytes = 50_000;
         reg.create_domain(id, counters).unwrap();
 
@@ -3889,9 +3893,15 @@ mod tests {
         let block_size = StatfsResult::DEFAULT_BLOCK_SIZE;
         assert_eq!(statfs.block_size, block_size);
         assert_eq!(statfs.blocks, 1_000_000 / block_size);
-        // Free = quota - (used + pinned) = 1_000_000 - 250_000 = 750_000
-        let expected_free_blocks = 750_000 / block_size;
+        // Free = quota - (used + reserved + orphan) = 700_000.
+        // pinned_snapshot_bytes is tracked separately and does not reduce
+        // POSIX statfs free/available blocks (#638, #649).
+        let expected_free_blocks = 700_000 / block_size;
         assert_eq!(statfs.blocks_free, expected_free_blocks);
+        assert_eq!(
+            reg.get(&id).unwrap().domain_pinned_snapshot_bytes,
+            50_000
+        );
         // Avail = free - 5% reserved
         let reserved = (1_000_000 / block_size) / 20;
         assert_eq!(statfs.blocks_avail, expected_free_blocks - reserved);
@@ -3904,6 +3914,7 @@ mod tests {
         let mut counters = test_domain_counters();
         counters.domain_quota_bytes = u64::MAX;
         counters.domain_logical_used_bytes = u64::MAX - 10;
+        counters.domain_reserved_bytes = 100;
         counters.domain_pinned_snapshot_bytes = 100;
         reg.create_domain(id, counters).unwrap();
 
