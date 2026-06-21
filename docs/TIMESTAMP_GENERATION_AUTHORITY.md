@@ -466,8 +466,12 @@ validation before TFR-005 can close:
 5. **Content object reclaim and orphan cleanup**.
    `data_version` is used as both a content identity token (for object key
    generation) and a storage-ordering hint (for reclaim liveness). These two
-   uses of `data_version` should be explicitly named and separated if they
-   diverge.
+   uses are now named separately in
+   `docs/CONTENT_OBJECT_VERSION_AUTHORITY.md`: `data_version` is the content
+   identity token for `(inode_id, data_version)` keys, while reclaim must
+   consume a separate liveness guard built from commit-group death/stability,
+   placement receipt epoch/generation evidence, and orphan replay watermarks.
+   Runtime reclaim and rebake policy remain owned by issues #675 and #676.
 
 6. **Format-golden and codec surfaces**.
    If a later slice intentionally changes the serialized ABI (e.g.,
