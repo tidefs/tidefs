@@ -4369,7 +4369,17 @@ impl VfsEngine for VfsLocalFileSystem {
             .as_ref()
             .is_some_and(|target| target.inode_id != old_record.inode_id)
         {
-            self.invalidate_cached_path_subtree(&new_path);
+            // Non-directory overwrite: the target inode is gone, but its
+            // path prefix does not anchor any child entries.  Remove only
+            // the target entry itself instead of scanning the entire cache.
+            if target_record.as_ref().is_some_and(|t| t.kind().has_child_namespace()) {
+                self.invalidate_cached_path_subtree(&new_path);
+            } else {
+                self.remove_cached_path_if_matches(
+                    target_record.as_ref().unwrap().inode_id,
+                    &new_path,
+                );
+            }
         }
 
         self.move_cached_path(
