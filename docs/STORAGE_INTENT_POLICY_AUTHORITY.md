@@ -387,9 +387,14 @@ understand well enough to choose sane placement and relocation behavior.
 | VM/block image | random writes, FUA/barriers, discard, large mixed reads | Barrier-aware intent lanes, extent roles by hotness, stable receipt refs, discard-informed reclaim | Treating all writes as streaming or all data as cold EC |
 | Metadata storm | create/unlink/rename/xattr, directory churn, fsyncdir | Metadata on low-latency media, batched durable namespace intents, hot directory index locality | Pool-wide commit for single directory sync |
 | Package/build tree | temp files, rename-overwrite, deletes, short lifetimes | Young-generation placement with durable intent only until stability; cheap reclaim | Promoting every short-lived byte to flash full placement |
+| Interactive source/home tree | small reads/writes, editor fsync, mixed source and generated files | Metadata-hot serving, young-generation build outputs, stable source/config read locality | Treating the whole tree as one hot or one cold class |
+| Small-file fanout/maildir/object shards | tiny payloads, metadata-data coupling, directory fanout, fsyncdir | Co-locate metadata and small payloads on low-latency media, shard hot directories, age cold tiny objects together | Scattering every tiny payload across remote/slow media independently |
+| Container/image layers | immutable content-addressed blobs, clone fanout, startup read bursts | Shared compressed/dedup base layers, hot manifests/indexes, clone refs instead of rewrites | Copying layers per container or promoting one pull burst to flash authority |
 | Append logs | sequential append, periodic fsync, high compressibility maybe | Coalesced extents, range intents, large sequential layout once stable | Tiny extents forever or forced random HDD placement |
+| Time-series/log aggregation | append-only hot window, TTL, compaction/downsample, high compression | Durable intent for hot window, compressed large records after stability, lifecycle-aware TTL reclaim | Rewriting soon-to-expire windows repeatedly on flash |
 | Large streaming ingest | large sequential writes, low reuse, low sync density | Direct HDD/EC/cold placement, large records, avoid flash unless policy asks | Flash writeback cache that doubles media writes |
 | Sequential read/media | large sequential reads, low mutation | HDD/EC layout optimized for scan, optional prefetch, limited flash pinning | Hot-cache pollution from single-pass scans |
+| Analytics/ML training set | large immutable shards, repeated epochs, hot manifests/indexes | Cold sequential or EC data, hot metadata/index serving role, scan-aware prefetch | Promoting an entire corpus to flash after one training pass |
 | Hot small read set | high reuse, small random reads, low mutation | DRAM/flash read cache, optional serving replica on NVMe, no authority unless receipt-backed | Confusing cache hit with durable placement |
 | Sparse/random scientific | large sparse files, mixed scan/random phases | Per-range shaping, prediction confidence before rebake | Whole-file policy flips after brief phase changes |
 | Snapshot/send/receive | long sequential copy, pinned old versions, remote lag | Snapshot-aware extents, delta transfer, remote backlog receipts | Relocating pinned generations without receipt stability |
@@ -427,6 +432,12 @@ TideFS can often predict:
 - whether a write is likely to be overwritten or deleted soon;
 - whether an extent should be small, large, compressed, or EC encoded;
 - whether a read is a one-time scan or a stable hot set;
+- whether small payloads should be co-located with metadata or aged as a cold
+  tiny-object group;
+- whether immutable shared data such as container layers or training shards can
+  use clone/dedup/compressed placement instead of per-consumer rewrites;
+- whether retention/TTL windows make expensive relocation pointless before
+  reclaim;
 - whether a sync workload benefits from sharded local intent, remote quorum
   intent, or full immediate placement;
 - whether an HDD layout should be optimized for streaming or random locality;
