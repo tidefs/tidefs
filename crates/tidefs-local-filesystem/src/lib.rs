@@ -10415,12 +10415,20 @@ impl LocalFileSystem {
 
         self.intent_log.sync(self.store.raw_primary_store_mut())?;
 
-        // Per #863: mark the inode as dirty so do_commit() persists
-        // state before clearing intent log entries. Without this, a
-        // clean commit silently drops all acknowledged intents.
+        // Advance the inode record so do_commit() persists the
+        // updated metadata alongside the intent log entries,
+        // then clears the intent log after a successful commit.
+        let mut record = self.committed_inode_record(inode_id)?;
+        let new_size = record.size.max(offset.saturating_add(length));
+        record.size = new_size;
+        let tick = next_generation_after(self.state.generation);
+        record.data_version = tick;
+        record.metadata_version = tick;
+        self.update_inode_record(inode_id, record)?;
+        // Mark dirty so do_commit() persists state then clears
+        // the now-redundant intent log entries.
         self.mark_inode_content_dirty(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
-        self.mark_inode_metadata_dirty(inode_id);
 
         Ok(IntentLogReplyState::IntentDurable)
     }
