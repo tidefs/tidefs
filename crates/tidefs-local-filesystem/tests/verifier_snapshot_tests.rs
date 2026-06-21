@@ -22,7 +22,9 @@ use tidefs_local_filesystem::{
     root_slot_object_key, verify_online, LocalFileSystem, OnlineVerifierOutcome,
     DEFAULT_DIRECTORY_PERMISSIONS, DEFAULT_FILE_PERMISSIONS,
 };
-use tidefs_local_object_store::{segment_file_name, LocalObjectStore, StoreOptions};
+use tidefs_local_object_store::{
+    segment_file_name, LocalObjectStore, ObjectLocation, StoreOptions,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -65,8 +67,27 @@ fn opts() -> StoreOptions {
     }
 }
 
+fn with_raw_primary_store<T>(
+    root: &Path,
+    store_opts: StoreOptions,
+    f: impl FnOnce(&LocalObjectStore) -> T,
+) -> T {
+    let pool = LocalFileSystem::default_development_pool(root, &store_opts, None, None)
+        .expect("open development pool");
+    f(pool.raw_primary_store())
+}
+
 fn seg_path(segments_dir: &Path, segment_id: u64) -> PathBuf {
     segments_dir.join(segment_file_name(segment_id))
+}
+
+fn object_record_path(store: &LocalObjectStore, loc: ObjectLocation) -> PathBuf {
+    let segments_dir = store.segments_dir();
+    if segments_dir.is_file() || (segments_dir.exists() && !segments_dir.is_dir()) {
+        segments_dir.to_path_buf()
+    } else {
+        seg_path(segments_dir, loc.segment_id)
+    }
 }
 
 fn corrupt_bytes(path: &Path, offset: u64, len: u64) {
@@ -96,9 +117,8 @@ fn corrupt_root_slot_payload(store: &LocalObjectStore, slot: u64) {
         .into_iter()
         .next()
         .expect("root slot must have at least one version");
-    let payload_start = loc.record_offset + tidefs_local_object_store::RECORD_HEADER_LEN as u64;
-    let path = seg_path(store.segments_dir(), loc.segment_id);
-    corrupt_bytes(&path, payload_start, 1);
+    let path = object_record_path(store, loc);
+    corrupt_bytes(&path, loc.payload_offset, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -285,8 +305,7 @@ fn verifier_detects_corrupted_snapshot_source_root() {
 
     // The root slot object for the snapshot's source root lives in the store.
     // We corrupt it to simulate a missing/broken snapshot reference.
-    {
-        let store = LocalObjectStore::open_with_options(&root, opts()).unwrap();
+    with_raw_primary_store(&root, opts(), |store| {
         let _all_keys = store.list_keys();
         // Find a root-slot key that corresponds to the snapshot source.
         // The root slot index varies; corrupt whichever root slot exists.
@@ -296,12 +315,12 @@ fn verifier_detects_corrupted_snapshot_source_root() {
             if store.version_locations_of(key).is_empty() {
                 continue;
             }
-            corrupt_root_slot_payload(&store, slot);
+            corrupt_root_slot_payload(store, slot);
             corrupted = true;
             break;
         }
         assert!(corrupted, "expected at least one populated root slot");
-    }
+    });
 
     // Detection: verifier should report IssuesFound or store-level error.
     match verify_online(&root, opts()) {

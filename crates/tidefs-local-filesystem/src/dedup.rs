@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::BTreeMap;
 
+use tidefs_dedup::DedupHash;
 use tidefs_local_object_store::ObjectKey;
 
 use crate::types::ContentFingerprint;
@@ -48,7 +49,7 @@ impl DedupStats {
 /// sessions; this index accelerates same-session dedup hits only.
 #[derive(Clone, Debug, Default)]
 pub struct DedupIndex {
-    map: BTreeMap<ContentFingerprint, (ObjectKey, u64)>,
+    map: BTreeMap<DedupHash, (ObjectKey, u64)>,
     stats: DedupStats,
 }
 
@@ -60,13 +61,14 @@ impl DedupIndex {
         }
     }
 
-    pub fn lookup(&self, fingerprint: &ContentFingerprint) -> Option<ObjectKey> {
-        self.map.get(fingerprint).map(|(key, _)| *key)
+    pub fn lookup_hash(&self, hash: &DedupHash) -> Option<ObjectKey> {
+        self.map.get(hash).map(|(key, _)| *key)
     }
 
     pub fn insert(&mut self, fingerprint: ContentFingerprint, canonical_key: ObjectKey) {
+        let hash = fingerprint.as_dedup_hash();
         self.map
-            .entry(fingerprint)
+            .entry(hash)
             .and_modify(|(_key, count)| *count += 1)
             .or_insert((canonical_key, 1));
     }
@@ -75,7 +77,7 @@ impl DedupIndex {
     /// Removes the entry when the count reaches zero.
     pub fn remove(&mut self, fingerprint: &ContentFingerprint) {
         use std::collections::btree_map::Entry;
-        if let Entry::Occupied(mut entry) = self.map.entry(*fingerprint) {
+        if let Entry::Occupied(mut entry) = self.map.entry(fingerprint.as_dedup_hash()) {
             let (_key, count) = entry.get_mut();
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -193,7 +195,7 @@ mod tests {
     fn lookup_returns_none_for_missing_fingerprint() {
         let idx = DedupIndex::new();
         let fp = fingerprint([1u8; 32]);
-        assert!(idx.lookup(&fp).is_none());
+        assert!(idx.lookup_hash(&fp.as_dedup_hash()).is_none());
     }
 
     #[test]
@@ -202,7 +204,19 @@ mod tests {
         let fp = fingerprint([1u8; 32]);
         let key = object_key([2u8; 32]);
         idx.insert(fp, key);
-        assert_eq!(idx.lookup(&fp), Some(key));
+        assert_eq!(idx.lookup_hash(&fp.as_dedup_hash()), Some(key));
+    }
+
+    #[test]
+    fn lookup_hash_uses_dedup_crate_identity() {
+        let mut idx = DedupIndex::new();
+        let hash = tidefs_dedup::DedupHash::compute_domain_separated(b"tidefs-test", b"payload");
+        let fp = ContentFingerprint::from_dedup_hash(hash);
+        let key = object_key([2u8; 32]);
+
+        idx.insert(fp, key);
+
+        assert_eq!(idx.lookup_hash(&hash), Some(key));
     }
 
     #[test]
@@ -210,9 +224,9 @@ mod tests {
         let mut idx = DedupIndex::new();
         let fp = fingerprint([1u8; 32]);
         idx.insert(fp, object_key([2u8; 32]));
-        assert!(idx.lookup(&fp).is_some());
+        assert!(idx.lookup_hash(&fp.as_dedup_hash()).is_some());
         idx.remove(&fp);
-        assert!(idx.lookup(&fp).is_none());
+        assert!(idx.lookup_hash(&fp.as_dedup_hash()).is_none());
     }
 
     #[test]
@@ -222,9 +236,9 @@ mod tests {
         idx.insert(fp, object_key([2u8; 32]));
         idx.insert(fp, object_key([3u8; 32]));
         idx.remove(&fp);
-        assert!(idx.lookup(&fp).is_some());
+        assert!(idx.lookup_hash(&fp.as_dedup_hash()).is_some());
         idx.remove(&fp);
-        assert!(idx.lookup(&fp).is_none());
+        assert!(idx.lookup_hash(&fp.as_dedup_hash()).is_none());
     }
 
     #[test]

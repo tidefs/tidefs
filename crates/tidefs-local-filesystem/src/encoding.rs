@@ -1456,11 +1456,11 @@ pub(crate) fn push_i64(out: &mut Vec<u8>, value: i64) {
 pub(crate) fn compute_content_fingerprint(
     uncompressed_bytes: &[u8],
 ) -> crate::types::ContentFingerprint {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(crate::constants::CONTENT_DEDUP_FINGERPRINT_DOMAIN);
-    hasher.update(&(uncompressed_bytes.len() as u64).to_le_bytes());
-    hasher.update(uncompressed_bytes);
-    crate::types::ContentFingerprint::from_bytes32(*hasher.finalize().as_bytes())
+    let hash = tidefs_dedup::DedupHash::compute_domain_separated(
+        crate::constants::CONTENT_DEDUP_FINGERPRINT_DOMAIN,
+        uncompressed_bytes,
+    );
+    crate::types::ContentFingerprint::from_dedup_hash(hash)
 }
 
 pub(crate) fn is_dedup_redirect(bytes: &[u8]) -> bool {

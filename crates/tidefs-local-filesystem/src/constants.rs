@@ -115,7 +115,7 @@ pub const DEFAULT_AUTO_COMPACTION_WASTE_THRESHOLD: f64 = 0.25;
 /// threshold for the same reason.
 pub const DEFAULT_MAX_UNCOMMITTED_MUTATIONS: u64 = 256;
 
-pub const CONTENT_DEDUP_SPEC: &str = "content-addressed deduplication: gated by `integrity.dedup` dataset property (default off via dataset-properties registry). When enabled, BLAKE3-256 fingerprints of uncompressed chunk content are mapped through an in-memory DedupIndex and cross-session canonical-object probing to prevent duplicate chunk writes; redirect records point to content-addressed canonical chunk objects. When disabled (default), chunk writes skip fingerprint computation and store inline chunk data only. The tidefs-dedup crate (DDT/scanner design) is not yet the live write-path authority.";
+pub const CONTENT_DEDUP_SPEC: &str = "content-addressed deduplication: gated by the `org.tidefs:dedup` dataset feature flag (default off, matching the dataset-properties dedup default). When enabled, BLAKE3-256 fingerprints of uncompressed chunk content are classified through the tidefs-dedup inline decision API, then persisted by the local-filesystem write path using DedupIndex session hits, cross-session canonical-object probing, redirect records, and durable refcounts. When disabled (default), chunk writes skip fingerprint computation and store inline chunk data only.";
 pub const CONTENT_DEDUP_MAGIC_ASCII: &str = "VFSDEDUP";
 pub const CONTENT_DEDUP_MAGIC_BYTES: [u8; 8] = *b"VFSDEDUP";
 pub const CONTENT_DEDUP_REDIRECT_FORMAT_VERSION: u16 = 1;
