@@ -48,6 +48,10 @@ jobs:
       - name: Check workspace metadata
         run: nix develop .#ci --command bash -c 'cargo metadata --locked --format-version 1 --no-deps >/dev/null'
 
+      - name: Check doc authority drift
+        continue-on-error: true
+        run: nix develop .#ci --command bash -c 'cargo run -p tidefs-xtask -- check-doc-authority-drift'
+
       - name: Run selected crate tests
         run: nix develop .#ci --command bash -c './scripts/ci-test-runner.sh --crates "$TIDEFS_RUST_FAST_CRATES" --json ci-test-summary.json'
 

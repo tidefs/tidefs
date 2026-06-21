@@ -10,6 +10,7 @@ mod cluster;
 mod contract_codecs;
 mod coverage;
 mod crash_oracle;
+mod doc_authority_drift;
 mod forgejo_work;
 mod format_golden;
 mod hygiene;
@@ -50,6 +51,12 @@ fn main() {
         None | Some("summary") => print_summary(),
         Some("check-workspace-policy" | "check") => {
             if let Err(err) = policy::check_current_workspace() {
+                eprintln!("{err}");
+                process::exit(1);
+            }
+        }
+        Some("check-doc-authority-drift") => {
+            if let Err(err) = doc_authority_drift::check_current_workspace() {
                 eprintln!("{err}");
                 process::exit(1);
             }
@@ -1836,6 +1843,7 @@ fn print_summary() {
         println!(" | stage={}", surface.stage);
     }
     println!("policy_check_command=check-workspace-policy");
+    println!("doc_authority_drift_check_command=check-doc-authority-drift");
     println!("code_navigability_check_command=check-code-navigability");
     println!("contract_codecs_check_command=check-contract-codecs");
     println!("terminology_command=terminology");
@@ -1992,6 +2000,7 @@ fn print_help() {
     println!();
     println!("  --- Individual check commands ---");
     println!("  check-workspace-policy   validate workspace_layout dependency-edge rules");
+    println!("  check-doc-authority-drift detect retired-crate, missing-doc, and stale-register references in live docs");
     println!(
         "  check-workspace-hygiene detect duplicate Cargo.toml deps, mod decls, and use imports"
     );
