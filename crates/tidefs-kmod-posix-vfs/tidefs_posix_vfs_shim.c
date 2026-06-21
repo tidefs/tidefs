@@ -746,6 +746,7 @@ struct tidefs_posix_vfs_mount {
 	u32 writepages_calls;
 	spinlock_t pagecache_fence_lock;
 	u64 pagecache_fence_generation;
+	u64 pagecache_fence_overflow_generation;
 	u32 pagecache_fence_cursor;
 	struct tidefs_posix_vfs_pagecache_fence
 		pagecache_fences[TIDEFS_POSIX_VFS_PAGECACHE_FENCE_SLOTS];
@@ -825,6 +826,7 @@ static void tidefs_posix_vfs_pagecache_fences_init(
 
 	spin_lock_init(&ctx->pagecache_fence_lock);
 	ctx->pagecache_fence_generation = 1;
+	ctx->pagecache_fence_overflow_generation = 0;
 	ctx->pagecache_fence_cursor = 0;
 }
 
@@ -3843,6 +3845,10 @@ static u64 tidefs_posix_vfs_pagecache_raise_fence(struct inode *inode,
 	slot = ctx->pagecache_fence_cursor++ %
 		TIDEFS_POSIX_VFS_PAGECACHE_FENCE_SLOTS;
 	fence = &ctx->pagecache_fences[slot];
+	/* On ring wrap, promote the evicted fence to a mount-wide drop fence. */
+	if (fence->generation != 0 &&
+	    ctx->pagecache_fence_overflow_generation < generation)
+		ctx->pagecache_fence_overflow_generation = generation;
 	fence->ino = inode->i_ino;
 	fence->start = start;
 	fence->end = end;
@@ -3862,7 +3868,7 @@ static u64 tidefs_posix_vfs_pagecache_fence_snapshot(struct inode *inode,
 	unsigned long flags;
 	loff_t start;
 	loff_t end;
-	u64 generation = 0;
+	u64 generation;
 	int i;
 
 	if (!inode || !inode->i_sb || len == 0 || pos < 0)
@@ -3882,6 +3888,7 @@ static u64 tidefs_posix_vfs_pagecache_fence_snapshot(struct inode *inode,
 		return 0;
 
 	spin_lock_irqsave(&ctx->pagecache_fence_lock, flags);
+	generation = ctx->pagecache_fence_overflow_generation;
 	for (i = 0; i < TIDEFS_POSIX_VFS_PAGECACHE_FENCE_SLOTS; i++) {
 		const struct tidefs_posix_vfs_pagecache_fence *fence =
 			&ctx->pagecache_fences[i];
