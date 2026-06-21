@@ -49,6 +49,13 @@ describe the reviewed live PR authority, not a file that exists on
 - GitHub issue #904 for media-capability evidence covering persistence domain,
   flush/FUA/barrier semantics, atomicity, geometry, health, freshness, and role
   eligibility.
+- GitHub issue #915 for compiled service-objective evidence binding latency
+  percentile/tail, throughput floor/ceiling, concurrency/queue, burst/dwell,
+  degradation/RPO/RTO, isolation, topology/media, cost, wear, attribution,
+  query-snapshot, comparator/claim, and refusal state to a policy revision.
+- GitHub issue #920 for storage-intent result/refusal evidence binding typed
+  caller outcomes, including success, degraded-visible, blocked, refused,
+  retryability, idempotency, and response-registry projection.
 - `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`: cache is not authority, every
   cache entry is evictable only under its cache law, and dirty state must drain
   through explicit state machines.
@@ -372,7 +379,13 @@ floor. Silent weakening is forbidden. In particular:
 
 Promotion and demotion also consume #898, #901, #902, #903, and #904 when the
 transition depends on reserve headroom, policy-revision rollout, budget
-ownership, freshness or expiry, or media eligibility. A policy revision cannot
+ownership, freshness or expiry, or media eligibility. When a transition can affect
+latency, throughput, tail, queue, burst, dwell, isolation, or cost envelopes, it
+must also consume #915 service-objective refs to avoid hiding degraded p99 or
+weaker throughput under a stale envelope claim. A caller-visible transition,
+refusal, or degraded result must consume #920 result/refusal refs instead of
+collapsing to generic success, timeout, EIO, or silent weaker guarantee. A
+policy revision cannot
 reinterpret old RAM receipts without #901 convergence or downgrade evidence.
 Capacity pressure cannot borrow protected sync, repair, evacuation, or
 receipt-retirement reserve without #898 evidence. PMem cannot satisfy a
@@ -409,6 +422,12 @@ file, range, or pool:
   RPO, or replay-age claims;
 - media-capability state from #904 for PMem persistence domain, flush/FUA,
   atomicity, geometry, health, freshness, and role eligibility;
+- compiled service-objective state from #915 when RAM or PMem authority
+  affects latency, throughput, tail, queue, burst, dwell, isolation, cost,
+  wear, or comparator claims;
+- result/refusal state from #920 for any caller-visible RAM authority outcome,
+  including success, degraded-visible, blocked, refused, retryability, and
+  idempotency classification;
 - any requested policy transition that was refused to avoid weakening
   guarantees.
 
@@ -429,6 +448,8 @@ This docs slice maps to existing and future implementation work as follows:
 | Tenant and budget isolation evidence for shared RAM authority | #902 | storage-intent isolation record or model crate selected by #902 |
 | Temporal evidence for loss windows, leases, expiry, and freshness | #903 | storage-intent temporal record or model crate selected by #903 |
 | Media-capability evidence for PMem persistence and flush/FUA roles | #904 | storage-intent media-capability record or model crate selected by #904 |
+| Compiled service-objective evidence for RAM authority latency, throughput, tail, isolation, and cost envelopes | #915 | storage-intent service-objective record or model crate selected by #915 |
+| Result/refusal evidence for caller-visible RAM authority outcomes and retryability | #920 | storage-intent result/refusal record or model crate selected by #920 |
 | Transport path evidence for volatile peer receipts | #846 | `crates/tidefs-transport/src/` |
 | Intent-aware admission and memory/QoS scheduling | #862 | scheduler or admission crate named by that issue |
 | Operator explanation of volatility and receipts | #849 | `apps/tidefsctl/` and operator docs |
