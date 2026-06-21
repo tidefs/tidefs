@@ -37,6 +37,12 @@ looked fast. It is legal only when the receipt cites the membership epoch,
 roster, quorum set, witness/data role, failure-domain binding, and fence state
 owned by the membership authority.
 
+Ordering and replay evidence are the matching local truth. A low-latency sync
+reply is not honest because an intent record exists somewhere. It is honest
+only when the receipt proves the caller-visible barrier scope, dependency set,
+replay identity, committed-root or intent publication boundary, and completion
+state that make the acknowledged bytes recoverable in the right order.
+
 ## Non-Claims
 
 This document does not implement runtime behavior, change POSIX durability
@@ -123,6 +129,7 @@ The core records are:
 | `StorageIntentReceipt` | Earned acknowledgment evidence for one operation, range, or convergence step. |
 | `StorageIntentEvidenceRef` | Reference to placement receipts, local intent records, transport/path evidence, media/cost ledgers, scheduler admission records, or validation artifacts. |
 | `StorageIntentMembershipEvidence` | Reference projection of membership epoch, committed roster, quorum-set identity, witness/data role, failure-domain binding, drain/fence state, and split-brain hazard state owned by #750. |
+| `StorageIntentOrderingEvidence` | Barrier, dependency, replay, dirty-epoch, intent-sequence, commit/root publication, and completion evidence owned by #894. |
 | `StorageIntentDataShape` | Requested and earned encoded shape for a range or generation, including record sizing, transform ordering, digest suite, dedup/encryption/EC compatibility, and rebake evidence. |
 | `StorageIntentLayoutEvidence` | Allocator and physical-layout evidence for fragmentation, free runs, alignment, zone/write-pointer state, pending frees, reclaim debt, and locality. |
 | `StorageIntentLifecycleEvidence` | Generation and retention evidence for write age, stability, snapshots, clones, receive bases, orphans, destroy/tombstone state, and reclaim frontiers. |
@@ -158,6 +165,8 @@ The #841 type/model slice should therefore expose tested helpers or equivalent
 model predicates for:
 
 - ack receipt class versus requested guarantee floor;
+- ordering/replay legality, including caller-visible barrier scope,
+  dependency closure, replay idempotency, and commit/root publication state;
 - local, node, rack, datacenter, WAN, internet, and geo failure-domain
   dimensions;
 - membership epoch, committed-roster, quorum-set, witness-role, fence/drain,
@@ -184,6 +193,7 @@ The policy has these logical fields:
 | --- | --- |
 | `guarantee_floor` | Minimum acknowledgment evidence needed before reporting success. |
 | `visibility_profile` | Whether weaker acknowledgments may be returned to callers or must fail closed. |
+| `ordering_policy` | Required barrier scope, dependency closure, replay idempotency, dirty-epoch sealing, intent sequence, and committed-root/publication boundary. |
 | `proximity_domain_set` | Allowed latency/topology domains for serving, intent, replica, and archive roles. |
 | `membership_epoch_policy` | Required epoch freshness, quorum-set identity, witness/data role, failure-domain binding, drain/fence treatment, and split-brain refusal law. |
 | `media_role_policy` | Which media classes may hold intent, metadata, serving data, cold data, read cache, or scratch data. |
@@ -203,6 +213,7 @@ floors from optimizer weights:
 | Axis | Hard-floor examples | Optimizer examples |
 | --- | --- | --- |
 | Acknowledgment | durable local intent, quorum intent, geo intent, explicit volatile | group size, sharding, pipelining, full-placement delay |
+| Ordering and replay | fsync/fdatasync/O_DSYNC/FUA barrier scope, replay idempotency, dependency closure, committed-root or durable-intent boundary | group commit shape, sharded intent lane, coalescing window, replay-index layout |
 | Latency and tail | p99 sync or FUA ceiling, max queue time before refusal | prefer local NVMe/PMem, reduce metadata fan-out, cache read hot sets |
 | Throughput | minimum ingest or rebuild rate under foreground protection | larger records, direct cold placement, batching, EC/archive shape |
 | Data shape and integrity | checksum/digest suite, encryption domain, mounted transform block state, dedup/EC compatibility | record size, compression level, coalescing, dedup verdict, EC/archive shape |
@@ -265,6 +276,7 @@ The compiler must produce:
 
 - a policy id and monotonically changing policy revision;
 - the effective guarantee floor and failure-domain floor;
+- the ordering, replay, barrier, dirty-epoch, and dependency requirements;
 - the membership epoch, quorum, witness, drain/fence, and split-brain evidence
   requirements;
 - the visibility/degradation law for weaker receipts;
@@ -307,6 +319,8 @@ The receipt must bind:
 - earned acknowledgment class;
 - subject id, object key, inode/range, or request id;
 - payload digest, range digest, or replay digest as appropriate;
+- ordering evidence refs for barrier scope, dirty epoch, dependency closure,
+  replay idempotency, intent sequence, and commit/root publication state;
 - intent-log receipt refs when replayable intent was used;
 - placement receipt refs when durable placement was reached;
 - transport/path evidence refs when remote receipt participated;
@@ -592,6 +606,57 @@ operators who want maximum speed and accept loss. That profile must:
 
 The goal is not to forbid fast unsafe products. The goal is to make them
 honest and unnecessary for normal high-performance sync workloads.
+
+## Ordering, Replay, And Barrier Authority
+
+Acknowledgment class and placement are not enough. A `local-intent` or
+`quorum-intent` receipt can be fast and still wrong if it omits the barrier
+scope, writes metadata in an unreplayable order, loses a prior writeback error,
+or lets recovery apply the same intent twice. #894 owns the storage-intent
+ordering-evidence slice.
+
+Ordering evidence must distinguish at least:
+
+| Evidence field | Storage-intent use |
+| --- | --- |
+| `operation_scope` | Range write, file fsync/fdatasync, directory fsync, O_DSYNC/FUA, `msync(MS_SYNC)`, syncfs/dataset barrier, relocation cutover, repair, or receipt retirement. |
+| `dirty_epoch_ref` | Binds accepted dirty bytes to the lifecycle and writeback boundary that must drain or replay. |
+| `barrier_sequence` | Orders caller-visible barriers without forcing unrelated pool-wide serialization. |
+| `intent_sequence` | Names durable intent-log or equivalent records used for replay. |
+| `replay_idempotency_key` | Proves replay can apply an acknowledged intent exactly once or classify it as a visible error. |
+| `dependency_refs` | Names prior writes, metadata deltas, namespace/link-count changes, extent/checksum updates, or remote quorum acks that must precede success. |
+| `publication_boundary` | Names the committed root, durable intent boundary, receipt publication, or replacement cutover that makes the operation recoverable. |
+| `completion_state` | Records satisfied, pending-convergence, blocked, refused, or failed ordering work. |
+
+Authority laws:
+
+- `fsync`, `fdatasync`, `O_DSYNC`, FUA, `msync(MS_SYNC)`, and `syncfs`
+  success must cite ordering evidence for their caller-visible scope.
+- Group commit, sharded intent lanes, coalescing, batching, and pipelining are
+  legal performance tools only when the evidence preserves required ordering
+  and records what convergence remains pending.
+- Intent-log markers, flush markers, transaction markers, and dirty epochs are
+  evidence inputs. They are not sufficient by themselves unless they also carry
+  or identify the bytes and metadata needed for exact replay.
+- Namespace operations must preserve parent/child, link-count, rename, and
+  directory-fsync dependencies. A data write receipt cannot silently stand in
+  for missing namespace ordering evidence.
+- Quorum and geo acknowledgments need both membership evidence and ordering
+  evidence. A remote peer that received bytes in the right epoch still cannot
+  satisfy a barrier if its dependency or replay evidence is incomplete.
+- Placement receipts say where bytes or shards are. Ordering evidence says
+  whether those bytes satisfy the barrier, replay, dependency, and publication
+  contract.
+- Missing, stale, unsealed, wrong-root, wrong-range, non-idempotent, partial
+  namespace, incomplete metadata-delta, lost writeback-error, under-quorum, or
+  contradictory ordering evidence becomes `unknown-evidence`, `blocked`,
+  `refused`, or degraded-visible according to policy. It must not be guessed
+  from a fast path.
+
+This is the piece that lets TideFS beat slow synchronous designs without
+imitating unsafe ones. The implementation may make a sync workload fast by
+moving less data, grouping more intelligently, and replaying exact deltas. It
+may not make it fast by erasing the order that the caller paid for.
 
 ## Proximity Domains
 
@@ -1176,6 +1241,8 @@ Planning is a hard-constraint filter followed by multi-objective scoring.
 Hard constraints include:
 
 - requested guarantee floor;
+- ordering, replay, barrier-scope, dirty-epoch, dependency, and publication
+  legality;
 - membership epoch, committed-roster, quorum-set, witness/data role, fence,
   drain, split-brain, and failure-domain legality;
 - capacity and reservation availability;
@@ -1196,6 +1263,7 @@ score =
     latency_weight       * predicted_latency_cost
   + tail_weight          * predicted_tail_cost
   + throughput_weight    * throughput_shortfall_cost
+  + ordering_weight      * barrier_dependency_and_replay_cost
   + wear_weight          * estimated_media_write_cost
   + shape_weight         * cpu_read_amplification_and_rebuild_cost
   + layout_weight        * fragmentation_locality_and_reclaim_cost
@@ -1240,11 +1308,28 @@ signal changes materially.
 3. The planner selects sharded `sync-intent` roles on high-endurance low
    latency media, optionally quorum intent when the dataset policy asks for
    distributed sync.
-4. The ack receipt is `local-intent` or `quorum-intent`, not full cold
+4. Ordering evidence binds the dirty epoch, barrier scope, replay idempotency
+   key, and dependency refs for the acknowledged range.
+5. The ack receipt is `local-intent` or `quorum-intent`, not full cold
    placement.
-5. Later convergence folds stable ranges into the file's durable placement.
-6. Flash wear is one compact intent write per sync group, not a full-object
+6. Later convergence folds stable ranges into the file's durable placement.
+7. Flash wear is one compact intent write per sync group, not a full-object
    rewrite per barrier.
+
+### Grouped Fsync Without Order Loss
+
+1. Several files issue `fsync` or `fdatasync` close together under a policy that
+   permits grouping.
+2. The scheduler may batch their durable intent writes and commit/root
+   publication work to reduce tail latency and media writes.
+3. Ordering evidence still records each file or directory barrier scope,
+   dependency closure, replay idempotency key, and completion state.
+4. A later barrier may share a batch, but it may not claim an earlier operation
+   succeeded unless that operation's dependency set and publication boundary
+   passed.
+5. If one file has a writeback error, wrong-range intent, or incomplete metadata
+   delta, that file's receipt is refused or failed without poisoning unrelated
+   legal receipts in the batch.
 
 ### Bulk Backup Ingest
 
@@ -1391,6 +1476,8 @@ The operator UAPI should eventually answer:
 - What policy applies to this dataset/file/range?
 - What is the current satisfaction state for that policy revision?
 - What ack class did the last write/fsync receive?
+- Which ordering evidence satisfied the barrier: dirty epoch, intent sequence,
+  replay idempotency key, dependency refs, and publication boundary?
 - Which placement receipts currently satisfy policy?
 - Which source class served a read, and which cache, trial, remote, stale, or
   degraded candidates were rejected?
@@ -1425,6 +1512,8 @@ Initial row families should cover:
 
 - small sync local intent latency;
 - small sync quorum intent latency;
+- barrier/order/replay latency for fsync, fdatasync, O_DSYNC/FUA,
+  `msync(MS_SYNC)`, syncfs, and directory fsync scopes;
 - quorum and geo latency while membership epochs advance, nodes drain, peers are
   fenced, or witnesses are present;
 - full-placement fsync latency;
@@ -1459,6 +1548,8 @@ Each row must bind:
 
 - requested and earned ack classes;
 - reconciled satisfaction state before and after the measured action;
+- ordering evidence for barrier scope, dirty epoch, dependency closure, replay
+  idempotency, intent sequence, and publication boundary;
 - membership epoch, quorum-set, participant-role, drain/fence, and
   failure-domain evidence where remote or clustered receipts participate;
 - workload envelope and prediction confidence/action class;
@@ -1492,6 +1583,10 @@ The matrix must cover at least these row families:
 
 - kill-before-ack and crash-after-ack for every acknowledgment class, from
   `volatile-local` through `geo-intent`;
+- ordering faults such as unsealed dirty epoch, wrong barrier sequence,
+  wrong-root intent, wrong-range replay, non-idempotent replay, incomplete
+  namespace dependency, lost writeback error, and transaction marker without
+  replayable bytes;
 - transport partition, latency stretch, bandwidth clamp, packet loss, and
   RDMA-absent TCP/internet paths for quorum and geo modes;
 - membership faults such as stale epoch, future epoch, forked roster,
@@ -1595,6 +1690,10 @@ This document composes existing authority surfaces:
   intent owns the compiled cross-source policy snapshot consumed by ack,
   placement, relocation, and explanation paths; it does not replace the
   source-specific property registries.
+- #894 owns the storage-intent ordering-evidence slice for barrier scope,
+  dependency closure, dirty epochs, replay idempotency, intent sequence, and
+  publication boundary. It composes page-cache/writeback, intent-log, recovery,
+  and distributed receipt evidence without replacing those runtime owners.
 - #750 owns the membership authority decision for epoch identity, quorum-write
   dispatch, witness-set role, join/drain lifecycle, and epoch/fence enforcement;
   storage intent consumes those evidence refs and must not originate a parallel
@@ -1687,13 +1786,13 @@ storage-intent language beside the shared records and compiled policy snapshot.
 
 | Stage | Graduation gate | Issues |
 | --- | --- | --- |
-| Records | Shared spellings and versioned records exist for policies, receipts, roles, proximity, membership evidence refs, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #878, #880, #881 |
+| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #878, #880, #881, #894 |
 | Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
-| Evidence feeds | Local ack paths, membership epoch/fence refs, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881 |
+| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894 |
 | Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile. | #874 |
-| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal membership/fence state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #862, #878, #880, #881 |
+| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #862, #878, #880, #881, #894 |
 | Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness, epoch/fence, and receipt evidence. | #750, #877, #675, #881 |
-| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #750, #847, #848, #878, #880, #881 |
+| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement and ordering evidence before source retirement. | #750, #847, #848, #878, #880, #881, #894 |
 | Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875 |
 
 Interface gates between stages are explicit:
@@ -1701,10 +1800,13 @@ Interface gates between stages are explicit:
 - Consumers take `StorageIntentPolicy` snapshots and receipt/evidence records,
   not raw caller hints, ad hoc dataset properties, or device labels.
 - Planners may score only candidates that already passed guarantee,
-  membership/epoch/fence, failure-domain, data-shape, layout/allocator,
-  lifecycle/generation, capacity, wear, transport, and degradation-law filters.
+  ordering/replay, membership/epoch/fence, failure-domain, data-shape,
+  layout/allocator, lifecycle/generation, capacity, wear, transport, and
+  degradation-law filters.
 - Schedulers may delay, throttle, or refuse work, but they may not convert one
   acknowledgment class into another after admission.
+- Ack receipt emitters may group, shard, coalesce, or pipeline work only when
+  ordering evidence preserves the caller-visible barrier and replay contract.
 - Read-serving paths may accelerate through cache, trial, RAM, local, remote,
   degraded, snapshot, geo, or archive sources only when freshness, receipt,
   membership epoch, fence, and degradation predicates pass for the compiled
@@ -1719,7 +1821,8 @@ Interface gates between stages are explicit:
   orphan, destroy, or reclaim-frontier evidence only through authority records
   or marked non-authoritative predictors.
 - Relocation workers may write speculative replacements, but they may not
-  retire source receipts until replacement receipts satisfy the target policy.
+  retire source receipts until replacement receipts and ordering evidence
+  satisfy the target policy.
 - Validation rows and claim ids are not an afterthought: each stage must either
   add the relevant #850/#863 row binding and #875 claim boundary, or state
   which later issue owns that proof.
@@ -1732,7 +1835,8 @@ this document except to update the issue map after live tickets exist.
 | Slice | Follow-up issue | Expected write set | Purpose |
 | --- | --- | --- | --- |
 | Membership epoch authority | #750 | `docs/MEMBERSHIP_AUTHORITY.md` | Decide epoch, quorum-write, witness-set, join/drain, fence, roster, and failure-domain authority, then expose typed refs storage-intent consumers can cite. |
-| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, membership evidence refs, media role, proximity, workload, data-shape refs, layout refs, lifecycle refs, and cost records. |
+| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, media role, proximity, workload, data-shape refs, layout refs, lifecycle refs, and cost records. |
+| Ordering evidence authority | #894 | ordering evidence model surface or #841 core model | Expose barrier scope, dirty epoch, dependency closure, replay idempotency, intent sequence, publication boundary, and completion state for sync, quorum, relocation, repair, and receipt-retirement receipts. |
 | Policy source and compilation | #855 | policy/config crate or `crates/tidefs-storage-intent-policy/` | Persist and compile pool, dataset, mount, caller, and internal maintenance policy into storage-intent records. |
 | Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths. |
 | Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, membership/fence refs, proximity domains, failure domains, and media constraints. |
