@@ -910,6 +910,21 @@ impl VfsLocalFileSystem {
         }
     }
 
+    fn move_cached_path(
+        &self,
+        inode_id: InodeId,
+        kind: NodeKind,
+        old_path: &str,
+        new_path: &str,
+    ) {
+        if kind.carries_child_namespace() {
+            self.rewrite_cached_path_subtree(old_path, new_path);
+        }
+        self.path_cache
+            .borrow_mut()
+            .insert(inode_id, new_path.to_string());
+    }
+
     fn exchange_cached_path_subtrees(&self, old_path: &str, new_path: &str) {
         let updates: Vec<_> = self
             .path_cache
@@ -925,6 +940,23 @@ impl VfsLocalFileSystem {
         for (inode_id, path) in updates {
             cache.insert(inode_id, path);
         }
+    }
+
+    fn exchange_cached_paths(
+        &self,
+        old_record: &InodeAttr,
+        old_path: &str,
+        target_record: &InodeAttr,
+        new_path: &str,
+    ) {
+        let old_is_directory = old_record.kind.carries_child_namespace();
+        let target_is_directory = target_record.kind.carries_child_namespace();
+        if old_is_directory || target_is_directory {
+            self.exchange_cached_path_subtrees(old_path, new_path);
+        }
+        let mut cache = self.path_cache.borrow_mut();
+        cache.insert(old_record.inode_id, new_path.to_string());
+        cache.insert(target_record.inode_id, old_path.to_string());
     }
 
     #[allow(dead_code)] // INTENT: VFS engine helpers for planned FUSE operation dispatch
@@ -4322,10 +4354,12 @@ impl VfsEngine for VfsLocalFileSystem {
         if renameat2_flags == RenameAt2Flags::EXCHANGE {
             if let Some(target_record) = target_record.as_ref() {
                 if target_record.inode_id != old_record.inode_id {
-                    self.exchange_cached_path_subtrees(&old_path, &new_path);
-                    let mut cache = self.path_cache.borrow_mut();
-                    cache.insert(old_record.inode_id, new_path);
-                    cache.insert(target_record.inode_id, old_path);
+                    self.exchange_cached_paths(
+                        &old_record,
+                        &old_path,
+                        target_record,
+                        &new_path,
+                    );
                     return Ok(());
                 }
             }
@@ -4336,10 +4370,12 @@ impl VfsEngine for VfsLocalFileSystem {
             self.invalidate_cached_path_subtree(&new_path);
         }
 
-        self.rewrite_cached_path_subtree(&old_path, &new_path);
-        self.path_cache
-            .borrow_mut()
-            .insert(old_record.inode_id, new_path);
+        self.move_cached_path(
+            old_record.inode_id,
+            old_record.kind,
+            &old_path,
+            &new_path,
+        );
         Ok(())
     }
 
@@ -13828,6 +13864,67 @@ mod tests {
 
         let path = engine.inode_path(attr.inode_id).unwrap();
         assert_eq!(path, "/newname");
+    }
+
+    #[test]
+    fn path_cache_file_rename_does_not_rewrite_non_directory_descendants() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (attr, _fh) = engine.create(root, b"oldname", 0o644, 0, &ctx()).unwrap();
+        let synthetic = InodeId::new(999_001);
+        engine
+            .path_cache
+            .borrow_mut()
+            .insert(synthetic, "/oldname/not-a-child".to_string());
+
+        engine
+            .rename(root, b"oldname", root, b"newname", 0, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            cached_path(&engine, attr.inode_id).as_deref(),
+            Some("/newname")
+        );
+        assert_eq!(
+            cached_path(&engine, synthetic).as_deref(),
+            Some("/oldname/not-a-child")
+        );
+    }
+
+    #[test]
+    fn path_cache_file_exchange_does_not_rewrite_non_directory_descendants() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (alpha, _alpha_fh) = engine.create(root, b"alpha.txt", 0o644, 0, &ctx()).unwrap();
+        let (beta, _beta_fh) = engine.create(root, b"beta.txt", 0o644, 0, &ctx()).unwrap();
+        let synthetic_alpha = InodeId::new(999_002);
+        let synthetic_beta = InodeId::new(999_003);
+        {
+            let mut cache = engine.path_cache.borrow_mut();
+            cache.insert(synthetic_alpha, "/alpha.txt/not-a-child".to_string());
+            cache.insert(synthetic_beta, "/beta.txt/not-a-child".to_string());
+        }
+
+        engine
+            .rename(root, b"alpha.txt", root, b"beta.txt", RENAME_EXCHANGE, &ctx())
+            .unwrap();
+
+        assert_eq!(
+            cached_path(&engine, alpha.inode_id).as_deref(),
+            Some("/beta.txt")
+        );
+        assert_eq!(
+            cached_path(&engine, beta.inode_id).as_deref(),
+            Some("/alpha.txt")
+        );
+        assert_eq!(
+            cached_path(&engine, synthetic_alpha).as_deref(),
+            Some("/alpha.txt/not-a-child")
+        );
+        assert_eq!(
+            cached_path(&engine, synthetic_beta).as_deref(),
+            Some("/beta.txt/not-a-child")
+        );
     }
 
     #[test]
