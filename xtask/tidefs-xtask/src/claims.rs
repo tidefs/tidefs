@@ -2227,7 +2227,7 @@ fn render_claim_registry_doc(registry: &ClaimRegistry) -> String {
     out.push_str("# TideFS Claim Registry\n\n");
     out.push_str("Maturity: generated claim registry.\n\n");
     out.push_str("This file is generated from `validation/claims.toml` by `cargo run -p tidefs-xtask -- check-claims-gate`. Edit the registry, not this document.\n\n");
-    out.push_str("`validate-claim <id>` succeeds only for `validated` claims with fresh evidence artifacts. Planned, blocked, and invalid claims fail closed and remain non-product claims.\n\n");
+    out.push_str("`validate-claim <id>` prints PASS, BLOCKED, or FAIL. PASS is limited to validated claims with fresh evidence artifacts; BLOCKED exits successfully for focused validation while remaining a non-product claim, and FAIL exits nonzero.\n\n");
     out.push_str("| Claim id | Status | Scope | Required evidence | Blockers | Generated text |\n");
     out.push_str("|---|---|---|---|---|---|\n");
     for claim in &registry.claims {
@@ -2718,7 +2718,7 @@ mod tests {
         let generated = render_claim_registry_doc(&registry);
         assert_eq!(generated, include_str!("../../../docs/CLAIM_REGISTRY.md"));
         assert!(generated.contains("offload.ready.non_authoritative.v1"));
-        assert!(generated.contains("Planned, blocked, and invalid claims fail closed"));
+        assert!(generated.contains("BLOCKED exits successfully for focused validation"));
     }
 
     #[test]
