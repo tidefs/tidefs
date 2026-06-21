@@ -29,12 +29,23 @@ records trace metadata, backend, validation tier, and claim coverage. See
 [`docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`](../../docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md)
 for the schema authority.
 
+`cargo run -p tidefs-xtask -- check-trace-oracle --trace <name>` writes a
+model-only replay manifest. `--compare-trace <path>` writes a harness-only
+model/local-runtime comparison manifest. By default these files are written
+under `$CARGO_TARGET_DIR/trace-oracle-artifacts/` when `CARGO_TARGET_DIR` is
+set, or `target/trace-oracle-artifacts/` otherwise; pass
+`--manifest <path>` to choose the exact manifest path.
+
 Key distinctions:
 
 - **Model-only evidence** (`validation_tier: "source-model"`,
   `evidence_class: "model-only"`): replayed through `tidefs-model-core`
   alone. Validates contract shape and deterministic model behavior.
   Insufficient for runtime crash claims.
+- **Harness-only comparison evidence** (`validation_tier: "harness-only"`,
+  `evidence_class: "harness-only"`): compares the model backend with the
+  local trace-oracle runtime harness. This diagnoses tooling/backend parity
+  but is still insufficient for mounted runtime or crash-safety claims.
 - **Runtime evidence** (`validation_tier: "mounted-userspace"` or another
   runtime `ValidationTier`, `evidence_class: "runtime"`): replayed through
   a mounted adapter with crash injection and recovery. Required for
@@ -46,6 +57,7 @@ Key distinctions:
 |--------|---------|
 | `lib.rs` | `TraceRunner`, `TraceEvent`, `TraceOracle`, cost baseline |
 | `protocol.rs` | Wire-stable op names, trace schema constants, JSON keys |
+| `artifact_manifest.rs` | v1 artifact manifest structures and writer helpers |
 | `backend.rs` | Model and local-runtime backends, `BackendStep`, comparison |
 | `manifest.rs` | Golden corpus `MANIFEST.json` loader/verifier |
 | `minimize.rs` | Failing trace minimizer (binary search, simplification) |

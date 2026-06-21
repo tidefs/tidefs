@@ -4,6 +4,7 @@
 //! Replays JSONL trace files against `LocalFileSystem`, tracking per-step cost
 //! deltas and computing deterministic BLAKE3-256 state fingerprints.
 
+pub mod artifact_manifest;
 pub mod backend;
 pub mod manifest;
 pub mod minimize;
