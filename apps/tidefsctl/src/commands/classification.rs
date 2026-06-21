@@ -410,6 +410,18 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "roll back through the live owner or explicit offline devices",
     },
     CommandSurface {
+        path: "snapshot export",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "register runtime-pending read-only snapshot export mount surface",
+    },
+    CommandSurface {
+        path: "snapshot extract",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "register runtime-pending one-shot snapshot file extraction surface",
+    },
+    CommandSurface {
         path: "snapshot send",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
@@ -802,6 +814,20 @@ mod tests {
         assert!(surface.summary.contains("live owner"));
         assert!(surface.summary.contains("offline receive is unsupported"));
         assert!(!surface.summary.contains("explicit offline devices"));
+    }
+
+    #[test]
+    fn snapshot_export_and_extract_are_runtime_pending_surfaces() {
+        for path in ["snapshot export", "snapshot extract"] {
+            let surface = find_surface(path).expect("snapshot export/extract classified");
+            assert_eq!(surface.class, CommandClass::PublicOperator);
+            assert_eq!(surface.routing, RoutingSemantics::LiveOwnerOrOfflineInput);
+            assert!(
+                surface.summary.contains("runtime-pending"),
+                "{path} summary must not claim implemented runtime behavior: {}",
+                surface.summary
+            );
+        }
     }
 
     #[test]
