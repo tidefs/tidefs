@@ -243,6 +243,17 @@ Important 2026-06-01 findings:
   insertion still has no device-number authority for replayed special-node
   `rdev`, the delegated store update sequence is not a crash-consistency proof,
   is still required for runtime mknod/rename claims.
+- `TFR-004` / `TFR-018`: issue #667 narrows the special-node replay debt for
+  local-filesystem create/mknod replay. `NamespaceCreateIntentRecord` embeds
+  the authoritative `InodeRecord`, so intent encoding, recovery replay, and
+  local namespace persistence validate a single entry/inode id, generation,
+  mode, and kind before replaying metadata-only file, FIFO, character-device,
+  block-device, and socket entries. The embedded inode record carries
+  special-node `rdev`; the generic metadata-buffer mknod record now uses the
+  same normalized `rdev` for local VFS mknod. This still does not close
+  TFR-004 or TFR-018: dataset-scoped allocation, FUSE lookup-reference
+  projection, old-catalog policy, and broader namespace replay authority remain
+  in their dedicated follow-up slices.
 - `TFR-004`: issue #655 adds `docs/INODE_NAMESPACE_AUTHORITY.md` as the
   design decision artifact for dataset-scoped inode identity. The decision
   selects a dedicated per-dataset inode authority, rejects namespace-owned

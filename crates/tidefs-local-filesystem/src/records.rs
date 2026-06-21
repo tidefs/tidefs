@@ -202,6 +202,13 @@ impl RootIdentity {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NamespaceCreateIntentRecord {
+    pub(crate) parent_inode_id: InodeId,
+    pub(crate) entry: NamespaceEntry,
+    pub(crate) inode: InodeRecord,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedChangedRecordRoot {
     pub(crate) source_root: CommittedRootSummary,

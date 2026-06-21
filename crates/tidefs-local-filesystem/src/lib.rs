@@ -236,8 +236,9 @@
 //!    created.
 //! 3. **Intent-log replay**: `IntentLog::load` reads any persisted
 //!    intent-log entries. `replay_uncommitted` replays
-//!    `SyncWriteRange`, `OdsyncDataRange`, `SharedMmapMsync`, and
-//!    `NamespaceSyncIntent` entries against the live `FileSystemState`.
+//!    `SyncWriteRange`, `OdsyncDataRange`, `SharedMmapMsync`,
+//!    `NamespaceSyncIntent`, and `NamespaceCreateIntent` entries against the
+//!    live `FileSystemState`.
 //!    If replay fails, mount is refused with
 //!    [`FileSystemError::CorruptState`].
 //! 4. **Intent-log clear**: replayed entries are cleared so they are not
@@ -10467,6 +10468,40 @@ impl LocalFileSystem {
         self.mark_inode_content_dirty(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
 
+        Ok(IntentLogReplyState::IntentDurable)
+    }
+
+    pub(crate) fn namespace_create_intent(
+        &mut self,
+        parent_inode_id: InodeId,
+        entry: NamespaceEntry,
+        inode: &InodeRecord,
+    ) -> Result<IntentLogReplyState> {
+        let root_anchor = IntentLogRootAnchor {
+            transaction_id: self.state.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID),
+            generation: self.state.generation,
+            manifest_digest: IntegrityDigest64(0),
+        };
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let accepted = self.intent_log.append(
+            self.store.raw_primary_store_mut(),
+            IntentLogEntryKind::NamespaceCreateIntent(NamespaceCreateIntentRecord {
+                parent_inode_id,
+                entry,
+                inode: inode.clone(),
+            }),
+            root_anchor,
+            timestamp_ns,
+        )?;
+
+        if !accepted {
+            return Ok(IntentLogReplyState::Refused);
+        }
+
+        self.intent_log.sync(self.store.raw_primary_store_mut())?;
         Ok(IntentLogReplyState::IntentDurable)
     }
 
