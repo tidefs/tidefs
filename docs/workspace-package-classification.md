@@ -52,7 +52,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `apps/tidefs-storage-node` | `tidefs-storage-node` | `workspace-member` | `adapter-operator` | operator entrypoint for storage-node experiments; cluster authority remains TFR-017. |
 | `apps/tidefs-store-demo` | `tidefs-store-demo` | `workspace-member` | `proof-harness` | demo entrypoint and proof harness; non-production Local Object Store exercise only. |
 | `apps/tidefsctl` | `tidefsctl` | `workspace-member` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
-| `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #815 required before release claims. |
 | `crates/tidefs-auth` | `tidefs-auth` | `workspace-member` | `policy-tooling` | current policy/tooling surface; not a production-readiness claim. |
 | `crates/tidefs-background-scheduler` | `tidefs-background-scheduler` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-binary_schema-checksum` | `tidefs-binary_schema-checksum` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -60,7 +60,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-binary_schema-core/fuzz` | `tidefs-binary_schema-core-fuzz` | `workspace-excluded` | `standalone-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 | `crates/tidefs-binary_schema-framing` | `tidefs-binary_schema-framing` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-block-allocator` | `tidefs-block-allocator` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `workspace-member` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |
+| `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `workspace-member` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue #816 required before release claims. |
 | `crates/tidefs-block-volume-adapter-core` | `tidefs-block-volume-adapter-core` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
 | `crates/tidefs-block-volume-adapter-ublk-control-runtime` | `tidefs-block-volume-adapter-ublk-control-runtime` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
 | `crates/tidefs-btree` | `tidefs-btree` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -75,11 +75,11 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-clock-timing` | `tidefs-clock-timing` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-cluster` | `tidefs-cluster` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-commit_group` | `tidefs-commit_group` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-compaction` | `tidefs-compaction` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
-| `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `workspace-member` | `proof-harness` | planned authority surface for model-only crash oracle validation; follow-up issue required before it can support runtime release claims. |
+| `crates/tidefs-compaction` | `tidefs-compaction` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #817 required before release claims. |
+| `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `workspace-member` | `proof-harness` | planned authority surface for model-only crash oracle validation; follow-up issue #818 required before it can support runtime release claims. |
 | `crates/tidefs-compression` | `tidefs-compression` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-coordination-strategy` | `tidefs-coordination-strategy` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-data-cleaner` | `tidefs-data-cleaner` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-data-cleaner` | `tidefs-data-cleaner` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #819 required before release claims. |
 | `crates/tidefs-dataset-catalog` | `tidefs-dataset-catalog` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-dataset-feature-flags` | `tidefs-dataset-feature-flags` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-dataset-lifecycle` | `tidefs-dataset-lifecycle` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -87,28 +87,28 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-dedup` | `tidefs-dedup` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-derived-catalog` | `tidefs-derived-catalog` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-device-removal` | `tidefs-device-removal` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-distributed-model-check` | `tidefs-distributed-model-check` | `workspace-member` | `proof-harness` | planned authority surface for deterministic distributed safety model checking; follow-up issue required before it can support release claims. |
+| `crates/tidefs-distributed-model-check` | `tidefs-distributed-model-check` | `workspace-member` | `proof-harness` | planned authority surface for deterministic distributed safety model checking; follow-up issue #820 required before it can support release claims. |
 | `crates/tidefs-dir-index` | `tidefs-dir-index` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-durability-layout` | `tidefs-durability-layout` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-encryption` | `tidefs-encryption` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-env-fuse-model` | `tidefs-env-fuse-model` | `workspace-member` | `proof-harness` | planned authority surface for FUSE lifecycle environment model evidence; follow-up issue required before it can support runtime release claims. |
-| `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `workspace-member` | `proof-harness` | planned authority surface for bounded uBLK qid/tag state model evidence; follow-up issue required before it can support runtime release claims. |
-| `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-env-fuse-model` | `tidefs-env-fuse-model` | `workspace-member` | `proof-harness` | planned authority surface for FUSE lifecycle environment model evidence; follow-up issue #821 required before it can support runtime release claims. |
+| `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `workspace-member` | `proof-harness` | planned authority surface for bounded uBLK qid/tag state model evidence; follow-up issue #822 required before it can support runtime release claims. |
+| `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #823 required before release claims. |
 | `crates/tidefs-erasure-coding` | `tidefs-erasure-coding` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-extent-map` | `tidefs-extent-map` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-flow-commit-coordinator` | `tidefs-flow-commit-coordinator` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-frame` | `tidefs-frame` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-fuser` | `fuser` | `workspace-member` | `vendored-third-party` | vendored dependency for FUSE adapter builds; provenance is tracked in docs/LICENSING.md. |
 | `crates/tidefs-gc-pin-set` | `tidefs-gc-pin-set` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-geometry-convert` | `tidefs-geometry-convert` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-geometry-convert` | `tidefs-geometry-convert` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #824 required before release claims. |
 | `crates/tidefs-incremental-job-core` | `tidefs-incremental-job-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-inode-attributes` | `tidefs-inode-attributes` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-inode-table` | `tidefs-inode-table` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-intent-log` | `tidefs-intent-log` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-invalidation-feed` | `tidefs-invalidation-feed` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-kernel-cutover-runtime` | `tidefs-kernel-cutover-runtime` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-kernel-cutover-runtime` | `tidefs-kernel-cutover-runtime` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #825 required before release claims. |
 | `crates/tidefs-kernel-storage-io` | `tidefs-kernel-storage-io` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-kmod-posix-vfs` | `tidefs-kmod-posix-vfs` | `workspace-member` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |
+| `crates/tidefs-kmod-posix-vfs` | `tidefs-kmod-posix-vfs` | `workspace-member` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue #826 required before release claims. |
 | `crates/tidefs-lease` | `tidefs-lease` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-lease-manager` | `tidefs-lease-manager` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-local-filesystem` | `tidefs-local-filesystem` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -120,16 +120,16 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-membership-epoch` | `tidefs-membership-epoch` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-membership-live` | `tidefs-membership-live` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-membership-types` | `tidefs-membership-types` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-model-core` | `tidefs-model-core` | `workspace-member` | `proof-harness` | planned authority surface for trace and oracle validation; follow-up issue required before it can support release claims. |
+| `crates/tidefs-model-core` | `tidefs-model-core` | `workspace-member` | `proof-harness` | planned authority surface for trace and oracle validation; follow-up issue #827 required before it can support release claims. |
 | `crates/tidefs-namespace` | `tidefs-namespace` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-node-drain` | `tidefs-node-drain` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-node-join` | `tidefs-node-join` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-object-io` | `tidefs-object-io` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-offload-core` | `tidefs-offload-core` | `workspace-member` | `product-code` | planned authority surface for non-authoritative offload descriptor, lease, CPU reference, and completion validation; not a GPU/FPGA production acceleration claim. |
-| `crates/tidefs-online-defrag` | `tidefs-online-defrag` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-offload-core` | `tidefs-offload-core` | `workspace-member` | `product-code` | planned authority surface for non-authoritative offload descriptor, lease, CPU reference, and completion validation; not a GPU/FPGA production acceleration claim; follow-up issue #828 required.
+| `crates/tidefs-online-defrag` | `tidefs-online-defrag` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #829 required before release claims. |
 | `crates/tidefs-orphan-index` | `tidefs-orphan-index` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-partition-runtime` | `tidefs-partition-runtime` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-performance-contract` | `tidefs-performance-contract` | `workspace-member` | `product-code` | planned authority surface for performance admission and queue metadata; follow-up issue required before release claims. |
+| `crates/tidefs-performance-contract` | `tidefs-performance-contract` | `workspace-member` | `product-code` | planned authority surface for performance admission and queue metadata; follow-up issue #830 required before release claims. |
 | `crates/tidefs-permission` | `tidefs-permission` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-placement-planner` | `tidefs-placement-planner` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-placement-runtime` | `tidefs-placement-runtime` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -137,10 +137,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-pool-import` | `tidefs-pool-import` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-pool-scan` | `tidefs-pool-scan` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-posix-acl` | `tidefs-posix-acl` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-posix-filesystem-adapter-reply` | `tidefs-posix-filesystem-adapter-reply` | `workspace-member` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |
+| `crates/tidefs-posix-filesystem-adapter-reply` | `tidefs-posix-filesystem-adapter-reply` | `workspace-member` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue #831 required before release claims. |
 | `crates/tidefs-posix-filesystem-adapter-workers-io` | `tidefs-posix-filesystem-adapter-workers-io` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
 | `crates/tidefs-posix-filesystem-adapter-workers-locks` | `tidefs-posix-filesystem-adapter-workers-locks` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
-| `crates/tidefs-posix-guarantee-verifier` | `tidefs-posix-guarantee-verifier` | `workspace-member` | `proof-harness` | planned authority surface for validation; follow-up issue required before it can support release claims. |
+| `crates/tidefs-posix-guarantee-verifier` | `tidefs-posix-guarantee-verifier` | `workspace-member` | `proof-harness` | planned authority surface for validation; follow-up issue #832 required before it can support release claims. |
 | `crates/tidefs-posix-semantics` | `tidefs-posix-semantics` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-quorum-write` | `tidefs-quorum-write` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-quorum-write-runtime` | `tidefs-quorum-write-runtime` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -160,17 +160,17 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-schema-codec-posix-filesystem-adapter` | `tidefs-schema-codec-posix-filesystem-adapter` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-schema-codec-vfs` | `tidefs-schema-codec-vfs` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-scrub-core` | `tidefs-scrub-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-secret-key-policy-runtime` | `tidefs-secret-key-policy-runtime` | `workspace-member` | `policy-tooling` | planned authority surface for policy work; follow-up issue required before release claims. |
+| `crates/tidefs-secret-key-policy-runtime` | `tidefs-secret-key-policy-runtime` | `workspace-member` | `policy-tooling` | planned authority surface for policy work; follow-up issue #833 required before release claims. |
 | `crates/tidefs-segment-cleaner` | `tidefs-segment-cleaner` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-send-stream` | `tidefs-send-stream` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-shard-group` | `tidefs-shard-group` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-snapshot-pruner` | `tidefs-snapshot-pruner` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-snapshot-pruner` | `tidefs-snapshot-pruner` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #834 required before release claims. |
 | `crates/tidefs-space-accounting` | `tidefs-space-accounting` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-spacemap-allocator` | `tidefs-spacemap-allocator` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-tdma-scheduler` | `tidefs-tdma-scheduler` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-trace-oracle` | `tidefs-trace-oracle` | `workspace-member` | `proof-harness` | current proof harness; test signal only and not a product capability claim. |
 | `crates/tidefs-transport` | `tidefs-transport` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-two-node-harness` | `tidefs-two-node-harness` | `workspace-member` | `proof-harness` | planned authority surface for validation; follow-up issue required before it can support release claims. |
+| `crates/tidefs-two-node-harness` | `tidefs-two-node-harness` | `workspace-member` | `proof-harness` | planned authority surface for validation; follow-up issue #835 required before it can support release claims. |
 | `crates/tidefs-types-cache-lattice-core` | `tidefs-types-cache-lattice-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-types-claim-ledger-core` | `tidefs-types-claim-ledger-core` | `workspace-member` | `policy-tooling` | current policy/tooling surface; not a production-readiness claim. |
 | `crates/tidefs-types-dataset-feature-flags-core` | `tidefs-types-dataset-feature-flags-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -195,7 +195,7 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `crates/tidefs-validation/fuzz` | `tidefs-validation-fuzz` | `workspace-excluded` | `standalone-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 | `crates/tidefs-verification-engine` | `tidefs-verification-engine` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-vfs-engine` | `tidefs-vfs-engine` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-vfs-rpc` | `tidefs-vfs-rpc` | `workspace-member` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-vfs-rpc` | `tidefs-vfs-rpc` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #836 required before release claims. |
 | `crates/tidefs-witness-set` | `tidefs-witness-set` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-workload` | `tidefs-workload` | `workspace-member` | `proof-harness` | current proof harness; test signal only and not a product capability claim. |
 | `crates/tidefs-xattr-storage` | `tidefs-xattr-storage` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -214,28 +214,28 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `apps/tidefs-storage-node` | `tidefs-storage-node` | `adapter-operator` | operator entrypoint for storage-node experiments; cluster authority remains TFR-017. |
 | `apps/tidefs-store-demo` | `tidefs-store-demo` | `proof-harness` | demo entrypoint and proof harness; non-production Local Object Store exercise only. |
 | `apps/tidefsctl` | `tidefsctl` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
-| `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `product-code` | planned authority surface; follow-up issue required before release claims. |
-| `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |
-| `crates/tidefs-compaction` | `tidefs-compaction` | `product-code` | planned authority surface; follow-up issue required before release claims. |
-| `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `proof-harness` | planned authority surface for model-only crash oracle validation; follow-up issue required before it can support runtime release claims. |
-| `crates/tidefs-data-cleaner` | `tidefs-data-cleaner` | `product-code` | planned authority surface; follow-up issue required before release claims. |
-| `crates/tidefs-distributed-model-check` | `tidefs-distributed-model-check` | `proof-harness` | planned authority surface for deterministic distributed safety model checking; follow-up issue required before it can support release claims. |
-| `crates/tidefs-env-fuse-model` | `tidefs-env-fuse-model` | `proof-harness` | planned authority surface for FUSE lifecycle environment model evidence; follow-up issue required before it can support runtime release claims. |
-| `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `proof-harness` | planned authority surface for bounded uBLK qid/tag state model evidence; follow-up issue required before it can support runtime release claims. |
-| `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `product-code` | planned authority surface; follow-up issue required before release claims. |
-| `crates/tidefs-geometry-convert` | `tidefs-geometry-convert` | `product-code` | planned authority surface; follow-up issue required before release claims. |
-| `crates/tidefs-kernel-cutover-runtime` | `tidefs-kernel-cutover-runtime` | `product-code` | planned authority surface; follow-up issue required before release claims. |
-| `crates/tidefs-kmod-posix-vfs` | `tidefs-kmod-posix-vfs` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |
-| `crates/tidefs-model-core` | `tidefs-model-core` | `proof-harness` | planned authority surface for trace and oracle validation; follow-up issue required before it can support release claims. |
-| `crates/tidefs-offload-core` | `tidefs-offload-core` | `product-code` | planned authority surface for non-authoritative offload descriptor, lease, CPU reference, and completion validation; not a GPU/FPGA production acceleration claim. |
-| `crates/tidefs-online-defrag` | `tidefs-online-defrag` | `product-code` | planned authority surface; follow-up issue required before release claims. |
-| `crates/tidefs-performance-contract` | `tidefs-performance-contract` | `product-code` | planned authority surface for performance admission and queue metadata; follow-up issue required before release claims. |
-| `crates/tidefs-posix-filesystem-adapter-reply` | `tidefs-posix-filesystem-adapter-reply` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue required before release claims. |
-| `crates/tidefs-posix-guarantee-verifier` | `tidefs-posix-guarantee-verifier` | `proof-harness` | planned authority surface for validation; follow-up issue required before it can support release claims. |
-| `crates/tidefs-secret-key-policy-runtime` | `tidefs-secret-key-policy-runtime` | `policy-tooling` | planned authority surface for policy work; follow-up issue required before release claims. |
-| `crates/tidefs-snapshot-pruner` | `tidefs-snapshot-pruner` | `product-code` | planned authority surface; follow-up issue required before release claims. |
-| `crates/tidefs-two-node-harness` | `tidefs-two-node-harness` | `proof-harness` | planned authority surface for validation; follow-up issue required before it can support release claims. |
-| `crates/tidefs-vfs-rpc` | `tidefs-vfs-rpc` | `product-code` | planned authority surface; follow-up issue required before release claims. |
+| `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `product-code` | planned authority surface; follow-up issue #815 required before release claims. |
+| `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue #816 required before release claims. |
+| `crates/tidefs-compaction` | `tidefs-compaction` | `product-code` | planned authority surface; follow-up issue #817 required before release claims. |
+| `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `proof-harness` | planned authority surface for model-only crash oracle validation; follow-up issue #818 required before it can support runtime release claims. |
+| `crates/tidefs-data-cleaner` | `tidefs-data-cleaner` | `product-code` | planned authority surface; follow-up issue #819 required before release claims. |
+| `crates/tidefs-distributed-model-check` | `tidefs-distributed-model-check` | `proof-harness` | planned authority surface for deterministic distributed safety model checking; follow-up issue #820 required before it can support release claims. |
+| `crates/tidefs-env-fuse-model` | `tidefs-env-fuse-model` | `proof-harness` | planned authority surface for FUSE lifecycle environment model evidence; follow-up issue #821 required before it can support runtime release claims. |
+| `crates/tidefs-env-ublk-model` | `tidefs-env-ublk-model` | `proof-harness` | planned authority surface for bounded uBLK qid/tag state model evidence; follow-up issue #822 required before it can support runtime release claims. |
+| `crates/tidefs-erasure-coded-store` | `tidefs-erasure-coded-store` | `product-code` | planned authority surface; follow-up issue #823 required before release claims. |
+| `crates/tidefs-geometry-convert` | `tidefs-geometry-convert` | `product-code` | planned authority surface; follow-up issue #824 required before release claims. |
+| `crates/tidefs-kernel-cutover-runtime` | `tidefs-kernel-cutover-runtime` | `product-code` | planned authority surface; follow-up issue #825 required before release claims. |
+| `crates/tidefs-kmod-posix-vfs` | `tidefs-kmod-posix-vfs` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue #826 required before release claims. |
+| `crates/tidefs-model-core` | `tidefs-model-core` | `proof-harness` | planned authority surface for trace and oracle validation; follow-up issue #827 required before it can support release claims. |
+| `crates/tidefs-offload-core` | `tidefs-offload-core` | `product-code` | planned authority surface for non-authoritative offload descriptor, lease, CPU reference, and completion validation; not a GPU/FPGA production acceleration claim; follow-up issue #828 required.
+| `crates/tidefs-online-defrag` | `tidefs-online-defrag` | `product-code` | planned authority surface; follow-up issue #829 required before release claims. |
+| `crates/tidefs-performance-contract` | `tidefs-performance-contract` | `product-code` | planned authority surface for performance admission and queue metadata; follow-up issue #830 required before release claims. |
+| `crates/tidefs-posix-filesystem-adapter-reply` | `tidefs-posix-filesystem-adapter-reply` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue #831 required before release claims. |
+| `crates/tidefs-posix-guarantee-verifier` | `tidefs-posix-guarantee-verifier` | `proof-harness` | planned authority surface for validation; follow-up issue #832 required before it can support release claims. |
+| `crates/tidefs-secret-key-policy-runtime` | `tidefs-secret-key-policy-runtime` | `policy-tooling` | planned authority surface for policy work; follow-up issue #833 required before release claims. |
+| `crates/tidefs-snapshot-pruner` | `tidefs-snapshot-pruner` | `product-code` | planned authority surface; follow-up issue #834 required before release claims. |
+| `crates/tidefs-two-node-harness` | `tidefs-two-node-harness` | `proof-harness` | planned authority surface for validation; follow-up issue #835 required before it can support release claims. |
+| `crates/tidefs-vfs-rpc` | `tidefs-vfs-rpc` | `product-code` | planned authority surface; follow-up issue #836 required before release claims. |
 | `xtask/tidefs-xtask` | `tidefs-xtask` | `policy-tooling` | policy gate and developer tooling entrypoint; validates this classification authority. |
 
 ## Excluded Manifest Authority
