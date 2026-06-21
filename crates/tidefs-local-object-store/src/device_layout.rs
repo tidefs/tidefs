@@ -20,6 +20,7 @@
 
 use crate::device::{Device, DeviceImpl, DeviceState, IoClass};
 use std::fmt;
+use tidefs_binary_schema_checksum::crc32c;
 
 // ---------------------------------------------------------------------------
 // DeviceMediaClass — physical device type
@@ -742,5 +743,1009 @@ mod tests {
         let policy = DeviceClassPolicy::hdd_friendly();
         assert!(policy.metadata_allow_hdd);
         assert!(policy.metadata_preference.contains(&DeviceMediaClass::Hdd));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeviceLayoutPolicy — layout policy abstraction
+// ---------------------------------------------------------------------------
+
+/// Layout policy for computing device region partitioning and segment sizes.
+///
+/// Three policies are supported:
+/// - [`Slice0Small`](DeviceLayoutPolicy::Slice0Small): fixed 1 MiB segments
+///   and small journal regions for test/tiny devices.
+/// - [`Auto`](DeviceLayoutPolicy::Auto): auto-scaling segment size chosen to
+///   keep per-region segment count below a configured ceiling.
+/// - [`Custom`](DeviceLayoutPolicy::Custom): operator-specified per-region
+///   segment sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceLayoutPolicy {
+    /// Historical small layout: 1 MiB segments, fixed small journal regions.
+    Slice0Small,
+    /// Auto-scaling: segment size chosen to keep segment count bounded.
+    Auto,
+    /// Operator-specified per-region segment sizes.  All sizes must be
+    /// powers of two within [1 MiB, 256 MiB].
+    Custom {
+        data_segment_size: u64,
+        metadata_segment_size: u64,
+        journal_segment_size: u64,
+    },
+}
+
+impl Default for DeviceLayoutPolicy {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl fmt::Display for DeviceLayoutPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Slice0Small => f.write_str("Slice0Small"),
+            Self::Auto => f.write_str("Auto"),
+            Self::Custom { .. } => f.write_str("Custom"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeviceLayoutPolicyDiscriminant — stored policy tag
+// ---------------------------------------------------------------------------
+
+/// Stored policy discriminant (preserves which policy created the layout).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+pub enum DeviceLayoutPolicyDiscriminant {
+    Slice0Small = 0,
+    Auto = 1,
+    Custom = 2,
+}
+
+impl DeviceLayoutPolicyDiscriminant {
+    /// Decode from a u16 wire value.
+    #[must_use]
+    pub const fn from_u16(v: u16) -> Option<Self> {
+        match v {
+            0 => Some(Self::Slice0Small),
+            1 => Some(Self::Auto),
+            2 => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    /// Encode to a u16 wire value.
+    #[must_use]
+    pub const fn to_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeviceLayoutV1 — on-media layout record
+// ---------------------------------------------------------------------------
+
+/// Persistent device layout record (written at pool creation, read on open).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceLayoutV1 {
+    /// Which policy produced this layout.
+    pub policy: DeviceLayoutPolicyDiscriminant,
+    /// Total device capacity in bytes.
+    pub device_size_bytes: u64,
+    /// Byte offset of system area.
+    pub system_area_offset: u64,
+    /// System area length in bytes.
+    pub system_area_len: u64,
+    /// Byte offset of poolmap journal region.
+    pub poolmap_journal_offset: u64,
+    /// Poolmap journal length in bytes.
+    pub poolmap_journal_len: u64,
+    /// Byte offset of metadata journal region.
+    pub metadata_journal_offset: u64,
+    /// Metadata journal length in bytes.
+    pub metadata_journal_len: u64,
+    /// Byte offset of data journal region.
+    pub data_journal_offset: u64,
+    /// Data journal length in bytes.
+    pub data_journal_len: u64,
+    /// Segment size for system area (bytes, power of two).
+    pub system_segment_size: u64,
+    /// Segment size for poolmap journal (bytes, power of two).
+    pub poolmap_segment_size: u64,
+    /// Segment size for metadata journal (bytes, power of two).
+    pub metadata_segment_size: u64,
+    /// Segment size for data journal (bytes, power of two).
+    pub data_segment_size: u64,
+}
+
+// ---------------------------------------------------------------------------
+// DeviceLayoutV1 wire-format constants
+// ---------------------------------------------------------------------------
+
+/// Magic bytes identifying a DeviceLayoutV1 record: `b"VFSDLAY1"`.
+pub const DEVICE_LAYOUT_V1_MAGIC: [u8; 8] = *b"VFSDLAY1";
+
+/// Wire format version.
+pub const DEVICE_LAYOUT_V1_VERSION: u16 = 1;
+
+/// Total wire size of a DeviceLayoutV1 record in bytes.
+pub const DEVICE_LAYOUT_V1_WIRE_SIZE: usize = 124;
+
+/// Offset of the CRC32C checksum in the wire format.
+pub const DEVICE_LAYOUT_V1_CRC32C_OFFSET: usize = 120;
+
+// ---------------------------------------------------------------------------
+// Layout computation constants
+// ---------------------------------------------------------------------------
+
+/// Target maximum segment count for the data region.
+pub const TARGET_DATA_SEGMENTS: u64 = 4_000_000;
+
+/// Minimum segment size: 1 MiB.
+pub const MIN_SEGMENT_SIZE_BYTES: u64 = 1024 * 1024;
+
+/// Maximum segment size: 256 MiB.
+pub const MAX_SEGMENT_SIZE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// System area size in segments (always 1).
+pub const SYSTEM_AREA_SEGMENTS: u64 = 1;
+
+/// Poolmap journal size in segments.
+pub const POOLMAP_JOURNAL_SEGMENTS: u64 = 16;
+
+/// Metadata journal size in segments.
+pub const METADATA_JOURNAL_SEGMENTS: u64 = 256;
+
+/// Slice0Small fixed segment size: 1 MiB.
+pub const SLICE0_SMALL_SEGMENT_BYTES: u64 = 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// LayoutPolicyError
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur during layout policy computation or decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutPolicyError {
+    /// Device size is zero (invalid).
+    DeviceSizeZero,
+    /// Device is too small for any valid layout.
+    DeviceTooSmall {
+        device_size_bytes: u64,
+        minimum_required_bytes: u64,
+    },
+    /// Input buffer is too small.
+    BufferTooSmall {
+        expected: usize,
+        actual: usize,
+    },
+    /// Magic bytes do not match.
+    BadMagic {
+        expected: [u8; 8],
+        found: [u8; 8],
+    },
+    /// Unrecognized format version.
+    UnsupportedVersion(u16),
+    /// Bad policy discriminant value.
+    BadPolicyDiscriminant(u16),
+    /// CRC32C checksum mismatch.
+    ChecksumMismatch {
+        expected: u32,
+        computed: u32,
+    },
+    /// Custom layout had an invalid segment size.
+    InvalidSegmentSize {
+        reason: InvalidSegmentSizeReason,
+    },
+    /// Custom layout region sizes exceed device capacity.
+    RegionOverflow {
+        device_size_bytes: u64,
+        required_bytes: u64,
+    },
+}
+
+impl fmt::Display for LayoutPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceSizeZero => f.write_str("device size is zero"),
+            Self::DeviceTooSmall {
+                device_size_bytes,
+                minimum_required_bytes,
+            } => write!(
+                f,
+                "device size {device_size_bytes} too small (min {minimum_required_bytes})"
+            ),
+            Self::BufferTooSmall { expected, actual } => write!(
+                f,
+                "buffer too small: need {expected} bytes, got {actual}"
+            ),
+            Self::BadMagic { expected: _, found } => {
+                write!(f, "bad magic bytes: {found:02x?}")
+            }
+            Self::UnsupportedVersion(v) => write!(f, "unsupported layout version {v}"),
+            Self::BadPolicyDiscriminant(v) => write!(f, "bad policy discriminant {v}"),
+            Self::ChecksumMismatch { expected, computed } => write!(
+                f,
+                "CRC32C mismatch: expected {expected:#08x}, computed {computed:#08x}"
+            ),
+            Self::InvalidSegmentSize { reason } => write!(f, "invalid segment size: {reason}"),
+            Self::RegionOverflow {
+                device_size_bytes,
+                required_bytes,
+            } => write!(
+                f,
+                "region overflow: device {device_size_bytes} bytes, layout needs {required_bytes} bytes"
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InvalidSegmentSizeReason
+// ---------------------------------------------------------------------------
+
+/// Reason a custom segment size was rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvalidSegmentSizeReason {
+    /// Value is not a power of two.
+    NotPowerOfTwo,
+    /// Value is below the minimum allowed segment size (1 MiB).
+    BelowMinimum { min: u64, actual: u64 },
+    /// Value is above the maximum allowed segment size (256 MiB).
+    AboveMaximum { max: u64, actual: u64 },
+}
+
+impl fmt::Display for InvalidSegmentSizeReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPowerOfTwo => f.write_str("not a power of two"),
+            Self::BelowMinimum { min, actual } => {
+                write!(f, "{actual} below minimum {min}")
+            }
+            Self::AboveMaximum { max, actual } => {
+                write!(f, "{actual} above maximum {max}")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: power-of-two check
+// ---------------------------------------------------------------------------
+
+/// Returns true if `n` is a non-zero power of two.
+#[inline]
+pub const fn is_power_of_two_u64(n: u64) -> bool {
+    n != 0 && (n & (n - 1)) == 0
+}
+
+// ---------------------------------------------------------------------------
+// Helper: choose power-of-two segment size for auto-scaling
+// ---------------------------------------------------------------------------
+
+/// Pick a power-of-two segment size that keeps the segment count for a
+/// region of `region_size_bytes` below or near `target_segments`.
+///
+/// Returns a power-of-two in [`MIN_SEGMENT_SIZE_BYTES`, `MAX_SEGMENT_SIZE_BYTES`].
+#[must_use]
+pub fn choose_segment_size_bytes(
+    region_size_bytes: u64,
+    target_segments: u64,
+) -> u64 {
+    if region_size_bytes == 0 {
+        return MIN_SEGMENT_SIZE_BYTES;
+    }
+    // Segment size that gives exactly target_segments segments.
+    let raw = region_size_bytes / target_segments;
+    // Clamp to bounds, then round up to next power of two.
+    let clamped = raw.clamp(MIN_SEGMENT_SIZE_BYTES, MAX_SEGMENT_SIZE_BYTES);
+    let pot = clamped.next_power_of_two();
+    pot.clamp(MIN_SEGMENT_SIZE_BYTES, MAX_SEGMENT_SIZE_BYTES)
+}
+
+// ---------------------------------------------------------------------------
+// validate_segment_size — Custom policy gate
+// ---------------------------------------------------------------------------
+
+/// Validate a caller-supplied segment size for the Custom policy.
+///
+/// Returns `Ok(())` if `size` is a power of two within [1 MiB, 256 MiB].
+pub fn validate_segment_size(size: u64) -> Result<(), LayoutPolicyError> {
+    if !is_power_of_two_u64(size) {
+        return Err(LayoutPolicyError::InvalidSegmentSize {
+            reason: InvalidSegmentSizeReason::NotPowerOfTwo,
+        });
+    }
+    if size < MIN_SEGMENT_SIZE_BYTES {
+        return Err(LayoutPolicyError::InvalidSegmentSize {
+            reason: InvalidSegmentSizeReason::BelowMinimum {
+                min: MIN_SEGMENT_SIZE_BYTES,
+                actual: size,
+            },
+        });
+    }
+    if size > MAX_SEGMENT_SIZE_BYTES {
+        return Err(LayoutPolicyError::InvalidSegmentSize {
+            reason: InvalidSegmentSizeReason::AboveMaximum {
+                max: MAX_SEGMENT_SIZE_BYTES,
+                actual: size,
+            },
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DeviceLayoutPolicy::compute — produce a DeviceLayoutV1
+// ---------------------------------------------------------------------------
+
+impl DeviceLayoutPolicy {
+    /// Compute [`DeviceLayoutV1`] for a device of `device_size_bytes`.
+    ///
+    /// The returned layout divides the device into four contiguous regions:
+    /// system area (1 segment), poolmap journal (16 segments),
+    /// metadata journal (256 segments), and data journal (remainder).
+    pub fn compute(self, device_size_bytes: u64) -> Result<DeviceLayoutV1, LayoutPolicyError> {
+        if device_size_bytes == 0 {
+            return Err(LayoutPolicyError::DeviceSizeZero);
+        }
+
+        match self {
+            Self::Slice0Small => Self::compute_slice0_small(device_size_bytes),
+            Self::Auto => Self::compute_auto(device_size_bytes),
+            Self::Custom {
+                data_segment_size,
+                metadata_segment_size,
+                journal_segment_size,
+            } => Self::compute_custom(
+                device_size_bytes,
+                data_segment_size,
+                metadata_segment_size,
+                journal_segment_size,
+            ),
+        }
+    }
+
+    /// Fixed 1 MiB segment sizes for all regions.
+    /// For devices too small for the full journal layout, journals are
+    /// sized down proportionally so the layout always fits.
+    fn compute_slice0_small(
+        device_size_bytes: u64,
+    ) -> Result<DeviceLayoutV1, LayoutPolicyError> {
+        let seg = SLICE0_SMALL_SEGMENT_BYTES;
+
+        // Absolute minimum: one segment for the system area.
+        let system_area_len = seg * SYSTEM_AREA_SEGMENTS;
+        if device_size_bytes < system_area_len {
+            return Err(LayoutPolicyError::DeviceTooSmall {
+                device_size_bytes,
+                minimum_required_bytes: system_area_len,
+            });
+        }
+
+        let remaining = device_size_bytes.saturating_sub(system_area_len);
+
+        // Distribute remaining space: poolmap gets ~5%, metadata ~15%, data the rest.
+        // Floor of 1 segment (1 MiB) for each journal when possible.
+        let poolmap_seg = (POOLMAP_JOURNAL_SEGMENTS).min(remaining / seg / 21);
+        let poolmap_journal_len = seg * poolmap_seg.max(1).min(remaining / seg);
+
+        let remaining_after_poolmap = remaining.saturating_sub(poolmap_journal_len);
+        let metadata_seg = METADATA_JOURNAL_SEGMENTS.min(remaining_after_poolmap / seg / 5);
+        let metadata_journal_len = seg * metadata_seg.max(1).min(remaining_after_poolmap / seg);
+
+        let remaining_after_metadata =
+            remaining_after_poolmap.saturating_sub(metadata_journal_len);
+        let data_journal_len = remaining_after_metadata;
+
+        let system_end = system_area_len;
+        let poolmap_end = system_end + poolmap_journal_len;
+        let metadata_end = poolmap_end + metadata_journal_len;
+
+        Ok(DeviceLayoutV1 {
+            policy: DeviceLayoutPolicyDiscriminant::Slice0Small,
+            device_size_bytes,
+            system_area_offset: 0,
+            system_area_len,
+            poolmap_journal_offset: system_end,
+            poolmap_journal_len,
+            metadata_journal_offset: poolmap_end,
+            metadata_journal_len,
+            data_journal_offset: metadata_end,
+            data_journal_len,
+            system_segment_size: seg,
+            poolmap_segment_size: seg,
+            metadata_segment_size: seg,
+            data_segment_size: seg,
+        })
+    }
+
+    /// Auto-scaling: pick a segment size that keeps data region segment count
+    /// below [`TARGET_DATA_SEGMENTS`], then size journal regions accordingly.
+    fn compute_auto(
+        device_size_bytes: u64,
+    ) -> Result<DeviceLayoutV1, LayoutPolicyError> {
+        // Minimum device size for Auto: system + poolmap + metadata at
+        // 1 MiB segment size.  Below this, fall back to Slice0Small.
+        let min_seg = MIN_SEGMENT_SIZE_BYTES;
+        let system_area_len = min_seg * SYSTEM_AREA_SEGMENTS;
+        let poolmap_journal_len = min_seg * POOLMAP_JOURNAL_SEGMENTS;
+        let metadata_journal_len = min_seg * METADATA_JOURNAL_SEGMENTS;
+        let fixed_overhead = system_area_len
+            .saturating_add(poolmap_journal_len)
+            .saturating_add(metadata_journal_len);
+
+        // For very small devices, fall back to Slice0Small.
+        if device_size_bytes < fixed_overhead {
+            return Self::compute_slice0_small(device_size_bytes);
+        }
+
+        let data_region_size = device_size_bytes.saturating_sub(fixed_overhead);
+        let data_segment_size =
+            choose_segment_size_bytes(data_region_size, TARGET_DATA_SEGMENTS);
+
+        let system_segment_size = MIN_SEGMENT_SIZE_BYTES; // always 1 MiB
+        let poolmap_journal_len = data_segment_size * POOLMAP_JOURNAL_SEGMENTS;
+        let metadata_journal_len = data_segment_size * METADATA_JOURNAL_SEGMENTS;
+
+        let system_end = system_area_len;
+        let poolmap_end = system_end + poolmap_journal_len;
+        let metadata_end = poolmap_end + metadata_journal_len;
+        let data_len = device_size_bytes.saturating_sub(metadata_end);
+
+        Ok(DeviceLayoutV1 {
+            policy: DeviceLayoutPolicyDiscriminant::Auto,
+            device_size_bytes,
+            system_area_offset: 0,
+            system_area_len,
+            poolmap_journal_offset: system_end,
+            poolmap_journal_len,
+            metadata_journal_offset: poolmap_end,
+            metadata_journal_len,
+            data_journal_offset: metadata_end,
+            data_journal_len: data_len,
+            system_segment_size,
+            poolmap_segment_size: data_segment_size,
+            metadata_segment_size: data_segment_size,
+            data_segment_size,
+        })
+    }
+    fn compute_custom(
+        device_size_bytes: u64,
+        data_segment_size: u64,
+        metadata_segment_size: u64,
+        journal_segment_size: u64,
+    ) -> Result<DeviceLayoutV1, LayoutPolicyError> {
+        validate_segment_size(data_segment_size)?;
+        validate_segment_size(metadata_segment_size)?;
+        validate_segment_size(journal_segment_size)?;
+
+        let system_area_len = MIN_SEGMENT_SIZE_BYTES * SYSTEM_AREA_SEGMENTS;
+        let poolmap_journal_len = journal_segment_size * POOLMAP_JOURNAL_SEGMENTS;
+        let metadata_journal_len = metadata_segment_size * METADATA_JOURNAL_SEGMENTS;
+        let required = system_area_len
+            .saturating_add(poolmap_journal_len)
+            .saturating_add(metadata_journal_len);
+
+        if device_size_bytes < required {
+            return Err(LayoutPolicyError::RegionOverflow {
+                device_size_bytes,
+                required_bytes: required,
+            });
+        }
+
+        let system_end = system_area_len;
+        let poolmap_end = system_end + poolmap_journal_len;
+        let metadata_end = poolmap_end + metadata_journal_len;
+        let data_len = device_size_bytes.saturating_sub(metadata_end);
+
+        Ok(DeviceLayoutV1 {
+            policy: DeviceLayoutPolicyDiscriminant::Custom,
+            device_size_bytes,
+            system_area_offset: 0,
+            system_area_len,
+            poolmap_journal_offset: system_end,
+            poolmap_journal_len,
+            metadata_journal_offset: poolmap_end,
+            metadata_journal_len,
+            data_journal_offset: metadata_end,
+            data_journal_len: data_len,
+            system_segment_size: MIN_SEGMENT_SIZE_BYTES,
+            poolmap_segment_size: journal_segment_size,
+            metadata_segment_size,
+            data_segment_size,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeviceLayoutV1 encode/decode
+// ---------------------------------------------------------------------------
+
+/// Encode a [`DeviceLayoutV1`] into `buf`, which must be at least
+/// [`DEVICE_LAYOUT_V1_WIRE_SIZE`] bytes.
+pub fn encode_device_layout_v1(layout: &DeviceLayoutV1, buf: &mut [u8]) {
+    assert!(buf.len() >= DEVICE_LAYOUT_V1_WIRE_SIZE);
+
+    buf[0..8].copy_from_slice(&DEVICE_LAYOUT_V1_MAGIC);
+    buf[8..10].copy_from_slice(&DEVICE_LAYOUT_V1_VERSION.to_le_bytes());
+    buf[10..12].copy_from_slice(&layout.policy.to_u16().to_le_bytes());
+    buf[12..20].copy_from_slice(&layout.device_size_bytes.to_le_bytes());
+    buf[20..28].copy_from_slice(&layout.system_area_offset.to_le_bytes());
+    buf[28..36].copy_from_slice(&layout.system_area_len.to_le_bytes());
+    buf[36..44].copy_from_slice(&layout.poolmap_journal_offset.to_le_bytes());
+    buf[44..52].copy_from_slice(&layout.poolmap_journal_len.to_le_bytes());
+    buf[52..60].copy_from_slice(&layout.metadata_journal_offset.to_le_bytes());
+    buf[60..68].copy_from_slice(&layout.metadata_journal_len.to_le_bytes());
+    buf[68..76].copy_from_slice(&layout.data_journal_offset.to_le_bytes());
+    buf[76..84].copy_from_slice(&layout.data_journal_len.to_le_bytes());
+    buf[84..92].copy_from_slice(&layout.system_segment_size.to_le_bytes());
+    buf[92..100].copy_from_slice(&layout.poolmap_segment_size.to_le_bytes());
+    buf[100..108].copy_from_slice(&layout.metadata_segment_size.to_le_bytes());
+    buf[108..116].copy_from_slice(&layout.data_segment_size.to_le_bytes());
+    // offset 116-120: reserved (zero)
+    buf[116..120].fill(0);
+
+    // CRC32C over bytes 0..120
+    let crc = crc32c(&buf[0..DEVICE_LAYOUT_V1_CRC32C_OFFSET]);
+    buf[DEVICE_LAYOUT_V1_CRC32C_OFFSET..DEVICE_LAYOUT_V1_WIRE_SIZE]
+        .copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Decode a [`DeviceLayoutV1`] from `buf`.
+pub fn decode_device_layout_v1(buf: &[u8]) -> Result<DeviceLayoutV1, LayoutPolicyError> {
+    if buf.len() < DEVICE_LAYOUT_V1_WIRE_SIZE {
+        return Err(LayoutPolicyError::BufferTooSmall {
+            expected: DEVICE_LAYOUT_V1_WIRE_SIZE,
+            actual: buf.len(),
+        });
+    }
+
+    let magic: [u8; 8] = buf[0..8].try_into().unwrap();
+    if magic != DEVICE_LAYOUT_V1_MAGIC {
+        return Err(LayoutPolicyError::BadMagic {
+            expected: DEVICE_LAYOUT_V1_MAGIC,
+            found: magic,
+        });
+    }
+
+    let version = u16::from_le_bytes(buf[8..10].try_into().unwrap());
+    if version != DEVICE_LAYOUT_V1_VERSION {
+        return Err(LayoutPolicyError::UnsupportedVersion(version));
+    }
+
+    let policy_disc = u16::from_le_bytes(buf[10..12].try_into().unwrap());
+    let policy = DeviceLayoutPolicyDiscriminant::from_u16(policy_disc)
+        .ok_or(LayoutPolicyError::BadPolicyDiscriminant(policy_disc))?;
+
+    let device_size_bytes = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+    let system_area_offset = u64::from_le_bytes(buf[20..28].try_into().unwrap());
+    let system_area_len = u64::from_le_bytes(buf[28..36].try_into().unwrap());
+    let poolmap_journal_offset = u64::from_le_bytes(buf[36..44].try_into().unwrap());
+    let poolmap_journal_len = u64::from_le_bytes(buf[44..52].try_into().unwrap());
+    let metadata_journal_offset = u64::from_le_bytes(buf[52..60].try_into().unwrap());
+    let metadata_journal_len = u64::from_le_bytes(buf[60..68].try_into().unwrap());
+    let data_journal_offset = u64::from_le_bytes(buf[68..76].try_into().unwrap());
+    let data_journal_len = u64::from_le_bytes(buf[76..84].try_into().unwrap());
+    let system_segment_size = u64::from_le_bytes(buf[84..92].try_into().unwrap());
+    let poolmap_segment_size = u64::from_le_bytes(buf[92..100].try_into().unwrap());
+    let metadata_segment_size = u64::from_le_bytes(buf[100..108].try_into().unwrap());
+    let data_segment_size = u64::from_le_bytes(buf[108..116].try_into().unwrap());
+
+    // Verify CRC32C.
+    let expected_crc = u32::from_le_bytes(
+        buf[DEVICE_LAYOUT_V1_CRC32C_OFFSET..DEVICE_LAYOUT_V1_WIRE_SIZE]
+            .try_into()
+            .unwrap(),
+    );
+    let computed_crc = crc32c(&buf[0..DEVICE_LAYOUT_V1_CRC32C_OFFSET]);
+    if computed_crc != expected_crc {
+        return Err(LayoutPolicyError::ChecksumMismatch {
+            expected: expected_crc,
+            computed: computed_crc,
+        });
+    }
+
+    Ok(DeviceLayoutV1 {
+        policy,
+        device_size_bytes,
+        system_area_offset,
+        system_area_len,
+        poolmap_journal_offset,
+        poolmap_journal_len,
+        metadata_journal_offset,
+        metadata_journal_len,
+        data_journal_offset,
+        data_journal_len,
+        system_segment_size,
+        poolmap_segment_size,
+        metadata_segment_size,
+        data_segment_size,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// DeviceLayoutPolicy tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod layout_policy_tests {
+    use super::*;
+
+    // -- Slice0Small --------------------------------------------------------
+
+    #[test]
+    fn slice0_small_512mb() {
+        let layout = DeviceLayoutPolicy::Slice0Small
+            .compute(512 * 1024 * 1024)
+            .expect("Slice0Small on 512 MiB");
+        assert_eq!(layout.policy, DeviceLayoutPolicyDiscriminant::Slice0Small);
+        assert_eq!(layout.device_size_bytes, 512 * 1024 * 1024);
+        assert_eq!(layout.system_segment_size, 1024 * 1024);
+        assert_eq!(layout.poolmap_segment_size, 1024 * 1024);
+        assert_eq!(layout.metadata_segment_size, 1024 * 1024);
+        assert_eq!(layout.data_segment_size, 1024 * 1024);
+        assert_eq!(layout.system_area_offset, 0);
+        assert_eq!(layout.system_area_len, 1024 * 1024);
+        // poolmap starts right after system
+        assert_eq!(
+            layout.poolmap_journal_offset,
+            layout.system_area_len
+        );
+        assert_eq!(
+            layout.poolmap_journal_len,
+            1024 * 1024 * POOLMAP_JOURNAL_SEGMENTS
+        );
+    }
+
+    #[test]
+    fn slice0_small_too_tiny() {
+        // 1 MiB is the minimum (system area needs 1 MiB)
+        let r = DeviceLayoutPolicy::Slice0Small.compute(512 * 1024);
+        assert!(r.is_err());
+        match r.unwrap_err() {
+            LayoutPolicyError::DeviceTooSmall { .. } => {}
+            e => panic!("expected DeviceTooSmall, got {e:?}"),
+        }
+    }
+
+    // -- Auto ---------------------------------------------------------------
+
+    fn approx_segment_count(_layout: &DeviceLayoutV1, region_size: u64, seg_size: u64) -> u64 {
+        if seg_size == 0 {
+            return 0;
+        }
+        region_size / seg_size
+    }
+
+    #[test]
+    fn auto_1gib() {
+        let dev_size: u64 = 1024 * 1024 * 1024;
+        let layout = DeviceLayoutPolicy::Auto
+            .compute(dev_size)
+            .expect("Auto on 1 GiB");
+        assert_eq!(layout.policy, DeviceLayoutPolicyDiscriminant::Auto);
+        // 1 GiB with 1 MiB segments: data region ~ (1 GiB - 17 MiB) ~ 1007 MiB -> ~1007 segments
+        // Well under 4M, so segment size stays at 1 MiB.
+        assert_eq!(layout.data_segment_size, 1024 * 1024);
+    }
+
+    #[test]
+    fn auto_1tib() {
+        // 1 TiB
+        let dev_size: u64 = 1_099_511_627_776;
+        let layout = DeviceLayoutPolicy::Auto
+            .compute(dev_size)
+            .expect("Auto on 1 TiB");
+        assert_eq!(layout.policy, DeviceLayoutPolicyDiscriminant::Auto);
+        // 1 TiB / 1 MiB = ~1M segments, under 4M -> 1 MiB
+        assert_eq!(layout.data_segment_size, 1024 * 1024);
+    }
+
+    #[test]
+    fn auto_1pib() {
+        // 1 PiB
+        let dev_size: u64 = 1_125_899_906_842_624;
+        let layout = DeviceLayoutPolicy::Auto
+            .compute(dev_size)
+            .expect("Auto on 1 PiB");
+        assert_eq!(layout.policy, DeviceLayoutPolicyDiscriminant::Auto);
+        // 1 PiB with target 4M segments: raw = 1 PiB / 4M ≈ 281.5 GiB per seg.
+        // Clamped to 256 MiB max.
+        assert_eq!(layout.data_segment_size, 256 * 1024 * 1024);
+        // Verify segment count is reasonable
+        let segs = approx_segment_count(
+            &layout,
+            layout.data_journal_len,
+            layout.data_segment_size,
+        );
+        assert!(
+            segs <= TARGET_DATA_SEGMENTS * 11 / 10,
+            "data region has {segs} segments, target {TARGET_DATA_SEGMENTS}"
+        );
+    }
+
+    #[test]
+    fn auto_segment_size_is_power_of_two() {
+        for &size in &[
+            300_000_000u64,
+            500_000_000,
+            1_000_000_000,
+            10_000_000_000,
+            100_000_000_000,
+            1_000_000_000_000,
+            10_000_000_000_000,
+            100_000_000_000_000,
+            1_000_000_000_000_000,
+        ] {
+            let layout = DeviceLayoutPolicy::Auto.compute(size).unwrap();
+            assert!(
+                layout.data_segment_size.is_power_of_two(),
+                "data_segment_size {} for device {size} not power of two",
+                layout.data_segment_size
+            );
+            assert!(
+                layout.metadata_segment_size.is_power_of_two(),
+                "metadata_segment_size {} for device {size} not power of two",
+                layout.metadata_segment_size
+            );
+            assert!(
+                layout.poolmap_segment_size.is_power_of_two(),
+                "poolmap_segment_size {} for device {size} not power of two",
+                layout.poolmap_segment_size
+            );
+        }
+    }
+
+    #[test]
+    fn auto_zero_device_size() {
+        let r = DeviceLayoutPolicy::Auto.compute(0);
+        assert!(matches!(r, Err(LayoutPolicyError::DeviceSizeZero)));
+    }
+
+    #[test]
+    fn auto_region_bounds_strictly_increasing() {
+        let layout = DeviceLayoutPolicy::Auto.compute(10_000_000_000).unwrap();
+        assert!(layout.system_area_offset < layout.poolmap_journal_offset);
+        assert!(layout.poolmap_journal_offset < layout.metadata_journal_offset);
+        assert!(layout.metadata_journal_offset < layout.data_journal_offset);
+    }
+
+    #[test]
+    fn auto_region_no_overlap() {
+        let layout = DeviceLayoutPolicy::Auto.compute(10_000_000_000).unwrap();
+        let sys_end = layout.system_area_offset + layout.system_area_len;
+        let poolmap_end = layout.poolmap_journal_offset + layout.poolmap_journal_len;
+        let meta_end = layout.metadata_journal_offset + layout.metadata_journal_len;
+        let data_end = layout.data_journal_offset + layout.data_journal_len;
+        assert!(sys_end <= layout.poolmap_journal_offset);
+        assert!(poolmap_end <= layout.metadata_journal_offset);
+        assert!(meta_end <= layout.data_journal_offset);
+        assert!(data_end <= layout.device_size_bytes);
+    }
+
+    // -- Custom -------------------------------------------------------------
+
+    #[test]
+    fn custom_valid() {
+        let dev_size: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
+        let layout = DeviceLayoutPolicy::Custom {
+            data_segment_size: 4 * 1024 * 1024,
+            metadata_segment_size: 2 * 1024 * 1024,
+            journal_segment_size: 1 * 1024 * 1024,
+        }
+        .compute(dev_size)
+        .expect("Custom valid");
+        assert_eq!(layout.data_segment_size, 4 * 1024 * 1024);
+        assert_eq!(layout.metadata_segment_size, 2 * 1024 * 1024);
+        assert_eq!(layout.poolmap_segment_size, 1 * 1024 * 1024);
+    }
+
+    #[test]
+    fn custom_not_power_of_two() {
+        let dev_size: u64 = 10 * 1024 * 1024 * 1024;
+        let r = DeviceLayoutPolicy::Custom {
+            data_segment_size: 3 * 1024 * 1024, // 3 MiB - not power of two
+            metadata_segment_size: 1 * 1024 * 1024,
+            journal_segment_size: 1 * 1024 * 1024,
+        }
+        .compute(dev_size);
+        assert!(r.is_err());
+        match r.unwrap_err() {
+            LayoutPolicyError::InvalidSegmentSize { reason } => {
+                assert_eq!(reason, InvalidSegmentSizeReason::NotPowerOfTwo);
+            }
+            e => panic!("expected InvalidSegmentSize, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_below_minimum() {
+        let r = DeviceLayoutPolicy::Custom {
+            data_segment_size: 512 * 1024, // 512 KiB - below 1 MiB
+            metadata_segment_size: 1 * 1024 * 1024,
+            journal_segment_size: 1 * 1024 * 1024,
+        }
+        .compute(10 * 1024 * 1024 * 1024);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn custom_above_maximum() {
+        let r = DeviceLayoutPolicy::Custom {
+            data_segment_size: 512 * 1024 * 1024, // 512 MiB - above 256 MiB
+            metadata_segment_size: 1 * 1024 * 1024,
+            journal_segment_size: 1 * 1024 * 1024,
+        }
+        .compute(10 * 1024 * 1024 * 1024);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn custom_region_overflow() {
+        // Device too small to fit all journals
+        let r = DeviceLayoutPolicy::Custom {
+            data_segment_size: 256 * 1024 * 1024, // 256 MiB
+            metadata_segment_size: 256 * 1024 * 1024,
+            journal_segment_size: 256 * 1024 * 1024,
+        }
+        .compute(1 * 1024 * 1024 * 1024); // 1 GiB — not enough for 16*256M + 256*256M + 256M
+        assert!(r.is_err());
+    }
+
+    // -- DeviceLayoutV1 encode/decode round-trip ---------------------------
+
+    #[test]
+    fn encode_decode_roundtrip_slice0_small() {
+        let layout = DeviceLayoutPolicy::Slice0Small
+            .compute(512 * 1024 * 1024)
+            .unwrap();
+        let mut buf = [0u8; DEVICE_LAYOUT_V1_WIRE_SIZE];
+        encode_device_layout_v1(&layout, &mut buf);
+        let decoded = decode_device_layout_v1(&buf).unwrap();
+        assert_eq!(layout, decoded);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_auto() {
+        let layout = DeviceLayoutPolicy::Auto
+            .compute(1_000_000_000_000)
+            .unwrap();
+        let mut buf = [0u8; DEVICE_LAYOUT_V1_WIRE_SIZE];
+        encode_device_layout_v1(&layout, &mut buf);
+        let decoded = decode_device_layout_v1(&buf).unwrap();
+        assert_eq!(layout, decoded);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_custom() {
+        let layout = DeviceLayoutPolicy::Custom {
+            data_segment_size: 8 * 1024 * 1024,
+            metadata_segment_size: 4 * 1024 * 1024,
+            journal_segment_size: 2 * 1024 * 1024,
+        }
+        .compute(100 * 1024 * 1024 * 1024)
+        .unwrap();
+        let mut buf = [0u8; DEVICE_LAYOUT_V1_WIRE_SIZE];
+        encode_device_layout_v1(&layout, &mut buf);
+        let decoded = decode_device_layout_v1(&buf).unwrap();
+        assert_eq!(layout, decoded);
+    }
+
+    #[test]
+    fn decode_bad_magic() {
+        let layout = DeviceLayoutPolicy::Auto.compute(1_000_000_000).unwrap();
+        let mut buf = [0u8; DEVICE_LAYOUT_V1_WIRE_SIZE];
+        encode_device_layout_v1(&layout, &mut buf);
+        buf[0] = 0; // corrupt magic
+        let r = decode_device_layout_v1(&buf);
+        assert!(matches!(r, Err(LayoutPolicyError::BadMagic { .. })));
+    }
+
+    #[test]
+    fn decode_bad_checksum() {
+        let layout = DeviceLayoutPolicy::Auto.compute(1_000_000_000).unwrap();
+        let mut buf = [0u8; DEVICE_LAYOUT_V1_WIRE_SIZE];
+        encode_device_layout_v1(&layout, &mut buf);
+        // Flip a bit in the CRC region
+        buf[DEVICE_LAYOUT_V1_CRC32C_OFFSET] ^= 0xFF;
+        let r = decode_device_layout_v1(&buf);
+        assert!(matches!(
+            r,
+            Err(LayoutPolicyError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_buffer_too_small() {
+        let buf = [0u8; 100];
+        let r = decode_device_layout_v1(&buf);
+        assert!(matches!(r, Err(LayoutPolicyError::BufferTooSmall { .. })));
+    }
+
+    // -- choose_segment_size_bytes -----------------------------------------
+
+    #[test]
+    fn choose_segment_size_power_of_two_output() {
+        for region_size in [1_000_000, 10_000_000, 100_000_000, 1_000_000_000, 10_000_000_000] {
+            let seg = choose_segment_size_bytes(region_size, 4_000_000);
+            assert!(
+                seg.is_power_of_two(),
+                "segment size {seg} for region {region_size} not power of two"
+            );
+            assert!(seg >= MIN_SEGMENT_SIZE_BYTES);
+            assert!(seg <= MAX_SEGMENT_SIZE_BYTES);
+        }
+    }
+
+    #[test]
+    fn choose_segment_size_clamps_to_min() {
+        // Very small region: raw = 1K / 4M ≈ 0, clamped to 1 MiB, next_power_of_two = 1 MiB
+        let seg = choose_segment_size_bytes(1024, 4_000_000);
+        assert_eq!(seg, MIN_SEGMENT_SIZE_BYTES);
+    }
+
+    #[test]
+    fn choose_segment_size_clamps_to_max() {
+        // Very large region: raw = 1 PiB / 4M ≈ 281 GiB, clamped to 256 MiB
+        let seg = choose_segment_size_bytes(1_125_899_906_842_624, 4_000_000);
+        assert_eq!(seg, MAX_SEGMENT_SIZE_BYTES);
+    }
+
+    // -- validate_segment_size ----------------------------------------------
+
+    #[test]
+    fn validate_segment_size_accepts_power_of_two() {
+        assert!(validate_segment_size(1 * 1024 * 1024).is_ok());
+        assert!(validate_segment_size(4 * 1024 * 1024).is_ok());
+        assert!(validate_segment_size(256 * 1024 * 1024).is_ok());
+    }
+
+    #[test]
+    fn validate_segment_size_rejects_non_power_of_two() {
+        assert!(validate_segment_size(3 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn validate_segment_size_rejects_too_small() {
+        assert!(validate_segment_size(512 * 1024).is_err());
+    }
+
+    #[test]
+    fn validate_segment_size_rejects_too_large() {
+        assert!(validate_segment_size(512 * 1024 * 1024).is_err());
+    }
+
+    // -- DeviceLayoutPolicyDiscriminant round-trip -------------------------
+
+    #[test]
+    fn policy_discriminant_roundtrip() {
+        for &v in &[0u16, 1, 2] {
+            let disc = DeviceLayoutPolicyDiscriminant::from_u16(v)
+                .expect("valid discriminant");
+            assert_eq!(disc.to_u16(), v);
+        }
+    }
+
+    #[test]
+    fn policy_discriminant_invalid() {
+        assert!(DeviceLayoutPolicyDiscriminant::from_u16(99).is_none());
+    }
+
+    // -- DeviceLayoutPolicy Display ----------------------------------------
+
+    #[test]
+    fn policy_display() {
+        assert_eq!(DeviceLayoutPolicy::Slice0Small.to_string(), "Slice0Small");
+        assert_eq!(DeviceLayoutPolicy::Auto.to_string(), "Auto");
+        assert_eq!(
+            DeviceLayoutPolicy::Custom {
+                data_segment_size: 1,
+                metadata_segment_size: 1,
+                journal_segment_size: 1,
+            }
+            .to_string(),
+            "Custom"
+        );
     }
 }
