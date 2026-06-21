@@ -144,7 +144,8 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
     /// The [`LockServiceHandle`] is constructed from the mount identity
     /// committed by [`ClusteredPosixMountRuntime`].  `node_id` is the
     /// local cluster member identifier used in per-request [`LockOwner`]
-    /// construction.  `leader` is the LOCK leader endpoint.
+    /// construction.  The LOCK leader endpoint is taken from the admitted
+    /// runtime authority snapshot.
     ///
     /// # Errors
     ///
@@ -152,11 +153,11 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
     pub fn new(
         runtime: ClusteredPosixMountRuntime,
         node_id: MemberId,
-        leader: MemberId,
         transport: LockServiceTransport<S>,
     ) -> Result<Self, LockServiceHandleError> {
         let handle =
             LockServiceHandle::new(LockOwner::new(node_id, 0, 0), runtime.mount_identity())?;
+        let leader = runtime.lock_leader();
         Ok(Self {
             runtime,
             handle,
@@ -649,10 +650,9 @@ mod tests {
     fn test_forwarder() -> ClusteredPosixLockForwarder<QueuedLockFrameSink> {
         let runtime = test_runtime();
         let node_id = MemberId::new(1);
-        let leader = MemberId::new(3);
         let sink = QueuedLockFrameSink::default();
         let transport = LockServiceTransport::new(sink);
-        ClusteredPosixLockForwarder::new(runtime, node_id, leader, transport).unwrap()
+        ClusteredPosixLockForwarder::new(runtime, node_id, transport).unwrap()
     }
 
     #[derive(Debug, Default)]
@@ -718,6 +718,7 @@ mod tests {
         assert_eq!(f.runtime().mount_identity().dataset_id, 1);
         assert_eq!(f.runtime().mount_identity().mount_id, 2);
         assert_eq!(f.runtime().current_epoch(), EpochId::new(5));
+        assert_eq!(f.leader, f.runtime().lock_leader());
     }
 
     // ── Same-inode different mount identities ───────────────────────
@@ -917,7 +918,6 @@ mod tests {
         let mut f = ClusteredPosixLockForwarder::new(
             runtime,
             MemberId::new(1),
-            MemberId::new(3),
             LockServiceTransport::new(FailingLockFrameSink),
         )
         .unwrap();
