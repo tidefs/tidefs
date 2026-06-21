@@ -21,10 +21,9 @@ performance gate. It does not prove that current TideFS runtime code satisfies
 POSIX durability, cluster availability, PMem power-fail behavior, or replay
 correctness.
 
-PR #840 is the storage-intent authority document gate for this design. Until
-that PR is merged, references to `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`
-describe the reviewed live PR authority, not a file that exists on
-`origin/master`.
+PR #840 (the storage-intent authority document gate for this design) is now merged
+into `origin/master`; `docs/STORAGE_INTENT_POLICY_AUTHORITY.md` is the
+canonical storage-intent authority on the default branch.
 
 ## Evidence Reviewed
 
