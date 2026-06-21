@@ -26,6 +26,11 @@ zone or erase-block alignment, pending-free safety, reclaim debt, and physical
 locality are not background trivia once they decide whether defrag, compaction,
 placement, or rebake will help or hurt.
 
+Lifecycle evidence is the same class of truth. Write age, overwrite/delete
+windows, snapshot and clone retention, receive-base dependencies, orphan-held
+bytes, dead-pending reclaim, and destroy/tombstone state decide whether moving
+bytes is wise, legal, or dangerous.
+
 ## Non-Claims
 
 This document does not implement runtime behavior, change POSIX durability
@@ -113,6 +118,7 @@ The core records are:
 | `StorageIntentEvidenceRef` | Reference to placement receipts, local intent records, transport/path evidence, media/cost ledgers, scheduler admission records, or validation artifacts. |
 | `StorageIntentDataShape` | Requested and earned encoded shape for a range or generation, including record sizing, transform ordering, digest suite, dedup/encryption/EC compatibility, and rebake evidence. |
 | `StorageIntentLayoutEvidence` | Allocator and physical-layout evidence for fragmentation, free runs, alignment, zone/write-pointer state, pending frees, reclaim debt, and locality. |
+| `StorageIntentLifecycleEvidence` | Generation and retention evidence for write age, stability, snapshots, clones, receive bases, orphans, destroy/tombstone state, and reclaim frontiers. |
 | `StorageIntentExplanation` | Renderable projection of policy, receipt, lag, volatility, cost, and refusal reasons. |
 
 The record contract follows the existing receipt and binary-schema discipline:
@@ -153,6 +159,8 @@ model predicates for:
   floors, dedup/encryption-domain rules, and rebake replacement evidence;
 - allocator/layout legality, including alignment, free-space, zone, pending-free,
   generation, and reclaim-debt boundaries;
+- lifecycle/generation legality, including retained roots, receive bases,
+  orphan holds, destroy state, and reclaim-frontier boundaries;
 - explicit refusal reasons when no legal receipt set satisfies the policy.
 
 ### StorageIntentPolicy
@@ -172,6 +180,7 @@ The policy has these logical fields:
 | `workload_shape` | Workload envelope the planner should optimize for without changing hard guarantees. |
 | `data_shape_policy` | Record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake constraints. |
 | `layout_geometry_policy` | Allocator class, physical layout, fragmentation, zone/alignment, free-space, pending-free, and reclaim constraints. |
+| `lifecycle_policy` | Generation age, retention, receive-base, orphan, destroy/tombstone, and reclaim-frontier constraints. |
 | `cost_model` | Relative cost weights for latency, tail, throughput, media wear, capacity, power, network egress, and operator money. |
 | `wear_budget` | Per-device or per-class write budget available for this policy and relocation class. |
 | `relocation_policy` | When the system may rewrite, rebake, promote, demote, defrag, or evacuate data. |
@@ -188,6 +197,7 @@ floors from optimizer weights:
 | Throughput | minimum ingest or rebuild rate under foreground protection | larger records, direct cold placement, batching, EC/archive shape |
 | Data shape and integrity | checksum/digest suite, encryption domain, mounted transform block state, dedup/EC compatibility | record size, compression level, coalescing, dedup verdict, EC/archive shape |
 | Allocation geometry | alignment, reserve, free-space, pending-free, zone/write-pointer compatibility | choose low-seek layout, largest legal free run, segment class, drain victim |
+| Lifecycle and retention | retained roots, receive bases, orphan holds, destroy state, reclaim frontier | defer flash full placement for young bytes, favor cold retained generations |
 | Distance and failure domain | node/rack/DC/site/region spread, internet path allowed or refused | nearest legal peer, measured RTT/loss/bandwidth scoring |
 | RPO/RTO | maximum remote lag or recovery window | delta batching, compression, catch-up lane priority |
 | Wear and money | critical write reserve, WAF ceiling, egress/capacity budget | promote/demote only when payback beats movement debt |
@@ -322,10 +332,10 @@ job is to make the current truth machine-readable:
 | `unsafe-volatile` | The policy intentionally requested weaker volatile/unsafe behavior and the receipt truth exposes that weaker guarantee. |
 
 Missing, stale, malformed, under-width, wrong-epoch, wrong-failure-domain,
-unknown-cost, unknown-WAF, cache-only, or contradictory evidence cannot satisfy
-a durable, geo, or low-latency floor by accident. They must become an explicit
-unknown, blocked, degraded, refused, or unsafe-visible state according to the
-compiled policy's degradation law.
+wrong-lifecycle, unknown-cost, unknown-WAF, cache-only, or contradictory
+evidence cannot satisfy a durable, geo, or low-latency floor by accident. They
+must become an explicit unknown, blocked, degraded, refused, or unsafe-visible
+state according to the compiled policy's degradation law.
 
 This loop is what keeps the whole design native. A predictor may believe a
 range is hot, a planner may propose a move, a scheduler may admit a lane, and a
@@ -407,15 +417,15 @@ TideFS must not predict:
 
 The adaptive loop is:
 
-1. Observe request, subject, device, path, and policy signals.
+1. Observe request, subject, lifecycle, device, path, and policy signals.
 2. Cite the compiled storage-intent policy revision for the operation or
    planning epoch.
 3. Reconcile current receipts and evidence into a satisfaction state.
 4. Compute a confidence-scored workload vector.
 5. Generate candidate acknowledgment, serving, durable-placement, or
    relocation plans.
-6. Reject candidates that do not meet hard guarantee, failure-domain, capacity,
-   wear, or operator-policy constraints.
+6. Reject candidates that do not meet hard guarantee, failure-domain, lifecycle,
+   capacity, wear, or operator-policy constraints.
 7. Estimate latency, tail, throughput, write amplification, recovery risk, and
    money/egress cost for remaining candidates.
 8. Reserve placement, transport, dirty-byte, and wear budgets.
@@ -843,8 +853,8 @@ Initial anti-wear laws:
    compiled policy and transform evidence permit it.
 5. Treat high fsync density as a reason to optimize intent lanes, not as a
    reason to rewrite full data objects for every barrier.
-6. Treat snapshot-pinned generations as stable candidates for cold placement,
-   not as hot-write candidates.
+6. Treat snapshot-pinned, clone-held, and receive-base-held generations as
+   stable candidates for cold placement, not as hot-write candidates.
 7. Do not defrag SSD/NVMe merely for contiguousness. SSD relocation needs a
    write-amplification, metadata fan-out, garbage collection, or placement
    satisfaction reason.
@@ -859,8 +869,9 @@ Initial anti-wear laws:
     benefit over extending them with more flash writes.
 12. Refuse or delay non-critical optimization before eroding reserves needed
     for durable sync, repair, evacuation, or policy-satisfaction catch-up.
-13. Treat pending-free and reclaimable bytes as unavailable until the allocator,
-    publication, fence, and receipt boundaries prove they are safe to reuse.
+13. Treat pending-free and reclaimable bytes as unavailable until lifecycle,
+    allocator, publication, fence, and receipt boundaries prove they are safe to
+    reuse.
 
 This is one of the main ways TideFS can be better than naive tiering: it can
 be fast without turning expensive flash into a disposable shock absorber for
@@ -876,8 +887,8 @@ are free.
 The non-wear cost ledger must track at least:
 
 - logical bytes stored by dataset, generation, media role, and failure domain;
-- capacity consumed by replicated, erasure-coded, archive, remote, and
-  snapshot-pinned data;
+- capacity consumed by replicated, erasure-coded, archive, remote,
+  snapshot-pinned, clone-held, and receive-base-held data;
 - transport bytes by proximity domain, carrier, peer/site, and reason;
 - network egress/ingress cost classes for WAN and internet paths;
 - rebuild, repair, evacuation, relocation, and geo catch-up bytes by reason;
@@ -885,7 +896,8 @@ The non-wear cost ledger must track at least:
   network, recovery-bandwidth, and foreground-disruption debt;
 - payback evidence for non-wear benefits such as capacity saved, RPO lag
   reduced, egress avoided, or rebuild risk reduced;
-- retention cost for cold and snapshot-pinned generations;
+- retention cost for cold, snapshot-pinned, clone-held, and receive-base-held
+  generations;
 - operator-defined weights for money, power/energy proxy, scarce capacity,
   scarce bandwidth, and regulatory or administrative domain preference.
 
@@ -955,6 +967,9 @@ The benefit/cost gate must account for:
 - reduced HDD seek cost or improved scan speed;
 - improved free-run shape, allocator locality, alignment, segment drain, or
   reclaim-debt pressure;
+- lifecycle benefit or risk, including young churn avoided, retained-root
+  stability, receive-base protection, orphan/destroy blockers, and reclaim
+  frontier progress;
 - reduced capacity cost;
 - improved RPO/RTO or rebuild risk;
 - read/write media cost of performing the move;
@@ -1016,10 +1031,11 @@ seconds is not genius; it is bad accounting.
 
 ## Data Lifecycle Model
 
-Storage intent should treat data age and stability as first-class signals.
-Most storage systems make poor cost decisions because they materialize bytes
-too early into their final expensive form. TideFS should separate the lifecycle
-of a write from the lifecycle of a durable object.
+Storage intent should treat data age, stability, and retention as first-class
+evidence. Most storage systems make poor cost decisions because they materialize
+bytes too early into their final expensive form, or reclaim old bytes before
+the dependency graph is truly gone. TideFS should separate the lifecycle of a
+write from the lifecycle of a durable object.
 
 | Generation | Description | Typical action |
 | --- | --- | --- |
@@ -1029,8 +1045,13 @@ of a write from the lifecycle of a durable object.
 | `stable-hot` | Bytes survived the short overwrite/delete window and are read often. | Add serving role on RAM/NVMe/SSD if benefit exceeds wear/cost. |
 | `stable-warm` | Bytes are useful but not latency-critical. | Normal replicated or mixed-media placement. |
 | `stable-cold` | Bytes are retained but rarely read or mutated. | HDD/EC/archive placement, large records, compression or dedup where legal, low relocation churn. |
-| `snapshot-pinned` | Older generation cannot be reclaimed because a snapshot or receive base needs it. | Favor cold placement and avoid needless reshaping. |
+| `snapshot-pinned` | Older generation cannot be reclaimed because a data-retaining snapshot needs it. | Favor cold placement and avoid needless reshaping. |
+| `clone-held` | A writable clone or promoted clone still depends on the generation. | Preserve retention authority, avoid unsafe source retirement. |
+| `receive-base-held` | Incremental receive, omitted-content validation, or geo catch-up needs this base identity. | Protect base roots, expose RPO/catch-up dependency. |
+| `bookmark-only-nonretaining` | A bookmark names lineage but does not retain data. | Refuse to treat it as a reclaim blocker or receive-base proof. |
+| `orphan-held` | Unlinked or destroying namespace state still has open or traversal-owned bytes. | Keep reclaim blocked until orphan/lifecycle evidence drains. |
 | `dead-pending-reclaim` | Replacement receipt or namespace state says data is obsolete but reclaim is not yet safe. | Receipt-gated reclaim only. |
+| `destroying` or `tombstone` | Dataset lifecycle fences new use or records completed destruction. | Refuse new authority, preserve explanation and replay safety. |
 
 This lifecycle lets TideFS reduce write amplification without weakening
 durability. A sync WAL write can earn a durable intent quickly, then be folded
@@ -1041,6 +1062,51 @@ die after intent/reclaim without ever consuming expensive serving media.
 The `serving-trial` generation is deliberately not durable authority; it is how
 TideFS can learn aggressively without letting a cache hit become a placement
 claim.
+
+### Lifecycle Evidence And Generation Authority
+
+#881 owns the storage-intent lifecycle-evidence boundary. This boundary is what
+lets the predictor say "probably short-lived" while the authority model says
+"definitely retained by this root" or "definitely not safe to reclaim yet."
+Those statements must not share one untyped hotness bit.
+
+The lifecycle evidence model should cover at least:
+
+| Evidence | Meaning |
+| --- | --- |
+| `generation_identity` | Subject/range, dataset, lineage, branch/clone, committed-root, and policy revision refs. |
+| `lifecycle_class` | Young, stable, snapshot-pinned, clone-held, receive-base-held, orphan-held, dead-pending, destroying, or tombstone state. |
+| `retained_root_refs` | Data-retaining snapshot or clone catalog entries, lifecycle pins, committed roots, and consistency evidence. |
+| `receive_base_dependency` | Incremental receive base root, omitted-content dependency, lineage manifest, and catch-up/RPO dependency refs. |
+| `nonretaining_anchor_refs` | Bookmark or lineage-only anchors that must not be mistaken for data retention. |
+| `orphan_destroy_state` | Open-unlinked, orphan-index, destroy traversal, poison/fence, and tombstone state that blocks admission or reclaim. |
+| `replacement_reclaim_frontier` | Replacement receipt, old-receipt retirement, publication/fence, deadlist, and segment-reclaim frontier refs. |
+| `lifecycle_generation` | Staleness and authority generation needed to reject old roots, stale pins, or contradictory retention evidence. |
+
+Authority boundaries are strict:
+
+- committed roots, snapshot and clone catalog entries, lifecycle pins, receive
+  contracts, placement receipts, reclaim receipts, and publication/fence records
+  are authority when the implementation defines them;
+- workload signals, caller hints, access heat, time-since-write, and phase
+  detection may predict lifetime, but they cannot prove that a root is retained,
+  reclaimable, or safe to discard;
+- bookmarks are non-retaining lineage anchors unless a later current authority
+  explicitly changes that rule;
+- receive-base and omitted-content dependencies are not optional local history;
+  if they are missing, unprotected, wrong-lineage, or checksum-invalid, the
+  planner must mark the state blocked/refused/unknown instead of publishing a
+  stronger receive or geo catch-up state;
+- dead-pending and reclaimable bytes are not capacity until lifecycle, receipt,
+  fence, and #880 layout evidence agree that reuse is safe.
+
+Lifecycle evidence must make cost decisions smarter without weakening safety.
+Young bytes can avoid expensive full flash placement only after earning the
+requested ack receipt. Snapshot-pinned or receive-base-held generations can be
+treated as cold placement candidates only when their retaining authority is
+current and consistent. Clone-held, orphan-held, destroying, or tombstone states
+must feed admission, read-serving, relocation, reclaim, and operator explanation
+as typed states, not hidden cleaner side effects.
 
 ## Planner Scoring
 
@@ -1055,6 +1121,8 @@ Hard constraints include:
 - data-shape compatibility and transform block state;
 - allocator/layout compatibility, including alignment, free-space, pending-free,
   and zone/write-pointer state;
+- lifecycle/generation compatibility, including retained roots, receive-base
+  protection, orphan holds, destroy state, and reclaim-frontier safety;
 - wear reserve availability;
 - transport/path eligibility;
 - operator policy and degradation law.
@@ -1069,6 +1137,7 @@ score =
   + wear_weight          * estimated_media_write_cost
   + shape_weight         * cpu_read_amplification_and_rebuild_cost
   + layout_weight        * fragmentation_locality_and_reclaim_cost
+  + lifecycle_weight     * churn_retention_and_reclaim_frontier_cost
   + capacity_weight      * capacity_cost
   + network_weight       * egress_and_congestion_cost
   + recovery_weight      * rebuild_or_rpo_risk
@@ -1140,6 +1209,23 @@ signal changes materially.
 6. A stale key epoch, illegal dedup domain, unknown digest suite, or mounted
    transform block turns the plan into `unknown-evidence`, `blocked`, or
    `refused` instead of a silent weaker shape.
+
+### Snapshot-Pinned Receive Base
+
+1. An old generation is retained by a data-retaining snapshot and also named as
+   an incremental receive or geo catch-up base.
+2. Lifecycle evidence cites the committed-root identity, snapshot/clone catalog
+   entry, lifecycle pin, receive-base contract, and omitted-content dependency.
+3. The planner treats the generation as cold/retained for placement and cost, but
+   not as reclaimable capacity.
+4. Reclaim, demotion, rebake, or relocation may only proceed when retained-root
+   authority, replacement receipts, receive-base safety, and #880 layout
+   frontiers all remain legal.
+5. A bookmark-only anchor, missing base root, wrong lineage, stale pin, or missing
+   omitted content makes receive/geo progress blocked or refused instead of
+   silently weakening history.
+6. Flash is not spent repeatedly reshaping this retained base unless policy and
+   payback evidence justify it.
 
 ### Hot Small Read Set
 
@@ -1235,6 +1321,9 @@ The operator UAPI should eventually answer:
   were selected, and which candidates were rejected or blocked?
 - What layout evidence applies: fragmentation, largest-run/free-run pressure,
   alignment, zone/write-pointer state, pending-free blockers, and reclaim debt?
+- What lifecycle evidence applies: young/stable class, retained roots, snapshot
+  or clone pins, receive-base dependencies, orphan/destroy state, and reclaim
+  frontiers?
 - How much flash endurance did this dataset consume?
 - Which relocation jobs were skipped because the wear or foreground-latency
   budget was not worth spending?
@@ -1265,6 +1354,9 @@ Initial row families should cover:
 - allocator/layout evidence for fragmentation, free-run scarcity, locality,
   alignment, zone/write-pointer constraints, pending-free safety, and reclaim
   debt;
+- lifecycle-aware placement for young churn, stable-hot promotion,
+  snapshot/clone/receive-base retention, orphan-held bytes, and dead-pending
+  reclaim;
 - one-pass scan cache behavior without persistent flash promotion;
 - hot read promotion benefit/cost;
 - serving-trial payback and cooldown behavior;
@@ -1293,6 +1385,8 @@ Each row must bind:
   where relevant;
 - allocator/layout evidence, fragmentation score, free-run pressure, alignment,
   pending-free safety, and reclaim debt where relevant;
+- lifecycle evidence, retained-root refs, receive-base safety, orphan/destroy
+  state, and reclaim-frontier refs where relevant;
 - movement debt, payback window, cooldown state, and skipped-move reason where
   relevant;
 - capacity and network cost where relevant;
@@ -1329,6 +1423,10 @@ The matrix must cover at least these row families:
   wrong-generation segment evidence, pending-free reuse before fence,
   zone/write-pointer incompatibility, under-aligned block-volume placement, and
   ENOSPC or reserve exhaustion;
+- lifecycle/generation faults such as missing data-retaining snapshot or clone
+  pins, bookmark-only receive bases, stale committed-root identity, orphan-held
+  bytes reclaimed early, destroy/tombstone admission leaks, and omitted-content
+  dependencies missing during receive or geo catch-up;
 - relocation, defrag, rebake, rebuild, evacuation, and geo catch-up interrupted
   before and after replacement receipt publication;
 - relocation anti-thrash cases proving cooldown, movement debt, and failed
@@ -1344,8 +1442,10 @@ volatile or from `geo-intent` to `geo-async`, split-brain receipt publication,
 old locator retirement before replacement receipt publication, reserve/wear
 breach hidden behind successful relocation, stale or wrong-domain data-shape
 evidence accepted as satisfied, allocator mirror evidence accepted as authority,
-pending-free bytes reused too early, and explanations that omit degradation, lag,
-volatility, transform block state, layout blockers, or refusal.
+stale lifecycle evidence accepted as retained/reclaimable, bookmark-only
+anchors treated as data-retaining, pending-free bytes reused too early, and
+explanations that omit degradation, lag, volatility, transform block state,
+lifecycle or layout blockers, or refusal.
 
 The validation matrix cross-links with #850 where a scenario also has latency,
 tail, throughput, RPO, or wear/cost budgets. #850 measures whether TideFS is
@@ -1379,6 +1479,16 @@ This document composes existing authority surfaces:
 - `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`: checksum architecture remains
   historical target input unless live source, validation, and claims evidence
   prove a narrower current behavior.
+- `docs/LOCAL_SNAPSHOTS_OW108.md` and `docs/SEND_RECEIVE_OW109.md`: scoped
+  local snapshot and send/receive authority inform #881, including their
+  still-open placement, reclaim, deadlist, distributed replication, and
+  incremental-resume gaps.
+- `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md`,
+  `docs/RECEIVE_STREAM_MERGE_POLICY.md`, and
+  `docs/DATASET_LIFECYCLE_DESIGN.md`: deadlist, receive-base, and dataset
+  lifecycle material inform #881, but historical or issue-scoped wording is not
+  broad storage-intent lifecycle authority until live source, issue, and claim
+  authority say so.
 - `docs/SPACEMAP_ALLOCATOR_DESIGN.md`,
   `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`,
   `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`,
@@ -1472,13 +1582,13 @@ storage-intent language beside the shared records and compiled policy snapshot.
 
 | Stage | Graduation gate | Issues |
 | --- | --- | --- |
-| Records | Shared spellings and versioned records exist for policies, receipts, roles, proximity, media, workload, data shape, layout evidence, cost, wear, and relocation reasons. | #841, #878, #880 |
+| Records | Shared spellings and versioned records exist for policies, receipts, roles, proximity, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #841, #878, #880, #881 |
 | Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
-| Evidence feeds | Local ack paths, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, and layout/allocator evidence can publish read-only evidence without making final placement decisions. | #842, #844, #845, #846, #856, #878, #880 |
+| Evidence feeds | Local ack paths, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #842, #844, #845, #846, #856, #878, #880, #881 |
 | Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile. | #874 |
-| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal data shapes and layout targets, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #843, #862, #878, #880 |
-| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, and archive sources with freshness and receipt evidence. | #877, #675 |
-| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #847, #848, #878, #880 |
+| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #843, #862, #878, #880, #881 |
+| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness and receipt evidence. | #877, #675, #881 |
+| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #847, #848, #878, #880, #881 |
 | Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875 |
 
 Interface gates between stages are explicit:
@@ -1486,8 +1596,8 @@ Interface gates between stages are explicit:
 - Consumers take `StorageIntentPolicy` snapshots and receipt/evidence records,
   not raw caller hints, ad hoc dataset properties, or device labels.
 - Planners may score only candidates that already passed guarantee,
-  failure-domain, data-shape, layout/allocator, capacity, wear, transport, and
-  degradation-law filters.
+  failure-domain, data-shape, layout/allocator, lifecycle/generation, capacity,
+  wear, transport, and degradation-law filters.
 - Schedulers may delay, throttle, or refuse work, but they may not convert one
   acknowledgment class into another after admission.
 - Read-serving paths may accelerate through cache, trial, RAM, local, remote,
@@ -1499,6 +1609,9 @@ Interface gates between stages are explicit:
 - Allocator and layout paths may use free-run, locality, zone, pending-free,
   reclaim, or fragmentation evidence only through authority records or marked
   non-authoritative mirrors.
+- Lifecycle paths may use write-age, retention, snapshot, clone, receive-base,
+  orphan, destroy, or reclaim-frontier evidence only through authority records
+  or marked non-authoritative predictors.
 - Relocation workers may write speculative replacements, but they may not
   retire source receipts until replacement receipts satisfy the target policy.
 - Validation rows and claim ids are not an afterthought: each stage must either
@@ -1512,13 +1625,14 @@ this document except to update the issue map after live tickets exist.
 
 | Slice | Follow-up issue | Expected write set | Purpose |
 | --- | --- | --- | --- |
-| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, media role, proximity, workload, data-shape refs, and cost records. |
+| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, media role, proximity, workload, data-shape refs, lifecycle refs, and cost records. |
 | Policy source and compilation | #855 | policy/config crate or `crates/tidefs-storage-intent-policy/` | Persist and compile pool, dataset, mount, caller, and internal maintenance policy into storage-intent records. |
 | Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths. |
 | Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, proximity domains, failure domains, and media constraints. |
 | Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, degraded-read law, geo stale-read boundaries, and read-repair evidence. |
 | Data-shape authority | #878 | data-shape records/model module or `crates/tidefs-storage-intent-data-shape/`, focused tests | Bind record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake decisions to compiled policy and evidence receipts. |
 | Layout evidence authority | #880 | layout-evidence records/model module or `crates/tidefs-storage-intent-layout-evidence/`, focused tests | Expose allocator geometry, fragmentation, free-run pressure, alignment, zone/write-pointer state, pending-free safety, and reclaim debt as policy evidence. |
+| Lifecycle evidence authority | #881 | lifecycle-evidence records/model module or `crates/tidefs-storage-intent-lifecycle-evidence/`, focused tests | Expose write age, stability, snapshot/clone/receive-base retention, orphan/destroy state, and reclaim frontiers as policy evidence. |
 | Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes. |
 | Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, and anti-thrash state for planning and performance rows. |
