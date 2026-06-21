@@ -58,6 +58,14 @@ reserve-escrow, and recovery headroom that lets the policy complete without
 stealing from protected sync, repair, evacuation, or receipt-retirement
 reserves.
 
+Recovery/degradation evidence is the failure counterpart. A degraded read,
+repair, rebuild, partition-healing, geo catch-up, or receipt-retirement decision
+is not legal because some surviving bytes can be found. It is legal only when
+the receipt cites the source receipts, reconstruction width, missing/corrupt
+targets, partition/fence state, repair obligation, replacement receipt
+publication, and visibility/refusal law that make the weaker or healing state
+honest.
+
 ## Non-Claims
 
 This document does not implement runtime behavior, change POSIX durability
@@ -147,6 +155,7 @@ The core records are:
 | `StorageIntentOrderingEvidence` | Barrier, dependency, replay, dirty-epoch, intent-sequence, commit/root publication, and completion evidence owned by #894. |
 | `StorageIntentTrustEvidence` | Security, administrative-domain, tenant-domain, key-epoch, authorization, audit, and compromise/quarantine evidence owned by #897 and sourced from the security, authz, transport, and transform authorities. |
 | `StorageIntentCapacityAdmissionEvidence` | Logical/physical headroom, allocation-ticket, claim/reserve ledger, dirty-window, pending-free, reserve-pressure, and ENOSPC/refusal evidence owned by #898 and sourced from capacity, allocator, reserve, scheduler, and lifecycle authorities. |
+| `StorageIntentRecoveryEvidence` | Degraded state, source receipt set, reconstruction width, missing/corrupt/stale target evidence, read-repair/rebuild obligation, replacement receipt publication, old-receipt retirement, partition/healing, RPO/RTO lag, and refusal evidence owned by #900 and sourced from placement receipts, scrub/repair/rebuild, membership, trust, ordering, capacity, layout, and lifecycle authorities. |
 | `StorageIntentDataShape` | Requested and earned encoded shape for a range or generation, including record sizing, transform ordering, digest suite, dedup/encryption/EC compatibility, and rebake evidence. |
 | `StorageIntentLayoutEvidence` | Allocator and physical-layout evidence for fragmentation, free runs, alignment, zone/write-pointer state, pending frees, reclaim debt, and locality. |
 | `StorageIntentLifecycleEvidence` | Generation and retention evidence for write age, stability, snapshots, clones, receive bases, orphans, destroy/tombstone state, and reclaim frontiers. |
@@ -195,6 +204,10 @@ model predicates for:
   physical allocation class headroom, dirty-window reserve, allocation ticket,
   reserve escrow, pending-free safety, protected floor, and ENOSPC/refusal
   state;
+- recovery/degradation legality, including source receipt set, reconstruction
+  width, degraded visibility, repair obligation, no-quorum or partition state,
+  replacement receipt publication, old-receipt retirement, RPO/RTO lag, and
+  hidden-downgrade refusal state;
 - volatile, durable-intent, full-placement, and RPO/lag dimensions;
 - media-role legality, including cache versus RAM authority separation;
 - data-shape legality, including transform compatibility, digest/integrity
@@ -222,6 +235,7 @@ The policy has these logical fields:
 | `membership_epoch_policy` | Required epoch freshness, quorum-set identity, witness/data role, failure-domain binding, drain/fence treatment, and split-brain refusal law. |
 | `trust_domain_policy` | Required security/admin/tenant domain eligibility, session-security posture, key epoch, authorization/audit refs, cross-domain sharing law, compromise/quarantine treatment, and regulatory/residency refusal law. |
 | `capacity_admission_policy` | Required logical/physical headroom, quota/slop law, allocation-ticket and reserve-escrow treatment, dirty-window reserve, pending-free eligibility, protected-floor law, and ENOSPC/refusal behavior. |
+| `recovery_degradation_policy` | Required degraded-mode visibility, reconstruction width, read-repair/rebuild obligation, no-quorum/partition handling, RPO/RTO lag, replacement receipt publication, old-receipt retirement, and hidden-downgrade refusal behavior. |
 | `media_role_policy` | Which media classes may hold intent, metadata, serving data, cold data, read cache, or scratch data. |
 | `workload_shape` | Workload envelope the planner should optimize for without changing hard guarantees. |
 | `data_shape_policy` | Record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake constraints. |
@@ -250,6 +264,7 @@ floors from optimizer weights:
 | Distance and failure domain | node/rack/DC/site/region spread, internet path allowed or refused | nearest legal peer, measured RTT/loss/bandwidth scoring |
 | RPO/RTO | maximum remote lag or recovery window | delta batching, compression, catch-up lane priority |
 | Capacity and reserve | logical quota/slop, physical free-space class, allocation ticket, dirty-window reserve, protected repair/sync floors, pending-free safety | choose lower-amplification shape, delay optimizer, trigger reclaim, batch convergence |
+| Recovery and degradation | source receipt set, reconstruction width, visible degraded state, repair obligation, no-quorum/partition refusal, replacement receipt before retirement | prioritize repair, choose cheaper reconstruction source, batch rebuild, tune read-repair foreground cost |
 | Wear and money | critical write reserve, WAF ceiling, egress/capacity budget | promote/demote only when payback beats movement debt |
 
 A candidate must satisfy all hard floors before scoring. Cost weights may pick
@@ -311,6 +326,9 @@ The compiler must produce:
   residency requirements;
 - the capacity admission, allocation-ticket, reserve-escrow, dirty-window,
   pending-free, protected-floor, and ENOSPC/refusal requirements;
+- the recovery/degradation, reconstruction-width, repair-obligation,
+  no-quorum/partition, RPO/RTO-lag, replacement-receipt, and old-receipt
+  retirement requirements;
 - the visibility/degradation law for weaker receipts;
 - allowed and forbidden proximity domains by role;
 - allowed and forbidden media roles by class and generation;
@@ -366,6 +384,10 @@ The receipt must bind:
   claim/reserve receipts, dirty-window reserve, pending-free safety,
   reserve-pressure state, and any ENOSPC/refusal outcome that shaped the
   result;
+- recovery/degradation refs for source receipt set, reconstruction width,
+  missing/corrupt/stale targets, repair or rebuild obligation, partition/healing
+  state, replacement receipt publication, old-receipt retirement, RPO/RTO lag,
+  and any visible degraded or refusal outcome that shaped the result;
 - failure domains represented in the receipt;
 - media class and persistence semantics for each receipt participant;
 - known missing work such as geo lag, archive conversion, or background
@@ -383,11 +405,12 @@ the current evidence set and publishes the satisfaction state other subsystems
 must act on.
 
 The reconciler consumes policy snapshots, ack receipts, placement receipts,
-transport path evidence, capacity/admission evidence, media-wear and non-wear
-cost ledgers, workload signal snapshots, scheduler admission evidence, RAM
-authority receipts, relocation state, and validation artifacts. It does not
-recompute policy, select new placement, retire old receipts, emit ack receipts,
-or execute relocation. Its job is to make the current truth machine-readable:
+transport path evidence, capacity/admission evidence, recovery/degradation
+evidence, media-wear and non-wear cost ledgers, workload signal snapshots,
+scheduler admission evidence, RAM authority receipts, relocation state, and
+validation artifacts. It does not recompute policy, select new placement, retire
+old receipts, emit ack receipts, or execute relocation. Its job is to make the
+current truth machine-readable:
 
 | State | Meaning |
 | --- | --- |
@@ -400,11 +423,11 @@ or execute relocation. Its job is to make the current truth machine-readable:
 | `unsafe-volatile` | The policy intentionally requested weaker volatile/unsafe behavior and the receipt truth exposes that weaker guarantee. |
 
 Missing, stale, malformed, under-reserved, expired-reserve, under-width,
-wrong-epoch, wrong-failure-domain, wrong-lifecycle, unknown-cost, unknown-WAF,
-cache-only, or contradictory evidence cannot satisfy a durable, geo, or
-low-latency floor by accident. They must become an explicit unknown, blocked,
-degraded, refused, or unsafe-visible state according to the compiled policy's
-degradation law.
+wrong-epoch, wrong-failure-domain, wrong-lifecycle, wrong-reconstruction-width,
+missing-repair-obligation, unknown-cost, unknown-WAF, cache-only, or
+contradictory evidence cannot satisfy a durable, geo, or low-latency floor by
+accident. They must become an explicit unknown, blocked, degraded, refused, or
+unsafe-visible state according to the compiled policy's degradation law.
 
 This loop is what keeps the whole design native. A predictor may believe a
 range is hot, a planner may propose a move, a scheduler may admit a lane, and a
@@ -979,6 +1002,9 @@ Every source must pass freshness and authority predicates before it can serve:
 - capacity/admission evidence when degraded reconstruction will trigger read
   repair, remote refresh, archive restore, serving promotion, or replacement
   receipt publication;
+- recovery/degradation evidence when the read uses under-redundant placement,
+  reconstructed bytes, repair-required sources, partition-healing state, stale
+  geo state, or receipt-retirement-sensitive sources;
 - digest/checksum evidence for placement, degraded, or reconstructed bytes;
 - transport/path evidence and lag evidence for remote or geo sources;
 - stale, missing, or contradictory evidence reason when a candidate is rejected.
@@ -1003,6 +1029,76 @@ lag envelope, but it must not satisfy a latest local POSIX read unless the
 compiled policy requested that weaker freshness. `geo-intent` or
 `geo-full-placement` reads still need receipt and path evidence for the remote
 authority being used; speed-of-light latency is not a correctness exception.
+
+## Recovery, Degraded Mode, And Receipt Retirement Authority
+
+Storage intent consumes recovery facts, but it does not own placement receipt
+authority, scrub, repair, rebuild, membership, trust, ordering, capacity, or
+relocation execution. #900 owns the storage-intent recovery/degradation evidence
+projection and the predicates that decide whether those facts satisfy a compiled
+policy role.
+
+This boundary matters whenever TideFS serves while under-width, reconstructs
+from surviving shards, repairs on read, rebuilds after loss, heals a partition,
+drains a target, catches up a geo peer, or retires an old receipt. The danger is
+not only data loss; it is a hidden downgrade where "some bytes were readable"
+becomes a fresh read, a durable ack, a full-placement claim, or permission to
+free the old authority.
+
+Authority boundaries are:
+
+- `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`, #675, and the #18 lineage own
+  durable placement receipt authority, source receipts, replacement receipts,
+  and receipt-backed repair publication;
+- read-serving (#877) owns source selection, but a degraded source must cite
+  #900 evidence when it is weaker, reconstructing, repair-required, geo-lagged,
+  or receipt-retirement-sensitive;
+- relocation/rebuild/geo movement (#848) may execute work, but it cannot declare
+  recovery complete or retire sources without replacement receipt and #900
+  predicate satisfaction;
+- satisfaction reconciliation (#874) consumes #900 evidence to publish exact,
+  degraded-visible, blocked, refused, or unknown state;
+- validation (#863) proves the forbidden outcomes under injected corruption,
+  partition, no-quorum, lag, reserve, and receipt-retirement faults;
+- membership (#750), trust/domain (#897), ordering/replay (#894), capacity (#898),
+  layout (#880), lifecycle (#881), and data shape (#878) remain the source
+  authorities for their evidence slices.
+
+The recovery/degradation evidence projection must distinguish at least:
+
+| Evidence field | Storage-intent use |
+| --- | --- |
+| `degradation_policy_ref` | Names whether exact, degraded-visible, stale-read, no-quorum, blocked, refused, or unsafe-visible behavior is permitted for this policy revision. |
+| `source_receipt_set_ref` | Binds the read, repair, rebuild, or relocation plan to current placement receipt generation, source targets, payload digest, and redundancy policy. |
+| `reconstruction_width_ref` | Proves replicated or EC reconstruction has enough verified sources and rejects under-width, malformed-policy, or stale-generation reconstruction. |
+| `target_health_ref` | Names missing, corrupt, stale, quarantined, fenced, draining, wrong-domain, unreachable, or suspect targets without converting them into usable sources. |
+| `repair_obligation_ref` | Carries read-repair, scrub finding, repair ticket, rebuild ticket, evacuation, geo catch-up, priority, retry, and repair-debt state. |
+| `replacement_receipt_ref` | Proves repaired or rebuilt placement publication before any stronger satisfaction state or source retirement is claimed. |
+| `retirement_frontier_ref` | Binds old-receipt retirement to replacement receipt, ordering/replay, lifecycle, capacity, fence, and reclaim-frontier safety. |
+| `partition_healing_ref` | Records no-quorum, split-brain hazard, old epoch, fence, witness/data role, and healing frontier state from membership evidence. |
+| `rpo_rto_lag_ref` | Records geo, archive, receive, and restore lag relative to policy and exposes when lag exceeds the requested envelope. |
+| `recovery_state` | Records exact, degraded-visible, reconstructing, repair-required, rebuild-required, geo-lagged, no-quorum, partitioned, blocked, refused, or unknown-evidence. |
+| `recovery_refusal_ref` | Carries typed refusal such as under-width, stale receipt, corrupt source, wrong epoch, fenced peer, quarantined source, wrong trust domain, under-reserved repair, missing replacement receipt, or lag exceeded. |
+
+Degraded state is a visible receipt state, not an implementation mood. If policy
+permits a degraded read, the read may be successful while still carrying
+repair-required or rebuild-required evidence. If policy requires exact or latest
+freshness, the same source set must block or refuse. The caller and operator
+must be able to see which guarantee was earned.
+
+No-quorum and partition handling fail closed unless the compiled policy names a
+weaker visible mode. A write that cannot earn its configured quorum floor is not
+a slow write; it is blocked, refused, or explicitly degraded only when the
+policy says that degraded result is legal. Healing after a partition must prove
+which epoch, fence, witness/data role, and receipt generation made each result
+safe.
+
+Repair, rebuild, and relocation completion require replacement receipts.
+Reconstructing bytes, copying bytes, or seeing a successful transfer is not
+placement authority. Old receipts, old locators, deadlist entries, and source
+targets may retire only after replacement receipt publication plus ordering,
+capacity, lifecycle, fence, and reclaim-frontier evidence say retirement is
+safe.
 
 ## Data Shape, Transforms, And Integrity
 
@@ -1450,6 +1546,9 @@ Hard constraints include:
 - membership epoch, committed-roster, quorum-set, witness/data role, fence,
   drain, split-brain, and failure-domain legality;
 - capacity and reservation availability;
+- recovery/degradation legality, including source receipts, reconstruction
+  width, visible degraded state, repair obligation, partition/no-quorum state,
+  replacement receipt publication, and old-receipt retirement;
 - media role eligibility;
 - data-shape compatibility and transform block state;
 - allocator/layout compatibility, including alignment, free-space, pending-free,
@@ -1693,6 +1792,44 @@ signal changes materially.
 6. The ack receipt binds the epoch and quorum evidence it actually earned, so a
    later epoch change can be explained and reconciled without rewriting history.
 
+### Degraded Read With Read Repair
+
+1. A read loses one replica or EC shard but still has enough receipt-backed
+   verified sources to reconstruct the requested bytes.
+2. Recovery evidence cites the source receipt set, reconstruction width,
+   payload/digest evidence, missing target, and degraded visibility policy.
+3. The read may succeed only under a policy that permits the degraded-visible or
+   reconstructed source class; otherwise it blocks, refreshes, or refuses.
+4. Read repair needs #898 reserve evidence before it may publish replacement
+   authority, and the replacement receipt becomes the proof of healed placement.
+5. The operator explanation shows both the successful read source and the
+   remaining repair/rebuild obligation.
+
+### Partition Healing No-Quorum Refusal
+
+1. A partition leaves one side with stale epoch evidence, no legal quorum, or a
+   split-brain hazard.
+2. Membership evidence blocks the side from earning quorum intent or full
+   placement, even if the local media and network path look fast.
+3. Recovery evidence records `no-quorum`, `partitioned`, `blocked`, or `refused`
+   instead of letting the path return an ordinary durable success.
+4. Healing requires a fresh epoch/fence frontier, source receipt comparison,
+   ordering/replay closure, and any repair or rollback obligation before
+   stronger satisfaction can be claimed.
+
+### Rebuild Completion And Receipt Retirement
+
+1. A rebuild or evacuation reconstructs data from receipt-backed sources and
+   writes replacement placement.
+2. Transfer success is not completion. The replacement receipt must be verified
+   and published with ordering, trust, capacity, layout, lifecycle, and recovery
+   evidence.
+3. Old locators, old receipt targets, deadlist entries, and reclaim tickets may
+   retire only after the retirement frontier proves no read, repair, receive,
+   snapshot, or geo dependency still needs them.
+4. If replacement receipt publication is missing or stale, satisfaction remains
+   `blocked` or `unknown-evidence`; reclaim does not get to guess.
+
 ### RAM Pool
 
 1. A scratch dataset requests `volatile-local` or `volatile-replicated`.
@@ -1755,6 +1892,10 @@ The operator UAPI should eventually answer:
 - Which logical quota, physical allocation class, allocation ticket,
   dirty-window, reserve-escrow, protected-floor, pending-free, and typed ENOSPC
   evidence made an operation admitted, blocked, throttled, degraded, or refused?
+- Which recovery evidence applies: source receipt set, reconstruction width,
+  missing/corrupt/stale targets, no-quorum or partition state, repair/rebuild
+  obligation, replacement receipt publication, old-receipt retirement frontier,
+  RPO/RTO lag, and typed recovery refusal?
 - How much flash endurance did this dataset consume?
 - Which relocation jobs were skipped because the wear or foreground-latency
   budget was not worth spending?
@@ -1785,6 +1926,9 @@ Initial row families should cover:
 - metadata storm p99 and fsyncdir latency;
 - read-serving source latency and stale/refresh/refusal rate by source class;
 - degraded read reconstruction latency and repair-on-read foreground cost;
+- recovery/degradation behavior for no-quorum refusal, partition healing,
+  repair/rebuild obligation, replacement receipt publication, receipt
+  retirement, and geo/archive lag under policy;
 - streaming ingest throughput without flash wear explosion;
 - data-shape selection for record size, compression, checksum/digest, dedup,
   encryption, EC/archive shape, and coalescing under latency and cost floors;
@@ -1836,6 +1980,10 @@ Each row must bind:
 - capacity/admission evidence, reserve class, ticket generation, pending-free
   frontier, capacity amplification, protected-floor state, and typed refusal
   reason where relevant;
+- recovery/degradation evidence, source receipt set, reconstruction width,
+  target health, repair/rebuild obligation, replacement receipt, retirement
+  frontier, no-quorum/partition state, RPO/RTO lag, and recovery refusal reason
+  where relevant;
 - lifecycle evidence, retained-root refs, receive-base safety, orphan/destroy
   state, and reclaim-frontier refs where relevant;
 - movement debt, payback window, cooldown state, and skipped-move reason where
@@ -1880,6 +2028,13 @@ The matrix must cover at least these row families:
   satisfy placement or durable ack receipts;
 - stale cache, stale snapshot generation, geo-async lag, and degraded-read
   cases proving read-serving choices obey freshness and receipt evidence;
+- recovery/degradation faults such as no-quorum success, stale source receipt
+  accepted for repair, under-width EC reconstruction served as exact, corrupt
+  repair source accepted, old epoch accepted after partition healing, fenced or
+  draining peer counted as data, quarantined or wrong-domain repair source
+  accepted, read repair without reserve, replacement receipt missing at
+  old-receipt retirement, geo/archive lag exceeding policy, and degraded state
+  hidden from caller/operator;
 - transform and data-shape faults such as wrong key epoch, illegal dedup domain,
   malformed compression frame, digest-suite mismatch, EC under-width
   reconstruction, and mounted transform block/refusal state;
@@ -1915,8 +2070,8 @@ evidence accepted as satisfied, allocator mirror evidence accepted as authority,
 stale lifecycle evidence accepted as retained/reclaimable, bookmark-only
 anchors treated as data-retaining, pending-free bytes reused too early, and
 explanations that omit degradation, lag, volatility, trust-domain refusal,
-transform block state, capacity/reserve refusal, lifecycle or layout blockers,
-or refusal.
+recovery obligation, replacement receipt blocker, transform block state,
+capacity/reserve refusal, lifecycle or layout blockers, or refusal.
 
 The validation matrix cross-links with #850 where a scenario also has latency,
 tail, throughput, RPO, or wear/cost budgets. #850 measures whether TideFS is
@@ -1942,6 +2097,12 @@ This document composes existing authority surfaces:
   locator authority and must drive reads, rebuild, and reclaim.
 - `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md`: pool-wide placement and
   failure-domain policy are receipt-backed.
+- `docs/SCRUB_REPAIR_RESILVER_DESIGN.md`,
+  `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`, and
+  `docs/CROSS_REPLICA_SCRUB_COMPARISON_DESIGN.md`: scrub, repair, resilver,
+  rebuild, anti-entropy, and movement material inform #900, but storage intent
+  consumes typed recovery/degradation refs instead of originating a parallel
+  repair or rebuild runtime.
 - `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`: mounted
   device-level compression and encryption remain blocked until mounted content,
   scrub, repair, recovery, and raw-store paths use one transform-aware authority.
@@ -1989,6 +2150,12 @@ This document composes existing authority surfaces:
   authorization/audit refs, residency, sharing-domain compatibility, and
   compromise/quarantine refusal. It composes security, authz, transport, and
   transform evidence without replacing those owners.
+- #900 owns the storage-intent recovery/degradation evidence slice for source
+  receipts, reconstruction width, target health, repair/rebuild obligation,
+  replacement receipt publication, old-receipt retirement, partition healing,
+  RPO/RTO lag, and hidden-downgrade refusal. It composes placement receipt,
+  scrub/repair/rebuild, membership, trust, ordering, capacity, layout, lifecycle,
+  and data-shape evidence without replacing those owners.
 - `docs/security/transport-security-boundary.md`: transport security is
   session-level. Storage intent may require and cite session-security evidence,
   but it must not reintroduce per-message crypto proof markers.
@@ -2096,14 +2263,14 @@ storage-intent language beside the shared records and compiled policy snapshot.
 
 | Stage | Graduation gate | Issues |
 | --- | --- | --- |
-| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, trust/domain evidence refs, capacity/admission evidence refs, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #878, #880, #881, #894, #897, #898 |
+| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, trust/domain evidence refs, capacity/admission evidence refs, recovery/degradation evidence refs, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #878, #880, #881, #894, #897, #898, #900 |
 | Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
-| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, trust/domain refs, capacity/admission refs, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894, #897, #898 |
+| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894, #897, #898, #900 |
 | Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile. | #874 |
-| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, trust/domain state, capacity/reserve state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #862, #878, #880, #881, #894, #897, #898 |
-| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness, epoch/fence, trust/domain, capacity-for-repair, and receipt evidence. | #750, #877, #675, #881, #897, #898 |
-| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement, ordering, trust/domain, and capacity/admission evidence before source retirement. | #750, #847, #848, #878, #880, #881, #894, #897, #898 |
-| Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, trust/domain, capacity/reserve, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875, #897, #898 |
+| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, trust/domain state, capacity/reserve state, recovery/degradation state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #862, #878, #880, #881, #894, #897, #898, #900 |
+| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness, epoch/fence, trust/domain, capacity-for-repair, recovery/degradation, and receipt evidence. | #750, #877, #675, #881, #897, #898, #900 |
+| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement, ordering, trust/domain, capacity/admission, and recovery/degradation evidence before source retirement. | #750, #847, #848, #878, #880, #881, #894, #897, #898, #900 |
+| Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, trust/domain, capacity/reserve, recovery/degradation, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875, #897, #898, #900 |
 
 Interface gates between stages are explicit:
 
@@ -2111,16 +2278,16 @@ Interface gates between stages are explicit:
   not raw caller hints, ad hoc dataset properties, or device labels.
 - Planners may score only candidates that already passed guarantee,
   ordering/replay, membership/epoch/fence, trust/domain, failure-domain,
-  data-shape, layout/allocator, lifecycle/generation, capacity, wear,
-  transport, and degradation-law filters.
+  data-shape, layout/allocator, lifecycle/generation, capacity, recovery,
+  wear, transport, and degradation-law filters.
 - Schedulers may delay, throttle, or refuse work, but they may not convert one
   acknowledgment class into another after admission.
 - Ack receipt emitters may group, shard, coalesce, or pipeline work only when
   ordering evidence preserves the caller-visible barrier and replay contract.
 - Read-serving paths may accelerate through cache, trial, RAM, local, remote,
   degraded, snapshot, geo, or archive sources only when freshness, receipt,
-  membership epoch, fence, trust/domain, and degradation predicates pass for
-  the compiled policy.
+  membership epoch, fence, trust/domain, recovery/degradation, and capacity
+  predicates pass for the compiled policy.
 - Data-shape and transform paths may change record size, compression,
   checksum/digest, dedup, encryption, EC, archive, or coalescing shape only
   through compiled policy and receipt/evidence records.
@@ -2134,9 +2301,14 @@ Interface gates between stages are explicit:
   claim-ledger, reserve-ledger, dirty-window, and protected-floor evidence only
   through authority records; cost estimates, reclaim queues, and mirror
   projections do not satisfy admission by themselves.
+- Recovery paths may use source receipts, reconstruction width, target health,
+  repair/rebuild obligation, replacement receipt, retirement frontier, partition
+  healing, and RPO/RTO lag only through authority records; reachable bytes,
+  transfer success, or topology guesses do not satisfy recovery by themselves.
 - Relocation workers may write speculative replacements, but they may not
   retire source receipts until replacement receipts, ordering evidence, and
-  trust/domain plus capacity/admission evidence satisfy the target policy.
+  trust/domain plus capacity/admission plus recovery/degradation evidence
+  satisfy the target policy.
 - Validation rows and claim ids are not an afterthought: each stage must either
   add the relevant #850/#863 row binding and #875 claim boundary, or state
   which later issue owns that proof.
@@ -2149,29 +2321,30 @@ this document except to update the issue map after live tickets exist.
 | Slice | Follow-up issue | Expected write set | Purpose |
 | --- | --- | --- | --- |
 | Membership epoch authority | #750 | `docs/MEMBERSHIP_AUTHORITY.md` | Decide epoch, quorum-write, witness-set, join/drain, fence, roster, and failure-domain authority, then expose typed refs storage-intent consumers can cite. |
-| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, trust/domain refs, capacity/admission refs, media role, proximity, workload, data-shape refs, layout refs, lifecycle refs, and cost records. |
+| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, media role, proximity, workload, data-shape refs, layout refs, lifecycle refs, and cost records. |
 | Ordering evidence authority | #894 | ordering evidence model surface or #841 core model | Expose barrier scope, dirty epoch, dependency closure, replay idempotency, intent sequence, publication boundary, and completion state for sync, quorum, relocation, repair, and receipt-retirement receipts. |
 | Trust/domain evidence authority | #897 | storage-intent trust/domain records in #841 or `crates/tidefs-storage-intent-trust/`, focused tests | Expose authenticated identity, admin/security/tenant domain, session-security posture, key epoch, authorization/audit refs, residency, sharing-domain compatibility, and quarantine/refusal state. |
 | Capacity/admission evidence authority | #898 | storage-intent capacity/admission records in #841 or `crates/tidefs-storage-intent-capacity/`, focused tests | Expose logical/physical headroom, allocation tickets, claim/reserve receipts, dirty-window reserve, protected floors, pending-free frontiers, capacity amplification, and typed ENOSPC/refusal state. |
+| Recovery/degradation evidence authority | #900 | storage-intent recovery/degradation records in #841 or `crates/tidefs-storage-intent-recovery/`, focused tests | Expose degraded state, source receipt set, reconstruction width, target health, repair/rebuild obligation, replacement receipt publication, old-receipt retirement, partition healing, RPO/RTO lag, and typed recovery refusal state. |
 | Policy source and compilation | #855 | policy/config crate or `crates/tidefs-storage-intent-policy/` | Persist and compile pool, dataset, mount, caller, and internal maintenance policy into storage-intent records. |
 | Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths with ordering and capacity/admission refs for the ack floor. |
 | Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, membership/fence refs, trust/domain refs, capacity/admission refs, proximity domains, failure domains, and media constraints. |
-| Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, epoch/fence law, trust/domain law, degraded-read law, geo stale-read boundaries, and read-repair capacity evidence. |
+| Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, epoch/fence law, trust/domain law, recovery/degradation law, geo stale-read boundaries, and read-repair capacity evidence. |
 | Data-shape authority | #878 | data-shape records/model module or `crates/tidefs-storage-intent-data-shape/`, focused tests | Bind record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake decisions to compiled policy and evidence receipts. |
 | Layout evidence authority | #880 | layout-evidence records/model module or `crates/tidefs-storage-intent-layout-evidence/`, focused tests | Expose allocator geometry, fragmentation, free-run pressure, alignment, zone/write-pointer state, pending-free safety, and reclaim debt as policy evidence. |
 | Lifecycle evidence authority | #881 | lifecycle-evidence records/model module or `crates/tidefs-storage-intent-lifecycle-evidence/`, focused tests | Expose write age, stability, snapshot/clone/receive-base retention, orphan/destroy state, and reclaim frontiers as policy evidence. |
 | Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes without replacing #898 admission evidence. |
 | Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, and anti-thrash state for planning and performance rows. |
-| Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against receipts and evidence as satisfied, converging, degraded, blocked, refused, or unsafe-visible without choosing placement. |
+| Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against receipts and evidence as satisfied, converging, degraded, blocked, refused, or unsafe-visible, including #900 recovery/degradation state, without choosing placement. |
 | Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy and #898 reserve state to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
 | Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier evidence without making RDMA mandatory. |
 | RAM authority design and implementation | #847 | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority. |
-| Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, wear movement, reserve admission, shadow evaluation, payback, and cooldown. |
-| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, receipts, lag, volatility, placement, trust/domain state, capacity/reserve state, and wear to operators. |
-| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, trust/domain changes, capacity admission, wear, cost, RPO, and relocation. |
-| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media, trust/domain, capacity/reserve, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
-| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, RAM, WAN, and wear promises. |
+| Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, wear movement, reserve admission, recovery/degradation predicates, shadow evaluation, payback, and cooldown. |
+| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, receipts, lag, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, and wear to operators. |
+| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, trust/domain changes, capacity admission, recovery/degradation, wear, cost, RPO, and relocation. |
+| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media, trust/domain, capacity/reserve, recovery/degradation, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
+| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, recovery/degradation, RAM, WAN, and wear promises. |
 
 ## Validation For This Slice
 
