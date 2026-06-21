@@ -772,7 +772,7 @@ pub(crate) struct FileSystemState {
     change_streams: BTreeMap<InodeId, BTreeMap<u64, DirChangeRecord>>,
     /// Per-file extent maps for byte-range-to-physical mapping persistence.
     /// Keyed by InodeId; only populated for file-like inodes with allocated extents.
-    pub(crate) extent_maps: BTreeMap<InodeId, tidefs_extent_map::ExtentMap>,
+    pub(crate) extent_maps: Arc<Mutex<BTreeMap<InodeId, tidefs_extent_map::ExtentMap>>>,
     /// Tracks which extent maps are dirty and need persistence on next commit.
     pub(crate) dirty_extent_maps: BTreeSet<InodeId>,
     #[allow(dead_code)]
@@ -1481,12 +1481,14 @@ pub struct LocalFileSystem {
     space_pressure: SpacePressure,
     background_cleaner: BackgroundCleaner,
     orphan_index: Arc<Mutex<OrphanIndex>>,
-    /// Shared extent maps for background defrag service. Initialised at open
-    /// as a clone of [`FileSystemState::extent_maps`], then kept in sync on
-    /// commit. The defrag service obtains a clone of this handle.
+    /// Shared extent maps for background defrag service. This is the
+    /// same [`Arc`] held by [`FileSystemState::extent_maps`], so defrag
+    /// results are committed directly to the canonical extent maps.
     extent_maps_shared: Option<Arc<Mutex<BTreeMap<InodeId, tidefs_extent_map::ExtentMap>>>>,
     /// Shared inode records (for file_size lookups by the defrag adapter).
-    inodes_shared: Option<Arc<Mutex<BTreeMap<InodeId, InodeRecord>>>>,
+    /// Uses the same [`Arc`] as [`FileSystemState::inodes`] so file-size
+    /// data is always up-to-date.
+    inodes_shared: Option<Arc<BTreeMap<InodeId, InodeRecord>>>,
     /// Shared statistics published by the online defrag job after each tick.
     online_defrag_stats: Option<Arc<Mutex<DefragStats>>>,
     feature_flags: FeatureFlags,
@@ -3297,12 +3299,12 @@ impl LocalFileSystem {
         let pool_uuid = pool_uuid_from_path(&root_path);
         let dataset_mount_id = allocate_local_dataset_mount_id(pool_uuid);
 
-        // Clone extent maps and inode records into shared handles for
-        // the background online-defrag service. These are separate from
-        // state.extent_maps / state.inodes so the defrag service can
-        // operate on them without blocking the main filesystem.
-        let extent_maps_shared = Arc::new(Mutex::new(state.extent_maps.clone()));
-        let inodes_shared = Arc::new(Mutex::new((*state.inodes).clone()));
+        // Share extent maps with the background online-defrag service.
+        // We clone the Arc (reference-count bump), not the map, so the
+        // defrag adapter modifies the same in-memory extent maps that the
+        // filesystem uses.
+        let extent_maps_shared = Arc::clone(&state.extent_maps);
+        let inodes_shared = Arc::clone(&state.inodes);
         let online_defrag_stats = Arc::new(Mutex::new(DefragStats::default()));
 
         let mut fs = Self {
@@ -3357,8 +3359,8 @@ impl LocalFileSystem {
             feature_flags: FeatureFlags::new(),
             content_compression_policy: ContentCompressionPolicy::default(),
             pending_orphan_deletions: Arc::new(Mutex::new(Vec::new())),
-            extent_maps_shared: Some(extent_maps_shared),
-            inodes_shared: Some(inodes_shared),
+            extent_maps_shared: Some(extent_maps_shared), // Arc::clone of state.extent_maps
+            inodes_shared: Some(inodes_shared), // Arc::clone of state.inodes
             online_defrag_stats: Some(Arc::clone(&online_defrag_stats)),
             background_scheduler: None,
             scrub_repair_schedule: None,
@@ -5069,6 +5071,8 @@ impl LocalFileSystem {
         let em = self
             .state
             .extent_maps
+            .lock()
+            .unwrap()
             .get_mut(&ino)
             .ok_or(FilesystemError::NotFound {
                 path: format!("inode:{}", ino.get()),
@@ -5097,6 +5101,8 @@ impl LocalFileSystem {
         let em = self
             .state
             .extent_maps
+            .lock()
+            .unwrap()
             .get(&ino)
             .ok_or_else(|| FilesystemError::NotFound {
                 path: format!("inode:{}", ino.get()),
@@ -5128,6 +5134,8 @@ impl LocalFileSystem {
         let em = self
             .state
             .extent_maps
+            .lock()
+            .unwrap()
             .get(&ino)
             .ok_or_else(|| FilesystemError::NotFound {
                 path: format!("inode:{}", ino.get()),
@@ -10979,7 +10987,7 @@ impl LocalFileSystem {
                 // so each allocate succeeds.
                 let _ = emap.allocate(entry.logical_offset, entry.length);
             }
-            self.state.extent_maps.insert(*inode_id, emap);
+            self.state.extent_maps.lock().unwrap().insert(*inode_id, emap);
         }
     }
 
@@ -11384,7 +11392,7 @@ impl LocalFileSystem {
         self.state.last_dir_write_tx.remove(&inode_id);
         self.state.last_extent_map_write_tx.remove(&inode_id);
         self.extent_allocator.remove_inode(inode_id.get());
-        self.state.extent_maps.remove(&inode_id);
+        self.state.extent_maps.lock().unwrap().remove(&inode_id);
         self.state.known_inode_ids.remove(&inode_id);
         self.obligation_ledger.release_claims_for_inode(inode_id);
         self.dirty_set.forget_inode(inode_id);
@@ -12812,7 +12820,7 @@ mod orphan_index_integration_tests {
             extent_map.allocate(0, 4096).expect("first extent");
             extent_map.allocate(8192, 4096).expect("second extent");
 
-            let inodes = Arc::new(Mutex::new(BTreeMap::new()));
+            let inodes = Arc::new(BTreeMap::new());
             let extent_maps = Arc::new(Mutex::new(BTreeMap::from([(inode, extent_map)])));
             let stats = Arc::new(Mutex::new(DefragStats::default()));
             let store =

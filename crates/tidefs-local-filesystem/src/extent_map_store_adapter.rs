@@ -20,13 +20,13 @@ use tidefs_types_extent_map_core::{ExtentMapError, ExtentMapEntryV2, ExtentMapV1
 /// the filesystem's in-memory extent maps.
 ///
 /// Held fields:
-/// - `inodes`: shared inode records, used to read `file_size` for the
-///   [`InlineExtentMap`] header.
+/// - `inodes`: shared inode records (read-only), used to read `file_size`
+///   for the [`InlineExtentMap`] header.
 /// - `extent_maps`: shared extent maps. Reads produce a temporary
 ///   [`InlineExtentMap`] for fragmentation scoring; writes call
 ///   [`ExtentMap::defrag`] directly on the production map.
 pub struct FilesystemExtentMapStore {
-    inodes: Arc<Mutex<BTreeMap<InodeId, InodeRecord>>>,
+    inodes: Arc<BTreeMap<InodeId, InodeRecord>>,
     extent_maps: Arc<Mutex<BTreeMap<InodeId, ExtentMap>>>,
 }
 
@@ -39,7 +39,7 @@ impl FilesystemExtentMapStore {
     /// Create a new adapter backed by the given shared handles.
     #[must_use]
     pub fn new(
-        inodes: Arc<Mutex<BTreeMap<InodeId, InodeRecord>>>,
+        inodes: Arc<BTreeMap<InodeId, InodeRecord>>,
         extent_maps: Arc<Mutex<BTreeMap<InodeId, ExtentMap>>>,
     ) -> Self {
         Self {
@@ -72,14 +72,11 @@ impl ExtentMapStore for FilesystemExtentMapStore {
             .lookup_range(0, u64::MAX)
             .map_err(|_| ExtentMapError::Corrupt)?;
 
-        // Drop the extent_map lock before acquiring the inode lock to
-        // avoid a potential deadlock.
+        // inodes is a read-only Arc<BTreeMap<>>, no lock needed.
         drop(em_guard);
 
         let file_size = self
             .inodes
-            .lock()
-            .map_err(|_| ExtentMapError::Corrupt)?
             .get(&InodeId::new(ino))
             .map(|rec| rec.size)
             .unwrap_or(0);
