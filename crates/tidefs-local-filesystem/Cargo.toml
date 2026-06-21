@@ -20,6 +20,7 @@ tidefs-block-allocator = { path = "../tidefs-block-allocator" }
 tidefs-types-dataset-feature-flags-core = { path = "../tidefs-types-dataset-feature-flags-core" }
 tidefs-dataset-lifecycle = { path = "../tidefs-dataset-lifecycle" }
 tidefs-dataset-properties = { path = "../tidefs-dataset-properties" }
+tidefs-dedup = { path = "../tidefs-dedup" }
 tidefs-types-cache-lattice-core = { path = "../tidefs-types-cache-lattice-core" }
 tidefs-types-space-accounting-core = { path = "../tidefs-types-space-accounting-core" }
 tidefs-space-accounting = { path = "../tidefs-space-accounting" }

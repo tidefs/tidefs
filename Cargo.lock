@@ -2692,6 +2692,7 @@ dependencies = [
  "tidefs-dataset-feature-flags",
  "tidefs-dataset-lifecycle",
  "tidefs-dataset-properties",
+ "tidefs-dedup",
  "tidefs-dir-index",
  "tidefs-durability-layout",
  "tidefs-encryption",
