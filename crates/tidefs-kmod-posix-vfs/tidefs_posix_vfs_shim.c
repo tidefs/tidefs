@@ -805,6 +805,13 @@ static const struct file_operations tidefs_posix_vfs_dir_file_operations;
 static const struct inode_operations tidefs_posix_vfs_file_inode_operations;
 static const struct file_operations tidefs_posix_vfs_file_operations;
 static const struct address_space_operations tidefs_posix_vfs_aops;
+static u64 tidefs_posix_vfs_pagecache_fence_snapshot(struct inode *inode,
+						     loff_t pos,
+						     size_t len);
+static bool tidefs_posix_vfs_pagecache_fence_still_current(struct inode *inode,
+							   loff_t pos,
+							   size_t len,
+							   u64 snapshot);
 static int tidefs_posix_vfs_drop_fenced_pagecache_range(struct inode *inode,
 							loff_t pos,
 							size_t len,
