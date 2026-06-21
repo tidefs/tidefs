@@ -50,6 +50,7 @@
 #include <linux/uio.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
+#include <linux/rwsem.h>
 #include <linux/limits.h>
 #include <linux/math64.h>
 /* ilog2 computed inline; no linux/log2.h include needed */
@@ -82,6 +83,22 @@ static inline void fserror_report_shutdown(struct super_block *sb, int flags)
 
 int tidefs_posix_vfs_register_fs(void);
 void tidefs_posix_vfs_unregister_fs(void);
+
+/*
+ * Linux 7.0 exposes exclusive filemap invalidation helpers, but not shared
+ * wrappers.  The VFS mapping still carries the rwsem that those helpers use.
+ */
+static void tidefs_posix_vfs_filemap_invalidate_lock_shared(
+	struct address_space *mapping)
+{
+	down_read(&mapping->invalidate_lock);
+}
+
+static void tidefs_posix_vfs_filemap_invalidate_unlock_shared(
+	struct address_space *mapping)
+{
+	up_read(&mapping->invalidate_lock);
+}
 
 /* Forward declaration for the block-device-backed fill_super. */
 static int tidefs_posix_vfs_fill_super_bdev(struct super_block *sb,
@@ -3639,16 +3656,18 @@ static ssize_t tidefs_posix_vfs_file_read_iter(struct kiocb *iocb,
 				if (ret)
 					return ret;
 
-				filemap_invalidate_lock_shared(inode->i_mapping);
+				tidefs_posix_vfs_filemap_invalidate_lock_shared(
+					inode->i_mapping);
 				if (!tidefs_posix_vfs_pagecache_fence_still_current(
 					    inode, pos, requested,
 					    fence_generation)) {
-					filemap_invalidate_unlock_shared(
+					tidefs_posix_vfs_filemap_invalidate_unlock_shared(
 						inode->i_mapping);
 					return -EAGAIN;
 				}
 				read_ret = generic_file_read_iter(iocb, to);
-				filemap_invalidate_unlock_shared(inode->i_mapping);
+				tidefs_posix_vfs_filemap_invalidate_unlock_shared(
+					inode->i_mapping);
 			} else {
 				read_ret = generic_file_read_iter(iocb, to);
 			}
