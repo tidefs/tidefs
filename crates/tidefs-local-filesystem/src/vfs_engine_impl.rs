@@ -917,7 +917,7 @@ impl VfsLocalFileSystem {
         old_path: &str,
         new_path: &str,
     ) {
-        if kind.carries_child_namespace() {
+        if kind.has_child_namespace() {
             self.rewrite_cached_path_subtree(old_path, new_path);
         }
         self.path_cache
@@ -949,8 +949,8 @@ impl VfsLocalFileSystem {
         target_record: &InodeAttr,
         new_path: &str,
     ) {
-        let old_is_directory = old_record.kind.carries_child_namespace();
-        let target_is_directory = target_record.kind.carries_child_namespace();
+        let old_is_directory = old_record.kind.has_child_namespace();
+        let target_is_directory = target_record.kind.has_child_namespace();
         if old_is_directory || target_is_directory {
             self.exchange_cached_path_subtrees(old_path, new_path);
         }
@@ -4354,10 +4354,12 @@ impl VfsEngine for VfsLocalFileSystem {
         if renameat2_flags == RenameAt2Flags::EXCHANGE {
             if let Some(target_record) = target_record.as_ref() {
                 if target_record.inode_id != old_record.inode_id {
+                    let old_attr = old_record.to_inode_attr();
+                    let target_attr = target_record.to_inode_attr();
                     self.exchange_cached_paths(
-                        &old_record,
+                        &old_attr,
                         &old_path,
-                        target_record,
+                        &target_attr,
                         &new_path,
                     );
                     return Ok(());
@@ -4372,7 +4374,7 @@ impl VfsEngine for VfsLocalFileSystem {
 
         self.move_cached_path(
             old_record.inode_id,
-            old_record.kind,
+            old_record.kind(),
             &old_path,
             &new_path,
         );
