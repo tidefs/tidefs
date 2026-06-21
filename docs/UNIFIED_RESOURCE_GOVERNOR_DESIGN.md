@@ -7,6 +7,15 @@ across all daemon-side memory categories.
 
 This document closes Forgejo issue #1237 and supersedes/unifies #1226 and #1211.
 
+## Claim Boundary
+
+The ZFS and Ceph material in this document is a design comparison and
+architecture target, not a present-tense performance, memory-efficiency, or
+operator-cost claim. Product-facing statements that TideFS is better, faster,
+more predictable, lower cost, or safer than an incumbent require the #928
+comparator-evidence fields, the #850 performance-budget rows, and the #875
+claim boundary for the exact workload, cache state, media, and failure mode.
+
 ## 1. Motivation
 
 The current design corpus defines cache architecture and memory budgeting as
@@ -440,7 +449,7 @@ the cleaner watermark (#1215), the space accounting layer pushes a pressure
 signal into the governor, raising `backpressure_level` to throttle writes
 before hitting ENOSPC.
 
-## 10. ZFS and Ceph Comparison
+## 10. ZFS and Ceph Design Lessons
 
 | Dimension | ZFS | Ceph | tidefs Unified Governor |
 |-----------|-----|------|------------------------|
@@ -451,37 +460,39 @@ before hitting ENOSPC.
 | **Observability** | `arc_summary`, `arcstat` (ARC only). ZIL stats in `/proc/spl/kstat/zfs/zil`. Dedup stats in separate kstat. No unified memory view. | `ceph daemon osd.N perf dump` (per-daemon). `ceph df` (cluster-level). No unified per-node memory budget view. | Single `tidefsctl memory` command: per-category utilization, hit rates, eviction counts, backpressure level, pressure trend. Prometheus-compatible counter schema. |
 | **Admission priority model** | Single class: all ARC inserts compete equally. Demand vs. prefetch is implicit (MRU vs. MFU ghost lists). | OSD op priorities (admin→high→normal→low) affect queue ordering but not memory admission. | Explicit 4-level `AdmissionPriority` (Critical/High/Normal/Low) at every admission point. Critical ops block until admitted; Low ops are deferred or rejected under soft pressure. |
 | **Dirty data bounding** | `zfs_dirty_data_max`: hard cap on dirty data; commit_group sync triggered when reached. No proportional backpressure — system stalls until sync completes. | Bluestore `bluestore_cache_size` limits onode/buffer cache. No explicit dirty data cap. | Staged flush thresholds: `FLUSH_BACKGROUND` (50%) starts background writeback, `FLUSH_SYNC` (70%) blocks admission, `FORCE_COMMIT_GROUP_SYNC` (85%) forces commit_group boundary. Proportional backpressure reduces admission rate smoothly rather than hitting a hard cliff. |
-| **Auto-tuning** | ARC size can be adjusted dynamically via module parameter. `zfs_arc_max` rewrite takes effect immediately. No workload-signal auto-tuning. | `osd_memory_target` is static per config file. No auto-tuning. | Optional `auto_tune` mode adjusts category fractions based on workload signals (read/write ratio, metadata intensity, cluster traffic volume). Operator opt-in, bounded by safety margins. |
+| **Auto-tuning** | ARC size can be adjusted dynamically via module parameter. `zfs_arc_max` rewrite takes effect immediately. No workload-signal auto-tuning. | `osd_memory_target` is static per config file. No auto-tuning. | Optional `auto_tune` mode targets category-fraction adjustment from workload signals (read/write ratio, metadata intensity, cluster traffic volume). Operator opt-in, bounded by safety margins. |
 
-### 10.1 Where tidefs Improves on ZFS
+### 10.1 Target Design Differences From ZFS
 
 - **Single budget authority**: ZFS has ARC, ZIL, dedup, and object_node caches each
-  managing memory independently. tidefs unifies all six categories under one
-  governor with cross-category pressure escalation.
-- **Proportional backpressure**: ZFS write throttle is a hard cliff at
-  `zfs_dirty_data_max`. tidefs provides graduated backpressure (Mild→Severe)
-  with smooth admission rate reduction.
+  managing memory independently. tidefs targets one governor for all six
+  categories with cross-category pressure escalation.
+- **Proportional backpressure**: ZFS write throttling behavior is a design input.
+  tidefs targets graduated backpressure (Mild→Severe) with admission-rate
+  reduction before a terminal commit-group fence.
 - **FUSE-aware eviction**: ZFS (in-kernel) relies on kernel VFS for eviction.
-  tidefs coordinates with the kernel via `FUSE_NOTIFY_PRUNE` to recover
-  userspace `InodeState` memory.
+  tidefs targets kernel coordination through `FUSE_NOTIFY_PRUNE` to recover
+  userspace `InodeState` memory when the FUSE implementation proves that path.
 - **Admission priority classes**: ZFS ARC treats all inserts equally. tidefs
-  has four explicit priority classes that control admission under pressure.
+  targets four explicit priority classes that control admission under pressure.
 
-### 10.2 Where tidefs Improves on Ceph
+### 10.2 Target Design Differences From Ceph
 
 - **Cross-subsystem budget**: Ceph OSD, MDS, and monitor each manage memory
-  independently. tidefs provides a single-node single-governor model.
+  independently. tidefs targets a single-node single-governor model.
 - **Unified observability**: Ceph requires multiple `ceph daemon ... perf dump`
-  invocations to get a partial picture. tidefs `tidefsctl memory` gives a
-  complete per-node view.
-- **Eviction as budgeted background work**: Ceph eviction is ad-hoc. tidefs
-  eviction is dispatched through the `BackgroundScheduler` with per-tick
-  operation budgets, preventing eviction storms from starving foreground I/O.
+  invocations to get a partial picture. tidefs targets a `tidefsctl memory`
+  view that reports per-node category state from one authority.
+- **Eviction as budgeted background work**: Ceph eviction behavior is a design
+  input. tidefs targets `BackgroundScheduler` dispatch with per-tick operation
+  budgets so foreground starvation remains a gateable outcome rather than an
+  asserted property.
 
-### 10.3 Where tidefs Matches
+### 10.3 Shared Design Inputs
 
 - **ARC-based eviction**: tidefs delegates L1-L4 eviction to the weighted ARC
-  from #1192, matching ZFS's battle-tested ARC algorithm.
+  from #1192, borrowing the ARC design lesson without claiming incumbent
+  parity until workload and comparator evidence exist.
 - **Dirty data cap**: Both ZFS and tidefs enforce a hard cap on dirty data
   with commit_group sync as the terminal escape valve. tidefs adds graduated thresholds.
 - **Operator-configurable budgets**: Both ZFS (`zfs_arc_max`) and tidefs

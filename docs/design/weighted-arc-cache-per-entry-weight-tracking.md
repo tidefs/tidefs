@@ -10,7 +10,8 @@
 ## Abstract
 
 The Adaptive Replacement Cache (ARC) algorithm by Megiddo & Modha balances recency
-and frequency to outperform LRU under diverse workloads. The original entry-count
+and frequency as a design answer to plain LRU's recency bias. This is an
+algorithmic input, not a TideFS product benchmark claim. The original entry-count
 ARC treats every entry identically: a 1 MiB data chunk and a 128-byte inode record
 each consume one "slot." This design extends ARC with per-entry weight (byte-count)
 tracking so capacity is measured in weight units — typically bytes — not entry

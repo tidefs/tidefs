@@ -37,13 +37,26 @@ through the intent log (#1252). The integration surface spans FUSE
 
 ZFS has no cluster mmap. CephFS supports mmap but with weak coherency: writes on
 one node may be invisible on another for seconds because kernel page-cache
-with **correct, high-performance mmap coherency** at sub-10µs remote-fault
-latency for RDMA-attached clusters — beating both ZFS and Ceph for distributed
-databases, shared-memory applications, and latency-sensitive multi-node workloads.
+state is local to each client. TideFS targets a lease-gated mmap coherency model
+with a sub-10µs remote-fault budget for RDMA-attached clusters. Those latency
+and incumbent-comparison statements are design targets only; they require #850
+performance-budget rows, #928 comparator evidence, and #875 claim scope before
+they may be described as validated superiority over ZFS, CephFS, or any other
+incumbent.
 
 ---
 
 ## 1. Problem Statement
+
+### Claim boundary
+
+This document is a design specification. It may state required invariants and
+latency budgets for future implementation, but it does not prove live cluster
+mmap correctness, RDMA readiness, cacheline-transfer performance, or superiority
+over ZFS/CephFS. Incumbent tables below are design lessons and validation
+targets. Product-facing claims must preserve comparator guarantee equivalence,
+transport, cache state, fault model, media, and workload scope through #928,
+#850, and #875.
 
 ### 1.1 mmap in clustered filesystems
 
@@ -57,19 +70,18 @@ clustered filesystems:
   modified data lives only in node A's kernel page cache.
 - **No push on store.** A store instruction to a mmap'd address does not trigger
   any syscall, so there is no natural point to propagate the write to other
-  nodes.
-  on node B until the capability lease expires, making mmap unusable for
-  latency-sensitive multi-node applications.
+  nodes. A remote reader may keep seeing its local cached page until the
+  filesystem forces invalidation or the cache lease expires.
 
-### 1.2 Why ZFS and Ceph fall short
+### 1.2 Cluster mmap design lessons from ZFS and CephFS
 
 | | ZFS | CephFS | TideFS (this design) |
 |---|---|---|---|
-| Multi-node writes | N/A (local only) | Weak, seconds of staleness | Correct, lease-gated |
-| Remote page fault | N/A | >1ms (network round-trip) | <10µs (RDMA) |
-| Cacheline transfer | N/A | Not supported | RDMA atomics |
+| Multi-node writes | N/A (local only) | Weak, seconds of staleness | Required lease-gated invariant |
+| Remote page fault | N/A | network round-trip design input | target <10µs budget on RDMA |
+| Cacheline transfer | N/A | Not supported in this comparison | RDMA atomics target |
 | Lease-revocation writeback | N/A | Capability expiry flush | Intent-log fast path |
-| Torn-write prevention | Bug-prone, commit_group/commit_group gap | Not guaranteed | commit_group-boundary-gated (§1.4) |
+| Torn-write prevention | Local-only comparison scope | Capability-timeout comparison input | commit_group-boundary-gated target (§1.4) |
 
 ### 1.3 Target workloads
 
@@ -80,7 +92,7 @@ clustered filesystems:
 3. **HPC checkpoint/restart**: burst writes to mmap'd files with strong
    consistency on `msync(MS_SYNC)` boundaries.
 4. **Machine learning**: parameter-server-like access patterns where gradient
-   updates must be visible to all readers within microseconds.
+   updates target reader visibility within the configured latency budget.
 
 ### 1.4 ZFS Anti-Pattern Hardening: mmap Torn-Write Prevention at commit_group Boundaries
 
@@ -103,7 +115,7 @@ mmap coherency MUST treat commit_group commit boundaries as the consistency poin
   the pre-commit_group or post-commit_group state, never an intermediate mix.
 
   commit that modified the file. This provides the strongest consistency
-  guarantee — every commit_group boundary is a visibility barrier. Suitable for
+  invariant — every commit_group boundary is a visibility barrier. Suitable for
   distributed databases and shared-memory applications where correctness is
   paramount.
 
@@ -132,9 +144,9 @@ mappings that was modified in the commit_group:
    application triggers a read fault (§5.1) which fetches the post-commit_group
    data from the writer node.
 
-This mechanism ensures that no TideFS mmap reader ever observes a torn write,
-even on a single node — a correctness property that ZFS cannot guarantee and
-CephFS only approximates with capability timeouts.
+This mechanism is the design invariant for preventing torn mmap reads. It is
+not a validated product claim until the implementation and fault evidence prove
+the commit-group boundary for the relevant local or clustered mode.
 
 ---
 
@@ -493,7 +505,7 @@ Daemon: MmapCoherencyEngine::handle_read_fault(inode_id, page_index)
   └─[6] Return page to kernel → kernel maps into application address space
 ```
 
-**Latency budget**: <10µs for RDMA (cacheline warm in remote memory), <100µs
+**Latency budget target**: <10µs for RDMA (cacheline warm in remote memory), <100µs
 for remote NVMe (cache miss on writer node, fetch from storage).
 
 ### 5.2 Write page fault (node holds SHARED lease, needs upgrade)
@@ -538,7 +550,7 @@ Daemon: MmapCoherencyEngine::handle_write_fault(inode_id, page_index, offset, le
   └─[7] Mark page writable in kernel → application store proceeds
 ```
 
-**Latency budget**: <50µs for the two-hop lock upgrade (request + grant).
+**Latency budget target**: <50µs for the two-hop lock upgrade (request + grant).
 
 ### 5.3 Cacheline-coherent write (no fault)
 
@@ -578,7 +590,7 @@ Node A (EXCLUSIVE writer):              Node B (SHARED reader):
 ```
 
 This bypasses the page fault entirely for the remote node. The data moves at
-RDMA wire speed (typically <2µs for a cacheline on InfiniBand/ROCE).
+target RDMA wire-speed behavior (sub-2µs for a cacheline on InfiniBand/ROCE).
 
 ### 5.4 Lease revocation + page writeback
 
@@ -621,7 +633,7 @@ Daemon: MmapCoherencyEngine::handle_lease_revoke(inode_id, byte_range)
         → Unregister RDMA region for remote writes
 ```
 
-**Latency budget**: <500µs for typical dirty page count (tens of pages).
+**Latency budget target**: <500µs for typical dirty page count (tens of pages).
 
 ### 5.5 False sharing resolution: sub-page conflict detection
 
@@ -743,7 +755,7 @@ all dirty pages in the revoked range are written back (§5.4).
 - Bulk transfer priority is HIGH for page faults (application is blocked).
 
 **Contract**: The BULK plane MUST deliver page-fault data within the latency
-budget (<10µs RDMA, <100µs NVMe). If RDMA is unavailable, the BULK plane
+budget target (<10µs RDMA, <100µs NVMe). If RDMA is unavailable, the BULK plane
 MUST fall back to TCP_STREAM.
 
 ### 7.4 With Intent Log (#1252)
@@ -778,21 +790,21 @@ crash and be readable by the next writer node.
 
 | Operation | Latency target | Notes |
 |---|---|---|
-| Read fault from remote RDMA | <10µs | Cacheline warm in remote node's memory |
-| Read fault from remote NVMe | <100µs | Cache miss, fetch from storage via BULK plane |
-| Write fault lease upgrade | <50µs | 2-hop: request + grant via lock service |
-| Lease revocation + writeback | <500µs | Typical dirty page count (tens of pages) |
-| Cacheline-coherent write (remote visibility) | <2µs | RDMA wire speed on InfiniBand/ROCE |
-| Local read (CLEAN_SHARED, epoch match) | <1µs | No remote interaction |
+| Read fault from remote RDMA | target <10µs | Cacheline warm in remote node's memory |
+| Read fault from remote NVMe | target <100µs | Cache miss, fetch from storage via BULK plane |
+| Write fault lease upgrade | target <50µs | 2-hop: request + grant via lock service |
+| Lease revocation + writeback | target <500µs | Typical dirty page count (tens of pages) |
+| Cacheline-coherent write (remote visibility) | target <2µs | RDMA wire speed on InfiniBand/ROCE |
+| Local read (CLEAN_SHARED, epoch match) | target <1µs | No remote interaction |
 
-### 8.1 Comparison
+### 8.1 Design Comparison Targets
 
 | | TideFS mmap (this design) | ZFS mmap | CephFS mmap |
 |---|---|---|---|
-| Multi-node writes | Correct, lease-gated | N/A (single node) | Weak, seconds of staleness |
-| Remote page fault latency | <10µs (RDMA) | N/A | >1ms (network round-trip) |
-| Cacheline transfer | RDMA atomics | N/A | Not supported |
-| Torn-write prevention | commit_group-boundary-gated | Bug-prone | Not guaranteed |
+| Multi-node writes | Required lease-gated invariant | N/A (single node) | Capability-coherency comparison input |
+| Remote page fault latency | target <10µs on RDMA | N/A | network round-trip comparison input |
+| Cacheline transfer | RDMA atomics target | N/A | Not supported in this comparison |
+| Torn-write prevention | commit_group-boundary-gated target | Local-only comparison scope | Capability-timeout comparison input |
 
 ---
 
@@ -817,11 +829,11 @@ TideFS instead uses **lease-gated coherency**:
   `FUSE_NOTIFY_INVAL_PAGE` to the reading node's kernel, forcing eviction
   before the application can observe stale data.
 - **Blocking lease acquisition**: Write faults block until the EXCLUSIVE
-  lease is granted, guaranteeing that no stale data is ever written.
+  lease is granted; the required invariant is that stale data is not written.
 
 **Tradeoff**: This adds lock-service latency to the write-fault path (~50µs).
 CephFS avoids this latency by making writes optimistic and resolving conflicts
-later, but that model cannot guarantee correctness for mmap. TideFS chooses
+later, but that model leaves an mmap correctness gap in this design analysis. TideFS chooses
 **correctness over write-fault latency** in the default path, while providing
 the `perf` coherency profile for workloads that accept eventual consistency.
 
@@ -848,7 +860,7 @@ overhead on a 4KB page.
 
 ### 9.3 Cacheline-coherent RDMA vs. page-fault model
 
-The cacheline-coherent extension (§3.4, §5.3) offers sub-2µs remote write
+The cacheline-coherent extension (§3.4, §5.3) targets sub-2µs remote write
 visibility via RDMA atomics, but it comes with significant constraints:
 
 - **Hardware dependency**: Requires RDMA-capable NICs (InfiniBand, RoCE).
@@ -873,7 +885,7 @@ be released. TideFS writes dirty sectors to the intent log (#1252) rather
 than directly to the backing store:
 
 - **Pro**: Intent-log writes are sequential and batched → low latency
-  (<500µs for typical dirty page count).
+  (target <500µs for typical dirty page count).
 - **Pro**: Data is durable after the intent-log `ack()`, so the lease can
   be released immediately.
 - **Con**: The intent log must eventually be replayed to the backing store,
