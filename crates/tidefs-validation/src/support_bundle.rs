@@ -294,6 +294,10 @@ pub struct CommandSurfaceSection {
     pub registry_marker: String,
     /// Source file that owns the command registry.
     pub registry_source_path: String,
+    /// Deterministic digest of the command classification registry entries,
+    /// computed over path, class, routing, admission, visibility, and summary.
+    #[serde(default)]
+    pub registry_digest: String,
     /// Classified command entries.
     pub entries: Vec<CommandSurfaceSummary>,
 }
@@ -383,6 +387,7 @@ fn unavailable_command_surface_section() -> CommandSurfaceSection {
         source: EvidenceSource::Unavailable,
         registry_marker: String::new(),
         registry_source_path: String::new(),
+        registry_digest: String::new(),
         entries: Vec::new(),
     }
 }

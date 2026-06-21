@@ -38,6 +38,7 @@ pub fn handle_diag(output_dir: Option<PathBuf>, device_paths: &[PathBuf], json: 
 
     match support_bundle::write_bundle_json(&bundle, &output_path) {
         Ok(()) => {
+            eprintln!("{}", command_registry_status_line(&bundle.command_surface));
             eprintln!(
                 "tidefsctl diag: source={} maturity={} redacted={}",
                 bundle.report_source.source.label(),
@@ -54,6 +55,13 @@ pub fn handle_diag(output_dir: Option<PathBuf>, device_paths: &[PathBuf], json: 
             process::exit(1);
         }
     }
+}
+
+fn command_registry_status_line(section: &CommandSurfaceSection) -> String {
+    format!(
+        "tidefsctl diag: registry={} source={} digest={}",
+        section.registry_marker, section.registry_source_path, section.registry_digest,
+    )
 }
 
 fn build_diag_bundle(device_paths: &[PathBuf]) -> support_bundle::SupportBundle {
@@ -93,6 +101,7 @@ fn build_command_surface_section() -> CommandSurfaceSection {
         source: EvidenceSource::CommandClassificationRegistry,
         registry_marker: super::classification::COMMAND_CLASSIFICATION_DOC_MARKER.to_string(),
         registry_source_path: super::classification::COMMAND_CLASSIFICATION_SOURCE_PATH.to_string(),
+        registry_digest: super::classification::compute_command_registry_digest(),
         entries,
     }
 }
@@ -315,6 +324,20 @@ mod tests {
             section.registry_marker,
             super::super::classification::COMMAND_CLASSIFICATION_DOC_MARKER
         );
+        assert_eq!(
+            section.registry_source_path,
+            super::super::classification::COMMAND_CLASSIFICATION_SOURCE_PATH
+        );
+    }
+
+    #[test]
+    fn command_registry_status_line_names_source_and_digest() {
+        let section = build_command_surface_section();
+        let status = command_registry_status_line(&section);
+
+        assert!(status.contains(&section.registry_marker));
+        assert!(status.contains(&section.registry_source_path));
+        assert!(status.contains(&section.registry_digest));
     }
 
     #[test]
@@ -369,6 +392,32 @@ mod tests {
         assert!(summary.live_owner_required);
         assert_eq!(summary.committed_root_count, 0);
         assert_eq!(summary.latest_txg, None);
+    }
+
+
+    #[test]
+    fn command_registry_digest_is_stable_across_calls() {
+        let digest_a = super::super::classification::compute_command_registry_digest();
+        let digest_b = super::super::classification::compute_command_registry_digest();
+
+        assert_eq!(digest_a, digest_b,
+            "registry digest must be deterministic across repeated calls");
+        assert!(!digest_a.is_empty(), "registry digest must be non-empty");
+        // blake3 hex output is always 64 chars (32 bytes)
+        assert_eq!(digest_a.len(), 64,
+            "registry digest must be a blake3 hex digest (64 hex chars)");
+    }
+
+    #[test]
+    fn json_bundle_contains_registry_digest_field() {
+        let bundle = build_diag_bundle(&[]);
+        let json = serde_json::to_value(&bundle)
+            .expect("support bundle must serialize to JSON");
+
+        let digest = json["command_surface"]["registry_digest"]
+            .as_str()
+            .expect("command_surface.registry_digest must be a JSON string field");
+        assert!(!digest.is_empty(), "registry_digest must be non-empty in JSON");
     }
 
     #[test]
