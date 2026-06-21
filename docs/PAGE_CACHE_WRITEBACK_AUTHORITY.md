@@ -65,9 +65,12 @@ The current authority is narrow:
   write-intent acknowledgments are ordering evidence. They do not by
   themselves mark a page-cache range clean; the writeback owner must join them
   with content/metadata persistence and recovery rules.
-- TFR-008 remains open. Issue #443 owns the cache-coherency/writeback proof
-  slice, issue #445 owns intent-log replay idempotency, and runtime
-  write/fsync/read/crash-recover evidence remains separate from this document.
+- TFR-008 remains open. Issue #443 (cache-coherency/writeback proof, closed)
+  and issue #445 (intent-log replay idempotency, closed) provided focused-unit
+  evidence now consumed by this authority document. Issue #486 (local VFS
+  write/fsync crash evidence, closed) provided bounded OpFsyncBeforeFlush
+  runtime crash evidence consumed by `local.vfs.write_fsync_crash.v1`.
+  Mounted writeback, mmap, and broader durability evidence remain future work.
 
 ## Aspirational Design Not Yet Authority
 
@@ -276,8 +279,9 @@ This writeback authority owns the dirty/writeback side of that boundary:
 - Invalidation completion for destructive operations must wait for the
   writeback authority or return a classified error.
 
-Issue #443 is the related implementation/proof slice for dirty -> writeback ->
-clean lifecycle, invalidation fencing, and crash-recovery integration.
+Issue #443 (closed) provided the focused-unit cache-coherency proof for
+dirty -> writeback -> clean lifecycle, invalidation fencing, and crash-recovery
+integration.
 
 ## Boundary With `tidefs-intent-log`
 
@@ -296,8 +300,8 @@ This writeback authority owns how page-cache state consumes that log:
 - replay idempotency must be proven before the claim path can validate crash
   behavior.
 
-Issue #445 is the related implementation/proof slice for intent-log replay
-idempotency under repeated replay and crash during replay.
+Issue #445 (closed) provided the focused-unit intent-log replay idempotency
+proof under repeated replay and crash during replay.
 
 ## Claim Path Gates
 
@@ -326,8 +330,14 @@ and ordering target only. It is not production durability evidence.
 - `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`: defines the invalidation
   trigger surface, stale-generation rule, and FUSE/kernel/cluster coherency
   lease model.
-- GitHub issue #443: cache-coherency proof for writeback lifecycle,
-  invalidation, and crash integration.
-- GitHub issue #445: intent-log replay idempotency under crash injection.
-- `validation/claims.toml`: current crash-safety claims remain blocked until
-  runtime evidence exists.
+- GitHub issue #443 (closed): cache-coherency proof for writeback lifecycle,
+  invalidation, and crash integration. Evidence consumed by this authority
+  document.
+- GitHub issue #445 (closed): intent-log replay idempotency under crash
+  injection. Evidence consumed by this authority document.
+- GitHub issue #486 (closed): local VFS write/fsync/read crash-recover runtime
+  evidence. Bounded to OpFsyncBeforeFlush; consumed by
+  `local.vfs.write_fsync_crash.v1`.
+- `validation/claims.toml`: `local.vfs.page_cache_writeback_authority.v1` is
+  registered as blocked; mounted writeback, mmap, and no-hidden-queue runtime
+  evidence remain required before the claim can validate.
