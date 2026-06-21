@@ -95,7 +95,13 @@ may use non-secret repository variables for scheduling gates, such as
   scheduled coverage, or when the failure set is not yet isolated.
 - `Release Candidate` is a manual-only self-hosted workflow. The `smoke`
   profile runs Rust, Nix, and QEMU smoke lanes; the `full` profile also runs
-  xfstests and RDMA.
+  xfstests and RDMA. Each run uploads a top-level
+  `release-candidate-evidence-index` JSON artifact that records the selected
+  profile, source SHA, lane job results, expected lane artifact names and path
+  patterns, and absent lane-local manifests without making a product-readiness
+  claim. Newer dispatches for the same branch and profile cancel older queued
+  or running copies so superseded release-candidate runs do not leave stale
+  self-hosted index jobs in the runner queue.
 
 ## Runner Contract
 
