@@ -21,6 +21,11 @@ suite, dedup scope, encryption boundary, erasure shape, coalescing, and rebake
 are not local transform preferences once they affect latency, flash lifetime,
 WAN cost, read amplification, rebuild behavior, or repair identity.
 
+Allocator geometry belongs there too. Fragmentation, free-run availability,
+zone or erase-block alignment, pending-free safety, reclaim debt, and physical
+locality are not background trivia once they decide whether defrag, compaction,
+placement, or rebake will help or hurt.
+
 ## Non-Claims
 
 This document does not implement runtime behavior, change POSIX durability
@@ -107,6 +112,7 @@ The core records are:
 | `StorageIntentReceipt` | Earned acknowledgment evidence for one operation, range, or convergence step. |
 | `StorageIntentEvidenceRef` | Reference to placement receipts, local intent records, transport/path evidence, media/cost ledgers, scheduler admission records, or validation artifacts. |
 | `StorageIntentDataShape` | Requested and earned encoded shape for a range or generation, including record sizing, transform ordering, digest suite, dedup/encryption/EC compatibility, and rebake evidence. |
+| `StorageIntentLayoutEvidence` | Allocator and physical-layout evidence for fragmentation, free runs, alignment, zone/write-pointer state, pending frees, reclaim debt, and locality. |
 | `StorageIntentExplanation` | Renderable projection of policy, receipt, lag, volatility, cost, and refusal reasons. |
 
 The record contract follows the existing receipt and binary-schema discipline:
@@ -145,6 +151,8 @@ model predicates for:
 - media-role legality, including cache versus RAM authority separation;
 - data-shape legality, including transform compatibility, digest/integrity
   floors, dedup/encryption-domain rules, and rebake replacement evidence;
+- allocator/layout legality, including alignment, free-space, zone, pending-free,
+  generation, and reclaim-debt boundaries;
 - explicit refusal reasons when no legal receipt set satisfies the policy.
 
 ### StorageIntentPolicy
@@ -163,6 +171,7 @@ The policy has these logical fields:
 | `media_role_policy` | Which media classes may hold intent, metadata, serving data, cold data, read cache, or scratch data. |
 | `workload_shape` | Workload envelope the planner should optimize for without changing hard guarantees. |
 | `data_shape_policy` | Record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake constraints. |
+| `layout_geometry_policy` | Allocator class, physical layout, fragmentation, zone/alignment, free-space, pending-free, and reclaim constraints. |
 | `cost_model` | Relative cost weights for latency, tail, throughput, media wear, capacity, power, network egress, and operator money. |
 | `wear_budget` | Per-device or per-class write budget available for this policy and relocation class. |
 | `relocation_policy` | When the system may rewrite, rebake, promote, demote, defrag, or evacuate data. |
@@ -178,6 +187,7 @@ floors from optimizer weights:
 | Latency and tail | p99 sync or FUA ceiling, max queue time before refusal | prefer local NVMe/PMem, reduce metadata fan-out, cache read hot sets |
 | Throughput | minimum ingest or rebuild rate under foreground protection | larger records, direct cold placement, batching, EC/archive shape |
 | Data shape and integrity | checksum/digest suite, encryption domain, mounted transform block state, dedup/EC compatibility | record size, compression level, coalescing, dedup verdict, EC/archive shape |
+| Allocation geometry | alignment, reserve, free-space, pending-free, zone/write-pointer compatibility | choose low-seek layout, largest legal free run, segment class, drain victim |
 | Distance and failure domain | node/rack/DC/site/region spread, internet path allowed or refused | nearest legal peer, measured RTT/loss/bandwidth scoring |
 | RPO/RTO | maximum remote lag or recovery window | delta batching, compression, catch-up lane priority |
 | Wear and money | critical write reserve, WAF ceiling, egress/capacity budget | promote/demote only when payback beats movement debt |
@@ -735,6 +745,57 @@ and its child issues prove the mounted runtime has one transform-aware
 authority. The storage-intent data-shape model may describe future legal shapes;
 it does not by itself enable those mounted product claims.
 
+## Allocation Geometry, Fragmentation, And Reclaim
+
+#880 owns the storage-intent layout-evidence boundary. This boundary makes
+allocator geometry visible to placement and relocation without making planners
+recompute allocator internals or trust stale runtime mirrors. It is the evidence
+source for questions like: is this target class legal, is there a large enough
+free run, would this write cross an erase block or zone boundary, is this
+pending free actually safe to reuse, and is defrag worth the rewrite?
+
+The layout evidence model should cover at least:
+
+| Evidence | Meaning |
+| --- | --- |
+| `allocation_class` | Policy-visible allocation class, segment class, region class, and block-volume alignment constraints. |
+| `free_run_summary` | Largest legal runs, free-run fragmentation, class-local scarcity, and confidence/staleness age. |
+| `locality_score` | Seek, scan-contiguity, range-map, and physical adjacency evidence for HDD or locality-sensitive media. |
+| `media_geometry` | Erase block, zone, write-pointer, reset, optimal I/O size, SMR/ZNS append, or other device geometry. |
+| `pending_free_frontier` | Publication, fence, snapshot, receipt, or generation boundary before bytes become reusable. |
+| `reclaim_debt` | Segment-drain pressure, victim score, reserve pressure, foreground disruption, and blocker refs. |
+| `allocator_generation` | Stale-pointer and stale-layout evidence needed by reads, repair, and relocation. |
+
+Authority boundaries are strict:
+
+- durable allocator, publication, placement, receipt, or fence records are
+  authority when the implementation defines them;
+- rebuildable mirrors such as largest-run heaps, victim queues, heat maps,
+  pressure gauges, and open-segment cursors may guide scoring but cannot satisfy
+  policy alone;
+- a topology scan or current free-space snapshot cannot retire receipts, admit
+  relocation, or claim satisfaction by itself;
+- pending-free bytes are not reusable until the publication, fence, snapshot,
+  generation, and receipt boundaries say they are safe;
+- ENOSPC, reserve pressure, and allocator refusal are visible storage-intent
+  states, not hidden retries that silently consume protected sync or repair
+  reserves.
+
+Allocation geometry is what makes defrag honest. On rotational media the useful
+signal is seek count, scan contiguity, range-map fragmentation, and free-run
+shape. On SSD/NVMe the useful signal is normally erase-block or zone alignment,
+garbage-collection pressure, metadata fan-out, future write amplification, and
+critical reserve protection. On ZNS, SMR, or other sequential-write media, the
+write pointer and reset budget are hard constraints before scoring. For block
+volumes, alignment and low-fragmentation targets can be stronger than ordinary
+file-data layout preferences.
+
+Unknown, stale, mirror-only, wrong-generation, under-aligned, pending-free,
+zone-incompatible, or reserve-unsafe layout evidence cannot satisfy policy by
+accident. The planner must choose a different legal candidate, admit a bounded
+convergence or reclaim action, mark the state unknown/blocked, or refuse
+according to policy.
+
 ## Flash Lifetime And Write Amplification
 
 Flash endurance is an authority input, not an afterthought. Every flash-backed
@@ -744,6 +805,8 @@ device must expose a media cost ledger with at least:
 - estimated physical media bytes when available;
 - write amplification estimate;
 - erase-block or zone alignment quality;
+- free-run, fragmentation, locality, and pending-free safety evidence where
+  layout producers expose it;
 - remaining endurance or wear percentage when available;
 - temperature/error health signals;
 - reserved write budget for critical intent and recovery work;
@@ -796,6 +859,8 @@ Initial anti-wear laws:
     benefit over extending them with more flash writes.
 12. Refuse or delay non-critical optimization before eroding reserves needed
     for durable sync, repair, evacuation, or policy-satisfaction catch-up.
+13. Treat pending-free and reclaimable bytes as unavailable until the allocator,
+    publication, fence, and receipt boundaries prove they are safe to reuse.
 
 This is one of the main ways TideFS can be better than naive tiering: it can
 be fast without turning expensive flash into a disposable shock absorber for
@@ -888,6 +953,8 @@ The benefit/cost gate must account for:
 - throughput improvement or tail-risk reduction;
 - reduced future write amplification;
 - reduced HDD seek cost or improved scan speed;
+- improved free-run shape, allocator locality, alignment, segment drain, or
+  reclaim-debt pressure;
 - reduced capacity cost;
 - improved RPO/RTO or rebuild risk;
 - read/write media cost of performing the move;
@@ -986,6 +1053,8 @@ Hard constraints include:
 - capacity and reservation availability;
 - media role eligibility;
 - data-shape compatibility and transform block state;
+- allocator/layout compatibility, including alignment, free-space, pending-free,
+  and zone/write-pointer state;
 - wear reserve availability;
 - transport/path eligibility;
 - operator policy and degradation law.
@@ -999,6 +1068,7 @@ score =
   + throughput_weight    * throughput_shortfall_cost
   + wear_weight          * estimated_media_write_cost
   + shape_weight         * cpu_read_amplification_and_rebuild_cost
+  + layout_weight        * fragmentation_locality_and_reclaim_cost
   + capacity_weight      * capacity_cost
   + network_weight       * egress_and_congestion_cost
   + recovery_weight      * rebuild_or_rpo_risk
@@ -1163,6 +1233,8 @@ The operator UAPI should eventually answer:
 - Which data is pending relocation, rebake, repair, or geo catch-up?
 - What data shape applies to this range, which transforms or EC/archive shape
   were selected, and which candidates were rejected or blocked?
+- What layout evidence applies: fragmentation, largest-run/free-run pressure,
+  alignment, zone/write-pointer state, pending-free blockers, and reclaim debt?
 - How much flash endurance did this dataset consume?
 - Which relocation jobs were skipped because the wear or foreground-latency
   budget was not worth spending?
@@ -1190,6 +1262,9 @@ Initial row families should cover:
 - streaming ingest throughput without flash wear explosion;
 - data-shape selection for record size, compression, checksum/digest, dedup,
   encryption, EC/archive shape, and coalescing under latency and cost floors;
+- allocator/layout evidence for fragmentation, free-run scarcity, locality,
+  alignment, zone/write-pointer constraints, pending-free safety, and reclaim
+  debt;
 - one-pass scan cache behavior without persistent flash promotion;
 - hot read promotion benefit/cost;
 - serving-trial payback and cooldown behavior;
@@ -1216,6 +1291,8 @@ Each row must bind:
 - write amplification and flash wear;
 - data-shape evidence, CPU cost, read amplification, and transform refusal state
   where relevant;
+- allocator/layout evidence, fragmentation score, free-run pressure, alignment,
+  pending-free safety, and reclaim debt where relevant;
 - movement debt, payback window, cooldown state, and skipped-move reason where
   relevant;
 - capacity and network cost where relevant;
@@ -1248,6 +1325,10 @@ The matrix must cover at least these row families:
 - transform and data-shape faults such as wrong key epoch, illegal dedup domain,
   malformed compression frame, digest-suite mismatch, EC under-width
   reconstruction, and mounted transform block/refusal state;
+- allocator/layout faults such as stale mirror-only free-run evidence,
+  wrong-generation segment evidence, pending-free reuse before fence,
+  zone/write-pointer incompatibility, under-aligned block-volume placement, and
+  ENOSPC or reserve exhaustion;
 - relocation, defrag, rebake, rebuild, evacuation, and geo catch-up interrupted
   before and after replacement receipt publication;
 - relocation anti-thrash cases proving cooldown, movement debt, and failed
@@ -1262,8 +1343,9 @@ success without required receipt evidence, hidden downgrade from durable to
 volatile or from `geo-intent` to `geo-async`, split-brain receipt publication,
 old locator retirement before replacement receipt publication, reserve/wear
 breach hidden behind successful relocation, stale or wrong-domain data-shape
-evidence accepted as satisfied, and explanations that omit degradation, lag,
-volatility, transform block state, or refusal.
+evidence accepted as satisfied, allocator mirror evidence accepted as authority,
+pending-free bytes reused too early, and explanations that omit degradation, lag,
+volatility, transform block state, layout blockers, or refusal.
 
 The validation matrix cross-links with #850 where a scenario also has latency,
 tail, throughput, RPO, or wear/cost budgets. #850 measures whether TideFS is
@@ -1297,6 +1379,14 @@ This document composes existing authority surfaces:
 - `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`: checksum architecture remains
   historical target input unless live source, validation, and claims evidence
   prove a narrower current behavior.
+- `docs/SPACEMAP_ALLOCATOR_DESIGN.md`,
+  `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`,
+  `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`,
+  `docs/ALLOCATOR_RECLAIM_FREE_SPACE_SCHEMA_FAMILY_P2-02.md`, and
+  `docs/LOCAL_OBJECT_STORE_ON_DISK_FORMAT.md`: allocator, space accounting,
+  segment, reclaim, and object-store material inform #880, but historical or
+  unclassified design wording is not current storage-intent evidence until live
+  source, issue, and claim authority say so.
 - `docs/DEVICE_LAYOUT_POLICIES_DESIGN.md` and
   `docs/design/device-layout-policies-adaptive-segment-sizing.md`: media class
   and device segment sizing are placement inputs; storage intent owns the
@@ -1382,13 +1472,13 @@ storage-intent language beside the shared records and compiled policy snapshot.
 
 | Stage | Graduation gate | Issues |
 | --- | --- | --- |
-| Records | Shared spellings and versioned records exist for policies, receipts, roles, proximity, media, workload, data shape, cost, wear, and relocation reasons. | #841, #878 |
+| Records | Shared spellings and versioned records exist for policies, receipts, roles, proximity, media, workload, data shape, layout evidence, cost, wear, and relocation reasons. | #841, #878, #880 |
 | Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
-| Evidence feeds | Local ack paths, path evidence, media/wear cost, non-wear cost, workload vectors, and data-shape evidence can publish read-only evidence without making final placement decisions. | #842, #844, #845, #846, #856, #878 |
+| Evidence feeds | Local ack paths, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, and layout/allocator evidence can publish read-only evidence without making final placement decisions. | #842, #844, #845, #846, #856, #878, #880 |
 | Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile. | #874 |
-| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal data shapes, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #843, #862, #878 |
+| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal data shapes and layout targets, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #843, #862, #878, #880 |
 | Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, and archive sources with freshness and receipt evidence. | #877, #675 |
-| Authority extensions | RAM authority, data-shape rebake, and relocation/defrag/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #847, #848, #878 |
+| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #847, #848, #878, #880 |
 | Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875 |
 
 Interface gates between stages are explicit:
@@ -1396,8 +1486,8 @@ Interface gates between stages are explicit:
 - Consumers take `StorageIntentPolicy` snapshots and receipt/evidence records,
   not raw caller hints, ad hoc dataset properties, or device labels.
 - Planners may score only candidates that already passed guarantee,
-  failure-domain, data-shape, capacity, wear, transport, and degradation-law
-  filters.
+  failure-domain, data-shape, layout/allocator, capacity, wear, transport, and
+  degradation-law filters.
 - Schedulers may delay, throttle, or refuse work, but they may not convert one
   acknowledgment class into another after admission.
 - Read-serving paths may accelerate through cache, trial, RAM, local, remote,
@@ -1406,6 +1496,9 @@ Interface gates between stages are explicit:
 - Data-shape and transform paths may change record size, compression,
   checksum/digest, dedup, encryption, EC, archive, or coalescing shape only
   through compiled policy and receipt/evidence records.
+- Allocator and layout paths may use free-run, locality, zone, pending-free,
+  reclaim, or fragmentation evidence only through authority records or marked
+  non-authoritative mirrors.
 - Relocation workers may write speculative replacements, but they may not
   retire source receipts until replacement receipts satisfy the target policy.
 - Validation rows and claim ids are not an afterthought: each stage must either
@@ -1425,6 +1518,7 @@ this document except to update the issue map after live tickets exist.
 | Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, proximity domains, failure domains, and media constraints. |
 | Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, degraded-read law, geo stale-read boundaries, and read-repair evidence. |
 | Data-shape authority | #878 | data-shape records/model module or `crates/tidefs-storage-intent-data-shape/`, focused tests | Bind record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake decisions to compiled policy and evidence receipts. |
+| Layout evidence authority | #880 | layout-evidence records/model module or `crates/tidefs-storage-intent-layout-evidence/`, focused tests | Expose allocator geometry, fragmentation, free-run pressure, alignment, zone/write-pointer state, pending-free safety, and reclaim debt as policy evidence. |
 | Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes. |
 | Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, and anti-thrash state for planning and performance rows. |
