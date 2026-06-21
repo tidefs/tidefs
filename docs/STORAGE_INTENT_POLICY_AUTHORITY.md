@@ -347,6 +347,36 @@ Low-confidence predictions may tune queueing, prefetch, or shadow plans. They
 must not trigger expensive relocation until hysteresis and benefit/cost gates
 are satisfied.
 
+### Confidence And Action Classes
+
+Prediction confidence is an admission input, not a decorative score. A
+workload vector must carry the observation window, sample mass, decay age,
+contradiction state, and hint provenance that produced its confidence.
+Operator or caller hints can seed a vector, but hints alone cannot make an
+authority-changing move high confidence.
+
+Different actions require different confidence:
+
+| Action | Minimum evidence |
+| --- | --- |
+| queue tuning, batching, prefetch | low confidence; droppable under pressure |
+| cache-only hot-read trial | medium confidence, budget admission, anchor/fence proof |
+| new-write extent shaping | medium confidence plus cooldown against immediate reversal |
+| serving-role promotion on flash | high confidence, wear budget, expected dwell time, and payback horizon |
+| durable placement movement or authority promotion | high confidence, policy-satisfaction proof, relocation plan, replacement receipts, and old-receipt retirement law |
+| guarantee weakening | never by prediction; only explicit policy revision and operator-visible receipt law |
+
+The predictor must distinguish cache promotion from authority promotion. A
+cache-only trial may populate RAM or flash serving state quickly because it is
+evictable and non-authoritative. An authority promotion changes placement
+truth, consumes receipt-retirement rights, and therefore needs the relocation
+governor.
+
+Stale, contradictory, or phase-changing signals reduce confidence. A read set
+that was hot for one minute, a build tree that is about to be deleted, or a
+sparse file that alternates scan and random phases should first produce shadow
+plans and cache trials, not whole-object rebake or durable media churn.
+
 ## Admission, Scheduling, And QoS
 
 Storage intent is enforced at admission and dispatch, not only at placement
@@ -488,11 +518,24 @@ device must expose a media cost ledger with at least:
 - remaining endurance or wear percentage when available;
 - temperature/error health signals;
 - reserved write budget for critical intent and recovery work;
-- relocation bytes charged by source and reason.
+- relocation bytes charged by source and reason;
+- wear reservations by class, including critical intent, degraded recovery,
+  normal foreground, and optimizer budgets;
+- movement debt carried by recently relocated subjects;
+- expected avoided future media writes and the payback horizon used to justify
+  relocation;
+- conservative physical-byte estimates when device-reported media bytes are
+  absent or stale.
 
 Placement and relocation must reserve wear budget before consuming it. If the
 budget is unavailable, the planner must choose a different legal candidate,
 defer optimization, or refuse according to policy.
+
+No flash write is free or uncharged. When physical media-write evidence is
+missing, the ledger must use a conservative multiplier rather than treating
+unknown write amplification as zero. Reservations must expire or be released
+when work aborts, but consumed wear and movement debt stay visible for future
+planning and operator explanation.
 
 Initial anti-wear laws:
 
@@ -514,6 +557,15 @@ Initial anti-wear laws:
    satisfaction reason.
 8. Preserve a critical write reserve for sync intents, repair, and evacuation.
    Background optimization may not spend that reserve.
+9. Do not turn one-pass scans into persistent flash authority. Cache admission
+   may be cheap and temporary; placement movement needs a dwell/payback proof.
+10. When relocation rewrites flash, charge the actual write and also record
+    movement debt that future scoring must overcome before moving the same
+    subject back.
+11. Prefer demoting or expiring serving trials that miss their predicted
+    benefit over extending them with more flash writes.
+12. Refuse or delay non-critical optimization before eroding reserves needed
+    for durable sync, repair, evacuation, or policy-satisfaction catch-up.
 
 This is one of the main ways TideFS can be better than naive tiering: it can
 be fast without turning expensive flash into a disposable shock absorber for
@@ -534,6 +586,10 @@ The non-wear cost ledger must track at least:
 - transport bytes by proximity domain, carrier, peer/site, and reason;
 - network egress/ingress cost classes for WAN and internet paths;
 - rebuild, repair, evacuation, relocation, and geo catch-up bytes by reason;
+- non-wear movement debt for recently relocated subjects, including capacity,
+  network, recovery-bandwidth, and foreground-disruption debt;
+- payback evidence for non-wear benefits such as capacity saved, RPO lag
+  reduced, egress avoided, or rebuild risk reduced;
 - retention cost for cold and snapshot-pinned generations;
 - operator-defined weights for money, power/energy proxy, scarce capacity,
   scarce bandwidth, and regulatory or administrative domain preference.
@@ -574,6 +630,18 @@ TideFS relocation is a single family with multiple reasons:
 | `geo-catchup` | Remote RPO/RTO target needs progress. |
 | `wear-rebalance` | Device endurance or error risk requires load movement. |
 
+Relocation decisions move through an explicit lifecycle:
+
+| State | Meaning |
+| --- | --- |
+| `observed` | Signals suggest a possible move, but no budget should be spent yet. |
+| `shadow-evaluated` | TideFS records the move it would make, predicted benefit, cost, and blockers. |
+| `serving-trial` | Optional cache or serving copy exists without changing durable authority. |
+| `admitted-move` | Budgets are reserved and a receipt-safe relocation plan is accepted. |
+| `replacement-published` | Replacement placement receipts exist and are visible. |
+| `old-receipt-retired` | Old locators are retired only after replacement receipt law permits it. |
+| `cooldown` | The subject carries movement debt and cannot churn unless policy, repair, or evacuation requires it. |
+
 Every relocation plan must pass:
 
 1. receipt authority check for the current source;
@@ -596,6 +664,20 @@ The benefit/cost gate must account for:
 - flash lifetime consumed by the move;
 - network egress and congestion cost;
 - foreground latency disruption.
+
+Anti-thrash law is part of relocation authority:
+
+- recently moved subjects carry movement debt in future planner scores;
+- ordinary promotion and demotion require a minimum dwell window or an explicit
+  reason to override it;
+- contradictory signals reset or lower confidence instead of flipping the
+  placement back immediately;
+- per-range movement is preferred over whole-file movement for phase-changing
+  sparse or scientific workloads;
+- failed payback creates a cooldown and a skip reason, not an immediate retry
+  loop;
+- repair, evacuation, and hard policy-satisfaction moves may override cooldown,
+  but the override must be receipt-visible and budget-visible.
 
 HDD defrag is therefore real and useful, but it is one optimizer action, not
 an architecture center. On HDD it may group hot sequential extents, reduce
@@ -646,6 +728,7 @@ of a write from the lifecycle of a durable object.
 | --- | --- | --- |
 | `young-dirty` | Newly accepted dirty bytes, not yet at the requested ack floor. | Admission, coalescing, intent reservation. |
 | `young-acknowledged` | Bytes have earned an ack receipt but may not yet have full final placement. | Keep replayable intent, defer expensive shaping if policy allows. |
+| `serving-trial` | A cache or serving copy exists because prediction says it may help, but durable authority has not changed. | Measure benefit, expire if payback is weak, preserve cache/authority distinction. |
 | `stable-hot` | Bytes survived the short overwrite/delete window and are read often. | Add serving role on RAM/NVMe/SSD if benefit exceeds wear/cost. |
 | `stable-warm` | Bytes are useful but not latency-critical. | Normal replicated or mixed-media placement. |
 | `stable-cold` | Bytes are retained but rarely read or mutated. | HDD/EC/archive placement, large records, low relocation churn. |
@@ -657,6 +740,10 @@ durability. A sync WAL write can earn a durable intent quickly, then be folded
 into full placement once the short-lived overwrite/delete window has passed.
 A backup stream can bypass flash full placement entirely. A temp-file burst can
 die after intent/reclaim without ever consuming expensive serving media.
+
+The `serving-trial` generation is deliberately not durable authority; it is how
+TideFS can learn aggressively without letting a cache hit become a placement
+claim.
 
 ## Planner Scoring
 
@@ -684,6 +771,9 @@ score =
   + network_weight       * egress_and_congestion_cost
   + recovery_weight      * rebuild_or_rpo_risk
   + disruption_weight    * foreground_interference
+  + confidence_weight    * misprediction_risk
+  + movement_weight      * recent_movement_debt
+  + payback_weight       * payback_failure_risk
   + complexity_weight    * rollback_and_operational_risk
 ```
 
@@ -696,6 +786,13 @@ The planner must also use shadow evaluation. Before expensive relocation, it
 should record what it would have moved, why, and what benefit it predicted.
 Only after repeated confidence should it spend large wear, network, or
 foreground disruption budgets.
+
+For every admitted non-repair relocation, the plan must name a payback window:
+the time, bytes read, seeks avoided, media writes avoided, RPO lag reduced, or
+capacity saved that would make the move worthwhile. If observed benefit misses
+the payback window, TideFS should demote or stop extending the trial, record a
+skip/cooldown reason, and make the next similar move harder to admit until the
+signal changes materially.
 
 ## Worked End-To-End Flows
 
@@ -727,12 +824,25 @@ foreground disruption budgets.
 ### Hot Small Read Set
 
 1. Repeated small reads produce a high-confidence hot working set.
-2. The planner can add a serving role on RAM/NVMe/SSD without changing durable
+2. The scheduler may admit a cache-only RAM or flash serving trial first.
+3. Operator explanation says whether the hit path is cache, serving trial, or
    authority.
-3. If the serving role is cache only, operator explanation says cache.
-4. If the serving role becomes authoritative RAM, it must use a RAM authority
+4. Persistent flash serving promotion requires high confidence, dwell time,
+   wear reservation, and payback proof.
+5. If the serving role becomes authoritative RAM, it must use a RAM authority
    class and receipts.
-5. Promotion requires benefit greater than flash wear and capacity cost.
+6. If measured benefit misses the payback window, the trial expires and the
+   skipped authority promotion is explained.
+
+### Phase-Changing Sparse File
+
+1. A large sparse file alternates between scan phases and random hot ranges.
+2. The predictor records phase changes and lowers whole-file confidence.
+3. The planner may tune prefetch, cache, or shape new writes by range.
+4. It must not rebake the whole file or move durable placement after one phase.
+5. Per-range relocation requires repeated confidence and its own payback
+   window.
+6. Conflicting phases produce cooldown or shadow plans rather than media churn.
 
 ### HDD Defrag
 
@@ -801,6 +911,10 @@ The operator UAPI should eventually answer:
 - How much flash endurance did this dataset consume?
 - Which relocation jobs were skipped because the wear or foreground-latency
   budget was not worth spending?
+- Which predictions are in shadow, serving-trial, admitted-move, cooldown, or
+  failed-payback state?
+- Which critical wear, capacity, or transport reserves are protecting sync,
+  repair, evacuation, or geo catch-up work?
 - Which guarantee would be lost if a device, node, rack, or site failed now?
 
 This explanation must be based on receipts and current evidence, not on
@@ -817,7 +931,10 @@ Initial row families should cover:
 - VM FUA/barrier tail latency;
 - metadata storm p99 and fsyncdir latency;
 - streaming ingest throughput without flash wear explosion;
+- one-pass scan cache behavior without persistent flash promotion;
 - hot read promotion benefit/cost;
+- serving-trial payback and cooldown behavior;
+- phase-changing sparse workload anti-thrash behavior;
 - HDD defrag benefit under seek-heavy and scan-heavy workloads;
 - SSD relocation write-amplification benefit/cost;
 - rebuild/repair foreground protection;
@@ -829,12 +946,14 @@ Initial row families should cover:
 Each row must bind:
 
 - requested and earned ack classes;
-- workload envelope;
+- workload envelope and prediction confidence/action class;
 - environment/profile, including media and topology;
 - p50/p95/p99 latency;
 - throughput;
 - foreground disruption;
 - write amplification and flash wear;
+- movement debt, payback window, cooldown state, and skipped-move reason where
+  relevant;
 - capacity and network cost where relevant;
 - comparator set when making ZFS/Ceph/DRBD comparisons.
 
@@ -858,8 +977,12 @@ The matrix must cover at least these row families:
   range, device loss, and endurance-reserve exhaustion;
 - RAM authority failure cases proving volatile receipts never satisfy durable
   POSIX barriers;
+- cache and serving-trial failures proving non-authoritative hot copies never
+  satisfy placement or durable ack receipts;
 - relocation, defrag, rebake, rebuild, evacuation, and geo catch-up interrupted
   before and after replacement receipt publication;
+- relocation anti-thrash cases proving cooldown, movement debt, and failed
+  payback cannot hide reserve erosion or stale placement;
 - policy publish, rollback, or conflict while writes, relocation, and remote
   backlog are in flight.
 
@@ -1002,13 +1125,13 @@ this document except to update the issue map after live tickets exist.
 | Policy source and compilation | #855 | policy/config crate or `crates/tidefs-storage-intent-policy/` | Persist and compile pool, dataset, mount, caller, and internal maintenance policy into storage-intent records. |
 | Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths. |
 | Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, proximity domains, failure domains, and media constraints. |
-| Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, and relocation write budgets. |
+| Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes. |
-| Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors for planning and performance rows. |
+| Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, and anti-thrash state for planning and performance rows. |
 | Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
 | Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier evidence without making RDMA mandatory. |
 | RAM authority design and implementation | #847 | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority. |
-| Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, and wear movement. |
+| Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, wear movement, shadow evaluation, payback, and cooldown. |
 | Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, receipts, lag, volatility, placement, and wear to operators. |
 | Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, wear, cost, RPO, and relocation. |
 | Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
