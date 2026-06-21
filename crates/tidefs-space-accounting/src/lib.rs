@@ -289,7 +289,8 @@ impl SpaceAccounting {
     /// This is the unified ENOSPC gate: it uses
     /// [`admission_check`](crate::admission_check) which checks quota
     /// (minus slop), physical capacity, and all committed consumption
-    /// including reserved, orphan, and pinned-snapshot bytes.
+    /// including reserved and orphan bytes. Snapshot-pinned bytes are tracked
+    /// separately because they are already a subset of logical used bytes.
     /// Returns `true` if the write should be refused with `ENOSPC`.
     #[must_use]
     pub fn check_enospc(&self, requested: u64) -> bool {
