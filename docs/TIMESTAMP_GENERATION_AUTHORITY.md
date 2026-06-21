@@ -452,8 +452,10 @@ validation before TFR-005 can close:
    `ScrubBlockId` uses `(inode_id, data_version)` as block identity. Scrub
    must not confuse wall-clock time, content version, checksum scope, and
    repair row identity. The scrub path already treats `data_version` as a
-   content-identity token; this is correct but should be explicitly documented
-   as the scrub-identity authority boundary.
+   content-identity token; `docs/SCRUB_IDENTITY_AUTHORITY.md` now records that
+   scrub-identity boundary. Remaining implementation work belongs to the
+   transform-aware scrub read, scrub routing, and repair dispatch slices rather
+   than to this timestamp/generation authority document.
 
 4. **Send/receive export/import**.
    Send/receive serializes timestamp and storage version fields. The

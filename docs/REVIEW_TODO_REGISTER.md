@@ -285,6 +285,16 @@ Important 2026-06-01 findings:
   `metadata_version` to `subtree_rev`/`dir_rev` coupling, intent-log replay
   version projection, scrub/repair identity, send/receive serialization,
   content-object reclaim identity, and format-golden/codec surfaces.
+- `TFR-005`: issue #742 adds `docs/SCRUB_IDENTITY_AUTHORITY.md` as the local
+  scrub identity boundary. It records that the content identity carried by
+  `ScrubBlockId` is `(inode_id, data_version)`, where `data_version` is the
+  content-identity token defined by
+  `docs/TIMESTAMP_GENERATION_AUTHORITY.md`, and explicitly excludes POSIX
+  timestamps, wall-clock time, `metadata_version`, storage-generation ticks,
+  and intent-log epochs from scrub identity authority. This documentation
+  slice does not change runtime behavior or close TFR-005; transform-aware
+  scrub read authority, scrub routing, and repair dispatch remain owned by
+  issues #650, #651, and #652.
 - `TFR-006`: Transform authority is still split across mounted-content
   compression, object-store device compression/encryption, helper compression
   and encryption crates, and inline content-addressed dedup. The
