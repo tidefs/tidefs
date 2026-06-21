@@ -110,6 +110,7 @@ members = [
   "crates/tidefs-intent-log",
   "crates/tidefs-storage-intent-core",
   "crates/tidefs-storage-intent-local-media-capability",
+  "crates/tidefs-storage-intent-remote-media-capability",
   "crates/tidefs-namespace",
   "crates/tidefs-inode-table",
   "crates/tidefs-xattr-storage",

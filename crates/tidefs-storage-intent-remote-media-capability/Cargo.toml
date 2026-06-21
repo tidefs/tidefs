@@ -1,0 +1,20 @@
+[package]
+name = "tidefs-storage-intent-remote-media-capability"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Conservative remote, object, and archive media-capability producer records for
+storage intent. Maps target identity, commit/finalize semantics, freshness,
+trust, cost, and restore facts into tidefs-storage-intent-core evidence without
+claiming durability from reachability, service labels, object puts, or RDMA.
+"""
+
+[dependencies]
+tidefs-storage-intent-core = { path = "../tidefs-storage-intent-core" }
+
+[lib]
+path = "src/lib.rs"
