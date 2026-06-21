@@ -705,18 +705,18 @@ Reference points for these lessons:
 The follow-up issues should be non-overlapping slices. They should not edit
 this document except to update the issue map after live tickets exist.
 
-| Slice | Expected write set | Purpose |
-| --- | --- | --- |
-| Storage intent core records | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, media role, proximity, workload, and cost records. |
-| Local ack receipt emission | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths. |
-| Placement planner integration | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, proximity domains, failure domains, and media constraints. |
-| Media cost and wear ledger | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, and relocation write budgets. |
-| Workload signal plane | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors for planning and performance rows. |
-| Transport path evidence | `crates/tidefs-transport/` | Expose measured path/proximity/carrier evidence without making RDMA mandatory. |
-| RAM authority design and implementation | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority. |
-| Relocation governor | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, and wear movement. |
-| Operator explanation UAPI | `apps/tidefsctl/`, operator docs | Explain policy, receipts, lag, volatility, placement, and wear to operators. |
-| Performance intent gates | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, wear, cost, RPO, and relocation. |
+| Slice | Follow-up issue | Expected write set | Purpose |
+| --- | --- | --- | --- |
+| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, media role, proximity, workload, and cost records. |
+| Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths. |
+| Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, proximity domains, failure domains, and media constraints. |
+| Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, and relocation write budgets. |
+| Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors for planning and performance rows. |
+| Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier evidence without making RDMA mandatory. |
+| RAM authority design and implementation | #847 | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority. |
+| Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, and wear movement. |
+| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, receipts, lag, volatility, placement, and wear to operators. |
+| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, wear, cost, RPO, and relocation. |
 
 ## Validation For This Slice
 
