@@ -38,11 +38,7 @@ pub fn handle_diag(output_dir: Option<PathBuf>, device_paths: &[PathBuf], json: 
 
     match support_bundle::write_bundle_json(&bundle, &output_path) {
         Ok(()) => {
-            eprintln!(
-                "tidefsctl diag: registry={} digest={}",
-                super::classification::COMMAND_CLASSIFICATION_DOC_MARKER,
-                bundle.command_surface.registry_digest,
-            );
+            eprintln!("{}", command_registry_status_line(&bundle.command_surface));
             eprintln!(
                 "tidefsctl diag: source={} maturity={} redacted={}",
                 bundle.report_source.source.label(),
@@ -59,6 +55,13 @@ pub fn handle_diag(output_dir: Option<PathBuf>, device_paths: &[PathBuf], json: 
             process::exit(1);
         }
     }
+}
+
+fn command_registry_status_line(section: &CommandSurfaceSection) -> String {
+    format!(
+        "tidefsctl diag: registry={} source={} digest={}",
+        section.registry_marker, section.registry_source_path, section.registry_digest,
+    )
 }
 
 fn build_diag_bundle(device_paths: &[PathBuf]) -> support_bundle::SupportBundle {
@@ -321,6 +324,20 @@ mod tests {
             section.registry_marker,
             super::super::classification::COMMAND_CLASSIFICATION_DOC_MARKER
         );
+        assert_eq!(
+            section.registry_source_path,
+            super::super::classification::COMMAND_CLASSIFICATION_SOURCE_PATH
+        );
+    }
+
+    #[test]
+    fn command_registry_status_line_names_source_and_digest() {
+        let section = build_command_surface_section();
+        let status = command_registry_status_line(&section);
+
+        assert!(status.contains(&section.registry_marker));
+        assert!(status.contains(&section.registry_source_path));
+        assert!(status.contains(&section.registry_digest));
     }
 
     #[test]
