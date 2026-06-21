@@ -26,7 +26,7 @@ use tidefs_local_filesystem::{
     DEFAULT_FILE_PERMISSIONS,
 };
 use tidefs_local_object_store::{
-    segment_file_name, LocalObjectStore, ObjectKey, StoreOptions, RECORD_HEADER_LEN,
+    segment_file_name, LocalObjectStore, ObjectKey, ObjectLocation, StoreOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -116,8 +116,27 @@ fn create_fs_with_file_opts(
     fs.sync_all().expect("sync");
 }
 
+fn with_raw_primary_store<T>(
+    root: &Path,
+    store_opts: StoreOptions,
+    f: impl FnOnce(&LocalObjectStore) -> T,
+) -> T {
+    let pool = LocalFileSystem::default_development_pool(root, &store_opts, None, None)
+        .expect("open development pool");
+    f(pool.raw_primary_store())
+}
+
 fn seg_path(segments_dir: &Path, segment_id: u64) -> PathBuf {
     segments_dir.join(segment_file_name(segment_id))
+}
+
+fn object_record_path(store: &LocalObjectStore, loc: ObjectLocation) -> PathBuf {
+    let segments_dir = store.segments_dir();
+    if segments_dir.is_file() || (segments_dir.exists() && !segments_dir.is_dir()) {
+        segments_dir.to_path_buf()
+    } else {
+        seg_path(segments_dir, loc.segment_id)
+    }
 }
 
 fn corrupt_bytes(path: &Path, offset: u64, len: u64) {
@@ -139,9 +158,9 @@ fn corrupt_bytes(path: &Path, offset: u64, len: u64) {
 
 fn corrupt_object_payload(store: &LocalObjectStore, key: ObjectKey) {
     let loc = store.location_of(key).expect("object location");
-    let path = seg_path(store.segments_dir(), loc.segment_id);
-    let payload_start = loc.record_offset + RECORD_HEADER_LEN as u64;
-    let corrupt_at = payload_start + (loc.payload_len / 2).max(1);
+    let path = object_record_path(store, loc);
+    assert!(loc.payload_len > 0, "object payload should be non-empty");
+    let corrupt_at = loc.payload_offset + (loc.payload_len / 2);
     corrupt_bytes(&path, corrupt_at, 1);
 }
 
@@ -259,20 +278,18 @@ fn corrupted_content_object_payload_detected() {
     let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
 
     // Sanity: object exists and has non-empty payload before corruption.
-    {
-        let store = LocalObjectStore::open_with_options(&root, opts()).unwrap();
+    with_raw_primary_store(&root, opts(), |store| {
         let loc = store.location_of(content_key).unwrap();
         // Content objects include an encode-content header, so raw bytes
         // will be longer than the user-visible content.
         let stored = store.get_at_location(loc).unwrap();
         assert!(stored.len() >= content.len());
-    }
+    });
 
     // Corrupt the content object's raw payload.
-    {
-        let store = LocalObjectStore::open_with_options(&root, opts()).unwrap();
-        corrupt_object_payload(&store, content_key);
-    }
+    with_raw_primary_store(&root, opts(), |store| {
+        corrupt_object_payload(store, content_key);
+    });
 
     assert_corruption_detected(&root, "content-object");
 
@@ -300,11 +317,10 @@ fn corrupted_transaction_manifest_detected() {
 
     let transaction_id = first_transaction_id(&root);
 
-    {
-        let store = LocalObjectStore::open_with_options(&root, opts()).unwrap();
+    with_raw_primary_store(&root, opts(), |store| {
         let key = transaction_manifest_object_key(transaction_id);
-        corrupt_object_payload(&store, key);
-    }
+        corrupt_object_payload(store, key);
+    });
 
     assert_corruption_detected(&root, "transaction-manifest");
     cleanup(&root);
@@ -320,11 +336,10 @@ fn corrupted_superblock_detected() {
 
     let transaction_id = first_transaction_id(&root);
 
-    {
-        let store = LocalObjectStore::open_with_options(&root, opts()).unwrap();
+    with_raw_primary_store(&root, opts(), |store| {
         let key = transaction_superblock_object_key(transaction_id);
-        corrupt_object_payload(&store, key);
-    }
+        corrupt_object_payload(store, key);
+    });
 
     assert_corruption_detected(&root, "superblock");
     cleanup(&root);
@@ -385,30 +400,31 @@ fn corrupted_content_chunk_payload_detected() {
         inode.data_version,
         1,
     );
+    // The verifier must count content chunks before corruption is
+    // injected.  After corruption, chunk-level failures can prevent
+    // the root report from contributing to the chunk counter.
+    let pre_corruption = verify_online(&root, my_opts.clone())
+        .expect("verifier must succeed on clean content chunks");
+    assert!(
+        pre_corruption.checked_content_chunks >= 2,
+        "expected >= 2 chunks checked before corruption, got {}",
+        pre_corruption.checked_content_chunks
+    );
+
 
     // Sanity: chunk exists and has data.
-    {
-        let store = LocalObjectStore::open_with_options(&root, my_opts.clone()).unwrap();
+    with_raw_primary_store(&root, my_opts.clone(), |store| {
         let loc = store.location_of(chunk_key).unwrap();
         let stored = store.get_at_location(loc).unwrap();
         assert!(!stored.is_empty(), "chunk 1 should have data");
-    }
+    });
 
     // Corrupt the chunk object's raw payload.
-    {
-        let store = LocalObjectStore::open_with_options(&root, my_opts.clone()).unwrap();
-        corrupt_object_payload(&store, chunk_key);
-    }
+    with_raw_primary_store(&root, my_opts.clone(), |store| {
+        corrupt_object_payload(store, chunk_key);
+    });
 
     assert_corruption_detected_opts(&root, "content-chunk", my_opts.clone());
-
-    if let Ok(report) = verify_online(&root, my_opts) {
-        assert!(
-            report.checked_content_chunks >= 2,
-            "expected >= 2 chunks checked, got {}",
-            report.checked_content_chunks
-        );
-    }
 
     cleanup(&root);
 }

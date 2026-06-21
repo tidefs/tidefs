@@ -53,6 +53,25 @@ impl DedupHash {
         DedupHash(hasher.finalize().into())
     }
 
+    /// Compute a content hash under an explicit caller-owned domain.
+    ///
+    /// The domain and payload length are part of the hashed identity so a
+    /// mounted write path can preserve its existing object-key namespace while
+    /// still routing hash authority through this crate.
+    #[must_use]
+    pub fn compute_domain_separated(domain: &[u8], data: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(domain);
+        hasher.update(&(data.len() as u64).to_le_bytes());
+        hasher.update(data);
+        DedupHash(hasher.finalize().into())
+    }
+
+    #[must_use]
+    pub const fn as_bytes32(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     #[must_use]
     pub fn hex(&self) -> String {
         let mut s = String::with_capacity(64);
@@ -253,6 +272,67 @@ impl DedupStats {
             return 0;
         }
         ((self.bytes_saved as u128 * 1000) / total as u128) as u16
+    }
+}
+
+/// Inline write-path dedup decision for a caller-owned canonical locator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InlineDedupDecision<C> {
+    /// The session index names a live canonical object.
+    SessionHit { canonical: C },
+    /// The session index names a canonical object that no longer exists.
+    StaleSessionEntry { canonical: C },
+    /// The session index missed, but the durable canonical store already has
+    /// the object from a prior mount or writer.
+    CanonicalStoreHit { canonical: C },
+    /// No usable canonical object exists; the caller should write one.
+    Miss { canonical: C },
+}
+
+impl<C> InlineDedupDecision<C> {
+    #[must_use]
+    pub const fn canonical(&self) -> &C {
+        match self {
+            Self::SessionHit { canonical }
+            | Self::StaleSessionEntry { canonical }
+            | Self::CanonicalStoreHit { canonical }
+            | Self::Miss { canonical } => canonical,
+        }
+    }
+}
+
+/// Decide how an inline write should consume a candidate canonical object.
+///
+/// The caller owns persistence, redirects, refcounts, and any transform
+/// receipts. This crate owns the hit/stale/miss classification so mounted
+/// write paths and the future DDT authority do not grow incompatible inline
+/// dedup semantics.
+#[must_use]
+pub fn decide_inline_dedup<C, Lookup, Exists>(
+    hash: &DedupHash,
+    canonical: C,
+    lookup_session: Lookup,
+    mut canonical_exists: Exists,
+) -> InlineDedupDecision<C>
+where
+    C: Copy,
+    Lookup: FnOnce(&DedupHash) -> Option<C>,
+    Exists: FnMut(C) -> bool,
+{
+    if let Some(existing) = lookup_session(hash) {
+        if canonical_exists(existing) {
+            InlineDedupDecision::SessionHit {
+                canonical: existing,
+            }
+        } else {
+            InlineDedupDecision::StaleSessionEntry {
+                canonical: existing,
+            }
+        }
+    } else if canonical_exists(canonical) {
+        InlineDedupDecision::CanonicalStoreHit { canonical }
+    } else {
+        InlineDedupDecision::Miss { canonical }
     }
 }
 
@@ -803,6 +883,63 @@ mod tests {
         let h = DedupHash::compute(b"data");
         let s = format!("{h}");
         assert_eq!(s.len(), 64);
+    }
+
+    #[test]
+    fn hash_domain_separation_includes_domain_and_length() {
+        let domain_a = DedupHash::compute_domain_separated(b"domain-a", b"payload");
+        let domain_b = DedupHash::compute_domain_separated(b"domain-b", b"payload");
+        let extended = DedupHash::compute_domain_separated(b"domain-a", b"payload-extra");
+
+        assert_eq!(
+            domain_a,
+            DedupHash::compute_domain_separated(b"domain-a", b"payload")
+        );
+        assert_ne!(domain_a, domain_b);
+        assert_ne!(domain_a, extended);
+    }
+
+    // ── Inline write-path decisions ────────────────────────────────────────
+
+    #[test]
+    fn inline_decision_prefers_live_session_hit() {
+        let hash = DedupHash::compute(b"payload");
+        let decision = decide_inline_dedup(&hash, 10, |_| Some(20), |canonical| canonical == 20);
+
+        assert_eq!(
+            decision,
+            InlineDedupDecision::SessionHit { canonical: 20 }
+        );
+    }
+
+    #[test]
+    fn inline_decision_reports_stale_session_entry() {
+        let hash = DedupHash::compute(b"payload");
+        let decision = decide_inline_dedup(&hash, 10, |_| Some(20), |_| false);
+
+        assert_eq!(
+            decision,
+            InlineDedupDecision::StaleSessionEntry { canonical: 20 }
+        );
+    }
+
+    #[test]
+    fn inline_decision_uses_cross_session_canonical_hit() {
+        let hash = DedupHash::compute(b"payload");
+        let decision = decide_inline_dedup(&hash, 10, |_| None, |canonical| canonical == 10);
+
+        assert_eq!(
+            decision,
+            InlineDedupDecision::CanonicalStoreHit { canonical: 10 }
+        );
+    }
+
+    #[test]
+    fn inline_decision_reports_miss_when_no_canonical_exists() {
+        let hash = DedupHash::compute(b"payload");
+        let decision = decide_inline_dedup(&hash, 10, |_| None, |_| false);
+
+        assert_eq!(decision, InlineDedupDecision::Miss { canonical: 10 });
     }
 
     // ── DedupEntry ──────────────────────────────────────────────────────
