@@ -10948,9 +10948,19 @@ impl LocalFileSystem {
         // When the intent log is non-empty, we MUST persist state even
         // when dirty tracking says it's clean — otherwise acknowledged
         // writes are silently dropped.
-        let state_was_dirty = self.is_state_dirty();
+        let had_intent_log_entries = !self.intent_log.is_empty();
+        if had_intent_log_entries {
+            // Fold acknowledged log records into the main transaction state
+            // before publishing the root that makes them redundant.
+            replay_uncommitted(
+                &self.intent_log,
+                &mut self.state,
+                self.store.raw_primary_store_mut(),
+                0,
+            )?;
+        }
         let must_persist =
-            self.is_state_dirty() || !self.intent_log.is_empty() || flushed_write_buffers;
+            self.is_state_dirty() || had_intent_log_entries || flushed_write_buffers;
 
         // COMMIT_GROUP STATE MACHINE: transition phases only when there is real work.
         // No-op commits (clean state + empty intent log) do not advance the commit_group.
@@ -11071,7 +11081,7 @@ impl LocalFileSystem {
         // Only clear the intent log after a successful state persist.
         // Uncommitted entries survive until the next state commit or
         // replay on remount (#862).
-        if state_was_dirty && !self.intent_log.is_empty() {
+        if had_intent_log_entries {
             self.intent_log.clear(self.store.raw_primary_store_mut())?;
         }
         // Rotate the current segment if rotation thresholds have been
