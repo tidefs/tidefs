@@ -65,12 +65,9 @@ pub fn decode_vrbt(bytes: &[u8]) -> Result<VrbtRoot, VrbtError> {
         return Err(VrbtError::UnsupportedVersion(version));
     }
 
-    #[cfg(CONFIG_RUST)]
-    {
-        if !blake3::blake3_available() {
-            return Err(VrbtError::DigestUnavailable);
-        }
-    }
+    // BLAKE3-256 is always available: the kmod bridge provides a
+    // self-contained software implementation under Kbuild, and the
+    // external blake3 crate is used under Cargo.
     let stored: [u8; 32] = bytes[VRBT_HASH_OFFSET..VRBT_WIRE_SIZE].try_into().unwrap();
     let mut hasher = blake3::Hasher::new();
     hasher.update(&bytes[..VRBT_HEADER_SIZE]);
@@ -423,12 +420,9 @@ pub fn parse_exmp_header(page_buf: &[u8]) -> Result<ExmpLeafPage, ExmpError> {
     let level = page_buf[8];
 
     // Verify BLAKE3-256 checksum: hash of hashed_header[0..22] + body data.
-    #[cfg(CONFIG_RUST)]
-    {
-        if !blake3::blake3_available() {
-            return Err(ExmpError::DigestUnavailable);
-        }
-    }
+    // BLAKE3-256 is always available: the kmod bridge provides a
+    // self-contained software implementation under Kbuild, and the
+    // external blake3 crate is used under Cargo.
 
     // Body starts at offset 54 and extends to entry_count * 89 bytes.
     let body_end = EXMP_PAGE_HEADER_SIZE

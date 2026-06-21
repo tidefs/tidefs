@@ -118,8 +118,10 @@ pub enum PoolImportError {
     LabelInvalid { detail: String },
     /// The system area pointer and size are inconsistent.
     SuperblockRegionInvalid { offset: u64, size: u64 },
-    /// BLAKE3-256 digest verification is unavailable (Kbuild stub);
-    /// label or ledger integrity cannot be verified.
+    /// BLAKE3-256 digest verification is unavailable on this kernel
+    /// configuration; label or ledger integrity cannot be verified.
+    /// Reserved: the current kmod bridge provides BLAKE3-256 in all
+    /// supported kernel builds.
     DigestUnavailable,
 }
 
@@ -147,7 +149,7 @@ impl fmt::Display for PoolImportError {
             Self::SuperblockRegionInvalid { offset, size } => {
                 write!(f, "superblock region invalid: offset={offset}, size={size}")
             }
-            Self::DigestUnavailable => f.write_str("BLAKE3 digest unavailable (Kbuild stub)"),
+            Self::DigestUnavailable => f.write_str("kernel BLAKE3 digest unavailable"),
         }
     }
 }
@@ -730,8 +732,10 @@ pub enum LedgerError {
     NoValidEntries,
     /// The declared entry count exceeds what the buffer can hold.
     EntryCountOverflow { count: u32, available: usize },
-    /// BLAKE3-256 digest verification is unavailable (Kbuild stub);
-    /// ledger integrity cannot be verified.
+    /// BLAKE3-256 digest verification is unavailable on this kernel
+    /// configuration; ledger integrity cannot be verified.
+    /// Reserved: the current kmod bridge provides BLAKE3-256 in all
+    /// supported kernel builds.
     DigestUnavailable,
 }
 
@@ -761,7 +765,7 @@ impl fmt::Display for LedgerError {
                     "entry count {count} exceeds available space ({available} bytes)"
                 )
             }
-            Self::DigestUnavailable => f.write_str("BLAKE3 digest unavailable (Kbuild stub)"),
+            Self::DigestUnavailable => f.write_str("kernel BLAKE3 digest unavailable"),
         }
     }
 }
@@ -868,14 +872,9 @@ impl MountRootSelector {
         }
 
         // Verify footer checksum over header + entries.
-        // Under Kbuild, BLAKE3 is a stub — fail closed instead of comparing
-        // against the zero-hash facade.
-        #[cfg(CONFIG_RUST)]
-        {
-            if !blake3::blake3_available() {
-                return Err(LedgerError::DigestUnavailable);
-            }
-        }
+        // BLAKE3-256 is always available: the kmod bridge provides a
+        // self-contained software implementation under Kbuild, and the
+        // external blake3 crate is used under Cargo.
         let payload_end = LEDGER_HEADER_SIZE + entries_bytes;
         let stored: [u8; 32] = buf[payload_end..payload_end + LEDGER_FOOTER_SIZE]
             .try_into()
@@ -918,13 +917,9 @@ impl MountRootSelector {
 
         let mut best: Option<(u64, CommittedRootAnchor)> = None;
 
-        // Under Kbuild, BLAKE3 is a stub — fail closed.
-        #[cfg(CONFIG_RUST)]
-        {
-            if !blake3::blake3_available() {
-                return Err(LedgerError::DigestUnavailable);
-            }
-        }
+        // BLAKE3-256 is always available: the kmod bridge provides a
+        // self-contained software implementation under Kbuild, and the
+        // external blake3 crate is used under Cargo.
 
         for entry in entries.iter() {
             // Verify per-entry BLAKE3 digest.
