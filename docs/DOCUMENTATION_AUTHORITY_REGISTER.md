@@ -1,6 +1,6 @@
 # Documentation Authority Register
 
-Date: 2026-06-18
+Date: 2026-06-21
 
 This register is the TFR-019 queue for imported documents that still need
 authority classification. It is deliberately narrow: it does not make the
@@ -256,53 +256,58 @@ comparator evidence required by #928/#930:
 - `docs/WHOLE_REPO_REVIEW.md`: incumbent references are fail-closed review
   blockers only.
 
-## Initial Open Queue
+## Initial Open Queue Resolution (#689)
 
-The first mechanical pass found 87 imported documents with maturity labels or
-issue-closeout wording outside the review register and whole-repo review. These
-paths are not automatically wrong, but each must be classified before it can be
-used as TideFS authority:
+Classified for TFR-019 / GitHub issue #689 on 2026-06-21 after reviewing the
+register method, `docs/WHOLE_REPO_REVIEW.md`, `validation/claims.toml`, and
+bounded source search for the tempting implementation references. This slice
+does not promote any initial-queue document to current policy or current spec:
+the documents below carry old Forgejo issue-closeout, sealed-design, maturity,
+or production-depth wording whose full source and claims-gate reconciliation is
+larger than this documentation-authority cleanup.
 
-- `docs/EXTENT_MAPS_LOCATOR_TABLES_DESIGN.md`
-- `docs/GENERATION_STALENESS_DISCIPLINE_DESIGN.md`
-- `docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md`
-- `docs/POSIX_ACL_XATTR_CODEC_DESIGN.md`
-- `docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md`
-- `docs/SEMANTIC_OP_CANONICAL_NAME_REGISTRY_DESIGN.md`
-- `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md`
-- `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`
-- `docs/UNIVERSAL_INCREMENTAL_CURSOR_FRAMEWORK_DESIGN.md`
-- `docs/V1_EXTENT_MAP_TRISTATE_MODEL_DESIGN.md`
-- `docs/design/1781-shard-groups-replicas-rebake-design-spec.md`
-- `docs/design/1782-shard-groups-replicas-rebake-design-spec.md`
-- `docs/design/1806-shard-groups-replicas-rebake-design-spec.md`
-- `docs/design/2068-shard-groups-replicas-rebake-pathway-design.md`
-- `docs/design/METADATA_ENGINE_PARALLELISM_DESIGN.md`
-- `docs/design/background-service-framework-canonical-consolidation.md`
-- `docs/design/background-service-framework-coordination-confirmed.md`
-- `docs/design/background-service-framework-design-1803.md`
-- `docs/design/background-service-framework-design-enhanced.md`
-- `docs/design/background-service-framework-design-spec.md`
-- `docs/design/background-service-framework-design.md`
-- `docs/design/background-service-framework-multithread-design.md`
-- `docs/design/background-service-framework-phases-5-10-wire-up-tracking-coordination-seal.md`
-- `docs/design/background-service-framework-phases-5-10-wire-up-tracking.md`
-- `docs/design/bounded-cluster-membership-state.md`
-- `docs/design/coordination-review-roadmap-priorities-update-1953.md`
-- `docs/design/deterministic-trace-oracle-system.md`
-- `docs/design/device-layout-policies-adaptive-segment-sizing.md`
-- `docs/design/directory-change-streams-namespace-event-protocol.md`
-- `docs/design/incremental-job-core-trait-checkpoint-codec-design.md`
-- `docs/design/polymorphic-extent-maps-design.md`
-- `docs/design/prefetch-readahead-budgeted-speculative-io.md`
-- `docs/design/rebake-architecture-ingest-journal-to-base-shard-conversion.md`
-- `docs/design/refcount-delta-based-incremental-data-cleanup-queues.md`
-- `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design-1952.md`
-- `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design-1965.md`
-- `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design.md`
-- `docs/design/scrub-deep-scrub-repair-resilver-orchestration-placement-ae-auditor.md`
-- `docs/design/shard-groups-replicas-rebake-design-1963.md`
-- `docs/design/shard-groups-replicas-rebake-design-spec.md`
-- `docs/design/v1-extent-map-tristate-model.md`
-- `docs/design/v1-locator-table-inline-hash.md`
-- `docs/design/workload-adaptive-recordsize-and-extent-shaping.md`
+| Path | State | Classification note |
+|---|---|---|
+| `docs/EXTENT_MAPS_LOCATOR_TABLES_DESIGN.md` | Historical input | Imported Forgejo #1285 design with on-media extent/locator authority wording. Live source has extent-map and locator-table crates, but this slice did not reconcile the full V2 media model, migration text, and claims-gate surface, so it is design input only. |
+| `docs/GENERATION_STALENESS_DISCIPLINE_DESIGN.md` | Historical input | Imported Forgejo #1242 stale-generation/fence model that spans caches, commit groups, metadata, replication, and jobs. It needs a dedicated source and claims review before it can govern current staleness behavior. |
+| `docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md` | Historical input | Imported Forgejo #1290 xattr storage design with proposed on-media records and ACL integration. Current xattr/ACL behavior and claims coverage were not audited here, so the document remains review material. |
+| `docs/POSIX_ACL_XATTR_CODEC_DESIGN.md` | Historical input | Imported ACL codec design that marks itself superseded and names a replacement issue lineage. It must not be cited as current POSIX ACL authority without a fresh ACL/xattr source review. |
+| `docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md` | Historical input | Imported Forgejo #1180 refcount-delta reclamation design. Current reclaim/deadlist work is active elsewhere, but the complete queue data model and runtime evidence were not validated in this slice. |
+| `docs/SEMANTIC_OP_CANONICAL_NAME_REGISTRY_DESIGN.md` | Historical input | Imported Forgejo #1200 semantic-op registry proposal. It describes a central naming authority broader than the current claims reviewed here and remains implementation-planning input. |
+| `docs/SNAPSHOT_DEADLIST_PINNING_DESIGN.md` | Historical input | Imported snapshot deadlist/pinning design that reaches into reclamation, references, and snapshot lifecycle. It needs a dedicated snapshot/deadlist source and claims-gate review before promotion. |
+| `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md` | Historical input | Imported resource-governor design with broad scheduling and budget claims. Open resource-governor implementation work is separate; this document is not current runtime authority. |
+| `docs/UNIVERSAL_INCREMENTAL_CURSOR_FRAMEWORK_DESIGN.md` | Historical input | Imported universal cursor framework design across scrub, send/receive, rebake, resilver, and cleanup jobs. Promotion would require cross-crate source and evidence review beyond this slice. |
+| `docs/V1_EXTENT_MAP_TRISTATE_MODEL_DESIGN.md` | Historical input | Imported design-sealed tristate extent model that claims implemented source coverage. Although bounded search found current extent-map crates, the old authority and phase wording exceed the reviewed claims surface. |
+| `docs/design/1781-shard-groups-replicas-rebake-design-spec.md` | Historical input | Imported shard-group/rebake design iteration. It is useful lineage for distributed layout planning, not current redundancy, rebake, or recovery evidence. |
+| `docs/design/1782-shard-groups-replicas-rebake-design-spec.md` | Historical input | Imported shard-group/rebake design iteration with old issue lineage. It remains historical comparison input until a distributed placement/rebake source audit promotes a narrower contract. |
+| `docs/design/1806-shard-groups-replicas-rebake-design-spec.md` | Historical input | Imported shard-group/rebake design iteration. It must not be cited as current distributed-storage behavior or runtime validation. |
+| `docs/design/2068-shard-groups-replicas-rebake-pathway-design.md` | Historical input | Imported rebake-pathway refinement whose production-depth flow claims exceed the current validation register. It remains design input for future rebake authority work. |
+| `docs/design/METADATA_ENGINE_PARALLELISM_DESIGN.md` | Historical input | Imported metadata-engine parallelism design with broad scheduling and correctness implications. It needs dedicated engine/source review before any current-spec promotion. |
+| `docs/design/background-service-framework-canonical-consolidation.md` | Historical input | Imported background-service consolidation note in a larger duplicate lineage. Current `tidefs-background-scheduler` source exists, but this closeout/consolidation document was not reconciled with live scheduler authority. |
+| `docs/design/background-service-framework-coordination-confirmed.md` | Historical input | Imported coordination-confirmed background-service note. It records old planning state, not current scheduler/runtime authority. |
+| `docs/design/background-service-framework-design-1803.md` | Historical input | Imported background-service design iteration. It remains lineage material for scheduler review and is not current service-contract authority. |
+| `docs/design/background-service-framework-design-enhanced.md` | Historical input | Imported enhanced background-service design. Current scheduler behavior and claims evidence were not audited against the enhancement set in this slice. |
+| `docs/design/background-service-framework-design-spec.md` | Historical input | Imported background-service design-spec variant. It is not authoritative over the current scheduler without a focused `tidefs-background-scheduler` source and claims review. |
+| `docs/design/background-service-framework-design.md` | Historical input | Imported background-service framework design referenced by multiple old distributed-service docs. It remains useful design context, not current runtime authority. |
+| `docs/design/background-service-framework-multithread-design.md` | Historical input | Imported multithreaded background-service design. It must be reconciled with current scheduler source and validation before being used as a current concurrency contract. |
+| `docs/design/background-service-framework-phases-5-10-wire-up-tracking-coordination-seal.md` | Historical input | Imported coordination-seal tracking note for background-service phases. It is old planning closeout material, not a current implementation-status record. |
+| `docs/design/background-service-framework-phases-5-10-wire-up-tracking.md` | Historical input | Imported phase-tracking note for background-service wire-up. It remains historical input until live source and validation are checked against the phase claims. |
+| `docs/design/bounded-cluster-membership-state.md` | Historical input | Imported bounded-membership state design. Current distributed membership authority is only whatever later scoped rows classify; this file is not current cluster-service evidence. |
+| `docs/design/coordination-review-roadmap-priorities-update-1953.md` | Historical input | Imported roadmap/priorities update. It is planning context and must not be treated as current policy, spec, or implementation evidence. |
+| `docs/design/deterministic-trace-oracle-system.md` | Historical input | Imported deterministic trace-oracle design. It may inform future validation tooling, but this slice did not promote any trace-oracle claim or scanned claims-gate surface. |
+| `docs/design/device-layout-policies-adaptive-segment-sizing.md` | Historical input | Imported adaptive segment-sizing/device-layout policy design. It needs storage allocator/device-layout source and evidence review before it can constrain current behavior. |
+| `docs/design/directory-change-streams-namespace-event-protocol.md` | Historical input | Imported directory change-stream protocol design. Current namespace event behavior and claims coverage were not audited here, so it remains design input. |
+| `docs/design/incremental-job-core-trait-checkpoint-codec-design.md` | Historical input | Imported incremental-job trait/checkpoint design. Live incremental-job crates exist, but this broad codec and job-contract document needs focused source review before promotion. |
+| `docs/design/polymorphic-extent-maps-design.md` | Historical input | Imported lowercase polymorphic-extent-map design duplicate/variant. It remains lineage material alongside the already historical extent-map comparison docs. |
+| `docs/design/prefetch-readahead-budgeted-speculative-io.md` | Historical input | Imported prefetch/readahead design with performance and scheduling implications. No current performance or runtime evidence was promoted in this slice. |
+| `docs/design/rebake-architecture-ingest-journal-to-base-shard-conversion.md` | Historical input | Imported rebake architecture document for ingest-journal to base-shard conversion. It is future distributed-layout input, not current rebake authority. |
+| `docs/design/refcount-delta-based-incremental-data-cleanup-queues.md` | Historical input | Imported lowercase refcount-delta cleanup design duplicate/variant. It is review material until reclamation source and claims evidence are reconciled. |
+| `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design-1952.md` | Historical input | Imported scrub/repair/resilver orchestration iteration. `validation/claims.toml` still blocks scrub/read isolation and scrub runtime queues, so this cannot be current integrity-service authority. |
+| `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design-1965.md` | Historical input | Imported scrub/repair/resilver orchestration iteration. Its distributed repair and resilver claims exceed current claim-registry evidence. |
+| `docs/design/scrub-deep-scrub-repair-resilver-orchestration-design.md` | Historical input | Imported broad integrity-service orchestration design. It remains historical input until scrub, deep-scrub, repair, and resilver source behavior and runtime evidence are reviewed together. |
+| `docs/design/scrub-deep-scrub-repair-resilver-orchestration-placement-ae-auditor.md` | Historical input | Imported placement/anti-entropy auditor refinement for scrub and repair. It is not current placement or anti-entropy authority without a dedicated implementation/evidence review. |
+| `docs/design/shard-groups-replicas-rebake-design-1963.md` | Historical input | Imported shard-group/rebake design iteration. It remains distributed-storage lineage material and not current runtime behavior. |
+| `docs/design/shard-groups-replicas-rebake-design-spec.md` | Historical input | Imported sealed shard-group/rebake design-spec with multiple prior-iteration links. It must not be used as current distributed redundancy or rebake evidence. |
+| `docs/design/v1-extent-map-tristate-model.md` | Historical input | Imported sealed architecture/design note for the V1 tristate extent model. It references current extent-map crates, but source/claims reconciliation for the full sparse-file, FIEMAP, fallocate, and stat-block contract remains out of scope here. |
+| `docs/design/v1-locator-table-inline-hash.md` | Historical input | Imported V1 locator-table inline-hash design that names `crates/tidefs-locator-table`. Promotion would require a focused locator-table source, validation, and claims-gate review. |
+| `docs/design/workload-adaptive-recordsize-and-extent-shaping.md` | Historical input | Imported workload-adaptive recordsize/extent-shaping design. It contains policy and performance implications that need storage allocator, extent, and claims evidence before becoming current authority. |

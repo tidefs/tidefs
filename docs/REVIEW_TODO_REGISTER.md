@@ -711,11 +711,11 @@ Important 2026-06-01 findings:
   classification and removal where they encode old authority. The first
   focused TFR-019 cleanup classified the 15 imported
   `closes open-work`, or `open-work item` wording as review material and
-  removed that narrow closeout wording from them. TFR-019 remains broad: a
-  follow-up scan still finds 87 imported docs outside this register and the
-  whole-repo review with `Maturity:` or Forgejo/design-closeout wording that
-  must be classified before the docs can be trusted as current authority. The
-  open queue is now listed in `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+  removed that narrow closeout wording from them. TFR-019 remains broad, but
+  GitHub issue #689 now classifies every path that remained in the initial open
+  queue in `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`. Those new rows leave the
+  documents as historical input until narrower source and claims-gate reviews
+  can justify any future current-policy/current-spec promotion.
   no longer exposes `--require-issue`, and the operator-demo and
   of JSON `issue` fields or issue-numbered default run ids. Focused `nix/` and
   `scripts/` scans for that interface and JSON issue metadata now return no
@@ -1105,10 +1105,11 @@ Important 2026-06-01 findings:
   documentation closure:
   `docs/workspace-package-classification.md` now records the current
   148-package workspace plus five excluded fuzz package roots and is checked by
-  `check-workspace-policy`, but many imported docs remain unclassified and
-  broader process authority still needs deliberate completion.
-  The doc set cannot be treated as release truth until every file is classified
-  as current policy, current spec, historical input, or delete candidate.
+  `check-workspace-policy`. GitHub issue #689 classifies every remaining path
+  from the initial open queue in `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` as
+  historical input, but broader process authority still needs deliberate
+  completion. Historical-input rows cannot be treated as release truth without
+  a later source and claims-gate review that promotes the specific document.
 - `TFR-019`: The checksum/BLAKE3 authority slice for GitHub issue #332
   classified `docs/BLAKE3_USAGE_POLICY.md` as current policy only for BLAKE3
   placement and review. `docs/CHECKSUM_ARCHITECTURE_DESIGN.md`,
@@ -1148,8 +1149,9 @@ Important 2026-06-01 findings:
   operator/placement docs. The new rows in
   `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` classify scoped source-boundary
   docs as current specs, the FUSE adapter bypass rule as current policy, and
-  broad production-depth ledgers as historical input. TFR-019 remains open for
-  the separate #497 slice, the remaining design-subdir queue, and any
+  broad production-depth ledgers as historical input. GitHub issue #689 resolves
+  the remaining initial-open-queue classifications by leaving the unpromoted
+  design-subdir documents as historical input. TFR-019 remains open for any
   per-document source audit needed before promoting additional docs to current
   spec or policy.
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
