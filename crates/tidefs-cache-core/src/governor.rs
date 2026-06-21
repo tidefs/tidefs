@@ -8,7 +8,7 @@
 //! This is the first integration slice: admission/release with per-category
 //! watermarks, backpressure signals, and one wired cache admission path.
 //! Full 6-level migration and cluster backpressure are deferred to follow-up
-//! slices (see [`UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`]).
+//! slices (see `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`).
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
