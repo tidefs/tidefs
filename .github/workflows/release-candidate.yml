@@ -16,8 +16,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.profile }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -198,4 +198,347 @@ jobs:
             /tmp/tidefs-rdma-two-node/**
             /tmp/tidefs-validation/**
           if-no-files-found: ignore
+          retention-days: 14
+
+  candidate-evidence-index:
+    name: Candidate evidence index
+    if: ${{ always() && !cancelled() }}
+    needs:
+      - rust-smoke
+      - nix
+      - qemu
+      - xfstests
+      - rdma
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Write candidate evidence index
+        env:
+          PROFILE: ${{ inputs.profile }}
+          RUST_SMOKE_RESULT: ${{ needs['rust-smoke'].result }}
+          NIX_RESULT: ${{ needs.nix.result }}
+          QEMU_RESULT: ${{ needs.qemu.result }}
+          XFSTESTS_RESULT: ${{ needs.xfstests.result }}
+          RDMA_RESULT: ${{ needs.rdma.result }}
+        run: |
+          mkdir -p release-candidate-evidence-index
+          out_path=release-candidate-evidence-index/index.json
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          nix develop .#ci --command jq -S -n \
+            --arg profile "$PROFILE" \
+            --arg rust_smoke_result "$RUST_SMOKE_RESULT" \
+            --arg nix_result "$NIX_RESULT" \
+            --arg qemu_result "$QEMU_RESULT" \
+            --arg xfstests_result "$XFSTESTS_RESULT" \
+            --arg rdma_result "$RDMA_RESULT" \
+            --arg workflow_name "$GITHUB_WORKFLOW" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg run_url "$run_url" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$GITHUB_REF" \
+            --arg ref_name "$GITHUB_REF_NAME" \
+            --arg sha "$GITHUB_SHA" \
+            '
+            def contains_value($values; $value):
+              ($values | index($value)) != null;
+            def lane_status($result; $profiles):
+              if (contains_value($profiles; $profile) | not) then
+                "skipped_by_profile"
+              elif $result == "success" then
+                "run"
+              elif contains_value(["failure", "cancelled", "timed_out"]; $result) then
+                "failed"
+              else
+                "missing_evidence"
+              end;
+            def artifact($name; $paths):
+              {
+                name: $name,
+                expected_path_patterns: $paths
+              };
+            def lane_manifest($owner_issue; $evidence_class):
+              if $owner_issue == null then
+                {
+                  status: "not_applicable",
+                  owner_issue: null,
+                  evidence_class: $evidence_class
+                }
+              else
+                {
+                  status: "absent",
+                  owner_issue: $owner_issue,
+                  evidence_class: $evidence_class,
+                  note: (
+                    "Lane-local manifests are outside this workflow slice; "
+                    + "the candidate index records their absence instead of "
+                    + "synthesizing a pass claim."
+                  )
+                }
+              end;
+
+            {
+              schema_version: 1,
+              workflow: {
+                name: $workflow_name,
+                run_id: $run_id,
+                run_attempt: $run_attempt,
+                run_url: $run_url
+              },
+              source: {
+                repository: $repository,
+                ref: $ref,
+                ref_name: $ref_name,
+                sha: $sha
+              },
+              profile: $profile,
+              candidate_evidence_index: {
+                artifact_name: "release-candidate-evidence-index",
+                path: "release-candidate-evidence-index/index.json",
+                scope: "top-level candidate evidence"
+              },
+              claim_boundary: {
+                product_readiness: "not_claimed",
+                coverage_broadening: false,
+                lane_local_manifests_synthesized: false
+              },
+              lane_local_manifest_boundaries: [
+                {
+                  owner_issue: 643,
+                  evidence_class: "xfstests lane-local evidence manifest",
+                  status: "absent"
+                },
+                {
+                  owner_issue: 644,
+                  evidence_class: "Kernel fsync lane-local evidence manifest",
+                  status: "absent"
+                },
+                {
+                  owner_issue: 645,
+                  evidence_class: "Focused Rust lane-local evidence manifest",
+                  status: "absent"
+                },
+                {
+                  owner_issue: 646,
+                  evidence_class: "RDMA lane-local evidence manifest",
+                  status: "absent"
+                }
+              ],
+              lanes: [
+                {
+                  id: "rust-smoke",
+                  job_id: "rust-smoke",
+                  job_name: "Rust smoke",
+                  profiles: ["smoke", "full"],
+                  github_needs_result: $rust_smoke_result,
+                  status: lane_status($rust_smoke_result; ["smoke", "full"]),
+                  artifacts: [
+                    artifact(
+                      "release-candidate-rust-summary";
+                      ["ci-test-summary.json"]
+                    )
+                  ],
+                  lane_local_manifest: lane_manifest(
+                    645;
+                    "Focused Rust lane-local evidence manifest"
+                  )
+                },
+                {
+                  id: "nix",
+                  job_id: "nix",
+                  job_name: "Nix build",
+                  profiles: ["smoke", "full"],
+                  github_needs_result: $nix_result,
+                  status: lane_status($nix_result; ["smoke", "full"]),
+                  artifacts: [],
+                  expected_artifact_path_patterns: [],
+                  lane_local_manifest: lane_manifest(
+                    null;
+                    "Nix release-candidate job result"
+                  )
+                },
+                {
+                  id: "qemu",
+                  job_id: "qemu",
+                  job_name: "QEMU smoke matrix",
+                  profiles: ["smoke", "full"],
+                  github_needs_result: $qemu_result,
+                  status: lane_status($qemu_result; ["smoke", "full"]),
+                  matrix_jobs: [
+                    {
+                      name: "kmod-xfstests-smoke",
+                      artifact_name: "release-candidate-qemu-kmod-xfstests-smoke",
+                      expected_artifact_path_patterns: [
+                        "/tmp/tidefs-validation/**"
+                      ]
+                    }
+                  ],
+                  artifacts: [
+                    artifact(
+                      "release-candidate-qemu-kmod-xfstests-smoke";
+                      ["/tmp/tidefs-validation/**"]
+                    )
+                  ],
+                  lane_local_manifest: lane_manifest(
+                    644;
+                    "Kernel fsync lane-local evidence manifest"
+                  )
+                },
+                {
+                  id: "xfstests",
+                  job_id: "xfstests",
+                  job_name: "xfstests matrix",
+                  profiles: ["full"],
+                  github_needs_result: $xfstests_result,
+                  status: lane_status($xfstests_result; ["full"]),
+                  matrix_jobs: [
+                    {
+                      target: "fuse",
+                      artifact_name: "release-candidate-xfstests-fuse",
+                      expected_artifact_path_patterns: [
+                        "/tmp/tidefs-validation/**"
+                      ]
+                    },
+                    {
+                      target: "kmod-smoke",
+                      artifact_name: "release-candidate-xfstests-kmod-smoke",
+                      expected_artifact_path_patterns: [
+                        "/tmp/tidefs-validation/**"
+                      ]
+                    },
+                    {
+                      target: "k7-vfs",
+                      artifact_name: "release-candidate-xfstests-k7-vfs",
+                      expected_artifact_path_patterns: [
+                        "/tmp/tidefs-validation/**"
+                      ]
+                    }
+                  ],
+                  artifacts: [
+                    artifact(
+                      "release-candidate-xfstests-fuse";
+                      ["/tmp/tidefs-validation/**"]
+                    ),
+                    artifact(
+                      "release-candidate-xfstests-kmod-smoke";
+                      ["/tmp/tidefs-validation/**"]
+                    ),
+                    artifact(
+                      "release-candidate-xfstests-k7-vfs";
+                      ["/tmp/tidefs-validation/**"]
+                    )
+                  ],
+                  lane_local_manifest: lane_manifest(
+                    643;
+                    "xfstests lane-local evidence manifest"
+                  )
+                },
+                {
+                  id: "rdma",
+                  job_id: "rdma",
+                  job_name: "RDMA matrix",
+                  profiles: ["full"],
+                  github_needs_result: $rdma_result,
+                  status: lane_status($rdma_result; ["full"]),
+                  matrix_jobs: [
+                    {
+                      name: "static-carrier-check",
+                      artifact_name: "release-candidate-rdma-static-carrier-check",
+                      expected_artifact_path_patterns: [
+                        "/tmp/tidefs-rdma-two-node/**",
+                        "/tmp/tidefs-validation/**"
+                      ]
+                    },
+                    {
+                      name: "host-probe",
+                      artifact_name: "release-candidate-rdma-host-probe",
+                      expected_artifact_path_patterns: [
+                        "/tmp/tidefs-rdma-two-node/**",
+                        "/tmp/tidefs-validation/**"
+                      ]
+                    },
+                    {
+                      name: "qemu-two-node",
+                      artifact_name: "release-candidate-rdma-qemu-two-node",
+                      expected_artifact_path_patterns: [
+                        "/tmp/tidefs-rdma-two-node/**",
+                        "/tmp/tidefs-validation/**"
+                      ]
+                    }
+                  ],
+                  artifacts: [
+                    artifact(
+                      "release-candidate-rdma-static-carrier-check";
+                      [
+                        "/tmp/tidefs-rdma-two-node/**",
+                        "/tmp/tidefs-validation/**"
+                      ]
+                    ),
+                    artifact(
+                      "release-candidate-rdma-host-probe";
+                      [
+                        "/tmp/tidefs-rdma-two-node/**",
+                        "/tmp/tidefs-validation/**"
+                      ]
+                    ),
+                    artifact(
+                      "release-candidate-rdma-qemu-two-node";
+                      [
+                        "/tmp/tidefs-rdma-two-node/**",
+                        "/tmp/tidefs-validation/**"
+                      ]
+                    )
+                  ],
+                  lane_local_manifest: lane_manifest(
+                    646;
+                    "RDMA lane-local evidence manifest"
+                  )
+                }
+              ]
+            }
+            ' > "$out_path"
+
+          nix develop .#ci --command jq -e '
+            def contains_value($values; $value):
+              ($values | index($value)) != null;
+            .profile as $profile |
+            ((.profile == "smoke") or (.profile == "full")) and
+            (.workflow.name == "Release Candidate") and
+            ((.source.sha | length) > 0) and
+            (.candidate_evidence_index.artifact_name == "release-candidate-evidence-index") and
+            (([.lanes[].id] | sort) == ["nix", "qemu", "rdma", "rust-smoke", "xfstests"]) and
+            all(.lanes[]; (
+              (.status as $status |
+                contains_value(["run", "skipped_by_profile", "failed", "missing_evidence"]; $status)) and
+              (if $profile == "smoke" and (.id == "xfstests" or .id == "rdma") then
+                .status == "skipped_by_profile"
+              else
+                true
+              end) and
+              (if $profile == "smoke" and (.id == "rust-smoke" or .id == "nix" or .id == "qemu") then
+                .status != "skipped_by_profile"
+              else
+                true
+              end) and
+              (if .lane_local_manifest.status == "absent" then
+                .lane_local_manifest.owner_issue != null
+              else
+                true
+              end)
+            ))
+            ' "$out_path" >/dev/null
+
+          printf '%s\n' "$out_path"
+
+      - name: Upload candidate evidence index
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-evidence-index
+          path: release-candidate-evidence-index/index.json
+          if-no-files-found: error
           retention-days: 14
