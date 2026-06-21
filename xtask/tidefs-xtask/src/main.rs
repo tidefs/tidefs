@@ -2019,7 +2019,10 @@ fn print_help() {
         "  check-trace-oracle       validate trace oracle crate and replay golden trace corpus"
     );
     println!(
-        "  check-trace-oracle --compare-trace <path> compare model/local-runtime backends for one trace"
+        "  check-trace-oracle --trace <name> [--manifest <path>] replay one model trace and write a manifest"
+    );
+    println!(
+        "  check-trace-oracle --compare-trace <path> [--manifest <path>] compare model/local-runtime backends and write a manifest"
     );
     println!("  check-crash-oracle       validate crash oracle crate and crash matrix artifact");
     println!("  check-contract-codecs    validate request contract codec golden vectors");

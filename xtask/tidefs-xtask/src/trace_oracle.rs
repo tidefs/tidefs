@@ -4,10 +4,14 @@
 //! Validates the `tidefs-trace-oracle` crate and the golden trace corpus by
 //! running crate tests and replaying all pool traces from `traces/MANIFEST.json`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tidefs_trace_oracle::backend::compare_model_and_runtime_trace;
+use tidefs_trace_oracle::artifact_manifest::{
+    default_manifest_path, generated_at_now_utc, sanitize_artifact_id, ArtifactRunResult,
+    TraceArtifactManifest, TRACE_ARTIFACT_BACKEND_COMPARE,
+};
+use tidefs_trace_oracle::backend::{compare_model_and_runtime_trace, BACKEND_MODEL};
 use tidefs_trace_oracle::manifest::{load_manifest, print_results, verify_trace_corpus};
 
 /// Run the full check-trace-oracle gate.
@@ -30,9 +34,7 @@ pub fn check_trace_oracle_current_workspace_with_args(
                 let trace = args
                     .next()
                     .ok_or_else(|| "--compare-trace requires a path".to_string())?;
-                if let Some(extra) = args.next() {
-                    return Err(format!("unexpected check-trace-oracle argument: {extra}"));
-                }
+                let requested_manifest_path = parse_manifest_path(&mut args)?;
                 let trace_path = if PathBuf::from(&trace).is_absolute() {
                     PathBuf::from(trace)
                 } else {
@@ -40,6 +42,25 @@ pub fn check_trace_oracle_current_workspace_with_args(
                 };
                 let comparison = compare_model_and_runtime_trace(&trace_path)
                     .map_err(|e| format!("backend comparison failed: {e}"))?;
+                let trace_path_label = trace_path_label(&repo_root, &trace_path);
+                let trace_descriptor = trace_descriptor_from_label(&trace_path_label);
+                let manifest = TraceArtifactManifest::local_comparison(
+                    &comparison,
+                    trace_path_label.clone(),
+                    trace_descriptor.clone(),
+                    generated_at_now_utc(),
+                )
+                .map_err(|e| format!("trace artifact manifest failed: {e}"))?;
+                let manifest_path = requested_manifest_path.unwrap_or_else(|| {
+                    default_manifest_path(
+                        &repo_root,
+                        &trace_descriptor,
+                        TRACE_ARTIFACT_BACKEND_COMPARE,
+                    )
+                });
+                manifest
+                    .write_json_file(&manifest_path)
+                    .map_err(|e| format!("write {}: {e}", manifest_path.display()))?;
                 println!("trace: {}", trace_path.display());
                 println!(
                     "model final fingerprint: {}",
@@ -51,6 +72,7 @@ pub fn check_trace_oracle_current_workspace_with_args(
                         .final_fingerprint("local_runtime")
                         .unwrap_or("(none)")
                 );
+                println!("artifact manifest: {}", manifest_path.display());
                 if let Some(first) = comparison.mismatches.first() {
                     return Err(first.to_string());
                 }
@@ -61,10 +83,12 @@ pub fn check_trace_oracle_current_workspace_with_args(
                 let trace_name = args
                     .next()
                     .ok_or_else(|| "--trace requires a trace name".to_string())?;
-                if let Some(extra) = args.next() {
-                    return Err(format!("unexpected check-trace-oracle argument: {extra}"));
-                }
-                return run_model_determinism_check(&repo_root, &trace_name);
+                let requested_manifest_path = parse_manifest_path(&mut args)?;
+                return run_model_determinism_check(
+                    &repo_root,
+                    &trace_name,
+                    requested_manifest_path,
+                );
             }
             other => return Err(format!("unknown check-trace-oracle argument: {other}")),
         }
@@ -116,7 +140,11 @@ pub fn check_trace_oracle_current_workspace_with_args(
 
 /// Replay a named trace through the model backend twice and verify
 /// deterministic output (same trace in, same fingerprint out across runs).
-fn run_model_determinism_check(repo_root: &PathBuf, trace_name: &str) -> Result<(), String> {
+fn run_model_determinism_check(
+    repo_root: &Path,
+    trace_name: &str,
+    requested_manifest_path: Option<PathBuf>,
+) -> Result<(), String> {
     use tidefs_trace_oracle::backend::{run_trace_with_backend, ModelTraceBackend};
 
     // Look up the trace by name/id from MANIFEST.json.
@@ -127,8 +155,8 @@ fn run_model_determinism_check(repo_root: &PathBuf, trace_name: &str) -> Result<
             manifest_path.display()
         ));
     }
-    let manifest = load_manifest(&manifest_path)
-        .map_err(|e| format!("failed to load manifest: {e}"))?;
+    let manifest =
+        load_manifest(&manifest_path).map_err(|e| format!("failed to load manifest: {e}"))?;
 
     let item = manifest
         .items
@@ -177,7 +205,29 @@ fn run_model_determinism_check(repo_root: &PathBuf, trace_name: &str) -> Result<
     println!("run 1 fingerprint: {fp_a}");
     println!("run 2 fingerprint: {fp_b}");
 
-    if fp_a == fp_b {
+    let result = if fp_a == fp_b {
+        ArtifactRunResult::Pass
+    } else {
+        ArtifactRunResult::Fail
+    };
+    let trace_path_label = trace_path_label(repo_root, &trace_path);
+    let manifest = TraceArtifactManifest::model_replay(
+        &trace_path,
+        trace_path_label,
+        item.id.clone(),
+        &events_a,
+        result,
+        generated_at_now_utc(),
+    )
+    .map_err(|e| format!("trace artifact manifest failed: {e}"))?;
+    let manifest_path = requested_manifest_path
+        .unwrap_or_else(|| default_manifest_path(repo_root, &item.id, BACKEND_MODEL));
+    manifest
+        .write_json_file(&manifest_path)
+        .map_err(|e| format!("write {}: {e}", manifest_path.display()))?;
+    println!("artifact manifest: {}", manifest_path.display());
+
+    if result == ArtifactRunResult::Pass {
         println!("model determinism check: PASS");
         Ok(())
     } else {
@@ -185,6 +235,40 @@ fn run_model_determinism_check(repo_root: &PathBuf, trace_name: &str) -> Result<
             "model determinism check: FAIL (fingerprints differ: {fp_a} vs {fp_b})"
         ))
     }
+}
+
+fn parse_manifest_path(args: &mut impl Iterator<Item = String>) -> Result<Option<PathBuf>, String> {
+    let mut manifest_path = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--manifest" => {
+                if manifest_path.is_some() {
+                    return Err("duplicate check-trace-oracle --manifest argument".into());
+                }
+                let path = args
+                    .next()
+                    .ok_or_else(|| "--manifest requires a path".to_string())?;
+                manifest_path = Some(PathBuf::from(path));
+            }
+            other => return Err(format!("unexpected check-trace-oracle argument: {other}")),
+        }
+    }
+    Ok(manifest_path)
+}
+
+fn trace_path_label(repo_root: &Path, trace_path: &Path) -> String {
+    trace_path
+        .strip_prefix(repo_root)
+        .unwrap_or(trace_path)
+        .display()
+        .to_string()
+}
+
+fn trace_descriptor_from_label(trace_path_label: &str) -> String {
+    let without_jsonl = trace_path_label
+        .strip_suffix(".jsonl")
+        .unwrap_or(trace_path_label);
+    sanitize_artifact_id(without_jsonl)
 }
 
 fn find_repo_root() -> Result<PathBuf, String> {
