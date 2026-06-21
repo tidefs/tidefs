@@ -38,10 +38,10 @@ exercised by `cargo test -p tidefs-schema-codec-vfs --all-targets`.
 This document is not proof that TideFS is kernelspace-ready. It does not freeze
 a production Linux ioctl, statx, or ublk ABI, and it is not a kernel-module ABI
 freeze. The preview boundary mirrors are development scaffolding that will
-change before any production release. This document also does not define the
-final distributed operator UAPI; cluster prototypes and development diagnostics
-remain non-release surfaces. Production UAPI/ABI freeze requires a separate
-tracked GitHub issue with implementation proof and an explicit freeze decision.
+change before any production release. Cluster prototypes and development
+diagnostics are not final distributed operator UAPI and remain non-release
+surfaces. Production UAPI/ABI freeze requires a separate tracked GitHub issue
+with implementation proof and an explicit freeze decision.
 
 ## tidefsctl command classification contract
 
