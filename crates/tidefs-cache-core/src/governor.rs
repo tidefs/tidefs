@@ -249,6 +249,7 @@ impl GovernorConfig {
 /// `Governor` is `Send + Sync` and uses interior mutability via
 /// `Arc<Mutex<…>>`.  It is safe to share across concurrent FUSE worker
 /// threads and background job tasks.
+#[derive(Clone)]
 pub struct Governor {
     inner: Arc<Mutex<GovernorInner>>,
 }

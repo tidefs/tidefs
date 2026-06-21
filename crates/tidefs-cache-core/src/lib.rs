@@ -636,7 +636,7 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheStore<K, V> {
         }
     }
 
-    fn invalidate_by_key_prefix<F>(&mut self, predicate: F) -> usize
+    fn invalidate_by_key_prefix<F>(&mut self, predicate: F) -> Vec<CacheEntry<V>>
     where
         F: Fn(&K) -> bool,
     {
@@ -646,25 +646,29 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheStore<K, V> {
             .filter(|k| predicate(k))
             .cloned()
             .collect();
-        let count = keys_to_remove.len();
+        let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
-            self.entries.remove(&key);
+            if let Some(entry) = self.entries.remove(&key) {
+                removed.push(entry);
+            }
         }
-        count
+        removed
     }
 
-    fn invalidate_by_token(&mut self, token: ValidityToken) -> usize {
+    fn invalidate_by_token(&mut self, token: ValidityToken) -> Vec<CacheEntry<V>> {
         let keys_to_remove: Vec<K> = self
             .entries
             .iter()
             .filter(|(_, e)| !token.matches(e.header.validity_token))
             .map(|(k, _)| k.clone())
             .collect();
-        let count = keys_to_remove.len();
+        let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
-            self.entries.remove(&key);
+            if let Some(entry) = self.entries.remove(&key) {
+                removed.push(entry);
+            }
         }
-        count
+        removed
     }
 
     fn entries_iter(&self) -> impl Iterator<Item = (&K, &CacheEntry<V>)> {
@@ -785,24 +789,60 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
         entry: CacheEntry<V>,
     ) -> Option<CacheEntry<V>> {
         let size = entry.header.entry_size_bytes;
+        let replaced = if self.governor.is_some() {
+            self.stores
+                .get_mut(&class)
+                .and_then(|store| store.remove(&key))
+        } else {
+            None
+        };
+        if let Some(ref replaced_entry) = replaced {
+            self.release_entry(replaced_entry);
+        }
 
-        // Governor-aware admission with one eviction retry on OverBudget.
+        // Governor-aware admission with pressure shedding and one eviction
+        // retry on OverBudget.
         if let Some(ref gov) = self.governor {
+            let pressure = gov.backpressure(BudgetCategory::DataCache);
+            if matches!(
+                pressure,
+                BackpressureSignal::SoftPressure | BackpressureSignal::HardPressure
+            ) {
+                if let Some(store) = self.stores.get_mut(&class) {
+                    if let Some(victim) = store.evict_one() {
+                        gov.release(BudgetCategory::DataCache, victim.header.entry_size_bytes);
+                        self.total_evictions += 1;
+                    }
+                }
+            }
             match gov.admit(BudgetCategory::DataCache, size) {
                 Ok(_ticket) => {} // granted
-                Err(BudgetError::OverBudget { .. }) | Err(BudgetError::GlobalOverBudget { .. }) => {
+                Err(BudgetError::OverBudget { .. })
+                | Err(BudgetError::GlobalOverBudget { .. }) => {
                     // Try to free space: evict one entry from the same store.
                     if let Some(store) = self.stores.get_mut(&class) {
                         if let Some(victim) = store.evict_one() {
-                            gov.release(BudgetCategory::DataCache, victim.header.entry_size_bytes);
+                            gov.release(
+                                BudgetCategory::DataCache,
+                                victim.header.entry_size_bytes,
+                            );
+                            self.total_evictions += 1;
                         }
                     }
                     // Retry admission after eviction.
                     if gov.admit(BudgetCategory::DataCache, size).is_err() {
-                        return None; // admission still rejected
+                        if replaced.is_some() {
+                            self.total_evictions += 1;
+                        }
+                        return replaced; // admission still rejected
                     }
                 }
-                Err(_) => return None, // UnknownCategory or other
+                Err(_) => {
+                    if replaced.is_some() {
+                        self.total_evictions += 1;
+                    }
+                    return replaced;
+                }
             }
         }
 
@@ -816,7 +856,12 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
             self.total_evictions += 1;
             self.release_entry(evicted_entry);
         }
-        evicted
+        if replaced.is_some() {
+            self.total_evictions += 1;
+            replaced
+        } else {
+            evicted
+        }
     }
 
     /// Remove an entry from the cache for the given class.
@@ -835,8 +880,12 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
         F: Fn(&K) -> bool,
     {
         if let Some(store) = self.stores.get_mut(&class) {
-            let count = store.invalidate_by_key_prefix(predicate);
+            let removed = store.invalidate_by_key_prefix(predicate);
+            let count = removed.len();
             self.total_invalidations += count as u64;
+            for entry in &removed {
+                self.release_entry(entry);
+            }
             count
         } else {
             0
@@ -847,10 +896,16 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
     /// Returns the total number of entries invalidated.
     pub fn invalidate_by_token(&mut self, token: ValidityToken) -> usize {
         let mut count = 0;
+        let mut removed_entries = Vec::new();
         for store in self.stores.values_mut() {
-            count += store.invalidate_by_token(token);
+            let mut removed = store.invalidate_by_token(token);
+            count += removed.len();
+            removed_entries.append(&mut removed);
         }
         self.total_invalidations += count as u64;
+        for entry in &removed_entries {
+            self.release_entry(entry);
+        }
         count
     }
 
@@ -858,9 +913,12 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
     /// Returns the number of entries removed.
     pub fn invalidate_all(&mut self, class: CacheClass) -> usize {
         if let Some(store) = self.stores.get_mut(&class) {
-            let count = store.len();
-            store.invalidate_by_key_prefix(|_| true);
+            let removed = store.invalidate_by_key_prefix(|_| true);
+            let count = removed.len();
             self.total_invalidations += count as u64;
+            for entry in &removed {
+                self.release_entry(entry);
+            }
             count
         } else {
             0
@@ -1162,6 +1220,19 @@ mod tests {
         h
     }
 
+    fn data_cache_governor(total_budget_bytes: u64) -> Governor {
+        Governor::new(GovernorConfig {
+            total_budget_bytes,
+            data_cache_fraction: 1.0,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
+    }
+
     // ── CacheEntry tests ─────────────────────────────────────────────
 
     #[test]
@@ -1295,9 +1366,106 @@ mod tests {
             );
         }
 
-        let count = reg.invalidate_by_key_prefix(CacheClass::PosixNamespaceMirror, |k| *k < 3);
+        let count =
+            reg.invalidate_by_key_prefix(CacheClass::PosixNamespaceMirror, |k| *k < 3);
         assert_eq!(count, 3);
         assert_eq!(reg.entry_count(CacheClass::PosixNamespaceMirror), 2);
+    }
+
+    #[test]
+    fn registry_governor_releases_budget_on_invalidation() {
+        let governor = data_cache_governor(1000);
+        let mut reg: CacheLatticeRegistry<u64, String> = CacheLatticeRegistry::new();
+        reg.set_governor(governor.clone());
+        reg.register_cache(CacheClass::PosixNamespaceMirror, 10, EvictionPolicyKind::Lru);
+
+        for i in 0..5 {
+            let mut h = make_servable_header(i);
+            h.entry_size_bytes = 100;
+            reg.insert(
+                CacheClass::PosixNamespaceMirror,
+                i,
+                CacheEntry::new(h, format!("val{i}")),
+            );
+        }
+
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 500);
+        let count = reg.invalidate_by_key_prefix(CacheClass::PosixNamespaceMirror, |k| *k < 3);
+        assert_eq!(count, 3);
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 200);
+
+        let count = reg.invalidate_all(CacheClass::PosixNamespaceMirror);
+        assert_eq!(count, 2);
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
+    }
+
+    #[test]
+    fn registry_governor_replacement_releases_before_admission() {
+        let governor = data_cache_governor(100);
+        let mut reg: CacheLatticeRegistry<u64, String> = CacheLatticeRegistry::new();
+        reg.set_governor(governor.clone());
+        reg.register_cache(CacheClass::PosixNamespaceMirror, 10, EvictionPolicyKind::Lru);
+
+        let mut old_header = make_servable_header(1);
+        old_header.entry_size_bytes = 100;
+        old_header.evictability = EvictabilityClass::Pinned;
+        reg.insert(
+            CacheClass::PosixNamespaceMirror,
+            1,
+            CacheEntry::new(old_header, "old".into()),
+        );
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 100);
+
+        let mut new_header = make_servable_header(1);
+        new_header.entry_size_bytes = 100;
+        new_header.evictability = EvictabilityClass::Pinned;
+        let evicted = reg.insert(
+            CacheClass::PosixNamespaceMirror,
+            1,
+            CacheEntry::new(new_header, "new".into()),
+        );
+
+        assert_eq!(evicted.unwrap().value, "old");
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 100);
+        assert_eq!(
+            reg.get(CacheClass::PosixNamespaceMirror, &1)
+                .unwrap()
+                .value,
+            "new"
+        );
+    }
+
+    #[test]
+    fn registry_governor_consumes_soft_pressure_on_insert() {
+        let governor = data_cache_governor(1000);
+        let mut reg: CacheLatticeRegistry<u64, String> = CacheLatticeRegistry::new();
+        reg.set_governor(governor.clone());
+        reg.register_cache(CacheClass::PosixNamespaceMirror, 10, EvictionPolicyKind::Lru);
+
+        let mut first = make_servable_header(1);
+        first.entry_size_bytes = 700;
+        reg.insert(
+            CacheClass::PosixNamespaceMirror,
+            1,
+            CacheEntry::new(first, "first".into()),
+        );
+        assert_eq!(
+            governor.backpressure(BudgetCategory::DataCache),
+            BackpressureSignal::SoftPressure
+        );
+
+        let mut second = make_servable_header(2);
+        second.entry_size_bytes = 50;
+        reg.insert(
+            CacheClass::PosixNamespaceMirror,
+            2,
+            CacheEntry::new(second, "second".into()),
+        );
+
+        assert_eq!(reg.eviction_count(), 1);
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 50);
+        assert!(reg.get(CacheClass::PosixNamespaceMirror, &1).is_none());
+        assert!(reg.get(CacheClass::PosixNamespaceMirror, &2).is_some());
     }
 
     #[test]
