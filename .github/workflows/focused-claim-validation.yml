@@ -137,7 +137,14 @@ jobs:
           case "$MODE" in
             validate-claim)
               echo "- Command: \`cargo run -p tidefs-xtask -- validate-claim '$CLAIM_ID'\`" >> "$GITHUB_STEP_SUMMARY"
-              nix develop .#ci --command cargo run -p tidefs-xtask -- validate-claim "$CLAIM_ID"
+              output=$(nix develop .#ci --command cargo run -p tidefs-xtask -- validate-claim "$CLAIM_ID" 2>&1)
+              claim_exit=$?
+              echo "$output"
+              claim_status=$(echo "$output" | grep -oP '^status:\s+\K\S+' || echo "UNKNOWN")
+              echo "claim_status=$claim_status" >> "$GITHUB_OUTPUT"
+              if [[ "$claim_exit" -ne 0 ]]; then
+                exit "$claim_exit"
+              fi
               ;;
             check-claims-gate)
               echo "- Command: \`cargo run -p tidefs-xtask -- check-claims-gate\`" >> "$GITHUB_STEP_SUMMARY"
@@ -166,7 +173,14 @@ jobs:
       - name: Report result
         if: always()
         run: |
-          if [[ "${{ steps.run.outcome }}" == "success" ]]; then
+          claim_status="${{ steps.run.outputs.claim_status }}"
+          if [[ "$claim_status" == "BLOCKED" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Result**: blocked" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$claim_status" == "PASS" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Result**: passed" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${{ steps.run.outcome }}" == "success" ]]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "**Result**: passed" >> "$GITHUB_STEP_SUMMARY"
           else

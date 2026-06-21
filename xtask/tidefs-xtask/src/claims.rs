@@ -261,7 +261,7 @@ pub enum ClaimValidationFormat {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum ClaimReceiptStatus {
+pub enum ClaimReceiptStatus {
     Pass,
     Blocked,
     Fail,
@@ -783,7 +783,7 @@ fn check_source_bound_claim_rules(missing: &mut Vec<String>) {
 pub fn validate_claim_current_workspace(
     id: &str,
     format: ClaimValidationFormat,
-) -> Result<bool, ClaimValidationError> {
+) -> Result<ClaimReceiptStatus, ClaimValidationError> {
     let root = find_workspace_root().ok_or_else(|| ClaimValidationError {
         failures: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
@@ -813,7 +813,7 @@ pub fn validate_claim_current_workspace(
     render_claim_validation_receipt(&receipt, format).map_err(|failure| ClaimValidationError {
         failures: vec![failure],
     })?;
-    Ok(receipt.status.is_pass())
+    Ok(receipt.status)
 }
 
 fn render_claim_validation_receipt(

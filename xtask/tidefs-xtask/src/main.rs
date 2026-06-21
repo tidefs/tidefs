@@ -786,8 +786,8 @@ fn main() {
                 }
             };
             match claims::validate_claim_current_workspace(&claim_id, format) {
-                Ok(true) => {}
-                Ok(false) => process::exit(1),
+                Ok(claims::ClaimReceiptStatus::Pass) | Ok(claims::ClaimReceiptStatus::Blocked) => {}
+                Ok(claims::ClaimReceiptStatus::Fail) => process::exit(1),
                 Err(err) => {
                     eprintln!("{err}");
                     process::exit(1);
