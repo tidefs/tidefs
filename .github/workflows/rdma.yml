@@ -58,7 +58,7 @@ jobs:
           ARTIFACT_ROOT: ${{ matrix.artifact_root }}
         run: |
           set -euo pipefail
-          rm -rf "$ARTIFACT_ROOT"
+          rm -rf /tmp/tidefs-rdma-two-node /tmp/tidefs-validation
           mkdir -p "$ARTIFACT_ROOT"
           {
             printf 'workflow=%s\n' "$GITHUB_WORKFLOW"
@@ -230,7 +230,13 @@ jobs:
           fi
 
           FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          ARTIFACT_PATHS="$(cd "$ARTIFACT_ROOT" && find . -type f -not -name evidence-manifest.json -printf '%P\n' | sort | paste -sd ',' -)"
+          ARTIFACT_PATHS="$(
+            cd "$ARTIFACT_ROOT"
+            find . -type f \
+              | sed 's#^\./##' \
+              | sort \
+              | awk '$0 != "evidence-manifest.json" { paths = paths sep $0; sep = "," } END { print paths }'
+          )"
           if [[ -z "$ARTIFACT_PATHS" ]]; then
             ARTIFACT_PATHS="none"
           fi
