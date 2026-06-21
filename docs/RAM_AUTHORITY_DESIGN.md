@@ -34,6 +34,9 @@ describe the reviewed live PR authority, not a file that exists on
   POSIX sync honesty rule, RAM pool class list, and child issue map.
 - GitHub issues #841, #842, and #846 for the intended storage-intent record,
   local acknowledgment receipt, and transport path evidence slices.
+- GitHub issue #894 for storage-intent ordering and replay evidence: barrier
+  scope, dirty epoch, dependency closure, replay idempotency, intent sequence,
+  publication boundary, and completion state.
 - `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`: cache is not authority, every
   cache entry is evictable only under its cache law, and dirty state must drain
   through explicit state machines.
@@ -76,7 +79,7 @@ use issue-scoped follow-ups with non-overlapping write sets.
 | --- | --- | --- | --- |
 | `ram-volatile-local` | Bytes are authoritative only inside one local process or host RAM authority instance. | Local volatile receipt. | Never sufficient. |
 | `ram-volatile-replicated` | Bytes are authoritative across a fenced volatile peer set for the current membership epoch. | Fenced volatile peer receipts. | Never sufficient. |
-| `ram-intent-backed` | RAM serves hot bytes while durable local or quorum intent earns the configured barrier. | RAM serving receipt plus durable intent receipt. | Sufficient only when the durable intent receipt satisfies the configured floor. |
+| `ram-intent-backed` | RAM serves hot bytes while durable local or quorum intent earns the configured barrier. | RAM serving receipt plus durable intent receipt. | Sufficient only when the durable intent and ordering/replay evidence satisfy the configured floor. |
 | `pmem-durable` | Bytes are persisted in PMem/NVDIMM-class media with platform persistence-domain and flush/fence evidence. | Persistent-memory flush/fence receipt. | Sufficient only when metadata, ordering, and recovery evidence also satisfy the floor. |
 
 ### `ram-volatile-local`
@@ -168,6 +171,9 @@ Required receipt evidence:
   equivalent durable intent evidence;
 - intent payload or locator strong enough for replay to reconstruct the bytes;
 - intent flush/fence evidence for the configured floor;
+- ordering/replay evidence refs from #894 covering barrier scope, dirty epoch,
+  dependency closure, replay idempotency key, intent sequence, publication
+  boundary, and completion state;
 - mapping from the RAM generation to the durable intent generation;
 - replay order relative to committed roots, page-cache writeback, and subsequent
   placement receipts;
@@ -184,6 +190,9 @@ Semantics:
 - If durable intent append, flush, or quorum receipt fails, the write may still
   have a volatile receipt, but the durable barrier must return an error,
   block, retry, or explicitly report the weaker unsafe receipt.
+- Batching, sharding, coalescing, pipelining, or quorum fanout can optimize a
+  durable RAM path only after the #894 ordering/replay gates prove the
+  caller-visible barrier and replay contract.
 - Subsequent full placement may retire the durable intent only after replacement
   placement receipts are published and replay no longer needs the intent.
 
@@ -205,6 +214,8 @@ Required receipt evidence:
 - store fence, drain, or ordering evidence before the receipt is issued;
 - metadata persistence evidence for the locator that makes the bytes
   reachable after restart;
+- ordering/replay evidence refs when PMem satisfies durable intent or a
+  caller-visible barrier rather than only holding already-ordered data;
 - recovery scanner or committed-root evidence that can distinguish complete,
   partial, stale, and poisoned PMem generations;
 - `lost_if` for media failure, platform profile mismatch, incomplete flush,
@@ -214,6 +225,9 @@ Semantics:
 
 - PMem can satisfy a durable barrier only for ranges whose bytes and recovery
   metadata are both persisted and ordered.
+- Wrong-root, wrong-range, non-idempotent, unsealed, contradictory, or incomplete
+  ordering evidence leaves the PMem receipt unknown, blocked, refused, or
+  degraded-visible according to policy; it is not a successful durable barrier.
 - A CPU cache store to a PMem mapping is not a receipt. Flush/fence evidence is
   required unless the platform profile proves that the persistence domain
   already includes the relevant caches.
@@ -240,6 +254,12 @@ Failure classification must be range- and generation-aware. A dataset may have
 some bytes intentionally volatile, some bytes intent-backed, and some bytes
 fully placed on durable media at the same time.
 
+For `ram-intent-backed` and `pmem-durable`, replay after durable intent also
+depends on #894 ordering evidence. Missing, stale, unsealed, wrong-root,
+wrong-range, non-idempotent, partial-namespace, lost writeback-error,
+under-quorum, or contradictory ordering evidence cannot be hidden by a RAM or
+PMem receipt.
+
 ## Storage-Intent Consumption
 
 The storage-intent core records from #841 should carry the RAM authority
@@ -253,8 +273,8 @@ record surface needs at least:
 - requested guarantee floor and earned receipt class;
 - `lost_if` and `survives` vectors for operator explanation;
 - resource-governor budget category and admission receipt;
-- local intent, quorum intent, placement, PMem, transport, membership epoch,
-  and fencing evidence refs when present;
+- local intent, quorum intent, ordering/replay, placement, PMem, transport,
+  membership epoch, and fencing evidence refs when present;
 - downgrade/refusal reason when the requested floor could not be earned.
 
 The local ack receipt work in #842 should emit or consume these records at
@@ -262,6 +282,12 @@ write, `fsync`, `fdatasync`, `O_DSYNC`, FUA, and shared mmap sync boundaries.
 The transport evidence work in #846 should supply path and carrier evidence
 for volatile peer receipts, but membership/runtime authority must still supply
 epoch and fencing proof.
+
+Issue #894 owns the shared ordering-evidence model that RAM authority consumes
+when it emits, interprets, reconciles, plans, schedules, explains, validates,
+or claims durable intent receipts. RAM authority may serve bytes fast, but it
+may not weaken barrier scope, dependency closure, replay idempotency, intent
+sequence, publication boundary, or completion state.
 
 ## Resource-Governor Boundary
 
@@ -293,9 +319,9 @@ auditable, and monotonic with respect to already-issued guarantees.
 | --- | --- | --- |
 | Cache -> `ram-volatile-local` | A compiled policy requests volatile authority and a resource-governor authority budget is admitted. | The caller only asked for read cache or the system would create the only authoritative copy from an evictable entry. |
 | `ram-volatile-local` -> `ram-volatile-replicated` | Fenced peers acknowledge the same generation under the committed epoch. | Peer receipts, epoch, or fencing evidence are missing or stale. |
-| Volatile RAM -> `ram-intent-backed` | Durable local or quorum intent covers the same generation before any durable barrier success is reported. | Intent append/flush/quorum evidence fails or does not cover the bytes strongly enough for replay. |
-| `ram-intent-backed` -> durable media placement | Replacement placement receipts are published and recovery no longer needs the intent for those bytes. | Placement is incomplete, stale, below policy, or would retire intent before replay is safe. |
-| `ram-intent-backed` -> `pmem-durable` | PMem flush/fence plus metadata persistence covers the same generation and role. | Platform persistence-domain, flush/fence, media health, or metadata evidence is missing. |
+| Volatile RAM -> `ram-intent-backed` | Durable local or quorum intent and #894 ordering evidence cover the same generation before any durable barrier success is reported. | Intent append/flush/quorum or ordering/replay evidence fails or does not cover the bytes strongly enough for replay. |
+| `ram-intent-backed` -> durable media placement | Replacement placement receipts are published and recovery no longer needs the intent for those bytes. | Placement is incomplete, stale, below policy, or would retire intent before replay and ordering evidence are safe. |
+| `ram-intent-backed` -> `pmem-durable` | PMem flush/fence plus metadata persistence and ordering evidence cover the same generation and role. | Platform persistence-domain, flush/fence, media health, metadata, or ordering evidence is missing. |
 | `pmem-durable` -> ordinary durable media | New durable placement receipts satisfy policy before PMem receipt retirement. | The move would lose the only durable authority or leave recovery metadata behind. |
 | Any durable class -> volatile RAM | Operator explicitly weakens policy for future writes and existing durable receipts remain historically true. | Existing bytes would be reclassified weaker without a policy revision and operator-visible consent. |
 | Any authority -> cache | Replacement authority exists, the old receipt is retired, or the product declares the volatile-loss event. | The bytes would remain reachable only through evictable cache. |
@@ -319,6 +345,8 @@ file, range, or pool:
 - the exact authority class for each reported range or generation;
 - which policy revision requested that class;
 - the last earned receipt and the evidence refs behind it;
+- ordering/replay evidence state for durable intent, PMem, and receipt
+  retirement;
 - what failures would lose the bytes;
 - what failures the bytes are expected to survive;
 - whether a durable intent replay is pending, complete, failed, or not
@@ -342,6 +370,7 @@ This docs slice maps to existing and future implementation work as follows:
 | --- | --- | --- |
 | Storage-intent RAM class records and receipt spellings | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests |
 | Local durable intent receipt emission | #842 | `crates/tidefs-local-filesystem/src/` and local intent-log/writeback-adjacent modules |
+| Storage-intent ordering and replay evidence | #894 | model surface selected by #894, with runtime paths excluded until that issue expands its write set |
 | Transport path evidence for volatile peer receipts | #846 | `crates/tidefs-transport/src/` |
 | Intent-aware admission and memory/QoS scheduling | #862 | scheduler or admission crate named by that issue |
 | Operator explanation of volatility and receipts | #849 | `apps/tidefsctl/` and operator docs |
