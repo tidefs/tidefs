@@ -73,6 +73,14 @@ in-flight fences, convergence frontiers, and mixed-revision explanation say
 which operations use the old revision, which use the new revision, and which
 receipts still owe convergence.
 
+Tenant and budget isolation evidence is the fairness counterpart. A plan is not
+high-performance because aggregate throughput improved while one dataset's bulk
+stream, rebuild, relocation, or geo catch-up destroys another tenant's p99 sync
+latency. It is legal only when budget-owner, isolation-scope, fair-share,
+borrowing/debt, starvation, noisy-neighbor, reserve-exemption, and
+throttle/refusal evidence say who is paying, who is protected, and which work is
+allowed to proceed under pressure.
+
 ## Non-Claims
 
 This document does not implement runtime behavior, change POSIX durability
@@ -164,6 +172,7 @@ The core records are:
 | `StorageIntentCapacityAdmissionEvidence` | Logical/physical headroom, allocation-ticket, claim/reserve ledger, dirty-window, pending-free, reserve-pressure, and ENOSPC/refusal evidence owned by #898 and sourced from capacity, allocator, reserve, scheduler, and lifecycle authorities. |
 | `StorageIntentRecoveryEvidence` | Degraded state, source receipt set, reconstruction width, missing/corrupt/stale target evidence, read-repair/rebuild obligation, replacement receipt publication, old-receipt retirement, partition/healing, RPO/RTO lag, and refusal evidence owned by #900 and sourced from placement receipts, scrub/repair/rebuild, membership, trust, ordering, capacity, layout, and lifecycle authorities. |
 | `StorageIntentPolicyRolloutEvidence` | Policy source provenance, compiled policy revision, publication transaction, change class, downgrade authorization, stage state, in-flight fence, convergence frontier, rollback/re-entry, supersession, and refusal evidence owned by #901 and sourced from policy config, authz/audit, operator runbook, satisfaction, and receipt authorities. |
+| `StorageIntentIsolationEvidence` | Tenant, dataset, policy/budget-owner, workload-class, isolation-scope, fair-share, burst, borrowing/debt, starvation, noisy-neighbor, reserve-exemption, throttle/defer, and refusal evidence owned by #902 and sourced from trust/domain, scheduler, resource-governor, cost, capacity, wear, transport, performance, and fault authorities. |
 | `StorageIntentDataShape` | Requested and earned encoded shape for a range or generation, including record sizing, transform ordering, digest suite, dedup/encryption/EC compatibility, and rebake evidence. |
 | `StorageIntentLayoutEvidence` | Allocator and physical-layout evidence for fragmentation, free runs, alignment, zone/write-pointer state, pending frees, reclaim debt, and locality. |
 | `StorageIntentLifecycleEvidence` | Generation and retention evidence for write age, stability, snapshots, clones, receive bases, orphans, destroy/tombstone state, and reclaim frontiers. |
@@ -220,6 +229,10 @@ model predicates for:
   revision, publication transaction, change class, downgrade authorization,
   stage state, in-flight fences, convergence frontier, rollback/re-entry, and
   mixed-revision explanation state;
+- tenant and budget isolation legality, including budget-owner identity,
+  isolation scope, fair-share floor/ceiling, burst and borrowing law,
+  usage/debt ledger, starvation state, noisy-neighbor harm, reserve exemption,
+  and throttle/defer/refusal state;
 - volatile, durable-intent, full-placement, and RPO/lag dimensions;
 - media-role legality, including cache versus RAM authority separation;
 - data-shape legality, including transform compatibility, digest/integrity
@@ -249,6 +262,7 @@ The policy has these logical fields:
 | `capacity_admission_policy` | Required logical/physical headroom, quota/slop law, allocation-ticket and reserve-escrow treatment, dirty-window reserve, pending-free eligibility, protected-floor law, and ENOSPC/refusal behavior. |
 | `recovery_degradation_policy` | Required degraded-mode visibility, reconstruction width, read-repair/rebuild obligation, no-quorum/partition handling, RPO/RTO lag, replacement receipt publication, old-receipt retirement, and hidden-downgrade refusal behavior. |
 | `policy_rollout_policy` | Required revision publication, staging, downgrade authorization, old-receipt grandfathering, convergence obligation, rollback/re-entry, supersession, and mixed-revision explanation behavior. |
+| `isolation_policy` | Required tenant/dataset/workload budget owner, fair-share floor and ceiling, burst/borrow/debt law, noisy-neighbor treatment, starvation override, reserve-exemption, and throttle/refusal behavior. |
 | `media_role_policy` | Which media classes may hold intent, metadata, serving data, cold data, read cache, or scratch data. |
 | `workload_shape` | Workload envelope the planner should optimize for without changing hard guarantees. |
 | `data_shape_policy` | Record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake constraints. |
@@ -279,6 +293,7 @@ floors from optimizer weights:
 | Capacity and reserve | logical quota/slop, physical free-space class, allocation ticket, dirty-window reserve, protected repair/sync floors, pending-free safety | choose lower-amplification shape, delay optimizer, trigger reclaim, batch convergence |
 | Recovery and degradation | source receipt set, reconstruction width, visible degraded state, repair obligation, no-quorum/partition refusal, replacement receipt before retirement | prioritize repair, choose cheaper reconstruction source, batch rebuild, tune read-repair foreground cost |
 | Policy revision rollout | published revision, change class, downgrade authorization, in-flight fence, convergence frontier, rollback receipt, mixed-revision visibility | stage cohorts, prioritize convergence, batch rematerialization, defer low-risk generations |
+| Tenant and budget isolation | budget owner, isolation scope, p99/tail floor, fair-share floor/ceiling, borrowing law, reserve-exemption, throttle/refusal state | donate unused share, schedule bursts, rebalance lanes, demote noisy background work |
 | Wear and money | critical write reserve, WAF ceiling, egress/capacity budget | promote/demote only when payback beats movement debt |
 
 A candidate must satisfy all hard floors before scoring. Cost weights may pick
@@ -337,6 +352,8 @@ The compiler must produce:
 - rollout change class, stage state, downgrade authorization requirement,
   old-receipt treatment, in-flight fence requirements, and convergence
   obligation for the revision;
+- budget-owner, isolation-scope, fair-share, borrowing/debt, starvation,
+  noisy-neighbor, reserve-exemption, and throttle/refusal requirements;
 - the effective guarantee floor and failure-domain floor;
 - the ordering, replay, barrier, dirty-epoch, and dependency requirements;
 - the membership epoch, quorum, witness, drain/fence, and split-brain evidence
@@ -400,6 +417,9 @@ The receipt must bind:
 - policy rollout refs where a revision change shaped admission, including
   source policy ref, compiled revision ref, publication transaction, stage
   state, in-flight fence, convergence frontier, or rollback/re-entry ref;
+- tenant/budget isolation refs where shared resources shaped admission,
+  including budget-owner, isolation-scope, fair-share, burst/borrow/debt,
+  starvation, noisy-neighbor, reserve-exemption, and throttle/refusal refs;
 - earned acknowledgment class;
 - subject id, object key, inode/range, or request id;
 - payload digest, range digest, or replay digest as appropriate;
@@ -438,13 +458,14 @@ owns the read-only reconciler that compares one compiled policy revision with
 the current evidence set and publishes the satisfaction state other subsystems
 must act on.
 
-The reconciler consumes policy snapshots, policy rollout evidence, ack
-receipts, placement receipts, transport path evidence, capacity/admission
-evidence, recovery/degradation evidence, media-wear and non-wear cost ledgers,
-workload signal snapshots, scheduler admission evidence, RAM authority
-receipts, relocation state, and validation artifacts. It does not recompute
-policy, select new placement, retire old receipts, emit ack receipts, or execute
-relocation. Its job is to make the current truth machine-readable:
+The reconciler consumes policy snapshots, policy rollout evidence,
+tenant/isolation evidence, ack receipts, placement receipts, transport path
+evidence, capacity/admission evidence, recovery/degradation evidence,
+media-wear and non-wear cost ledgers, workload signal snapshots, scheduler
+admission evidence, RAM authority receipts, relocation state, and validation
+artifacts. It does not recompute policy, select new placement, retire old
+receipts, emit ack receipts, or execute relocation. Its job is to make the
+current truth machine-readable:
 
 | State | Meaning |
 | --- | --- |
@@ -457,13 +478,14 @@ relocation. Its job is to make the current truth machine-readable:
 | `unsafe-volatile` | The policy intentionally requested weaker volatile/unsafe behavior and the receipt truth exposes that weaker guarantee. |
 
 Missing, stale, malformed, wrong-policy-revision, superseded-revision,
-missing-rollout-fence, under-reserved, expired-reserve, under-width,
-wrong-epoch, wrong-failure-domain, wrong-lifecycle,
+missing-rollout-fence, missing-budget-owner, over-budget, illegal-borrow,
+reserve-theft, noisy-neighbor-harm, under-reserved, expired-reserve,
+under-width, wrong-epoch, wrong-failure-domain, wrong-lifecycle,
 wrong-reconstruction-width, missing-repair-obligation, unknown-cost,
 unknown-WAF, cache-only, or contradictory evidence cannot satisfy a durable,
-geo, or low-latency floor by accident. They must become an explicit unknown,
-blocked, degraded, refused, or unsafe-visible state according to the compiled
-policy's degradation law.
+geo, isolation, or low-latency floor by accident. They must become an explicit
+unknown, blocked, degraded, refused, or unsafe-visible state according to the
+compiled policy's degradation law.
 
 This loop is what keeps the whole design native. A predictor may believe a
 range is hot, a planner may propose a move, a scheduler may admit a lane, and a
@@ -744,16 +766,83 @@ retire old placement receipts before replacement receipts exist.
 Admission evidence must be observable:
 
 - policy id and revision used for classification;
+- tenant, dataset, workload, policy, or internal-maintenance budget owner;
+- isolation scope and fair-share window used for classification;
 - action class and prediction confidence used for classification;
 - selected lane and priority class;
 - queue time and dispatch time;
 - resource budget that throttled or refused the operation;
+- borrowed budget, donation source, debt, reserve-exemption, or starvation
+  override used for the operation;
+- noisy-neighbor victim/offender state when admission is changed to protect p99
+  latency or a protected floor;
 - starvation override or repair escalation reason;
 - whether the work was dropped, deferred, admitted, or completed.
 
 This is the mechanism that lets TideFS optimize both latency and throughput
 without turning one tenant's bulk stream, rebuild, or geo catch-up into another
 tenant's p99 failure.
+
+## Tenant, Budget, And Noisy-Neighbor Isolation Authority
+
+Storage intent consumes scheduler, governor, cost, capacity, wear, transport,
+trust/domain, and performance evidence, but it still needs a native fairness
+projection. #902 owns the storage-intent evidence that says which tenant,
+dataset, workload class, policy owner, or internal maintenance reason is allowed
+to spend scarce resources while other promises remain protected.
+
+#902 does not dispatch work, partition daemon memory, account money, allocate
+space, count flash media writes, authenticate tenants, or run validation
+campaigns. It composes refs from those owners into the hard predicates that
+admission, receipt emission, planning, relocation, read serving, recovery, and
+operator explanation can all consume.
+
+The isolation evidence projection must distinguish at least:
+
+| Evidence field | Storage-intent use |
+| --- | --- |
+| `budget_owner_ref` | Names tenant, dataset, clone family, mount, workload class, policy owner, or internal-maintenance reason charged for the work. |
+| `tenant_domain_ref` | Cites #897 tenant/security/admin-domain eligibility so budget ownership is not inferred from a caller string. |
+| `isolation_scope_ref` | Binds the decision to pool, dataset, tenant, workload class, media role, proximity domain, transport path, device class, failure domain, or repair/relocation class. |
+| `resource_vector_ref` | Names the resources being protected or spent: latency/tail, throughput, queue time, dirty bytes, memory, transport window, device queue, capacity reserve, wear, repair bandwidth, relocation budget, geo backlog, money, or egress. |
+| `fair_share_policy_ref` | Defines floor, ceiling, weight, and fairness window for the owner/scope under the compiled policy. |
+| `burst_borrow_ref` | Records permitted burst, donor scope, reclaimability, expiry, and whether the borrowed share can be preempted. |
+| `isolation_debt_ref` | Tracks consumed burst/debt so repeated short bursts cannot become permanent priority inversion. |
+| `starvation_state_ref` | Shows oldest wait, starvation override, bounded progress rule, and whether the override counted against the correct budget. |
+| `noisy_neighbor_ref` | Identifies offender scope, victim scope, measured p95/p99 or queue harm, saturated resource vector, pressure age, and mitigation. |
+| `reserve_exemption_ref` | Cites policy, recovery, evacuation, quorum-safety, degraded-risk, or operator authorization evidence that allows temporary use of protected resources. |
+| `throttle_refusal_ref` | Gives typed throttle, defer, drop, downgrade-visible, or refusal reason for over-budget, unowned work, missing tenant/domain evidence, illegal borrow, reserve theft, starvation, stale pressure, or policy conflict. |
+
+Isolation legality is a hard gate:
+
+1. A global free resource or good average throughput does not prove a tenant,
+   dataset, workload, or internal-maintenance action may proceed.
+2. Every nontrivial foreground, background, repair, relocation, geo, RAM,
+   read-serving, or receipt-retirement action must carry a budget owner or fail
+   as unowned work.
+3. Scheduler lanes (#862) enforce dispatch, but #902 decides whether the lane
+   admission evidence satisfies the compiled isolation policy for the affected
+   owner and victim scope.
+4. Per-dataset memory partitions (#893), capacity admission (#898), non-wear
+   cost (#856), media wear (#844), transport backpressure (#846/#891), and
+   workload signals (#845) remain source evidence. None of them alone proves
+   cross-resource fairness.
+5. Borrowing unused share is legal only when the policy records donor scope,
+   expiry, reclaimability, debt, and preemption behavior. Borrowing from sync,
+   repair, evacuation, receipt-retirement, or quorum-safety reserve is illegal
+   unless a reserve-exemption ref says otherwise.
+6. Background optimizers, serving trials, one-pass scans, defrag, rebake,
+   rebuild, relocation, and geo catch-up must demote, pause, split, or refuse
+   when their measured harm exceeds the protected victim floor.
+7. Repair, evacuation, and degraded-risk reduction may preempt ordinary
+   fairness only through visible reserve-exemption and debt evidence, so the
+   operator can see why normal isolation changed.
+8. Internet and WAN work must be charged to both transport/egress budgets and
+   tenant or policy owner scopes. A remote backlog may not consume unbounded
+   foreground, repair, or egress budget because the path is slow or lossy.
+9. Missing, stale, contradictory, over-budget, unowned, illegal-borrow, or
+   reserve-theft evidence becomes `unknown-evidence`, `blocked`, `throttled`,
+   or `refused`; it is not converted into "best effort" throughput silently.
 
 ## Capacity Admission, Reserve, And ENOSPC Authority
 
@@ -1833,6 +1922,21 @@ signal changes materially.
 4. Repair or evacuation may still escalate if policy grants critical reserve,
    but optional movement cannot borrow that floor.
 
+### Tenant Bulk Scan Versus Sync WAL
+
+1. Tenant A starts a large sequential scan or backup ingest that can fill device
+   queues, transport windows, read cache, and dirty-byte budget.
+2. Tenant B runs a small sync WAL workload with an explicit p99/fdatasync floor.
+3. #902 isolation evidence names both budget owners, isolation scopes,
+   fair-share windows, resource vectors, and the victim p99 floor.
+4. The scheduler may donate unused share to Tenant A while Tenant B is idle, but
+   the donation carries burst expiry and debt.
+5. When Tenant B's queue time or p99 risk approaches the floor, Tenant A's scan
+   is demoted, split, throttled, or refused before Tenant B's sync receipt is
+   weakened.
+6. Operator explanation reports the noisy-neighbor mitigation, borrowed budget
+   debt, and any throughput left unused to protect the latency contract.
+
 ### Hot Small Read Set
 
 1. Repeated small reads produce a high-confidence hot working set.
@@ -2068,6 +2172,10 @@ The operator UAPI should eventually answer:
   missing/corrupt/stale targets, no-quorum or partition state, repair/rebuild
   obligation, replacement receipt publication, old-receipt retirement frontier,
   RPO/RTO lag, and typed recovery refusal?
+- Which tenant, dataset, workload class, policy owner, or internal-maintenance
+  reason owns the budget, which isolation scope was protected, and which
+  fair-share, burst, borrow, debt, starvation, noisy-neighbor, reserve-exemption,
+  throttle, or refusal evidence shaped admission?
 - How much flash endurance did this dataset consume?
 - Which relocation jobs were skipped because the wear or foreground-latency
   budget was not worth spending?
@@ -2096,6 +2204,9 @@ Initial row families should cover:
 - policy revision rollout behavior for dry-run, preflight, staged,
   active-for-new-writes, converging-existing, rollback, supersession, and
   unsafe downgrade refusal while old and new receipts coexist;
+- tenant/workload isolation rows for sync latency protected from bulk ingest,
+  one-pass scans, serving trials, rebuild, relocation, and geo catch-up under
+  mixed-owner pressure;
 - full-placement fsync latency;
 - VM FUA/barrier tail latency;
 - metadata storm p99 and fsyncdir latency;
@@ -2138,6 +2249,10 @@ Each row must bind:
 - policy rollout evidence, including source refs, change class, stage state,
   publication transaction, in-flight fence, convergence frontier, rollback or
   supersession refs, and downgrade refusal where relevant;
+- isolation evidence, including budget owner, tenant/domain refs, isolation
+  scope, fair-share window, resource vector, burst/borrow/debt state,
+  starvation state, noisy-neighbor harm, reserve-exemption, and throttle/refusal
+  reason where relevant;
 - ordering evidence for barrier scope, dirty epoch, dependency closure, replay
   idempotency, intent sequence, and publication boundary;
 - membership epoch, quorum-set, participant-role, drain/fence, and
@@ -2240,6 +2355,13 @@ The matrix must cover at least these row families:
   fsync crossing a revision fence, relocation or receipt retirement crossing
   without re-entry, rollback receipt missing after partial stage, convergence
   frontier skipped, and mixed-revision state hidden from explanation.
+- isolation faults such as unowned work admitted, wrong tenant charged,
+  per-dataset memory budget bypassed, illegal burst borrowing from protected
+  sync/repair reserve, background relocation destroying foreground p99,
+  starvation override becoming unbounded, noisy-neighbor victim omitted,
+  internet geo catch-up exceeding tenant egress budget, repair reserve exemption
+  hidden, stale pressure evidence accepted, and throttle/refusal omitted from
+  explanation.
 
 Every row must name the requested policy revision, workload envelope,
 topology/media profile, fault schedule, earned receipt set, post-recovery
@@ -2249,14 +2371,16 @@ volatile or from `geo-intent` to `geo-async`, split-brain receipt publication,
 old locator retirement before replacement receipt publication, old receipts
 rewritten by policy change, hidden downgrade during policy rollout,
 mixed-revision receipt sets reported as fully converged, reserve/wear breach
-hidden behind successful relocation, stale or wrong-domain data-shape evidence
-accepted as satisfied, allocator mirror evidence accepted as authority, stale
-lifecycle evidence accepted as retained/reclaimable, bookmark-only anchors
-treated as data-retaining, pending-free bytes reused too early, and explanations
-that omit degradation, lag, volatility, trust-domain refusal, recovery
-obligation, replacement receipt blocker, transform block state,
-capacity/reserve refusal, policy rollout stage, in-flight fence, convergence
-frontier, lifecycle or layout blockers, or refusal.
+hidden behind successful relocation, budget-owner or noisy-neighbor harm hidden
+behind aggregate throughput, isolation debt erased, protected reserve borrowed
+without exemption, stale or wrong-domain data-shape evidence accepted as
+satisfied, allocator mirror evidence accepted as authority, stale lifecycle
+evidence accepted as retained/reclaimable, bookmark-only anchors treated as
+data-retaining, pending-free bytes reused too early, and explanations that omit
+degradation, lag, volatility, trust-domain refusal, recovery obligation,
+replacement receipt blocker, transform block state, capacity/reserve refusal,
+policy rollout stage, in-flight fence, convergence frontier, isolation scope,
+borrow/debt state, lifecycle or layout blockers, or refusal.
 
 The validation matrix cross-links with #850 where a scenario also has latency,
 tail, throughput, RPO, or wear/cost budgets. #850 measures whether TideFS is
@@ -2347,6 +2471,13 @@ This document composes existing authority surfaces:
   supersession, and typed rollout refusal. It composes #855 policy sources,
   authz/audit refs, operator runbook state, #874 satisfaction, and receipt
   evidence without replacing those owners.
+- #902 owns the storage-intent tenant/budget/noisy-neighbor isolation evidence
+  slice for budget-owner identity, isolation scope, fair-share windows, burst
+  borrowing, debt, starvation, noisy-neighbor harm, reserve exemptions, and typed
+  throttle/refusal state. It composes #897 trust/tenant-domain refs, #862 lane
+  evidence, #893 per-dataset memory accounting, #856 cost, #898 capacity, #844
+  wear, #846/#891 transport pressure, #850 performance, and #863 fault evidence
+  without replacing those owners.
 - `docs/security/transport-security-boundary.md`: transport security is
   session-level. Storage intent may require and cite session-security evidence,
   but it must not reintroduce per-message crypto proof markers.
@@ -2380,6 +2511,10 @@ This document composes existing authority surfaces:
   authority must be modeled explicitly.
 - `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`: admission, dirty debt, transport
   queues, and memory budgets are hard gates for any optimizer.
+- #893 and `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`: per-dataset memory
+  partitioning and governor pressure are source evidence for #902 isolation, but
+  storage intent owns the cross-resource policy question of whether an admitted
+  action is fair, borrowed, throttled, or refused for the current receipt.
 - `docs/SPACE_ACCOUNTING_MODEL_DESIGN.md`, `docs/SPACEMAP_ALLOCATOR_DESIGN.md`,
   `docs/LOCAL_STORAGE_ALLOCATOR_OW102.md`, and the claim/reserve ledger crates:
   quota, statfs, allocator, pending-free, allocation-ticket, claim, and reserve
@@ -2460,15 +2595,15 @@ storage-intent language beside the shared records and compiled policy snapshot.
 
 | Stage | Graduation gate | Issues |
 | --- | --- | --- |
-| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, trust/domain evidence refs, capacity/admission evidence refs, recovery/degradation evidence refs, policy-rollout evidence refs, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #878, #880, #881, #894, #897, #898, #900, #901 |
+| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, trust/domain evidence refs, capacity/admission evidence refs, recovery/degradation evidence refs, policy-rollout evidence refs, tenant/isolation evidence refs, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #878, #880, #881, #894, #897, #898, #900, #901, #902 |
 | Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
 | Policy revision rollout | Compiled revisions publish, stage, roll back, supersede, and converge with explicit source provenance, publication transaction, downgrade authz, in-flight fences, old-receipt treatment, and convergence frontiers. | #901 |
-| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894, #897, #898, #900, #901 |
-| Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile, including policy rollout stage and mixed-revision obligations. | #874, #901 |
-| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, trust/domain state, capacity/reserve state, recovery/degradation state, policy-rollout state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #862, #878, #880, #881, #894, #897, #898, #900, #901 |
-| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness, epoch/fence, trust/domain, capacity-for-repair, recovery/degradation, policy revision, and receipt evidence. | #750, #877, #675, #881, #897, #898, #900, #901 |
-| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement, ordering, trust/domain, capacity/admission, recovery/degradation, and policy-rollout evidence before source retirement. | #750, #847, #848, #878, #880, #881, #894, #897, #898, #900, #901 |
-| Operator and gates | Operators can inspect the policy, rollout stage, receipt, lag, volatility, cost, trust/domain, capacity/reserve, recovery/degradation, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875, #897, #898, #900, #901 |
+| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, tenant/isolation refs, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894, #897, #898, #900, #901, #902 |
+| Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile, including policy rollout stage, mixed-revision obligations, and tenant isolation state. | #874, #901, #902 |
+| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, trust/domain state, capacity/reserve state, recovery/degradation state, policy-rollout state, tenant/isolation state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #862, #878, #880, #881, #894, #897, #898, #900, #901, #902 |
+| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness, epoch/fence, trust/domain, capacity-for-repair, recovery/degradation, policy revision, tenant isolation, and receipt evidence. | #750, #877, #675, #881, #897, #898, #900, #901, #902 |
+| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement, ordering, trust/domain, capacity/admission, recovery/degradation, policy-rollout, and tenant/isolation evidence before source retirement. | #750, #847, #848, #878, #880, #881, #894, #897, #898, #900, #901, #902 |
+| Operator and gates | Operators can inspect the policy, rollout stage, receipt, lag, volatility, cost, trust/domain, capacity/reserve, recovery/degradation, isolation/throttle, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875, #897, #898, #900, #901, #902 |
 
 Interface gates between stages are explicit:
 
@@ -2480,7 +2615,8 @@ Interface gates between stages are explicit:
 - Planners may score only candidates that already passed guarantee,
   ordering/replay, membership/epoch/fence, trust/domain, failure-domain,
   data-shape, layout/allocator, lifecycle/generation, capacity, recovery,
-  policy-rollout, wear, transport, and degradation-law filters.
+  policy-rollout, tenant/isolation, wear, transport, and degradation-law
+  filters.
 - Schedulers may delay, throttle, or refuse work, but they may not convert one
   acknowledgment class into another after admission.
 - Ack receipt emitters may group, shard, coalesce, or pipeline work only when
@@ -2509,10 +2645,14 @@ Interface gates between stages are explicit:
 - Policy rollout paths may publish, stage, activate, roll back, supersede, or
   retire a revision only through #901 evidence; raw config updates, operator
   intent, or successful dry-run output do not activate a storage-intent policy.
+- Tenant isolation paths may borrow, donate, throttle, defer, escalate, or
+  refuse work only through #902 evidence; global idle resources, average
+  throughput, or local lane state do not prove cross-tenant fairness by
+  themselves.
 - Relocation workers may write speculative replacements, but they may not
   retire source receipts until replacement receipts, ordering evidence, and
   trust/domain plus capacity/admission plus recovery/degradation plus rollout
-  evidence satisfy the target policy.
+  plus isolation evidence satisfy the target policy.
 - Validation rows and claim ids are not an afterthought: each stage must either
   add the relevant #850/#863 row binding and #875 claim boundary, or state
   which later issue owns that proof.
@@ -2525,13 +2665,14 @@ this document except to update the issue map after live tickets exist.
 | Slice | Follow-up issue | Expected write set | Purpose |
 | --- | --- | --- | --- |
 | Membership epoch authority | #750 | `docs/MEMBERSHIP_AUTHORITY.md` | Decide epoch, quorum-write, witness-set, join/drain, fence, roster, and failure-domain authority, then expose typed refs storage-intent consumers can cite. |
-| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, media role, proximity, workload, data-shape refs, layout refs, lifecycle refs, and cost records. |
+| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, tenant/isolation refs, media role, proximity, workload, data-shape refs, layout refs, lifecycle refs, and cost records. |
 | Ordering evidence authority | #894 | ordering evidence model surface or #841 core model | Expose barrier scope, dirty epoch, dependency closure, replay idempotency, intent sequence, publication boundary, and completion state for sync, quorum, relocation, repair, and receipt-retirement receipts. |
 | Trust/domain evidence authority | #897 | storage-intent trust/domain records in #841 or `crates/tidefs-storage-intent-trust/`, focused tests | Expose authenticated identity, admin/security/tenant domain, session-security posture, key epoch, authorization/audit refs, residency, sharing-domain compatibility, and quarantine/refusal state. |
 | Capacity/admission evidence authority | #898 | storage-intent capacity/admission records in #841 or `crates/tidefs-storage-intent-capacity/`, focused tests | Expose logical/physical headroom, allocation tickets, claim/reserve receipts, dirty-window reserve, protected floors, pending-free frontiers, capacity amplification, and typed ENOSPC/refusal state. |
 | Recovery/degradation evidence authority | #900 | storage-intent recovery/degradation records in #841 or `crates/tidefs-storage-intent-recovery/`, focused tests | Expose degraded state, source receipt set, reconstruction width, target health, repair/rebuild obligation, replacement receipt publication, old-receipt retirement, partition healing, RPO/RTO lag, and typed recovery refusal state. |
 | Policy source and compilation | #855 | policy/config crate or `crates/tidefs-storage-intent-policy/` | Persist and compile pool, dataset, mount, caller, and internal maintenance policy into storage-intent records. |
 | Policy revision rollout evidence authority | #901 | storage-intent policy-rollout records in #841 or `crates/tidefs-storage-intent-policy-rollout/`, focused tests | Expose source policy provenance, compiled revision publication, change class, downgrade authorization, stage state, in-flight fence, convergence frontier, rollback/re-entry, supersession, and typed rollout refusal state. |
+| Tenant/isolation evidence authority | #902 | storage-intent tenant/isolation records in #841 or `crates/tidefs-storage-intent-isolation/`, focused tests | Expose budget owner, tenant/domain refs, isolation scope, resource-vector budgets, fair-share windows, burst/borrow/debt, starvation, noisy-neighbor harm, reserve exemptions, and typed throttle/refusal state. |
 | Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths with ordering and capacity/admission refs for the ack floor. |
 | Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, membership/fence refs, trust/domain refs, capacity/admission refs, proximity domains, failure domains, and media constraints. |
 | Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, epoch/fence law, trust/domain law, recovery/degradation law, geo stale-read boundaries, and read-repair capacity evidence. |
@@ -2541,15 +2682,15 @@ this document except to update the issue map after live tickets exist.
 | Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes without replacing #898 admission evidence. |
 | Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, and anti-thrash state for planning and performance rows. |
-| Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against receipts and evidence as satisfied, converging, degraded, blocked, refused, or unsafe-visible, including #900 recovery/degradation and #901 rollout state, without choosing placement. |
-| Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy and #898 reserve state to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
+| Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against receipts and evidence as satisfied, converging, degraded, blocked, refused, or unsafe-visible, including #900 recovery/degradation, #901 rollout, and #902 isolation state, without choosing placement. |
+| Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy, #898 reserve state, and #902 isolation state to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
 | Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier evidence without making RDMA mandatory. |
 | RAM authority design and implementation | #847 | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority. |
 | Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, wear movement, reserve admission, recovery/degradation predicates, shadow evaluation, payback, and cooldown. |
-| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, rollout stage, receipts, lag, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, and wear to operators. |
-| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, trust/domain changes, capacity admission, recovery/degradation, policy rollout, wear, cost, RPO, and relocation. |
-| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media, trust/domain, capacity/reserve, recovery/degradation, policy rollout, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
-| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, recovery/degradation, policy rollout, RAM, WAN, and wear promises. |
+| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, rollout stage, receipts, lag, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, isolation/throttle state, and wear to operators. |
+| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, trust/domain changes, capacity admission, recovery/degradation, policy rollout, tenant isolation, wear, cost, RPO, and relocation. |
+| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media, trust/domain, capacity/reserve, recovery/degradation, policy rollout, tenant isolation, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
+| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, recovery/degradation, policy rollout, tenant isolation, RAM, WAN, and wear promises. |
 
 ## Validation For This Slice
 
