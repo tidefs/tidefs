@@ -1646,6 +1646,44 @@ fn dirty_overlay_range_reads_reuse_committed_layout_cache() {
 }
 
 #[test]
+fn buffered_overwrite_admission_reuses_committed_layout_cache() {
+    let root = temp_root("buffered-overwrite-layout-cache");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+    let record = fs.create_file("/hot.bin", 0o644).expect("create file");
+    let chunk = content_chunk_size() as usize;
+    let base_len = chunk * 3;
+    let mut base = Vec::with_capacity(base_len);
+    for index in 0..base_len {
+        base.push((index % 251) as u8);
+    }
+
+    fs.write_file("/hot.bin", 0, &base).expect("write baseline");
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush baseline");
+    assert_eq!(fs.content_layout_cache_len_for_test(), 0);
+
+    let first_offset = chunk as u64 + 11;
+    fs.write_file("/hot.bin", first_offset, b"alpha")
+        .expect("buffer first overwrite");
+    assert!(fs.write_buffers.contains_key(&record.inode_id));
+    assert_eq!(fs.content_layout_cache_len_for_test(), 1);
+
+    fs.write_file("/hot.bin", first_offset + 64, b"bravo")
+        .expect("buffer second overwrite");
+    assert_eq!(fs.content_layout_cache_len_for_test(), 1);
+
+    fs.write_file("/hot.bin", first_offset + 128, b"charlie")
+        .expect("buffer third overwrite");
+    assert_eq!(fs.content_layout_cache_len_for_test(), 1);
+
+    fs.flush_write_buffer(record.inode_id)
+        .expect("flush buffered overwrites");
+    assert_eq!(fs.content_layout_cache_len_for_test(), 0);
+    drop(fs);
+    cleanup(&root);
+}
+
+#[test]
 fn write_file_non_empty_invalidates_hot_read_cache() {
     let root = temp_root("write-file-invalidate-hot-read-cache");
     let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
