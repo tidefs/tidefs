@@ -35,7 +35,8 @@ use crate::device::{
 };
 use crate::device_health::{DeviceHealth, DeviceHealthState, DeviceHealthTransition};
 use crate::device_layout::{
-    DeviceClassPolicy, DeviceLayoutStats, DeviceMediaClass, WriteAllocator,
+    DeviceClassPolicy, DeviceLayoutPolicy, DeviceLayoutStats, DeviceLayoutV1,
+    DeviceMediaClass, WriteAllocator,
 };
 use crate::device_manager::{DeviceManager, SparePolicy};
 use crate::io_scheduler::IoClass as SchedClass;
@@ -213,6 +214,8 @@ pub struct PoolProperties {
     pub redundancy_policy: PoolRedundancyPolicy,
     /// Failure-domain level enforced by the placement planner.
     pub failure_domain_level: FailureDomainLevel,
+    /// Layout policy for computing per-device region segmentation.
+    pub layout_policy: DeviceLayoutPolicy,
 }
 
 impl Default for PoolProperties {
@@ -225,6 +228,7 @@ impl Default for PoolProperties {
             low_watermark_bytes: 0,
             redundancy_policy: PoolRedundancyPolicy::default(),
             failure_domain_level: FailureDomainLevel::Device,
+            layout_policy: DeviceLayoutPolicy::default(),
         }
     }
 }
@@ -944,6 +948,9 @@ pub struct Pool {
     device_class_policy: DeviceClassPolicy,
     /// Per-device layout statistics for observability.
     device_layout_stats: Vec<DeviceLayoutStats>,
+    /// Per-device layout records computed from the pool's layout policy.
+    /// Populated during pool creation and reconstructed during import.
+    device_layouts: Vec<DeviceLayoutV1>,
     /// Optional separate intent-log device writer (LOG_DEVICE).
     log_device: Option<LogDeviceWriter>,
     /// Persistent pool identity (randomly generated on create).
@@ -1079,6 +1086,21 @@ impl Pool {
         // Open the log device writer if an IntentLog device is present.
         let log_device = open_log_device_for_devices(&config.devices)?;
 
+        // Compute per-device layout records from the pool's layout policy.
+        let device_layouts: Vec<DeviceLayoutV1> = devices
+            .iter()
+            .map(|d| {
+                properties.layout_policy
+                    .compute(d.store().capacity_bytes())
+                    .unwrap_or_else(|_| {
+                        // Fall back to Slice0Small on any error.
+                        DeviceLayoutPolicy::Slice0Small
+                            .compute(d.store().capacity_bytes())
+                            .expect("Slice0Small must succeed for non-zero device")
+                    })
+            })
+            .collect();
+
         let mut pool = Self {
             config,
             properties,
@@ -1090,6 +1112,7 @@ impl Pool {
             write_allocator,
             device_class_policy,
             device_layout_stats,
+            device_layouts,
             log_device,
             pool_guid,
             device_guids,
@@ -1321,6 +1344,22 @@ impl Pool {
         // Open the log device writer if an IntentLog device is present.
         let log_device = open_log_device_for_devices(&config.devices)?;
 
+        // Recompute per-device layout records from the pool's layout policy.
+        // During import the previously persisted DeviceLayoutV1 records are
+        // not yet read back from the system area; recompute deterministically.
+        let device_layouts: Vec<DeviceLayoutV1> = devices
+            .iter()
+            .map(|d| {
+                properties.layout_policy
+                    .compute(d.store().capacity_bytes())
+                    .unwrap_or_else(|_| {
+                        DeviceLayoutPolicy::Slice0Small
+                            .compute(d.store().capacity_bytes())
+                            .expect("Slice0Small must succeed for non-zero device")
+                    })
+            })
+            .collect();
+
         let mut pool = Self {
             config,
             properties,
@@ -1332,6 +1371,7 @@ impl Pool {
             write_allocator,
             device_class_policy,
             device_layout_stats,
+            device_layouts,
             log_device,
             pool_guid: pg,
             device_guids,
@@ -1401,6 +1441,12 @@ impl Pool {
     }
 
     /// Per-device health states, indexed by device position.
+    /// Return a copy of the per-device layout records.
+    #[must_use]
+    pub fn device_layouts(&self) -> &[DeviceLayoutV1] {
+        &self.device_layouts
+    }
+
     pub fn device_health_states(&self) -> Vec<(usize, DeviceHealthState)> {
         self.devices
             .iter()
