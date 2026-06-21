@@ -21,9 +21,10 @@ use crate::encoding::decode_content;
 use crate::encoding::split_inline_checksum;
 use crate::object_keys::{content_chunk_object_key_for_version, content_object_key_for_version};
 use crate::records::ContentChunkRef;
-use crate::types::*;
+use crate::types::InodeRecord;
 use crate::ContentLayout;
 use crate::Result;
+pub(crate) use crate::types::{ScrubBlockId, ScrubBlockKind};
 
 // ── Scrub data types ──────────────────────────────────────────────────
 
@@ -47,21 +48,6 @@ pub(crate) enum ScrubBlockOutcome {
     #[allow(dead_code)] // INTENT: scrub types for planned checksum verification and repair pipeline
     /// Block has no applicable checksum (prior-generation format or metadata gap).
     NoChecksum,
-}
-
-/// Identity of a content block being scrubbed.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct ScrubBlockId {
-    pub inode_id: u64,
-    pub data_version: u64,
-    pub kind: ScrubBlockKind,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum ScrubBlockKind {
-    InlineContent,
-    ContentManifest,
-    ContentChunk { chunk_index: u64 },
 }
 
 /// Record of a single corrupt or unreadable block.

@@ -11,12 +11,13 @@ use tidefs_local_object_store::{
 };
 use tidefs_types_vfs_core::InodeId;
 
+use crate::checksum::{BlockChecksum, FastBlockChecksum};
 use crate::constants::*;
 use crate::dedup::DedupIndex;
 use crate::encoding::{
     decode_content, decode_content_chunk, decode_content_manifest, decode_dedup_redirect,
     encode_content, encode_content_chunk, encode_content_manifest, encode_content_manifest_sparse,
-    is_dedup_redirect,
+    is_dedup_redirect, split_inline_checksum,
 };
 use crate::error::FileSystemError;
 use crate::object_keys::{
@@ -177,6 +178,225 @@ pub(crate) struct PunchHoleContent<'a, S: ContentWriteStore> {
     pub hole_length: u64,
     pub quorum_store: Option<&'a mut tidefs_quorum_write_runtime::QuorumObjectStore>,
     pub compression_policy: &'a ContentCompressionPolicy,
+}
+
+#[allow(dead_code)] // INTENT: issue #650 API consumed by later scrub routing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MountedContentScrubReadTarget<'a> {
+    Inline,
+    ContentChunk(&'a ContentChunkRef),
+}
+
+#[allow(dead_code)] // INTENT: issue #650 API consumed by later scrub routing.
+pub(crate) fn read_mounted_content_scrub_block(
+    store: &LocalObjectStore,
+    inode_id: InodeId,
+    record: &InodeRecord,
+    target: MountedContentScrubReadTarget<'_>,
+    pool: Option<&Pool>,
+) -> Result<MountedContentScrubRead> {
+    if record.inode_id != inode_id {
+        return Err(FileSystemError::CorruptState {
+            reason: "mounted content scrub authority inode record mismatch",
+        });
+    }
+
+    match target {
+        MountedContentScrubReadTarget::Inline => {
+            read_mounted_inline_content_scrub_block(store, inode_id, record, pool)
+        }
+        MountedContentScrubReadTarget::ContentChunk(chunk_ref) => {
+            if chunk_ref.data_version != record.data_version {
+                return Err(FileSystemError::CorruptState {
+                    reason: "mounted content scrub authority stale chunk data version",
+                });
+            }
+            read_mounted_chunk_content_scrub_block(store, inode_id, chunk_ref, pool)
+        }
+    }
+}
+
+fn read_mounted_inline_content_scrub_block(
+    store: &LocalObjectStore,
+    inode_id: InodeId,
+    record: &InodeRecord,
+    pool: Option<&Pool>,
+) -> Result<MountedContentScrubRead> {
+    let key = content_object_key_for_version(inode_id, record.data_version);
+    let encoded = store.get(key)?.ok_or(FileSystemError::CorruptState {
+        reason: "mounted content scrub authority missing inline content object",
+    })?;
+    let (checksum_body, expected) = split_inline_checksum(&encoded)?;
+    let checksum_evidence = MountedContentChecksumEvidence {
+        layer: MountedContentChecksumLayer::InlineContentBody,
+        expected,
+        actual: FastBlockChecksum::compute(checksum_body),
+        encoded_len: checksum_body.len() as u64,
+    };
+    if !checksum_evidence.matches_expected() {
+        return Err(FileSystemError::CorruptState {
+            reason: "mounted content scrub authority inline checksum mismatch",
+        });
+    }
+
+    let content = decode_content(&encoded)?;
+    if content.inode_id != inode_id {
+        return Err(FileSystemError::CorruptState {
+            reason: "mounted content scrub authority inline inode mismatch",
+        });
+    }
+    if content.data_version != record.data_version {
+        return Err(FileSystemError::CorruptState {
+            reason: "mounted content scrub authority inline data version mismatch",
+        });
+    }
+    if u64::try_from(content.bytes.len()).unwrap_or(u64::MAX) != record.size {
+        return Err(FileSystemError::CorruptState {
+            reason: "mounted content scrub authority inline size mismatch",
+        });
+    }
+
+    Ok(MountedContentScrubRead {
+        block_id: ScrubBlockId {
+            inode_id: inode_id.get(),
+            data_version: record.data_version,
+            kind: ScrubBlockKind::InlineContent,
+        },
+        object_key: Some(key),
+        plaintext_bytes: content.bytes,
+        checksum_evidence,
+        placement_evidence: placement_evidence_for_content_key(pool, key, None),
+    })
+}
+
+fn read_mounted_chunk_content_scrub_block(
+    store: &LocalObjectStore,
+    inode_id: InodeId,
+    chunk_ref: &ContentChunkRef,
+    pool: Option<&Pool>,
+) -> Result<MountedContentScrubRead> {
+    if chunk_ref.is_hole() {
+        return Ok(MountedContentScrubRead {
+            block_id: ScrubBlockId {
+                inode_id: inode_id.get(),
+                data_version: chunk_ref.data_version,
+                kind: ScrubBlockKind::ContentChunk {
+                    chunk_index: chunk_ref.chunk_index,
+                },
+            },
+            object_key: None,
+            plaintext_bytes: vec![0_u8; chunk_ref.len as usize],
+            checksum_evidence: MountedContentChecksumEvidence {
+                layer: MountedContentChecksumLayer::SparseHole,
+                expected: Some(IntegrityDigest64(0)),
+                actual: IntegrityDigest64(0),
+                encoded_len: 0,
+            },
+            placement_evidence: MountedContentPlacementEvidence::SparseHole,
+        });
+    }
+
+    let key = content_chunk_object_key_for_version(
+        inode_id,
+        chunk_ref.data_version,
+        chunk_ref.chunk_index,
+    );
+    let encoded = store.get(key)?.ok_or(FileSystemError::CorruptState {
+        reason: "mounted content scrub authority missing content chunk object",
+    })?;
+    let checksum_evidence = MountedContentChecksumEvidence {
+        layer: MountedContentChecksumLayer::EncodedContentChunk,
+        expected: Some(chunk_ref.checksum),
+        actual: FastBlockChecksum::compute(&encoded),
+        encoded_len: encoded.len() as u64,
+    };
+    if !checksum_evidence.matches_expected() {
+        return Err(FileSystemError::CorruptState {
+            reason: "mounted content scrub authority chunk checksum mismatch",
+        });
+    }
+
+    let (chunk, resolved_via_dedup) =
+        try_validate_chunk_bytes(store, inode_id, chunk_ref, &encoded).ok_or(
+            FileSystemError::CorruptState {
+                reason: "mounted content scrub authority chunk decode mismatch",
+            },
+        )?;
+    if !resolved_via_dedup
+        && (chunk.inode_id != inode_id
+            || chunk.data_version != chunk_ref.data_version
+            || chunk.chunk_index != chunk_ref.chunk_index)
+    {
+        return Err(FileSystemError::CorruptState {
+            reason: "mounted content scrub authority chunk identity mismatch",
+        });
+    }
+
+    Ok(MountedContentScrubRead {
+        block_id: ScrubBlockId {
+            inode_id: inode_id.get(),
+            data_version: chunk_ref.data_version,
+            kind: ScrubBlockKind::ContentChunk {
+                chunk_index: chunk_ref.chunk_index,
+            },
+        },
+        object_key: Some(key),
+        plaintext_bytes: chunk.bytes,
+        checksum_evidence,
+        placement_evidence: placement_evidence_for_content_key(
+            pool,
+            key,
+            nonzero_receipt_generation(chunk_ref.placement_receipt_generation),
+        ),
+    })
+}
+
+fn nonzero_receipt_generation(generation: u64) -> Option<u64> {
+    if generation == 0 {
+        None
+    } else {
+        Some(generation)
+    }
+}
+
+fn placement_evidence_for_content_key(
+    pool: Option<&Pool>,
+    key: ObjectKey,
+    expected_generation: Option<u64>,
+) -> MountedContentPlacementEvidence {
+    let Some(pool) = pool else {
+        return match expected_generation {
+            Some(expected_generation) => MountedContentPlacementEvidence::ReceiptUnavailable {
+                expected_generation: Some(expected_generation),
+            },
+            None => MountedContentPlacementEvidence::ReceiptMissing {
+                expected_generation: None,
+            },
+        };
+    };
+
+    match pool.placement_receipt_for_key(DeviceIoClass::Data, key) {
+        Ok(Some(receipt)) => match expected_generation {
+            Some(expected_generation) if receipt.generation == expected_generation => {
+                MountedContentPlacementEvidence::ReceiptVerified {
+                    generation: expected_generation,
+                }
+            }
+            Some(expected_generation) => MountedContentPlacementEvidence::ReceiptStale {
+                expected_generation,
+                observed_generation: receipt.generation,
+            },
+            None => MountedContentPlacementEvidence::ReceiptObservedButUnbound {
+                generation: receipt.generation,
+            },
+        },
+        Ok(None) => MountedContentPlacementEvidence::ReceiptMissing {
+            expected_generation,
+        },
+        Err(_) => MountedContentPlacementEvidence::ReceiptUnavailable {
+            expected_generation,
+        },
+    }
 }
 
 pub(crate) fn read_content_from_store(
@@ -2159,6 +2379,11 @@ pub(crate) fn reflink_chunked_content<S: ContentWriteStore>(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tidefs_local_object_store::pool::{PoolConfig, PoolProperties};
+    use tidefs_local_object_store::{
+        DeviceBacking, DeviceClass, DeviceConfig, DeviceKind, StoreOptions,
+    };
+    use tidefs_types_vfs_core::{Generation, NodeKind};
 
     fn temp_store(label: &str) -> LocalObjectStore {
         let nanos = SystemTime::now()
@@ -2170,6 +2395,232 @@ mod tests {
             std::process::id()
         ));
         LocalObjectStore::open(root).expect("open temp object store")
+    }
+
+    fn temp_pool(label: &str) -> Pool {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-content-pool-{label}-{nanos}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let data_dir = root.join("data");
+        let config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root,
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Single { path: data_dir },
+                encryption: None,
+                compression: None,
+            }],
+        };
+        Pool::create(
+            config,
+            PoolProperties::default(),
+            &StoreOptions::test_fast(),
+        )
+        .expect("create temp pool")
+    }
+
+    fn test_record(inode_id: u64, data_version: u64, size: u64) -> InodeRecord {
+        InodeRecord {
+            dir_storage_kind: 0,
+            inode_id: InodeId::new(inode_id),
+            generation: Generation(1),
+            facets: NodeKind::File.to_facets(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size,
+            data_version,
+            metadata_version: data_version,
+            posix_time: PosixTimeRecord::now(),
+            xattr_storage_kind: 0,
+            xattrs: BTreeMap::new(),
+            dir_rev: 0,
+            rdev: 0,
+        }
+    }
+
+    #[test]
+    fn mounted_content_scrub_authority_reads_inline_plaintext_and_evidence() {
+        let mut store = temp_store("mounted-inline-authority");
+        let payload = b"inline plaintext".to_vec();
+        let record = test_record(7, 3, payload.len() as u64);
+        let key = content_object_key_for_version(record.inode_id, record.data_version);
+        let encoded = encode_content(&record, &payload);
+        store.put(key, &encoded).expect("write inline");
+
+        let read = read_mounted_content_scrub_block(
+            &store,
+            record.inode_id,
+            &record,
+            MountedContentScrubReadTarget::Inline,
+            None,
+        )
+        .expect("authority read");
+
+        assert_eq!(
+            read.block_id,
+            ScrubBlockId {
+                inode_id: record.inode_id.get(),
+                data_version: record.data_version,
+                kind: ScrubBlockKind::InlineContent,
+            }
+        );
+        assert_eq!(read.object_key, Some(key));
+        assert_eq!(read.plaintext_bytes, payload);
+        assert_eq!(
+            read.checksum_evidence.layer,
+            MountedContentChecksumLayer::InlineContentBody
+        );
+        assert!(read.checksum_evidence.matches_expected());
+        assert_eq!(
+            read.placement_evidence,
+            MountedContentPlacementEvidence::ReceiptMissing {
+                expected_generation: None,
+            }
+        );
+        assert!(!read.placement_evidence.allows_repair_dispatch());
+    }
+
+    #[test]
+    fn mounted_content_scrub_authority_reads_chunk_plaintext_and_checksum_layer() {
+        let mut store = temp_store("mounted-chunk-authority");
+        let payload = b"chunk plaintext authority".to_vec();
+        let record = test_record(9, 4, payload.len() as u64);
+        let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
+        let encoded =
+            encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let checksum = FastBlockChecksum::compute(&encoded);
+        store.put(key, &encoded).expect("write chunk");
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: record.data_version,
+            len: payload.len() as u32,
+            checksum,
+            placement_receipt_generation: 0,
+        };
+
+        let read = read_mounted_content_scrub_block(
+            &store,
+            record.inode_id,
+            &record,
+            MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
+            None,
+        )
+        .expect("authority read");
+
+        assert_eq!(
+            read.block_id,
+            ScrubBlockId {
+                inode_id: record.inode_id.get(),
+                data_version: record.data_version,
+                kind: ScrubBlockKind::ContentChunk { chunk_index: 0 },
+            }
+        );
+        assert_eq!(read.object_key, Some(key));
+        assert_eq!(read.plaintext_bytes, payload);
+        assert_eq!(
+            read.checksum_evidence,
+            MountedContentChecksumEvidence {
+                layer: MountedContentChecksumLayer::EncodedContentChunk,
+                expected: Some(checksum),
+                actual: checksum,
+                encoded_len: encoded.len() as u64,
+            }
+        );
+        assert_eq!(
+            read.placement_evidence,
+            MountedContentPlacementEvidence::ReceiptMissing {
+                expected_generation: None,
+            }
+        );
+        assert!(!read.placement_evidence.allows_repair_dispatch());
+    }
+
+    #[test]
+    fn mounted_content_scrub_authority_rejects_stale_chunk_ref() {
+        let mut store = temp_store("mounted-stale-chunk-ref");
+        let payload = b"stale chunk reference".to_vec();
+        let stale_record = test_record(13, 6, payload.len() as u64);
+        let current_record = test_record(13, 7, payload.len() as u64);
+        let key = content_chunk_object_key_for_version(
+            stale_record.inode_id,
+            stale_record.data_version,
+            0,
+        );
+        let encoded =
+            encode_content_chunk(&stale_record, 0, &payload, &ContentCompressionPolicy::off());
+        let checksum = FastBlockChecksum::compute(&encoded);
+        store.put(key, &encoded).expect("write stale chunk");
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: stale_record.data_version,
+            len: payload.len() as u32,
+            checksum,
+            placement_receipt_generation: 0,
+        };
+
+        let err = read_mounted_content_scrub_block(
+            &store,
+            current_record.inode_id,
+            &current_record,
+            MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
+            None,
+        )
+        .expect_err("stale chunk refs must fail closed");
+
+        assert!(matches!(err, FileSystemError::CorruptState { .. }));
+    }
+
+    #[test]
+    fn mounted_content_scrub_authority_marks_stale_chunk_receipt() {
+        let mut pool = temp_pool("mounted-stale-receipt");
+        let payload = b"receipt-stale chunk".to_vec();
+        let record = test_record(11, 5, payload.len() as u64);
+        let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
+        let encoded =
+            encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let checksum = FastBlockChecksum::compute(&encoded);
+        let (_, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, key, &encoded)
+            .expect("write through pool");
+        let expected_generation = receipt.generation.saturating_add(1);
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: record.data_version,
+            len: payload.len() as u32,
+            checksum,
+            placement_receipt_generation: expected_generation,
+        };
+
+        let read = read_mounted_content_scrub_block(
+            pool.raw_primary_store(),
+            record.inode_id,
+            &record,
+            MountedContentScrubReadTarget::ContentChunk(&chunk_ref),
+            Some(&pool),
+        )
+        .expect("authority read");
+
+        assert_eq!(read.plaintext_bytes, payload);
+        assert_eq!(
+            read.placement_evidence,
+            MountedContentPlacementEvidence::ReceiptStale {
+                expected_generation,
+                observed_generation: receipt.generation,
+            }
+        );
+        assert!(!read.placement_evidence.allows_repair_dispatch());
     }
 
     #[test]
