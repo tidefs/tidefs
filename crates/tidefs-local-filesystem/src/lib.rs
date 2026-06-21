@@ -4766,8 +4766,7 @@ impl LocalFileSystem {
             return Ok(false);
         }
         let effective_length = record.size.saturating_sub(offset).min(length);
-        let layout =
-            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        let layout = self.read_committed_content_layout_cached(inode_id, record)?;
         match layout {
             ContentLayout::Inline(content) => {
                 let start = usize::try_from(offset)
@@ -4812,8 +4811,7 @@ impl LocalFileSystem {
         if ranges.is_empty() || record.size == 0 {
             return Ok(0);
         }
-        let layout =
-            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        let layout = self.read_committed_content_layout_cached(inode_id, record)?;
         let mut bytes = 0_u64;
         match layout {
             ContentLayout::Inline(content) => {
@@ -6417,14 +6415,11 @@ impl LocalFileSystem {
             self.rollback_mutation_delta();
             return Err(err);
         }
-        let mut rewrite_trim_plan = match read_content_layout_from_store(
-            self.store.raw_primary_store(),
-            inode_id,
-            &old_record,
-            true,
-        )
-        .and_then(|old_layout| self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record))
-        {
+        let mut rewrite_trim_plan = match self
+            .read_committed_content_layout_cached(inode_id, &old_record)
+            .and_then(|old_layout| {
+                self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record)
+            }) {
             Ok(plan) => plan,
             Err(err) => {
                 self.rollback_mutation_delta();
@@ -6700,12 +6695,7 @@ impl LocalFileSystem {
         if offset >= committed.size {
             return Ok(Some(copy_len));
         }
-        let layout = read_content_layout_from_store(
-            self.store.raw_primary_store(),
-            inode_id,
-            &committed,
-            true,
-        )?;
+        let layout = self.read_committed_content_layout_cached(inode_id, &committed)?;
         let ContentLayout::Chunked(manifest) = layout else {
             return Ok(None);
         };
@@ -6762,8 +6752,7 @@ impl LocalFileSystem {
         {
             return Ok(false);
         }
-        let layout =
-            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        let layout = self.read_committed_content_layout_cached(inode_id, record)?;
         let ContentLayout::Chunked(manifest) = layout else {
             return Ok(false);
         };
@@ -7200,7 +7189,9 @@ impl LocalFileSystem {
             handle.commit();
         }
         check_crash_hook(CrashInjectionPoint::OpWriteBeforeExtentUpdate);
-        self.invalidate_hot_read_cache_for_inode(inode_id);
+        // Buffered writes change the read overlay immediately, but the
+        // committed layout remains valid until a later flush publishes it.
+        self.invalidate_hot_read_bytes_for_inode(inode_id);
 
         // Buffer the write — flush on threshold or explicit fsync.
         let may_flush_after_ingest = self
@@ -9860,14 +9851,11 @@ impl LocalFileSystem {
         // applied only after commit_mutation succeeds so rollback paths do
         // not leave stale reclaim work for still-live extents.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
-        let rewrite_trim_plan = match read_content_layout_from_store(
-            self.store.raw_primary_store(),
-            inode_id,
-            &old_record,
-            true,
-        )
-        .and_then(|old_layout| self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record))
-        {
+        let rewrite_trim_plan = match self
+            .read_committed_content_layout_cached(inode_id, &old_record)
+            .and_then(|old_layout| {
+                self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record)
+            }) {
             Ok(plan) => plan,
             Err(err) => {
                 self.rollback_mutation_delta();
@@ -10005,14 +9993,11 @@ impl LocalFileSystem {
         // plan is applied only after commit_mutation succeeds so rollback
         // paths do not leave stale reclaim work for still-live extents.
         // INTENT: rewrite-path extent trimming with receipt durability gating (issue #377)
-        let mut rewrite_trim_plan = match read_content_layout_from_store(
-            self.store.raw_primary_store(),
-            inode_id,
-            &old_record,
-            true,
-        )
-        .and_then(|old_layout| self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record))
-        {
+        let mut rewrite_trim_plan = match self
+            .read_committed_content_layout_cached(inode_id, &old_record)
+            .and_then(|old_layout| {
+                self.rewrite_trim_plan_for_layout(inode_id, &old_layout, &record)
+            }) {
             Ok(plan) => plan,
             Err(err) => {
                 self.rollback_mutation_delta();
@@ -11512,18 +11497,7 @@ impl LocalFileSystem {
     }
 
     fn read_content(&self, inode_id: InodeId, record: &InodeRecord) -> Result<Vec<u8>> {
-        let role = HotReadCacheObjectRole::from_node_kind(record.kind()).ok_or(
-            FileSystemError::NotFile {
-                path: format!("inode:{}", inode_id.get()),
-                kind: record.kind(),
-            },
-        )?;
-        let key = HotReadCacheKey {
-            role,
-            inode_id: inode_id.get(),
-            data_version: record.data_version,
-            size: record.size,
-        };
+        let key = Self::content_layout_cache_key(inode_id, record)?;
         if let Some(wb) = self.write_buffers.get(&inode_id) {
             let read_len_u64 = wb.max_offset().unwrap_or(0).max(record.size);
             let read_len =
@@ -11603,18 +11577,7 @@ impl LocalFileSystem {
             usize::try_from(clipped_len_u64).map_err(|_| FileSystemError::SizeOverflow {
                 requested: clipped_len_u64,
             })?;
-        let role = HotReadCacheObjectRole::from_node_kind(record.kind()).ok_or(
-            FileSystemError::NotFile {
-                path: format!("inode:{}", inode_id.get()),
-                kind: record.kind(),
-            },
-        )?;
-        let key = HotReadCacheKey {
-            role,
-            inode_id: inode_id.get(),
-            data_version: record.data_version,
-            size: record.size,
-        };
+        let key = Self::content_layout_cache_key(inode_id, record)?;
         if let Some(bytes) = self.hot_read_cache.borrow_mut().get(key) {
             let start = usize::try_from(offset)
                 .map_err(|_| FileSystemError::SizeOverflow { requested: offset })?;
@@ -11657,8 +11620,7 @@ impl LocalFileSystem {
             );
         }
 
-        let layout =
-            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        let layout = self.read_committed_content_layout_cached(inode_id, record)?;
         let bytes = read_content_range_from_layout(
             self.store.raw_primary_store(),
             &layout,
@@ -11666,14 +11628,53 @@ impl LocalFileSystem {
             clipped_len,
             Some(&self.store),
         )?;
-        if matches!(layout, ContentLayout::Chunked(_)) {
-            self.content_layout_cache.borrow_mut().insert(key, layout);
-        }
         Ok(bytes)
     }
 
-    fn invalidate_hot_read_cache_for_inode(&self, inode_id: InodeId) {
+    fn content_layout_cache_key(
+        inode_id: InodeId,
+        record: &InodeRecord,
+    ) -> Result<HotReadCacheKey> {
+        let role = HotReadCacheObjectRole::from_node_kind(record.kind()).ok_or(
+            FileSystemError::NotFile {
+                path: format!("inode:{}", inode_id.get()),
+                kind: record.kind(),
+            },
+        )?;
+        Ok(HotReadCacheKey {
+            role,
+            inode_id: inode_id.get(),
+            data_version: record.data_version,
+            size: record.size,
+        })
+    }
+
+    fn read_committed_content_layout_cached(
+        &self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+    ) -> Result<ContentLayout> {
+        let key = Self::content_layout_cache_key(inode_id, record)?;
+        if let Some(layout) = self.content_layout_cache.borrow().get(&key).cloned() {
+            return Ok(layout);
+        }
+
+        let layout =
+            read_content_layout_from_store(self.store.raw_primary_store(), inode_id, record, true)?;
+        if matches!(layout, ContentLayout::Chunked(_)) {
+            self.content_layout_cache
+                .borrow_mut()
+                .insert(key, layout.clone());
+        }
+        Ok(layout)
+    }
+
+    fn invalidate_hot_read_bytes_for_inode(&self, inode_id: InodeId) {
         self.hot_read_cache.borrow_mut().invalidate_inode(inode_id);
+    }
+
+    fn invalidate_hot_read_cache_for_inode(&self, inode_id: InodeId) {
+        self.invalidate_hot_read_bytes_for_inode(inode_id);
         self.content_layout_cache
             .borrow_mut()
             .retain(|key, _layout| key.inode_id != inode_id.get());
