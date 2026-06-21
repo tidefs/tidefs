@@ -38,7 +38,7 @@ use crate::helpers::{kind_bits, validate_name};
 use crate::open_dispatch::{self, FileHandleState, FileHandleTable};
 use crate::readahead::ReadaheadTracker;
 use crate::release_dispatch;
-use crate::types::{InodeRecord, NamespaceEntry};
+use crate::types::{InodeRecord, IntentLogReplyState, NamespaceEntry};
 use crate::xattr_dispatch;
 use crate::ContentLayout;
 use tidefs_inode_attributes::timestamp::{TimestampPolicy, TimestampUpdate};
@@ -1198,6 +1198,17 @@ impl VfsLocalFileSystem {
             .map_err(|e| map_errno(&e))?;
 
         fs.begin_mutation();
+        if !fs.state.inodes.contains_key(&parent_id) {
+            fs.rollback_mutation_delta();
+            return Err(Errno::ENOENT);
+        }
+        if !fs.state.directories.contains_key(&parent_id) {
+            let err = FileSystemError::CorruptState {
+                reason: "parent directory object is missing",
+            };
+            fs.rollback_mutation_delta();
+            return Err(map_errno(&err));
+        }
         let tick = fs.bump_generation();
         let inode_id = fs.allocate_inode_id();
         let generation = Generation::new(tick);
@@ -1242,6 +1253,36 @@ impl VfsLocalFileSystem {
             mode: new_mode,
         };
 
+        let _ = fs.intent_log_buffer.as_ref().map(|buf| {
+            let record = match kind {
+                NodeKind::File => tidefs_intent_log::IntentLogRecord::Create {
+                    parent: parent_id.get(),
+                    name: name.clone(),
+                    mode: new_mode,
+                    ino: inode_id.get(),
+                },
+                NodeKind::Fifo | NodeKind::CharDev | NodeKind::BlockDev | NodeKind::Socket => {
+                    tidefs_intent_log::IntentLogRecord::Mknod {
+                        parent: parent_id.get(),
+                        name: name.clone(),
+                        mode: new_mode,
+                        rdev: u64::from(record.rdev),
+                        ino: inode_id.get(),
+                    }
+                }
+                NodeKind::Dir | NodeKind::Symlink | NodeKind::Whiteout => unreachable!(),
+            };
+            let _frame = buf.append(record, 0);
+        });
+        let create_intent_state =
+            match fs.namespace_create_intent(parent_id, entry.clone(), &record) {
+                Ok(state) => state,
+                Err(err) => {
+                    fs.rollback_mutation_delta();
+                    return Err(map_errno(&err));
+                }
+            };
+
         fs.mark_inode_metadata_dirty(inode_id);
         fs.mark_dir_dirty(parent_id);
         fs.mark_inode_metadata_dirty(parent_id);
@@ -1253,7 +1294,13 @@ impl VfsLocalFileSystem {
         }
         fs.update_parent_metadata_timestamps(parent_id, tick);
 
-        fs.commit_mutation(record)
+        let committed = if create_intent_state == IntentLogReplyState::Refused {
+            fs.force_commit(record)
+        } else {
+            fs.commit_mutation(record)
+        };
+
+        committed
             .map(|record| record.to_inode_attr())
             .map_err(|e| map_errno(&e))
             .inspect(|attr| {
@@ -1487,6 +1534,14 @@ impl VfsLocalFileSystem {
             facets: NodeKind::File.to_facets(),
             mode: new_mode,
         };
+        let create_intent_state =
+            match fs.namespace_create_intent(parent_id, entry.clone(), &record) {
+                Ok(state) => state,
+                Err(err) => {
+                    fs.rollback_mutation_delta();
+                    return Err(map_errno(&err));
+                }
+            };
 
         fs.mark_inode_metadata_dirty(inode_id);
         fs.mark_dir_dirty(parent_id);
@@ -1499,7 +1554,12 @@ impl VfsLocalFileSystem {
         }
         fs.update_parent_metadata_timestamps(parent_id, tick);
 
-        let record = fs.commit_mutation(record).map_err(|e| map_errno(&e))?;
+        let committed = if create_intent_state == IntentLogReplyState::Refused {
+            fs.force_commit(record)
+        } else {
+            fs.commit_mutation(record)
+        };
+        let record = committed.map_err(|e| map_errno(&e))?;
         fs.state
             .quota_table
             .apply_delta(&inode_ancestors, delta_bytes, 1);
@@ -7084,6 +7144,39 @@ mod tests {
     }
 
     #[test]
+    fn create_file_records_namespace_create_intent() {
+        use crate::intent_log::IntentLogEntryKind;
+
+        let (engine, _td) = temp_fs();
+        engine.fs.borrow_mut().set_auto_commit(false);
+        let root = engine.get_root_inode(&root_ctx()).unwrap();
+
+        let (attr, fh) = engine
+            .create(root, b"regular", 0o600, 0, &root_ctx())
+            .unwrap();
+        engine.release(&fh).unwrap();
+
+        let fs = engine.fs.borrow();
+        let intent = fs
+            .intent_log
+            .pending_entries()
+            .iter()
+            .find_map(|entry| match &entry.entry_kind {
+                IntentLogEntryKind::NamespaceCreateIntent(intent) => Some(intent),
+                _ => None,
+            })
+            .expect("regular create should leave a namespace create intent");
+        assert_eq!(intent.parent_inode_id, root);
+        assert_eq!(intent.entry.name, b"regular");
+        assert_eq!(intent.entry.inode_id, attr.inode_id);
+        assert_eq!(intent.entry.kind(), NodeKind::File);
+        assert_eq!(intent.entry.mode, S_IFREG | 0o600);
+        assert_eq!(intent.inode.inode_id, attr.inode_id);
+        assert_eq!(intent.inode.kind(), NodeKind::File);
+        assert_eq!(intent.inode.rdev, 0);
+    }
+
+    #[test]
     fn create_file_initializes_posix_times_from_wall_clock() {
         let (engine, _td) = temp_fs();
         let root = engine.get_root_inode(&ctx()).unwrap();
@@ -7559,6 +7652,41 @@ mod tests {
         let looked_up = engine.lookup(root, b"null", &root_ctx()).unwrap();
         assert_eq!(looked_up.inode_id, attr.inode_id);
         assert_eq!(looked_up.posix.rdev, 0x0103);
+    }
+
+    #[test]
+    fn mknod_char_device_records_rdev_intent() {
+        use tidefs_intent_log::{IntentLogBuffer, IntentLogRecord};
+
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&root_ctx()).unwrap();
+        let buf = Arc::new(IntentLogBuffer::new());
+        engine.fs.borrow_mut().set_intent_log_buffer(buf.clone());
+
+        let attr = engine
+            .mknod(root, b"null", S_IFCHR | 0o600, 0x0103, &root_ctx())
+            .unwrap();
+
+        let frames = buf.drain_since(0);
+        assert_eq!(frames.len(), 1);
+        let frame = &frames[0];
+        assert!(frame.verify().is_ok());
+        match &frame.record {
+            IntentLogRecord::Mknod {
+                parent,
+                name,
+                mode,
+                rdev,
+                ino,
+            } => {
+                assert_eq!(*parent, root.get());
+                assert_eq!(name, b"null");
+                assert_eq!(*mode, S_IFCHR | 0o600);
+                assert_eq!(*rdev, 0x0103);
+                assert_eq!(*ino, attr.inode_id.get());
+            }
+            other => panic!("expected Mknod record, got {other:?}"),
+        }
     }
 
     #[test]

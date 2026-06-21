@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use tidefs_local_object_store::{IntegrityDigest64, LocalObjectStore};
-use tidefs_types_vfs_core::InodeId;
+use tidefs_types_vfs_core::{Generation, InodeId, NodeKind};
 
 use crate::constants::*;
 use crate::encoding::*;
 use crate::error::FileSystemError;
 use crate::object_keys::*;
+use crate::records::NamespaceCreateIntentRecord;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -271,6 +272,9 @@ pub enum IntentLogEntryKind {
         affected_inode_ids: Vec<InodeId>,
         link_count_deltas: Vec<(InodeId, i64)>,
     },
+    /// Replayable metadata-only create/mknod intent. The embedded inode
+    /// record is the authority for mode, facets, and special-node `rdev`.
+    NamespaceCreateIntent(NamespaceCreateIntentRecord),
     /// Fast path refused: system under pressure, fell back to full commit.
     PressureFallback,
     /// Marker written during crash-recovery reconcile pass.
@@ -281,6 +285,9 @@ impl IntentLogEntryKind {
     ///
     /// Covers SyncWriteRange, OdsyncDataRange, SharedMmapMsync, and
     /// FsyncDirtyDrain (which drains accumulated intents for listed inodes).
+    /// NamespaceCreateIntent is metadata-only: directory fsync tracks it
+    /// through is_namespace_sync_for_dir(), but file fsync/fdatasync must not
+    /// treat it as durable data authority for the created inode.
     pub fn references_data_inode(&self, inode_id: InodeId) -> bool {
         match self {
             IntentLogEntryKind::SyncWriteRange { inode_id: id, .. }
@@ -290,6 +297,7 @@ impl IntentLogEntryKind {
             IntentLogEntryKind::NamespaceSyncIntent {
                 affected_inode_ids, ..
             } => affected_inode_ids.contains(&inode_id),
+            IntentLogEntryKind::NamespaceCreateIntent(_) => false,
             IntentLogEntryKind::PressureFallback | IntentLogEntryKind::CrashReplayReconcile => {
                 false
             }
@@ -300,6 +308,10 @@ impl IntentLogEntryKind {
     pub fn is_namespace_sync_for_dir(&self, parent_inode_id: InodeId) -> bool {
         matches!(self,
             IntentLogEntryKind::NamespaceSyncIntent { parent_inode_id: pid, .. }
+            | IntentLogEntryKind::NamespaceCreateIntent(NamespaceCreateIntentRecord {
+                parent_inode_id: pid,
+                ..
+            })
             if *pid == parent_inode_id)
     }
 }
@@ -321,10 +333,76 @@ const KIND_SHARED_MMAP_MSYNC: u8 = 4;
 const KIND_NAMESPACE_SYNC_INTENT: u8 = 5;
 const KIND_PRESSURE_FALLBACK: u8 = 6;
 const KIND_CRASH_REPLAY_RECONCILE: u8 = 7;
+const KIND_NAMESPACE_CREATE_INTENT: u8 = 8;
 
 // ---------------------------------------------------------------------------
 // Encoding / decoding
 // ---------------------------------------------------------------------------
+
+fn encode_namespace_create_intent(out: &mut Vec<u8>, intent: &NamespaceCreateIntentRecord) {
+    push_u64(out, intent.parent_inode_id.get());
+    push_u64(out, intent.entry.name.len() as u64);
+    out.extend_from_slice(&intent.entry.name);
+    push_u64(out, intent.entry.inode_id.get());
+    push_u64(out, intent.entry.generation.get());
+    push_u32(out, intent.entry.kind().as_u32());
+    push_u32(out, intent.entry.mode);
+
+    let inode = encode_inode(&intent.inode);
+    push_u64(out, inode.len() as u64);
+    out.extend_from_slice(&inode);
+}
+
+fn read_decoder_vec(decoder: &mut Decoder<'_>, len: usize) -> Result<Vec<u8>> {
+    let end = decoder
+        .offset
+        .checked_add(len)
+        .ok_or(FileSystemError::Decode {
+            object: decoder.object,
+            reason: "offset overflow",
+        })?;
+    if end > decoder.bytes.len() {
+        return Err(FileSystemError::Decode {
+            object: decoder.object,
+            reason: "record ended early",
+        });
+    }
+    let bytes = decoder.bytes[decoder.offset..end].to_vec();
+    decoder.offset = end;
+    Ok(bytes)
+}
+
+fn decode_namespace_create_intent(
+    decoder: &mut Decoder<'_>,
+) -> Result<NamespaceCreateIntentRecord> {
+    let parent_inode_id = InodeId::new(decoder.read_u64()?);
+    let name_len = decoder.read_count_bounded(MAX_NAME_BYTES)?;
+    let name = read_decoder_vec(decoder, name_len)?;
+    crate::helpers::validate_name(&name)?;
+    let entry_inode_id = InodeId::new(decoder.read_u64()?);
+    let entry_generation = Generation::new(decoder.read_u64()?);
+    let kind_raw = decoder.read_u32()?;
+    let entry_kind = NodeKind::try_from(kind_raw).map_err(|_| FileSystemError::Decode {
+        object: "intent log entry",
+        reason: "unknown namespace create entry kind",
+    })?;
+    let entry_mode = decoder.read_u32()?;
+    let inode_len =
+        decoder.read_count_bounded(decoder.bytes.len().saturating_sub(decoder.offset))?;
+    let inode = decode_inode(&read_decoder_vec(decoder, inode_len)?)?;
+    let entry = crate::types::NamespaceEntry {
+        name,
+        inode_id: entry_inode_id,
+        generation: entry_generation,
+        facets: entry_kind.to_facets(),
+        mode: entry_mode,
+    };
+    Ok(NamespaceCreateIntentRecord {
+        parent_inode_id,
+        entry,
+        inode,
+    })
+}
 
 fn encode_intent_log_entry(entry: &IntentLogEntry) -> Vec<u8> {
     let mut out = Vec::new();
@@ -408,6 +486,10 @@ fn encode_intent_log_entry(entry: &IntentLogEntry) -> Vec<u8> {
                 push_u64(&mut out, inode_id.get());
                 push_i64(&mut out, *delta);
             }
+        }
+        IntentLogEntryKind::NamespaceCreateIntent(intent) => {
+            out.push(KIND_NAMESPACE_CREATE_INTENT);
+            encode_namespace_create_intent(&mut out, intent);
         }
         IntentLogEntryKind::PressureFallback => {
             out.push(KIND_PRESSURE_FALLBACK);
@@ -494,6 +576,9 @@ fn decode_intent_log_entry(bytes: &[u8]) -> Result<IntentLogEntry> {
                 affected_inode_ids,
                 link_count_deltas,
             }
+        }
+        KIND_NAMESPACE_CREATE_INTENT => {
+            IntentLogEntryKind::NamespaceCreateIntent(decode_namespace_create_intent(&mut decoder)?)
         }
         KIND_PRESSURE_FALLBACK => IntentLogEntryKind::PressureFallback,
         KIND_CRASH_REPLAY_RECONCILE => IntentLogEntryKind::CrashReplayReconcile,
@@ -691,6 +776,13 @@ fn encoded_entry_len(entry: &IntentLogEntry) -> usize {
             len += affected_inode_ids.len() * 8;
             len += 8; // delta count
             len += link_count_deltas.len() * (8 + 8); // (inode_id + delta) per entry
+        }
+        IntentLogEntryKind::NamespaceCreateIntent(intent) => {
+            len += 1; // kind
+            len += 8; // parent_inode_id
+            len += 8 + intent.entry.name.len(); // name length + bytes
+            len += 8 + 8 + 4 + 4; // inode_id + generation + kind + mode
+            len += 8 + encode_inode(&intent.inode).len(); // inode payload length + bytes
         }
         IntentLogEntryKind::PressureFallback => {
             len += 1; // kind byte only
@@ -1328,6 +1420,97 @@ impl IntentLog {
 // Standalone replay functions (used by both IntentLog and recovery module)
 // ---------------------------------------------------------------------------
 
+fn validate_namespace_create_intent(intent: &NamespaceCreateIntentRecord) -> Result<()> {
+    if intent.entry.inode_id != intent.inode.inode_id {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log replay: namespace create entry/inode id mismatch",
+        });
+    }
+    if intent.entry.generation != intent.inode.generation {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log replay: namespace create generation mismatch",
+        });
+    }
+    if intent.entry.mode != intent.inode.mode {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log replay: namespace create mode mismatch",
+        });
+    }
+    if intent.entry.kind() != intent.inode.kind() {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log replay: namespace create kind mismatch",
+        });
+    }
+    match intent.inode.kind() {
+        NodeKind::CharDev | NodeKind::BlockDev => Ok(()),
+        NodeKind::File | NodeKind::Fifo | NodeKind::Socket if intent.inode.rdev == 0 => Ok(()),
+        NodeKind::File | NodeKind::Fifo | NodeKind::Socket => Err(FileSystemError::CorruptState {
+            reason: "intent log replay: namespace create rdev is invalid for node kind",
+        }),
+        NodeKind::Dir | NodeKind::Symlink | NodeKind::Whiteout => {
+            Err(FileSystemError::CorruptState {
+                reason: "intent log replay: namespace create kind needs a dedicated replay path",
+            })
+        }
+    }
+}
+
+fn replay_namespace_create_intent(
+    intent: &NamespaceCreateIntentRecord,
+    state: &mut crate::FileSystemState,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    validate_namespace_create_intent(intent)?;
+
+    if !state.inodes.contains_key(&intent.parent_inode_id) {
+        return Err(FileSystemError::CorruptState {
+            reason: "intent log replay: namespace create parent inode not found",
+        });
+    }
+
+    let parent_dir = state
+        .directories
+        .get(&intent.parent_inode_id)
+        .ok_or(FileSystemError::CorruptState {
+            reason: "intent log replay: namespace create parent directory not found",
+        })?;
+    if let Some(existing) = state.inodes.get(&intent.inode.inode_id) {
+        if existing != &intent.inode {
+            return Err(FileSystemError::CorruptState {
+                reason: "intent log replay: namespace create inode conflicts with state",
+            });
+        }
+    }
+    match parent_dir.get(&intent.entry.name) {
+        Some(existing) if existing == &intent.entry => {}
+        Some(_) => {
+            return Err(FileSystemError::CorruptState {
+                reason: "intent log replay: namespace create directory entry conflict",
+            });
+        }
+        None => {}
+    }
+
+    if !state.inodes.contains_key(&intent.inode.inode_id) {
+        Arc::make_mut(&mut state.inodes).insert(intent.inode.inode_id, intent.inode.clone());
+    }
+
+    let parent_dir = Arc::make_mut(&mut state.directories)
+        .get_mut(&intent.parent_inode_id)
+        .expect("namespace create parent directory was validated before replay mutation");
+    if !parent_dir.contains_key(&intent.entry.name) {
+        parent_dir.insert(intent.entry.name.clone(), intent.entry.clone());
+    }
+
+    state.observe_explicit_inode_id(intent.inode.inode_id);
+    state.known_inode_ids.insert(intent.parent_inode_id);
+    state.dirty_inodes.insert(intent.inode.inode_id);
+    state.dirty_inodes.insert(intent.parent_inode_id);
+    state.dirty_dirs.insert(intent.parent_inode_id);
+    Ok(())
+}
+
 /// Replay a single intent log entry against the filesystem state.
 ///
 /// Dispatches on [`IntentLogEntryKind`]:
@@ -1335,6 +1518,8 @@ impl IntentLog {
 ///   store, apply to inode content, update size and metadata version.
 /// - NamespaceSyncIntent: apply link_count_deltas to affected inodes, mark
 ///   parent directory dirty.
+/// - NamespaceCreateIntent: restore metadata-only create/mknod inodes and
+///   directory entries, using the embedded inode record as `rdev` authority.
 /// - FsyncDirtyDrain / PressureFallback / CrashReplayReconcile: no-op.
 pub(crate) fn replay_entry(
     entry: &IntentLogEntry,
@@ -1495,6 +1680,9 @@ pub(crate) fn replay_entry(
             for id in affected_inode_ids {
                 state.observe_explicit_inode_id(*id);
             }
+        }
+        IntentLogEntryKind::NamespaceCreateIntent(intent) => {
+            replay_namespace_create_intent(intent, state)?;
         }
     }
     Ok(())
@@ -1774,7 +1962,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tidefs_types_vfs_core::{Generation, NodeKind};
+    use tidefs_types_vfs_core::{
+        Generation, NodeKind, ROOT_INODE_ID, S_IFBLK, S_IFCHR, S_IFIFO, S_IFREG, S_IFSOCK,
+    };
 
     fn test_root_anchor() -> IntentLogRootAnchor {
         IntentLogRootAnchor {
@@ -1923,6 +2113,39 @@ mod tests {
                 assert_eq!(parent_inode_id.get(), 100);
                 assert_eq!(affected_inode_ids.len(), 2);
                 assert_eq!(link_count_deltas.len(), 2);
+            }
+            _ => panic!("wrong kind"),
+        }
+    }
+
+    #[test]
+    fn round_trip_namespace_create_intent_preserves_rdev_authority() {
+        let inode = special_inode(InodeId::new(44), NodeKind::CharDev, S_IFCHR | 0o600, 0x0103);
+        let namespace_entry = namespace_entry("null", &inode);
+        let entry = IntentLogEntry {
+            entry_id: 44,
+            entry_kind: IntentLogEntryKind::NamespaceCreateIntent(
+                NamespaceCreateIntentRecord {
+                    parent_inode_id: ROOT_INODE_ID,
+                    entry: namespace_entry,
+                    inode,
+                },
+            ),
+            root_anchor: test_root_anchor(),
+            timestamp_ns: test_timestamp(),
+        };
+
+        let bytes = encode_intent_log_entry(&entry);
+        let decoded = decode_intent_log_entry(&bytes).expect("decode");
+        match &decoded.entry_kind {
+            IntentLogEntryKind::NamespaceCreateIntent(intent) => {
+                assert_eq!(intent.parent_inode_id, ROOT_INODE_ID);
+                assert_eq!(intent.entry.name, b"null");
+                assert_eq!(intent.inode.kind(), NodeKind::CharDev);
+                assert_eq!(intent.inode.rdev, 0x0103);
+                assert_eq!(intent.entry.mode, S_IFCHR | 0o600);
+                assert!(!decoded.entry_kind.references_data_inode(InodeId::new(44)));
+                assert!(decoded.entry_kind.is_namespace_sync_for_dir(ROOT_INODE_ID));
             }
             _ => panic!("wrong kind"),
         }
@@ -2711,6 +2934,8 @@ mod tests {
     fn encoded_entry_len_various_kinds() {
         let anchor = test_root_anchor();
         let ts = test_timestamp();
+        let special_node =
+            special_inode(InodeId::new(103), NodeKind::CharDev, S_IFCHR | 0o600, 0x0103);
 
         let cases: Vec<IntentLogEntry> = vec![
             IntentLogEntry {
@@ -2735,6 +2960,18 @@ mod tests {
                     link_count_deltas: vec![(InodeId::new(101), 1), (InodeId::new(102), -1)],
                 },
                 root_anchor: anchor,
+                timestamp_ns: ts,
+            },
+            IntentLogEntry {
+                entry_id: 3,
+                entry_kind: IntentLogEntryKind::NamespaceCreateIntent(
+                    NamespaceCreateIntentRecord {
+                        parent_inode_id: ROOT_INODE_ID,
+                        entry: namespace_entry("null", &special_node),
+                        inode: special_node,
+                    },
+                ),
+                root_anchor: test_root_anchor(),
                 timestamp_ns: ts,
             },
         ];
@@ -2810,6 +3047,42 @@ mod tests {
         };
         Arc::make_mut(&mut state.inodes).insert(inode_id, record);
         state.observe_explicit_inode_id(inode_id);
+    }
+
+    fn special_inode(
+        inode_id: InodeId,
+        kind: NodeKind,
+        mode: u32,
+        rdev: u32,
+    ) -> InodeRecord {
+        InodeRecord {
+            rdev,
+            dir_storage_kind: 0,
+            inode_id,
+            generation: Generation::new(inode_id.get()),
+            facets: kind.to_facets(),
+            mode,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size: 0,
+            data_version: 1,
+            metadata_version: 1,
+            posix_time: crate::types::PosixTimeRecord::new(1, 1, 1, 1),
+            xattr_storage_kind: 0,
+            xattrs: BTreeMap::new(),
+            dir_rev: 0,
+        }
+    }
+
+    fn namespace_entry(name: &str, inode: &InodeRecord) -> crate::types::NamespaceEntry {
+        crate::types::NamespaceEntry {
+            name: name.as_bytes().to_vec(),
+            inode_id: inode.inode_id,
+            generation: inode.generation,
+            facets: inode.facets,
+            mode: inode.mode,
+        }
     }
 
     #[test]
@@ -3025,6 +3298,105 @@ mod tests {
 
         // Parent directory should be marked dirty
         assert!(state.dirty_dirs.contains(&dir_id));
+    }
+
+    #[test]
+    fn replay_namespace_create_intent_restores_files_and_special_nodes_with_rdev() {
+        let (mut store, _dir) = test_store();
+        let mut state = minimal_state();
+        let cases = [
+            ("file", NodeKind::File, S_IFREG | 0o644, 0),
+            ("fifo", NodeKind::Fifo, S_IFIFO | 0o644, 0),
+            ("char", NodeKind::CharDev, S_IFCHR | 0o600, 0x0103),
+            ("block", NodeKind::BlockDev, S_IFBLK | 0o660, 0x0801),
+            ("socket", NodeKind::Socket, S_IFSOCK | 0o700, 0),
+        ];
+
+        for (idx, (name, kind, mode, rdev)) in cases.into_iter().enumerate() {
+            let inode = special_inode(InodeId::new(200 + idx as u64), kind, mode, rdev);
+            let intent = NamespaceCreateIntentRecord {
+                parent_inode_id: ROOT_INODE_ID,
+                entry: namespace_entry(name, &inode),
+                inode: inode.clone(),
+            };
+            let entry = IntentLogEntry {
+                entry_id: 100 + idx as u64,
+                entry_kind: IntentLogEntryKind::NamespaceCreateIntent(intent),
+                root_anchor: anchor_for_tx(2),
+                timestamp_ns: 0,
+            };
+
+            replay_entry(&entry, &mut state, &mut store).expect("replay create");
+
+            let recovered = state.inodes.get(&inode.inode_id).expect("inode");
+            assert_eq!(recovered.kind(), kind, "wrong kind for {name}");
+            assert_eq!(recovered.mode, mode, "wrong mode for {name}");
+            assert_eq!(recovered.rdev, rdev, "wrong rdev for {name}");
+
+            let root_dir = state.directories.get(&ROOT_INODE_ID).expect("root dir");
+            let recovered_entry = root_dir
+                .get(name.as_bytes())
+                .unwrap_or_else(|| panic!("missing entry for {name}"));
+            assert_eq!(recovered_entry.inode_id, inode.inode_id);
+            assert_eq!(recovered_entry.kind(), kind);
+            assert!(state.known_inode_ids.contains(&inode.inode_id));
+            assert!(state.dirty_inodes.contains(&inode.inode_id));
+        }
+
+        assert!(state.dirty_dirs.contains(&ROOT_INODE_ID));
+        assert!(state.dirty_inodes.contains(&ROOT_INODE_ID));
+        assert_eq!(state.next_inode_id(), InodeId::new(205));
+    }
+
+    #[test]
+    fn replay_namespace_create_intent_is_idempotent() {
+        let (mut store, _dir) = test_store();
+        let mut state = minimal_state();
+        let inode = special_inode(InodeId::new(250), NodeKind::CharDev, S_IFCHR | 0o600, 0x0105);
+        let intent = NamespaceCreateIntentRecord {
+            parent_inode_id: ROOT_INODE_ID,
+            entry: namespace_entry("tty", &inode),
+            inode,
+        };
+        let entry = IntentLogEntry {
+            entry_id: 250,
+            entry_kind: IntentLogEntryKind::NamespaceCreateIntent(intent),
+            root_anchor: anchor_for_tx(2),
+            timestamp_ns: 0,
+        };
+
+        replay_entry(&entry, &mut state, &mut store).expect("first replay");
+        replay_entry(&entry, &mut state, &mut store).expect("second replay");
+
+        let root_dir = state.directories.get(&ROOT_INODE_ID).expect("root dir");
+        assert_eq!(root_dir.get(b"tty".as_slice()).unwrap().inode_id.get(), 250);
+        assert_eq!(state.inodes.get(&InodeId::new(250)).unwrap().rdev, 0x0105);
+    }
+
+    #[test]
+    fn replay_namespace_create_intent_rejects_non_device_rdev() {
+        let (mut store, _dir) = test_store();
+        let mut state = minimal_state();
+        let inode = special_inode(InodeId::new(251), NodeKind::Fifo, S_IFIFO | 0o644, 0x0103);
+        let intent = NamespaceCreateIntentRecord {
+            parent_inode_id: ROOT_INODE_ID,
+            entry: namespace_entry("pipe", &inode),
+            inode,
+        };
+        let entry = IntentLogEntry {
+            entry_id: 251,
+            entry_kind: IntentLogEntryKind::NamespaceCreateIntent(intent),
+            root_anchor: anchor_for_tx(2),
+            timestamp_ns: 0,
+        };
+
+        assert!(replay_entry(&entry, &mut state, &mut store).is_err());
+        assert!(!state.inodes.contains_key(&InodeId::new(251)));
+        assert!(!state
+            .directories
+            .get(&ROOT_INODE_ID)
+            .expect("root dir")
+            .contains_key(b"pipe".as_slice()));
     }
 
     #[test]

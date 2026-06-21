@@ -283,6 +283,9 @@ fn referenced_inode_ids(kind: &IntentLogEntryKind) -> Vec<u64> {
         IntentLogEntryKind::NamespaceSyncIntent {
             affected_inode_ids, ..
         } => affected_inode_ids.iter().map(|id| id.get()).collect(),
+        IntentLogEntryKind::NamespaceCreateIntent(intent) => {
+            vec![intent.parent_inode_id.get()]
+        }
         IntentLogEntryKind::PressureFallback | IntentLogEntryKind::CrashReplayReconcile => {
             Vec::new()
         }
