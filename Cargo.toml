@@ -108,6 +108,7 @@ members = [
   "crates/tidefs-dir-index",
   "crates/tidefs-durability-layout",
   "crates/tidefs-intent-log",
+  "crates/tidefs-storage-intent-core",
   "crates/tidefs-namespace",
   "crates/tidefs-inode-table",
   "crates/tidefs-xattr-storage",

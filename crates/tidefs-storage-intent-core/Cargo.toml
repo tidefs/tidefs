@@ -1,0 +1,20 @@
+[package]
+name = "tidefs-storage-intent-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+description = """
+Storage intent policy, receipt, evidence reference, media role, trust,
+durability, relocation, cost/wear, and predicate types for the media-native
+storage intent authority. no_std / forbid(unsafe_code).
+"""
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
