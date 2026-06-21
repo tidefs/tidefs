@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Fixed-width little-endian codecs for the TideFS request contract.
 //!
+//! Format-golden gate: the xtasks/`check-contract-codecs` tooling validates
+//! the embedded (compile-time) golden vectors, the on-disk golden `.bin`
+//! files, and the MANIFEST.json against each other.  This is codec/tooling
+//! evidence, not runtime adapter proof.  When a serialized ABI field changes,
+//! the golden vectors and manifest must be regenerated atomically.
 //! Versioned v1 records are exact-size packets. Decoding rejects unsupported
 //! versions, invalid length fields, unknown metadata tags, and non-zero
 //! reserved fields. Unknown request opcodes remain explicit unsupported
@@ -273,6 +278,9 @@ pub const CONTRACT_VFS_READ_COMPLETION_V1: [u8; TIDE_COMPLETION_V1_ENCODED_LEN] 
         [CONTRACT_VFS_IO_LEN, 0, 0],
     );
 
+// Compile-time golden vectors: each entry links a manifest name, file name,
+// and the embedded constant bytes so `check-contract-codecs` can cross-check
+// the manifest and on-disk `.bin` files against the compiled codec constants.
 pub static CONTRACT_VFS_WRITE_FSYNC_READ_V1_FIXTURES: [ContractGoldenFixture; 8] = [
     ContractGoldenFixture {
         manifest_name: "VfsContractWriteFsyncReadCreateRequestV1",
