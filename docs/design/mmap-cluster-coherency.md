@@ -894,10 +894,11 @@ than directly to the backing store:
   blocks until space is available.
 
 **Alternative considered**: Write dirty pages directly to the backing store
-(like NFS's `COMMIT`). Rejected because random 4KB writes to the backing
-store are ~10× slower than sequential intent-log appends, and the lease
-cannot be released until all writes are durable — blocking the requesting
-node's write fault.
+(like NFS's `COMMIT`). Rejected because the design assumes sequential
+intent-log appends can provide a lower-latency revocation path than random 4KB
+backing-store writes for the intended media and topology. That remains a
+validation target; the lease still cannot be released until all writes are
+durable, which blocks the requesting node's write fault.
 
 ### 9.5 FUSE path vs. kernel module (OW-201)
 
