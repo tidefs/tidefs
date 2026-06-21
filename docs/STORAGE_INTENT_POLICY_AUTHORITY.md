@@ -250,7 +250,7 @@ The core records are:
 | `StorageIntentRecoveryEvidence` | Degraded state, source receipt set, reconstruction width, missing/corrupt/stale target evidence, read-repair/rebuild obligation, replacement receipt publication, old-receipt retirement, partition/healing, RPO/RTO lag, and refusal evidence owned by #900 and sourced from placement receipts, scrub/repair/rebuild, membership, trust, ordering, capacity, layout, and lifecycle authorities. |
 | `StorageIntentPolicyRolloutEvidence` | Policy source provenance, compiled policy revision, publication transaction, change class, downgrade authorization, stage state, in-flight fence, convergence frontier, rollback/re-entry, supersession, and refusal evidence owned by #901 and sourced from policy config, authz/audit, operator runbook, satisfaction, and receipt authorities. |
 | `StorageIntentIsolationEvidence` | Tenant, dataset, policy/budget-owner, workload-class, isolation-scope, fair-share, burst, borrowing/debt, starvation, noisy-neighbor, reserve-exemption, throttle/defer, and refusal evidence owned by #902 and sourced from trust/domain, scheduler, resource-governor, cost, capacity, wear, transport, performance, and fault authorities. |
-| `StorageIntentWorkloadEvidence` | Bounded workload observations, prediction confidence, hint provenance, action class, shadow/trial/admitted decision refs, outcome/payback/harm refs, cooldown, misprediction, and confidence-update evidence owned by #845 and consumed by placement, scheduling, relocation, explanation, performance, and fault gates. |
+| `StorageIntentWorkloadEvidence` | Bounded workload observations, prediction confidence, hint provenance, signal materialization and collection-cost refs, action class, shadow/trial/admitted decision refs, outcome/payback/harm refs, cooldown, misprediction, and confidence-update evidence owned by #845 and consumed by placement, scheduling, relocation, explanation, performance, and fault gates. |
 | `StorageIntentTemporalEvidence` | Timebase identity, clock-health, skew/uncertainty, evidence age, event/frontier stamp, lag/staleness, expiry/deadline, sequence-to-time conversion, and temporal refusal evidence owned by #903 and consumed by geo, read-serving, lifecycle, rollout, trust, prediction, relocation, performance, and fault gates. |
 | `StorageIntentMediaCapabilityEvidence` | Device/media identity, persistence domain, flush/FUA/barrier semantics, volatile-cache policy, atomicity/granularity, protocol/geometry capability, health/freshness, role eligibility, and refusal evidence owned by #904 and consumed by ack receipts, placement, layout, wear, RAM/PMem, relocation, explanation, performance, and fault gates. |
 | `StorageIntentDecisionEvidence` | Decision identity, candidate frontier, hard-gate results, score vector, selected candidate, tie-breaker, reserve/admission refs, counterfactual baseline, payback/harm anchors, and refusal/defer evidence owned by #905 and consumed by placement, scheduling, read-serving, relocation, explanation, performance, fault, and claims gates. |
@@ -926,6 +926,23 @@ All high-cardinality state must be bounded with decay, sketches, histograms,
 top-K sets, or explicit promotion. No per-file or per-range signal may become
 an unbounded memory leak.
 
+Signal collection has a cost and is part of the design, not an invisible
+observer. Hotness counters, directory sketches, per-range histories, derived
+views, predictor checkpoints, and operator-facing telemetry may consume CPU,
+memory, durable metadata writes, flash endurance, and evidence-retention space.
+The default shape is cheap, lossy, decayed, and memory-local. Persistent signal
+state must be aggregated, sampled, rate-limited, or piggybacked on existing
+commit/evidence publication boundaries unless the compiled policy explicitly
+admits stronger materialization.
+
+Prediction evidence must therefore record the materialization mode that produced
+it. A high-confidence vector from bounded in-memory sketches is useful for
+queueing, prefetch, shadow evaluation, or cache trials, but it is not the same
+as a durable historical proof. A persistent signal record can support later
+payback, attribution, explanation, and claims only when #844/#856 cost, #902
+budget ownership, #910 retention, and #913 query-snapshot evidence prove that
+recording the signal was itself legal.
+
 ### Predictable Properties
 
 TideFS can often predict:
@@ -964,7 +981,8 @@ The adaptive loop is:
    planning epoch.
 3. Reconcile current receipts and evidence into a satisfaction state.
 4. Compute a confidence-scored workload vector with bounded observation,
-   contradiction, and hint-provenance evidence.
+   materialization mode, collection cost, contradiction, and hint-provenance
+   evidence.
 5. Generate candidate acknowledgment, serving, durable-placement, or
    relocation plans, and record prediction-decision refs for shadow, trial, or
    admitted actions.
@@ -972,7 +990,8 @@ The adaptive loop is:
    temporal, lifecycle, capacity, wear, or operator-policy constraints.
 7. Estimate latency, tail, throughput, write amplification, recovery risk, and
    money/egress cost for remaining candidates.
-8. Reserve placement, transport, capacity, dirty-byte, and wear budgets.
+8. Reserve placement, transport, capacity, dirty-byte, signal-persistence, and
+   wear budgets.
 9. Admit and dispatch the selected work through the scheduler/resource-governor
    lanes that match its action class.
 10. Publish receipts before claiming stronger placement or retiring older
