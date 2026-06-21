@@ -295,6 +295,16 @@ Important 2026-06-01 findings:
   slice does not change runtime behavior or close TFR-005; transform-aware
   scrub read authority, scrub routing, and repair dispatch remain owned by
   issues #650, #651, and #652.
+- `TFR-005`: issue #746 adds `docs/CONTENT_OBJECT_VERSION_AUTHORITY.md` as the
+  content-object version boundary. It records that `data_version` is the
+  content identity token for `(inode_id, data_version)` content keys, not a
+  reclaim clock, and names the separate reclaim liveness guard:
+  `death_commit_group`, `stable_committed_txg`, replacement/base placement
+  receipt epoch and generation evidence, and `OrphanReplayWatermark` when
+  orphan recovery participates. This documentation slice resolves the section 9
+  item 5 naming blocker without changing reclaim dispatch, rebake policy,
+  orphan cleanup, storage format, or runtime behavior; issues #675 and #676
+  still own implementation policy.
 - `TFR-006`: Transform authority is still split across mounted-content
   compression, object-store device compression/encryption, helper compression
   and encryption crates, and inline content-addressed dedup. The
