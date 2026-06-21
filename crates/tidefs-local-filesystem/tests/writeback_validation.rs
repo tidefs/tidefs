@@ -440,7 +440,10 @@ fn daemon_survives_metadata_operations() {
 
     {
         let mut fs = open_fs(&dir);
-        assert!(!fs.has_writeback_daemon(), "daemon must not be started (#5940)");
+        assert!(
+            !fs.has_writeback_daemon(),
+            "daemon must not be started (#5940)"
+        );
 
         // Create a file with data.
         fs.create_file("/file", DEFAULT_FILE_PERMISSIONS)
@@ -451,7 +454,10 @@ fn daemon_survives_metadata_operations() {
         let _stat = fs.stat("/file").expect("stat");
 
         // Daemon should still be running.
-        assert!(!fs.has_writeback_daemon(), "daemon must not be started (#5940)");
+        assert!(
+            !fs.has_writeback_daemon(),
+            "daemon must not be started (#5940)"
+        );
     }
     // Drop triggers daemon shutdown — should not panic.
 }
@@ -682,7 +688,8 @@ fn fsync_fast_path_preserves_intent_log_entries() {
     let payload: Vec<u8> = b"fsync-fast-path-keep-intents-test-data-01-sync-intent".to_vec();
     {
         let mut fs = open_fs(&dir);
-        let rec = fs.create_file("/keep", DEFAULT_FILE_PERMISSIONS)
+        let rec = fs
+            .create_file("/keep", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
         let digest = IntegrityDigest64(0);
         fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
@@ -709,7 +716,8 @@ fn fdatasync_fast_path_preserves_intent_log_entries() {
     let payload: Vec<u8> = b"fdatasync-fast-path-keep-intents-test-data-01-sync-intent".to_vec();
     {
         let mut fs = open_fs(&dir);
-        let rec = fs.create_file("/fdatakeep", DEFAULT_FILE_PERMISSIONS)
+        let rec = fs
+            .create_file("/fdatakeep", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
         let digest = IntegrityDigest64(0);
         fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
@@ -741,7 +749,8 @@ fn fsync_fast_path_data_survives_crash_reopen() {
     // Session 1: sync_write_intent, fsync, drop without commit.
     {
         let mut fs = open_fs(&dir);
-        let rec = fs.create_file("/crashsave", DEFAULT_FILE_PERMISSIONS)
+        let rec = fs
+            .create_file("/crashsave", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
         let digest = IntegrityDigest64(0);
         fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
@@ -757,7 +766,7 @@ fn fsync_fast_path_data_survives_crash_reopen() {
 
     // Session 2: reopen — the data must be recovered.
     {
-        let mut fs = open_fs(&dir);
+        let fs = open_fs(&dir);
         let data = fs.read_file("/crashsave").expect("read after reopen");
         assert_eq!(
             data, payload,
@@ -777,7 +786,8 @@ fn intent_log_cleared_after_full_commit() {
     let payload: Vec<u8> = b"commit-clears-intent-log-test-data-01-sync-intent".to_vec();
     {
         let mut fs = open_fs(&dir);
-        let rec = fs.create_file("/commitme", DEFAULT_FILE_PERMISSIONS)
+        let rec = fs
+            .create_file("/commitme", DEFAULT_FILE_PERMISSIONS)
             .expect("create file");
         let digest = IntegrityDigest64(0);
         fs.sync_write_intent(rec.inode_id, 0, payload.len() as u64, digest, &payload)
