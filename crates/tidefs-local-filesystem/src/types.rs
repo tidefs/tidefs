@@ -2627,8 +2627,16 @@ impl ContentFingerprint {
         Self(bytes)
     }
 
+    pub(crate) fn from_dedup_hash(hash: tidefs_dedup::DedupHash) -> Self {
+        Self(*hash.as_bytes32())
+    }
+
     pub const fn as_bytes32(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    pub(crate) fn as_dedup_hash(&self) -> tidefs_dedup::DedupHash {
+        tidefs_dedup::DedupHash::from(self.0)
     }
 }
 
