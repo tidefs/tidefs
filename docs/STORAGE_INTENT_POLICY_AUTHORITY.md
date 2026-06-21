@@ -270,6 +270,47 @@ Low-confidence predictions may tune queueing, prefetch, or shadow plans. They
 must not trigger expensive relocation until hysteresis and benefit/cost gates
 are satisfied.
 
+## Admission, Scheduling, And QoS
+
+Storage intent is enforced at admission and dispatch, not only at placement
+time. A compiled policy that asks for low-latency sync behavior must affect
+dirty-byte admission, device queues, transport windows, background optimizer
+budgets, and speculative work. Otherwise TideFS would know the right answer
+while still letting bulk work destroy the tail.
+
+TideFS should map storage-intent work onto the unified lane vocabulary rather
+than inventing a second scheduler:
+
+| Work class | Typical lane behavior |
+| --- | --- |
+| Sync barrier / FUA | latency-critical demand or metadata/control-adjacent work; never droppable; bounded queue time before receipt or refusal |
+| Metadata storm | metadata lane with namespace-intent batching and fsyncdir tail budget |
+| Ordinary foreground read/write | demand lane with workload and tenant budgets |
+| VM/random I/O | demand lane with strict p99/tail amplification budget |
+| Bulk ingest | throughput-oriented demand lane with large records and bounded cache admission |
+| Speculative prefetch or hot-read promotion | speculative lane; droppable under pressure |
+| Relocation/defrag/rebake/geo catch-up | background lane unless policy satisfaction or RPO risk escalates it |
+| Repair/evacuation | background or critical escalation according to receipt risk and policy floor |
+
+The scheduler consumes compiled policy, workload signals, resource-governor
+pressure, media/cost ledgers, and transport evidence. It may delay,
+backpressure, drop speculative work, or return typed refusals according to
+policy. It may not weaken an acknowledgment receipt, hide volatile behavior, or
+retire old placement receipts before replacement receipts exist.
+
+Admission evidence must be observable:
+
+- policy id and revision used for classification;
+- selected lane and priority class;
+- queue time and dispatch time;
+- resource budget that throttled or refused the operation;
+- starvation override or repair escalation reason;
+- whether the work was dropped, deferred, admitted, or completed.
+
+This is the mechanism that lets TideFS optimize both latency and throughput
+without turning one tenant's bulk stream, rebuild, or geo catch-up into another
+tenant's p99 failure.
+
 ## Acknowledgment Classes
 
 The acknowledgment class names what TideFS has earned before reporting
@@ -749,6 +790,12 @@ This document composes existing authority surfaces:
   authority must be modeled explicitly.
 - `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`: admission, dirty debt, transport
   queues, and memory budgets are hard gates for any optimizer.
+- `docs/design/unified-scheduling-classes-lane-priority-model.md`: storage
+  intent maps onto the shared lane vocabulary for admission, dispatch,
+  starvation prevention, and pressure throttling.
+- `docs/design/background-service-framework-design.md`: relocation, repair,
+  rebuild, scrub, compaction, and geo catch-up run as budgeted resumable work
+  when they are not serving a foreground or critical policy risk.
 - `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`: performance
   truth requires workload envelopes, KPIs, budgets, and receipts.
 - `docs/OPERATOR_UAPI_AUTHORITY.md`: operator surfaces must distinguish
@@ -811,6 +858,7 @@ this document except to update the issue map after live tickets exist.
 | Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, and relocation write budgets. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes. |
 | Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors for planning and performance rows. |
+| Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
 | Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier evidence without making RDMA mandatory. |
 | RAM authority design and implementation | #847 | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority. |
 | Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, and wear movement. |
