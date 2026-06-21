@@ -76,6 +76,7 @@ pub mod page_cache;
 pub mod path_lookup_cache;
 pub mod prefetch;
 pub mod weighted_arc;
+pub mod governor;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -86,6 +87,9 @@ use tidefs_types_cache_lattice_core::{
 
 // Re-exports from weighted_arc
 pub use weighted_arc::{ArcList, ArcWeightStats, WeightedArc, WeightedArcEntry};
+
+// Re-exports from governor
+pub use governor::{AdmissionTicket, BackpressureSignal, BudgetCategory, BudgetError, Governor, GovernorConfig};
 
 // ---------------------------------------------------------------------------
 // Entry weight for ARC eviction
@@ -591,7 +595,7 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheStore<K, V> {
         self.entries.remove(key)
     }
 
-    fn evict_one(&mut self) -> Option<CacheEntry<V>> {
+    pub(crate) fn evict_one(&mut self) -> Option<CacheEntry<V>> {
         // Collect non-pinned, clean entries as candidates
         let candidates: Vec<(&K, &CacheEntry<V>)> = self
             .entries
@@ -685,6 +689,8 @@ pub struct CacheLatticeRegistry<K: Eq + std::hash::Hash + Clone + fmt::Debug, V>
     total_misses: u64,
     total_evictions: u64,
     total_invalidations: u64,
+    /// Optional resource governor for budget-aware cache admission.
+    governor: Option<Governor>,
 }
 
 impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V> {
@@ -698,6 +704,22 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
             total_misses: 0,
             total_evictions: 0,
             total_invalidations: 0,
+            governor: None,
+        }
+    }
+
+    /// Attach a resource governor for budget-aware admission control.
+    ///
+    /// Once set, every cache `insert` will call [`Governor::admit`] and
+    /// every eviction/invalidation will call [`Governor::release`].
+    pub fn set_governor(&mut self, governor: Governor) {
+        self.governor = Some(governor);
+    }
+
+    /// Release bytes for an evicted or invalidated entry.
+    fn release_entry(&self, entry: &CacheEntry<V>) {
+        if let Some(ref gov) = self.governor {
+            gov.release(BudgetCategory::DataCache, entry.header.entry_size_bytes);
         }
     }
 
@@ -749,6 +771,11 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
     }
 
     /// Insert an entry into the cache for the given class.
+    ///
+    /// If a governor is attached, admission is checked first.  When
+    /// admission fails with [`BudgetError::OverBudget`], the store evicts
+    /// one entry (releasing its budget) and retries admission once.
+    ///
     /// If the cache is at capacity, the best eviction candidate is evicted.
     /// Returns the evicted entry if one was removed.
     pub fn insert(
@@ -757,21 +784,48 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
         key: K,
         entry: CacheEntry<V>,
     ) -> Option<CacheEntry<V>> {
+        let size = entry.header.entry_size_bytes;
+
+        // Governor-aware admission with one eviction retry on OverBudget.
+        if let Some(ref gov) = self.governor {
+            match gov.admit(BudgetCategory::DataCache, size) {
+                Ok(_ticket) => {} // granted
+                Err(BudgetError::OverBudget { .. }) | Err(BudgetError::GlobalOverBudget { .. }) => {
+                    // Try to free space: evict one entry from the same store.
+                    if let Some(store) = self.stores.get_mut(&class) {
+                        if let Some(victim) = store.evict_one() {
+                            gov.release(BudgetCategory::DataCache, victim.header.entry_size_bytes);
+                        }
+                    }
+                    // Retry admission after eviction.
+                    if gov.admit(BudgetCategory::DataCache, size).is_err() {
+                        return None; // admission still rejected
+                    }
+                }
+                Err(_) => return None, // UnknownCategory or other
+            }
+        }
+
         let store = self
             .stores
             .entry(class)
             .or_insert_with(|| CacheStore::new(256, EvictionPolicyKind::default()));
         self.total_inserts += 1;
         let evicted = store.insert(key, entry);
-        if evicted.is_some() {
+        if let Some(ref evicted_entry) = evicted {
             self.total_evictions += 1;
+            self.release_entry(evicted_entry);
         }
         evicted
     }
 
     /// Remove an entry from the cache for the given class.
     pub fn remove(&mut self, class: CacheClass, key: &K) -> Option<CacheEntry<V>> {
-        self.stores.get_mut(&class)?.remove(key)
+        let removed = self.stores.get_mut(&class)?.remove(key);
+        if let Some(ref entry) = removed {
+            self.release_entry(entry);
+        }
+        removed
     }
 
     /// Invalidate entries in the given class whose keys match the predicate.
