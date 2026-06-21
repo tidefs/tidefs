@@ -474,6 +474,90 @@ impl SimpleFS {
 
         Ok(())
     }
+
+    /// Compute real statfs fields from the backing inode and content store.
+    ///
+    /// Walks the on-disk inode directory to count files/dirs/symlinks, sums
+    /// actual content sizes, and queries the underlying filesystem for free
+    /// space so the FUSE mount reports honest capacity rather than a hardcoded
+    /// stub.
+    fn compute_statfs_fields(&self) -> fuser::statfs::StatfsFields {
+        let inodes_dir = Path::new(&self.data_dir).join("inodes");
+        let contents_dir = Path::new(&self.data_dir).join("contents");
+
+        let mut total_inodes: u64 = 0;
+        let mut logical_content_bytes: u64 = 0;
+        let mut physical_content_bytes: u64 = 0;
+
+        if let Ok(entries) = fs::read_dir(&inodes_dir) {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                if let Some(inode_num) = file_name.to_str().and_then(|s| s.parse::<u64>().ok()) {
+                    total_inodes = total_inodes.saturating_add(1);
+                    // Recorded logical size from InodeAttributes
+                    if let Ok(attrs) = self.get_inode(inode_num) {
+                        logical_content_bytes = logical_content_bytes.saturating_add(attrs.size);
+                    }
+                    // Physical content file size (includes directory descriptors)
+                    let content_path = contents_dir.join(inode_num.to_string());
+                    if let Ok(meta) = fs::metadata(&content_path) {
+                        physical_content_bytes =
+                            physical_content_bytes.saturating_add(meta.len());
+                    }
+                }
+            }
+        }
+
+        let used_blocks = logical_content_bytes
+            .max(physical_content_bytes)
+            .div_ceil(BLOCK_SIZE);
+
+        // Report the underlying filesystem capacity as the block pool for
+        // this demo filesystem, with the content store as a conservative
+        // fallback when statvfs is unavailable.
+        let (total_blocks, free_blocks): (u64, u64) = {
+            let Ok(dir) = std::ffi::CString::new(self.data_dir.as_bytes()) else {
+                return fuser::statfs::build_statvfs(
+                    used_blocks,
+                    0,
+                    total_inodes,
+                    0,
+                    BLOCK_SIZE as u32,
+                    MAX_NAME_LENGTH,
+                );
+            };
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(dir.as_ptr(), &mut stat) } == 0 {
+                let fragment_size = (if stat.f_frsize > 0 {
+                    stat.f_frsize as u64
+                } else {
+                    stat.f_bsize as u64
+                })
+                .max(1);
+                let to_blocks = |fragments: u64| {
+                    fragments
+                        .saturating_mul(fragment_size)
+                        .div_ceil(BLOCK_SIZE)
+                };
+                (
+                    to_blocks(stat.f_blocks as u64).max(used_blocks),
+                    to_blocks(stat.f_bfree as u64),
+                )
+            } else {
+                (used_blocks, 0)
+            }
+        };
+
+        fuser::statfs::build_statvfs(
+            total_blocks,
+            free_blocks,
+            total_inodes,
+            0,
+            BLOCK_SIZE as u32,
+            MAX_NAME_LENGTH,
+        )
+    }
+
 }
 
 impl Filesystem for SimpleFS {
@@ -1553,18 +1637,8 @@ impl Filesystem for SimpleFS {
     }
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-        warn!("statfs() implementation is a stub");
-        // Review debt TFR-016: real implementation of this
-        reply.statfs(
-            10_000,
-            10_000,
-            10_000,
-            1,
-            10_000,
-            BLOCK_SIZE as u32,
-            MAX_NAME_LENGTH,
-            BLOCK_SIZE as u32,
-        );
+        let fields = self.compute_statfs_fields();
+        fields.reply(reply);
     }
 
     fn setxattr(
