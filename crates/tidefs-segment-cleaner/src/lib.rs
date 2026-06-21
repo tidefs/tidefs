@@ -60,6 +60,11 @@ pub use ledger::{
     CleanerLedger, CleanerLedgerRecord, CLEANER_LEDGER_MAGIC, CLEANER_LEDGER_RECORD_SIZE,
     CLEANER_LEDGER_VERSION,
 };
+mod physical_reclaim;
+pub use physical_reclaim::{
+    drain_receipt_bound_physical_reclaim, PhysicalReclaimAuthority, PhysicalReclaimConfig,
+    PhysicalReclaimDrain,
+};
 pub use scanner::{
     CandidateRanker, CompactionCandidate, LivenessSource, ScannerConfig, SegmentLivenessScanner,
 };

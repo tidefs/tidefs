@@ -3432,9 +3432,11 @@ dependencies = [
  "tidefs-commit_group",
  "tidefs-gc-pin-set",
  "tidefs-incremental-job-core",
+ "tidefs-reclaim",
  "tidefs-reclaim-queue-core",
  "tidefs-types-dataset-lifecycle-core",
  "tidefs-types-incremental-job-core",
+ "tidefs-types-reclaim-queue-core",
 ]
 
 [[package]]

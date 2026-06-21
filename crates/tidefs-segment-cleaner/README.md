@@ -18,6 +18,7 @@ resumption.
 | `candidate_selector.rs` | `CandidateSelector`: pin-set-aware candidate selection filtering out segments reachable from pinned traversal roots |
 | `policy.rs` | `CleaningPolicy` (Auto/Deferred/Urgent) with space-pressure selection, `CleanerBackpressure` for write-path throttling, `SegmentScorer` for cost-benefit ranking |
 | `ledger.rs` | `CleanerLedger` with BLAKE3-verified `CleanerLedgerRecord` (magic VCLD, version 1, 80-byte on-disk format) for crash-safe cleaning resumption |
+| `physical_reclaim.rs` | Receipt-bound physical reclaim bridge: consumes `DeadObjectReclaimQueue`, returns `ReclaimReceipt`, and frees through `SegmentFreer` without creating a second capacity authority |
 
 ## Cleaning Policy
 
@@ -40,6 +41,7 @@ segments and to resume from the last cleaned segment.
 ## Integration Points
 
 - `tidefs-reclaim-queue-core`: `SegmentLivenessQueue` for dead/live byte accounting
+- `tidefs-reclaim`: `ReclaimReceipt`, `SegmentFreer`, and the receipt-bound dead-object drain used as the durable physical-reclaim authority
 - `tidefs-gc-pin-set`: `GcPinSet` for pin-aware candidate filtering
 - `tidefs-incremental-job-core`: `IncrementalJob` trait for background scheduling
 - The `BlockStore` trait abstracts the local object store for block enumeration,
@@ -48,5 +50,5 @@ segments and to resume from the last cleaned segment.
 ## Validation
 
 ```
-cargo test -p tidefs-segment-cleaner  # 220 tests
+cargo test -p tidefs-segment-cleaner
 ```

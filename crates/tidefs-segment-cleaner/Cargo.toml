@@ -20,4 +20,6 @@ tidefs-gc-pin-set = { path = "../tidefs-gc-pin-set" }
 tidefs-types-dataset-lifecycle-core = { path = "../tidefs-types-dataset-lifecycle-core" }
 tidefs-cleanup-queue-core = { path = "../tidefs-cleanup-queue-core" }
 tidefs-commit_group = { path = "../tidefs-commit_group" }
+tidefs-reclaim = { path = "../tidefs-reclaim" }
+tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
 blake3 = "1"
