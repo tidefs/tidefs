@@ -163,24 +163,18 @@ impl CommandSurface {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CommandRegistryDigestEntry<'a> {
+    path: &'a str,
+    class: &'a str,
+    routing: &'a str,
+    admission: &'a str,
+    visibility: &'a str,
+    summary: &'a str,
+}
 
-
-/// Compute a deterministic blake3 digest of the command classification registry.
-///
-/// The digest covers, for each command sorted by path: path, class label,
-/// routing label, admission label, visibility label, and summary text.
-/// This ensures the digest changes when a meaningful registry field changes
-/// but remains stable across map iteration order or JSON formatting changes.
-pub(crate) fn compute_command_registry_digest() -> String {
-    let mut hasher = blake3::Hasher::new();
-
-    // Collect into a BTreeMap (sorted by path) for deterministic iteration.
-    let mut sorted: std::collections::BTreeMap<&str, &CommandSurface> = std::collections::BTreeMap::new();
-    for surface in COMMAND_SURFACES {
-        sorted.insert(surface.path, surface);
-    }
-
-    for surface in sorted.values() {
+impl<'a> CommandRegistryDigestEntry<'a> {
+    fn from_surface(surface: &'a CommandSurface) -> Self {
         let admission = crate::commands::authz::command_admission(surface.path)
             .expect("classified command surface admission");
         let visibility = if surface.visible_in_root_help() {
@@ -188,18 +182,94 @@ pub(crate) fn compute_command_registry_digest() -> String {
         } else {
             "hidden"
         };
-        // Canonical field order: path|class|routing|admission|visibility|summary
-        hasher.update(surface.path.as_bytes());
-        hasher.update(surface.class.label().as_bytes());
-        hasher.update(surface.routing.label().as_bytes());
-        hasher.update(admission.label().as_bytes());
-        hasher.update(visibility.as_bytes());
-        hasher.update(surface.summary.as_bytes());
+
+        Self {
+            path: surface.path,
+            class: surface.class.label(),
+            routing: surface.routing.label(),
+            admission: admission.label(),
+            visibility,
+            summary: surface.summary,
+        }
+    }
+}
+
+/// Compute a deterministic blake3 digest of the command classification registry.
+///
+/// The digest covers, for each command sorted by path: path, class label,
+/// routing label, admission label, visibility label, and summary text. Each
+/// canonical field is length-prefixed so adjacent fields cannot alias.
+/// This ensures the digest changes when a meaningful registry field changes
+/// but remains stable across map iteration order or JSON formatting changes.
+pub(crate) fn compute_command_registry_digest() -> String {
+    compute_command_registry_digest_for_surfaces(COMMAND_SURFACES)
+}
+
+pub(crate) fn compute_command_registry_digest_for_surfaces(
+    surfaces: &[CommandSurface],
+) -> String {
+    let entries = surfaces
+        .iter()
+        .map(CommandRegistryDigestEntry::from_surface)
+        .collect();
+    compute_command_registry_digest_from_entries(entries)
+}
+
+fn compute_command_registry_digest_from_entries(
+    mut entries: Vec<CommandRegistryDigestEntry<'_>>,
+) -> String {
+    entries.sort_by(|left, right| {
+        (
+            left.path,
+            left.class,
+            left.routing,
+            left.admission,
+            left.visibility,
+            left.summary,
+        )
+            .cmp(&(
+                right.path,
+                right.class,
+                right.routing,
+                right.admission,
+                right.visibility,
+                right.summary,
+            ))
+    });
+
+    let mut hasher = blake3::Hasher::new();
+    update_registry_digest_field(
+        &mut hasher,
+        "format",
+        "tidefsctl-command-registry-digest-v1",
+    );
+    update_registry_digest_field(
+        &mut hasher,
+        "entry-count",
+        &entries.len().to_string(),
+    );
+
+    for entry in entries {
+        update_registry_digest_field(&mut hasher, "path", entry.path);
+        update_registry_digest_field(&mut hasher, "class", entry.class);
+        update_registry_digest_field(&mut hasher, "routing", entry.routing);
+        update_registry_digest_field(&mut hasher, "admission", entry.admission);
+        update_registry_digest_field(&mut hasher, "visibility", entry.visibility);
+        update_registry_digest_field(&mut hasher, "summary", entry.summary);
     }
 
     hasher.finalize().to_hex().to_string()
 }
 
+fn update_registry_digest_field(hasher: &mut blake3::Hasher, name: &str, value: &str) {
+    update_registry_digest_bytes(hasher, name.as_bytes());
+    update_registry_digest_bytes(hasher, value.as_bytes());
+}
+
+fn update_registry_digest_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
 
 pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
     CommandSurface {
@@ -774,6 +844,109 @@ mod tests {
 
         assert!(!help.contains("pool list [removed]"));
         assert!(!help.contains("device rebuild [removed]"));
+    }
+
+    #[test]
+    fn command_registry_digest_is_independent_of_surface_order() {
+        let digest = compute_command_registry_digest();
+        let mut reversed = COMMAND_SURFACES.to_vec();
+        reversed.reverse();
+
+        assert_eq!(
+            digest,
+            compute_command_registry_digest_for_surfaces(&reversed),
+            "registry digest must be independent of source-file entry order"
+        );
+    }
+
+    #[test]
+    fn command_registry_digest_changes_for_each_canonical_field() {
+        let base = CommandRegistryDigestEntry {
+            path: "pool status",
+            class: "public-operator",
+            routing: "live-owner-or-offline-input",
+            admission: "local-only",
+            visibility: "visible",
+            summary: "query the live owner by pool name",
+        };
+        let base_digest = compute_command_registry_digest_from_entries(vec![base]);
+
+        for (field, changed) in [
+            (
+                "path",
+                CommandRegistryDigestEntry {
+                    path: "pool status changed",
+                    ..base
+                },
+            ),
+            (
+                "class",
+                CommandRegistryDigestEntry {
+                    class: "operator-diagnostic",
+                    ..base
+                },
+            ),
+            (
+                "routing",
+                CommandRegistryDigestEntry {
+                    routing: "passive-diagnostic",
+                    ..base
+                },
+            ),
+            (
+                "admission",
+                CommandRegistryDigestEntry {
+                    admission: "unguarded",
+                    ..base
+                },
+            ),
+            (
+                "visibility",
+                CommandRegistryDigestEntry {
+                    visibility: "hidden",
+                    ..base
+                },
+            ),
+            (
+                "summary",
+                CommandRegistryDigestEntry {
+                    summary: "query a changed live-owner status summary",
+                    ..base
+                },
+            ),
+        ] {
+            assert_ne!(
+                base_digest,
+                compute_command_registry_digest_from_entries(vec![changed]),
+                "registry digest must change when {field} changes"
+            );
+        }
+    }
+
+    #[test]
+    fn command_registry_digest_preserves_field_boundaries() {
+        let first = CommandRegistryDigestEntry {
+            path: "ab",
+            class: "c",
+            routing: "d",
+            admission: "e",
+            visibility: "f",
+            summary: "g",
+        };
+        let second = CommandRegistryDigestEntry {
+            path: "a",
+            class: "bc",
+            routing: "d",
+            admission: "e",
+            visibility: "f",
+            summary: "g",
+        };
+
+        assert_ne!(
+            compute_command_registry_digest_from_entries(vec![first]),
+            compute_command_registry_digest_from_entries(vec![second]),
+            "adjacent field bytes must not collapse into the same digest input"
+        );
     }
 
     // -- StatusSource tests --

@@ -404,38 +404,6 @@ mod tests {
     }
 
     #[test]
-    fn registry_digest_is_independent_of_entry_iteration_order() {
-        let digest = super::super::classification::compute_command_registry_digest();
-
-        use super::super::classification::CommandSurface;
-        let surfaces = super::super::classification::COMMAND_SURFACES;
-        let mut reversed: Vec<&CommandSurface> = surfaces.iter().collect();
-        reversed.reverse();
-
-        let mut sorted: std::collections::BTreeMap<&str, &&CommandSurface> =
-            std::collections::BTreeMap::new();
-        for surface in &reversed {
-            sorted.insert(surface.path, surface);
-        }
-
-        let mut hasher = blake3::Hasher::new();
-        for surface in sorted.values() {
-            let admission = crate::commands::authz::command_admission(surface.path)
-                .expect("classified command surface admission");
-            let visibility = if surface.visible_in_root_help() { "visible" } else { "hidden" };
-            hasher.update(surface.path.as_bytes());
-            hasher.update(surface.class.label().as_bytes());
-            hasher.update(surface.routing.label().as_bytes());
-            hasher.update(admission.label().as_bytes());
-            hasher.update(visibility.as_bytes());
-            hasher.update(surface.summary.as_bytes());
-        }
-        let reversed_digest = hasher.finalize().to_hex().to_string();
-        assert_eq!(digest, reversed_digest,
-            "registry digest must be independent of source-file entry order");
-    }
-
-    #[test]
     fn validation_summary_is_unavailable_when_no_rows_are_consulted() {
         let summary = build_validation_summary();
 
@@ -444,35 +412,5 @@ mod tests {
         assert_eq!(summary.source_count, 0);
         assert!(summary.by_status.is_empty());
         assert!(summary.by_tier.is_empty());
-    }
-
-    #[test]
-    fn registry_digest_changes_when_entry_set_differs() {
-        let full_digest = super::super::classification::compute_command_registry_digest();
-
-        // Recompute a digest using only the first few entries — must differ.
-        let surfaces = super::super::classification::COMMAND_SURFACES;
-        let subset: Vec<&super::super::classification::CommandSurface> =
-            surfaces.iter().take(3).collect();
-        let mut sorted: std::collections::BTreeMap<&str, &&super::super::classification::CommandSurface> =
-            std::collections::BTreeMap::new();
-        for surface in &subset {
-            sorted.insert(surface.path, surface);
-        }
-        let mut hasher = blake3::Hasher::new();
-        for surface in sorted.values() {
-            let admission = crate::commands::authz::command_admission(surface.path)
-                .expect("classified command surface admission");
-            let visibility = if surface.visible_in_root_help() { "visible" } else { "hidden" };
-            hasher.update(surface.path.as_bytes());
-            hasher.update(surface.class.label().as_bytes());
-            hasher.update(surface.routing.label().as_bytes());
-            hasher.update(admission.label().as_bytes());
-            hasher.update(visibility.as_bytes());
-            hasher.update(surface.summary.as_bytes());
-        }
-        let subset_digest = hasher.finalize().to_hex().to_string();
-        assert_ne!(full_digest, subset_digest,
-            "digest must differ when the entry set changes");
     }
 }
