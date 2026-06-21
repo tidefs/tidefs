@@ -25,31 +25,31 @@ These surfaces carry historical "Wave Zero" or pre-alpha stage language that no 
   - Current text: `description = "Wave Zero POSIX Filesystem Adapter userspace mirror surface stub for TideFS"`
   - Classification: **Delete** the "Wave Zero" and "stub" wording.
   - The daemon is now a live FUSE adapter with committed dispatch surfaces. Retaining "stub" is misleading.
-  - Follow-up issue: remove "Wave Zero" and "stub" wording from this and sibling descriptions; replace with scoped adapter-operator description matching the package-role classification.
+  - Follow-up issue: #783 removes the "Wave Zero" and "stub" wording from this and sibling descriptions; replace with scoped adapter-operator description matching the package-role classification.
 
 - **Surface**: `crates/tidefs-types-secret-key-policy-core/Cargo.toml:9`
   - Current text: `description = "secret_key_policy_0 record types and enums (P9-04) for Wave Zero tidefs"`
   - Classification: **Delete** the "Wave Zero" wording.
-  - Follow-up issue: same removal issue as above.
+  - Follow-up issue: #783.
 
 - **Surface**: `crates/tidefs-types-posix-filesystem-adapter-core/src/lib.rs:7`
   - Current text: `//! Wave Zero does not widen the POSIX surface yet`
   - Classification: **Delete** the "Wave Zero" phrasing.
-  - Follow-up issue: same removal issue as above.
+  - Follow-up issue: #783.
 
 ### 1.2 Wave Zero label in xtask output
 
 - **Surface**: `xtask/tidefs-xtask/src/main.rs:1774`
   - Current text: `println!("tidefs Wave Zero workspace summary");`
   - Classification: **Delete** the "Wave Zero" wording; replace with neutral label.
-  - Follow-up issue: same removal issue as above.
+  - Follow-up issue: #783.
 
 ### 1.3 Wave Zero label in review docs
 
 - **Surface**: `docs/WHOLE_REPO_REVIEW.md:688`
   - Current text: `daemon a Wave Zero stub;`
   - Classification: **Delete** the "Wave Zero stub" wording (update the review note to reference this inventory instead).
-  - Follow-up issue: update WHOLE_REPO_REVIEW.md after deletion issues close.
+  - Follow-up issue: #783 updates `docs/WHOLE_REPO_REVIEW.md` after deletion issues close.
 
 ---
 
@@ -61,7 +61,7 @@ These surfaces carry historical "Wave Zero" or pre-alpha stage language that no 
   - Nine functions (algorithms #2-#10 from P5-01 section 10) that return `::default()` values and accept `_unused` parameters.
   - Functions: `normalize_mount_helper_argv_env_to_posix_filesystem_adapter_mount_intent`, `admit_posix_filesystem_adapter_mount_intent_under_package_policy_and_global_budget`, `spawn_posix_filesystem_adapter_session_runtime_and_transfer_mount_capsule`, `materialize_posix_filesystem_adapter_session_thread_sets_from_p5_02_and_p5_03_laws`, `bind_posix_filesystem_adapter_session_to_policy_authority_publication_pipeline_response_registry_and_observe_surfaces`, `issue_posix_filesystem_adapter_ready_or_refusal_receipt_and_release_mount_helper`, `drain_posix_filesystem_adapter_session_for_unmount_cutover_failover_or_pressure`, `classify_posix_filesystem_adapter_session_crash_or_abnormal_stop`, `recover_or_quarantine_posix_filesystem_adapter_session_after_crash_or_supervisor_restart`.
   - Classification: **Implement** — real daemon session lifecycle steps that currently have no body logic. Each function name declares a contract that must be fulfilled before product claims.
-  - Follow-up issue: implement daemon session lifecycle (scoped to one coherent slice of the topology state machine).
+  - Follow-up issue: #784 implements daemon session lifecycle (scoped to one coherent slice of the topology state machine).
 
 ### 2.2 statfs() stub in vendored FUSE example
 
@@ -69,14 +69,14 @@ These surfaces carry historical "Wave Zero" or pre-alpha stage language that no 
   - Returns hardcoded `10_000` values for blocks/files and logs `warn!("statfs() implementation is a stub")`.
   - Has an inline `// Review debt TFR-016` comment.
   - Classification: **Implement** — the `simple.rs` example is a vendored/demo harness, but the stub is the only available statfs reference implementation.
-  - Follow-up issue: implement real statfs in the example or wire the engine's statfs into the example path.
+  - Follow-up issue: #785 implements real statfs in the example or wires the engine's statfs into the example path.
 
 ### 2.3 FUSE_BMAP returning ENOSYS
 
 - **Surface**: `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md:177`
   - Documents `FUSE_BMAP` / `bmap()` as "Implemented" but "Stub returning ENOSYS".
   - Classification: **Implement** — bmap support is a real POSIX surface gap.
-  - Follow-up issue: implement bmap() in the FUSE adapter or classify as intentionally unsupported with a rationale doc.
+  - Follow-up issue: #786 implements bmap() in the FUSE adapter or classifies it as intentionally unsupported with a rationale doc.
 
 ---
 
@@ -89,7 +89,7 @@ These surfaces carry historical "Wave Zero" or pre-alpha stage language that no 
   - Phase B stubs section (line 821): tests gated behind `Claimed`/`NotReady` that are declared as stubs.
   - However, the actual test bodies (e.g., namespace-backed lookup tests) contain real assertions and exercise wired dispatch paths.
   - Classification: **Implement** — the `Claimed`/`NotReady` gate labels must be resolved to `Committed` for tests that exercise committed surfaces, or the stubs must be documented with concrete follow-up issues.
-  - Follow-up issue: audit FUSE e2e smoke test gates; promote tests whose dispatch surfaces are committed; file implementation issues for the remaining gated tests.
+  - Follow-up issue: #787 audits FUSE e2e smoke test gates; promote tests whose dispatch surfaces are committed; file implementation issues for the remaining gated tests.
 
 ---
 
@@ -103,14 +103,14 @@ These surfaces carry historical "Wave Zero" or pre-alpha stage language that no 
 - **Surface**: `crates/tidefs-block-kmod/src/dispatch.rs:1156, 1191`
   - Similarly marked "Kbuild stub" for lifecycle event digests.
 - Classification: **Implement** — these are legitimate kernel-build limitations, not scaffolding. The BLAKE3 kernel compatibility story needs resolution: either port BLAKE3 to the kernel build or document the fail-closed policy as permanent.
-- Follow-up issue: resolve BLAKE3 availability in kernel builds; update stub markers to scoped TFR references.
+- Follow-up issue: #788 resolves BLAKE3 availability in kernel builds; update stub markers to scoped TFR references.
 
 ### 4.2 ENOSYS returns in kernel VFS module
 
 - **Surface**: `crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_main.rs:4574, 5539, 5701, 5709, 6376, 6384, 6486`
   - Multiple VFS operations return ENOSYS: fallocate, fiemap, some xattr paths, etc.
 - Classification: **Implement** — these are gaps in kernel VFS operation coverage. Some are intentionally deferred (noted in review register).
-- Follow-up issue: already tracked by TFR-018 kernel VFS xfstests burn-down; this inventory notes the stub ENOSYS returns as part of that surface.
+- Follow-up issue: #799 resolves or explicitly classifies the kernel VFS ENOSYS-returning operation paths under TFR-018.
 
 ### 4.3 Kernel intent writer no-op stub
 
@@ -156,7 +156,7 @@ These are not stubs in the traditional sense (they contain real code and tests),
 
 Classification: **Implement** — each needs a dedicated follow-up issue to establish its authority claim or reclassify it. Issues #815–#836 carry the per-crate implementation scope.
 
-Follow-up scope: issue #789 split the tracking surface into per-crate issues #815–#836 with disjoint expected write sets.
+Follow-up scope: #789 tracks the 22 planned-authority surfaces and has split the tracking surface into per-crate issues #815–#836 with disjoint expected write sets.
 
 ---
 
@@ -167,35 +167,35 @@ Follow-up scope: issue #789 split the tracking surface into per-crate issues #81
 - **Surface**: `crates/tidefs-dedup/`
   - Listed in `docs/ARCHITECTURE.md` integrity layer with note "not live write-path authority".
 - Classification: **Implement** — the crate exists but its integration into the write path is deferred.
-- Follow-up issue: wire dedup into the live write path or reclassify as historical design input.
+- Follow-up issue: #790 wires dedup into the live write path or reclassifies it as historical design input.
 
 ### 6.2 Segment cleaner model surface
 
 - **Surface**: `crates/tidefs-segment-cleaner/`
   - Listed in `docs/ARCHITECTURE.md` with note "model surface; live physical reclaim requires receipt-bound dead-object drains".
 - Classification: **Implement** — the model surface exists but physical reclaim is incomplete.
-- Follow-up issue: complete the receipt-bound dead-object drain integration.
+- Follow-up issue: #791 completes the receipt-bound dead-object drain integration.
 
 ### 6.3 CryptoPlaceholder error variant
 
 - **Surface**: `crates/tidefs-secret-key-policy-runtime/src/lib.rs:122, 798`
   - `CryptoPlaceholder` error variant and its emission path.
 - Classification: **Implement** — placeholder for real cryptographic policy enforcement.
-- Follow-up issue: implement the cryptographic policy enforcement path; remove the placeholder error variant.
+- Follow-up issue: #792 implements the cryptographic policy enforcement path; remove the placeholder error variant.
 
 ### 6.4 Transport placeholder endpoint type
 
 - **Surface**: `crates/tidefs-transport/src/config.rs:37-42`
   - Comment: "Placeholder endpoint type -- will be replaced by the canonical endpoint type once #5787 lands."
 - Classification: **Implement** — blocked on a design issue (#5787 is a historical Forgejo reference; needs a current GitHub issue).
-- Follow-up issue: create or locate the current canonical endpoint type issue; replace the placeholder.
+- Follow-up issue: #793 creates or locates the current canonical endpoint type authority and replaces the placeholder.
 
 ### 6.5 Cluster orchestrator scaffolding notes
 
 - **Surface**: `crates/tidefs-cluster/src/pool_orchestrator.rs:5-19`
   - Comments mark `ClusterPoolOrchestrator` and `PoolTransport` trait as scaffolding.
 - Classification: **Implement** — the orchestrator builds real per-node transport but is still classified as scaffolding.
-- Follow-up issue: promote the orchestrator from scaffolding to product-code; resolve TFR-017 transport authority gates.
+- Follow-up issue: #794 promotes the orchestrator from scaffolding to product-code and resolves TFR-017 transport authority gates for this surface.
 
 ### 6.6 unimplemented!() in node-drain test mock
 
@@ -209,7 +209,7 @@ Follow-up scope: issue #789 split the tracking surface into per-crate issues #81
 - **Surface**: `crates/tidefs-rebuild-runtime/src/engine.rs:36, 169, 241; admission.rs:95, 163; completion.rs:109`
   - Comments and error variants describing synthetic placeholders used when real durable receipts are unavailable.
 - Classification: **Implement** — the rebuild runtime has real logic but accepts synthetic placeholders for scaffolding callers.
-- Follow-up issue: remove synthetic placeholder acceptance paths; require durable receipt evidence.
+- Follow-up issue: #795 removes synthetic placeholder acceptance paths and requires durable receipt evidence.
 
 ---
 
@@ -221,14 +221,14 @@ Follow-up scope: issue #789 split the tracking surface into per-crate issues #81
   - These are references to design spec documents (e.g., OW-101, PC-003, NEXT-204), not anonymous debt markers.
   - However, many originate from the Forgejo era and reference issue numbers that are not GitHub-valid.
 - Classification: **Implement** — these labels are design-document cross-references, not stubs. However, the broader renaming from Forgejo-era labels should be tracked.
-- Follow-up issue: audit OW/PC/NEXT label references for stale Forgejo links; reclassify or update as needed.
+- Follow-up issue: #796 audits OW/PC/NEXT label references for stale Forgejo links; reclassify or update as needed.
 
 ### 7.2 Forgejo references in unclassified docs
 
 - **Surface**: Multiple docs under `docs/` and `docs/design/` still reference Forgejo issue numbers and URLs (e.g., `http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/...`).
   - This is tracked by TFR-019 and the `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` initial open queue.
 - Classification: **Implement** — already queued under TFR-019 documentation authority classification.
-- Already has follow-up: `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` initial open queue (87 unclassified docs).
+- Follow-up issue: #689 tracks the `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` initial open queue (87 unclassified docs).
 
 ### 7.3 FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX maturity table
 
@@ -236,7 +236,7 @@ Follow-up scope: issue #789 split the tracking surface into per-crate issues #81
   - Documents stub/implemented status for each FUSE operation.
   - `FUSE_BMAP` listed as stub returning ENOSYS.
 - Classification: **Implement** — the matrix is current but several stubs need resolution.
-- Follow-up issue: resolve remaining FUSE operation stubs or document intentional non-support.
+- Follow-up issue: #797 resolves remaining FUSE operation stubs or documents intentional non-support.
 
 ---
 
@@ -279,41 +279,42 @@ These surfaces are intentionally non-production and preserved for signal collect
 
 These surfaces were identified as stub/placeholder during the audit but already have active follow-up issues or are tracked by existing registers.
 
-- **TFR-017 transport/cluster authority** — covers `apps/tidefs-storage-node` cluster authority gap and `crates/tidefs-cluster` scaffolding.
-- **TFR-018 kernel VFS xfstests** — covers kernel VFS ENOSYS returns and mount-path stubs.
-- **TFR-011 operator UAPI** — covers CLI command classification and admission gaps.
-- **TFR-019 doc authority** — covers Forgejo references and unclassified imported docs.
+- **TFR-017 transport/cluster authority** — covers `apps/tidefs-storage-node` cluster authority gap and `crates/tidefs-cluster` scaffolding; #793 and #794 track the endpoint and orchestrator placeholder surfaces identified here.
+- **TFR-018 kernel VFS xfstests** — covers kernel VFS ENOSYS returns and mount-path stubs; #799 tracks the ENOSYS operation-surface follow-up.
+- **TFR-011 operator UAPI** — covers CLI command classification and admission gaps; existing operator UAPI issues #657, #658, #659, #660, and #662 carry current slices.
+- **TFR-019 doc authority** — covers Forgejo references and unclassified imported docs; #689 tracks the remaining documentation authority queue.
 - **Issue #276** — already deleted scaffold-transitional package roots.
 
 ---
 
 ## Follow-Up Issue Map
 
-| Follow-Up Issue (proposed) | Surface(s) | Disposition | Expected Write Set |
+| Follow-Up Issue | Surface(s) | Disposition | Expected Write Set |
 | --- | --- | --- | --- |
-| `issue-wave-zero-wording-removal` | Section 1 (Wave Zero labels in Cargo.toml, lib.rs, xtask, WHOLE_REPO_REVIEW.md) | Delete | 4-5 files |
-| `issue-daemon-topology-session-lifecycle` | Section 2.1 (algorithm stubs in daemon_topology.rs) | Implement | `apps/tidefs-posix-filesystem-adapter-daemon/src/runtime/daemon_topology.rs` |
-| `issue-statfs-fuse-example` | Section 2.2 (statfs stub in simple.rs) | Implement | `crates/tidefs-fuser/examples/simple.rs` |
-| `issue-fuse-bmap-implementation` | Section 2.3 (FUSE_BMAP ENOSYS) | Implement | FUSE adapter bmap wiring |
-| `issue-e2e-smoke-test-gate-audit` | Section 3.1 (Claimed/NotReady test gates) | Implement | `apps/tidefs-posix-filesystem-adapter-daemon/tests/fuse_e2e_smoke.rs` |
-| `issue-blake3-kernel-availability` | Section 4.1 (Kbuild BLAKE3 stubs) | Implement | `crates/tidefs-kmod-posix-vfs/src/mount.rs`, `crates/tidefs-block-kmod/src/dispatch.rs` |
-| `issue-planned-authority-tracking` | Section 5 (22 planned-authority-surface crates) | Implement | Tracking issue; individual crate follow-ups |
-| `issue-dedup-write-path-integration` | Section 6.1 (dedup crate) | Implement | `crates/tidefs-dedup/` |
-| `issue-segment-cleaner-physical-reclaim` | Section 6.2 (segment cleaner) | Implement | `crates/tidefs-segment-cleaner/` |
-| `issue-crypto-policy-enforcement` | Section 6.3 (CryptoPlaceholder) | Implement | `crates/tidefs-secret-key-policy-runtime/` |
-| `issue-transport-canonical-endpoint` | Section 6.4 (transport placeholder endpoint) | Implement | `crates/tidefs-transport/src/config.rs` |
-| `issue-cluster-orchestrator-promotion` | Section 6.5 (cluster orchestrator scaffolding) | Implement | `crates/tidefs-cluster/src/pool_orchestrator.rs` |
-| `issue-rebuild-runtime-durable-receipts` | Section 6.7 (synthetic placeholder receipts) | Implement | `crates/tidefs-rebuild-runtime/` |
-| `issue-ow-pc-next-label-audit` | Section 7.1 (issue-era labels) | Implement | Multiple files |
-| `issue-fuse-matrix-stub-resolution` | Section 7.3 (FUSE feature matrix stubs) | Implement | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` |
+| #783 | Section 1 (Wave Zero labels in Cargo.toml, lib.rs, xtask, WHOLE_REPO_REVIEW.md) | Delete | 4-5 files |
+| #784 | Section 2.1 (algorithm stubs in daemon_topology.rs) | Implement | `apps/tidefs-posix-filesystem-adapter-daemon/src/runtime/daemon_topology.rs` |
+| #785 | Section 2.2 (statfs stub in simple.rs) | Implement | `crates/tidefs-fuser/examples/simple.rs` |
+| #786 | Section 2.3 (FUSE_BMAP ENOSYS) | Implement | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`, `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs`, `crates/tidefs-fuser/src/lib.rs` |
+| #787 | Section 3.1 (Claimed/NotReady test gates) | Implement | `apps/tidefs-posix-filesystem-adapter-daemon/tests/fuse_e2e_smoke.rs` |
+| #788 | Section 4.1 (Kbuild BLAKE3 stubs) | Implement | `crates/tidefs-kmod-posix-vfs/src/mount.rs`, `crates/tidefs-block-kmod/src/dispatch.rs` |
+| #799 | Section 4.2 (kernel VFS ENOSYS returns) | Implement | `crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_main.rs` |
+| #789 | Section 5 (22 planned-authority-surface crates) | Implement | Tracking issue; individual crate follow-ups |
+| #790 | Section 6.1 (dedup crate) | Implement | `crates/tidefs-dedup/` |
+| #791 | Section 6.2 (segment cleaner) | Implement | `crates/tidefs-segment-cleaner/` |
+| #792 | Section 6.3 (CryptoPlaceholder) | Implement | `crates/tidefs-secret-key-policy-runtime/` |
+| #793 | Section 6.4 (transport placeholder endpoint) | Implement | `crates/tidefs-transport/src/config.rs` |
+| #794 | Section 6.5 (cluster orchestrator scaffolding) | Implement | `crates/tidefs-cluster/src/pool_orchestrator.rs` |
+| #795 | Section 6.7 (synthetic placeholder receipts) | Implement | `crates/tidefs-rebuild-runtime/` |
+| #796 | Section 7.1 (issue-era labels) | Implement | Multiple files |
+| #797 | Section 7.3 (FUSE feature matrix stubs) | Implement | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` |
 
-Note: Concrete issue numbers should be assigned when each follow-up is filed. The Wave Zero wording removal and the planned-authority tracking issue are the highest-priority slices because they touch the broadest surfaces with the lowest implementation risk.
+The Wave Zero wording removal and the planned-authority tracking issue are the highest-priority slices because they touch the broadest surfaces with the lowest implementation risk.
 
 ---
 
 ## Verification
 
-- Source/doc inspection completed against `origin/master` at `30a9ad8d`.
+- Source/doc inspection completed against `origin/master` at `9372d6b1`.
 - `git diff --check` passes (this document only).
 - No runtime, build, or test validation required for this inventory slice.
 - This inventory does not duplicate the `docs/workspace-package-classification.md` package-role audit; it focuses on non-package stub surfaces and package-level placeholder behavior the role table does not resolve.
