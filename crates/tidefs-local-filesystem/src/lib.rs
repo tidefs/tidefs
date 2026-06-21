@@ -3021,17 +3021,20 @@ impl LocalFileSystem {
         // GC pin set starts empty.
         // Load or create the durable dataset catalog from the pool store.
         // This is the canonical dataset catalog authority for the mounted
-        // filesystem. On first mount the catalog is empty; it is populated
-        // from state.snapshots below and persisted before returning.
+        // filesystem. On first mount the catalog is absent; persisted catalog
+        // bytes that cannot be decoded or loaded are refused instead of
+        // recreated as an implicit migration for retired pre-release input.
         let mut dataset_catalog = match store.primary_store().get(dataset_catalog_object_key()) {
-            Ok(Some(bytes)) => DatasetCatalog::decode(&bytes).unwrap_or_else(|e| {
-                eprintln!("warning: dataset catalog decode failed: {e}; starting empty");
-                DatasetCatalog::new()
-            }),
+            Ok(Some(bytes)) => {
+                DatasetCatalog::decode(&bytes).map_err(|_| FileSystemError::CorruptState {
+                    reason: "dataset catalog decode failed during reopen",
+                })?
+            }
             Ok(None) => DatasetCatalog::new(),
-            Err(e) => {
-                eprintln!("warning: dataset catalog load failed: {e}; starting empty");
-                DatasetCatalog::new()
+            Err(_) => {
+                return Err(FileSystemError::CorruptState {
+                    reason: "dataset catalog load failed during reopen",
+                });
             }
         };
 

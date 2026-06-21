@@ -137,8 +137,10 @@ Important 2026-06-01 findings:
   SpaceBook bridge, and the FUSE mount path now pushes a resolved catalog
   `DatasetId` into `LocalFileSystem::mounted_dataset_id()` before wrapping the
   engine. Existing pre-rebuild catalogs whose `root` entry already carries a
-  different ID now fail closed on mount, but still need a deliberate
-  dataset-ID migration design under TFR-004. Namespace
+  different ID now fail closed on mount. Under
+  `docs/UNRELEASED_AUTHORITY_POLICY.md`, those retired pre-release catalogs are
+  not a default migration target unless a future issue names a real external
+  or operator-owned boundary. Namespace
   persistence can feed loaded inode IDs back into `LocalFileSystem` through
   `insert_inode_at()`, and FUSE lookup/forget paths wrap the separate
   `tidefs-inode-table` registry. The main code hotspots now carry
@@ -161,9 +163,10 @@ Important 2026-06-01 findings:
   `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target cargo test -p
   tidefs-local-filesystem --locked
   root_dataset_catalog_id_matches_mounted_dataset_id`, and `git diff --check`.
-  This still does not close TFR-004: old root catalog ID migration,
-  dataset-scoped inode identity, and duplicate namespace/inode-table allocation
-  authorities remain open.
+  This still does not close TFR-004: dataset-scoped inode identity and
+  duplicate namespace/inode-table allocation authorities remain open, while
+  old root catalog compatibility remains fail-closed unless a future issue
+  names the boundary required by `docs/UNRELEASED_AUTHORITY_POLICY.md`.
 - `TFR-004`: commit `b789492c` removes the remaining warning-only root dataset
   identity mismatch path. When a persisted dataset catalog contains `root` with
   an ID different from `ROOT_DATASET_ID`, `LocalFileSystem` now returns
@@ -173,9 +176,10 @@ Important 2026-06-01 findings:
   `CARGO_TARGET_DIR=/root/ai/tmp/tidefs-target cargo check -p
   tidefs-local-filesystem --lib --locked`, `cargo fmt -p
   tidefs-local-filesystem --check`, and scoped `git diff --check` for the
-  touched files. This still does not close TFR-004: fail-closed refusal is not
-  a migration path, and inode allocation remains split across local
-  filesystem, namespace, FUSE lookup registry, and inode-table paths.
+  touched files. This still does not close TFR-004: fail-closed refusal is the
+  default old-catalog policy rather than a migration path, and inode allocation
+  remains split across local filesystem, namespace, FUSE lookup registry, and
+  inode-table paths.
 - `TFR-004`: commit `ba5e7647` fixes a namespace-persistence allocator leak.
   The in-memory `PersistentInodeStore` now preserves explicit nonzero inode IDs
   in `InodeAttributes` and advances the bump allocator past them, matching the
@@ -242,6 +246,16 @@ Important 2026-06-01 findings:
   projection, #666 for old catalog fail-closed policy refinement, and #667 for
   special-node `rdev` replay. This documentation slice does not implement
   runtime inode behavior and does not close TFR-004.
+- `TFR-004`: issue #666 records the old-catalog policy refinement after issue
+  #655. Root catalog absence on first mount is still initialized, but persisted
+  dataset catalog bytes that cannot be decoded or loaded now fail closed
+  during reopen instead of being treated as an empty catalog. Persisted `root`
+  dataset ID mismatch also remains fail-closed. No migration or compatibility
+  behavior is authorized unless a future issue names the external boundary or
+  operator-owned data set, validation plan, and retirement/graduation criteria
+  required by `docs/UNRELEASED_AUTHORITY_POLICY.md`. This does not implement
+  dataset-scoped allocator extraction, FUSE lookup-reference ownership, or
+  special-node `rdev` replay.
 - `TFR-005`: POSIX timestamp paths write through `metadata_version` and
   `data_version`, and `InodeRecord::to_inode_attr()` projects those same
   persisted fields back as POSIX atime/mtime/ctime/btime. `data_version` is
