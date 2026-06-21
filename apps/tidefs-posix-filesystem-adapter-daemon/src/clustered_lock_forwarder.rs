@@ -132,6 +132,8 @@ pub struct ClusteredPosixLockForwarder<S: LockFrameSink> {
     pending: BTreeMap<u64, Arc<PendingRequest>>,
     /// Tracked granted leases: (ino, owner_key, start, len) → lease_id.
     granted: BTreeMap<GrantKey, u64>,
+    /// Terminal blocking setlkw responses surfaced on the FUSE retry path.
+    terminal_failures: BTreeMap<GrantKey, LockDispatchError>,
     /// Default timeout for synchronous dispatch waits.
     dispatch_timeout: std::time::Duration,
     /// Leader endpoint for LOCK frames.
@@ -166,6 +168,7 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
             leader,
             pending: BTreeMap::new(),
             granted: BTreeMap::new(),
+            terminal_failures: BTreeMap::new(),
             dispatch_timeout: std::time::Duration::from_secs(30),
         })
     }
@@ -318,6 +321,18 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
         };
 
         if let Some(pending) = self.pending.remove(&op_id) {
+            if pending.blocking() {
+                if let Some(key) = pending.request_key() {
+                    match &result {
+                        Ok(_) => {
+                            self.terminal_failures.remove(&key);
+                        }
+                        Err(err) => {
+                            self.terminal_failures.insert(key, err.clone());
+                        }
+                    }
+                }
+            }
             pending.set_result(result);
         }
     }
@@ -424,6 +439,9 @@ impl<S: LockFrameSink> FusePosixLockDispatch for ClusteredPosixLockForwarder<S> 
 
         let len = safe_len(request.start, request.end);
         let key = (request.ino, request.lock_owner, request.start, len);
+        if let Some(err) = self.terminal_failures.remove(&key) {
+            return Err(err);
+        }
         if self.granted.contains_key(&key) {
             return Ok(());
         }
@@ -1043,6 +1061,32 @@ mod tests {
         assert!(f.pending.is_empty());
         assert_eq!(f.granted.get(&(100, 42, 0, 100)), Some(&88));
         f.setlkw(req).unwrap();
+    }
+
+    #[test]
+    fn setlkw_terminal_ack_is_returned_on_retry() {
+        let mut f = test_forwarder();
+        let req = lock_request(100, 42, 0, 99, 1, 1234);
+
+        let signal = match f.setlkw(req) {
+            Err(LockDispatchError::Blocked { signal }) => signal,
+            other => panic!("expected blocked setlkw, got {other:?}"),
+        };
+        let op_id = *f.pending.keys().next().unwrap();
+
+        f.handle_response(LockFrame::new(
+            op_id,
+            LockPayload::SetlkAck(tidefs_lock_service::SetlkAck {
+                status: LockServiceStatus::DeniedFenced,
+                lock_id: 0,
+                conflict: None,
+            }),
+        ));
+
+        assert!(signal.wait_timeout(std::time::Duration::from_millis(100)));
+        assert!(f.pending.is_empty());
+        assert!(matches!(f.setlkw(req), Err(LockDispatchError::Internal(_))));
+        assert!(f.pending.is_empty());
     }
 
     // ── Local-mode dispatch stays in-process ────────────────────────
