@@ -3,12 +3,19 @@
 Date: 2026-05-05
 Status: Accepted
 
+Current authority note: this ADR records the accepted historical design
+direction. It does not prove current end-to-end checksum, scrub self-heal,
+erasure-coded repair, or OpenZFS/Ceph-class integrity behavior. Product-facing
+comparison or successor wording still requires #875 claim ids plus #928/#930
+comparator evidence.
+
 ## Context
 
 Data integrity is a non-negotiable requirement for any next-generation storage
 system. ZFS defines the bar with end-to-end 256-bit checksums on every block
 pointer and self-healing from redundant copies. Ceph offers optional per-object
-checksums but silent corruption can persist when they are disabled.
+checksums but silent corruption can persist when they are disabled. These are
+design inputs, not current TideFS comparator evidence.
 
 TideFS needed a canonical checksum strategy that:
 - Is mandatory (never optional)

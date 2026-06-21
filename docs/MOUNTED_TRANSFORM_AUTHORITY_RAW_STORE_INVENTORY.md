@@ -83,7 +83,7 @@ branch can pass the guard.
 | Intent log, fsync, commit, rollback | `sync_write_intent`, `flush_intent_log_if_needed`, `fsync_*`, `sync_*`, `fdatasync_inode`, `do_commit`, `rollback_mutation_delta`, `selected_current_root_summary` | blocked | Durability barriers and replay anchors still write and clear raw state/log objects. |
 | Directory/inode fallback reads | `inode`, `inode_record_only`, `ensure_inode_loaded_for_write` | blocked | These paths recover inode and directory records directly from raw store keys. |
 | Live dataset key administration | `live_dataset_seal_key`, `live_dataset_rotate_key` in `vfs_engine_impl.rs` | metadata/raw-only | These paths store sealed key records rather than file payloads, but the format still needs transform-authority review before it becomes a product encryption claim. |
-| Crash-matrix boundary staging | `src/crash_recovery.rs` | blocked validation fixture | This is not a mounted product write path, but it proves raw state construction is still required by validation. |
+| Crash-matrix boundary staging | `src/crash_recovery.rs` | blocked validation fixture | This is not a mounted product write path, but it shows raw state construction is still required by validation. |
 | Placement, locator, rebuild, and default pool-media writes | #17, #18, #91 surfaces | later receipt/placement issue | This issue deliberately does not edit those write paths. |
 
 ## Scrub/Repair Identity Boundary

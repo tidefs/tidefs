@@ -97,7 +97,7 @@ switch to uncompressed plaintext while raw media stores encrypted or compressed
 bytes.
 
 Reclaim identity is not plaintext identity. Reclaim consumes the committed
-object key, locator, placement receipt, or replacement receipt that proves
+object key, locator, placement receipt, or replacement receipt that authorizes
 which physical storage can be retired.
 
 Dedup redirects are transform payloads too. A redirect may select a canonical
@@ -175,6 +175,11 @@ Prior art supports the shape but does not define TideFS policy:
   all-or-nothing transaction input to the object store; TideFS adopts the
   lesson that transformed bytes and placement evidence should cross one
   storage authority boundary rather than several hidden wrappers.
+
+These prior-art references are not comparator evidence and do not authorize
+OpenZFS/Ceph successor, performance, durability, transform, compression, or
+encryption claims. Any product-facing comparison must route through #875 claim
+ids and #928/#930 comparator evidence.
 
 ## Implementation Map
 

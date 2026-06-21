@@ -11,6 +11,12 @@ coordinator (data_copy_7), and anti-entropy auditor (data_copy_8).
 Scrub/repair/resilver findings flow through canonical P8-03 loss-event →
 rebuild-flow → transfer-verify-place chains.
 
+Claim boundary: this is target-design material for distributed integrity
+services. ZFS/Ceph comparisons, RTO/RPO targets, receipt-chain advantages, and
+coverage language below are design lessons and validation requirements, not
+current TideFS capability or successor evidence. Product-facing comparison
+wording still requires #875 claim ids and #928/#930 comparator evidence.
+
 Superseded designs: #1705, #1739, #1836, #1841, #1885, #1913, #1917,
 #1948, #2055, #1957.
 
@@ -32,7 +38,8 @@ cannot be separately prioritized. Ceph scatters them across per-PG scrub,
 per-OSD backfill, and per-PG deep scrub — three separate systems with no
 unified resource model.
 
-TideFS unifies all four under the background service framework, with
+The target TideFS design unifies all four under the background service framework,
+with
 independent per-service budgets, priority staging, validity-token
 stale-task prevention, and comprehensive observability.
 
@@ -104,9 +111,9 @@ gets 90%, admin/liveness gets 5%.
     └──────────────────────────────────────────────────┘
 ```
 
-### 2.3 End-to-End Integrity Guarantee Chain
+### 2.3 Target End-to-End Integrity Chain
 
-For a repaired chunk, the full integrity chain is:
+For a repaired chunk, the target integrity evidence chain is:
 
 1. Scrub/DeepScrub detects corruption
 2. SuspectLog: authoritative record of finding with `validity_token`
@@ -182,7 +189,7 @@ pub struct WitnessSet {
 }
 ```
 
-Deterministic construction guarantees:
+Target deterministic construction requirements:
 
 - **G1.** For fixed inputs, output is bit-identical across callers.
 - **G2.** `verified_sources` contains only healthy, non-flapping replicas.
@@ -475,9 +482,10 @@ State machine:
 5. Ticketed: create repair tickets (if auto-repair enabled) or operator alerts
 6. Resolved: all divergences addressed, transition to Idle
 
-Coverage guarantee: Every persistent corruption is eventually detected
-by at least one of {scrub, deep scrub, anti-entropy auditor} within
-max(scrub_interval, deep_scrub_interval, ae_scan_interval) of occurrence.
+Coverage target: persistent corruption is detected by at least one of
+{scrub, deep scrub, anti-entropy auditor} within max(scrub_interval,
+deep_scrub_interval, ae_scan_interval) of occurrence. This is a validation
+requirement, not a current coverage claim.
 ```
 
 ### 4.8 Marginal-Media Detection
@@ -521,8 +529,8 @@ Function: detect_marginal_media(chunk_id, read_latency_us, read_error) -> Option
 
 2. **Receipt-backed transfers vs. heartbeat-based.**
    `ReplicaTransferReceipt → ReplicaVerificationReceipt →
-   ReplicaPlacementReceipt` chains provide auditable transfer records
-   that heartbeat-based systems cannot offer. Cost: per-transfer overhead.
+   ReplicaPlacementReceipt` chains target auditable transfer records rather
+   than heartbeat-only liveness evidence. Cost: per-transfer overhead.
    Mitigated by batch amortization in `FlowCommitCoordinator`.
 
 3. **COMMIT_GROUP-gated write barriers vs. optimistic locking.** COMMIT_GROUP barriers

@@ -4,6 +4,12 @@ Maturity: **design-spec** for production erasure coding families, CRUSH-like
 deterministic placement, automated recovery loop orchestration, and integration
 contracts with shard groups, checksums, transport, and rebake.
 
+Claim boundary: the ZFS/Ceph comparison sections in this document are design
+lessons and target architecture differences only. They do not prove current
+erasure-coded durability, repair performance, placement quality, space/cost
+efficiency, or OpenZFS/Ceph successor behavior. Any retained product-facing
+comparison needs a #875 claim id and #928/#930 comparator evidence.
+
 This document closes Forgejo issue #1249.
 
 ## 1. Motivation
@@ -36,9 +42,9 @@ These are implementation-tracked non-release models. What's missing is the bridg
 4. **No integration contracts with sibling pillars.** Erasure coding must
    interact with shard groups (#1286), checksums (#1287), transport (#1229),
    and rebake (#1222), but these interfaces are unspecified.
-5. **No ZFS/Ceph positioning.** The design must articulate where tidefs improves
-   on ZFS PARITY_RAID (ashift constraints, device-scoped redundancy) and Ceph CRUSH
-   (PG combinatorics, per-PG rebuild scope).
+5. **No ZFS/Ceph positioning.** The design must articulate which ZFS
+   PARITY_RAID and Ceph CRUSH design lessons TideFS intends to consume, while
+   keeping any superiority language behind claim evidence.
 
 ## 2. Design Overview
 
@@ -201,12 +207,11 @@ The failure-domain topology is shared. Both placement systems consume the same
 | Upmap/balance | Manual pg-upmap entries needed for balance | Straw2 proportional distribution |
 | OSDMap coupling | Tight: CRUSH map embedded in OSDMap epoch | Loose: topology from membership epoch, placement computed independently |
 
-TideCRUSH improves on Ceph CRUSH in two specific dimensions:
-- **Per-stripe rebuild**: Ceph must rebuild entire PGs (100-200 objects) when a
-  single OSD fails. TideCRUSH rebuilds only the stripes missing shards on the
-  failed device.
-- **No rule language**: Ceph's CRUSH rule language is a DSL that operators must
-  learn. TideCRUSH uses Rust types with compile-time verification.
+The target TideCRUSH design differs from Ceph CRUSH in two planned dimensions:
+- **Per-stripe rebuild**: the design aims to rebuild only stripes missing
+  shards on the failed device, rather than using a PG-granularity rebuild
+  unit.
+- **No rule language**: the design uses Rust types instead of a CRUSH rule DSL.
 
 TideCRUSH intentionally does not provide Ceph's "CRUSH tunables" (chooseleaf
 variants, indep vs firstn). The design opts for a single algorithm with
@@ -222,10 +227,11 @@ predictable behavior over configurable but fragile tuning knobs.
 | Failure domain | Single chassis (all disks in one device) | Configurable across 6-domain hierarchy |
 | Device heterogeneity | All disks in device must be same size | Heterogeneous device weights via straw2 |
 
-Key tidefs advantage: ZFS PARITY_RAID ties redundancy to a fixed device disk set.
-Losing a device loses all data on it. TideCRUSH spreads each stripe's shards
-across the entire cluster topology, so individual device/node/rack failures
-are survivable up to the parity count.
+Target design lesson: ZFS PARITY_RAID ties redundancy to a fixed device disk
+set. TideCRUSH is intended to spread each stripe's shards across configured
+failure domains. The survivability statement is a target property of the
+design and still requires implementation and validation evidence before it can
+support product wording.
 
 ## 4. Erasure Family Catalog
 
@@ -651,65 +657,64 @@ This is stored alongside the existing extent map entries for the dataset.
 | **Write penalty** | Full-stripe writes are optimal; partial writes suffer RMW | Full-stripe writes optimal; partial writes trigger RMW (or WAL/journal) | Full-stripe writes via commit_group batching; partial writes RMW in commit_group commit |
 | **Recovery throttling** | `zfs_resilver_delay` and `zfs_scan_idle` | `osd_recovery_sleep`, `osd_max_backfills` | Bandwidth-budget throttling with priority classes |
 
-### 7.2 Where TideCRUSH Improves on ZFS
+### 7.2 Target Design Differences From ZFS
+
+These are design lessons and intended architecture differences, not current
+validated performance, durability, cost, or wear claims.
 
 1. **Dynamic topology**: ZFS PARITY_RAID disk sets are fixed at device creation.
-   Adding a disk requires adding a new device. TideCRUSH reassigns shards
-   when topology changes via membership epoch.
+   Adding a disk requires adding a new device. TideCRUSH is intended to
+   reassign shards when topology changes via membership epoch.
 2. **Cross-chassis resilience**: ZFS PARITY_RAID protects against disk failure
-   within a single chassis. TideCRUSH spreads shards across racks/zones,
-   tolerating entire rack failures.
-3. **Fine-grained rebuild**: ZFS resilver reads and rewrites all data on
-   the replacement disk (up to 20 TB). TideCRUSH rebuilds only the shards
-   that were on the failed device (proportional to device utilization, not
-   device capacity).
-4. **Heterogeneous devices**: ZFS cannot mix 1 TB and 16 TB disks in the
-   same PARITY_RAID device efficiently (the smaller disk limits capacity).
-   TideCRUSH uses weighted straw2 placement, so larger devices naturally
-   receive proportionally more shards.
-5. **No ashift constraint**: ZFS PARITY_RAID parity computation is tied to ashift
-   (512B or 4K). This creates write amplification for small blocks.
-   TideCRUSH uses configurable shard_len (power of two, 512B-1MiB),
-   independent of device block alignment.
+   within a single chassis. TideCRUSH is intended to spread shards across
+   racks/zones so correlated-failure policy can be expressed above a disk set.
+3. **Fine-grained rebuild**: ZFS resilver reads and rewrites data through a
+   device-level scan. TideCRUSH targets shard rebuild for the stripes that
+   lost placement, proportional to used placement rather than device capacity.
+4. **Heterogeneous devices**: ZFS PARITY_RAID capacity is constrained by the
+   members in a device. TideCRUSH targets weighted straw2 placement so larger
+   devices can receive proportionally more shards.
+5. **No ashift constraint**: ZFS PARITY_RAID parity computation is tied to
+   ashift (512B or 4K). TideCRUSH targets configurable shard_len
+   (power of two, 512B-1MiB), independent of device block alignment.
 
-### 7.3 Where TideCRUSH Improves on Ceph
+### 7.3 Target Design Differences From Ceph
+
+These comparisons are also target design framing only; they must not be cited
+as current superiority without #875 claim scope and #928/#930 evidence.
 
 1. **Per-stripe rebuild**: Ceph's PG-level rebuild means losing 1 OSD
    triggers backfill of all PGs that had that OSD in their acting set.
-   Each PG contains 100-200 objects. TideCRUSH rebuilds only the
-   stripes that lost shards.
+   TideCRUSH targets rebuild for only the stripes that lost shards.
 2. **No PG combinatorics**: Ceph PG count management (pg_num, pgp_num,
-   pg_autoscale) is a frequent source of operator error and performance
-   problems. TideCRUSH has no PG indirection — placement is computed
-   directly per stripe.
-3. **No CRUSH rule language**: Ceph operators must learn the CRUSH rule
-   DSL. Incorrect rules cause silent durability violations (e.g., all
-   replicas in the same rack). TideCRUSH uses compile-time typed
-   failure-domain classes.
+   pg_autoscale) is an operational consideration. TideCRUSH targets direct
+   per-stripe placement without PG indirection.
+3. **No CRUSH rule language**: Ceph operators configure a CRUSH rule DSL.
+   TideCRUSH targets compile-time typed failure-domain classes.
 4. **No OSDMap epoch coupling**: Ceph's CRUSH map is embedded in the
    OSDMap and changes require map propagation through the monitor quorum.
-   TideCRUSH placement is computed from the current membership epoch
-   independently.
-5. **No pg-upmap drift**: Ceph requires manual `pg-upmap` entries to
-   correct placement imbalances. TideCRUSH straw2 weighting produces
-   proportional distribution without manual rebalancing.
+   TideCRUSH targets placement computed from the current membership epoch.
+5. **No pg-upmap drift**: Ceph can require `pg-upmap` entries to correct
+   placement imbalances. TideCRUSH targets proportional distribution through
+   straw2 weighting without a separate manual rebalancing surface.
 
-### 7.4 Where TideCRUSH Matches or Defers
+### 7.4 Target Matches, Dependencies, and Deferrals
 
-1. **GF(2^8) RS**: tidefs uses the same math as Ceph's jerasure plugin
+1. **GF(2^8) RS**: the target design uses the same math as Ceph's jerasure plugin
    and ZFS's PARITY_RAID parity. The encoding is mathematically equivalent.
-2. **Write batching**: tidefs commit_group batching provides the same full-stripe
-   write optimization that ZFS and Ceph achieve — multiple small writes
-   are accumulated into a commit_group and written as full stripes.
+2. **Write batching**: target commit_group batching is intended to provide
+   full-stripe write optimization by accumulating multiple small writes into a
+   commit_group and writing them as full stripes.
 3. **Checksum integration**: ZFS has Fletcher/checksum per block; Ceph
-   has CRC32C per object; tidefs has BLAKE3-256 per shard with CRC32C
-   per header — stronger integrity than both.
+   has CRC32C per object; the target TideFS design uses BLAKE3-256 per shard
+   with CRC32C per header. The algorithm choice is not by itself a validated
+   stronger-integrity claim.
 4. **Recovery prioritization**: ZFS resilver is single-threaded priority;
-   Ceph has `osd_recovery_sleep`/`osd_max_backfills`. TideCRUSH
-   bandwidth-budget throttling with three priority queues provides finer
-   control.
-5. **Caching**: ZFS ARC, Ceph OSD page cache, and tidefs block cache
-   are equivalent at this level — all benefit from OS page cache.
+   Ceph has `osd_recovery_sleep`/`osd_max_backfills`. TideCRUSH targets
+   bandwidth-budget throttling with three priority queues.
+5. **Caching**: ZFS ARC, Ceph OSD page cache, and the target TideFS block cache
+   are comparable only at the broad architecture level; this section does not
+   claim latency, hit-rate, or memory-efficiency parity.
 
 ## 8. Implementation Strategy
 

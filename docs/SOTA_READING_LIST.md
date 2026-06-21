@@ -10,7 +10,9 @@ Policy:
 - When a new gap is discovered, add at least one “baseline” and one “SOTA” reference.
 
 This is not intended to be exhaustive. It exists so we can systematically
-one-up the state of the art.
+track baseline and state-of-the-art design inputs. Listing a paper or system
+here is not evidence that TideFS currently exceeds it; product-facing
+comparison still needs claim-registry and comparator-evidence approval.
 
 ---
 

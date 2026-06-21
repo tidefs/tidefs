@@ -4,6 +4,12 @@ Maturity: **design-spec** for the background integrity services: budgeted
 scrub scheduler, deep scrub with reconstruction verification, prioritized
 repair pipeline, and parallel resilver with topology integration.
 
+Claim boundary: the ZFS/Ceph comparison text in this design is target-design
+input only. It does not prove current scrub coverage, repair correctness,
+resilver performance, foreground isolation, durability, or OpenZFS/Ceph
+successor behavior. Product-facing comparison wording requires #875 claim ids
+and #928/#930 comparator evidence.
+
 This document closes Forgejo issue #1288.
 
 ## 1. Motivation
@@ -24,9 +30,9 @@ cannot be separately prioritized. Ceph scatters them across per-PG scrub,
 per-OSD backfill, and per-PG deep scrub — three separate systems with no
 unified resource model.
 
-tidefs unifies all four under the background service framework (#1179),
-with independent per-service budgets, priority staging, validity-token
-stale-task prevention, and comprehensive observability.
+The target TideFS design unifies all four under the background service
+framework (#1179), with independent per-service budgets, priority staging,
+validity-token stale-task prevention, and comprehensive observability.
 
 ### Dependency Map
 
@@ -723,31 +729,35 @@ The scrub service reads these fields from `IntegrityTrailerV2`:
 | **Prioritization** | Birth-commit_group order only | Per-PG priority via OSD config | Metadata-first scrub; dataset-hotness; mounted-first resilver |
 | **Idempotency** | None — repeated scans re-verify everything | None — repeated scrubs re-do work | Validity tokens prevent rework on known-good data |
 
-### 10.2 Where tidefs Improves
+### 10.2 Target Design Differences
 
-1. **Stripe-parallel resilver**: ZFS sequential resilver is a well-known
-   bottleneck on large pools. tidefs builds a priority-sorted stripe list
-   and rebuilds multiple stripes concurrently within per-tick budgets.
-2. **Deep scrub with reconstruction**: Neither ZFS nor Ceph can detect
-   simultaneous data+checksum corruption without an independent reference.
-   tidefs deep scrub reconstructs from k-of-n shards to provide that reference.
-3. **Unified observability**: ZFS provides a single `zpool status` percentage.
-   Ceph has per-PG counters that must be aggregated. tidefs has per-service
-   counters feeding a unified scheduler dashboard.
-4. **Idempotent repair**: ZFS will attempt to repair a block even if another
-   repair already succeeded. tidefs validity tokens skip known-repaired tasks.
-5. **Budget cascading**: When the repair queue is empty, the repair budget
-   cascades to scrub. When scrub is idle, budget cascades to deep scrub.
-   This maximizes background utilization without starving demand I/O.
+These bullets capture design intent and prior-art lessons. They are not current
+evidence that TideFS outperforms ZFS or Ceph for scrub, repair, or resilver.
 
-### 10.3 Where tidefs Matches
+1. **Stripe-parallel resilver**: ZFS sequential resilver is the baseline this
+   design reacts to. TideFS targets a priority-sorted stripe list and multiple
+   concurrent stripe rebuilds within per-tick budgets.
+2. **Deep scrub with reconstruction**: The target design uses k-of-n shard
+   reconstruction as an independent reference for deep scrub. This remains a
+   planned detection model, not a validated data-integrity guarantee.
+3. **Unified observability**: ZFS exposes `zpool status` and Ceph exposes PG
+   counters. TideFS targets per-service counters feeding a unified scheduler
+   dashboard.
+4. **Idempotent repair**: TideFS targets validity tokens so already-repaired
+   tasks can be skipped when the token still identifies the same subject.
+5. **Budget cascading**: The target scheduler cascades idle repair budget to
+   scrub and idle scrub budget to deep scrub, subject to demand-I/O isolation
+   evidence before any performance claim is made.
 
-1. **Checksum-gated repair**: ZFS, Ceph, and tidefs all verify source data
-   before using it for repair ("trust but verify").
-2. **Cursor-based resumability**: ZFS scan checkpoints and tidefs `ScrubCursor`
-   both survive restart and resume.
-3. **Demand-read repair**: All three systems can trigger repair on a read-path
-   checksum mismatch.
+### 10.3 Target Matches and Deferrals
+
+1. **Checksum-gated repair**: ZFS, Ceph, and the TideFS target design verify
+   source data before using it for repair.
+2. **Cursor-based resumability**: ZFS scan checkpoints and the target TideFS
+   `ScrubCursor` are comparable restart/resume design points.
+3. **Demand-read repair**: All three designs include a read-path checksum
+   mismatch as a repair trigger, but this document does not claim current
+   TideFS repair dispatch authority.
 
 ## 11. Implementation Strategy
 

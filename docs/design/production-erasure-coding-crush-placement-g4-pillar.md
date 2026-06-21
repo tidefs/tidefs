@@ -6,6 +6,12 @@ G4 pillar architecture integrating the erasure coding engine, coded store,
 placement planner, placement runtime, and locator table into a unified
 production data-placement subsystem.
 
+Claim boundary: the Ceph CRUSH comparison text below is design input and
+target architecture framing. It does not prove current placement quality,
+rebalance behavior, repair performance, cost efficiency, erasure-coded
+durability, or OpenZFS/Ceph successor status. Product-facing comparison
+wording still requires #875 claim ids and #928/#930 comparator evidence.
+
 This document closes Forgejo issue #1779 (coordinator-generated issue). Supersedes prior issues #1623, #1672, #1857, #1932, and #2027.
 
 Supersedes earlier design sketches at `docs/ERASURE_CODING_PLACEMENT_DESIGN.md`
@@ -35,8 +41,8 @@ arise:
 Ceph's CRUSH algorithm has proven over two decades that deterministic
 pseudo-random placement based on a hierarchical cluster map is the right
 abstraction for distributed storage. tidefs adapts this model to its
-shard-level granularity rather than PG-level, eliminating PG state
-combinatorics entirely.
+shard-level granularity rather than PG-level. The intended reduction in PG
+state is a target design property, not current measured evidence.
 
 | Concern | Ceph CRUSH | tidefs TideCRUSH |
 |---------|------------|------------------|
@@ -247,8 +253,8 @@ pub struct ShardPlacementSeed {
 /// Place `(k+m)` shards for one stripe across the cluster.
 ///
 /// Returns `k+m` `CrushPlacement` results, one per shard index.
-/// Guarantees that all returned placements target distinct devices
-/// (when the cluster has enough healthy devices).
+/// Requires all returned placements to target distinct devices when the
+/// cluster has enough healthy devices.
 pub fn place_shards(
     seed: &ShardPlacementSeed,
     crush_map: &CrushMapV1,
@@ -681,12 +687,12 @@ TideCRUSH provides the following guarantees:
 |-----------|------------|-----------------|----------------------|
 | Placement unit | DEVICE (disk group) | Placement group | Individual shard |
 | Placement algorithm | Fixed round-robin within device | CRUSH straw2 on PG | CRUSH straw2 on shard |
-| State combinatorics | None (single-node) | PG peering/activation/backfill | None (no PGs) |
-| Rebalancing cost | Full resilver | Proportional to delta | Proportional to delta |
+| State combinatorics | None (single-node) | PG peering/activation/backfill | Target: no PG indirection |
+| Rebalancing cost | Full resilver | Proportional to delta | Target: proportional to placement delta |
 | EC profile flexibility | Limited (PARITY_RAID1/Z2/Z3) | Per-pool EC profile | Per-dataset EcProfile |
 | Failure domain | None (single node) | Bucket hierarchy | `CrushDomainClass` enum |
 | Metadata overhead | None | PG state metadata | `ShardDescriptor` per shard |
-| Write amplification | Immediate (1+k+m) | Replication at write or EC at write | 1x at ingest; k+m at rebake |
+| Write amplification | Immediate (1+k+m) | Replication at write or EC at write | Target: 1x at ingest; k+m at rebake |
 
 ## 13. Open Questions
 

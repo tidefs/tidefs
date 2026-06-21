@@ -11,6 +11,13 @@ service crates (`tidefs-scrub-service`, `tidefs-deep-scrub-service`,
 `tidefs-repair-service`, `tidefs-resilver-service`) is deferred to wire-up
 issues. This document closes Forgejo issue #1965.
 
+Claim boundary: this is target-design material for distributed integrity
+services. Internal "canonical", "guarantee", latency, throughput, and
+correctness wording below names intended architecture and validation targets,
+not current TideFS product capability, performance evidence, durability
+evidence, or successor evidence. Product-facing comparison wording still
+requires #875 claim ids and #928/#930 comparator evidence.
+
 Prior canonical revisions: #1609 (unified scheduler integration), #1705
 (distributed rebuild/recovery refinement), #1739 (replica-health + throttle),
 #1913 (RebuildPlanner + RecoveryLoop), #2055 (full P8-03 data-flow pathway).
