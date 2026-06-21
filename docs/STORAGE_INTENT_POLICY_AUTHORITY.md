@@ -259,6 +259,44 @@ The receipt must bind:
 Receipts are not marketing. They are the bridge between caller semantics,
 crash recovery, placement, and operator UAPI.
 
+## Satisfaction Reconciliation Loop
+
+Storage intent is a closed control loop, not a one-shot planner output. #874
+owns the read-only reconciler that compares one compiled policy revision with
+the current evidence set and publishes the satisfaction state other subsystems
+must act on.
+
+The reconciler consumes policy snapshots, ack receipts, placement receipts,
+transport path evidence, media-wear and non-wear cost ledgers, workload signal
+snapshots, scheduler admission evidence, RAM authority receipts, relocation
+state, and validation artifacts. It does not recompute policy, select new
+placement, retire old receipts, emit ack receipts, or execute relocation. Its
+job is to make the current truth machine-readable:
+
+| State | Meaning |
+| --- | --- |
+| `satisfied` | Current receipts and evidence satisfy the compiled policy revision. |
+| `converging` | The ack floor was earned, but full placement, geo, archive, or cost convergence remains pending and visible. |
+| `degraded-visible` | The policy explicitly permits a weaker temporary state, and the weaker state is surfaced to callers/operators. |
+| `unknown-evidence` | Required evidence is absent, stale, malformed, or contradictory, so satisfaction cannot be inferred. |
+| `blocked` | Repair, relocation, geo catch-up, evidence refresh, or reserve recovery is required before success can be claimed. |
+| `refused` | No legal receipt set can satisfy the policy under current media, topology, or cost constraints. |
+| `unsafe-volatile` | The policy intentionally requested weaker volatile/unsafe behavior and the receipt truth exposes that weaker guarantee. |
+
+Missing, stale, malformed, under-width, wrong-epoch, wrong-failure-domain,
+unknown-cost, unknown-WAF, cache-only, or contradictory evidence cannot satisfy
+a durable, geo, or low-latency floor by accident. They must become an explicit
+unknown, blocked, degraded, refused, or unsafe-visible state according to the
+compiled policy's degradation law.
+
+This loop is what keeps the whole design native. A predictor may believe a
+range is hot, a planner may propose a move, a scheduler may admit a lane, and a
+relocation worker may publish replacement bytes, but TideFS only claims policy
+satisfaction when the reconciler can cite the receipts and evidence that prove
+it. Conversely, when evidence decays or policy strengthens, the reconciler is
+the common trigger for visible convergence, repair, relocation, or refusal
+instead of each subsystem inventing its own drift detector.
+
 ## Access Pattern Inventory
 
 The predictor must model access patterns as continuous signals rather than
@@ -1107,6 +1145,7 @@ storage-intent language beside the shared records and compiled policy snapshot.
 | Records | Shared spellings and versioned records exist for policies, receipts, roles, proximity, media, workload, cost, wear, and relocation reasons. | #841 |
 | Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
 | Evidence feeds | Local ack paths, path evidence, media/wear cost, non-wear cost, and workload vectors can publish read-only evidence without making final placement decisions. | #842, #844, #845, #846, #856 |
+| Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile. | #874 |
 | Planning and admission | Hard constraints reject illegal candidates before scoring, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #843, #862 |
 | Authority extensions | RAM authority and relocation/defrag/rebake/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #847, #848 |
 | Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, and refusal story, and every implementation claim maps to performance and fault rows. | #849, #850, #863 |
@@ -1138,6 +1177,7 @@ this document except to update the issue map after live tickets exist.
 | Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes. |
 | Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, and anti-thrash state for planning and performance rows. |
+| Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against receipts and evidence as satisfied, converging, degraded, blocked, refused, or unsafe-visible without choosing placement. |
 | Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
 | Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier evidence without making RDMA mandatory. |
 | RAM authority design and implementation | #847 | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority. |
