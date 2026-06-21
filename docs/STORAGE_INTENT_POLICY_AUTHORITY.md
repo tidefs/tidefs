@@ -31,6 +31,12 @@ windows, snapshot and clone retention, receive-base dependencies, orphan-held
 bytes, dead-pending reclaim, and destroy/tombstone state decide whether moving
 bytes is wise, legal, or dangerous.
 
+Cluster membership evidence is equally native. A quorum, geo, replicated-RAM,
+remote-read, drain, or split-brain decision is not legal because a network path
+looked fast. It is legal only when the receipt cites the membership epoch,
+roster, quorum set, witness/data role, failure-domain binding, and fence state
+owned by the membership authority.
+
 ## Non-Claims
 
 This document does not implement runtime behavior, change POSIX durability
@@ -116,6 +122,7 @@ The core records are:
 | `StorageIntentPolicyId` and `StorageIntentPolicyRevision` | Stable identity for the compiled policy snapshot used by one operation or planning epoch. |
 | `StorageIntentReceipt` | Earned acknowledgment evidence for one operation, range, or convergence step. |
 | `StorageIntentEvidenceRef` | Reference to placement receipts, local intent records, transport/path evidence, media/cost ledgers, scheduler admission records, or validation artifacts. |
+| `StorageIntentMembershipEvidence` | Reference projection of membership epoch, committed roster, quorum-set identity, witness/data role, failure-domain binding, drain/fence state, and split-brain hazard state owned by #750. |
 | `StorageIntentDataShape` | Requested and earned encoded shape for a range or generation, including record sizing, transform ordering, digest suite, dedup/encryption/EC compatibility, and rebake evidence. |
 | `StorageIntentLayoutEvidence` | Allocator and physical-layout evidence for fragmentation, free runs, alignment, zone/write-pointer state, pending frees, reclaim debt, and locality. |
 | `StorageIntentLifecycleEvidence` | Generation and retention evidence for write age, stability, snapshots, clones, receive bases, orphans, destroy/tombstone state, and reclaim frontiers. |
@@ -153,6 +160,8 @@ model predicates for:
 - ack receipt class versus requested guarantee floor;
 - local, node, rack, datacenter, WAN, internet, and geo failure-domain
   dimensions;
+- membership epoch, committed-roster, quorum-set, witness-role, fence/drain,
+  and split-brain legality;
 - volatile, durable-intent, full-placement, and RPO/lag dimensions;
 - media-role legality, including cache versus RAM authority separation;
 - data-shape legality, including transform compatibility, digest/integrity
@@ -176,6 +185,7 @@ The policy has these logical fields:
 | `guarantee_floor` | Minimum acknowledgment evidence needed before reporting success. |
 | `visibility_profile` | Whether weaker acknowledgments may be returned to callers or must fail closed. |
 | `proximity_domain_set` | Allowed latency/topology domains for serving, intent, replica, and archive roles. |
+| `membership_epoch_policy` | Required epoch freshness, quorum-set identity, witness/data role, failure-domain binding, drain/fence treatment, and split-brain refusal law. |
 | `media_role_policy` | Which media classes may hold intent, metadata, serving data, cold data, read cache, or scratch data. |
 | `workload_shape` | Workload envelope the planner should optimize for without changing hard guarantees. |
 | `data_shape_policy` | Record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake constraints. |
@@ -198,6 +208,7 @@ floors from optimizer weights:
 | Data shape and integrity | checksum/digest suite, encryption domain, mounted transform block state, dedup/EC compatibility | record size, compression level, coalescing, dedup verdict, EC/archive shape |
 | Allocation geometry | alignment, reserve, free-space, pending-free, zone/write-pointer compatibility | choose low-seek layout, largest legal free run, segment class, drain victim |
 | Lifecycle and retention | retained roots, receive bases, orphan holds, destroy state, reclaim frontier | defer flash full placement for young bytes, favor cold retained generations |
+| Membership and fencing | committed roster epoch, quorum-set identity, witness/data role, fence/drain legality, split-brain refusal | prefer stable nearby quorum, avoid draining peers, reduce epoch-churn disruption |
 | Distance and failure domain | node/rack/DC/site/region spread, internet path allowed or refused | nearest legal peer, measured RTT/loss/bandwidth scoring |
 | RPO/RTO | maximum remote lag or recovery window | delta batching, compression, catch-up lane priority |
 | Wear and money | critical write reserve, WAF ceiling, egress/capacity budget | promote/demote only when payback beats movement debt |
@@ -254,6 +265,8 @@ The compiler must produce:
 
 - a policy id and monotonically changing policy revision;
 - the effective guarantee floor and failure-domain floor;
+- the membership epoch, quorum, witness, drain/fence, and split-brain evidence
+  requirements;
 - the visibility/degradation law for weaker receipts;
 - allowed and forbidden proximity domains by role;
 - allowed and forbidden media roles by class and generation;
@@ -297,7 +310,9 @@ The receipt must bind:
 - intent-log receipt refs when replayable intent was used;
 - placement receipt refs when durable placement was reached;
 - transport/path evidence refs when remote receipt participated;
-- membership/placement epoch and fencing context;
+- membership epoch ref, committed roster hash or equivalent roster identity,
+  quorum-set identity, witness/data participant roles, placement epoch, and
+  fencing context;
 - failure domains represented in the receipt;
 - media class and persistence semantics for each receipt participant;
 - known missing work such as geo lag, archive conversion, or background
@@ -603,6 +618,52 @@ domain, power/failure-domain relation, and measurement age. RDMA may improve a
 path evidence record, but absence of RDMA must not make the product
 semantically invalid.
 
+## Membership Epoch, Fencing, And Quorum Authority
+
+Storage intent depends on membership truth, but it does not own membership
+truth. #750 owns the decision record for the membership epoch authority,
+quorum-write dispatch owner, witness-set role, node join/drain lifecycle, and
+epoch/fence enforcement. Storage intent consumes that authority through typed
+evidence refs.
+
+This boundary is a hard design law:
+
+- transport path evidence may report RTT, loss, bandwidth, carrier, queue
+  pressure, and session-local refusal state, but it may not originate roster,
+  quorum, witness, or fence decisions;
+- placement and receipt code may consume membership and failure-domain refs,
+  but it may not recompute membership as a substitute for the authority owner;
+- a quorum, geo, remote-volatile, remote-read, relocation, or repair receipt
+  must name the membership epoch and quorum/failure-domain evidence under which
+  it was earned;
+- stale, future, missing, contradictory, wrong-quorum, split-brain, fenced,
+  draining-without-policy, or witness-counted-as-data evidence cannot satisfy a
+  durable quorum, geo, read-serving, RAM-replication, repair, or relocation
+  floor;
+- an epoch change after a receipt is earned does not erase the old receipt, but
+  new writes, read serving, retirement, and repair must prove whether that old
+  receipt is still legal under the current policy and fence state;
+- RDMA remains an optional accelerator. TCP and internet paths still need the
+  same membership evidence; they are slower, not less correct.
+
+The membership evidence projection must distinguish at least:
+
+| Evidence field | Storage-intent use |
+| --- | --- |
+| `membership_epoch_ref` | Binds a receipt or candidate to the committed membership epoch it used. |
+| `committed_roster_identity` | Detects stale, future, forked, or contradictory rosters. |
+| `quorum_set_identity` | Proves the write/read/repair plan used the policy-selected quorum set. |
+| `failure_domain_binding` | Names node/rack/DC/site/region relation from membership authority, not path inference alone. |
+| `participant_role` | Separates data-bearing participants, voters, witnesses, learners, observers, and cache-only peers. |
+| `join_drain_fence_state` | Blocks unsafe use of peers that are joining, draining, quarantined, fenced, or departed. |
+| `split_brain_hazard_state` | Forces refusal, blocking, or degraded-visible behavior when membership cannot prove one authority view. |
+| `receipt_epoch_binding` | Lets recovery and explanation show which epoch made an acknowledgment or placement legal. |
+
+The planner may prefer stable, nearby, low-loss quorum members during scoring,
+but membership legality is not a score. A very fast peer in the wrong epoch, a
+witness-only peer counted as a data replica, or a draining peer used without an
+explicit policy allowance is not a slower candidate. It is illegal.
+
 ## Media Roles
 
 Media class is not enough. TideFS must know what role a device is playing.
@@ -647,8 +708,8 @@ Every source must pass freshness and authority predicates before it can serve:
 - current inode/object/range identity and namespace or snapshot generation;
 - compiled policy id/revision and read freshness profile;
 - placement receipt refs or explicit cache/trial anchor refs;
-- membership, lease, and fencing epoch when remote or clustered state
-  participates;
+- membership epoch, committed roster identity, lease, participant role, and
+  fencing state when remote or clustered state participates;
 - digest/checksum evidence for placement, degraded, or reconstructed bytes;
 - transport/path evidence and lag evidence for remote or geo sources;
 - stale, missing, or contradictory evidence reason when a candidate is rejected.
@@ -1115,7 +1176,8 @@ Planning is a hard-constraint filter followed by multi-objective scoring.
 Hard constraints include:
 
 - requested guarantee floor;
-- failure-domain and membership epoch rules;
+- membership epoch, committed-roster, quorum-set, witness/data role, fence,
+  drain, split-brain, and failure-domain legality;
 - capacity and reservation availability;
 - media role eligibility;
 - data-shape compatibility and transform block state;
@@ -1138,6 +1200,7 @@ score =
   + shape_weight         * cpu_read_amplification_and_rebuild_cost
   + layout_weight        * fragmentation_locality_and_reclaim_cost
   + lifecycle_weight     * churn_retention_and_reclaim_frontier_cost
+  + membership_weight    * epoch_churn_quorum_stability_and_drain_risk
   + capacity_weight      * capacity_cost
   + network_weight       * egress_and_congestion_cost
   + recovery_weight      * rebuild_or_rpo_risk
@@ -1272,6 +1335,23 @@ signal changes materially.
 5. If the operator asks for `geo-intent`, the planner must pay the WAN latency
    before success or return a refusal.
 
+### Quorum Write During Node Drain
+
+1. A dataset requests `quorum-intent` while one nearby peer is draining and
+   another peer is witness-only.
+2. Membership evidence from #750 names the committed epoch, quorum set,
+   participant roles, failure-domain binding, and drain/fence state.
+3. The planner may score the nearby draining peer as attractive for latency, but
+   it cannot use that peer as data-bearing quorum evidence unless policy permits
+   drain participation for this operation.
+4. The witness may help the membership protocol if #750 defines that role, but
+   it cannot satisfy a data-placement or durable-intent replica slot.
+5. If no legal quorum remains, the write blocks, reroutes, returns a typed
+   refusal, or receives an explicitly degraded receipt only when the compiled
+   policy allows that result.
+6. The ack receipt binds the epoch and quorum evidence it actually earned, so a
+   later epoch change can be explained and reconciled without rewriting history.
+
 ### RAM Pool
 
 1. A scratch dataset requests `volatile-local` or `volatile-replicated`.
@@ -1294,7 +1374,7 @@ Legal RAM authority classes:
 | Class | Evidence | Use |
 | --- | --- | --- |
 | `ram-volatile-local` | local volatile receipt | single-host scratch, tests, throwaway intermediate data |
-| `ram-volatile-replicated` | fenced peer volatile receipts with epoch | ultra-low-latency clustered scratch that survives one live-node failure but not power loss |
+| `ram-volatile-replicated` | fenced data-peer volatile receipts with membership epoch and quorum/failure-domain evidence | ultra-low-latency clustered scratch that survives one live-node failure but not power loss |
 | `ram-intent-backed` | RAM serving plus durable local/quorum intent | low-latency reads/writes with replayable durability |
 | `pmem-durable` | persistent-memory flush/fence evidence | durable low-latency intent or data role |
 
@@ -1315,6 +1395,8 @@ The operator UAPI should eventually answer:
 - Which source class served a read, and which cache, trial, remote, stale, or
   degraded candidates were rejected?
 - Which remote paths are behind, and by how much?
+- Which membership epoch, roster, quorum set, witness/data role, and fence or
+  drain state made a remote receipt legal or illegal?
 - Which data is intentionally volatile?
 - Which data is pending relocation, rebake, repair, or geo catch-up?
 - What data shape applies to this range, which transforms or EC/archive shape
@@ -1343,6 +1425,8 @@ Initial row families should cover:
 
 - small sync local intent latency;
 - small sync quorum intent latency;
+- quorum and geo latency while membership epochs advance, nodes drain, peers are
+  fenced, or witnesses are present;
 - full-placement fsync latency;
 - VM FUA/barrier tail latency;
 - metadata storm p99 and fsyncdir latency;
@@ -1375,6 +1459,8 @@ Each row must bind:
 
 - requested and earned ack classes;
 - reconciled satisfaction state before and after the measured action;
+- membership epoch, quorum-set, participant-role, drain/fence, and
+  failure-domain evidence where remote or clustered receipts participate;
 - workload envelope and prediction confidence/action class;
 - environment/profile, including media and topology;
 - p50/p95/p99 latency;
@@ -1408,6 +1494,10 @@ The matrix must cover at least these row families:
   `volatile-local` through `geo-intent`;
 - transport partition, latency stretch, bandwidth clamp, packet loss, and
   RDMA-absent TCP/internet paths for quorum and geo modes;
+- membership faults such as stale epoch, future epoch, forked roster,
+  split-brain hazard, wrong quorum set, fenced peer accepted, draining peer
+  counted without policy, witness-only participant counted as data, and
+  topology/failure-domain drift;
 - media corruption, flush omission, stale copy, truncation, bit flip, zeroed
   range, device loss, and endurance-reserve exhaustion;
 - RAM authority failure cases proving volatile receipts never satisfy durable
@@ -1505,6 +1595,21 @@ This document composes existing authority surfaces:
   intent owns the compiled cross-source policy snapshot consumed by ack,
   placement, relocation, and explanation paths; it does not replace the
   source-specific property registries.
+- #750 owns the membership authority decision for epoch identity, quorum-write
+  dispatch, witness-set role, join/drain lifecycle, and epoch/fence enforcement;
+  storage intent consumes those evidence refs and must not originate a parallel
+  membership authority.
+- `docs/MEMBERSHIP_CONFIG_QUORUM_SET_IDENTITY_OW302B.md`: scoped current spec
+  for deterministic quorum-set identity; it is input to #750 and storage-intent
+  membership evidence, not a full membership service claim.
+- `docs/MEMBERSHIP_SERVICE_DESIGN.md` and
+  `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`: historical input
+  for #750; useful for semantics, but not broad current authority by themselves.
+- `docs/POOL_WIDE_REDUNDANCY_PLACEMENT_CONTRACT.md` and
+  `docs/LOCAL_DISTRIBUTED_RECEIPT_AUTHORITY.md`: scoped current specs for
+  receipt-backed placement. Storage intent may consume their receipt refs but
+  still needs #750 membership evidence for clustered quorum, fence, witness,
+  and failure-domain freshness.
 - `docs/RDMA_TRANSPORT_POSITION.md`: RDMA is optional acceleration; TCP-class
   transport remains the correctness baseline.
 - `docs/TRANSPORT_CLUSTER_AUTHORITY.md`: transport owns session-local mechanics
@@ -1582,13 +1687,13 @@ storage-intent language beside the shared records and compiled policy snapshot.
 
 | Stage | Graduation gate | Issues |
 | --- | --- | --- |
-| Records | Shared spellings and versioned records exist for policies, receipts, roles, proximity, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #841, #878, #880, #881 |
+| Records | Shared spellings and versioned records exist for policies, receipts, roles, proximity, membership evidence refs, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #878, #880, #881 |
 | Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
-| Evidence feeds | Local ack paths, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #842, #844, #845, #846, #856, #878, #880, #881 |
+| Evidence feeds | Local ack paths, membership epoch/fence refs, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881 |
 | Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile. | #874 |
-| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #843, #862, #878, #880, #881 |
-| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness and receipt evidence. | #877, #675, #881 |
-| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #847, #848, #878, #880, #881 |
+| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal membership/fence state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #862, #878, #880, #881 |
+| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness, epoch/fence, and receipt evidence. | #750, #877, #675, #881 |
+| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #750, #847, #848, #878, #880, #881 |
 | Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875 |
 
 Interface gates between stages are explicit:
@@ -1596,13 +1701,14 @@ Interface gates between stages are explicit:
 - Consumers take `StorageIntentPolicy` snapshots and receipt/evidence records,
   not raw caller hints, ad hoc dataset properties, or device labels.
 - Planners may score only candidates that already passed guarantee,
-  failure-domain, data-shape, layout/allocator, lifecycle/generation, capacity,
-  wear, transport, and degradation-law filters.
+  membership/epoch/fence, failure-domain, data-shape, layout/allocator,
+  lifecycle/generation, capacity, wear, transport, and degradation-law filters.
 - Schedulers may delay, throttle, or refuse work, but they may not convert one
   acknowledgment class into another after admission.
 - Read-serving paths may accelerate through cache, trial, RAM, local, remote,
   degraded, snapshot, geo, or archive sources only when freshness, receipt,
-  fence, and degradation predicates pass for the compiled policy.
+  membership epoch, fence, and degradation predicates pass for the compiled
+  policy.
 - Data-shape and transform paths may change record size, compression,
   checksum/digest, dedup, encryption, EC, archive, or coalescing shape only
   through compiled policy and receipt/evidence records.
@@ -1625,11 +1731,12 @@ this document except to update the issue map after live tickets exist.
 
 | Slice | Follow-up issue | Expected write set | Purpose |
 | --- | --- | --- | --- |
-| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, media role, proximity, workload, data-shape refs, lifecycle refs, and cost records. |
+| Membership epoch authority | #750 | `docs/MEMBERSHIP_AUTHORITY.md` | Decide epoch, quorum-write, witness-set, join/drain, fence, roster, and failure-domain authority, then expose typed refs storage-intent consumers can cite. |
+| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, membership evidence refs, media role, proximity, workload, data-shape refs, layout refs, lifecycle refs, and cost records. |
 | Policy source and compilation | #855 | policy/config crate or `crates/tidefs-storage-intent-policy/` | Persist and compile pool, dataset, mount, caller, and internal maintenance policy into storage-intent records. |
 | Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths. |
-| Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, proximity domains, failure domains, and media constraints. |
-| Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, degraded-read law, geo stale-read boundaries, and read-repair evidence. |
+| Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, membership/fence refs, proximity domains, failure domains, and media constraints. |
+| Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, epoch/fence law, degraded-read law, geo stale-read boundaries, and read-repair evidence. |
 | Data-shape authority | #878 | data-shape records/model module or `crates/tidefs-storage-intent-data-shape/`, focused tests | Bind record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake decisions to compiled policy and evidence receipts. |
 | Layout evidence authority | #880 | layout-evidence records/model module or `crates/tidefs-storage-intent-layout-evidence/`, focused tests | Expose allocator geometry, fragmentation, free-run pressure, alignment, zone/write-pointer state, pending-free safety, and reclaim debt as policy evidence. |
 | Lifecycle evidence authority | #881 | lifecycle-evidence records/model module or `crates/tidefs-storage-intent-lifecycle-evidence/`, focused tests | Expose write age, stability, snapshot/clone/receive-base retention, orphan/destroy state, and reclaim frontiers as policy evidence. |
