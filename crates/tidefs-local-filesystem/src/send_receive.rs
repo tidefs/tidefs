@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tidefs_extent_map::ExtentMap;
 use tidefs_local_object_store::{
-    checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey, StoreOptions,
+    checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey, StoreError, StoreOptions,
 };
 use tidefs_types_vfs_core::{InodeId, NodeKind, ROOT_INODE_ID};
 
@@ -1426,17 +1426,15 @@ pub(crate) fn sync_directory_path(path: &Path) -> Result<()> {
 /// Classify a receive error as retryable (staging checkpoint preserved)
 /// or non-retryable (staging checkpoint discarded).
 ///
-/// Retryable errors include I/O failures and stream corruption before all
-/// records are persisted — these are likely to succeed on retry.
-/// Non-retryable errors include export identity mismatches, stream decode
-/// failures, and target pool corruption that permanently invalidates the
-/// receive checkpoint.
+/// Retryable errors include transient storage failures that can plausibly
+/// succeed on retry. Non-retryable errors include export identity mismatches,
+/// stream decode failures, deterministic store/configuration failures, and
+/// target pool corruption that permanently invalidates the receive checkpoint.
 ///
 /// Per `docs/RECEIVE_STREAM_MERGE_POLICY.md` §2.2.
 fn is_receive_error_retryable(err: &FileSystemError) -> bool {
     match err {
-        // I/O and store-level errors — transient hardware or filesystem issues.
-        FileSystemError::Store(_) => true,
+        FileSystemError::Store(store_err) => is_receive_store_error_retryable(store_err),
         // I/O errors during the publish step are retryable.
         FileSystemError::PublishOutcomeUncertain { .. } => true,
         // Decode errors mean the stream is malformed — not retryable.
@@ -1448,6 +1446,13 @@ fn is_receive_error_retryable(err: &FileSystemError) -> bool {
         // All other errors default to non-retryable (fail closed).
         _ => false,
     }
+}
+
+fn is_receive_store_error_retryable(err: &StoreError) -> bool {
+    matches!(
+        err,
+        StoreError::Io { .. } | StoreError::NoSpace | StoreError::PressureRefused { .. }
+    )
 }
 
 pub(crate) fn receive_incremental_changed_records(
@@ -2180,6 +2185,49 @@ mod tests {
             compute_export_identity(&export2),
             "different exports must produce different identities"
         );
+    }
+
+    #[test]
+    fn receive_error_retryability_preserves_staging_for_transient_store_errors() {
+        use tidefs_local_object_store::IoClass;
+
+        let io_error = FileSystemError::Store(StoreError::Io {
+            operation: "write",
+            path: std::path::PathBuf::from("segment"),
+            source: std::io::Error::from(std::io::ErrorKind::Interrupted),
+        });
+        assert!(is_receive_error_retryable(&io_error));
+        assert!(is_receive_error_retryable(&FileSystemError::Store(StoreError::NoSpace)));
+        assert!(is_receive_error_retryable(&FileSystemError::Store(
+            StoreError::PressureRefused {
+                class: IoClass::Metadata,
+            }
+        )));
+    }
+
+    #[test]
+    fn receive_error_retryability_discards_staging_for_deterministic_store_errors() {
+        assert!(!is_receive_error_retryable(&FileSystemError::Store(
+            StoreError::PayloadTooLarge {
+                len: 65_536,
+                max: 16_384,
+            }
+        )));
+        assert!(!is_receive_error_retryable(&FileSystemError::Store(
+            StoreError::InvalidOptions {
+                reason: "bad receive store options",
+            }
+        )));
+        assert!(!is_receive_error_retryable(&FileSystemError::Store(
+            StoreError::ReadOnly { operation: "write" }
+        )));
+        assert!(!is_receive_error_retryable(&FileSystemError::Store(
+            StoreError::CorruptHeader {
+                segment_id: 1,
+                offset: 0,
+                reason: "bad header",
+            }
+        )));
     }
 
     // ── Tier 3: mounted userspace resume validation ────────────────────────
