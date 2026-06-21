@@ -3489,6 +3489,13 @@ name = "tidefs-spacemap-allocator"
 version = "0.421.0"
 
 [[package]]
+name = "tidefs-storage-intent-core"
+version = "0.421.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "tidefs-storage-node"
 version = "0.421.0"
 dependencies = [
