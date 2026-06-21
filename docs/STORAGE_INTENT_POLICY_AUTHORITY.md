@@ -1087,6 +1087,12 @@ tail, throughput, RPO, or wear/cost budgets. #850 measures whether TideFS is
 fast enough under a declared envelope; #863 proves that the envelope remains
 honest when the system is broken on purpose.
 
+#875 owns the claim-registry boundary for these promises. Performance and fault
+rows can generate evidence, but publishing-facing wording about fast durable
+sync, WAN/internet geo behavior, RAM authority, flash-wear protection, adaptive
+placement, or OpenZFS/Ceph/DRBD successor comparisons must still map to stable
+planned, blocked, or validated claim ids before it can become product language.
+
 ## Relationship To Existing Authority
 
 This document composes existing authority surfaces:
@@ -1126,6 +1132,9 @@ This document composes existing authority surfaces:
 - `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`: fault,
   corruption, partition, and recovery campaigns must name fault classes,
   legal outcomes, forbidden outcomes, recovery receipts, and gate artifacts.
+- `docs/CLAIMS_GATE_POLICY.md`: publishing-facing storage-intent promises must
+  stay behind registered claim ids, required evidence classes, and fail-closed
+  validation.
 - `docs/OPERATOR_UAPI_AUTHORITY.md`: operator surfaces must distinguish
   prototype, diagnostic, live-owner, and final UAPI claims.
 - `docs/UNRELEASED_AUTHORITY_POLICY.md`: TideFS should choose the current
@@ -1187,7 +1196,7 @@ storage-intent language beside the shared records and compiled policy snapshot.
 | Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile. | #874 |
 | Planning and admission | Hard constraints reject illegal candidates before scoring, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #843, #862 |
 | Authority extensions | RAM authority and relocation/defrag/rebake/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #847, #848 |
-| Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, and refusal story, and every implementation claim maps to performance and fault rows. | #849, #850, #863 |
+| Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875 |
 
 Interface gates between stages are explicit:
 
@@ -1199,8 +1208,9 @@ Interface gates between stages are explicit:
   acknowledgment class into another after admission.
 - Relocation workers may write speculative replacements, but they may not
   retire source receipts until replacement receipts satisfy the target policy.
-- Validation rows are not an afterthought: each stage must either add the
-  relevant #850/#863 row binding or state which later issue owns that proof.
+- Validation rows and claim ids are not an afterthought: each stage must either
+  add the relevant #850/#863 row binding and #875 claim boundary, or state
+  which later issue owns that proof.
 
 ## Follow-Up Implementation Map
 
@@ -1224,6 +1234,7 @@ this document except to update the issue map after live tickets exist.
 | Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, receipts, lag, volatility, placement, and wear to operators. |
 | Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, wear, cost, RPO, and relocation. |
 | Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
+| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, RAM, WAN, and wear promises. |
 
 ## Validation For This Slice
 
