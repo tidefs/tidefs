@@ -66,6 +66,13 @@ targets, partition/fence state, repair obligation, replacement receipt
 publication, and visibility/refusal law that make the weaker or healing state
 honest.
 
+Policy rollout evidence is the time counterpart. A new policy revision is not
+legal because a property was edited or a caller asked for a different shape. It
+is legal only when publication, stage, rollback, downgrade authorization,
+in-flight fences, convergence frontiers, and mixed-revision explanation say
+which operations use the old revision, which use the new revision, and which
+receipts still owe convergence.
+
 ## Non-Claims
 
 This document does not implement runtime behavior, change POSIX durability
@@ -156,6 +163,7 @@ The core records are:
 | `StorageIntentTrustEvidence` | Security, administrative-domain, tenant-domain, key-epoch, authorization, audit, and compromise/quarantine evidence owned by #897 and sourced from the security, authz, transport, and transform authorities. |
 | `StorageIntentCapacityAdmissionEvidence` | Logical/physical headroom, allocation-ticket, claim/reserve ledger, dirty-window, pending-free, reserve-pressure, and ENOSPC/refusal evidence owned by #898 and sourced from capacity, allocator, reserve, scheduler, and lifecycle authorities. |
 | `StorageIntentRecoveryEvidence` | Degraded state, source receipt set, reconstruction width, missing/corrupt/stale target evidence, read-repair/rebuild obligation, replacement receipt publication, old-receipt retirement, partition/healing, RPO/RTO lag, and refusal evidence owned by #900 and sourced from placement receipts, scrub/repair/rebuild, membership, trust, ordering, capacity, layout, and lifecycle authorities. |
+| `StorageIntentPolicyRolloutEvidence` | Policy source provenance, compiled policy revision, publication transaction, change class, downgrade authorization, stage state, in-flight fence, convergence frontier, rollback/re-entry, supersession, and refusal evidence owned by #901 and sourced from policy config, authz/audit, operator runbook, satisfaction, and receipt authorities. |
 | `StorageIntentDataShape` | Requested and earned encoded shape for a range or generation, including record sizing, transform ordering, digest suite, dedup/encryption/EC compatibility, and rebake evidence. |
 | `StorageIntentLayoutEvidence` | Allocator and physical-layout evidence for fragmentation, free runs, alignment, zone/write-pointer state, pending frees, reclaim debt, and locality. |
 | `StorageIntentLifecycleEvidence` | Generation and retention evidence for write age, stability, snapshots, clones, receive bases, orphans, destroy/tombstone state, and reclaim frontiers. |
@@ -208,6 +216,10 @@ model predicates for:
   width, degraded visibility, repair obligation, no-quorum or partition state,
   replacement receipt publication, old-receipt retirement, RPO/RTO lag, and
   hidden-downgrade refusal state;
+- policy rollout legality, including source provenance, compiled policy
+  revision, publication transaction, change class, downgrade authorization,
+  stage state, in-flight fences, convergence frontier, rollback/re-entry, and
+  mixed-revision explanation state;
 - volatile, durable-intent, full-placement, and RPO/lag dimensions;
 - media-role legality, including cache versus RAM authority separation;
 - data-shape legality, including transform compatibility, digest/integrity
@@ -236,6 +248,7 @@ The policy has these logical fields:
 | `trust_domain_policy` | Required security/admin/tenant domain eligibility, session-security posture, key epoch, authorization/audit refs, cross-domain sharing law, compromise/quarantine treatment, and regulatory/residency refusal law. |
 | `capacity_admission_policy` | Required logical/physical headroom, quota/slop law, allocation-ticket and reserve-escrow treatment, dirty-window reserve, pending-free eligibility, protected-floor law, and ENOSPC/refusal behavior. |
 | `recovery_degradation_policy` | Required degraded-mode visibility, reconstruction width, read-repair/rebuild obligation, no-quorum/partition handling, RPO/RTO lag, replacement receipt publication, old-receipt retirement, and hidden-downgrade refusal behavior. |
+| `policy_rollout_policy` | Required revision publication, staging, downgrade authorization, old-receipt grandfathering, convergence obligation, rollback/re-entry, supersession, and mixed-revision explanation behavior. |
 | `media_role_policy` | Which media classes may hold intent, metadata, serving data, cold data, read cache, or scratch data. |
 | `workload_shape` | Workload envelope the planner should optimize for without changing hard guarantees. |
 | `data_shape_policy` | Record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake constraints. |
@@ -265,6 +278,7 @@ floors from optimizer weights:
 | RPO/RTO | maximum remote lag or recovery window | delta batching, compression, catch-up lane priority |
 | Capacity and reserve | logical quota/slop, physical free-space class, allocation ticket, dirty-window reserve, protected repair/sync floors, pending-free safety | choose lower-amplification shape, delay optimizer, trigger reclaim, batch convergence |
 | Recovery and degradation | source receipt set, reconstruction width, visible degraded state, repair obligation, no-quorum/partition refusal, replacement receipt before retirement | prioritize repair, choose cheaper reconstruction source, batch rebuild, tune read-repair foreground cost |
+| Policy revision rollout | published revision, change class, downgrade authorization, in-flight fence, convergence frontier, rollback receipt, mixed-revision visibility | stage cohorts, prioritize convergence, batch rematerialization, defer low-risk generations |
 | Wear and money | critical write reserve, WAF ceiling, egress/capacity budget | promote/demote only when payback beats movement debt |
 
 A candidate must satisfy all hard floors before scoring. Cost weights may pick
@@ -318,6 +332,11 @@ not secretly lower the acknowledgment floor.
 The compiler must produce:
 
 - a policy id and monotonically changing policy revision;
+- source-policy provenance refs, previous and target revision refs, policy
+  epoch, and policy publication transaction or commit boundary;
+- rollout change class, stage state, downgrade authorization requirement,
+  old-receipt treatment, in-flight fence requirements, and convergence
+  obligation for the revision;
 - the effective guarantee floor and failure-domain floor;
 - the ordering, replay, barrier, dirty-epoch, and dependency requirements;
 - the membership epoch, quorum, witness, drain/fence, and split-brain evidence
@@ -357,6 +376,18 @@ Policy change semantics are part of the contract:
 5. Internal maintenance intents may ask for special privileges such as repair
    reserve or evacuation priority, but they still cite the policy revision and
    may not bypass receipt retirement rules.
+6. A published revision becomes applicable only through #901 rollout evidence.
+   A raw source edit is not an active storage-intent language until the
+   publication transaction, stage state, and in-flight fences say so.
+7. Old receipts are immutable history. They may be grandfathered, converged, or
+   refused for future use under the current policy, but a policy change does not
+   rewrite the guarantee that was actually earned.
+8. A revision that is superseded, rolled back, or retired cannot accept new work
+   unless the rollout evidence says the work is rollback repair, receipt
+   retirement, or other bounded re-entry for old obligations.
+9. In-flight fsync/FUA, repair, relocation, rebake, geo catch-up, archive restore,
+   and receipt retirement must either finish under their fenced revision or
+   re-enter through a new revision with explicit rollback/retry evidence.
 
 ### StorageIntentReceipt
 
@@ -366,6 +397,9 @@ projection. It names what was earned, not merely what was requested.
 The receipt must bind:
 
 - requested policy id and revision;
+- policy rollout refs where a revision change shaped admission, including
+  source policy ref, compiled revision ref, publication transaction, stage
+  state, in-flight fence, convergence frontier, or rollback/re-entry ref;
 - earned acknowledgment class;
 - subject id, object key, inode/range, or request id;
 - payload digest, range digest, or replay digest as appropriate;
@@ -404,13 +438,13 @@ owns the read-only reconciler that compares one compiled policy revision with
 the current evidence set and publishes the satisfaction state other subsystems
 must act on.
 
-The reconciler consumes policy snapshots, ack receipts, placement receipts,
-transport path evidence, capacity/admission evidence, recovery/degradation
-evidence, media-wear and non-wear cost ledgers, workload signal snapshots,
-scheduler admission evidence, RAM authority receipts, relocation state, and
-validation artifacts. It does not recompute policy, select new placement, retire
-old receipts, emit ack receipts, or execute relocation. Its job is to make the
-current truth machine-readable:
+The reconciler consumes policy snapshots, policy rollout evidence, ack
+receipts, placement receipts, transport path evidence, capacity/admission
+evidence, recovery/degradation evidence, media-wear and non-wear cost ledgers,
+workload signal snapshots, scheduler admission evidence, RAM authority
+receipts, relocation state, and validation artifacts. It does not recompute
+policy, select new placement, retire old receipts, emit ack receipts, or execute
+relocation. Its job is to make the current truth machine-readable:
 
 | State | Meaning |
 | --- | --- |
@@ -422,12 +456,14 @@ current truth machine-readable:
 | `refused` | No legal receipt set can satisfy the policy under current media, topology, or cost constraints. |
 | `unsafe-volatile` | The policy intentionally requested weaker volatile/unsafe behavior and the receipt truth exposes that weaker guarantee. |
 
-Missing, stale, malformed, under-reserved, expired-reserve, under-width,
-wrong-epoch, wrong-failure-domain, wrong-lifecycle, wrong-reconstruction-width,
-missing-repair-obligation, unknown-cost, unknown-WAF, cache-only, or
-contradictory evidence cannot satisfy a durable, geo, or low-latency floor by
-accident. They must become an explicit unknown, blocked, degraded, refused, or
-unsafe-visible state according to the compiled policy's degradation law.
+Missing, stale, malformed, wrong-policy-revision, superseded-revision,
+missing-rollout-fence, under-reserved, expired-reserve, under-width,
+wrong-epoch, wrong-failure-domain, wrong-lifecycle,
+wrong-reconstruction-width, missing-repair-obligation, unknown-cost,
+unknown-WAF, cache-only, or contradictory evidence cannot satisfy a durable,
+geo, or low-latency floor by accident. They must become an explicit unknown,
+blocked, degraded, refused, or unsafe-visible state according to the compiled
+policy's degradation law.
 
 This loop is what keeps the whole design native. A predictor may believe a
 range is hot, a planner may propose a move, a scheduler may admit a lane, and a
@@ -436,6 +472,96 @@ satisfaction when the reconciler can cite the receipts and evidence that prove
 it. Conversely, when evidence decays or policy strengthens, the reconciler is
 the common trigger for visible convergence, repair, relocation, or refusal
 instead of each subsystem inventing its own drift detector.
+
+Rollout stage is evidence, not a hidden side channel. A revision may be
+`active-for-new-writes` while existing generations reconcile as `converging`;
+`rollback-required` normally projects as `blocked` or `refused`; `superseded`
+cannot satisfy new work; and `rolled-back` means future admission has returned
+to the restored revision while old receipts and partial-stage obligations remain
+visible until converged or retired.
+
+## Policy Revision Rollout, Rollback, And Convergence Authority
+
+Storage intent consumes policy sources from #855 and production step grammar
+from the operator runbook authority, but it still needs its own time-domain
+evidence. #901 owns the storage-intent projection that says when a compiled
+revision is published, staged, active, converging, rolled back, superseded, or
+refused for a particular scope.
+
+#901 does not persist raw policy configuration, grant privileged overrides,
+choose placement, execute relocation, or run validation campaigns. It composes
+refs from those authorities into predicates that every storage-intent consumer
+can use before admitting new work or reinterpreting old evidence.
+
+The rollout evidence projection must distinguish at least:
+
+| Evidence field | Storage-intent use |
+| --- | --- |
+| `source_policy_ref` | Names the pool, dataset, mount, caller, inherited-default, override, or internal-maintenance source set from #855. |
+| `compiled_revision_ref` | Binds the candidate to the immutable `StorageIntentPolicy` id/revision that consumers must cite. |
+| `previous_revision_ref` and `target_revision_ref` | Distinguish old, restored, target, and superseding policy languages without rewriting old receipts. |
+| `policy_epoch_ref` | Orders policy publication relative to membership, receipt, and runbook events. |
+| `publication_transaction_ref` | Proves the compiled revision was durably published or explains why it remained a dry-run/preflight artifact. |
+| `source_provenance_set` | Records which policy sources participated and which conflicts or inheritance rules were applied. |
+| `change_class` | Classifies strengthen, weaken, lateral, incompatible, emergency override, rollback, re-entry, or retirement changes. |
+| `downgrade_authorization_ref` | Cites authz/audit evidence required when a change lowers durability, RPO, trust, recovery, capacity, or visibility floors. |
+| `stage_state` | Names draft, dry-run, preflight-admitted, staged, active-for-new-writes, converging-existing, blocked, rollback-required, rolled-back, superseded, retired, or refused. |
+| `scope_selector` | Names the pool, dataset, mount, file, range, generation, cohort, or internal-maintenance scope affected by the revision. |
+| `old_receipt_treatment` | Says whether old receipts are grandfathered, require convergence, are unusable for new claims, or must be refused. |
+| `in_flight_fence_ref` | States which writes, sync barriers, reads, repair, rebuild, relocation, rebake, geo catch-up, archive restore, and receipt-retirement actions continue under old or new revision. |
+| `convergence_frontier_ref` | Names per-range, per-generation, per-receipt, or per-cohort progress toward the target revision. |
+| `replacement_receipt_set_ref` | Proves stronger placement, shape, trust, recovery, or capacity requirements were earned before old-revision satisfaction is claimed. |
+| `outstanding_obligation_ref` | Exposes remaining convergence, rollback repair, receipt-retirement, validation, or operator-review work. |
+| `rollback_reentry_ref` | Binds rollback anchor, dry-run/preflight result, failed-stage reason, restored revision, rollback receipt, and post-rollback verification. |
+| `supersession_ref` | Shows a later revision replaced this one and which obligations remain valid for cleanup. |
+| `rollout_refusal_ref` | Gives a typed reason for stale source, conflict, missing authz, unsafe downgrade, fence failure, validation gate failure, convergence debt, or unsupported combination. |
+
+Stage transitions are legal only when their predicates hold:
+
+| Stage | Meaning |
+| --- | --- |
+| `draft` | Source policy exists but is not a storage-intent language for admission. |
+| `dry-run` | The compiler and planner can explain effects, but no new receipt may cite the revision as active. |
+| `preflight-admitted` | Capacity, trust, membership, recovery, validation, and runbook refs are sufficient to stage within the selected scope. |
+| `staged` | The revision is published for a bounded scope or cohort, with in-flight fences and rollback anchors recorded. |
+| `active-for-new-writes` | New operations in scope must cite the new revision, while old receipts keep their historical revision. |
+| `converging-existing` | Existing ranges or generations owe replacement receipts, rebake, relocation, repair, or geo catch-up before satisfying the new revision. |
+| `blocked` | Evidence, reserve, trust, membership, validation, or runbook prerequisites are missing but the revision is not yet rolled back. |
+| `rollback-required` | The stage cannot safely continue; admission must fence new work or re-enter a restored revision. |
+| `rolled-back` | Future admission uses the restored revision, while rollback receipts and remaining obligations stay visible. |
+| `superseded` | A later revision replaced this one; new work cannot cite it except for bounded cleanup or re-entry. |
+| `retired` | No live receipt, convergence, rollback, or explanation dependency still needs the revision. |
+| `refused` | The change cannot become active for the selected scope under current evidence or policy. |
+
+Hard rollout laws:
+
+1. Publication is not activation. A compiled revision can exist for dry-run,
+   comparison, and operator explanation without admitting new writes.
+2. Activation for new writes requires a publication transaction, scope selector,
+   stage state, and in-flight fence. Missing one of those is
+   `unknown-evidence`, `blocked`, or `refused`.
+3. Strengthening may gate new operations immediately, but old generations reach
+   stronger satisfaction only after replacement receipts, convergence frontiers,
+   and old-receipt retirement law say so.
+4. Weakening requires downgrade authorization and audit refs, and it must not
+   turn prior durable, geo, recovery, trust, or capacity promises into weaker
+   product claims.
+5. Reads, repair, rebuild, relocation, rebake, geo catch-up, RAM authority,
+   block-volume flush/FUA, and receipt retirement must choose the policy
+   revision by receipt identity and rollout fence, not by a mutable global
+   property lookup.
+6. Relocation across a revision boundary must publish target receipts for the
+   target revision before claiming convergence, and it must preserve source
+   receipts until rollback and old-receipt retirement law allow retirement.
+7. Rollback is a receipt-producing operation. It restores future admission to a
+   previous or superseding revision, but it does not erase receipts earned while
+   the failed revision was staged.
+8. Superseded revisions remain visible until no live receipt, retained
+   generation, receive base, geo backlog, repair obligation, or operator claim
+   still depends on their explanation.
+9. Product claims and comparator claims may cite a rollout only when #875
+   records whether the behavior is planned, blocked, or validated for the
+   specific revision-change class.
 
 ## Access Pattern Inventory
 
@@ -1830,6 +1956,49 @@ signal changes materially.
 4. If replacement receipt publication is missing or stale, satisfaction remains
    `blocked` or `unknown-evidence`; reclaim does not get to guess.
 
+### Strengthen Quorum Policy With Existing Local-Intent Receipts
+
+1. A dataset policy changes from local durable intent to quorum durable intent.
+2. #901 rollout evidence publishes the target revision as
+   `active-for-new-writes` and records old local-intent receipts as
+   `converging-existing`, not upgraded.
+3. New writes must earn quorum-intent receipts or fail according to policy.
+4. Old generations remain readable under their historical receipts only where
+   the compiled policy allows grandfathering or visible convergence.
+5. Relocation or catch-up workers publish replacement quorum receipts before the
+   reconciler may mark the old generations satisfied under the stronger
+   revision.
+6. Operator explanation shows mixed revision state, convergence frontier, and
+   any range that is still protected only by the old local-intent receipt.
+
+### Unsafe Downgrade Refusal
+
+1. An operator or automation tries to weaken a dataset from `geo-intent` to
+   `geo-async` or from durable to volatile without the required authorization.
+2. Policy source compilation may describe the requested target, but #901 rollout
+   evidence records missing downgrade authorization or audit refs.
+3. The revision remains `refused`; no new receipt may cite the weaker revision
+   as active.
+4. Existing durable or geo receipts keep their historical promise and product
+   claims cannot be rewritten to the weaker language.
+5. The operator explanation reports the downgrade refusal instead of presenting
+   the dataset as merely delayed or under-replicated.
+
+### Rollback After Failed Policy Preflight Or Partial Stage
+
+1. A new revision passes compilation but later fails preflight, validation,
+   reserve admission, trust evidence, or an in-flight fsync/relocation fence.
+2. #901 rollout evidence moves the revision to `rollback-required`, names the
+   failed stage reason, and fences new work from ambiguous admission.
+3. A rollback receipt restores future admission to the previous or superseding
+   revision, but receipts already earned during the stage remain historical
+   evidence.
+4. Partially staged writes, geo backlog, repair, relocation, and receipt
+   retirement either finish under their fenced revision or re-enter through an
+   explicit rollback/re-entry ref.
+5. Satisfaction remains `blocked`, `converging`, or `refused` until the rollback
+   frontier proves no hidden mixed-revision obligation remains.
+
 ### RAM Pool
 
 1. A scratch dataset requests `volatile-local` or `volatile-replicated`.
@@ -1868,6 +2037,9 @@ The operator UAPI should eventually answer:
 
 - What policy applies to this dataset/file/range?
 - What is the current satisfaction state for that policy revision?
+- Which policy revision is draft, staged, active, converging, rolled back,
+  superseded, or refused, and what in-flight fence or convergence frontier
+  controls old receipts?
 - What ack class did the last write/fsync receive?
 - Which ordering evidence satisfied the barrier: dirty epoch, intent sequence,
   replay idempotency key, dependency refs, and publication boundary?
@@ -1921,6 +2093,9 @@ Initial row families should cover:
   fenced, or witnesses are present;
 - remote and geo latency while trust epochs, key epochs, authorization/audit
   refs, or residency policy change;
+- policy revision rollout behavior for dry-run, preflight, staged,
+  active-for-new-writes, converging-existing, rollback, supersession, and
+  unsafe downgrade refusal while old and new receipts coexist;
 - full-placement fsync latency;
 - VM FUA/barrier tail latency;
 - metadata storm p99 and fsyncdir latency;
@@ -1960,6 +2135,9 @@ Each row must bind:
 
 - requested and earned ack classes;
 - reconciled satisfaction state before and after the measured action;
+- policy rollout evidence, including source refs, change class, stage state,
+  publication transaction, in-flight fence, convergence frontier, rollback or
+  supersession refs, and downgrade refusal where relevant;
 - ordering evidence for barrier scope, dirty epoch, dependency closure, replay
   idempotency, intent sequence, and publication boundary;
 - membership epoch, quorum-set, participant-role, drain/fence, and
@@ -2056,22 +2234,29 @@ The matrix must cover at least these row families:
   before and after replacement receipt publication;
 - relocation anti-thrash cases proving cooldown, movement debt, and failed
   payback cannot hide reserve erosion or stale placement;
-- policy publish, rollback, or conflict while writes, relocation, and remote
-  backlog are in flight.
+- policy rollout faults such as stale policy source accepted as active,
+  publication transaction missing, conflicting override accepted, downgrade
+  without authorization, active revision superseded during admission, in-flight
+  fsync crossing a revision fence, relocation or receipt retirement crossing
+  without re-entry, rollback receipt missing after partial stage, convergence
+  frontier skipped, and mixed-revision state hidden from explanation.
 
 Every row must name the requested policy revision, workload envelope,
 topology/media profile, fault schedule, earned receipt set, post-recovery
 receipt obligations, and forbidden outcomes. Forbidden outcomes include durable
 success without required receipt evidence, hidden downgrade from durable to
 volatile or from `geo-intent` to `geo-async`, split-brain receipt publication,
-old locator retirement before replacement receipt publication, reserve/wear
-breach hidden behind successful relocation, stale or wrong-domain data-shape
-evidence accepted as satisfied, allocator mirror evidence accepted as authority,
-stale lifecycle evidence accepted as retained/reclaimable, bookmark-only
-anchors treated as data-retaining, pending-free bytes reused too early, and
-explanations that omit degradation, lag, volatility, trust-domain refusal,
-recovery obligation, replacement receipt blocker, transform block state,
-capacity/reserve refusal, lifecycle or layout blockers, or refusal.
+old locator retirement before replacement receipt publication, old receipts
+rewritten by policy change, hidden downgrade during policy rollout,
+mixed-revision receipt sets reported as fully converged, reserve/wear breach
+hidden behind successful relocation, stale or wrong-domain data-shape evidence
+accepted as satisfied, allocator mirror evidence accepted as authority, stale
+lifecycle evidence accepted as retained/reclaimable, bookmark-only anchors
+treated as data-retaining, pending-free bytes reused too early, and explanations
+that omit degradation, lag, volatility, trust-domain refusal, recovery
+obligation, replacement receipt blocker, transform block state,
+capacity/reserve refusal, policy rollout stage, in-flight fence, convergence
+frontier, lifecycle or layout blockers, or refusal.
 
 The validation matrix cross-links with #850 where a scenario also has latency,
 tail, throughput, RPO, or wear/cost budgets. #850 measures whether TideFS is
@@ -2156,6 +2341,12 @@ This document composes existing authority surfaces:
   RPO/RTO lag, and hidden-downgrade refusal. It composes placement receipt,
   scrub/repair/rebuild, membership, trust, ordering, capacity, layout, lifecycle,
   and data-shape evidence without replacing those owners.
+- #901 owns the storage-intent policy-rollout evidence slice for source policy
+  refs, compiled revision publication, change class, downgrade authorization,
+  stage state, in-flight fences, convergence frontiers, rollback/re-entry,
+  supersession, and typed rollout refusal. It composes #855 policy sources,
+  authz/audit refs, operator runbook state, #874 satisfaction, and receipt
+  evidence without replacing those owners.
 - `docs/security/transport-security-boundary.md`: transport security is
   session-level. Storage intent may require and cite session-security evidence,
   but it must not reintroduce per-message crypto proof markers.
@@ -2200,6 +2391,12 @@ This document composes existing authority surfaces:
 - `docs/design/background-service-framework-design.md`: relocation, repair,
   rebuild, scrub, compaction, and geo catch-up run as budgeted resumable work
   when they are not serving a foreground or critical policy risk.
+- `docs/POLICY_AUTHORITY_RUNTIME_SURFACE_P3-01.md`,
+  `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`, and
+  `docs/UPGRADE_FAILOVER_CUTOVER_OPERATOR_RUNBOOKS_P9-03.md`: policy publish,
+  dataset/property mutation visibility, dry-run, stage, commit, verify, and
+  rollback grammar are inputs to #855/#901; storage intent consumes their refs
+  instead of inventing a second operator runbook engine.
 - `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`: performance
   truth requires workload envelopes, KPIs, budgets, and receipts.
 - `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`: fault,
@@ -2263,23 +2460,27 @@ storage-intent language beside the shared records and compiled policy snapshot.
 
 | Stage | Graduation gate | Issues |
 | --- | --- | --- |
-| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, trust/domain evidence refs, capacity/admission evidence refs, recovery/degradation evidence refs, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #878, #880, #881, #894, #897, #898, #900 |
+| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, trust/domain evidence refs, capacity/admission evidence refs, recovery/degradation evidence refs, policy-rollout evidence refs, media, workload, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #878, #880, #881, #894, #897, #898, #900, #901 |
 | Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
-| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894, #897, #898, #900 |
-| Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile. | #874 |
-| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, trust/domain state, capacity/reserve state, recovery/degradation state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #862, #878, #880, #881, #894, #897, #898, #900 |
-| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness, epoch/fence, trust/domain, capacity-for-repair, recovery/degradation, and receipt evidence. | #750, #877, #675, #881, #897, #898, #900 |
-| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement, ordering, trust/domain, capacity/admission, and recovery/degradation evidence before source retirement. | #750, #847, #848, #878, #880, #881, #894, #897, #898, #900 |
-| Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, trust/domain, capacity/reserve, recovery/degradation, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875, #897, #898, #900 |
+| Policy revision rollout | Compiled revisions publish, stage, roll back, supersede, and converge with explicit source provenance, publication transaction, downgrade authz, in-flight fences, old-receipt treatment, and convergence frontiers. | #901 |
+| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, path evidence, media/wear cost, non-wear cost, workload vectors, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894, #897, #898, #900, #901 |
+| Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile, including policy rollout stage and mixed-revision obligations. | #874, #901 |
+| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, trust/domain state, capacity/reserve state, recovery/degradation state, policy-rollout state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #862, #878, #880, #881, #894, #897, #898, #900, #901 |
+| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness, epoch/fence, trust/domain, capacity-for-repair, recovery/degradation, policy revision, and receipt evidence. | #750, #877, #675, #881, #897, #898, #900, #901 |
+| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement, ordering, trust/domain, capacity/admission, recovery/degradation, and policy-rollout evidence before source retirement. | #750, #847, #848, #878, #880, #881, #894, #897, #898, #900, #901 |
+| Operator and gates | Operators can inspect the policy, rollout stage, receipt, lag, volatility, cost, trust/domain, capacity/reserve, recovery/degradation, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875, #897, #898, #900, #901 |
 
 Interface gates between stages are explicit:
 
 - Consumers take `StorageIntentPolicy` snapshots and receipt/evidence records,
   not raw caller hints, ad hoc dataset properties, or device labels.
+- Consumers that see a policy source change must use #901 rollout evidence for
+  publication, stage, in-flight fences, rollback, and convergence; they may not
+  reinterpret old receipts by reading the newest mutable property value.
 - Planners may score only candidates that already passed guarantee,
   ordering/replay, membership/epoch/fence, trust/domain, failure-domain,
   data-shape, layout/allocator, lifecycle/generation, capacity, recovery,
-  wear, transport, and degradation-law filters.
+  policy-rollout, wear, transport, and degradation-law filters.
 - Schedulers may delay, throttle, or refuse work, but they may not convert one
   acknowledgment class into another after admission.
 - Ack receipt emitters may group, shard, coalesce, or pipeline work only when
@@ -2305,10 +2506,13 @@ Interface gates between stages are explicit:
   repair/rebuild obligation, replacement receipt, retirement frontier, partition
   healing, and RPO/RTO lag only through authority records; reachable bytes,
   transfer success, or topology guesses do not satisfy recovery by themselves.
+- Policy rollout paths may publish, stage, activate, roll back, supersede, or
+  retire a revision only through #901 evidence; raw config updates, operator
+  intent, or successful dry-run output do not activate a storage-intent policy.
 - Relocation workers may write speculative replacements, but they may not
   retire source receipts until replacement receipts, ordering evidence, and
-  trust/domain plus capacity/admission plus recovery/degradation evidence
-  satisfy the target policy.
+  trust/domain plus capacity/admission plus recovery/degradation plus rollout
+  evidence satisfy the target policy.
 - Validation rows and claim ids are not an afterthought: each stage must either
   add the relevant #850/#863 row binding and #875 claim boundary, or state
   which later issue owns that proof.
@@ -2321,12 +2525,13 @@ this document except to update the issue map after live tickets exist.
 | Slice | Follow-up issue | Expected write set | Purpose |
 | --- | --- | --- | --- |
 | Membership epoch authority | #750 | `docs/MEMBERSHIP_AUTHORITY.md` | Decide epoch, quorum-write, witness-set, join/drain, fence, roster, and failure-domain authority, then expose typed refs storage-intent consumers can cite. |
-| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, media role, proximity, workload, data-shape refs, layout refs, lifecycle refs, and cost records. |
+| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, media role, proximity, workload, data-shape refs, layout refs, lifecycle refs, and cost records. |
 | Ordering evidence authority | #894 | ordering evidence model surface or #841 core model | Expose barrier scope, dirty epoch, dependency closure, replay idempotency, intent sequence, publication boundary, and completion state for sync, quorum, relocation, repair, and receipt-retirement receipts. |
 | Trust/domain evidence authority | #897 | storage-intent trust/domain records in #841 or `crates/tidefs-storage-intent-trust/`, focused tests | Expose authenticated identity, admin/security/tenant domain, session-security posture, key epoch, authorization/audit refs, residency, sharing-domain compatibility, and quarantine/refusal state. |
 | Capacity/admission evidence authority | #898 | storage-intent capacity/admission records in #841 or `crates/tidefs-storage-intent-capacity/`, focused tests | Expose logical/physical headroom, allocation tickets, claim/reserve receipts, dirty-window reserve, protected floors, pending-free frontiers, capacity amplification, and typed ENOSPC/refusal state. |
 | Recovery/degradation evidence authority | #900 | storage-intent recovery/degradation records in #841 or `crates/tidefs-storage-intent-recovery/`, focused tests | Expose degraded state, source receipt set, reconstruction width, target health, repair/rebuild obligation, replacement receipt publication, old-receipt retirement, partition healing, RPO/RTO lag, and typed recovery refusal state. |
 | Policy source and compilation | #855 | policy/config crate or `crates/tidefs-storage-intent-policy/` | Persist and compile pool, dataset, mount, caller, and internal maintenance policy into storage-intent records. |
+| Policy revision rollout evidence authority | #901 | storage-intent policy-rollout records in #841 or `crates/tidefs-storage-intent-policy-rollout/`, focused tests | Expose source policy provenance, compiled revision publication, change class, downgrade authorization, stage state, in-flight fence, convergence frontier, rollback/re-entry, supersession, and typed rollout refusal state. |
 | Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths with ordering and capacity/admission refs for the ack floor. |
 | Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, membership/fence refs, trust/domain refs, capacity/admission refs, proximity domains, failure domains, and media constraints. |
 | Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, epoch/fence law, trust/domain law, recovery/degradation law, geo stale-read boundaries, and read-repair capacity evidence. |
@@ -2336,15 +2541,15 @@ this document except to update the issue map after live tickets exist.
 | Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes without replacing #898 admission evidence. |
 | Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, and anti-thrash state for planning and performance rows. |
-| Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against receipts and evidence as satisfied, converging, degraded, blocked, refused, or unsafe-visible, including #900 recovery/degradation state, without choosing placement. |
+| Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against receipts and evidence as satisfied, converging, degraded, blocked, refused, or unsafe-visible, including #900 recovery/degradation and #901 rollout state, without choosing placement. |
 | Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy and #898 reserve state to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
 | Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier evidence without making RDMA mandatory. |
 | RAM authority design and implementation | #847 | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority. |
 | Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, wear movement, reserve admission, recovery/degradation predicates, shadow evaluation, payback, and cooldown. |
-| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, receipts, lag, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, and wear to operators. |
-| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, trust/domain changes, capacity admission, recovery/degradation, wear, cost, RPO, and relocation. |
-| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media, trust/domain, capacity/reserve, recovery/degradation, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
-| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, recovery/degradation, RAM, WAN, and wear promises. |
+| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, rollout stage, receipts, lag, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, and wear to operators. |
+| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, trust/domain changes, capacity admission, recovery/degradation, policy rollout, wear, cost, RPO, and relocation. |
+| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media, trust/domain, capacity/reserve, recovery/degradation, policy rollout, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
+| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, recovery/degradation, policy rollout, RAM, WAN, and wear promises. |
 
 ## Validation For This Slice
 
