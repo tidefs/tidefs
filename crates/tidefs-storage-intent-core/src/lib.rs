@@ -17,6 +17,41 @@
 
 use core::fmt;
 
+macro_rules! impl_u8_canonical {
+    ($ty:ident, { $($variant:ident = $value:literal => $name:literal),+ $(,)? }) => {
+        impl $ty {
+            /// Stable diagnostic spelling.
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)+
+                }
+            }
+
+            /// Encode to a stable discriminant.
+            #[must_use]
+            pub const fn to_discriminant(self) -> u8 {
+                self as u8
+            }
+
+            /// Decode from a stable discriminant. Unknown values fail closed.
+            #[must_use]
+            pub const fn from_discriminant(raw: u8) -> Option<Self> {
+                match raw {
+                    $($value => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
 /// Canonical identifier for this authority surface.
 pub const STORAGE_INTENT_CORE_SPEC: &str = "tidefs-storage-intent-core-v1-issue-841";
 
@@ -225,11 +260,33 @@ pub enum StorageIntentEvidenceKind {
     MetadataNamespaceEvidence = 23,
     /// Read freshness or source-selection evidence.
     ReadFreshnessEvidence = 24,
+    /// Service objective, latency, throughput, tail, isolation, and cost evidence.
+    ServiceObjectiveEvidence = 25,
+    /// Non-authoritative what-if simulation evidence.
+    PreflightSimulationEvidence = 26,
+    /// Planner candidate, gate, score, and selected-frontier evidence.
+    DecisionFrontierEvidence = 27,
+    /// Action execution, idempotency, cutover, abort, and outcome evidence.
+    ActionExecutionEvidence = 28,
+    /// Caller-visible result/refusal projection evidence.
+    ResultRefusalEvidence = 29,
+    /// Timebase, freshness, expiry, skew, and lag evidence.
+    TemporalEvidence = 30,
+    /// Media capability, persistence-domain, flush/FUA, and role evidence.
+    MediaCapabilityEvidence = 31,
+    /// Comparator-equivalence and allowed-claim-scope evidence.
+    ComparatorEvidence = 32,
+    /// Claim-gate evidence bounding successor, performance, and durability claims.
+    ClaimGateEvidence = 33,
+    /// RAM authority class, loss, survival, and admission evidence.
+    RamAuthorityEvidence = 34,
+    /// Lifecycle, generation, retained-root, and reclaim-frontier evidence.
+    LifecycleGenerationEvidence = 35,
 }
 
 impl StorageIntentEvidenceKind {
     /// Number of defined evidence kinds.
-    pub const COUNT: usize = 25;
+    pub const COUNT: usize = 36;
 
     /// Stable diagnostic spelling.
     #[must_use]
@@ -260,6 +317,17 @@ impl StorageIntentEvidenceKind {
             Self::EvidenceRetentionEvidence => "evidence-retention-evidence",
             Self::MetadataNamespaceEvidence => "metadata-namespace-evidence",
             Self::ReadFreshnessEvidence => "read-freshness-evidence",
+            Self::ServiceObjectiveEvidence => "service-objective-evidence",
+            Self::PreflightSimulationEvidence => "preflight-simulation-evidence",
+            Self::DecisionFrontierEvidence => "decision-frontier-evidence",
+            Self::ActionExecutionEvidence => "action-execution-evidence",
+            Self::ResultRefusalEvidence => "result-refusal-evidence",
+            Self::TemporalEvidence => "temporal-evidence",
+            Self::MediaCapabilityEvidence => "media-capability-evidence",
+            Self::ComparatorEvidence => "comparator-evidence",
+            Self::ClaimGateEvidence => "claim-gate-evidence",
+            Self::RamAuthorityEvidence => "ram-authority-evidence",
+            Self::LifecycleGenerationEvidence => "lifecycle-generation-evidence",
         }
     }
 
@@ -298,6 +366,17 @@ impl StorageIntentEvidenceKind {
             22 => Some(Self::EvidenceRetentionEvidence),
             23 => Some(Self::MetadataNamespaceEvidence),
             24 => Some(Self::ReadFreshnessEvidence),
+            25 => Some(Self::ServiceObjectiveEvidence),
+            26 => Some(Self::PreflightSimulationEvidence),
+            27 => Some(Self::DecisionFrontierEvidence),
+            28 => Some(Self::ActionExecutionEvidence),
+            29 => Some(Self::ResultRefusalEvidence),
+            30 => Some(Self::TemporalEvidence),
+            31 => Some(Self::MediaCapabilityEvidence),
+            32 => Some(Self::ComparatorEvidence),
+            33 => Some(Self::ClaimGateEvidence),
+            34 => Some(Self::RamAuthorityEvidence),
+            35 => Some(Self::LifecycleGenerationEvidence),
             _ => None,
         }
     }
@@ -806,6 +885,18 @@ impl FailureDomainDimension {
             _ => None,
         }
     }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+}
+
+impl fmt::Display for FailureDomainDimension {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Set of proved failure-domain dimensions.
@@ -895,6 +986,36 @@ impl ProximityClass {
             Self::Geo => "geo",
             Self::ArchiveOffline => "archive-offline",
         }
+    }
+
+    /// Decode from stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::InProcess),
+            1 => Some(Self::LocalRam),
+            2 => Some(Self::LocalMedia),
+            3 => Some(Self::Node),
+            4 => Some(Self::Rack),
+            5 => Some(Self::Datacenter),
+            6 => Some(Self::Wan),
+            7 => Some(Self::Internet),
+            8 => Some(Self::Geo),
+            9 => Some(Self::ArchiveOffline),
+            _ => None,
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+}
+
+impl fmt::Display for ProximityClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1429,6 +1550,12 @@ impl StorageMediaRole {
         }
     }
 
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
     /// Returns true when this role is cache-only and cannot be authority.
     #[must_use]
     pub const fn is_cache_only(self) -> bool {
@@ -1506,6 +1633,141 @@ impl MediaRoleRequirement {
 impl Default for MediaRoleRequirement {
     fn default() -> Self {
         Self::AUTHORITY
+    }
+}
+
+/// RAM or PMem authority class.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum RamAuthorityClass {
+    /// Evictable RAM cache, not authority.
+    #[default]
+    NonAuthoritativeCache = 0,
+    /// Bytes are authoritative only in one live local RAM authority instance.
+    RamVolatileLocal = 1,
+    /// Volatile RAM authority replicated across fenced peers.
+    RamVolatileReplicated = 2,
+    /// RAM serving copy covered by durable intent evidence.
+    RamIntentBacked = 3,
+    /// Durable PMem authority with persistence-domain and flush/fence evidence.
+    PmemDurable = 4,
+}
+
+/// Failure or recovery event used for RAM authority explanation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum AuthorityEvent {
+    #[default]
+    ProcessCrash = 0,
+    DaemonRestart = 1,
+    HostCrash = 2,
+    PowerLoss = 3,
+    PeerLoss = 4,
+    NetworkPartition = 5,
+    FencingAmbiguity = 6,
+    ReplayAfterDurableIntent = 7,
+}
+
+/// Set of failure/recovery events for authority explanation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct AuthorityEventMask(pub u32);
+
+impl AuthorityEventMask {
+    pub const EMPTY: Self = Self(0);
+
+    /// Construct a one-event mask.
+    #[must_use]
+    pub const fn from_event(event: AuthorityEvent) -> Self {
+        Self(1_u32 << event as u8)
+    }
+
+    /// Add one event.
+    #[must_use]
+    pub const fn with(self, event: AuthorityEvent) -> Self {
+        Self(self.0 | (1_u32 << event as u8))
+    }
+
+    /// Returns true if this mask contains `event`.
+    #[must_use]
+    pub const fn contains(self, event: AuthorityEvent) -> bool {
+        (self.0 & (1_u32 << event as u8)) != 0
+    }
+}
+
+/// Object, range, generation, and dataset scope for authority records.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentObjectScope {
+    pub dataset_id: StorageIntentDomainId,
+    pub object_id: StorageIntentEvidenceId,
+    pub range_start: u64,
+    pub range_len: u64,
+    pub generation: u64,
+}
+
+/// RAM/PMem authority record carried by #841 without runtime-local policy dialects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct RamAuthorityRecord {
+    pub authority_class: RamAuthorityClass,
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub scope: StorageIntentObjectScope,
+    pub requested_guarantee: StorageIntentGuaranteeClass,
+    pub earned_receipt: StorageIntentReceiptId,
+    pub earned_ack_class: StorageIntentGuaranteeClass,
+    pub lost_if: AuthorityEventMask,
+    pub survives: AuthorityEventMask,
+    pub resource_budget_ref: StorageIntentEvidenceRef,
+    pub admission_ref: StorageIntentEvidenceRef,
+    pub local_intent_ref: StorageIntentEvidenceRef,
+    pub quorum_intent_ref: StorageIntentEvidenceRef,
+    pub ordering_ref: StorageIntentEvidenceRef,
+    pub placement_ref: StorageIntentEvidenceRef,
+    pub pmem_ref: StorageIntentEvidenceRef,
+    pub transport_ref: StorageIntentEvidenceRef,
+    pub membership_epoch_ref: StorageIntentEvidenceRef,
+    pub fencing_ref: StorageIntentEvidenceRef,
+    pub capacity_admission_ref: StorageIntentEvidenceRef,
+    pub policy_rollout_ref: StorageIntentEvidenceRef,
+    pub tenant_isolation_ref: StorageIntentEvidenceRef,
+    pub temporal_ref: StorageIntentEvidenceRef,
+    pub media_capability_ref: StorageIntentEvidenceRef,
+    pub downgrade_refusal: StorageIntentRefusalReason,
+}
+
+impl Default for RamAuthorityRecord {
+    fn default() -> Self {
+        Self {
+            authority_class: RamAuthorityClass::NonAuthoritativeCache,
+            policy_id: StorageIntentPolicyId::ZERO,
+            policy_revision: StorageIntentPolicyRevision(0),
+            scope: StorageIntentObjectScope::default(),
+            requested_guarantee: StorageIntentGuaranteeClass::VolatileLocal,
+            earned_receipt: StorageIntentReceiptId::ZERO,
+            earned_ack_class: StorageIntentGuaranteeClass::VolatileLocal,
+            lost_if: AuthorityEventMask::EMPTY,
+            survives: AuthorityEventMask::EMPTY,
+            resource_budget_ref: StorageIntentEvidenceRef::default(),
+            admission_ref: StorageIntentEvidenceRef::default(),
+            local_intent_ref: StorageIntentEvidenceRef::default(),
+            quorum_intent_ref: StorageIntentEvidenceRef::default(),
+            ordering_ref: StorageIntentEvidenceRef::default(),
+            placement_ref: StorageIntentEvidenceRef::default(),
+            pmem_ref: StorageIntentEvidenceRef::default(),
+            transport_ref: StorageIntentEvidenceRef::default(),
+            membership_epoch_ref: StorageIntentEvidenceRef::default(),
+            fencing_ref: StorageIntentEvidenceRef::default(),
+            capacity_admission_ref: StorageIntentEvidenceRef::default(),
+            policy_rollout_ref: StorageIntentEvidenceRef::default(),
+            tenant_isolation_ref: StorageIntentEvidenceRef::default(),
+            temporal_ref: StorageIntentEvidenceRef::default(),
+            media_capability_ref: StorageIntentEvidenceRef::default(),
+            downgrade_refusal: StorageIntentRefusalReason::None,
+        }
     }
 }
 
@@ -1771,6 +2033,249 @@ pub enum SkippedMoveReason {
     StaleEvidence = 10,
 }
 
+impl_u8_canonical!(EvidenceConsumerClass, {
+    Planner = 0 => "planner",
+    Reconciler = 1 => "reconciler",
+    ReadPath = 2 => "read-path",
+    ActionExecutor = 3 => "action-executor",
+    MeasurementAttribution = 4 => "measurement-attribution",
+    OperatorExplanation = 5 => "operator-explanation",
+    PerformanceGate = 6 => "performance-gate",
+    FaultGate = 7 => "fault-gate",
+    ClaimGate = 8 => "claim-gate",
+});
+
+impl_u8_canonical!(EvidenceCompletenessVerdict, {
+    Complete = 0 => "complete",
+    Partial = 1 => "partial",
+    Stale = 2 => "stale",
+    Contradictory = 3 => "contradictory",
+    Refused = 4 => "refused",
+});
+
+impl_u8_canonical!(EvidenceRetentionClass, {
+    ExactRequired = 0 => "exact-required",
+    Summarizable = 1 => "summarizable",
+    Redactable = 2 => "redactable",
+    Purgeable = 3 => "purgeable",
+});
+
+impl_u8_canonical!(DurabilityState, {
+    Volatile = 0 => "volatile",
+    DurableIntent = 1 => "durable-intent",
+    FullPlacement = 2 => "full-placement",
+});
+
+impl_u8_canonical!(SessionSecurityClass, {
+    None = 0 => "none",
+    Authenticated = 1 => "authenticated",
+    Encrypted = 2 => "encrypted",
+    MutualAuthenticated = 3 => "mutual-authenticated",
+    Attested = 4 => "attested",
+});
+
+impl_u8_canonical!(ResidencyScope, {
+    Unspecified = 0 => "unspecified",
+    LocalNode = 1 => "local-node",
+    Datacenter = 2 => "datacenter",
+    Region = 3 => "region",
+    Jurisdiction = 4 => "jurisdiction",
+    GeoReplicaAllowed = 5 => "geo-replica-allowed",
+    InternetAllowed = 6 => "internet-allowed",
+});
+
+impl_u8_canonical!(SharingDomainClass, {
+    PrivateDataset = 0 => "private-dataset",
+    SameTenant = 1 => "same-tenant",
+    CrossTenantAllowed = 2 => "cross-tenant-allowed",
+    PublicInternet = 3 => "public-internet",
+});
+
+impl_u8_canonical!(CompromiseState, {
+    Clear = 0 => "clear",
+    Suspect = 1 => "suspect",
+    Compromised = 2 => "compromised",
+});
+
+impl_u8_canonical!(QuarantineState, {
+    Clear = 0 => "clear",
+    Pending = 1 => "pending",
+    Quarantined = 2 => "quarantined",
+});
+
+impl_u8_canonical!(StorageMediaClass, {
+    SystemRam = 0 => "system-ram",
+    RemoteRam = 1 => "remote-ram",
+    PersistentMemory = 2 => "persistent-memory",
+    NvmeFlash = 3 => "nvme-flash",
+    SsdFlash = 4 => "ssd-flash",
+    HddRotational = 5 => "hdd-rotational",
+    ZonedHdd = 6 => "zoned-hdd",
+    ZonedFlash = 7 => "zoned-flash",
+    ObjectAppliance = 8 => "object-appliance",
+    CloudObject = 9 => "cloud-object",
+    OpticalArchive = 10 => "optical-archive",
+    TapeArchive = 11 => "tape-archive",
+});
+
+impl_u8_canonical!(RamAuthorityClass, {
+    NonAuthoritativeCache = 0 => "non-authoritative-cache",
+    RamVolatileLocal = 1 => "ram-volatile-local",
+    RamVolatileReplicated = 2 => "ram-volatile-replicated",
+    RamIntentBacked = 3 => "ram-intent-backed",
+    PmemDurable = 4 => "pmem-durable",
+});
+
+impl_u8_canonical!(AuthorityEvent, {
+    ProcessCrash = 0 => "process-crash",
+    DaemonRestart = 1 => "daemon-restart",
+    HostCrash = 2 => "host-crash",
+    PowerLoss = 3 => "power-loss",
+    PeerLoss = 4 => "peer-loss",
+    NetworkPartition = 5 => "network-partition",
+    FencingAmbiguity = 6 => "fencing-ambiguity",
+    ReplayAfterDurableIntent = 7 => "replay-after-durable-intent",
+});
+
+impl_u8_canonical!(WorkloadShape, {
+    Unknown = 0 => "unknown",
+    SyncSmallWrite = 1 => "sync-small-write",
+    AsyncBulkWrite = 2 => "async-bulk-write",
+    RandomReadHot = 3 => "random-read-hot",
+    SequentialReadScan = 4 => "sequential-read-scan",
+    MetadataHotset = 5 => "metadata-hotset",
+    AppendLog = 6 => "append-log",
+    MixedTailSensitive = 7 => "mixed-tail-sensitive",
+    RepairRebuild = 8 => "repair-rebuild",
+    GeoCatchup = 9 => "geo-catchup",
+    ArchiveIngest = 10 => "archive-ingest",
+    Scratch = 11 => "scratch",
+});
+
+impl_u8_canonical!(PredictionConfidence, {
+    Unknown = 0 => "unknown",
+    Low = 1 => "low",
+    Medium = 2 => "medium",
+    High = 3 => "high",
+});
+
+impl_u8_canonical!(ContradictionState, {
+    None = 0 => "none",
+    WeakContradiction = 1 => "weak-contradiction",
+    StrongContradiction = 2 => "strong-contradiction",
+    Refused = 3 => "refused",
+});
+
+impl_u8_canonical!(HintProvenance, {
+    None = 0 => "none",
+    Caller = 1 => "caller",
+    OperatorPolicy = 2 => "operator-policy",
+    RuntimeObserved = 3 => "runtime-observed",
+    ImportedMetadata = 4 => "imported-metadata",
+    BenchmarkProfile = 5 => "benchmark-profile",
+    LearningModel = 6 => "learning-model",
+});
+
+impl_u8_canonical!(StorageIntentActionClass, {
+    QueuePrefetchTuning = 0 => "queue-prefetch-tuning",
+    CacheOnlyServingTrial = 1 => "cache-only-serving-trial",
+    NewWriteShaping = 2 => "new-write-shaping",
+    FlashServingPromotion = 3 => "flash-serving-promotion",
+    AuthorityPromotion = 4 => "authority-promotion",
+    DurablePlacementMovement = 5 => "durable-placement-movement",
+    ReadSourceRefresh = 6 => "read-source-refresh",
+    DegradedReadReconstruction = 7 => "degraded-read-reconstruction",
+    ReadTriggeredRepair = 8 => "read-triggered-repair",
+    DefragRepack = 9 => "defrag-repack",
+    ReclaimRelocation = 10 => "reclaim-relocation",
+    GeoCatchup = 11 => "geo-catchup",
+    ArchiveMigration = 12 => "archive-migration",
+});
+
+impl_u8_canonical!(ReadServingSourceClass, {
+    Cache = 0 => "cache",
+    ServingTrial = 1 => "serving-trial",
+    RamAuthority = 2 => "ram-authority",
+    PlacementReceipt = 3 => "placement-receipt",
+    RemoteReceipt = 4 => "remote-receipt",
+    DegradedReconstruction = 5 => "degraded-reconstruction",
+    SnapshotGeneration = 6 => "snapshot-generation",
+    GeoAsyncLag = 7 => "geo-async-lag",
+    ArchiveRestore = 8 => "archive-restore",
+});
+
+impl_u8_canonical!(TransformRefusalClass, {
+    None = 0 => "none",
+    UnsupportedCompression = 1 => "unsupported-compression",
+    UnsupportedChecksum = 2 => "unsupported-checksum",
+    DedupDomainMismatch = 3 => "dedup-domain-mismatch",
+    EncryptionKeyEpochStale = 4 => "encryption-key-epoch-stale",
+    ErasureShapeIllegal = 5 => "erasure-shape-illegal",
+    RebakeWouldWeakenReceipt = 6 => "rebake-would-weaken-receipt",
+    ReplacementReceiptMissing = 7 => "replacement-receipt-missing",
+});
+
+impl_u8_canonical!(AllocationClass, {
+    Unknown = 0 => "unknown",
+    IntentLog = 1 => "intent-log",
+    Metadata = 2 => "metadata",
+    SmallData = 3 => "small-data",
+    LargeSequential = 4 => "large-sequential",
+    ErasureShard = 5 => "erasure-shard",
+    ArchiveStripe = 6 => "archive-stripe",
+    RepairScratch = 7 => "repair-scratch",
+});
+
+impl_u8_canonical!(SegmentRegionClass, {
+    Unknown = 0 => "unknown",
+    Hot = 1 => "hot",
+    Warm = 2 => "warm",
+    Cold = 3 => "cold",
+    ZoneAppend = 4 => "zone-append",
+    EraseBlockAligned = 5 => "erase-block-aligned",
+    Fragmented = 6 => "fragmented",
+});
+
+impl_u8_canonical!(RelocationReasonClass, {
+    Unknown = 0 => "unknown",
+    DefragRotationalLocality = 1 => "defrag-rotational-locality",
+    ReclaimPressure = 2 => "reclaim-pressure",
+    FlashServingPromotion = 3 => "flash-serving-promotion",
+    AuthorityConvergence = 4 => "authority-convergence",
+    Evacuation = 5 => "evacuation",
+    Repair = 6 => "repair",
+    GeoCatchup = 7 => "geo-catchup",
+    ArchiveMigration = 8 => "archive-migration",
+    DataShapeRebake = 9 => "data-shape-rebake",
+});
+
+impl_u8_canonical!(RelocationLifecycleState, {
+    Proposed = 0 => "proposed",
+    Admitted = 1 => "admitted",
+    Copying = 2 => "copying",
+    Verifying = 3 => "verifying",
+    PublishingReceipt = 4 => "publishing-receipt",
+    RetiringSource = 5 => "retiring-source",
+    Complete = 6 => "complete",
+    Cooldown = 7 => "cooldown",
+    Refused = 8 => "refused",
+    Aborted = 9 => "aborted",
+});
+
+impl_u8_canonical!(SkippedMoveReason, {
+    None = 0 => "none",
+    MovementDebtTooHigh = 1 => "movement-debt-too-high",
+    FlashWearBudgetExceeded = 2 => "flash-wear-budget-exceeded",
+    PaybackWindowTooLong = 3 => "payback-window-too-long",
+    NoLegalTarget = 4 => "no-legal-target",
+    ReceiptWouldWeaken = 5 => "receipt-would-weaken",
+    SourceQuarantined = 6 => "source-quarantined",
+    ReclaimReserveUnavailable = 7 => "reclaim-reserve-unavailable",
+    CooldownActive = 8 => "cooldown-active",
+    CostBudgetExceeded = 9 => "cost-budget-exceeded",
+    StaleEvidence = 10 => "stale-evidence",
+});
+
 /// Cost/wear and movement-debt evidence projection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -1963,6 +2468,45 @@ impl StorageIntentRefusalReason {
             Self::FlashWearBudgetExceeded => "flash-wear-budget-exceeded",
             Self::EvidenceNotUsable => "evidence-not-usable",
         }
+    }
+
+    /// Decode from stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u16) -> Option<Self> {
+        match raw {
+            0 => Some(Self::None),
+            1 => Some(Self::NoLegalReceiptSet),
+            2 => Some(Self::GuaranteeFloorNotMet),
+            3 => Some(Self::FailureDomainNotMet),
+            4 => Some(Self::ProximityTooFar),
+            5 => Some(Self::DurabilityOrRpoNotMet),
+            6 => Some(Self::MissingAuthenticatedPrincipal),
+            7 => Some(Self::WrongDomain),
+            8 => Some(Self::StaleKeyEpoch),
+            9 => Some(Self::MissingAuthorization),
+            10 => Some(Self::MissingAudit),
+            11 => Some(Self::MissingRequiredSessionSecurity),
+            12 => Some(Self::IllegalSharingDomain),
+            13 => Some(Self::ResidencyViolation),
+            14 => Some(Self::CompromisedRepairSource),
+            15 => Some(Self::QuarantinedSource),
+            16 => Some(Self::MediaRoleNotAllowed),
+            17 => Some(Self::CacheCannotBeAuthority),
+            18 => Some(Self::VolatileRamCannotSatisfyDurableIntent),
+            19 => Some(Self::TemporaryMediaCannotBeAuthority),
+            20 => Some(Self::PersistentMediaRequired),
+            21 => Some(Self::ReceiptWouldWeaken),
+            22 => Some(Self::MovementDebtNotPaidBack),
+            23 => Some(Self::FlashWearBudgetExceeded),
+            24 => Some(Self::EvidenceNotUsable),
+            _ => None,
+        }
+    }
+
+    /// Encode to stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u16 {
+        self as u16
     }
 }
 
@@ -2283,6 +2827,60 @@ pub const fn evaluate_receipt_against_policy(
     )
 }
 
+/// Predicate result for a receipt set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct ReceiptSetPredicateResult {
+    /// Whether at least one receipt in the set satisfies the policy.
+    pub satisfied: bool,
+    /// Number of satisfying receipts in the candidate set.
+    pub satisfying_receipts: usize,
+    /// First refusal observed while scanning candidates.
+    pub first_refusal: StorageIntentRefusalReason,
+    /// Typed refusal to surface when the set is not legal.
+    pub refusal: StorageIntentRefusal,
+}
+
+/// Evaluate a bounded candidate set against one compiled policy.
+#[must_use]
+pub fn evaluate_receipt_set_against_policy(
+    policy: StorageIntentPolicy,
+    receipts: &[StorageIntentReceipt],
+) -> ReceiptSetPredicateResult {
+    let mut satisfying_receipts = 0_usize;
+    let mut first_refusal = StorageIntentRefusalReason::None;
+
+    for receipt in receipts {
+        let result = evaluate_receipt_against_policy(policy, *receipt);
+        if result.satisfied {
+            satisfying_receipts += 1;
+        } else if first_refusal == StorageIntentRefusalReason::None {
+            first_refusal = result.refusal;
+        }
+    }
+
+    if satisfying_receipts > 0 {
+        ReceiptSetPredicateResult {
+            satisfied: true,
+            satisfying_receipts,
+            first_refusal,
+            refusal: refusal_for_no_legal_receipt_set(policy, StorageIntentRefusalReason::None),
+        }
+    } else {
+        let reason = if first_refusal == StorageIntentRefusalReason::None {
+            StorageIntentRefusalReason::NoLegalReceiptSet
+        } else {
+            first_refusal
+        };
+        ReceiptSetPredicateResult {
+            satisfied: false,
+            satisfying_receipts: 0,
+            first_refusal: reason,
+            refusal: refusal_for_no_legal_receipt_set(policy, reason),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2460,6 +3058,93 @@ mod tests {
         assert_eq!(
             result.refusal,
             StorageIntentRefusalReason::DurabilityOrRpoNotMet
+        );
+    }
+
+    #[test]
+    fn receipt_set_surfaces_no_legal_set_refusal() {
+        let policy = durable_policy();
+        let mut receipt = durable_receipt();
+        receipt.media_role = StorageMediaRole::RamCache;
+
+        let result = evaluate_receipt_set_against_policy(policy, &[receipt]);
+        assert!(!result.satisfied);
+        assert_eq!(result.satisfying_receipts, 0);
+        assert_eq!(
+            result.refusal.reason,
+            StorageIntentRefusalReason::CacheCannotBeAuthority
+        );
+
+        let result = evaluate_receipt_set_against_policy(policy, &[]);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal.reason,
+            StorageIntentRefusalReason::NoLegalReceiptSet
+        );
+    }
+
+    #[test]
+    fn canonical_spellings_and_decoders_are_stable() {
+        assert_eq!(
+            StorageIntentEvidenceKind::from_discriminant(31),
+            Some(StorageIntentEvidenceKind::MediaCapabilityEvidence)
+        );
+        assert_eq!(
+            StorageIntentEvidenceKind::MediaCapabilityEvidence.as_str(),
+            "media-capability-evidence"
+        );
+        assert_eq!(
+            StorageIntentActionClass::from_discriminant(5),
+            Some(StorageIntentActionClass::DurablePlacementMovement)
+        );
+        assert_eq!(
+            StorageIntentActionClass::DurablePlacementMovement.as_str(),
+            "durable-placement-movement"
+        );
+        assert_eq!(StorageMediaClass::NvmeFlash.to_discriminant(), 3);
+        assert_eq!(
+            StorageIntentRefusalReason::from_discriminant(18),
+            Some(StorageIntentRefusalReason::VolatileRamCannotSatisfyDurableIntent)
+        );
+        assert_eq!(SkippedMoveReason::from_discriminant(99), None);
+    }
+
+    #[test]
+    fn ram_authority_record_carries_loss_and_evidence_refs() {
+        let ram_record = RamAuthorityRecord {
+            authority_class: RamAuthorityClass::RamIntentBacked,
+            requested_guarantee: StorageIntentGuaranteeClass::LocalIntent,
+            earned_ack_class: StorageIntentGuaranteeClass::LocalIntent,
+            lost_if: AuthorityEventMask::from_event(AuthorityEvent::ProcessCrash)
+                .with(AuthorityEvent::PowerLoss),
+            survives: AuthorityEventMask::from_event(AuthorityEvent::ReplayAfterDurableIntent),
+            ordering_ref: StorageIntentEvidenceRef::new(
+                StorageIntentEvidenceKind::OrderingEvidence,
+                StorageIntentEvidenceId([3_u8; 32]),
+                7,
+                1,
+            ),
+            media_capability_ref: StorageIntentEvidenceRef::new(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                StorageIntentEvidenceId([4_u8; 32]),
+                8,
+                1,
+            ),
+            ..RamAuthorityRecord::default()
+        };
+
+        assert_eq!(ram_record.authority_class.as_str(), "ram-intent-backed");
+        assert!(ram_record.lost_if.contains(AuthorityEvent::PowerLoss));
+        assert!(ram_record
+            .survives
+            .contains(AuthorityEvent::ReplayAfterDurableIntent));
+        assert_eq!(
+            ram_record.ordering_ref.kind,
+            StorageIntentEvidenceKind::OrderingEvidence
+        );
+        assert_eq!(
+            ram_record.media_capability_ref.kind,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence
         );
     }
 
