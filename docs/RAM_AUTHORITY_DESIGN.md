@@ -37,6 +37,18 @@ describe the reviewed live PR authority, not a file that exists on
 - GitHub issue #894 for storage-intent ordering and replay evidence: barrier
   scope, dirty epoch, dependency closure, replay idempotency, intent sequence,
   publication boundary, and completion state.
+- GitHub issue #898 for storage-intent capacity/admission evidence around
+  logical, physical, dirty-window, reserve, and ENOSPC legality.
+- GitHub issue #901 for policy-revision rollout evidence, including
+  publication, downgrade authorization, in-flight fences, and mixed-revision
+  convergence state.
+- GitHub issue #902 for tenant, budget, fair-share, noisy-neighbor,
+  reserve-exemption, throttle, and refusal evidence.
+- GitHub issue #903 for temporal evidence around timebase identity, clock
+  health, staleness, expiry, lease, lag, and freshness claims.
+- GitHub issue #904 for media-capability evidence covering persistence domain,
+  flush/FUA/barrier semantics, atomicity, geometry, health, freshness, and role
+  eligibility.
 - `docs/CACHE_TAXONOMY_INVARIANTS_P4-02.md`: cache is not authority, every
   cache entry is evictable only under its cache law, and dirty state must drain
   through explicit state machines.
@@ -275,6 +287,10 @@ record surface needs at least:
 - resource-governor budget category and admission receipt;
 - local intent, quorum intent, ordering/replay, placement, PMem, transport,
   membership epoch, and fencing evidence refs when present;
+- capacity/admission, policy-rollout, tenant-isolation, temporal, and
+  media-capability evidence refs when RAM authority depends on reserve
+  legality, policy-revision state, budget-owner protection, freshness or loss
+  windows, PMem persistence domain, or flush/FUA/barrier semantics;
 - downgrade/refusal reason when the requested floor could not be earned.
 
 The local ack receipt work in #842 should emit or consume these records at
@@ -288,6 +304,15 @@ when it emits, interprets, reconciles, plans, schedules, explains, validates,
 or claims durable intent receipts. RAM authority may serve bytes fast, but it
 may not weaken barrier scope, dependency closure, replay idempotency, intent
 sequence, publication boundary, or completion state.
+
+Issues #898, #901, #902, #903, and #904 own the capacity/admission,
+policy-rollout, tenant-isolation, temporal, and media-capability evidence that
+RAM authority consumes. A RAM receipt may cite those refs, but this document
+does not define their record layouts or runtime producers. Missing, stale,
+expired, contradictory, over-budget, unsafe-downgrade, unknown-timebase,
+unknown-persistence-domain, or unsupported-flush/FUA evidence must become a
+typed unknown, blocked, throttled, refused, failed, or degraded-visible state
+according to policy; it is not a silent weaker RAM authority success.
 
 ## Resource-Governor Boundary
 
@@ -310,6 +335,15 @@ the contract is fixed:
   debt, volatile authority, RAM serving copies backed by durable intent, PMem
   durable ranges, and transport queue memory.
 
+Capacity, budget-owner, and temporal evidence remain separate from the local
+memory counter. `ram-intent-backed` and `pmem-durable` roles must preserve #898
+reserve/admission refs when dirty windows, intent media, PMem mappings, repair
+reserve, or receipt retirement need protected headroom. Shared RAM authority,
+transport queues, and replay work must preserve #902 budget-owner and
+fair-share refs rather than hiding one tenant's p99 harm behind aggregate
+throughput. Any loss window, lease, expiry, cooldown, or freshness claim must
+cite #903 temporal refs or degrade to unknown/refused according to policy.
+
 ## Promotion And Demotion Rules
 
 Promotion or demotion changes the receipt class. It must be explicit,
@@ -321,7 +355,7 @@ auditable, and monotonic with respect to already-issued guarantees.
 | `ram-volatile-local` -> `ram-volatile-replicated` | Fenced peers acknowledge the same generation under the committed epoch. | Peer receipts, epoch, or fencing evidence are missing or stale. |
 | Volatile RAM -> `ram-intent-backed` | Durable local or quorum intent and #894 ordering evidence cover the same generation before any durable barrier success is reported. | Intent append/flush/quorum or ordering/replay evidence fails or does not cover the bytes strongly enough for replay. |
 | `ram-intent-backed` -> durable media placement | Replacement placement receipts are published and recovery no longer needs the intent for those bytes. | Placement is incomplete, stale, below policy, or would retire intent before replay and ordering evidence are safe. |
-| `ram-intent-backed` -> `pmem-durable` | PMem flush/fence plus metadata persistence and ordering evidence cover the same generation and role. | Platform persistence-domain, flush/fence, media health, metadata, or ordering evidence is missing. |
+| `ram-intent-backed` -> `pmem-durable` | PMem flush/fence plus metadata persistence, #904 media-capability refs, and ordering evidence cover the same generation and role. | Platform persistence-domain, flush/fence, media health, metadata, media-capability, or ordering evidence is missing. |
 | `pmem-durable` -> ordinary durable media | New durable placement receipts satisfy policy before PMem receipt retirement. | The move would lose the only durable authority or leave recovery metadata behind. |
 | Any durable class -> volatile RAM | Operator explicitly weakens policy for future writes and existing durable receipts remain historically true. | Existing bytes would be reclassified weaker without a policy revision and operator-visible consent. |
 | Any authority -> cache | Replacement authority exists, the old receipt is retired, or the product declares the volatile-loss event. | The bytes would remain reachable only through evictable cache. |
@@ -335,6 +369,15 @@ floor. Silent weakening is forbidden. In particular:
 - a replicated volatile receipt without current fencing evidence cannot be
   treated as clustered authority;
 - memory pressure cannot convert authority into cache.
+
+Promotion and demotion also consume #898, #901, #902, #903, and #904 when the
+transition depends on reserve headroom, policy-revision rollout, budget
+ownership, freshness or expiry, or media eligibility. A policy revision cannot
+reinterpret old RAM receipts without #901 convergence or downgrade evidence.
+Capacity pressure cannot borrow protected sync, repair, evacuation, or
+receipt-retirement reserve without #898 evidence. PMem cannot satisfy a
+durable role from a media label alone; it needs #904 persistence-domain and
+flush/FUA/barrier evidence.
 
 ## Operator Explanation Requirements
 
@@ -356,6 +399,16 @@ file, range, or pool:
 - which PMem ranges are durable, poisoned, incomplete, or pending flush;
 - resource-governor budget pressure for volatile authority, RAM serving,
   dirty intent, PMem mappings, and cluster queues;
+- capacity/admission, reserve, and ENOSPC state from #898 when RAM intent or
+  PMem durability depends on protected headroom;
+- policy rollout and mixed-revision state from #901 when a RAM authority class
+  changes or old receipts remain under an earlier policy;
+- tenant, budget-owner, fair-share, noisy-neighbor, and throttle state from
+  #902 when RAM or PMem pressure can harm another protected scope;
+- temporal evidence from #903 for loss-window, lease, expiry, freshness, lag,
+  RPO, or replay-age claims;
+- media-capability state from #904 for PMem persistence domain, flush/FUA,
+  atomicity, geometry, health, freshness, and role eligibility;
 - any requested policy transition that was refused to avoid weakening
   guarantees.
 
@@ -371,6 +424,11 @@ This docs slice maps to existing and future implementation work as follows:
 | Storage-intent RAM class records and receipt spellings | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests |
 | Local durable intent receipt emission | #842 | `crates/tidefs-local-filesystem/src/` and local intent-log/writeback-adjacent modules |
 | Storage-intent ordering and replay evidence | #894 | model surface selected by #894, with runtime paths excluded until that issue expands its write set |
+| Capacity/admission evidence for RAM intent and PMem roles | #898 | storage-intent capacity/admission record or model crate selected by #898 |
+| Policy-revision rollout evidence for RAM authority changes | #901 | storage-intent rollout record or model crate selected by #901 |
+| Tenant and budget isolation evidence for shared RAM authority | #902 | storage-intent isolation record or model crate selected by #902 |
+| Temporal evidence for loss windows, leases, expiry, and freshness | #903 | storage-intent temporal record or model crate selected by #903 |
+| Media-capability evidence for PMem persistence and flush/FUA roles | #904 | storage-intent media-capability record or model crate selected by #904 |
 | Transport path evidence for volatile peer receipts | #846 | `crates/tidefs-transport/src/` |
 | Intent-aware admission and memory/QoS scheduling | #862 | scheduler or admission crate named by that issue |
 | Operator explanation of volatility and receipts | #849 | `apps/tidefsctl/` and operator docs |
