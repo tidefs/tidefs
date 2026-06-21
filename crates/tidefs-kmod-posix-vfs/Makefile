@@ -12,6 +12,9 @@ ifneq ($(KERNELRELEASE),)
 # Inside kbuild
 obj-m := tidefs_posix_vfs.o
 tidefs_posix_vfs-y := tidefs_posix_vfs_main.o tidefs_posix_vfs_shim.o
+# Rust-generated code may trigger false-positive objtool fall-through
+# warnings. Suppress objtool on the Rust object until the toolchain matures.
+OBJECT_FILES_NON_STANDARD_tidefs_posix_vfs_main.o := y
 else
 # Outside kbuild: delegate to the kernel build system
 KDIR ?= /root/ai/state/tidefs/kernel-dev/hot-loop/linux-7.0/build
