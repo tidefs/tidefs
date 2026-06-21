@@ -1,6 +1,6 @@
 # Storage Intent Policy Authority
 
-Issue: #839, #957
+Issue: #839, #957, #968
 Date: 2026-06-21
 Status: design authority and media-native convergence gate for follow-up
 implementation slices
@@ -277,6 +277,7 @@ Every authority-changing decision must preserve this spine:
 | #842 ack receipts | Earned receipt naming requested guarantee, actual receipt class, replay/flush/fence/order evidence, media role, pending convergence, and refusal/degradation if the floor was not earned. |
 | #844/#856 wear and cost ledgers | Flash endurance, write amplification, movement debt, capacity, egress, power/money, foreground p99, and payback or refusal evidence. |
 | #847 RAM authority | Cache, volatile scratch, replicated volatile authority, intent-backed RAM authority, and PMem durable authority are separate receipt classes with explicit loss/recovery semantics. |
+| #967 prefetch and residency authority | Dataset-scoped speculative prefetch, serving-trial, cache-admission, staging, promotion, and demotion decisions with action class, source/target media refs, budget owner, cost/wear refs, admission state, freshness/RPO refs, attribution refs, and cache-vs-authority state. |
 | #848 relocation governor | Defrag, compaction, rebake, rebuild, evacuation, geo catch-up, archive migration, and reclaim are one receipt-preserving optimizer family. |
 | #926 preflight simulation | Non-authoritative what-if result with query basis, simulated decision frontiers, projected deltas, activation blockers, cost, fidelity, expiry, and non-authority marker. |
 | #911 action execution | Idempotent actuation state, source protection, target verification, cutover/publication, abort/rollback visibility, and source-retirement proof. |
@@ -1442,6 +1443,84 @@ Hard prediction laws:
 9. Prediction evidence may be compacted or decayed only after no receipt,
    relocation decision, cooldown, claim artifact, operator explanation, or
    measurement-attribution dependency still depends on the detailed result.
+
+## Prefetch And Dynamic Media Residency
+
+#967 owns the storage-intent prefetch and dynamic media-residency decision
+model. #968 owns this documentation authority slice. Prefetch is not a pool-wide
+read-ahead knob, a cache-device mode, or a benchmark trick. It is a
+dataset-scoped policy decision that may warm cache, stage slow data, run serving
+trials, or propose promotion/demotion only through the same evidence spine as
+placement, read serving, relocation, cost, and claims.
+
+Pool defaults may provide inheritance, but they are not the authority for
+prefetch or residency. A dataset policy can enable, refuse, cap, or shape
+prefetch windows, cache admission, serving trials, promotion, demotion, dwell,
+cooldown, payback, and override classes. Per-file or per-range overrides are
+legal only when the compiled dataset policy admits that override class.
+
+Prefetch and residency decisions must bind at least:
+
+| Decision field | Required authority |
+| --- | --- |
+| `policy_ref` | #855 compiled dataset policy revision, inherited pool defaults if any, override legality, and refusal/degradation behavior. |
+| `subject_ref` | Dataset, inode/object/range/cohort, generation, snapshot/clone/receive-base context, and budget owner. |
+| `access_pattern_ref` | #845 workload vector, observation window, sample mass, decay, contradiction state, action class, and materialization/cost refs. |
+| `service_objective_ref` | #915 latency/tail, throughput, freshness, RPO/RTO, cost/wear, isolation, and media/topology envelope for the action. |
+| `source_media_ref` and `target_media_ref` | #904/#960/#961/#962 capability and freshness evidence for RAM, PMem, flash, HDD, local, remote, WAN/internet, object, or archive roles. |
+| `action_class` | No-prefetch, bounded sequential read-ahead, strided/vector prefetch, metadata/namespace prefetch, small-random hotset trial, snapshot/clone prefetch, degraded-read reconstruction prefetch, WAN/geo delta prefetch, object/archive restore staging, cache-only serving trial, or promotion/demotion proposal. |
+| `admission_ref` | #862 scheduler lane, queue/admission result, throttle/drop/refusal state, foreground-protection state, and escalation reason if recovery or policy satisfaction makes the work non-speculative. |
+| `wear_cost_ref` | #844/#856 flash wear, WAF, memory, CPU, capacity, egress, restore, metadata-retention, power/money, payback, and unknown-cost refs. |
+| `read_serving_ref` | #877 cache/trial/read-source legality, anchor/fence state, freshness, stale/lag profile, and repair-on-read interaction. |
+| `movement_ref` | #848/#911/#920 refs when a decision becomes authority-changing promotion, demotion, source-retirement, action execution, or caller-visible result/refusal. |
+| `evidence_cut_ref` | #913 query snapshot and #905 decision frontier used for candidate hard gates, score inputs, rejected alternatives, and replayability. |
+| `attribution_ref` | #912 measurement-attribution verdict before confidence rises, payback closes, cooldown clears, or any claim boundary can cite the outcome. |
+
+Hard prefetch and residency laws:
+
+1. Dataset policy wins. Pool defaults cannot force prefetch, cache admission,
+   flash promotion, PMem promotion, demotion, or archive/object staging when the
+   dataset policy is stricter or refuses that override class.
+2. Speculative work is droppable. Prefetch, cache warming, slow-media staging,
+   serving trials, and predictor/evidence writes must yield to protected sync,
+   repair, evacuation, receipt-retirement, foreground p99, wear, capacity,
+   egress, and tenant-isolation budgets unless policy or recovery evidence
+   escalates the work.
+3. Cache is not authority. Prefetched bytes, warmed cache, and cache-only
+   serving trials may reduce latency only while their anchors, fences,
+   freshness, and policy refs remain valid. They do not satisfy durable
+   placement, latest-read, RAM authority, geo freshness, archive restore,
+   source retirement, or product claims by themselves.
+4. Slow media is first class. HDD locality, SMR/ZNS constraints, remote
+   durability, WAN/internet latency and bandwidth, object commit semantics,
+   archive retention and restore time, and RDMA-absent transport are modeled
+   as explicit evidence, not special cases after a fast-media plan exists.
+5. Prediction lowers action class when evidence is weak. One-pass scans,
+   phase-changing sparse workloads, low sample mass, contradicted hints,
+   memory-only sketches, sampled-away observations, and noisy tenants may admit
+   no-prefetch, bounded read-ahead, shadow evaluation, or cache-only trials, but
+   not persistent flash/PMem promotion, durable relocation, old-receipt
+   retirement, or confidence transfer across owners.
+6. Flash lifetime is charged. Promotion, staging, predictor checkpoints,
+   signal summaries, cache indexes, failed promotion attempts, retained
+   evidence, and source-retirement bookkeeping consume #844/#856 cost/wear
+   evidence. Unknown WAF, missing health/freshness, absent protected reserve,
+   missing payback, or missing attribution blocks persistent promotion.
+7. Promotion and demotion are relocation law. A serving-trial hit can recommend
+   authority movement, but #848/#911/#920 own the source receipts, target
+   receipt publication, action execution, replacement proof, source-retirement
+   law, result/refusal, dwell, payback, and cooldown. Demotion must preserve the
+   requested objective and receipt set or return degraded-visible, blocked, or
+   refused state.
+8. Learning needs attribution. Cache-hit rate, hotset wins, HDD seek wins,
+   archive restore wins, or WAN staging wins may train future decisions only
+   when #912 says the result belongs to the exact policy, workload, media,
+   topology, scheduler, cost/wear, action, and comparator envelope.
+9. Validation and claims stay blocked. Better-than-OpenZFS/Ceph/DRBD prefetch,
+   adaptive residency, flash-wear, RAM-fast, HDD-defrag, WAN/object/archive, or
+   cost-effectiveness wording requires matching #850 performance rows, #863
+   fault rows, #912 attribution, #913 evidence cuts, #928 comparator evidence,
+   #875 claim ids, and retained proof for the exact envelope.
 
 ## Temporal Evidence, Lag, And Timebase
 
@@ -4355,6 +4434,11 @@ Interface gates between stages are explicit:
   service-objective, metadata/namespace, membership epoch, fence, trust/domain,
   media-capability, action-execution, recovery/degradation, evidence-retention,
   and capacity predicates pass for the compiled policy.
+- Prefetch and residency paths may warm cache, stage slow data, admit serving
+  trials, or propose promotion/demotion only through #967 decisions bound to
+  dataset policy, #913 evidence cuts, #845 prediction evidence, #904 media
+  capability, #915 objectives, #862 admission, #844/#856 cost/wear, #877
+  read-serving law, #848/#911/#920 movement/result law, and #912 attribution.
 - Data-shape and transform paths may change record size, compression,
   checksum/digest, dedup, encryption, EC, archive, or coalescing shape only
   through compiled policy and receipt/evidence records.
@@ -4438,6 +4522,7 @@ this document except to update the issue map after live tickets exist.
 | Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, metadata, preflight-simulation, and signal-persistence write amplification, media health, movement debt, payback evidence, and relocation write budgets while consuming #904 refs for media class, health, and capability freshness and feeding #926 projected wear deltas. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, metadata amplification, preflight-simulation cost, network egress, retention, relocation, operator-defined cost envelopes, and projected #926 cost deltas without replacing #898 admission evidence. |
 | Workload and prediction evidence plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, signal-materialization and collection-cost refs, confidence classes, temporal refs, decision/outcome refs, payback verdicts, confidence updates, and anti-thrash state for planning, relocation, explanation, performance, and fault rows while linking authority-changing decisions to #905, objective scope to #915, execution/outcome to #911, attribution to #912, evidence cuts to #913, cost/wear budgets to #844/#856/#902, and retention/compaction to #910. |
+| Prefetch and dynamic media residency | #967/#968 | #968 updates this authority doc; #967 source work should use a focused prefetch/residency model crate or selected storage-intent model module, with focused tests | Define dataset-scoped prefetch, cache-admission, serving-trial, staging, promotion, demotion, dwell, cooldown, payback, and no-prefetch decisions across RAM, PMem, flash, HDD, local, remote, WAN/internet, object, and archive media while consuming #855 policy, #845 prediction, #913 evidence snapshots, #915 objectives, #904/#960/#961/#962 media capability/freshness, #862 admission, #877 read serving, #848 relocation, #844/#856 cost/wear, #912 attribution, #850/#863 validation, and #875 claim boundaries. |
 | Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against #913 query snapshots as satisfied, converging, degraded, blocked, refused, or unsafe-visible, including #900 recovery/degradation, #901 rollout, #902 isolation, #904 media-capability, #922 metadata/namespace, #905 decision-frontier, #915 service-objective refusal, #911 action-execution, #920 result/refusal, and #910 retention state, without choosing placement. |
 | Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy, #915 service-objective refs, #913 query snapshots, #898 reserve state, #902 isolation state, #904 media-capability refusal state, #922 metadata/namespace state, #926 preflight blockers/recommendations, #905 decision-frontier refs, and #920 result/refusal refs to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
 | Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier and temporal-sample evidence without making RDMA mandatory, and feed WAN/internet deltas to #926 previews when proposed policy or placement changes depend on path behavior. |
