@@ -3,7 +3,8 @@
 Networked storage node daemon: bridges `tidefs-transport` with
 `tidefs-replicated-object-store` and provides a unified runtime
 authority spine that discloses the active transport backend to
-all subsystems.
+all subsystems. This is storage-node runtime evidence, not final
+distributed operator UAPI.
 
 ## Runtime Authority Spine
 
@@ -11,7 +12,10 @@ The storage node constructs a `RuntimeAuthority` at startup that
 declares one coherent backend choice. Every subsystem (transport,
 membership, placement, replication) consults the same spine rather
 than maintaining separate deterministic-only and live-only truth
-paths.
+paths. The spine is daemon-internal backend disclosure: it does not
+authorize `tidefsctl cluster pool create` beyond its prototype command
+class, does not make placement/heal exercises operator status or repair
+authority, and does not replace the `cluster status` live-owner path.
 
 ## Data Path Selection
 
@@ -24,7 +28,8 @@ At startup, the storage node selects its object store backend based on
   s `replication_factor()` drives `write_quorum` and `total_replicas`
   in the `TransportReplicatedStoreConfig`. Membership peers are connected
   as replicas. When no membership peers are configured, a warning is
-  emitted.
+  emitted. This proves which backend the daemon selected; it is not a
+  distributed operator-maturity claim by itself.
 
 - **Non-live backends** (Loopback, DeterministicInMemory, NotRun, or
   no authority): opens a local path-backed `ReplicatedObjectStore` using
@@ -66,7 +71,7 @@ disclosure → transport config → membership → placement → replication
 The authority spine holds the disclosed backend and derived transport
 configuration. Membership, placement, and replication subsystems receive
 the same backend disclosure and settings during initialization, ensuring
-one coherent authority model.
+one coherent daemon-internal authority model.
 
 ### Replication Factor
 
@@ -84,7 +89,7 @@ initialization time.
   membership service, send/receive, stats).
 - `authority_spine`: Runtime authority spine (`RuntimeAuthority`) that
   discloses the active transport backend and wires it through all
-  subsystems.
+  subsystems without defining final cluster operator UAPI.
 
 ## Inbound Replication Handler
 
@@ -169,10 +174,10 @@ flow-commit gates, but first require the planned-read source member,
 `PlacementReceiptRef`, payload length, and payload digest to match the
 scheduled `BackfillTask`. The planned-read bridge still does not perform
 replacement orchestration, cluster-wide convergence, degraded-read routing, or
-reclaim completion. The cluster
-placement map can consume the completed rebuild `FlowCommitResult` through
+reclaim completion. The cluster placement map can consume the completed
+rebuild `FlowCommitResult` through
 `PlacementMap::publish_rebuild_flow_commit_result()` and update local
-cluster-visible repaired-placement state after validating subject, target,
+cluster-runtime repaired-placement state after validating subject, target,
 epoch, and receipt authority. `PlacementHealCoordinator` and
 `ClusterLeaseRuntime` expose the same local publication path through their
 owned placement state. These local placement-publication owner boundaries are

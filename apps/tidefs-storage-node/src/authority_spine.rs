@@ -6,6 +6,12 @@
 //! subsystem consults. It eliminates separate deterministic-only and
 //! live-only truth paths by establishing one coherent configuration surface
 //! at storage-node startup.
+//!
+//! This spine is daemon-internal backend disclosure. It is not final
+//! distributed operator UAPI, does not authorize cluster pool prototype
+//! commands, and does not turn placement/heal exercises into operator status
+//! or repair authority. Public `cluster status` must still route through a
+//! reachable live owner and fail closed when no owner can provide evidence.
 
 use std::net::SocketAddr;
 
@@ -17,7 +23,8 @@ use tidefs_transport::config::{TransportConfig, TransportConfigBuilder, Transpor
 ///
 /// Holds the disclosed backend, a derived transport configuration, and
 /// initialization parameters shared by membership, placement, and
-/// replication.
+/// replication. This type is storage-node runtime evidence only; it is not a
+/// final distributed operator surface.
 #[derive(Clone, Debug)]
 pub struct RuntimeAuthority {
     disclosure: BackendDisclosure,
@@ -87,7 +94,8 @@ impl RuntimeAuthority {
     }
 
     /// Returns `true` when the backend uses a real network transport.
-    /// Delegates to [`BackendDisclosure::is_live`].
+    /// Delegates to [`BackendDisclosure::is_live`]. This is backend
+    /// disclosure only, not cluster status or repair authority.
     #[must_use]
     pub fn is_live(&self) -> bool {
         self.disclosure.is_live()

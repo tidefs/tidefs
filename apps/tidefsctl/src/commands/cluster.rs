@@ -28,6 +28,13 @@ use tidefs_cluster::{
 use tidefs_membership_epoch::HealthClass;
 use tidefs_transport::{NodeInfo, SessionId, Transport, TransportAddr};
 
+const CLUSTER_POOL_CREATE_SURFACE_CLASS: &str = "prototype";
+const CLUSTER_POOL_CREATE_ROUTING: &str = "prototype-only";
+const CLUSTER_POOL_CREATE_BOUNDARY: &str = "not final distributed operator UAPI";
+const CLUSTER_EXERCISE_SURFACE_CLASS: &str = "development-diagnostic";
+const CLUSTER_EXERCISE_ROUTING: &str = "development-exercise";
+const CLUSTER_EXERCISE_BOUNDARY: &str = "not operator status or repair authority";
+
 #[derive(Subcommand, Debug)]
 pub enum ClusterCommand {
     /// Manage prototype clustered pools
@@ -562,7 +569,7 @@ fn handle_cluster_pool_create(
 
     // 7. Dispatch create requests through transport.
     eprintln!(
-        "tidefsctl: dispatching cluster pool create to {} node(s)...",
+        "tidefsctl: dispatching prototype cluster pool create to {} node(s)...",
         config.node_count()
     );
 
@@ -607,10 +614,18 @@ fn handle_cluster_pool_create(
                     "node_results": node_results_json,
                     "redundancy": &canonical_redundancy,
                     "topology_generation": config.topology_generation,
+                    "surface_class": CLUSTER_POOL_CREATE_SURFACE_CLASS,
+                    "routing": CLUSTER_POOL_CREATE_ROUTING,
+                    "operator_uapi_boundary": CLUSTER_POOL_CREATE_BOUNDARY,
                 });
                 println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
             } else {
-                println!("cluster pool created: {}", outcome.pool_name);
+                println!("cluster pool prototype created: {}", outcome.pool_name);
+                println!(
+                    "  surface:        {}/{}",
+                    CLUSTER_POOL_CREATE_SURFACE_CLASS, CLUSTER_POOL_CREATE_ROUTING
+                );
+                println!("  boundary:       {CLUSTER_POOL_CREATE_BOUNDARY}");
                 println!("  pool GUID:      {}", hex_guid(&outcome.pool_guid));
                 println!(
                     "  nodes:          {}/{} succeeded",
@@ -640,7 +655,7 @@ fn handle_cluster_pool_create(
                 ..
             } = &e
             {
-                eprintln!("tidefsctl: cluster pool create partially failed: {e}");
+                eprintln!("tidefsctl: prototype cluster pool create partially failed: {e}");
                 eprintln!(
                     "  nodes: {}/{} succeeded",
                     outcome.succeeded, outcome.total_nodes
@@ -653,7 +668,7 @@ fn handle_cluster_pool_create(
                     }
                 }
             } else {
-                eprintln!("tidefsctl: cluster pool create failed: {e}");
+                eprintln!("tidefsctl: prototype cluster pool create failed: {e}");
             }
             process::exit(1);
         }
@@ -720,6 +735,11 @@ fn handle_placement_exercise(epoch: u64, json: bool) {
     if json {
         let json_out = serde_json::json!({
             "operation": "cluster_placement_exercise",
+            "surface_class": CLUSTER_EXERCISE_SURFACE_CLASS,
+            "routing": CLUSTER_EXERCISE_ROUTING,
+            "authority_boundary": CLUSTER_EXERCISE_BOUNDARY,
+            "operator_status": false,
+            "repair_authority": false,
             "epoch": pm.epoch(),
             "member_count": pm.member_count(),
             "object_count": pm.object_count(),
@@ -739,7 +759,9 @@ fn handle_placement_exercise(epoch: u64, json: bool) {
         });
         println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
     } else {
-        println!("PlacementMap exercise (epoch {}):", pm.epoch());
+        println!("PlacementMap development diagnostic (epoch {}):", pm.epoch());
+        println!("  surface:     {CLUSTER_EXERCISE_SURFACE_CLASS}/{CLUSTER_EXERCISE_ROUTING}");
+        println!("  boundary:    {CLUSTER_EXERCISE_BOUNDARY}");
         println!("  members:     {}", pm.member_count());
         println!("  objects:     {}", pm.object_count());
         println!("  replicas:    {}", pm.total_replicas());
@@ -815,6 +837,11 @@ fn handle_heal_exercise(epoch: u64, lost_member: u64, json: bool) {
     if json {
         let json_out = serde_json::json!({
             "operation": "cluster_heal_exercise",
+            "surface_class": CLUSTER_EXERCISE_SURFACE_CLASS,
+            "routing": CLUSTER_EXERCISE_ROUTING,
+            "authority_boundary": CLUSTER_EXERCISE_BOUNDARY,
+            "operator_status": false,
+            "repair_authority": false,
             "epoch": epoch,
             "lost_member": lost_member,
             "initial_state": format!("{:?}", HealState::Idle),
@@ -846,7 +873,11 @@ fn handle_heal_exercise(epoch: u64, lost_member: u64, json: bool) {
         });
         println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
     } else {
-        println!("PlacementHealCoordinator exercise (epoch {epoch}):");
+        println!("PlacementHealCoordinator development diagnostic (epoch {epoch}):");
+        println!(
+            "  surface:            {CLUSTER_EXERCISE_SURFACE_CLASS}/{CLUSTER_EXERCISE_ROUTING}"
+        );
+        println!("  boundary:           {CLUSTER_EXERCISE_BOUNDARY}");
         println!("  lost member:        {lost_member}");
         println!("  initial state:      {:?}", HealState::Idle);
         println!("  post-loss state:    {state:?}");
@@ -866,19 +897,13 @@ fn handle_heal_exercise(epoch: u64, lost_member: u64, json: bool) {
 
 // ---------------------------------------------------------------------------
 /// Query live cluster status through the live owner, or fail closed
-
 /// with source-classified refusal when no live owner is reachable.
-
 fn handle_cluster_status(pool_name: String, json: bool) {
-
     // Try the live owner first; exits if reachable.
-
     super::live_owner::route_status_if_owner_exists("cluster", "status", &pool_name, json);
 
     // No live owner reachable; fail closed with source classification.
-
     super::live_owner::refuse_no_live_status_evidence("cluster", "status", &pool_name, json);
-
 }
 
 // Helpers
@@ -1183,6 +1208,24 @@ mod tests {
         assert_eq!(
             format_cluster_redundancy(ClusterPlacementPolicy::ErasureCoded { data: 4, parity: 2 }),
             "erasure=4+2"
+        );
+    }
+
+    #[test]
+    fn cluster_output_boundary_labels_match_surface_roles() {
+        assert_eq!(CLUSTER_POOL_CREATE_SURFACE_CLASS, "prototype");
+        assert_eq!(CLUSTER_POOL_CREATE_ROUTING, "prototype-only");
+        assert!(
+            CLUSTER_POOL_CREATE_BOUNDARY.contains("not final distributed operator UAPI"),
+            "cluster pool create output must stay prototype-framed"
+        );
+
+        assert_eq!(CLUSTER_EXERCISE_SURFACE_CLASS, "development-diagnostic");
+        assert_eq!(CLUSTER_EXERCISE_ROUTING, "development-exercise");
+        assert!(
+            CLUSTER_EXERCISE_BOUNDARY.contains("not operator status")
+                && CLUSTER_EXERCISE_BOUNDARY.contains("repair authority"),
+            "placement/heal exercise output must deny status and repair authority"
         );
     }
 
