@@ -348,11 +348,10 @@ impl Governor {
         inner.categories[idx].used = new_used;
 
         // Recompute pressure signals.
-        let util = if cap > 0 {
-            new_used as f64 / cap as f64
-        } else { 0.0 };
-        inner.categories[idx].hard_pressure = util >= 0.95;
-        inner.categories[idx].soft_pressure = new_used >= soft_watermark;
+        let (soft_pressure, hard_pressure) =
+            Self::pressure_flags(new_used, cap, soft_watermark);
+        inner.categories[idx].hard_pressure = hard_pressure;
+        inner.categories[idx].soft_pressure = soft_pressure;
 
         Ok(AdmissionTicket { category, size })
     }
@@ -367,16 +366,16 @@ impl Governor {
         let soft_watermark = inner.category_configs[idx].soft_watermark;
         let cap = inner.category_configs[idx].cap;
 
-        inner.categories[idx].used = inner.categories[idx].used.saturating_sub(size);
-        inner.total_used = inner.total_used.saturating_sub(size);
+        let released = inner.categories[idx].used.min(size);
+        inner.categories[idx].used -= released;
+        inner.total_used = inner.total_used.saturating_sub(released);
 
         // Recompute pressure signals.
         let used = inner.categories[idx].used;
-        let util = if cap > 0 {
-            used as f64 / cap as f64
-        } else { 0.0 };
-        inner.categories[idx].hard_pressure = util >= 0.95;
-        inner.categories[idx].soft_pressure = used >= soft_watermark;
+        let (soft_pressure, hard_pressure) =
+            Self::pressure_flags(used, cap, soft_watermark);
+        inner.categories[idx].hard_pressure = hard_pressure;
+        inner.categories[idx].soft_pressure = soft_pressure;
     }
 
     /// Return the backpressure signal for a specific category.
@@ -452,9 +451,15 @@ impl Governor {
         }
     }
 
-
+    fn pressure_flags(used: u64, cap: u64, soft_watermark: u64) -> (bool, bool) {
+        if used == 0 || cap == 0 {
+            return (false, false);
+        }
+        let hard_pressure = (used as u128) * 100 >= (cap as u128) * 95;
+        let soft_pressure = used >= soft_watermark;
+        (soft_pressure, hard_pressure)
+    }
 }
-
 
 impl fmt::Debug for Governor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -690,6 +695,46 @@ mod tests {
         g.release(BudgetCategory::DataCache, 1024);
         assert_eq!(g.category_used(BudgetCategory::DataCache), 0);
         assert_eq!(g.total_used(), 0);
+    }
+
+    #[test]
+    fn over_release_does_not_reclaim_other_category_usage() {
+        let g = Governor::new(test_config()).unwrap();
+        g.admit(BudgetCategory::DataCache, 1024).unwrap();
+        g.admit(BudgetCategory::MetaCache, 512).unwrap();
+
+        g.release(BudgetCategory::DataCache, 4096);
+
+        assert_eq!(g.category_used(BudgetCategory::DataCache), 0);
+        assert_eq!(g.category_used(BudgetCategory::MetaCache), 512);
+        assert_eq!(g.total_used(), 512);
+    }
+
+    #[test]
+    fn zero_cap_category_zero_usage_has_no_pressure() {
+        let config = GovernorConfig {
+            total_budget_bytes: 1000,
+            data_cache_fraction: 1.0,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        };
+        let g = Governor::new(config).unwrap();
+
+        g.release(BudgetCategory::MetaCache, 0);
+        assert_eq!(
+            g.backpressure(BudgetCategory::MetaCache),
+            BackpressureSignal::None
+        );
+
+        g.admit(BudgetCategory::MetaCache, 0).unwrap();
+        assert_eq!(g.category_used(BudgetCategory::MetaCache), 0);
+        assert_eq!(
+            g.backpressure(BudgetCategory::MetaCache),
+            BackpressureSignal::None
+        );
     }
 
     #[test]
