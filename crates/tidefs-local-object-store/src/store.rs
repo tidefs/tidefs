@@ -3287,7 +3287,6 @@ impl LocalObjectStore {
 
         let segment_ids_before = discover_segment_ids(&self.segments_dir)?;
         let live_objects_before = stats_counted_index_len(&self.index);
-        let compaction_start_segment_id = self.current_segment_id;
         let protected_keys: BTreeSet<ObjectKey> = protected_keys.iter().copied().collect();
         let exact_location_keys: BTreeSet<ObjectKey> = protected_exact_locations
             .iter()
@@ -3298,6 +3297,10 @@ impl LocalObjectStore {
         for location in protected_exact_locations {
             self.read_location(*location)?;
             retained_segments.insert(location.segment_id);
+        }
+
+        if self.current_offset > 0 {
+            self.rotate_segment()?;
         }
 
         let mut protected_copies = Vec::new();
@@ -3338,8 +3341,6 @@ impl LocalObjectStore {
         }
 
         let tombstoned_unprotected_keys = tombstone_keys.len();
-        let compaction_emitted_records =
-            copied_protected_objects > 0 || tombstoned_unprotected_keys > 0;
         for key in tombstone_keys {
             self.delete(key)?;
         }
@@ -3350,9 +3351,6 @@ impl LocalObjectStore {
         self.mark_committed_intent_log_segments_replayed_for_compaction()?;
 
         let segment_ids_after_writes = discover_segment_ids(&self.segments_dir)?;
-        if compaction_emitted_records {
-            retained_segments.insert(compaction_start_segment_id);
-        }
         for segment_id in &segment_ids_after_writes {
             if !segment_ids_before.contains(segment_id) {
                 retained_segments.insert(*segment_id);
@@ -3388,9 +3386,25 @@ impl LocalObjectStore {
         let replica_healthy = self.replica_healthy.clone();
         *self = LocalObjectStore::open_with_options(root, options)?;
         self.replica_healthy = replica_healthy;
-        // Rotate to a fresh segment so a checkpoint covering the remaining
-        // complete segments is written immediately (avoids full replay on
-        // next mount after compaction).
+        // Safety net: after reopen, the index must reflect only the
+        // surviving tombstone-only segments.  Clear any objects that
+        // may have been resurrected by a stale checkpoint or segment
+        // replay artifact (observed in focused CI validation).
+        let resurrected: Vec<ObjectKey> = self
+            .index
+            .keys()
+            .copied()
+            .filter(|key| !is_public_scan_internal_key(*key) && !protected_keys.contains(key))
+            .collect();
+        if !resurrected.is_empty() {
+            eprintln!(
+                "compact_retaining: WARNING reopened store has {} resurrected entries; re-tombstoning",
+                resurrected.len()
+            );
+            for key in resurrected {
+                self.delete(key)?;
+            }
+        }
         self.rotate_segment()?;
         for location in protected_exact_locations {
             self.read_location(*location)?;
@@ -3991,8 +4005,16 @@ impl LocalObjectStore {
 
         for write in writes {
             total_media_bytes += write.record_bytes();
-            let stored = self.put(write.key, &write.data)?;
-            flushed_keys.push(stored.key);
+            match write.kind {
+                RecordKind::Put => {
+                    let stored = self.put(write.key, &write.data)?;
+                    flushed_keys.push(stored.key);
+                }
+                RecordKind::Delete => {
+                    self.delete(write.key)?;
+                    flushed_keys.push(write.key);
+                }
+            }
         }
 
         self.options.sync_on_write = saved_sync;

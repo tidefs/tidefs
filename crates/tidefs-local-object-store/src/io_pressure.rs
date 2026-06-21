@@ -191,11 +191,10 @@ mod tests {
     fn dynamic_probe_returns_correct_value() {
         let counter = Arc::new(AtomicU64::new(0));
         let c = Arc::clone(&counter);
-        let probe =
-            IoPressureProbe::new(move || (c.fetch_add(1, Ordering::SeqCst) + 1) as f64 / 10.0);
+        let probe = IoPressureProbe::new(move || c.fetch_add(1, Ordering::SeqCst) as f64 / 10.0);
 
+        assert!((probe.pressure() - 0.0).abs() < 0.001);
         assert!((probe.pressure() - 0.1).abs() < 0.001);
-        assert!((probe.pressure() - 0.2).abs() < 0.001);
     }
 
     #[test]
