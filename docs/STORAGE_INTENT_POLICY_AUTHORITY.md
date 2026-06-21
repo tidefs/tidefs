@@ -395,8 +395,9 @@ than inventing a second scheduler:
 | Ordinary foreground read/write | demand lane with workload and tenant budgets |
 | VM/random I/O | demand lane with strict p99/tail amplification budget |
 | Bulk ingest | throughput-oriented demand lane with large records and bounded cache admission |
-| Speculative prefetch or hot-read promotion | speculative lane; droppable under pressure |
-| Relocation/defrag/rebake/geo catch-up | background lane unless policy satisfaction or RPO risk escalates it |
+| Speculative prefetch or cache-only hot-read trial | speculative lane; droppable under pressure |
+| Authority promotion or policy-satisfaction relocation | background lane unless receipt risk, payback, or policy satisfaction escalates it |
+| Defrag/rebake/geo catch-up optimizer | background lane unless policy satisfaction or RPO risk escalates it |
 | Repair/evacuation | background or critical escalation according to receipt risk and policy floor |
 
 The scheduler consumes compiled policy, workload signals, resource-governor
@@ -408,6 +409,7 @@ retire old placement receipts before replacement receipts exist.
 Admission evidence must be observable:
 
 - policy id and revision used for classification;
+- action class and prediction confidence used for classification;
 - selected lane and priority class;
 - queue time and dispatch time;
 - resource budget that throttled or refused the operation;
@@ -450,6 +452,14 @@ configured durability floor. If the floor cannot be earned within the policy,
 TideFS must block, retry, or return an error. It must not return success on
 `volatile-local` or `volatile-replicated` evidence while presenting itself as a
 normal POSIX durable mount.
+
+Fast sync behavior must come from optimizing the path that earns durable
+evidence, not from hiding async behavior. TideFS may group, shard, coalesce,
+or pipeline local/quorum intent when policy permits, but the receipt must bind
+the replayable intent, payload or range digest, policy revision, flush/fence
+evidence, and any pending full-placement convergence. Deferring full placement
+after a sync reply is legal only when the earned receipt class satisfies the
+compiled policy and the missing work is visible.
 
 TideFS may expose an explicit non-POSIX or unsafe product profile for
 operators who want maximum speed and accept loss. That profile must:
