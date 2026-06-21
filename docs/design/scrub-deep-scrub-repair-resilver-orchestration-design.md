@@ -11,6 +11,13 @@ planner (data_copy_0), chunk shipper (data_copy_6), flow-commit coordinator
 Scrub/repair/resilver findings flow through canonical P8-03 loss-event →
 rebuild-flow → transfer-verify-place chains rather than ad-hoc local paths.
 
+Claim boundary: this is target-design material for distributed integrity
+services. ZFS/Ceph comparisons, RTO/RPO tables, failure-isolation language, and
+coverage statements below are design intent and validation requirements, not
+current performance, durability, availability, or successor evidence.
+Product-facing comparison wording still requires #875 claim ids and #928/#930
+comparator evidence.
+
 This revision (#1766) consolidates the architecture, data structures, algorithms,
 and tradeoff analysis for all four services and closes Forgejo issue #1766.
 Prior iterations: #1705, #1739, #1757, #1836, #1837, #1841, #1885, #1913, #1917, #1948,
@@ -47,7 +54,7 @@ cannot be separately prioritized. Ceph scatters them across per-PG scrub,
 per-OSD backfill, and per-PG deep scrub—three separate systems with no
 unified resource model.
 
-tidefs unifies all four under the background service framework
+The target TideFS design unifies all four under the background service framework
 (`docs/design/background-service-framework-design.md`, #1549), with
 independent per-service budgets, priority staging, validity-token
 stale-task prevention, and comprehensive observability.
@@ -94,7 +101,7 @@ deployments, this approach fails because:
   (`data_copy_8`), a locally repaired replica may be stale or divergent.
 
 By routing all integrity findings through the P8-03 distributed infrastructure,
-tidefs guarantees that every repaired replica is failure-domain-aware,
+the target design requires every repaired replica to be failure-domain-aware,
 receipt-backed, capacity-admitted, health-propagated, and anti-entropy-verified.
 
 ### 1.2 Mapping to P8-03 Canonical Data-Flow Classes
@@ -783,17 +790,17 @@ Algorithm: RecoveryThrottle::adjust(target_budget: f64) -> f64
   9. // the backoff curve: higher values yield steeper cutoffs
 ```
 
-**Saturation analysis:** The per-domain cap `R = RECOVERY_MAX_CONCURRENT_PER_DOMAIN`
-guarantees that within a domain of `N` nodes, no more than `R` flows target
-any single node's resources. The aggregate cap `A = RECOVERY_MAX_AGGREGATE_LOAD`
-prevents cluster-wide saturation even when multiple domains have few active
-flows. The two-level guard eliminates both micro-domain overwhelm and
-macro-cluster saturation that a single-level guard would miss.
+**Saturation analysis:** The target invariant for per-domain cap
+`R = RECOVERY_MAX_CONCURRENT_PER_DOMAIN` is that, within a domain of `N` nodes,
+no more than `R` flows target any single node's resources. The aggregate cap
+`A = RECOVERY_MAX_AGGREGATE_LOAD` is intended to prevent cluster-wide
+saturation even when multiple domains have few active flows.
 
-**Failure isolation guarantee:** The `CascadingFailureGuard` guarantees that
-recovery traffic for domain `D_i` does not impact client traffic for domain
-`D_j` for `i != j`, provided each domain has independent network paths and
-the bandwidth budget is configured below the cross-domain link capacity.
+**Target failure-isolation invariant:** The `CascadingFailureGuard` is designed
+so recovery traffic for domain `D_i` does not impact client traffic for domain
+`D_j` for `i != j`, provided each domain has independent network paths and the
+bandwidth budget is configured below the cross-domain link capacity. This is a
+validation requirement, not a current guarantee.
 
 #### 2.6.13 Distributed Recovery Time Objectives (RTO/RPO)
 
@@ -803,7 +810,7 @@ the bandwidth budget is configured below the cross-domain link capacity.
 | **RTO-single** (single chunk repair) | <100ms (inline) / <10s (deferred) | `RepairOutcome.elapsed_ms` from SuspectLog timestamp to `clear_suspect_chunk` | Inline repair on read path; deferred repair priority queue sorts by `RepairPriority::Loss` first |
 | **RTO-node** (full node rebuild) | <N_minutes where N = data_size / recovery_bandwidth | `ResilverProgress.bytes_rebuilt / plan.total_bytes` | `RecoveryThrottle` maximizes throughput under client-latency constraint; `CascadingFailureGuard` prevents multi-node saturation |
 | **RTO-stripe** (EC stripe rebuild) | <stripes_per_tick × tick_interval | `ResilverProgress.stripes_completed / plan.total_stripes` | PlacementPlanner anti-affinity ensures source shards are on distinct failure domains |
-| **Detection latency** | <1 tick (1s default) for health-tracker-monitored chunks | `ReplicaHealthAlert.timestamp` to SuspectLog entry | Dual-source health (receipt chains + anti-entropy) catches failures that heartbeats miss |
+| **Detection latency** | <1 tick (1s default) for health-tracker-monitored chunks | `ReplicaHealthAlert.timestamp` to SuspectLog entry | Target dual-source health is intended to catch failure modes heartbeat-only designs can miss |
 
 **Recovery timeline formula for full node replacement:**
 
@@ -884,9 +891,9 @@ the original and replica nodes are independently lost). The
 surviving partition while re-replication runs.
 
 **Tradeoff:** Re-replicating data from the majority partition during a
-split creates temporary write amplification but guarantees that data
-remains at full redundancy regardless of which partition ultimately
-survives.
+split creates temporary write amplification and targets full redundancy
+regardless of which partition ultimately survives. That remains a validation
+requirement, not a current availability claim.
 
 ### 2.7 Anti-Entropy Auditor Integration
 
@@ -1000,9 +1007,9 @@ disagree, all replicas are marked suspect and escalated to operator review.
 - `StaleReplica` -- replica behind receipt frontier
 
 
-### 2.8 End-to-End Integrity Guarantee Chain
+### 2.8 Target End-to-End Integrity Chain
 
-The full integrity guarantee chain for a repaired chunk:
+The target integrity evidence chain for a repaired chunk:
 
 ```
    1. Scrub/DeepScrub detects corruption

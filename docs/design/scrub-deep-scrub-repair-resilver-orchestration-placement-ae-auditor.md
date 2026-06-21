@@ -10,6 +10,13 @@ and resilver through the canonical P8-03 data-flow infrastructure: the
 continuous recovery loop (#901), rebuild planner (#893), flow commit
 coordinator, and chunk shipper.
 
+Claim boundary: this is target-design material for placement and anti-entropy
+integration. CRUSH analogies, ZFS/Ceph comparisons, degraded-placement
+tradeoffs, latency/backfill wording, and verification language below are
+design lessons and validation targets, not current placement quality, repair
+performance, availability, or successor evidence. Product-facing comparison
+wording still requires #875 claim ids and #928/#930 comparator evidence.
+
 Issue: #1943.
 
 ## 1. Scope and Relationship to Prior Design
@@ -218,7 +225,7 @@ per loss-event to avoid recomputation during batched stripe rebuilds.
 | Decision | Rationale |
 |----------|-----------|
 | Round-robin over weighted distribution | Simpler to reason about; least-loaded-first ordering approximates weighted balancing without per-member weight fields |
-| Fallback to degraded on exhaustion | Prevents repair deadlock when topology is too small for strict anti-affinity; degraded placement beats no placement |
+| Fallback to degraded on exhaustion | Target behavior to avoid repair deadlock when topology is too small for strict anti-affinity; degraded placement is an explicit policy choice rather than a quality claim |
 | Stateless (no persisted state) | All inputs are externally observable (topology, policy, epoch); no internal state to drift |
 | No cross-stripe placement awareness | Each call is independent; batching across stripes is the caller's responsibility (rebuild planner) |
 
@@ -551,11 +558,11 @@ AntiEntropyAuditor::targeted_audit()  (post-resilver verification)
   a full rack), the available domain count may be temporarily below the
   strict anti-affinity threshold. The planner degrades gracefully.
 - **Progress tracking**: each resilver batch advances a `ResilverProgress`
-  cursor; unlike ZFS's single-tree-order scan, tidefs can pause and
-  resume resilver at stripe granularity.
+  cursor; the target design differs from ZFS's single-tree-order scan by
+  recording stripe-granular pause/resume state.
 - **Client IO impact**: the recovery throttle dynamically adjusts
-  resilver bandwidth based on client latency, preventing the "resilver
-  storm" problem seen in Ceph backfill.
+  resilver bandwidth based on client latency. This is the intended mitigation
+  for backfill-style client impact, not measured current evidence.
 
 ## 7. Deep Scrub and Anti-Entropy: Complementary Verification
 

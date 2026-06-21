@@ -169,7 +169,7 @@ The following evidence is not comparable for repair writeback:
 - evidence from different checksum layers without an explicit mapping;
 - synthetic placement receipts;
 - evidence from a different membership epoch unless the membership authority
-  explicitly proves it remains valid for the comparison epoch;
+  explicitly establishes that it remains valid for the comparison epoch;
 - topology-only replica lists;
 - a transport success result without subject, receipt, and checksum evidence.
 
@@ -182,13 +182,13 @@ classifies the remaining evidence for one comparison candidate.
 |---|---|---|
 | Every authoritative receipt target reports the expected checksum for the same subject, layer, receipt epoch, and receipt generation. | `CleanAgreement`. | No repair writeback. A prior local finding is stale or already cleared. |
 | One replica reports mismatch or unreadable, and every other authoritative target reports the expected checksum under the same receipt. | `SingleReplicaCorruption`. | Repair may be considered only for the corrupt local target, from the clean receipt-bound source set, after stale-generation checks pass. |
-| The local replica reports mismatch and at least one remote target reports the expected checksum, but another current receipt target is missing evidence. | `IncompleteComparison`. | No writeback until the missing target is either evidenced, fenced out by membership authority, or the policy-specific implementation issue proves that the remaining source set is sufficient. |
+| The local replica reports mismatch and at least one remote target reports the expected checksum, but another current receipt target is missing evidence. | `IncompleteComparison`. | No writeback until the missing target is either evidenced, fenced out by membership authority, or the policy-specific implementation issue defines and validates that the remaining source set is sufficient. |
 | A remote replica reports mismatch while the local replica and other targets report the expected checksum. | `RemoteReplicaCorruption`. | The local node must not write remote state from this comparison. It may emit suspect evidence for the remote repair owner. |
 | Replicas report two or more non-expected checksum values for the same subject, or disagree about which checksum is expected. | `CrossReplicaDisagreement`. | Fail closed as `ScrubRepairOutcome::CrossReplicaDisagreement`. |
 | All reachable replicas agree on a checksum that differs from the receipt or manifest expected checksum. | `ChecksumAuthorityDisagreement`. | Fail closed as `ScrubRepairOutcome::CrossReplicaDisagreement`; no replica has proven itself a clean source. |
 | Any evidence carries a stale data generation, stale receipt generation, stale membership epoch, or mismatched object key. | `StaleEvidence`. | No writeback. The caller must refresh evidence from current authority. |
 | A current receipt target returns `NoChecksum` for a block that requires a checksum. | `MissingChecksumEvidence`. | No writeback; treat as missing comparison evidence, not as clean data. |
-| A current receipt target is unreachable, backpressured, or epoch-rejected. | `MissingReplicaEvidence`. | No writeback unless later policy-specific code proves the target is no longer authoritative for this receipt epoch. |
+| A current receipt target is unreachable, backpressured, or epoch-rejected. | `MissingReplicaEvidence`. | No writeback unless later policy-specific code establishes that the target is no longer authoritative for this receipt epoch. |
 
 The comparison engine must preserve negative evidence. A missing or
 backpressured peer is not a clean peer, and a clean peer on a stale receipt is

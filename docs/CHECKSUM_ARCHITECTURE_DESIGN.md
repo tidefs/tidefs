@@ -22,8 +22,9 @@ counters) must be used instead.
 
 ZFS provides end-to-end checksums as its defining data-integrity feature.
 Every block pointer carries a 256-bit checksum; every read verifies it; a
-mismatch triggers self-healing from a redundant copy. This is table-stakes
-for any filesystem aspiring to exceed ZFS.
+mismatch triggers self-healing from a redundant copy. This is historical
+baseline context for the target design, not evidence that TideFS currently
+matches or exceeds ZFS.
 
 Ceph provides per-object checksums at the RADOS layer (crc32c default,
 optional xxhash64), but they are optional per-pool, per-object granularity,
@@ -352,13 +353,14 @@ current OpenZFS/Ceph-class integrity claim.
 | Suspect tracking | Implicit (failed reads retry) | Target: explicit SuspectLog + SuspectSet |
 | Performance cost | ~0.5-3% (sha256) / ~0.1-1% (edonr) | Target estimate: ~0.5-3% for data, negligible for metadata |
 
-The target design aimed to improve on ZFS by:
+The target design differed from ZFS in these planned ways:
 
 - Making checksums **mandatory** (no checksum=off footgun)
 - Adding **domain separation** preventing cross-type attacks
 - Adding **explicit suspect tracking** with persistent SuspectLog
 - Using a **single algorithm** with a formal migration path
-- Providing **segment-level hash chaining** beyond ZFS root_record anchoring
+- Providing target **segment-level hash chaining** beyond ZFS root_record
+  anchoring
 
 ## 10. Historical Implementation Phases
 

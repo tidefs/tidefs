@@ -33,8 +33,9 @@ and claim-registry evidence cover the specific path.
 
 ZFS provides end-to-end checksums as its defining data-integrity feature:
 every block pointer carries a 256-bit checksum, every read verifies it, and
-a mismatch triggers self-healing from a redundant copy. This is table-stakes
-for any filesystem aspiring to exceed ZFS.
+a mismatch triggers self-healing from a redundant copy. This is baseline
+context for the target design, not evidence that TideFS currently matches or
+exceeds ZFS.
 
 Ceph provides per-object checksums at the RADOS layer (crc32c default,
 optional xxhash64), but they are optional per-pool and silent corruption can
@@ -117,9 +118,10 @@ the record type field causes the wrong decoder to be selected).
 
 ### 3.2 Payload Digest: BLAKE3-256 (Per-Record End-to-End)
 
-Every record payload carries a BLAKE3-256 digest over the payload bytes,
-domain-separated by record type. This is the **canonical end-to-end
-integrity guarantee**.
+Target record payloads carry a BLAKE3-256 digest over the payload bytes,
+domain-separated by record type. This is target design language; it is not a
+current end-to-end integrity guarantee unless a specific path is backed by
+live source behavior and claim-registry evidence.
 
 ```
 IntegrityTrailerV2 {
@@ -188,7 +190,8 @@ SegmentIntegrityFooter {
 The `chain_digest` links each segment to its predecessor, forming a hash
 chain from the current segment back to the system area root. This is
 analogous to ZFS's root_record-to-block-tree chain of trust, but at segment
-granularity.
+granularity. It must not be cited as a tamper-proof committed-root or
+ZFS-superiority claim without matching evidence.
 
 ### 3.5 Root Authentication
 
@@ -439,7 +442,8 @@ current OpenZFS/Ceph-class integrity claim.
 | Suspect tracking | Implicit (failed reads retry) | N/A | Target: explicit SuspectLog + SuspectSet |
 | Performance cost | 0.5-3% (sha256) | <1% (crc32c) | Target estimate: 0.5-3% (BLAKE3-256) |
 
-The target design aimed to improve over both ZFS and Ceph by:
+The target design differs from the ZFS and Ceph baselines in these planned
+ways:
 
 - **Mandatory checksums** -- no silent-corruption footgun
 - **Domain separation** -- cross-type collision attacks prevented
