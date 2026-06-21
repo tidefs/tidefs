@@ -13454,7 +13454,11 @@ mod orphan_index_integration_tests {
         fs.do_commit().expect("commit setup");
 
         assert!(
-            fs.state.extent_maps.contains_key(&replaced.inode_id),
+            fs.state
+                .extent_maps
+                .lock()
+                .unwrap()
+                .contains_key(&replaced.inode_id),
             "setup should persist the replaced inode extent map"
         );
         assert!(
@@ -13480,7 +13484,11 @@ mod orphan_index_integration_tests {
             "overwritten inode record must be removed from live state"
         );
         assert!(
-            !fs.state.extent_maps.contains_key(&replaced.inode_id),
+            !fs.state
+                .extent_maps
+                .lock()
+                .unwrap()
+                .contains_key(&replaced.inode_id),
             "overwritten inode extent map must be removed from committed state"
         );
         assert!(
