@@ -404,12 +404,6 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "destroy snapshots through the live owner or explicit offline devices",
     },
     CommandSurface {
-        path: "snapshot rollback",
-        class: CommandClass::PublicOperator,
-        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "roll back through the live owner or explicit offline devices",
-    },
-    CommandSurface {
         path: "snapshot export",
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
@@ -420,6 +414,12 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         class: CommandClass::PublicOperator,
         routing: RoutingSemantics::LiveOwnerOrOfflineInput,
         summary: "register runtime-pending one-shot snapshot file extraction surface",
+    },
+    CommandSurface {
+        path: "snapshot rollback",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
+        summary: "roll back through the live owner or explicit offline devices",
     },
     CommandSurface {
         path: "snapshot send",
