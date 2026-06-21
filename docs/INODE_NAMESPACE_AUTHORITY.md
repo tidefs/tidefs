@@ -241,6 +241,12 @@ with the current mounted dataset authority must fail closed by default. TideFS
 has no public release or named operator-owned data set that makes those
 catalogs a compatibility promise.
 
+The only default root-catalog creation case is first mount with no persisted
+catalog. Existing persisted catalog bytes that cannot be decoded or loaded are
+refused rather than treated as an empty catalog, and a persisted `root` entry
+whose dataset ID differs from the mounted root is refused rather than
+rewritten.
+
 Migration is allowed only if a future GitHub issue names the external boundary
 or operator-owned data set, the validation plan, and the removal or graduation
 criteria required by `docs/UNRELEASED_AUTHORITY_POLICY.md`. Issue #666 owns

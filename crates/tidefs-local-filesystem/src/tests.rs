@@ -8064,6 +8064,46 @@ fn root_dataset_catalog_id_mismatch_fails_closed() {
 }
 
 #[test]
+fn root_dataset_catalog_decode_failure_fails_closed() {
+    let root = temp_root("root-dataset-catalog-decode");
+
+    {
+        let mut fs = LocalFileSystem::open_with_root_authentication_key(
+            &root,
+            options(),
+            RootAuthenticationKey::demo_key(),
+        )
+        .expect("open fs");
+        fs.store
+            .put(
+                DeviceIoClass::Data,
+                dataset_catalog_object_key(),
+                b"retired-pre-release-catalog",
+            )
+            .expect("persist undecodable dataset catalog fixture");
+        fs.store.sync_all().expect("sync undecodable catalog");
+    }
+
+    let result = LocalFileSystem::open_with_root_authentication_key(
+        &root,
+        options(),
+        RootAuthenticationKey::demo_key(),
+    );
+    match result {
+        Err(FileSystemError::CorruptState { reason }) => {
+            assert!(
+                reason.contains("dataset catalog decode failed"),
+                "{reason}"
+            );
+        }
+        Ok(_) => panic!("undecodable root dataset catalog must fail closed"),
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+
+    cleanup(&root);
+}
+
+#[test]
 fn mounted_dataset_spacebook_counters_use_mounted_dataset_id() {
     let root = temp_root("mounted-dataset-spacebook");
     let mounted_dataset_id = [0x42; 16];

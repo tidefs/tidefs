@@ -279,8 +279,9 @@ space deltas now synchronize store-layer `SpaceBook` counters with
 `mounted_dataset_id` rather than the hard-coded root dataset. The regression
 test sets a non-root mounted dataset, writes data, syncs, and verifies the
 store usage is charged to that dataset rather than `ROOT_DATASET_ID`.
-test, and `git diff --check`. This is only another bridge cleanup; it does not
-settle old catalog migration or the global inode authority model.
+test, and `git diff --check`. This is only another bridge cleanup; old catalog
+compatibility remains fail-closed unless a future issue names a real boundary,
+and the global inode authority model remains unsettled.
 
 Commit `b789492c` removes the warning-only root dataset mismatch path. A
 persisted catalog whose `root` entry has an ID different from
