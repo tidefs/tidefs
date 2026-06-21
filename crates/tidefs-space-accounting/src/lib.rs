@@ -3552,7 +3552,8 @@ mod tests {
         counters.pinned_snapshot_bytes = 100_000_000;
         let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
         let s = sa.statfs();
-        let expected_free = (TEST_QUOTA_BYTES - 100_000_000) / 4096;
+        // pinned_snapshot_bytes excluded from total_consumed_bytes (#638, #649):
+        let expected_free = TEST_QUOTA_BYTES / 4096;
         assert_eq!(s.blocks_free, expected_free);
     }
 
@@ -6633,13 +6634,14 @@ mod tests {
         let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
         let s = sa.statfs();
         let free_blocks = s.blocks_free;
-        let free_bytes = free_blocks * 4096;
         // Full quota should still be free (pinned_snapshot excluded from
         // total_consumed_bytes).
-        assert_eq!(free_bytes, TEST_QUOTA_BYTES);
+        // Compare at block level: TEST_QUOTA_BYTES is not block-aligned,
+        // so free_blocks * 4096 would lose the remainder.
+        assert_eq!(free_blocks, TEST_QUOTA_BYTES / 4096);
         // Admission must allow writes up to the full quota.
-        assert!(!sa.check_enospc(free_bytes));
-        assert!(sa.check_enospc(free_bytes + 4096));
+        assert!(!sa.check_enospc(free_blocks * 4096));
+        assert!(sa.check_enospc(free_blocks * 4096 + 4096));
     }
 
     // -- Pending-delta commit boundaries --
@@ -6691,7 +6693,7 @@ mod tests {
         assert!(sa.check_enospc(999_500_001));
     }
 
-    // -- Combined consumption: reserved + orphan + pinned_snapshot --
+    // -- Combined consumption excludes snapshot-pinned classification --
 
     #[test]
     fn statfs_combines_all_counter_families() {
