@@ -159,6 +159,23 @@ The policy has these logical fields:
 | `degradation_policy` | Whether to refuse, block, serve stale-forbidden errors, or return explicit lower-class receipts under failure. |
 | `explanation_scope` | Minimum operator-visible reason data that must be preserved. |
 
+The policy is a tradeoff envelope, not a single tier label. It separates hard
+floors from optimizer weights:
+
+| Axis | Hard-floor examples | Optimizer examples |
+| --- | --- | --- |
+| Acknowledgment | durable local intent, quorum intent, geo intent, explicit volatile | group size, sharding, pipelining, full-placement delay |
+| Latency and tail | p99 sync or FUA ceiling, max queue time before refusal | prefer local NVMe/PMem, reduce metadata fan-out, cache read hot sets |
+| Throughput | minimum ingest or rebuild rate under foreground protection | larger records, direct cold placement, batching, EC/archive shape |
+| Distance and failure domain | node/rack/DC/site/region spread, internet path allowed or refused | nearest legal peer, measured RTT/loss/bandwidth scoring |
+| RPO/RTO | maximum remote lag or recovery window | delta batching, compression, catch-up lane priority |
+| Wear and money | critical write reserve, WAF ceiling, egress/capacity budget | promote/demote only when payback beats movement debt |
+
+A candidate must satisfy all hard floors before scoring. Cost weights may pick
+among legal candidates, but they may not trade away durability, failure-domain
+spread, RPO, or explicit latency floors unless a new compiled policy revision
+permits the weaker visible result.
+
 ### Policy Sources And Compilation
 
 `StorageIntentPolicy` is a compiled snapshot, not a bag of ad hoc hints
@@ -370,20 +387,40 @@ TideFS must not predict:
 The adaptive loop is:
 
 1. Observe request, subject, device, path, and policy signals.
-2. Compute a confidence-scored workload vector.
-3. Generate candidate placement or relocation plans.
-4. Reject candidates that do not meet hard guarantee, failure-domain, capacity,
+2. Cite the compiled storage-intent policy revision for the operation or
+   planning epoch.
+3. Reconcile current receipts and evidence into a satisfaction state.
+4. Compute a confidence-scored workload vector.
+5. Generate candidate acknowledgment, serving, durable-placement, or
+   relocation plans.
+6. Reject candidates that do not meet hard guarantee, failure-domain, capacity,
    wear, or operator-policy constraints.
-5. Estimate latency, tail, throughput, write amplification, recovery risk, and
+7. Estimate latency, tail, throughput, write amplification, recovery risk, and
    money/egress cost for remaining candidates.
-6. Reserve placement, transport, dirty-byte, and wear budgets.
-7. Execute the selected plan.
-8. Publish receipts.
-9. Feed observed result back into the predictor.
+8. Reserve placement, transport, dirty-byte, and wear budgets.
+9. Admit and dispatch the selected work through the scheduler/resource-governor
+   lanes that match its action class.
+10. Publish receipts before claiming stronger placement or retiring older
+    locators.
+11. Reconcile the new evidence back into a satisfaction state.
+12. Feed observed result, payback, cooldown, and refusal evidence back into
+    the predictor.
 
 Low-confidence predictions may tune queueing, prefetch, or shadow plans. They
 must not trigger expensive relocation until hysteresis and benefit/cost gates
 are satisfied.
+
+The satisfaction state is also the actuation boundary:
+
+| State | Allowed response |
+| --- | --- |
+| `satisfied` | Serve normally; optional optimizers may run only under payback, wear, and foreground-disruption budgets. |
+| `converging` | Schedule bounded convergence, geo catch-up, archive conversion, or full-placement work while exposing the pending state. |
+| `degraded-visible` | Serve only the degradation shape the policy permits, with operator/caller-visible explanation and repair/convergence pressure. |
+| `unknown-evidence` | Refresh, remeasure, scrub, or revalidate evidence; do not infer satisfaction from stale topology or cache state. |
+| `blocked` | Escalate repair, relocation, reserve recovery, or geo catch-up according to policy priority and scheduler budgets. |
+| `refused` | Return a typed refusal or keep the operation unadmitted; do not silently choose a weaker guarantee. |
+| `unsafe-volatile` | Preserve the explicit unsafe/volatile receipt boundary and exclude the state from durable POSIX or geo claims. |
 
 ### Confidence And Action Classes
 
@@ -951,6 +988,7 @@ Operators need a receipt explanation surface, not a pile of hidden heuristics.
 The operator UAPI should eventually answer:
 
 - What policy applies to this dataset/file/range?
+- What is the current satisfaction state for that policy revision?
 - What ack class did the last write/fsync receive?
 - Which placement receipts currently satisfy policy?
 - Which remote paths are behind, and by how much?
@@ -994,6 +1032,7 @@ Initial row families should cover:
 Each row must bind:
 
 - requested and earned ack classes;
+- reconciled satisfaction state before and after the measured action;
 - workload envelope and prediction confidence/action class;
 - environment/profile, including media and topology;
 - p50/p95/p99 latency;
