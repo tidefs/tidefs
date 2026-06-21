@@ -250,7 +250,10 @@ comparator evidence required by #928/#930:
 - `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md`: ZFS/Ceph deferred-redundancy
   and write-amplification comparison is design input only.
 - `docs/ONLINE_DEFRAG_BPR_DESIGN.md`: ZFS/Ceph defrag and BPR comparison text
-  is target design input, not evidence of implemented online defrag.
+  is target mechanism input, not evidence of implemented online defrag; its
+  BPR mechanism is subordinate to #848 storage-intent relocation gates, #844/#856
+  cost and wear evidence, #845 prediction/payback evidence, and #904 media
+  capability evidence.
 - `docs/design/openzfs-ceph-successor-claim.md`: the sealed successor claim is
   historical input, not current claim authority.
 - `docs/WHOLE_REPO_REVIEW.md`: incumbent references are fail-closed review
