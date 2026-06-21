@@ -739,6 +739,7 @@ const DEFAULT_DEVELOPMENT_DEVICE_DIR: &str = ".tidefs-devices";
 const DEFAULT_DEVELOPMENT_DEVICE_IMAGE: &str = "data0.img";
 pub const DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const DEVELOPMENT_DEVICE_CHURN_SLACK_DIVISOR: u64 = 4;
+const RECEIPT_BOUND_RECLAIM_IDLE_BACKOFF_TICKS: u8 = 32;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FileSystemState {
@@ -1465,6 +1466,10 @@ pub struct LocalFileSystem {
     /// old extent should be reclaimed once the replacement receipt is
     /// durable.  Processed by [`process_deferred_rewrite_trims`].
     deferred_rewrite_trims: Vec<(ObjectKey, ObjectKey)>,
+    /// Clean commit ticks to skip after receipt-bound reclaim finds queued
+    /// work but cannot free a complete segment yet. New local reclaim handoff
+    /// resets this so overwrite/delete churn still wakes reclaim immediately.
+    receipt_bound_reclaim_idle_ticks_remaining: u8,
     total_reclaim_drains: u64,
     total_reclaim_entries_drained: u64,
     page_cache: RefCell<PageCache>,
@@ -3268,6 +3273,7 @@ impl LocalFileSystem {
             scrub_corruption_detected: None,
             reclaim_queue: Arc::new(Mutex::new(BPlusTreeReclaimQueue::new())),
             deferred_rewrite_trims: Vec::new(),
+            receipt_bound_reclaim_idle_ticks_remaining: 0,
             total_reclaim_drains: 0,
             total_reclaim_entries_drained: 0,
             page_cache: RefCell::new(PageCache::with_default_page_size()),
@@ -4021,25 +4027,66 @@ impl LocalFileSystem {
         ReclaimDrainStats { entries_drained }
     }
 
-    fn drain_receipt_bound_reclaim_for_committed_state(&mut self) {
+    fn should_attempt_receipt_bound_reclaim(&mut self, local_entries_drained: usize) -> bool {
+        if local_entries_drained > 0 {
+            self.receipt_bound_reclaim_idle_ticks_remaining = 0;
+            return true;
+        }
+
+        if self.receipt_bound_reclaim_idle_ticks_remaining > 0 {
+            self.receipt_bound_reclaim_idle_ticks_remaining -= 1;
+            return false;
+        }
+
+        true
+    }
+
+    fn record_receipt_bound_reclaim_result(
+        &mut self,
+        segments_reclaimed: u64,
+        reclaim_queue_depth: usize,
+    ) {
+        if reclaim_queue_depth == 0 || segments_reclaimed > 0 {
+            self.receipt_bound_reclaim_idle_ticks_remaining = 0;
+            return;
+        }
+
+        self.receipt_bound_reclaim_idle_ticks_remaining =
+            RECEIPT_BOUND_RECLAIM_IDLE_BACKOFF_TICKS;
+    }
+
+    fn drain_receipt_bound_reclaim_for_committed_state(&mut self, local_entries_drained: usize) {
         const MAX_RECEIPT_BOUND_RECLAIM_PER_TICK: usize = 1024;
+        const ERROR_BACKOFF_TICKS: u8 = 32;
 
         if self.is_state_dirty() {
             return;
         }
 
-        if let Err(error) = self
+        if !self.should_attempt_receipt_bound_reclaim(local_entries_drained) {
+            return;
+        }
+
+        let drain_result = self
             .store
             .drain_receipt_bound_dead_objects_at_stable_generation(
                 DeviceIoClass::Data,
                 u64::MAX,
                 u64::MAX,
                 MAX_RECEIPT_BOUND_RECLAIM_PER_TICK,
-            )
-        {
-            eprintln!("background-services: receipt-bound reclaim drain failed: {error}");
+            );
+        match drain_result {
+            Ok(stats) => self.record_receipt_bound_reclaim_result(
+                stats.segments_reclaimed,
+                stats.reclaim_queue_depth,
+            ),
+            Err(error) => {
+                self.receipt_bound_reclaim_idle_ticks_remaining = ERROR_BACKOFF_TICKS;
+                eprintln!("background-services: receipt-bound reclaim drain failed: {error}");
+            }
         }
     }
+
     /// Build a deferred extent trim plan for a content rewrite.
     ///
     /// For chunked layouts, compares old and new manifests to identify
@@ -4522,8 +4569,8 @@ impl LocalFileSystem {
         // --- Duty 2: drain reclaim queue into object-store authority ---
         // Hands off local B+tree reclaim queue entries through Pool::delete().
         // Physical segment freeing is reserved for the receipt-bound drain below.
-        let _drain_stats = self.drain_local_reclaim_queue_into_store();
-        self.drain_receipt_bound_reclaim_for_committed_state();
+        let drain_stats = self.drain_local_reclaim_queue_into_store();
+        self.drain_receipt_bound_reclaim_for_committed_state(drain_stats.entries_drained);
 
         // --- Duty 3: dispatch pending scrub-triggered repairs ---
         // The background scrubber sets scrub_corruption_detected when it finds
@@ -12973,6 +13020,42 @@ mod orphan_index_integration_tests {
             fs.reclaim_queue_depth(),
             0,
             "one committed background tick must drain a bounded burst of local reclaim entries"
+        );
+    }
+
+    #[test]
+    fn receipt_bound_reclaim_backoff_resets_for_new_local_handoff() {
+        let (_root, mut fs) = make_test_fs("receipt_reclaim_backoff_reset").expect("open");
+
+        fs.record_receipt_bound_reclaim_result(0, 1);
+        assert_eq!(
+            fs.receipt_bound_reclaim_idle_ticks_remaining,
+            RECEIPT_BOUND_RECLAIM_IDLE_BACKOFF_TICKS,
+            "queued receipt-bound reclaim with no segment progress should enter idle backoff"
+        );
+
+        assert!(
+            !fs.should_attempt_receipt_bound_reclaim(0),
+            "unchanged clean ticks should skip receipt-bound reclaim during backoff"
+        );
+        assert_eq!(fs.receipt_bound_reclaim_idle_ticks_remaining, 31);
+
+        assert!(
+            fs.should_attempt_receipt_bound_reclaim(1),
+            "new local reclaim handoff must wake receipt-bound reclaim immediately"
+        );
+        assert_eq!(fs.receipt_bound_reclaim_idle_ticks_remaining, 0);
+
+        fs.record_receipt_bound_reclaim_result(1, 1);
+        assert_eq!(
+            fs.receipt_bound_reclaim_idle_ticks_remaining, 0,
+            "physical segment progress should keep reclaim active"
+        );
+
+        fs.record_receipt_bound_reclaim_result(0, 0);
+        assert_eq!(
+            fs.receipt_bound_reclaim_idle_ticks_remaining, 0,
+            "an empty receipt-bound queue should not arm backoff"
         );
     }
 
