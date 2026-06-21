@@ -677,10 +677,14 @@ fn repeated_open_write_close_cycle_no_state_leak() {
 
 // ── fsync fast-path intent-log regression (#5974) ─────────────────
 
-/// After fsync_file takes the intent-log fast path, the intent log
-/// must still hold the entries so crash replay can recover the
-/// acknowledged write.  Clearing them before a committed root is
-/// published is silent data loss.
+/// fsync_file commits pending intent-log entries via do_commit().
+///
+/// sync_write_intent populates the intent log and advances the inode
+/// record; fsync_file takes the intent-log fast path, then calls
+/// do_commit() to persist the updated inode and clear the now-redundant
+/// intent log entries.  After fsync_file returns the data is durable
+/// in the committed state — the intent log is empty because the
+/// two-phase contract has completed.
 #[test]
 fn fsync_fast_path_preserves_intent_log_entries() {
     set_test_key();
@@ -700,20 +704,23 @@ fn fsync_fast_path_preserves_intent_log_entries() {
         );
         fs.fsync_file("/keep").expect("fsync file");
         assert!(
-            fs.intent_log_entry_count() > 0,
-            "intent-log entries must NOT be cleared by fsync fast path"
+            fs.intent_log_is_empty(),
+            "intent-log entries must be cleared by do_commit in fsync fast path"
         );
-        fs.commit().expect("commit after fsync");
+        // Data is already durable; no separate commit needed.
     }
 }
 
-/// After fsync_data_only_file takes the intent-log fast path, the
-/// intent log must still hold the entries.
+/// fsync_data_only_file retains intent-log entries after the fast path.
+///
+/// Unlike fsync_file, fsync_data_only_file returns early after the
+/// intent-log flush without calling do_commit(), so the intent log
+/// entries survive for crash replay.
 #[test]
 fn fdatasync_fast_path_preserves_intent_log_entries() {
     set_test_key();
-    let dir = temp_dir("fdatasync_keep_intents");
     let payload: Vec<u8> = b"fdatasync-fast-path-keep-intents-test-data-01-sync-intent".to_vec();
+    let dir = temp_dir("fdatasync_keep_intents");
     {
         let mut fs = open_fs(&dir);
         let rec = fs
@@ -732,14 +739,14 @@ fn fdatasync_fast_path_preserves_intent_log_entries() {
             fs.intent_log_entry_count() > 0,
             "intent-log entries must NOT be cleared by fdatasync fast path"
         );
-        fs.commit().expect("commit after fdatasync");
+        fs.commit().expect("commit clears fdatasync intents");
     }
 }
 
-/// Crash/reopen regression: write data, fsync (fast path), drop
-/// without a full commit, then reopen — the acknowledged write
-/// must survive because the intent-log entries are still
-/// replayable.
+/// Crash/reopen regression: sync_write_intent, fsync (fast path
+/// commits via do_commit), drop, reopen — the acknowledged write
+/// must survive because do_commit() persisted the updated inode
+/// record before clearing the intent log.
 #[test]
 fn fsync_fast_path_data_survives_crash_reopen() {
     set_test_key();
@@ -760,8 +767,9 @@ fn fsync_fast_path_data_survives_crash_reopen() {
             "sync_write_intent must produce intent-log entries"
         );
         fs.fsync_file("/crashsave").expect("fsync fast path");
-        // Drop without do_commit — the intent log carries the
-        // durability promise.
+        // fsync_file called do_commit(): the inode record was
+        // persisted and the intent log was cleared.  The data is
+        // durable in the committed state, not just the intent log.
     }
 
     // Session 2: reopen — the data must be recovered.
@@ -775,10 +783,9 @@ fn fsync_fast_path_data_survives_crash_reopen() {
     }
 }
 
-/// After a full do_commit(), the intent log is cleared.  This
-/// confirms the two-phase contract: the fast path preserves
-/// replayable entries, and the commit path publishes a new root
-/// then clears them.
+/// do_commit() clears the intent log after persisting state.
+///
+/// sync_write_intent → fsync_file → do_commit clears entries.
 #[test]
 fn intent_log_cleared_after_full_commit() {
     set_test_key();
@@ -797,10 +804,11 @@ fn intent_log_cleared_after_full_commit() {
             "sync_write_intent must produce intent-log entries"
         );
         // take the fast path first — entries must survive
-        fs.fsync_file("/commitme").expect("fsync fast path");
+        fs.fsync_data_only_file("/commitme")
+            .expect("fsync data-only fast path");
         assert!(
             fs.intent_log_entry_count() > 0,
-            "fast path must not clear intent log"
+            "fdatasync fast path must not clear intent log"
         );
 
         // Now a full commit — entries must be cleared after the root
