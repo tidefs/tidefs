@@ -130,6 +130,13 @@ Important 2026-06-01 findings:
   role semantics. This hardens the TFR-002 workspace authority gate but does
   not close the item: the broader import cleanup and remaining dead-crate
   audit still need separate classification work.
+- `TFR-002`: issue #681 maps the existing
+  `docs/workspace-package-classification.md` authority to the required
+  product, harness, third-party, and delete categories instead of creating a
+  second drifting package table. The register now records 157 classified
+  package roots, zero unclassified roots, zero disputed roots, and zero
+  delete-classified roots; each package row keeps its machine-checked role and
+  one-line disposition as the per-package justification.
 - `TFR-004`: `LocalFileSystem` still has global inode and directory maps plus
   global `next_inode_id`; namespace and inode-table crates maintain separate
   inode allocation authorities. The fresh root dataset catalog path now uses
@@ -550,6 +557,11 @@ Important 2026-06-01 findings:
   runners, old issue-era gate labels outside the first cleaned xtask gate set,
   and app/workspace classification docs that list deleted or quarantined
   packages as current surfaces.
+- `TFR-013`: issue #681 confirms the current package classification authority
+  has no `scaffold-transitional`, `archive-delete-candidate`, or other
+  delete-classified package roots. Future dead-scaffolding package candidates
+  must carry TFR-002/TFR-013 evidence and an issue-backed delete/archive plan
+  instead of using a retired role as a holding area.
 - `TFR-013`/`TFR-016`: commit `ccf087a4` removes one POSIX adapter
   structural/tracing module was deleted after `#![deny(dead_code)]` proved it
   markers were removed from live read/write/rename/flush/fsync dispatch

@@ -15,6 +15,26 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | Discovered package manifests | 157 |
 | Classified package roots | 157 |
 
+## TFR-002 Category Mapping
+
+Issue #681 asks for product, harness, third-party, and delete classifications.
+This document remains the equivalent authority instead of adding a second
+package table: the `Role` column below maps to the TFR-002 category here, and
+the per-row `Disposition` remains the one-line justification for that package
+root.
+
+| TFR-002 category | Current roles | Count | Boundary |
+| --- | --- | ---: | --- |
+| `product` | `product-code`, `adapter-operator` | 131 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
+| `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 25 | Repo policy tooling, CI/developer support, demos, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
+| `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
+| `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
+
+There are currently no unclassified package roots and no disputed package roots
+in this authority. Delete-classified dead scaffolding is also empty after the
+#276 and #513 sweeps; future rows must not use a retired role as a silent
+holding area.
+
 ## Role Semantics
 
 | Role | Meaning |
@@ -25,8 +45,8 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `proof-harness` | Validation, deterministic harness, demo, oracle, or workload surface used to collect signal. |
 | `vendored-third-party` | Vendored upstream dependency carried in-tree with separate provenance. |
 | `standalone-fuzz` | Cargo-fuzz package intentionally excluded from the root workspace and checked as standalone harness material. |
-| `scaffold-transitional` | Retired TFR-002 role for stale workspace scaffolding. No current package root is assigned this role; future scaffold recovery requires a prepared issue and current-role classification instead. |
-| `archive-delete-candidate` | Retired TFR-002 role. No current package root is assigned this role; packages that need archival must use an explicit issue-backed plan instead. |
+| `scaffold-transitional` | Retired TFR-002/TFR-013 role for stale workspace scaffolding. No current package root is assigned this role; future scaffold recovery requires a prepared issue and current-role classification instead. |
+| `archive-delete-candidate` | Retired TFR-002/TFR-013 role. No current package root is assigned this role; packages that need archival must use an explicit issue-backed plan instead. |
 
 ## Role Counts
 
@@ -42,6 +62,11 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 | `archive-delete-candidate` | 0 |
 
 ## Package Role Authority
+
+For issue #681, read each row's four-category classification by applying the
+TFR-002 category mapping above to its `Role`. The `Disposition` cell is the
+one-line justification. The table keeps the five machine-checked columns so
+`check-workspace-policy` can continue to validate the authority.
 
 | Package root | Package | Cargo status | Role | Disposition |
 | --- | --- | --- | --- | --- |
