@@ -477,7 +477,7 @@ The transport lane model is the 5-lane multiplexer defined in
 
 | Lane | Priority | Used by | Behavior under congestion |
 |------|----------|---------|--------------------------|
-| `Control` | 0 | Membership, heartbeats, fence | Never throttled |
+| `Control` | 0 | Membership, heartbeats, fence | Protected from speculative/background throttles; still subject to global safety and fault gates |
 | `Metadata` | 1 | Log/progress metadata, receipts | Minimal throttling |
 | `Demand` | 2 | Foreground demand fetches, FUSE replies | Prioritized |
 | `Speculative` | 3 | Prefetch, warmup, shadow compare | Throttled before Demand |

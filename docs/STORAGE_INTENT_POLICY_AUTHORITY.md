@@ -2120,9 +2120,9 @@ Initial anti-wear laws:
     allocator, publication, fence, and receipt boundaries prove they are safe to
     reuse.
 
-This is one of the main ways TideFS can be better than naive tiering: it can
-be fast without turning expensive flash into a disposable shock absorber for
-every cold stream and short-lived temp file.
+This is one of the main design distinctions from naive tiering: TideFS should
+preserve fast paths without turning expensive flash into a disposable shock
+absorber for every cold stream and short-lived temp file.
 
 ## Non-Wear Cost And Economic Budgets
 

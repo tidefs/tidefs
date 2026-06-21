@@ -196,8 +196,9 @@ On membership leader failover:
 
 All LOCK service messages use `LaneClass::Control` (lane 0, highest priority
 per #1241). Lock operations are latency-critical: a delayed lock grant or recall
-directly stalls user applications. CONTROL lane provides bounded latency and
-starvation prevention.
+directly stalls user applications. CONTROL lane is latency-budgeted and protected
+from speculative/background backpressure; concrete latency claims require the
+matching #850 performance row and #875 claim boundary.
 
 ---
 

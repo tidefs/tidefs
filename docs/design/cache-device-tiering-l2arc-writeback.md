@@ -9,12 +9,11 @@
 
 ## Abstract
 
-ZFS's FlashTier (second-level Adaptive Replacement Cache) on fast SSD/NVMe is one of its key
-performance features, enabling working sets larger than RAM to be served at near-RAM
-speeds. Ceph has cache-tier pools but with complex semantics. tidefs designs cache device
-tiering from scratch with the benefit of hindsight: simpler semantics, unified with the
-existing cache lattice (#1226), cluster-aware, and with admission control that avoids
-ZFS's known FlashTier weaknesses (scan pollution, cold start, no cross-node sharing).
+OpenZFS L2ARC/secondary-cache behavior and Ceph cache-tier pools are design
+inputs for TideFS cache device tiering. TideFS targets simpler semantics,
+integration with the existing cache lattice (#1226), cluster awareness, and
+admission control that avoids scan pollution, cold start, and no-cross-node
+sharing traps. These are targets, not product-facing performance claims.
 
 This design introduces three tiers of the read cache hierarchy and the cache device model
 that hosts both the FlashTier (read cache) and the log device partition (write cache, per #1252):
@@ -27,6 +26,14 @@ Level 3: Pool devices (main)    — authoritative data on pool devices
 ```
 
 ---
+
+## Claim Boundary
+
+OpenZFS/L2ARC and Ceph references in this document are design inputs, not
+product-facing proof that TideFS is faster, more flash-friendly, lower cost, or
+incumbent-superior. Latency and wear/cost language below is a target or gating
+rule until #928 comparator evidence, #850 performance rows, and #875 claim
+scope prove the exact workload, media, cache state, and durability envelope.
 
 ## 1. Cache Device Model
 
@@ -189,10 +196,11 @@ pub struct FlashTierLocation {
 
 ## 3. FlashTier Admission Control
 
-### 3.1 Ghost-list hit requirement (beats ZFS)
+### 3.1 Ghost-list hit requirement (scan-pollution guard)
 
-ZFS's FlashTier has a known weakness: sequential scans can pollute the FlashTier by
-evicting useful data with single-access scan data. tidefs fixes this:
+OpenZFS L2ARC scan behavior is a design input: sequential scans can pollute a
+secondary cache by evicting useful data with single-access scan data. TideFS
+targets an explicit admission guard:
 
 **Rule**: An entry is FlashTier-eligible only if it was hit at least once while in the
 ghost list (B1 or B2). Single-access entries that never receive a ghost hit are
@@ -598,9 +606,10 @@ When a peer has the data, the fetch uses the BULK plane:
 3. Node B decompresses (if needed) and streams the data to Node A via RDMA.
 4. Node A receives the data and promotes it to L1ARC.
 
-Latency target: < 100us for a cross-node FlashTier hit (RDMA read + NVMe read). This
-is faster than a local pool-device read on HDD-backed pools and competitive with
-local NVMe pool reads when the data is not in the local FlashTier.
+Latency target: < 100us for a cross-node FlashTier hit (RDMA read + NVMe read).
+This target is intended to be useful for HDD-backed pools and competitive with
+local NVMe pool reads only when validated for the exact topology, cache state,
+media, and durability envelope.
 
 ### 8.4 Cross-node dedup cache (DDT L2)
 

@@ -372,6 +372,5 @@ Still completed later, but now on explicit rails:
 With this pass settled:
 - posix_filesystem_adapter worker topology (`P5-02`) now has a lawful byte-residency and dirty/writeback partner model
 - cache and pressure law (`P4-02`, `P4-03`) now connect directly to page-cache and mmap behavior
-- the next biggest unresolved production risk is no longer "how do buffered I/O and mmap fit into the runtime?"
-- it is now the exact **zero-copy / pinning / page-loan law** (`P4-04`) and the **block_volume_adapter queue topology / flush semantics** (`P6-01`, `P6-02`)
-- the cluster mmap coherency extension (#1259) now has a settled design; multi-node page-level lease-gated consistency, remote page faulting via BULK plane, cacheline-granularity RDMA transfer, and false-sharing mitigation are on explicit rails for implementation
+- the remaining design risk is narrowed from the broad "how do buffered I/O and mmap fit into the runtime?" question to the exact **zero-copy / pinning / page-loan law** (`P4-04`) and the **block_volume_adapter queue topology / flush semantics** (`P6-01`, `P6-02`)
+- the cluster mmap coherency extension (#1259) has a documented target design; multi-node page-level lease-gated consistency, remote page faulting via BULK plane, cacheline-granularity RDMA transfer, and false-sharing mitigation are on explicit rails for implementation but remain non-claims until runtime and comparator evidence prove them
