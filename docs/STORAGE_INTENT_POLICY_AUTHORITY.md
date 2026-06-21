@@ -85,6 +85,59 @@ must preserve durable locator authority.
 
 ## Native Object Model
 
+### Record Contract
+
+#841 owns the shared record surface. It must define enough structure that local
+filesystem, placement, transport, scheduler, relocation, validation, and
+operator code can exchange storage-intent evidence without inventing local
+policy dialects.
+
+The core records are:
+
+| Record | Purpose |
+| --- | --- |
+| `StorageIntentPolicy` | Requested durable/authoritative behavior after policy compilation. |
+| `StorageIntentPolicyId` and `StorageIntentPolicyRevision` | Stable identity for the compiled policy snapshot used by one operation or planning epoch. |
+| `StorageIntentReceipt` | Earned acknowledgment evidence for one operation, range, or convergence step. |
+| `StorageIntentEvidenceRef` | Reference to placement receipts, local intent records, transport/path evidence, media/cost ledgers, scheduler admission records, or validation artifacts. |
+| `StorageIntentExplanation` | Renderable projection of policy, receipt, lag, volatility, cost, and refusal reasons. |
+
+The record contract follows the existing receipt and binary-schema discipline:
+
+- records use stable canonical spellings and explicit ids/revisions;
+- authority records are `no_std`-suitable and do not depend on local filesystem,
+  transport runtime, FUSE, operator UI, or platform-width types;
+- optional serialization is a transport or artifact projection, not the durable
+  authority unless the consuming issue explicitly defines that wire/on-disk
+  format;
+- unknown discriminants, non-zero reserved fields, malformed widths, and
+  unsupported versions fail closed for authority paths;
+- high-cardinality observations are bounded by sketches, histograms, digests,
+  top-K sets, or evidence references rather than unbounded per-file/per-range
+  vectors;
+- existing `TierGoal`, pool-label `DeviceClass`, transport lane, and placement
+  policy types are input projections or adapters, not storage-intent authority.
+
+Most importantly, receipt satisfaction is a predicate, not an enum comparison.
+A caller or planner must ask whether a specific receipt set satisfies a
+specific policy revision under the declared failure, proximity, media, RPO,
+cost, and degradation requirements. A `geo-async` receipt can satisfy a local
+durability floor with explicit remote lag, but it must not satisfy a
+`geo-intent` floor. A full local placement receipt may satisfy local durability
+but still fail a remote-site requirement. A volatile replicated receipt may
+survive a primary process failure but still fail a power-loss durability
+barrier.
+
+The #841 type/model slice should therefore expose tested helpers or equivalent
+model predicates for:
+
+- ack receipt class versus requested guarantee floor;
+- local, node, rack, datacenter, WAN, internet, and geo failure-domain
+  dimensions;
+- volatile, durable-intent, full-placement, and RPO/lag dimensions;
+- media-role legality, including cache versus RAM authority separation;
+- explicit refusal reasons when no legal receipt set satisfies the policy.
+
 ### StorageIntentPolicy
 
 Every durable or authoritative placement decision consumes a
@@ -314,8 +367,9 @@ tenant's p99 failure.
 ## Acknowledgment Classes
 
 The acknowledgment class names what TideFS has earned before reporting
-success. The classes are ordered by evidence, not by desirability. Different
-products may choose different floors.
+success. The classes are evidence labels, not a numeric dominance ladder.
+Different products may choose different floors, and a receipt satisfies a floor
+only through the policy-specific predicate described in the record contract.
 
 | Ack class | Evidence required before success | Survives | Does not survive | POSIX durability barrier floor |
 | --- | --- | --- | --- | --- |
