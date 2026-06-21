@@ -96,6 +96,14 @@ events have timestamps. They are useful only when timebase identity, clock
 health, skew or uncertainty bounds, sequence frontiers, expiry/deadline refs,
 and temporal refusal evidence say which ages and lags are comparable.
 
+Media capability evidence is the device-semantics counterpart. A target is not
+eligible for durable intent, PMem authority, block-volume FUA, ZNS placement,
+or archive durability because it was labeled NVMe, SSD, HDD, PMem, RAM, or
+remote. It is eligible only when persistence domain, flush/FUA behavior,
+volatile-write-cache policy, atomicity, namespace identity, protocol/geometry,
+health, freshness, and role-eligibility evidence say the media can legally play
+that role.
+
 ## Non-Claims
 
 This document does not implement runtime behavior, change POSIX durability
@@ -190,6 +198,7 @@ The core records are:
 | `StorageIntentIsolationEvidence` | Tenant, dataset, policy/budget-owner, workload-class, isolation-scope, fair-share, burst, borrowing/debt, starvation, noisy-neighbor, reserve-exemption, throttle/defer, and refusal evidence owned by #902 and sourced from trust/domain, scheduler, resource-governor, cost, capacity, wear, transport, performance, and fault authorities. |
 | `StorageIntentWorkloadEvidence` | Bounded workload observations, prediction confidence, hint provenance, action class, shadow/trial/admitted decision refs, outcome/payback/harm refs, cooldown, misprediction, and confidence-update evidence owned by #845 and consumed by placement, scheduling, relocation, explanation, performance, and fault gates. |
 | `StorageIntentTemporalEvidence` | Timebase identity, clock-health, skew/uncertainty, evidence age, event/frontier stamp, lag/staleness, expiry/deadline, sequence-to-time conversion, and temporal refusal evidence owned by #903 and consumed by geo, read-serving, lifecycle, rollout, trust, prediction, relocation, performance, and fault gates. |
+| `StorageIntentMediaCapabilityEvidence` | Device/media identity, persistence domain, flush/FUA/barrier semantics, volatile-cache policy, atomicity/granularity, protocol/geometry capability, health/freshness, role eligibility, and refusal evidence owned by #904 and consumed by ack receipts, placement, layout, wear, RAM/PMem, relocation, explanation, performance, and fault gates. |
 | `StorageIntentDataShape` | Requested and earned encoded shape for a range or generation, including record sizing, transform ordering, digest suite, dedup/encryption/EC compatibility, and rebake evidence. |
 | `StorageIntentLayoutEvidence` | Allocator and physical-layout evidence for fragmentation, free runs, alignment, zone/write-pointer state, pending frees, reclaim debt, and locality. |
 | `StorageIntentLifecycleEvidence` | Generation and retention evidence for write age, stability, snapshots, clones, receive bases, orphans, destroy/tombstone state, and reclaim frontiers. |
@@ -258,6 +267,10 @@ model predicates for:
   domain, skew or uncertainty bound, evidence age, event/frontier stamp,
   expiry/deadline state, sequence-to-time conversion, and temporal refusal
   state;
+- media capability legality, including device identity, namespace/pool binding,
+  persistence domain, flush/FUA/barrier semantics, volatile-cache policy,
+  atomic write granularity, protocol/geometry capability, health/freshness,
+  role eligibility, and media-capability refusal state;
 - volatile, durable-intent, full-placement, and RPO/lag dimensions;
 - media-role legality, including cache versus RAM authority separation;
 - data-shape legality, including transform compatibility, digest/integrity
@@ -292,6 +305,7 @@ The policy has these logical fields:
 | `workload_shape` | Workload envelope the planner should optimize for without changing hard guarantees. |
 | `prediction_control_policy` | Required confidence, dwell, shadow-evaluation, action-class threshold, feedback, cooldown, and misprediction treatment before prediction-driven movement or serving promotion is legal. |
 | `temporal_policy` | Required timebase, skew/uncertainty, freshness, expiry, lag, deadline, and sequence-frontier evidence before wall-time or age-based claims are legal. |
+| `media_capability_policy` | Required persistence domain, flush/FUA, atomicity, namespace identity, volatile-cache, protocol/geometry, health, and freshness predicates for each media role. |
 | `data_shape_policy` | Record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake constraints. |
 | `layout_geometry_policy` | Allocator class, physical layout, fragmentation, zone/alignment, free-space, pending-free, and reclaim constraints. |
 | `lifecycle_policy` | Generation age, retention, receive-base, orphan, destroy/tombstone, and reclaim-frontier constraints. |
@@ -1301,6 +1315,49 @@ The same file may have different roles for different ranges and generations.
 For example, a database file may keep hot random ranges on NVMe, cold stable
 ranges on HDD/EC, and recent sync deltas in a durable intent lane.
 
+## Media Capability And Device Semantics
+
+#904 owns the storage-intent media capability evidence projection. It does not
+probe hardware, account wear, expose allocator geometry, choose placement, or
+emit ack receipts. It makes media-role eligibility explicit enough that those
+consumers do not infer durable behavior from marketing names or broad device
+classes.
+
+The media capability evidence projection must distinguish at least:
+
+| Evidence field | Storage-intent use |
+| --- | --- |
+| `device_identity_ref` | Binds a target to stable device, namespace, path/multipath, firmware/capability generation, pool member, and stale-reattach evidence. |
+| `persistence_domain_ref` | Distinguishes volatile RAM, cache-only state, PLP-backed volatile cache, ordinary flash, PMem persistence domain, rotational media, remote durable target, archive/object target, and unknown persistence. |
+| `flush_fua_semantics_ref` | Proves supported flush, FUA, barrier, cache-policy, passthrough, ordering, and failure semantics for durable roles. |
+| `volatile_cache_policy_ref` | States whether volatile device or controller write cache is enabled, protected, bypassed, flushed, or unsafe for the requested role. |
+| `atomicity_granularity_ref` | Names logical/physical block size, atomic write unit, torn-write risk, alignment, optimal I/O size, and idempotent replay implications. |
+| `protocol_geometry_capability_ref` | Reports rotational seek class, SSD/NVMe behavior, erase-block, ZNS/SMR append/reset constraints, PMem flush/fence requirements, remote/object commit semantics, and queue-depth/latency class. |
+| `health_freshness_ref` | Cites SMART/NVMe/PMem health, thermal/error state, device reset, firmware/settings changes, multipath failover, stale probe age, and unknown-capability state. |
+| `role_eligibility_ref` | States whether the target may play sync-intent, metadata-hot, serving-data-hot, bulk-data-cold, geo-delta, scratch-volatile, repair-temp, PMem-durable, cache-only, or archive roles. |
+| `media_capability_refusal_ref` | Gives typed missing-capability, unknown-persistence, unsupported-flush/FUA, unsafe-volatile-cache, unstable-namespace, wrong-atomicity, unsupported-zone, stale-probe, degraded-health, or unsupported-remote-commit refusal reasons. |
+
+Hard media-capability laws:
+
+1. Device class, media role, path name, controller type, or benchmark result
+   does not prove durable eligibility. Durable roles need #904 evidence.
+2. A local durable intent, full-placement durability, PMem-durable receipt, or
+   block-volume flush/FUA success may cite a device only when persistence,
+   flush/FUA/barrier, atomicity, volatile-cache, and identity evidence satisfy
+   the compiled policy.
+3. A fast target with unknown flush semantics, unsafe volatile write cache,
+   stale namespace identity, unsupported FUA, wrong atomic write granularity, or
+   stale capability probe is not a slower durable target. It is unknown,
+   blocked, unsafe-visible, or refused.
+4. PMem durability requires persistence-domain and CPU-cache flush/fence
+   evidence, not merely a memory mapping or low latency.
+5. ZNS, SMR, append-only, and remote/object targets must satisfy their
+   protocol/geometry and commit semantics before placement or rebake can claim
+   compatibility.
+6. Media cost (#844), layout geometry (#880), capacity admission (#898), and
+   ack receipts (#842) consume capability refs. None of them alone may invent
+   missing persistence or flush semantics.
+
 ## Read Serving And Degraded Reads
 
 Write acknowledgment honesty is not enough. Read source selection must also
@@ -1884,7 +1941,9 @@ Hard constraints include:
 - temporal legality, including timebase, clock-health, skew/uncertainty,
   evidence age, sequence frontier, lag/staleness, expiry/deadline, and
   temporal refusal state;
-- media role eligibility;
+- media role eligibility and media capability legality, including persistence
+  domain, flush/FUA/barrier semantics, atomicity/granularity, namespace
+  identity, volatile-cache policy, health, and stale-probe refusal;
 - data-shape compatibility and transform block state;
 - allocator/layout compatibility, including alignment, free-space, pending-free,
   and zone/write-pointer state;
@@ -2320,6 +2379,10 @@ The operator UAPI should eventually answer:
 - Which timebase, clock-health, skew/uncertainty, event frontier, lag,
   staleness, expiry, deadline, or sequence-only evidence made an age-based
   decision legal, degraded, unknown, blocked, or refused?
+- Which media capability evidence made this target eligible or ineligible:
+  persistence domain, flush/FUA behavior, volatile-cache policy, atomicity,
+  namespace identity, protocol/geometry, health, capability generation, and
+  refusal reason?
 - Which critical wear, capacity, or transport reserves are protecting sync,
   repair, evacuation, or geo catch-up work?
 - Which guarantee would be lost if a device, node, rack, or site failed now?
@@ -2376,6 +2439,10 @@ Initial row families should cover:
 - temporal rows proving RPO lag, stale-read age, TTL/lifecycle windows,
   lease/key expiry, rollout deadlines, cooldowns, and payback windows cite
   clock-health, skew, frontier, or sequence-only evidence;
+- media-capability rows proving sync intent, PMem durability, block-volume
+  FUA/flush, ZNS/SMR placement, and remote durable target claims cite
+  persistence-domain, flush/FUA, atomicity, namespace, health, and stale-probe
+  evidence;
 - phase-changing sparse workload anti-thrash behavior;
 - HDD defrag benefit under seek-heavy and scan-heavy workloads;
 - SSD relocation write-amplification benefit/cost;
@@ -2407,6 +2474,9 @@ Each row must bind:
   encrypted, repair, or geo receipts participate;
 - workload envelope and prediction confidence/action class;
 - environment/profile, including media and topology;
+- media capability evidence, including persistence domain, flush/FUA/barrier
+  semantics, atomicity/granularity, namespace identity, volatile-cache policy,
+  protocol/geometry, health/freshness, and refusal reason where relevant;
 - p50/p95/p99 latency;
 - throughput;
 - foreground disruption;
@@ -2460,6 +2530,12 @@ The matrix must cover at least these row families:
   source accepted as authority;
 - media corruption, flush omission, stale copy, truncation, bit flip, zeroed
   range, device loss, and endurance-reserve exhaustion;
+- media capability faults such as unknown persistence accepted as durable,
+  unsupported or ignored FUA accepted as success, unsafe volatile write cache
+  accepted for sync intent, stale namespace identity accepted after reattach,
+  stale capability probe accepted after firmware/settings change, wrong atomic
+  write granularity accepted for replay, and ZNS/SMR random-incompatible target
+  accepted as ordinary placement;
 - RAM authority failure cases proving volatile receipts never satisfy durable
   POSIX barriers;
 - cache and serving-trial failures proving non-authoritative hot copies never
@@ -2648,6 +2724,13 @@ This document composes existing authority surfaces:
   lifecycle, prediction, transport, recovery, performance, and fault evidence
   without implementing clock synchronization, issuing leases, or replacing
   membership epochs.
+- #904 owns the storage-intent media capability evidence slice for device and
+  namespace identity, persistence domain, flush/FUA/barrier semantics,
+  volatile-cache policy, atomicity/granularity, protocol/geometry capability,
+  health/freshness, role eligibility, and media-capability refusal state. It
+  composes local block/media facts, RAM/PMem authority, layout, wear, ack
+  receipts, placement, recovery, performance, and fault evidence without
+  probing devices, accounting wear, choosing placement, or emitting receipts.
 - `docs/security/transport-security-boundary.md`: transport security is
   session-level. Storage intent may require and cite session-security evidence,
   but it must not reintroduce per-message crypto proof markers.
@@ -2765,15 +2848,15 @@ storage-intent language beside the shared records and compiled policy snapshot.
 
 | Stage | Graduation gate | Issues |
 | --- | --- | --- |
-| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, trust/domain evidence refs, capacity/admission evidence refs, recovery/degradation evidence refs, policy-rollout evidence refs, tenant/isolation evidence refs, workload/prediction evidence refs, temporal evidence refs, media, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #845, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903 |
+| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, trust/domain evidence refs, capacity/admission evidence refs, recovery/degradation evidence refs, policy-rollout evidence refs, tenant/isolation evidence refs, workload/prediction evidence refs, temporal evidence refs, media capability refs, media roles, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #845, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904 |
 | Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
 | Policy revision rollout | Compiled revisions publish, stage, roll back, supersede, and converge with explicit source provenance, publication transaction, downgrade authz, in-flight fences, old-receipt treatment, and convergence frontiers. | #901 |
-| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, tenant/isolation refs, temporal refs, path evidence, media/wear cost, non-wear cost, workload vectors, prediction decision/outcome refs, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903 |
-| Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile, including policy rollout stage, mixed-revision obligations, and tenant isolation state. | #874, #901, #902 |
-| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, trust/domain state, temporal state, capacity/reserve state, recovery/degradation state, policy-rollout state, tenant/isolation state, prediction confidence/action state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #845, #862, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903 |
-| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness, epoch/fence, trust/domain, temporal/staleness, capacity-for-repair, recovery/degradation, policy revision, tenant isolation, and receipt evidence. | #750, #877, #675, #881, #897, #898, #900, #901, #902, #903 |
-| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement, ordering, trust/domain, temporal, capacity/admission, recovery/degradation, policy-rollout, and tenant/isolation evidence before source retirement. | #750, #847, #848, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903 |
-| Operator and gates | Operators can inspect the policy, rollout stage, receipt, lag/timebase, volatility, cost, trust/domain, capacity/reserve, recovery/degradation, isolation/throttle, prediction outcome, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #845, #849, #850, #863, #875, #897, #898, #900, #901, #902, #903 |
+| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, tenant/isolation refs, temporal refs, media-capability refs, path evidence, media/wear cost, non-wear cost, workload vectors, prediction decision/outcome refs, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904 |
+| Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile, including policy rollout stage, mixed-revision obligations, tenant isolation state, and media-capability refusal state. | #874, #901, #902, #904 |
+| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, trust/domain state, temporal state, media-capability state, capacity/reserve state, recovery/degradation state, policy-rollout state, tenant/isolation state, prediction confidence/action state, data shapes, layout targets, and lifecycle states, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #750, #843, #845, #862, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904 |
+| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, and retained-root sources with freshness, epoch/fence, trust/domain, temporal/staleness, media-capability, capacity-for-repair, recovery/degradation, policy revision, tenant isolation, and receipt evidence. | #750, #877, #675, #881, #897, #898, #900, #901, #902, #903, #904 |
+| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement, ordering, trust/domain, temporal, media-capability, capacity/admission, recovery/degradation, policy-rollout, and tenant/isolation evidence before source retirement. | #750, #847, #848, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904 |
+| Operator and gates | Operators can inspect the policy, rollout stage, receipt, lag/timebase, media capability, volatility, cost, trust/domain, capacity/reserve, recovery/degradation, isolation/throttle, prediction outcome, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #845, #849, #850, #863, #875, #897, #898, #900, #901, #902, #903, #904 |
 
 Interface gates between stages are explicit:
 
@@ -2784,17 +2867,20 @@ Interface gates between stages are explicit:
   reinterpret old receipts by reading the newest mutable property value.
 - Planners may score only candidates that already passed guarantee,
   ordering/replay, membership/epoch/fence, trust/domain, failure-domain,
-  data-shape, layout/allocator, lifecycle/generation, capacity, recovery,
-  policy-rollout, tenant/isolation, wear, transport, and degradation-law
-  filters.
+  media-capability, data-shape, layout/allocator, lifecycle/generation,
+  capacity, recovery, policy-rollout, tenant/isolation, wear, transport, and
+  degradation-law filters.
 - Schedulers may delay, throttle, or refuse work, but they may not convert one
   acknowledgment class into another after admission.
 - Ack receipt emitters may group, shard, coalesce, or pipeline work only when
   ordering evidence preserves the caller-visible barrier and replay contract.
+- Media-capability paths may claim durable, PMem, FUA, ZNS/SMR, archive, or
+  remote-target eligibility only through #904 evidence; device labels, path
+  names, benchmark results, and stale probes are never role eligibility.
 - Read-serving paths may accelerate through cache, trial, RAM, local, remote,
   degraded, snapshot, geo, or archive sources only when freshness, receipt,
-  membership epoch, fence, trust/domain, recovery/degradation, and capacity
-  predicates pass for the compiled policy.
+  membership epoch, fence, trust/domain, media-capability,
+  recovery/degradation, and capacity predicates pass for the compiled policy.
 - Data-shape and transform paths may change record size, compression,
   checksum/digest, dedup, encryption, EC, archive, or coalescing shape only
   through compiled policy and receipt/evidence records.
@@ -2829,7 +2915,7 @@ Interface gates between stages are explicit:
   cross-node freshness or wall-time RPO by themselves.
 - Relocation workers may write speculative replacements, but they may not
   retire source receipts until replacement receipts, ordering evidence, and
-  trust/domain plus temporal plus capacity/admission plus
+  trust/domain plus temporal plus media-capability plus capacity/admission plus
   recovery/degradation plus rollout plus isolation evidence satisfy the target
   policy.
 - Validation rows and claim ids are not an afterthought: each stage must either
@@ -2844,7 +2930,7 @@ this document except to update the issue map after live tickets exist.
 | Slice | Follow-up issue | Expected write set | Purpose |
 | --- | --- | --- | --- |
 | Membership epoch authority | #750 | `docs/MEMBERSHIP_AUTHORITY.md` | Decide epoch, quorum-write, witness-set, join/drain, fence, roster, and failure-domain authority, then expose typed refs storage-intent consumers can cite. |
-| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, trust/domain refs, temporal refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, tenant/isolation refs, workload/prediction refs, media role, proximity, data-shape refs, layout refs, lifecycle refs, and cost records. |
+| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, trust/domain refs, temporal refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, tenant/isolation refs, workload/prediction refs, media-capability refs, media role, proximity, data-shape refs, layout refs, lifecycle refs, and cost records. |
 | Ordering evidence authority | #894 | ordering evidence model surface or #841 core model | Expose barrier scope, dirty epoch, dependency closure, replay idempotency, intent sequence, publication boundary, and completion state for sync, quorum, relocation, repair, and receipt-retirement receipts. |
 | Trust/domain evidence authority | #897 | storage-intent trust/domain records in #841 or `crates/tidefs-storage-intent-trust/`, focused tests | Expose authenticated identity, admin/security/tenant domain, session-security posture, key epoch, authorization/audit refs, residency, sharing-domain compatibility, and quarantine/refusal state. |
 | Capacity/admission evidence authority | #898 | storage-intent capacity/admission records in #841 or `crates/tidefs-storage-intent-capacity/`, focused tests | Expose logical/physical headroom, allocation tickets, claim/reserve receipts, dirty-window reserve, protected floors, pending-free frontiers, capacity amplification, and typed ENOSPC/refusal state. |
@@ -2853,24 +2939,25 @@ this document except to update the issue map after live tickets exist.
 | Policy revision rollout evidence authority | #901 | storage-intent policy-rollout records in #841 or `crates/tidefs-storage-intent-policy-rollout/`, focused tests | Expose source policy provenance, compiled revision publication, change class, downgrade authorization, stage state, in-flight fence, convergence frontier, rollback/re-entry, supersession, and typed rollout refusal state. |
 | Tenant/isolation evidence authority | #902 | storage-intent tenant/isolation records in #841 or `crates/tidefs-storage-intent-isolation/`, focused tests | Expose budget owner, tenant/domain refs, isolation scope, resource-vector budgets, fair-share windows, burst/borrow/debt, starvation, noisy-neighbor harm, reserve exemptions, and typed throttle/refusal state. |
 | Temporal evidence authority | #903 | storage-intent temporal records in #841 or `crates/tidefs-storage-intent-temporal/`, focused tests | Expose timebase identity, clock-health, skew/uncertainty, evidence age, event/frontier stamps, lag/staleness, expiry/deadline, sequence-to-time conversion, and temporal refusal state. |
-| Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths with ordering and capacity/admission refs for the ack floor. |
-| Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, membership/fence refs, trust/domain refs, capacity/admission refs, proximity domains, failure domains, and media constraints. |
-| Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, epoch/fence law, trust/domain law, recovery/degradation law, geo stale-read boundaries, and read-repair capacity evidence. |
+| Media capability evidence authority | #904 | storage-intent media-capability records in #841 or `crates/tidefs-storage-intent-media-capability/`, focused tests | Expose device/media identity, persistence domain, flush/FUA/barrier semantics, volatile-cache policy, atomicity/granularity, protocol/geometry capability, health/freshness, role eligibility, and media-capability refusal state. |
+| Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths with ordering, media-capability, and capacity/admission refs for the ack floor. |
+| Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, membership/fence refs, trust/domain refs, media-capability refs, capacity/admission refs, proximity domains, failure domains, and media-role constraints before scoring candidates. |
+| Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, epoch/fence law, trust/domain law, media-capability law, recovery/degradation law, geo stale-read boundaries, and read-repair capacity evidence. |
 | Data-shape authority | #878 | data-shape records/model module or `crates/tidefs-storage-intent-data-shape/`, focused tests | Bind record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake decisions to compiled policy and evidence receipts. |
-| Layout evidence authority | #880 | layout-evidence records/model module or `crates/tidefs-storage-intent-layout-evidence/`, focused tests | Expose allocator geometry, fragmentation, free-run pressure, alignment, zone/write-pointer state, pending-free safety, and reclaim debt as policy evidence. |
+| Layout evidence authority | #880 | layout-evidence records/model module or `crates/tidefs-storage-intent-layout-evidence/`, focused tests | Expose allocator geometry, fragmentation, free-run pressure, alignment, zone/write-pointer state, pending-free safety, and reclaim debt as policy evidence while consuming #904 capability refs for device semantics. |
 | Lifecycle evidence authority | #881 | lifecycle-evidence records/model module or `crates/tidefs-storage-intent-lifecycle-evidence/`, focused tests | Expose write age, stability, snapshot/clone/receive-base retention, orphan/destroy state, and reclaim frontiers as policy evidence. |
-| Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets. |
+| Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets while consuming #904 refs for media class, health, and capability freshness. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes without replacing #898 admission evidence. |
 | Workload and prediction evidence plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, temporal refs, decision/outcome refs, payback verdicts, confidence updates, and anti-thrash state for planning, relocation, explanation, performance, and fault rows. |
-| Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against receipts and evidence as satisfied, converging, degraded, blocked, refused, or unsafe-visible, including #900 recovery/degradation, #901 rollout, and #902 isolation state, without choosing placement. |
-| Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy, #898 reserve state, and #902 isolation state to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
+| Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against receipts and evidence as satisfied, converging, degraded, blocked, refused, or unsafe-visible, including #900 recovery/degradation, #901 rollout, #902 isolation, and #904 media-capability state, without choosing placement. |
+| Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy, #898 reserve state, #902 isolation state, and #904 media-capability refusal state to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
 | Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier and temporal-sample evidence without making RDMA mandatory. |
-| RAM authority design and implementation | #847 | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority. |
-| Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, wear movement, reserve admission, recovery/degradation predicates, shadow evaluation, payback, and cooldown. |
-| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, rollout stage, receipts, lag/timebase, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, isolation/throttle state, prediction outcome, and wear to operators. |
-| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, trust/domain changes, temporal freshness/lag, capacity admission, recovery/degradation, policy rollout, tenant isolation, prediction accuracy, wear, cost, RPO, and relocation. |
-| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media, trust/domain, temporal freshness/lag, capacity/reserve, recovery/degradation, policy rollout, tenant isolation, prediction accountability, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
-| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, temporal lag/freshness, recovery/degradation, policy rollout, tenant isolation, adaptive prediction, RAM, WAN, and wear promises. |
+| RAM authority design and implementation | #847 | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority while consuming #904 evidence for PMem persistence-domain and flush/fence eligibility. |
+| Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, wear movement, media-capability gates, reserve admission, recovery/degradation predicates, shadow evaluation, payback, and cooldown. |
+| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, rollout stage, receipts, lag/timebase, media capability, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, isolation/throttle state, prediction outcome, and wear to operators. |
+| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, media-capability role legality, trust/domain changes, temporal freshness/lag, capacity admission, recovery/degradation, policy rollout, tenant isolation, prediction accuracy, wear, cost, RPO, and relocation. |
+| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media capability, trust/domain, temporal freshness/lag, capacity/reserve, recovery/degradation, policy rollout, tenant isolation, prediction accountability, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
+| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, media-capability role eligibility, temporal lag/freshness, recovery/degradation, policy rollout, tenant isolation, adaptive prediction, RAM, WAN, and wear promises. |
 
 ## Validation For This Slice
 
