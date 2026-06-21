@@ -19,6 +19,79 @@ use crate::decode_changed_record_export;
 use crate::encode_changed_record_export;
 use crate::error::FileSystemError;
 use crate::Result;
+
+/// Identity of a content block being scrubbed.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ScrubBlockId {
+    pub inode_id: u64,
+    pub data_version: u64,
+    pub kind: ScrubBlockKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ScrubBlockKind {
+    InlineContent,
+    ContentManifest,
+    ContentChunk { chunk_index: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountedContentChecksumLayer {
+    InlineContentBody,
+    EncodedContentChunk,
+    SparseHole,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountedContentChecksumEvidence {
+    pub layer: MountedContentChecksumLayer,
+    pub expected: Option<IntegrityDigest64>,
+    pub actual: IntegrityDigest64,
+    pub encoded_len: u64,
+}
+
+impl MountedContentChecksumEvidence {
+    pub fn matches_expected(&self) -> bool {
+        self.expected.map_or(true, |expected| expected == self.actual)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MountedContentPlacementEvidence {
+    SparseHole,
+    ReceiptVerified {
+        generation: u64,
+    },
+    ReceiptObservedButUnbound {
+        generation: u64,
+    },
+    ReceiptMissing {
+        expected_generation: Option<u64>,
+    },
+    ReceiptStale {
+        expected_generation: u64,
+        observed_generation: u64,
+    },
+    ReceiptUnavailable {
+        expected_generation: Option<u64>,
+    },
+}
+
+impl MountedContentPlacementEvidence {
+    pub fn allows_repair_dispatch(&self) -> bool {
+        matches!(self, Self::ReceiptVerified { .. })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountedContentScrubRead {
+    pub block_id: ScrubBlockId,
+    pub object_key: Option<ObjectKey>,
+    pub plaintext_bytes: Vec<u8>,
+    pub checksum_evidence: MountedContentChecksumEvidence,
+    pub placement_evidence: MountedContentPlacementEvidence,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PosixSupport {
     IncludedInCurrentUserspaceImpl,
