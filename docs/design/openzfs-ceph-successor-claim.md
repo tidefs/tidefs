@@ -1,7 +1,14 @@
-# OpenZFS/Ceph Successor Claim
+# OpenZFS/Ceph Successor Claim (Historical Input)
 
-**Status: Sealed** — Maturity: **design-spec** for the TideFS successor claim
-to OpenZFS and Ceph, with an 8-dimension quantitative comparison covering
+**Current authority notice:** This imported file is historical design input,
+not a current TideFS capability, performance-superiority, cost-effectiveness,
+flash-wear, RAM, WAN, durability, or OpenZFS/Ceph successor claim. The claims
+gate currently blocks publishing an OpenZFS/Ceph successor claim. Any future
+retained product-facing comparison must be expressed through a #875 claim id
+and the comparator evidence required by #928/#930.
+
+Historical status: sealed design-spec for the TideFS successor claim to
+OpenZFS and Ceph, with an 8-dimension quantitative comparison covering
 placement granularity, failure-domain flexibility, topology dynamics, device
 heterogeneity, checksum integrity, redundancy model, algorithm simplicity,
 and codebase efficiency.
@@ -14,12 +21,13 @@ and codebase efficiency.
 
 ---
 
-## 0. Seal Notice
+## 0. Historical Seal Notice
 
-This document is the **sealed design specification** for the OpenZFS/Ceph
-successor claim. The 8-dimension comparison, quantified improvements, and
-architectural analysis described here are final. No further design changes
-will be accepted without a new design issue.
+This section records the historical imported seal. It is not current TideFS
+claim authority. The 8-dimension comparison, quantified improvements, and
+architectural analysis described here may be used as design input only until a
+future claim is explicitly registered through #875 and backed by #928/#930
+comparator evidence.
 
 **Rust implementation is deferred to wire-up issues.** Each dependency
 (TideCRUSH placement, recovery orchestrator, rebake service, checksum
@@ -29,8 +37,9 @@ in their implementation issues and must not deviate from the claims, dimensions,
 or quantified improvements defined here without first opening a new
 design issue.
 
-The design decisions recorded in Sections 2–8 are binding for all
-subsequent storage-core implementation work.
+The design decisions recorded in Sections 2-8 are not binding current
+successor-claim authority unless a current issue, current spec, and claim
+evidence chain explicitly re-adopts the specific statement.
 
 ---
 
@@ -42,14 +51,14 @@ subsequent storage-core implementation work.
 
 ## 0. Executive Summary
 
-TideFS is designed as a next-generation successor to both OpenZFS and Ceph. It
-addresses 60 documented design mistakes from those systems (38 ZFS, 22 Ceph)
-while introducing a fundamentally different redundancy model: **per-stripe
+Historically, this document described TideFS as a next-generation successor to
+both OpenZFS and Ceph. It recorded 60 alleged design mistakes from those
+systems (38 ZFS, 22 Ceph) and a target redundancy model: **per-stripe
 erasure-coded placement with deferred redundancy via budgeted rebake**. This
-document establishes the quantitative claim across 8 architectural dimensions
-where TideFS improves on the state of the art.
+document does not establish a current quantitative claim. It preserves the
+historical 8-dimension framing as input for future #875/#928-gated evidence.
 
-The claim rests on four pillars:
+The historical claim framing rests on four pillars:
 
 | Pillar | TideFS design | ZFS equivalent | Ceph equivalent |
 |--------|--------------|----------------|-----------------|
@@ -608,8 +617,10 @@ These gaps are tracked in the PC-010 blocker map
 
 The [ZFS and Ceph Design Mistake Coverage Matrix](../ZFS_CEPH_DESIGN_MISTAKE_COVERAGE_MATRIX.md)
 enumerates 60 design mistakes (38 ZFS, 22 Ceph), all COVERED by TideFS
-design issues. This successor claim document provides the positive framing:
-for each category of mistake, TideFS has a concrete design solution.
+design issues. In current authority, that coverage is historical input only:
+it does not prove an implemented-source, runtime, measured, or successor
+claim. Each positive statement below needs current issue/spec adoption plus
+#875/#928 evidence before it can become product-facing.
 
 | Mistake category | Count | Representative TideFS solution |
 |---|---|---|
@@ -625,8 +636,9 @@ for each category of mistake, TideFS has a concrete design solution.
 | Other operational gaps | 3 | Online dataset rename; geometry conversion (#1282, #1275) |
 
 
-The successor claim transitions from *aspirational* to *design-spec* when all
-referenced design documents are sealed. It transitions to *implemented-source*
+Historically, the successor claim was expected to transition from
+*aspirational* to *design-spec* when all referenced design documents were
+sealed. Under current authority, it transitions to *implemented-source* only
 when the four pillars (placement, redundancy, integrity, dynamics) are
 
 **Current gate**: `cargo check --workspace` (no breakage from this document).

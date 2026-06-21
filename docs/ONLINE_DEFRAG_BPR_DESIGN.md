@@ -7,6 +7,14 @@
 **Depends on**: #1222 (rebake), #1232 (snapshot deadlist), #1189 (spacemap), #1241 (BACKGROUND lane), #1229 (BULK plane)
 **Merged from**: #1262 (duplicate)
 
+## Incumbent Comparison Boundary
+
+This imported design document uses ZFS and Ceph defragmentation behavior as
+historical design input. Its comparison text is not current TideFS online
+defrag capability, performance, availability, cost, or successor evidence.
+Any future product-facing comparison must name a #875 claim id and carry the
+comparator evidence required by #928/#930.
+
 ## Abstract
 
 This document defines the online defragmentation design for tidefs. Defrag rewrites
@@ -47,7 +55,7 @@ defrag rewrites existing base shards to improve physical layout.
 
 ## 3. Block Pointer Rewrite (BPR) Domain
 
-### 3.1 Why tidefs Can Rewrite Block Pointers (Unlike ZFS)
+### 3.1 Target Block-Pointer Rewrite Model Relative To ZFS
 
 ZFS cannot rewrite block pointers because its block pointer tree (root_record → objset
 → object_node → indirect blocks → data blocks) ties physical addresses directly to the
@@ -225,9 +233,9 @@ surfaces a soft error. No data loss — existing shards remain valid.
 | DF-09 | Dataset destroy during defrag | Defrag cancelled, no partial state |
 | DF-10 | Out-of-space during defrag write | Defrag pauses, existing data intact |
 
-## 12. Comparison: tidefs vs. ZFS vs. Ceph
+## 12. ZFS and Ceph Design Lessons (Non-Claim)
 
-| Aspect | ZFS | Ceph (Bluestore) | tidefs |
+| Aspect | ZFS | Ceph (Bluestore) | TideFS target design |
 |---|---|---|---|
 | Online defrag | None (send/recv only) | Internal (opaque, not extent-aligned) | Extent-aligned BPR via locator swap |
 | BPR mechanism | Impossible (cascading indirect updates) | N/A (object storage) | Extent_id indirection makes BPR single-level |

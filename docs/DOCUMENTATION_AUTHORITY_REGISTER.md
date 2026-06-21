@@ -136,11 +136,11 @@ surface beyond adding `docs/CLAIMS_GATE_POLICY.md`, which was already scanned.
 | `docs/CLUSTER_TRANSPORT_BOUNDEDNESS_DESIGN.md` | Historical input | Imported design-spec for bounded cluster transport. References Forgejo issue #1210. Claims registry has no validated distributed-transport claim. |
 | `docs/INTENT_LOG_SYNC_WRITE_LATENCY_PC008.md` | Historical input | Imported implemented-source specification for intent-log sync write latency (PC-008). Binds PC-008 closeout to source without claiming production persistent WAL or measured SLO pass. |
 | `docs/TRANSACTION_COMMIT_GROUPS_PC007.md` | Historical input | Imported implemented-source specification for transaction commit groups (PC-007). Binds existing Local Filesystem transaction-root implementation and FUSE fsync boundary. |
-| `docs/MEMBERSHIP_SERVICE_DESIGN.md` | Historical input | Imported design-spec for cluster membership service. References Forgejo issue #1209. Claims registry has no validated cluster-membership claim. |
-| `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md` | Historical input | Imported design-spec for distributed extent redundancy with ShardGroupV1 encoding. References Forgejo issue #1286. |
+| `docs/MEMBERSHIP_SERVICE_DESIGN.md` | Historical input | Imported design-spec for cluster membership service. References Forgejo issue #1209. ZFS/Ceph comparison text is design input only and is not a cluster-membership, distributed-availability, scale, performance, or successor claim. Claims registry has no validated cluster-membership claim. |
+| `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md` | Historical input | Imported design-spec for distributed extent redundancy with ShardGroupV1 encoding. References Forgejo issue #1286. ZFS/Ceph comparison text is design input only and is not a write-latency, write-amplification, durability, cost, or successor claim. |
 | `docs/SCRUB_REPAIR_RESILVER_DESIGN.md` | Historical input | Imported design-spec for background integrity services. References Forgejo issue #1288. Claims registry has only planned/blocked scrub claims. |
 | `docs/ERASURE_CODING_PLACEMENT_DESIGN.md` | Historical input | Imported design-spec superseded by the G4 pillar at `docs/design/production-erasure-coding-crush-placement-g4-pillar.md`. References Forgejo issue #1249. |
-| `docs/design/openzfs-ceph-successor-claim.md` | Historical input | Imported sealed design-spec for the OpenZFS/Ceph successor claim with 8-dimension quantitative comparison. Claims gate currently blocks publishing an OpenZFS/Ceph successor claim. |
+| `docs/design/openzfs-ceph-successor-claim.md` | Historical input | Imported sealed design-spec for the OpenZFS/Ceph successor claim with 8-dimension quantitative comparison. The seal is historical, not current claim authority. Claims gate currently blocks publishing an OpenZFS/Ceph successor claim; any future retained product-facing statement needs a #875 claim id and #928/#930 comparator evidence. |
 | `docs/design/production-erasure-coding-crush-placement-g4-pillar.md` | Historical input | Imported G4 pillar design-spec for TideCRUSH deterministic placement. References Forgejo issue #1779. Supersedes earlier erasure-coding placement designs. |
 | `docs/design/compression-design-strategy.md` | Historical input | Imported design-spec for compression format extension model. References Forgejo issue #1245. Transform authority blocks mounted compression claims. |
 | `docs/design/2159-milestone-targets-velocity-update.md` | Historical input | Imported milestone-target architecture with May 2026 velocity assessment. Supersedes prior milestone targets. Useful coordination reference. |
@@ -228,6 +228,34 @@ xfstests coverage, distributed behavior, or runtime crash claims.
 | `docs/RAM_AUTHORITY_DESIGN.md` | Current spec | Scoped current spec for the issue #847 RAM authority boundary: `ram-volatile-local`, `ram-volatile-replicated`, `ram-intent-backed`, and `pmem-durable` semantics, receipts, failure behavior, policy-transition rules, resource-governor boundaries, and operator explanation requirements. It is not runtime implementation, PMem platform validation, distributed quorum proof, or POSIX durability evidence. |
 | `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md` | Historical input | Imported production-depth replication, rebuild, and relocation flow design. It is not current runtime proof for anti-entropy, repair rebuild, relocation, failover, or cutover drains. |
 
+## Incumbent Comparison Audit Slice (#931)
+
+This initial #931 slice classifies the following legacy incumbent-comparison
+sections as historical design lessons or fail-closed review blockers, not
+current TideFS product evidence. None of these documents may be cited for a
+current OpenZFS, ZFS, Ceph, DRBD, ext4/XFS, performance-superiority,
+cost-effectiveness, flash-wear, RAM, WAN, durability, or successor claim
+unless the cited statement is re-expressed through a #875 claim id and the
+comparator evidence required by #928/#930:
+
+- `docs/PERSISTENT_ORPHAN_INDEX_DESIGN.md`: ZFS/ext4/CephFS orphan-index
+  table and former "key advantages" list are non-claim design lessons.
+- `docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md`: ZFS ZAP comparison and former
+  "improvements over ZFS" list are non-claim design lessons.
+- `docs/POLYMORPHIC_EXTENT_MAPS_DESIGN.md`: ZFS/Ceph extent-layout tables,
+  random-read cost hypothesis, and design-mistake coverage are non-claim
+  design lessons.
+- `docs/MEMBERSHIP_SERVICE_DESIGN.md`: ZFS/Ceph cluster-membership comparison
+  is design input only; no cluster-membership claim is validated.
+- `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md`: ZFS/Ceph deferred-redundancy
+  and write-amplification comparison is design input only.
+- `docs/ONLINE_DEFRAG_BPR_DESIGN.md`: ZFS/Ceph defrag and BPR comparison text
+  is target design input, not evidence of implemented online defrag.
+- `docs/design/openzfs-ceph-successor-claim.md`: the sealed successor claim is
+  historical input, not current claim authority.
+- `docs/WHOLE_REPO_REVIEW.md`: incumbent references are fail-closed review
+  blockers only.
+
 ## Initial Open Queue
 
 The first mechanical pass found 87 imported documents with maturity labels or
@@ -237,9 +265,6 @@ used as TideFS authority:
 
 - `docs/EXTENT_MAPS_LOCATOR_TABLES_DESIGN.md`
 - `docs/GENERATION_STALENESS_DISCIPLINE_DESIGN.md`
-- `docs/PERSISTENT_ORPHAN_INDEX_DESIGN.md`
-- `docs/POLYMORPHIC_DIRECTORY_INDEX_DESIGN.md`
-- `docs/POLYMORPHIC_EXTENT_MAPS_DESIGN.md`
 - `docs/POLYMORPHIC_XATTR_STORAGE_DESIGN.md`
 - `docs/POSIX_ACL_XATTR_CODEC_DESIGN.md`
 - `docs/REFCOUNT_DELTA_CLEANUP_QUEUES_DESIGN.md`

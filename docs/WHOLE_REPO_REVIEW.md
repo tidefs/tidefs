@@ -24,6 +24,15 @@ The current policy is different:
 - each commit should have one reason to exist; review notes, workspace
   be lumped together.
 
+## Incumbent Comparison Boundary
+
+This review may refer to OpenZFS, ZFS, Ceph, DRBD, ext4/XFS, kernel parity,
+or production-scale incumbents when describing why TideFS is not yet honest
+to claim that class of behavior. Those references are fail-closed review
+blockers, not current superiority or successor claims. Any future positive
+product-facing comparison must route through a #875 claim id and the
+comparator evidence required by #928/#930.
+
 ## Current Scope
 
 The first inventory found:
