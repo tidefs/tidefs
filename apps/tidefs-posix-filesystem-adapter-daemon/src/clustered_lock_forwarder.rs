@@ -48,6 +48,8 @@ struct PendingInner {
     /// When set, maps this pending request to a grant key so that
     /// [`handle_response`] can store the granted `lock_id`.
     request_key: Option<GrantKey>,
+    /// True for blocking setlkw requests that remain pending after Queue acks.
+    blocking: bool,
 }
 
 /// A synchronous pending request: the FUSE thread blocks on `signal`
@@ -58,12 +60,13 @@ struct PendingRequest {
 }
 
 impl PendingRequest {
-    fn new(request_key: Option<GrantKey>) -> Self {
+    fn new(request_key: Option<GrantKey>, blocking: bool) -> Self {
         Self {
             signal: Arc::new((Mutex::new(false), Condvar::new())),
             inner: Mutex::new(PendingInner {
                 result: None,
                 request_key,
+                blocking,
             }),
         }
     }
@@ -100,6 +103,10 @@ impl PendingRequest {
 
     fn request_key(&self) -> Option<GrantKey> {
         self.inner.lock().unwrap().request_key
+    }
+
+    fn blocking(&self) -> bool {
+        self.inner.lock().unwrap().blocking
     }
 }
 
@@ -148,10 +155,8 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
         leader: MemberId,
         transport: LockServiceTransport<S>,
     ) -> Result<Self, LockServiceHandleError> {
-        let handle = LockServiceHandle::new(
-            LockOwner::new(node_id, 0, 0),
-            runtime.mount_identity(),
-        )?;
+        let handle =
+            LockServiceHandle::new(LockOwner::new(node_id, 0, 0), runtime.mount_identity())?;
         Ok(Self {
             runtime,
             handle,
@@ -197,7 +202,7 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
         frame: LockFrame,
         request_key: Option<GrantKey>,
     ) -> Result<ClusteredLockOutcome, LockDispatchError> {
-        let pending = Arc::new(PendingRequest::new(request_key));
+        let pending = Arc::new(PendingRequest::new(request_key, false));
         self.pending.insert(op_id, Arc::clone(&pending));
 
         if let Err(err) = self.transport.send(self.leader, &frame) {
@@ -223,7 +228,10 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
     /// status to a [`ClusteredLockOutcome`] or [`LockDispatchError`],
     /// and wakes the blocked FUSE thread.
     pub fn handle_response(&mut self, response: LockFrame) {
-        let op_id = response.op_id;
+        let op_id = match &response.payload {
+            LockPayload::LockGrantEvent(event) => event.request_id,
+            _ => response.op_id,
+        };
         let result = match &response.payload {
             LockPayload::GetlkAck(ack) => match ack.status {
                 LockServiceStatus::Granted => {
@@ -242,15 +250,15 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
                     });
                     Ok(ClusteredLockOutcome::Getlk(conflict))
                 }
-                LockServiceStatus::DeniedConflict => Ok(ClusteredLockOutcome::Getlk(Some(
-                    LockRange {
+                LockServiceStatus::DeniedConflict => {
+                    Ok(ClusteredLockOutcome::Getlk(Some(LockRange {
                         start: 0,
                         len: 0,
                         lock_type: LockType::Write,
                         owner: 0,
                         pid: 0,
-                    },
-                ))),
+                    })))
+                }
                 _ => Err(map_lock_status(ack.status)),
             },
             LockPayload::SetlkAck(ack) => match ack.status {
@@ -264,10 +272,9 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
                     Ok(ClusteredLockOutcome::Acquired)
                 }
                 LockServiceStatus::Queued => {
-                    // For setlkw, the leader queued the request.
-                    // A future GrantEvent (not handled here) will
-                    // deliver the lease.  Report as conflict for
-                    // non-blocking setlk.
+                    if self.pending.get(&op_id).is_some_and(|p| p.blocking()) {
+                        return;
+                    }
                     Err(LockDispatchError::Conflict(build_empty_conflict()))
                 }
                 LockServiceStatus::DeniedConflict => {
@@ -284,7 +291,9 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
                     }
                     Ok(ClusteredLockOutcome::Acquired)
                 }
-                tidefs_lock_service::ServiceLockStatus::DeniedConflict => Err(LockDispatchError::WouldBlock),
+                tidefs_lock_service::ServiceLockStatus::DeniedConflict => {
+                    Err(LockDispatchError::WouldBlock)
+                }
                 _ => Err(map_lease_status(ack.status)),
             },
             LockPayload::ReleaseAck(ack) => match ack.status {
@@ -293,6 +302,14 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
                 }
                 _ => Err(map_lock_status(ack.status)),
             },
+            LockPayload::LockGrantEvent(event) => {
+                if let Some(p) = self.pending.get(&op_id) {
+                    if let Some(key) = p.request_key() {
+                        self.granted.insert(key, event.lease_id);
+                    }
+                }
+                Ok(ClusteredLockOutcome::Acquired)
+            }
             _ => {
                 // Unexpected response payload for a synchronous dispatch.
                 return;
@@ -357,10 +374,7 @@ impl<S: LockFrameSink> FusePosixLockDispatch for ClusteredPosixLockForwarder<S> 
         }
     }
 
-    fn setlk(
-        &mut self,
-        request: FusePosixLockRequest,
-    ) -> Result<(), LockDispatchError> {
+    fn setlk(&mut self, request: FusePosixLockRequest) -> Result<(), LockDispatchError> {
         let len = safe_len(request.start, request.end);
         let owner = self.lock_owner(request.pid, request.lock_owner);
 
@@ -402,18 +416,20 @@ impl<S: LockFrameSink> FusePosixLockDispatch for ClusteredPosixLockForwarder<S> 
         Ok(())
     }
 
-    fn setlkw(
-        &mut self,
-        request: FusePosixLockRequest,
-    ) -> Result<(), LockDispatchError> {
+    fn setlkw(&mut self, request: FusePosixLockRequest) -> Result<(), LockDispatchError> {
         if request.typ == FUSE_LOCK_TYPE_UNLCK {
             return self.setlk(request);
+        }
+
+        let len = safe_len(request.start, request.end);
+        let key = (request.ino, request.lock_owner, request.start, len);
+        if self.granted.contains_key(&key) {
+            return Ok(());
         }
 
         let lock_type = fuse_type_to_range_lock_type(request.typ)
             .ok_or(LockDispatchError::InvalidLockType(request.typ as u32))?;
 
-        let len = safe_len(request.start, request.end);
         let owner = self.lock_owner(request.pid, request.lock_owner);
 
         let op_id = fresh_op_id(&self.pending);
@@ -437,7 +453,7 @@ impl<S: LockFrameSink> FusePosixLockDispatch for ClusteredPosixLockForwarder<S> 
         // For blocking setlkw, send the frame but do NOT block the
         // FUSE thread.  Spawn a thread that waits for the response
         // and notifies the WaiterSignal.
-        let pending = Arc::new(PendingRequest::new(None));
+        let pending = Arc::new(PendingRequest::new(Some(key), true));
         self.pending.insert(op_id, Arc::clone(&pending));
 
         if let Err(e) = self.transport.send(self.leader, &frame) {
@@ -526,12 +542,8 @@ fn map_lock_status(status: LockServiceStatus) -> LockDispatchError {
         LockServiceStatus::NotFound => {
             LockDispatchError::Internal("clustered lock: not found".into())
         }
-        LockServiceStatus::DeniedConflict => {
-            LockDispatchError::Conflict(build_empty_conflict())
-        }
-        _ => LockDispatchError::Internal(format!(
-            "clustered lock unexpected status: {status:?}"
-        )),
+        LockServiceStatus::DeniedConflict => LockDispatchError::Conflict(build_empty_conflict()),
+        _ => LockDispatchError::Internal(format!("clustered lock unexpected status: {status:?}")),
     }
 }
 
@@ -805,10 +817,7 @@ mod tests {
         };
         let err =
             ClusteredPosixMountRuntime::open_committed_mount(identity, authority).unwrap_err();
-        assert_eq!(
-            err,
-            ClusteredPosixMountAdmissionError::MissingAuthorityTerm
-        );
+        assert_eq!(err, ClusteredPosixMountAdmissionError::MissingAuthorityTerm);
     }
 
     #[test]
@@ -839,7 +848,10 @@ mod tests {
         let mut f = test_forwarder();
         let req = lock_request(100, 42, 0, 99, 99, 1234);
         let result = f.getlk(req);
-        assert!(matches!(result, Err(LockDispatchError::InvalidLockType(99))));
+        assert!(matches!(
+            result,
+            Err(LockDispatchError::InvalidLockType(99))
+        ));
     }
 
     #[test]
@@ -847,7 +859,10 @@ mod tests {
         let mut f = test_forwarder();
         let req = lock_request(100, 42, 0, 99, 99, 1234);
         let result = f.setlk(req);
-        assert!(matches!(result, Err(LockDispatchError::InvalidLockType(99))));
+        assert!(matches!(
+            result,
+            Err(LockDispatchError::InvalidLockType(99))
+        ));
     }
 
     #[test]
@@ -913,6 +928,71 @@ mod tests {
         assert!(f.pending.is_empty());
     }
 
+    #[test]
+    fn setlkw_granted_ack_tracks_lease_for_retry_and_unlock() {
+        let mut f = test_forwarder();
+        let req = lock_request(100, 42, 0, 99, 1, 1234);
+
+        let signal = match f.setlkw(req) {
+            Err(LockDispatchError::Blocked { signal }) => signal,
+            other => panic!("expected blocked setlkw, got {other:?}"),
+        };
+        let op_id = *f.pending.keys().next().unwrap();
+
+        f.handle_response(LockFrame::new(
+            op_id,
+            LockPayload::SetlkAck(tidefs_lock_service::SetlkAck {
+                status: LockServiceStatus::Granted,
+                lock_id: 77,
+                conflict: None,
+            }),
+        ));
+
+        assert!(signal.wait_timeout(std::time::Duration::from_millis(100)));
+        assert!(f.pending.is_empty());
+        assert_eq!(f.granted.get(&(100, 42, 0, 100)), Some(&77));
+
+        f.setlkw(req).unwrap();
+    }
+
+    #[test]
+    fn setlkw_queued_ack_waits_for_grant_event() {
+        let mut f = test_forwarder();
+        let req = lock_request(100, 42, 0, 99, 1, 1234);
+
+        let signal = match f.setlkw(req) {
+            Err(LockDispatchError::Blocked { signal }) => signal,
+            other => panic!("expected blocked setlkw, got {other:?}"),
+        };
+        let op_id = *f.pending.keys().next().unwrap();
+
+        f.handle_response(LockFrame::new(
+            op_id,
+            LockPayload::SetlkAck(tidefs_lock_service::SetlkAck {
+                status: LockServiceStatus::Queued,
+                lock_id: 0,
+                conflict: None,
+            }),
+        ));
+        assert!(f.pending.contains_key(&op_id));
+        assert!(!signal.wait_timeout(std::time::Duration::from_millis(1)));
+
+        f.handle_response(LockFrame::new(
+            999,
+            LockPayload::LockGrantEvent(tidefs_lock_service::LockGrantEvent {
+                request_id: op_id,
+                lease_id: 88,
+                callback_opaque: 0,
+                expires_at_millis: 123,
+            }),
+        ));
+
+        assert!(signal.wait_timeout(std::time::Duration::from_millis(100)));
+        assert!(f.pending.is_empty());
+        assert_eq!(f.granted.get(&(100, 42, 0, 100)), Some(&88));
+        f.setlkw(req).unwrap();
+    }
+
     // ── Local-mode dispatch stays in-process ────────────────────────
 
     #[test]
@@ -931,7 +1011,7 @@ mod tests {
 
     #[test]
     fn pending_request_stores_and_retrieves_result() {
-        let pending = PendingRequest::new(None);
+        let pending = PendingRequest::new(None, false);
         assert!(!pending.wait_timeout(std::time::Duration::from_millis(1)));
         pending.set_result(Ok(ClusteredLockOutcome::Acquired));
         assert!(pending.wait_timeout(std::time::Duration::from_millis(1)));
@@ -942,13 +1022,15 @@ mod tests {
     #[test]
     fn pending_request_stores_request_key() {
         let key = (1, 100, 0, 50);
-        let pending = PendingRequest::new(Some(key));
+        let pending = PendingRequest::new(Some(key), true);
         assert_eq!(pending.request_key(), Some(key));
+        assert!(pending.blocking());
     }
 
     #[test]
     fn pending_request_no_key_returns_none() {
-        let pending = PendingRequest::new(None);
+        let pending = PendingRequest::new(None, false);
         assert_eq!(pending.request_key(), None);
+        assert!(!pending.blocking());
     }
 }
