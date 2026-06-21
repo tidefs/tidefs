@@ -6,6 +6,14 @@ entry count.
 
 This document closes Forgejo issue #1289.
 
+## Incumbent Comparison Boundary
+
+This imported design document uses ZFS ZAP behavior as historical design
+input. Its comparison section is a non-claim design lesson and does not prove
+TideFS lookup latency, readdir behavior, scalability, or ZFS-superiority. Any
+future product-facing comparison must route through a #875 claim id and the
+comparator evidence required by #928/#930.
+
 ## 1. Motivation
 
 Directory sizes span 6+ orders of magnitude in real workloads:
@@ -26,7 +34,7 @@ made at directory creation time based on the expected number of entries
 created with 5 entries that later grows to 500K stays in micro ZAP mode —
 the directory is re-created externally to switch.
 
-TideFS must do better:
+The target design records these requirements:
 
 - **Online switching**: change representation without user-visible disruption.
 - **Hysteresis**: no oscillation at the boundary.
@@ -404,7 +412,7 @@ At the switching boundary (51 entries with 16-char names), the B-tree uses
 ~2.5 KiB for data pages + 1 internal page (4 KiB) = ~6.5 KiB total vs ~2 KiB
 for micro-list. The 3x overhead is acceptable: it buys O(log n) scaling.
 
-### 7.3 Comparison with ZFS
+### 7.3 ZFS Design Lessons (Non-Claim)
 
 | Property | ZFS (micro ZAP) | ZFS (fat ZAP) | TideFS MicroList | TideFS BTree |
 |---|---|---|---|---|
@@ -415,7 +423,7 @@ for micro-list. The 3x overhead is acceptable: it buys O(log n) scaling.
 | Lookup (large) | O(n) if small ZAP | O(1) expected, O(n) worst | N/A (small only) | O(log n), no worst-case chains |
 | Max size | ~128 KiB (object_node limit) | 16 EiB | Inode payload limit (~4 KiB) | 2^64 entries |
 
-TideFS improvements over ZFS:
+Target design differences relative to ZFS:
 
 - **Online switching**: ZFS never switches; TideFS migrates dynamically.
 - **No hash chains**: B-tree avoids the O(n) worst-case that ZAP hash chains

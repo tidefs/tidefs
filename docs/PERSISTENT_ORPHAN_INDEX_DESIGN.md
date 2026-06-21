@@ -6,6 +6,14 @@ mount-time scan with an O(orphan-count) indexed approach.
 
 This document closes Forgejo issue #1207.
 
+## Incumbent Comparison Boundary
+
+This imported design document uses ZFS, ext4, and CephFS as historical design
+inputs. Its comparison table and "advantage" language are not current TideFS
+capability, performance-superiority, cost, durability, or successor claims.
+Any future product-facing comparison must route through a #875 claim id and
+the comparator evidence required by #928/#930.
+
 ## 1. Motivation
 
 POSIX filesystems must reclaim storage for unlinked files whose last file descriptor
@@ -197,7 +205,7 @@ Orphan index entry deleted immediately after processing; deadlist handles snapsh
 Dataset destroy (#1219): `TraversalRootType::OrphanIndex` walker reclaims all remaining
 orphans, skipping snapshot checks since the dataset is being destroyed.
 
-## 8. ZFS and Other Filesystem Comparison
+## 8. ZFS and Other Filesystem Design Lessons (Non-Claim)
 
 | Dimension | ZFS (`zfs_unlinked_drain`) | ext4 | CephFS | tidefs orphan index |
 |---|---|---|---|---|
@@ -210,7 +218,7 @@ orphans, skipping snapshot checks since the dataset is being destroyed.
 | Snapshot safety | `zfs destroy` EBUSY on snapshotted orphans | Current gen only | N/A | Deadlist (#1232) gates extent reclamation |
 | Deferred cleanup | Synchronous at mount; no background service | `ext4lazyinit` for inode table only | MDS tick for strays | Deferred cleanup (#1212) for post-mount orphans |
 
-Key advantages over ZFS:
+Design lessons recorded by this historical comparison:
 1. **No entry count limit**: B+tree vs ZAP ~100K fragmentation
 2. **Bounded mount-time processing**: Configurable WorkBudget vs synchronous drain
 3. **First-class O_TMPFILE**: Explicit lifecycle with indexed tracking

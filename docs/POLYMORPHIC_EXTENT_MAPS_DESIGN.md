@@ -6,6 +6,14 @@ TiB-scale fragmented files, with transactional promotion/demotion per commit_gro
 
 This document closes Forgejo issue #1291.
 
+## Incumbent Comparison Boundary
+
+This imported design document uses ZFS and Ceph extent-layout behavior as
+historical design input. Its comparison sections are non-claim design lessons:
+they do not prove TideFS metadata-I/O, latency, throughput, tiny-file,
+fragmentation, or successor superiority. Any retained product-facing comparison
+requires a #875 claim id and the comparator evidence required by #928/#930.
+
 ## 1. Motivation
 
 Extent maps face extreme scaling variance across file sizes:
@@ -357,7 +365,7 @@ The 2 extra page reads in V3 (one extra internal level) are a negligible cost
 for the mutation performance win. At NVMe latencies (~100 µs), this adds ~200 µs
 to a random read — invisible compared to the 4 KiB data read itself.
 
-## 8. ZFS and Ceph Comparison
+## 8. ZFS and Ceph Design Lessons (Non-Claim)
 
 ### 8.1 ZFS Indirect Block Tree
 
@@ -406,11 +414,15 @@ Ceph stores file extents as rados objects keyed by (ino, offset):
 | Fragmentation | Object count explodes with small writes | Extent entries are cheap (89 bytes), pages hold 45 each |
 | Read path | OSD lookup → object read | Locator table lookup → page read (one fewer hop) |
 
-Ceph's additional OSD hop makes the random read path ~2× more expensive than
-tidefs' direct locator table resolution. The multi-level B-tree provides the
-same scalable namespace as Ceph's omap without requiring a distributed KV.
+This historical comparison treats Ceph's additional OSD hop as a design
+hypothesis about random-read path cost. It is not a measured TideFS-vs-Ceph
+latency claim. Any future ratio or superiority statement must be backed by a
+#875 claim id and #928/#930 comparator evidence.
 
-### 8.3 Where tidefs Improves
+The multi-level B-tree is retained here as a target design for a scalable
+namespace without requiring a distributed KV.
+
+### 8.3 Target Design Differences
 
 1. **Polymorphism**: tidefs automatically selects the optimal representation
    and adapts as the file grows/shrinks. ZFS and Ceph use single representations.
@@ -579,7 +591,7 @@ pub enum PolymorphicExtentMapError {
 - [#1255] Inline and Post-Process Deduplication (future)
 - [#1257] Workload-Adaptive Recordsize and Extent Shaping (future)
 
-## ZFS and Ceph Design-Mistake Coverage
+## ZFS and Ceph Design-Mistake Inputs (Non-Claim)
 
 - **ZFS fixed-depth indirect block tree**: ZFS always uses indirect blocks
   even for tiny files. tidefs uses inline list (zero extra I/O) for files

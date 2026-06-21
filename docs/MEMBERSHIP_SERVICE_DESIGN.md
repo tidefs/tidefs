@@ -7,6 +7,15 @@ auto-detection.
 
 This document closes Forgejo issue #1209.
 
+## Incumbent Comparison Boundary
+
+This imported design document uses ZFS and Ceph as historical design inputs
+for cluster-membership shape. The comparison rows below are design lessons,
+not current TideFS capability, distributed-availability, scale, performance,
+operator-readiness, or successor claims. Current registry authority records no
+validated cluster-membership claim; any future product-facing comparison must
+name a #875 claim id and carry the comparator evidence required by #928/#930.
+
 ## 1. Motivation
 
 A topology-aware coherency profile (`auto` from #1184) requires every node to
@@ -574,7 +583,7 @@ category. The leader's view aggregation buffer is bounded:
 - `MAX_HEARTBEAT_BUFFER_SIZE_BYTES`: 256 KiB
 - `MAX_JOIN_QUEUE_DEPTH`: 16 concurrent JOIN requests
 
-## 8. ZFS and Ceph Comparison
+## 8. ZFS and Ceph Design Lessons (Non-Claim)
 
 | Dimension | ZFS | Ceph | tidefs MEMBERSHIP Service |
 |-----------|-----|------|---------------------------|
@@ -587,7 +596,7 @@ category. The leader's view aggregation buffer is bounded:
 | **Scalability** | N/A for clusters. Max 2 nodes in HA pair. | OSDMap grows without bound — hundreds of MB in large clusters. Monitor memory pressure is a known operational issue (#1283 documents this anti-pattern). | Explicitly bounded: max 256 nodes, 65536 datasets per view. Tombstoned nodes removed after grace period. Leader memory bounded by `cluster_queues` budget. No unbounded map growth. |
 | **Observability** | No cluster-wide membership observability. Per-node `zpool status` only. | `ceph status`, `ceph osd tree`, `ceph mds stat` — fragmented across daemon types. No single "who has what mounted" view. | Single `ClusterViewV1` provides complete picture: all nodes, all mounts, writer identification, coherency profiles, liveness. Available to every node on every `CLUSTER_VIEW` push. |
 
-### 8.1 Where tidefs Improves on ZFS
+### 8.1 Target Design Differences Relative To ZFS
 
 - **Built-in cluster membership**: ZFS requires external HA frameworks with
   manual configuration. tidefs provides a self-contained membership service
@@ -599,7 +608,7 @@ category. The leader's view aggregation buffer is bounded:
   tidefs uses joint-consensus membership changes with deterministic split-brain
   hazard detection from `tidefs-membership-epoch`.
 
-### 8.2 Where tidefs Improves on Ceph
+### 8.2 Target Design Differences Relative To Ceph
 
 - **Bounded state**: Ceph OSDMap grows without bound, causing monitor OOM
   in large clusters. tidefs `ClusterViewV1` is explicitly bounded and
@@ -613,7 +622,7 @@ category. The leader's view aggregation buffer is bounded:
   tidefs `Auto` profile uses membership data to automatically select the
   optimal coherency strategy.
 
-### 8.3 Where tidefs Matches
+### 8.3 Shared Design Patterns
 
 - **Heartbeat-based liveness**: Both Ceph and tidefs use heartbeat-based
   failure detection with configurable intervals and timeouts.

@@ -7,6 +7,14 @@ ingest extents into base shards.
 
 This document closes Forgejo issue #1286.
 
+## Incumbent Comparison Boundary
+
+This imported design document uses ZFS and Ceph write-redundancy behavior as
+historical design input. The comparison rows below are not current TideFS
+durability, write-latency, write-amplification, space-efficiency, cost, or
+successor claims. Any future product-facing comparison must name a #875 claim
+id and carry the comparator evidence required by #928/#930.
+
 ## 1. Motivation
 
 tidefs writes data in two forms: **ingest extents** (append-only journal,
@@ -25,13 +33,13 @@ ZFS solves (1) and (2) through mirrors or PARITY_RAID at write time, at the
 cost of write amplification on every IOP. Ceph solves (1) through
 replication at write time, at the cost of multi-hop latency.
 
-tidefs takes a different approach: **fast ingest writes** land on a
+The target TideFS design explores a different approach: **fast ingest writes** land on a
 single device for minimal latency, then a **budgeted background rebake
 service** converts them to base shards with full redundancy. The ingest
 window is protected by a **durability ladder** that triggers emergency
 rebake if replica counts fall below threshold.
 
-| Concern | ZFS | Ceph | tidefs |
+| Concern | ZFS | Ceph | TideFS target design |
 |---------|-----|------|--------|
 | Write latency | Pay redundancy cost at write | Pay replication hop at write | Pay single-device latency; redundancy deferred |
 | Write amplification | Always k+m writes | Always r writes | 1x at ingest; k+m at rebake |
@@ -530,11 +538,11 @@ and the repair service to identify which specific shard is corrupt.
 | `replicas_degraded_total` | Gauge | Extents below target replica count |
 | `locator_base_complete_ratio` | Gauge | Fraction of locator entries with BASE_COMPLETE |
 
-## 10. ZFS and Ceph Comparison
+## 10. ZFS and Ceph Design Lessons (Non-Claim)
 
 ### 10.1 Redundancy Models
 
-| Dimension | ZFS | Ceph | tidefs |
+| Dimension | ZFS | Ceph | TideFS target design |
 |-----------|-----|------|--------|
 | **Redundancy timing** | At write (mirror or PARITY_RAID) | At write (replication or EC pool) | Deferred: fast ingest, background rebake |
 | **Write amplification** | Always k+m or r | Always r or k+m | 1x at ingest; k+m or r at rebake |
@@ -545,7 +553,7 @@ and the repair service to identify which specific shard is corrupt.
 | **Shard health** | Checksum → self-heal from mirror/parity | Per-PG scrub → repair | Per-shard `suspect_count` in locator; SuspectLog integration |
 | **Space efficiency** | Good | Good | Excellent: ingest fragments reclaimed after rebake |
 
-### 10.2 Where tidefs Improves
+### 10.2 Target Design Differences
 
 1. **Deferred redundancy with bounded risk window.** ZFS and Ceph pay
    redundancy overhead on every write. tidefs writes fast (single device),
