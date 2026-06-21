@@ -151,6 +151,17 @@ const fn bytes16_equal(left: [u8; 16], right: [u8; 16]) -> bool {
     true
 }
 
+const fn bytes32_equal(left: [u8; 32], right: [u8; 32]) -> bool {
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 /// Versioned record envelope state used by persistence or transport codecs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -2209,6 +2220,462 @@ pub struct WorkloadPrediction {
     pub evidence: StorageIntentEvidenceRef,
 }
 
+/// Scope at which a bounded workload signal was collected or summarized.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum WorkloadSignalScopeClass {
+    /// Scope is not known.
+    #[default]
+    Unknown = 0,
+    /// One foreground request or small request cohort.
+    Request = 1,
+    /// One object/range/generation cohort.
+    SubjectRange = 2,
+    /// One dataset policy envelope.
+    Dataset = 3,
+    /// Pool-wide default or fallback signal. Never enough to relax a dataset.
+    Pool = 4,
+    /// One local or remote media device.
+    Device = 5,
+    /// One transport, path, route, or endpoint.
+    Path = 6,
+    /// One tenant or workload-budget owner.
+    TenantBudget = 7,
+}
+
+/// Bounded storage mode for a workload signal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum SignalMaterializationMode {
+    /// Signal was not materialized.
+    #[default]
+    Unknown = 0,
+    /// Memory-only sketch; advisory and not durable proof.
+    MemoryOnlySketch = 1,
+    /// Sampled counter with explicit sampling/drop policy.
+    SampledCounter = 2,
+    /// Decayed histogram with bounded retention.
+    DecayedHistogram = 3,
+    /// Top-K set with bounded cardinality.
+    TopKSet = 4,
+    /// Durable summary charged to the cost/wear ledger.
+    DurableSummary = 5,
+    /// Derived view rebuilt from other authority records.
+    DerivedView = 6,
+    /// Retained evidence root kept for audit, validation, or claims.
+    RetainedEvidence = 7,
+}
+
+/// Access-pattern class projected by bounded workload signals.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum AccessPatternClass {
+    #[default]
+    Unknown = 0,
+    SequentialRead = 1,
+    StridedRead = 2,
+    VectorRead = 3,
+    SmallRandomHotset = 4,
+    MetadataNamespace = 5,
+    ManifestIndexFanout = 6,
+    SnapshotCloneRepeat = 7,
+    DegradedReconstruction = 8,
+    WanGeoDelta = 9,
+    ObjectArchiveRestore = 10,
+    OnePassScan = 11,
+    PhaseChangingSparse = 12,
+    NoisyAdversarial = 13,
+    SyncSmallWrite = 14,
+    AsyncBulkWrite = 15,
+    OverwriteChurn = 16,
+    AppendLog = 17,
+}
+
+/// Prefetch/residency candidate emitted by workload signals for #967.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchResidencyCandidateClass {
+    /// No prefetch or residency action is justified.
+    #[default]
+    NoPrefetch = 0,
+    /// Bounded sequential readahead only.
+    BoundedReadahead = 1,
+    /// Strided or vector range prefetch.
+    StridedVectorPrefetch = 2,
+    /// Metadata, namespace, or directory/index prefetch.
+    MetadataNamespacePrefetch = 3,
+    /// Cache-only hotset serving trial.
+    SmallRandomHotsetTrial = 4,
+    /// Manifest or index fanout prefetch.
+    ManifestIndexPrefetch = 5,
+    /// Snapshot/clone repeated-read prefetch.
+    SnapshotClonePrefetch = 6,
+    /// Degraded-read reconstruction prefetch.
+    DegradedReadPrefetch = 7,
+    /// WAN or geo delta prefetch.
+    WanGeoDeltaPrefetch = 8,
+    /// Object/archive restore staging.
+    ObjectArchiveRestoreStage = 9,
+    /// Generic cache-only trial.
+    CacheOnlyTrial = 10,
+    /// Volatile RAM serving trial, not authority.
+    VolatileRamTrial = 11,
+    /// RAM serving backed by durable intent evidence.
+    IntentBackedRam = 12,
+    /// PMem durable residency candidate.
+    PmemDurable = 13,
+    /// Flash/NVMe/SSD hot serving candidate.
+    FlashHotServing = 14,
+    /// HDD locality or layout-optimized serving candidate.
+    HddLocalityOptimized = 15,
+    /// Authority-changing promotion candidate.
+    AuthorityPromotionCandidate = 16,
+    /// Demotion candidate.
+    DemotionCandidate = 17,
+    /// Cooldown candidate after failed payback or anti-thrash evidence.
+    Cooldown = 18,
+    /// More evidence is required before action selection.
+    NeedMoreEvidence = 19,
+    /// Policy or evidence refused the candidate.
+    Refused = 20,
+}
+
+/// Flags carried by a bounded workload signal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct WorkloadSignalFlags(pub u64);
+
+impl WorkloadSignalFlags {
+    pub const EMPTY: Self = Self(0);
+    pub const HINT_ONLY: Self = Self(1_u64 << 0);
+    pub const MEMORY_ONLY: Self = Self(1_u64 << 1);
+    pub const SAMPLED_AWAY: Self = Self(1_u64 << 2);
+    pub const DROPPED_OBSERVATIONS: Self = Self(1_u64 << 3);
+    pub const COMPACTED_BEYOND_AUTHORITY: Self = Self(1_u64 << 4);
+    pub const LOW_SAMPLE_MASS: Self = Self(1_u64 << 5);
+    pub const ONE_PASS_SCAN: Self = Self(1_u64 << 6);
+    pub const PHASE_CHANGE: Self = Self(1_u64 << 7);
+    pub const NOISY_NEIGHBOR: Self = Self(1_u64 << 8);
+    pub const CONTRADICTED: Self = Self(1_u64 << 9);
+    pub const UNKNOWN_COLLECTION_COST: Self = Self(1_u64 << 10);
+    pub const UNKNOWN_WAF: Self = Self(1_u64 << 11);
+    pub const UNKNOWN_EGRESS_OR_RESTORE_COST: Self = Self(1_u64 << 12);
+    pub const FOREGROUND_TAIL_PRESSURE: Self = Self(1_u64 << 13);
+    pub const SNAPSHOT_PINNED: Self = Self(1_u64 << 14);
+    pub const DURABLE_METADATA_WRITES: Self = Self(1_u64 << 15);
+
+    /// Merge two flag sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns true when all requested flags are present.
+    #[must_use]
+    pub const fn contains_all(self, required: Self) -> bool {
+        (self.0 & required.0) == required.0
+    }
+
+    /// Returns true when any requested flag is present.
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+}
+
+/// Bounded workload signal projected for policy, prefetch, and residency.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct WorkloadSignalRecord {
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub scope: StorageIntentObjectScope,
+    pub pool_id: StorageIntentDomainId,
+    pub signal_scope: WorkloadSignalScopeClass,
+    pub access_pattern: AccessPatternClass,
+    pub confidence: PredictionConfidence,
+    pub observation_window_ms: u64,
+    pub sample_mass: u32,
+    pub decay_age_ms: u64,
+    pub contradiction: ContradictionState,
+    pub provenance: HintProvenance,
+    pub materialization_mode: SignalMaterializationMode,
+    pub flags: WorkloadSignalFlags,
+    pub budget_owner: StorageIntentDomainId,
+    pub source_media: StorageMediaClass,
+    pub target_media: StorageMediaClass,
+    pub source_media_ref: StorageIntentEvidenceRef,
+    pub target_media_ref: StorageIntentEvidenceRef,
+    pub service_objective_ref: StorageIntentEvidenceRef,
+    pub topology_ref: StorageIntentEvidenceRef,
+    pub signal_materialization_ref: StorageIntentEvidenceRef,
+    pub signal_collection_cost_ref: StorageIntentEvidenceRef,
+    pub candidate: PrefetchResidencyCandidateClass,
+    pub refusal: StorageIntentRefusalReason,
+}
+
+impl Default for WorkloadSignalRecord {
+    fn default() -> Self {
+        Self {
+            policy_id: StorageIntentPolicyId::ZERO,
+            policy_revision: StorageIntentPolicyRevision(0),
+            scope: StorageIntentObjectScope::default(),
+            pool_id: StorageIntentDomainId::ZERO,
+            signal_scope: WorkloadSignalScopeClass::Unknown,
+            access_pattern: AccessPatternClass::Unknown,
+            confidence: PredictionConfidence::Unknown,
+            observation_window_ms: 0,
+            sample_mass: 0,
+            decay_age_ms: 0,
+            contradiction: ContradictionState::None,
+            provenance: HintProvenance::None,
+            materialization_mode: SignalMaterializationMode::Unknown,
+            flags: WorkloadSignalFlags::EMPTY,
+            budget_owner: StorageIntentDomainId::ZERO,
+            source_media: StorageMediaClass::SystemRam,
+            target_media: StorageMediaClass::SystemRam,
+            source_media_ref: StorageIntentEvidenceRef::default(),
+            target_media_ref: StorageIntentEvidenceRef::default(),
+            service_objective_ref: StorageIntentEvidenceRef::default(),
+            topology_ref: StorageIntentEvidenceRef::default(),
+            signal_materialization_ref: StorageIntentEvidenceRef::default(),
+            signal_collection_cost_ref: StorageIntentEvidenceRef::default(),
+            candidate: PrefetchResidencyCandidateClass::NoPrefetch,
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+}
+
+const fn prefetch_candidate_requires_wear_or_cost(
+    candidate: PrefetchResidencyCandidateClass,
+    target_media: StorageMediaClass,
+) -> bool {
+    target_media.charges_rewrite_wear()
+        || matches!(
+            candidate,
+            PrefetchResidencyCandidateClass::IntentBackedRam
+                | PrefetchResidencyCandidateClass::PmemDurable
+                | PrefetchResidencyCandidateClass::FlashHotServing
+                | PrefetchResidencyCandidateClass::AuthorityPromotionCandidate
+        )
+}
+
+const fn prefetch_candidate_requires_egress_or_restore_cost(
+    candidate: PrefetchResidencyCandidateClass,
+    target_media: StorageMediaClass,
+) -> bool {
+    target_media.is_object_like()
+        || target_media.is_archive()
+        || matches!(
+            target_media,
+            StorageMediaClass::RemoteRam | StorageMediaClass::ObjectAppliance
+        )
+        || matches!(
+            candidate,
+            PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch
+                | PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage
+        )
+}
+
+/// Returns true when a candidate can change durable authority or receipt state.
+#[must_use]
+pub const fn prefetch_candidate_changes_authority(
+    candidate: PrefetchResidencyCandidateClass,
+) -> bool {
+    matches!(
+        candidate,
+        PrefetchResidencyCandidateClass::IntentBackedRam
+            | PrefetchResidencyCandidateClass::PmemDurable
+            | PrefetchResidencyCandidateClass::AuthorityPromotionCandidate
+    )
+}
+
+const fn evidence_ref_has_id(evidence: StorageIntentEvidenceRef) -> bool {
+    evidence.kind as u16 != StorageIntentEvidenceKind::Unknown as u16
+        && !bytes32_are_zero(evidence.id.0)
+}
+
+const fn evidence_ref_equal(
+    left: StorageIntentEvidenceRef,
+    right: StorageIntentEvidenceRef,
+) -> bool {
+    left.kind as u16 == right.kind as u16
+        && bytes32_equal(left.id.0, right.id.0)
+        && left.generation == right.generation
+        && left.version == right.version
+}
+
+/// Returns true when a signal carries an evidence root for materialization.
+#[must_use]
+pub const fn workload_signal_has_materialization_evidence(signal: WorkloadSignalRecord) -> bool {
+    evidence_ref_has_id(signal.signal_materialization_ref)
+}
+
+/// Returns true when a signal carries an evidence root for materialization cost.
+#[must_use]
+pub const fn workload_signal_has_collection_cost(signal: WorkloadSignalRecord) -> bool {
+    evidence_ref_has_id(signal.signal_collection_cost_ref)
+        && !signal
+            .flags
+            .contains_all(WorkloadSignalFlags::UNKNOWN_COLLECTION_COST)
+}
+
+/// Returns true when a signal can raise confidence for promotion or movement.
+#[must_use]
+pub const fn workload_signal_can_train_upward(signal: WorkloadSignalRecord) -> bool {
+    if matches!(
+        signal.confidence,
+        PredictionConfidence::Unknown | PredictionConfidence::Low
+    ) || matches!(
+        signal.signal_scope,
+        WorkloadSignalScopeClass::Unknown | WorkloadSignalScopeClass::Pool
+    ) || signal.sample_mass == 0
+        || !matches!(signal.contradiction, ContradictionState::None)
+        || matches!(
+            signal.materialization_mode,
+            SignalMaterializationMode::Unknown | SignalMaterializationMode::MemoryOnlySketch
+        )
+        || signal.flags.intersects(
+            WorkloadSignalFlags::HINT_ONLY
+                .union(WorkloadSignalFlags::MEMORY_ONLY)
+                .union(WorkloadSignalFlags::SAMPLED_AWAY)
+                .union(WorkloadSignalFlags::DROPPED_OBSERVATIONS)
+                .union(WorkloadSignalFlags::COMPACTED_BEYOND_AUTHORITY)
+                .union(WorkloadSignalFlags::LOW_SAMPLE_MASS)
+                .union(WorkloadSignalFlags::ONE_PASS_SCAN)
+                .union(WorkloadSignalFlags::PHASE_CHANGE)
+                .union(WorkloadSignalFlags::NOISY_NEIGHBOR)
+                .union(WorkloadSignalFlags::CONTRADICTED)
+                .union(WorkloadSignalFlags::UNKNOWN_COLLECTION_COST)
+                .union(WorkloadSignalFlags::FOREGROUND_TAIL_PRESSURE),
+        )
+    {
+        return false;
+    }
+
+    if prefetch_candidate_requires_wear_or_cost(signal.candidate, signal.target_media)
+        && signal.flags.contains_all(WorkloadSignalFlags::UNKNOWN_WAF)
+    {
+        return false;
+    }
+
+    if prefetch_candidate_requires_egress_or_restore_cost(signal.candidate, signal.target_media)
+        && signal
+            .flags
+            .contains_all(WorkloadSignalFlags::UNKNOWN_EGRESS_OR_RESTORE_COST)
+    {
+        return false;
+    }
+
+    workload_signal_has_materialization_evidence(signal)
+        && workload_signal_has_collection_cost(signal)
+}
+
+/// Returns true when a learned result may transfer between two signal records.
+#[must_use]
+pub const fn workload_signal_same_learning_envelope(
+    left: WorkloadSignalRecord,
+    right: WorkloadSignalRecord,
+) -> bool {
+    bytes16_equal(left.policy_id.0, right.policy_id.0)
+        && left.policy_revision.0 == right.policy_revision.0
+        && bytes16_equal(left.pool_id.0, right.pool_id.0)
+        && bytes16_equal(left.scope.dataset_id.0, right.scope.dataset_id.0)
+        && bytes16_equal(left.budget_owner.0, right.budget_owner.0)
+        && left.access_pattern as u8 == right.access_pattern as u8
+        && left.source_media as u8 == right.source_media as u8
+        && left.target_media as u8 == right.target_media as u8
+        && evidence_ref_equal(left.service_objective_ref, right.service_objective_ref)
+        && evidence_ref_equal(left.topology_ref, right.topology_ref)
+        && evidence_ref_equal(left.source_media_ref, right.source_media_ref)
+        && evidence_ref_equal(left.target_media_ref, right.target_media_ref)
+}
+
+/// Lower a requested prefetch/residency candidate according to signal quality.
+#[must_use]
+pub const fn workload_signal_lowered_candidate(
+    signal: WorkloadSignalRecord,
+) -> PrefetchResidencyCandidateClass {
+    if signal.refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return PrefetchResidencyCandidateClass::Refused;
+    }
+
+    if matches!(
+        signal.contradiction,
+        ContradictionState::StrongContradiction | ContradictionState::Refused
+    ) || signal.flags.intersects(
+        WorkloadSignalFlags::CONTRADICTED.union(WorkloadSignalFlags::COMPACTED_BEYOND_AUTHORITY),
+    ) {
+        return PrefetchResidencyCandidateClass::Refused;
+    }
+
+    if signal.flags.intersects(
+        WorkloadSignalFlags::PHASE_CHANGE
+            .union(WorkloadSignalFlags::NOISY_NEIGHBOR)
+            .union(WorkloadSignalFlags::FOREGROUND_TAIL_PRESSURE),
+    ) {
+        return PrefetchResidencyCandidateClass::Cooldown;
+    }
+
+    if signal
+        .flags
+        .contains_all(WorkloadSignalFlags::UNKNOWN_COLLECTION_COST)
+        || signal
+            .flags
+            .contains_all(WorkloadSignalFlags::UNKNOWN_EGRESS_OR_RESTORE_COST)
+    {
+        return match signal.access_pattern {
+            AccessPatternClass::SequentialRead | AccessPatternClass::OnePassScan => {
+                PrefetchResidencyCandidateClass::BoundedReadahead
+            }
+            AccessPatternClass::StridedRead | AccessPatternClass::VectorRead => {
+                PrefetchResidencyCandidateClass::StridedVectorPrefetch
+            }
+            AccessPatternClass::SmallRandomHotset => {
+                PrefetchResidencyCandidateClass::CacheOnlyTrial
+            }
+            _ => PrefetchResidencyCandidateClass::NoPrefetch,
+        };
+    }
+
+    if !workload_signal_can_train_upward(signal) {
+        return match signal.access_pattern {
+            AccessPatternClass::SequentialRead | AccessPatternClass::OnePassScan => {
+                PrefetchResidencyCandidateClass::BoundedReadahead
+            }
+            AccessPatternClass::StridedRead | AccessPatternClass::VectorRead => {
+                PrefetchResidencyCandidateClass::StridedVectorPrefetch
+            }
+            AccessPatternClass::MetadataNamespace => {
+                PrefetchResidencyCandidateClass::MetadataNamespacePrefetch
+            }
+            AccessPatternClass::ManifestIndexFanout => {
+                PrefetchResidencyCandidateClass::ManifestIndexPrefetch
+            }
+            AccessPatternClass::SnapshotCloneRepeat => {
+                PrefetchResidencyCandidateClass::SnapshotClonePrefetch
+            }
+            AccessPatternClass::DegradedReconstruction => {
+                PrefetchResidencyCandidateClass::DegradedReadPrefetch
+            }
+            AccessPatternClass::WanGeoDelta => PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch,
+            AccessPatternClass::ObjectArchiveRestore => {
+                PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage
+            }
+            AccessPatternClass::SmallRandomHotset => {
+                PrefetchResidencyCandidateClass::CacheOnlyTrial
+            }
+            _ => PrefetchResidencyCandidateClass::NoPrefetch,
+        };
+    }
+
+    signal.candidate
+}
+
 /// Planner/action class. These are optimizer intents, not proof of success.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -2624,6 +3091,73 @@ impl_u8_canonical!(HintProvenance, {
     ImportedMetadata = 4 => "imported-metadata",
     BenchmarkProfile = 5 => "benchmark-profile",
     LearningModel = 6 => "learning-model",
+});
+
+impl_u8_canonical!(WorkloadSignalScopeClass, {
+    Unknown = 0 => "unknown",
+    Request = 1 => "request",
+    SubjectRange = 2 => "subject-range",
+    Dataset = 3 => "dataset",
+    Pool = 4 => "pool",
+    Device = 5 => "device",
+    Path = 6 => "path",
+    TenantBudget = 7 => "tenant-budget",
+});
+
+impl_u8_canonical!(SignalMaterializationMode, {
+    Unknown = 0 => "unknown",
+    MemoryOnlySketch = 1 => "memory-only-sketch",
+    SampledCounter = 2 => "sampled-counter",
+    DecayedHistogram = 3 => "decayed-histogram",
+    TopKSet = 4 => "top-k-set",
+    DurableSummary = 5 => "durable-summary",
+    DerivedView = 6 => "derived-view",
+    RetainedEvidence = 7 => "retained-evidence",
+});
+
+impl_u8_canonical!(AccessPatternClass, {
+    Unknown = 0 => "unknown",
+    SequentialRead = 1 => "sequential-read",
+    StridedRead = 2 => "strided-read",
+    VectorRead = 3 => "vector-read",
+    SmallRandomHotset = 4 => "small-random-hotset",
+    MetadataNamespace = 5 => "metadata-namespace",
+    ManifestIndexFanout = 6 => "manifest-index-fanout",
+    SnapshotCloneRepeat = 7 => "snapshot-clone-repeat",
+    DegradedReconstruction = 8 => "degraded-reconstruction",
+    WanGeoDelta = 9 => "wan-geo-delta",
+    ObjectArchiveRestore = 10 => "object-archive-restore",
+    OnePassScan = 11 => "one-pass-scan",
+    PhaseChangingSparse = 12 => "phase-changing-sparse",
+    NoisyAdversarial = 13 => "noisy-adversarial",
+    SyncSmallWrite = 14 => "sync-small-write",
+    AsyncBulkWrite = 15 => "async-bulk-write",
+    OverwriteChurn = 16 => "overwrite-churn",
+    AppendLog = 17 => "append-log",
+});
+
+impl_u8_canonical!(PrefetchResidencyCandidateClass, {
+    NoPrefetch = 0 => "no-prefetch",
+    BoundedReadahead = 1 => "bounded-readahead",
+    StridedVectorPrefetch = 2 => "strided-vector-prefetch",
+    MetadataNamespacePrefetch = 3 => "metadata-namespace-prefetch",
+    SmallRandomHotsetTrial = 4 => "small-random-hotset-trial",
+    ManifestIndexPrefetch = 5 => "manifest-index-prefetch",
+    SnapshotClonePrefetch = 6 => "snapshot-clone-prefetch",
+    DegradedReadPrefetch = 7 => "degraded-read-prefetch",
+    WanGeoDeltaPrefetch = 8 => "wan-geo-delta-prefetch",
+    ObjectArchiveRestoreStage = 9 => "object-archive-restore-stage",
+    CacheOnlyTrial = 10 => "cache-only-trial",
+    VolatileRamTrial = 11 => "volatile-ram-trial",
+    IntentBackedRam = 12 => "intent-backed-ram",
+    PmemDurable = 13 => "pmem-durable",
+    FlashHotServing = 14 => "flash-hot-serving",
+    HddLocalityOptimized = 15 => "hdd-locality-optimized",
+    AuthorityPromotionCandidate = 16 => "authority-promotion-candidate",
+    DemotionCandidate = 17 => "demotion-candidate",
+    Cooldown = 18 => "cooldown",
+    NeedMoreEvidence = 19 => "need-more-evidence",
+    Refused = 20 => "refused",
 });
 
 impl_u8_canonical!(StorageIntentActionClass, {
@@ -3847,6 +4381,65 @@ mod tests {
         }
     }
 
+    fn evidence_ref(kind: StorageIntentEvidenceKind, byte: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            kind,
+            StorageIntentEvidenceId([byte; 32]),
+            u64::from(byte),
+            1,
+        )
+    }
+
+    fn workload_signal(
+        dataset_id: StorageIntentDomainId,
+        access_pattern: AccessPatternClass,
+        candidate: PrefetchResidencyCandidateClass,
+        flags: WorkloadSignalFlags,
+    ) -> WorkloadSignalRecord {
+        WorkloadSignalRecord {
+            policy_id: StorageIntentPolicyId([7_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(11),
+            scope: StorageIntentObjectScope {
+                dataset_id,
+                object_id: StorageIntentEvidenceId([8_u8; 32]),
+                range_start: 4096,
+                range_len: 131_072,
+                generation: 19,
+            },
+            pool_id: StorageIntentDomainId([9_u8; 16]),
+            signal_scope: WorkloadSignalScopeClass::Dataset,
+            access_pattern,
+            confidence: PredictionConfidence::High,
+            observation_window_ms: 60_000,
+            sample_mass: 512,
+            decay_age_ms: 1_000,
+            contradiction: ContradictionState::None,
+            provenance: HintProvenance::RuntimeObserved,
+            materialization_mode: SignalMaterializationMode::RetainedEvidence,
+            flags,
+            budget_owner: dataset_id,
+            source_media: StorageMediaClass::HddRotational,
+            target_media: StorageMediaClass::NvmeFlash,
+            source_media_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 20),
+            target_media_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 21),
+            service_objective_ref: evidence_ref(
+                StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                22,
+            ),
+            topology_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 23),
+            signal_materialization_ref: evidence_ref(
+                StorageIntentEvidenceKind::PredictionEvidence,
+                24,
+            ),
+            signal_collection_cost_ref: evidence_ref(
+                StorageIntentEvidenceKind::MediaCostWearLedger,
+                25,
+            ),
+            candidate,
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
     #[test]
     fn guarantee_floor_uses_capability_predicates() {
         assert!(ack_receipt_satisfies_requested_floor(
@@ -4283,6 +4876,18 @@ mod tests {
             MediaRemoteCommitSemantics::from_discriminant(7),
             Some(MediaRemoteCommitSemantics::RdmaRequiredOnly)
         );
+        assert_eq!(
+            AccessPatternClass::from_discriminant(11),
+            Some(AccessPatternClass::OnePassScan)
+        );
+        assert_eq!(
+            PrefetchResidencyCandidateClass::FlashHotServing.as_str(),
+            "flash-hot-serving"
+        );
+        assert_eq!(
+            SignalMaterializationMode::from_discriminant(5),
+            Some(SignalMaterializationMode::DurableSummary)
+        );
         assert_eq!(SkippedMoveReason::from_discriminant(99), None);
     }
 
@@ -4331,6 +4936,119 @@ mod tests {
         assert!(!StorageMediaClass::NvmeFlash.favors_extent_locality_defrag());
         assert!(StorageMediaClass::NvmeFlash.charges_rewrite_wear());
         assert!(!StorageMediaClass::HddRotational.charges_rewrite_wear());
+    }
+
+    #[test]
+    fn workload_signal_learning_stays_dataset_scoped() {
+        let dataset_a = workload_signal(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::FlashHotServing,
+            WorkloadSignalFlags::EMPTY,
+        );
+        let dataset_b = workload_signal(
+            DOMAIN_B,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::NoPrefetch,
+            WorkloadSignalFlags::UNKNOWN_WAF,
+        );
+
+        assert!(workload_signal_can_train_upward(dataset_a));
+        assert!(!workload_signal_can_train_upward(dataset_b));
+        assert!(!workload_signal_same_learning_envelope(
+            dataset_a, dataset_b
+        ));
+        assert_eq!(dataset_a.pool_id, dataset_b.pool_id);
+        let pool_scope = WorkloadSignalRecord {
+            signal_scope: WorkloadSignalScopeClass::Pool,
+            ..dataset_a
+        };
+        assert!(!workload_signal_can_train_upward(pool_scope));
+        assert_eq!(
+            workload_signal_lowered_candidate(dataset_b),
+            PrefetchResidencyCandidateClass::BoundedReadahead
+        );
+    }
+
+    #[test]
+    fn weak_or_confounded_signals_do_not_promote_flash() {
+        let one_pass = workload_signal(
+            DOMAIN_A,
+            AccessPatternClass::OnePassScan,
+            PrefetchResidencyCandidateClass::FlashHotServing,
+            WorkloadSignalFlags::ONE_PASS_SCAN,
+        );
+        let hint_only = workload_signal(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::AuthorityPromotionCandidate,
+            WorkloadSignalFlags::HINT_ONLY,
+        );
+        let memory_only = workload_signal(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::PmemDurable,
+            WorkloadSignalFlags::MEMORY_ONLY,
+        );
+        let sketch_only = WorkloadSignalRecord {
+            materialization_mode: SignalMaterializationMode::MemoryOnlySketch,
+            ..workload_signal(
+                DOMAIN_A,
+                AccessPatternClass::SmallRandomHotset,
+                PrefetchResidencyCandidateClass::PmemDurable,
+                WorkloadSignalFlags::EMPTY,
+            )
+        };
+
+        assert!(!workload_signal_can_train_upward(one_pass));
+        assert_eq!(
+            workload_signal_lowered_candidate(one_pass),
+            PrefetchResidencyCandidateClass::BoundedReadahead
+        );
+        assert!(!workload_signal_can_train_upward(hint_only));
+        assert_eq!(
+            workload_signal_lowered_candidate(hint_only),
+            PrefetchResidencyCandidateClass::CacheOnlyTrial
+        );
+        assert!(!workload_signal_can_train_upward(memory_only));
+        assert_eq!(
+            workload_signal_lowered_candidate(memory_only),
+            PrefetchResidencyCandidateClass::CacheOnlyTrial
+        );
+        assert!(!workload_signal_can_train_upward(sketch_only));
+        assert_eq!(
+            workload_signal_lowered_candidate(sketch_only),
+            PrefetchResidencyCandidateClass::CacheOnlyTrial
+        );
+    }
+
+    #[test]
+    fn unknown_waf_and_collection_cost_lower_action_class() {
+        let unknown_waf = workload_signal(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::FlashHotServing,
+            WorkloadSignalFlags::UNKNOWN_WAF,
+        );
+        let unknown_collection_cost = workload_signal(
+            DOMAIN_A,
+            AccessPatternClass::WanGeoDelta,
+            PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch,
+            WorkloadSignalFlags::UNKNOWN_COLLECTION_COST,
+        );
+
+        assert!(!workload_signal_can_train_upward(unknown_waf));
+        assert_eq!(
+            workload_signal_lowered_candidate(unknown_waf),
+            PrefetchResidencyCandidateClass::BoundedReadahead
+        );
+        assert!(!workload_signal_has_collection_cost(
+            unknown_collection_cost
+        ));
+        assert_eq!(
+            workload_signal_lowered_candidate(unknown_collection_cost),
+            PrefetchResidencyCandidateClass::NoPrefetch
+        );
     }
 
     #[test]
