@@ -640,7 +640,7 @@ incumbent claim; any such product-facing statement must use #875 claim ids and
 | Hot-spare | External `zed` scripting | CRUSH map `device class` | Built-in `SparePolicy` with auto-activation |
 | Failure handling | zed event → `device state` | Monitor marks OSD down | I/O error → state machine → observability event |
 | Cluster integration | None (single-node) | Native (monitor cluster) | Hybrid: standalone or cluster mode; pool lease |
-| Cross-system portability | Yes (label-driven) | No (monitor-bound) | Yes (label-driven, device_guid identity) |
+| Cross-system portability | Yes (label-driven) | No (monitor-bound) | Target: label-driven with device_guid identity |
 
 ---
 
