@@ -10,12 +10,15 @@
 
 The intent log is the durability fast-path for synchronous writes. It decouples
 fsync/O_DSYNC latency from the main transaction group (commit_group) commit cycle, which
-may batch seconds of accumulated writes. ZFS achieves sub-100us fsync latency
-via its ZIL (ZFS Intent Log) on a dedicated log device; tidefs must match or
-beat this. CephFS has no equivalent — all sync writes traverse the full
-replication path. This design specifies the intent log architecture, log device
-model, record format, crash recovery contract, cluster-aware semantics, and
-integration with the commit_group state machine.
+may batch seconds of accumulated writes. ZFS ZIL and CephFS sync-write behavior
+are design comparison inputs for the target latency envelope, not present-tense
+TideFS superiority evidence. Product-facing statements that TideFS matches,
+beats, or replaces incumbent sync-write behavior require #928 comparator
+evidence, #850 performance-budget rows, and #875 claim scope for the exact
+media, durability, cache, workload, and failure envelope. This design specifies
+the intent log architecture, log device model, record format, crash recovery
+contract, cluster-aware semantics, and integration with the commit_group state
+machine.
 
 ---
 
@@ -28,7 +31,7 @@ profiles:
 
 ```
                     ┌──────────────────┐
-  fsync / O_DSYNC ──┤  INTENT LOG      │──→ <100us on LOG_DEVICE NVMe
+  fsync / O_DSYNC ──┤  INTENT LOG      │──→ target <100us on LOG_DEVICE NVMe
   O_SYNC            │  (fast path)     │
                     │  small records   │
                     │  batched commits │
@@ -133,8 +136,8 @@ fallback = "mainpool" # use main pool devices if LOG_DEVICE missing
 ### 2.4 LOG_DEVICE write batching
 
 Multiple fsync calls that arrive while a log device write is in flight are batched
-into a single LOG_DEVICE segment flush. This is the key to sub-100us amortized
-latency:
+into a single LOG_DEVICE segment flush. This is the design target for sub-100us
+amortized latency:
 
 ```
 Time ──────────────────────────────────────────→
