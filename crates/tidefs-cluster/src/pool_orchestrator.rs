@@ -2,18 +2,17 @@
 //! Cluster pool orchestration: request builders for multi-node pool
 //! creation and import.
 //!
-//! **Scaffolding note**: the [`ClusterPoolOrchestrator`] builds per-node
+//! **Prototype boundary note**: the [`ClusterPoolOrchestrator`] builds per-node
 //! protocol messages ([ClusterPoolCreateRequest], [ClusterPoolImportRequest])
 //! from a [ClusterPoolConfig] and provides aggregation helpers for
 //! responses.  It does **not** send or collect messages itself — callers
 //! are responsible for transport dispatch.
 //!
-//! The [`PoolTransport`] trait is a scaffolding abstraction for
-//! message dispatch.  An in-memory channel implementation
-//! ([ChannelPoolTransport]) exists for unit tests, but no live transport
-//! backend (tidefs-transport sessions) is wired into the orchestrator yet.
-//! Real transport dispatch belongs to Review debt TFR-017.
-//! (#6602 and related POOLCLUSTER tracker issues).
+//! The [`PoolTransport`] trait is a transport-neutral abstraction for
+//! prototype message dispatch.  `tidefsctl cluster pool create` may provide a
+//! `tidefs-transport` adapter, while the in-memory [ChannelPoolTransport]
+//! remains a unit-test transport.  Neither path makes this orchestrator a
+//! final distributed operator UAPI or a cluster status authority.
 //!
 //! Do not close any clustered-pool runtime gate with SourceModel,
 //! CargoUnit, in-memory channel, or scaffolding-only validation.
@@ -30,12 +29,13 @@ use crate::pool_protocol::{
 // PoolTransport — abstract transport for pool protocol messages
 // ---------------------------------------------------------------------------
 
-/// Trait for sending and receiving cluster pool protocol messages.
+/// Trait for sending and receiving cluster pool prototype messages.
 ///
 /// Implementations may use tidefs-transport sessions, in-memory channels
 /// for testing, or any other reliable delivery mechanism.  The transport
 /// is responsible for authenticity and integrity; this protocol layer
-/// does not add per-message cryptographic verification.
+/// does not add per-message cryptographic verification and does not define
+/// final distributed operator UAPI.
 pub trait PoolTransport {
     /// The error type returned by send/receive operations.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -317,7 +317,7 @@ impl ClusterPoolOrchestrator {
     /// Returns `Ok(CreateOutcome)` when all nodes respond with success.
     /// Returns `Err(OrchestratorError::QuorumNotReached)` when one or more
     /// nodes fail or time out.  Partial results are preserved in the
-    /// outcome for operator diagnostics.
+    /// outcome for prototype diagnostics.
     ///
     /// The caller is responsible for providing a transport already
     /// connected to all target nodes.
@@ -397,7 +397,8 @@ impl ClusterPoolOrchestrator {
         }
 
         // Capture counts before moving outcome. Per-node failure details are
-        // preserved in the outcome carried by the error for operator diagnostics.
+        // preserved in the outcome carried by the error for prototype
+        // diagnostics.
         let succeeded = outcome.succeeded;
         let total = outcome.total_nodes;
 
