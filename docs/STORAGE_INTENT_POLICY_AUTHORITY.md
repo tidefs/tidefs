@@ -591,6 +591,58 @@ The same file may have different roles for different ranges and generations.
 For example, a database file may keep hot random ranges on NVMe, cold stable
 ranges on HDD/EC, and recent sync deltas in a durable intent lane.
 
+## Read Serving And Degraded Reads
+
+Write acknowledgment honesty is not enough. Read source selection must also
+consume storage intent so a fast hit does not become stale, under-width, or
+non-authoritative truth by accident. #877 owns the storage-intent read-serving
+model.
+
+A read-serving decision must distinguish at least these source classes:
+
+- dirty or writeback page-cache bytes that are visible under page-cache law;
+- clean page cache whose anchor, fence, and policy revision remain valid;
+- cache-only RAM or flash serving trials;
+- authoritative RAM, PMem, or durable serving roles;
+- local placement receipts;
+- remote placement receipts;
+- degraded reconstruction from receipt targets;
+- snapshot or read-only generation sources;
+- geo-async remote sources with explicit lag/RPO;
+- archive or restore sources.
+
+Every source must pass freshness and authority predicates before it can serve:
+
+- current inode/object/range identity and namespace or snapshot generation;
+- compiled policy id/revision and read freshness profile;
+- placement receipt refs or explicit cache/trial anchor refs;
+- membership, lease, and fencing epoch when remote or clustered state
+  participates;
+- digest/checksum evidence for placement, degraded, or reconstructed bytes;
+- transport/path evidence and lag evidence for remote or geo sources;
+- stale, missing, or contradictory evidence reason when a candidate is rejected.
+
+Cache-only or serving-trial hits may reduce latency while their anchors and
+fences remain valid, but they do not satisfy durable placement, RAM authority,
+geo, or successor claims by themselves. If an anchor is stale, the read must
+invalidate, refresh, repair, degrade visibly, or refuse according to policy. It
+must not fall through to a topology-only guess and call the result satisfied.
+
+Degraded reads are legal only when receipt evidence proves the requested bytes
+from surviving targets. A digest mismatch, under-width reconstruction, stale
+receipt generation, or ambiguous membership epoch must produce a typed error,
+unknown-evidence state, or policy-visible degradation instead of returning
+unverified bytes. Opportunistic read repair may be useful, but it must reserve
+wear, capacity, transport, and scheduler budgets and publish replacement
+receipts before changing authority or retiring old receipts.
+
+WAN and internet reads need explicit freshness law. A `geo-async` remote source
+may satisfy a disaster-recovery or stale-read profile inside the recorded RPO
+lag envelope, but it must not satisfy a latest local POSIX read unless the
+compiled policy requested that weaker freshness. `geo-intent` or
+`geo-full-placement` reads still need receipt and path evidence for the remote
+authority being used; speed-of-light latency is not a correctness exception.
+
 ## Flash Lifetime And Write Amplification
 
 Flash endurance is an authority input, not an afterthought. Every flash-backed
@@ -991,6 +1043,8 @@ The operator UAPI should eventually answer:
 - What is the current satisfaction state for that policy revision?
 - What ack class did the last write/fsync receive?
 - Which placement receipts currently satisfy policy?
+- Which source class served a read, and which cache, trial, remote, stale, or
+  degraded candidates were rejected?
 - Which remote paths are behind, and by how much?
 - Which data is intentionally volatile?
 - Which data is pending relocation, rebake, repair, or geo catch-up?
@@ -1016,6 +1070,8 @@ Initial row families should cover:
 - full-placement fsync latency;
 - VM FUA/barrier tail latency;
 - metadata storm p99 and fsyncdir latency;
+- read-serving source latency and stale/refresh/refusal rate by source class;
+- degraded read reconstruction latency and repair-on-read foreground cost;
 - streaming ingest throughput without flash wear explosion;
 - one-pass scan cache behavior without persistent flash promotion;
 - hot read promotion benefit/cost;
@@ -1066,6 +1122,8 @@ The matrix must cover at least these row families:
   POSIX barriers;
 - cache and serving-trial failures proving non-authoritative hot copies never
   satisfy placement or durable ack receipts;
+- stale cache, stale snapshot generation, geo-async lag, and degraded-read
+  cases proving read-serving choices obey freshness and receipt evidence;
 - relocation, defrag, rebake, rebuild, evacuation, and geo catch-up interrupted
   before and after replacement receipt publication;
 - relocation anti-thrash cases proving cooldown, movement debt, and failed
@@ -1195,6 +1253,7 @@ storage-intent language beside the shared records and compiled policy snapshot.
 | Evidence feeds | Local ack paths, path evidence, media/wear cost, non-wear cost, and workload vectors can publish read-only evidence without making final placement decisions. | #842, #844, #845, #846, #856 |
 | Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile. | #874 |
 | Planning and admission | Hard constraints reject illegal candidates before scoring, and admission/scheduling enforces the compiled policy with typed delay, throttle, or refusal. | #843, #862 |
+| Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, and archive sources with freshness and receipt evidence. | #877, #675 |
 | Authority extensions | RAM authority and relocation/defrag/rebake/rebuild/geo catch-up use the same receipt spine and publish replacement evidence before source retirement. | #847, #848 |
 | Operator and gates | Operators can inspect the policy, receipt, lag, volatility, cost, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #849, #850, #863, #875 |
 
@@ -1206,6 +1265,9 @@ Interface gates between stages are explicit:
   failure-domain, capacity, wear, transport, and degradation-law filters.
 - Schedulers may delay, throttle, or refuse work, but they may not convert one
   acknowledgment class into another after admission.
+- Read-serving paths may accelerate through cache, trial, RAM, local, remote,
+  degraded, snapshot, geo, or archive sources only when freshness, receipt,
+  fence, and degradation predicates pass for the compiled policy.
 - Relocation workers may write speculative replacements, but they may not
   retire source receipts until replacement receipts satisfy the target policy.
 - Validation rows and claim ids are not an afterthought: each stage must either
@@ -1223,6 +1285,7 @@ this document except to update the issue map after live tickets exist.
 | Policy source and compilation | #855 | policy/config crate or `crates/tidefs-storage-intent-policy/` | Persist and compile pool, dataset, mount, caller, and internal maintenance policy into storage-intent records. |
 | Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths. |
 | Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, proximity domains, failure domains, and media constraints. |
+| Read-serving authority | #877 | read-serving model crate or `crates/tidefs-storage-intent-read-serving/`, focused tests | Define legal read source classes, freshness predicates, degraded-read law, geo stale-read boundaries, and read-repair evidence. |
 | Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes. |
 | Workload signal plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, and anti-thrash state for planning and performance rows. |
