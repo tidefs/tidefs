@@ -30,6 +30,9 @@ This authority does not cover private mmap copy-on-write bytes, read-only clean
 cache population, direct I/O semantics beyond cached-range reconciliation, or
 distributed replica placement. Those paths may reference this contract only
 when they create, drain, invalidate, or observe shared dirty file data.
+`docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` owns the page-cache invalidation
+trigger surface, stale-generation rule, and FUSE/kernel/cluster coherency
+lease model.
 
 ## Authority Terms
 
@@ -320,6 +323,9 @@ and ordering target only. It is not production durability evidence.
 
 - TFR-008 in `docs/REVIEW_TODO_REGISTER.md`: tracks the broader recovery,
   fsync, writeback, mmap, and page-cache authority gap.
+- `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`: defines the invalidation
+  trigger surface, stale-generation rule, and FUSE/kernel/cluster coherency
+  lease model.
 - GitHub issue #443: cache-coherency proof for writeback lifecycle,
   invalidation, and crash integration.
 - GitHub issue #445: intent-log replay idempotency under crash injection.

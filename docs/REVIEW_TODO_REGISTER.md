@@ -12,7 +12,7 @@ OpenZFS/Ceph-class claims.
 | TFR-005 | Timestamp/revision/on-disk format | POSIX timestamps, storage version fields, content object keys, scrub identity, replay ticks, rename metadata stamps, and serialized format fields are coupled. | Specify one authority model for POSIX time, generation, txg, object-version, and on-disk compatibility before changing behavior. |
 | TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Consolidate transform ordering, checksums, key handling, and raw-store visibility. |
 | TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Define one capacity authority and make all adapters consume it. |
-| TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` as the page-cache writeback authority contract, then prove and test the end-to-end durability and cache-coherency contract. |
+| TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` for the dirty/writeback durability contract and `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` for the invalidation trigger, stale-generation, and FUSE/kernel/cluster lease model; then prove and test the end-to-end durability and cache-coherency contract. |
 | TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Unify snapshot lifecycle, object protection, deadlists, and stream formats. |
 | TFR-011 | Operator CLI/UAPI | CLI, FUSE, ublk, kernel UAPI, and docs can describe different truths. | Define one public operator/UAPI boundary and keep internal crates behind it. |
 | TFR-013 | Stub/placeholder stage | Several crates and docs still look like stage scaffolding rather than product behavior. | Classify placeholders explicitly and delete or implement them. |
@@ -445,6 +445,15 @@ Important 2026-06-01 findings:
   terminology, but it does not implement runtime writeback, close TFR-008, or
   validate crash safety. Issue #443 still owns the cache-coherency writeback
   proof, and issue #445 still owns intent-log replay idempotency.
+- `TFR-008`: issue #736 adds
+  `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` as the companion invalidation
+  authority for page-cache trigger granularity, advisory versus mandatory
+  invalidation, stale-generation checks, and the FUSE/kernel/cluster lease
+  model. This is a design boundary only: it does not implement FUSE
+  notifications, kernel page-cache coherency, clustered lease plumbing, mmap
+  fault behavior, or claim-gate evidence. Follow-up implementation is split
+  across #752 for FUSE data-cache invalidation, #753 for kernel page-cache
+  coherency fences, and #754 for clustered cache lease epoch invalidation.
 - `TFR-009`: Kernel residency is still a tiered bring-up, not terminal; TideFS
   is not yet full-kernel. The kernel-resident architecture doc explicitly says the
   current mounted operation slice uses a small fixed in-kernel namespace/data
