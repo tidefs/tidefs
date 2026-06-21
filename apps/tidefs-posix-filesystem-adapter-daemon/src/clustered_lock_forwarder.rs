@@ -16,7 +16,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use tidefs_lock_service::{
     AcquireRequest, GetlkRequest, LeaseTarget, LockFrame, LockFrameSink, LockMode, LockPayload,
     LockServiceError, LockServiceHandle, LockServiceHandleError, LockServiceStatus,
-    LockServiceTransport, MemberId, ServiceLockOwner as LockOwner,
+    LockServiceTransport, MemberId, ReleaseRequest, ServiceLockOwner as LockOwner,
     ServiceRangeLockType as RangeLockType, SetlkRequest,
 };
 use tidefs_posix_filesystem_adapter_workers_locks::{LockConflict, LockRange, LockType};
@@ -39,6 +39,8 @@ enum ClusteredLockOutcome {
 
 /// Grant-tracking key: (ino, owner_key, start, len).
 type GrantKey = (u64, u64, u64, u64);
+
+const FUSE_LOCK_TYPE_UNLCK: i32 = 2;
 
 /// Inner state for a pending synchronous request.
 struct PendingInner {
@@ -198,9 +200,10 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
         let pending = Arc::new(PendingRequest::new(request_key));
         self.pending.insert(op_id, Arc::clone(&pending));
 
-        self.transport
-            .send(self.leader, &frame)
-            .map_err(map_transport_error)?;
+        if let Err(err) = self.transport.send(self.leader, &frame) {
+            self.pending.remove(&op_id);
+            return Err(map_transport_error(err));
+        }
 
         let outcome = if pending.wait_timeout(self.dispatch_timeout) {
             pending.take_result()
@@ -296,9 +299,21 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
             }
         };
 
-        if let Some(pending) = self.pending.get(&op_id) {
+        if let Some(pending) = self.pending.remove(&op_id) {
             pending.set_result(result);
         }
+    }
+
+    fn build_release_frame(&self, op_id: u64, lease_id: u64, owner: LockOwner) -> LockFrame {
+        LockFrame::new(
+            op_id,
+            LockPayload::Release(ReleaseRequest {
+                lease_id,
+                owner,
+                dataset_mount_id: self.handle.dataset_mount_id(),
+                epoch: self.runtime.current_epoch(),
+            }),
+        )
     }
 }
 
@@ -310,13 +325,13 @@ impl<S: LockFrameSink> FusePosixLockDispatch for ClusteredPosixLockForwarder<S> 
         &mut self,
         request: FusePosixLockRequest,
     ) -> Result<Option<LockRange>, LockDispatchError> {
-        let lock_type = fuse_type_to_range_lock_type(request.typ)
-            .ok_or(LockDispatchError::InvalidLockType(request.typ as u32))?;
-
         // F_UNLCK on getlk: no conflict to report.
-        if request.typ == 2 {
+        if request.typ == FUSE_LOCK_TYPE_UNLCK {
             return Ok(None);
         }
+
+        let lock_type = fuse_type_to_range_lock_type(request.typ)
+            .ok_or(LockDispatchError::InvalidLockType(request.typ as u32))?;
 
         let len = safe_len(request.start, request.end);
         let owner = self.lock_owner(request.pid, request.lock_owner);
@@ -346,26 +361,23 @@ impl<S: LockFrameSink> FusePosixLockDispatch for ClusteredPosixLockForwarder<S> 
         &mut self,
         request: FusePosixLockRequest,
     ) -> Result<(), LockDispatchError> {
-        let lock_type = fuse_type_to_range_lock_type(request.typ)
-            .ok_or(LockDispatchError::InvalidLockType(request.typ as u32))?;
-
         let len = safe_len(request.start, request.end);
         let owner = self.lock_owner(request.pid, request.lock_owner);
 
         // Unlock path: find the lease_id and send ReleaseRequest.
-        if request.typ == 2 {
+        if request.typ == FUSE_LOCK_TYPE_UNLCK {
             let key = (request.ino, request.lock_owner, request.start, len);
             if let Some(lease_id) = self.granted.remove(&key) {
                 let op_id = fresh_op_id(&self.pending);
-                let frame =
-                    self.handle
-                        .build_release(lease_id, self.runtime.current_epoch());
-                let frame = LockFrame::new(op_id, frame.payload);
+                let frame = self.build_release_frame(op_id, lease_id, owner);
                 self.dispatch_sync(op_id, frame, None)?;
             }
             // If no lease found, treat as success (idempotent release).
             return Ok(());
         }
+
+        let lock_type = fuse_type_to_range_lock_type(request.typ)
+            .ok_or(LockDispatchError::InvalidLockType(request.typ as u32))?;
 
         let op_id = fresh_op_id(&self.pending);
         let frame = LockFrame::new(
@@ -394,6 +406,10 @@ impl<S: LockFrameSink> FusePosixLockDispatch for ClusteredPosixLockForwarder<S> 
         &mut self,
         request: FusePosixLockRequest,
     ) -> Result<(), LockDispatchError> {
+        if request.typ == FUSE_LOCK_TYPE_UNLCK {
+            return self.setlk(request);
+        }
+
         let lock_type = fuse_type_to_range_lock_type(request.typ)
             .ok_or(LockDispatchError::InvalidLockType(request.typ as u32))?;
 
@@ -454,11 +470,9 @@ impl<S: LockFrameSink> FusePosixLockDispatch for ClusteredPosixLockForwarder<S> 
             let key = (ino, lock_owner, 0, 0);
             if let Some(lease_id) = self.granted.remove(&key) {
                 let op_id = fresh_op_id(&self.pending);
-                let frame =
-                    self.handle
-                        .build_release(lease_id, self.runtime.current_epoch());
-                let frame = LockFrame::new(op_id, frame.payload);
-                let _ = self.dispatch_sync(op_id, frame, None);
+                let owner = self.lock_owner(0, lock_owner);
+                let frame = self.build_release_frame(op_id, lease_id, owner);
+                self.dispatch_sync(op_id, frame, None)?;
             }
             return Ok(());
         }
@@ -627,6 +641,22 @@ mod tests {
         let sink = QueuedLockFrameSink::default();
         let transport = LockServiceTransport::new(sink);
         ClusteredPosixLockForwarder::new(runtime, node_id, leader, transport).unwrap()
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingLockFrameSink;
+
+    impl LockFrameSink for FailingLockFrameSink {
+        fn send_lock_frame(
+            &mut self,
+            peer: MemberId,
+            _frame: Vec<u8>,
+        ) -> Result<(), LockServiceError> {
+            Err(LockServiceError::TransportClosed {
+                peer,
+                reason: "test sink closed".into(),
+            })
+        }
     }
 
     fn lock_request(
@@ -818,6 +848,69 @@ mod tests {
         let req = lock_request(100, 42, 0, 99, 99, 1234);
         let result = f.setlk(req);
         assert!(matches!(result, Err(LockDispatchError::InvalidLockType(99))));
+    }
+
+    #[test]
+    fn getlk_unlock_reports_no_conflict_without_pending_request() {
+        let mut f = test_forwarder();
+        let req = lock_request(100, 42, 0, 99, FUSE_LOCK_TYPE_UNLCK, 1234);
+
+        assert_eq!(f.getlk(req).unwrap(), None);
+        assert!(f.pending.is_empty());
+    }
+
+    #[test]
+    fn setlk_unlock_without_tracked_grant_is_idempotent_success() {
+        let mut f = test_forwarder();
+        let req = lock_request(100, 42, 0, 99, FUSE_LOCK_TYPE_UNLCK, 1234);
+
+        f.setlk(req).unwrap();
+        assert!(f.pending.is_empty());
+        assert!(f.granted.is_empty());
+    }
+
+    #[test]
+    fn setlkw_unlock_without_tracked_grant_uses_release_path() {
+        let mut f = test_forwarder();
+        let req = lock_request(100, 42, 0, 99, FUSE_LOCK_TYPE_UNLCK, 1234);
+
+        f.setlkw(req).unwrap();
+        assert!(f.pending.is_empty());
+        assert!(f.granted.is_empty());
+    }
+
+    #[test]
+    fn release_frame_uses_request_owner_and_mount_identity() {
+        let f = test_forwarder();
+        let owner = f.lock_owner(1234, 42);
+        let frame = f.build_release_frame(7, 55, owner);
+
+        match frame.payload {
+            LockPayload::Release(request) => {
+                assert_eq!(request.lease_id, 55);
+                assert_eq!(request.owner, owner);
+                assert_eq!(request.dataset_mount_id, f.handle.dataset_mount_id());
+                assert_eq!(request.epoch, f.runtime.current_epoch());
+            }
+            payload => panic!("unexpected release payload: {payload:?}"),
+        }
+    }
+
+    #[test]
+    fn send_failure_removes_pending_request() {
+        let runtime = test_runtime();
+        let mut f = ClusteredPosixLockForwarder::new(
+            runtime,
+            MemberId::new(1),
+            MemberId::new(3),
+            LockServiceTransport::new(FailingLockFrameSink),
+        )
+        .unwrap();
+        let req = lock_request(100, 42, 0, 99, 1, 1234);
+
+        let err = f.setlk(req).unwrap_err();
+        assert!(matches!(err, LockDispatchError::Internal(_)));
+        assert!(f.pending.is_empty());
     }
 
     // ── Local-mode dispatch stays in-process ────────────────────────
