@@ -150,7 +150,10 @@ No time-check helper is provided because wall-clock enforcement is inherently
 runtime-dependent (requires `Instant`), which is not available in `core`.
 Implementations track time externally and stop cooperatively.
 
-#### Comparison to prior art
+#### Design input from prior art
+
+The following bullets are design inputs only. They do not validate TideFS
+runtime behavior or establish a product-facing comparison against ZFS or Ceph.
 
 - **ZFS**: No unified budget. Scrub/resilver can consume all IOPS. `zfs_scan`
   has a per-commit_group byte limit (`zfs_scan_legacy` tunable) but no items or time
@@ -564,7 +567,13 @@ tidefs-background-scheduler        ← scheduling loop (Phase 3)
 job dependency graph. No tidefs crate depends on it at the type-definition
 level — only at the implementation level.
 
-## 9. ZFS / Ceph Comparison
+## 9. ZFS / Ceph design-input comparison
+
+This table compares interface shape and design requirements for the type crate.
+It is not evidence that deployed TideFS background work is more reliable,
+faster, safer, or cheaper than incumbent implementations. Product-facing
+incumbent claims must be tracked through #875 and #928/#930 comparator
+evidence.
 
 | Dimension | tidefs types crate | ZFS | Ceph |
 |---|---|---|---|

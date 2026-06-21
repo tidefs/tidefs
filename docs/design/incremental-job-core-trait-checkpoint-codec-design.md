@@ -421,7 +421,12 @@ The multiplier is applied to `DEFAULT_TICK` to produce the per-tick budget.
 The scheduler sums all multipliers across active jobs and caps the total at
 100% of the background IO budget to prevent starvation of foreground workloads.
 
-## 6. ZFS / Ceph Comparison
+## 6. ZFS / Ceph design-input comparison
+
+This section treats ZFS and Ceph as design inputs for a shared trait and
+checkpoint codec. It is not a measured claim that TideFS already provides
+better crash resumption, latency, or operator visibility. Such statements
+remain blocked behind #875 and #928/#930 comparator evidence.
 
 | Dimension | tidefs (this crate) | ZFS | Ceph |
 |---|---|---|---|
@@ -434,25 +439,21 @@ The scheduler sums all multipliers across active jobs and caps the total at
 | **Trait object dispatch** | `Box<dyn IncrementalJob>` through vtable | N/A | N/A (virtual dispatch not used for PG operations) |
 | **Unsafe code** | `#![forbid(unsafe_code)]` | Ubiquitous (kernel module, raw pointers, assembly) | Some (buffer management, messenger, async messenger) |
 
-### 6.1 Concrete ZFS pain points addressed
+### 6.1 ZFS design risks this contract targets
 
-1. **Scrub crash restart**: ZFS scrub restarts from the beginning after a
-   crash because it has no persistent checkpoint — only an in-memory
-   `dsl_scan_phys_t`. TideFS scrub checkpoints every `step()`, resuming
-   from the last checkpoint after a crash. On a 100 TB pool, this saves
-   days of re-scanning.
+1. **Scrub crash restart**: the design target is to avoid restart-from-beginning
+   background jobs by persisting checkpoints after bounded steps. This document
+   does not quantify saved time on real pools.
 
 2. **Deferred free fragmentation**: ZFS's `bpobj` (block pointer object) for
-   deferred frees has no budget enforcement — a single `bpobj_iterate()` can
-   process millions of entries in one commit_group, causing latency spikes. TideFS's
-   `WorkBudget` caps each `step()` at `DEFAULT_TICK` (1024 items, 64 MiB,
-   100 ms), bounding per-commit_group latency.
+   deferred frees is used here as the design input for requiring per-step work
+   budgets. The target `WorkBudget` values describe TideFS contract shape, not
+   measured per-commit_group latency against ZFS.
 
 3. **Admin fragmentation**: ZFS has `zpool scrub`, `zpool resilver`,
    `zfs destroy`, and `zpool initialize` — each with different progress
-   reporting (`scrub: 45.2%`, `resilver: 12.8%`, `destroy: running`).
-   TideFS provides unified progress via `JobProgress.completion_permille`
-   across all job types, enabling a single `tidefsctl jobs list` command.
+   reporting. TideFS targets unified progress via `JobProgress` and a single
+   jobs command; current operator-visible superiority remains unclaimed here.
 
 ## 7. Testing Strategy
 

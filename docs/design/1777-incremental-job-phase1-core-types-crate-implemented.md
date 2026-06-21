@@ -435,7 +435,11 @@ defines its own cursor format, budget semantics, and completion criteria.
 
 ---
 
-## 6. Comparison to ZFS and Ceph
+## 6. ZFS and Ceph design-input comparison
+
+This table is a design-input summary for the Phase 1 type contract. It does
+not validate deployed TideFS background-job reliability, performance, or safety
+relative to ZFS or Ceph.
 
 | Dimension | TideFS (this design) | ZFS | Ceph |
 |---|---|---|---|

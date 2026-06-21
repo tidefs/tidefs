@@ -13,6 +13,14 @@ in `crates/tidefs-background-scheduler/` and the `IncrementalJob` trait system
 (`crates/tidefs-types-incremental-job-core/`). It serves as the canonical reference
 for all background-service wire-up issues.
 
+Claim boundary: this document records background-service design requirements,
+implemented-scope status, and incumbent design inputs. It is not evidence that
+TideFS currently has lower latency, better throughput isolation, stronger crash
+recovery, or better operator visibility than ZFS, Ceph, or other filesystems.
+Product-facing incumbent comparisons must be handled through #875 with
+#928/#930 comparator evidence for the exact implementation, workload, and
+storage class.
+
 ## 1. Problem Statement
 
 A storage system running in userspace must perform continuous background maintenance:
@@ -688,6 +696,11 @@ Chaos tests inject faults at specific points in the scheduling loop:
 
 ### 12.5 Performance Regression Gates
 
+These gates are acceptance targets for scheduler validation. They are not
+benchmark evidence and do not support product-facing latency or throughput
+claims until backed by recorded validation artifacts for the exact branch,
+configuration, workload, and storage class.
+
 | Gate | Threshold | Description |
 |------|-----------|-------------|
 | `tick_latency_p99_us` | ≤ 5000 µs | P99 wall-clock duration of a single service tick under DEFAULT_TICK |
@@ -696,7 +709,12 @@ Chaos tests inject faults at specific points in the scheduling loop:
 | `memory_overhead_per_service` | ≤ 256 bytes | Per-service scheduler metadata (excl. service-owned state) |
 
 
-## 13. Comparison: ZFS, Ceph, and TideFS
+## 13. Design-input comparison: ZFS, Ceph, and TideFS
+
+This table classifies scheduler-shape differences as design input. The TideFS
+column describes the design target or implemented-scope abstraction in this
+document; it is not a current operational superiority, cost, or bounded-latency
+claim.
 
 | Dimension | ZFS | Ceph | TideFS |
 |-----------|-----|------|--------|
@@ -708,11 +726,11 @@ Chaos tests inject faults at specific points in the scheduling loop:
 | **Derived cache** | ARC/FlashTier (data only, no views) | N/A | Persistent derived catalog B-tree with build/serve/evict/compact lifecycle |
 | **Compaction** | ZFS metaslab compaction runs in spa_sync path | RocksDB compaction (background, per-OSD) | Incremental B-tree compaction with cursor-resumable scanning |
 
-Key architectural distinction: TideFS is the only system with a **unified budget across
-all background services**, **validity-token stale-task prevention**, and a **persistent
-derived catalog** that survives daemon restart. ZFS and Ceph both use disjoint mechanisms
-for different background tasks, making global budget enforcement and operator visibility
-impossible.
+Key architectural target: TideFS should keep background work behind one budget,
+one stale-task prevention model, and one derived-catalog lifecycle instead of
+letting each service grow a separate throttling and visibility mechanism. This
+is a design lesson, not proof that current TideFS deployments outperform the
+disjoint incumbent mechanisms.
 
 ## 14. Tradeoffs and Design Decisions
 
@@ -754,10 +772,11 @@ a dedicated background thread with message-passing can be introduced.
 
 **Decision: Three dimensions (items, bytes, milliseconds).**
 
-ZFS uses one dimension (delay). Ceph uses two (sleep time, max concurrent).
-Three dimensions provide finer-grained control: a scrub tick can be byte-heavy but
-item-light; a reclaim tick can be item-heavy but byte-light. The `max_ms` dimension
-provides a latency safety net independent of I/O throughput.
+ZFS and Ceph provide the design input that one or two throttle dimensions can
+miss important service-shape differences. TideFS therefore targets three
+dimensions: a scrub tick can be byte-heavy but item-light; a reclaim tick can
+be item-heavy but byte-light. The `max_ms` dimension is the intended latency
+safety net, with any operational claim left to measured validation.
 
 ### 14.5 Derived Catalog: Shared vs. Separate B-tree
 

@@ -406,7 +406,10 @@ The full xtask gate: `tidefs-xtask check-incremental-cursor` verifies
 integration with the background scheduler and the deterministic crash
 injection harness (#1230).
 
-## 8. Comparison to ZFS and Ceph
+## 8. ZFS and Ceph design-input comparison
+
+This table records design requirements for the implemented type crates. It is
+not evidence of current product superiority over ZFS or Ceph.
 
 | Dimension | TideFS (this design) | ZFS | Ceph |
 |---|---|---|---|

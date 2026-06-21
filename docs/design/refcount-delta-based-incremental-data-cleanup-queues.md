@@ -81,7 +81,13 @@ Without an incremental reclamation mechanism, every freed extent requires
 either a full-dataset scan (O(dataset size)) or an unbounded synchronous
 teardown during unlink/truncate (O(file size)). Neither scales.
 
-### 1.1 Comparison: existing filesystems
+### 1.1 Design-input comparison: existing filesystems
+
+This comparison classifies incumbent mechanisms as design input only. It is not
+evidence that TideFS currently has better reclaim latency, crash safety,
+throughput, cost, or durability than ZFS or Ceph. Any future product-facing
+comparison must be a #875 claim backed by #928/#930 comparator evidence for the
+exact implementation and workload.
 
 | Property | ZFS | Ceph | TideFS (this design) |
 |---|---|---|---|

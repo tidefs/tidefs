@@ -15,6 +15,13 @@ under #1877 / #1946.
 design (#1592, #1674), the enhanced lifecycle/starvation/backpressure design (#1624),
 and the multi-threaded work-stealing design (#1625).
 
+Claim boundary: this document is a design-spec and implementation-status record.
+Its ZFS/Ceph comparisons are design inputs only, not product evidence that
+TideFS currently provides better latency, throughput isolation, crash
+resumption, operator visibility, or cost. Product-facing incumbent comparisons
+must be delegated to #875 and backed by #928/#930 comparator evidence for the
+exact implementation, workload, and storage class.
+
 ---
 
 ## 1. Problem Statement
@@ -68,7 +75,10 @@ The framework applies five design principles:
 5. **Incremental progress** — Every service implements the `IncrementalJob` trait,
    advancing a cursor through a potentially infinite work domain.
 
-### 2.1 Comparison to ZFS / Ceph
+### 2.1 ZFS / Ceph design-input comparison
+
+The table below records scheduler-shape lessons. The TideFS row describes the
+target framework shape, not a measured current superiority claim.
 
 | System | Background model | Budget | Priority |
 |---|---|---|---|
@@ -553,10 +563,11 @@ Unhealthy services are skipped in future cycles until manually reset via
 
 **Decision**: Planning runs inline on the FUSE event loop (phase 4).
 
-**Rationale**: The planning phase (`plan_cycle`) is O(services × priorities) and
-completes in < 100µs for typical configurations. A dedicated planner thread adds
-synchronization cost and complexity without measurable benefit for the current
-scale.
+**Rationale**: The planning phase (`plan_cycle`) is intended to stay
+O(services x priorities) and small enough for inline execution at the current
+service scale. The `< 100us` and `> 500us` figures below are design budgets and
+re-evaluation gates, not current benchmark evidence or incumbent-comparison
+claims.
 
 **Re-evaluation gate**: If profiling shows `plan_cycle` exceeding 500µs, add a
 dedicated planner thread with a lock-free work queue. This is deferred to v1.1.

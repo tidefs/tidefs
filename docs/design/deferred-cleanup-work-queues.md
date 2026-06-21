@@ -21,8 +21,10 @@ application expects to be fast.
 This design specifies a **two-phase deletion** model: a bounded synchronous phase that
 commits metadata and enqueues a 128-byte work item in O(1) time, and a budgeted background
 phase that processes work items under the `IncrementalJob` contract to reclaim physical
-space. The design guarantees bounded synchronous latency, bounded memory, eventual
-reclamation, crash safety, and consistent space accounting.
+space. These are TideFS design requirements and implemented-scope boundaries for the
+documented phases, not incumbent-comparison claims. Product-facing claims about latency,
+memory, reclamation, crash safety, or space accounting relative to ZFS, Ceph, ext4, or
+other filesystems require #875 claim ids and #928/#930 comparator evidence.
 
 ---
 
@@ -456,7 +458,13 @@ reclamation completes:
 
 ---
 
-## 9. Comparison to ZFS and Ceph
+## 9. Design-input comparison to ZFS and Ceph
+
+The following comparison is a design lesson map. It keeps the useful
+foreground/background reclaim analysis while preventing the table from being
+read as current TideFS performance, durability, cost, or successor evidence.
+Any product-facing claim that TideFS outperforms or matches an incumbent in
+these rows must be delegated to #875 with #928/#930 comparator evidence.
 
 ### 9.1 ZFS
 
@@ -469,8 +477,10 @@ reclamation completes:
 | Work item limit | Unlimited — `bpobj` can grow to gigabytes | Soft cap of 10,000 items; beyond that, limited inline free |
 | Stale work detection | None — `bpobj` entries always processed | `created_commit_group` vs `birth_commit_group` check |
 
-**Key ZFS weakness**: On a 10 TiB file with 128 KiB recordsize (~80M extents), `rm`
-can hang for minutes. TideFS enqueues a 128-byte work item and returns immediately.
+**ZFS design risk**: large foreground extent-free work can turn a namespace
+operation into storage-size work. TideFS targets a small enqueue record and
+background cursor processing, but measured latency and operational comparison
+remain outside this design document.
 
 ### 9.2 Ceph
 
@@ -481,9 +491,11 @@ can hang for minutes. TideFS enqueues a 128-byte work item and returns immediate
 | Background reclamation | PG removal, per-PG, no global scheduling | Unified `IncrementalJob` contract with budget enforcement |
 | Space accounting | Implicit via OSD snap trimming | Explicit logical/physical split with `phys_reclaimable_bytes` |
 
-**Key Ceph weakness**: No deferred work-queue abstraction; space accounting and
-reclamation are coupled directly to the metadata operation. TideFS decouples
-enqueue (O(log N), 128 bytes) from reclamation (bounded background ticks).
+**Ceph design risk**: when deferred data deletion is not represented as a
+typed, scheduler-visible work queue, space accounting and reclaim pressure can
+be harder to reason about globally. TideFS targets a decoupled enqueue and
+budgeted background-tick model; that target is not validated here as a
+performance or cost claim.
 
 ---
 

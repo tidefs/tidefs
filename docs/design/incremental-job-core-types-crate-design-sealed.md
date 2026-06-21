@@ -369,7 +369,11 @@ cargo clippy -p tidefs-types-incremental-job-core -- -D warnings
 cargo check --workspace
 ```
 
-## 8. ZFS / Ceph Comparison
+## 8. ZFS / Ceph design-input comparison
+
+This sealed comparison records why the type vocabulary was shaped this way. It
+is not validation evidence for deployed TideFS background-job behavior, and it
+does not make a product-facing claim against ZFS or Ceph.
 
 | Dimension | tidefs types crate | ZFS | Ceph |
 |---|---|---|---|
