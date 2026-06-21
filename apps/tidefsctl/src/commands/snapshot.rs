@@ -280,6 +280,10 @@ pub enum SnapshotCommand {
     Receive(SnapshotReceiveArgs),
     /// Rollback the dataset to a named snapshot state
     Rollback(SnapshotRollbackArgs),
+    /// Register the runtime-pending read-only snapshot export mount surface
+    Export(SnapshotExportArgs),
+    /// Register the runtime-pending one-shot snapshot file extraction surface
+    Extract(SnapshotExtractArgs),
 }
 
 /// `snapshot create <pool> <name> [--devices <dev>...]`
@@ -790,6 +794,54 @@ pub struct SnapshotRollbackArgs {
     pub devices: Option<Vec<PathBuf>>,
 }
 
+/// `snapshot export <snapshot-name> <export-path>`
+/// Parse arguments for the runtime-pending read-only snapshot export surface.
+/// Snapshot names follow the `@` prefix convention, e.g. `mypool@mysnap`.
+#[derive(Args, Debug)]
+pub struct SnapshotExportArgs {
+    /// Pool and snapshot name in pool@snapshot form
+    #[arg(
+        value_name = "SNAPSHOT_NAME",
+        help = "Snapshot name in pool@snapshot form"
+    )]
+    pub snapshot_name: String,
+
+    /// Mount path reserved for the future read-only FUSE export session
+    #[arg(
+        value_name = "EXPORT_PATH",
+        help = "Filesystem path reserved for the future read-only snapshot view"
+    )]
+    pub export_path: PathBuf,
+}
+
+/// `snapshot extract <snapshot-name> <file-path>`
+/// Parse arguments for the runtime-pending one-shot snapshot extraction surface.
+/// Snapshot names follow the `@` prefix convention, e.g. `mypool@mysnap`.
+#[derive(Args, Debug)]
+pub struct SnapshotExtractArgs {
+    /// Pool and snapshot name in pool@snapshot form
+    #[arg(
+        value_name = "SNAPSHOT_NAME",
+        help = "Snapshot name in pool@snapshot form"
+    )]
+    pub snapshot_name: String,
+
+    /// File path within the snapshot to extract
+    #[arg(
+        value_name = "FILE_PATH",
+        help = "Path of the file within the snapshot to extract"
+    )]
+    pub file_path: String,
+
+    /// Output file path; writes to stdout when omitted
+    #[arg(
+        long = "output",
+        short = 'o',
+        help = "Write extracted content to this file instead of stdout"
+    )]
+    pub output: Option<PathBuf>,
+}
+
 /// Dispatch the snapshot subcommand.
 pub fn handle_snapshot(cmd: SnapshotCommand) {
     match cmd {
@@ -805,6 +857,8 @@ pub fn handle_snapshot(cmd: SnapshotCommand) {
         SnapshotCommand::Send(args) => handle_send(args),
         SnapshotCommand::Receive(args) => handle_receive(args),
         SnapshotCommand::Rollback(args) => handle_rollback(args),
+        SnapshotCommand::Export(args) => handle_export(args),
+        SnapshotCommand::Extract(args) => handle_extract(args),
     }
 }
 
@@ -1714,6 +1768,31 @@ fn handle_rollback(args: SnapshotRollbackArgs) {
     }
 }
 
+fn handle_export(args: SnapshotExportArgs) {
+    let _guard = super::authz::require_local_only("snapshot export");
+    let _ = args;
+    eprintln!(
+        concat!(
+            "tidefsctl snapshot export: runtime snapshot export is not yet implemented; ",
+            "issue #765 will wire the read-only export session and issue #766 ",
+            "will add export holds"
+        )
+    );
+    process::exit(1);
+}
+
+fn handle_extract(args: SnapshotExtractArgs) {
+    let _guard = super::authz::require_local_only("snapshot extract");
+    let _ = args;
+    eprintln!(
+        concat!(
+            "tidefsctl snapshot extract: runtime snapshot extraction is not yet ",
+            "implemented; issue #925 will wire one-shot snapshot file reads"
+        )
+    );
+    process::exit(1);
+}
+
 fn handle_send(args: SnapshotSendArgs) {
     let _guard = super::authz::require_local_only("snapshot send");
 
@@ -2010,7 +2089,9 @@ mod tests {
             | SnapshotCommand::Prune(_)
             | SnapshotCommand::Send(_)
             | SnapshotCommand::Receive(_)
-            | SnapshotCommand::Rollback(_) => {
+            | SnapshotCommand::Rollback(_)
+            | SnapshotCommand::Export(_)
+            | SnapshotCommand::Extract(_) => {
                 panic!("expected destroy command")
             }
         }
@@ -2155,5 +2236,68 @@ mod tests {
         assert_eq!(lines[1], "pruned snapshots: old");
         assert_eq!(lines[2], "retained snapshots: new");
         assert_eq!(lines[3], "skipped held snapshots: held");
+    }
+
+    #[test]
+    fn snapshot_export_args_bindings() {
+        let args = SnapshotExportArgs {
+            snapshot_name: "mypool@mysnap".into(),
+            export_path: PathBuf::from("/mnt/snap"),
+        };
+        assert_eq!(args.snapshot_name, "mypool@mysnap");
+        assert_eq!(args.export_path, PathBuf::from("/mnt/snap"));
+    }
+
+    #[test]
+    fn snapshot_extract_args_bindings() {
+        let args = SnapshotExtractArgs {
+            snapshot_name: "mypool@mysnap".into(),
+            file_path: "/data/lostfile".into(),
+            output: Some(PathBuf::from("/tmp/recovered")),
+        };
+        assert_eq!(args.snapshot_name, "mypool@mysnap");
+        assert_eq!(args.file_path, "/data/lostfile");
+        assert_eq!(args.output, Some(PathBuf::from("/tmp/recovered")));
+    }
+
+    #[test]
+    fn snapshot_extract_args_defaults_to_stdout() {
+        let args = SnapshotExtractArgs {
+            snapshot_name: "mypool@daily.0".into(),
+            file_path: "/etc/config".into(),
+            output: None,
+        };
+        assert!(args.output.is_none());
+    }
+
+    #[test]
+    fn snapshot_export_command_is_registered_in_enum() {
+        let cmd = SnapshotCommand::Export(SnapshotExportArgs {
+            snapshot_name: "mypool@snap1".into(),
+            export_path: PathBuf::from("/mnt/snap"),
+        });
+        match cmd {
+            SnapshotCommand::Export(args) => {
+                assert_eq!(args.snapshot_name, "mypool@snap1");
+                assert_eq!(args.export_path, PathBuf::from("/mnt/snap"));
+            }
+            _ => panic!("expected export command"),
+        }
+    }
+
+    #[test]
+    fn snapshot_extract_command_is_registered_in_enum() {
+        let cmd = SnapshotCommand::Extract(SnapshotExtractArgs {
+            snapshot_name: "mypool@snap1".into(),
+            file_path: "/data/file".into(),
+            output: None,
+        });
+        match cmd {
+            SnapshotCommand::Extract(args) => {
+                assert_eq!(args.snapshot_name, "mypool@snap1");
+                assert_eq!(args.file_path, "/data/file");
+            }
+            _ => panic!("expected extract command"),
+        }
     }
 }
