@@ -23,11 +23,26 @@ jobs:
       matrix:
         include:
           - name: static-carrier-check
-            command: nix build -L .#checks.x86_64-linux.rdmaCarrierTwoNode
+            command_class: static-carrier
+            evidence_class: rdma-static-carrier-check
+            validation_tier: harness-only
+            artifact_root: /tmp/tidefs-validation/rdma/static-carrier-check
+            primary_artifact: command-status.env
+            command: 'nix build -L .#checks.x86_64-linux.rdmaCarrierTwoNode'
           - name: host-probe
-            command: nix run .#rdma-probe
+            command_class: host-probe
+            evidence_class: rdma-host-probe
+            validation_tier: harness-only
+            artifact_root: /tmp/tidefs-validation/rdma/host-probe
+            primary_artifact: summary.env
+            command: 'nix run .#rdma-probe -- --validation-dir /tmp/tidefs-validation/rdma/host-probe'
           - name: qemu-two-node
-            command: nix run .#qemu-rdma-two-node-nixos -- --validation-dir /tmp/tidefs-rdma-two-node
+            command_class: qemu-two-node
+            evidence_class: rdma-qemu-two-node
+            validation_tier: multi-process-distributed
+            artifact_root: /tmp/tidefs-rdma-two-node
+            primary_artifact: summary.env
+            command: 'nix run .#qemu-rdma-two-node-nixos -- --validation-dir /tmp/tidefs-rdma-two-node'
 
     steps:
       - name: Checkout
@@ -38,8 +53,228 @@ jobs:
           test -c /dev/kvm
           command -v modinfo >/dev/null
 
+      - name: Prepare RDMA output
+        env:
+          ARTIFACT_ROOT: ${{ matrix.artifact_root }}
+        run: |
+          set -euo pipefail
+          rm -rf "$ARTIFACT_ROOT"
+          mkdir -p "$ARTIFACT_ROOT"
+          {
+            printf 'workflow=%s\n' "$GITHUB_WORKFLOW"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'job=%s\n' "$GITHUB_JOB"
+            printf 'matrix_target=%s\n' "${{ matrix.name }}"
+            printf 'command_class=%s\n' "${{ matrix.command_class }}"
+            printf 'artifact_root=%s\n' "$ARTIFACT_ROOT"
+            printf 'source_ref=%s\n' "$GITHUB_REF"
+            printf 'source_sha=%s\n' "$GITHUB_SHA"
+            printf 'utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$ARTIFACT_ROOT/artifact-root.env"
+
       - name: Run RDMA target
-        run: timeout --foreground 10800s bash -lc '${{ matrix.command }}'
+        id: rdma
+        env:
+          ARTIFACT_ROOT: ${{ matrix.artifact_root }}
+          RDMA_COMMAND: ${{ matrix.command }}
+          RDMA_COMMAND_TIMEOUT_SECONDS: "10500"
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_ROOT"
+
+          STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          STDOUT_LOG="$ARTIFACT_ROOT/command.stdout.log"
+          STDERR_LOG="$ARTIFACT_ROOT/command.stderr.log"
+          STATUS_FILE="$ARTIFACT_ROOT/command-status.env"
+
+          {
+            printf 'workflow=%s\n' "$GITHUB_WORKFLOW"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'source_ref=%s\n' "$GITHUB_REF"
+            printf 'source_sha=%s\n' "$GITHUB_SHA"
+            printf 'matrix_target=%s\n' "${{ matrix.name }}"
+            printf 'command_class=%s\n' "${{ matrix.command_class }}"
+            printf 'command=%s\n' "$RDMA_COMMAND"
+            printf 'timeout_seconds=%s\n' "$RDMA_COMMAND_TIMEOUT_SECONDS"
+            printf 'started_at=%s\n' "$STARTED_AT"
+          } > "$STATUS_FILE"
+
+          set +e
+          timeout --foreground "${RDMA_COMMAND_TIMEOUT_SECONDS}s" \
+            bash -lc "$RDMA_COMMAND" \
+            > >(tee "$STDOUT_LOG") \
+            2> >(tee "$STDERR_LOG" >&2)
+          COMMAND_STATUS=$?
+          set -e
+
+          FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [[ "$COMMAND_STATUS" -eq 0 ]]; then
+            RESULT_STATUS="pass"
+          elif [[ "$COMMAND_STATUS" -eq 124 || "$COMMAND_STATUS" -eq 137 ]]; then
+            RESULT_STATUS="timeout"
+          else
+            RESULT_STATUS="fail"
+          fi
+
+          {
+            printf 'finished_at=%s\n' "$FINISHED_AT"
+            printf 'command_status=%s\n' "$COMMAND_STATUS"
+            printf 'result_status=%s\n' "$RESULT_STATUS"
+            printf 'stdout_log=%s\n' "$STDOUT_LOG"
+            printf 'stderr_log=%s\n' "$STDERR_LOG"
+          } >> "$STATUS_FILE"
+
+          echo "command_status=$COMMAND_STATUS" >> "$GITHUB_OUTPUT"
+          echo "result_status=$RESULT_STATUS" >> "$GITHUB_OUTPUT"
+
+          if [[ "$COMMAND_STATUS" -ne 0 ]]; then
+            exit "$COMMAND_STATUS"
+          fi
+
+      - name: Write RDMA evidence manifest
+        if: always()
+        env:
+          EXPECTED_ARTIFACT_ROOT: ${{ matrix.artifact_root }}
+          FALLBACK_ARTIFACT_ROOT: /tmp/tidefs-validation/rdma/${{ matrix.name }}
+          MATRIX_TARGET: ${{ matrix.name }}
+          COMMAND_CLASS: ${{ matrix.command_class }}
+          EVIDENCE_CLASS: ${{ matrix.evidence_class }}
+          VALIDATION_TIER: ${{ matrix.validation_tier }}
+          PRIMARY_ARTIFACT: ${{ matrix.primary_artifact }}
+          RDMA_COMMAND: ${{ matrix.command }}
+          EVIDENCE_WORKFLOW: ${{ github.workflow }}
+          EVIDENCE_RUN_ID: ${{ github.run_id }}
+          EVIDENCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          EVIDENCE_SOURCE_REF: ${{ github.ref }}
+          EVIDENCE_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          json_string() {
+            local escaped
+            escaped="$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+            printf '"%s"' "$escaped"
+          }
+
+          read_status_value() {
+            local file="$1"
+            local key="$2"
+            local default="$3"
+            awk -F= -v key="$key" -v default="$default" '
+              $1 == key {
+                print substr($0, length(key) + 2)
+                found = 1
+                exit
+              }
+              END { if (!found) print default }
+            ' "$file"
+          }
+
+          ARTIFACT_ROOT="$EXPECTED_ARTIFACT_ROOT"
+          OUTPUT_DIR_STATE="present"
+          if [[ ! -d "$ARTIFACT_ROOT" ]]; then
+            OUTPUT_DIR_STATE="missing"
+            ARTIFACT_ROOT="$FALLBACK_ARTIFACT_ROOT"
+            mkdir -p "$ARTIFACT_ROOT"
+            {
+              printf 'expected_artifact_root=%s\n' "$EXPECTED_ARTIFACT_ROOT"
+              printf 'fallback_artifact_root=%s\n' "$FALLBACK_ARTIFACT_ROOT"
+              printf 'matrix_target=%s\n' "$MATRIX_TARGET"
+              printf 'result_status=missing-output-dir\n'
+            } > "$ARTIFACT_ROOT/missing-output-dir.txt"
+          fi
+
+          STATUS_FILE="$ARTIFACT_ROOT/command-status.env"
+          if [[ -f "$STATUS_FILE" ]]; then
+            COMMAND_STATUS="$(read_status_value "$STATUS_FILE" command_status unknown)"
+            RESULT_STATUS="$(read_status_value "$STATUS_FILE" result_status unknown)"
+            STARTED_AT="$(read_status_value "$STATUS_FILE" started_at '')"
+          else
+            COMMAND_STATUS="missing"
+            RESULT_STATUS="missing-command-status"
+            STARTED_AT=""
+            {
+              printf 'workflow=%s\n' "$EVIDENCE_WORKFLOW"
+              printf 'run_id=%s\n' "$EVIDENCE_RUN_ID"
+              printf 'run_attempt=%s\n' "$EVIDENCE_RUN_ATTEMPT"
+              printf 'source_ref=%s\n' "$EVIDENCE_SOURCE_REF"
+              printf 'source_sha=%s\n' "$EVIDENCE_SOURCE_SHA"
+              printf 'matrix_target=%s\n' "$MATRIX_TARGET"
+              printf 'command_class=%s\n' "$COMMAND_CLASS"
+              printf 'command=%s\n' "$RDMA_COMMAND"
+              printf 'command_status=%s\n' "$COMMAND_STATUS"
+              printf 'result_status=%s\n' "$RESULT_STATUS"
+            } > "$STATUS_FILE"
+          fi
+
+          if [[ "$OUTPUT_DIR_STATE" == "missing" ]]; then
+            RESULT_STATUS="missing-output-dir"
+          fi
+
+          PRIMARY_PATH="$PRIMARY_ARTIFACT"
+          PRIMARY_STATE="present"
+          if [[ ! -f "$ARTIFACT_ROOT/$PRIMARY_PATH" ]]; then
+            PRIMARY_STATE="missing"
+            if [[ "$RESULT_STATUS" == "pass" || "$RESULT_STATUS" == "unknown" ]]; then
+              RESULT_STATUS="missing-primary-artifact"
+            fi
+            PRIMARY_PATH="primary-artifact.missing"
+            {
+              printf 'primary_artifact=%s\n' "$PRIMARY_ARTIFACT"
+              printf 'matrix_target=%s\n' "$MATRIX_TARGET"
+              printf 'command_class=%s\n' "$COMMAND_CLASS"
+              printf 'result_status=%s\n' "$RESULT_STATUS"
+            } > "$ARTIFACT_ROOT/$PRIMARY_PATH"
+          fi
+
+          FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ARTIFACT_PATHS="$(cd "$ARTIFACT_ROOT" && find . -type f -not -name evidence-manifest.json -printf '%P\n' | sort | paste -sd ',' -)"
+          if [[ -z "$ARTIFACT_PATHS" ]]; then
+            ARTIFACT_PATHS="none"
+          fi
+
+          DIGEST="$(nix shell nixpkgs#b3sum --command b3sum "$ARTIFACT_ROOT/$PRIMARY_PATH" 2>/dev/null | awk '{print $1}' || true)"
+          if [[ ! "$DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            DIGEST="0000000000000000000000000000000000000000000000000000000000000000"
+          fi
+          CONTENT_DIGEST="blake3:${DIGEST}"
+
+          CLAIM_ID="rdma.validation.${MATRIX_TARGET}.v1"
+          SOURCE_LABEL="rdma-workflow"
+          SCOPE="workflow=${EVIDENCE_WORKFLOW} run_id=${EVIDENCE_RUN_ID} run_attempt=${EVIDENCE_RUN_ATTEMPT} source_ref=${EVIDENCE_SOURCE_REF} source_sha=${EVIDENCE_SOURCE_SHA} matrix_target=${MATRIX_TARGET} command_class=${COMMAND_CLASS} command=${RDMA_COMMAND} status=${RESULT_STATUS} command_status=${COMMAND_STATUS} validation_tier=${VALIDATION_TIER} artifact_root=${ARTIFACT_ROOT} output_dir_state=${OUTPUT_DIR_STATE} primary_artifact=${PRIMARY_PATH} primary_artifact_state=${PRIMARY_STATE} artifact_paths=${ARTIFACT_PATHS}"
+
+          cat > "$ARTIFACT_ROOT/evidence-manifest.json" << MANIFESTEOF
+          {
+            "manifest_version": 1,
+            "claim_id": $(json_string "$CLAIM_ID"),
+            "evidence_class": $(json_string "$EVIDENCE_CLASS"),
+            "validation_tier": $(json_string "$VALIDATION_TIER"),
+            "source": $(json_string "$SOURCE_LABEL"),
+            "scope": $(json_string "$SCOPE"),
+            "artifact_path": $(json_string "$PRIMARY_PATH"),
+            "content_digest": $(json_string "$CONTENT_DIGEST"),
+            "generated_at": $(json_string "$FINISHED_AT")
+          }
+          MANIFESTEOF
+
+          {
+            echo "## RDMA evidence manifest"
+            echo ""
+            echo "- Matrix target: \`$MATRIX_TARGET\`"
+            echo "- Command class: \`$COMMAND_CLASS\`"
+            echo "- Status: \`$RESULT_STATUS\`"
+            echo "- Manifest: \`$ARTIFACT_ROOT/evidence-manifest.json\`"
+            if [[ -n "$STARTED_AT" ]]; then
+              echo "- Started: \`$STARTED_AT\`"
+            fi
+            echo "- Finished: \`$FINISHED_AT\`"
+            echo ""
+            echo '```json'
+            cat "$ARTIFACT_ROOT/evidence-manifest.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload RDMA output
         if: always()
