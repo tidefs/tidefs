@@ -3991,8 +3991,16 @@ impl LocalObjectStore {
 
         for write in writes {
             total_media_bytes += write.record_bytes();
-            let stored = self.put(write.key, &write.data)?;
-            flushed_keys.push(stored.key);
+            match write.kind {
+                RecordKind::Put => {
+                    let stored = self.put(write.key, &write.data)?;
+                    flushed_keys.push(stored.key);
+                }
+                RecordKind::Delete => {
+                    self.delete(write.key)?;
+                    flushed_keys.push(write.key);
+                }
+            }
         }
 
         self.options.sync_on_write = saved_sync;
