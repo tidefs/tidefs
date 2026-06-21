@@ -20,16 +20,19 @@ unreachable nodes, and integration with the MEMBERSHIP service (#1209), commit_g
 state machine (#1267), intent log drain (#1252), publication pipeline, and
 snapshot deadlist pinning (#1232).
 
-ZFS snapshots are local-only — a pool can be snapshotted on one node, but
-there is no concept of a cluster-wide consistent snapshot. CephFS supports
-per-directory snapshots, but multi-MDS snapshot consistency is complex and
-unreliable. Neither has true cluster-wide atomic snapshots.
+ZFS and CephFS are prior-art inputs for this design, not evidence of current
+TideFS superiority. They motivate a target protocol with:
+- **Cluster-wide atomicity target**: a snapshot freezes a consistent
+  point-in-time across participating nodes
+- **Low-disruption target**: snapshot creation does not require unmounting,
+  while writers may see a bounded commit_group formation gate
+- **Cluster-addressability target**: the snapshot catalog is visible from any
+  participating node
 
-tidefs beats both by designing snapshots that are:
-- **Cluster-wide atomic**: a snapshot freezes a consistent point-in-time
-  across all nodes
-- **Zero-downtime**: snapshot creation doesn't pause IO
-- **Cluster-addressable**: the snapshot is visible from any node
+This document is not a validated cluster-snapshot, zero-downtime,
+availability, durability, or successor claim. Any product-facing comparison
+to ZFS/CephFS remains blocked behind #875 claim ids and #928/#930 comparator
+evidence.
 
 ---
 
@@ -725,19 +728,24 @@ aborted anyway. Early rejection gives faster feedback to the caller.
 
 ---
 
-## 16. ZFS/Ceph Comparison
+## 16. ZFS/Ceph Prior-Art Comparison
 
-| Feature | ZFS | CephFS | tidefs |
+This table records design targets against prior-art pressure. The TideFS
+column does not claim current cluster-wide snapshot availability, validated
+zero-downtime behavior, cluster catalog maturity, audit superiority, or
+operational safety versus ZFS/CephFS.
+
+| Feature | ZFS prior art | CephFS prior art | TideFS design target |
 |---|---|---|---|
-| Local snapshots | Yes (per-pool) | Yes (per-directory) | Yes (per-dataset, #1232) |
-| Cluster-wide atomic snapshots | No | No (multi-MDS unreliable) | **Yes (this design)** |
-| Zero-downtime snapshot | Yes (commit_group-based) | Partial (MDS quiesce) | Yes |
-| Partial participation | N/A | N/A | Yes (degraded snapshots) |
-| Snapshot barrier | N/A (local only) | MDS quiesce (per-MDS) | Leader-coordinated freeze |
-| Cross-node catalog | N/A | N/A | Yes (`ClusterSnapshotCatalog`) |
-| Cluster-aware destroy | N/A | N/A | Yes (with tombstones) |
-| Snapshot diffs | `zfs diff` | None | `diff_snapshots()` |
-| Audit trail | None | None | `ClusterSnapshotTombstone` |
+| Local snapshots | Yes (per-pool) | Yes (per-directory) | Target: per-dataset (#1232) |
+| Cluster-wide atomic snapshots | No cluster-wide pool concept | Multi-MDS consistency is a design pressure | Target: participating-node consistent cut |
+| Low-disruption snapshot | Commit_group-based local snapshot | MDS quiesce pressure | Target: no unmount, bounded writer gate |
+| Partial participation | N/A | N/A | Target: degraded snapshot record |
+| Snapshot barrier | N/A (local only) | MDS quiesce (per-MDS) | Target: leader-coordinated freeze |
+| Cross-node catalog | N/A | N/A | Target: `ClusterSnapshotCatalog` |
+| Cluster-aware destroy | N/A | N/A | Target: tombstoned destroy propagation |
+| Snapshot diffs | `zfs diff` | None | Target: `diff_snapshots()` |
+| Audit trail | None | None | Target: `ClusterSnapshotTombstone` |
 
 ---
 

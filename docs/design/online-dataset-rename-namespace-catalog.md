@@ -1,4 +1,4 @@
-# Online Dataset Rename: Namespace Catalog Design — Avoiding the ZFS Unmount Requirement
+# Online Dataset Rename Namespace Catalog Design
 
 **Issue**: [#1282](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1282)
 **Status**: design-spec
@@ -6,15 +6,15 @@
 and namespace hierarchy management
 **Priority**: P2
 **Lane**: storage-core
-**Anti-pattern addressed**: ZFS mistake #19 — rename requires unmount
-(`zfs rename` fails if mounted; `zfs rename -u` unmounts, renames, remounts,
-disrupting applications)
+**Prior-art pressure**: ZFS-style dataset rename couples dataset naming to
+mount lifecycle; this design targets stable dataset identity without treating
+that target as a validated current online-rename claim.
 
 ## 1. Problem Statement
 
-ZFS conflates "filesystem" with "mount point" at the architectural level.
-A dataset is simultaneously a filesystem namespace AND a mount boundary.
-This makes renaming a dataset a disruptive operator event:
+ZFS-style prior art couples "filesystem" and "mount point" at the operator
+boundary. A dataset is simultaneously a filesystem namespace and a mount
+boundary, making rename a disruptive operator event:
 
 - `zfs rename pool/a pool/b` requires unmounting `pool/a` first, or using
   `-u` which unmount-renames-remounts automatically. Either way, open file
@@ -24,21 +24,23 @@ This makes renaming a dataset a disruptive operator event:
   complicating automation and orchestration.
 
 In cloud/container environments where datasets proliferate (one per tenant,
-per volume, per snapshot schedule), renaming a tenant's dataset or
-restructuring namespace hierarchy should NOT require application downtime.
-The POSIX `rename(2)` on directories within a dataset works fine — renaming
-the dataset root should be equally non-disruptive.
+per volume, per snapshot schedule), the design target is that renaming a
+tenant's dataset or restructuring namespace hierarchy does not require
+application downtime. The POSIX `rename(2)` on directories within a dataset
+works through a different boundary; this design applies that lesson to the
+dataset-root catalog target.
 
-This design addresses ZFS design mistake #19 (rename-equals-remount) by
-separating dataset identity from mount semantics.
+This design separates dataset identity from mount semantics. It is not a
+current parity, online-rename, or superiority claim.
 
 ## 2. Architectural Principle: Dataset as Logical Namespace, Not Mount Point
 
 ### 2.1 Core separation
 
-tidefs treats three concerns that ZFS conflates as distinct:
+The TideFS design treats three concerns that the ZFS-style prior-art pressure
+couples as distinct:
 
-| Concern | ZFS | tidefs |
+| Concern | ZFS-style prior art | TideFS design target |
 |---|---|---|
 | **Filesystem namespace** | Tied to dataset = mount point | Dataset is a logical namespace within the pool; identity is a stable UUID |
 | **Mount domain** | Per-dataset mount | Pool is the mount domain; a single FUSE daemon mounts the pool |
@@ -146,8 +148,8 @@ tidefs chooses UUID key because:
 1. All internal references (extent sharing, lease tables, snapshot catalogs,
    cluster lock service) must point at a stable identifier.
 2. A rename that changed the primary key would require cascading updates to
-   every referencing data structure — similar to the ZFS problem we're
-   trying to avoid.
+   every referencing data structure — the same coupling pressure this design
+   intentionally avoids.
 3. The name→UUID lookup index is a secondary structure that can be updated
    atomically with the catalog entry.
 
@@ -607,8 +609,8 @@ No data movement, no extent allocation, no inode tree traversal.
 **Rationale**: Stable identifiers are essential for every internal
 reference — extents, leases, locks, snapshots, send streams, cluster
 consensus. Making the name the primary key would require cascading updates
-to all of these on every rename, recreating the ZFS problem at a different
-layer. The cost is a secondary index and an extra lookup on name-based
+to all of these on every rename, recreating an incumbent coupling pressure at a
+different layer. The cost is a secondary index and an extra lookup on name-based
 operations, which is a O(log N) B+tree probe — negligible compared to the
 disruption of a cascade.
 
@@ -616,13 +618,12 @@ disruption of a cascade.
 
 **Decision**: Single pool FUSE mount; datasets appear as subdirectories.
 
-**Rationale**: This eliminates the mount-point identity problem entirely.
+**Rationale**: This targets the mount-point identity problem directly.
 ZFS requires per-dataset mounts because each dataset is an independent
 `zpl` filesystem instance with its own superblock. tidefs has a single pool
 superblock and a single FUSE daemon; datasets share the same inode space
 (though logically partitioned). This is closer to CephFS's subvolume model,
-but without Ceph's MDS subtree pinning limitations — tidefs datasets can
-be moved freely within the pool namespace.
+while avoiding a CephFS-style subtree-pinning dependency in the design target.
 
 ### 12.3 Why allow reparenting but gate it behind a flag?
 
@@ -646,16 +647,21 @@ branch-predictable. The 255-byte name field (plus 1-byte length) matches
 `NAME_MAX`, and the 96-byte reserved block leaves room for future fields
 without format changes.
 
-### 12.5 Comparison to ZFS and CephFS
+### 12.5 Prior-Art Comparison to ZFS and CephFS
 
-| Feature | ZFS | CephFS | tidefs |
+This table is a design-target comparison only. It does not claim current
+TideFS parity, validated online rename support, cross-dataset reflink support,
+cluster-catalog production readiness, or superiority over ZFS/CephFS. Product
+comparisons remain gated by #875 and #928/#930 evidence.
+
+| Feature | ZFS prior art | CephFS prior art | TideFS design target |
 |---|---|---|---|
-| Dataset rename requires unmount | Yes | N/A (no dataset concept) | No |
+| Dataset rename requires unmount | Yes | N/A (no dataset concept) | Target: no |
 | Dataset identity | Name + GUID | N/A | UUID (stable) |
 | Mount domain | Per-dataset | Per-filesystem | Per-pool |
-| Namespace restructuring | Disruptive (unmount required) | Subvolume pinning to rank | Online, non-disruptive |
-| Cross-dataset reflink | No | No reflink | Yes (#1276) |
-| Cluster awareness | No | Native | Cluster catalog (#1283) |
+| Namespace restructuring | Disruptive (unmount required) | Subvolume pinning to rank | Target: online, non-disruptive |
+| Cross-dataset reflink | No | No reflink | Planned target (#1276) |
+| Cluster awareness | No | Native | Planned cluster catalog (#1283) |
 
 ## 13. Testing Strategy
 

@@ -659,10 +659,11 @@ discovered before any data interpretation begins.
 support sparse feature sets (most datasets have 0–5 features enabled)
 and allow feature names up to 127 bytes.
 
-**Alternative considered**: ZFS-style feature flags (single on-disk
-bitmap with `features_for_read` mask). Rejected because the ZFS model
-ties feature identity to a pool version number, making cross-implementation
-feature gating implicit. TideFS makes feature gating explicit via named flags.
+**Alternative considered**: ZFS-style feature flags (single on-disk bitmap with
+`features_for_read` mask). This prior-art model motivates the TideFS target of
+explicit named flags rather than implicit cross-implementation feature gating.
+This is a design choice, not a validated format-lifecycle or interoperability
+superiority claim.
 
 ### T3. Background Rebake vs. Online Conversion
 

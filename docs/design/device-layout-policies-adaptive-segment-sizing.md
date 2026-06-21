@@ -100,7 +100,7 @@ pub enum DeviceLayoutPolicy {
 |--------|-------------|----------|
 | `Slice0Small` | Tests, tiny devices (<1 GiB), embedded | Predictable, no scaling, wastes space on large devices |
 | `Auto` | **Production default**. All general-purpose pools. | Auto-tunes segment size; ~100–4.2M segments across 10^7x device range |
-| `Custom` | Operator knows workload better than auto; hybrid pools | Full control, but operator bears correctness burden |
+| `Custom` | Operator has workload-specific requirements beyond auto; hybrid pools | Full control, but operator bears correctness burden |
 
 ## 4. Auto-Scaling Segment Size Algorithm
 
@@ -240,8 +240,8 @@ grows.
 ## 7. Per-Device Segment Sizing (Heterogeneous Pools)
 
 Different devices in the same pool may have different `DeviceLayoutV1` records
-with different segment sizes. This is the key design differentiator from ZFS,
-where `ashift` is a pool-wide property.
+with different segment sizes. This is a design distinction from ZFS-style
+pool-wide `ashift`, not a validated current performance or cost claim.
 
 ### 7.1 Example: Hybrid NVMe + HDD Pool
 
@@ -452,17 +452,22 @@ pub enum InvalidSegmentSizeReason {
 }
 ```
 
-## 11. ZFS Comparison
+## 11. ZFS Prior-Art Comparison
 
-| Dimension | TideFS | ZFS | Winner |
-|-----------|--------|-----|--------|
-| Segment size granularity | Per-device, per-region | Pool-wide `ashift` | TideFS |
-| Segment count scaling | Auto-scaling keeps count bounded (~100-4.2M) | Manual `zfs_device_metaslab_shift` tuning | TideFS |
-| Heterogeneous device segment sizes | Yes -- different sizes per device in same pool | No -- `ashift` is pool-wide | TideFS |
-| Region partitioning | 4 explicit regions with independent sizing | Implicit: root_record area + metaslab space | ZFS (simpler) |
-| Journal sizing | Scales with segment size (16x, 256x) | Fixed ZIL size, per-pool config | TideFS |
-| Operator policy | 3 policies (Slice0Small, Auto, Custom) | Ashift only | TideFS |
-| Metadata segregation | Dedicated metadata journal region | Special allocation class (separate devices) | ZFS (more mature) |
+This table records design tradeoffs only. It is not a current claim that TideFS
+outperforms ZFS, reduces cost, preserves flash lifetime, or is more mature.
+Product-facing comparisons require #875 claim ids and #928/#930 comparator
+evidence.
+
+| Dimension | TideFS design target | ZFS prior art | Design lesson |
+|-----------|----------------------|---------------|---------------|
+| Segment size granularity | Per-device, per-region | Pool-wide `ashift` | Per-device layout is the target. |
+| Segment count scaling | Auto-scaling keeps count bounded (~100-4.2M) | Manual `zfs_device_metaslab_shift` tuning | Bound metadata cardinality explicitly. |
+| Heterogeneous device segment sizes | Different sizes per device in same pool | `ashift` is pool-wide | Avoid pool-wide alignment lock-in. |
+| Region partitioning | 4 explicit regions with independent sizing | Implicit: root_record area + metaslab space | More knobs require stronger validation. |
+| Journal sizing | Scales with segment size (16x, 256x) | Fixed ZIL size, per-pool config | Make sizing policy explicit. |
+| Operator policy | 3 policies (Slice0Small, Auto, Custom) | Ashift only | Keep operator intent in a policy enum. |
+| Metadata segregation | Dedicated metadata journal region | Special allocation class (separate devices) | Maturity remains unclaimed. |
 
 ## 12. Implementation Plan
 

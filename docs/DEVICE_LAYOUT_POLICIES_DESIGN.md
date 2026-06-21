@@ -15,7 +15,8 @@ scale:
 
 - A 1 MiB segment on a 1 PB pool produces ~1e9 segments — the bring-up scan cost
   during pool import (walking all segments to reconstruct the free map) is
-  prohibitive. Even a ZFS metaslab scan at ~200 GiB each would be cheaper.
+  prohibitive. ZFS metaslab sizing is prior-art context for this scale
+  pressure, not a validated TideFS import-performance comparison.
 - Fixed journal sizes waste space on large devices (padding unused region capacity)
   or starve on small ones (journal too small for burst writes).
 - No explicit layout policy abstraction exists — layout decisions are embedded
@@ -471,9 +472,13 @@ implementation-tracked non-release by `tidefs-xtask check-device-layout-constant
   reclaim a single segment's dead space, creating latency spikes. A 256 MiB relocation
   at 1 GB/s takes ~250 ms — acceptable as background work.
 
-## 11. ZFS Comparison
+## 11. ZFS Prior-Art Comparison
 
-| Dimension | ZFS | tidefs |
+This section records design pressure and target behavior. It is not evidence
+for a current ZFS-relative performance, write-amplification, latency, or
+heterogeneous-device production-readiness claim.
+
+| Dimension | ZFS prior art | TideFS design target |
 |-----------|-----|--------|
 | **Metaslab/Segment sizing** | Fixed at pool creation (metaslab size defaults to 1/200 of device, min 16 MiB, max 16 GiB). Changing requires pool destruction. | Auto-scaling segment size at creation time per-device, recomputed on device add. Segment count stays bounded across 7 orders of magnitude. |
 | **Region partitioning** | No explicit journal regions. ZIL and LOG_DEVICE are separate devices, not region-partitioned. All writes go through the DMU/ZIO pipeline regardless of I/O class. | Four explicit regions per device (system, poolmap, metadata, data), each with independent segment sizing and GC. I/O class routing is the pool's responsibility, but the layout gives each class its own write domain. |
@@ -484,19 +489,16 @@ implementation-tracked non-release by `tidefs-xtask check-device-layout-constant
 | **Determinism** | Metaslab count = device_size / metaslab_size, rounded up. Variable per device based on exact size. | `choose_segment_size_bytes()` is purely deterministic from device size + constants. Same device always produces same layout. |
 | **Migrating segment size** | Not possible without pool destruction. | Not possible without data evacuation (consistent with format immutability principle). But heterogeneous segment sizes across devices means new devices can adopt different sizes without pool-wide migration. |
 
-### 11.1 Where tidefs Improves on ZFS
+### 11.1 TideFS Design Responses to ZFS Prior Art
 
-- **Auto-scaling**: ZFS requires the operator to think about metaslab sizing, or
-  accepts the 1/200-of-device default (which produces 16M metaslabs on a 3.2 TB
-  device!). tidefs bounds segment count to ~4M regardless of device size.
-- **Per-region sizing**: ZFS has one block size for everything (ashift). tidefs
-  allows metadata to use smaller segments than data on the same device, reducing
-  metadata write amplification.
-- **Journal proportionality**: ZFS ZIL sizing doesn't scale with device size —
-  a 1 TB pool and a 1 PB pool get the same ZIL size by default. tidefs scales
-  journal regions with segment size.
-- **Device heterogeneity**: ZFS constrains all devices to the same ashift. tidefs
-  allows different segment sizes per device in the same pool.
+- **Auto-scaling target**: bound segment count explicitly instead of relying on
+  operator-tuned metaslab sizing.
+- **Per-region sizing target**: allow metadata and data regions to carry
+  different segment policies on the same device.
+- **Journal proportionality target**: derive journal region sizing from the
+  layout policy rather than leaving it implicit.
+- **Device heterogeneity target**: allow different segment sizes per device in
+  the same pool without claiming validated performance benefit yet.
 
 ### 11.2 Where tidefs Matches ZFS
 

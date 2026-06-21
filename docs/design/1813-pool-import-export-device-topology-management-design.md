@@ -622,9 +622,14 @@ optimization that does not change any public API.
 
 ---
 
-## 10. ZFS / Ceph comparison
+## 10. ZFS / Ceph Prior-Art Comparison
 
-| Dimension | ZFS | Ceph | TideFS |
+This comparison records design inputs and planned behavior. The TideFS column
+is not a current capability, availability, cost, durability, or better-than-
+incumbent claim; any such product-facing statement must use #875 claim ids and
+#928/#930 comparator evidence.
+
+| Dimension | ZFS prior art | Ceph prior art | TideFS design target |
 |---|---|---|---|
 | Label format | 256 KiB device_label, 4 copies | None (monitor cluster) | 256 KiB PoolLabelV1, 2 copies, BLAKE3-256 |
 | Import mechanism | `zpool import -a` scans all devices | OSDs connect to monitors | Label-driven scan + pool_guid grouping; portable |
@@ -635,7 +640,7 @@ optimization that does not change any public API.
 | Hot-spare | External `zed` scripting | CRUSH map `device class` | Built-in `SparePolicy` with auto-activation |
 | Failure handling | zed event → `device state` | Monitor marks OSD down | I/O error → state machine → observability event |
 | Cluster integration | None (single-node) | Native (monitor cluster) | Hybrid: standalone or cluster mode; pool lease |
-| Cross-system portability | Yes (label-driven) | No (monitor-bound) | Yes (label-driven, device_guid identity) |
+| Cross-system portability | Yes (label-driven) | No (monitor-bound) | Target: label-driven with device_guid identity |
 
 ---
 

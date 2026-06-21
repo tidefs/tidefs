@@ -1,4 +1,4 @@
-# Variable Device Sector Alignment: Avoiding ZFS ashift Immutability
+# Variable Device Sector Alignment Design
 
 **Issue**: [#1280](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1280)
 **Status**: design-spec
@@ -9,10 +9,12 @@
 
 ## Abstract
 
-ZFS's `ashift` is a pool-wide property set at device creation and immutable for life.
-A pool built with ashift=9 (512B) cannot add 4K-native NVMe drives without wasting
-50%+ capacity due to read-modify-write amplification on every 4K sector. Ceph's
-`bluestore_min_alloc_size` has a similar per-OSD immutability constraint.
+ZFS `ashift`, Ceph BlueStore allocation sizing, and btrfs sector sizing are
+prior-art inputs for this design. They do not prove a current TideFS capacity,
+flash-wear, throughput, or better-than-incumbent claim. A pool-wide alignment
+choice can make later mixed-sector media inefficient through padding or
+read-modify-write behavior; this design records how TideFS intends to avoid that
+lock-in.
 
 tidefs avoids this by tying alignment to the **extent locator** rather than the pool
 or device. Every `ExtentLocatorValueV1` carries alignment flags that tell the I/O path
@@ -27,10 +29,10 @@ space.
 
 | System | Pool-wide alignment | Add 4K drive to 512B pool | Per-extent alignment | No-read-modify-write for mixed sectors |
 |--------|--------------------|--------------------------|---------------------|--------------------------------------|
-| **ZFS** | Yes (ashift) | No — wastes 50%+ space | No | No |
+| **ZFS** | Yes (ashift) | No — can waste space or amplify writes | No | No |
 | **Ceph BlueStore** | per-OSD (min_alloc_size) | No — requires OSD recreation | No | No |
 | **btrfs** | per-device (sectorsize) | Yes, but per-device not per-extent | No | Partial (per-device) |
-| **tidefs** | Pool declares *supported* set | **Yes** — new writes auto-adapt | **Yes** | **Yes** |
+| **tidefs target** | Pool declares *supported* set | Target: new writes auto-adapt | Target: yes | Target: yes |
 
 ---
 
@@ -395,23 +397,24 @@ The background relocation service (built on #1265 defrag infrastructure and
 
 ## 5. Anti-Pattern Avoidance
 
-### 5.1 ZFS ashift Immutability
+### 5.1 ZFS ashift Immutability Pressure
 
-**ZFS problem**: `zpool create -o ashift=9 pool …` with 512B drives. Later add a
+**Prior-art pressure**: `zpool create -o ashift=9 pool ...` with 512B drives. Later add a
 4K-native NVMe. ZFS writes every 4K sector as 8 × 512B logical blocks, but on a
 4K-native device, a 512B write triggers a read-modify-write of the entire 4K
-physical sector. This doubles I/O per sector and halves effective throughput.
+physical sector. This can amplify I/O and reduce effective throughput.
 
-**tidefs avoidance**: Extents placed on the 4K-native device use `ALIGNMENT_4K`.
+**TideFS design target**: Extents placed on the 4K-native device use `ALIGNMENT_4K`.
 The allocator rounds to 4K boundaries. The block layer issues 4K-aligned I/O.
-No read-modify-write penalty.
+The target is to avoid read-modify-write on mixed-sector pools where the device
+and extent policy permit it.
 
 ### 5.2 Ceph bluestore_min_alloc_size Immutability
 
-**Ceph problem**: `bluestore_min_alloc_size` is set per-OSD at creation time. To
+**Prior-art pressure**: `bluestore_min_alloc_size` is set per-OSD at creation time. To
 change it, the OSD must be destroyed and recreated — losing all data on that OSD.
 
-**tidefs avoidance**: `supported_alignments` is a pool-level policy that can be
+**TideFS design target**: `supported_alignments` is a pool-level policy that can be
 widened at any time (additive). Individual extents carry their own alignment.
 No OSD/device recreation is needed.
 
@@ -484,9 +487,9 @@ than from a static pool property.
 
 ### 7.1 No Read-Modify-Write on Mixed-Sector Pools
 
-| Write scenario | ZFS (ashift=9, 4K drive) | tidefs (per-extent alignment) |
+| Write scenario | ZFS prior-art example (ashift=9, 4K drive) | TideFS design target (per-extent alignment) |
 |---|---|---|
-| 4 KiB write to 4K NVMe | RMW: read 4K, merge 512B×8, write 4K | Direct 4K write, no RMW |
+| 4 KiB write to 4K NVMe | RMW: read 4K, merge 512B×8, write 4K | Target: direct 4K write, no RMW |
 | 512 B write to 512B HDD | Direct 512B write | Direct 512B write |
 | 4 KiB write to 512e HDD | 8 × 512B (no RMW, emulated at drive) | 8 × 512B or aligned 4K if drive supports |
 

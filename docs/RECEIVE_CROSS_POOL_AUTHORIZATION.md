@@ -243,3 +243,7 @@ send/receive source, changed-record encoding, active receive tests, transport
 authentication, cluster membership, placement receipts, or persistent
 operator policy. It only decides the receive authorization model that those
 future implementation issues must satisfy.
+
+OpenZFS references in this document are prior-art inputs for explicit operator
+intent. They are not a send/receive maturity, compatibility, safety, or
+superiority claim for TideFS.

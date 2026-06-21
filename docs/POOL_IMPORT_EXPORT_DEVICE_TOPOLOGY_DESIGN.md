@@ -9,18 +9,21 @@ This document closes Forgejo issue #1254.
 ## 1. Motivation
 
 Production storage systems must survive hardware reconfiguration without data
-loss or external configuration databases. ZFS handles this well: `zpool import`
+loss or external configuration databases. ZFS and Ceph are prior-art design
+inputs here, not evidence for a current TideFS product claim: `zpool import`
 scans devices, discovers pool topology from on-device labels, and reconstructs
-pool state. Ceph takes a fundamentally different approach: OSDs join a monitor
-cluster that holds the topology map centrally.
+pool state, while Ceph OSDs join a monitor cluster that holds the topology map
+centrally.
 
 tidefs must support both standalone pools (ZFS-like portability) and
 cluster-attached pools (Ceph-like coordination) through a unified label-driven
 discovery protocol. Online device management — adding, removing, replacing, and
-handling failed devices while the pool is live — is table-stakes for production
-storage and a hard requirement for the "better than ZFS/Ceph" standard.
+handling failed devices while the pool is live — is a design target for the
+operator lifecycle model. It is not a validated availability, safety,
+cost-effectiveness, or better-than-incumbent claim until #875 and #928/#930
+evidence name and prove that scope.
 
-ZFS limitations this design addresses:
+Prior-art pressures this design records:
 
 - ZFS device removal is a recent addition (post-0.8.0) and remains limited
   (mirror device removal only; PARITY_RAID removal requires pool-wide remapping).
@@ -503,6 +506,10 @@ flags are used for pool-level capability changes within a label version.
 
 ## 13. Non-claims (explicit boundaries)
 
+- ZFS and Ceph references in this document are prior-art/design-pressure
+  context. They do not claim current TideFS parity, superiority, lower
+  operational cost, better availability, or production-ready online device
+  lifecycle behavior.
 - This design does not include the data evacuation engine implementation
   (cursor-driven, bulk-plane data movement) — tracked in #1239, #1229, #1241.
 - This design does not cover erasure coding redundancy or rebuild algorithms —

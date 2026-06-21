@@ -13,11 +13,11 @@ are added. Without a feature flag system, there are two bad choices: never chang
 the format (stagnation leading to competitive irrelevance) or break backward
 compatibility on every change (operational nightmare for users).
 
-OpenZFS solved this with per-pool feature flags that gate format changes and
-prevent older code from damaging newer-format data. ext4 uses a similar
-compat/ro_compat/incompat triplet in its superblock. These proven approaches
-share a common architecture: enumerate capabilities as named flags, classify
-them by compatibility impact, and check on mount.
+OpenZFS per-pool feature flags and the ext4 compat/ro_compat/incompat
+superblock triplet are prior-art inputs for this design. The lesson carried
+forward here is architectural: enumerate capabilities as named flags, classify
+them by compatibility impact, and check them on mount. This is not a claim that
+the TideFS feature-flag implementation has current OpenZFS/ext4 parity.
 
 tidefs must implement feature flags per dataset (not just per pool) because:
 
@@ -340,9 +340,13 @@ skipped. This is the same skip-unknown-TLV rule that applies to all TLV fields.
 - Integration test: create dataset, enable feature, mount, verify feature in
   B-tree, unmount, verify older-code simulation handles feature correctly.
 
-## 11. ZFS Comparison
+## 11. OpenZFS Prior-Art Comparison
 
-| Aspect | OpenZFS | tidefs (this design) |
+This table records design targets only. It does not claim validated
+compatibility safety, upgrade UX parity, operational superiority, or
+format-lifecycle maturity versus OpenZFS.
+
+| Aspect | OpenZFS prior art | TideFS design target |
 |---|---|---|
 | Feature scope | Per-pool (zpool) | Per-dataset (datasets within same pool can have different features) |
 | Feature naming | `org.openzfs:feature_name` | `org.tidefs:feature_name` (same convention) |

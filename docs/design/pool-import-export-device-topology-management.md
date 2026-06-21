@@ -215,22 +215,22 @@ Existing approaches:
 - **Linux MD/DM**: superblocks on devices carry UUID, event counter, and device
   role. `mdadm --assemble` scans and assembles arrays from component devices.
 
-tidefs must support **both** standalone pools (ZFS-like portability) and
-cluster-attached pools (Ceph-like coordination) through a single, unified
-label-driven discovery protocol. Online device management — adding, removing,
-replacing, and handling failed devices while the pool is live — is table-stakes
-for production storage.
+The TideFS design target is to support **both** standalone-pool portability and
+cluster-attached coordination through a single label-driven discovery protocol.
+Online device management — adding, removing, replacing, and handling failed
+devices while the pool is live — remains a design target in this document, not
+a validated current product claim.
 
-ZFS limitations this design addresses:
+Prior-art pressures this design records:
 
-- ZFS device removal is post-0.8.0 and remains limited (mirror device removal
-  only; RAID‑Z removal requires pool‑wide remapping).
-- ZFS device replacement requires manual `zpool replace`; hot‑spare
-  auto‑activation depends on external `zed` scripting.
-- ZFS pool export requires unmounting all datasets; online export is not
-  supported.
-- ZFS label format couples topology to device hierarchy; tidefs decouples label
-  discovery from the internal pool tree.
+- ZFS device removal is post-0.8.0 and has topology constraints such as mirror
+  device removal only; RAID-Z removal requires pool-wide remapping.
+- ZFS device replacement uses `zpool replace`; hot-spare activation depends on
+  `zed` scripting.
+- ZFS pool export requires unmounting all datasets; online export is outside
+  that prior-art model.
+- ZFS label format couples topology to device hierarchy; this TideFS design
+  target separates label discovery from the internal pool tree.
 
 ## 2. Scope and non-scope
 
@@ -1334,9 +1334,15 @@ allocator's internal concurrency model changes.
 - `tidefs-xtask check-label-corruption`: injects label corruption and
   verifies import detects and reports it
 
-## 18. ZFS/Ceph comparative analysis
+## 18. ZFS/Ceph Prior-Art Analysis
 
-| Dimension | ZFS | Ceph | tidefs (this design) |
+This section is a design-pressure comparison only. The TideFS column describes
+targets in this specification, not validated current implementation, parity,
+superiority, production availability, lower operational cost, or complete online
+device lifecycle support. Product-facing incumbent comparisons remain blocked
+behind #875 claim ids and #928/#930 comparator evidence.
+
+| Dimension | ZFS prior art | Ceph prior art | TideFS design target |
 |---|---|---|---|
 | Label format | 256 KiB device_label, 4 copies | None (monitor cluster) | 256 KiB PoolLabelV1, 2 copies, BLAKE3‑256 |
 | Import mechanism | `zpool import -a` scans all devices | OSDs connect to monitors | Label‑driven scan + pool_guid grouping; portable |
@@ -1347,7 +1353,7 @@ allocator's internal concurrency model changes.
 | Hot‑spare | External `zed` scripting | CRUSH map `device class` | Built‑in `SparePolicy` with auto‑activation |
 | Failure handling | zed event → `device state` | Monitor marks OSD down | I/O error → state machine → observability event |
 | Cluster integration | None (single‑node) | Native (monitor cluster) | Hybrid: standalone or cluster mode; pool lease |
-| Cross‑system portability | Yes (label‑driven) | No (monitor‑bound) | Yes (label‑driven, device_guid identity) |
+| Cross‑system portability | Yes (label‑driven) | No (monitor‑bound) | Target: label-driven with device_guid identity |
 
 ## 19. Risk register
 

@@ -489,12 +489,12 @@ is used transparently. If both are corrupt, the device is marked for recovery.
 
 ### 4.1 Label size: 256 KiB vs smaller alternatives
 
-**Choice**: 256 KiB per label copy (ZFS heritage).
+**Choice**: 256 KiB per label copy, informed by ZFS prior art.
 
-**Advantages**: room for future expansion; alignment-friendly (matches common
-device block sizes); straightforward fixed-size read/write.
+**Design benefit target**: room for future expansion; alignment-friendly
+(matches common device block sizes); straightforward fixed-size read/write.
 
-**Disadvantages**: 512 KiB total label overhead per device (negligible on
+**Tradeoffs**: 512 KiB total label overhead per device (negligible on
 modern devices).
 
 **Alternatives considered**: 4 KiB label (too small for rich topology
@@ -517,10 +517,11 @@ calls during export.
 **Choice**: Majority vote among device labels for `topology_generation` and
 `device_count` on import.
 
-**Advantages**: self-contained (no external coordination); simple to implement
-and reason about; handles partial device failure gracefully.
+**Design benefit target**: self-contained operation without external
+coordination; simple to implement and reason about; handles partial device
+failure through explicit import rules.
 
-**Disadvantages**: even-split scenarios require operator intervention; no
+**Tradeoffs**: even-split scenarios require operator intervention; no
 protection against a majority of devices having stale labels from a partial
 topology change that crashed.
 
@@ -532,35 +533,37 @@ adds cluster dependency for standalone pools.
 
 **Choice**: Eager evacuation before device removal.
 
-**Advantages**: clean and immediate removal; device can be physically detached
-after removal; no residual references; aligns with ZFS operator expectations.
+**Design benefit target**: clean and immediate removal; device can be
+physically detached after removal; no residual references; aligns with
+operator expectations from label-driven storage workflows.
 
-**Disadvantages**: evacuation can take a long time for large devices; requires
+**Tradeoffs**: evacuation can take a long time for large devices; requires
 the evacuation engine (#1239) to be implemented first.
 
-**Alternatives considered**: lazy reclamation (Ceph-style) — adds long-lived
-"zombie" device state, complicates crash recovery, risks data loss if device
-is physically detached before reclamation completes.
+**Alternatives considered**: lazy reclamation, as seen in distributed-storage
+prior art, adds long-lived "zombie" device state, complicates crash recovery,
+and risks data loss if a device is physically detached before reclamation
+completes.
 
 ### 4.5 Cluster-aware pool ownership: lease vs lock service
 
 **Choice**: Pool lease with fencing on expiry (deferred to wire-up).
 
-**Advantages**: simple one-node-owns-at-a-time model; compatible with
+**Design benefit target**: simple one-node-owns-at-a-time model; compatible with
 standalone mode (lease check is a no-op when not clustered); fencing
 guarantees no split-brain writes.
 
-**Disadvantages**: lease renewal adds periodic overhead; fencing requires
+**Tradeoffs**: lease renewal adds periodic overhead; fencing requires
 cluster membership (#1283) and distributed lock service (#1248).
 
 ### 4.6 Device wrapper ordering: encrypt-then-compress vs compress-then-encrypt
 
 **Choice**: Encrypt before compress (`InnerDevice -> EncryptedDevice -> CompressedDevice`).
 
-**Advantages**: no metadata leakage through compression ratio side channels
-(CRIME/BREACH-style attacks); correct security posture.
+**Design benefit target**: no metadata leakage through compression ratio side
+channels (CRIME/BREACH-style attacks); correct security posture.
 
-**Disadvantages**: compression provides no space savings for encrypted data;
+**Tradeoffs**: compression provides no space savings for encrypted data;
 users who want both should use filesystem-level compression before encryption.
 
 **Decision**: security trumps space efficiency.

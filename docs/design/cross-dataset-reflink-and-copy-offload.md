@@ -4,17 +4,22 @@
 **Status**: design-draft
 **Maturity**: spec-draft — defines the pool-wide extent sharing architecture for clone, copy offload, and dedup
 **Lane**: storage-core
-**Anti-patterns addressed**: ZFS (reflink only within dataset), CephFS (no reflink), XFS/Btrfs (no cross-subvolume)
+**Prior-art inputs**: ZFS, CephFS, XFS, and Btrfs behavior inform the design
+pressure only. This draft does not claim current TideFS reflink/copy-offload
+parity, superiority, or production readiness.
 
 ## 1. Problem statement
 
-Existing filesystems restrict reflink to objects within the same namespace domain:
+Existing filesystem behavior that motivates this design:
 
 - **ZFS** limits `clonefile` to the same dataset; cross-dataset requires send/recv (full data copy).
 - **CephFS** has no reflink primitive at all.
 - **XFS/Btrfs** support cross-reflink within a filesystem but not across subvolumes.
 
-TideFS must provide **pool-wide extent sharing** where two datasets, clones, or snapshots can reference the same physical extent bytes through a pool-wide `ExtentId`, making cross-dataset reflink a pure metadata operation — O(num_extents), not O(file_size).
+The TideFS design target is **pool-wide extent sharing** where two datasets,
+clones, or snapshots can reference the same physical extent bytes through a
+pool-wide `ExtentId`, making cross-dataset reflink a metadata operation with
+cost proportional to the number of extent records rather than payload size.
 
 ## 2. Scope and non-scope
 
@@ -514,16 +519,20 @@ struct CopyFileRangeSummary {
 
 ## 11. Comparison with existing filesystems
 
-| Capability | ZFS | CephFS | XFS/Btrfs | TideFS |
+This table is a target matrix for the draft design. It does not claim the
+listed TideFS capabilities are implemented, validated, or superior to the
+incumbents.
+
+| Capability | ZFS prior art | CephFS prior art | XFS/Btrfs prior art | TideFS design target |
 |---|---|---|---|---|
-| Within-dataset reflink | Yes | No | Yes | Yes |
-| Cross-dataset reflink | No (send/recv) | No | No (per subvol) | **Yes** |
-| Cross-pool reflink | No | No | No | No (BULK) |
-| Reflink is metadata-only | Yes | N/A | Yes | **Yes** |
-| Post-process dedup across datasets | No | No | No | **Yes** (#1255) |
-| Snapshot + reflink integration | Clones only | N/A | Per-subvol | **Pool-wide** |
-| CoW granularity | Block | N/A | Extent | **Extent** |
-| Atomic cross-dataset commit_group | N/A | N/A | N/A | **Yes** |
+| Within-dataset reflink | Yes | No | Yes | Target: yes |
+| Cross-dataset reflink | No (send/recv) | No | No (per subvol) | Target: yes |
+| Cross-pool reflink | No | No | No | Target: no (BULK) |
+| Reflink is metadata-only | Yes | N/A | Yes | Target: yes |
+| Post-process dedup across datasets | No | No | No | Planned target (#1255) |
+| Snapshot + reflink integration | Clones only | N/A | Per-subvol | Target: pool-wide |
+| CoW granularity | Block | N/A | Extent | Target: extent |
+| Atomic cross-dataset commit_group | N/A | N/A | N/A | Target: yes |
 
 ## 12. Relationship to existing issues
 
