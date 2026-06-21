@@ -11,7 +11,7 @@ OpenZFS/Ceph-class claims.
 | TFR-004 | Dataset/inode authority | Dataset/mount identity and inode ownership need deep review; earlier audit suspected root-level inode list behavior. | Use `docs/INODE_NAMESPACE_AUTHORITY.md`: a dedicated dataset-scoped inode authority owns allocation, persisted IDs, root identity, and recovery seeding while namespace, FUSE lookup state, and inode-table registries remain projections. Implement the non-overlapping follow-ups #664, #665, #666, and #667 before closing this item. |
 | TFR-005 | Timestamp/revision/on-disk format | POSIX timestamps, storage version fields, content object keys, scrub identity, replay ticks, rename metadata stamps, and serialized format fields are coupled. | Specify one authority model for POSIX time, generation, txg, object-version, and on-disk compatibility before changing behavior. |
 | TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Consolidate transform ordering, checksums, key handling, and raw-store visibility. |
-| TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Define one capacity authority and make all adapters consume it. |
+| TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Use `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` as the boundary decision and close the linked follow-up issue map. |
 | TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` for the dirty/writeback durability contract and `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` for the invalidation trigger, stale-generation, and FUSE/kernel/cluster lease model; then prove and test the end-to-end durability and cache-coherency contract. |
 | TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Unify snapshot lifecycle, object protection, deadlists, and stream formats. |
 | TFR-011 | Operator CLI/UAPI | CLI, FUSE, ublk, kernel UAPI, and docs can describe different truths. | Define one public operator/UAPI boundary and keep internal crates behind it. |
@@ -413,6 +413,17 @@ Important 2026-06-01 findings:
   ledgers, and store-layer `SpaceBook` persistence. The capacity authority docs
   therefore overstate "single authority"; they describe a desired end state,
   not the complete production reality.
+- `TFR-007`: `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` records the authority
+  decision for issue #680. Mounted dataset capacity is owned by
+  `tidefs-local-filesystem::CapacityAuthority`, backed by
+  `tidefs-space-accounting` and `tidefs-types-space-accounting-core`.
+  Block allocation, dataset properties, cleanup/reclaim, dedup, inode table,
+  POSIX adapter, and `tidefsctl` surfaces are classified as physical inputs,
+  delta producers, projections, or reporting consumers. The document also
+  records explicit non-claims and a follow-up issue map for the non-overlapping
+  implementation slices needed before TFR-007 can close, including #857, #858,
+  #859, #860, existing #790/#791/#785, and the gated runtime authority closeout
+  row that must wait for overlapping #613/#761 local-filesystem capacity paths.
 - `TFR-007`: commit `5a01cc11` fixes one zero-range accounting leak.
   `LocalFileSystem::zero_range()` now charges `CapacityAuthority` and physical
   `SpaceAccounting` only for holes that become allocated. Existing DATA and
