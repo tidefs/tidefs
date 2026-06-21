@@ -276,9 +276,6 @@ impl ClaimReceiptStatus {
         }
     }
 
-    const fn is_pass(self) -> bool {
-        matches!(self, Self::Pass)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
