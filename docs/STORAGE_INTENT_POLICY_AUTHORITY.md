@@ -1060,6 +1060,8 @@ The prediction evidence projection must distinguish at least:
 | `observation_window_ref` | Names time, bytes, operations, ranges, and decay horizon behind the vector. |
 | `sample_mass_ref` | Prevents one read, one caller hint, or one short burst from becoming high-confidence authority movement. |
 | `feature_vector_ref` | Captures bounded hotness, reuse distance, sync density, write lifetime, compression/dedup value, sequentiality, locality, phase, and path signals. |
+| `signal_materialization_ref` | Names memory-only sketch, sampled counter, decayed histogram, top-K set, durable summary, derived view, or retained evidence mode, plus sampling, decay, rate-limit, drop, and compaction rules. |
+| `signal_collection_cost_ref` | Records CPU, memory, durable metadata writes, flash wear, network emission, evidence-retention bytes, budget-owner, and conservative unknown-cost state for collecting and preserving the signal. |
 | `hint_provenance_ref` | Separates caller, operator, inherited policy, historical, and synthetic hints from observed behavior. |
 | `contradiction_state` | Records phase changes, one-pass scans, churn, tenant manipulation, stale evidence, or conflicting locality/lifetime signals. |
 | `action_class` | Distinguishes queue tuning, prefetch, cache-only trial, new-write shaping, serving promotion, authority promotion, durable relocation, read repair, and geo catch-up. |
@@ -1079,22 +1081,30 @@ Hard prediction laws:
 2. A hint-only or one-off observation may admit queue tuning, prefetch, shadow
    evaluation, or cache-only trial. It must not admit authority promotion,
    durable relocation, old-receipt retirement, or guarantee weakening.
-3. Every prediction-driven authority-changing move must leave a decision ref
+3. Signal collection and signal persistence are admitted work. They may not
+   consume protected sync, repair, evacuation, receipt-retirement, metadata, or
+   flash-wear reserves unless #844/#856/#902/#910 evidence says the budget owner,
+   cost, retention class, and reserve exemption are legal.
+4. Missing, sampled-away, memory-only, compacted, or dropped signal evidence
+   lowers the allowed action class. It may explain why TideFS stayed
+   conservative, but it may not be inflated into high-confidence durable
+   movement or successor claims.
+5. Every prediction-driven authority-changing move must leave a decision ref
    and outcome attribution ref. Missing or refused #912 evidence is not success;
    later similar moves become conservative, shadow-only, cooled down, blocked,
    or refused.
-4. Failed payback, foreground harm, excessive wear, tenant harm, or confounded
+6. Failed payback, foreground harm, excessive wear, tenant harm, or confounded
    measurement attribution must lower, cap, or quarantine confidence, record
    movement debt or cooldown, and be visible to explanation, performance rows,
    and fault rows.
-5. Predictor confidence may rise only from attributable or explicitly bounded
+7. Predictor confidence may rise only from attributable or explicitly bounded
    partially attributable outcomes. Confounded, stale, insufficient-sample,
    contradicted, or cross-scope measurements may diagnose or force conservative
    cooldown, but they may not make authority-changing actions easier to admit.
-6. A tenant, workload, or caller may not train confidence for another owner
+8. A tenant, workload, or caller may not train confidence for another owner
    without #902 isolation evidence, #897 trust/domain eligibility, and #912
    transfer-scope evidence for the measurement.
-7. Prediction evidence may be compacted or decayed only after no receipt,
+9. Prediction evidence may be compacted or decayed only after no receipt,
    relocation decision, cooldown, claim artifact, operator explanation, or
    measurement-attribution dependency still depends on the detailed result.
 
@@ -3165,6 +3175,10 @@ Initial row families should cover:
 - prediction-accountability rows proving missing outcome evidence, failed
   payback, tenant harm, or excessive wear lowers future confidence instead of
   becoming hidden success;
+- signal-materialization rows proving access-pattern observation, derived
+  views, predictor checkpoints, and operator telemetry stay bounded, rate
+  limited, budget-owned, and charged for CPU, memory, evidence bytes, metadata
+  writes, and flash wear instead of becoming hidden write amplification;
 - temporal rows proving RPO lag, stale-read age, TTL/lifecycle windows,
   lease/key expiry, rollout deadlines, cooldowns, and payback windows cite
   clock-health, skew, frontier, or sequence-only evidence;
@@ -3354,6 +3368,12 @@ The matrix must cover at least these row families:
   vector accepted after policy/evidence change, unknown cost treated as zero,
   nondeterministic tie-breaker accepted, rejected candidate reasons discarded,
   and failed payback attached to no original decision;
+- workload/signal faults such as unbounded per-file tracking admitted,
+  telemetry writes hidden from wear accounting, signal persistence consuming
+  protected sync or repair reserve, memory-only sketches treated as durable
+  historical proof, sampled-away evidence inflated into high confidence,
+  dropped predictor checkpoints hidden from explanation, and observability
+  overhead omitted from performance or attribution rows;
 - action-execution faults such as target write treated as cutover, crash after
   copy before verification, crash after replacement publication before source
   retirement, duplicate retry double-spending reserves, stale action continuing
@@ -3923,9 +3943,9 @@ this document except to update the issue map after live tickets exist.
 | Data-shape authority | #878 | data-shape records/model module or `crates/tidefs-storage-intent-data-shape/`, focused tests | Bind record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, small-object inline/packed/external shape, and rebake decisions to compiled policy, metadata/namespace refs, and evidence receipts. |
 | Layout evidence authority | #880 | layout-evidence records/model module or `crates/tidefs-storage-intent-layout-evidence/`, focused tests | Expose allocator geometry, fragmentation, free-run pressure, alignment, zone/write-pointer state, directory/index locality, pending-free safety, and reclaim debt as policy evidence while consuming #904 capability refs for device semantics and #922 refs for metadata locality. |
 | Lifecycle evidence authority | #881 | lifecycle-evidence records/model module or `crates/tidefs-storage-intent-lifecycle-evidence/`, focused tests | Expose write age, stability, snapshot/clone/receive-base retention, orphan/destroy state, metadata/small-object stability, and reclaim frontiers as policy evidence. |
-| Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, metadata write amplification, media health, movement debt, payback evidence, and relocation write budgets while consuming #904 refs for media class, health, and capability freshness. |
+| Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, metadata and signal-persistence write amplification, media health, movement debt, payback evidence, and relocation write budgets while consuming #904 refs for media class, health, and capability freshness. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, metadata amplification, network egress, retention, relocation, and operator-defined cost envelopes without replacing #898 admission evidence. |
-| Workload and prediction evidence plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, temporal refs, decision/outcome refs, payback verdicts, confidence updates, and anti-thrash state for planning, relocation, explanation, performance, and fault rows while linking authority-changing decisions to #905, objective scope to #915, execution/outcome to #911, attribution to #912, evidence cuts to #913, and retention/compaction to #910. |
+| Workload and prediction evidence plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, signal-materialization and collection-cost refs, confidence classes, temporal refs, decision/outcome refs, payback verdicts, confidence updates, and anti-thrash state for planning, relocation, explanation, performance, and fault rows while linking authority-changing decisions to #905, objective scope to #915, execution/outcome to #911, attribution to #912, evidence cuts to #913, cost/wear budgets to #844/#856/#902, and retention/compaction to #910. |
 | Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against #913 query snapshots as satisfied, converging, degraded, blocked, refused, or unsafe-visible, including #900 recovery/degradation, #901 rollout, #902 isolation, #904 media-capability, #922 metadata/namespace, #905 decision-frontier, #915 service-objective refusal, #911 action-execution, #920 result/refusal, and #910 retention state, without choosing placement. |
 | Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy, #915 service-objective refs, #913 query snapshots, #898 reserve state, #902 isolation state, #904 media-capability refusal state, #922 metadata/namespace state, #905 decision-frontier refs, and #920 result/refusal refs to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
 | Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier and temporal-sample evidence without making RDMA mandatory. |
@@ -3933,8 +3953,8 @@ this document except to update the issue map after live tickets exist.
 | Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, metadata repack, directory-index compaction, rebuild, evacuation, geo catch-up, wear movement, #915 service objectives, #913 query snapshots, media-capability gates, metadata/namespace gates, decision-frontier, action-execution, result/refusal, measurement-attribution, and evidence-retention evidence, reserve admission, recovery/degradation predicates, shadow evaluation, payback, and cooldown. |
 | Result/refusal caller evidence | #920 | storage-intent core/result model, response-registry integration docs or code, adapter/result tests | Bind typed storage-intent outcomes to policy/query/decision/receipt refs, degraded-visible state, response-registry projection, errno/block/API/trace compression, retryability, delivery/index refs, and retention/audit proof. |
 | Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, rollout stage, receipts, service objective, result/refusal projection, evidence-query snapshot, lag/timebase, media capability, metadata/namespace state, decision frontier, action execution, measurement attribution, evidence retention, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, isolation/throttle state, prediction outcome, and wear to operators. |
-| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, metadata storm, fsyncdir, lookup/readdir, small-object shape, throughput, tail, service-objective envelope consistency, result/refusal projection, evidence-query consistency, media-capability role legality, decision-frontier preservation, action-execution safety, measurement-attribution safety, evidence-retention safety, trust/domain changes, temporal freshness/lag, capacity admission, recovery/degradation, policy rollout, tenant isolation, prediction accuracy, wear, cost, RPO, and relocation. |
-| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, metadata/namespace, service-objective consistency, result/refusal preservation, evidence-query consistency, media capability, decision-frontier, action-execution, measurement-attribution, evidence-retention, trust/domain, temporal freshness/lag, capacity/reserve, recovery/degradation, policy rollout, tenant isolation, prediction accountability, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
+| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, metadata storm, fsyncdir, lookup/readdir, small-object shape, throughput, tail, service-objective envelope consistency, result/refusal projection, evidence-query consistency, media-capability role legality, decision-frontier preservation, action-execution safety, measurement-attribution safety, evidence-retention safety, trust/domain changes, temporal freshness/lag, capacity admission, recovery/degradation, policy rollout, tenant isolation, prediction accuracy, signal-materialization overhead, wear, cost, RPO, and relocation. |
+| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, metadata/namespace, service-objective consistency, result/refusal preservation, evidence-query consistency, media capability, decision-frontier, action-execution, measurement-attribution, evidence-retention, trust/domain, temporal freshness/lag, capacity/reserve, recovery/degradation, policy rollout, tenant isolation, prediction accountability, signal-materialization safety, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
 | Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, metadata/namespace, service-objective envelope consistency, result/refusal preservation, evidence-query consistency, media-capability role eligibility, decision-frontier accountability, action-execution safety, measurement-attribution safety, evidence-retention safety, temporal lag/freshness, recovery/degradation, policy rollout, tenant isolation, adaptive prediction, RAM, WAN, and wear promises. |
 
 ## Validation For This Slice
