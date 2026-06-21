@@ -64,7 +64,7 @@
 //! | `plan_vfs_copy_file_range_dispatch`    | src handle not found                 | `EBADF`      |
 //! | `plan_vfs_copy_file_range_dispatch`    | dst handle not found                 | `EBADF`      |
 //! | `plan_vfs_copy_file_range_dispatch`    | overlapping ranges                   | `EINVAL`     |
-//! | `plan_vfs_bmap`                        | blocksize == 0                       | `EINVAL`     |
+//! | `bmap`                                 | current userspace adapter boundary   | `EOPNOTSUPP` |
 //! | `parse_vfs_fiemap_request`             | unknown ioctl cmd                    | `EOPNOTSUPP` |
 //! | `parse_vfs_fiemap_request`             | malformed header                     | `EINVAL`     |
 //! | `dispatch_lookup` (negative cache hit) |                                      | `ENOENT`     |
