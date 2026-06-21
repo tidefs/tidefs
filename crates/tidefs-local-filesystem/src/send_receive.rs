@@ -1360,8 +1360,16 @@ pub(crate) fn receive_changed_records_into_empty_root(
     match result {
         Ok((report, _newly_persisted)) => Ok(report),
         Err(e) => {
-            // Leave staging + checkpoint intact so a retry can resume.
-            let _ = fs::remove_dir_all(&staging);
+            // Per RECEIVE_STREAM_MERGE_POLICY §2.2: preserve staging
+            // and checkpoint on retryable errors so a retry can resume;
+            // remove staging on non-retryable errors that make the
+            // checkpoint unrecoverable (export identity mismatch,
+            // decode failure, target pool corruption).
+            if !is_receive_error_retryable(&e) {
+                let _ = fs::remove_dir_all(&staging);
+            }
+            // Return the original error unchanged regardless of cleanup;
+            // the caller decides whether to retry.
             Err(e)
         }
     }
@@ -1415,12 +1423,44 @@ pub(crate) fn sync_directory_path(path: &Path) -> Result<()> {
         .map_err(|source| fs_io_error("sync_all", path, source))
 }
 
+/// Classify a receive error as retryable (staging checkpoint preserved)
+/// or non-retryable (staging checkpoint discarded).
+///
+/// Retryable errors include I/O failures and stream corruption before all
+/// records are persisted — these are likely to succeed on retry.
+/// Non-retryable errors include export identity mismatches, stream decode
+/// failures, and target pool corruption that permanently invalidates the
+/// receive checkpoint.
+///
+/// Per `docs/RECEIVE_STREAM_MERGE_POLICY.md` §2.2.
+fn is_receive_error_retryable(err: &FileSystemError) -> bool {
+    match err {
+        // I/O and store-level errors — transient hardware or filesystem issues.
+        FileSystemError::Store(_) => true,
+        // I/O errors during the publish step are retryable.
+        FileSystemError::PublishOutcomeUncertain { .. } => true,
+        // Decode errors mean the stream is malformed — not retryable.
+        FileSystemError::Decode { .. } => false,
+        // Unsupported operations mean the stream is structurally wrong.
+        FileSystemError::Unsupported { .. } => false,
+        // Target pool corruption invalidates the base root.
+        FileSystemError::CorruptState { .. } => false,
+        // All other errors default to non-retryable (fail closed).
+        _ => false,
+    }
+}
+
 pub(crate) fn receive_incremental_changed_records(
     root: &Path,
     options: StoreOptions,
     export: &ChangedRecordExport,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<ChangedRecordImportReport> {
+    // No staging directory and no checkpoint — this function persists
+    // directly to the target object store.  Errors propagate without
+    // cleanup because partial object puts are unreferenced until a root
+    // slot is published.  See `is_receive_error_retryable` for error
+    // classification shared with the empty-target staging path.
     if !export.incremental {
         return Err(FileSystemError::Unsupported {
             operation: "incremental receive",
