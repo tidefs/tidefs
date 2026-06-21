@@ -3386,9 +3386,25 @@ impl LocalObjectStore {
         let replica_healthy = self.replica_healthy.clone();
         *self = LocalObjectStore::open_with_options(root, options)?;
         self.replica_healthy = replica_healthy;
-        // Rotate to a fresh segment so a checkpoint covering the remaining
-        // complete segments is written immediately (avoids full replay on
-        // next mount after compaction).
+        // Safety net: after reopen, the index must reflect only the
+        // surviving tombstone-only segments.  Clear any objects that
+        // may have been resurrected by a stale checkpoint or segment
+        // replay artifact (observed in focused CI validation).
+        let resurrected: Vec<ObjectKey> = self
+            .index
+            .keys()
+            .copied()
+            .filter(|key| !is_public_scan_internal_key(*key) && !protected_keys.contains(key))
+            .collect();
+        if !resurrected.is_empty() {
+            eprintln!(
+                "compact_retaining: WARNING reopened store has {} resurrected entries; re-tombstoning",
+                resurrected.len()
+            );
+            for key in resurrected {
+                self.delete(key)?;
+            }
+        }
         self.rotate_segment()?;
         for location in protected_exact_locations {
             self.read_location(*location)?;
