@@ -1,8 +1,9 @@
 # Storage Intent Policy Authority
 
-Issue: #839
+Issue: #839, #957
 Date: 2026-06-21
-Status: design authority for follow-up implementation slices
+Status: design authority and media-native convergence gate for follow-up
+implementation slices
 
 This document defines TideFS storage intent as a native cross-cutting
 architecture contract. It is not a tiering add-on, a defrag feature, a cache
@@ -228,6 +229,225 @@ must preserve durable locator authority.
     that row for successor wording until version, configuration, guarantee,
     topology, media, cache state, failure mode, cost, and allowed claim scope
     are first-class evidence.
+
+## Media-Native Convergence Gate
+
+#957 is the end-to-end convergence gate across the storage-intent child issues.
+It prevents the child slices from landing as independent local dialects. A
+device class label is never authority. `fast`, `ssd`, `nvme`, `ram`, `remote`,
+and `archive` are inventory hints until policy, query snapshot, media
+capability, service objective, decision frontier, receipt, cost/wear, RAM,
+relocation, preflight, action, result/refusal, and claim evidence agree.
+
+This gate is binding for product-facing activation, operator wording, and
+successor/comparator claims. Narrow implementation slices may still add neutral
+records, predicates, tests, and evidence refs while preserving this gate, but
+they must not treat their local record as a complete architecture.
+
+### State Vocabulary
+
+The media and role matrices use these states:
+
+| State | Meaning |
+| --- | --- |
+| `L` legal | Evidence is complete for this role. The candidate may enter planning or execution, but only after all hard gates for the requested policy pass. |
+| `I` illegal | This media/role pair cannot satisfy the requested authority. It must be filtered before scoring and returned as a typed refusal when selected by policy or caller demand. |
+| `U` unknown | Required evidence is missing, stale, contradictory, redacted beyond use, or outside its freshness window. Durable sync, full placement, PMem durable authority, block-volume FUA/flush, and remote durable roles fail closed in this state. |
+| `D` degraded-visible | A weaker state is allowed only because policy, recovery/degradation evidence, and result/refusal evidence make the degradation visible. It cannot strengthen an ack receipt or retire source receipts. |
+| `C` cache-only | The target may serve, prewarm, trial, or learn. It is not placement authority, durability authority, receipt-retirement authority, or comparator proof. |
+
+`U` is written explicitly in the matrix cells. If the evidence cut used by #913
+does not prove the cell's prerequisites, the cell is `U` even when a class label
+sounds promising.
+
+### End-To-End Evidence Spine
+
+Every authority-changing decision must preserve this spine:
+
+| Gate | Required output before the next gate may rely on it |
+| --- | --- |
+| Policy source and compilation | A compiled policy revision with source provenance, merge/refusal result, rollout state, and operator-visible requested guarantee. |
+| #913 evidence-query snapshot | One consistent evidence cut with subject scope, policy revision, freshness frontier, producer generations, completeness verdict, and missing/stale/refused inputs. |
+| #904 media capability | Persistence domain, flush/FUA/barrier truth, atomicity, geometry/protocol constraints, health, namespace identity, and stale-probe refusal. |
+| #915 service objective | Workload/operation envelope, latency/tail/throughput/RPO/RTO targets, topology/media scope, isolation, cost, wear, and refusal behavior. |
+| #905 decision frontier | Complete legal/illegal/unknown/degraded candidate set, hard-gate result, score vector, rejected-candidate reasons, deterministic tie-breaker, and counterfactual/payback anchors. |
+| #843 placement planner | Legal placement and role assignment only after illegal and unknown hard-gate failures are removed from scoring. |
+| #842 ack receipts | Earned receipt naming requested guarantee, actual receipt class, replay/flush/fence/order evidence, media role, pending convergence, and refusal/degradation if the floor was not earned. |
+| #844/#856 wear and cost ledgers | Flash endurance, write amplification, movement debt, capacity, egress, power/money, foreground p99, and payback or refusal evidence. |
+| #847 RAM authority | Cache, volatile scratch, replicated volatile authority, intent-backed RAM authority, and PMem durable authority are separate receipt classes with explicit loss/recovery semantics. |
+| #848 relocation governor | Defrag, compaction, rebake, rebuild, evacuation, geo catch-up, archive migration, and reclaim are one receipt-preserving optimizer family. |
+| #926 preflight simulation | Non-authoritative what-if result with query basis, simulated decision frontiers, projected deltas, activation blockers, cost, fidelity, expiry, and non-authority marker. |
+| #911 action execution | Idempotent actuation state, source protection, target verification, cutover/publication, abort/rollback visibility, and source-retirement proof. |
+| #920 result/refusal | Caller-visible success, degraded-visible success, block, retry, refusal, or unsafe-visible result bound to the same policy/query/decision/action/receipt refs. |
+| #875/#928/#931 claim gates | Planned, blocked, partial, or validated claim scope with exact guarantee, topology, media, workload, cache state, fault state, cost/wear model, comparator baseline, and allowed wording. |
+
+### Design Round 1: Access Pattern And Receipt Pass
+
+This pass starts from caller-visible behavior. Each row names the requested
+guarantee, the only legal receipt shape, stale/unsafe refusal, and the outcome
+operators must be able to see.
+
+| Access pattern | Requested guarantee | Legal receipt | Stale or unsafe refusal | Operator-visible outcome |
+| --- | --- | --- | --- | --- |
+| Sync write | Configured durable or explicitly volatile sync floor for the write range. | Local durable intent, quorum intent, full placement, replicated volatile, or explicit volatile receipt matching policy. | Unknown media persistence, missing flush/fence/order evidence, unsafe volatile cache, under-quorum, stale policy, or reserve theft. | Requested floor, earned receipt, pending convergence, latency/tail cost, and refusal reason. |
+| `fsync`/`fdatasync` | Barrier completion for data and required metadata scope. | Receipt binds replay digest, dependency closure, flush/FUA/barrier truth, and media role. | Unsealed dirty epoch, missing namespace dependency, unsupported FUA, stale capability probe, or lost writeback error. | Which bytes and metadata are durable, which remain pending, and why a barrier failed or degraded. |
+| Metadata storms | Namespace and metadata durability plus p99 protection. | Metadata/namespace receipt with locality, fsyncdir semantics, capacity reserve, scheduler lane, and service objective. | Metadata reserve pressure, stale namespace authority, noisy-neighbor p99 harm, or cache-only directory state. | Metadata receipt, queue/backpressure state, protected tenants, and any throttled/refused operations. |
+| Small random writes | Durable update with bounded write amplification and tail latency. | Coalesced or logged receipt with ordering evidence and WAF/cost admission. | Unknown atomic granularity, ZNS/SMR random-incompatible target, WAF ceiling breach, or stale cost evidence. | WAF and tail budget used, legal alternatives, and why the selected target beat them. |
+| Streaming ingest | Sustained throughput without weakening durability, reserves, or tenant floors. | Placement/ack receipts for sequential shape plus capacity, scheduler, and cost admission. | Throughput-only hint tries to bypass sync floor, reserve exhaustion, or noisy-neighbor harm. | Admitted rate, lag, cost, reserve use, and throttle/defer/refusal state. |
+| VM/block-volume flush/FUA | Guest-visible flush/FUA ordering and persistence. | Block receipt with FUA/flush passthrough truth, barrier scope, replay identity, and media capability. | Unsupported/ignored FUA, volatile cache without PLP, unknown persistence, or stale namespace identity. | Flush/FUA guarantee earned or exact block-visible refusal/error. |
+| Logs | Low-latency append with replayable order. | Durable local or quorum intent receipt on a legal log/sync role, with group-commit boundaries. | Log device without flush truth, media health degraded beyond policy, or unbounded write amplification. | Commit group, replay frontier, pending placement, and wear/cost impact. |
+| Snapshots/clones | Stable generation and retained source receipt identity. | Placement/lifecycle receipt that preserves snapshot/clone lineage and old-receipt obligations. | Source retirement before replacement receipt, receive-base dependency hidden, or lifecycle evidence stale. | Protected generations, pinned cost/capacity, and old/new receipt state. |
+| Send/receive | Transfer preserving source guarantee and target policy. | Receive receipt with source lineage, target placement, trust/domain, and convergence/lag refs. | Trust/domain mismatch, stale remote capability, unsupported target media role, or policy downgrade without authorization. | Source and target guarantees, lag, refused roles, and recovery obligation. |
+| Scrub/repair/rebuild | Restore or verify guarantee without losing source authority. | Recovery/degradation and action receipts with source receipt set, reconstruction width, replacement publication, and action result. | Missing/corrupt source set, stale health, no-quorum, reserve pressure, or target verification failure. | Degraded state, repair obligation, replacement receipt, and source-retirement status. |
+| Geo catch-up | Bounded RPO/RTO convergence across trust and path domains. | Geo/remote receipt with temporal lag, trust/domain, path, cost/egress, and policy revision refs. | WAN path stale, trust mismatch, RDMA-only assumption, egress budget breach, or lag beyond policy. | Current lag, RPO state, path/cost, and catch-up/refusal reason. |
+| Archive restore | Restore from cold/object/archive media without claiming hot durable sync. | Archive restore/action receipt with object commit semantics, integrity, cost, and latency envelope. | Archive/object commit semantics unknown, egress budget missing, stale retention proof, or unsupported hot role. | Restore ETA, cost/egress, integrity proof, and remaining degraded/refused state. |
+| Hot read serving | Serve from fastest legal source without inventing authority. | Read-serving receipt from cache, serving trial, RAM authority, placement receipt, degraded reconstruction, or repair-on-read source. | Cache-only treated as durable, stale generation, trust mismatch, or degraded source hidden. | Source used, cache/authority state, staleness, repair-on-read, and alternative legal sources. |
+| Cold bulk data | Low-cost retained placement with truthful durability and restore service objective. | Full placement, archive/object, HDD/SMR/ZNS, or remote durable receipt matching cost/RPO/RTO policy. | Unknown archive durability, unsupported geometry, reserve pressure, or hidden restore egress cost. | Where bytes live, restore cost/latency, retention proof, and refusal/defer state. |
+| Cache-only trials | Learn or prewarm without authority promotion. | Cache-only/trial evidence with scope, expiry, non-authority marker, signal cost, and allowed action class. | Trial output used as receipt, placement authority, source-retirement proof, or claim evidence. | Trial scope, expiry, signal/wear cost, and why it is not authority. |
+| Degraded reads | Return weaker service only when visible and policy-allowed. | Degraded-visible result with source receipt set, missing targets, reconstruction width, repair obligation, and retry/refusal law. | Degraded source hidden as normal success, stale recovery evidence, no legal reconstruction, or unsafe trust/fence state. | Exact degraded state, data source, repair plan, RPO/RTO lag, and caller result projection. |
+
+### Design Round 2: Media Economics Pass
+
+This pass starts from target truth. It records persistence, flush/FUA/barrier
+semantics, latency shape, economic risk, legal roles, illegal roles, and
+unknown-capability refusal before any placement score can run.
+
+| Media class | Persistence and flush truth | Latency/bandwidth shape | Economic and wear risk | Legal roles | Illegal/refusal states |
+| --- | --- | --- | --- | --- | --- |
+| Volatile RAM | Lost on process, host, or power failure unless another receipt backs it. No durable flush truth. | Fastest local read/write, capacity scarce. | Memory pressure and eviction can destroy state. | Scratch, cache, unsafe-visible volatile receipt. | Durable sync, full placement, PMem durable, block FUA, source retirement, or claims beyond volatile scope. |
+| Replicated volatile RAM | Survives one member only while membership, quorum, fencing, and loss semantics hold; still not power-loss durable. | Low latency until quorum/path pressure or partition. | Memory, network, and recovery obligations can harm tenants. | Replicated-volatile authority and hot serving when explicit. | Durable or PMem claims, remote geo guarantee, hidden degradation, or source retirement without durable replacement. |
+| Intent-backed RAM | RAM may serve authority only through a durable intent or placement receipt elsewhere. | Fast serving with commit path bounded by backing intent. | Double-writes, replay cost, and memory pressure. | Durable sync when backing intent is legal, hot read authority, fast replay cache. | Authority without backing receipt, hidden loss semantics, or unbounded foreground p99 cost. |
+| PMem/NVDIMM | Durable only with proven persistence domain, flush/fence instructions, atomicity, and health. | Memory-like latency, finite endurance. | Flush discipline, endurance, platform identity drift. | PMem durable authority, local intent, selected full placement. | PMem class label without #904 proof, stale namespace identity, wrong atomicity, or unsafe health state. |
+| LOG/sync device | Legal only as an intent/log role with flush/FUA/barrier truth and replay linkage. | Low write latency, usually small capacity. | Endurance hot spot and recovery coupling. | Local durable intent, grouped fsync, write-ahead log. | Full placement by itself, cold data, source retirement, or hidden log-device failure. |
+| NVMe/SSD | Durable only when write-cache, flush/FUA, atomicity, health, and namespace evidence pass. | High random IOPS and bandwidth. | Flash wear, WAF, thermal throttling, endurance reserve. | Durable sync, full placement, hot reads, metadata, selected relocation target. | Unknown flush, unsafe volatile cache, WAF/payback failure, or class-label-only receipt. |
+| ZNS | Legal when append/reset/write-pointer and zone lifecycle shape match the workload. | High sequential bandwidth, constrained random writes. | Reset/movement amplification and zone fragmentation. | Sequential full placement, cold/bulk, shape-aware rebake, selected logs if modeled. | Ordinary random placement, hidden write-pointer violation, or wrong atomic granularity. |
+| SMR | Legal when sequential/write-managed shape and recovery plan match policy. | Good bulk throughput, poor random overwrite. | Rewrite bands, cleaning debt, foreground p99 harm. | Cold bulk, archive-like local role, sequential relocation target. | Metadata-hot or random sync role without shape evidence; hidden cleaning debt. |
+| HDD | Durable with flush/FUA truth, but seek and rebuild costs dominate. | High capacity, seek-limited small I/O. | Rebuild time, fragmentation, power, p99 seek cost. | Full placement, cold data, archive-ish local, defrag target when payback holds. | Hot-sync claims without p99 evidence, hidden degraded rebuild risk, or unpriced defrag churn. |
+| Remote durable | Durable only with remote commit semantics, trust/domain, path, lag, and cost evidence. | Path latency and bandwidth dominate. | Egress, WAN variability, remote admin/security risk. | Remote durable placement, geo/RPO, backup/receive target. | Local low-latency sync claim by label, stale trust/path, unknown commit semantics. |
+| WAN/internet | Correctness must hold without RDMA; RDMA is acceleration evidence only. | High/variable RTT, jitter, loss, carrier changes. | Egress, throttling, partitions, RPO lag. | Geo catch-up, remote durable, async/lagged read when visible. | RDMA-required correctness, hidden lag, cross-domain trust mismatch, or p99 sync promise without envelope. |
+| Object/archive | Durable only through object/archive commit, integrity, retention, and restore semantics. | High latency, large-object/bulk shape. | Egress, request cost, restore time, retention lock. | Archive, cold bulk, restore source, geo/backstop. | POSIX/block FUA, hot metadata, low-latency sync, or class-label durability. |
+| Cache-only devices | No authority unless paired with another receipt; may have volatile or best-effort persistence. | Can be fast and cheap for reads/trials. | Eviction, stale generation, signal collection cost. | Cache, prewarm, serving trial, prediction input. | Ack receipt, placement authority, source retirement, or comparator proof. |
+
+### Media Role State Matrix
+
+Cells list the only states this media class may produce for the role. `U` means
+unknown evidence fails closed for that role. `D` never upgrades an ack; it only
+describes a visible weaker state that policy already allows.
+
+| Media class | Volatile/scratch ack | Durable sync/local intent | Full placement | PMem durable | Block flush/FUA | Remote durable/geo | Hot read serving | Cold/archive | Relocation/source retirement | Cache-only trial |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Volatile RAM | `L/U` | `I/U` | `I/U` | `I/U` | `I/U` | `I/U` | `C/U` | `I/U` | `I/U` | `C/U` |
+| Replicated volatile RAM | `L/D/U` | `I/U` | `I/U` | `I/U` | `I/U` | `I/D/U` | `L/D/C/U` | `I/U` | `I/U` | `C/U` |
+| Intent-backed RAM | `L/D/U` | `L/D/U` | `D/U` | `I/U` | `L/D/U` | `D/U` | `L/D/C/U` | `I/U` | `L/D/U` | `C/U` |
+| PMem/NVDIMM | `L/U` | `L/U` | `L/D/U` | `L/U` | `L/U` | `I/U` | `L/C/U` | `L/U` | `L/D/U` | `C/U` |
+| LOG/sync device | `I/U` | `L/U` | `I/D/U` | `I/U` | `L/U` | `I/U` | `I/C/U` | `I/U` | `I/U` | `C/U` |
+| NVMe/SSD | `I/U` | `L/U` | `L/D/U` | `I/U` | `L/U` | `I/U` | `L/C/U` | `L/U` | `L/D/U` | `C/U` |
+| ZNS | `I/U` | `L/U` | `L/D/U` | `I/U` | `L/U` | `I/U` | `L/C/U` | `L/U` | `L/D/U` | `C/U` |
+| SMR | `I/U` | `L/D/U` | `L/D/U` | `I/U` | `L/D/U` | `I/U` | `L/C/U` | `L/U` | `L/D/U` | `C/U` |
+| HDD | `I/U` | `L/U` | `L/D/U` | `I/U` | `L/U` | `I/U` | `L/C/U` | `L/U` | `L/D/U` | `C/U` |
+| Remote durable | `I/U` | `L/D/U` | `L/D/U` | `I/U` | `I/U` | `L/D/U` | `D/C/U` | `L/D/U` | `L/D/U` | `C/U` |
+| WAN/internet | `I/U` | `L/D/U` | `L/D/U` | `I/U` | `I/U` | `L/D/U` | `D/C/U` | `L/D/U` | `L/D/U` | `C/U` |
+| Object/archive | `I/U` | `I/U` | `L/D/U` | `I/U` | `I/U` | `L/D/U` | `D/C/U` | `L/U` | `L/D/U` | `C/U` |
+| Cache-only | `I/U` | `I/U` | `I/U` | `I/U` | `I/U` | `I/U` | `C/U` | `C/U` | `I/U` | `C/U` |
+
+### Design Round 3: Operations And Failure Pass
+
+This pass starts from things that go wrong. A role remains legal only while the
+operation/failure evidence still supports the same receipt and policy.
+
+| Operation or failure | Evidence gate | Legal outcome | Refusal or operator-visible weakened state |
+| --- | --- | --- | --- |
+| Crash/power loss | Ordering, replay, media persistence, flush/fence, and committed-root or intent publication. | Receipt survives replay with the promised bytes and metadata. | Unknown/unsafe media becomes refusal; post-ack loss is a fault until validation proves otherwise. |
+| Volatile cache loss | RAM/cache authority and source receipt refs. | Cache loss does not remove acknowledged authority; replicated volatile loss follows its explicit receipt law. | Cache-only loss is visible; authority loss is unsafe unless policy requested volatile semantics. |
+| Device reset | Media capability generation, namespace identity, health, path/multipath, and stale-probe state. | Revalidate before future receipt or source retirement. | Stale identity or unknown capability blocks durable, FUA, PMem, and full-placement roles. |
+| Namespace identity drift | Device identity, pool/member binding, generation, and placement receipt refs. | Old receipts remain bound to the proven target identity. | Drift without proof blocks reads, source retirement, and claims; operator sees stale/probe refusal. |
+| Stale media probes | #904 freshness and #913 query frontier. | Candidate can be used only inside freshness window. | Unknown/stale capability is not a zero score; it is a blocked/refused hard gate. |
+| Health degradation | SMART/NVMe/PMem/remote health, thermal/error state, recovery evidence, and service objective. | Degraded-visible operation may continue if policy allows and repair/evacuation is admitted. | Refuse new durable roles, defer relocation, or mark source as degraded until replacement receipt exists. |
+| Network/path loss | Transport path, temporal evidence, membership, trust/domain, and remote commit state. | Local receipts continue; remote/geo state becomes lagged or degraded if policy allows. | No hidden remote durable success; lag, RPO, and refusal are operator-visible. |
+| WAN jitter | Service objective, path freshness, scheduler, cost, and preflight deltas. | WAN role is legal when correctness and envelope tolerate the jitter. | p99/lag/cost breach refuses or degrades the role; RDMA absence is not correctness failure. |
+| Partition/fence state | Membership epoch, quorum set, witness/data role, split-brain hazard, and fence evidence. | Quorum/geo actions use only legal epoch members. | Under-quorum, fenced, future/stale epoch, or split-brain risk refuses receipt or source retirement. |
+| Trust/domain mismatch | Authenticated identity, admin/security/tenant domain, key epoch, authorization, residency, and audit. | Cross-domain role only when policy and trust evidence allow it. | Remote, dedup, repair, archive, and geo roles refuse on mismatch or quarantine. |
+| Policy rollout/rollback | #901 publication, stage, in-flight fence, downgrade authorization, convergence frontier, and rollback/re-entry. | New and old receipts remain interpretable; rollback produces its own receipt. | Raw source edit cannot weaken old receipts or hide mixed-revision convergence. |
+| Relocation abort | #911 action step, idempotency, source protection, target verification, and abort/rollback refs. | Source receipt remains authoritative until replacement and cutover evidence permit retirement. | Partial copy, crash, stale action, or duplicate retry is visible and cannot retire source authority. |
+| Replacement receipt publication | Target receipt, ordering, layout, lifecycle, wear/cost, capacity/reserve, recovery/degradation, and result evidence. | Source receipt may be considered for retirement only after replacement publication is durable and visible. | Missing target proof, missing payback, or degraded target keeps old receipt live. |
+| Source-retirement safety | #848 optimizer law, #911 action execution, #900 recovery, #898 capacity, #844/#856 cost, and #920 result. | Retirement is an explicit receipt-preserving action. | Illegal, unknown, stale, unpriced, or weaker target blocks retirement. |
+| Capacity reserve pressure | Allocation tickets, reserve escrow, dirty windows, pending-free, protected floors, and ENOSPC law. | Work proceeds only within admitted reserves or explicit reserve exemption. | Durable sync, repair, evacuation, and receipt-retirement reserves cannot be borrowed silently. |
+| Noisy-neighbor pressure | Tenant/isolation budgets, fair-share, p99 floors, borrowing/debt, scheduler lane, and service objective. | Background ingest, relocation, rebuild, or signal collection throttles before harming protected work. | Aggregate spare capacity does not justify protected p99 harm; result is throttle/defer/refusal. |
+| Claim/validation evidence | #850/#863 rows, #912 attribution, #928 comparator basis, #910 retention, and #875 claim id. | Claim scope is planned, partial, blocked, or validated for an exact envelope. | Broad successor, cost-effective, flash-friendly, RAM-fast, WAN-safe, or sync-performance wording remains blocked. |
+
+### Final Synthesis: Legal Frontier Before Optimization
+
+The three passes collapse into these hard laws:
+
+1. A target reaches placement scoring only after policy, query snapshot, media
+   capability, service objective, trust, membership, capacity, recovery,
+   rollout, isolation, and role-specific hard gates say the candidate is legal.
+   Illegal candidates and unknown hard gates do not get a low score; they leave
+   the frontier as `I` or `U`.
+2. The decision frontier must preserve legal, illegal, unknown, degraded, and
+   cache-only candidates. Winner-only records are not authority because later
+   receipts, explanations, preflight results, attribution, and claims need to
+   replay rejected and unknown alternatives.
+3. Unknown cost, benefit, wear, freshness, trust, path, service objective, or
+   payback is not zero. It is an explicit `U`, `blocked`, `deferred`, or
+   `refused` state until the relevant evidence family supplies a lawful value.
+4. Durable sync, full placement, PMem durable authority, block-volume FUA/flush,
+   and remote durable roles fail closed on unknown or unsafe media capability.
+   A class label never satisfies a receipt.
+5. Relocation, defrag, compaction, rebake, rebuild, evacuation, geo catch-up,
+   archive migration, and reclaim are one receipt-preserving optimizer family.
+   A source receipt cannot retire until replacement receipt, ordering, layout,
+   lifecycle, wear/cost, service objective, capacity/reserve,
+   recovery/degradation, action-execution, and result/refusal evidence all
+   allow it.
+6. Flash lifetime, write amplification, foreground p99, capacity reserves,
+   egress, and operator money/power are blockers. A move that improves read
+   latency while burning endurance, write budget, egress budget, or protected
+   foreground latency without payback evidence is refused, deferred, or
+   cache-only/trial.
+7. RAM roles are not interchangeable. Cache, volatile scratch, replicated
+   volatile authority, intent-backed RAM authority, and PMem durable authority
+   carry separate receipts, loss semantics, recovery obligations, and refusal
+   states.
+8. WAN and internet roles must be correctness-valid without RDMA. RDMA may
+   appear as an acceleration evidence field, but correctness depends on remote
+   commit semantics, temporal lag/RPO, trust/domain, security, path, cost/egress,
+   partition/fence state, and stale-evidence refusal.
+9. Access-pattern prediction names confidence, observation cost, stale or
+   contradictory evidence behavior, allowed action class, cooldown, and
+   outcome/payback attribution. It may optimize placement, preflight, and
+   scheduling, but it may not weaken an acknowledgment guarantee.
+10. Operator-visible policy and results must answer: what guarantee was
+    requested, what receipt was earned, where the bytes live, what is lagging,
+    degraded, cache-only, unknown, or refused, what it cost in latency,
+    bandwidth, wear, capacity, egress, and money/power, and why the selected
+    legal candidate beat legal alternatives.
+11. Comparator, successor, "better than ZFS/Ceph/DRBD", cost-effective,
+    flash-friendly, RAM-fast, WAN-safe, and sync-performance wording remains
+    blocked until #875 claim ids and #928 comparator evidence identify the
+    exact guarantee, topology, media, workload, cache state, cost model, fault
+    state, and allowed claim scope.
+
+### Child Issue Consumption Boundary
+
+Workers on child issues must point their local records at this gate instead of
+creating new local media-role policy. The expected issue boundaries are:
+
+| Issue | Boundary preserved by this convergence gate |
+| --- | --- |
+| #841 | Defines shared records and refs; it does not choose media roles without the full spine. |
+| #842 | Emits earned ack receipts; it refuses unknown/unsafe durable sync and FUA media evidence. |
+| #843 | Plans only after hard legality filtering; optimization cannot trade away receipt floors. |
+| #844/#856 | Price wear and non-wear cost; unknown cost or WAF is a blocker, not score zero. |
+| #847 | Defines RAM authority classes and refuses cache/volatile labels as durable authority. |
+| #848 | Governs the receipt-preserving optimizer family and source-retirement safety. |
+| #904 | Owns capability predicates and unknown/stale/refused media states for role eligibility. |
+| #905 | Records the complete decision frontier, including illegal, unknown, degraded, and cache-only alternatives. |
+| #911 | Executes only from a valid decision/action basis and preserves source receipts through aborts. |
+| #915 | Supplies workload/service envelopes that decide whether a role is legal for the caller-visible objective. |
+| #920 | Projects typed success, degraded-visible success, block, retry, refusal, or unsafe-visible results. |
+| #926 | Previews policy/media/RAM/WAN/relocation changes without becoming authority or claim evidence. |
+| #875/#928/#931 | Keep successor, comparator, and legacy-claim wording blocked until exact evidence scope exists. |
 
 ## Native Object Model
 
@@ -4144,6 +4364,7 @@ this document except to update the issue map after live tickets exist.
 | --- | --- | --- | --- |
 | Membership epoch authority | #750 | `docs/MEMBERSHIP_AUTHORITY.md` | Decide epoch, quorum-write, witness-set, join/drain, fence, roster, and failure-domain authority, then expose typed refs storage-intent consumers can cite. |
 | Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, metadata/namespace refs, membership evidence refs, trust/domain refs, temporal refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, preflight-simulation refs, tenant/isolation refs, workload/prediction refs, media-capability refs, decision-frontier refs, action-execution refs, service-objective refs, result/refusal refs, measurement-attribution refs, comparator evidence refs, evidence-query refs, evidence-retention refs, media role, proximity, data-shape refs, layout refs, lifecycle refs, and cost records. |
+| Media-native convergence gate | #957 | `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`, child issue comments | Preserve the end-to-end policy -> evidence-query -> media-capability -> service-objective -> decision-frontier -> planner -> receipt -> wear/cost -> RAM -> relocation -> preflight -> action -> result/refusal -> claim spine, including the media/role state matrix, before child slices claim implementation readiness. |
 | Ordering evidence authority | #894 | ordering evidence model surface or #841 core model | Expose barrier scope, dirty epoch, dependency closure, replay idempotency, intent sequence, publication boundary, and completion state for sync, quorum, relocation, repair, and receipt-retirement receipts. |
 | Metadata/namespace evidence authority | #922 | storage-intent metadata/namespace records in #841 or `crates/tidefs-storage-intent-metadata-namespace/`, focused tests | Expose metadata subject, namespace operation, VFS/namespace authority refs, namespace-intent and fsyncdir receipts, metadata locality, small-object shape, metadata write amplification, decision/action/result refs, and typed metadata refusal state without replacing VFS or inode authority. |
 | Trust/domain evidence authority | #897 | storage-intent trust/domain records in #841 or `crates/tidefs-storage-intent-trust/`, focused tests | Expose authenticated identity, admin/security/tenant domain, session-security posture, key epoch, authorization/audit refs, residency, sharing-domain compatibility, and quarantine/refusal state. |
