@@ -129,6 +129,17 @@ const fn bytes16_are_zero(bytes: [u8; 16]) -> bool {
     true
 }
 
+const fn bytes32_are_zero(bytes: [u8; 32]) -> bool {
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0 {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 const fn bytes16_equal(left: [u8; 16], right: [u8; 16]) -> bool {
     let mut index = 0;
     while index < left.len() {
@@ -1465,6 +1476,24 @@ impl StorageMediaClass {
                 | Self::SsdFlash
         )
     }
+
+    /// Returns true for media whose geometry is write-pointer constrained.
+    #[must_use]
+    pub const fn is_zoned(self) -> bool {
+        matches!(self, Self::ZonedHdd | Self::ZonedFlash)
+    }
+
+    /// Returns true for object-like media that need explicit commit semantics.
+    #[must_use]
+    pub const fn is_object_like(self) -> bool {
+        matches!(self, Self::ObjectAppliance | Self::CloudObject)
+    }
+
+    /// Returns true for offline or nearline archive media.
+    #[must_use]
+    pub const fn is_archive(self) -> bool {
+        matches!(self, Self::OpticalArchive | Self::TapeArchive)
+    }
 }
 
 /// Media role in a policy or receipt.
@@ -1633,6 +1662,343 @@ impl MediaRoleRequirement {
 impl Default for MediaRoleRequirement {
     fn default() -> Self {
         Self::AUTHORITY
+    }
+}
+
+/// Facts proven by media-capability evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct MediaCapabilityFlags(pub u64);
+
+impl MediaCapabilityFlags {
+    pub const EMPTY: Self = Self(0);
+    pub const STABLE_DEVICE_IDENTITY: Self = Self(1_u64 << 0);
+    pub const STABLE_NAMESPACE_IDENTITY: Self = Self(1_u64 << 1);
+    pub const POOL_MEMBER_BINDING: Self = Self(1_u64 << 2);
+    pub const FIRMWARE_CAPABILITY_GENERATION: Self = Self(1_u64 << 3);
+    pub const PERSISTENCE_DOMAIN: Self = Self(1_u64 << 4);
+    pub const FLUSH_FUA_ORDERING: Self = Self(1_u64 << 5);
+    pub const WRITE_CACHE_SAFE: Self = Self(1_u64 << 6);
+    pub const ATOMICITY_GRANULARITY: Self = Self(1_u64 << 7);
+    pub const PROTOCOL_GEOMETRY: Self = Self(1_u64 << 8);
+    pub const HEALTH: Self = Self(1_u64 << 9);
+    pub const FRESHNESS: Self = Self(1_u64 << 10);
+    pub const PMEM_FLUSH_FENCE: Self = Self(1_u64 << 11);
+    pub const REMOTE_COMMIT: Self = Self(1_u64 << 12);
+    pub const ARCHIVE_RESTORE_RETENTION: Self = Self(1_u64 << 13);
+    pub const TRANSPORT_RDMA_ABSENT_LEGAL: Self = Self(1_u64 << 14);
+    pub const DISCARD_ZEROES_SHAPE: Self = Self(1_u64 << 15);
+
+    /// Merge two capability flag sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Remove one capability flag set from another.
+    #[must_use]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// Returns true when all required facts are present.
+    #[must_use]
+    pub const fn contains_all(self, required: Self) -> bool {
+        (self.0 & required.0) == required.0
+    }
+}
+
+/// Persistence domain proven for a media target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MediaPersistenceDomain {
+    #[default]
+    Unknown = 0,
+    VolatileRam = 1,
+    CacheOnlyVolatile = 2,
+    PlpBackedVolatileCache = 3,
+    OrdinaryPersistent = 4,
+    PersistentMemory = 5,
+    RotationalPersistent = 6,
+    RemoteDurable = 7,
+    ObjectDurable = 8,
+    ArchiveDurable = 9,
+}
+
+impl MediaPersistenceDomain {
+    /// Returns true when this domain can be durable authority for data.
+    #[must_use]
+    pub const fn can_be_durable_authority(self, flags: MediaCapabilityFlags) -> bool {
+        match self {
+            Self::PlpBackedVolatileCache => {
+                flags.contains_all(MediaCapabilityFlags::WRITE_CACHE_SAFE)
+            }
+            Self::OrdinaryPersistent
+            | Self::PersistentMemory
+            | Self::RotationalPersistent
+            | Self::RemoteDurable
+            | Self::ObjectDurable
+            | Self::ArchiveDurable => true,
+            Self::Unknown | Self::VolatileRam | Self::CacheOnlyVolatile => false,
+        }
+    }
+}
+
+/// Flush, FUA, ordering, and commit semantics proven for a media target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MediaFlushOrderingClass {
+    #[default]
+    Unknown = 0,
+    None = 1,
+    FlushOnly = 2,
+    FuaOnly = 3,
+    FlushAndFua = 4,
+    PmemFlushFence = 5,
+    OrderedRemoteCommit = 6,
+    ObjectCommit = 7,
+    ArchiveCommit = 8,
+}
+
+impl MediaFlushOrderingClass {
+    /// Returns true when ordinary block durable writes have flush and FUA proof.
+    #[must_use]
+    pub const fn supports_block_durable(self) -> bool {
+        matches!(self, Self::FlushAndFua)
+    }
+
+    /// Returns true when persistent memory has explicit flush/fence proof.
+    #[must_use]
+    pub const fn supports_pmem_flush_fence(self) -> bool {
+        matches!(self, Self::PmemFlushFence)
+    }
+
+    /// Returns true when remote or object commit is explicitly durable.
+    #[must_use]
+    pub const fn supports_remote_or_object_commit(self) -> bool {
+        matches!(self, Self::OrderedRemoteCommit | Self::ObjectCommit)
+    }
+
+    /// Returns true when archive commit semantics are explicitly retained.
+    #[must_use]
+    pub const fn supports_archive_commit(self) -> bool {
+        matches!(self, Self::ArchiveCommit)
+    }
+}
+
+/// Atomicity and replay granularity proven for a media target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MediaAtomicityClass {
+    #[default]
+    Unknown = 0,
+    TornWritesPossible = 1,
+    LogicalBlockAtomic = 2,
+    PhysicalBlockAtomic = 3,
+    AtomicWriteUnit = 4,
+    IdempotentObjectPut = 5,
+    AppendRecordAtomic = 6,
+}
+
+impl MediaAtomicityClass {
+    /// Returns true when block writes have a usable atomic replay granularity.
+    #[must_use]
+    pub const fn supports_block_durable(self) -> bool {
+        matches!(
+            self,
+            Self::LogicalBlockAtomic | Self::PhysicalBlockAtomic | Self::AtomicWriteUnit
+        )
+    }
+
+    /// Returns true when object/archive writes have idempotent commit semantics.
+    #[must_use]
+    pub const fn supports_object_or_archive(self) -> bool {
+        matches!(self, Self::IdempotentObjectPut | Self::AppendRecordAtomic)
+    }
+}
+
+/// Protocol geometry or access constraint proven for a media target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MediaProtocolGeometryClass {
+    #[default]
+    Unknown = 0,
+    RamByteAddressable = 1,
+    PmemByteAddressable = 2,
+    RandomBlock = 3,
+    RotationalSeek = 4,
+    ZonedSequential = 5,
+    ZonedAppend = 6,
+    ObjectKeyValue = 7,
+    RemoteObject = 8,
+    ArchiveSequential = 9,
+}
+
+/// Health verdict proven by media-capability evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MediaHealthState {
+    #[default]
+    Unknown = 0,
+    Healthy = 1,
+    Warning = 2,
+    Degraded = 3,
+    Failed = 4,
+    Quarantined = 5,
+}
+
+/// Freshness verdict for the capability snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MediaCapabilityFreshnessState {
+    #[default]
+    Missing = 0,
+    Fresh = 1,
+    Stale = 2,
+    Contradictory = 3,
+    Refused = 4,
+}
+
+/// Remote commit semantics proven for a target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MediaRemoteCommitSemantics {
+    #[default]
+    Unknown = 0,
+    NotRemote = 1,
+    VolatileAckOnly = 2,
+    DurableAck = 3,
+    QuorumDurableAck = 4,
+    ObjectConditionalDurable = 5,
+    ArchiveRetained = 6,
+    RdmaRequiredOnly = 7,
+}
+
+impl MediaRemoteCommitSemantics {
+    /// Returns true when a remote target can acknowledge durable commit.
+    #[must_use]
+    pub const fn supports_durable_commit(self) -> bool {
+        matches!(
+            self,
+            Self::DurableAck
+                | Self::QuorumDurableAck
+                | Self::ObjectConditionalDurable
+                | Self::ArchiveRetained
+        )
+    }
+}
+
+/// Archive restore and retention semantics proven for a target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MediaArchiveRestoreSemantics {
+    #[default]
+    Unknown = 0,
+    NotArchive = 1,
+    RestoreUnbounded = 2,
+    RestoreRetained = 3,
+    RestoreAudited = 4,
+}
+
+impl MediaArchiveRestoreSemantics {
+    /// Returns true when archive retention and restore semantics are bounded.
+    #[must_use]
+    pub const fn supports_retained_restore(self) -> bool {
+        matches!(self, Self::RestoreRetained | Self::RestoreAudited)
+    }
+}
+
+/// Evidence-bound media capability projection consumed by role predicates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentMediaCapabilityRecord {
+    pub media_class: StorageMediaClass,
+    pub flags: MediaCapabilityFlags,
+    pub identity_generation: u64,
+    pub namespace_generation: u64,
+    pub firmware_generation: u64,
+    pub settings_generation: u64,
+    pub pool_member_generation: u64,
+    pub persistence: MediaPersistenceDomain,
+    pub flush_ordering: MediaFlushOrderingClass,
+    pub atomicity: MediaAtomicityClass,
+    pub geometry: MediaProtocolGeometryClass,
+    pub health: MediaHealthState,
+    pub freshness: MediaCapabilityFreshnessState,
+    pub remote_commit: MediaRemoteCommitSemantics,
+    pub archive_restore: MediaArchiveRestoreSemantics,
+    pub logical_block_bytes: u32,
+    pub physical_block_bytes: u32,
+    pub atomic_write_unit_bytes: u32,
+    pub optimal_io_bytes: u32,
+    pub max_queue_depth: u32,
+    pub latency_class_us: u32,
+    pub evidence: StorageIntentEvidenceRef,
+    pub stable_identity_ref: StorageIntentEvidenceRef,
+    pub namespace_identity_ref: StorageIntentEvidenceRef,
+    pub persistence_ref: StorageIntentEvidenceRef,
+    pub flush_ref: StorageIntentEvidenceRef,
+    pub atomicity_ref: StorageIntentEvidenceRef,
+    pub geometry_ref: StorageIntentEvidenceRef,
+    pub health_ref: StorageIntentEvidenceRef,
+    pub freshness_ref: StorageIntentEvidenceRef,
+    pub remote_commit_ref: StorageIntentEvidenceRef,
+    pub archive_restore_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentMediaCapabilityRecord {
+    /// Returns true when the record cites a non-empty media-capability artifact.
+    #[must_use]
+    pub const fn has_media_capability_evidence(self) -> bool {
+        self.evidence.kind as u16 == StorageIntentEvidenceKind::MediaCapabilityEvidence as u16
+            && !bytes32_are_zero(self.evidence.id.0)
+    }
+}
+
+impl Default for StorageIntentMediaCapabilityRecord {
+    fn default() -> Self {
+        Self {
+            media_class: StorageMediaClass::SystemRam,
+            flags: MediaCapabilityFlags::EMPTY,
+            identity_generation: 0,
+            namespace_generation: 0,
+            firmware_generation: 0,
+            settings_generation: 0,
+            pool_member_generation: 0,
+            persistence: MediaPersistenceDomain::Unknown,
+            flush_ordering: MediaFlushOrderingClass::Unknown,
+            atomicity: MediaAtomicityClass::Unknown,
+            geometry: MediaProtocolGeometryClass::Unknown,
+            health: MediaHealthState::Unknown,
+            freshness: MediaCapabilityFreshnessState::Missing,
+            remote_commit: MediaRemoteCommitSemantics::Unknown,
+            archive_restore: MediaArchiveRestoreSemantics::Unknown,
+            logical_block_bytes: 0,
+            physical_block_bytes: 0,
+            atomic_write_unit_bytes: 0,
+            optimal_io_bytes: 0,
+            max_queue_depth: 0,
+            latency_class_us: 0,
+            evidence: StorageIntentEvidenceRef::default(),
+            stable_identity_ref: StorageIntentEvidenceRef::default(),
+            namespace_identity_ref: StorageIntentEvidenceRef::default(),
+            persistence_ref: StorageIntentEvidenceRef::default(),
+            flush_ref: StorageIntentEvidenceRef::default(),
+            atomicity_ref: StorageIntentEvidenceRef::default(),
+            geometry_ref: StorageIntentEvidenceRef::default(),
+            health_ref: StorageIntentEvidenceRef::default(),
+            freshness_ref: StorageIntentEvidenceRef::default(),
+            remote_commit_ref: StorageIntentEvidenceRef::default(),
+            archive_restore_ref: StorageIntentEvidenceRef::default(),
+        }
     }
 }
 
@@ -2118,6 +2484,90 @@ impl_u8_canonical!(StorageMediaClass, {
     TapeArchive = 11 => "tape-archive",
 });
 
+impl_u8_canonical!(MediaPersistenceDomain, {
+    Unknown = 0 => "unknown",
+    VolatileRam = 1 => "volatile-ram",
+    CacheOnlyVolatile = 2 => "cache-only-volatile",
+    PlpBackedVolatileCache = 3 => "plp-backed-volatile-cache",
+    OrdinaryPersistent = 4 => "ordinary-persistent",
+    PersistentMemory = 5 => "persistent-memory",
+    RotationalPersistent = 6 => "rotational-persistent",
+    RemoteDurable = 7 => "remote-durable",
+    ObjectDurable = 8 => "object-durable",
+    ArchiveDurable = 9 => "archive-durable",
+});
+
+impl_u8_canonical!(MediaFlushOrderingClass, {
+    Unknown = 0 => "unknown",
+    None = 1 => "none",
+    FlushOnly = 2 => "flush-only",
+    FuaOnly = 3 => "fua-only",
+    FlushAndFua = 4 => "flush-and-fua",
+    PmemFlushFence = 5 => "pmem-flush-fence",
+    OrderedRemoteCommit = 6 => "ordered-remote-commit",
+    ObjectCommit = 7 => "object-commit",
+    ArchiveCommit = 8 => "archive-commit",
+});
+
+impl_u8_canonical!(MediaAtomicityClass, {
+    Unknown = 0 => "unknown",
+    TornWritesPossible = 1 => "torn-writes-possible",
+    LogicalBlockAtomic = 2 => "logical-block-atomic",
+    PhysicalBlockAtomic = 3 => "physical-block-atomic",
+    AtomicWriteUnit = 4 => "atomic-write-unit",
+    IdempotentObjectPut = 5 => "idempotent-object-put",
+    AppendRecordAtomic = 6 => "append-record-atomic",
+});
+
+impl_u8_canonical!(MediaProtocolGeometryClass, {
+    Unknown = 0 => "unknown",
+    RamByteAddressable = 1 => "ram-byte-addressable",
+    PmemByteAddressable = 2 => "pmem-byte-addressable",
+    RandomBlock = 3 => "random-block",
+    RotationalSeek = 4 => "rotational-seek",
+    ZonedSequential = 5 => "zoned-sequential",
+    ZonedAppend = 6 => "zoned-append",
+    ObjectKeyValue = 7 => "object-key-value",
+    RemoteObject = 8 => "remote-object",
+    ArchiveSequential = 9 => "archive-sequential",
+});
+
+impl_u8_canonical!(MediaHealthState, {
+    Unknown = 0 => "unknown",
+    Healthy = 1 => "healthy",
+    Warning = 2 => "warning",
+    Degraded = 3 => "degraded",
+    Failed = 4 => "failed",
+    Quarantined = 5 => "quarantined",
+});
+
+impl_u8_canonical!(MediaCapabilityFreshnessState, {
+    Missing = 0 => "missing",
+    Fresh = 1 => "fresh",
+    Stale = 2 => "stale",
+    Contradictory = 3 => "contradictory",
+    Refused = 4 => "refused",
+});
+
+impl_u8_canonical!(MediaRemoteCommitSemantics, {
+    Unknown = 0 => "unknown",
+    NotRemote = 1 => "not-remote",
+    VolatileAckOnly = 2 => "volatile-ack-only",
+    DurableAck = 3 => "durable-ack",
+    QuorumDurableAck = 4 => "quorum-durable-ack",
+    ObjectConditionalDurable = 5 => "object-conditional-durable",
+    ArchiveRetained = 6 => "archive-retained",
+    RdmaRequiredOnly = 7 => "rdma-required-only",
+});
+
+impl_u8_canonical!(MediaArchiveRestoreSemantics, {
+    Unknown = 0 => "unknown",
+    NotArchive = 1 => "not-archive",
+    RestoreUnbounded = 2 => "restore-unbounded",
+    RestoreRetained = 3 => "restore-retained",
+    RestoreAudited = 4 => "restore-audited",
+});
+
 impl_u8_canonical!(RamAuthorityClass, {
     NonAuthoritativeCache = 0 => "non-authoritative-cache",
     RamVolatileLocal = 1 => "ram-volatile-local",
@@ -2433,6 +2883,32 @@ pub enum StorageIntentRefusalReason {
     FlashWearBudgetExceeded = 23,
     /// Required evidence is missing, stale, contradictory, or refused.
     EvidenceNotUsable = 24,
+    /// Media-capability evidence is absent or not a media-capability artifact.
+    MissingMediaCapabilityEvidence = 25,
+    /// Persistence domain is unknown or unproved.
+    UnknownPersistenceDomain = 26,
+    /// Flush, FUA, barrier, or ordering semantics are missing or too weak.
+    UnsupportedFlushFuaSemantics = 27,
+    /// Volatile write cache is not proven safe for a durable role.
+    UnsafeVolatileWriteCache = 28,
+    /// Device, namespace, path, or pool-member identity is unstable or stale.
+    UnstableNamespaceIdentity = 29,
+    /// Atomicity, block size, or write granularity is not legal for the role.
+    WrongAtomicityGranularity = 30,
+    /// Zoned or write-pointer constraints are not legal for the role.
+    UnsupportedZoneWritePointer = 31,
+    /// Media-capability evidence is older than the legal freshness frontier.
+    StaleMediaCapabilityEvidence = 32,
+    /// Health evidence reports a degraded, failed, or quarantined target.
+    DegradedMediaHealth = 33,
+    /// Remote/object commit semantics cannot prove the requested durability.
+    UnsupportedRemoteCommitSemantics = 34,
+    /// Persistent-memory durable authority lacks flush/fence proof.
+    PmemFlushFenceMissing = 35,
+    /// Archive restore or retention semantics are unknown or unbounded.
+    UnknownArchiveRestoreRetention = 36,
+    /// Correctness depends on RDMA being present for a remote target.
+    RdmaRequiredForCorrectness = 37,
 }
 
 impl StorageIntentRefusalReason {
@@ -2467,6 +2943,19 @@ impl StorageIntentRefusalReason {
             Self::MovementDebtNotPaidBack => "movement-debt-not-paid-back",
             Self::FlashWearBudgetExceeded => "flash-wear-budget-exceeded",
             Self::EvidenceNotUsable => "evidence-not-usable",
+            Self::MissingMediaCapabilityEvidence => "missing-media-capability-evidence",
+            Self::UnknownPersistenceDomain => "unknown-persistence-domain",
+            Self::UnsupportedFlushFuaSemantics => "unsupported-flush-fua-semantics",
+            Self::UnsafeVolatileWriteCache => "unsafe-volatile-write-cache",
+            Self::UnstableNamespaceIdentity => "unstable-namespace-identity",
+            Self::WrongAtomicityGranularity => "wrong-atomicity-granularity",
+            Self::UnsupportedZoneWritePointer => "unsupported-zone-write-pointer",
+            Self::StaleMediaCapabilityEvidence => "stale-media-capability-evidence",
+            Self::DegradedMediaHealth => "degraded-media-health",
+            Self::UnsupportedRemoteCommitSemantics => "unsupported-remote-commit-semantics",
+            Self::PmemFlushFenceMissing => "pmem-flush-fence-missing",
+            Self::UnknownArchiveRestoreRetention => "unknown-archive-restore-retention",
+            Self::RdmaRequiredForCorrectness => "rdma-required-for-correctness",
         }
     }
 
@@ -2499,6 +2988,19 @@ impl StorageIntentRefusalReason {
             22 => Some(Self::MovementDebtNotPaidBack),
             23 => Some(Self::FlashWearBudgetExceeded),
             24 => Some(Self::EvidenceNotUsable),
+            25 => Some(Self::MissingMediaCapabilityEvidence),
+            26 => Some(Self::UnknownPersistenceDomain),
+            27 => Some(Self::UnsupportedFlushFuaSemantics),
+            28 => Some(Self::UnsafeVolatileWriteCache),
+            29 => Some(Self::UnstableNamespaceIdentity),
+            30 => Some(Self::WrongAtomicityGranularity),
+            31 => Some(Self::UnsupportedZoneWritePointer),
+            32 => Some(Self::StaleMediaCapabilityEvidence),
+            33 => Some(Self::DegradedMediaHealth),
+            34 => Some(Self::UnsupportedRemoteCommitSemantics),
+            35 => Some(Self::PmemFlushFenceMissing),
+            36 => Some(Self::UnknownArchiveRestoreRetention),
+            37 => Some(Self::RdmaRequiredForCorrectness),
             _ => None,
         }
     }
@@ -2748,6 +3250,377 @@ pub const fn sharing_domain_satisfies(
     }
 }
 
+const fn media_capability_identity_flags_required() -> MediaCapabilityFlags {
+    MediaCapabilityFlags::STABLE_DEVICE_IDENTITY
+        .union(MediaCapabilityFlags::STABLE_NAMESPACE_IDENTITY)
+        .union(MediaCapabilityFlags::POOL_MEMBER_BINDING)
+        .union(MediaCapabilityFlags::FIRMWARE_CAPABILITY_GENERATION)
+}
+
+const fn media_capability_requires_stable_identity(
+    role: StorageMediaRole,
+    ack_class: StorageIntentGuaranteeClass,
+) -> bool {
+    durable_media_required(ack_class)
+        || !matches!(
+            role,
+            StorageMediaRole::ReadCache
+                | StorageMediaRole::RamCache
+                | StorageMediaRole::ScratchVolatile
+                | StorageMediaRole::RepairTemp
+                | StorageMediaRole::OptimizerTemp
+                | StorageMediaRole::RamVolatileAuthority
+        )
+}
+
+const fn media_capability_requires_durable_media(
+    role: StorageMediaRole,
+    ack_class: StorageIntentGuaranteeClass,
+) -> bool {
+    durable_media_required(ack_class)
+        || matches!(
+            role,
+            StorageMediaRole::SyncIntent
+                | StorageMediaRole::MetadataHot
+                | StorageMediaRole::ServingDataHot
+                | StorageMediaRole::BulkDataCold
+                | StorageMediaRole::RamIntentBackedAuthority
+                | StorageMediaRole::PlacementAuthority
+                | StorageMediaRole::GeoAsyncReplica
+                | StorageMediaRole::ArchiveEc
+        )
+}
+
+const fn media_capability_requires_remote_commit(
+    role: StorageMediaRole,
+    capability: StorageIntentMediaCapabilityRecord,
+    durable_required: bool,
+) -> bool {
+    durable_required
+        && (capability.media_class.is_object_like()
+            || matches!(
+                capability.persistence,
+                MediaPersistenceDomain::RemoteDurable | MediaPersistenceDomain::ObjectDurable
+            )
+            || matches!(role, StorageMediaRole::GeoAsyncReplica))
+}
+
+const fn media_capability_requires_archive_restore(
+    role: StorageMediaRole,
+    capability: StorageIntentMediaCapabilityRecord,
+) -> bool {
+    capability.media_class.is_archive()
+        || matches!(
+            capability.persistence,
+            MediaPersistenceDomain::ArchiveDurable
+        )
+        || matches!(role, StorageMediaRole::ArchiveEc)
+}
+
+const fn media_capability_freshness_satisfies(
+    capability: StorageIntentMediaCapabilityRecord,
+) -> ReceiptPredicateResult {
+    if !capability.has_media_capability_evidence()
+        || !capability
+            .flags
+            .contains_all(MediaCapabilityFlags::FRESHNESS)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence,
+        );
+    }
+    match capability.freshness {
+        MediaCapabilityFreshnessState::Fresh => ReceiptPredicateResult::SATISFIED,
+        MediaCapabilityFreshnessState::Missing => ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence,
+        ),
+        MediaCapabilityFreshnessState::Stale => ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::StaleMediaCapabilityEvidence,
+        ),
+        MediaCapabilityFreshnessState::Contradictory | MediaCapabilityFreshnessState::Refused => {
+            ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+        }
+    }
+}
+
+const fn media_capability_health_satisfies(
+    capability: StorageIntentMediaCapabilityRecord,
+    durable_required: bool,
+) -> ReceiptPredicateResult {
+    if !durable_required && !capability.flags.contains_all(MediaCapabilityFlags::HEALTH) {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    if !capability.flags.contains_all(MediaCapabilityFlags::HEALTH)
+        || matches!(capability.health, MediaHealthState::Unknown)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if matches!(
+        capability.health,
+        MediaHealthState::Degraded | MediaHealthState::Failed | MediaHealthState::Quarantined
+    ) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::DegradedMediaHealth);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+const fn media_capability_geometry_satisfies(
+    role: StorageMediaRole,
+    capability: StorageIntentMediaCapabilityRecord,
+    durable_required: bool,
+) -> ReceiptPredicateResult {
+    if capability.media_class.is_zoned() {
+        if !capability
+            .flags
+            .contains_all(MediaCapabilityFlags::PROTOCOL_GEOMETRY)
+            || !matches!(
+                capability.geometry,
+                MediaProtocolGeometryClass::ZonedSequential
+                    | MediaProtocolGeometryClass::ZonedAppend
+            )
+        {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::UnsupportedZoneWritePointer,
+            );
+        }
+        if matches!(
+            role,
+            StorageMediaRole::SyncIntent
+                | StorageMediaRole::MetadataHot
+                | StorageMediaRole::ServingDataHot
+                | StorageMediaRole::PlacementAuthority
+                | StorageMediaRole::RamIntentBackedAuthority
+        ) && !matches!(capability.geometry, MediaProtocolGeometryClass::ZonedAppend)
+        {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::UnsupportedZoneWritePointer,
+            );
+        }
+    } else if durable_required
+        && !capability
+            .flags
+            .contains_all(MediaCapabilityFlags::PROTOCOL_GEOMETRY)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+const fn media_capability_atomicity_satisfies(
+    capability: StorageIntentMediaCapabilityRecord,
+    durable_required: bool,
+) -> ReceiptPredicateResult {
+    if !durable_required {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    if !capability
+        .flags
+        .contains_all(MediaCapabilityFlags::ATOMICITY_GRANULARITY)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::WrongAtomicityGranularity,
+        );
+    }
+    if capability.media_class.is_object_like() || capability.media_class.is_archive() {
+        if !capability.atomicity.supports_object_or_archive() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::WrongAtomicityGranularity,
+            );
+        }
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    if !capability.atomicity.supports_block_durable()
+        || capability.logical_block_bytes == 0
+        || capability.physical_block_bytes == 0
+        || capability.atomic_write_unit_bytes == 0
+        || capability.physical_block_bytes % capability.logical_block_bytes != 0
+        || capability.atomic_write_unit_bytes % capability.logical_block_bytes != 0
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::WrongAtomicityGranularity,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+const fn media_capability_flush_satisfies(
+    capability: StorageIntentMediaCapabilityRecord,
+    durable_required: bool,
+) -> ReceiptPredicateResult {
+    if !durable_required {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    if matches!(
+        capability.persistence,
+        MediaPersistenceDomain::PersistentMemory
+    ) || matches!(capability.media_class, StorageMediaClass::PersistentMemory)
+    {
+        if !capability
+            .flags
+            .contains_all(MediaCapabilityFlags::PMEM_FLUSH_FENCE)
+            || !capability.flush_ordering.supports_pmem_flush_fence()
+        {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::PmemFlushFenceMissing,
+            );
+        }
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    if capability.media_class.is_object_like()
+        || capability.media_class.is_archive()
+        || matches!(
+            capability.persistence,
+            MediaPersistenceDomain::RemoteDurable
+                | MediaPersistenceDomain::ObjectDurable
+                | MediaPersistenceDomain::ArchiveDurable
+        )
+    {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    if !capability
+        .flags
+        .contains_all(MediaCapabilityFlags::FLUSH_FUA_ORDERING)
+        || !capability.flush_ordering.supports_block_durable()
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnsupportedFlushFuaSemantics,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+const fn media_capability_remote_commit_satisfies(
+    capability: StorageIntentMediaCapabilityRecord,
+) -> ReceiptPredicateResult {
+    if matches!(
+        capability.remote_commit,
+        MediaRemoteCommitSemantics::RdmaRequiredOnly
+    ) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::RdmaRequiredForCorrectness,
+        );
+    }
+    if !capability
+        .flags
+        .contains_all(MediaCapabilityFlags::REMOTE_COMMIT)
+        || !capability.remote_commit.supports_durable_commit()
+        || !(capability.flush_ordering.supports_remote_or_object_commit()
+            || capability.flush_ordering.supports_archive_commit())
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnsupportedRemoteCommitSemantics,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+const fn media_capability_archive_restore_satisfies(
+    capability: StorageIntentMediaCapabilityRecord,
+) -> ReceiptPredicateResult {
+    if !capability
+        .flags
+        .contains_all(MediaCapabilityFlags::ARCHIVE_RESTORE_RETENTION)
+        || !capability.archive_restore.supports_retained_restore()
+        || !capability.flush_ordering.supports_archive_commit()
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnknownArchiveRestoreRetention,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can capability evidence legally support a media role.
+#[must_use]
+pub const fn media_capability_satisfies_role(
+    requirement: MediaRoleRequirement,
+    ack_class: StorageIntentGuaranteeClass,
+    role: StorageMediaRole,
+    capability: StorageIntentMediaCapabilityRecord,
+) -> ReceiptPredicateResult {
+    let role_result =
+        media_role_satisfies_receipt(requirement, ack_class, role, capability.media_class);
+    if !role_result.satisfied {
+        return role_result;
+    }
+
+    let freshness = media_capability_freshness_satisfies(capability);
+    if !freshness.satisfied {
+        return freshness;
+    }
+
+    let durable_required = media_capability_requires_durable_media(role, ack_class);
+    let health = media_capability_health_satisfies(capability, durable_required);
+    if !health.satisfied {
+        return health;
+    }
+
+    if media_capability_requires_stable_identity(role, ack_class)
+        && !capability
+            .flags
+            .contains_all(media_capability_identity_flags_required())
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnstableNamespaceIdentity,
+        );
+    }
+
+    if !capability
+        .flags
+        .contains_all(MediaCapabilityFlags::PERSISTENCE_DOMAIN)
+        || matches!(capability.persistence, MediaPersistenceDomain::Unknown)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnknownPersistenceDomain,
+        );
+    }
+
+    if durable_required {
+        if matches!(
+            capability.persistence,
+            MediaPersistenceDomain::CacheOnlyVolatile
+        ) {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::UnsafeVolatileWriteCache,
+            );
+        }
+        if !capability
+            .persistence
+            .can_be_durable_authority(capability.flags)
+        {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::PersistentMediaRequired,
+            );
+        }
+    }
+
+    let geometry = media_capability_geometry_satisfies(role, capability, durable_required);
+    if !geometry.satisfied {
+        return geometry;
+    }
+    let atomicity = media_capability_atomicity_satisfies(capability, durable_required);
+    if !atomicity.satisfied {
+        return atomicity;
+    }
+    let flush = media_capability_flush_satisfies(capability, durable_required);
+    if !flush.satisfied {
+        return flush;
+    }
+    if media_capability_requires_remote_commit(role, capability, durable_required) {
+        let remote_commit = media_capability_remote_commit_satisfies(capability);
+        if !remote_commit.satisfied {
+            return remote_commit;
+        }
+    }
+    if media_capability_requires_archive_restore(role, capability) {
+        let archive_restore = media_capability_archive_restore_satisfies(capability);
+        if !archive_restore.satisfied {
+            return archive_restore;
+        }
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
 /// Predicate: can a media role/class legally support this receipt?
 #[must_use]
 pub const fn media_role_satisfies_receipt(
@@ -2914,6 +3787,66 @@ mod tests {
         }
     }
 
+    fn media_evidence(byte: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            StorageIntentEvidenceId([byte; 32]),
+            u64::from(byte),
+            1,
+        )
+    }
+
+    fn durable_media_flags() -> MediaCapabilityFlags {
+        MediaCapabilityFlags::STABLE_DEVICE_IDENTITY
+            .union(MediaCapabilityFlags::STABLE_NAMESPACE_IDENTITY)
+            .union(MediaCapabilityFlags::POOL_MEMBER_BINDING)
+            .union(MediaCapabilityFlags::FIRMWARE_CAPABILITY_GENERATION)
+            .union(MediaCapabilityFlags::PERSISTENCE_DOMAIN)
+            .union(MediaCapabilityFlags::FLUSH_FUA_ORDERING)
+            .union(MediaCapabilityFlags::ATOMICITY_GRANULARITY)
+            .union(MediaCapabilityFlags::PROTOCOL_GEOMETRY)
+            .union(MediaCapabilityFlags::HEALTH)
+            .union(MediaCapabilityFlags::FRESHNESS)
+    }
+
+    fn proven_nvme_capability() -> StorageIntentMediaCapabilityRecord {
+        let evidence = media_evidence(9);
+        StorageIntentMediaCapabilityRecord {
+            media_class: StorageMediaClass::NvmeFlash,
+            flags: durable_media_flags(),
+            identity_generation: 1,
+            namespace_generation: 2,
+            firmware_generation: 3,
+            settings_generation: 4,
+            pool_member_generation: 5,
+            persistence: MediaPersistenceDomain::OrdinaryPersistent,
+            flush_ordering: MediaFlushOrderingClass::FlushAndFua,
+            atomicity: MediaAtomicityClass::AtomicWriteUnit,
+            geometry: MediaProtocolGeometryClass::RandomBlock,
+            health: MediaHealthState::Healthy,
+            freshness: MediaCapabilityFreshnessState::Fresh,
+            remote_commit: MediaRemoteCommitSemantics::NotRemote,
+            archive_restore: MediaArchiveRestoreSemantics::NotArchive,
+            logical_block_bytes: 512,
+            physical_block_bytes: 4096,
+            atomic_write_unit_bytes: 4096,
+            optimal_io_bytes: 131_072,
+            max_queue_depth: 64,
+            latency_class_us: 100,
+            evidence,
+            stable_identity_ref: evidence,
+            namespace_identity_ref: evidence,
+            persistence_ref: evidence,
+            flush_ref: evidence,
+            atomicity_ref: evidence,
+            geometry_ref: evidence,
+            health_ref: evidence,
+            freshness_ref: evidence,
+            remote_commit_ref: evidence,
+            archive_restore_ref: evidence,
+        }
+    }
+
     #[test]
     fn guarantee_floor_uses_capability_predicates() {
         assert!(ack_receipt_satisfies_requested_floor(
@@ -3040,6 +3973,238 @@ mod tests {
     }
 
     #[test]
+    fn media_capability_requires_fresh_evidence_not_class_labels() {
+        assert!(
+            media_role_satisfies_receipt(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::SyncIntent,
+                StorageMediaClass::NvmeFlash,
+            )
+            .satisfied
+        );
+
+        let class_label_only = StorageIntentMediaCapabilityRecord {
+            media_class: StorageMediaClass::NvmeFlash,
+            ..StorageIntentMediaCapabilityRecord::default()
+        };
+        assert_eq!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::SyncIntent,
+                class_label_only,
+            )
+            .refusal,
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        );
+
+        let stale = StorageIntentMediaCapabilityRecord {
+            freshness: MediaCapabilityFreshnessState::Stale,
+            ..proven_nvme_capability()
+        };
+        assert_eq!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::SyncIntent,
+                stale,
+            )
+            .refusal,
+            StorageIntentRefusalReason::StaleMediaCapabilityEvidence
+        );
+    }
+
+    #[test]
+    fn media_capability_blocks_unsafe_flush_and_cache_durable() {
+        assert!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::SyncIntent,
+                proven_nvme_capability(),
+            )
+            .satisfied
+        );
+
+        let unsupported_fua = StorageIntentMediaCapabilityRecord {
+            flush_ordering: MediaFlushOrderingClass::FlushOnly,
+            ..proven_nvme_capability()
+        };
+        assert_eq!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::SyncIntent,
+                unsupported_fua,
+            )
+            .refusal,
+            StorageIntentRefusalReason::UnsupportedFlushFuaSemantics
+        );
+
+        let unsafe_cache = StorageIntentMediaCapabilityRecord {
+            persistence: MediaPersistenceDomain::CacheOnlyVolatile,
+            ..proven_nvme_capability()
+        };
+        assert_eq!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::SyncIntent,
+                unsafe_cache,
+            )
+            .refusal,
+            StorageIntentRefusalReason::UnsafeVolatileWriteCache
+        );
+    }
+
+    #[test]
+    fn media_capability_blocks_pmem_without_flush_fence() {
+        let pmem_without_fence = StorageIntentMediaCapabilityRecord {
+            media_class: StorageMediaClass::PersistentMemory,
+            persistence: MediaPersistenceDomain::PersistentMemory,
+            flush_ordering: MediaFlushOrderingClass::FlushAndFua,
+            geometry: MediaProtocolGeometryClass::PmemByteAddressable,
+            ..proven_nvme_capability()
+        };
+
+        assert_eq!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::SyncIntent,
+                pmem_without_fence,
+            )
+            .refusal,
+            StorageIntentRefusalReason::PmemFlushFenceMissing
+        );
+    }
+
+    #[test]
+    fn media_capability_blocks_stale_identity_and_bad_atomicity() {
+        let stale_namespace = StorageIntentMediaCapabilityRecord {
+            flags: durable_media_flags().without(MediaCapabilityFlags::STABLE_NAMESPACE_IDENTITY),
+            ..proven_nvme_capability()
+        };
+        assert_eq!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::SyncIntent,
+                stale_namespace,
+            )
+            .refusal,
+            StorageIntentRefusalReason::UnstableNamespaceIdentity
+        );
+
+        let torn_writes = StorageIntentMediaCapabilityRecord {
+            atomicity: MediaAtomicityClass::TornWritesPossible,
+            ..proven_nvme_capability()
+        };
+        assert_eq!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::SyncIntent,
+                torn_writes,
+            )
+            .refusal,
+            StorageIntentRefusalReason::WrongAtomicityGranularity
+        );
+    }
+
+    #[test]
+    fn media_capability_blocks_zoned_remote_and_archive_gaps() {
+        let random_zoned_flash = StorageIntentMediaCapabilityRecord {
+            media_class: StorageMediaClass::ZonedFlash,
+            geometry: MediaProtocolGeometryClass::RandomBlock,
+            ..proven_nvme_capability()
+        };
+        assert_eq!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::SyncIntent,
+                random_zoned_flash,
+            )
+            .refusal,
+            StorageIntentRefusalReason::UnsupportedZoneWritePointer
+        );
+
+        let rdma_only_object = StorageIntentMediaCapabilityRecord {
+            media_class: StorageMediaClass::CloudObject,
+            flags: durable_media_flags().union(MediaCapabilityFlags::REMOTE_COMMIT),
+            persistence: MediaPersistenceDomain::ObjectDurable,
+            flush_ordering: MediaFlushOrderingClass::ObjectCommit,
+            atomicity: MediaAtomicityClass::IdempotentObjectPut,
+            geometry: MediaProtocolGeometryClass::RemoteObject,
+            remote_commit: MediaRemoteCommitSemantics::RdmaRequiredOnly,
+            ..proven_nvme_capability()
+        };
+        assert_eq!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageMediaRole::PlacementAuthority,
+                rdma_only_object,
+            )
+            .refusal,
+            StorageIntentRefusalReason::RdmaRequiredForCorrectness
+        );
+
+        let unknown_archive_restore = StorageIntentMediaCapabilityRecord {
+            media_class: StorageMediaClass::TapeArchive,
+            persistence: MediaPersistenceDomain::ArchiveDurable,
+            flush_ordering: MediaFlushOrderingClass::ArchiveCommit,
+            atomicity: MediaAtomicityClass::AppendRecordAtomic,
+            geometry: MediaProtocolGeometryClass::ArchiveSequential,
+            remote_commit: MediaRemoteCommitSemantics::ArchiveRetained,
+            archive_restore: MediaArchiveRestoreSemantics::Unknown,
+            ..proven_nvme_capability()
+        };
+        assert_eq!(
+            media_capability_satisfies_role(
+                MediaRoleRequirement::AUTHORITY,
+                StorageIntentGuaranteeClass::ArchiveEc,
+                StorageMediaRole::ArchiveEc,
+                unknown_archive_restore,
+            )
+            .refusal,
+            StorageIntentRefusalReason::UnknownArchiveRestoreRetention
+        );
+    }
+
+    #[test]
+    fn media_capability_allows_cache_only_prefetch_when_policy_allows() {
+        let evidence = media_evidence(10);
+        let cache_requirement = MediaRoleRequirement {
+            allowed_roles: MediaRoleMask::from_role(StorageMediaRole::ReadCache),
+            require_authority_role: false,
+        };
+        let ram_cache = StorageIntentMediaCapabilityRecord {
+            media_class: StorageMediaClass::SystemRam,
+            flags: MediaCapabilityFlags::PERSISTENCE_DOMAIN.union(MediaCapabilityFlags::FRESHNESS),
+            persistence: MediaPersistenceDomain::VolatileRam,
+            freshness: MediaCapabilityFreshnessState::Fresh,
+            geometry: MediaProtocolGeometryClass::RamByteAddressable,
+            evidence,
+            persistence_ref: evidence,
+            freshness_ref: evidence,
+            ..StorageIntentMediaCapabilityRecord::default()
+        };
+
+        assert!(
+            media_capability_satisfies_role(
+                cache_requirement,
+                StorageIntentGuaranteeClass::VolatileLocal,
+                StorageMediaRole::ReadCache,
+                ram_cache,
+            )
+            .satisfied
+        );
+    }
+
+    #[test]
     fn receipt_evaluation_returns_first_refusal() {
         let policy = durable_policy();
         let mut receipt = durable_receipt();
@@ -3105,6 +4270,18 @@ mod tests {
         assert_eq!(
             StorageIntentRefusalReason::from_discriminant(18),
             Some(StorageIntentRefusalReason::VolatileRamCannotSatisfyDurableIntent)
+        );
+        assert_eq!(
+            StorageIntentRefusalReason::from_discriminant(37),
+            Some(StorageIntentRefusalReason::RdmaRequiredForCorrectness)
+        );
+        assert_eq!(
+            MediaFlushOrderingClass::PmemFlushFence.as_str(),
+            "pmem-flush-fence"
+        );
+        assert_eq!(
+            MediaRemoteCommitSemantics::from_discriminant(7),
+            Some(MediaRemoteCommitSemantics::RdmaRequiredOnly)
         );
         assert_eq!(SkippedMoveReason::from_discriminant(99), None);
     }
