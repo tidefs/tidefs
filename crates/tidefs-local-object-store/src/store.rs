@@ -2243,6 +2243,15 @@ impl LocalObjectStore {
         if plan.current_segment_would_be_reclaimed(self.current_segment_id) {
             self.rotate_segment()?;
         }
+        // The plan already examined the bounded eligible batch. If it cannot
+        // free any complete segment, skip the consumer's second queue walk.
+        if plan.eligible_object_ids.is_empty() || plan.dead_segments.is_empty() {
+            return Ok(tidefs_reclaim::ReclaimConsumerStats {
+                entries_processed: plan.eligible_object_ids.len(),
+                reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+                ..tidefs_reclaim::ReclaimConsumerStats::ZERO
+            });
+        }
 
         let queue_snapshot = self.dead_object_reclaim_queue.clone();
         let gate = CommittedDeadObjectReclaimGate {
