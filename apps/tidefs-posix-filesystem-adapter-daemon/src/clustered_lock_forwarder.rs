@@ -244,7 +244,7 @@ impl<S: LockFrameSink> ClusteredPosixLockForwarder<S> {
                         LockRange {
                             start,
                             len,
-                            lock_type: LockType::Write,
+                            lock_type: lock_mode_to_lock_type(c.mode),
                             owner: 0,
                             pid: c.holder.0 as u32,
                         }
@@ -598,6 +598,15 @@ fn fuse_type_to_range_lock_type(typ: i32) -> Option<RangeLockType> {
     }
 }
 
+/// Convert lock-service conflict mode into the POSIX range lock type reported
+/// back through getlk.
+fn lock_mode_to_lock_type(mode: LockMode) -> LockType {
+    match mode {
+        LockMode::None | LockMode::Shared => LockType::Read,
+        LockMode::Exclusive => LockType::Write,
+    }
+}
+
 /// Compute a safe length from start/end, treating `end == u64::MAX` as EOF.
 fn safe_len(start: u64, end: u64) -> u64 {
     if end == u64::MAX {
@@ -630,7 +639,9 @@ mod tests {
     use crate::clustered_mount::{
         ClusteredPosixAuthoritySnapshot, ClusteredPosixMountAdmissionError,
     };
-    use tidefs_lock_service::{DatasetMountIdentity, EpochId, QueuedLockFrameSink};
+    use tidefs_lock_service::{
+        ConflictInfo, DatasetMountIdentity, EpochId, GetlkAck, QueuedLockFrameSink,
+    };
 
     fn test_runtime() -> ClusteredPosixMountRuntime {
         let identity = DatasetMountIdentity {
@@ -910,6 +921,47 @@ mod tests {
             }
             payload => panic!("unexpected release payload: {payload:?}"),
         }
+    }
+
+    #[test]
+    fn getlk_ack_conflict_preserves_reported_lock_mode() {
+        fn delivered_conflict(mode: LockMode) -> LockRange {
+            let mut f = test_forwarder();
+            let op_id = fresh_op_id(&f.pending);
+            let pending = Arc::new(PendingRequest::new(None, false));
+            f.pending.insert(op_id, Arc::clone(&pending));
+
+            f.handle_response(LockFrame::new(
+                op_id,
+                LockPayload::GetlkAck(GetlkAck {
+                    status: LockServiceStatus::Granted,
+                    conflict: Some(ConflictInfo {
+                        lease_id: 77,
+                        holder: MemberId::new(9),
+                        target: LeaseTarget::ByteRange {
+                            dataset_id: 1,
+                            ino: 100,
+                            start: 11,
+                            len: 23,
+                        },
+                        mode,
+                    }),
+                }),
+            ));
+
+            match pending.take_result() {
+                Ok(ClusteredLockOutcome::Getlk(Some(range))) => range,
+                other => panic!("unexpected getlk result: {other:?}"),
+            }
+        }
+
+        let shared = delivered_conflict(LockMode::Shared);
+        assert_eq!(shared.start, 11);
+        assert_eq!(shared.len, 23);
+        assert_eq!(shared.lock_type, LockType::Read);
+
+        let exclusive = delivered_conflict(LockMode::Exclusive);
+        assert_eq!(exclusive.lock_type, LockType::Write);
     }
 
     #[test]
