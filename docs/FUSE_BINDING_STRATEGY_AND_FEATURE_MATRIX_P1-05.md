@@ -134,7 +134,16 @@ Anti-regression rule:
 
 ## 3. Opcode coverage matrix
 
-### 3.1 Required opcodes (xfstests-grade POSIX surface)
+This matrix records TideFS adapter behavior, not only whether the vendored
+`fuser` trait exposes a callback. Rows outside the current POSIX subset must
+say so directly, and rows that still need a product decision must name the
+follow-up issue that owns support vs intentional non-support.
+
+The #713 audit identified `FUSE_BMAP` as the remaining visible FUSE operation
+gap in this document. Issue #786 owns the behavior decision and any
+adapter implementation or explicit non-support change for that opcode.
+
+### 3.1 Required and adapter-exposed opcodes
 
 | Opcode | fuser method | Status | Notes |
 |---|---|---|---|
@@ -149,7 +158,7 @@ Anti-regression rule:
 | `FUSE_UNLINK` | `unlink()` | **Implemented** | |
 | `FUSE_RMDIR` | `rmdir()` | **Implemented** | |
 | `FUSE_RENAME` | `rename()` | **Implemented** | |
-| `FUSE_RENAME2` | `rename2()` | fuser v0.14+ | `RENAME_EXCHANGE`/`RENAME_NOREPLACE` implemented; `RENAME_WHITEOUT` deferred |
+| `FUSE_RENAME2` | `rename2()` | **Partially implemented** | `RENAME_EXCHANGE`/`RENAME_NOREPLACE` implemented; `RENAME_WHITEOUT` intentionally unsupported until overlay/whiteout semantics enter the POSIX subset |
 | `FUSE_LINK` | `link()` | **Implemented** | |
 | `FUSE_READ` | `read()` | **Implemented** | |
 | `FUSE_WRITE` | `write()` | **Implemented** | Bounded by dirty-window budget |
@@ -173,8 +182,8 @@ Anti-regression rule:
 | `FUSE_FALLOCATE` | `fallocate()` | **Implemented** | mode 0, PUNCH_HOLE, ZERO_RANGE, KEEP_SIZE |
 | `FUSE_LSEEK` | `lseek()` | **Implemented** | SEEK_SET/END/CUR/DATA/HOLE (PC-004B) |
 | `FUSE_IOCTL` | `ioctl()` | **Implemented** | FS_IOC_FIEMAP wired |
-| `FUSE_COPY_FILE_RANGE` | `copy_file_range()` | fuser v0.14+ | Deferred — not in POSIX subset |
-| `FUSE_BMAP` | `bmap()` | **Implemented** | Stub returning `ENOSYS` |
+| `FUSE_COPY_FILE_RANGE` | `copy_file_range()` | **Explicitly unsupported** | Outside the current POSIX subset; the daemon does not claim clone/copy offload support |
+| `FUSE_BMAP` | `bmap()` | **Deferred to #786** | Current adapter has no BMAP implementation; the vendored `fuser` default returns `ENOSYS` until #786 resolves support vs intentional non-support |
 | `FUSE_DESTROY` | `destroy()` | **Implemented** | |
 | `FUSE_INTERRUPT` | (internal to fuser) | **Implemented** | Routed through queue_class_0 |
 | `FUSE_BATCH_FORGET` | (internal to fuser) | **Implemented** | |
@@ -184,8 +193,8 @@ Anti-regression rule:
 | Opcode | Protocol | Needed for | Deferral reason |
 |---|---|---|---|
 | `FUSE_TMPFILE` | ≥ 7.9 | xfstests O_TMPFILE | Not in POSIX subset |
-| `FUSE_COPY_FILE_RANGE` | ≥ 7.28 | xfstests file clone | Not in POSIX subset |
-| `FUSE_COPY_FILE_RANGE_64` | ≥ 7.45 | Large file clone | Not in POSIX subset |
+| `FUSE_COPY_FILE_RANGE` | ≥ 7.28 | xfstests file clone | Explicitly unsupported in the current POSIX subset |
+| `FUSE_COPY_FILE_RANGE_64` | ≥ 7.45 | Large file clone | Explicitly unsupported in the current POSIX subset |
 | `FUSE_STATX` | ≥ 7.33 | btime, mnt_id | Not in POSIX subset |
 | `FUSE_SYNCFS` | ≥ 7.32 | Full filesystem sync | Not in POSIX subset |
 
