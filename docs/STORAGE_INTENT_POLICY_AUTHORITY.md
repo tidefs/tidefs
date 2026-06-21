@@ -449,6 +449,36 @@ creating new local media-role policy. The expected issue boundaries are:
 | #926 | Previews policy/media/RAM/WAN/relocation changes without becoming authority or claim evidence. |
 | #875/#928/#931 | Keep successor, comparator, and legacy-claim wording blocked until exact evidence scope exists. |
 
+The broader evidence issues are non-blocking for narrow record, predicate, and
+test work, but blocking for product-facing activation, implementation-readiness
+claims, and comparator or successor wording. They consume this gate as follows:
+
+| Issue | Boundary preserved by this convergence gate |
+| --- | --- |
+| #845 | Read-serving may use media, proximity, lag, and cache evidence only inside the earned receipt and visibility envelope. |
+| #846 | Maintenance scheduling may rank work only after legality, receipt preservation, wear, cost, and isolation gates have already passed. |
+| #849 | Performance evidence records measured envelopes; it is not a broad speed claim without #875/#928 scope. |
+| #850 | Validation rows must bind workload, media, cache, topology, failure state, and receipt class before supporting a product claim. |
+| #855 | Policy source and compilation produce requested guarantees; labels or edited properties do not bypass evidence gates. |
+| #862 | Data-shape work must price transform, rebake, layout, and repair effects before placement or relocation can rely on it. |
+| #863 | Benchmark authority must keep media, workload, cache, and comparator scope explicit instead of converting a run into a general claim. |
+| #874 | Compatibility and surface projection work must not widen guarantees beyond the receipt/result evidence. |
+| #877 | Operator explanation work renders the earned state, including unknowns and refusals, without becoming authority itself. |
+| #878 | Health and observability producers feed freshness, degradation, and refusal evidence without silently strengthening placement legality. |
+| #880 | Device lifecycle work must preserve namespace identity, stale-probe refusal, evacuation, source-retirement, and replacement-receipt law. |
+| #881 | Alerting and operations surfaces expose blocked/degraded/cache-only states without converting them into success. |
+| #894 | Ordering evidence is required for sync, replay, relocation, repair, and source-retirement receipts; absence is a hard unknown. |
+| #897 | Trust/domain evidence gates remote, WAN, internet, cross-tenant, encrypted, repair, geo, and replicated-RAM roles. |
+| #898 | Capacity/admission evidence gates write, repair, relocation, reserve, and receipt-retirement work before scoring. |
+| #900 | Recovery/degradation evidence gates degraded service, repair, rebuild, geo catch-up, and replacement receipt publication. |
+| #901 | Policy rollout evidence gates mixed-revision behavior, downgrade authorization, convergence, and rollback receipts. |
+| #902 | Tenant/isolation evidence blocks plans that buy aggregate throughput by stealing protected p99 or reserve budgets. |
+| #903 | Temporal evidence gates lag, freshness, expiry, clock/skew, prediction windows, and stale-evidence refusal. |
+| #910 | Evidence retention preserves query, claim, comparator, receipt, and audit proof before compaction or purge. |
+| #912 | Measurement attribution decides what a run can prove and which claim, policy, workload, and environment may consume it. |
+| #913 | Query snapshots bind the evidence cut; consumers must fail closed on missing, stale, contradictory, or refused inputs. |
+| #922 | Metadata/namespace evidence must price metadata locality, fsyncdir, small-object shape, and namespace receipt effects. |
+
 ## Native Object Model
 
 ### Record Contract
