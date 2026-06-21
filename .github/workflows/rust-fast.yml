@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [master]
     types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'COPYING'
   workflow_dispatch:
 
 permissions:

@@ -57,6 +57,15 @@ may use non-secret repository variables for scheduling gates, such as
   trigger broad xfstests, RDMA, kernel, or release-candidate validation.
 - `Secret Policy` runs on the same self-hosted TideFS runner labels and keeps
   the GitHub secret boundary checked without spending hosted Actions minutes.
+- Standing PR validation is path-filtered so docs-only design and authority
+  PRs do not occupy scarce self-hosted runner slots when their issue validation
+  tier is documentation/design/source inspection. `Rust Fast` and `Nix Checks`
+  ignore pull requests that only touch `docs/**`, root Markdown policy text, or
+  `COPYING`; pushes to `master` and manual dispatches still run them.
+  `Secret Policy` pull-request runs are limited to the workflow/policy files it
+  scans plus the xtask and build inputs that can change the scanner itself. If
+  a documentation-only PR needs runtime or build validation, record that in the
+  issue validation tier and dispatch the focused workflow explicitly.
 - `Codex Nexus Relay` is a self-hosted event bridge for the local
   `tidefs-codex-nexus` dashboard. It does not run tests or checkout source; it
   relays issue, pull-request, push, and manual-dispatch events by signing the
