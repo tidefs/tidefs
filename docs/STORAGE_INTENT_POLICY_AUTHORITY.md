@@ -120,6 +120,16 @@ target verification, publication boundary, abort/rollback state, and budget
 outcome evidence prove how the selected plan moved from intention to durable
 effect.
 
+Measurement-attribution evidence is the causality counterpart. A p99 drop,
+throughput gain, cache-hit change, flash-write reduction, egress saving, or
+payback result is not proof that the selected policy/action caused it merely
+because the numbers were measured nearby. It is usable only when measurement
+identity, subject scope, policy revision, workload envelope, environment/noise
+profile, sample window, comparator/counterfactual lineage, decision/action refs,
+metric vector, confounder state, attribution verdict, and retention refs say
+whether the outcome belongs to the intervention and what it may legally
+influence.
+
 Evidence-retention evidence is the proof-lifetime counterpart. Storage intent
 must not create an unbounded write-amplifying metadata system, but it also must
 not compact away the receipts, decision frontiers, outcomes, cooldowns, fault
@@ -225,6 +235,7 @@ The core records are:
 | `StorageIntentMediaCapabilityEvidence` | Device/media identity, persistence domain, flush/FUA/barrier semantics, volatile-cache policy, atomicity/granularity, protocol/geometry capability, health/freshness, role eligibility, and refusal evidence owned by #904 and consumed by ack receipts, placement, layout, wear, RAM/PMem, relocation, explanation, performance, and fault gates. |
 | `StorageIntentDecisionEvidence` | Decision identity, candidate frontier, hard-gate results, score vector, selected candidate, tie-breaker, reserve/admission refs, counterfactual baseline, payback/harm anchors, and refusal/defer evidence owned by #905 and consumed by placement, scheduling, read-serving, relocation, explanation, performance, fault, and claims gates. |
 | `StorageIntentActionExecutionEvidence` | Action identity, decision/admission refs, step state, idempotency/replay proof, source protection, target verification, publication/cutover boundary, abort/rollback state, outcome/budget accounting, and execution refusal evidence owned by #911 and consumed by relocation, rebake, repair, read-serving, receipt retirement, explanation, performance, fault, and claims gates. |
+| `StorageIntentMeasurementAttributionEvidence` | Measurement identity, subject scope, policy/workload/environment/noise binding, sample window, comparator/counterfactual lineage, decision/action/admission refs, metric/KPI/cost/wear vectors, confounder state, attribution verdict, and allowed-use/refusal evidence owned by #912 and consumed by prediction, relocation, explanation, performance, fault, and claims gates. |
 | `StorageIntentEvidenceRetention` | Evidence identity, dependency graph, retention class, proof root, compaction/summarization rule, safe purge frontier, retention media/cost/privacy envelope, and retention refusal evidence owned by #910 and consumed by evidence producers, explanation, performance, fault, claims, recovery, rollout, and cleanup gates. |
 | `StorageIntentDataShape` | Requested and earned encoded shape for a range or generation, including record sizing, transform ordering, digest suite, dedup/encryption/EC compatibility, and rebake evidence. |
 | `StorageIntentLayoutEvidence` | Allocator and physical-layout evidence for fragmentation, free runs, alignment, zone/write-pointer state, pending frees, reclaim debt, and locality. |
@@ -306,6 +317,11 @@ model predicates for:
   reserve/admission refs, step state, idempotency key, replay generation, source
   receipt protection, target verification, publication/cutover boundary,
   abort/rollback state, outcome/budget accounting, and execution refusal state;
+- measurement-attribution legality, including measurement identity, subject
+  scope, policy revision, workload envelope, environment/noise profile, temporal
+  sample, comparator/counterfactual lineage, decision/action/admission refs,
+  metric/KPI vectors, cost/wear deltas, confounder/censoring state, attribution
+  verdict, and allowed-use/refusal state;
 - evidence-retention legality, including evidence identity, dependency graph,
   retention class, proof root, compaction rule, summarization fidelity,
   redaction/audit state, tombstone state, safe purge frontier, retention media
@@ -347,6 +363,7 @@ The policy has these logical fields:
 | `media_capability_policy` | Required persistence domain, flush/FUA, atomicity, namespace identity, volatile-cache, protocol/geometry, health, and freshness predicates for each media role. |
 | `decision_audit_policy` | Required candidate retention, hard-gate result retention, score-vector dimensions, unknown-cost treatment, deterministic tie-breakers, counterfactual baseline, and outcome/payback attachment for planner and optimizer decisions. |
 | `action_execution_policy` | Required action step state, idempotency/replay proof, source protection, target verification, publication/cutover boundary, abort/rollback treatment, and execution outcome accounting for authority-changing actions. |
+| `measurement_attribution_policy` | Required sample window, measurement source, baseline/counterfactual, noise/confounder treatment, attribution verdict, cross-scope transfer rule, and refusal behavior before outcome metrics may train prediction, close payback, drive movement, spend wear budget, or support claims. |
 | `evidence_retention_policy` | Required retention class, dependency retention, proof-root/tombstone treatment, compaction fidelity, redaction/audit treatment, safe purge frontier, retention media placement, and evidence metadata budget for storage-intent proof. |
 | `data_shape_policy` | Record sizing, compression, checksum/digest, dedup, encryption, EC/archive, coalescing, and rebake constraints. |
 | `layout_geometry_policy` | Allocator class, physical layout, fragmentation, zone/alignment, free-space, pending-free, and reclaim constraints. |
@@ -378,6 +395,7 @@ floors from optimizer weights:
 | Policy revision rollout | published revision, change class, downgrade authorization, in-flight fence, convergence frontier, rollback receipt, mixed-revision visibility | stage cohorts, prioritize convergence, batch rematerialization, defer low-risk generations |
 | Tenant and budget isolation | budget owner, isolation scope, p99/tail floor, fair-share floor/ceiling, borrowing law, reserve-exemption, throttle/refusal state | donate unused share, schedule bursts, rebalance lanes, demote noisy background work |
 | Action execution | idempotency key, step state, source protection, target verification, cutover/publication proof, abort/rollback visibility | batch copy work, pause/retry, choose cheaper safe source, delay source retirement |
+| Measurement attribution | valid sample window, comparator/counterfactual, noise/confounder bounds, decision/action refs, attribution verdict | choose shadow experiment, observation window, conservative cooldown, transfer scope |
 | Wear and money | critical write reserve, WAF ceiling, egress/capacity budget | promote/demote only when payback beats movement debt |
 
 A candidate must satisfy all hard floors before scoring. Cost weights may pick
@@ -452,6 +470,8 @@ The compiler must produce:
 - the action-execution step, idempotency/replay, source-protection,
   target-verification, publication/cutover, abort/rollback, and outcome-accounting
   requirements;
+- the measurement-attribution sample, comparator/counterfactual, noise/confounder,
+  transfer-scope, verdict, allowed-use, and refusal requirements;
 - the evidence-retention class, dependency/proof-root requirements, compaction
   fidelity, tombstone, safe-purge, redaction/audit, and evidence metadata budget
   requirements;
@@ -851,6 +871,7 @@ The prediction evidence projection must distinguish at least:
 | `decision_ref` | Points to #905 decision-frontier evidence binding the prediction to the policy revision, candidate set, rejected candidates, selected action, threshold, score vector, and admission result. |
 | `shadow_trial_ref` | Records what TideFS would have done or temporarily served without changing durable authority. |
 | `outcome_window_ref` | Measures latency, tail, throughput, reads saved, seeks avoided, media writes avoided, capacity saved, RPO lag, egress, foreground harm, and tenant harm after the action. |
+| `measurement_attribution_ref` | Points to #912 evidence saying whether the measured outcome is attributable, partially attributable, confounded, stale, insufficient, contradicted, shadow-only, or refused for the policy/action/environment. |
 | `payback_verdict_ref` | Says whether the admitted or shadow action met its payback window. |
 | `confidence_update_ref` | Records whether the result raised, lowered, capped, or quarantined confidence for the subject, policy, tenant, device, path, or rule. |
 | `cooldown_ref` | Prevents immediate retry, flip-flop movement, repeated flash writes, or cross-tenant manufactured confidence after a bad or ambiguous result. |
@@ -864,16 +885,23 @@ Hard prediction laws:
    evaluation, or cache-only trial. It must not admit authority promotion,
    durable relocation, old-receipt retirement, or guarantee weakening.
 3. Every prediction-driven authority-changing move must leave a decision ref
-   and an outcome ref. Missing outcome evidence is not success; later similar
-   moves become conservative, shadow-only, cooled down, blocked, or refused.
-4. Failed payback, foreground harm, excessive wear, or tenant harm must lower
-   confidence, record movement debt or cooldown, and be visible to explanation,
-   performance rows, and fault rows.
-5. A tenant, workload, or caller may not train confidence for another owner
-   without #902 isolation evidence and trust/domain eligibility.
-6. Prediction evidence may be compacted or decayed only after no receipt,
-   relocation decision, cooldown, claim artifact, or operator explanation still
-   depends on the detailed result.
+   and outcome attribution ref. Missing or refused #912 evidence is not success;
+   later similar moves become conservative, shadow-only, cooled down, blocked,
+   or refused.
+4. Failed payback, foreground harm, excessive wear, tenant harm, or confounded
+   measurement attribution must lower, cap, or quarantine confidence, record
+   movement debt or cooldown, and be visible to explanation, performance rows,
+   and fault rows.
+5. Predictor confidence may rise only from attributable or explicitly bounded
+   partially attributable outcomes. Confounded, stale, insufficient-sample,
+   contradicted, or cross-scope measurements may diagnose or force conservative
+   cooldown, but they may not make authority-changing actions easier to admit.
+6. A tenant, workload, or caller may not train confidence for another owner
+   without #902 isolation evidence, #897 trust/domain eligibility, and #912
+   transfer-scope evidence for the measurement.
+7. Prediction evidence may be compacted or decayed only after no receipt,
+   relocation decision, cooldown, claim artifact, operator explanation, or
+   measurement-attribution dependency still depends on the detailed result.
 
 ## Temporal Evidence, Lag, And Timebase
 
@@ -2151,6 +2179,67 @@ Action-execution examples:
   verification, replacement receipt publication, and recovery evidence prove the
   repaired copy is policy-satisfying.
 
+## Measurement Attribution And Outcome Causality
+
+#912 owns the storage-intent measurement-attribution evidence projection. It
+does not run benchmarks, choose placement, execute actions, train predictors, or
+publish product claims. It decides whether a measured outcome may be treated as
+caused by a policy decision or executed action strongly enough to influence
+prediction, payback, relocation, wear spend, operator explanation, performance
+gates, fault rows, or claims.
+
+This is a separate authority surface because TideFS will operate in noisy
+systems: phase-changing workloads, warm cache effects, queue contention, thermal
+throttling, repair storms, WAN jitter, policy rollout, membership churn, tenant
+interference, and measurement harness drift can all make a real metric change
+look like optimizer success. Storage intent may diagnose those observations, but
+it must not turn them into placement authority without attribution proof.
+
+Measurement-attribution records must distinguish at least:
+
+| Evidence field | Storage-intent use |
+| --- | --- |
+| `measurement_identity_ref` | Names measurement id, producer/component version, artifact digest, subject scope, policy id/revision, observation generation, and temporal refs. |
+| `workload_environment_ref` | Binds workload envelope, request mix, cache state, environment profile, media/topology profile, noise policy, background-load declaration, and sample freshness. |
+| `intervention_lineage_ref` | Points to decision frontier, action execution, admission/scheduler, isolation, capacity, media capability, trust/domain, transport, recovery, rollout, layout, lifecycle, and retention refs that shaped the observed run. |
+| `sample_window_ref` | Records warmup, sample count, sample mass, duration/byte/op window, censor/drop policy, variance, confidence interval or bounded-uncertainty state, and insufficient-sample refusal. |
+| `baseline_counterfactual_ref` | Names previous admitted variant, shadow plan, no-op baseline, incumbent comparator, same-policy cohort, or explicit no-valid-baseline refusal. |
+| `metric_vector_ref` | Carries raw metrics and normalized KPI vectors with units: latency/tail, throughput, read amplification, write amplification, media writes avoided or spent, capacity saved, egress, RPO/RTO lag, CPU, foreground disruption, tenant harm, and payback deltas. |
+| `confounder_state_ref` | Records concurrent repair/rebuild/relocation, policy rollout, membership or trust epoch change, device health/thermal state, WAN jitter, cache warmup, workload phase change, noisy-neighbor pressure, measurement-source drift, and fault/campaign state. |
+| `attribution_verdict_ref` | Declares attributable, partially-attributable-with-bounds, confounded, insufficient-sample, stale, contradicted, shadow-only, or refused. |
+| `allowed_use_ref` | States whether the result may diagnose, cool down, train confidence, close payback, admit future movement, spend extra wear budget, retire receipts, support performance/fault evidence, or support a claim, plus the #910 retention dependency. |
+
+Hard measurement-attribution laws:
+
+1. A performance artifact, raw metric, dashboard sample, or action outcome is not
+   outcome proof by itself. Authority-changing learning needs #912 evidence.
+2. Confounded, stale, insufficient-sample, contradicted, or refused measurements
+   may diagnose, open investigation, lower confidence, or force conservative
+   cooldown. They may not train confidence upward, close payback, justify
+   authority-changing movement, retire source receipts, spend extra flash
+   movement budget, or support product/comparator claims.
+3. Attribution is scoped. A result from one tenant, workload phase, policy
+   revision, media class, transport path, topology, or environment does not
+   transfer to another scope unless #912 records the transfer rule and the
+   relevant #902 isolation, #897 trust/domain, #904 media capability, #846 path,
+   and #903 temporal evidence allow it.
+4. Baseline and counterfactual lineage must remain inspectable. If the baseline
+   is missing, stale, not comparable, or hidden by rollout/fault/noise state, the
+   result is shadow-only, partially attributable with bounds, blocked, or refused
+   according to policy.
+5. #911 may prove the action completed, but #912 proves whether the measured
+   benefit or harm belongs to that action. Completed actions with confounded
+   outcomes remain complete for receipt safety but unresolved, failed, or cooled
+   down for payback and prediction.
+6. #850 performance rows, #863 fault rows, and #875 claims may consume metric
+   artifacts only through attribution verdicts when adaptive placement,
+   relocation, RAM/volatile, WAN/internet, wear, cost, or incumbent-comparator
+   claims depend on measured improvement.
+7. #910 controls retention of raw evidence, summaries, tombstones, and proof
+   roots for attribution. Optional telemetry may expire early, but exact proof
+   needed by payback, confidence, movement, validation, explanation, audit, or
+   claims may not be purged until #910 records a safe frontier.
+
 ## Evidence Retention And Proof Compaction
 
 #910 owns the storage-intent evidence-retention projection. It does not clean
@@ -2628,6 +2717,9 @@ The operator UAPI should eventually answer:
   admitted/prepared/copying/verifying/publishing/cutover state, idempotency key,
   source protection, target verification, abort/rollback state, and completion
   or refusal reason?
+- Which measurement-attribution verdict applies: measurement id, workload and
+  environment scope, sample window, baseline/counterfactual lineage, metric/KPI
+  deltas, confounder state, transfer scope, and allowed or refused uses?
 - Which evidence is retained exactly, summarized, redacted, tombstoned, or
   purgeable, and which receipt, decision, cooldown, recovery, rollout,
   validation, claim, audit, or operator-explanation dependency controls that
@@ -2699,6 +2791,11 @@ Initial row families should cover:
 - action-execution rows proving admitted actions preserve idempotency, source
   protection, target verification, cutover/publication, abort/rollback,
   source-retirement, and outcome/budget evidence across retries and crashes;
+- measurement-attribution rows proving outcome metrics bind to policy revision,
+  workload envelope, environment/noise profile, sample window, decision/action
+  lineage, comparator/counterfactual, confounder state, attribution verdict, and
+  allowed-use/refusal state before learning, payback, movement, wear spend, or
+  claims consume them;
 - evidence-retention rows proving exact evidence, summaries, redaction,
   proof roots, tombstones, purge frontiers, retention-media placement, metadata
   budgets, and claim/audit holds preserve receipt, decision, recovery, rollout,
@@ -2741,6 +2838,10 @@ Each row must bind:
   proof, source protection, target verification, publication/cutover boundary,
   abort/rollback state, source-retirement state, and execution refusal where
   relevant;
+- measurement-attribution evidence, including measurement id, sample window,
+  warmup/censor/drop policy, workload/environment/noise binding,
+  baseline/counterfactual lineage, metric/KPI vectors, confounder state,
+  attribution verdict, transfer scope, and allowed/refused uses where relevant;
 - evidence-retention evidence, including retention class, dependent receipts or
   decisions, proof root, compaction rule, safe purge frontier, summary fidelity,
   retention-media class, redaction state, and retention refusal where relevant;
@@ -2768,9 +2869,13 @@ Each row must bind:
 - movement debt, payback window, cooldown state, and skipped-move reason where
   relevant;
 - capacity and network cost where relevant;
-- comparator set when making ZFS/Ceph/DRBD comparisons.
+- comparator set and accepted attribution verdict when making ZFS/Ceph/DRBD
+  comparisons.
 
 No performance claim should close merely because average throughput improved.
+No adaptive-placement, relocation-payback, wear-savings, RAM-latency,
+WAN/internet, or incumbent-comparator claim should close from confounded,
+stale, insufficient, contradicted, or refused attribution evidence.
 
 ## Fault And Validation Matrix
 
@@ -2817,6 +2922,13 @@ The matrix must cover at least these row families:
   retirement, duplicate retry double-spending reserves, stale action continuing
   after policy/media/capacity change, rollback source deleted early, partial
   target served as authoritative, and aborted work hidden from operators;
+- measurement-attribution faults such as confounded metrics accepted as payback,
+  insufficient samples treated as confidence gain, stale baseline accepted for a
+  changed policy revision, workload phase change hidden during learning,
+  unrelated cache warmup credited to relocation, tenant interference training
+  another tenant's predictor, WAN jitter credited to geo policy, thermal/device
+  throttling omitted from attribution, and comparator claims made from
+  no-valid-baseline measurements;
 - evidence-retention faults such as exact receipt proof compacted while live,
   decision frontier purged before outcome/cooldown closure, refused/unknown
   candidates dropped from summaries, claim artifact evidence deleted before
@@ -2897,11 +3009,13 @@ unknown-skew or sequence-only evidence, stale or wrong-domain data-shape
 evidence accepted as satisfied, allocator mirror evidence accepted as
 authority, stale lifecycle evidence accepted as retained/reclaimable,
 bookmark-only anchors treated as data-retaining, pending-free bytes reused too
-early, and explanations that omit degradation, lag/timebase, volatility,
+early, false payback or adaptive confidence from refused attribution evidence,
+comparator superiority from no-valid-baseline measurements, and explanations
+that omit degradation, lag/timebase, volatility,
 trust-domain refusal, recovery obligation, replacement receipt blocker,
 transform block state, capacity/reserve refusal, policy rollout stage,
 in-flight fence, convergence frontier, isolation scope, borrow/debt state,
-lifecycle or layout blockers, or refusal.
+lifecycle or layout blockers, attribution refusal, or refusal.
 
 The validation matrix cross-links with #850 where a scenario also has latency,
 tail, throughput, RPO, or wear/cost budgets. #850 measures whether TideFS is
@@ -3004,8 +3118,8 @@ This document composes existing authority surfaces:
   confidence provenance, contradiction state, action classes, decision refs,
   outcome windows, payback verdicts, confidence updates, cooldowns, and
   anti-thrash state. It composes lifecycle, layout, path, wear, cost, scheduler,
-  tenant, performance, and fault evidence without choosing placement, executing
-  relocation, or publishing receipts.
+  tenant, measurement-attribution, performance, and fault evidence without
+  choosing placement, executing relocation, or publishing receipts.
 - #903 owns the storage-intent temporal evidence slice for timebase identity,
   clock health, skew/uncertainty, evidence age, event/frontier stamps,
   lag/staleness, expiry/deadline, sequence-to-time conversion, and temporal
@@ -3035,13 +3149,21 @@ This document composes existing authority surfaces:
   #900 recovery/degradation, #901 rollout, #910 retention, ordering receipts,
   read-serving, relocation, rebake, repair, performance, and fault evidence
   without choosing candidates, scheduling lanes, or implementing workers.
+- #912 owns the storage-intent measurement-attribution evidence slice for
+  measurement identity, subject scope, policy/workload/environment binding,
+  sample windows, baseline/counterfactual lineage, decision/action/admission
+  refs, metric/KPI/cost/wear vectors, confounder state, attribution verdicts,
+  transfer scope, and allowed-use/refusal state. It composes #845 prediction,
+  #905 decision-frontier, #911 action-execution, #850 performance, #863 fault,
+  #875 claims, #910 retention, and operator-explanation evidence without running
+  benchmarks, training predictors, executing actions, or deciding claims.
 - #910 owns the storage-intent evidence-retention slice for evidence identity,
   dependency graphs, retention classes, proof roots, compaction/summarization
   rules, safe purge frontiers, retention media/cost/privacy envelopes, and
   retention refusal state. It composes temporal, lifecycle, claims, recovery,
-  rollout, prediction, decision-frontier, performance, fault, operator
-  explanation, read-serving, relocation, and cleanup evidence without reclaiming
-  stored data, expiring time, or deciding product claims.
+  rollout, prediction, decision-frontier, measurement-attribution, performance,
+  fault, operator explanation, read-serving, relocation, and cleanup evidence
+  without reclaiming stored data, expiring time, or deciding product claims.
 - `docs/security/transport-security-boundary.md`: transport security is
   session-level. Storage intent may require and cite session-security evidence,
   but it must not reintroduce per-message crypto proof markers.
@@ -3159,15 +3281,15 @@ storage-intent language beside the shared records and compiled policy snapshot.
 
 | Stage | Graduation gate | Issues |
 | --- | --- | --- |
-| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, trust/domain evidence refs, capacity/admission evidence refs, recovery/degradation evidence refs, policy-rollout evidence refs, tenant/isolation evidence refs, workload/prediction evidence refs, temporal evidence refs, media capability refs, decision-frontier refs, action-execution refs, evidence-retention refs, media roles, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #845, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904, #905, #910, #911 |
+| Records | Shared spellings and versioned records exist for policies, receipts, roles, ordering evidence, proximity, membership evidence refs, trust/domain evidence refs, capacity/admission evidence refs, recovery/degradation evidence refs, policy-rollout evidence refs, tenant/isolation evidence refs, workload/prediction evidence refs, temporal evidence refs, media capability refs, decision-frontier refs, action-execution refs, measurement-attribution refs, evidence-retention refs, media roles, data shape, layout evidence, lifecycle evidence, cost, wear, and relocation reasons. | #750, #841, #845, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904, #905, #910, #911, #912 |
 | Policy compilation | Pool, dataset, mount, caller, and internal maintenance sources compile into immutable policy snapshots that consumers cite by id/revision. | #855 |
 | Policy revision rollout | Compiled revisions publish, stage, roll back, supersede, and converge with explicit source provenance, publication transaction, downgrade authz, in-flight fences, old-receipt treatment, and convergence frontiers. | #901 |
-| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, tenant/isolation refs, temporal refs, media-capability refs, decision-frontier refs, action-execution refs, evidence-retention refs, path evidence, media/wear cost, non-wear cost, workload vectors, prediction decision/outcome refs, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904, #905, #910, #911 |
+| Evidence feeds | Local ack paths, ordering/replay refs, membership epoch/fence refs, trust/domain refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, tenant/isolation refs, temporal refs, media-capability refs, decision-frontier refs, action-execution refs, measurement-attribution refs, evidence-retention refs, path evidence, media/wear cost, non-wear cost, workload vectors, prediction decision/outcome refs, data-shape evidence, layout/allocator evidence, and lifecycle evidence can publish read-only evidence without making final placement decisions. | #750, #842, #844, #845, #846, #856, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904, #905, #910, #911, #912 |
 | Satisfaction reconciliation | Current receipts and evidence are reconciled against the compiled policy as satisfied, converging, degraded-visible, blocked, refused, or unsafe/volatile, including policy rollout stage, mixed-revision obligations, tenant isolation state, media-capability refusal state, action-execution state, and evidence-retention blockers. | #874, #901, #902, #904, #910, #911 |
-| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, trust/domain state, temporal state, media-capability state, capacity/reserve state, recovery/degradation state, policy-rollout state, tenant/isolation state, prediction confidence/action state, active action conflicts, data shapes, layout targets, and lifecycle states, then decision-frontier evidence records candidate sets, hard-gate results, score vectors, tie-breakers, selected plans, and defer/refusal state before admission/scheduling enforces the compiled policy. | #750, #843, #845, #862, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904, #905, #911 |
+| Planning and admission | Hard constraints reject illegal candidates before scoring, including illegal ordering/replay state, membership/fence state, trust/domain state, temporal state, media-capability state, capacity/reserve state, recovery/degradation state, policy-rollout state, tenant/isolation state, prediction confidence/action state, measurement-attribution state, active action conflicts, data shapes, layout targets, and lifecycle states, then decision-frontier evidence records candidate sets, hard-gate results, score vectors, tie-breakers, selected plans, and defer/refusal state before admission/scheduling enforces the compiled policy. | #750, #843, #845, #862, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904, #905, #911, #912 |
 | Read serving | Read source selection distinguishes cache, serving-trial, RAM authority, local/remote receipt, degraded reconstruction, snapshot, geo, archive, in-progress action source/target, and retained-root sources with freshness, epoch/fence, trust/domain, temporal/staleness, media-capability, decision-frontier, action-execution, evidence-retention, capacity-for-repair, recovery/degradation, policy revision, tenant isolation, and receipt evidence. | #750, #877, #675, #881, #897, #898, #900, #901, #902, #903, #904, #905, #910, #911 |
-| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement, ordering, trust/domain, temporal, media-capability, decision-frontier, action-execution, evidence-retention, capacity/admission, recovery/degradation, policy-rollout, and tenant/isolation evidence before source retirement. | #750, #847, #848, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904, #905, #910, #911 |
-| Operator and gates | Operators can inspect the policy, rollout stage, receipt, lag/timebase, media capability, decision frontier, action execution, evidence retention, volatility, cost, trust/domain, capacity/reserve, recovery/degradation, isolation/throttle, prediction outcome, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #845, #849, #850, #863, #875, #897, #898, #900, #901, #902, #903, #904, #905, #910, #911 |
+| Authority extensions | RAM authority, data-shape rebake, allocator-aware defrag/compaction, lifecycle-aware reclaim, and relocation/rebuild/geo catch-up use the same receipt spine and publish replacement, ordering, trust/domain, temporal, media-capability, decision-frontier, action-execution, evidence-retention, capacity/admission, recovery/degradation, policy-rollout, tenant/isolation, and measurement-attribution evidence before source retirement or outcome learning as appropriate. | #750, #847, #848, #878, #880, #881, #894, #897, #898, #900, #901, #902, #903, #904, #905, #910, #911, #912 |
+| Operator and gates | Operators can inspect the policy, rollout stage, receipt, lag/timebase, media capability, decision frontier, action execution, measurement attribution, evidence retention, volatility, cost, trust/domain, capacity/reserve, recovery/degradation, isolation/throttle, prediction outcome, and refusal story, and every implementation claim maps to performance, fault, and claim-registry gates. | #845, #849, #850, #863, #875, #897, #898, #900, #901, #902, #903, #904, #905, #910, #911, #912 |
 
 Interface gates between stages are explicit:
 
@@ -3233,9 +3355,10 @@ Interface gates between stages are explicit:
   throughput, or local lane state do not prove cross-tenant fairness by
   themselves.
 - Prediction paths may raise confidence, admit an action class, declare
-  payback, lower confidence, or clear cooldown only through #845 evidence;
-  raw hints, one-off heat, hidden model state, or missing outcome samples do
-  not prove an authority-changing move is wise.
+  payback, lower confidence, or clear cooldown only through #845 evidence plus
+  #912 attribution verdicts; raw hints, one-off heat, hidden model state,
+  confounded metrics, or missing outcome samples do not prove an
+  authority-changing move is wise.
 - Temporal paths may claim lag, age, freshness, expiry, deadline satisfaction,
   TTL, cooldown, or payback only through #903 evidence; raw timestamps,
   sequence counters without conversion, or local wall-clock reads do not prove
@@ -3257,7 +3380,7 @@ this document except to update the issue map after live tickets exist.
 | Slice | Follow-up issue | Expected write set | Purpose |
 | --- | --- | --- | --- |
 | Membership epoch authority | #750 | `docs/MEMBERSHIP_AUTHORITY.md` | Decide epoch, quorum-write, witness-set, join/drain, fence, roster, and failure-domain authority, then expose typed refs storage-intent consumers can cite. |
-| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, trust/domain refs, temporal refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, tenant/isolation refs, workload/prediction refs, media-capability refs, decision-frontier refs, action-execution refs, evidence-retention refs, media role, proximity, data-shape refs, layout refs, lifecycle refs, and cost records. |
+| Storage intent core records | #841 | `crates/tidefs-storage-intent-core/`, workspace manifests | Define policy, ack class, receipt, ordering refs, membership evidence refs, trust/domain refs, temporal refs, capacity/admission refs, recovery/degradation refs, policy-rollout refs, tenant/isolation refs, workload/prediction refs, media-capability refs, decision-frontier refs, action-execution refs, measurement-attribution refs, evidence-retention refs, media role, proximity, data-shape refs, layout refs, lifecycle refs, and cost records. |
 | Ordering evidence authority | #894 | ordering evidence model surface or #841 core model | Expose barrier scope, dirty epoch, dependency closure, replay idempotency, intent sequence, publication boundary, and completion state for sync, quorum, relocation, repair, and receipt-retirement receipts. |
 | Trust/domain evidence authority | #897 | storage-intent trust/domain records in #841 or `crates/tidefs-storage-intent-trust/`, focused tests | Expose authenticated identity, admin/security/tenant domain, session-security posture, key epoch, authorization/audit refs, residency, sharing-domain compatibility, and quarantine/refusal state. |
 | Capacity/admission evidence authority | #898 | storage-intent capacity/admission records in #841 or `crates/tidefs-storage-intent-capacity/`, focused tests | Expose logical/physical headroom, allocation tickets, claim/reserve receipts, dirty-window reserve, protected floors, pending-free frontiers, capacity amplification, and typed ENOSPC/refusal state. |
@@ -3269,6 +3392,7 @@ this document except to update the issue map after live tickets exist.
 | Media capability evidence authority | #904 | storage-intent media-capability records in #841 or `crates/tidefs-storage-intent-media-capability/`, focused tests | Expose device/media identity, persistence domain, flush/FUA/barrier semantics, volatile-cache policy, atomicity/granularity, protocol/geometry capability, health/freshness, role eligibility, and media-capability refusal state. |
 | Decision-frontier evidence authority | #905 | storage-intent decision-frontier records in #841 or `crates/tidefs-storage-intent-decision/`, focused tests | Expose decision identity, candidate frontier, hard-gate results, score vector, selected candidate, tie-breaker, reserve/admission refs, counterfactual baseline, payback/harm anchors, and refusal/defer state. |
 | Action-execution evidence authority | #911 | storage-intent action-execution records in #841 or `crates/tidefs-storage-intent-action-execution/`, focused tests | Expose action identity, selected decision/admission refs, step state, idempotency/replay proof, source protection, target verification, publication/cutover boundary, abort/rollback state, outcome/budget accounting, and execution refusal state for idempotent actuation and source retirement. |
+| Measurement-attribution evidence authority | #912 | storage-intent measurement-attribution records in #841 or `crates/tidefs-storage-intent-measurement-attribution/`, focused tests | Expose measurement identity, subject/policy/workload/environment binding, sample window, baseline/counterfactual lineage, decision/action/admission refs, metric/KPI/cost/wear vectors, confounder state, attribution verdict, transfer scope, and allowed-use/refusal state. |
 | Evidence-retention authority | #910 | storage-intent evidence-retention records in #841 or `crates/tidefs-storage-intent-evidence-retention/`, focused tests | Expose evidence identity, dependency graph, retention class, proof root, compaction/summarization rule, safe purge frontier, retention media/cost/privacy envelope, and retention refusal state for proof-safe evidence compaction. |
 | Local ack receipt emission | #842 | `crates/tidefs-local-filesystem/`, intent-log-adjacent code | Publish earned ack receipts for write, fsync, fdatasync, O_DSYNC, and mmap sync paths with ordering, media-capability, and capacity/admission refs for the ack floor. |
 | Placement planner integration | #843 | `crates/tidefs-placement-planner/`, `crates/tidefs-replication-model/` | Consume intent roles, membership/fence refs, trust/domain refs, media-capability refs, decision-frontier refs, capacity/admission refs, proximity domains, failure domains, and media-role constraints before scoring candidates. |
@@ -3278,16 +3402,16 @@ this document except to update the issue map after live tickets exist.
 | Lifecycle evidence authority | #881 | lifecycle-evidence records/model module or `crates/tidefs-storage-intent-lifecycle-evidence/`, focused tests | Expose write age, stability, snapshot/clone/receive-base retention, orphan/destroy state, and reclaim frontiers as policy evidence. |
 | Media cost and wear ledger | #844 | `crates/tidefs-local-object-store/` | Track flash wear, WAF estimates, media health, movement debt, payback evidence, and relocation write budgets while consuming #904 refs for media class, health, and capability freshness. |
 | Non-wear cost ledger | #856 | cost-ledger crate or `crates/tidefs-storage-intent-cost/` | Account capacity, network egress, retention, relocation, and operator-defined cost envelopes without replacing #898 admission evidence. |
-| Workload and prediction evidence plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, temporal refs, decision/outcome refs, payback verdicts, confidence updates, and anti-thrash state for planning, relocation, explanation, performance, and fault rows while linking authority-changing decisions to #905, execution/outcome to #911, and retention/compaction to #910. |
+| Workload and prediction evidence plane | #845 | `crates/tidefs-performance-contract/`, focused local signal producers | Materialize bounded workload vectors, confidence classes, temporal refs, decision/outcome refs, payback verdicts, confidence updates, and anti-thrash state for planning, relocation, explanation, performance, and fault rows while linking authority-changing decisions to #905, execution/outcome to #911, attribution to #912, and retention/compaction to #910. |
 | Satisfaction reconciler | #874 | satisfaction/reconciliation crate or `crates/tidefs-storage-intent-satisfaction/` | Reconcile compiled policy against receipts and evidence as satisfied, converging, degraded, blocked, refused, or unsafe-visible, including #900 recovery/degradation, #901 rollout, #902 isolation, #904 media-capability, #905 decision-frontier, #911 action-execution, and #910 retention state, without choosing placement. |
 | Intent-aware admission and scheduling | #862 | scheduler/admission crate or `crates/tidefs-storage-intent-scheduler/` | Map compiled policy, #898 reserve state, #902 isolation state, #904 media-capability refusal state, and #905 decision-frontier refs to lanes, backpressure, QoS budgets, and observable scheduling evidence. |
 | Transport path evidence | #846 | `crates/tidefs-transport/` | Expose measured path/proximity/carrier and temporal-sample evidence without making RDMA mandatory. |
 | RAM authority design and implementation | #847 | docs first, then storage/runtime crates | Define volatile, replicated-volatile, intent-backed, and PMem-backed authority while consuming #904 evidence for PMem persistence-domain and flush/fence eligibility. |
-| Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, wear movement, media-capability gates, decision-frontier, action-execution, and evidence-retention evidence, reserve admission, recovery/degradation predicates, shadow evaluation, payback, and cooldown. |
-| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, rollout stage, receipts, lag/timebase, media capability, decision frontier, action execution, evidence retention, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, isolation/throttle state, prediction outcome, and wear to operators. |
-| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, media-capability role legality, decision-frontier preservation, action-execution safety, evidence-retention safety, trust/domain changes, temporal freshness/lag, capacity admission, recovery/degradation, policy rollout, tenant isolation, prediction accuracy, wear, cost, RPO, and relocation. |
-| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media capability, decision-frontier, action-execution, evidence-retention, trust/domain, temporal freshness/lag, capacity/reserve, recovery/degradation, policy rollout, tenant isolation, prediction accountability, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
-| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, media-capability role eligibility, decision-frontier accountability, action-execution safety, evidence-retention safety, temporal lag/freshness, recovery/degradation, policy rollout, tenant isolation, adaptive prediction, RAM, WAN, and wear promises. |
+| Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, wear movement, media-capability gates, decision-frontier, action-execution, measurement-attribution, and evidence-retention evidence, reserve admission, recovery/degradation predicates, shadow evaluation, payback, and cooldown. |
+| Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, rollout stage, receipts, lag/timebase, media capability, decision frontier, action execution, measurement attribution, evidence retention, volatility, placement, trust/domain state, capacity/reserve state, recovery/degradation state, isolation/throttle state, prediction outcome, and wear to operators. |
+| Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, media-capability role legality, decision-frontier preservation, action-execution safety, measurement-attribution safety, evidence-retention safety, trust/domain changes, temporal freshness/lag, capacity admission, recovery/degradation, policy rollout, tenant isolation, prediction accuracy, wear, cost, RPO, and relocation. |
+| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media capability, decision-frontier, action-execution, measurement-attribution, evidence-retention, trust/domain, temporal freshness/lag, capacity/reserve, recovery/degradation, policy rollout, tenant isolation, prediction accountability, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
+| Storage intent claims gate | #875 | `validation/claims.toml`, generated `docs/CLAIM_REGISTRY.md`, focused claims-gate tests if needed | Register planned/blocked claim ids and evidence boundaries for storage-intent successor, performance, durability, media-capability role eligibility, decision-frontier accountability, action-execution safety, measurement-attribution safety, evidence-retention safety, temporal lag/freshness, recovery/degradation, policy rollout, tenant isolation, adaptive prediction, RAM, WAN, and wear promises. |
 
 ## Validation For This Slice
 
