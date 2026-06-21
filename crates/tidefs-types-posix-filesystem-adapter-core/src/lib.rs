@@ -4,9 +4,9 @@
 
 //! Portable `no_std` `posix_filesystem_adapter` wake-receipt core types.
 //!
-//! Wave Zero does not widen the POSIX surface yet, but `posix_filesystem_adapter` still needs a typed
-//! family-local receipt proving whether a committed publication produced a view
-//! wake or whether a refusal left the product surface unchanged.
+//! The adapter family keeps the POSIX surface unchanged while providing typed
+//! family-local receipts proving whether a committed publication produced a
+//! view wake or whether a refusal left the product surface unchanged.
 
 use core::convert::TryFrom;
 

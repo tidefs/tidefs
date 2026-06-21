@@ -1806,7 +1806,7 @@ fn run_cargo_fmt_check() -> Result<(), String> {
 }
 
 fn print_summary() {
-    println!("tidefs Wave Zero workspace summary");
+    println!("tidefs workspace summary");
     println!("group_commands=check-group-policy,check-group-terminology,check-group-platform,check-group-observe,check-group-authority,check-group-cluster,check-group-block,check-group-storage,check-group-claims,check-group-all");
     println!("human_spine=Control Plane -> Policy Authority -> Publication Pipeline -> Response Registry");
     println!("stable_locator_spine=control_plane -> policy_authority -> publication_pipeline -> response_registry");
