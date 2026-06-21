@@ -24,8 +24,11 @@ This design specifies a **two-phase deletion** model:
    contract processes work items in bounded batches, iterates extent maps with a
    resumable 64-byte cursor, and enqueues refcount deltas for physical reclamation.
 
-The design guarantees bounded synchronous latency, bounded memory, eventual
-reclamation, crash safety, and consistent space accounting.
+The design requires bounded synchronous latency, bounded memory, eventual
+reclamation, crash safety, and consistent space accounting. Those requirements
+are not incumbent-comparison claims; any future product-facing statement about
+TideFS outperforming or matching another filesystem needs #875 and #928/#930
+comparator evidence.
 
 ---
 
@@ -285,7 +288,8 @@ The per-dataset queue is capped at 10,000 items. When the cap is hit:
 - **Strategy**: Limited inline free on subsequent unlink/truncate syscalls.
   Free at most 64 extents synchronously before enqueuing.
 - **Rationale**: Prevents unbounded queue growth during heavy delete workloads
-  while maintaining bounded syscall latency (64 extents x ~1us = acceptable).
+  while keeping the synchronous fallback explicitly capped; the exact latency
+  budget requires focused validation.
 - **Backpressure**: ENOSPC pressure detection boosts `CleanupJob` to Critical
   scheduling priority, accelerating drain.
 
@@ -295,18 +299,23 @@ The per-dataset queue is capped at 10,000 items. When the cap is hit:
 
 ### 4.1 Two-phase vs. synchronous deletion
 
-| Aspect | Two-phase (this design) | Synchronous (ZFS-style) |
+This tradeoff table records the design input that foreground extent-free work
+can scale with file size. It is not measured TideFS latency evidence and does
+not prove superiority over ZFS or any other filesystem.
+
+| Aspect | Two-phase (this design) | Synchronous foreground free path |
 |---|---|---|
-| unlink latency | O(1) relative to file size | O(extents) — minutes for large files |
+| unlink latency | Target: O(1) relative to file size | O(extents); can grow with very large files |
 | Memory | 128 bytes per pending item | O(extents) heap during syscall |
 | Crash safety | Work item is durable in commit_group | Partial free may leave dangling refs |
 | Space reclamation | Eventual (background) | Immediate |
 | Complexity | Higher (queue, cursor, stale detection) | Lower (single code path) |
 
-**Decision**: Two-phase. The latency guarantee for large-file deletion is
-non-negotiable for a general-purpose filesystem. Eventual reclamation is
-acceptable because `st_blocks` is immediately correct and ENOSPC pressure
-can boost cleanup priority.
+**Decision**: Two-phase. Bounded large-file deletion latency is a design
+requirement for TideFS. Eventual reclamation is acceptable only when
+`st_blocks` is immediately correct and ENOSPC pressure can boost cleanup
+priority; current product claims still require implementation and validation
+evidence.
 
 ### 4.2 B+tree queue vs. flat log
 
@@ -426,27 +435,32 @@ Implements `CleanupJob` as an `IncrementalJob`:
 
 ---
 
-## 7. Comparison to Existing Systems
+## 7. Design-input comparison to existing systems
+
+This section preserves incumbent failure modes as design inputs. It is not a
+claim that TideFS currently outperforms ZFS or CephFS on unlink latency,
+memory boundedness, crash safety, or reclamation cost.
 
 ### 7.1 ZFS
 
 ZFS performs `dmu_free_long_range()` synchronously during `zfs_rmdir` and
-`zfs_znode_delete`. On a 10 TiB file with 128 KiB recordsize, `rm` can hang
-for minutes while the DMU iterates and frees every block. There is no
-background deferred cleanup; the caller blocks for O(extents) time.
+`zfs_znode_delete`. The design input is that foreground deletion work can scale
+with extent count when the implementation iterates and frees every block before
+returning to the caller.
 
-**TideFS advantage**: 128-byte enqueue in O(1), immediate return to caller,
-background reclamation with bounded per-tick work.
+**TideFS target**: small durable enqueue, prompt return to caller, and
+background reclamation with bounded per-tick work. This remains a target, not
+measured comparative evidence.
 
 ### 7.2 CephFS
 
-CephFS MDS blocks during unlink of large files. No deferred work-queue
-abstraction exists; the MDS journal is the closest analogue but is not
-designed for bulk extent reclamation. PG removal is a heavyweight state
-machine but not a fine-grained budgeted job.
+CephFS is useful design input because metadata and placement-group work are not
+represented as one fine-grained, per-deletion, scheduler-visible cleanup queue.
+The MDS journal and PG removal machinery solve different problems.
 
-**TideFS advantage**: `IncrementalJob` contract with resumable cursors
-and per-tick budget enforcement.
+**TideFS target**: an `IncrementalJob` contract with resumable cursors and
+per-tick budget enforcement, with product comparisons left to #875 and
+#928/#930 evidence.
 
 ---
 

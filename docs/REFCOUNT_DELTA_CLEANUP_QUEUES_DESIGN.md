@@ -24,9 +24,12 @@ model with explicit refcount tracking. This spec defines the **incremental
 reclamation mechanism** that acts on refcount transitions to free dead space
 without full-dataset scans.
 
-ZFS solves this with the `dsl_scan`/`dsl_destroy` pipeline and the `bpobj`
-(block_ref object) deferred-free subsystem. TideFS must provide an equivalent
-that is deterministic, budgeted, and crash-safe.
+ZFS is useful historical design input here because its `dsl_scan`/`dsl_destroy`
+pipeline and `bpobj` (block_ref object) deferred-free subsystem name the same
+class of deferred-reclaim problem. This document does not claim current TideFS
+parity or superiority over ZFS. The TideFS design target is a deterministic,
+budgeted, crash-safe mechanism that still needs implementation and comparator
+evidence before it can support a product-facing incumbent claim.
 
 ### 1.1 Why deltas, not full scans
 
@@ -356,7 +359,13 @@ without letting the queue grow unbounded.
 | `encoding.rs` | Object encode/decode. Reclaim queue uses B-tree encoding from this module. |
 | `lib.rs` (`LocalFileSystem`) | Hosts the `BackgroundService` set including reclaim processor. |
 
-## 9. ZFS comparison
+## 9. ZFS design-input comparison
+
+The table below is a design lesson map, not validation evidence and not a
+successor or performance claim. Any future product-facing statement that TideFS
+matches or outperforms ZFS reclaim behavior must be represented as a #875 claim
+and backed by #928/#930 comparator evidence for the exact workload and media
+class being discussed.
 
 | Property | ZFS | TideFS (this spec) |
 |---|---|---|
@@ -366,9 +375,10 @@ without letting the queue grow unbounded.
 | Budget model | Implicit (syncing commit_group) | Explicit `budget` entries per tick |
 | Crash safety | ZIL + commit_group atomic commit | Persistent queue + atomic commit with refcount B-tree |
 
-TideFS improves on ZFS by making processing explicitly budgeted (no
-unbounded `dsl_scan` pass at mount) and by tying reclaim directly to
-the locator table lifecycle rather than an indirect birth_commit_group model.
+The design lesson taken from this comparison is to make processing explicitly
+budgeted and to tie reclaim directly to the locator table lifecycle. Whether
+that design produces better latency, throughput, durability, or operational
+cost than ZFS is an evidence question outside this document.
 
 ## 10. Implementation plan
 

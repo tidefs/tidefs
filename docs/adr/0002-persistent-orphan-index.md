@@ -11,10 +11,11 @@ which blocks become unreferenced (orphaned) so they can be reclaimed. Without a
 persistent index, orphan detection requires a full dataset scan — expensive and
 unbounded in time.
 
-Previous approaches (ZFS spacemap traversal, Ceph per-object reference counting)
-trade correctness for performance or vice versa. TideFS needed an approach that
-is crash-safe, incremental, and tightly integrated with the transaction-group
-(COMMIT_GROUP) commit model.
+ZFS spacemap traversal and Ceph per-object reference tracking are historical
+design inputs for the orphan/reclaim problem space. This ADR does not claim
+that TideFS is currently more correct, faster, or more reliable than either
+incumbent; it records the design requirement for a crash-safe, incremental
+orphan index integrated with the transaction-group (COMMIT_GROUP) commit model.
 
 ## Decision
 

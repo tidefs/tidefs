@@ -447,7 +447,12 @@ Each wire-up issue must:
 
 ---
 
-## 6. Comparison to ZFS and Ceph
+## 6. ZFS and Ceph design-input comparison
+
+This comparison motivates the Phase 1 contract shape. It is not a
+product-facing claim that TideFS currently has better background-job
+boundedness, crash resumption, or safety than ZFS or Ceph; those claims require
+#875 and #928/#930 comparator evidence.
 
 | Dimension | TideFS (this design) | ZFS | Ceph |
 |---|---|---|---|

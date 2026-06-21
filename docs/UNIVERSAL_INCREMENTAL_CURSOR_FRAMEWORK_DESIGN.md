@@ -29,11 +29,12 @@ Without a shared contract, each subsystem:
 - Exposes its own admin interface (fragmented operator experience)
 - Duplicates crash-recovery logic (subtle divergence in edge cases)
 
-ZFS illustrates the cost: its ARC, COMMIT_GROUP sync, scrub, resilver, send/receive, and
-dataset destroy each use completely different progress-tracking mechanisms with no
-shared contract. Ceph's PG recovery, backfill, scrub, and deep-scrub similarly
-duplicate progress tracking. This design eliminates that duplication before it enters
-the tidefs codebase.
+ZFS and Ceph provide useful historical design input: their background and
+repair paths have multiple progress-tracking mechanisms rather than one shared
+TideFS-style cursor contract. This document does not claim current TideFS
+parity or superiority over either system; it records the architectural lesson
+that TideFS should avoid duplicating cursor, checkpoint, and visibility logic
+across subsystems before those paths become entrenched.
 
 ## 2. Relationship to Existing Designs
 
@@ -427,7 +428,14 @@ Scheduling priorities are derived from `JobKind`:
 The scheduler may boost priority when resource pressure is detected (e.g., ENOSPC
 boosts CLEANUP and CLEAN to TIME_CRITICAL).
 
-## 9. ZFS, Ceph, and ext4 Comparison
+## 9. ZFS, Ceph, and ext4 design-input comparison
+
+The table below is a design-input classification. It is not benchmark evidence,
+not a current operational capability claim, and not a successor claim. Any
+future statement that TideFS provides better boundedness, crash resumption,
+operator visibility, or scheduling than these incumbents must be expressed as a
+#875 claim with #928/#930 comparator evidence for the exact implementation and
+workload.
 
 | Dimension | tidefs (this design) | ZFS | Ceph | ext4 |
 |---|---|---|---|---|
@@ -438,7 +446,7 @@ boosts CLEANUP and CLEAN to TIME_CRITICAL).
 | **Scheduling integration** | Priority classes per `JobKind`; budget fraction allocation; pressure-driven boosting | ZFS IO scheduler prioritizes sync writes over scrub; no unified scheduling model | Ceph has op priorities but backfill/recovery scheduling is coarse (osd_max_backfills) | No background scheduling |
 | **Epoch fencing** | Epoch counter enables stale checkpoint detection and split-brain prevention | No epoch mechanism; split-brain detection relies on pool import/export | OSDMap epoch is global but not used for per-job fencing | Not applicable |
 
-### 9.1 ZFS fragmentation analysis
+### 9.1 ZFS design-input analysis
 
 ZFS's background work falls into distinct categories, none sharing a cursor contract:
 
@@ -455,7 +463,7 @@ ZFS's background work falls into distinct categories, none sharing a cursor cont
 - **ARC eviction**: Bounded by ARC size but uses an LRU/most-recently-used hybrid
   with no cursor or checkpoint concept.
 
-### 9.2 Ceph fragmentation analysis
+### 9.2 Ceph design-input analysis
 
 - **PG recovery/backfill**: Progress tracked per-PG in memory. On OSD restart,
   recovery restarts from the PG log — efficient for recent changes but O(PG count)

@@ -2,8 +2,9 @@
 
 Maturity: **design-spec** for the bounded-memory work-item framework that decouples
 synchronous syscall work (unlink, truncate, rmdir, rename-overwrite) from unbounded
-extent-map iteration, ensuring O(1) per-syscall memory while guaranteeing eventual
-space reclamation through the background `IncrementalJob` infrastructure.
+extent-map iteration. The design requires O(1) per-syscall memory and eventual
+space reclamation through the background `IncrementalJob` infrastructure; it is
+not itself runtime evidence that deployed TideFS meets those bounds.
 
 This document closes Forgejo issue #1212.
 
@@ -15,12 +16,13 @@ the file's storage — potentially millions of extents spanning terabytes. Naive
 code builds in-memory lists of every extent and blows RAM. Even a streaming
 walk adds unpredictable latency to what the application expects to be fast.
 
-ZFS illustrates the anti-pattern: `zfs_rmdir` and `zfs_znode_delete` perform a
-synchronous `dmu_free_long_range` that blocks the caller for O(extents) time.
-On a 10 TiB file with 128 KiB recordsize (~80M extents), `rm` can hang for minutes.
-CephFS similarly blocks the MDS during unlink of large files.
+ZFS and CephFS are useful design inputs because they expose the same foreground
+unlink/truncate versus background reclaim tension. This paragraph is not a
+measured product comparison: the operational lesson is that any implementation
+that lets extent-count work stay in the foreground path can create unbounded
+caller latency unless bounded by a separate cursor and scheduler contract.
 
-tidefs must guarantee:
+The design requires TideFS to provide:
 
 - **Bounded synchronous work**: unlink/truncate syscall latency is O(directory entry
   depth + inode metadata) regardless of file size or extent count
@@ -373,7 +375,7 @@ impl IncrementalJob for CleanupJob {
 }
 ```
 
-### 6.2 Boundedness guarantee
+### 6.2 Boundedness requirement
 
 The `CleanupJob` respects `WorkBudget` at two levels:
 - **Per-extent**: Each extent-map cursor advance is O(log N) in the B+tree, not
@@ -381,8 +383,10 @@ The `CleanupJob` respects `WorkBudget` at two levels:
 - **Per-step**: The `iter_extents_from()` method accepts a budget and returns at
   most `max_items` extents, regardless of how many remain
 
-This guarantees the background worker never allocates O(total-extents) memory
-and never blocks the commit_group sync for unbounded time.
+These requirements are intended to keep the background worker from allocating
+O(total-extents) memory or blocking commit_group sync for unbounded time. They
+remain design requirements until backed by implementation and validation
+evidence.
 
 ### 6.3 Crash safety
 
@@ -468,7 +472,13 @@ Cleanup is scheduled at **HIGH** priority because it directly enables space
 reclamation. If `phys_reclaimable_bytes` exceeds a threshold or ENOSPC is
 approaching, cleanup priority is boosted to **TIME_CRITICAL**.
 
-## 9. ZFS, Ceph, and ext4 Comparison
+## 9. ZFS, Ceph, and ext4 design-input comparison
+
+This comparison records design requirements and failure modes to avoid. It is
+not a claim that TideFS currently has lower unlink/truncate latency, better
+ENOSPC behavior, or better memory boundedness than ZFS, Ceph, or ext4. Any
+future product-facing comparison must route through #875 and carry #928/#930
+comparator evidence for the exact implementation, workload, and storage class.
 
 | Dimension | tidefs (this design) | ZFS | Ceph | ext4 |
 |---|---|---|---|---|
@@ -481,23 +491,24 @@ approaching, cleanup priority is boosted to **TIME_CRITICAL**.
 | **Extent-map dependency** | Requires subtree-summary extent maps (#1191) and range-delete operations | ZFS has block-pointer trees with on-disk summaries (already present) | Ceph uses object maps; no extent tree in MDS | ext4 has extent trees with per-node entry counts (already present) |
 | **Worker integration** | `CleanupJob` implements `IncrementalJob` (#1239); scheduled by `BackgroundService` (#1179); feeds `ReclaimQueue` (#1180) | `bpobj` processed by `spa_sync` thread in single-threaded context; no background scheduling | Async data deletion by OSD via `osd_pg_delete`; MDS has no background cleanup worker | No background worker; synchronous freeing only |
 
-### 9.1 ZFS bpobj deep-dive
+### 9.1 ZFS bpobj design input
 
-ZFS's `bpobj` (block_ref object) is the closest analog to tidefs's cleanup work queue:
+ZFS's `bpobj` (block_ref object) is the closest design input for this cleanup
+work queue:
 
-- **ZFS approach**: When a dataset is destroyed or a large file is truncated,
+- **ZFS design input**: When a dataset is destroyed or a large file is truncated,
   ZFS creates a `bpobj` containing all the freed block pointers. The `spa_sync`
   thread then iterates the `bpobj` synchronously during commit_group sync.
-- **Key weakness**: `bpobj` processing is single-threaded and competes with
-  application IO in the same `spa_sync` context. A large backlog (gigabytes of
-  freed blocks) causes multi-second commit_group sync stalls.
-- **tidefs improvement**: Cleanup is decoupled from commit_group sync. The synchronous
-  phase only enqueues a small work item. The background worker runs in its own
-  scheduling context with bounded per-tick budgets, never blocking application IO.
+- **Design risk to avoid**: reclaim work that competes with application IO in
+  the same sync context can create commit_group stalls when backlog grows.
+- **TideFS target design**: cleanup is decoupled from commit_group sync. The
+  synchronous phase only enqueues a small work item, and the background worker
+  runs in a scheduling context with bounded per-tick budgets. This remains a
+  design target, not a measured superiority claim.
 - **Ceph comparison**: Ceph has no equivalent of `bpobj`. Data object deletion is
   handled by the OSD's `pg_removal` process, which is asynchronous but per-PG
   rather than per-deletion-op. Large deletions create PG-level work backlogs
-  with no global scheduling.
+  with no global scheduling in this design model.
 
 ## 10. Implementation Plan
 
