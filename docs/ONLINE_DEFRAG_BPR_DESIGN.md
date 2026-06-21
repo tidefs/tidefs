@@ -15,20 +15,52 @@ defrag capability, performance, availability, cost, or successor evidence.
 Any future product-facing comparison must name a #875 claim id and carry the
 comparator evidence required by #928/#930.
 
+## Storage Intent Authority Boundary
+
+This document is a target mechanism note for block-pointer-rewrite-style
+extent relocation. In the current TideFS authority model, online defrag is not
+an independent background optimization and not a standalone product claim.
+Defrag, compaction, rebake, rebuild, evacuation, promotion/demotion,
+wear-rebalance, archive migration, and geo catch-up are one
+receipt-preserving optimizer family owned by #848 and gated by
+`docs/STORAGE_INTENT_POLICY_AUTHORITY.md`.
+
+Any future activation of this mechanism must consume the relevant storage
+intent evidence before it moves bytes or retires old receipts: media
+capability and freshness (#904/#960/#961/#962), workload prediction and
+payback (#845), flash wear and write amplification (#844), non-wear cost
+(#856), layout/lifecycle evidence (#880/#881), capacity admission (#898),
+recovery/degradation state (#900), action execution (#911), decision-frontier
+evidence (#905), query snapshots (#913), and result/refusal projection (#920).
+HDD defrag is only a legal optimizer when seek, scan, locality, or free-run
+payback clears those gates. Flash/NVMe rewriting must prove write-amplification
+budget, protected reserve, wear, and payback safety instead of treating fast
+media as free scratch. Remote or WAN movement belongs to the same relocation
+family and must carry proximity, cost, batching, and RPO/lag evidence; RDMA is
+never required for correctness.
+
+Mechanical scheduler wiring such as #630/#734 may prove that a defrag job can
+run at a low priority. It does not prove media-native placement, flash-friendly
+movement, WAN-safe geo behavior, or better-than-ZFS/Ceph defrag.
+
 ## Abstract
 
-This document defines the online defragmentation design for tidefs. Defrag rewrites
-existing base shards to improve physical layout — reducing shard count, healing
-fragmentation, and compacting space — without taking datasets offline. The
-architecture reuses the rebake machinery (#1222) and leverages extent_id indirection
-to make block pointer rewrite (BPR) safe, transactional, and snapshot-aware.
+This document describes a target online-defragmentation mechanism for TideFS.
+The mechanism rewrites existing base shards through extent-id indirection so a
+receipt-preserving relocation governor can improve physical layout without
+taking datasets offline. It may reduce shard count, heal fragmentation, or
+compact space, but only when the storage-intent gates above admit the move.
+The architecture reuses the rebake machinery (#1222) and leverages extent_id
+indirection to make block pointer rewrite (BPR) safe, transactional, and
+snapshot-aware.
 
 ## 1. Motivation
 
-ZFS's most notorious missing feature is online defrag: no BPR means physical layout is
-permanent post-write. The only defrag option is `zfs send | zfs recv`, requiring free
-space ≥ dataset size and downtime. Ceph avoids this with object storage but still
-fragments within OSDs.
+ZFS's most notorious missing feature is online defrag: no BPR means physical
+layout is permanent post-write. The only defrag option is `zfs send | zfs recv`,
+requiring free space >= dataset size and downtime. Ceph avoids this with object
+storage but still fragments within OSDs. Those are design lessons, not evidence
+that TideFS should always rewrite fragmented data.
 
 After extended tidefs operation:
 - Partially overwritten files leave holes in base shards
@@ -36,7 +68,10 @@ After extended tidefs operation:
 - Hot files that are frequently appended/truncated develop sparse extent maps
 - Spacemap fragmentation reduces large-allocation efficiency
 
-Without online defrag, performance degrades monotonically.
+Without any relocation mechanism, layout can degrade over time. With storage
+intent, the stronger rule is more precise: TideFS should rewrite only when
+receipt safety, medium semantics, cost, wear, capacity, workload confidence,
+and measured payback justify the movement.
 
 ## 2. Core Design: Defrag = Rebake++
 
@@ -107,6 +142,11 @@ frag_score(extent_id) =
 | `snapshot_dead_bytes / total_bytes` | Dead space behind snapshots | w4 = 3.0 |
 
 Only extents with `frag_score > threshold` (default: 2.0) are defrag candidates.
+This legacy score is a candidate feature, not an admission decision. The
+storage-intent relocation governor must still reject or defer candidates whose
+media capability, wear/WAF, non-wear cost, capacity, lifecycle, recovery,
+prediction confidence, preflight, or result/refusal evidence is missing, stale,
+contradictory, or too weak for the requested movement.
 
 ### 4.2 Candidate Selection
 
@@ -122,10 +162,10 @@ Only extents with `frag_score > threshold` (default: 2.0) are defrag candidates.
 defrag_extent(extent_id):
     1. Read all live shards for extent_id from the locator table
     2. Reassemble the logical extent from shards
-    3. Re-encode with current dataset durability policy:
+    3. Re-encode with the storage-intent relocation plan's target policy:
        a. Compression (if enabled per dataset policy)
        b. Erasure coding (if enabled per dataset policy)
-       c. Placement (optimal device selection)
+       c. Placement selected by storage-intent hard gates and receipts
     4. Write new base shards to fresh segments via the BULK allocation plane
     5. In a single commit_group:
        a. Update locator: atomically swap old base pointers → new base pointers
@@ -235,13 +275,13 @@ surfaces a soft error. No data loss — existing shards remain valid.
 
 ## 12. ZFS and Ceph Design Lessons (Non-Claim)
 
-| Aspect | ZFS | Ceph (Bluestore) | TideFS target design |
+| Aspect | ZFS | Ceph (Bluestore) | TideFS target mechanism lesson |
 |---|---|---|---|
-| Online defrag | None (send/recv only) | Internal (opaque, not extent-aligned) | Extent-aligned BPR via locator swap |
-| BPR mechanism | Impossible (cascading indirect updates) | N/A (object storage) | Extent_id indirection makes BPR single-level |
-| Snapshot-aware | N/A | N/A | Yes — deadlist tracks old shards |
-| Budget control | N/A | Tunable priority | Per-tick budget with demand throttle |
-| Observability | N/A | Internal counters | frag_score histogram, per-extent metrics |
+| Online defrag | None (send/recv only) | Internal (opaque, not extent-aligned) | Extent-aligned BPR via locator swap, admitted by #848 storage-intent relocation gates |
+| BPR mechanism | Impossible (cascading indirect updates) | N/A (object storage) | Extent_id indirection can make BPR single-level, but receipt retirement still needs #911/#920 evidence |
+| Snapshot-aware | N/A | N/A | Deadlist tracking is a mechanism input; lifecycle and reclaim legality come from #881/#880 |
+| Budget control | N/A | Tunable priority | Per-tick throttles are necessary but insufficient without #844/#856/#898/#902 reserves |
+| Observability | N/A | Internal counters | frag_score metrics are low-level evidence, not performance or successor claims without #845/#850/#875/#928 |
 
 ## 13. References
 
@@ -250,5 +290,10 @@ surfaces a soft error. No data loss — existing shards remain valid.
 - #1189 — Spacemap allocator
 - #1241 — BACKGROUND lane scheduler
 - #1229 — BULK plane for data movement
+- #848 — storage-intent relocation governor
+- #844/#856 — media wear and non-wear cost ledgers
+- #845 — workload prediction, payback, and anti-thrash evidence
+- #904/#960/#961/#962 — media capability predicates, producers, and freshness
+- #875/#928/#931 — claim and incumbent-comparison gates
 - `docs/SHARD_GROUPS_REPLICAS_REBAKE_DESIGN.md` — rebake design
 - Issue #1262 — merged duplicate with extended rationale
