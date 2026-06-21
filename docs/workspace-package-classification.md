@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 153 |
+| Workspace packages | 154 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 158 |
-| Classified package roots | 158 |
+| Discovered package manifests | 159 |
+| Classified package roots | 159 |
 
 ## TFR-002 Category Mapping
 
@@ -25,7 +25,7 @@ root.
 
 | TFR-002 category | Current roles | Count | Boundary |
 | --- | --- | ---: | --- |
-| `product` | `product-code`, `adapter-operator` | 132 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
+| `product` | `product-code`, `adapter-operator` | 133 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
 | `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 25 | Repo policy tooling, CI/developer support, demos, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
 | `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
 | `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
@@ -52,7 +52,7 @@ holding area.
 
 | Role | Count |
 | --- | ---: |
-| `product-code` | 118 |
+| `product-code` | 119 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
 | `proof-harness` | 12 |
@@ -193,6 +193,7 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-space-accounting` | `tidefs-space-accounting` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-spacemap-allocator` | `tidefs-spacemap-allocator` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-storage-intent-core` | `tidefs-storage-intent-core` | `workspace-member` | `product-code` | planned authority surface for #841 storage-intent records and predicates; downstream wiring required before release claims. |
+| `crates/tidefs-storage-intent-local-media-capability` | `tidefs-storage-intent-local-media-capability` | `workspace-member` | `product-code` | planned authority surface for #960 local media-capability producer records; model/fixture slice only and downstream freshness/runtime wiring required before release claims. |
 | `crates/tidefs-tdma-scheduler` | `tidefs-tdma-scheduler` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-trace-oracle` | `tidefs-trace-oracle` | `workspace-member` | `proof-harness` | current proof harness; test signal only and not a product capability claim. |
 | `crates/tidefs-transport` | `tidefs-transport` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
