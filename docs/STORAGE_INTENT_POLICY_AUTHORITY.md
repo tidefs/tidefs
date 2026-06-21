@@ -762,6 +762,43 @@ Each row must bind:
 
 No performance claim should close merely because average throughput improved.
 
+## Fault And Validation Matrix
+
+Performance rows are necessary, but they do not prove storage intent. A fast
+acknowledgment is meaningful only when the same requested intent, earned
+receipt, placement state, and operator explanation survive the faults that the
+ack class claims to cover. Storage-intent validation therefore needs a dedicated
+matrix, tracked by #863, that binds policy promises to destructive evidence.
+
+The matrix must cover at least these row families:
+
+- kill-before-ack and crash-after-ack for every acknowledgment class, from
+  `volatile-local` through `geo-intent`;
+- transport partition, latency stretch, bandwidth clamp, packet loss, and
+  RDMA-absent TCP/internet paths for quorum and geo modes;
+- media corruption, flush omission, stale copy, truncation, bit flip, zeroed
+  range, device loss, and endurance-reserve exhaustion;
+- RAM authority failure cases proving volatile receipts never satisfy durable
+  POSIX barriers;
+- relocation, defrag, rebake, rebuild, evacuation, and geo catch-up interrupted
+  before and after replacement receipt publication;
+- policy publish, rollback, or conflict while writes, relocation, and remote
+  backlog are in flight.
+
+Every row must name the requested policy revision, workload envelope,
+topology/media profile, fault schedule, earned receipt set, post-recovery
+receipt obligations, and forbidden outcomes. Forbidden outcomes include durable
+success without required receipt evidence, hidden downgrade from durable to
+volatile or from `geo-intent` to `geo-async`, split-brain receipt publication,
+old locator retirement before replacement receipt publication, reserve/wear
+breach hidden behind successful relocation, and explanations that omit
+degradation, lag, volatility, or refusal.
+
+The validation matrix cross-links with #850 where a scenario also has latency,
+tail, throughput, RPO, or wear/cost budgets. #850 measures whether TideFS is
+fast enough under a declared envelope; #863 proves that the envelope remains
+honest when the system is broken on purpose.
+
 ## Relationship To Existing Authority
 
 This document composes existing authority surfaces:
@@ -798,6 +835,9 @@ This document composes existing authority surfaces:
   when they are not serving a foreground or critical policy risk.
 - `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`: performance
   truth requires workload envelopes, KPIs, budgets, and receipts.
+- `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`: fault,
+  corruption, partition, and recovery campaigns must name fault classes,
+  legal outcomes, forbidden outcomes, recovery receipts, and gate artifacts.
 - `docs/OPERATOR_UAPI_AUTHORITY.md`: operator surfaces must distinguish
   prototype, diagnostic, live-owner, and final UAPI claims.
 - `docs/UNRELEASED_AUTHORITY_POLICY.md`: TideFS should choose the current
@@ -864,6 +904,7 @@ this document except to update the issue map after live tickets exist.
 | Relocation governor | #848 | new relocation/optimizer crate or existing background-service integration | Unify defrag, compaction, rebake, rebuild, evacuation, geo catch-up, and wear movement. |
 | Operator explanation UAPI | #849 | `apps/tidefsctl/`, operator docs | Explain policy, receipts, lag, volatility, placement, and wear to operators. |
 | Performance intent gates | #850 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `crates/tidefs-performance-contract/`, validation matrix | Add rows for ack latency, throughput, tail, wear, cost, RPO, and relocation. |
+| Storage intent fault validation | #863 | `docs/FAULT_INJECTION_CHAOS_CORRUPTION_CAMPAIGNS_P10-02.md`, storage-intent validation matrix/config docs | Prove ack, placement, media, relocation, RAM, scheduler, and WAN promises under typed faults and forbidden-outcome checks. |
 
 ## Validation For This Slice
 
