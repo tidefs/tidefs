@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Cluster pool orchestration: request builders for multi-node pool
-//! creation and import.
+//! Cluster pool orchestration: request planning, transport dispatch, and
+//! response aggregation for clustered pool creation and import.
 //!
-//! **Prototype boundary note**: the [`ClusterPoolOrchestrator`] builds per-node
-//! protocol messages ([ClusterPoolCreateRequest], [ClusterPoolImportRequest])
-//! from a [ClusterPoolConfig] and provides aggregation helpers for
-//! responses.  It does **not** send or collect messages itself — callers
-//! are responsible for transport dispatch.
+//! The [`ClusterPoolOrchestrator`] owns the crate-local product boundary for
+//! turning a [`ClusterPoolConfig`] into per-node protocol requests, dispatching
+//! those typed messages through a caller-supplied [`PoolTransport`], correlating
+//! create responses, and enforcing full-node quorum for the current
+//! clustered-pool create path.
 //!
-//! The [`PoolTransport`] trait is a transport-neutral abstraction for
-//! prototype message dispatch.  `tidefsctl cluster pool create` may provide a
-//! `tidefs-transport` adapter, while the in-memory [ChannelPoolTransport]
-//! remains a unit-test transport.  Neither path makes this orchestrator a
-//! final distributed operator UAPI or a cluster status authority.
-//!
-//! Do not close any clustered-pool runtime gate with SourceModel,
-//! CargoUnit, in-memory channel, or scaffolding-only validation.
+//! The orchestrator does not own membership, transport authentication,
+//! storage-node runtime authority, cluster status, or final distributed
+//! operator UAPI.  Live transport adapters provide delivery, while
+//! [`ChannelPoolTransport`](crate::channel_transport::ChannelPoolTransport)
+//! remains a harness transport for orchestrator tests.  TFR-017 remains open
+//! for end-to-end distributed authority beyond this crate-local boundary.
 
 use std::collections::BTreeMap;
 
@@ -29,13 +27,12 @@ use crate::pool_protocol::{
 // PoolTransport — abstract transport for pool protocol messages
 // ---------------------------------------------------------------------------
 
-/// Trait for sending and receiving cluster pool prototype messages.
+/// Trait for sending and receiving typed cluster pool protocol messages.
 ///
-/// Implementations may use tidefs-transport sessions, in-memory channels
-/// for testing, or any other reliable delivery mechanism.  The transport
-/// is responsible for authenticity and integrity; this protocol layer
-/// does not add per-message cryptographic verification and does not define
-/// final distributed operator UAPI.
+/// Implementations provide delivery for already-authorized node sessions.
+/// The transport is responsible for authenticity, integrity, peer admission,
+/// and flow control; this orchestrator layer only constructs messages and
+/// correlates responses for the selected pool operation.
 pub trait PoolTransport {
     /// The error type returned by send/receive operations.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -46,6 +43,21 @@ pub trait PoolTransport {
     /// Receive a pool protocol message (blocking or async wrapper).
     /// Returns `None` if no message is available within a timeout.
     fn recv(&self) -> Result<Option<(u64, ClusterPoolMessage)>, Self::Error>;
+}
+
+fn pool_message_kind(message: &ClusterPoolMessage) -> &'static str {
+    match message {
+        ClusterPoolMessage::CreateRequest(_) => "create request",
+        ClusterPoolMessage::CreateResponse(_) => "create response",
+        ClusterPoolMessage::ImportRequest(_) => "import request",
+        ClusterPoolMessage::ImportResponse(_) => "import response",
+        ClusterPoolMessage::LeaseRequest(_) => "lease request",
+        ClusterPoolMessage::LeaseResponse(_) => "lease response",
+        ClusterPoolMessage::CatalogDeltaRequest(_) => "catalog delta request",
+        ClusterPoolMessage::CatalogDeltaResponse(_) => "catalog delta response",
+        ClusterPoolMessage::CatalogQueryRequest(_) => "catalog query request",
+        ClusterPoolMessage::CatalogQueryResponse(_) => "catalog query response",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +230,54 @@ impl ClusterPoolOrchestrator {
         map
     }
 
+    fn validate_create_targets(config: &ClusterPoolConfig) -> Result<(), OrchestratorError> {
+        if config.node_ids.is_empty() {
+            return Err(OrchestratorError::NoDevicesForNode { node_id: 0 });
+        }
+
+        for &node_id in &config.node_ids {
+            if config.devices_for_node(node_id).is_empty() {
+                return Err(OrchestratorError::NoDevicesForNode { node_id });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_create_response(
+        node_id: u64,
+        request_id: u64,
+        pool_guid: [u8; 16],
+        expected_nodes: &[u64],
+        response: &ClusterPoolCreateResponse,
+    ) -> Result<(), OrchestratorError> {
+        if !expected_nodes.contains(&node_id) {
+            return Err(OrchestratorError::UnknownNode { node_id });
+        }
+
+        if response.node_id != node_id {
+            return Err(OrchestratorError::Transport(format!(
+                "create response node mismatch: transport node {node_id}, payload node {}",
+                response.node_id
+            )));
+        }
+
+        if response.request_id != request_id {
+            return Err(OrchestratorError::Transport(format!(
+                "create response request_id mismatch from node {node_id}: got {}, expected {request_id}",
+                response.request_id
+            )));
+        }
+
+        if response.pool_guid != pool_guid {
+            return Err(OrchestratorError::Transport(format!(
+                "create response pool_guid mismatch from node {node_id}"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Aggregate create responses into a [`CreateOutcome`].
     ///
     /// `responses` is a map from node_id to the response received from
@@ -317,7 +377,7 @@ impl ClusterPoolOrchestrator {
     /// Returns `Ok(CreateOutcome)` when all nodes respond with success.
     /// Returns `Err(OrchestratorError::QuorumNotReached)` when one or more
     /// nodes fail or time out.  Partial results are preserved in the
-    /// outcome for prototype diagnostics.
+    /// outcome for operator diagnostics.
     ///
     /// The caller is responsible for providing a transport already
     /// connected to all target nodes.
@@ -327,13 +387,14 @@ impl ClusterPoolOrchestrator {
         transport: &dyn PoolTransport<Error = OrchestratorError>,
         timeout_iterations: usize,
     ) -> Result<CreateOutcome, OrchestratorError> {
-        // 1. Build per-node requests.
+        // 1. Validate and build per-node requests.
+        Self::validate_create_targets(config)?;
         let requests = Self::build_create_requests(config, request_id);
         if requests.is_empty() {
             return Err(OrchestratorError::NoDevicesForNode { node_id: 0 });
         }
 
-        let expected_nodes: Vec<u64> = requests.keys().copied().collect();
+        let expected_nodes = config.node_ids.clone();
 
         // 2. Send all requests.
         for (&node_id, req) in &requests {
@@ -355,16 +416,23 @@ impl ClusterPoolOrchestrator {
             match transport.recv() {
                 Ok(Some((node_id, msg))) => match msg {
                     ClusterPoolMessage::CreateResponse(resp) => {
+                        Self::validate_create_response(
+                            node_id,
+                            request_id,
+                            config.pool_guid,
+                            &expected_nodes,
+                            &resp,
+                        )?;
                         if !responses.contains_key(&node_id) {
                             remaining -= 1;
                             responses.insert(node_id, resp);
                         }
                     }
                     other => {
-                        eprintln!(
-                            "tidefsctl: unexpected response type from node {node_id}: {:?}",
-                            std::mem::discriminant(&other)
-                        );
+                        return Err(OrchestratorError::Transport(format!(
+                            "unexpected {} while waiting for create response from node {node_id}",
+                            pool_message_kind(&other)
+                        )));
                     }
                 },
                 Ok(None) => {
@@ -397,8 +465,7 @@ impl ClusterPoolOrchestrator {
         }
 
         // Capture counts before moving outcome. Per-node failure details are
-        // preserved in the outcome carried by the error for prototype
-        // diagnostics.
+        // preserved in the outcome carried by the error for diagnostics.
         let succeeded = outcome.succeeded;
         let total = outcome.total_nodes;
 
@@ -428,7 +495,41 @@ mod tests {
     use crate::pool_config::{
         ClusterPlacementPolicy, ClusterRedundancy, FailureDomain, NodeDevice,
     };
+    use std::cell::RefCell;
     use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct ScriptedTransport {
+        sent: RefCell<Vec<(u64, ClusterPoolMessage)>>,
+        received: RefCell<Vec<(u64, ClusterPoolMessage)>>,
+    }
+
+    impl ScriptedTransport {
+        fn with_received(mut received: Vec<(u64, ClusterPoolMessage)>) -> Self {
+            received.reverse();
+            Self {
+                sent: RefCell::new(Vec::new()),
+                received: RefCell::new(received),
+            }
+        }
+    }
+
+    impl PoolTransport for ScriptedTransport {
+        type Error = OrchestratorError;
+
+        fn send(
+            &self,
+            target_node_id: u64,
+            message: ClusterPoolMessage,
+        ) -> Result<(), Self::Error> {
+            self.sent.borrow_mut().push((target_node_id, message));
+            Ok(())
+        }
+
+        fn recv(&self) -> Result<Option<(u64, ClusterPoolMessage)>, Self::Error> {
+            Ok(self.received.borrow_mut().pop())
+        }
+    }
 
     fn make_test_device(node_id: u64, local_idx: u32, global_idx: u32) -> NodeDevice {
         NodeDevice::new(
@@ -454,6 +555,21 @@ mod tests {
             devices,
             ClusterPlacementPolicy::Stripe,
         )
+    }
+
+    fn create_success_response(
+        node_id: u64,
+        request_id: u64,
+        pool_guid: [u8; 16],
+    ) -> ClusterPoolMessage {
+        ClusterPoolMessage::CreateResponse(ClusterPoolCreateResponse {
+            request_id,
+            node_id,
+            pool_guid,
+            success: true,
+            device_guids: vec![[node_id as u8; 16]],
+            error: None,
+        })
     }
 
     // -- build_create_requests tests --
@@ -570,6 +686,81 @@ mod tests {
         for req in requests.values() {
             assert!(req.read_only);
         }
+    }
+
+    // -- dispatch_create tests --
+
+    #[test]
+    fn dispatch_create_sends_all_targets_and_requires_full_quorum() {
+        let config = make_three_node_config();
+        let transport = ScriptedTransport::with_received(vec![
+            (1, create_success_response(1, 77, [0xAB; 16])),
+            (2, create_success_response(2, 77, [0xAB; 16])),
+            (3, create_success_response(3, 77, [0xAB; 16])),
+        ]);
+
+        let outcome = ClusterPoolOrchestrator::dispatch_create(&config, 77, &transport, 3).unwrap();
+
+        assert_eq!(outcome.total_nodes, 3);
+        assert_eq!(outcome.succeeded, 3);
+        assert_eq!(transport.sent.borrow().len(), 3);
+        for (node_id, message) in transport.sent.borrow().iter() {
+            match message {
+                ClusterPoolMessage::CreateRequest(request) => {
+                    assert_eq!(request.target_node_id, *node_id);
+                    assert_eq!(request.request_id, 77);
+                    assert_eq!(request.pool_guid, [0xAB; 16]);
+                }
+                other => panic!("unexpected sent message: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_create_rejects_configured_node_without_devices() {
+        let mut config = make_three_node_config();
+        config.node_ids.push(4);
+        let transport = ScriptedTransport::default();
+
+        let err = ClusterPoolOrchestrator::dispatch_create(&config, 1, &transport, 0).unwrap_err();
+
+        assert!(matches!(
+            err,
+            OrchestratorError::NoDevicesForNode { node_id: 4 }
+        ));
+        assert!(transport.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn dispatch_create_rejects_unknown_response_sender() {
+        let config = make_three_node_config();
+        let transport = ScriptedTransport::with_received(vec![(
+            99,
+            create_success_response(99, 1, [0xAB; 16]),
+        )]);
+
+        let err = ClusterPoolOrchestrator::dispatch_create(&config, 1, &transport, 1).unwrap_err();
+
+        assert!(matches!(
+            err,
+            OrchestratorError::UnknownNode { node_id: 99 }
+        ));
+        assert_eq!(transport.sent.borrow().len(), 3);
+    }
+
+    #[test]
+    fn dispatch_create_rejects_mismatched_response_request_id() {
+        let config = make_three_node_config();
+        let transport =
+            ScriptedTransport::with_received(vec![(1, create_success_response(1, 2, [0xAB; 16]))]);
+
+        let err = ClusterPoolOrchestrator::dispatch_create(&config, 1, &transport, 1).unwrap_err();
+
+        assert!(matches!(
+            err,
+            OrchestratorError::Transport(message)
+                if message.contains("request_id mismatch")
+        ));
     }
 
     // -- aggregate_create_responses tests --
