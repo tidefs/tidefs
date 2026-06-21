@@ -6,7 +6,7 @@ publish.workspace = true
 license.workspace = true
 authors.workspace = true
 
-description = "secret_key_policy_0 record types and enums (P9-04) for Wave Zero tidefs"
+description = "Secret-key policy core record types and enums for TideFS policy tooling"
 
 [lib]
 path = "src/lib.rs"

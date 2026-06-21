@@ -694,8 +694,10 @@ Examples include:
 - `apps/tidefsctl/src/main.rs` still needing broader UAPI authority review even
   after `7dbb0759` removed `pool list` scaffolding and downgraded exercise
   wording;
-- `apps/tidefs-posix-filesystem-adapter-daemon/Cargo.toml` still calling the
-  daemon a Wave Zero stub;
+- `apps/tidefs-posix-filesystem-adapter-daemon/Cargo.toml` now follows
+  `docs/workspace-package-classification.md` adapter-operator authority, and
+  `docs/STUB_PLACEHOLDER_INVENTORY.md` section 1 records the stale wording
+  cleanup;
 - `apps/tidefs-posix-filesystem-adapter-daemon/tests/fuse_e2e_smoke.rs`
   defining Claimed/NotReady test stubs;
 - kernel compatibility stubs in `kmod/src/kernel_types.rs`;

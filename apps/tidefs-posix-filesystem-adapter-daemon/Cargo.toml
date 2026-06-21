@@ -6,7 +6,7 @@ publish.workspace = true
 license.workspace = true
 authors.workspace = true
 
-description = "Wave Zero POSIX Filesystem Adapter userspace mirror surface stub for TideFS"
+description = "POSIX filesystem adapter operator entrypoint and FUSE validation harness for TideFS"
 
 [dependencies]
 tidefs-workload = { path = "../../crates/tidefs-workload" }
