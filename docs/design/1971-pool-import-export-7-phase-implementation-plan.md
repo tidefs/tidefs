@@ -773,10 +773,14 @@ Each phase is complete when:
 3. **Integration tests** (where applicable) pass: export/import roundtrip,
    device add/remove, failure injection.
 4. **xtask gate** (Phase 7) passes for the cumulative set of implemented phases.
-5. **Forgejo issue** for the phase is closed with a comment containing the
-   commit SHA, commands run, result, and residual risk.
-6. **STATUS.md** is updated with the phase completion entry.
-7. **FEATURE_MATRIX.md** is updated when capability state changes.
+5. **GitHub issue or pull request** for the phase records the commit SHA,
+   commands run, result, and residual risk.
+6. **Repo-doc updates**, when required, target the current authority document
+   named by the phase issue or PR, such as the relevant design/spec document or
+   `docs/CLAIM_REGISTRY.md` when an explicit claim entry exists.
+7. **Public-facing capability claims** remain absent unless the phase issue or
+   PR names the current authority owner and evidence required for the claim
+   update.
 
 ---
 
