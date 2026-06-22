@@ -495,7 +495,9 @@ State semantics:
   `check-device-topology` (generation majority, device_count consistency),
   `check-label-corruption` (inject corruption, verify detection)
 - Additionally: cluster-aware pool import with lease acquisition
-  (#1283, #1248); STATUS.md and FEATURE_MATRIX.md updates
+  (#1283, #1248); current completion evidence belongs in GitHub
+  issue/PR state and repo-doc authority classifications such as
+  `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` when claims change
 
 ### Per-metaslab parallelism deferral
 
@@ -653,8 +655,11 @@ Each phase is complete when:
 3. Integration tests pass for applicable scenarios
 4. xtask gate (Phase 7) passes for the cumulative set of implemented phases
 5. Forgejo issue is closed with commit SHA, commands run, result, and residual risk
-6. `docs/STATUS.md` is updated with the phase completion entry
-7. `docs/FEATURE_MATRIX.md` is updated when capability state changes
+6. Current GitHub issue/PR state records phase completion evidence when the
+   phase is implemented
+7. Current repo-doc authority classifications, such as
+   `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, are cited when capability or
+   design-status claims change
 
 ---
 
