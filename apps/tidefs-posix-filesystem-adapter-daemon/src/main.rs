@@ -215,13 +215,11 @@ fn run() -> Result<(), String> {
 
 #[allow(unsafe_code)]
 fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
-    // FUSE snapshot mounts are not yet supported.
-    if let Some(ref snap) = config.snapshot_name {
-        return Err(format!(
-            "FUSE snapshot mounts are not yet supported (requested snapshot: {snap}).\n\
-             Use 'tidefs ublk-serve --snapshot {snap}' for read-only block-volume export\n\
-             or 'tidefsctl snapshot ...' for CLI snapshot management."
-        ));
+    let snapshot_name = config.snapshot_name.clone();
+    let snapshot_export = snapshot_name.is_some();
+    let effective_mode = effective_mount_mode(&config);
+    if snapshot_export && config.queue_depth_artifact.is_some() {
+        return Err("--queue-depth-artifact is not supported for snapshot export mounts".into());
     }
     use std::fs;
     use std::sync::{
@@ -250,31 +248,35 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     // Detect whether the previous shutdown was unclean and replay
     // intent-log segments before opening the full filesystem.
     let mount_state_path = config.store_root.join(".tidefs_mount_state_fuse");
-    let mut recovery = CrashRecoveryLoop::detect(&mount_state_path)
-        .map_err(|e| format!("crash recovery detection: {e}"))?;
+    if !snapshot_export {
+        let mut recovery = CrashRecoveryLoop::detect(&mount_state_path)
+            .map_err(|e| format!("crash recovery detection: {e}"))?;
 
-    recovery.advance();
-    if recovery.state == CrashRecoveryState::Replay {
-        eprintln!(
-            "Unclean shutdown detected — replaying intent log in {}",
-            config.store_root.display()
-        );
-        let store = tidefs_local_object_store::LocalObjectStore::open(&config.store_root)
-            .map_err(|e| format!("open store for crash recovery: {e}"))?;
-        recovery
-            .run_replay(&store)
-            .map_err(|e| format!("intent log replay failed: {e}"))?;
-        recovery.reconcile_and_finish();
-        eprintln!("Crash recovery complete — pool is ready.");
+        recovery.advance();
+        if recovery.state == CrashRecoveryState::Replay {
+            eprintln!(
+                "Unclean shutdown detected — replaying intent log in {}",
+                config.store_root.display()
+            );
+            let store = tidefs_local_object_store::LocalObjectStore::open(&config.store_root)
+                .map_err(|e| format!("open store for crash recovery: {e}"))?;
+            recovery
+                .run_replay(&store)
+                .map_err(|e| format!("intent log replay failed: {e}"))?;
+            recovery.reconcile_and_finish();
+            eprintln!("Crash recovery complete — pool is ready.");
+        }
     }
 
     // ── Namespace loading ─────────────────────────────────────────────
     // Try to load a persistent namespace from the store. If none exists,
     // create a fresh one (will be flushed on clean shutdown).
-    let namespace: Arc<Namespace> = {
+    let namespace: Option<Arc<Namespace>> = if snapshot_export {
+        None
+    } else {
         let store = tidefs_local_object_store::LocalObjectStore::open(&config.store_root)
             .map_err(|e| format!("open store for namespace load: {e}"))?;
-        match Namespace::load(&store) {
+        Some(match Namespace::load(&store) {
             Ok(ns) => {
                 eprintln!("Loaded persistent namespace from store.");
                 Arc::new(ns)
@@ -283,122 +285,155 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
                 eprintln!("No persistent namespace found — creating fresh.");
                 Arc::new(Namespace::new())
             }
-        }
+        })
     };
 
     // Mark the mount state dirty for this daemon session.
     // On clean shutdown the daemon will write Clean.
-    MountState::Dirty
-        .write_to_path(&mount_state_path)
-        .map_err(|e| format!("write mount-state: {e}"))?;
-
-    let store_options = StoreOptions {
-        background_scrub_interval_secs: config.background_scrub_interval_secs,
-        reclaim_enabled: config.enable_reclaim,
-        fault_injection_config: config.fault_inject_corruption.map(|p| {
-            tidefs_local_object_store::FaultInjectionConfig {
-                byte_corruption_probability: p,
-                ..tidefs_local_object_store::FaultInjectionConfig::off()
-            }
-        }),
-        ..StoreOptions::default()
-    };
-    let scrub_interval = config.background_scrub_interval_secs;
-    let scrub_store_root = config.store_root.clone();
-
-    let mut lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
-        &config.store_root,
-        LocalFileSystemOpenConfig {
-            options: store_options,
-            allocator_policy: LocalStorageAllocatorPolicy {
-                content_capacity_bytes: config.content_capacity_bytes,
-                ..LocalStorageAllocatorPolicy::default()
-            },
-            root_authentication_key: config.root_authentication_key,
-            encryption: None,
-            compression: config.compression,
-            log_device_device_path: None,
-            recovery_policy: if config.enable_repair_writeback {
-                tidefs_recovery_loop::RecoveryPolicy::RepairWriteback
-            } else {
-                tidefs_recovery_loop::RecoveryPolicy::default()
-            },
-            block_devices: None,
-        },
-    )
-    .map_err(|e| format!("open store: {e}"))?;
-    lfs.set_write_buffer_flush_threshold_bytes(MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES);
-
-    // Enable org.tidefs:dedup dataset feature when requested by the operator.
-    if config.enable_dedup {
-        use tidefs_types_dataset_feature_flags_core::{FeatureClass, FeatureName};
-        let dedup_name = FeatureName::from_str("org.tidefs:dedup")
-            .expect("org.tidefs:dedup is a valid FeatureName");
-        lfs.feature_flags_mut()
-            .enable_feature(dedup_name, FeatureClass::RoCompat)
-            .map_err(|e| format!("enable dedup feature: {e}"))?;
-        lfs.persist_feature_flags()
-            .map_err(|e| format!("persist dedup feature flag: {e}"))?;
-        lfs.refresh_policies_from_features();
+    if !snapshot_export {
+        MountState::Dirty
+            .write_to_path(&mount_state_path)
+            .map_err(|e| format!("write mount-state: {e}"))?;
     }
 
-    // ── Committed-root validation ──────────────────────────────────────
-    // Validate the committed root discovered during pool import via
-    // BLAKE3 domain-separated chain verification.
-    {
-        let committed_root = lfs.object_store().txg_manager().committed_root();
-        if committed_root.commit_group_id.is_valid() {
-            let root_path = config.store_root.join("tidefs-committed-root");
-            let chain_digest = std::fs::read(&root_path)
-                .ok()
-                .and_then(|payload| {
-                    tidefs_local_object_store::txg_manager::CommitGroupManager::decode_root_with_digest(&payload)
-                })
-                .and_then(|(_root, digest)| digest);
-            match tidefs_recovery_loop::recovery_loop::validate_committed_root(
-                committed_root,
-                chain_digest,
-            ) {
-                Ok(()) => {
-                    eprintln!(
-                        "Committed root validated: commit_group={} handle={}",
-                        committed_root.commit_group_id.0, committed_root.root_handle,
-                    );
+    let store_options = StoreOptions {
+        background_scrub_interval_secs: effective_mode.background_scrub_interval_secs,
+        reclaim_enabled: !snapshot_export && config.enable_reclaim,
+        fault_injection_config: if snapshot_export {
+            None
+        } else {
+            config.fault_inject_corruption.map(|p| {
+                tidefs_local_object_store::FaultInjectionConfig {
+                    byte_corruption_probability: p,
+                    ..tidefs_local_object_store::FaultInjectionConfig::off()
                 }
-                Err(e) => {
-                    eprintln!(
-                        "warning: committed root validation failed: {e};                          continuing with unvalidated root"
-                    );
+            })
+        },
+        ..StoreOptions::default()
+    };
+    let scrub_interval = effective_mode.background_scrub_interval_secs;
+    let scrub_store_root = config.store_root.clone();
+
+    let open_config = LocalFileSystemOpenConfig {
+        options: store_options,
+        allocator_policy: LocalStorageAllocatorPolicy {
+            content_capacity_bytes: config.content_capacity_bytes,
+            ..LocalStorageAllocatorPolicy::default()
+        },
+        root_authentication_key: config.root_authentication_key,
+        encryption: None,
+        compression: config.compression,
+        log_device_device_path: None,
+        recovery_policy: if snapshot_export {
+            tidefs_recovery_loop::RecoveryPolicy::ReadOnly
+        } else if config.enable_repair_writeback {
+            tidefs_recovery_loop::RecoveryPolicy::RepairWriteback
+        } else {
+            tidefs_recovery_loop::RecoveryPolicy::default()
+        },
+        block_devices: None,
+    };
+
+    let (mut vfs_engine, writeback_tracker) = if let Some(snapshot_name) = snapshot_name.as_deref() {
+        let session =
+            LocalFileSystem::open_snapshot_export(&config.store_root, snapshot_name, open_config)
+                .map_err(|e| format!("open snapshot export `{snapshot_name}`: {e}"))?;
+        let summary = session.summary().clone();
+        eprintln!(
+            "Opened snapshot export `{}` at generation {} root inode {}",
+            summary.snapshot.name,
+            summary.generation,
+            summary.root_inode_id.get()
+        );
+        (
+            session
+                .into_engine()
+                .with_sync_guarantee(SyncGuarantee::Local),
+            None,
+        )
+    } else {
+        let mut lfs = LocalFileSystem::open_with_allocator_policy_and_root_authentication_key(
+            &config.store_root,
+            open_config,
+        )
+        .map_err(|e| format!("open store: {e}"))?;
+        lfs.set_write_buffer_flush_threshold_bytes(MOUNT_VFS_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES);
+
+        // Enable org.tidefs:dedup dataset feature when requested by the operator.
+        if config.enable_dedup {
+            use tidefs_types_dataset_feature_flags_core::{FeatureClass, FeatureName};
+            let dedup_name = FeatureName::from_str("org.tidefs:dedup")
+                .expect("org.tidefs:dedup is a valid FeatureName");
+            lfs.feature_flags_mut()
+                .enable_feature(dedup_name, FeatureClass::RoCompat)
+                .map_err(|e| format!("enable dedup feature: {e}"))?;
+            lfs.persist_feature_flags()
+                .map_err(|e| format!("persist dedup feature flag: {e}"))?;
+            lfs.refresh_policies_from_features();
+        }
+
+        // ── Committed-root validation ──────────────────────────────────────
+        // Validate the committed root discovered during pool import via
+        // BLAKE3 domain-separated chain verification.
+        {
+            let committed_root = lfs.object_store().txg_manager().committed_root();
+            if committed_root.commit_group_id.is_valid() {
+                let root_path = config.store_root.join("tidefs-committed-root");
+                let chain_digest = std::fs::read(&root_path)
+                    .ok()
+                    .and_then(|payload| {
+                        tidefs_local_object_store::txg_manager::CommitGroupManager::decode_root_with_digest(&payload)
+                    })
+                    .and_then(|(_root, digest)| digest);
+                match tidefs_recovery_loop::recovery_loop::validate_committed_root(
+                    committed_root,
+                    chain_digest,
+                ) {
+                    Ok(()) => {
+                        eprintln!(
+                            "Committed root validated: commit_group={} handle={}",
+                            committed_root.commit_group_id.0, committed_root.root_handle,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                                "warning: committed root validation failed: {e};                          continuing with unvalidated root"
+                            );
+                    }
                 }
             }
         }
-    }
 
-    // Resolve the effective sync_guarantee: CLI flag overrides catalog value.
+        // Resolve the effective sync_guarantee: CLI flag overrides catalog value.
 
-    // For the default (Local), consult the dataset catalog for the pool root.
-    let effective_sync_guarantee = if config.sync_guarantee == SyncGuarantee::Local {
-        lfs.dataset_catalog()
-            .sync_guarantee("root")
-            .unwrap_or(SyncGuarantee::Local)
-    } else {
-        config.sync_guarantee
+        // For the default (Local), consult the dataset catalog for the pool root.
+        let effective_sync_guarantee = if config.sync_guarantee == SyncGuarantee::Local {
+            lfs.dataset_catalog()
+                .sync_guarantee("root")
+                .unwrap_or(SyncGuarantee::Local)
+        } else {
+            config.sync_guarantee
+        };
+        if effective_sync_guarantee != SyncGuarantee::Local {
+            eprintln!(
+                "tidefs-daemon: dataset sync_guarantee={effective_sync_guarantee} (from catalog)"
+            );
+        }
+
+        // Mounted FUSE uses commit-group batching for ordinary metadata writes.
+        // Keep the threshold large enough for metadata bursts while fsync, fsyncdir,
+        // syncfs, and destroy still force the durability barrier.
+        lfs.set_auto_commit(false);
+        lfs.set_commit_group_throughput_profile();
+        lfs.set_max_uncommitted_mutations(MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS);
+
+        let writeback_tracker = std::sync::Arc::clone(lfs.writeback_range_tracker());
+        (
+            VfsLocalFileSystem::new(lfs).with_sync_guarantee(effective_sync_guarantee),
+            Some(writeback_tracker),
+        )
     };
-    if effective_sync_guarantee != SyncGuarantee::Local {
-        eprintln!(
-            "tidefs-daemon: dataset sync_guarantee={effective_sync_guarantee} (from catalog)"
-        );
-    }
-
-    // Mounted FUSE uses commit-group batching for ordinary metadata writes.
-    // Keep the threshold large enough for metadata bursts while fsync, fsyncdir,
-    // syncfs, and destroy still force the durability barrier.
-    lfs.set_auto_commit(false);
-    lfs.set_commit_group_throughput_profile();
-    lfs.set_max_uncommitted_mutations(MOUNT_VFS_MAX_UNCOMMITTED_MUTATIONS);
-
-    let writeback_tracker = std::sync::Arc::clone(lfs.writeback_range_tracker());
-    let engine_timestamp_policy = if config.read_only {
+    let engine_timestamp_policy = if effective_mode.read_only {
         EngineTimestampPolicy::Noatime
     } else {
         match config.mount_opts.timestamp_policy {
@@ -409,18 +444,26 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
             crate::mount_options::TimestampPolicy::NoAtime => EngineTimestampPolicy::Noatime,
         }
     };
-    let mut vfs_engine = VfsLocalFileSystem::new(lfs).with_sync_guarantee(effective_sync_guarantee);
     vfs_engine.set_timestamp_policy(engine_timestamp_policy);
-    let adapter = fuse_vfs_adapter::FuseVfsAdapter::new(
+    if effective_mode.read_only {
+        vfs_engine = vfs_engine.with_read_only();
+    }
+
+    let mut adapter = fuse_vfs_adapter::FuseVfsAdapter::new(
         Box::new(vfs_engine) as Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send>
     )
     .map_err(|e| format!("adapter init: {e:?}"))?
-    .with_commit_group_cycle(Arc::new(
-        crate::txg_cycle::CommitGroupCycle::with_store_root(config.store_root.clone()),
-    ))
-    .with_namespace(Arc::clone(&namespace))
-    .with_background_scheduler(BackgroundScheduler::new(ServiceBudget::MAINTENANCE_TICK))
     .with_coherency_profile(config.coherency_profile);
+    if !snapshot_export {
+        adapter = adapter
+            .with_commit_group_cycle(Arc::new(
+                crate::txg_cycle::CommitGroupCycle::with_store_root(config.store_root.clone()),
+            ))
+            .with_background_scheduler(BackgroundScheduler::new(ServiceBudget::MAINTENANCE_TICK));
+    }
+    if let Some(ref namespace) = namespace {
+        adapter = adapter.with_namespace(Arc::clone(namespace));
+    }
     // Demand-preemption signal: when set, the background scheduler yields
 
     // after the current service tick so foreground FUSE I/O is not starved.
@@ -428,7 +471,9 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     let fuse_demand = Arc::new(AtomicBool::new(false));
 
     adapter.set_scheduler_preempt_signal(Arc::clone(&fuse_demand));
-    let adapter = if config.writeback_cache {
+    let adapter = if effective_mode.writeback_cache {
+        let writeback_tracker =
+            writeback_tracker.ok_or("writeback cache is unavailable for snapshot export")?;
         adapter
             .with_writeback_cache_enabled()
             .with_writeback_cache_timeout(config.writeback_cache_timeout)
@@ -441,7 +486,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     } else {
         adapter
     };
-    let adapter_timestamp_policy = if config.read_only {
+    let adapter_timestamp_policy = if effective_mode.read_only {
         crate::mount_options::TimestampPolicy::NoAtime
     } else {
         config.mount_opts.timestamp_policy
@@ -449,13 +494,13 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     let adapter = adapter
         .with_timestamp_policy(adapter_timestamp_policy)
         .with_suppress_dir_atime(config.mount_opts.suppress_dir_atime);
-    let adapter = if config.read_only {
+    let adapter = if effective_mode.read_only {
         adapter.with_read_only()
     } else {
         adapter
     };
 
-    let adapter = if config.intent_log_write {
+    let adapter = if effective_mode.intent_log_write {
         let buf = Arc::new(IntentLogBuffer::new());
         adapter.with_intent_log_buffer(buf)
     } else {
@@ -463,7 +508,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     };
 
     let mut options = vec![
-        if config.read_only {
+        if effective_mode.read_only {
             fuser::MountOption::RO
         } else {
             fuser::MountOption::RW
@@ -472,18 +517,20 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     ];
     options.extend(fuse_mount_options_for_mode(
         &config.mount_opts,
-        config.read_only,
+        effective_mode.read_only,
     ));
-    if config.writeback_cache {
+    if effective_mode.writeback_cache {
         options.push(fuser::MountOption::WritebackCache);
     }
 
-    let ns_handle = adapter
-        .namespace_handle()
-        .expect("namespace must be attached");
+    let ns_handle = adapter.namespace_handle();
     let queue_depth_engine = adapter.engine_handle();
     let bg_scheduler = adapter.background_scheduler_handle();
-    let txg_cycle = adapter.txg_cycle_cell();
+    let txg_cycle = if snapshot_export {
+        None
+    } else {
+        Some(adapter.txg_cycle_cell())
+    };
     let notifier_cell = adapter.notifier_cell();
     let mmap_coherency = adapter.mmap_coherency_cell();
     // Diagnostic: confirm namespace availability for FUSE dispatch.
@@ -526,7 +573,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    let mode = if config.read_only { "RO" } else { "RW" };
+    let mode = if effective_mode.read_only { "RO" } else { "RW" };
     eprintln!(
         "Mounted TideFS (VFS engine) at {} ({})",
         config.mountpoint.display(),
@@ -563,13 +610,14 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
 
     // -- Periodic commit_group commit cycle ---------------------------------
     let txg_shutdown = Arc::clone(&shutdown_flag);
-    let txg_cycle_for_loop = txg_cycle;
-    let txg_handle = std::thread::spawn(move || {
-        crate::txg_cycle::CommitGroupCycle::spawn_periodic_commit_loop(
-            txg_cycle_for_loop,
-            txg_shutdown,
-            std::time::Duration::from_secs(MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS),
-        );
+    let txg_handle = txg_cycle.map(|txg_cycle_for_loop| {
+        std::thread::spawn(move || {
+            crate::txg_cycle::CommitGroupCycle::spawn_periodic_commit_loop(
+                txg_cycle_for_loop,
+                txg_shutdown,
+                std::time::Duration::from_secs(MOUNT_VFS_TXG_COMMIT_INTERVAL_SECS),
+            );
+        })
     });
 
     // -- Background segment scrub thread ---------------------------
@@ -728,7 +776,9 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     }
 
     // Wait for the periodic commit_group commit loop to finish its final flush.
-    let _ = txg_handle.join();
+    if let Some(handle) = txg_handle {
+        let _ = handle.join();
+    }
 
     // Wait for the background scrub thread to finish.
     if let Some(handle) = scrub_handle {
@@ -749,7 +799,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     }
 
     // ── Persistent namespace flush ────────────────────────────────────
-    {
+    if let Some(ns_handle) = ns_handle {
         let mut ns_store = tidefs_local_object_store::LocalObjectStore::open(&config.store_root)
             .map_err(|e| format!("open store for namespace flush: {e}"))?;
         ns_handle
@@ -758,9 +808,11 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         eprintln!("Persistent namespace flushed to store.");
     }
 
-    MountState::Clean
-        .write_to_path(&msp_for_sig)
-        .map_err(|e| format!("write clean mount-state: {e}"))?;
+    if !snapshot_export {
+        MountState::Clean
+            .write_to_path(&msp_for_sig)
+            .map_err(|e| format!("write clean mount-state: {e}"))?;
+    }
     Ok(())
 }
 
@@ -826,6 +878,28 @@ fn write_queue_depth_runtime_artifact(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectiveMountMode {
+    read_only: bool,
+    writeback_cache: bool,
+    intent_log_write: bool,
+    background_scrub_interval_secs: u64,
+}
+
+fn effective_mount_mode(config: &MountVfsConfig) -> EffectiveMountMode {
+    let snapshot_export = config.snapshot_name.is_some();
+    EffectiveMountMode {
+        read_only: config.read_only || snapshot_export,
+        writeback_cache: config.writeback_cache && !snapshot_export,
+        intent_log_write: config.intent_log_write && !snapshot_export,
+        background_scrub_interval_secs: if snapshot_export {
+            0
+        } else {
+            config.background_scrub_interval_secs
+        },
+    }
+}
+
 fn fuse_mount_options_for_mode(
     mount_opts: &MountOptions,
     read_only: bool,
@@ -844,8 +918,8 @@ fn fuse_mount_options_for_mode(
 pub struct MountVfsConfig {
     pub read_only: bool,
     /// Optional snapshot name for read-only snapshot-backed mounts.
-    /// FUSE snapshot mounts are not yet supported; specifying this causes
-    /// an explicit refusal with guidance to use ublk or tidefsctl instead.
+    /// Specifying this opens the committed snapshot root as a separate
+    /// read-only FUSE export session.
     pub snapshot_name: Option<String>,
     pub store_root: PathBuf,
     pub mountpoint: PathBuf,
@@ -3869,7 +3943,7 @@ fn run_scrub_repair_smoke() -> Result<(), String> {
 
 fn print_help() {
     println!("tidefs-posix-filesystem-adapter-daemon");
-    println!("  mount-vfs --store <path> --mount <path> [--fs-name <name>] [--root-auth-key-hex <64 hex>] [--read-only] [--sync] [--writeback-cache] [--no-writeback-cache] [--content-capacity-bytes <bytes>] [--writeback-cache-timeout <seconds>] [--drain-timeout-secs <seconds>] [--background-scrub-interval <seconds>] [--queue-depth-artifact <path>]");
+    println!("  mount-vfs --store <path> --mount <path> [--fs-name <name>] [--root-auth-key-hex <64 hex>] [--read-only] [--snapshot <name>] [--sync] [--writeback-cache] [--no-writeback-cache] [--content-capacity-bytes <bytes>] [--writeback-cache-timeout <seconds>] [--drain-timeout-secs <seconds>] [--background-scrub-interval <seconds>] [--queue-depth-artifact <path>]");
     println!("    root auth key fallback env: {ROOT_AUTHENTICATION_ENV_VAR}");
     println!(
         "    --background-scrub-interval  seconds between scrub cycles (0 disables, default 0)"
@@ -4235,5 +4309,26 @@ mod tests {
             !config.writeback_cache,
             "--no-writeback-cache after --writeback-cache should win"
         );
+    }
+
+    #[test]
+    fn snapshot_mount_effective_mode_forces_read_only_export() {
+        let mut args = required_mount_args();
+        args.push("--snapshot".to_string());
+        args.push("snap0".to_string());
+        args.push("--writeback-cache".to_string());
+        args.push("--intent-log-write".to_string());
+        args.push("--background-scrub-interval".to_string());
+        args.push("60".to_string());
+
+        let config = parse_mount_vfs_config(args).expect("parse mount config");
+        let mode = effective_mount_mode(&config);
+
+        assert_eq!(config.snapshot_name.as_deref(), Some("snap0"));
+        assert!(!config.read_only);
+        assert!(mode.read_only);
+        assert!(!mode.writeback_cache);
+        assert!(!mode.intent_log_write);
+        assert_eq!(mode.background_scrub_interval_secs, 0);
     }
 }

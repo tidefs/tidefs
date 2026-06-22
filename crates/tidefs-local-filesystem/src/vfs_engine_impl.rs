@@ -148,6 +148,7 @@ fn map_errno(err: &FileSystemError) -> Errno {
 /// single tree walk from root on first miss and invalidated as needed.
 pub struct VfsLocalFileSystem {
     fs: RefCell<LocalFileSystem>,
+    read_only: bool,
     path_cache: RefCell<BTreeMap<InodeId, String>>,
     file_handle_table: RefCell<FileHandleTable>,
     active_dir_handles: RefCell<BTreeMap<DirHandleId, InodeId>>,
@@ -484,6 +485,7 @@ impl VfsLocalFileSystem {
         path_cache.insert(ROOT_INODE_ID, "/".to_string());
         Self {
             fs: RefCell::new(fs),
+            read_only: false,
             path_cache: RefCell::new(path_cache),
             file_handle_table: RefCell::new(FileHandleTable::new()),
             active_dir_handles: RefCell::new(BTreeMap::new()),
@@ -520,6 +522,26 @@ impl VfsLocalFileSystem {
     pub fn with_sync_guarantee(mut self, guarantee: SyncGuarantee) -> Self {
         self.sync_guarantee = guarantee;
         self
+    }
+
+    /// Force the VFS adapter to reject namespace and data mutations.
+    pub fn with_read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    #[inline]
+    fn ensure_writable(&self) -> std::result::Result<(), Errno> {
+        if self.read_only {
+            Err(Errno::EROFS)
+        } else {
+            Ok(())
+        }
     }
 
     /// Return the effective root path for path resolution.
@@ -3983,6 +4005,7 @@ impl VfsEngine for VfsLocalFileSystem {
         handle: Option<&EngineFileHandle>,
         _ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
+        self.ensure_writable()?;
         self.validate_optional_file_handle(inode, handle)?;
         const SUPPORTED_SETATTR_BITS: u32 = FATTR_MODE
             | FATTR_UID
@@ -4037,6 +4060,7 @@ impl VfsEngine for VfsLocalFileSystem {
         mode: u32,
         ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
+        self.ensure_writable()?;
         let parent_path = self.inode_path(parent)?;
         let parent_record = {
             let fs = self.fs.borrow();
@@ -4076,6 +4100,7 @@ impl VfsEngine for VfsLocalFileSystem {
         flags: u32,
         ctx: &RequestCtx,
     ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
+        self.ensure_writable()?;
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
 
@@ -4166,6 +4191,7 @@ impl VfsEngine for VfsLocalFileSystem {
         flags: u32,
         ctx: &RequestCtx,
     ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
+        self.ensure_writable()?;
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
 
@@ -4220,6 +4246,7 @@ impl VfsEngine for VfsLocalFileSystem {
         flags: u32,
         ctx: &RequestCtx,
     ) -> std::result::Result<(InodeAttr, EngineFileHandle), Errno> {
+        self.ensure_writable()?;
         let parent_path = self.inode_path(parent)?;
         let parent_record = self
             .fs
@@ -4260,6 +4287,7 @@ impl VfsEngine for VfsLocalFileSystem {
         name: &[u8],
         ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        self.ensure_writable()?;
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
         let (parent_record, record) = self.parent_and_child_records(parent, &parent_path, name)?;
@@ -4326,6 +4354,7 @@ impl VfsEngine for VfsLocalFileSystem {
         name: &[u8],
         ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        self.ensure_writable()?;
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
         let (parent_record, record) = self.parent_and_child_records(parent, &parent_path, name)?;
@@ -4354,6 +4383,7 @@ impl VfsEngine for VfsLocalFileSystem {
         flags: u32,
         ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        self.ensure_writable()?;
         let old_parent_path = self.inode_path(old_parent)?;
         let new_parent_path = self.inode_path(new_parent)?;
         let old_path = build_child_path(&old_parent_path, old_name)?;
@@ -4416,12 +4446,7 @@ impl VfsEngine for VfsLocalFileSystem {
                 if target_record.inode_id != old_record.inode_id {
                     let old_attr = old_record.to_inode_attr();
                     let target_attr = target_record.to_inode_attr();
-                    self.exchange_cached_paths(
-                        &old_attr,
-                        &old_path,
-                        &target_attr,
-                        &new_path,
-                    );
+                    self.exchange_cached_paths(&old_attr, &old_path, &target_attr, &new_path);
                     return Ok(());
                 }
             }
@@ -4432,7 +4457,10 @@ impl VfsEngine for VfsLocalFileSystem {
             // Non-directory overwrite: the target inode is gone, but its
             // path prefix does not anchor any child entries.  Remove only
             // the target entry itself instead of scanning the entire cache.
-            if target_record.as_ref().is_some_and(|t| t.kind().has_child_namespace()) {
+            if target_record
+                .as_ref()
+                .is_some_and(|t| t.kind().has_child_namespace())
+            {
                 self.invalidate_cached_path_subtree(&new_path);
             } else {
                 self.remove_cached_path_if_matches(
@@ -4442,12 +4470,7 @@ impl VfsEngine for VfsLocalFileSystem {
             }
         }
 
-        self.move_cached_path(
-            old_record.inode_id,
-            old_record.kind(),
-            &old_path,
-            &new_path,
-        );
+        self.move_cached_path(old_record.inode_id, old_record.kind(), &old_path, &new_path);
         Ok(())
     }
 
@@ -4458,6 +4481,7 @@ impl VfsEngine for VfsLocalFileSystem {
         new_name: &[u8],
         ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
+        self.ensure_writable()?;
         // Materialize anonymous tmpfiles: when an O_TMPFILE inode is
         // linked into the namespace, use the engine's own create+write
         // path to build a proper filesystem inode and directory entry,
@@ -4554,6 +4578,7 @@ impl VfsEngine for VfsLocalFileSystem {
         target: &[u8],
         ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
+        self.ensure_writable()?;
         let parent_path = self.inode_path(parent)?;
         let child_path = build_child_path(&parent_path, name)?;
         let target_str = bytes_to_str(target)?;
@@ -4610,6 +4635,7 @@ impl VfsEngine for VfsLocalFileSystem {
         rdev: u32,
         ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
+        self.ensure_writable()?;
         let file_type = mode & S_IFMT;
         let rdev = match file_type {
             S_IFCHR | S_IFBLK => rdev,
@@ -4644,6 +4670,9 @@ impl VfsEngine for VfsLocalFileSystem {
         flags: u32,
         _ctx: &RequestCtx,
     ) -> std::result::Result<EngineFileHandle, Errno> {
+        if self.read_only && (open_flags_allow_write(flags) || flags & O_TRUNC != 0) {
+            return Err(Errno::EROFS);
+        }
         let path = self.inode_path(inode)?;
         let kind = {
             let record = self.fs.borrow().stat(&path).map_err(|e| map_errno(&e))?;
@@ -4712,6 +4741,9 @@ impl VfsEngine for VfsLocalFileSystem {
         inode: InodeId,
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        if self.read_only {
+            return Ok(());
+        }
         self.fs
             .borrow_mut()
             .apply_deferred_timestamp_update(inode, TimestampUpdate::Read, self.timestamp_policy)
@@ -4725,6 +4757,7 @@ impl VfsEngine for VfsLocalFileSystem {
         data: &[u8],
         _ctx: &RequestCtx,
     ) -> std::result::Result<u32, Errno> {
+        self.ensure_writable()?;
         let live = self.validate_file_handle(fh)?;
         if live.enforce_access_mode && !open_flags_allow_write(live.open_flags) {
             return Err(Errno::EBADF);
@@ -4801,6 +4834,9 @@ impl VfsEngine for VfsLocalFileSystem {
 
     fn flush(&self, fh: &EngineFileHandle, _ctx: &RequestCtx) -> std::result::Result<(), Errno> {
         self.validate_file_handle(fh)?;
+        if self.read_only {
+            return Ok(());
+        }
         // Anonymous tmpfiles have no path and no backing store;
         // they are reclaimed on release so flush is a no-op.
         if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
@@ -4821,6 +4857,9 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
         self.validate_file_handle(fh)?;
+        if self.read_only {
+            return Ok(());
+        }
         if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
             return Ok(());
         }
@@ -4848,6 +4887,7 @@ impl VfsEngine for VfsLocalFileSystem {
         length: u64,
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        self.ensure_writable()?;
         self.validate_file_handle(fh)?;
         if let Some(file) = self.anonymous_tmpfiles.borrow_mut().get_mut(&fh.inode_id) {
             let end = offset.checked_add(length).ok_or(Errno::EINVAL)?;
@@ -4994,6 +5034,7 @@ impl VfsEngine for VfsLocalFileSystem {
         length: u64,
         ctx: &RequestCtx,
     ) -> std::result::Result<u32, Errno> {
+        self.ensure_writable()?;
         if length == 0 {
             return Ok(0);
         }
@@ -5503,6 +5544,9 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
         self.validate_file_handle(fh)?;
+        if self.read_only {
+            return Ok(());
+        }
         if self.anonymous_tmpfiles.borrow().contains_key(&fh.inode_id) {
             return Ok(());
         }
@@ -5519,6 +5563,9 @@ impl VfsEngine for VfsLocalFileSystem {
         _ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
         self.validate_dir_handle(dh)?;
+        if self.read_only {
+            return Ok(());
+        }
         let path = self.inode_path(dh.inode_id)?;
         self.fs
             .borrow_mut()
@@ -5527,6 +5574,9 @@ impl VfsEngine for VfsLocalFileSystem {
     }
 
     fn syncfs(&self, _ctx: &RequestCtx) -> std::result::Result<(), Errno> {
+        if self.read_only {
+            return Ok(());
+        }
         self.fs.borrow_mut().sync_all().map_err(|e| map_errno(&e))
     }
 
@@ -5553,6 +5603,7 @@ impl VfsEngine for VfsLocalFileSystem {
         flags: u32,
         ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        self.ensure_writable()?;
         if name.starts_with(b"trusted.") && ctx.uid != 0 {
             return Err(Errno::EPERM);
         }
@@ -5593,6 +5644,7 @@ impl VfsEngine for VfsLocalFileSystem {
         name: &[u8],
         ctx: &RequestCtx,
     ) -> std::result::Result<(), Errno> {
+        self.ensure_writable()?;
         if name.starts_with(b"trusted.") && ctx.uid != 0 {
             return Err(Errno::EPERM);
         }
@@ -5649,6 +5701,7 @@ impl VfsEngine for VfsLocalFileSystem {
     }
 
     fn check_write_admission(&self, byte_count: u64) -> std::result::Result<(), Errno> {
+        self.ensure_writable()?;
         self.fs
             .borrow()
             .check_write_admission(byte_count)
@@ -5660,6 +5713,7 @@ impl VfsEngine for VfsLocalFileSystem {
         ino: InodeId,
         _ctx: &RequestCtx,
     ) -> std::result::Result<(u64, u64), Errno> {
+        self.ensure_writable()?;
         let mut fs = self.fs.borrow_mut();
         let before_after = fs.defrag_extent_map(ino).map_err(|_e| Errno::EIO)?;
         if before_after.1 < before_after.0 {
