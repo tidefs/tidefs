@@ -1,111 +1,198 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! BackgroundCompaction — BackgroundService for B+tree compaction.
+//! Scheduler adapter for the compaction authority.
 //!
-//! Periodically compacts B+tree-backed data structures that experience
-//! insert/delete churn. Compaction rebuilds trees from sorted entries,
-//! restoring canonical fanout and eliminating sparse nodes.
-//!
-//! ## Design (better than ZFS/Ceph)
-//!
-//! - **ZFS**: ZAP micro-zap converts to fat-zap at 2K entries, but
-//!   neither form compacts after deletes. Long-running datasets
-//!   accumulate sparse ZAP objects that waste space and slow lookups.
-//!   No background compaction exists.
-//! - **Ceph**: OSDMap grows unboundedly with cluster history; no
-//!   compaction of historical epochs. OMAP (leveldb) does compact
-//!   but is opaque to the filesystem layer.
-//! - **TideFS**: BackgroundCompaction periodically compacts B+tree-
-//!   backed structures under per-tick budget control with configurable
-//!   fill thresholds. Trees that fall below threshold are rebuilt to
-//!   canonical fanout, reclaiming space and improving locality.
+//! The background scheduler owns cadence, priority, and per-tick budget. This
+//! adapter supplies those scheduler inputs to `tidefs-compaction`, then records
+//! the authority's policy report without inspecting or reordering candidates.
 
 use std::sync::{Arc, Mutex};
 
 use tidefs_background_scheduler::{
-    BackgroundService, ServiceBudget, ServiceError, ServicePriority, TickReport,
+    BackgroundScheduler, BackgroundService, ServiceBudget, ServiceError, ServicePriority,
+    TickReport,
 };
-use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
+use tidefs_compaction::{
+    CompactionPressureLevel, CompactionRun, CompactionRunReport, CompactionStore,
+    CompactionTrigger, CompactionTriggerInput,
+};
 
-/// Default fill threshold for triggering compaction.
-/// Trees with leaf fill below 25% are candidates.
-pub const DEFAULT_COMPACTION_THRESHOLD: f64 = 0.25;
+/// Authority surface driven by the scheduler-facing compaction adapter.
+pub trait CompactionAuthority: Send {
+    /// Return whether the authority has liveness/candidate state worth ticking.
+    fn has_compaction_work(&self) -> bool;
 
-/// Background service that periodically compacts the reclaim queue's
-/// underlying B+tree.
-///
-/// Holds a shared reference to the reclaim queue. On each tick, checks
-/// the tree's fill ratio. If it falls below the configured threshold,
-/// rebuilds the tree from sorted entries to restore canonical fanout.
-///
-/// Scheduled at BestEffort priority — compaction is a housekeeping
-/// operation that improves space efficiency and lookup locality but
-/// is not latency-critical.
-///
-/// # Architecture note
-///
-/// The current B+tree's `delete()` performs an inline rebuild-from-entries
-/// (O(n)), so trees normally stay compact. This BackgroundService exists
-/// as infrastructure for the planned O(log n) delete optimization (#1197
-/// bottom-up merge pass), after which sparse trees will accumulate and
-/// need periodic background compaction. The service also handles trees
-/// that become sparse through clear-and-rebuild or batch-load patterns.
-pub struct BackgroundCompaction {
-    queue: Arc<Mutex<BPlusTreeReclaimQueue>>,
-    threshold: f64,
-    compactions_run: u64,
-    last_fill_percent: f64,
+    /// Run one compaction-authority tick with explicit trigger and budget input.
+    fn run_compaction_tick(&mut self, input: CompactionTriggerInput) -> CompactionRunReport;
 }
 
-impl BackgroundCompaction {
-    /// Create a new compaction service wrapping `queue`.
-    ///
-    /// Uses [`DEFAULT_COMPACTION_THRESHOLD`] (0.25) — trees with
-    /// leaf fill below 25% will be compacted.
-    #[must_use]
-    pub fn new(queue: Arc<Mutex<BPlusTreeReclaimQueue>>) -> Self {
-        Self {
-            queue,
-            threshold: DEFAULT_COMPACTION_THRESHOLD,
-            compactions_run: 0,
-            last_fill_percent: 1.0,
-        }
+impl<S> CompactionAuthority for CompactionRun<'_, S>
+where
+    S: CompactionStore + Send,
+{
+    fn has_compaction_work(&self) -> bool {
+        true
     }
 
-    /// Create a compaction service with a custom fill threshold.
-    #[must_use]
-    #[allow(dead_code)] // INTENT: background compaction types for planned segment reclamation
-    pub fn with_threshold(queue: Arc<Mutex<BPlusTreeReclaimQueue>>, threshold: f64) -> Self {
-        Self {
-            queue,
-            threshold: threshold.clamp(0.0, 1.0),
-            compactions_run: 0,
-            last_fill_percent: 1.0,
-        }
-    }
-
-    /// Number of compactions performed since creation.
-    #[must_use]
-    #[allow(dead_code)] // INTENT: background compaction types for planned segment reclamation
-    pub fn compactions_run(&self) -> u64 {
-        self.compactions_run
-    }
-
-    /// Fill percentage observed on the last tick.
-    #[must_use]
-    #[allow(dead_code)] // INTENT: background compaction types for planned segment reclamation
-    pub fn last_fill_percent(&self) -> f64 {
-        self.last_fill_percent
-    }
-
-    /// Queue handle for sharing with other components.
-    #[must_use]
-    #[allow(dead_code)] // INTENT: background compaction types for planned segment reclamation
-    pub fn queue_handle(&self) -> Arc<Mutex<BPlusTreeReclaimQueue>> {
-        Arc::clone(&self.queue)
+    fn run_compaction_tick(&mut self, input: CompactionTriggerInput) -> CompactionRunReport {
+        self.run_tick_with_trigger(input)
     }
 }
 
-impl BackgroundService for BackgroundCompaction {
+/// Report category for one background compaction tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundCompactionTickKind {
+    /// Ordinary scheduler-driven BestEffort pass.
+    Scheduled,
+    /// Tick admitted with an explicit cleaner/allocator pressure level.
+    Pressure(CompactionPressureLevel),
+}
+
+impl BackgroundCompactionTickKind {
+    fn from_trigger(trigger: CompactionTrigger) -> Self {
+        match trigger {
+            CompactionTrigger::Scheduled => Self::Scheduled,
+            CompactionTrigger::PressureEscalated(level) => Self::Pressure(level),
+        }
+    }
+}
+
+/// Scheduler-facing report for one compaction-authority tick.
+#[derive(Clone, Debug)]
+pub struct BackgroundCompactionRunReport {
+    /// Whether this was a scheduled or pressure tick.
+    pub tick_kind: BackgroundCompactionTickKind,
+    /// Report returned to the scheduler for generic budget accounting.
+    pub scheduler_report: TickReport,
+    /// Full authority report, including trigger input and admission decisions.
+    pub authority_report: CompactionRunReport,
+    /// True when policy skipped the tick only because every candidate exceeded
+    /// the active write-amplification cap.
+    pub skipped_by_write_amplification: bool,
+}
+
+#[derive(Debug, Default)]
+struct BackgroundCompactionControlState {
+    next_pressure: Option<CompactionPressureLevel>,
+    scheduled_ticks: u64,
+    pressure_ticks: u64,
+    skipped_by_write_amplification_ticks: u64,
+    reports: Vec<BackgroundCompactionRunReport>,
+}
+
+/// Shared control and report handle for a registered compaction service.
+#[derive(Clone, Debug, Default)]
+pub struct BackgroundCompactionControl {
+    state: Arc<Mutex<BackgroundCompactionControlState>>,
+}
+
+impl BackgroundCompactionControl {
+    /// Request that the next scheduler tick use pressure-escalated compaction input.
+    pub fn request_pressure_tick(&self, level: CompactionPressureLevel) {
+        if let Ok(mut state) = self.state.lock() {
+            state.next_pressure = Some(level);
+        }
+    }
+
+    /// Number of ordinary scheduled ticks recorded so far.
+    #[must_use]
+    pub fn scheduled_ticks(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.scheduled_ticks)
+            .unwrap_or(0)
+    }
+
+    /// Number of pressure-escalated ticks recorded so far.
+    #[must_use]
+    pub fn pressure_ticks(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.pressure_ticks)
+            .unwrap_or(0)
+    }
+
+    /// Number of ticks skipped by the compaction write-amplification cap.
+    #[must_use]
+    pub fn skipped_by_write_amplification_ticks(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.skipped_by_write_amplification_ticks)
+            .unwrap_or(0)
+    }
+
+    /// Most recent compaction run report.
+    #[must_use]
+    pub fn last_report(&self) -> Option<BackgroundCompactionRunReport> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.reports.last().cloned())
+    }
+
+    fn take_next_pressure(&self) -> Option<CompactionPressureLevel> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.next_pressure.take())
+    }
+
+    fn record(&self, report: BackgroundCompactionRunReport) {
+        if let Ok(mut state) = self.state.lock() {
+            match report.tick_kind {
+                BackgroundCompactionTickKind::Scheduled => {
+                    state.scheduled_ticks = state.scheduled_ticks.saturating_add(1);
+                }
+                BackgroundCompactionTickKind::Pressure(_) => {
+                    state.pressure_ticks = state.pressure_ticks.saturating_add(1);
+                }
+            }
+            if report.skipped_by_write_amplification {
+                state.skipped_by_write_amplification_ticks =
+                    state.skipped_by_write_amplification_ticks.saturating_add(1);
+            }
+            state.reports.push(report);
+        }
+    }
+}
+
+/// Background scheduler service for compaction authority ticks.
+pub struct BackgroundCompaction<A> {
+    authority: A,
+    control: BackgroundCompactionControl,
+}
+
+impl<A> BackgroundCompaction<A>
+where
+    A: CompactionAuthority,
+{
+    /// Create a compaction service and its shared control/report handle.
+    #[must_use]
+    pub fn new(authority: A) -> Self {
+        Self {
+            authority,
+            control: BackgroundCompactionControl::default(),
+        }
+    }
+
+    /// Shared pressure/report handle to retain after scheduler registration.
+    #[must_use]
+    pub fn control(&self) -> BackgroundCompactionControl {
+        self.control.clone()
+    }
+
+    fn trigger_input(&self, budget: &ServiceBudget) -> CompactionTriggerInput {
+        let work_budget = budget.to_work_budget();
+        match self.control.take_next_pressure() {
+            Some(level) => CompactionTriggerInput::pressure_escalated(level, work_budget),
+            None => CompactionTriggerInput::scheduled(work_budget),
+        }
+    }
+}
+
+impl<A> BackgroundService for BackgroundCompaction<A>
+where
+    A: CompactionAuthority,
+{
     fn name(&self) -> &'static str {
         "compaction"
     }
@@ -115,166 +202,243 @@ impl BackgroundService for BackgroundCompaction {
     }
 
     fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
-        // Guard against empty budget — compaction is at least O(n).
-        if budget.max_items == 0 && budget.max_bytes == 0 {
-            return Ok(TickReport {
-                processed: 0,
-                skipped: 0,
-                errors: 0,
-                items_consumed: 0,
-                bytes_consumed: 0,
-                has_more: false,
-            });
-        }
+        let trigger_input = self.trigger_input(budget);
+        let authority_report = self.authority.run_compaction_tick(trigger_input);
+        let policy = &authority_report.policy_report;
 
-        let mut q = self.queue.lock().map_err(|_| ServiceError::Internal {
-            service: "compaction",
-            message: "reclaim queue lock poisoned",
-        })?;
+        let skipped_by_write_amplification = policy.candidates_considered > 0
+            && policy.candidates_admitted == 0
+            && policy.rejected_write_amplification > 0
+            && policy.rejected_write_amplification
+                == policy
+                    .candidates_considered
+                    .saturating_sub(policy.cleaner_only_segments)
+                    .saturating_sub(policy.rejected_empty)
+                    .saturating_sub(policy.rejected_no_reclaim)
+                    .saturating_sub(policy.rejected_live_bytes_floor);
 
-        let count = q.len();
-        self.last_fill_percent = q.fill_percent();
+        let skipped = if skipped_by_write_amplification { 1 } else { 0 };
+        let items_consumed = (policy.candidates_admitted as u64).saturating_add(skipped);
+        let tick_report = TickReport {
+            processed: authority_report
+                .segments_freed
+                .saturating_add(authority_report.segments_partial),
+            skipped,
+            errors: authority_report.errors,
+            items_consumed,
+            bytes_consumed: authority_report.bytes_relocated,
+            has_more: self.authority.has_compaction_work(),
+        };
 
-        if count == 0 || self.last_fill_percent >= self.threshold {
-            return Ok(TickReport {
-                processed: 0,
-                skipped: 0,
-                errors: 0,
-                items_consumed: 0,
-                bytes_consumed: 0,
-                has_more: false,
-            });
-        }
+        self.control.record(BackgroundCompactionRunReport {
+            tick_kind: BackgroundCompactionTickKind::from_trigger(trigger_input.trigger),
+            scheduler_report: tick_report.clone(),
+            authority_report,
+            skipped_by_write_amplification,
+        });
 
-        // Gate: skip compaction if tree is too large for a single tick.
-        if count > budget.max_items as usize && budget.max_items > 0 {
-            return Ok(TickReport {
-                processed: 0,
-                skipped: 1,
-                errors: 0,
-                items_consumed: 0,
-                bytes_consumed: 0,
-                has_more: true,
-            });
-        }
-
-        let before_nodes = q.node_count();
-        let compacted = q.compact_if_needed(self.threshold);
-        let after_nodes = q.node_count();
-
-        if compacted {
-            self.compactions_run = self.compactions_run.saturating_add(1);
-        }
-
-        Ok(TickReport {
-            processed: if compacted { 1 } else { 0 },
-            skipped: 0,
-            errors: 0,
-            items_consumed: before_nodes.saturating_sub(after_nodes) as u64,
-            bytes_consumed: 0,
-            has_more: false,
-        })
+        Ok(tick_report)
     }
 
     fn has_work(&self) -> bool {
-        match self.queue.lock() {
-            Ok(q) => !q.is_empty() && q.fill_percent() < self.threshold,
-            Err(_) => false,
-        }
+        self.authority.has_compaction_work()
     }
+}
+
+/// Register a compaction authority with the background scheduler.
+#[must_use]
+pub fn register_background_compaction<A>(
+    scheduler: &mut BackgroundScheduler,
+    authority: A,
+) -> BackgroundCompactionControl
+where
+    A: CompactionAuthority + 'static,
+{
+    let service = BackgroundCompaction::new(authority);
+    let control = service.control();
+    scheduler.register(Box::new(service));
+    control
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_types_reclaim_queue_core::{ObjectKey, QueueFamily, ReclaimQueueEntry};
+    use tidefs_background_scheduler::{RegisteredService, ServiceBudget};
+    use tidefs_compaction::{
+        CompactionConfig, CompactionPolicy, CompactionPolicyReport, CompactionPressureLevel,
+        CompactionTrigger, WriteAmplification,
+    };
+    use tidefs_reclaim_queue_core::SegmentLivenessEntry;
+    use tidefs_types_incremental_job_core::WorkBudget;
 
-    /// Helper: build an ObjectKey from a u8 id byte.
-    fn key(id: u8) -> ObjectKey {
-        let mut k = [0u8; 32];
-        k[0] = id;
-        ObjectKey(k)
+    #[derive(Debug)]
+    struct MockAuthority {
+        report: CompactionRunReport,
+        inputs: Vec<CompactionTriggerInput>,
+        has_work: bool,
     }
 
-    /// Helper: build a ReclaimQueueEntry.
-    fn entry(id: u8, delta: i64, family: QueueFamily) -> ReclaimQueueEntry {
-        ReclaimQueueEntry::new(key(id), delta, family)
-    }
-
-    #[test]
-    fn compaction_idle_on_empty_queue() {
-        let q = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-        let mut svc = BackgroundCompaction::new(Arc::clone(&q));
-        let budget = ServiceBudget::default();
-        assert!(!svc.has_work());
-        let report = svc.tick(&budget).unwrap();
-        assert_eq!(report.processed, 0);
-    }
-
-    #[test]
-    fn compaction_idle_on_dense_tree() {
-        let q = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-        for i in 0..200u8 {
-            q.lock().unwrap().insert(entry(i, -1, QueueFamily::Extent));
+    impl MockAuthority {
+        fn with_policy_report(policy_report: CompactionPolicyReport) -> Self {
+            Self {
+                report: CompactionRunReport {
+                    candidates_considered: policy_report.candidates_considered,
+                    segments_freed: policy_report.candidates_admitted as u64,
+                    policy_report,
+                    ..CompactionRunReport::default()
+                },
+                inputs: Vec::new(),
+                has_work: true,
+            }
         }
-        let mut svc = BackgroundCompaction::new(Arc::clone(&q));
+    }
+
+    impl CompactionAuthority for MockAuthority {
+        fn has_compaction_work(&self) -> bool {
+            self.has_work
+        }
+
+        fn run_compaction_tick(&mut self, input: CompactionTriggerInput) -> CompactionRunReport {
+            self.inputs.push(input);
+            let mut report = self.report.clone();
+            report.policy_report.trigger_input = input;
+            report.policy_report.write_amplification_cap = input.write_amplification_cap();
+            report
+        }
+    }
+
+    fn policy_report(
+        entries: &[SegmentLivenessEntry],
+        input: CompactionTriggerInput,
+    ) -> CompactionPolicyReport {
+        CompactionPolicy::new(CompactionConfig::default()).evaluate_entries(entries, input)
+    }
+
+    #[test]
+    fn registration_uses_best_effort_without_scheduler_policy() {
+        let report = policy_report(
+            &[SegmentLivenessEntry::new(7, 30_000, 70_000)],
+            CompactionTriggerInput::default(),
+        );
+        let mut scheduler = BackgroundScheduler::new(ServiceBudget::DEFAULT_TICK);
+
+        let _control = register_background_compaction(
+            &mut scheduler,
+            MockAuthority::with_policy_report(report),
+        );
+
+        assert_eq!(
+            scheduler.registered_services(),
+            vec![RegisteredService {
+                name: "compaction",
+                priority: ServicePriority::BestEffort,
+            }]
+        );
+    }
+
+    #[test]
+    fn scheduled_tick_passes_scheduler_budget_to_authority() {
         let budget = ServiceBudget {
-            max_items: 500,
-            max_bytes: 1_000_000,
-            max_ms: 1000,
+            max_items: 3,
+            max_bytes: 128_000,
+            max_ms: 10,
         };
-        let report = svc.tick(&budget).unwrap();
-        // Dense tree — no compaction needed.
-        assert_eq!(report.processed, 0);
-        assert!(svc.last_fill_percent() >= DEFAULT_COMPACTION_THRESHOLD);
+        let input = CompactionTriggerInput::scheduled(budget.to_work_budget());
+        let report = policy_report(&[SegmentLivenessEntry::new(1, 30_000, 70_000)], input);
+        let mut scheduler = BackgroundScheduler::new(budget);
+        let control = register_background_compaction(
+            &mut scheduler,
+            MockAuthority::with_policy_report(report),
+        );
+
+        let cycle = scheduler.run_cycle();
+        let last = control.last_report().expect("compaction report");
+
+        assert_eq!(cycle.services_ran, 1);
+        assert_eq!(control.scheduled_ticks(), 1);
+        assert_eq!(control.pressure_ticks(), 0);
+        assert_eq!(last.tick_kind, BackgroundCompactionTickKind::Scheduled);
+        assert_eq!(
+            last.authority_report.policy_report.trigger_input,
+            CompactionTriggerInput::scheduled(WorkBudget {
+                max_items: 3,
+                max_bytes: 128_000,
+                max_ms: 10,
+            })
+        );
     }
 
     #[test]
-    fn compaction_service_registers_without_panic() {
-        let q = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-        let svc = BackgroundCompaction::new(Arc::clone(&q));
-        assert_eq!(svc.name(), "compaction");
-        assert_eq!(svc.priority(), ServicePriority::BestEffort);
-        assert_eq!(svc.compactions_run(), 0);
+    fn pressure_tick_uses_explicit_pressure_input() {
+        let budget = ServiceBudget {
+            max_items: 2,
+            max_bytes: 128_000,
+            max_ms: 10,
+        };
+        let report = policy_report(
+            &[SegmentLivenessEntry::new(11, 60_000, 40_000)],
+            CompactionTriggerInput::pressure_escalated(
+                CompactionPressureLevel::Auto,
+                budget.to_work_budget(),
+            ),
+        );
+        let mut scheduler = BackgroundScheduler::new(budget);
+        let control = register_background_compaction(
+            &mut scheduler,
+            MockAuthority::with_policy_report(report),
+        );
+        control.request_pressure_tick(CompactionPressureLevel::Auto);
+
+        scheduler.run_cycle();
+        let last = control.last_report().expect("pressure compaction report");
+
+        assert_eq!(control.scheduled_ticks(), 0);
+        assert_eq!(control.pressure_ticks(), 1);
+        assert_eq!(
+            last.tick_kind,
+            BackgroundCompactionTickKind::Pressure(CompactionPressureLevel::Auto)
+        );
+        assert_eq!(
+            last.authority_report.policy_report.trigger_input.trigger,
+            CompactionTrigger::PressureEscalated(CompactionPressureLevel::Auto)
+        );
+        assert_eq!(
+            last.authority_report.policy_report.write_amplification_cap,
+            WriteAmplification::PRESSURE_CAP
+        );
     }
 
     #[test]
-    fn compaction_tick_respects_zero_budget() {
-        let q = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-        for i in 0..100u8 {
-            q.lock().unwrap().insert(entry(i, -1, QueueFamily::Extent));
-        }
-        let mut svc = BackgroundCompaction::new(Arc::clone(&q));
-        let budget = ServiceBudget::default(); // max_items=0, max_bytes=0
-        let report = svc.tick(&budget).unwrap();
-        assert_eq!(report.processed, 0);
-    }
+    fn report_distinguishes_write_amplification_skip() {
+        let input = CompactionTriggerInput::scheduled(WorkBudget {
+            max_items: 8,
+            max_bytes: 128_000,
+            max_ms: 10,
+        });
+        let report = policy_report(&[SegmentLivenessEntry::new(3, 60_000, 40_000)], input);
+        let mut scheduler = BackgroundScheduler::new(ServiceBudget {
+            max_items: 8,
+            max_bytes: 128_000,
+            max_ms: 10,
+        });
+        let control = register_background_compaction(
+            &mut scheduler,
+            MockAuthority::with_policy_report(report),
+        );
 
-    #[test]
-    fn compaction_custom_threshold() {
-        let q = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-        let svc = BackgroundCompaction::with_threshold(Arc::clone(&q), 0.75);
-        assert_eq!(svc.threshold, 0.75);
-    }
+        let cycle = scheduler.run_cycle();
+        let last = control.last_report().expect("write amplification report");
 
-    #[test]
-    fn compaction_queue_handle_shares_reference() {
-        let q = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-        let svc = BackgroundCompaction::new(Arc::clone(&q));
-        let handle = svc.queue_handle();
-        handle
-            .lock()
-            .unwrap()
-            .insert(entry(1, -1, QueueFamily::Extent));
-        assert_eq!(q.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn compaction_threshold_clamped() {
-        let q = Arc::new(Mutex::new(BPlusTreeReclaimQueue::new()));
-        let svc1 = BackgroundCompaction::with_threshold(Arc::clone(&q), -0.5);
-        assert_eq!(svc1.threshold, 0.0);
-        let svc2 = BackgroundCompaction::with_threshold(Arc::clone(&q), 1.5);
-        assert_eq!(svc2.threshold, 1.0);
+        assert_eq!(cycle.total_skipped, 1);
+        assert_eq!(last.scheduler_report.items_consumed, 1);
+        assert_eq!(control.skipped_by_write_amplification_ticks(), 1);
+        assert!(last.skipped_by_write_amplification);
+        assert_eq!(
+            last.authority_report
+                .policy_report
+                .rejected_write_amplification,
+            1
+        );
+        assert_eq!(last.authority_report.policy_report.candidates_admitted, 0);
     }
 }

@@ -710,6 +710,15 @@ pub struct SchedulerStats {
     pub budget_exhausted: u64,
 }
 
+/// Read-only snapshot of a registered background service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegisteredService {
+    /// Unique service name used in cycle reports and metrics.
+    pub name: &'static str,
+    /// Priority used by the scheduler's stage ordering.
+    pub priority: ServicePriority,
+}
+
 // ---------------------------------------------------------------------------
 // CycleReport — aggregate report for one full scheduling cycle
 // ---------------------------------------------------------------------------
@@ -862,6 +871,18 @@ impl BackgroundScheduler {
     #[must_use]
     pub fn service_count(&self) -> usize {
         self.services.len()
+    }
+
+    /// Return the currently registered services and their scheduler priority.
+    #[must_use]
+    pub fn registered_services(&self) -> Vec<RegisteredService> {
+        self.services
+            .iter()
+            .map(|service| RegisteredService {
+                name: service.name(),
+                priority: service.priority(),
+            })
+            .collect()
     }
 
     /// Remove and return the last registered service, if any.

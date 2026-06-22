@@ -2688,6 +2688,7 @@ dependencies = [
  "tidefs-block-allocator",
  "tidefs-claim-ledger",
  "tidefs-cleanup-engine",
+ "tidefs-compaction",
  "tidefs-commit_group",
  "tidefs-dataset-feature-flags",
  "tidefs-dataset-lifecycle",
