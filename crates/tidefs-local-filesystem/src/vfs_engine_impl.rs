@@ -4259,7 +4259,24 @@ impl VfsEngine for VfsLocalFileSystem {
 
         let inode_id = self.allocate_anonymous_inode_id()?;
         let attr = Self::anonymous_attr(inode_id, mode, ctx);
-        let fh = self.register_file_handle(inode_id, flags, true)?;
+        // Track in the persistent orphan index for crash-safe recovery.
+        let ino_u64 = inode_id.get();
+        let generation = Generation::new(ino_u64);
+        self.fs
+            .borrow_mut()
+            .track_tmpfile_orphan(inode_id, generation.get(), ctx.pid)
+            .map_err(|e| map_errno(&e))?;
+
+        let fh = match self.register_file_handle(inode_id, flags, true) {
+            Ok(fh) => fh,
+            Err(err) => {
+                let _ = self
+                    .fs
+                    .borrow_mut()
+                    .remove_tmpfile_orphan_on_link(inode_id);
+                return Err(err);
+            }
+        };
         self.anonymous_tmpfiles.borrow_mut().insert(
             inode_id,
             AnonymousTmpfile {
@@ -4267,16 +4284,6 @@ impl VfsEngine for VfsLocalFileSystem {
                 data: SparseAnonymousData::new(),
             },
         );
-
-        // Track in the persistent orphan index for crash-safe recovery.
-        let ino_u64 = inode_id.get();
-        let generation = Generation::new(ino_u64);
-        self.fs
-            .borrow()
-            .orphan_index
-            .lock()
-            .unwrap()
-            .insert_tmpfile(ino_u64, generation.get(), ctx.pid, 0);
 
         Ok((attr, fh))
     }
@@ -4486,16 +4493,8 @@ impl VfsEngine for VfsLocalFileSystem {
         // linked into the namespace, use the engine's own create+write
         // path to build a proper filesystem inode and directory entry,
         // then remap the handle table so the open fd stays valid.
-        let tmpfile_opt = self.anonymous_tmpfiles.borrow_mut().remove(&target);
-        if let Some(tmpfile) = tmpfile_opt {
-            // Remove from persistent orphan index: the inode is no longer
-            // orphaned once it has a directory entry.
-            self.fs
-                .borrow()
-                .orphan_index
-                .lock()
-                .unwrap()
-                .remove_on_link(target.get(), 0);
+        let is_anonymous_tmpfile = self.anonymous_tmpfiles.borrow().contains_key(&target);
+        if is_anonymous_tmpfile {
             // Check for duplicate before calling create().
             {
                 let new_parent_path = self.inode_path(new_parent)?;
@@ -4504,6 +4503,18 @@ impl VfsEngine for VfsLocalFileSystem {
                     return Err(Errno::EEXIST);
                 }
             }
+
+            // Remove from persistent orphan index: the inode is no longer
+            // orphaned once it has a directory entry.
+            self.fs
+                .borrow_mut()
+                .remove_tmpfile_orphan_on_link(target)
+                .map_err(|e| map_errno(&e))?;
+            let tmpfile = self
+                .anonymous_tmpfiles
+                .borrow_mut()
+                .remove(&target)
+                .ok_or(Errno::EIO)?;
 
             // Use create() to allocate a proper filesystem inode with a
             // directory entry.  With flags=0, this creates-or-opens the

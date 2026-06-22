@@ -4000,6 +4000,53 @@ impl LocalFileSystem {
         Ok(inserted)
     }
 
+    /// Mark an anonymous O_TMPFILE inode as orphaned at creation time.
+    pub fn track_tmpfile_orphan(
+        &mut self,
+        inode_id: InodeId,
+        generation: u64,
+        creating_pid: u32,
+    ) -> Result<bool> {
+        let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
+        let insert_result = {
+            let mut orphan_index = self.orphan_index.lock().unwrap();
+            orphan_index.insert_tmpfile_admitted(
+                inode_id.get(),
+                generation,
+                creating_pid,
+                0,
+                &orphan_md_permit,
+            )
+        };
+        let inserted = match insert_result {
+            Ok(inserted) => inserted,
+            Err(err) => {
+                self.release_metadata_admission_permit(orphan_md_permit)?;
+                return Err(Self::orphan_index_admission_error(err));
+            }
+        };
+        self.release_metadata_admission_permit(orphan_md_permit)?;
+        Ok(inserted)
+    }
+
+    /// Remove an anonymous O_TMPFILE inode from the orphan index after linkat.
+    pub fn remove_tmpfile_orphan_on_link(&mut self, inode_id: InodeId) -> Result<bool> {
+        let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
+        let remove_result = {
+            let mut orphan_index = self.orphan_index.lock().unwrap();
+            orphan_index.remove_on_link_admitted(inode_id.get(), 0, &orphan_md_permit)
+        };
+        let removed = match remove_result {
+            Ok(removed) => removed,
+            Err(err) => {
+                self.release_metadata_admission_permit(orphan_md_permit)?;
+                return Err(Self::orphan_index_admission_error(err));
+            }
+        };
+        self.release_metadata_admission_permit(orphan_md_permit)?;
+        Ok(removed)
+    }
+
     /// Queue an already tracked orphan for deferred background reclamation.
     ///
     /// This is intentionally idempotent so adapter release paths can call it

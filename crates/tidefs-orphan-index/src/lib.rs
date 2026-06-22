@@ -462,6 +462,19 @@ impl OrphanIndex {
         self.insert(inode_id, entry)
     }
 
+    /// Insert an O_TMPFILE entry after validating an orphan-index metadata permit.
+    pub fn insert_tmpfile_admitted(
+        &mut self,
+        inode_id: u64,
+        generation: u64,
+        creating_pid: u32,
+        txg: u64,
+        permit: &AdmissionPermit,
+    ) -> Result<bool, OrphanIndexAdmissionError> {
+        validate_orphan_index_permit(permit)?;
+        Ok(self.insert_tmpfile(inode_id, generation, creating_pid, txg))
+    }
+
     /// Remove a tmpfile entry from the orphan index when it is linked into
     /// the namespace via .
     ///
@@ -472,6 +485,17 @@ impl OrphanIndex {
     /// Returns  if the inode was present and removed.
     pub fn remove_on_link(&mut self, inode_id: u64, _txg: u64) -> bool {
         self.remove(inode_id)
+    }
+
+    /// Remove an O_TMPFILE entry after validating an orphan-index metadata permit.
+    pub fn remove_on_link_admitted(
+        &mut self,
+        inode_id: u64,
+        txg: u64,
+        permit: &AdmissionPermit,
+    ) -> Result<bool, OrphanIndexAdmissionError> {
+        validate_orphan_index_permit(permit)?;
+        Ok(self.remove_on_link(inode_id, txg))
     }
 
     /// Scan for O_TMPFILE entries whose creating process has exited.
@@ -1063,6 +1087,30 @@ mod tests {
         assert!(idx
             .remove_admitted(42, &remove_permit)
             .expect("remove admitted"));
+        state.release(remove_permit).expect("release remove permit");
+    }
+
+    #[test]
+    fn admitted_tmpfile_insert_and_remove_accept_metadata_permits() {
+        let mut state = tidefs_performance_contract::WriteAdmissionState::new(
+            tidefs_performance_contract::WriteAdmissionConfig::new(0, 0, 0, 2),
+        );
+        let mut idx = OrphanIndex::new();
+
+        let insert_permit = state
+            .try_admit_metadata(0)
+            .expect("metadata permit admitted");
+        assert!(idx
+            .insert_tmpfile_admitted(42, 7, 1234, 0, &insert_permit)
+            .expect("tmpfile insert admitted"));
+        state.release(insert_permit).expect("release insert permit");
+
+        let remove_permit = state
+            .try_admit_metadata(1)
+            .expect("metadata permit admitted");
+        assert!(idx
+            .remove_on_link_admitted(42, 0, &remove_permit)
+            .expect("tmpfile remove admitted"));
         state.release(remove_permit).expect("release remove permit");
     }
 

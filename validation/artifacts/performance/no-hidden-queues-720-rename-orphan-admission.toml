@@ -18,7 +18,7 @@ blocked_claim_ids = [
 ]
 non_claims = [
   "This receipt records source and registry coverage for rename and active orphan-index metadata-mutation admission wiring.",
-  "Active local-filesystem orphan-index insert/remove paths call OrphanIndex::insert_admitted/remove_admitted with a metadata AdmissionPermit.",
+  "Active local-filesystem orphan-index insert/remove and O_TMPFILE insert/remove-on-link paths call admitted OrphanIndex APIs with a metadata AdmissionPermit.",
   "This receipt does not by itself satisfy queue-depth-runtime-artifact evidence.",
   "Mount-time orphan-index log recovery (recover_from_log) and background orphan reclamation (tick_background_services) are not admission-gated in this slice.",
   "Existing issue #498 dirty-write smoke queue-depth evidence does not exercise rename/orphan-index metadata-mutation paths.",
