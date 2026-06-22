@@ -2569,6 +2569,7 @@ pub struct PrefetchResidencyDecisionEvidenceRefs {
     pub service_objective_ref: StorageIntentEvidenceRef,
     pub evidence_query_ref: StorageIntentEvidenceRef,
     pub decision_frontier_ref: StorageIntentEvidenceRef,
+    pub media_capability_ref: StorageIntentEvidenceRef,
     pub scheduler_admission_ref: StorageIntentEvidenceRef,
     pub capacity_reserve_ref: StorageIntentEvidenceRef,
     pub tenant_isolation_ref: StorageIntentEvidenceRef,
@@ -5616,6 +5617,10 @@ mod tests {
             decision_frontier_ref: evidence_ref(
                 StorageIntentEvidenceKind::DecisionFrontierEvidence,
                 43,
+            ),
+            media_capability_ref: evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                54,
             ),
             scheduler_admission_ref: evidence_ref(
                 StorageIntentEvidenceKind::SchedulerAdmissionRecord,
