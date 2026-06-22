@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use serde::{Deserialize, Serialize};
-use tidefs_membership_epoch::{ClusterMemberRecord, EpochId, FailureDomainVector, MemberId};
+use tidefs_membership_epoch::{
+    ClusterMemberRecord, EpochId, FailureDomainVector, MemberClass, MemberId,
+};
 
 /// Quorum class for witness verification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +152,21 @@ pub enum WitnessError {
     RefuseQuarantinedWitness(u64),
     #[error("witness {0} is not in the current epoch {1}")]
     WitnessNotInEpoch(u64, u64),
+    #[error("witness {witness} is unknown in membership epoch {epoch}")]
+    UnknownWitness { witness: u64, epoch: u64 },
+    #[error(
+        "witness {witness} belongs to membership epoch {member_epoch}, current epoch is {current_epoch}"
+    )]
+    StaleWitnessEpoch {
+        witness: u64,
+        member_epoch: u64,
+        current_epoch: u64,
+    },
+    #[error("witness {witness} has member class {member_class:?}, not voter")]
+    WitnessNotVoter {
+        witness: u64,
+        member_class: MemberClass,
+    },
     #[error("witness {0} has invalid signature")]
     InvalidSignature(u64),
     #[error("collection timed out: collected {collected} of {required}")]
@@ -183,6 +200,37 @@ pub struct WitnessSelectionContext {
     pub min_witnesses: usize,
     /// Current epoch.
     pub current_epoch: EpochId,
+}
+
+// ---------------------------------------------------------------------------
+// Witness membership classification
+// ---------------------------------------------------------------------------
+
+/// Membership-epoch classification snapshot consumed by the ack tracker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessMemberClassification {
+    /// Member identity from `tidefs-membership-epoch`.
+    pub member_id: MemberId,
+    /// Committed membership epoch that produced this classification.
+    pub epoch: EpochId,
+    /// Member class in that epoch.
+    pub member_class: MemberClass,
+}
+
+impl WitnessMemberClassification {
+    #[must_use]
+    pub const fn from_record(record: &ClusterMemberRecord) -> Self {
+        Self {
+            member_id: record.member_id,
+            epoch: record.current_membership_epoch_ref,
+            member_class: record.member_class,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_voter_in_epoch(self, epoch: EpochId) -> bool {
+        self.epoch.0 == epoch.0 && self.member_class.can_vote()
+    }
 }
 
 // ---------------------------------------------------------------------------

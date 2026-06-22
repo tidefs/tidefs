@@ -11,6 +11,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
+use tidefs_membership_epoch::{ClusterMemberRecord, EpochId, MemberClass, MemberId};
+
+use crate::types::{WitnessError, WitnessMemberClassification};
 
 // ---------------------------------------------------------------------------
 // Quorum threshold
@@ -70,6 +73,8 @@ impl QuorumThreshold {
 pub struct WitnessSet {
     /// Nodes currently in the witness set, ordered for deterministic iteration.
     witnesses: BTreeSet<u64>,
+    /// Membership-epoch classifications keyed by member id.
+    member_classifications: BTreeMap<u64, WitnessMemberClassification>,
     /// Current epoch number. Acks are valid only within this epoch.
     current_epoch: u64,
     /// Quorum threshold configuration.
@@ -85,6 +90,7 @@ impl WitnessSet {
     pub fn new(threshold: QuorumThreshold) -> Self {
         Self {
             witnesses: BTreeSet::new(),
+            member_classifications: BTreeMap::new(),
             current_epoch: 0,
             threshold,
             acks: BTreeMap::new(),
@@ -95,6 +101,7 @@ impl WitnessSet {
     pub fn with_epoch(threshold: QuorumThreshold, epoch: u64) -> Self {
         Self {
             witnesses: BTreeSet::new(),
+            member_classifications: BTreeMap::new(),
             current_epoch: epoch,
             threshold,
             acks: BTreeMap::new(),
@@ -105,10 +112,77 @@ impl WitnessSet {
 
     /// Add a node to the witness set.
     ///
-    /// If the node is already a member, this is a no-op. Returns true if the
-    /// node was newly added.
+    /// The node must be known to the current membership epoch and classified
+    /// as a voter by `tidefs-membership-epoch`. If the node is already a
+    /// witness, this is a no-op. Returns true if the node was newly added.
     pub fn add_witness(&mut self, node_id: u64) -> bool {
-        self.witnesses.insert(node_id)
+        self.try_add_witness(node_id).unwrap_or(false)
+    }
+
+    /// Add a node to the witness set, returning the membership refusal reason.
+    pub fn try_add_witness(&mut self, node_id: u64) -> Result<bool, WitnessError> {
+        self.ensure_current_voter(node_id)?;
+        Ok(self.witnesses.insert(node_id))
+    }
+
+    /// Validate that `node_id` is eligible to witness the current epoch.
+    pub fn validate_witness_eligibility(&self, node_id: u64) -> Result<(), WitnessError> {
+        self.ensure_current_voter(node_id)
+    }
+
+    /// Install voter classification for the current membership epoch.
+    ///
+    /// `tidefs-membership-epoch` remains the authority for member class and
+    /// epoch identity. The witness set stores only the classification snapshot
+    /// needed to reject unknown, non-voter, or stale-epoch acknowledgments.
+    /// Installing a different epoch advances this witness set and clears all
+    /// pending acknowledgments before pruning witnesses that are no longer
+    /// current voters.
+    pub fn install_membership_epoch(&mut self, epoch: EpochId, members: &[ClusterMemberRecord]) {
+        let mut classifications = BTreeMap::new();
+        for member in members {
+            let classification = WitnessMemberClassification::from_record(member);
+            classifications.insert(member.member_id.0, classification);
+        }
+
+        self.replace_member_classifications(epoch, classifications);
+    }
+
+    /// Install the voter set exported by a membership config epoch.
+    pub fn install_voter_ids_for_epoch(&mut self, epoch: EpochId, voter_ids: &[MemberId]) {
+        let classifications = voter_ids
+            .iter()
+            .copied()
+            .map(|member_id| {
+                (
+                    member_id.0,
+                    WitnessMemberClassification {
+                        member_id,
+                        epoch,
+                        member_class: MemberClass::Voter,
+                    },
+                )
+            })
+            .collect();
+
+        self.replace_member_classifications(epoch, classifications);
+    }
+
+    fn replace_member_classifications(
+        &mut self,
+        epoch: EpochId,
+        classifications: BTreeMap<u64, WitnessMemberClassification>,
+    ) {
+        if epoch.0 != self.current_epoch {
+            self.advance_epoch(epoch.0);
+        }
+
+        if classifications != self.member_classifications {
+            self.member_classifications = classifications;
+            self.acks.clear();
+        }
+
+        self.prune_ineligible_witnesses();
     }
 
     /// Remove a node from the witness set and clear all of its acknowledgments.
@@ -215,8 +289,10 @@ impl WitnessSet {
 
     /// Advance to a new epoch, clearing all pending acknowledgments.
     ///
-    /// The witness membership is preserved. All per-operation ack state is
-    /// dropped because acks from a prior epoch are considered stale.
+    /// Advancing to a different epoch invalidates witness membership until the
+    /// caller installs the new membership-epoch voter classification. All
+    /// per-operation ack state is dropped because acks from a prior epoch are
+    /// considered stale.
     ///
     /// Panics if `new_epoch < current_epoch` (epochs must be monotonic).
     pub fn advance_epoch(&mut self, new_epoch: u64) {
@@ -226,8 +302,100 @@ impl WitnessSet {
             self.current_epoch,
             new_epoch
         );
+        let advanced = new_epoch != self.current_epoch;
         self.current_epoch = new_epoch;
         self.acks.clear();
+        if advanced {
+            self.witnesses.clear();
+            self.member_classifications.clear();
+        } else {
+            self.prune_ineligible_witnesses();
+        }
+    }
+
+    fn ensure_current_voter(&self, node_id: u64) -> Result<(), WitnessError> {
+        let Some(classification) = self.member_classifications.get(&node_id) else {
+            return Err(WitnessError::UnknownWitness {
+                witness: node_id,
+                epoch: self.current_epoch,
+            });
+        };
+
+        if classification.epoch.0 != self.current_epoch {
+            return Err(WitnessError::StaleWitnessEpoch {
+                witness: node_id,
+                member_epoch: classification.epoch.0,
+                current_epoch: self.current_epoch,
+            });
+        }
+
+        if !classification.member_class.can_vote() {
+            return Err(WitnessError::WitnessNotVoter {
+                witness: node_id,
+                member_class: classification.member_class,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn prune_ineligible_witnesses(&mut self) {
+        let current_epoch = EpochId::new(self.current_epoch);
+        let classifications = &self.member_classifications;
+        self.witnesses.retain(|node_id| {
+            classifications
+                .get(node_id)
+                .is_some_and(|classification| classification.is_voter_in_epoch(current_epoch))
+        });
+        let witnesses = &self.witnesses;
+        for ack_set in self.acks.values_mut() {
+            ack_set.retain(|node_id| witnesses.contains(node_id));
+        }
+    }
+}
+
+#[cfg(test)]
+fn witness_member_record(
+    id: u64,
+    epoch: u64,
+    member_class: tidefs_membership_epoch::MemberClass,
+) -> ClusterMemberRecord {
+    use tidefs_membership_epoch::{DomainId, FailureDomainVector, HealthClass, MemberId};
+
+    ClusterMemberRecord {
+        member_id: MemberId::new(id),
+        member_class,
+        current_membership_epoch_ref: EpochId::new(epoch),
+        log_frontier: 0,
+        health: HealthClass::Healthy,
+        failure_domain_vector: FailureDomainVector::new(
+            DomainId::new(id),
+            DomainId::new(id),
+            DomainId::new(id),
+            DomainId::new(id),
+            DomainId::new(id),
+            DomainId::new(id),
+        ),
+        digest: 0,
+    }
+}
+
+#[cfg(test)]
+fn install_voters(ws: &mut WitnessSet, ids: &[u64]) {
+    let epoch = ws.epoch();
+    let members: Vec<_> = ids
+        .iter()
+        .copied()
+        .map(|id| witness_member_record(id, epoch, tidefs_membership_epoch::MemberClass::Voter))
+        .collect();
+    ws.install_membership_epoch(EpochId::new(epoch), &members);
+}
+
+#[cfg(test)]
+fn add_voters(ws: &mut WitnessSet, ids: &[u64]) {
+    install_voters(ws, ids);
+    for id in ids {
+        assert!(ws.add_witness(*id), "voter {id} must be accepted");
     }
 }
 
@@ -300,6 +468,7 @@ mod tests {
     #[test]
     fn test_add_witness() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
+        install_voters(&mut ws, &[10]);
         assert!(ws.add_witness(10));
         assert!(ws.contains(10));
         assert_eq!(ws.len(), 1);
@@ -311,9 +480,7 @@ mod tests {
     #[test]
     fn test_add_multiple_witnesses() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(3);
-        ws.add_witness(1);
-        ws.add_witness(2);
+        add_voters(&mut ws, &[3, 1, 2]);
         assert_eq!(ws.len(), 3);
         assert!(ws.contains(1));
         assert!(ws.contains(2));
@@ -323,8 +490,7 @@ mod tests {
     #[test]
     fn test_remove_witness() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(5);
-        ws.add_witness(7);
+        add_voters(&mut ws, &[5, 7]);
         assert!(ws.remove_witness(5));
         assert!(!ws.contains(5));
         assert!(ws.contains(7));
@@ -336,9 +502,7 @@ mod tests {
     #[test]
     fn test_remove_witness_clears_acks() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3);
+        add_voters(&mut ws, &[1, 2, 3]);
         ws.ack(1, 100);
         ws.ack(2, 100);
         ws.ack(3, 100);
@@ -355,9 +519,7 @@ mod tests {
     #[test]
     fn test_iter_deterministic() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(30);
-        ws.add_witness(10);
-        ws.add_witness(20);
+        add_voters(&mut ws, &[30, 10, 20]);
         let ids: Vec<u64> = ws.iter().collect();
         assert_eq!(ids, vec![10, 20, 30]);
     }
@@ -366,7 +528,7 @@ mod tests {
     fn test_is_empty() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
         assert!(ws.is_empty());
-        ws.add_witness(1);
+        add_voters(&mut ws, &[1]);
         assert!(!ws.is_empty());
     }
 
@@ -375,7 +537,7 @@ mod tests {
     #[test]
     fn test_ack_single() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
+        add_voters(&mut ws, &[1]);
         assert!(ws.ack(1, 42));
         assert_eq!(ws.ack_count(42), 1);
     }
@@ -383,7 +545,7 @@ mod tests {
     #[test]
     fn test_ack_duplicate_is_idempotent() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
+        add_voters(&mut ws, &[1]);
         assert!(ws.ack(1, 42));
         assert!(!ws.ack(1, 42)); // duplicate
         assert!(!ws.ack(1, 42)); // duplicate
@@ -393,9 +555,7 @@ mod tests {
     #[test]
     fn test_ack_multiple_witnesses_same_operation() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3);
+        add_voters(&mut ws, &[1, 2, 3]);
         ws.ack(1, 77);
         ws.ack(2, 77);
         ws.ack(3, 77);
@@ -405,9 +565,7 @@ mod tests {
     #[test]
     fn test_ack_set_returns_correct_nodes() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3);
+        add_voters(&mut ws, &[1, 2, 3]);
         ws.ack(1, 100);
         ws.ack(3, 100);
         let acked = ws.ack_set(100).unwrap();
@@ -425,8 +583,7 @@ mod tests {
     #[test]
     fn test_distinct_operations_independent() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
+        add_voters(&mut ws, &[1, 2]);
         ws.ack(1, 10);
         ws.ack(2, 20);
         assert_eq!(ws.ack_count(10), 1);
@@ -446,9 +603,7 @@ mod tests {
     #[test]
     fn test_has_quorum_majority_satisfied() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3); // 3 members, majority = 2
+        add_voters(&mut ws, &[1, 2, 3]); // 3 members, majority = 2
         ws.ack(1, 100);
         ws.ack(2, 100);
         assert!(ws.has_quorum(100));
@@ -457,9 +612,7 @@ mod tests {
     #[test]
     fn test_has_quorum_majority_not_met() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3); // 3 members, majority = 2
+        add_voters(&mut ws, &[1, 2, 3]); // 3 members, majority = 2
         ws.ack(1, 100); // only 1 ack
         assert!(!ws.has_quorum(100));
     }
@@ -467,9 +620,7 @@ mod tests {
     #[test]
     fn test_has_quorum_exact_threshold() {
         let mut ws = WitnessSet::new(QuorumThreshold::Exact(2));
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3);
+        add_voters(&mut ws, &[1, 2, 3]);
         ws.ack(1, 100);
         assert!(!ws.has_quorum(100));
         ws.ack(2, 100);
@@ -479,18 +630,13 @@ mod tests {
     #[test]
     fn test_has_quorum_super_majority() {
         let mut ws = WitnessSet::new(QuorumThreshold::SuperMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3); // 3 members, super-majority ceil(6/3)=2
+        add_voters(&mut ws, &[1, 2, 3]); // 3 members, super-majority ceil(6/3)=2
         ws.ack(1, 100);
         ws.ack(2, 100);
         assert!(ws.has_quorum(100));
 
         let mut ws2 = WitnessSet::new(QuorumThreshold::SuperMajority);
-        ws2.add_witness(1);
-        ws2.add_witness(2);
-        ws2.add_witness(3);
-        ws2.add_witness(4); // 4 members, super-majority ceil(8/3)=3
+        add_voters(&mut ws2, &[1, 2, 3, 4]); // 4 members, super-majority ceil(8/3)=3
         ws2.ack(1, 100);
         ws2.ack(2, 100);
         assert!(!ws2.has_quorum(100));
@@ -507,16 +653,14 @@ mod tests {
     #[test]
     fn test_has_quorum_unknown_operation() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
+        add_voters(&mut ws, &[1]);
         assert!(!ws.has_quorum(999));
     }
 
     #[test]
     fn test_has_quorum_after_remove_recalculates() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3); // 3 members, majority = 2
+        add_voters(&mut ws, &[1, 2, 3]); // 3 members, majority = 2
         ws.ack(1, 100);
         ws.ack(2, 100);
         assert!(ws.has_quorum(100)); // 2 of 3 = majority satisfied
@@ -532,9 +676,7 @@ mod tests {
     #[test]
     fn test_advance_epoch_clears_acks() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3);
+        add_voters(&mut ws, &[1, 2, 3]);
         ws.ack(1, 100);
         ws.ack(2, 100);
         ws.ack(3, 100);
@@ -545,19 +687,99 @@ mod tests {
         assert_eq!(ws.epoch(), 5);
         assert_eq!(ws.ack_count(100), 0);
         assert!(!ws.has_quorum(100));
-        // Membership preserved.
-        assert_eq!(ws.len(), 3);
-        assert!(ws.contains(1));
+        assert_eq!(ws.len(), 0);
+        assert!(!ws.contains(1));
     }
 
     #[test]
     fn test_advance_epoch_same_epoch_noop() {
         let mut ws = WitnessSet::with_epoch(QuorumThreshold::StrictMajority, 3);
-        ws.add_witness(1);
+        add_voters(&mut ws, &[1]);
         ws.ack(1, 100);
         ws.advance_epoch(3); // same epoch, allowed (monotonic non-strict)
         assert_eq!(ws.epoch(), 3);
         assert_eq!(ws.ack_count(100), 0); // acks cleared
+    }
+
+    #[test]
+    fn test_add_witness_rejects_non_voter() {
+        let mut ws = WitnessSet::with_epoch(QuorumThreshold::StrictMajority, 7);
+        let members = [witness_member_record(
+            10,
+            7,
+            tidefs_membership_epoch::MemberClass::Learner,
+        )];
+        ws.install_membership_epoch(EpochId::new(7), &members);
+
+        assert!(matches!(
+            ws.try_add_witness(10),
+            Err(WitnessError::WitnessNotVoter { witness: 10, .. })
+        ));
+        assert!(!ws.add_witness(10));
+        assert!(ws.is_empty());
+    }
+
+    #[test]
+    fn test_add_witness_rejects_stale_epoch_member() {
+        let mut ws = WitnessSet::with_epoch(QuorumThreshold::StrictMajority, 8);
+        let members = [witness_member_record(
+            11,
+            7,
+            tidefs_membership_epoch::MemberClass::Voter,
+        )];
+        ws.install_membership_epoch(EpochId::new(8), &members);
+
+        assert!(matches!(
+            ws.try_add_witness(11),
+            Err(WitnessError::StaleWitnessEpoch {
+                witness: 11,
+                member_epoch: 7,
+                current_epoch: 8,
+            })
+        ));
+        assert!(!ws.add_witness(11));
+        assert!(ws.is_empty());
+    }
+
+    #[test]
+    fn test_add_witness_rejects_unknown_member() {
+        let mut ws = WitnessSet::with_epoch(QuorumThreshold::StrictMajority, 9);
+        install_voters(&mut ws, &[1, 2, 3]);
+
+        assert!(matches!(
+            ws.try_add_witness(99),
+            Err(WitnessError::UnknownWitness {
+                witness: 99,
+                epoch: 9,
+            })
+        ));
+        assert!(!ws.add_witness(99));
+        assert_eq!(ws.len(), 0);
+    }
+
+    #[test]
+    fn test_membership_epoch_advance_invalidates_stale_witnesses() {
+        let mut ws = WitnessSet::with_epoch(QuorumThreshold::StrictMajority, 1);
+        add_voters(&mut ws, &[1, 2, 3]);
+        ws.ack(1, 55);
+        ws.ack(2, 55);
+        assert!(ws.has_quorum(55));
+
+        let members = [
+            witness_member_record(2, 2, tidefs_membership_epoch::MemberClass::Voter),
+            witness_member_record(3, 2, tidefs_membership_epoch::MemberClass::Voter),
+            witness_member_record(4, 2, tidefs_membership_epoch::MemberClass::Voter),
+        ];
+        ws.install_membership_epoch(EpochId::new(2), &members);
+
+        assert_eq!(ws.epoch(), 2);
+        assert_eq!(ws.ack_count(55), 0);
+        assert!(!ws.has_quorum(55));
+        assert_eq!(ws.len(), 0);
+        assert!(!ws.add_witness(1));
+        assert!(ws.add_witness(2));
+        assert!(ws.add_witness(4));
+        assert!(!ws.has_quorum(55));
     }
 
     #[test]
@@ -581,9 +803,7 @@ mod tests {
     #[test]
     fn test_serialize_deserialize_with_data() {
         let mut ws = WitnessSet::new(QuorumThreshold::SuperMajority);
-        ws.add_witness(10);
-        ws.add_witness(20);
-        ws.add_witness(30);
+        add_voters(&mut ws, &[10, 20, 30]);
         ws.ack(10, 1);
         ws.ack(20, 1);
         ws.ack(30, 1);
@@ -607,9 +827,7 @@ mod tests {
     #[test]
     fn test_smoke_5_nodes_3_quorum() {
         let mut ws = WitnessSet::new(QuorumThreshold::Exact(3));
-        for id in 1..=5 {
-            ws.add_witness(id);
-        }
+        add_voters(&mut ws, &[1, 2, 3, 4, 5]);
         assert_eq!(ws.len(), 5);
 
         // Ack from 3 nodes → quorum.
@@ -627,9 +845,7 @@ mod tests {
     #[test]
     fn test_smoke_epoch_advance_and_reack() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3);
+        add_voters(&mut ws, &[1, 2, 3]);
         ws.ack(1, 10);
         ws.ack(2, 10);
         assert!(ws.has_quorum(10));
@@ -638,6 +854,7 @@ mod tests {
         assert!(!ws.has_quorum(10));
 
         // Re-ack after epoch advance.
+        add_voters(&mut ws, &[1, 2, 3]);
         ws.ack(1, 10);
         ws.ack(2, 10);
         ws.ack(3, 10);
@@ -649,12 +866,8 @@ mod tests {
         let mut ws1 = WitnessSet::new(QuorumThreshold::StrictMajority);
         let mut ws2 = WitnessSet::new(QuorumThreshold::StrictMajority);
         // Same nodes, different insertion order.
-        for id in [5u64, 2, 8, 1, 9, 3, 7, 4, 6] {
-            ws1.add_witness(id);
-        }
-        for id in [1u64, 9, 3, 6, 2, 8, 5, 7, 4] {
-            ws2.add_witness(id);
-        }
+        add_voters(&mut ws1, &[5, 2, 8, 1, 9, 3, 7, 4, 6]);
+        add_voters(&mut ws2, &[1, 9, 3, 6, 2, 8, 5, 7, 4]);
         let ids1: Vec<u64> = ws1.iter().collect();
         let ids2: Vec<u64> = ws2.iter().collect();
         assert_eq!(ids1, ids2);
@@ -819,9 +1032,8 @@ mod quorum_selection_tests {
 
     fn make_ws(count: usize, threshold: QuorumThreshold) -> WitnessSet {
         let mut ws = WitnessSet::new(threshold);
-        for id in 1..=count as u64 {
-            ws.add_witness(id);
-        }
+        let ids: Vec<u64> = (1..=count as u64).collect();
+        add_voters(&mut ws, &ids);
         ws
     }
 
@@ -1007,12 +1219,8 @@ mod quorum_selection_tests {
     fn test_quorum_selection_deterministic_ordering() {
         let mut ws1 = WitnessSet::new(QuorumThreshold::StrictMajority);
         let mut ws2 = WitnessSet::new(QuorumThreshold::StrictMajority);
-        for id in [5u64, 2, 8, 1, 9, 3, 7, 4, 6] {
-            ws1.add_witness(id);
-        }
-        for id in [1u64, 9, 3, 6, 2, 8, 5, 7, 4] {
-            ws2.add_witness(id);
-        }
+        add_voters(&mut ws1, &[5, 2, 8, 1, 9, 3, 7, 4, 6]);
+        add_voters(&mut ws2, &[1, 9, 3, 6, 2, 8, 5, 7, 4]);
         let q1 = ws1.select_quorum();
         let q2 = ws2.select_quorum();
         assert_eq!(q1.read_quorum, q2.read_quorum);
@@ -1030,8 +1238,7 @@ mod entry_tests {
     #[test]
     fn test_insert_witness_entry() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
+        add_voters(&mut ws, &[1, 2]);
 
         let entry = WitnessEntry {
             node_id: NodeId(1),
@@ -1047,7 +1254,7 @@ mod entry_tests {
     #[test]
     fn test_insert_duplicate_entry_is_idempotent() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
+        add_voters(&mut ws, &[1]);
 
         let e = WitnessEntry {
             node_id: NodeId(1),
@@ -1064,9 +1271,7 @@ mod entry_tests {
     #[test]
     fn test_insert_multiple_entries_same_txg_quorum() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3);
+        add_voters(&mut ws, &[1, 2, 3]);
 
         for nid in 1..=3u64 {
             ws.insert(&WitnessEntry {
@@ -1083,9 +1288,7 @@ mod entry_tests {
     #[test]
     fn test_remove_ack() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
-        ws.add_witness(2);
-        ws.add_witness(3);
+        add_voters(&mut ws, &[1, 2, 3]);
         ws.ack(1, 100);
         ws.ack(2, 100);
         ws.ack(3, 100);
@@ -1098,7 +1301,7 @@ mod entry_tests {
     #[test]
     fn test_remove_ack_non_existent_operation() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        ws.add_witness(1);
+        add_voters(&mut ws, &[1]);
         assert!(!ws.remove_ack(1, 999));
     }
 }

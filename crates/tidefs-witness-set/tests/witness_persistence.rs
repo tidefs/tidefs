@@ -3,6 +3,7 @@
 // crash/restart cycles, codec fidelity for wire transfer, and
 // WitnessSetConfig BLAKE3-verified integrity verification.
 
+use tidefs_membership_epoch::{EpochId, MemberId};
 use tidefs_witness_set::witness_set::{QuorumThreshold, WitnessSet};
 use tidefs_witness_set::{
     MembershipQuorum, PersistError, WitnessMember, WitnessSetCodec, WitnessSetConfig,
@@ -22,6 +23,19 @@ fn sample_config() -> WitnessSetConfig {
         MembershipQuorum::StrictMajority,
     )
     .with_min_healthy_fraction(0.6)
+}
+
+fn install_voters(ws: &mut WitnessSet, ids: impl IntoIterator<Item = u64>) {
+    let voter_ids: Vec<MemberId> = ids.into_iter().map(MemberId::new).collect();
+    ws.install_voter_ids_for_epoch(EpochId::new(ws.epoch()), &voter_ids);
+}
+
+fn add_voters(ws: &mut WitnessSet, ids: impl IntoIterator<Item = u64>) {
+    let ids: Vec<u64> = ids.into_iter().collect();
+    install_voters(ws, ids.iter().copied());
+    for id in ids {
+        assert!(ws.add_witness(id), "voter {id} must be accepted");
+    }
 }
 
 // -- WitnessSetConfig persistence round-trip -------------------------------
@@ -89,9 +103,7 @@ fn test_config_persisted_struct_verify() {
 #[test]
 fn test_witness_set_encode_decode_full_cycle() {
     let mut ws = WitnessSet::with_epoch(QuorumThreshold::SuperMajority, 7);
-    for id in 1..=10u64 {
-        ws.add_witness(id);
-    }
+    add_voters(&mut ws, 1..=10u64);
     ws.ack(1, 100);
     ws.ack(3, 100);
     ws.ack(5, 100);
@@ -120,9 +132,7 @@ fn test_witness_set_codec_empty_to_full_to_empty() {
     let dec1 = WitnessSetCodec::decode(&enc1).unwrap();
     assert!(dec1.is_empty());
 
-    for id in 1..=5u64 {
-        ws.add_witness(id);
-    }
+    add_voters(&mut ws, 1..=5u64);
     ws.ack(1, 10);
     ws.ack(2, 10);
     ws.ack(3, 10);
@@ -134,7 +144,7 @@ fn test_witness_set_codec_empty_to_full_to_empty() {
     ws.advance_epoch(1);
     let enc3 = WitnessSetCodec::encode_to_vec(&ws);
     let dec3 = WitnessSetCodec::decode(&enc3).unwrap();
-    assert_eq!(dec3.len(), 5);
+    assert_eq!(dec3.len(), 0);
     assert_eq!(dec3.epoch(), 1);
     assert_eq!(dec3.operation_count(), 0);
 }
@@ -142,9 +152,7 @@ fn test_witness_set_codec_empty_to_full_to_empty() {
 #[test]
 fn test_codec_buffer_underrun_variants() {
     let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-    for id in 1..=20u64 {
-        ws.add_witness(id);
-    }
+    add_voters(&mut ws, 1..=20u64);
     ws.ack(1, 100);
     ws.ack(2, 100);
     ws.ack(3, 100);
@@ -164,9 +172,7 @@ fn test_codec_buffer_underrun_variants() {
 #[test]
 fn test_simulated_crash_restart_witness_state() {
     let mut ws = WitnessSet::with_epoch(QuorumThreshold::StrictMajority, 0);
-    for id in 1..=5u64 {
-        ws.add_witness(id);
-    }
+    add_voters(&mut ws, 1..=5u64);
     ws.ack(1, 42);
     ws.ack(2, 42);
     ws.ack(3, 42);
@@ -189,9 +195,7 @@ fn test_simulated_crash_restart_witness_state() {
 #[test]
 fn test_crash_restart_mid_epoch() {
     let mut ws = WitnessSet::with_epoch(QuorumThreshold::SuperMajority, 3);
-    for id in 1..=7u64 {
-        ws.add_witness(id);
-    }
+    add_voters(&mut ws, 1..=7u64);
     ws.ack(1, 100);
     ws.ack(2, 100);
     ws.ack(3, 100);
@@ -219,9 +223,7 @@ fn test_crash_restart_mid_epoch() {
 #[test]
 fn test_crash_restart_epoch_advances_then_restart() {
     let mut ws = WitnessSet::with_epoch(QuorumThreshold::StrictMajority, 10);
-    for id in 1..=3u64 {
-        ws.add_witness(id);
-    }
+    add_voters(&mut ws, 1..=3u64);
     ws.ack(1, 100);
     ws.ack(2, 100);
     ws.ack(3, 100);
@@ -232,7 +234,7 @@ fn test_crash_restart_epoch_advances_then_restart() {
     let recovered = WitnessSetCodec::decode(&snapshot).unwrap();
 
     assert_eq!(recovered.epoch(), 11);
-    assert_eq!(recovered.len(), 3);
+    assert_eq!(recovered.len(), 0);
     assert_eq!(recovered.operation_count(), 0);
     assert!(!recovered.has_quorum(100));
 }
@@ -242,15 +244,16 @@ fn test_crash_restart_epoch_advances_then_restart() {
 #[test]
 fn test_add_remove_persist_cycle() {
     let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-    ws.add_witness(10);
-    ws.add_witness(20);
-    ws.add_witness(30);
+    install_voters(&mut ws, [10, 20, 30, 40]);
+    assert!(ws.add_witness(10));
+    assert!(ws.add_witness(20));
+    assert!(ws.add_witness(30));
     ws.ack(10, 1);
     ws.ack(20, 1);
     ws.ack(30, 1);
 
     ws.remove_witness(20);
-    ws.add_witness(40);
+    assert!(ws.add_witness(40));
     ws.ack(40, 1);
 
     let snapshot = WitnessSetCodec::encode_to_vec(&ws);
@@ -272,9 +275,7 @@ fn test_all_threshold_types_survive_persist_cycle() {
         QuorumThreshold::Exact(5),
     ] {
         let mut ws = WitnessSet::new(threshold);
-        for id in 1..=10u64 {
-            ws.add_witness(id);
-        }
+        add_voters(&mut ws, 1..=10u64);
         ws.ack(1, 100);
         ws.ack(2, 100);
 

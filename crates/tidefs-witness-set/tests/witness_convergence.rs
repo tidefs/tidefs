@@ -8,6 +8,7 @@
 // epoch transitions.
 
 use std::collections::BTreeSet;
+use tidefs_membership_epoch::{EpochId, MemberId};
 use tidefs_witness_set::witness_set::{QuorumThreshold, WitnessSet};
 use tidefs_witness_set::WitnessSetCodec;
 
@@ -15,18 +16,27 @@ use tidefs_witness_set::WitnessSetCodec;
 
 fn make_ws(count: usize, threshold: QuorumThreshold) -> WitnessSet {
     let mut ws = WitnessSet::new(threshold);
-    for id in 1..=count as u64 {
-        ws.add_witness(id);
-    }
+    add_voters(&mut ws, 1..=count as u64);
     ws
 }
 
 fn make_ws_with_epoch(count: usize, threshold: QuorumThreshold, epoch: u64) -> WitnessSet {
     let mut ws = WitnessSet::with_epoch(threshold, epoch);
-    for id in 1..=count as u64 {
-        ws.add_witness(id);
-    }
+    add_voters(&mut ws, 1..=count as u64);
     ws
+}
+
+fn install_voters(ws: &mut WitnessSet, ids: impl IntoIterator<Item = u64>) {
+    let voter_ids: Vec<MemberId> = ids.into_iter().map(MemberId::new).collect();
+    ws.install_voter_ids_for_epoch(EpochId::new(ws.epoch()), &voter_ids);
+}
+
+fn add_voters(ws: &mut WitnessSet, ids: impl IntoIterator<Item = u64>) {
+    let ids: Vec<u64> = ids.into_iter().collect();
+    install_voters(ws, ids.iter().copied());
+    for id in ids {
+        assert!(ws.add_witness(id), "voter {id} must be accepted");
+    }
 }
 
 // -- Multi-node witness accumulation across synthetic epoch boundaries ----
@@ -46,6 +56,7 @@ fn test_accumulation_crosses_epoch_boundary() {
     assert_eq!(ws.ack_count(100), 0);
 
     // Re-ack in epoch 1
+    add_voters(&mut ws, 1..=5u64);
     ws.ack(1, 200);
     ws.ack(2, 200);
     ws.ack(3, 200);
@@ -54,12 +65,14 @@ fn test_accumulation_crosses_epoch_boundary() {
 }
 
 #[test]
-fn test_consecutive_epoch_advances_preserve_membership() {
+fn test_consecutive_epoch_advances_require_membership_reinstall() {
     let mut ws = make_ws(7, QuorumThreshold::SuperMajority);
     let members_before: Vec<u64> = ws.iter().collect();
 
     for e in 1..=5u64 {
         ws.advance_epoch(e);
+        assert!(ws.is_empty());
+        add_voters(&mut ws, members_before.iter().copied());
         let members_after: Vec<u64> = ws.iter().collect();
         assert_eq!(members_after, members_before);
         assert_eq!(ws.epoch(), e);
@@ -111,6 +124,7 @@ fn test_multiple_operations_across_epochs() {
     assert_eq!(ws.operation_count(), 0);
 
     // Epoch 1: new operations 40, 50
+    add_voters(&mut ws, 1..=5u64);
     for op in [40u64, 50] {
         ws.ack(1, op);
         ws.ack(2, op);
@@ -149,9 +163,8 @@ fn test_partition_independent_witness_sets() {
 #[test]
 fn test_post_merge_quorum_requires_reack_for_new_ops() {
     // 5 initial witnesses, majority = 3.
-    // Ack 4 for op 100 (headroom). Then add 2 more witnesses (total 7,
-    // majority = 4) and verify old ops survive and new ops reach quorum
-    // after sufficient re-acking.
+    // Ack 4 for op 100 (headroom). Then replace the voter snapshot with 7
+    // voters, which clears stale acks before new ops can reach quorum.
     let mut ws = make_ws_with_epoch(5, QuorumThreshold::StrictMajority, 0);
 
     // Build headroom: 4 of 5 for op 100
@@ -161,12 +174,14 @@ fn test_post_merge_quorum_requires_reack_for_new_ops() {
     ws.ack(4, 100);
     assert!(ws.has_quorum(100));
 
-    // Merge: add 2 new witnesses (total now 7, majority = 4)
-    ws.add_witness(6);
-    ws.add_witness(7);
+    // Merge: install 2 new voters (total now 7, majority = 4)
+    install_voters(&mut ws, 1..=7u64);
+    assert!(ws.add_witness(6));
+    assert!(ws.add_witness(7));
 
-    // Op 100 still has 4 acks of 7 → quorum preserved
-    assert!(ws.has_quorum(100));
+    // Membership replacement invalidates op 100's prior acks.
+    assert_eq!(ws.ack_count(100), 0);
+    assert!(!ws.has_quorum(100));
 
     // New op 200: need 4 of 7. Ack 4 nodes.
     ws.ack(1, 200);
@@ -208,9 +223,11 @@ fn test_deterministic_behavior_after_epoch_reset() {
         ws.ack(2, 10);
         ws.ack(3, 10);
         ws.advance_epoch(1);
+        add_voters(ws, 1..=5u64);
         ws.ack(1, 20);
         ws.ack(2, 20);
         ws.advance_epoch(2);
+        add_voters(ws, 1..=5u64);
         ws.ack(1, 30);
         ws.ack(2, 30);
         ws.ack(3, 30);
@@ -297,9 +314,7 @@ fn test_large_operation_ids() {
 #[test]
 fn test_large_node_ids() {
     let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-    ws.add_witness(u64::MAX);
-    ws.add_witness(u64::MAX - 1);
-    ws.add_witness(0);
+    add_voters(&mut ws, [u64::MAX, u64::MAX - 1, 0]);
     assert_eq!(ws.len(), 3);
     ws.ack(u64::MAX, 1);
     ws.ack(u64::MAX - 1, 1);

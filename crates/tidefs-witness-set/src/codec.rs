@@ -6,6 +6,7 @@
 use crate::types::WitnessEntry;
 use crate::witness_set::{QuorumThreshold, WitnessSet};
 use tidefs_binary_schema_core::{U32Le, U64Le};
+use tidefs_membership_epoch::{EpochId, MemberId};
 
 /// Codec error variants.
 #[derive(Debug, PartialEq, Eq)]
@@ -106,13 +107,19 @@ impl WitnessSetCodec {
         }
         let wc = u32::from(U32Le::from_le_bytes(buf[pos..pos + 4].try_into().unwrap())) as usize;
         pos += 4;
+        let mut witness_ids = Vec::with_capacity(wc);
         for _ in 0..wc {
             if pos + 8 > buf.len() {
                 return Err(CodecError::BufferUnderrun);
             }
             let id = u64::from(U64Le::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()));
-            ws.add_witness(id);
+            witness_ids.push(id);
             pos += 8;
+        }
+        let voter_ids: Vec<MemberId> = witness_ids.iter().copied().map(MemberId::new).collect();
+        ws.install_voter_ids_for_epoch(EpochId::new(epoch), &voter_ids);
+        for id in witness_ids {
+            ws.add_witness(id);
         }
 
         if pos + 4 > buf.len() {
@@ -227,6 +234,14 @@ mod tests {
     use super::*;
     use crate::types::{AckKind, NodeId, ObjectId, TxgId};
 
+    fn add_voters(ws: &mut WitnessSet, ids: &[u64]) {
+        let voter_ids: Vec<MemberId> = ids.iter().copied().map(MemberId::new).collect();
+        ws.install_voter_ids_for_epoch(EpochId::new(ws.epoch()), &voter_ids);
+        for id in ids {
+            assert!(ws.add_witness(*id), "voter {id} must be accepted");
+        }
+    }
+
     // -- WitnessSet codec ------------------------------------------------
 
     #[test]
@@ -242,9 +257,7 @@ mod tests {
     #[test]
     fn test_witness_set_codec_with_witnesses() {
         let mut ws = WitnessSet::new(QuorumThreshold::SuperMajority);
-        ws.add_witness(10);
-        ws.add_witness(20);
-        ws.add_witness(30);
+        add_voters(&mut ws, &[10, 20, 30]);
         let enc = WitnessSetCodec::encode_to_vec(&ws);
         let dec = WitnessSetCodec::decode(&enc).unwrap();
         assert_eq!(dec.len(), 3);
@@ -298,9 +311,7 @@ mod tests {
     #[test]
     fn test_witness_set_codec_roundtrip_with_acks() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        for id in 1..=5u64 {
-            ws.add_witness(id);
-        }
+        add_voters(&mut ws, &[1, 2, 3, 4, 5]);
         ws.ack(1, 100);
         ws.ack(2, 100);
         ws.ack(3, 100);
@@ -321,9 +332,7 @@ mod tests {
     #[test]
     fn test_witness_set_codec_roundtrip_epoch_and_exact_threshold() {
         let mut ws = WitnessSet::with_epoch(QuorumThreshold::Exact(2), 42);
-        ws.add_witness(10);
-        ws.add_witness(20);
-        ws.add_witness(30);
+        add_voters(&mut ws, &[10, 20, 30]);
         ws.ack(10, 1);
         ws.ack(20, 1);
 
@@ -338,8 +347,7 @@ mod tests {
     #[test]
     fn test_witness_set_codec_roundtrip_empty_operations() {
         let mut ws = WitnessSet::new(QuorumThreshold::SuperMajority);
-        ws.add_witness(5);
-        ws.add_witness(6);
+        add_voters(&mut ws, &[5, 6]);
         assert_eq!(ws.operation_count(), 0);
 
         let enc = WitnessSetCodec::encode_to_vec(&ws);
@@ -352,9 +360,7 @@ mod tests {
     #[test]
     fn test_witness_set_codec_roundtrip_operations_preserved() {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        for id in 1..=7u64 {
-            ws.add_witness(id);
-        }
+        add_voters(&mut ws, &[1, 2, 3, 4, 5, 6, 7]);
         ws.ack(1, 10);
         ws.ack(2, 10);
         ws.ack(3, 10);
