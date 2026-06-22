@@ -182,6 +182,261 @@ Normal `cargo check --workspace` must not require optional formal-verification
 tools. If a proof command is added before tools are available everywhere, it
 must emit an honest skipped-tool receipt, not a fake pass.
 
+
+## Verification Surface Survey
+
+This survey catalogues every verification, model, trace, crash, performance,
+adapter, and offload surface found in the repository as of 2026-06-22. The
+survey scope is informed by `docs/workspace-package-classification.md`, root
+`Cargo.toml`, live crate sources, and the claim registry at
+`validation/claims.toml`.
+
+### Model Surfaces
+
+| Surface | Crate / Path | Role | Description |
+| --- | --- | --- | --- |
+| Deterministic VFS model | `crates/tidefs-model-core` | `proof-harness` | Pure in-memory `ModelFs` with `ModelPath`, `ModelRequest`, deterministic `ModelFingerprint`, and `ModelRunReceipt`. Accepts contract request envelopes from `tidefs-types-vfs-core`. Owns no runtime storage. |
+| Distributed safety model | `crates/tidefs-distributed-model-check` | `proof-harness` | Bounded model check of membership epochs, leases, quorum writes, placement receipts, and rebuild safety invariants. Emits `DistributedSafetyReceipt` for claim coverage. |
+| Replication model | `crates/tidefs-replication-model` | `product-code` | Canonical replica-set state machines (flow, chunk, durability), placement intent, and failure-domain classification. Consumed by all multi-node replication crates. |
+
+### Trace Surfaces
+
+| Surface | Crate / Path | Role | Description |
+| --- | --- | --- | --- |
+| Trace oracle | `crates/tidefs-trace-oracle` | `proof-harness` | JSONL trace replay against `LocalFileSystem`, model/runtime comparison, minimization, and `TraceArtifactManifest` output. Golden corpus in `traces/`. |
+| Trace artifact schema | `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md` | schema authority | Defines the artifact manifest schema v1 for trace-oracle outputs: required fields, input/output descriptors, claims coverage, and CI artifact references. |
+| Trace protocol | `crates/tidefs-trace-oracle/src/protocol.rs` | wire format | Pool and cluster trace schemas (`POOL_TRACE_SCHEMA`, `CLUSTER_TRACE_SCHEMA`), op names, trace version. |
+| Trace comparison backend | `crates/tidefs-trace-oracle/src/backend.rs` | comparison engine | `BackendStep`, `TraceComparison`, model vs. local-runtime comparison logic. |
+| Trace minimization | `crates/tidefs-trace-oracle/src/minimize.rs` | reproducer | `MinimizedManifestEntry` sidecar for minimized trace failures. |
+
+### Crash-Oracle Surfaces
+
+| Surface | Crate / Path | Role | Description |
+| --- | --- | --- | --- |
+| Crash oracle (model) | `crates/tidefs-crash-oracle` | `proof-harness` | Model-first `CrashBoundary` enumeration covering intent-append through cache-evict. Produces crash matrices with `CrashClassification` outcomes. Claim ids include `storage.write_fsync.crash_safety.v1`, `namespace.rename.atomicity.v1`. |
+| Crash runtime report | `crates/tidefs-crash-oracle/src/runtime_report.rs` | runtime schema | Local runtime crash report schema and verifier, distinct from model-only crash matrices. |
+| Intent-log replay matrix | `crates/tidefs-crash-oracle/src/intent_log_replay_matrix.rs` | recovery matrix | Feature-gated (`intent-log-replay`) module for intent-log crash/recovery matrix generation. |
+| Validation crash recovery | `crates/tidefs-validation/src/crash_recovery.rs` | validation helper | Mounted crash/recovery test helpers. |
+| Local VFS runtime crash | `crates/tidefs-validation/src/local_vfs_runtime_crash_artifact.rs` | runtime artifact | Local VFS runtime crash artifact collection and verification. |
+| kmod crash consistency | `crates/tidefs-validation/src/kmod_crash_consistency_e2e.rs` | kernel validation | Kernel-module end-to-end crash consistency validation. |
+
+### Performance Surfaces
+
+| Surface | Crate / Path | Role | Description |
+| --- | --- | --- | --- |
+| Performance contract | `crates/tidefs-performance-contract` | `product-code` | Typed `WorkClass`, `ResourceDomain`, `WriteAdmissionState`, `BudgetedQueue`, and deterministic `OracleConfig`/`OracleOutcome`. Pure accounting and oracle signal. |
+| Performance gate | `crates/tidefs-validation/src/performance_gate.rs` | validation gate | Performance gate helpers for validation runs. |
+| No-hidden-queues | `validation/performance/no-hidden-queues.toml` | registry | Queue registry checking configuration. |
+| Performance xtask | `xtask check-no-hidden-queues` | policy tooling | Tooling gate for queue visibility enforcement. |
+
+### Offload Surfaces
+
+| Surface | Crate / Path | Role | Description |
+| --- | --- | --- | --- |
+| Offload core | `crates/tidefs-offload-core` | `product-code` | `OffloadDescV1`, `OffloadCompletionV1`, `BufferLeaseV1`, `CpuReferenceBackend`. Non-authoritative; CPU backend is semantic reference for future accelerators. |
+| Offload validation | `crates/tidefs-offload-core` (tests) | unit validation | Inline test suite for descriptor encoding, completion validation, lease matching, and CPU reference execution. |
+
+### Adapter Environment Model Surfaces
+
+| Surface | Crate / Path | Role | Description |
+| --- | --- | --- | --- |
+| FUSE env model | `crates/tidefs-env-fuse-model` | `proof-harness` | Pure FUSE connection/request lifecycle model. Translates semantic FUSE requests into TideFS request-contract envelopes, replays through `tidefs-model-core`. Model-only evidence; not runtime xfstests replacement. |
+| uBLK env model | `crates/tidefs-env-ublk-model` | `proof-harness` | Bounded uBLK qid/tag lifecycle model. Records slot ownership, generates legal uBLK I/O submissions as contract envelopes, enforces exactly-once completion per request token. |
+
+### Validation and Tier Surfaces
+
+| Surface | Crate / Path | Role | Description |
+| --- | --- | --- | --- |
+| Validation crate | `crates/tidefs-validation` | `proof-harness` | Central userspace validation support: `ValidationTier` enum (T0-T7), `ValidationRow`, `EvidenceArtifactManifest`, crash recovery, kernel validation matrix, kernel fsync evidence, xfstests evidence, uBLK artifacts, smoke tests, and trace helpers. |
+| Validation schema | `crates/tidefs-validation/src/validation_schema.rs` | schema | Canonical `ValidationTier` enum, `ValidationRow`, `ValidationBackend`. |
+| Evidence artifact manifest | `crates/tidefs-validation/src/evidence_artifact_manifest.rs` | manifest | Reusable `EvidenceArtifactManifest` with `claim_id`, `evidence_class`, `validation_tier`, `content_digest`, and `blocking_issues`. |
+| Validation status | `crates/tidefs-validation/src/validation_status.rs` | status | `ValidationStatus` records for pass/fail/skip/deferred outcomes. |
+| Kernel validation matrix | `crates/tidefs-validation/src/kernel_validation_matrix.rs` | kernel validation | Mounted kernel VFS validation matrix helpers. |
+| Kernel fsync evidence | `crates/tidefs-validation/src/kernel_fsync_evidence.rs` | kernel evidence | Kernel fsync durability evidence collection. |
+| Kernel pagecache writeback | `crates/tidefs-validation/src/kernel_pagecache_writeback_validation.rs` | kernel validation | Page-cache writeback validation. |
+| xfstests evidence manifest | `crates/tidefs-validation/src/xfstests_evidence_manifest.rs` | xfstests | xfstests run evidence manifest collection. |
+| xfstests tiering | `crates/tidefs-validation/src/xfstests_tiering.rs` | xfstests | xfstests tiering classification. |
+| uBLK completion artifact | `crates/tidefs-validation/src/ublk_completion_artifact.rs` | uBLK | uBLK completion validation artifact. |
+| uBLK started export | `crates/tidefs-validation/src/ublk_started_export_admission_artifact.rs` | uBLK | uBLK export admission artifact. |
+| Two-node harness | `crates/tidefs-two-node-harness` | `proof-harness` | Deterministic two-node transport harness for distributed validation: identity exchange, BLAKE3-authenticated messages, chunk shipping, deterministic teardown. |
+| FUSE integrity (two-node) | `crates/tidefs-validation/src/two_node_harness_fuse_integrity.rs` | harness test | Two-node harness FUSE integrity validation. |
+
+### Claim and Evidence Aggregation Surfaces
+
+| Surface | Crate / Path | Role | Description |
+| --- | --- | --- | --- |
+| Claim registry | `validation/claims.toml` | registry authority | Registry of claim ids, statuses, required evidence classes, blockers, and generated documentation. |
+| Claim ledger | `crates/tidefs-claim-ledger` | `policy-tooling` | Policy-tooling surface for claim management. |
+| Claims gate policy | `docs/CLAIMS_GATE_POLICY.md` | policy guardrail | Publishing-facing capability wording enforcement via `xtask check-claims-gate`. |
+| Claims gate xtask | `xtask check-claims-gate`, `xtask validate-claim` | policy tooling | Enforceable CI gate and per-claim validation. |
+| Contract codec xtask | `xtask check-contract-codecs` | policy tooling | Golden-vector contract codec validation. |
+| Workspace policy xtask | `xtask check-workspace-policy` | policy tooling | Package role classification enforcement. |
+
+## Evidence-Chain Model
+
+TFR-021 records that the verification spine needs one evidence chain instead of
+separate request-contract, model, trace, crash, performance, adapter, and
+offload systems. This section compares two evidence-chain models and records
+the chosen design.
+
+### Model A: Unified Evidence Manifest with Typed Claim Anchors (chosen)
+
+All evidence artifacts carry a typed manifest that records the claim id,
+evidence class, validation tier, source crate, artifact content digest, and
+blocking issues. The central claims registry (`validation/claims.toml`)
+defines which evidence classes are required for each claim. The claims-gate
+tooling (`xtask check-claims-gate`, `xtask validate-claim`) validates that
+all required evidence classes exist with matching artifacts.
+
+Evidence flow:
+
+```
+Model / Trace / Crash / Performance / Adapter / Offload
+             |
+             v
+     Evidence Artifact (JSON/TOML/JSONL + manifest)
+             |
+             v
+    claims.toml registry (required evidence classes)
+             |
+             v
+    xtask check-claims-gate / validate-claim
+             |
+             v
+    docs/CLAIM_REGISTRY.md (generated, CI-enforced)
+```
+
+Benefits:
+
+- Single evidence manifest schema (`EvidenceArtifactManifest` for
+  claim support, `TraceArtifactManifest` for trace-oracle outputs).
+- Machine-checkable claim closure: `validate-claim` rejects claims with
+  missing evidence classes or stale artifacts.
+- Consistent evidence-class vocabulary across model, runtime, and
+  distributed artifacts.
+- No manual assembly step between evidence generation and claim validation.
+
+Drawbacks:
+
+- All evidence producers must adopt the manifest format (though the schema
+  is intentionally minimal and crate-agnostic).
+- Central claims registry requires deliberate update discipline; registry
+  drift without evidence is caught by `check-claims-gate`.
+
+### Model B: Per-System Artifact Bundles with Manual Assembly (rejected)
+
+Each verification system produces its own artifact format (crash matrices in
+one JSON shape, trace artifacts in another, performance outcomes in TOML,
+adapter model evidence in yet another). A human reviewer assembles these into
+a claim review document that states whether the claim is satisfied.
+
+Benefits:
+
+- Each system is independently evolvable without a shared manifest contract.
+- No central registry bottleneck.
+
+Drawbacks (why rejected):
+
+- No automated evidence-chain validation; manual assembly is error-prone.
+- Impossibility of machine-checking that all required evidence classes exist
+  for a claim.
+- Evidence fragmentation makes it hard to see verification coverage gaps
+  across the program.
+- This is the pre-existing scattered approach that TFR-021 identifies as a
+  problem.
+
+### Chosen Model and Binding Detail
+
+Model A is chosen. The unified evidence chain is the program authority,
+enforced through the claims-gate tooling. The following bindings define how
+each verification domain feeds into the chain:
+
+**Model-to-trace binding.** `tidefs-model-core` produces deterministic
+`ModelFingerprint` values from contract request envelopes.
+`tidefs-trace-oracle` replays model-generated or captured traces and compares
+model fingerprints against local-runtime fingerprints. The binding is through
+`tidefs-types-vfs-core` request envelopes and `ModelFingerprint` (BLAKE3-256).
+The trace oracle records comparison outcomes in `TraceArtifactManifest`
+entries with `evidence_class: "model-only"` or `"harness-only"`.
+
+**Trace-oracle artifact schema.** Defined in
+`docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md` and implemented in
+`crates/tidefs-trace-oracle/src/artifact_manifest.rs`. Every trace replay or
+comparison produces a `TraceArtifactManifest` recording input digest, output
+fingerprint, mismatches, backend, validation tier, evidence class, and claim
+coverage. The manifest distinguishes model-only evidence (insufficient for
+runtime crash claims) from runtime evidence (requires CI artifact reference).
+
+**Crash-oracle integration.** `tidefs-crash-oracle` produces model crash
+matrices (`CrashBoundary` times `CrashClassification`) and runtime crash reports.
+Model matrices are `source-model` evidence for `model-crash-matrix` classes.
+Runtime crash reports from mounted backends produce `mounted-userspace`
+evidence for `runtime-crash-oracle` classes. The crash-oracle's claim ids
+(e.g. `local.vfs.write_fsync_crash.v1`) map to `validation/claims.toml`
+entries that name their required evidence classes.
+
+**Performance-contract binding.** `tidefs-performance-contract` provides
+deterministic `OracleOutcome` values from `OracleConfig` inputs, proving
+that admission and scheduling protect foreground work under bounded
+background pressure. Performance oracle outcomes are `harness-only` evidence
+for `admission-budget` or `isolation-model` evidence classes. Runtime
+performance claims (queue-depth, dirty-debt caps) require `mounted-userspace`
+or higher-tier artifacts. The `no-hidden-queues` registry and
+`xtask check-no-hidden-queues` gate provide queue-visibility evidence
+independent of oracle outcomes.
+
+**Adapter model evidence.** `tidefs-env-fuse-model` and
+`tidefs-env-ublk-model` produce model-only evidence that adapter request
+translation is legal: FUSE operations refine into TideFS request-contract
+envelopes without semantic distortion, and uBLK qid/tag slots enforce
+exactly-once completion per request token. This evidence is `source-model`
+tier and feeds into `claims-gate-review` classes. Adapter models do not
+validate mounted runtime behavior.
+
+**Offload staging.** `tidefs-offload-core` provides the `offload.ready.
+non_authoritative.v1` claim with descriptor validation, buffer lease matching,
+completion validation, and CPU reference kernels. Offload evidence is
+`harness-only` at the descriptor/lease/completion level; future accelerator
+conformance (GPU, FPGA, DMA, RDMA) requires the same evidence classes as the
+CPU reference path plus accelerator-specific validation artifacts.
+Offload results are performance mechanism evidence only and must never be
+treated as storage semantics authority.
+
+## Evidence Producer and Consumer Map
+
+### Primary Evidence Producers
+
+These crates are the canonical evidence sources. Each produces artifacts with
+typed manifests that feed the claims registry.
+
+| Producer crate | Role | Evidence produced | Manifest type | Validation tier |
+| --- | --- | --- | --- | --- |
+| `tidefs-model-core` | `proof-harness` | `ModelRunReceipt`, deterministic fingerprint | `ModelRunReceipt` (JSON) | `source-model` |
+| `tidefs-trace-oracle` | `proof-harness` | Trace replay/comparison artifacts | `TraceArtifactManifest` | `source-model` or `harness-only` |
+| `tidefs-crash-oracle` | `proof-harness` | Crash matrices, runtime crash reports | `EvidenceArtifactManifest` | `source-model` or `mounted-userspace` |
+| `tidefs-performance-contract` | `product-code` | Admission/oracle outcomes | `EvidenceArtifactManifest` | `harness-only` |
+| `tidefs-offload-core` | `product-code` | Descriptor/completion/lease validation, CPU reference results | `EvidenceArtifactManifest` | `harness-only` |
+| `tidefs-env-fuse-model` | `proof-harness` | FUSE adapter-to-contract refinement evidence | `EvidenceArtifactManifest` | `source-model` |
+| `tidefs-env-ublk-model` | `proof-harness` | uBLK qid/tag lifecycle evidence | `EvidenceArtifactManifest` | `source-model` |
+| `tidefs-distributed-model-check` | `proof-harness` | `DistributedSafetyReceipt` | `EvidenceArtifactManifest` | `source-model` |
+| `tidefs-two-node-harness` | `proof-harness` | Two-node transport determinism evidence | `EvidenceArtifactManifest` | `harness-only` |
+| `tidefs-validation` | `proof-harness` | Mounted runtime artifacts (kernel VFS, FUSE, uBLK, xfstests) | `EvidenceArtifactManifest` | `mounted-userspace` through `multi-process-distributed` |
+
+### Primary Evidence Consumers and Aggregators
+
+These crates and tools consume evidence artifacts and aggregate them into
+claim validation outcomes.
+
+| Consumer | Role | Consumes | Output |
+| --- | --- | --- | --- |
+| `validation/claims.toml` | registry authority | Evidence manifest references | Claim status, required evidence classes |
+| `tidefs-claim-ledger` | `policy-tooling` | Evidence manifests | Claim ledger records |
+| `xtask check-claims-gate` | policy tooling | Claims registry + evidence manifests | CI pass/fail, drift detection |
+| `xtask validate-claim <id>` | policy tooling | Claims registry + single claim evidence | Per-claim validation receipt |
+| `docs/CLAIM_REGISTRY.md` | generated doc | Claims registry (generated) | Human-readable claim status |
+| `docs/CLAIMS_GATE_POLICY.md` | policy guardrail | All of the above | Publishing-facing wording enforcement |
+| `tidefs-validation::evidence_artifact_manifest` | validation helper | Evidence manifest files | Manifest validation |
+
 ## Adapter Boundary
 
 Adapters may decode external protocols, validate external shape, map external
@@ -297,3 +552,91 @@ This program does not say TideFS has completed:
 Those can become present-tense claims only through tracked issues, current
 evidence artifacts, validation-tier review, claim registry updates, and
 `validate-claim` receipts.
+
+
+## Follow-Up Implementation Issue Map
+
+The evidence-chain design recorded in this document defines a spine that
+existing and planned follow-up issues implement. Each follow-up has a
+non-overlapping write set and a named dependency on this design document.
+
+### Existing Follow-Up Issues (already open)
+
+| Issue | Title | Write set | Depends on this design? |
+| ---: | --- | --- | --- |
+| #809 | evidence-chain-format | Evidence manifest format, schema, and validation | Yes -- implements the unified manifest schema |
+| #810 | claims-gate-spine: consume unified evidence manifests | Claims-gate tooling consumes unified manifests | Yes -- consumes the evidence chain |
+| #811 | adapter-model-evidence-chain | Adapter model evidence manifests and claim binding | Yes -- adapter models produce unified evidence |
+| #818 | tidefs-crash-oracle: runtime release claims | Runtime crash-oracle artifacts for release claims | Yes -- crash evidence feeds the chain |
+| #820 | tidefs-distributed-model-check: release claims | Distributed safety evidence for release claims | Yes -- distributed evidence feeds the chain |
+| #821 | tidefs-env-fuse-model: runtime release claims | FUSE env model runtime evidence | Yes -- adapter evidence feeds the chain |
+| #822 | tidefs-env-ublk-model: runtime release claims | uBLK env model runtime evidence | Yes -- adapter evidence feeds the chain |
+| #827 | tidefs-model-core: release claims | Model-core evidence for release claims | Yes -- model evidence feeds the chain |
+| #828 | tidefs-offload-core: release claims | Offload-core evidence for release claims | Yes -- offload evidence feeds the chain |
+| #830 | tidefs-performance-contract: release claims | Performance-contract runtime evidence | Yes -- performance evidence feeds the chain |
+| #835 | tidefs-two-node-harness: release claims | Two-node harness evidence for release claims | Yes -- harness evidence feeds the chain |
+
+### New Follow-Up Issues Needed
+
+These gaps were identified during the #1066 survey. Each should become a
+prepared GitHub issue with acceptance criteria, expected write set, and
+non-overlap constraints before implementation begins.
+
+| Proposed issue | Area | Rationale |
+| --- | --- | --- |
+| Trace-oracle runtime artifact integration | `tidefs-trace-oracle` | The trace oracle has model and harness-only comparison artifacts. Runtime trace comparison through a mounted backend with CI artifact references (as described in `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`) requires a dedicated issue to wire mounted-backend replay, capture CI artifact refs, and produce runtime-tier `TraceArtifactManifest` entries. |
+| Unified manifest adoption across all producer crates | Evidence chain | Each evidence producer crate must adopt `EvidenceArtifactManifest` (or `TraceArtifactManifest` for trace-oracle) as its canonical output. This is a coordination issue that tracks per-crate manifest adoption slices; each slice is a sub-issue or checklist entry. |
+| Crash-oracle model-to-runtime bridge | `tidefs-crash-oracle` | The crash oracle has separate model and runtime report paths. The evidence chain needs an explicit bridge document or artifact that pairs a model crash matrix with its corresponding runtime crash report, proving the model boundary correctly predicted runtime behavior. |
+| Performance-contract runtime evidence class | `tidefs-performance-contract` | The performance contract currently has `harness-only` oracle outcomes. A distinct evidence class for `runtime-admission-budget` (mounted-userspace or higher) is needed before performance isolation claims can advance beyond harness-only. |
+| Offload accelerator conformance vectors | `tidefs-offload-core` | Future GPU, FPGA, DMA, RDMA, and kernel-integrated offload paths need conformance vectors that mirror the CPU reference path. This issue defines the evidence class and artifact schema for non-CPU offload validation. |
+| Adapter model lifecycle coverage expansion | `tidefs-env-fuse-model`, `tidefs-env-ublk-model` | Both adapter models cover a bounded set of operations and lifecycles. The follow-up expands coverage to the full FUSE and uBLK operation sets specified in the request contract, with named-gap allowlisting for unsupported operations. |
+
+### Issue Creation Protocol
+
+New follow-up issues must:
+
+- Reference this document and issue #1066 as the design authority.
+- Name the expected write set (crates, docs, and `validation/claims.toml`
+  entries affected).
+- State the evidence class and validation tier required.
+- Declare non-overlap with the existing issues mapped above.
+- Be prepared (acceptance criteria, behavior, write set, validation tier)
+  before implementation starts.
+
+Issue creation is out of scope for this design slice. The map above is the
+authoritative follow-up list. Workers picking up these follow-ups should
+create the GitHub issues using the protocol defined here.
+
+## Design Decision Record
+
+This document was updated for issue #1066 on 2026-06-22 with the following
+decisions recorded:
+
+1. **Evidence chain**: Unified evidence manifest with typed claim anchors
+   (Model A), enforced through `validation/claims.toml` and claims-gate
+   tooling. Rejected: per-system artifact bundles with manual assembly
+   (Model B).
+2. **Evidence producers**: Eleven crates identified as primary evidence
+   producers (see Evidence Producer and Consumer Map above).
+3. **Evidence consumers**: Seven consumers/aggregators identified, with
+   `validation/claims.toml` as the authoritative registry.
+4. **Follow-up map**: Six new follow-up issue areas identified; eleven
+   existing follow-up issues (#809 through #835 range) are confirmed as
+   consumers of this design.
+5. **Non-claims**: The non-claims section is preserved and extended with
+   explicit boundaries for each producer crate:
+   - `tidefs-model-core` does not claim runtime storage correctness.
+   - `tidefs-crash-oracle` does not claim production crash safety without
+     runtime crash-oracle evidence.
+   - `tidefs-performance-contract` does not claim performance isolation
+     without runtime queue-depth evidence.
+   - `tidefs-offload-core` does not claim GPU/FPGA/DMA/RDMA acceleration.
+   - `tidefs-env-fuse-model` and `tidefs-env-ublk-model` do not claim
+     mounted runtime adapter correctness.
+   - `tidefs-distributed-model-check` does not claim distributed production
+     correctness.
+   - `tidefs-two-node-harness` does not claim multi-node distributed
+     production correctness.
+   - `tidefs-trace-oracle` does not claim runtime crash safety or
+     production performance regression detection without mounted-backend
+     CI artifacts.
