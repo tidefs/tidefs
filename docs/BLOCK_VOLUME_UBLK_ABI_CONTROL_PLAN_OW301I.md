@@ -49,8 +49,7 @@ tidefs-xtask check-block-volume-ublk-abi
 
 ## Relationship To Parent Gates
 
-This is a prerequisite for #30 / OW-301. It is below the #50 / PC-005 and #57 /
-PC-012 Linux block-device acceptance gates: it defines and tests the typed ABI
+This is a prerequisite for OW-301. It is below the PC-012 Linux block-device acceptance gates: it defines and tests the typed ABI
 and does not create `/dev/ublkbN`.
 
 OW-301H decides whether a host can admit live `ublk` work. OW-301I defines the

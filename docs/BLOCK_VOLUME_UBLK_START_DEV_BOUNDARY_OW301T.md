@@ -78,11 +78,11 @@ tidefs-xtask check-block-volume-ublk-start-dev-boundary
 
 ## Relationship To Parent Gates
 
-This follows #100 / OW-301S. OW-301S proves guarded SET_PARAMS with cleanup;
+This follows OW-301S. OW-301S proves guarded SET_PARAMS with cleanup;
 OW-301T adds the real START_DEV command shape and prevents unsafe START_DEV
 submission until the real ublk data-queue FETCH_REQ prerequisite exists.
 
-This remains below #30 / OW-301, #50 / PC-005, and #57 / PC-012. It is not a
+This remains below OW-301 and PC-012. It is not a
 block-device acceptance harness.
 
 ## Non-Claims

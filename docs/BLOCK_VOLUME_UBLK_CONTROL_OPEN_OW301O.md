@@ -44,12 +44,12 @@ tidefs-xtask check-block-volume-ublk-control-open
 
 ## Relationship To Parent Gates
 
-This follows #95 / OW-301N. OW-301N proves that block-volume semantics can run
+This follows OW-301N. OW-301N proves that block-volume semantics can run
 against a durable userspace backing file; OW-301O adds the real control-device
 admission/open boundary that a future live ublk runtime must pass before it can
 attempt attach/list/detach behavior.
 
-This remains below #30 / OW-301, #50 / PC-005, and #57 / PC-012. It is not
+This remains below OW-301 and PC-012. It is not
 harness.
 
 ## Non-Claims

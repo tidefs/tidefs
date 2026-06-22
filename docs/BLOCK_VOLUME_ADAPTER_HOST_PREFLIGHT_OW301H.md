@@ -41,8 +41,7 @@ tidefs-xtask check-block-volume-host-preflight
 
 ## Relationship To Parent Gates
 
-This is a prerequisite for #30 / OW-301. It is below the #50 / PC-005 and #57 /
-PC-012 Linux block-device acceptance gates: it records whether the host can
+This is a prerequisite for OW-301. It is below the PC-012 Linux block-device acceptance gates: it records whether the host can
 not create `/dev/ublkbN`.
 
 On hosts without Linux 7.0+ and `/dev/ublk-control`, the correct outcome is an

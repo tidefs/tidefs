@@ -54,11 +54,11 @@ tidefs-xtask check-block-volume-ublk-data-queue-open-boundary
 
 ## Relationship To Parent Gates
 
-This follows #102 / OW-301U. OW-301U source-binds FETCH_REQ readiness but
+This follows OW-301U. OW-301U source-binds FETCH_REQ readiness but
 requires live data-queue runtime ownership. OW-301V provides the guarded runtime
 open boundary that can satisfy that liveness input without submitting FETCH_REQ.
 
-This remains below #30 / OW-301, #50 / PC-005, and #57 / PC-012. It is not a
+This remains below OW-301 and PC-012. It is not a
 block-device acceptance harness.
 
 ## Non-Claims

@@ -45,10 +45,9 @@ claiming a live `ublk` export.
 
 ## Relationship To Parent Gates
 
-This is a prerequisite for #30 / OW-301. It provides queue/admission records and
+This is a prerequisite for OW-301. It provides queue/admission records and
 deterministic refusal behavior before any Linux export surface is admitted.
 
 ## Non-Claims
 
 This is not a ublk daemon, not a Linux block device, not a `/dev/ublk-control`
-It does not close #30, #50, or #57.

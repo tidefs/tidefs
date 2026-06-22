@@ -52,11 +52,11 @@ tidefs-xtask check-block-volume-ublk-fetch-req-submit-boundary
 
 ## Relationship To Parent Gates
 
-This follows #103 / OW-301V. OW-301V opens and owns the concrete `/dev/ublkcN`
+This follows OW-301V. OW-301V opens and owns the concrete `/dev/ublkcN`
 runtime after ADD_DEV; OW-301W uses that live runtime as the guard for submitting
 the required FETCH_REQ commands that a future START_DEV completion path needs.
 
-This remains below #30 / OW-301, #50 / PC-005, and #57 / PC-012. It is not a
+This remains below OW-301 and PC-012. It is not a
 block-device acceptance harness.
 
 ## Non-Claims

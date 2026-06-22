@@ -58,11 +58,11 @@ tidefs-xtask check-block-volume-ublk-fetch-req-readiness-boundary
 
 ## Relationship To Parent Gates
 
-This follows #101 / OW-301T. OW-301T source-binds START_DEV and refuses it
+This follows OW-301T. OW-301T source-binds START_DEV and refuses it
 until data queue readiness exists; OW-301U source-binds the first data-queue
 FETCH_REQ readiness primitive and makes runtime liveness part of that readiness.
 
-This remains below #30 / OW-301, #50 / PC-005, and #57 / PC-012. It is not a
+This remains below OW-301 and PC-012. It is not a
 block-device acceptance harness.
 
 ## Non-Claims
