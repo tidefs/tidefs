@@ -2998,6 +2998,7 @@ dependencies = [
  "tidefs-device-removal",
  "tidefs-encryption",
  "tidefs-intent-log",
+ "tidefs-local-object-store",
  "tidefs-pool-scan",
  "tidefs-types-pool-label-core",
 ]

@@ -4394,12 +4394,16 @@ mod tests {
         }
     }
 
-    fn create_regular_file_device(path: &Path) {
+    fn create_regular_file_device_with_size(path: &Path, size: u64) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
         let file = std::fs::File::create(path).unwrap();
-        file.set_len(2 * 1024 * 1024).unwrap();
+        file.set_len(size).unwrap();
+    }
+
+    fn create_regular_file_device(path: &Path) {
+        create_regular_file_device_with_size(path, 2 * 1024 * 1024);
     }
 
     fn regular_file_device_config(path: PathBuf) -> DeviceConfig {
@@ -4439,6 +4443,9 @@ mod tests {
         for idx in 0..pool.device_guids.len() {
             pool.device_guids[idx] = deterministic_device_guid(idx);
         }
+        pool.persisted_label_epoch = None;
+        pool.persist_active_labels_if_needed()
+            .expect("persist deterministic test device GUID labels");
     }
 
     #[test]
@@ -6644,13 +6651,29 @@ mod tests {
     fn create_persists_device_layout_and_open_uses_label_record() {
         let root = temp_dir("layout-label-reopen");
         let _ = std::fs::remove_dir_all(&root);
-        let config = single_device_config(&root);
+        let dev_path = root.join("pool.img");
+        create_regular_file_device_with_size(&dev_path, 300 * 1024 * 1024);
+        let config = PoolConfig {
+            name: "layout-label-reopen".into(),
+            root_path: root.clone(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: dev_path.clone(),
+                backing: DeviceBacking::RegularFileDev,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Block {
+                    path: dev_path.clone(),
+                },
+                encryption: None,
+                compression: None,
+            }],
+        };
         let mut options = test_options();
         options.max_segment_bytes = 16 * 1024;
         let custom_policy = DeviceLayoutPolicy::Custom {
-            data_segment_size: 2 * 1024 * 1024,
-            metadata_segment_size: 2 * 1024 * 1024,
-            journal_segment_size: 2 * 1024 * 1024,
+            data_segment_size: 1024 * 1024,
+            metadata_segment_size: 1024 * 1024,
+            journal_segment_size: 1024 * 1024,
         };
         let properties = PoolProperties {
             layout_policy: custom_policy,
@@ -6664,8 +6687,9 @@ mod tests {
             crate::device_layout::DeviceLayoutPolicyDiscriminant::Custom
         );
 
-        let label_path = label_file_path(&device_root_path(&config.devices[0]));
-        let label_bytes = fs::read(&label_path).unwrap();
+        let mut label_bytes = vec![0u8; pool_label::POOL_LABEL_SIZE];
+        let mut label_file = fs::File::open(device_root_path(&config.devices[0])).unwrap();
+        label_file.read_exact(&mut label_bytes).unwrap();
         let label = pool_label::decode_label(&label_bytes).unwrap();
         assert!(label.features_compat & features::DEVICE_LAYOUT_V1 != 0);
         let layout_bytes = pool_label::decode_device_layout_v1_bytes(&label_bytes)
