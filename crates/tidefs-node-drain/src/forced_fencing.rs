@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use crate::drain::{NodeDrain, NodeState};
+use crate::epoch_gate::DrainFenceEpochTransition;
 use serde::{Deserialize, Serialize};
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{EpochAdvanceError, EpochId, EpochTransitionBarrier, MemberId};
 use tidefs_replication_model::ReplicatedReceiptId;
 
 // ---------------------------------------------------------------------------
@@ -153,6 +154,13 @@ pub enum FencingError {
         presented: FenceToken,
         expected_min: FenceToken,
     },
+    /// Membership-epoch transition barrier could not be acquired.
+    EpochBarrierRefused {
+        node_id: MemberId,
+        from_epoch: EpochId,
+        to_epoch: EpochId,
+        reason: EpochAdvanceError,
+    },
     /// Maximum consecutive fences reached — operator intervention required.
     MaxFencesExceeded { node_id: MemberId, consecutive: u32 },
 }
@@ -187,6 +195,18 @@ impl std::fmt::Display for FencingError {
                     f,
                     "node {} presented fence token {} but minimum expected is {}",
                     node_id.0, presented.0, expected_min.0
+                )
+            }
+            Self::EpochBarrierRefused {
+                node_id,
+                from_epoch,
+                to_epoch,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "node {} forced fence refused: epoch transition {:?}->{:?} barrier acquisition failed: {:?}",
+                    node_id.0, from_epoch, to_epoch, reason
                 )
             }
             Self::MaxFencesExceeded {
@@ -230,6 +250,10 @@ pub struct ForcedFencing {
     /// Placement receipt ids that referenced the node at the time of
     /// the last fence, keyed by node_id. Captured for audit/recovery.
     placement_evidence: std::collections::BTreeMap<u64, Vec<ReplicatedReceiptId>>,
+    /// Membership-epoch transition barrier held while a forced fence advances.
+    epoch_barrier: EpochTransitionBarrier,
+    /// Active forced-fence transition guarded by `epoch_barrier`.
+    active_epoch_transition: Option<DrainFenceEpochTransition>,
 }
 
 impl ForcedFencing {
@@ -243,6 +267,8 @@ impl ForcedFencing {
             consecutive_fences: std::collections::BTreeMap::new(),
             fenced_nodes: std::collections::BTreeMap::new(),
             placement_evidence: std::collections::BTreeMap::new(),
+            epoch_barrier: EpochTransitionBarrier::new(),
+            active_epoch_transition: None,
         }
     }
 
@@ -256,6 +282,8 @@ impl ForcedFencing {
             consecutive_fences: std::collections::BTreeMap::new(),
             fenced_nodes: std::collections::BTreeMap::new(),
             placement_evidence: std::collections::BTreeMap::new(),
+            epoch_barrier: EpochTransitionBarrier::new(),
+            active_epoch_transition: None,
         }
     }
 
@@ -302,6 +330,32 @@ impl ForcedFencing {
         self.fenced_nodes.keys().copied().collect()
     }
 
+    /// Returns true while forced fencing is holding the membership epoch
+    /// transition barrier and lease acquisition must be refused.
+    #[must_use]
+    pub fn lease_acquisition_blocked(&self) -> bool {
+        self.epoch_barrier.is_blocked()
+    }
+
+    /// Return the pending membership epoch targeted by the held barrier.
+    #[must_use]
+    pub fn pending_epoch(&self) -> Option<EpochId> {
+        self.epoch_barrier.pending_epoch()
+    }
+
+    /// Return the active forced-fence epoch transition, if one is held.
+    #[must_use]
+    pub fn active_epoch_transition(&self) -> Option<DrainFenceEpochTransition> {
+        self.active_epoch_transition
+    }
+
+    /// Release the forced-fence epoch barrier after the membership runtime
+    /// commits or aborts the transition.
+    pub fn release_epoch_barrier(&mut self) {
+        self.epoch_barrier.release();
+        self.active_epoch_transition = None;
+    }
+
     // -----------------------------------------------------------------------
     // Fencing lifecycle
     // -----------------------------------------------------------------------
@@ -317,20 +371,14 @@ impl ForcedFencing {
         node_id: MemberId,
         trigger: FenceTrigger,
         drain: &mut NodeDrain,
-        current_epoch: u64,
+        from_epoch: u64,
     ) -> Result<FenceToken, FencingError> {
         let placement_evidence = drain
             .evacuation_receipt()
             .map(|r| r.placement_receipt_refs.clone())
             .unwrap_or_default();
 
-        self.fence_with_placement_evidence(
-            node_id,
-            trigger,
-            drain,
-            current_epoch,
-            placement_evidence,
-        )
+        self.fence_with_placement_evidence(node_id, trigger, drain, from_epoch, placement_evidence)
     }
 
     /// Perform a forced fence while recording explicit placement evidence
@@ -344,12 +392,40 @@ impl ForcedFencing {
         node_id: MemberId,
         trigger: FenceTrigger,
         drain: &mut NodeDrain,
-        current_epoch: u64,
+        from_epoch: u64,
         placement_evidence: Vec<ReplicatedReceiptId>,
     ) -> Result<FenceToken, FencingError> {
         let nid = node_id.0;
 
-        // Check eligibility
+        let consecutive = self.validate_fence_eligibility(node_id, drain)?;
+        let transition = DrainFenceEpochTransition::next(node_id, EpochId::new(from_epoch));
+        let barrier_hold = transition
+            .acquire(&mut self.epoch_barrier)
+            .map_err(|reason| FencingError::EpochBarrierRefused {
+                node_id,
+                from_epoch: transition.from_epoch(),
+                to_epoch: transition.to_epoch(),
+                reason,
+            })?;
+        self.active_epoch_transition = Some(barrier_hold.transition());
+
+        Ok(self.apply_fence_after_barrier(
+            nid,
+            trigger,
+            drain,
+            transition.to_epoch(),
+            placement_evidence,
+            consecutive,
+        ))
+    }
+
+    fn validate_fence_eligibility(
+        &self,
+        node_id: MemberId,
+        drain: &NodeDrain,
+    ) -> Result<u32, FencingError> {
+        let nid = node_id.0;
+
         if self.is_fenced(node_id) {
             let (token, _) = self.fenced_nodes[&nid];
             return Err(FencingError::AlreadyFenced { node_id, token });
@@ -363,7 +439,6 @@ impl ForcedFencing {
             });
         }
 
-        // Check consecutive fence limit
         let consecutive = self.consecutive_fences.get(&nid).copied().unwrap_or(0) + 1;
         if consecutive > self.config.max_consecutive_fences {
             return Err(FencingError::MaxFencesExceeded {
@@ -372,7 +447,18 @@ impl ForcedFencing {
             });
         }
 
-        // Increment the fence token
+        Ok(consecutive)
+    }
+
+    fn apply_fence_after_barrier(
+        &mut self,
+        nid: u64,
+        trigger: FenceTrigger,
+        drain: &mut NodeDrain,
+        fenced_epoch: EpochId,
+        placement_evidence: Vec<ReplicatedReceiptId>,
+        consecutive: u32,
+    ) -> FenceToken {
         let current_token = self.tokens.get(&nid).copied().unwrap_or(FenceToken::ZERO);
         let new_token = current_token.next();
         self.tokens.insert(nid, new_token);
@@ -385,7 +471,7 @@ impl ForcedFencing {
         // event carries the last committed placement evidence known for the
         // node. This is used for post-fence audit and recovery.
         self.record_placement_evidence(nid, placement_evidence);
-        self.fenced_nodes.insert(nid, (new_token, current_epoch));
+        self.fenced_nodes.insert(nid, (new_token, fenced_epoch.0));
 
         // Record stats
         self.stats.record_fence(trigger);
@@ -393,7 +479,7 @@ impl ForcedFencing {
         // A rebuild will be triggered externally via placement-runtime
         self.stats.record_rebuild();
 
-        Ok(new_token)
+        new_token
     }
 
     /// Validate a fence token presented by a node attempting to rejoin.
@@ -570,6 +656,8 @@ mod tests {
             .unwrap();
         assert_eq!(token.value(), 1);
         assert!(ff.is_fenced(node(1)));
+        assert!(ff.lease_acquisition_blocked());
+        assert_eq!(ff.pending_epoch(), Some(EpochId::new(6)));
         assert_eq!(ff.stats().nodes_fenced, 1);
         assert_eq!(ff.stats().fence_triggers_manual, 1);
         assert_eq!(ff.stats().rebuilds_triggered, 1);
@@ -593,6 +681,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(token.value(), 1);
+        assert!(ff.lease_acquisition_blocked());
         assert!(ff.has_placement_evidence(node(12)));
         assert_eq!(ff.placement_evidence_for(node(12)).unwrap(), evidence);
     }
@@ -695,6 +784,7 @@ mod tests {
             .unwrap();
         assert_eq!(token1.value(), 1);
         ff.clear_fence(node(7), FenceToken::new(1)).unwrap();
+        ff.release_epoch_barrier();
 
         let (mut drain2, _) = NodeDrain::drain(node(7));
         let token2 = ff
@@ -702,6 +792,7 @@ mod tests {
             .unwrap();
         assert_eq!(token2.value(), 2);
         ff.clear_fence(node(7), FenceToken::new(2)).unwrap();
+        ff.release_epoch_barrier();
 
         let (mut drain3, _) = NodeDrain::drain(node(7));
         let err = ff
@@ -718,6 +809,7 @@ mod tests {
         ff.fence(node(10), FenceTrigger::Timeout, &mut d1, 1)
             .unwrap();
         ff.clear_fence(node(10), FenceToken::new(1)).unwrap();
+        ff.release_epoch_barrier();
 
         let (mut d2, _) = NodeDrain::drain(node(10));
         ff.fence(node(10), FenceTrigger::Operator, &mut d2, 2)
@@ -768,6 +860,7 @@ mod tests {
 
         ff.fence(node(20), FenceTrigger::Timeout, &mut d1, 1)
             .unwrap();
+        ff.release_epoch_barrier();
         ff.fence(node(21), FenceTrigger::Operator, &mut d2, 1)
             .unwrap();
 
@@ -788,10 +881,91 @@ mod tests {
             .unwrap();
         assert_eq!(ff.consecutive_fences.get(&30), Some(&1));
         ff.clear_fence(node(30), FenceToken::new(1)).unwrap();
+        ff.release_epoch_barrier();
 
         let (mut d2, _) = NodeDrain::drain(node(30));
         ff.fence(node(30), FenceTrigger::Timeout, &mut d2, 2)
             .unwrap();
         assert_eq!(ff.consecutive_fences.get(&30), Some(&2));
+    }
+
+    #[test]
+    fn forced_fence_acquires_epoch_transition_barrier() {
+        let mut ff = ForcedFencing::new();
+        let (mut drain, _) = NodeDrain::drain(node(40));
+
+        let token = ff
+            .fence(node(40), FenceTrigger::Operator, &mut drain, 9)
+            .unwrap();
+
+        assert_eq!(token, FenceToken::new(1));
+        assert!(ff.lease_acquisition_blocked());
+        assert_eq!(ff.pending_epoch(), Some(EpochId::new(10)));
+        assert_eq!(
+            ff.active_epoch_transition().unwrap(),
+            DrainFenceEpochTransition::next(node(40), EpochId::new(9))
+        );
+    }
+
+    #[test]
+    fn barrier_held_blocks_lease_acquisition_until_released() {
+        let mut ff = ForcedFencing::new();
+        let (mut drain, _) = NodeDrain::drain(node(41));
+
+        ff.fence(node(41), FenceTrigger::Timeout, &mut drain, 4)
+            .unwrap();
+
+        assert!(ff.lease_acquisition_blocked());
+        assert_eq!(ff.pending_epoch(), Some(EpochId::new(5)));
+
+        ff.release_epoch_barrier();
+
+        assert!(!ff.lease_acquisition_blocked());
+        assert_eq!(ff.pending_epoch(), None);
+        assert_eq!(ff.active_epoch_transition(), None);
+    }
+
+    #[test]
+    fn barrier_acquisition_failure_refuses_without_advancing() {
+        let mut ff = ForcedFencing::new();
+        let (mut first, _) = NodeDrain::drain(node(42));
+        let (mut second, _) = NodeDrain::drain(node(43));
+
+        ff.fence(node(42), FenceTrigger::Timeout, &mut first, 12)
+            .unwrap();
+
+        let err = ff
+            .fence(node(43), FenceTrigger::Operator, &mut second, 12)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            FencingError::EpochBarrierRefused {
+                node_id: node(43),
+                from_epoch: EpochId::new(12),
+                to_epoch: EpochId::new(13),
+                reason: EpochAdvanceError::TransitionInProgress,
+            }
+        );
+        assert!(!ff.is_fenced(node(43)));
+        assert_eq!(ff.token_for(node(43)), FenceToken::ZERO);
+        assert_eq!(ff.stats().nodes_fenced, 1);
+        assert_eq!(ff.pending_epoch(), Some(EpochId::new(13)));
+    }
+
+    #[test]
+    fn forced_fence_records_advanced_epoch_only_after_barrier_is_held() {
+        let mut ff = ForcedFencing::new();
+        let (mut drain, _) = NodeDrain::drain(node(44));
+
+        ff.fence(node(44), FenceTrigger::Operator, &mut drain, 21)
+            .unwrap();
+
+        assert!(ff.lease_acquisition_blocked());
+        assert_eq!(ff.pending_epoch(), Some(EpochId::new(22)));
+        assert_eq!(
+            ff.fenced_nodes.get(&44).copied(),
+            Some((FenceToken::new(1), 22))
+        );
     }
 }
