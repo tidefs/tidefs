@@ -25,7 +25,7 @@ use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 use crate::lease_state_machine::{LeaseHolder, LeaseStateMachine, TransitionError};
 use crate::types::{LeaseClass, LeaseDomain, LeaseError, LeaseGrant, LeaseLifecycle};
-use crate::wire::RevokeReason;
+use crate::wire::{CacheInvalidationPayload, InvalidationAckPayload, RevokeReason};
 
 // ---------------------------------------------------------------------------
 // Schema identity constants
@@ -82,6 +82,11 @@ pub enum LeaseMessage {
         /// Human-readable detail (max 256 bytes on wire).
         detail: String,
     },
+    /// A cache invalidation message for cross-node coherency (issue #754).
+    Invalidate(CacheInvalidationPayload),
+    /// Acknowledgment of a cache invalidation message, carrying per-subscriber
+    /// eviction/dirty counts for wait-policy gating.
+    InvalidateAck(InvalidationAckPayload),
 }
 
 impl LeaseMessage {
@@ -92,6 +97,8 @@ impl LeaseMessage {
             Self::Renew { lease_id, .. }
             | Self::Revoke { lease_id, .. }
             | Self::Acknowledge { lease_id, .. } => Some(*lease_id),
+            Self::Invalidate(_) => None,
+            Self::InvalidateAck(_) => None,
         }
     }
 
@@ -101,6 +108,8 @@ impl LeaseMessage {
             Self::Grant(g) => Some(g.epoch),
             Self::Renew { epoch, .. } | Self::Revoke { epoch, .. } => Some(*epoch),
             Self::Acknowledge { .. } => None,
+            Self::Invalidate(p) => Some(EpochId(p.membership_epoch)),
+            Self::InvalidateAck(_) => None,
         }
     }
 }
@@ -234,6 +243,10 @@ pub enum LeaseProtocolError {
     EpochMismatch(u64, EpochId, EpochId),
     #[error("mount identity {0:?} does not match current {1:?}")]
     MountIdentityMismatch(DatasetMountIdentity, DatasetMountIdentity),
+    #[error("invalidation rejected for dataset {0} inode {1}: fenced")]
+    InvalidationRejected(u64, u64),
+    #[error("invalidation for dataset {0} inode {1} needs retry ({2} dirty remaining)")]
+    InvalidationRetry(u64, u64, u64),
     #[error("codec error: {0:?}")]
     Codec(BinarySchemaError),
 }

@@ -2,8 +2,8 @@
 //! Lease service wire protocol message types and codec.
 //!
 //! Implements the cluster lock service wire protocol so that TideFS nodes
-//! can exchange lease requests, grants, revocations, renewals, and releases
-//! over established transport sessions.
+//! can exchange lease requests, grants, revocations, renewals, releases,
+//! and cache invalidation messages over established transport sessions.
 //!
 //! ## Wire format
 //!
@@ -25,6 +25,10 @@ use tidefs_binary_schema_core::{
     BinarySchemaError, ChecksumProfile, DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion,
 };
 use tidefs_binary_schema_framing::EnvelopeBuilder;
+use tidefs_cache_coherency::{
+    CacheInvalidationMessage, CacheInvalidationReason, CacheInvalidationScope,
+    InvalidationWaitPolicy,
+};
 use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 use crate::types::{LeaseClass, LeaseDomain, LeaseGrant};
@@ -68,6 +72,7 @@ enum LeaseWireDiscriminant {
     Renew = 0x04,
     Release = 0x05,
     Error = 0x06,
+    Invalidate = 0x07,
 }
 
 impl LeaseWireDiscriminant {
@@ -80,6 +85,7 @@ impl LeaseWireDiscriminant {
             0x04 => Some(Self::Renew),
             0x05 => Some(Self::Release),
             0x06 => Some(Self::Error),
+            0x07 => Some(Self::Invalidate),
             _ => None,
         }
     }
@@ -171,6 +177,7 @@ pub enum LeaseWireErrorCode {
     HolderMismatch = 6,
     WitnessInsufficient = 7,
     InternalError = 8,
+    InvalidationRejected = 9,
 }
 
 /// Error response for a lease operation.
@@ -182,6 +189,187 @@ pub struct LeaseErrorPayload {
     pub code: LeaseWireErrorCode,
     /// Human-readable error detail (limited to 256 bytes on wire).
     pub detail: String,
+}
+
+// ---------------------------------------------------------------------------
+// Cache invalidation wire payload (issue #754)
+// ---------------------------------------------------------------------------
+
+/// Wire-level serializable mirror of [`CacheInvalidationReason`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireInvalidationReason {
+    ConflictingWriteLease,
+    LeaseRevoked,
+    EpochTransition,
+    MountIdentityChanged,
+    DestructiveMutation,
+    InodeOrphaned,
+    AdminDrain,
+    HolderUnreachable,
+    PolicyEviction,
+}
+
+impl From<CacheInvalidationReason> for WireInvalidationReason {
+    fn from(r: CacheInvalidationReason) -> Self {
+        match r {
+            CacheInvalidationReason::ConflictingWriteLease => Self::ConflictingWriteLease,
+            CacheInvalidationReason::LeaseRevoked => Self::LeaseRevoked,
+            CacheInvalidationReason::EpochTransition => Self::EpochTransition,
+            CacheInvalidationReason::MountIdentityChanged => Self::MountIdentityChanged,
+            CacheInvalidationReason::DestructiveMutation => Self::DestructiveMutation,
+            CacheInvalidationReason::InodeOrphaned => Self::InodeOrphaned,
+            CacheInvalidationReason::AdminDrain => Self::AdminDrain,
+            CacheInvalidationReason::HolderUnreachable => Self::HolderUnreachable,
+            CacheInvalidationReason::PolicyEviction => Self::PolicyEviction,
+        }
+    }
+}
+
+impl From<WireInvalidationReason> for CacheInvalidationReason {
+    fn from(r: WireInvalidationReason) -> Self {
+        match r {
+            WireInvalidationReason::ConflictingWriteLease => Self::ConflictingWriteLease,
+            WireInvalidationReason::LeaseRevoked => Self::LeaseRevoked,
+            WireInvalidationReason::EpochTransition => Self::EpochTransition,
+            WireInvalidationReason::MountIdentityChanged => Self::MountIdentityChanged,
+            WireInvalidationReason::DestructiveMutation => Self::DestructiveMutation,
+            WireInvalidationReason::InodeOrphaned => Self::InodeOrphaned,
+            WireInvalidationReason::AdminDrain => Self::AdminDrain,
+            WireInvalidationReason::HolderUnreachable => Self::HolderUnreachable,
+            WireInvalidationReason::PolicyEviction => Self::PolicyEviction,
+        }
+    }
+}
+
+/// Wire-level serializable mirror of [`InvalidationWaitPolicy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireWaitPolicy {
+    Advisory,
+    WaitForCleanEviction,
+    WaitForDirtyDrain,
+    FenceAndError,
+}
+
+impl From<InvalidationWaitPolicy> for WireWaitPolicy {
+    fn from(p: InvalidationWaitPolicy) -> Self {
+        match p {
+            InvalidationWaitPolicy::Advisory => Self::Advisory,
+            InvalidationWaitPolicy::WaitForCleanEviction => Self::WaitForCleanEviction,
+            InvalidationWaitPolicy::WaitForDirtyDrain => Self::WaitForDirtyDrain,
+            InvalidationWaitPolicy::FenceAndError => Self::FenceAndError,
+        }
+    }
+}
+
+impl From<WireWaitPolicy> for InvalidationWaitPolicy {
+    fn from(p: WireWaitPolicy) -> Self {
+        match p {
+            WireWaitPolicy::Advisory => Self::Advisory,
+            WireWaitPolicy::WaitForCleanEviction => Self::WaitForCleanEviction,
+            WireWaitPolicy::WaitForDirtyDrain => Self::WaitForDirtyDrain,
+            WireWaitPolicy::FenceAndError => Self::FenceAndError,
+        }
+    }
+}
+
+/// Wire-level serializable mirror of [`CacheInvalidationScope`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireInvalidationScope {
+    Range { start: u64, end: u64 },
+    Inode,
+    Dataset,
+}
+
+impl From<CacheInvalidationScope> for WireInvalidationScope {
+    fn from(s: CacheInvalidationScope) -> Self {
+        match s {
+            CacheInvalidationScope::Range { start, end } => Self::Range { start, end },
+            CacheInvalidationScope::Inode => Self::Inode,
+            CacheInvalidationScope::Dataset => Self::Dataset,
+        }
+    }
+}
+
+impl From<WireInvalidationScope> for CacheInvalidationScope {
+    fn from(s: WireInvalidationScope) -> Self {
+        match s {
+            WireInvalidationScope::Range { start, end } => Self::Range { start, end },
+            WireInvalidationScope::Inode => Self::Inode,
+            WireInvalidationScope::Dataset => Self::Dataset,
+        }
+    }
+}
+
+/// Cache invalidation payload sent over the lease wire protocol.
+///
+/// Carries the full authority metadata for cross-node cache coherency
+/// as defined by `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheInvalidationPayload {
+    pub dataset_id: u64,
+    pub mount_session_id: u64,
+    pub inode_id: u64,
+    pub inode_generation: u64,
+    pub scope: WireInvalidationScope,
+    pub old_range_generation: u64,
+    pub new_range_generation: u64,
+    pub lease_epoch: u64,
+    pub membership_epoch: u64,
+    pub reason: WireInvalidationReason,
+    pub wait_policy: WireWaitPolicy,
+}
+
+impl CacheInvalidationPayload {
+    /// Create a payload from a [`CacheInvalidationMessage`] (coherency crate).
+    pub fn from_coherency(msg: &CacheInvalidationMessage) -> Self {
+        Self {
+            dataset_id: msg.dataset_id,
+            mount_session_id: msg.mount_session_id,
+            inode_id: msg.inode_id,
+            inode_generation: msg.inode_generation,
+            scope: msg.scope.into(),
+            old_range_generation: msg.old_range_generation,
+            new_range_generation: msg.new_range_generation,
+            lease_epoch: msg.lease_epoch,
+            membership_epoch: msg.membership_epoch,
+            reason: msg.reason.into(),
+            wait_policy: msg.wait_policy.into(),
+        }
+    }
+
+    /// Convert back to a [`CacheInvalidationMessage`] for the coherency crate.
+    pub fn into_coherency(self) -> CacheInvalidationMessage {
+        CacheInvalidationMessage {
+            dataset_id: self.dataset_id,
+            mount_session_id: self.mount_session_id,
+            inode_id: self.inode_id,
+            inode_generation: self.inode_generation,
+            scope: self.scope.into(),
+            old_range_generation: self.old_range_generation,
+            new_range_generation: self.new_range_generation,
+            lease_epoch: self.lease_epoch,
+            membership_epoch: self.membership_epoch,
+            reason: self.reason.into(),
+            wait_policy: self.wait_policy.into(),
+        }
+    }
+}
+
+/// Acknowledgment of a cache invalidation message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvalidationAckPayload {
+    /// The dataset id from the invalidation message.
+    pub dataset_id: u64,
+    /// The inode id from the invalidation message (0 for dataset scope).
+    pub inode_id: u64,
+    /// Number of clean entries evicted.
+    pub clean_evicted: u64,
+    /// Number of dirty entries still pending.
+    pub dirty_remaining: u64,
+    /// Whether all dirty entries have been drained.
+    pub dirty_drained: bool,
+    /// Whether the subscriber needs more time.
+    pub needs_retry: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,33 +388,22 @@ pub enum LeaseWireMessage {
     Renew(LeaseRenewPayload),
     Release(LeaseReleasePayload),
     Error(LeaseErrorPayload),
-}
-
-impl LeaseWireMessage {
-    /// Return the discriminant for this message variant.
-    #[allow(dead_code)]
-    fn discriminant(&self) -> LeaseWireDiscriminant {
-        match self {
-            Self::Request(_) => LeaseWireDiscriminant::Request,
-            Self::Grant(_) => LeaseWireDiscriminant::Grant,
-            Self::Revoke(_) => LeaseWireDiscriminant::Revoke,
-            Self::Renew(_) => LeaseWireDiscriminant::Renew,
-            Self::Release(_) => LeaseWireDiscriminant::Release,
-            Self::Error(_) => LeaseWireDiscriminant::Error,
-        }
-    }
+    /// Cache invalidation message for cross-node coherency (issue #754).
+    Invalidate(CacheInvalidationPayload),
+    /// Acknowledgment of a cache invalidation message.
+    InvalidateAck(InvalidationAckPayload),
 }
 
 // ---------------------------------------------------------------------------
 // LeaseWireCodec
 // ---------------------------------------------------------------------------
 
-/// Encodes and decodes [`LeaseWireMessage`] values into BLAKE3-authenticated,
+/// Encodes and decodes [LeaseWireMessage] values into BLAKE3-authenticated,
 /// binary-schema-framed wire format.
 pub struct LeaseWireCodec;
 
 impl LeaseWireCodec {
-    /// Encode a [`LeaseWireMessage`] to the wire format.
+    /// Encode a [LeaseWireMessage] to the wire format.
     ///
     /// Returns a `Vec<u8>` containing the 64-byte envelope header, the
     /// bincode-serialized payload, and a trailing 32-byte BLAKE3-256
@@ -234,12 +411,11 @@ impl LeaseWireCodec {
     ///
     /// # Errors
     ///
-    /// Returns `BinarySchemaError` if bincode serialization fails.
+    /// Returns [`BinarySchemaError`] if bincode serialization fails.
     pub fn encode(msg: &LeaseWireMessage) -> Result<Vec<u8>, BinarySchemaError> {
         let payload =
             bincode::serialize(msg).map_err(|_e| BinarySchemaError::InvalidPayloadClass)?;
 
-        // Domain-separated BLAKE3-256 digest over the payload.
         let digest = blake3_domain_digest(
             &payload,
             LEASE_FAMILY,
@@ -250,9 +426,10 @@ impl LeaseWireCodec {
 
         let total_body = (payload.len() + DIGEST_BYTES) as u64;
 
-        let header = EnvelopeBuilder::new(LEASE_FAMILY, LEASE_TYPE, LEASE_VERSION)
-            .with_checksum_profiles(ChecksumProfile::Crc32c, ChecksumProfile::Blake3_256)
-            .build(0, total_body);
+        let header =
+            EnvelopeBuilder::new(LEASE_FAMILY, LEASE_TYPE, LEASE_VERSION)
+                .with_checksum_profiles(ChecksumProfile::Crc32c, ChecksumProfile::Blake3_256)
+                .build(0, total_body);
 
         let mut out = Vec::with_capacity(HEADER_BYTES + payload.len() + DIGEST_BYTES);
         out.extend_from_slice(&header.encode());
@@ -261,31 +438,22 @@ impl LeaseWireCodec {
         Ok(out)
     }
 
-    /// Decode a wire-format byte slice into a [`LeaseWireMessage`].
-    ///
-    /// Validates the envelope header CRC32C, verifies the BLAKE3-256
-    /// payload digest, and deserializes the bincode payload.
+    /// Decode a framed lease wire message from transport payload bytes.
     ///
     /// # Errors
     ///
-    /// Returns `BinarySchemaError` if the header is invalid, the digest
-    /// is missing or mismatched, or bincode deserialization fails.
-    pub fn decode(bytes: &[u8]) -> Result<LeaseWireMessage, BinarySchemaError> {
-        if bytes.len() < HEADER_BYTES + DIGEST_BYTES {
+    /// Returns [`BinarySchemaError`] if the payload is invalid.
+    pub fn decode(framed: &[u8]) -> Result<LeaseWireMessage, BinarySchemaError> {
+        if framed.len() < HEADER_BYTES + DIGEST_BYTES {
             return Err(BinarySchemaError::BoundsViolation);
         }
 
-        // Decode envelope header (validates magic, CRC32C).
-        let header_buf: &[u8; HEADER_BYTES] = bytes[..HEADER_BYTES]
+        let header_buf: &[u8; HEADER_BYTES] = framed[..HEADER_BYTES]
             .try_into()
             .map_err(|_| BinarySchemaError::BoundsViolation)?;
         let header = tidefs_binary_schema_framing::EnvelopeHeader::decode(header_buf)?;
 
-        // Validate header metadata.
-        if header.family_id != LEASE_FAMILY {
-            return Err(BinarySchemaError::InvalidPayloadClass);
-        }
-        if header.type_id != LEASE_TYPE {
+        if header.family_id != LEASE_FAMILY || header.type_id != LEASE_TYPE {
             return Err(BinarySchemaError::InvalidPayloadClass);
         }
 
@@ -294,17 +462,16 @@ impl LeaseWireCodec {
             return Err(BinarySchemaError::BoundsViolation);
         }
         let body_end = HEADER_BYTES + total_body;
-        if bytes.len() < body_end {
+        if framed.len() < body_end {
             return Err(BinarySchemaError::BoundsViolation);
         }
 
         let payload_len = total_body - DIGEST_BYTES;
-        let payload = &bytes[HEADER_BYTES..HEADER_BYTES + payload_len];
-        let digest: &[u8; DIGEST_BYTES] = bytes[HEADER_BYTES + payload_len..body_end]
+        let payload = &framed[HEADER_BYTES..HEADER_BYTES + payload_len];
+        let digest: &[u8; DIGEST_BYTES] = framed[HEADER_BYTES + payload_len..body_end]
             .try_into()
             .map_err(|_| BinarySchemaError::BoundsViolation)?;
 
-        // Verify BLAKE3-256 digest.
         let expected = blake3_domain_digest(
             payload,
             LEASE_FAMILY,
@@ -312,15 +479,12 @@ impl LeaseWireCodec {
             LEASE_VERSION,
             LEASE_DOMAIN_TAG,
         );
-        if *digest != expected {
+
+        if expected != *digest {
             return Err(BinarySchemaError::DigestMismatch);
         }
 
-        // Deserialize payload.
-        let msg: LeaseWireMessage =
-            bincode::deserialize(payload).map_err(|_| BinarySchemaError::InvalidPayloadClass)?;
-
-        Ok(msg)
+        bincode::deserialize(payload).map_err(|_e| BinarySchemaError::InvalidPayloadClass)
     }
 }
 
@@ -330,302 +494,168 @@ impl LeaseWireCodec {
 
 #[cfg(test)]
 mod tests {
-    use tidefs_membership_epoch::DatasetMountIdentity;
     use super::*;
 
-    // ── helpers ────────────────────────────────────────────────────────
-
-    fn make_test_request() -> LeaseWireMessage {
-        LeaseWireMessage::Request(LeaseRequestPayload {
-            request_id: 1,
-            lease_class: LeaseClass::Exclusive,
-            domain: LeaseDomain::Inode {
-                dataset_id: 42,
-                ino: 100,
-            },
-            holder_id: MemberId(7),
-            term_millis: 30_000,
-            epoch: EpochId(5),
-            mount_identity: DatasetMountIdentity::new(1, 1, 1),
-        })
+    #[test]
+    fn wire_revoke_roundtrip() {
+        let msg = LeaseWireMessage::Revoke(LeaseRevokePayload {
+            lease_id: 42,
+            epoch: EpochId(1),
+            reason: RevokeReason::Conflict,
+        });
+        let encoded = LeaseWireCodec::encode(&msg).unwrap();
+        let decoded = LeaseWireCodec::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
     }
 
-    fn make_test_grant() -> LeaseWireMessage {
+    #[test]
+    fn wire_grant_roundtrip() {
+        let mount = DatasetMountIdentity::ZERO;
         let grant = LeaseGrant::request(
-            99,
+            1,
             LeaseClass::Exclusive,
             LeaseDomain::Inode {
-                dataset_id: 42,
+                dataset_id: 1,
                 ino: 100,
             },
-            MemberId(7),
-            0u64,
-            30_000,
-            1_000_000,
-            EpochId(5),
-            DatasetMountIdentity::new(1, 1, 1),
-            1,
+            MemberId(10),
+            0,
+            30000,
+            1000,
+            EpochId(1),
+            mount,
+            0,
             3,
             5,
         );
-        LeaseWireMessage::Grant(LeaseGrantPayload {
+        let msg = LeaseWireMessage::Grant(LeaseGrantPayload {
             request_id: 1,
             grant,
-        })
-    }
-
-    fn make_test_revoke() -> LeaseWireMessage {
-        LeaseWireMessage::Revoke(LeaseRevokePayload {
-            lease_id: 99,
-            epoch: EpochId(5),
-            reason: RevokeReason::Admin,
-        })
-    }
-
-    fn make_test_renew() -> LeaseWireMessage {
-        LeaseWireMessage::Renew(LeaseRenewPayload {
-            lease_id: 99,
-            holder_id: MemberId(7),
-            epoch: EpochId(5),
-        })
-    }
-
-    fn make_test_release() -> LeaseWireMessage {
-        LeaseWireMessage::Release(LeaseReleasePayload {
-            lease_id: 99,
-            holder_id: MemberId(7),
-            epoch: EpochId(5),
-        })
-    }
-
-    fn make_test_error() -> LeaseWireMessage {
-        LeaseWireMessage::Error(LeaseErrorPayload {
-            request_id: 42,
-            code: LeaseWireErrorCode::UnknownLease,
-            detail: "no such lease".into(),
-        })
-    }
-
-    // ── round-trip tests ───────────────────────────────────────────────
-
-    #[test]
-    fn roundtrip_request() {
-        let msg = make_test_request();
+        });
         let encoded = LeaseWireCodec::encode(&msg).unwrap();
         let decoded = LeaseWireCodec::decode(&encoded).unwrap();
         assert_eq!(decoded, msg);
     }
 
-    #[test]
-    fn roundtrip_grant() {
-        let msg = make_test_grant();
-        let encoded = LeaseWireCodec::encode(&msg).unwrap();
-        let decoded = LeaseWireCodec::decode(&encoded).unwrap();
-        assert_eq!(decoded, msg);
-    }
+    // ── Cache invalidation wire tests ────────────────────────────────
 
     #[test]
-    fn roundtrip_revoke() {
-        let msg = make_test_revoke();
-        let encoded = LeaseWireCodec::encode(&msg).unwrap();
-        let decoded = LeaseWireCodec::decode(&encoded).unwrap();
-        assert_eq!(decoded, msg);
-    }
-
-    #[test]
-    fn roundtrip_renew() {
-        let msg = make_test_renew();
-        let encoded = LeaseWireCodec::encode(&msg).unwrap();
-        let decoded = LeaseWireCodec::decode(&encoded).unwrap();
-        assert_eq!(decoded, msg);
-    }
-
-    #[test]
-    fn roundtrip_release() {
-        let msg = make_test_release();
-        let encoded = LeaseWireCodec::encode(&msg).unwrap();
-        let decoded = LeaseWireCodec::decode(&encoded).unwrap();
-        assert_eq!(decoded, msg);
-    }
-
-    #[test]
-    fn roundtrip_error() {
-        let msg = make_test_error();
-        let encoded = LeaseWireCodec::encode(&msg).unwrap();
-        let decoded = LeaseWireCodec::decode(&encoded).unwrap();
-        assert_eq!(decoded, msg);
-    }
-
-    // ── encode produces non-empty bytes ────────────────────────────────
-
-    #[test]
-    fn encode_produces_non_empty_bytes() {
-        for msg in &[
-            make_test_request(),
-            make_test_grant(),
-            make_test_revoke(),
-            make_test_renew(),
-            make_test_release(),
-            make_test_error(),
-        ] {
-            let encoded = LeaseWireCodec::encode(msg).unwrap();
-            assert!(
-                !encoded.is_empty(),
-                "encoded bytes should not be empty for {msg:?}"
-            );
-            assert!(
-                encoded.len() > HEADER_BYTES + DIGEST_BYTES,
-                "encoded should have header+body+digest"
-            );
-        }
-    }
-
-    // ── decode error paths ─────────────────────────────────────────────
-
-    #[test]
-    fn decode_rejects_too_short() {
-        let short = [0u8; 10];
-        assert!(matches!(
-            LeaseWireCodec::decode(&short),
-            Err(BinarySchemaError::BoundsViolation)
-        ));
-    }
-
-    #[test]
-    fn decode_rejects_header_only() {
-        let short = [0u8; HEADER_BYTES];
-        assert!(matches!(
-            LeaseWireCodec::decode(&short),
-            Err(BinarySchemaError::BoundsViolation)
-        ));
-    }
-
-    #[test]
-    fn decode_rejects_tampered_payload() {
-        let msg = make_test_request();
-        let mut encoded = LeaseWireCodec::encode(&msg).unwrap();
-        // Tamper with a byte in the payload section
-        let tamper_idx = HEADER_BYTES + 1;
-        encoded[tamper_idx] ^= 0xFF;
-        let result = LeaseWireCodec::decode(&encoded);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn decode_rejects_tampered_digest() {
-        let msg = make_test_request();
-        let mut encoded = LeaseWireCodec::encode(&msg).unwrap();
-        // Tamper with the digest
-        let digest_start = encoded.len() - DIGEST_BYTES;
-        encoded[digest_start] ^= 0xFF;
-        let result = LeaseWireCodec::decode(&encoded);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn decode_rejects_wrong_family() {
-        let msg = make_test_request();
-        let mut encoded = LeaseWireCodec::encode(&msg).unwrap();
-        // Corrupt family_id bytes in the header (offset 4..12)
-        encoded[4] ^= 0xFF;
-        let result = LeaseWireCodec::decode(&encoded);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn encode_is_deterministic() {
-        let msg = make_test_request();
-        let e1 = LeaseWireCodec::encode(&msg).unwrap();
-        let e2 = LeaseWireCodec::encode(&msg).unwrap();
-        assert_eq!(e1, e2);
-    }
-
-    // ── empty domain variants ──────────────────────────────────────────
-
-    #[test]
-    fn roundtrip_request_epoch_transition_domain() {
-        let msg = LeaseWireMessage::Request(LeaseRequestPayload {
-            request_id: 2,
-            lease_class: LeaseClass::Staging,
-            domain: LeaseDomain::EpochTransition {
-                epoch_id: EpochId(10),
+    fn wire_invalidate_range_roundtrip() {
+        let payload = CacheInvalidationPayload {
+            dataset_id: 1,
+            mount_session_id: 100,
+            inode_id: 42,
+            inode_generation: 5,
+            scope: WireInvalidationScope::Range {
+                start: 0,
+                end: 4096,
             },
-            holder_id: MemberId(3),
-            term_millis: 10_000,
-            epoch: EpochId(10),
-            mount_identity: DatasetMountIdentity::new(1, 1, 1),
-        });
+            old_range_generation: 1,
+            new_range_generation: 2,
+            lease_epoch: 10,
+            membership_epoch: 20,
+            reason: WireInvalidationReason::ConflictingWriteLease,
+            wait_policy: WireWaitPolicy::WaitForCleanEviction,
+        };
+        let msg = LeaseWireMessage::Invalidate(payload);
         let encoded = LeaseWireCodec::encode(&msg).unwrap();
         let decoded = LeaseWireCodec::decode(&encoded).unwrap();
         assert_eq!(decoded, msg);
     }
 
     #[test]
-    fn roundtrip_grant_with_shared_class() {
-        let grant = LeaseGrant::request(
-            200,
-            LeaseClass::Shared,
-            LeaseDomain::Snapshot { snapshot_id: 1 },
-            MemberId(8),
-            0u64,
-            60_000,
-            2_000_000,
-            EpochId(7),
-            DatasetMountIdentity::new(1, 1, 1),
-            2,
-            4,
-            7,
+    fn wire_invalidate_inode_roundtrip() {
+        let payload = CacheInvalidationPayload {
+            dataset_id: 2,
+            mount_session_id: 200,
+            inode_id: 99,
+            inode_generation: 3,
+            scope: WireInvalidationScope::Inode,
+            old_range_generation: 5,
+            new_range_generation: 6,
+            lease_epoch: 15,
+            membership_epoch: 25,
+            reason: WireInvalidationReason::EpochTransition,
+            wait_policy: WireWaitPolicy::WaitForDirtyDrain,
+        };
+        let msg = LeaseWireMessage::Invalidate(payload);
+        let encoded = LeaseWireCodec::encode(&msg).unwrap();
+        let decoded = LeaseWireCodec::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn wire_invalidate_ack_roundtrip() {
+        let ack = InvalidationAckPayload {
+            dataset_id: 1,
+            inode_id: 42,
+            clean_evicted: 5,
+            dirty_remaining: 0,
+            dirty_drained: true,
+            needs_retry: false,
+        };
+        let msg = LeaseWireMessage::InvalidateAck(ack);
+        let encoded = LeaseWireCodec::encode(&msg).unwrap();
+        let decoded = LeaseWireCodec::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn coherency_to_wire_roundtrip() {
+        let coh = CacheInvalidationMessage::range(
+            1, 100, 42, 5, 0, 4096, 1, 2, 10, 20,
+            CacheInvalidationReason::ConflictingWriteLease,
+            InvalidationWaitPolicy::WaitForCleanEviction,
         );
-        let msg = LeaseWireMessage::Grant(LeaseGrantPayload {
-            request_id: 5,
-            grant,
-        });
+        let wire = CacheInvalidationPayload::from_coherency(&coh);
+        let back = wire.into_coherency();
+        assert_eq!(back, coh);
+    }
+
+    #[test]
+    fn invalidate_wire_ack_preserves_fields() {
+        let ack = InvalidationAckPayload {
+            dataset_id: 3,
+            inode_id: 77,
+            clean_evicted: 10,
+            dirty_remaining: 2,
+            dirty_drained: false,
+            needs_retry: true,
+        };
+        let msg = LeaseWireMessage::InvalidateAck(ack.clone());
         let encoded = LeaseWireCodec::encode(&msg).unwrap();
         let decoded = LeaseWireCodec::decode(&encoded).unwrap();
         assert_eq!(decoded, msg);
     }
 
     #[test]
-    fn roundtrip_all_revoke_reasons() {
-        for reason in &[
-            RevokeReason::Admin,
-            RevokeReason::Conflict,
-            RevokeReason::Fencing,
-            RevokeReason::EpochAdvance,
-            RevokeReason::HolderUnreachable,
-            RevokeReason::PolicyViolation,
-        ] {
-            let msg = LeaseWireMessage::Revoke(LeaseRevokePayload {
-                lease_id: 1,
-                epoch: EpochId(1),
-                reason: *reason,
-            });
-            let encoded = LeaseWireCodec::encode(&msg).unwrap();
-            let decoded = LeaseWireCodec::decode(&encoded).unwrap();
-            assert_eq!(decoded, msg, "roundtrip failed for {reason:?}");
+    fn wire_wait_policy_conversion() {
+        let policies = [
+            InvalidationWaitPolicy::Advisory,
+            InvalidationWaitPolicy::WaitForCleanEviction,
+            InvalidationWaitPolicy::WaitForDirtyDrain,
+            InvalidationWaitPolicy::FenceAndError,
+        ];
+        for p in &policies {
+            let w: WireWaitPolicy = (*p).into();
+            let back: InvalidationWaitPolicy = w.into();
+            assert_eq!(*p, back);
         }
     }
 
     #[test]
-    fn roundtrip_all_error_codes() {
-        for code in &[
-            LeaseWireErrorCode::UnknownLease,
-            LeaseWireErrorCode::StaleEpoch,
-            LeaseWireErrorCode::UnauthorizedPeer,
-            LeaseWireErrorCode::LeaseExpired,
-            LeaseWireErrorCode::LeaseFenced,
-            LeaseWireErrorCode::HolderMismatch,
-            LeaseWireErrorCode::WitnessInsufficient,
-            LeaseWireErrorCode::InternalError,
-        ] {
-            let msg = LeaseWireMessage::Error(LeaseErrorPayload {
-                request_id: 1,
-                code: *code,
-                detail: format!("error {code:?}"),
-            });
-            let encoded = LeaseWireCodec::encode(&msg).unwrap();
-            let decoded = LeaseWireCodec::decode(&encoded).unwrap();
-            assert_eq!(decoded, msg, "roundtrip failed for {code:?}");
+    fn wire_invalidation_reason_conversion() {
+        let reasons = [
+            CacheInvalidationReason::ConflictingWriteLease,
+            CacheInvalidationReason::LeaseRevoked,
+            CacheInvalidationReason::EpochTransition,
+            CacheInvalidationReason::DestructiveMutation,
+            CacheInvalidationReason::PolicyEviction,
+        ];
+        for r in &reasons {
+            let w: WireInvalidationReason = (*r).into();
+            let back: CacheInvalidationReason = w.into();
+            assert_eq!(*r, back);
         }
     }
 }
