@@ -2461,7 +2461,8 @@ mod tests {
             MemberId::new(2),
             2000,
             1_000_000_000_000,
-        );
+        )
+        .with_epoch(EpochId::new(1));
         nj.accept_token(token, 2000).unwrap();
         nj.bootstrap_complete(4096, 3000).unwrap();
         nj.catch_up_progress(0, true, 4000).unwrap();
@@ -2637,7 +2638,8 @@ mod tests {
             MemberId::new(2),
             2000,
             1_000_000_000,
-        );
+        )
+        .with_epoch(EpochId::new(1));
         nj.accept_token(token, 2000).unwrap();
         nj.fail(3000);
 
@@ -2787,7 +2789,8 @@ mod tests {
             MemberId::new(2),
             2000,
             1_000_000_000,
-        );
+        )
+        .with_epoch(EpochId::new(1));
         nj2.accept_token(token, 2000).unwrap();
         nj2.bootstrap_complete(4096, 3000).unwrap();
         nj2.catch_up_progress(0, true, 4000).unwrap();
@@ -2807,7 +2810,8 @@ mod tests {
             MemberId::new(2),
             2000,
             1_000_000_000,
-        );
+        )
+        .with_epoch(EpochId::new(1));
         nj.accept_token(token, 2000).unwrap();
         assert!(!nj.can_receive_placements()); // Bootstrapping
 
