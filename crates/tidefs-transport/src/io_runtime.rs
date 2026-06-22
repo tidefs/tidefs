@@ -4,10 +4,10 @@
 //!
 //! ## Purpose
 //!
-//! The transport crate provides connection management (#5788 lifecycle state
-//! machine, #5795 connection registry), per-peer send queuing (#5793), message
-//! dispatch (#5801), request-response correlation (#5800), and endpoint
-//! addressing (#5787).  None of these components perform actual socket I/O.
+//! The transport crate provides connection management, connection registry,
+//! per-peer send queuing, message dispatch, request-response correlation, and
+//! canonical `TransportAddr` endpoint addressing. None of these components
+//! perform actual socket I/O.
 //! This module bridges that gap, providing TCP listener bind, accept loop,
 //! and per-connection read/write tasks that move bytes.
 //!

@@ -46,8 +46,11 @@ At startup, the storage node selects its object store backend based on
    equivalent JSON config fields, produce a `BackendDisclosure` (RDMA, TCP,
    Loopback, DeterministicInMemory, or NotRun).
 2. `RuntimeAuthority::build()` validates the disclosure, derives a
-   `TransportConfig`, and stores node parameters (member class,
-   failure domain, replication factor).
+   `TransportConfig` with the canonical `TransportAddr` endpoint authority,
+   and stores node parameters (member class, failure domain, replication
+   factor). RDMA disclosure accepts a canonical `rdma://` endpoint when one is
+   supplied, or the existing TCP fallback bind socket for the current
+   `--rdma` flag path.
 3. The authority spine is logged at startup. Downstream subsystems
    query `authority.backend()`, `authority.transport_config()`,
    and `authority.is_live()` instead of inspecting raw CLI flags.
@@ -56,7 +59,7 @@ At startup, the storage node selects its object store backend based on
 
 | Variant | Description | `is_live()` |
 |---|---|---|
-| `Rdma(addr)` | RDMA transport with device/address string | true |
+| `Rdma(addr)` | RDMA transport with canonical RDMA endpoint or TCP fallback bind socket | true |
 | `Tcp(addr)` | TCP transport bound to socket address | true |
 | `Loopback` | In-process loopback for single-node deterministic testing | false |
 | `DeterministicInMemory` | Fully deterministic in-memory backend for unit/validation harnesses | false |

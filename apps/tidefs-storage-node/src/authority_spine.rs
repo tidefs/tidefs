@@ -17,7 +17,10 @@ use std::net::SocketAddr;
 
 use tidefs_membership_epoch::MemberClass;
 use tidefs_membership_live::BackendDisclosure;
-use tidefs_transport::config::{TransportConfig, TransportConfigBuilder, TransportEndpoint};
+use tidefs_transport::{
+    config::{TransportConfig, TransportConfigBuilder},
+    TransportAddr,
+};
 
 /// Single authority spine constructed at storage-node startup.
 ///
@@ -106,15 +109,32 @@ impl RuntimeAuthority {
 
 fn default_endpoint_for_disclosure(
     disclosure: &BackendDisclosure,
-) -> Result<TransportEndpoint, String> {
+) -> Result<TransportAddr, String> {
     match disclosure {
-        BackendDisclosure::Tcp(addr) => Ok(TransportEndpoint::Tcp(*addr)),
-        BackendDisclosure::Rdma(addr) => Ok(TransportEndpoint::Rdma(addr.clone())),
+        BackendDisclosure::Tcp(addr) => Ok(TransportAddr::Tcp(*addr)),
+        BackendDisclosure::Rdma(addr) => {
+            if let Ok(endpoint) = addr.parse::<TransportAddr>() {
+                return match endpoint {
+                    TransportAddr::Rdma { .. } | TransportAddr::Tcp(_) => Ok(endpoint),
+                    TransportAddr::Unix(_) => Err(format!(
+                        "RDMA disclosure cannot use a Unix transport endpoint `{addr}`"
+                    )),
+                };
+            }
+
+            if let Ok(tcp_fallback) = addr.parse::<SocketAddr>() {
+                return Ok(TransportAddr::Tcp(tcp_fallback));
+            }
+
+            Err(format!(
+                "RDMA disclosure must use an rdma:// TransportAddr or TCP fallback socket address, got `{addr}`"
+            ))
+        }
         BackendDisclosure::Loopback | BackendDisclosure::DeterministicInMemory => {
             // Use a localhost address as a reasonable non-network endpoint
             // for in-process / deterministic modes.
             let local: SocketAddr = "127.0.0.1:0".parse().map_err(|e| format!("{e}"))?;
-            Ok(TransportEndpoint::Tcp(local))
+            Ok(TransportAddr::Tcp(local))
         }
         BackendDisclosure::NotRun => {
             Err("cannot derive transport endpoint for NotRun backend".into())
@@ -137,6 +157,10 @@ fn derive_transport_config(
 mod tests {
     use super::*;
 
+    fn rdma_endpoint_uri() -> &'static str {
+        "rdma://fe80:0000:0000:0000:0000:0000:0000:0001:42:1"
+    }
+
     // ── Build succeeds for every live variant ─────────────────────────
 
     #[test]
@@ -152,7 +176,7 @@ mod tests {
 
     #[test]
     fn build_rdma() {
-        let d = BackendDisclosure::Rdma("mlx5_0".into());
+        let d = BackendDisclosure::Rdma("127.0.0.1:9100".into());
         let a = RuntimeAuthority::build(d, 7, None, None, 1).expect("build");
         assert!(a.is_live());
         assert_eq!(a.node_id(), 7);
@@ -198,17 +222,30 @@ mod tests {
         let a = RuntimeAuthority::build(d, 5, None, None, 1).expect("build");
         let tc = a.transport_config();
         // The endpoint should match the TCP address.
-        assert_eq!(tc.endpoint(), &TransportEndpoint::Tcp(addr));
+        assert_eq!(tc.endpoint(), &TransportAddr::Tcp(addr));
     }
 
     #[test]
-    fn rdma_transport_config_has_rdma_endpoint() {
-        let d = BackendDisclosure::Rdma("rxe0".into());
+    fn rdma_transport_config_uses_tcp_fallback_endpoint() {
+        let addr: SocketAddr = "127.0.0.1:9100".parse().unwrap();
+        let d = BackendDisclosure::Rdma(addr.to_string());
         let a = RuntimeAuthority::build(d, 5, None, None, 1).expect("build");
-        assert_eq!(
-            a.transport_config().endpoint(),
-            &TransportEndpoint::Rdma("rxe0".into())
-        );
+        assert_eq!(a.transport_config().endpoint(), &TransportAddr::Tcp(addr));
+    }
+
+    #[test]
+    fn rdma_transport_config_accepts_canonical_rdma_endpoint() {
+        let expected: TransportAddr = rdma_endpoint_uri().parse().unwrap();
+        let d = BackendDisclosure::Rdma(rdma_endpoint_uri().into());
+        let a = RuntimeAuthority::build(d, 5, None, None, 1).expect("build");
+        assert_eq!(a.transport_config().endpoint(), &expected);
+    }
+
+    #[test]
+    fn rdma_disclosure_requires_canonical_endpoint() {
+        let d = BackendDisclosure::Rdma("rxe0".into());
+        let err = RuntimeAuthority::build(d, 5, None, None, 1).unwrap_err();
+        assert!(err.contains("RDMA disclosure must use"));
     }
 
     #[test]
@@ -219,7 +256,7 @@ mod tests {
         // for in-process use.
         assert!(matches!(
             a.transport_config().endpoint(),
-            TransportEndpoint::Tcp(_)
+            TransportAddr::Tcp(_)
         ));
     }
 

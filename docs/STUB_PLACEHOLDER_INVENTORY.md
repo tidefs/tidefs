@@ -183,12 +183,12 @@ Follow-up scope: #789 tracks the 22 planned-authority surfaces and has split the
 - Classification: **Implement** — placeholder for real cryptographic policy enforcement.
 - Follow-up issue: #792 implements the cryptographic policy enforcement path; remove the placeholder error variant.
 
-### 6.4 Transport placeholder endpoint type
+### 6.4 Transport endpoint type authority
 
-- **Surface**: `crates/tidefs-transport/src/config.rs:37-42`
-  - Comment: "Placeholder endpoint type -- will be replaced by the canonical endpoint type once #5787 lands."
-- Classification: **Implement** — blocked on a design issue (#5787 is a historical Forgejo reference; needs a current GitHub issue).
-- Follow-up issue: #793 creates or locates the current canonical endpoint type authority and replaces the placeholder.
+- **Surface**: `crates/tidefs-transport/src/config.rs`
+  - `TransportConfig` now stores the canonical `TransportAddr` endpoint type from `crates/tidefs-transport/src/addr.rs`.
+- Classification: **Resolved by #793** — the historical Forgejo placeholder reference is replaced by the current GitHub endpoint authority.
+- Residual boundary: storage-node RDMA disclosure maps either to a canonical `rdma://` `TransportAddr` or to the existing TCP fallback bind socket; opaque RDMA device strings are rejected instead of being preserved as a second endpoint ABI.
 
 ### 6.5 Cluster orchestrator scaffolding notes
 
@@ -326,7 +326,7 @@ These surfaces were identified as stub/placeholder during the audit but already 
 | #790 | Section 6.1 (dedup crate) | Implement | `crates/tidefs-dedup/` |
 | #791 | Section 6.2 (segment cleaner) | Implement | `crates/tidefs-segment-cleaner/` |
 | #792 | Section 6.3 (CryptoPlaceholder) | Implement | `crates/tidefs-secret-key-policy-runtime/` |
-| #793 | Section 6.4 (transport placeholder endpoint) | Implement | `crates/tidefs-transport/src/config.rs` |
+| #793 | Section 6.4 (transport endpoint type authority) | Resolved: canonical `TransportAddr` | `crates/tidefs-transport/src/config.rs` |
 | #794 | Section 6.5 (cluster orchestrator scaffolding) | Implement | `crates/tidefs-cluster/src/pool_orchestrator.rs` |
 | #795 | Section 6.7 (synthetic placeholder receipts) | Implement | `crates/tidefs-rebuild-runtime/` |
 | #796 | Section 7.1 (issue-era label audit and split) | Implement | `docs/STUB_PLACEHOLDER_INVENTORY.md`, `docs/REVIEW_TODO_REGISTER.md` |
