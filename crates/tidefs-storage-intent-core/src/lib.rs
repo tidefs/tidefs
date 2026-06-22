@@ -520,6 +520,23 @@ impl StorageIntentEvidenceRefs {
         }
         false
     }
+
+    /// Returns true if this exact bound evidence ref is present in the cut.
+    #[must_use]
+    pub const fn contains_ref(&self, evidence_ref: StorageIntentEvidenceRef) -> bool {
+        if !evidence_ref.is_bound() {
+            return false;
+        }
+
+        let mut index = 0;
+        while index < self.len as usize {
+            if evidence_ref_equal(self.refs[index], evidence_ref) {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
 }
 
 impl Default for StorageIntentEvidenceRefs {
@@ -813,7 +830,50 @@ impl EvidenceFamilyFreshnessSet {
     /// Returns true when the family is explicitly fresh for authority use.
     #[must_use]
     pub const fn family_is_fresh_for_authority(&self, kind: StorageIntentEvidenceKind) -> bool {
-        self.state_for_kind(kind).is_fresh_for_authority()
+        self.fresh_ref_for_kind(kind).is_some()
+    }
+
+    /// Return the single fresh replay anchor for one family, if it is unambiguous.
+    #[must_use]
+    pub const fn fresh_ref_for_kind(
+        &self,
+        kind: StorageIntentEvidenceKind,
+    ) -> Option<StorageIntentEvidenceRef> {
+        let mut index = 0;
+        let mut found = false;
+        let mut evidence_ref = StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::Unknown,
+            id: StorageIntentEvidenceId::ZERO,
+            generation: 0,
+            version: 0,
+        };
+
+        while index < self.len as usize {
+            let family = self.families[index];
+            if family.kind as u16 == kind as u16 {
+                if found {
+                    return None;
+                }
+                if !family.state.is_fresh_for_authority()
+                    || family.source_index_generation == 0
+                    || family.producer_generation == 0
+                    || family.freshness_frontier_ms == 0
+                    || family.evidence_ref.kind as u16 != kind as u16
+                    || !family.evidence_ref.is_bound()
+                {
+                    return None;
+                }
+                found = true;
+                evidence_ref = family.evidence_ref;
+            }
+            index += 1;
+        }
+
+        if found {
+            Some(evidence_ref)
+        } else {
+            None
+        }
     }
 }
 
@@ -945,8 +1005,10 @@ impl StorageIntentEvidenceQuerySnapshot {
     /// Returns true when one included family is fresh enough for authority use.
     #[must_use]
     pub const fn contains_fresh_authority_family(self, kind: StorageIntentEvidenceKind) -> bool {
-        self.contains_evidence_kind(kind)
-            && self.family_freshness.family_is_fresh_for_authority(kind)
+        match self.family_freshness.fresh_ref_for_kind(kind) {
+            Some(evidence_ref) => self.included_refs.contains_ref(evidence_ref),
+            None => false,
+        }
     }
 
     /// Returns true when media capability evidence is present and fresh.
@@ -6275,6 +6337,126 @@ mod tests {
                 StorageIntentEvidenceKind::MediaCapabilityEvidence
             ));
         }
+    }
+
+    #[test]
+    fn fresh_family_requires_bound_ref_inside_snapshot_cut() {
+        let mut unbound = base_query_snapshot(
+            EvidenceConsumerClass::Planner,
+            EvidenceQueryContextClass::PrefetchResidency,
+        );
+        let unbound_media_ref = StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            id: StorageIntentEvidenceId::ZERO,
+            generation: 61,
+            version: 1,
+        };
+        unbound.included_refs.push(unbound_media_ref).unwrap();
+        unbound
+            .family_freshness
+            .push(EvidenceFamilyFreshness {
+                kind: StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                state: EvidenceFamilyFreshnessState::Fresh,
+                source_index_generation: 61,
+                producer_generation: 61,
+                freshness_frontier_ms: 10_061,
+                allowed_staleness_ms: 100,
+                evidence_ref: unbound_media_ref,
+            })
+            .unwrap();
+
+        assert!(unbound.contains_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+        assert!(!unbound
+            .family_freshness
+            .family_is_fresh_for_authority(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+        assert!(!unbound.has_fresh_media_capability());
+        assert!(!unbound
+            .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+
+        let mut missing_included = base_query_snapshot(
+            EvidenceConsumerClass::Planner,
+            EvidenceQueryContextClass::PrefetchResidency,
+        );
+        missing_included
+            .family_freshness
+            .push(freshness_row(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+                62,
+            ))
+            .unwrap();
+
+        assert!(!missing_included.has_fresh_media_capability());
+        assert!(!missing_included
+            .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+    }
+
+    #[test]
+    fn fresh_family_ref_must_match_included_snapshot_ref() {
+        let mut snapshot = base_query_snapshot(
+            EvidenceConsumerClass::Planner,
+            EvidenceQueryContextClass::PrefetchResidency,
+        );
+        snapshot
+            .included_refs
+            .push(evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                63,
+            ))
+            .unwrap();
+        snapshot
+            .family_freshness
+            .push(freshness_row(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+                64,
+            ))
+            .unwrap();
+
+        assert!(snapshot.contains_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+        assert!(snapshot
+            .family_freshness
+            .family_is_fresh_for_authority(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+        assert!(!snapshot.has_fresh_media_capability());
+        assert!(!snapshot
+            .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+
+        snapshot
+            .included_refs
+            .push(evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                64,
+            ))
+            .unwrap();
+
+        assert!(snapshot.has_fresh_media_capability());
+        assert!(snapshot
+            .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+    }
+
+    #[test]
+    fn duplicate_family_freshness_rows_fail_closed() {
+        let mut snapshot = snapshot_with_fresh_media(
+            EvidenceConsumerClass::Planner,
+            EvidenceQueryContextClass::PrefetchResidency,
+        );
+        assert!(snapshot.has_fresh_media_capability());
+
+        snapshot
+            .family_freshness
+            .push(freshness_row(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+                65,
+            ))
+            .unwrap();
+
+        assert!(!snapshot
+            .family_freshness
+            .family_is_fresh_for_authority(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+        assert!(!snapshot.has_fresh_media_capability());
+        assert!(!snapshot
+            .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence));
     }
 
     #[test]
