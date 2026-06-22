@@ -5,13 +5,12 @@ active development. The filesystem is functional for local experiments but is
 not yet production-ready or POSIX-complete.
 
 Use this manual with:
-- `docs/STATUS.md` for current project state
+- `README.md` for repository scope, current policy, and readiness caveats
+- `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` for documentation authority state
 - `docs/ARCHITECTURE.md` for system architecture and design rationale
 - `docs/POSIX_COMPLIANCE.md` for per-operation POSIX status
-- `docs/GAP_ANALYSIS.md` for known gaps against ZFS and CephFS
-- `docs/FEATURE_MATRIX.md` for capability boundaries
-- `docs/POSIX_SUBSET.md` for the mounted syscall matrix
-- `docs/FUSE_MOUNT.md` for the FUSE adapter surface
+- `docs/REVIEW_TODO_REGISTER.md` for current review debt and capability blockers
+- `docs/POSIX_SUBSET.md` for historical first-FUSE subset context
 
 ## What You Can Do
 
@@ -138,9 +137,9 @@ uncompressed storage automatically.
 
 ## Known Limitations
 
-This section is a summary. The authoritative inventory is
-`docs/KNOWN_LIMITATIONS.md`, which distinguishes product limitations from
-environment refusals (host/sandbox constraints that are not product defects).
+This section is a summary, not an exhaustive authority. For current review
+debt and capability blockers, use `docs/REVIEW_TODO_REGISTER.md`; for mounted
+operation status, use `docs/POSIX_COMPLIANCE.md`.
 
 Key product limitations:
 
@@ -152,5 +151,4 @@ Key product limitations:
 - No automated self-healing (online verifier is read-only)
 - Broad xfstests coverage not yet runtime output at Tier 3
 
-See `docs/KNOWN_LIMITATIONS.md` for the complete list and
-`docs/GAP_ANALYSIS.md` for gap severity classification.
+See `docs/REVIEW_TODO_REGISTER.md` for the broader review-debt inventory.
