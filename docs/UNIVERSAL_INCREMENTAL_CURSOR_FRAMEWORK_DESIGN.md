@@ -519,9 +519,12 @@ ZFS's background work falls into distinct categories, none sharing a cursor cont
 - Admin command: verify `tidefsctl jobs list|inspect|pause|resume|cancel` output
 
 
-The xtask gate `tidefs-xtask check-incremental-cursor` verifies:
+The imported design plan proposed that the xtask gate
+`tidefs-xtask check-incremental-cursor` would verify:
 
-1. Spec, feature matrix, and status entries present
+1. Current documentation authority review recorded in
+   `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` before any future promotion of
+   this historical design
 2. Phase 1 crate compiles with `no_std` + optional `alloc`
 3. `WorkBudget` enforcement: mock job that overruns budget → test fails
 4. Checkpoint round-trip: serialize → deserialize → assert equality
