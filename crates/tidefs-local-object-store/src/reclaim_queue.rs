@@ -1080,7 +1080,7 @@ mod tests {
     fn publish_replacement_receipt_ignores_equal_or_lower_generation() {
         let key = dead_object_key(0xA3);
         let entry = DeadObjectEntry::new(key, [0xA3; 16], 10, true, 9);
-        let (mut store, _dir) = temp_store_with_dead_object_entry(entry);
+        let (mut store, dir) = temp_store_with_dead_object_entry(entry);
 
         let receipt_gen5 = receipt_for(key, 5);
         assert!(store
@@ -1099,6 +1099,13 @@ mod tests {
 
         store.sync_all().expect("sync");
         let loaded = load_dead_object_reclaim_queue(&store);
+        let entries = loaded.all_entries();
+        let published = entries.iter().find(|e| e.object_id == key).unwrap();
+        assert_eq!(published.replacement_receipt, Some(receipt_gen5));
+        drop(store);
+
+        let reopened = LocalObjectStore::open(dir.path()).expect("reopen store");
+        let loaded = load_dead_object_reclaim_queue(&reopened);
         let entries = loaded.all_entries();
         let published = entries.iter().find(|e| e.object_id == key).unwrap();
         assert_eq!(published.replacement_receipt, Some(receipt_gen5));

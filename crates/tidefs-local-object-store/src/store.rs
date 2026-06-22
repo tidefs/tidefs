@@ -2280,9 +2280,10 @@ impl LocalObjectStore {
     /// Enqueue one dead object whose old placement may be retired only after
     /// replacement/base receipt evidence and commit-group stability agree.
     ///
-    /// The inserted queue state is dirty in memory until [`sync_all`](Self::sync_all)
-    /// persists it. Duplicate object ids are accepted as idempotent replays and
-    /// return `Ok(false)`.
+    /// The receipt-bearing queue state reaches [`sync_all`](Self::sync_all)
+    /// before this method returns `Ok(true)`, so a later drain cannot race an
+    /// in-memory-only receipt publication. Duplicate object ids are accepted as
+    /// idempotent replays and return `Ok(false)`.
     pub fn enqueue_receipt_bound_dead_object(&mut self, entry: DeadObjectEntry) -> Result<bool> {
         self.ensure_writable("enqueue_receipt_bound_dead_object")?;
         let Some(receipt) = entry.replacement_receipt else {
@@ -2299,6 +2300,37 @@ impl LocalObjectStore {
         let inserted = self.dead_object_reclaim_queue.enqueue(entry);
         if inserted {
             self.dead_object_reclaim_queue_dirty = true;
+        }
+        if self.dead_object_reclaim_queue_dirty {
+            self.sync_all()?;
+        }
+        Ok(inserted)
+    }
+
+    /// Persist pending receipt-bound dead-object work before replacement/base
+    /// receipt publication is available.
+    ///
+    /// This preserves enqueue-before-publish replay state while keeping the
+    /// entry ineligible for drain until
+    /// [`publish_dead_object_replacement_receipt`](Self::publish_dead_object_replacement_receipt)
+    /// attaches durable, authorizing receipt evidence.
+    pub fn enqueue_pending_receipt_bound_dead_object(
+        &mut self,
+        entry: DeadObjectEntry,
+    ) -> Result<bool> {
+        self.ensure_writable("enqueue_pending_receipt_bound_dead_object")?;
+        if entry.replacement_receipt.is_some() {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "pending receipt-bound enqueue must not include a replacement receipt",
+            });
+        }
+
+        let inserted = self.dead_object_reclaim_queue.enqueue(entry);
+        if inserted {
+            self.dead_object_reclaim_queue_dirty = true;
+        }
+        if self.dead_object_reclaim_queue_dirty {
+            self.sync_all()?;
         }
         Ok(inserted)
     }
@@ -2332,6 +2364,9 @@ impl LocalObjectStore {
         if updated {
             self.dead_object_reclaim_queue_dirty = true;
         }
+        if self.dead_object_reclaim_queue_dirty {
+            self.sync_all()?;
+        }
         Ok(updated)
     }
 
@@ -2349,6 +2384,12 @@ impl LocalObjectStore {
     ) -> std::result::Result<tidefs_reclaim::ReclaimConsumerStats, ReceiptBoundDeadObjectDrainError>
     {
         self.ensure_writable("drain_receipt_bound_dead_objects_at_stable_generation")?;
+        if self.dead_object_reclaim_queue_dirty {
+            return Ok(tidefs_reclaim::ReclaimConsumerStats {
+                reclaim_queue_depth: self.dead_object_reclaim_queue.len(),
+                ..tidefs_reclaim::ReclaimConsumerStats::ZERO
+            });
+        }
 
         let plan = self.receipt_bound_dead_object_drain_plan(
             stable_committed_txg,
@@ -7699,8 +7740,7 @@ mod reclaim_queue_production_tests {
         assert!(!store
             .enqueue_receipt_bound_dead_object(entry)
             .expect("duplicate enqueue is idempotent"));
-        assert!(store.dead_object_reclaim_queue_dirty);
-        store.sync_all().expect("sync dead-object queue");
+        assert!(!store.dead_object_reclaim_queue_dirty);
         drop(store);
 
         let reopened = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
@@ -7729,6 +7769,71 @@ mod reclaim_queue_production_tests {
             err,
             StoreError::InvalidDeadObjectReceipt {
                 reason: "missing replacement receipt"
+            }
+        ));
+        assert!(store.dead_object_reclaim_queue.is_empty());
+        assert!(!store.dead_object_reclaim_queue_dirty);
+    }
+
+    #[test]
+    fn pending_receipt_bound_dead_object_replays_until_receipt_publish() {
+        let (mut store, dir) = temp_store();
+        let key = dead_object_key(0x53);
+        let pending =
+            tidefs_types_reclaim_queue_core::DeadObjectEntry::new(key, [0x53; 16], 5, true, 5);
+
+        assert!(store
+            .enqueue_pending_receipt_bound_dead_object(pending)
+            .expect("persist pending receipt-bound work"));
+        assert!(!store.dead_object_reclaim_queue_dirty);
+        drop(store);
+
+        let mut reopened =
+            LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+                .expect("reopen pending work");
+        assert_eq!(reopened.dead_object_reclaim_queue.len(), 1);
+        let entry = reopened.dead_object_reclaim_queue.all_entries()[0];
+        assert_eq!(entry.object_id, key);
+        assert_eq!(entry.replacement_receipt, None);
+        assert_eq!(
+            reopened
+                .dead_object_reclaim_queue
+                .receipt_bound_eligible_count_with_stable_generation(6, 1),
+            0
+        );
+
+        let receipt = dead_object_receipt(key, 1);
+        assert!(reopened
+            .publish_dead_object_replacement_receipt(&key, receipt)
+            .expect("publish replacement receipt"));
+        assert!(!reopened.dead_object_reclaim_queue_dirty);
+        drop(reopened);
+
+        let reopened = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+            .expect("reopen published work");
+        let entry = reopened.dead_object_reclaim_queue.all_entries()[0];
+        assert_eq!(entry.replacement_receipt, Some(receipt));
+        assert_eq!(
+            reopened
+                .dead_object_reclaim_queue
+                .receipt_bound_eligible_count_with_stable_generation(6, 1),
+            1
+        );
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_enqueue_rejects_receipt_bearing_pending_work() {
+        let (mut store, _dir) = temp_store();
+        let key = dead_object_key(0x54);
+        let entry = dead_object_entry_for_key(key, 5, true, 1);
+
+        let err = store
+            .enqueue_pending_receipt_bound_dead_object(entry)
+            .expect_err("pending enqueue must not carry receipt evidence");
+        assert!(matches!(
+            err,
+            StoreError::InvalidDeadObjectReceipt {
+                reason: "pending receipt-bound enqueue must not include a replacement receipt"
             }
         ));
         assert!(store.dead_object_reclaim_queue.is_empty());
@@ -7781,6 +7886,35 @@ mod reclaim_queue_production_tests {
         assert!(reopened.dead_object_reclaim_queue.is_empty());
         assert_eq!(reopened.reclaim_receipts(), &[receipt]);
         assert!(!segment_path(&reopened.segments_dir, old_segment_id).exists());
+    }
+
+    #[test]
+    fn receipt_bound_dead_object_drain_refuses_unflushed_publication() {
+        let (mut store, _dir) = temp_store();
+        let key = ObjectKey::from_name(b"receipt-bound/dead-object/dirty-publication");
+
+        store.put(key, b"obsolete payload").expect("put");
+        let old_segment_id = store.index.get(&key).expect("location").segment_id;
+        assert!(store.delete(key).expect("delete"));
+
+        let reclaim_key = reclaim_key(key);
+        let entry = dead_object_entry_for_key(reclaim_key, 0, true, 1);
+        assert!(store.dead_object_reclaim_queue.enqueue(entry));
+        store.dead_object_reclaim_queue_dirty = true;
+
+        let stats = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("dirty receipt publication is refused");
+
+        assert_eq!(stats.entries_processed, 0);
+        assert_eq!(stats.segments_reclaimed, 0);
+        assert_eq!(stats.reclaim_queue_depth, 1);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        assert!(store.dead_object_reclaim_queue_dirty);
+        assert!(
+            segment_path(&store.segments_dir, old_segment_id).exists(),
+            "dirty receipt publication must not let drain reclaim storage"
+        );
     }
 
     #[test]
