@@ -12,7 +12,7 @@ OpenZFS/Ceph-class claims.
 | TFR-005 | Timestamp/revision/on-disk format | POSIX timestamps, storage version fields, content object keys, scrub identity, replay ticks, rename metadata stamps, and serialized format fields are coupled. | Specify one authority model for POSIX time, generation, txg, object-version, and on-disk compatibility before changing behavior. |
 | TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Use `docs/TRANSFORM_PIPELINE_AUTHORITY.md` as the #1063 boundary decision and close its non-overlapping follow-up map before claiming runtime conformance. |
 | TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Use `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` as the boundary decision and close the linked follow-up issue map. |
-| TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` for the dirty/writeback durability contract and `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` for the invalidation trigger, stale-generation, and FUSE/kernel/cluster lease model; then prove and test the end-to-end durability and cache-coherency contract. |
+| TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` for the integrated recovery/fsync/writeback/mmap durability boundary and follow-up map, and `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` for the invalidation trigger, stale-generation, and FUSE/kernel/cluster lease model; then prove and test the end-to-end durability and cache-coherency contract. |
 | TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Unify snapshot lifecycle, object protection, deadlists, and stream formats. |
 | TFR-011 | Operator CLI/UAPI | CLI, FUSE, ublk, kernel UAPI, and docs can describe different truths. | Define one public operator/UAPI boundary and keep internal crates behind it. |
 | TFR-013 | Stub/placeholder stage | Several crates and docs still look like stage scaffolding rather than product behavior. | Classify placeholders explicitly and delete or implement them. |
@@ -519,6 +519,15 @@ Important 2026-06-01 findings:
   fault behavior, or claim-gate evidence. Follow-up implementation is split
   across #752 for FUSE data-cache invalidation, #753 for kernel page-cache
   coherency fences, and #754 for clustered cache lease epoch invalidation.
+- `TFR-008`: issue #1065 expands `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`
+  into the integrated recovery/fsync/writeback/mmap authority decision. The
+  chosen boundary keeps durability in committed-root publication plus durable
+  intent-log replay, keeps cache-core page state non-durable, keeps
+  cache-coherency and lease crates authoritative for stale-generation fencing,
+  and classifies FUSE/kmod page caches as projections. It also records explicit
+  non-claims and the follow-up implementation map for dirty lifecycle
+  unification, local fsync/recovery ordering, FUSE projection, kmod projection,
+  and claim-gate evidence.
 - `TFR-009`: Kernel residency is still a tiered bring-up, not terminal; TideFS
   is not yet full-kernel. The kernel-resident architecture doc explicitly says the
   current mounted operation slice uses a small fixed in-kernel namespace/data

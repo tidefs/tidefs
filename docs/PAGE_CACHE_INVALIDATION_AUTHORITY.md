@@ -11,7 +11,8 @@ is a design authority boundary only. It does not implement invalidation,
 eviction, lease protocols, kernel page-cache notifications, mmap fault
 handling, or runtime validation.
 
-The dirty/writeback durability contract remains in
+The dirty/writeback durability contract and the integrated TFR-008
+recovery/fsync/writeback/mmap boundary remain in
 `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`. This document defines the trigger and
 coherency side of that boundary: which event makes cached bytes stale, what
 granularity is required, and what generation a reader must prove before serving
