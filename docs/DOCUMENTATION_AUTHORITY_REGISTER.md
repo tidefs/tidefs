@@ -44,6 +44,79 @@ too large for the current slice, leave the document as historical input and
 record the blocker in `docs/REVIEW_TODO_REGISTER.md` or
 `docs/WHOLE_REPO_REVIEW.md`.
 
+## Doc-Authority Drift Cleanup Coordination (#952)
+
+Recorded on 2026-06-22 for the `check-doc-authority-drift` follow-up from PR
+#950. This section is a coordination map only: it does not promote or demote
+any document, does not change scanner behavior, and does not make product
+readiness claims.
+
+For this guard, current docs are scanned unless this register classifies them
+as historical input or delete candidates. Historical-input docs and
+delete-candidate docs are intentional skip surfaces for the guard; they may
+preserve retired paths as review material but must not be cited as current
+status. Evidence-only docs are `docs/workspace-package-classification.md`,
+`docs/REVIEW_TODO_REGISTER.md`, this register, and
+`docs/WHOLE_REPO_REVIEW.md`; those files intentionally record retired crates,
+deleted docs, and old paths as authority evidence rather than rewrite targets.
+
+The #952 live-doc cleanup is split into exact-file child slices. Those paths
+stay out of this coordination slice:
+
+- #1015 owns current-doc retired scaffold root references in
+  `docs/ARCHITECTURE.md`.
+- #1016 owns deleted status/matrix links in `docs/USER_MANUAL.md`.
+- #1017 owns the visible historical-input treatment for retired crate paths in
+  `docs/HUMAN_TERMINOLOGY.md`.
+- #1018 owns historical/evidence treatment for retired type-root consolidation
+  records in `docs/crates/types-core-consolidation-plan.md`.
+- #1019 owns historical/evidence treatment for retired type-root dependency
+  tables in
+  `docs/design/crate-dependency-graph-ownership-boundaries.md`.
+- #1020 owns retired type-root workspace prose in
+  `docs/crates/workspace-structure.md`.
+- #1021 owns the deleted `docs/FEATURE_MATRIX.md` reference in
+  `docs/design/deterministic-cluster-simnet-protocol-correctness-testing.md`.
+- #1022 owns deleted status/matrix closeout references in
+  `docs/design/deferred-cleanup-work-queues.md`.
+- #1023 owns feature-matrix/status wording in
+  `docs/design/persistent-orphan-index-consolidated-design.md`.
+- #1024 owns deleted status/matrix delivery outputs in
+  `docs/design/node-lifecycle-management.md`.
+- #1025 owns deleted status/matrix update targets in
+  `docs/design/deferred-cleanup-background-service-scheduling.md`.
+
+Bounded source/doc inspection for this coordination slice also found older
+status/matrix references outside the #1015-#1025 child map. Already-classified
+historical-input examples, including
+`docs/design/2159-milestone-targets-velocity-update.md`,
+`docs/design/coordination-review-roadmap-priorities-update-1953.md`,
+`docs/design/openzfs-ceph-successor-claim.md`, and
+`docs/design/production-erasure-coding-crush-placement-g4-pillar.md`, remain
+historical input under their existing rows. Unclassified status/matrix
+leftovers in
+`docs/design/1813-pool-import-export-device-topology-management-design.md`,
+`docs/design/1971-pool-import-export-7-phase-implementation-plan.md`,
+`docs/design/coordination-pipeline-cluster-services-design-seal.md`,
+`docs/design/coordination-pipeline-health-advancement-strategy.md`,
+`docs/design/coordination-pipeline-status-update.md`,
+`docs/design/coordination-pipeline-status-update-1767.md`,
+`docs/design/coordination-pipeline-status-update-1839.md`,
+`docs/design/coordination-pipeline-status-update-1915.md`,
+`docs/design/coordination-pipeline-status-update-1954.md`,
+`docs/design/coordination-pipeline-status-update-2054.md`,
+`docs/design/coordination-review-roadmap-priorities-update.md`,
+`docs/design/derived-views-first-class-architectural-pillar.md`,
+`docs/design/incremental-job-core-wire-up-deferred-design.md`, and
+`docs/design/unified-on-media-format-lifecycle.md` are left for a later
+planner turn because each needs its own expected write set and per-document
+authority decision. Rewriting them here would recreate the broad docs sweep
+that #952 split into focused slices.
+
+#952 must remain open until #1015 through #1025 are closed and a current guard
+run or equivalent source inspection shows no remaining blocking live-doc drift
+for this issue family.
+
 ## Classified Authority Slices
 
 ### Checksum and BLAKE3 Authority
