@@ -23,8 +23,7 @@ use std::sync::Arc;
 use tidefs_cache_coherency::CoherencyEventBus;
 use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseGrant};
 use tidefs_lease_manager::manager::LeaseManager;
-use tidefs_membership_epoch::EpochId;
-use tidefs_membership_epoch::MemberId;
+use tidefs_membership_epoch::{EpochId, EpochToken, MemberId};
 use tidefs_quorum_write::{QuorumWriteResult, QuorumWriteSummary, WriteClass};
 use tidefs_tdma_scheduler::slot_allocator::{SlotAllocator, SlotAssignment};
 use tidefs_tdma_scheduler::slot_grant::SlotGrant;
@@ -46,8 +45,16 @@ pub enum CoordinatorError {
     /// Slot grant validation failed (BLAKE3 token mismatch).
     /// Epoch mismatch between coordinator and slot grant.
     EpochMismatch { expected: u64, actual: u64 },
+    /// No membership-epoch token has witnessed the coordinator's current epoch.
+    MissingEpochToken { current_epoch: u64 },
+    /// A supplied membership-epoch token is older than the coordinator epoch.
+    StaleEpochToken { token_epoch: u64, current_epoch: u64 },
+    /// A supplied membership-epoch token does not match the coordinator epoch.
+    EpochTokenMismatch { token_epoch: u64, current_epoch: u64 },
     /// Slot is stale (epoch too old).
     StaleSlot { slot_epoch: u64, current_epoch: u64 },
+    /// Write lease epoch differs from the token-witnessed coordinator epoch.
+    LeaseEpochMismatch { expected: u64, actual: u64 },
     /// Lease acquisition failed.
     LeaseAcquisitionFailed(String),
     /// Quorum write dispatch failed.
@@ -70,6 +77,30 @@ impl fmt::Display for CoordinatorError {
             Self::EpochMismatch { expected, actual } => {
                 write!(f, "epoch mismatch: expected {expected}, got {actual}")
             }
+            Self::MissingEpochToken { current_epoch } => {
+                write!(
+                    f,
+                    "missing membership epoch token for current epoch {current_epoch}"
+                )
+            }
+            Self::StaleEpochToken {
+                token_epoch,
+                current_epoch,
+            } => {
+                write!(
+                    f,
+                    "stale membership epoch token: token epoch {token_epoch} < current epoch {current_epoch}"
+                )
+            }
+            Self::EpochTokenMismatch {
+                token_epoch,
+                current_epoch,
+            } => {
+                write!(
+                    f,
+                    "membership epoch token mismatch: token epoch {token_epoch}, current epoch {current_epoch}"
+                )
+            }
             Self::StaleSlot {
                 slot_epoch,
                 current_epoch,
@@ -78,6 +109,9 @@ impl fmt::Display for CoordinatorError {
                     f,
                     "stale slot: slot epoch {slot_epoch} < current epoch {current_epoch}"
                 )
+            }
+            Self::LeaseEpochMismatch { expected, actual } => {
+                write!(f, "lease epoch mismatch: expected {expected}, got {actual}")
             }
             Self::LeaseAcquisitionFailed(reason) => {
                 write!(f, "lease acquisition failed: {reason}")
@@ -159,6 +193,9 @@ pub struct QuorumWriteCoordinator {
     /// The last epoch this coordinator was configured for.
     current_epoch: EpochId,
 
+    /// Membership-epoch proof that witnessed `current_epoch`.
+    current_epoch_token: Option<EpochToken>,
+
     /// Whether lease acquisition is enabled.
     lease_enabled: bool,
 
@@ -184,6 +221,7 @@ impl QuorumWriteCoordinator {
             node_id: 0,
             time_source_ms: 0,
             current_epoch: EpochId::new(0),
+            current_epoch_token: None,
             lease_enabled: false,
             slot_enabled: false,
         }
@@ -220,6 +258,9 @@ impl QuorumWriteCoordinator {
         if let Some(ref bus) = self.coherency_bus {
             lm.set_coherency_bus(Arc::clone(bus));
         }
+        if self.current_epoch > lm.current_epoch() {
+            lm.advance_epoch(self.current_epoch);
+        }
         self.lease_manager = Some(lm);
         self
     }
@@ -242,9 +283,51 @@ impl QuorumWriteCoordinator {
         self.current_epoch
     }
 
-    /// Advance to a new epoch. This invalidates all slots and leases from
-    /// prior epochs. Returns the number of leases revoked.
+    /// Get the current membership-epoch token proof.
+    #[must_use]
+    pub fn current_epoch_token(&self) -> Option<EpochToken> {
+        self.current_epoch_token
+    }
+
+    /// Consume a membership-epoch token proving the coordinator's current epoch.
+    ///
+    /// The token is issued and owned by `tidefs-membership-epoch`; the quorum
+    /// coordinator only mirrors the witnessed epoch and refuses writes without
+    /// a matching token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::StaleEpochToken`] if the token is older than
+    /// the coordinator's current epoch.
+    pub fn witness_epoch_token(
+        &mut self,
+        token: EpochToken,
+    ) -> Result<usize, CoordinatorError> {
+        if token.epoch < self.current_epoch {
+            return Err(CoordinatorError::StaleEpochToken {
+                token_epoch: token.epoch.0,
+                current_epoch: self.current_epoch.0,
+            });
+        }
+
+        let revoked = self.apply_epoch(token.epoch);
+        self.current_epoch_token = Some(token);
+        Ok(revoked)
+    }
+
+    /// Advance to a locally observed epoch without proof authority.
+    ///
+    /// This invalidates all slots and leases from prior epochs, clears any
+    /// previously witnessed token, and returns the number of leases revoked.
+    /// Call [`Self::witness_epoch_token`] with a token from
+    /// `tidefs-membership-epoch` before dispatching another quorum write.
     pub fn advance_epoch(&mut self, new_epoch: EpochId) -> usize {
+        let revoked = self.apply_epoch(new_epoch);
+        self.current_epoch_token = None;
+        revoked
+    }
+
+    fn apply_epoch(&mut self, new_epoch: EpochId) -> usize {
         let revoked = if let Some(ref mut lm) = self.lease_manager {
             lm.advance_epoch(new_epoch).len()
         } else {
@@ -297,11 +380,13 @@ impl QuorumWriteCoordinator {
         data: &[u8],
         write_txg: u64,
     ) -> Result<CoordinatorOutcome, CoordinatorError> {
+        self.validate_current_epoch_token()?;
+
         // ── 1. Slot acquisition ────────────────────────────────────
         let slot_grant = if self.slot_enabled {
             self.acquire_slot(write_txg)?
         } else {
-            SlotGrant::new(0, EpochId::new(0), 0, 0)
+            SlotGrant::new(0, self.current_epoch, 0, 0)
         };
 
         // ── 2. Epoch validation ────────────────────────────────────
@@ -313,8 +398,12 @@ impl QuorumWriteCoordinator {
         } else {
             None
         };
+        if let Some(ref grant) = lease_grant {
+            self.validate_lease_epoch(grant)?;
+        }
 
         // ── 4. Quorum dispatch ─────────────────────────────────────
+        self.validate_current_epoch_token()?;
         let (quorum_result, quorum_summary) = self
             .runtime
             .execute_write(object_key, data)
@@ -325,6 +414,7 @@ impl QuorumWriteCoordinator {
 
         // ── 5. Commit or abort ─────────────────────────────────────
         if quorum_reached {
+            self.validate_current_epoch_token()?;
             self.release_slot_success(&slot_grant, write_txg);
         } else {
             self.abort_write(&slot_grant, write_txg)?;
@@ -367,6 +457,7 @@ impl QuorumWriteCoordinator {
 
     /// Validate that the slot grant matches the current epoch.
     fn validate_slot_epoch(&self, grant: &SlotGrant) -> Result<(), CoordinatorError> {
+        self.validate_current_epoch_token()?;
         if grant.is_stale(self.current_epoch) {
             return Err(CoordinatorError::StaleSlot {
                 slot_epoch: grant.epoch.0,
@@ -382,11 +473,42 @@ impl QuorumWriteCoordinator {
         Ok(())
     }
 
+    fn validate_current_epoch_token(&self) -> Result<(), CoordinatorError> {
+        let Some(token) = self.current_epoch_token else {
+            return Err(CoordinatorError::MissingEpochToken {
+                current_epoch: self.current_epoch.0,
+            });
+        };
+
+        if token.epoch < self.current_epoch {
+            return Err(CoordinatorError::StaleEpochToken {
+                token_epoch: token.epoch.0,
+                current_epoch: self.current_epoch.0,
+            });
+        }
+        if token.epoch != self.current_epoch {
+            return Err(CoordinatorError::EpochTokenMismatch {
+                token_epoch: token.epoch.0,
+                current_epoch: self.current_epoch.0,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_lease_epoch(&self, grant: &LeaseGrant) -> Result<(), CoordinatorError> {
+        self.validate_current_epoch_token()?;
+        if grant.epoch != self.current_epoch {
+            return Err(CoordinatorError::LeaseEpochMismatch {
+                expected: self.current_epoch.0,
+                actual: grant.epoch.0,
+            });
+        }
+        Ok(())
+    }
+
     /// Acquire a write lease for the target object domain.
     fn acquire_write_lease(&mut self, object_key: &str) -> Result<LeaseGrant, CoordinatorError> {
-        let lm = self.lease_manager.as_mut().ok_or_else(|| {
-            CoordinatorError::LeaseAcquisitionFailed("no lease manager configured".into())
-        })?;
+        self.validate_current_epoch_token()?;
 
         let domain = LeaseDomain::Subtree {
             dataset_id: 0,
@@ -394,14 +516,22 @@ impl QuorumWriteCoordinator {
         };
         let holder = MemberId::new(self.node_id);
 
-        lm.grant(
-            LeaseClass::Exclusive,
-            domain,
-            holder,
-            0,
-            self.time_source_ms,
-        )
-        .map_err(|e| CoordinatorError::LeaseAcquisitionFailed(format!("{e:?}")))
+        let grant = {
+            let lm = self.lease_manager.as_mut().ok_or_else(|| {
+                CoordinatorError::LeaseAcquisitionFailed("no lease manager configured".into())
+            })?;
+
+            lm.grant(
+                LeaseClass::Exclusive,
+                domain,
+                holder,
+                0,
+                self.time_source_ms,
+            )
+            .map_err(|e| CoordinatorError::LeaseAcquisitionFailed(format!("{e:?}")))?
+        };
+        self.validate_lease_epoch(&grant)?;
+        Ok(grant)
     }
 
     /// Release the slot with a success marker.
@@ -444,6 +574,18 @@ mod tests {
         QuorumWriteCoordinator::new(make_config(), PathBuf::from("/tmp/qwc"))
     }
 
+    fn epoch_token(epoch: u64, generation: u64) -> EpochToken {
+        EpochToken {
+            epoch: EpochId::new(epoch),
+            generation,
+        }
+    }
+
+    fn authorize_epoch(c: &mut QuorumWriteCoordinator, epoch: u64, generation: u64) {
+        c.witness_epoch_token(epoch_token(epoch, generation))
+            .expect("epoch token should authorize coordinator");
+    }
+
     // ── Basic coordinator construction ──────────────────────────────
 
     #[test]
@@ -452,6 +594,7 @@ mod tests {
         assert!(!c.slot_enabled());
         assert!(!c.lease_enabled());
         assert_eq!(c.current_epoch(), EpochId::new(0));
+        assert_eq!(c.current_epoch_token(), None);
     }
 
     #[test]
@@ -495,9 +638,11 @@ mod tests {
     fn advance_epoch_increments_current() {
         let mut c = make_coordinator();
         assert_eq!(c.current_epoch().0, 0);
+        authorize_epoch(&mut c, 0, 0);
         let revoked = c.advance_epoch(EpochId::new(5));
         assert_eq!(revoked, 0);
         assert_eq!(c.current_epoch().0, 5);
+        assert_eq!(c.current_epoch_token(), None);
     }
 
     #[test]
@@ -510,9 +655,70 @@ mod tests {
         let mut c = make_coordinator().with_lease_manager(lm);
         c.set_node_id(1);
         c.set_time_ms(1000);
+        authorize_epoch(&mut c, 0, 0);
         let revoked = c.advance_epoch(EpochId::new(3));
         assert_eq!(revoked, 0);
         assert_eq!(c.current_epoch().0, 3);
+        assert_eq!(c.current_epoch_token(), None);
+    }
+
+    #[test]
+    fn witness_epoch_token_accepts_current_epoch_token() {
+        let mut c = make_coordinator();
+        authorize_epoch(&mut c, 0, 0);
+
+        assert_eq!(c.current_epoch(), EpochId::new(0));
+        assert_eq!(c.current_epoch_token(), Some(epoch_token(0, 0)));
+        assert!(c.validate_current_epoch_token().is_ok());
+    }
+
+    #[test]
+    fn witness_epoch_token_rejects_stale_token() {
+        let mut c = make_coordinator();
+        authorize_epoch(&mut c, 0, 0);
+        c.advance_epoch(EpochId::new(2));
+
+        let result = c.witness_epoch_token(epoch_token(0, 0));
+
+        match result.unwrap_err() {
+            CoordinatorError::StaleEpochToken {
+                token_epoch,
+                current_epoch,
+            } => {
+                assert_eq!(token_epoch, 0);
+                assert_eq!(current_epoch, 2);
+            }
+            other => panic!("expected StaleEpochToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_current_epoch_token_rejects_absent_token() {
+        let c = make_coordinator();
+
+        match c.validate_current_epoch_token().unwrap_err() {
+            CoordinatorError::MissingEpochToken { current_epoch } => {
+                assert_eq!(current_epoch, 0);
+            }
+            other => panic!("expected MissingEpochToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_current_epoch_token_rejects_mismatched_token() {
+        let mut c = make_coordinator();
+        c.current_epoch_token = Some(epoch_token(5, 1));
+
+        match c.validate_current_epoch_token().unwrap_err() {
+            CoordinatorError::EpochTokenMismatch {
+                token_epoch,
+                current_epoch,
+            } => {
+                assert_eq!(token_epoch, 5);
+                assert_eq!(current_epoch, 0);
+            }
+            other => panic!("expected EpochTokenMismatch, got {other:?}"),
+        }
     }
 
     // ── Slot acquisition ────────────────────────────────────────────
@@ -570,14 +776,16 @@ mod tests {
 
     #[test]
     fn validate_slot_epoch_matching_epoch_passes() {
-        let c = make_coordinator();
+        let mut c = make_coordinator();
+        authorize_epoch(&mut c, 0, 0);
         let grant = SlotGrant::new(0, EpochId::new(0), 1, 100);
         assert!(c.validate_slot_epoch(&grant).is_ok());
     }
 
     #[test]
     fn validate_slot_epoch_future_epoch_rejected() {
-        let c = make_coordinator();
+        let mut c = make_coordinator();
+        authorize_epoch(&mut c, 0, 0);
         let grant = SlotGrant::new(0, EpochId::new(5), 1, 100);
         let result = c.validate_slot_epoch(&grant);
         assert!(result.is_err());
@@ -587,6 +795,7 @@ mod tests {
     fn validate_slot_epoch_stale_detected() {
         let mut c = make_coordinator();
         c.current_epoch = EpochId::new(10);
+        c.current_epoch_token = Some(epoch_token(10, 1));
         let grant = SlotGrant::new(0, EpochId::new(3), 1, 100);
         let result = c.validate_slot_epoch(&grant);
         assert!(result.is_err());
@@ -614,6 +823,7 @@ mod tests {
         let mut c = make_coordinator().with_lease_manager(lm);
         c.set_node_id(1);
         c.set_time_ms(1000);
+        authorize_epoch(&mut c, 0, 0);
 
         let grant = c.acquire_write_lease("obj/test_lease");
         assert!(grant.is_ok());
@@ -626,9 +836,41 @@ mod tests {
         let mut c = make_coordinator();
         c.set_node_id(1);
         c.lease_enabled = true;
+        authorize_epoch(&mut c, 0, 0);
 
         let result = c.acquire_write_lease("obj/test");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_lease_epoch_rejects_mismatched_write_epoch() {
+        let mut c = make_coordinator();
+        authorize_epoch(&mut c, 1, 1);
+        let grant = LeaseGrant::request(
+            1,
+            LeaseClass::Exclusive,
+            LeaseDomain::Subtree {
+                dataset_id: 0,
+                prefix: "obj/stale".into(),
+            },
+            MemberId::new(1),
+            0,
+            5_000,
+            1_000,
+            EpochId::new(0),
+            tidefs_membership_epoch::DatasetMountIdentity::ZERO,
+            0,
+            0,
+            0,
+        );
+
+        match c.validate_lease_epoch(&grant).unwrap_err() {
+            CoordinatorError::LeaseEpochMismatch { expected, actual } => {
+                assert_eq!(expected, 1);
+                assert_eq!(actual, 0);
+            }
+            other => panic!("expected LeaseEpochMismatch, got {other:?}"),
+        }
     }
 
     // ── Slot release and abort ──────────────────────────────────────
@@ -695,6 +937,7 @@ mod tests {
     #[test]
     fn coordinated_write_single_target_no_slot_no_lease() {
         let mut c = make_coordinator();
+        authorize_epoch(&mut c, 0, 0);
         c.set_targets(vec![NodeId::new(1)]);
 
         let result = c.execute_coordinated_write("obj/e2e", b"payload", 1);
@@ -710,6 +953,7 @@ mod tests {
         let alloc = SlotAllocator::new(EpochId::new(0), 64).unwrap();
         let mut c = make_coordinator().with_slot_allocator(alloc);
         c.set_node_id(1);
+        authorize_epoch(&mut c, 0, 0);
         c.set_targets(vec![NodeId::new(1)]);
 
         let result = c.execute_coordinated_write("obj/slotted", b"data", 100);
@@ -733,6 +977,7 @@ mod tests {
             .with_lease_manager(lm);
         c.set_node_id(1);
         c.set_time_ms(2000);
+        authorize_epoch(&mut c, 0, 0);
         c.set_targets(vec![NodeId::new(1)]);
 
         let result = c.execute_coordinated_write("obj/both", b"payload", 200);
@@ -746,8 +991,25 @@ mod tests {
     #[test]
     fn coordinated_write_no_targets_error() {
         let mut c = make_coordinator();
+        authorize_epoch(&mut c, 0, 0);
         let result = c.execute_coordinated_write("obj/notarget", b"data", 1);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn coordinated_write_no_epoch_token_rejected() {
+        let mut c = make_coordinator();
+        c.set_targets(vec![NodeId::new(1)]);
+
+        match c
+            .execute_coordinated_write("obj/no_token", b"data", 1)
+            .unwrap_err()
+        {
+            CoordinatorError::MissingEpochToken { current_epoch } => {
+                assert_eq!(current_epoch, 0);
+            }
+            other => panic!("expected MissingEpochToken, got {other:?}"),
+        }
     }
 
     #[test]
@@ -765,16 +1027,23 @@ mod tests {
         let r2 = c.acquire_slot(42);
         assert!(r2.is_err());
     }
-    fn coordinated_write_epoch_change_mid_write_rejected() {
+    #[test]
+    fn coordinated_write_epoch_change_clears_token_and_rejects_write() {
         let alloc = SlotAllocator::new(EpochId::new(0), 64).unwrap();
         let mut c = make_coordinator().with_slot_allocator(alloc);
         c.set_node_id(1);
+        authorize_epoch(&mut c, 0, 0);
         c.set_targets(vec![NodeId::new(1)]);
 
         c.advance_epoch(EpochId::new(5));
 
         let result = c.execute_coordinated_write("obj/epoch", b"data", 10);
-        assert!(result.is_err());
+        match result.unwrap_err() {
+            CoordinatorError::MissingEpochToken { current_epoch } => {
+                assert_eq!(current_epoch, 5);
+            }
+            other => panic!("expected MissingEpochToken, got {other:?}"),
+        }
     }
 
     // ── CoordinatorError Display ────────────────────────────────────
@@ -813,6 +1082,7 @@ mod tests {
     #[test]
     fn idempotent_retry_after_transient_failure() {
         let mut c = make_coordinator();
+        authorize_epoch(&mut c, 0, 0);
         let r1 = c.execute_coordinated_write("obj/retry", b"data", 1);
         assert!(r1.is_err());
 
