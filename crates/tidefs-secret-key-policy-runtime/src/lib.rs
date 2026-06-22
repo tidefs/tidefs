@@ -91,9 +91,26 @@ pub enum SecretKeyPolicyRuntimeError {
     RotationNotInDualValidity {
         plan_id: SecretKeyPolicyId128,
     },
+    RotationHandleMismatch {
+        plan_id: SecretKeyPolicyId128,
+        handle_id: SecretKeyPolicyId128,
+        plan_handle_id: SecretKeyPolicyId128,
+    },
     RotationPredecessorNotFound {
         plan_id: SecretKeyPolicyId128,
         envelope_id: SecretKeyPolicyId128,
+    },
+    RotationSuccessorMissing {
+        plan_id: SecretKeyPolicyId128,
+    },
+    RotationSuccessorMatchesPredecessor {
+        plan_id: SecretKeyPolicyId128,
+        envelope_id: SecretKeyPolicyId128,
+    },
+    RotationSuccessorVersionNotAdvanced {
+        plan_id: SecretKeyPolicyId128,
+        predecessor_version: u32,
+        successor_version: u32,
     },
 
     RevocationNoLiveLeases {
@@ -118,8 +135,6 @@ pub enum SecretKeyPolicyRuntimeError {
         surface: DisclosureSurfaceClass,
         reason: RefusalReason,
     },
-
-    CryptoPlaceholder,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -779,24 +794,84 @@ pub fn rotate_leaf_secret_with_dual_validity_and_successor<S: SealProvider>(
     _expiry_ref: SecretKeyPolicyId128,
 ) -> Result<(SecretHandleRecord, SecretEnvelopeRecord), SecretKeyPolicyRuntimeError> {
     let mut handle = store.lookup_handle(handle_id)?;
+    if rotation_plan.handle_id != handle_id {
+        return Err(SecretKeyPolicyRuntimeError::RotationHandleMismatch {
+            plan_id: rotation_plan.rotation_plan_id,
+            handle_id,
+            plan_handle_id: rotation_plan.handle_id,
+        });
+    }
+
     let rotation_class = rotation_plan.rotation_class()?;
     let wants_dual = rotation_class.allows_dual_validity();
-    let secret_class = handle.secret_class()?;
-    let material = provider.generate_secret_material(secret_class)?;
+    let lifecycle_state = handle.lifecycle_state()?;
+    match lifecycle_state {
+        SecretLifecycleState::Active | SecretLifecycleState::RotatingDualValid => {}
+        SecretLifecycleState::Revoked => {
+            return Err(SecretKeyPolicyRuntimeError::HandleRevoked { handle_id });
+        }
+        SecretLifecycleState::Quarantined => {
+            return Err(SecretKeyPolicyRuntimeError::HandleQuarantined { handle_id });
+        }
+        _ => {
+            return Err(SecretKeyPolicyRuntimeError::HandleNotActive {
+                handle_id,
+                actual: lifecycle_state,
+            });
+        }
+    }
 
-    let key_id = rotation_plan.predecessor_envelope_id;
-    let wrapping_key = store.lookup_wrapping_key(key_id).map_err(|_| {
-        SecretKeyPolicyRuntimeError::EnvelopeNotFound {
-            envelope_id: key_id,
+    let secret_class = handle.secret_class()?;
+
+    let predecessor_envelope_id = rotation_plan.predecessor_envelope_id;
+    if predecessor_envelope_id.is_zero() || predecessor_envelope_id != handle.active_envelope_id {
+        return Err(SecretKeyPolicyRuntimeError::RotationPredecessorNotFound {
+            plan_id: rotation_plan.rotation_plan_id,
+            envelope_id: predecessor_envelope_id,
+        });
+    }
+    let predecessor = store.lookup_envelope(predecessor_envelope_id).map_err(|_| {
+        SecretKeyPolicyRuntimeError::RotationPredecessorNotFound {
+            plan_id: rotation_plan.rotation_plan_id,
+            envelope_id: predecessor_envelope_id,
         }
     })?;
-
-    let sealed_digest = provider.seal_payload(&material, &wrapping_key)?;
+    if predecessor.handle_id != handle_id
+        || predecessor.envelope_version != rotation_plan.predecessor_envelope_version
+    {
+        return Err(SecretKeyPolicyRuntimeError::RotationPredecessorNotFound {
+            plan_id: rotation_plan.rotation_plan_id,
+            envelope_id: predecessor_envelope_id,
+        });
+    }
 
     let successor_envelope_id = rotation_plan.successor_envelope_id;
     if successor_envelope_id.is_zero() {
-        return Err(SecretKeyPolicyRuntimeError::CryptoPlaceholder);
+        return Err(SecretKeyPolicyRuntimeError::RotationSuccessorMissing {
+            plan_id: rotation_plan.rotation_plan_id,
+        });
     }
+    if successor_envelope_id == predecessor_envelope_id {
+        return Err(
+            SecretKeyPolicyRuntimeError::RotationSuccessorMatchesPredecessor {
+                plan_id: rotation_plan.rotation_plan_id,
+                envelope_id: successor_envelope_id,
+            },
+        );
+    }
+    if rotation_plan.successor_envelope_version <= predecessor.envelope_version {
+        return Err(
+            SecretKeyPolicyRuntimeError::RotationSuccessorVersionNotAdvanced {
+                plan_id: rotation_plan.rotation_plan_id,
+                predecessor_version: predecessor.envelope_version,
+                successor_version: rotation_plan.successor_envelope_version,
+            },
+        );
+    }
+
+    let wrapping_key = store.lookup_wrapping_key(predecessor.wrapping_key_id)?;
+    let material = provider.generate_secret_material(secret_class)?;
+    let sealed_digest = provider.seal_payload(&material, &wrapping_key)?;
 
     let successor = SecretEnvelopeRecord {
         envelope_id: successor_envelope_id,
@@ -1268,7 +1343,7 @@ pub fn validate_handle_disclosure(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use tidefs_types_secret_key_policy_core::WrappingKeyClass;
+    use tidefs_types_secret_key_policy_core::{RotationClass, WrappingKeyClass};
 
     // ── Test double: InMemoryHandleStore ───
 
@@ -2285,6 +2360,183 @@ mod tests {
             other => {
                 panic!("expected ManifestIncompatible with ContinuityWindowClosed, got {other:?}")
             }
+        }
+    }
+
+    // ── Algorithm 7 tests ───
+
+    fn make_rotation_test_store(
+        handle_id: SecretKeyPolicyId128,
+        predecessor_envelope_id: SecretKeyPolicyId128,
+        wrapping_key_id: SecretKeyPolicyId128,
+        state: SecretLifecycleState,
+    ) -> InMemoryHandleStore {
+        let mut store = InMemoryHandleStore::new();
+        store.wrapping_keys.insert(
+            wrapping_key_id.as_u128_le(),
+            WrappingKeyRecord {
+                wrapping_key_id,
+                wrapping_key_class: WrappingKeyClass::ClusterRoot.as_u32(),
+                wrapping_key_version: 1,
+                ..Default::default()
+            },
+        );
+        store.handles.insert(
+            handle_id.as_u128_le(),
+            SecretHandleRecord {
+                handle_id,
+                secret_class: SecretClass::TransportTls.as_u32(),
+                lifecycle_state: state.as_u32(),
+                active_envelope_version: 1,
+                active_envelope_id: predecessor_envelope_id,
+                ..Default::default()
+            },
+        );
+        store.envelopes.insert(
+            predecessor_envelope_id.as_u128_le(),
+            SecretEnvelopeRecord {
+                envelope_id: predecessor_envelope_id,
+                handle_id,
+                envelope_version: 1,
+                wrapping_key_id,
+                wrapping_key_version: 1,
+                ..Default::default()
+            },
+        );
+        store
+    }
+
+    fn make_rotation_plan(
+        plan_id: SecretKeyPolicyId128,
+        handle_id: SecretKeyPolicyId128,
+        predecessor_envelope_id: SecretKeyPolicyId128,
+        successor_envelope_id: SecretKeyPolicyId128,
+    ) -> SecretRotationPlanRecord {
+        SecretRotationPlanRecord {
+            rotation_plan_id: plan_id,
+            handle_id,
+            rotation_class: RotationClass::Standard.as_u32(),
+            predecessor_envelope_id,
+            successor_envelope_id,
+            predecessor_envelope_version: 1,
+            successor_envelope_version: 2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rotation_seals_successor_with_predecessor_wrapping_key() {
+        let provider = MockSealProvider::new();
+        let handle_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let predecessor_envelope_id = SecretKeyPolicyId128::from_u128_le(0x4000);
+        let successor_envelope_id = SecretKeyPolicyId128::from_u128_le(0x5000);
+        let wrapping_key_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let plan_id = SecretKeyPolicyId128::from_u128_le(0x6000);
+        let store = make_rotation_test_store(
+            handle_id,
+            predecessor_envelope_id,
+            wrapping_key_id,
+            SecretLifecycleState::Active,
+        );
+        let plan = make_rotation_plan(
+            plan_id,
+            handle_id,
+            predecessor_envelope_id,
+            successor_envelope_id,
+        );
+
+        let (updated, successor) = rotate_leaf_secret_with_dual_validity_and_successor(
+            &provider,
+            &store,
+            handle_id,
+            &plan,
+            SecretKeyPolicyId128::from_u128_le(0x7000),
+        )
+        .expect("valid rotation plan should seal a successor envelope");
+
+        assert_eq!(updated.lifecycle_state(), Ok(SecretLifecycleState::Active));
+        assert_eq!(updated.active_envelope_id, successor_envelope_id);
+        assert_eq!(updated.active_envelope_version, 2);
+        assert_eq!(successor.envelope_id, successor_envelope_id);
+        assert_eq!(successor.handle_id, handle_id);
+        assert_eq!(successor.wrapping_key_id, wrapping_key_id);
+        assert_eq!(successor.sealed_payload_digest, [0xAAu8; 32]);
+        assert_eq!(successor.predecessor_envelope_id, predecessor_envelope_id);
+    }
+
+    #[test]
+    fn rotation_refuses_missing_successor_envelope_id() {
+        let provider = MockSealProvider::new();
+        let handle_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let predecessor_envelope_id = SecretKeyPolicyId128::from_u128_le(0x4000);
+        let wrapping_key_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let plan_id = SecretKeyPolicyId128::from_u128_le(0x6000);
+        let store = make_rotation_test_store(
+            handle_id,
+            predecessor_envelope_id,
+            wrapping_key_id,
+            SecretLifecycleState::Active,
+        );
+        let plan = make_rotation_plan(
+            plan_id,
+            handle_id,
+            predecessor_envelope_id,
+            SecretKeyPolicyId128::ZERO,
+        );
+
+        let result = rotate_leaf_secret_with_dual_validity_and_successor(
+            &provider,
+            &store,
+            handle_id,
+            &plan,
+            SecretKeyPolicyId128::from_u128_le(0x7000),
+        );
+
+        match result {
+            Err(SecretKeyPolicyRuntimeError::RotationSuccessorMissing { plan_id: actual }) => {
+                assert_eq!(actual, plan_id);
+            }
+            other => panic!("expected RotationSuccessorMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rotation_refuses_successor_reusing_predecessor_envelope_id() {
+        let provider = MockSealProvider::new();
+        let handle_id = SecretKeyPolicyId128::from_u128_le(0x3000);
+        let predecessor_envelope_id = SecretKeyPolicyId128::from_u128_le(0x4000);
+        let wrapping_key_id = SecretKeyPolicyId128::from_u128_le(0x2000);
+        let plan_id = SecretKeyPolicyId128::from_u128_le(0x6000);
+        let store = make_rotation_test_store(
+            handle_id,
+            predecessor_envelope_id,
+            wrapping_key_id,
+            SecretLifecycleState::Active,
+        );
+        let plan = make_rotation_plan(
+            plan_id,
+            handle_id,
+            predecessor_envelope_id,
+            predecessor_envelope_id,
+        );
+
+        let result = rotate_leaf_secret_with_dual_validity_and_successor(
+            &provider,
+            &store,
+            handle_id,
+            &plan,
+            SecretKeyPolicyId128::from_u128_le(0x7000),
+        );
+
+        match result {
+            Err(SecretKeyPolicyRuntimeError::RotationSuccessorMatchesPredecessor {
+                plan_id: actual_plan,
+                envelope_id: actual_envelope,
+            }) => {
+                assert_eq!(actual_plan, plan_id);
+                assert_eq!(actual_envelope, predecessor_envelope_id);
+            }
+            other => panic!("expected RotationSuccessorMatchesPredecessor, got {other:?}"),
         }
     }
 
