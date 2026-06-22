@@ -720,8 +720,8 @@ impl CompactionPlanner {
         entries: &[tidefs_reclaim_queue_core::SegmentLivenessEntry],
         trigger_input: CompactionTriggerInput,
     ) -> Vec<CompactionRequest> {
-        let report = CompactionPolicy::new(self.config.clone())
-            .evaluate_entries(entries, trigger_input);
+        let report =
+            CompactionPolicy::new(self.config.clone()).evaluate_entries(entries, trigger_input);
 
         if report.admitted_candidates.len() < 2 {
             return Vec::new();
@@ -934,7 +934,7 @@ impl<'q, S: CompactionStore> CompactionRun<'q, S> {
 
         // Build and commit the atomic swap.
         let swap = CompactionSwap {
-            freed_segments: all_freed,
+            freed_segments: all_freed.clone(),
             registered_segments: all_new_segs,
             entries: all_entries.clone(),
         };
@@ -1735,10 +1735,7 @@ mod tests {
     fn candidate_selector_strict_liveness_boundary() {
         // seg 1: write amplification exactly 2.0 (admitted by the cap)
         // seg 2: write amplification just below 2.0 (ordered first)
-        let q = make_queue_with(&[
-            (1, 50_000, 50_000),
-            (2, 49_999, 50_001),
-        ]);
+        let q = make_queue_with(&[(1, 50_000, 50_000), (2, 49_999, 50_001)]);
         let selector = CompactionCandidateSelector::new(&q, CompactionConfig::default());
         let candidates = selector.select_candidates();
         assert_eq!(candidates.len(), 2);
