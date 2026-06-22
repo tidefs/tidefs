@@ -114,14 +114,6 @@ source_root = "crates/tidefs-local-filesystem/src"
 coverage = "registered-source-marker-present"
 
 [[queue_root_coverage]]
-id = "transport.send_queue_depth"
-package = "tidefs-transport"
-path = "crates/tidefs-transport/src/send_queue_depth.rs"
-symbol = "SendQueueDepth"
-source_root = "crates/tidefs-transport/src"
-coverage = "registered-source-marker-present"
-
-[[queue_root_coverage]]
 id = "orphan_index.persistent_index"
 package = "tidefs-orphan-index"
 path = "crates/tidefs-orphan-index/src/lib.rs"
