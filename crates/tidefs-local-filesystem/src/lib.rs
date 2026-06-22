@@ -3922,6 +3922,16 @@ impl LocalFileSystem {
             })
     }
 
+    fn release_optional_metadata_admission_permit(
+        &mut self,
+        permit: Option<AdmissionPermit>,
+    ) -> Result<()> {
+        if let Some(permit) = permit {
+            self.release_metadata_admission_permit(permit)?;
+        }
+        Ok(())
+    }
+
     /// Mark an inode as orphaned after its namespace link count reaches zero.
     ///
     /// Returns `true` when the inode was newly inserted into the persistent
@@ -6013,10 +6023,18 @@ impl LocalFileSystem {
                 reason: "this MVP only hard-links regular files",
             });
         }
+        let mut orphan_md_permit = if source_record.nlink == 0 {
+            Some(self.write_admission.try_admit_metadata_mutation()?)
+        } else {
+            None
+        };
         self.begin_mutation();
         // Re-verify parent exists after lock acquisition
         if !self.state.inodes.contains_key(&parent_id) {
+            let release_result =
+                self.release_optional_metadata_admission_permit(orphan_md_permit.take());
             self.rollback_mutation_delta();
+            release_result?;
             return Err(FileSystemError::NotFound {
                 path: new_path.to_string(),
             });
@@ -6039,16 +6057,23 @@ impl LocalFileSystem {
         updated.metadata_version = tick;
         // If nlink transitions from 0 to 1, the inode is no longer orphaned.
         if updated.nlink == 1 {
-            let _orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
+            let orphan_md_permit =
+                orphan_md_permit
+                    .take()
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "missing orphan-index metadata admission permit",
+                    })?;
             let remove_result = {
                 let mut orphan_index = self.orphan_index.lock().unwrap();
-                orphan_index.remove_admitted(inode_id.get(), &_orphan_md_permit)
+                orphan_index.remove_admitted(inode_id.get(), &orphan_md_permit)
             };
             if let Err(err) = remove_result {
-                self.release_metadata_admission_permit(_orphan_md_permit)?;
+                let release_result = self.release_metadata_admission_permit(orphan_md_permit);
+                self.rollback_mutation_delta();
+                release_result?;
                 return Err(Self::orphan_index_admission_error(err));
             }
-            self.release_metadata_admission_permit(_orphan_md_permit)?;
+            self.release_metadata_admission_permit(orphan_md_permit)?;
         }
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated.clone());
         self.inode_cache.borrow_mut().invalidate(inode_id);
@@ -8733,6 +8758,11 @@ impl LocalFileSystem {
         }
 
         let was_multilinked = record.nlink > 1;
+        let mut orphan_md_permit = if was_multilinked {
+            None
+        } else {
+            Some(self.write_admission.try_admit_metadata_mutation()?)
+        };
 
         self.begin_mutation(); // was: let previous_state = self.state.clone()
                                // Accumulate space delta for unlink only when this removes the last link.
@@ -8762,7 +8792,10 @@ impl LocalFileSystem {
         }
         // Re-verify parent exists after lock acquisition
         if !self.state.inodes.contains_key(&parent_id) {
+            let release_result =
+                self.release_optional_metadata_admission_permit(orphan_md_permit.take());
             self.rollback_mutation_delta();
+            release_result?;
             return Err(FileSystemError::NotFound {
                 path: path_for_error.to_string(),
             });
@@ -8784,7 +8817,10 @@ impl LocalFileSystem {
         self.mark_dir_dirty(parent_id);
         self.mark_inode_metadata_dirty(parent_id);
         if let Err(err) = self.remove_directory_entry(parent_id, name, tick) {
+            let release_result =
+                self.release_optional_metadata_admission_permit(orphan_md_permit.take());
             self.rollback_mutation_delta();
+            release_result?;
             return Err(err);
         }
         self.update_parent_metadata_timestamps(parent_id, tick);
@@ -8813,20 +8849,27 @@ impl LocalFileSystem {
                 record.nlink,
                 orphan_flags,
             );
-            let _orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
+            let orphan_md_permit =
+                orphan_md_permit
+                    .take()
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "missing orphan-index metadata admission permit",
+                    })?;
             let insert_result = {
                 let mut orphan_index = self.orphan_index.lock().unwrap();
                 orphan_index.insert_admitted(
                     entry.inode_id.get(),
                     orphan_entry,
-                    &_orphan_md_permit,
+                    &orphan_md_permit,
                 )
             };
             if let Err(err) = insert_result {
-                self.release_metadata_admission_permit(_orphan_md_permit)?;
+                let release_result = self.release_metadata_admission_permit(orphan_md_permit);
+                self.rollback_mutation_delta();
+                release_result?;
                 return Err(Self::orphan_index_admission_error(err));
             }
-            self.release_metadata_admission_permit(_orphan_md_permit)?;
+            self.release_metadata_admission_permit(orphan_md_permit)?;
             // Record nlink=0 in state so record_reclaim_delta can iterate
             // chunk keys for dedup refcount decrement (#6167).
             if let Some(stored) = Arc::make_mut(&mut self.state.inodes).get_mut(&entry.inode_id) {
