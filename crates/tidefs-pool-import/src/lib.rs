@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use tidefs_local_object_store::device_layout::decode_device_layout_v1;
 use tidefs_pool_scan::{DeviceType, PoolConfig};
 
 use tidefs_intent_log::{
@@ -296,6 +297,8 @@ struct LabelAgreementMember {
     member_uuid: [u8; 16],
     /// Device index recorded in the label.
     device_index: u32,
+    /// Device capacity recorded in the label.
+    device_capacity_bytes: u64,
     /// Topology generation recorded in the label.
     topology_generation: u64,
     /// Pool member count recorded in the label.
@@ -825,6 +828,7 @@ fn label_agreement_member(
         pool_uuid: label.pool_guid,
         member_uuid: label.device_guid,
         device_index: label.device_index,
+        device_capacity_bytes: label.device_capacity_bytes,
         topology_generation: label.topology_generation,
         device_count: label.device_count,
         committed_txg: label.commit_group,
@@ -864,6 +868,7 @@ fn verify_label_agreement(report: &LabelAgreementReport) -> Result<(), ImportErr
     ensure_device_classes_agree(report)?;
     ensure_feature_flags_agree(report)?;
     ensure_device_layout_records_match_feature_flags(report)?;
+    ensure_device_layout_records_decode(report)?;
 
     Ok(())
 }
@@ -1137,6 +1142,28 @@ fn ensure_device_layout_records_match_feature_flags(
             values: missing,
         })
     }
+}
+
+fn ensure_device_layout_records_decode(report: &LabelAgreementReport) -> Result<(), ImportError> {
+    for member in &report.members {
+        let Some(device_layout_v1) = &member.device_layout_v1 else {
+            continue;
+        };
+        let layout = decode_device_layout_v1(device_layout_v1).map_err(|e| ImportError::Io {
+            device_path: Some(member.device_path.clone()),
+            msg: format!("decode DeviceLayoutV1 from label: {e}"),
+        })?;
+        if layout.device_size_bytes != member.device_capacity_bytes {
+            return Err(ImportError::Io {
+                device_path: Some(member.device_path.clone()),
+                msg: format!(
+                    "DeviceLayoutV1 device size mismatch: label capacity {} bytes, layout {} bytes",
+                    member.device_capacity_bytes, layout.device_size_bytes
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn committed_root_value(member: &LabelAgreementMember) -> String {
@@ -1989,11 +2016,13 @@ fn replay_intent_log_data(data: &[u8], recovery_txg: u64) -> Result<u64, String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
+    use tidefs_local_object_store::device_layout::{encode_device_layout_v1, DeviceLayoutPolicy};
     use tidefs_pool_scan::DeviceHealth;
     use tidefs_types_pool_label_core::{
-        encode_label, seal_label, DeviceClass, PoolLabelV1, PoolRedundancyPolicy, PoolState,
-        POOL_LABEL_V1_EXT_WIRE_SIZE,
+        encode_label, encode_label_with_device_layout, seal_label, seal_label_with_device_layout,
+        DeviceClass, DeviceLayoutV1Bytes, PoolLabelV1, PoolRedundancyPolicy, PoolState,
+        POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
     };
 
     /// Build a minimal single-device PoolConfig for testing.
@@ -2170,6 +2199,39 @@ mod tests {
         let padding =
             vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE - POOL_LABEL_V1_EXT_WIRE_SIZE];
         file.write_all(&padding).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn write_test_label_with_device_layout(
+        file: &mut File,
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
+        pool_name: &str,
+        label_capacity_bytes: u64,
+        layout_device_size_bytes: u64,
+        mutate_layout: impl FnOnce(&mut DeviceLayoutV1Bytes),
+    ) {
+        let mut label = PoolLabelV1::new(pool_guid, device_guid, pool_name);
+        label.pool_state = PoolState::Exported;
+        label.device_index = 0;
+        label.device_count = 1;
+        label.topology_generation = 1;
+        label.device_capacity_bytes = label_capacity_bytes;
+
+        let layout = DeviceLayoutPolicy::Slice0Small
+            .compute(layout_device_size_bytes)
+            .unwrap();
+        let mut layout_bytes = [0u8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        encode_device_layout_v1(&layout, &mut layout_bytes);
+        mutate_layout(&mut layout_bytes);
+
+        let sealed = seal_label_with_device_layout(label, Some(&layout_bytes)).unwrap();
+        let mut buf = vec![0u8; POOL_LABEL_SIZE];
+        encode_label_with_device_layout(&sealed, Some(&layout_bytes), &mut buf).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&buf).unwrap();
+        file.set_len(label_capacity_bytes.max(POOL_LABEL_SIZE as u64))
+            .unwrap();
         file.flush().unwrap();
     }
 
@@ -2724,6 +2786,59 @@ mod tests {
                 assert!(values.contains(&"erasure=1+1".to_string()));
             }
             err => panic!("expected redundancy-policy disagreement, got {err}"),
+        }
+    }
+
+    #[test]
+    fn pool_import_label_agreement_rejects_corrupt_device_layout_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("device0");
+        let capacity = 2 * 1024 * 1024;
+        {
+            let mut f = File::create(&dev_path).unwrap();
+            write_test_label_with_device_layout(
+                &mut f,
+                [0xD1u8; 16],
+                [0x01u8; 16],
+                "bad_layout",
+                capacity,
+                capacity,
+                |layout| layout[0] ^= 0xFF,
+            );
+        }
+
+        match pool_import(&[dev_path], &dir.path().join("locks"), false, None, None).unwrap_err() {
+            ImportError::Io { msg, .. } => {
+                assert!(msg.contains("decode DeviceLayoutV1"), "{msg}");
+                assert!(msg.contains("bad magic"), "{msg}");
+            }
+            err => panic!("expected corrupt DeviceLayoutV1 rejection, got {err}"),
+        }
+    }
+
+    #[test]
+    fn pool_import_label_agreement_rejects_device_layout_size_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("device0");
+        let capacity = 2 * 1024 * 1024;
+        {
+            let mut f = File::create(&dev_path).unwrap();
+            write_test_label_with_device_layout(
+                &mut f,
+                [0xD2u8; 16],
+                [0x02u8; 16],
+                "layout_drift",
+                capacity,
+                capacity + 1024 * 1024,
+                |_| {},
+            );
+        }
+
+        match pool_import(&[dev_path], &dir.path().join("locks"), false, None, None).unwrap_err() {
+            ImportError::Io { msg, .. } => {
+                assert!(msg.contains("DeviceLayoutV1 device size mismatch"), "{msg}");
+            }
+            err => panic!("expected DeviceLayoutV1 size-drift rejection, got {err}"),
         }
     }
 

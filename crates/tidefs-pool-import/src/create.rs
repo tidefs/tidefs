@@ -14,10 +14,14 @@ use std::path::{Path, PathBuf};
 
 use tidefs_commit_group::{seal_commit_hash, CommitGroupId, RootPointer};
 use tidefs_encryption::StoreKey;
+use tidefs_local_object_store::device_layout::{
+    encode_device_layout_v1, DeviceLayoutPolicy, MIN_SEGMENT_SIZE_BYTES,
+};
 use tidefs_pool_scan::PoolDeviceBacking;
 use tidefs_types_pool_label_core::{
-    decode_label, encode_label, encode_vcrl_ledger_into, pool_guid_to_uuid32, seal_label,
-    vcrl_required_len, DeviceClass, LabelError, PoolLabelV1, PoolState, VcrlEntry, POOL_LABEL_SIZE,
+    decode_label, encode_label_with_device_layout, encode_vcrl_ledger_into, pool_guid_to_uuid32,
+    seal_label_with_device_layout, vcrl_required_len, DeviceClass, DeviceLayoutV1Bytes, LabelError,
+    PoolLabelV1, PoolState, VcrlEntry, POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE, POOL_LABEL_SIZE,
 };
 
 use crate::committed_root::{
@@ -29,8 +33,13 @@ use tidefs_auth::local_only::LocalOnlyGuard;
 /// Pool-wide redundancy policy accepted by pool creation.
 pub use tidefs_types_pool_label_core::PoolRedundancyPolicy as RedundancyPolicy;
 
-const MIN_DEVICE_BYTES: u64 =
+const LABEL_AND_COMMIT_MIN_DEVICE_BYTES: u64 =
     (2 * POOL_LABEL_SIZE as u64) + COMMIT_RECORD_REGION_OFFSET + COMMIT_RECORD_REGION_MAX;
+const MIN_DEVICE_BYTES: u64 = if LABEL_AND_COMMIT_MIN_DEVICE_BYTES > MIN_SEGMENT_SIZE_BYTES {
+    LABEL_AND_COMMIT_MIN_DEVICE_BYTES
+} else {
+    MIN_SEGMENT_SIZE_BYTES
+};
 const INITIAL_ROOT_INO: u64 = 1;
 const INITIAL_TXG: u64 = 1;
 const INITIAL_SYSTEM_AREA_BLOCK_SIZE: u64 = 4096;
@@ -330,9 +339,14 @@ impl CreationDevice {
     }
 
     /// Encode and write a sealed label at `offset`.
-    fn write_label_at(&mut self, label: &PoolLabelV1, offset: u64) -> Result<(), CreateError> {
+    fn write_label_at(
+        &mut self,
+        label: &PoolLabelV1,
+        device_layout_v1: Option<&DeviceLayoutV1Bytes>,
+        offset: u64,
+    ) -> Result<(), CreateError> {
         let mut buf = vec![0u8; POOL_LABEL_SIZE];
-        encode_label(label, &mut buf)?;
+        encode_label_with_device_layout(label, device_layout_v1, &mut buf)?;
 
         self.file
             .seek(SeekFrom::Start(offset))
@@ -562,18 +576,33 @@ impl PoolCreator {
             labels.push(label);
         }
 
+        let mut device_layouts: Vec<DeviceLayoutV1Bytes> =
+            Vec::with_capacity(device_count as usize);
+        for handle in &handles {
+            let layout = DeviceLayoutPolicy::Slice0Small
+                .compute(handle.capacity_bytes)
+                .map_err(|e| CreateError::Io {
+                    device_path: Some(handle.device_path.clone()),
+                    msg: format!("compute DeviceLayoutV1: {e}"),
+                })?;
+            let mut bytes = [0u8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+            encode_device_layout_v1(&layout, &mut bytes);
+            device_layouts.push(bytes);
+        }
+
         // Phase 3: seal labels with BLAKE3 and write dual copies.
         for (i, label) in labels.iter().enumerate() {
-            let sealed = seal_label(label.clone())?;
+            let device_layout = &device_layouts[i];
+            let sealed = seal_label_with_device_layout(label.clone(), Some(device_layout))?;
 
             // Label 0 at offset 0.
-            handles[i].write_label_at(&sealed, 0)?;
+            handles[i].write_label_at(&sealed, Some(device_layout), 0)?;
 
             // Label 1 near the end of the device.
             let label1_offset = handles[i]
                 .capacity_bytes
                 .saturating_sub(POOL_LABEL_SIZE as u64);
-            handles[i].write_label_at(&sealed, label1_offset)?;
+            handles[i].write_label_at(&sealed, Some(device_layout), label1_offset)?;
         }
 
         // Phase 4: create initial committed root (epoch 1, txg 1).
@@ -700,8 +729,9 @@ fn filesystem_uuid() -> Result<[u8; 16], std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
+    use tidefs_local_object_store::device_layout::decode_device_layout_v1;
     use tidefs_types_pool_label_core::verify_label_checksum;
 
     /// Create a temporary file of `size` bytes and return its path.
@@ -718,6 +748,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dev = temp_device(&dir, "device0", size);
         (dir, dev)
+    }
+
+    fn read_raw_label_at(handle: &mut CreationDevice, offset: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; POOL_LABEL_SIZE];
+        handle.file.seek(SeekFrom::Start(offset)).unwrap();
+        handle.file.read_exact(&mut buf).unwrap();
+        buf
     }
 
     // -- basic creation tests --
@@ -1249,6 +1286,36 @@ mod tests {
             label.features_compat & tidefs_types_pool_label_core::features::DEVICE_CLASS_AWARE,
             tidefs_types_pool_label_core::features::DEVICE_CLASS_AWARE
         );
+    }
+
+    #[test]
+    fn create_pool_persists_device_layout_sidecar_in_dual_labels() {
+        let (_dir, dev) = setup_single_device(MIN_DEVICE_BYTES);
+        let config = PoolCreateConfig {
+            pool_name: "layout-sidecar".into(),
+            pool_guid: Some([0x4Cu8; 16]),
+            redundancy: RedundancyPolicy::replicated(1),
+            encryption_key: None,
+            clustered: false,
+        };
+        PoolCreator::create_pool(&[dev.clone()], &config).unwrap();
+
+        let mut handle = CreationDevice::open(&dev, 0).unwrap();
+        let label1_offset = handle.capacity_bytes - POOL_LABEL_SIZE as u64;
+        for offset in [0, label1_offset] {
+            let raw = read_raw_label_at(&mut handle, offset);
+            let label = decode_label(&raw).unwrap();
+            assert_ne!(
+                label.features_compat & tidefs_types_pool_label_core::features::DEVICE_LAYOUT_V1,
+                0
+            );
+
+            let layout_bytes = tidefs_types_pool_label_core::decode_device_layout_v1_bytes(&raw)
+                .unwrap()
+                .expect("layout sidecar");
+            let layout = decode_device_layout_v1(&layout_bytes).unwrap();
+            assert_eq!(layout.device_size_bytes, handle.capacity_bytes);
+        }
     }
 
     #[test]

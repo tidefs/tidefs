@@ -14,6 +14,7 @@ dataset mount readiness, and pool activation. Phase 3 of pool import/export.
 [dependencies]
 tidefs-auth = { path = "../tidefs-auth" }
 tidefs-pool-scan = { path = "../tidefs-pool-scan" }
+tidefs-local-object-store = { path = "../tidefs-local-object-store" }
 tidefs-device-removal = { path = "../tidefs-device-removal" }
 tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
