@@ -576,7 +576,8 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
         &[
             "caller-supplied [`PoolTransport`]",
             "does not own membership, transport authentication",
-            "final distributed operator UAPI",
+            "final distributed",
+            "operator UAPI",
             "TFR-017 remains open",
             "crate-local boundary",
         ],
