@@ -803,7 +803,7 @@ impl CompactionSwap {
 /// Summary of a single [`CompactionRun`] tick.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompactionRunReport {
-    /// Number of candidate segments evaluated.
+    /// Number of liveness records evaluated by policy.
     pub candidates_considered: usize,
     /// Segments that were completely relocated and freed.
     pub segments_freed: u64,
@@ -897,7 +897,7 @@ impl<'q, S: CompactionStore> CompactionRun<'q, S> {
             .iter()
             .map(|candidate| candidate.segment_id)
             .collect();
-        let candidates_considered = candidates.len();
+        let candidates_considered = policy_report.candidates_considered;
 
         let mut tick_freed = 0u64;
         let mut tick_partial = 0u64;
@@ -2187,6 +2187,25 @@ mod tests {
 
         let report = run.run_tick();
         assert_eq!(report.candidates_considered, 0);
+        assert_eq!(report.segments_freed, 0);
+        assert_eq!(report.objects_relocated, 0);
+    }
+
+    #[test]
+    fn compaction_run_counts_policy_rejections_as_considered() {
+        let mut queue = SegmentLivenessQueue::new();
+        queue.record_write(10, 100_000);
+        queue.record_delete(10, 20_000); // write amplification 5.0 exceeds scheduled cap.
+
+        let store = MockCompactionStore::new();
+        let cfg = CompactionConfig::default();
+        let mut run = CompactionRun::new(&queue, store, cfg);
+
+        let report = run.run_tick();
+        assert_eq!(report.candidates_considered, 1);
+        assert_eq!(report.policy_report.candidates_considered, 1);
+        assert_eq!(report.policy_report.candidates_admitted, 0);
+        assert_eq!(report.policy_report.rejected_write_amplification, 1);
         assert_eq!(report.segments_freed, 0);
         assert_eq!(report.objects_relocated, 0);
     }

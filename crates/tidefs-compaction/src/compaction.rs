@@ -262,7 +262,7 @@ impl CompactionIntent {
 /// Summary produced by [`CompactionDriver::run_compaction_pass`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompactionPassReport {
-    /// Number of candidate segments evaluated.
+    /// Number of liveness records evaluated by policy.
     pub candidates_considered: usize,
     /// Segments fully relocated and freed.
     pub segments_freed: u64,
