@@ -7172,6 +7172,64 @@ fn selected_root_for_test(root: &Path, key: RootAuthenticationKey) -> CommittedR
         .expect("selected current root")
 }
 
+fn assert_incremental_receive_base_root_conflict(
+    err: FileSystemError,
+    expected_from_root: &CommittedRootSummary,
+    expected_found_in_recovery_audit: bool,
+    expected_protection_found: bool,
+) {
+    let message = err.to_string();
+    match err {
+        FileSystemError::IncrementalReceiveBaseRootConflict {
+            from_root,
+            found_in_recovery_audit,
+            protected_by_data_retaining_snapshot_or_clone,
+            operator_action_guidance,
+        } => {
+            let expected_identity =
+                IncrementalReceiveBaseRootIdentity::from_summary(expected_from_root);
+            assert_eq!(from_root, expected_identity);
+            assert_eq!(
+                found_in_recovery_audit, expected_found_in_recovery_audit,
+                "unexpected recovery-audit flag in {message}"
+            );
+            assert_eq!(
+                protected_by_data_retaining_snapshot_or_clone, expected_protection_found,
+                "unexpected protection flag in {message}"
+            );
+            assert_eq!(
+                operator_action_guidance,
+                INCREMENTAL_RECEIVE_BASE_ROOT_CONFLICT_OPERATOR_ACTIONS
+            );
+            assert!(
+                message.contains(&format!(
+                    "transaction_id={}",
+                    expected_from_root.transaction_id
+                )),
+                "message must name from_root transaction id: {message}"
+            );
+            assert!(
+                message.contains(&format!("generation={}", expected_from_root.generation)),
+                "message must name from_root generation: {message}"
+            );
+            assert!(
+                message.contains(&format!(
+                    "superblock_checksum=0x{:016x}",
+                    expected_from_root.superblock_checksum.get()
+                )),
+                "message must name from_root superblock checksum: {message}"
+            );
+            assert!(
+                message.contains("delete-and-re-receive")
+                    && message.contains("create a data-retaining base snapshot")
+                    && message.contains("rollback to a shared ancestor"),
+                "message must name operator actions: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
 fn omitted_incremental_content_key(export: &ChangedRecordExport) -> ObjectKey {
     for root in &export.roots {
         let manifest_record = root
@@ -7446,10 +7504,15 @@ fn incremental_receive_rejects_target_missing_base_root() {
         fixture.target_key,
     )
     .expect_err("missing base must fail");
-    assert!(
-        err.to_string()
-            .contains("target recovery audit does not contain the incremental base root identity"),
-        "unexpected error: {err}"
+    assert_incremental_receive_base_root_conflict(
+        err,
+        fixture
+            .incremental_export
+            .from_root
+            .as_ref()
+            .expect("incremental fixture has from_root"),
+        false,
+        false,
     );
     let after = selected_root_for_test(&other_root, fixture.target_key);
     assert_eq!(after, before);
@@ -7471,11 +7534,15 @@ fn incremental_receive_rejects_loose_unprotected_base_root() {
         fixture.target_key,
     )
     .expect_err("loose base root without snapshot authority must fail");
-    assert!(
-        err.to_string().contains(
-            "incremental base root is not protected by a data-retaining snapshot or clone"
-        ),
-        "unexpected error: {err}"
+    assert_incremental_receive_base_root_conflict(
+        err,
+        fixture
+            .incremental_export
+            .from_root
+            .as_ref()
+            .expect("incremental fixture has from_root"),
+        true,
+        false,
     );
     let after = selected_root_for_test(&fixture.target_root, fixture.target_key);
     assert_eq!(after, before);

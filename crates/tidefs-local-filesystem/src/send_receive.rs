@@ -20,7 +20,10 @@ use crate::constants::*;
 use crate::content::*;
 use crate::encoding::*;
 use crate::encoding::{decode_dedup_redirect, is_dedup_redirect};
-use crate::error::FileSystemError;
+use crate::error::{
+    FileSystemError, IncrementalReceiveBaseRootIdentity,
+    INCREMENTAL_RECEIVE_BASE_ROOT_CONFLICT_OPERATOR_ACTIONS,
+};
 use crate::fs_io_error;
 use crate::load_state_from_transaction;
 use crate::object_keys::*;
@@ -669,20 +672,16 @@ fn verify_incremental_base_root_authority(
         }
     }
 
-    if audit
+    let found_in_recovery_audit = audit
         .valid_committed_roots
         .iter()
-        .any(|candidate| committed_root_incremental_base_identity_matches(candidate, from_root))
-    {
-        return Err(FileSystemError::Unsupported {
-            operation: "incremental receive",
-            reason: "incremental base root is not protected by a data-retaining snapshot or clone",
-        });
-    }
+        .any(|candidate| committed_root_incremental_base_identity_matches(candidate, from_root));
 
-    Err(FileSystemError::Unsupported {
-        operation: "incremental receive",
-        reason: "target recovery audit does not contain the incremental base root identity",
+    Err(FileSystemError::IncrementalReceiveBaseRootConflict {
+        from_root: IncrementalReceiveBaseRootIdentity::from_summary(from_root),
+        found_in_recovery_audit,
+        protected_by_data_retaining_snapshot_or_clone: false,
+        operator_action_guidance: INCREMENTAL_RECEIVE_BASE_ROOT_CONFLICT_OPERATOR_ACTIONS,
     })
 }
 

@@ -5,7 +5,31 @@ use tidefs_local_object_store::StoreError;
 use tidefs_types_space_accounting_core::AdmissionResult;
 use tidefs_types_vfs_core::{InodeId, NodeKind};
 
-use crate::types::{CrashRecoveryExpectation, FilesystemCommitBoundary, LocalStorageResource};
+use crate::types::{
+    CommittedRootSummary, CrashRecoveryExpectation, FilesystemCommitBoundary, LocalStorageResource,
+};
+
+pub const INCREMENTAL_RECEIVE_BASE_ROOT_CONFLICT_OPERATOR_ACTIONS: &str =
+    "delete-and-re-receive into a fresh target; create a data-retaining base snapshot if the base content exists but is unprotected; or rollback to a shared ancestor snapshot matching from_root, then retry";
+
+/// Identity fields from an incremental receive stream's `from_root`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IncrementalReceiveBaseRootIdentity {
+    pub transaction_id: u64,
+    pub generation: u64,
+    pub superblock_checksum: u64,
+}
+
+impl IncrementalReceiveBaseRootIdentity {
+    pub fn from_summary(summary: &CommittedRootSummary) -> Self {
+        Self {
+            transaction_id: summary.transaction_id,
+            generation: summary.generation,
+            superblock_checksum: summary.superblock_checksum.get(),
+        }
+    }
+}
+
 /// Unified error type for local filesystem operations.
 ///
 /// `FileSystemError` covers three categories:
@@ -90,6 +114,12 @@ pub enum FileSystemError {
     Unsupported {
         operation: &'static str,
         reason: &'static str,
+    },
+    IncrementalReceiveBaseRootConflict {
+        from_root: IncrementalReceiveBaseRootIdentity,
+        found_in_recovery_audit: bool,
+        protected_by_data_retaining_snapshot_or_clone: bool,
+        operator_action_guidance: &'static str,
     },
     NoSpace {
         resource: LocalStorageResource,
@@ -222,6 +252,18 @@ impl fmt::Display for FileSystemError {
             Self::Unsupported { operation, reason } => {
                 write!(f, "unsupported {operation}: {reason}")
             }
+            Self::IncrementalReceiveBaseRootConflict {
+                from_root,
+                found_in_recovery_audit,
+                protected_by_data_retaining_snapshot_or_clone,
+                operator_action_guidance,
+            } => write!(
+                f,
+                "incremental receive conflicts with non-empty target: from_root transaction_id={} generation={} superblock_checksum=0x{:016x}; recovery_audit_found={found_in_recovery_audit}; protection_found={protected_by_data_retaining_snapshot_or_clone}; operator actions: {operator_action_guidance}",
+                from_root.transaction_id,
+                from_root.generation,
+                from_root.superblock_checksum,
+            ),
             Self::NoSpace {
                 resource,
                 requested,
