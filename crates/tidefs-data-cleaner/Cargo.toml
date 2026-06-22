@@ -6,7 +6,7 @@ publish.workspace = true
 license.workspace = true
 authors.workspace = true
 
-description = "DataCleaner incremental background job: processes refcount deltas from the reclaim queue and frees zero-refcount segments"
+description = "DataCleaner incremental background job: drains refcount deltas into liveness and deadlist handoff state"
 
 [dependencies]
 tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
@@ -14,7 +14,6 @@ tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core" }
 tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
 tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
 tidefs-reclaim = { path = "../tidefs-reclaim" }
-tidefs-spacemap-allocator = { path = "../tidefs-spacemap-allocator" }
 
 [lib]
 path = "src/lib.rs"
