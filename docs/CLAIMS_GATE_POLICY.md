@@ -34,6 +34,17 @@ registered claim as validated evidence. Planned, blocked, and invalid claims
 fail closed; validated claims also fail closed when required evidence artifacts
 are missing or older than `validation/claims.toml`.
 
+When a claim evidence requirement names a `manifest_path`,
+`validate-claim <id>` treats that unified evidence manifest as the evidence
+record for the requirement. The manifest must be version 2, workspace-relative,
+schema-valid, digest-matched to its artifact, current for the checked source,
+and must match the claim id, evidence class, validation tier, artifact path,
+run id, source ref, pass outcome, residual risk, source, scope, and blocking
+issue state expected by the registry. Missing, stale, malformed, mismatched,
+non-pass, or blocked manifests fail closed; receipt integrity may support
+evidence integrity, but it does not replace the registry or `validate-claim`
+as claim-status authority.
+
 ## Validation Tier Evidence Map
 
 The nextgen program authority is
