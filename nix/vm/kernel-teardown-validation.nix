@@ -429,7 +429,6 @@ INITSCRIPT
       -nographic \
       -m 512M \
       -no-reboot \
-      -serial stdio \
       2>&1 | tee "$RUN_DIR/qemu.log" || true
 
     echo ""
