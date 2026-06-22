@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
+use tidefs_validation::evidence_artifact_manifest::{
+    load_evidence_artifact_manifest_json_path, BlockingIssueRef, EvidenceArtifactManifest,
+};
 use tidefs_validation::local_vfs_runtime_crash_artifact::{
     validate_local_vfs_rename_runtime_crash_artifact_path,
     validate_local_vfs_runtime_crash_artifact_path, LOCAL_VFS_RENAME_RUNTIME_CRASH_EVIDENCE_CLASS,
@@ -19,6 +22,7 @@ use tidefs_validation::ublk_started_export_admission_artifact::{
     UBLK_STARTED_EXPORT_ADMISSION_ARTIFACT_EVIDENCE_CLASS,
 };
 use tidefs_validation::validation_schema::ValidationTier;
+use tidefs_validation::validation_status::ValidationStatus;
 
 pub const CLAIMS_GATE_POLICY_SPEC: &str = "claims gate: publishing-facing TideFS docs must not claim current OpenZFS/Ceph successor, production-ready, POSIX-complete, distributed, kernelspace, RDMA data-path, or final distributed operator UAPI capability before matching proof exists; unreleased internal TideFS paths must not be framed as product compatibility or migration promises without a real external boundary; tidefsctl command classification/admission is the public operator/harness/diagnostic/prototype/removed boundary; validation/claims.toml is the stable claim registry authority";
 pub const CLAIMS_GATE_REQUIRED_COMMAND: &str = "cargo run -p tidefs-xtask -- check-claims-gate";
@@ -217,6 +221,8 @@ struct ClaimEvidenceRequirement {
     path: String,
     validation_tier: ValidationTier,
     #[serde(default)]
+    manifest_path: Option<String>,
+    #[serde(default)]
     blocking_issues: Vec<String>,
 }
 
@@ -276,14 +282,15 @@ impl ClaimReceiptStatus {
             Self::Fail => "FAIL",
         }
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum EvidenceClassStatus {
     Present,
+    Blocked,
     Missing,
+    Malformed,
     Stale,
 }
 
@@ -291,7 +298,9 @@ impl EvidenceClassStatus {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Present => "PRESENT",
+            Self::Blocked => "BLOCKED",
             Self::Missing => "MISSING",
+            Self::Malformed => "MALFORMED",
             Self::Stale => "STALE",
         }
     }
@@ -315,6 +324,22 @@ struct ClaimEvidenceClassReceipt {
     artifact_path: String,
     validation_tier: String,
     blocking_issues: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    residual_risk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_scope: Option<String>,
     details: Vec<String>,
 }
 
@@ -847,6 +872,30 @@ fn render_claim_validation_summary(receipt: &ClaimValidationReceipt) -> String {
             "    validation_tier: {}\n",
             evidence.validation_tier
         ));
+        if let Some(manifest_path) = &evidence.manifest_path {
+            out.push_str(&format!("    manifest_path: {manifest_path}\n"));
+        }
+        if let Some(content_digest) = &evidence.content_digest {
+            out.push_str(&format!("    content_digest: {content_digest}\n"));
+        }
+        if let Some(run_id) = &evidence.run_id {
+            out.push_str(&format!("    run_id: {run_id}\n"));
+        }
+        if let Some(source_ref) = &evidence.source_ref {
+            out.push_str(&format!("    source_ref: {source_ref}\n"));
+        }
+        if let Some(outcome) = &evidence.outcome {
+            out.push_str(&format!("    outcome: {outcome}\n"));
+        }
+        if let Some(residual_risk) = &evidence.residual_risk {
+            out.push_str(&format!("    residual_risk: {residual_risk}\n"));
+        }
+        if let Some(source) = &evidence.source {
+            out.push_str(&format!("    source: {source}\n"));
+        }
+        if let Some(scope) = &evidence.evidence_scope {
+            out.push_str(&format!("    evidence_scope: {scope}\n"));
+        }
         let issues = if evidence.blocking_issues.is_empty() {
             "-".to_string()
         } else {
@@ -889,9 +938,9 @@ fn build_claim_validation_receipt(
             )
         })
         .collect::<Vec<_>>();
-    let has_evidence_gap = required_evidence
-        .iter()
-        .any(|evidence| evidence.status != EvidenceClassStatus::Present);
+    let has_evidence_gap = required_evidence.iter().any(|evidence| {
+        evidence.status != EvidenceClassStatus::Present || !evidence.blocking_issues.is_empty()
+    });
     let status = match claim.status {
         ClaimStatus::Validated if !has_evidence_gap => ClaimReceiptStatus::Pass,
         ClaimStatus::Validated => ClaimReceiptStatus::Fail,
@@ -937,6 +986,40 @@ fn build_claim_evidence_class_receipt(
         .map(|requirement| requirement.blocking_issues.clone())
         .unwrap_or_else(|| issue_refs_from_blockers(&claim.blockers));
 
+    if let Some(requirement) = requirement {
+        if requirement.manifest_path.is_some() {
+            let manifest_details = validate_evidence_manifest_for_requirement(
+                root,
+                registry_modified,
+                claim,
+                requirement,
+                enforce_freshness,
+            );
+            let mut all_blocking_issues = blocking_issues;
+            all_blocking_issues.extend(manifest_details.blocking_issues);
+            all_blocking_issues.sort();
+            all_blocking_issues.dedup();
+            return ClaimEvidenceClassReceipt {
+                class: class.to_string(),
+                status: manifest_details.status,
+                artifact_path: manifest_details
+                    .artifact_path
+                    .unwrap_or_else(|| requirement.path.clone()),
+                validation_tier,
+                blocking_issues: all_blocking_issues,
+                manifest_path: requirement.manifest_path.clone(),
+                content_digest: manifest_details.content_digest,
+                run_id: manifest_details.run_id,
+                source_ref: manifest_details.source_ref,
+                outcome: manifest_details.outcome,
+                residual_risk: manifest_details.residual_risk,
+                source: manifest_details.source,
+                evidence_scope: manifest_details.evidence_scope,
+                details: manifest_details.details,
+            };
+        }
+    }
+
     if matching.is_empty() {
         return ClaimEvidenceClassReceipt {
             class: class.to_string(),
@@ -944,6 +1027,14 @@ fn build_claim_evidence_class_receipt(
             artifact_path,
             validation_tier,
             blocking_issues,
+            manifest_path: None,
+            content_digest: None,
+            run_id: None,
+            source_ref: None,
+            outcome: None,
+            residual_risk: None,
+            source: None,
+            evidence_scope: None,
             details: vec![format!(
                 "no evidence_artifacts entry registers class `{class}` for claim `{}`",
                 claim.id
@@ -952,8 +1043,7 @@ fn build_claim_evidence_class_receipt(
     }
 
     let mut details = Vec::new();
-    let mut saw_missing = false;
-    let mut saw_stale = false;
+    let mut status = EvidenceClassStatus::Present;
     for artifact in matching {
         let artifact_details = validate_evidence_artifact_for_receipt(
             root,
@@ -962,21 +1052,9 @@ fn build_claim_evidence_class_receipt(
             artifact,
             enforce_freshness,
         );
-        match artifact_details.status {
-            EvidenceClassStatus::Present => {}
-            EvidenceClassStatus::Missing => saw_missing = true,
-            EvidenceClassStatus::Stale => saw_stale = true,
-        }
+        status = worse_evidence_status(status, artifact_details.status);
         details.extend(artifact_details.details);
     }
-
-    let status = if saw_stale {
-        EvidenceClassStatus::Stale
-    } else if saw_missing {
-        EvidenceClassStatus::Missing
-    } else {
-        EvidenceClassStatus::Present
-    };
 
     ClaimEvidenceClassReceipt {
         class: class.to_string(),
@@ -984,8 +1062,335 @@ fn build_claim_evidence_class_receipt(
         artifact_path,
         validation_tier,
         blocking_issues,
+        manifest_path: None,
+        content_digest: None,
+        run_id: None,
+        source_ref: None,
+        outcome: None,
+        residual_risk: None,
+        source: None,
+        evidence_scope: None,
         details,
     }
+}
+
+struct EvidenceManifestReceiptDetails {
+    status: EvidenceClassStatus,
+    artifact_path: Option<String>,
+    content_digest: Option<String>,
+    run_id: Option<String>,
+    source_ref: Option<String>,
+    outcome: Option<String>,
+    residual_risk: Option<String>,
+    source: Option<String>,
+    evidence_scope: Option<String>,
+    blocking_issues: Vec<String>,
+    details: Vec<String>,
+}
+
+fn validate_evidence_manifest_for_requirement(
+    root: &Path,
+    registry_modified: SystemTime,
+    claim: &ClaimRecord,
+    requirement: &ClaimEvidenceRequirement,
+    enforce_freshness: bool,
+) -> EvidenceManifestReceiptDetails {
+    let Some(manifest_path) = requirement.manifest_path.as_deref() else {
+        return EvidenceManifestReceiptDetails::empty(EvidenceClassStatus::Missing);
+    };
+    let rel = match workspace_relative_str_path(claim, "evidence manifest", manifest_path) {
+        Ok(rel) => rel,
+        Err(err) => {
+            return EvidenceManifestReceiptDetails {
+                details: vec![err],
+                ..EvidenceManifestReceiptDetails::empty(EvidenceClassStatus::Missing)
+            };
+        }
+    };
+
+    let full_path = root.join(&rel);
+    let metadata = match fs::metadata(&full_path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return EvidenceManifestReceiptDetails {
+                details: vec![format!(
+                    "claim `{}` missing evidence manifest `{manifest_path}` for class `{}`: {err}",
+                    claim.id, requirement.class
+                )],
+                ..EvidenceManifestReceiptDetails::empty(EvidenceClassStatus::Missing)
+            };
+        }
+    };
+
+    let manifest = match load_evidence_artifact_manifest_json_path(&full_path) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            return EvidenceManifestReceiptDetails {
+                details: vec![format!(
+                    "claim `{}` evidence manifest `{manifest_path}` for class `{}` is malformed or unsupported: {err}",
+                    claim.id, requirement.class
+                )],
+                ..EvidenceManifestReceiptDetails::empty(EvidenceClassStatus::Malformed)
+            };
+        }
+    };
+
+    let mut details = Vec::new();
+    let mut status = EvidenceClassStatus::Present;
+    if enforce_freshness && !committed_evidence_tree_is_current(root, &rel) {
+        match metadata.modified() {
+            Ok(modified) if modified < registry_modified => {
+                status = worse_evidence_status(status, EvidenceClassStatus::Stale);
+                details.push(format!(
+                    "claim `{}` has stale evidence manifest `{manifest_path}` for class `{}`; manifest is older than `{CLAIM_REGISTRY_PATH}`",
+                    claim.id, requirement.class
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                status = worse_evidence_status(status, EvidenceClassStatus::Stale);
+                details.push(format!(
+                    "claim `{}` could not read mtime for evidence manifest `{manifest_path}`: {err}",
+                    claim.id
+                ));
+            }
+        }
+    }
+
+    let artifact_rel = match manifest.artifact_path_under(root) {
+        Ok(path) => path
+            .strip_prefix(root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| PathBuf::from(&manifest.artifact_path)),
+        Err(err) => {
+            status = worse_evidence_status(status, EvidenceClassStatus::Malformed);
+            details.push(format!(
+                "claim `{}` evidence manifest `{manifest_path}` has invalid artifact_path for class `{}`: {err}",
+                claim.id, requirement.class
+            ));
+            PathBuf::from(&manifest.artifact_path)
+        }
+    };
+
+    if let Err(err) = manifest.verify_artifact_digest(root) {
+        let error_text = err.to_string();
+        let digest_status = if error_text.contains("read artifact_path") {
+            EvidenceClassStatus::Missing
+        } else {
+            EvidenceClassStatus::Stale
+        };
+        status = worse_evidence_status(status, digest_status);
+        details.push(format!(
+            "claim `{}` evidence manifest `{manifest_path}` failed artifact digest verification for class `{}`: {err}",
+            claim.id, requirement.class
+        ));
+    }
+
+    if enforce_freshness && !committed_evidence_tree_is_current(root, &artifact_rel) {
+        match fs::metadata(root.join(&artifact_rel)).and_then(|metadata| metadata.modified()) {
+            Ok(modified) if modified < registry_modified => {
+                status = worse_evidence_status(status, EvidenceClassStatus::Stale);
+                details.push(format!(
+                    "claim `{}` has stale evidence artifact `{}` for class `{}`; artifact is older than `{CLAIM_REGISTRY_PATH}`",
+                    claim.id, manifest.artifact_path, requirement.class
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                status = worse_evidence_status(status, EvidenceClassStatus::Missing);
+                details.push(format!(
+                    "claim `{}` could not read evidence artifact `{}` for class `{}`: {err}",
+                    claim.id, manifest.artifact_path, requirement.class
+                ));
+            }
+        }
+    }
+
+    status = validate_manifest_matches_requirement(
+        root,
+        claim,
+        requirement,
+        manifest_path,
+        &manifest,
+        enforce_freshness,
+        status,
+        &mut details,
+    );
+
+    let mut blocking_issues = manifest
+        .blocking_issues
+        .iter()
+        .map(blocking_issue_ref_label)
+        .collect::<Vec<_>>();
+    blocking_issues.sort();
+    blocking_issues.dedup();
+
+    EvidenceManifestReceiptDetails {
+        status,
+        artifact_path: Some(manifest.artifact_path),
+        content_digest: Some(manifest.content_digest),
+        run_id: Some(manifest.run_id),
+        source_ref: Some(manifest.source_ref),
+        outcome: Some(manifest.outcome.label().to_string()),
+        residual_risk: Some(manifest.residual_risk),
+        source: Some(manifest.source),
+        evidence_scope: Some(manifest.scope),
+        blocking_issues,
+        details,
+    }
+}
+
+impl EvidenceManifestReceiptDetails {
+    fn empty(status: EvidenceClassStatus) -> Self {
+        Self {
+            status,
+            artifact_path: None,
+            content_digest: None,
+            run_id: None,
+            source_ref: None,
+            outcome: None,
+            residual_risk: None,
+            source: None,
+            evidence_scope: None,
+            blocking_issues: Vec::new(),
+            details: Vec::new(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_manifest_matches_requirement(
+    root: &Path,
+    claim: &ClaimRecord,
+    requirement: &ClaimEvidenceRequirement,
+    manifest_path: &str,
+    manifest: &EvidenceArtifactManifest,
+    enforce_freshness: bool,
+    mut status: EvidenceClassStatus,
+    details: &mut Vec<String>,
+) -> EvidenceClassStatus {
+    if manifest.claim_id != claim.id {
+        status = worse_evidence_status(status, EvidenceClassStatus::Malformed);
+        details.push(format!(
+            "claim `{}` evidence manifest `{manifest_path}` names claim_id `{}`, expected `{}`",
+            claim.id, manifest.claim_id, claim.id
+        ));
+    }
+    if manifest.evidence_class != requirement.class {
+        status = worse_evidence_status(status, EvidenceClassStatus::Malformed);
+        details.push(format!(
+            "claim `{}` evidence manifest `{manifest_path}` names evidence_class `{}`, expected `{}`",
+            claim.id, manifest.evidence_class, requirement.class
+        ));
+    }
+    if manifest.validation_tier != requirement.validation_tier {
+        status = worse_evidence_status(status, EvidenceClassStatus::Malformed);
+        details.push(format!(
+            "claim `{}` evidence manifest `{manifest_path}` names validation_tier `{}`, expected `{}`",
+            claim.id, manifest.validation_tier, requirement.validation_tier
+        ));
+    }
+    if manifest.artifact_path != requirement.path {
+        status = worse_evidence_status(status, EvidenceClassStatus::Malformed);
+        details.push(format!(
+            "claim `{}` evidence manifest `{manifest_path}` names artifact_path `{}`, expected `{}`",
+            claim.id, manifest.artifact_path, requirement.path
+        ));
+    }
+    if manifest.outcome != ValidationStatus::Pass {
+        status = worse_evidence_status(status, EvidenceClassStatus::Blocked);
+        details.push(format!(
+            "claim `{}` evidence manifest `{manifest_path}` outcome is `{}`, expected `PASS` for claim closure",
+            claim.id,
+            manifest.outcome.label()
+        ));
+    }
+    if !manifest.blocking_issues.is_empty() {
+        status = worse_evidence_status(status, EvidenceClassStatus::Blocked);
+        let issues = manifest
+            .blocking_issues
+            .iter()
+            .map(blocking_issue_ref_label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        details.push(format!(
+            "claim `{}` evidence manifest `{manifest_path}` names unresolved blocking issues: {issues}",
+            claim.id
+        ));
+    }
+    if !requirement.blocking_issues.is_empty() {
+        status = worse_evidence_status(status, EvidenceClassStatus::Blocked);
+        details.push(format!(
+            "claim `{}` evidence requirement for class `{}` names unresolved blocking issues: {}",
+            claim.id,
+            requirement.class,
+            requirement.blocking_issues.join(", ")
+        ));
+    }
+    if enforce_freshness && is_full_hex_sha(&manifest.source_ref) {
+        if let Some(head) = current_git_head(root) {
+            if !manifest.source_ref.eq_ignore_ascii_case(&head) {
+                status = worse_evidence_status(status, EvidenceClassStatus::Stale);
+                details.push(format!(
+                    "claim `{}` evidence manifest `{manifest_path}` source_ref `{}` does not match current HEAD `{head}`",
+                    claim.id, manifest.source_ref
+                ));
+            }
+        }
+    }
+
+    status
+}
+
+fn worse_evidence_status(
+    current: EvidenceClassStatus,
+    next: EvidenceClassStatus,
+) -> EvidenceClassStatus {
+    if evidence_status_rank(next) > evidence_status_rank(current) {
+        next
+    } else {
+        current
+    }
+}
+
+const fn evidence_status_rank(status: EvidenceClassStatus) -> u8 {
+    match status {
+        EvidenceClassStatus::Present => 0,
+        EvidenceClassStatus::Blocked => 1,
+        EvidenceClassStatus::Stale => 2,
+        EvidenceClassStatus::Missing => 3,
+        EvidenceClassStatus::Malformed => 4,
+    }
+}
+
+fn blocking_issue_ref_label(issue: &BlockingIssueRef) -> String {
+    match issue.repo.as_deref() {
+        Some("tidefs/tidefs") | None => format!("#{}", issue.number),
+        Some(repo) => format!("{repo}#{}", issue.number),
+    }
+}
+
+fn current_git_head(root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let head = String::from_utf8(output.stdout).ok()?;
+    let head = head.trim();
+    if is_full_hex_sha(head) {
+        Some(head.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_full_hex_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 struct EvidenceArtifactReceiptDetails {
@@ -1282,6 +1687,19 @@ fn validate_claim_registry(registry: &ClaimRegistry) -> Vec<String> {
                     "claim `{}` evidence requirement path `{}` must be workspace-relative",
                     claim.id, requirement.path
                 ));
+            }
+            if let Some(manifest_path) = &requirement.manifest_path {
+                let rel = Path::new(manifest_path);
+                if rel.is_absolute()
+                    || rel
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    failures.push(format!(
+                        "claim `{}` evidence requirement manifest_path `{manifest_path}` must be workspace-relative",
+                        claim.id
+                    ));
+                }
             }
         }
         for class in &claim.required_evidence_classes {
@@ -2055,15 +2473,23 @@ fn workspace_relative_path(
     claim: &ClaimRecord,
     artifact: &ClaimEvidenceArtifact,
 ) -> Result<PathBuf, String> {
-    let rel = Path::new(&artifact.path);
+    workspace_relative_str_path(claim, "evidence artifact", &artifact.path)
+}
+
+fn workspace_relative_str_path(
+    claim: &ClaimRecord,
+    path_kind: &str,
+    path: &str,
+) -> Result<PathBuf, String> {
+    let rel = Path::new(path);
     if rel.is_absolute()
         || rel
             .components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
     {
         return Err(format!(
-            "claim `{}` evidence artifact `{}` must be a workspace-relative path",
-            claim.id, artifact.path
+            "claim `{}` {path_kind} `{path}` must be a workspace-relative path",
+            claim.id
         ));
     }
     Ok(rel.to_path_buf())
@@ -2144,6 +2570,24 @@ fn validate_registered_evidence_artifacts_for_claim(
 ) -> Vec<String> {
     let mut failures = Vec::new();
     for class in &claim.required_evidence_classes {
+        let requirement = claim
+            .evidence_requirements
+            .iter()
+            .find(|requirement| &requirement.class == class);
+        if let Some(requirement) = requirement {
+            if requirement.manifest_path.is_some() {
+                let manifest_details = validate_evidence_manifest_for_requirement(
+                    root,
+                    registry_modified,
+                    claim,
+                    requirement,
+                    true,
+                );
+                failures.extend(manifest_details.details);
+                continue;
+            }
+        }
+
         let matching = claim
             .evidence_artifacts
             .iter()
@@ -2227,6 +2671,9 @@ fn missing_required_evidence_class_failures(claim: &ClaimRecord) -> Vec<String> 
                 .evidence_artifacts
                 .iter()
                 .any(|artifact| &artifact.class == *class)
+                && !claim.evidence_requirements.iter().any(|requirement| {
+                    &requirement.class == *class && requirement.manifest_path.is_some()
+                })
         })
         .map(|class| {
             format!(
@@ -2619,14 +3066,21 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
+    use tidefs_validation::evidence_artifact_manifest::{
+        content_digest_for_bytes, BlockingIssueRef, EvidenceArtifactManifest,
+        EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+    };
+    use tidefs_validation::validation_schema::ValidationTier;
+    use tidefs_validation::validation_status::ValidationStatus;
+
     use super::{
         build_claim_validation_receipt, claims_gate_rules, line_has_present_tense_overclaim,
         parse_claim_registry, parse_command_admissions, parse_command_surfaces,
         render_claim_registry_doc, render_claim_validation_summary, render_command_authority_table,
         validate_claim_record, validate_crash_claims_gate_review_artifact_content,
         validate_model_crash_matrix_artifact_content, validate_registered_crash_artifacts,
-        validate_runtime_crash_artifact_content, ClaimEvidenceArtifact, ClaimGateRuleTopic,
-        ClaimReceiptStatus, ClaimRecord, ClaimStatus, EvidenceClassStatus,
+        validate_runtime_crash_artifact_content, ClaimEvidenceArtifact, ClaimEvidenceRequirement,
+        ClaimGateRuleTopic, ClaimReceiptStatus, ClaimRecord, ClaimStatus, EvidenceClassStatus,
         APP_INDEX_LIMITATION_MARKERS, CLAIMS_GATE_POLICY_SPEC, CLAIMS_GATE_REQUIRED_COMMAND,
         CLAIMS_GATE_REVIEW_EVIDENCE_CLASS, CLAIMS_GATE_SCANNED_DOCS, CRASH_CLAIMS_GATE_REVIEW_PATH,
         CRASH_CLAIMS_GATE_REVIEW_SCOPE, CRASH_CLAIMS_GATE_REVIEW_SOURCE, CRASH_CLAIM_IDS,
@@ -2942,6 +3396,123 @@ mod tests {
     }
 
     #[test]
+    fn validate_claim_accepts_manifest_backed_evidence_requirement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact_body = "manifest-backed evidence body";
+        write_artifact(temp.path(), "evidence/summary.txt", artifact_body);
+        write_manifest_fixture(
+            temp.path(),
+            "evidence/summary.manifest.json",
+            "example.manifest.validated.v1",
+            "cargo-fixture",
+            "evidence/summary.txt",
+            artifact_body,
+            ValidationStatus::Pass,
+            Vec::new(),
+        );
+        let claim = manifest_fixture_claim(
+            "example.manifest.validated.v1",
+            ClaimStatus::Validated,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let receipt = build_claim_validation_receipt(&temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Pass);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("manifest-backed evidence receipt");
+        assert_eq!(evidence.status, EvidenceClassStatus::Present);
+        assert_eq!(evidence.artifact_path, "evidence/summary.txt");
+        assert_eq!(
+            evidence.manifest_path.as_deref(),
+            Some("evidence/summary.manifest.json")
+        );
+        let expected_digest = content_digest_for_bytes(artifact_body.as_bytes());
+        assert_eq!(
+            evidence.content_digest.as_deref(),
+            Some(expected_digest.as_str())
+        );
+        assert_eq!(evidence.run_id.as_deref(), Some("fixture-run-810/1"));
+        assert_eq!(evidence.source_ref.as_deref(), Some("fixture-source-ref"));
+        assert_eq!(evidence.outcome.as_deref(), Some("PASS"));
+        assert_eq!(
+            evidence.residual_risk.as_deref(),
+            Some("Fixture proves manifest gate behavior only.")
+        );
+        assert!(evidence.details.is_empty(), "{:?}", evidence.details);
+        assert!(validate_claim_record(&temp.path(), SystemTime::UNIX_EPOCH, &claim).is_empty());
+
+        let summary = render_claim_validation_summary(&receipt);
+        assert!(summary.contains("manifest_path: evidence/summary.manifest.json"));
+        assert!(summary.contains("run_id: fixture-run-810/1"));
+        assert!(summary.contains("source_ref: fixture-source-ref"));
+        assert!(summary.contains("residual_risk: Fixture proves manifest gate behavior only."));
+    }
+
+    #[test]
+    fn validate_claim_reports_blocked_missing_manifest_requirement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let claim = manifest_fixture_claim(
+            "example.manifest.blocked.v1",
+            ClaimStatus::Blocked,
+            vec!["GitHub issue #810 fixture blocker".to_string()],
+            vec!["#810".to_string()],
+        );
+
+        let receipt = build_claim_validation_receipt(&temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Blocked);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("manifest-backed evidence receipt");
+        assert_eq!(evidence.status, EvidenceClassStatus::Missing);
+        assert_eq!(evidence.blocking_issues, vec!["#810".to_string()]);
+        assert!(evidence
+            .details
+            .iter()
+            .any(|detail| detail.contains("missing evidence manifest")));
+    }
+
+    #[test]
+    fn validate_claim_fails_closed_for_malformed_manifest_requirement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact(temp.path(), "evidence/summary.txt", "evidence body");
+        write_artifact(
+            temp.path(),
+            "evidence/summary.manifest.json",
+            "{ this is not valid manifest JSON",
+        );
+        let claim = manifest_fixture_claim(
+            "example.manifest.validated.v1",
+            ClaimStatus::Validated,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let receipt = build_claim_validation_receipt(&temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("manifest-backed evidence receipt");
+        assert_eq!(evidence.status, EvidenceClassStatus::Malformed);
+        assert!(evidence
+            .details
+            .iter()
+            .any(|detail| detail.contains("malformed or unsupported")));
+
+        let failures = validate_claim_record(&temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("malformed or unsupported")));
+    }
+
+    #[test]
     fn claims_gate_accepts_current_crash_model_artifact_scope() {
         let root = workspace_root();
         let registry = parse_claim_registry(include_str!("../../../validation/claims.toml"))
@@ -3231,6 +3802,70 @@ const UNGUARDED_COMMANDS: &[&str] = &["pool scan", "diag"];
             generated_doc: "Validated crash fixture claim.".to_string(),
             evidence_artifacts,
         }
+    }
+
+    fn manifest_fixture_claim(
+        id: &str,
+        status: ClaimStatus,
+        blockers: Vec<String>,
+        requirement_blocking_issues: Vec<String>,
+    ) -> ClaimRecord {
+        ClaimRecord {
+            id: id.to_string(),
+            status,
+            scope: "manifest-backed claim fixture".to_string(),
+            required_evidence_classes: vec!["cargo-fixture".to_string()],
+            evidence_requirements: vec![ClaimEvidenceRequirement {
+                class: "cargo-fixture".to_string(),
+                path: "evidence/summary.txt".to_string(),
+                validation_tier: ValidationTier::CargoUnit,
+                manifest_path: Some("evidence/summary.manifest.json".to_string()),
+                blocking_issues: requirement_blocking_issues,
+            }],
+            blockers,
+            generated_doc: match status {
+                ClaimStatus::Validated => "Validated manifest-backed fixture claim.".to_string(),
+                ClaimStatus::Blocked => "Blocked manifest-backed fixture claim.".to_string(),
+                ClaimStatus::Planned => "Planned manifest-backed fixture claim.".to_string(),
+                ClaimStatus::Invalid => "Invalid manifest-backed fixture claim.".to_string(),
+            },
+            evidence_artifacts: Vec::new(),
+        }
+    }
+
+    fn write_manifest_fixture(
+        root: &Path,
+        manifest_path: &str,
+        claim_id: &str,
+        evidence_class: &str,
+        artifact_path: &str,
+        artifact_body: &str,
+        outcome: ValidationStatus,
+        blocking_issues: Vec<BlockingIssueRef>,
+    ) {
+        let manifest = EvidenceArtifactManifest {
+            manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+            claim_id: claim_id.to_string(),
+            evidence_class: evidence_class.to_string(),
+            validation_tier: ValidationTier::CargoUnit,
+            scope: "manifest-backed cargo fixture".to_string(),
+            artifact_path: artifact_path.to_string(),
+            content_digest: content_digest_for_bytes(artifact_body.as_bytes()),
+            run_id: "fixture-run-810/1".to_string(),
+            source_ref: "fixture-source-ref".to_string(),
+            outcome,
+            residual_risk: "Fixture proves manifest gate behavior only.".to_string(),
+            source: "tidefs-xtask-test".to_string(),
+            generated_at: "2026-06-22T15:00:00Z".to_string(),
+            blocking_issues,
+        };
+        write_artifact(
+            root,
+            manifest_path,
+            &manifest
+                .to_json_pretty()
+                .expect("serialize manifest fixture"),
+        );
     }
 
     fn write_current_model_matrix(root: &Path) {

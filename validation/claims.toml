@@ -11,9 +11,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = ["#286"] },
-  { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", validation_tier = "mounted-userspace", blocking_issues = ["#493"] },
-  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/model-crash-matrices.manifest.json", blocking_issues = ["#286"] },
+  { class = "runtime-crash-oracle", path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.manifest.json", blocking_issues = ["#493"] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/claims-gate-review.manifest.json", blocking_issues = ["#329"] },
 ]
 blockers = [
   "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
