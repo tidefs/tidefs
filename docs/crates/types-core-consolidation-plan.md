@@ -4,6 +4,21 @@ Integration review of `tidefs-types-*-core` single-file zero-test crates.
 Issue: [#5943](https://forgejo/forgeadmin/tidefs/issues/5943)
 Date: 2026-05-18
 
+## Document Classification
+
+This file is **historical consolidation evidence**, not current package
+authority.  It records the 2026-05-18 inventory, analysis, and consolidation
+plan that drove the 2026-06-01 type-root deletions.  Several crate roots it
+names (`tidefs-types-archive-control-core`, `tidefs-types-observe-core`,
+`tidefs-types-policy-authority-core`, `tidefs-types-shadow-pilot`,
+`tidefs-types-truth-view-core`, `tidefs-schema-codec-outcome`) no longer
+exist in the TideFS checkout.  Consumer counts, table rows, and the
+Before/After projections below are snapshots of the workspace at that time.
+
+Current package authority lives in
+[`docs/workspace-package-classification.md`](/docs/workspace-package-classification.md).
+Do not read this file as a live work plan or active type-root register.
+
 **Freshness note (2026-06-01)**: This plan was written against
 an earlier workspace snapshot. The five non-workspace types crate roots on
 disk (`tidefs-types-archive-control-core`, `tidefs-types-observe-core`,
@@ -53,7 +68,10 @@ These are well-justified separations with many heterogeneous consumers.
 
 ### Stable Splits (3-8 consumers)
 
-Crates with 3-8 consumers that represent meaningful domain boundaries.
+Snapshot of crates with 3-8 consumers as of 2026-05-18.  Two of the rows
+below (`tidefs-types-policy-authority-core`, `tidefs-types-observe-core`)
+were subsequently deleted and are historical archive entries only; the
+remaining rows are the surviving stable splits.
 
 | Crate | Consumers | Lines | Domain |
 |---|---|---|---|
@@ -62,19 +80,20 @@ Crates with 3-8 consumers that represent meaningful domain boundaries.
 | tidefs-types-dataset-feature-flags-core | 6 | 689 | Dataset flags |
 | tidefs-types-response-registry-core | 6 | 1,106 | Response registry |
 | tidefs-types-dataset-lifecycle-core | 5 | 1,946 | Dataset lifecycle |
-| tidefs-types-policy-authority-core | 5 | 1,352 | Historical policy authority split; deleted 2026-06-01 in the fresh checkout |
+| tidefs-types-policy-authority-core | 5 | 1,352 | Historical archive entry; deleted 2026-06-01 |
 | tidefs-types-publication-pipeline-core | 5 | 894 | Publication |
 | tidefs-types-deferred-cleanup-core | 4 | 699 | Cleanup scheduling |
 | tidefs-types-polymorphic-directory-index-core | 4 | 1,124 | Directory indexing |
 | tidefs-types-cache-lattice-core | 3 | 1,421 | Cache topology |
 | tidefs-types-claim-ledger-core | 3 | 999 | Claim ledger |
-| tidefs-types-observe-core | 3 | 2,244 | Historical observability split; deleted 2026-06-01 in the fresh checkout |
+| tidefs-types-observe-core | 3 | 2,244 | Historical archive entry; deleted 2026-06-01 |
 | tidefs-types-package-profile-catalog | 3 | 782 | Package profiles |
 | tidefs-types-polymorphic-xattr-core | 3 | 924 | Extended attributes |
 | tidefs-types-space-accounting-core | 3 | 1,975 | Space accounting |
 
-**Recommendation**: Keep as-is. Each represents a coherent domain boundary with
-multiple consumers that would not benefit from inlining.
+**Recommendation (historical)**: Keep as-is for the surviving crates; each
+represented a coherent domain boundary with multiple consumers that would not
+have benefited from inlining.  The two deleted rows are archive evidence only.
 
 ### Near-Dead Splits (2 consumers)
 
@@ -97,7 +116,7 @@ multiple consumers that would not benefit from inlining.
 
 | Crate | Lines | Status |
 |---|---|---|
-| tidefs-types-shadow-pilot | 2,125 | Not in workspace members, zero consumers |
+| tidefs-types-shadow-pilot | 2,125 | Historical archive entry; deleted 2026-06-01 |
 
 ## Dependency Graph
 
@@ -193,6 +212,10 @@ the excluded crate root was deleted.
 
 ## Before / After
 
+Historical consolidation projection as of 2026-05-18.  Several projected
+removals were completed in the fresh checkout; see the per-row 2026-06-01
+notes above for which rows are archive evidence rather than current counts.
+
 | | Before | After (P1+P2) | After (P1+P2+P3) |
 |---|---|---|---|
 | types-core crates | 29 | 25 | 22 |
@@ -205,6 +228,10 @@ After P1+P2+P3: 7 crates removed, 22 remain, 0 orphans, 0 dead splits.
 
 ## Dependency Graph (After Consolidation)
 
+Historical projection as of 2026-05-18.  `tidefs-schema-codec-outcome` no
+longer exists in the current checkout; the surviving archive/truth-view
+record surfaces live in `tidefs-types-vfs-core`.
+
 ```
 tidefs-types-control-plane-core  ── hub (10 types + 13 non-types consumers)
 tidefs-types-vfs-core            ── hub (3 types + 18 non-types consumers)
@@ -215,6 +242,13 @@ tidefs-types-transport-session   ── unchanged (2 distinct consumers)
 ```
 
 ## Implementation Plan
+
+**Historical note (2026-06-22)**: This plan was written against the
+2026-05-18 workspace.  Several listed source and consumer crates have since
+been deleted, and the consolidation strategy for issues 2-6 is superseded by
+the fresh-checkout deletions recorded in the 2026-06-01 notes above.  The
+numbered issue descriptions below are historical review input only; do not
+execute them against the current checkout.
 
 ### Issue 1: Remove orphan tidefs-types-shadow-pilot
 - Done 2026-06-01 in the fresh TideFS checkout.
