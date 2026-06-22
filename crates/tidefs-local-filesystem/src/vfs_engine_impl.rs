@@ -3870,6 +3870,7 @@ impl VfsLocalFileSystem {
         debug_assert_eq!(tick, planned_tick);
         dest_record.data_version = tick;
         dest_record.metadata_version = tick;
+        LocalFileSystem::advance_subtree_revision(&mut dest_record);
         if let Err(err) = fs.account_new_file_content(
             dest_fh.inode_id,
             materialized_bytes,
@@ -9809,6 +9810,68 @@ mod tests {
             engine.fs.borrow().capacity_authority().used_bytes(),
             data_len as u64,
             "unlink of whole-file copy destination must release its charged capacity"
+        );
+    }
+
+    #[test]
+    fn copy_file_range_whole_file_advances_destination_subtree_rev() {
+        let (engine, _td) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).unwrap();
+        let (_source_attr, source_create) = engine
+            .create(root, b"copy-rev-source.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let (_dest_attr, dest_create) = engine
+            .create(root, b"copy-rev-dest.txt", 0o644, O_RDWR, &ctx())
+            .unwrap();
+        let payload = b"whole-file copy revision payload";
+
+        engine.write(&source_create, 0, payload, &ctx()).unwrap();
+        {
+            let mut fs = engine.fs.borrow_mut();
+            let mut seeded = fs
+                .get_inode_by_id(dest_create.inode_id)
+                .expect("destination inode before copy")
+                .clone();
+            seeded.subtree_rev = 64;
+            fs.update_inode_record(dest_create.inode_id, seeded)
+                .expect("seed independent destination subtree_rev");
+        }
+        let before = engine
+            .getattr(dest_create.inode_id, None, &ctx())
+            .expect("destination attr before copy");
+
+        let copied = engine
+            .copy_file_range(
+                &source_create,
+                0,
+                &dest_create,
+                0,
+                payload.len() as u64,
+                &ctx(),
+            )
+            .unwrap();
+
+        assert_eq!(copied, payload.len() as u32);
+        let after = engine
+            .getattr(dest_create.inode_id, None, &ctx())
+            .expect("destination attr after copy");
+        assert!(
+            after.subtree_rev > before.subtree_rev,
+            "whole-file copy fast path must advance destination subtree_rev"
+        );
+        let stored = engine
+            .fs
+            .borrow()
+            .get_inode_by_id(dest_create.inode_id)
+            .expect("destination inode")
+            .clone();
+        assert_eq!(
+            after.subtree_rev, stored.subtree_rev,
+            "VFS attr must project the stored subtree_rev"
+        );
+        assert!(
+            stored.subtree_rev > stored.metadata_version,
+            "seeded subtree_rev must stay independent from metadata_version after reflink copy"
         );
     }
 

@@ -11464,3 +11464,121 @@ fn metadata_version_bump_does_not_impersonate_dir_rev() {
     assert_eq!(record.metadata_version, metadata_version,
         "record metadata_version unchanged");
 }
+
+#[test]
+fn deferred_write_timestamp_update_advances_subtree_rev_independently() {
+    let root = temp_root("deferred-write-subtree-rev");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+
+    let created = fs.create_file("/file.bin", 0o644).expect("create file");
+    let mut seeded = fs.stat("/file.bin").expect("stat file");
+    seeded.metadata_version = 10_000;
+    seeded.subtree_rev = 4;
+    fs.update_inode_record(created.inode_id, seeded)
+        .expect("seed independent revision fields");
+
+    fs.apply_deferred_timestamp_update(
+        created.inode_id,
+        tidefs_inode_attributes::timestamp::TimestampUpdate::Write,
+        tidefs_inode_attributes::timestamp::TimestampPolicy::Strictatime,
+    )
+    .expect("deferred write timestamp update");
+
+    let after = fs.stat("/file.bin").expect("stat after update");
+    assert_eq!(
+        after.metadata_version, 10_000,
+        "metadata_version must remain its own storage authority"
+    );
+    assert_eq!(
+        after.subtree_rev, 5,
+        "deferred content timestamp updates must advance subtree_rev"
+    );
+    assert_ne!(
+        after.subtree_rev, after.metadata_version,
+        "subtree_rev must not be projected from metadata_version"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn direct_write_subtree_rev_survives_reopen() {
+    let root = temp_root("direct-write-subtree-rev");
+    let inode_id;
+    let persisted_subtree_rev;
+
+    {
+        let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+        let created = fs.create_file("/data.bin", 0o644).expect("create file");
+        inode_id = created.inode_id;
+        let mut seeded = fs.stat("/data.bin").expect("stat created file");
+        seeded.subtree_rev = 40;
+        fs.update_inode_record(inode_id, seeded)
+            .expect("seed independent subtree_rev");
+        let before = fs.stat("/data.bin").expect("stat before write");
+
+        fs.write_file("/data.bin", 0, b"subtree revision payload")
+            .expect("write file");
+        fs.flush_write_buffer(inode_id).expect("flush write buffer");
+        let after = fs.stat("/data.bin").expect("stat after write");
+
+        assert!(
+            after.subtree_rev > before.subtree_rev,
+            "direct content writes must advance subtree_rev"
+        );
+        assert!(
+            after.subtree_rev > after.metadata_version,
+            "seeded subtree_rev must stay independent from metadata_version"
+        );
+        persisted_subtree_rev = after.subtree_rev;
+        fs.sync_all().expect("sync write");
+    }
+
+    let fs = LocalFileSystem::open_with_options(&root, options()).expect("reopen fs");
+    let reopened = fs.stat("/data.bin").expect("stat reopened file");
+    assert_eq!(reopened.inode_id, inode_id);
+    assert_eq!(
+        reopened.subtree_rev, persisted_subtree_rev,
+        "persisted subtree_rev must survive reopen"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn truncate_and_fallocate_advance_subtree_rev() {
+    let root = temp_root("truncate-fallocate-subtree-rev");
+    let mut fs = LocalFileSystem::open_with_options(&root, options()).expect("open fs");
+
+    fs.create_file("/data.bin", 0o644).expect("create file");
+    fs.write_file("/data.bin", 0, b"0123456789abcdef")
+        .expect("write file");
+    let inode_id = fs.stat("/data.bin").expect("stat written file").inode_id;
+    fs.flush_write_buffer(inode_id).expect("flush write buffer");
+    let mut seeded = fs.stat("/data.bin").expect("stat flushed file");
+    seeded.subtree_rev = 80;
+    fs.update_inode_record(inode_id, seeded)
+        .expect("seed independent subtree_rev");
+    let before_truncate = fs.stat("/data.bin").expect("stat before truncate");
+
+    fs.truncate_file("/data.bin", 8).expect("truncate file");
+    let after_truncate = fs.stat("/data.bin").expect("stat after truncate");
+    assert!(
+        after_truncate.subtree_rev > before_truncate.subtree_rev,
+        "truncate must advance subtree_rev"
+    );
+
+    fs.fallocate_file("/data.bin", 8, 4096)
+        .expect("fallocate file");
+    let after_fallocate = fs.stat("/data.bin").expect("stat after fallocate");
+    assert!(
+        after_fallocate.subtree_rev > after_truncate.subtree_rev,
+        "fallocate content allocation must advance subtree_rev"
+    );
+    assert!(
+        after_fallocate.subtree_rev > after_fallocate.metadata_version,
+        "seeded subtree_rev must stay independent from metadata_version"
+    );
+
+    cleanup(&root);
+}

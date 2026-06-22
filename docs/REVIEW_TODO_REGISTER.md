@@ -362,6 +362,16 @@ Important 2026-06-01 findings:
   intent-log replay version projection, scrub/repair identity, send/receive
   serialization, content-object reclaim identity, and format-golden/codec
   surfaces.
+- `TFR-005`: issue #994 advances the content-write follow-up from issue
+  #688. Local write, truncate, fallocate, reflink, and VFS whole-file
+  copy-file-range paths now advance `subtree_rev` from the stored namespace
+  revision counter, and deferred write/truncate/metadata timestamp updates do
+  the same independently of `metadata_version`. Focused local-filesystem tests
+  cover deferred timestamp updates, direct write persistence across reopen,
+  truncate/fallocate advancement, and VFS whole-file copy projection. This
+  leaves the other TFR-005 blockers open: intent-log replay version
+  projection, scrub/repair identity, send/receive serialization,
+  content-object reclaim identity, and format-golden/codec surfaces.
 - `TFR-006`: Transform authority is still split across mounted-content
   compression, object-store device compression/encryption, helper compression
   and encryption crates, and inline content-addressed dedup. The
