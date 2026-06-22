@@ -26,8 +26,8 @@
 use std::sync::{Arc, Mutex};
 
 use tidefs_extent_map::InlineExtentMap;
-use tidefs_types_incremental_job_core::IncrementalJob;
 use tidefs_types_extent_map_core::{ExtentMapEntryV2, ExtentMapError, LocatorId};
+use tidefs_types_incremental_job_core::IncrementalJob;
 use tidefs_types_incremental_job_core::{
     Checkpoint, CursorState, JobError, JobId, JobKind, JobProgress, StepResult, WorkBudget,
 };
@@ -239,7 +239,6 @@ pub struct OnlineDefragService {
     stats: DefragStats,
     stats_sink: Option<Arc<Mutex<DefragStats>>>,
     min_extent_size: u64,
-    complete_flag: bool,
 }
 
 impl OnlineDefragService {
@@ -248,19 +247,17 @@ impl OnlineDefragService {
     /// denominator (typically 4 KiB).
     #[must_use]
     pub fn new(job_id: JobId, store: Box<dyn ExtentMapStore>, min_extent_size: u64) -> Self {
-        let inodes = store.list_inodes();
-        let mut sorted = inodes;
-        sorted.sort_unstable();
-        OnlineDefragService {
+        let mut service = OnlineDefragService {
             job_id,
             store,
-            inodes: sorted,
+            inodes: Vec::new(),
             cursor: DefragCursor::default(),
             stats: DefragStats::default(),
             stats_sink: None,
             min_extent_size,
-            complete_flag: false,
-        }
+        };
+        service.refresh_inodes();
+        service
     }
 
     /// Publish accumulated stats into a shared sink after each tick.
@@ -284,6 +281,29 @@ impl OnlineDefragService {
             }
         }
     }
+
+    fn refresh_inodes(&mut self) {
+        let mut inodes = self.store.list_inodes();
+        inodes.sort_unstable();
+        inodes.dedup();
+        self.inodes = inodes;
+    }
+
+    fn build_checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            job_id: self.job_id,
+            job_kind: JobKind::Defrag,
+            epoch: 1,
+            cursor_state: CursorState(self.cursor.to_bytes().to_vec()),
+            progress: JobProgress {
+                items_processed: self.stats.inodes_scanned,
+                items_total_estimate: self.inodes.len() as u64,
+                bytes_processed: 0,
+                bytes_total_estimate: 0,
+                elapsed_ms: 0,
+            },
+        }
+    }
 }
 
 impl IncrementalJob for OnlineDefragService {
@@ -295,20 +315,8 @@ impl IncrementalJob for OnlineDefragService {
     }
 
     fn step(&mut self, budget: WorkBudget) -> StepResult {
-        if self.complete_flag {
-            return StepResult::complete(Checkpoint {
-                job_id: self.job_id,
-                job_kind: JobKind::Defrag,
-                epoch: 1,
-                cursor_state: CursorState(self.cursor.to_bytes().to_vec()),
-                progress: JobProgress {
-                    items_processed: self.stats.inodes_scanned,
-                    items_total_estimate: self.inodes.len() as u64,
-                    bytes_processed: 0,
-                    bytes_total_estimate: 0,
-                    elapsed_ms: 0,
-                },
-            });
+        if self.cursor.inode_index == 0 {
+            self.refresh_inodes();
         }
 
         let max_items = if budget.max_items == 0 {
@@ -333,22 +341,7 @@ impl IncrementalJob for OnlineDefragService {
                 self.stats.extents_before += extents_before;
                 self.stats.extents_after += extents_after;
                 self.publish_stats();
-                let cursor_state = CursorState(self.cursor.to_bytes().to_vec());
-                let progress = JobProgress {
-                    items_processed: self.stats.inodes_scanned,
-                    items_total_estimate: self.inodes.len() as u64,
-                    bytes_processed: 0,
-                    bytes_total_estimate: 0,
-                    elapsed_ms: 0,
-                };
-                let checkpoint = Checkpoint {
-                    job_id: self.job_id,
-                    job_kind: JobKind::Defrag,
-                    epoch: 1,
-                    cursor_state,
-                    progress,
-                };
-                return StepResult::in_progress(checkpoint);
+                return StepResult::in_progress(self.build_checkpoint());
             }
 
             let ino = self.inodes[idx];
@@ -382,42 +375,16 @@ impl IncrementalJob for OnlineDefragService {
         self.stats.extents_after += extents_after;
         self.publish_stats();
 
-        self.complete_flag = true;
-        self.cursor.inode_index = self.inodes.len() as u64;
+        // Keep the registered scheduler job alive: mounted filesystems can
+        // gain new extent maps after open-time registration, so each full
+        // pass resets and the next tick refreshes the inode list.
+        self.cursor = DefragCursor::default();
 
-        let cursor_state = CursorState(self.cursor.to_bytes().to_vec());
-        let progress = JobProgress {
-            items_processed: self.stats.inodes_scanned,
-            items_total_estimate: self.inodes.len() as u64,
-            bytes_processed: 0,
-            bytes_total_estimate: 0,
-            elapsed_ms: 0,
-        };
-        let checkpoint = Checkpoint {
-            job_id: self.job_id,
-            job_kind: JobKind::Defrag,
-            epoch: 1,
-            cursor_state,
-            progress,
-        };
-
-        StepResult::complete(checkpoint)
+        StepResult::in_progress(self.build_checkpoint())
     }
 
     fn persist_checkpoint(&self) -> Checkpoint {
-        Checkpoint {
-            job_id: self.job_id,
-            job_kind: JobKind::Defrag,
-            epoch: 1,
-            cursor_state: CursorState(self.cursor.to_bytes().to_vec()),
-            progress: JobProgress {
-                items_processed: self.stats.inodes_scanned,
-                items_total_estimate: self.inodes.len() as u64,
-                bytes_processed: 0,
-                bytes_total_estimate: 0,
-                elapsed_ms: 0,
-            },
-        }
+        self.build_checkpoint()
     }
 
     fn complete(self) {}
@@ -733,9 +700,7 @@ impl IncrementalJob for ObjectRelocator {
                             }
 
                             // Read the object data.
-                            let data = match self
-                                .reloc_store
-                                .read_object(entry.locator_id, obj_len)
+                            let data = match self.reloc_store.read_object(entry.locator_id, obj_len)
                             {
                                 Ok(d) => d,
                                 Err(e) => {
@@ -751,8 +716,8 @@ impl IncrementalJob for ObjectRelocator {
                             };
 
                             // Relocate to contiguous segments.
-                            if let Err(e) = self.reloc_store
-                                .relocate_object(entry.locator_id, &data)
+                            if let Err(e) =
+                                self.reloc_store.relocate_object(entry.locator_id, &data)
                             {
                                 // Log the relocation error and skip.
                                 let _ = e;
@@ -857,14 +822,14 @@ impl ObjectRelocator {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tidefs_types_extent_map_core::LocatorId;
 
     // ── Mock ExtentMapStore ───────────────────────────────────────────
 
     struct MockStore {
         maps: Mutex<HashMap<u64, InlineExtentMap>>,
-        inode_order: Vec<u64>,
+        inode_order: Mutex<Vec<u64>>,
         save_errors: Mutex<HashMap<u64, bool>>,
     }
 
@@ -872,15 +837,23 @@ mod tests {
         fn new(inodes: Vec<u64>, maps: HashMap<u64, InlineExtentMap>) -> Self {
             MockStore {
                 maps: Mutex::new(maps),
-                inode_order: inodes,
+                inode_order: Mutex::new(inodes),
                 save_errors: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn insert_inode(&self, ino: u64, map: InlineExtentMap) {
+            self.maps.lock().unwrap().insert(ino, map);
+            let mut inode_order = self.inode_order.lock().unwrap();
+            if !inode_order.contains(&ino) {
+                inode_order.push(ino);
             }
         }
     }
 
     impl ExtentMapStore for MockStore {
         fn list_inodes(&self) -> Vec<u64> {
-            self.inode_order.clone()
+            self.inode_order.lock().unwrap().clone()
         }
 
         fn load_extent_map(&self, ino: u64) -> Result<InlineExtentMap, ExtentMapError> {
@@ -898,6 +871,20 @@ mod tests {
             }
             self.maps.lock().unwrap().insert(ino, map.clone());
             Ok(())
+        }
+    }
+
+    impl ExtentMapStore for Arc<MockStore> {
+        fn list_inodes(&self) -> Vec<u64> {
+            self.as_ref().list_inodes()
+        }
+
+        fn load_extent_map(&self, ino: u64) -> Result<InlineExtentMap, ExtentMapError> {
+            self.as_ref().load_extent_map(ino)
+        }
+
+        fn save_extent_map(&self, ino: u64, map: &InlineExtentMap) -> Result<(), ExtentMapError> {
+            self.as_ref().save_extent_map(ino, map)
         }
     }
 
@@ -1121,7 +1108,7 @@ mod tests {
         assert_eq!(svc.job_kind(), JobKind::Defrag);
 
         let result = svc.step(WorkBudget::UNBOUNDED);
-        assert!(result.is_complete);
+        assert!(!result.is_complete);
 
         let stats = svc.stats();
         assert_eq!(stats.inodes_scanned, 3);
@@ -1163,16 +1150,18 @@ mod tests {
         assert_eq!(svc.stats().inodes_scanned, 15);
 
         let r4 = svc.step(budget);
-        assert!(r4.is_complete);
+        assert!(!r4.is_complete);
         assert_eq!(svc.stats().inodes_scanned, 20);
+        let cursor = DefragCursor::from_bytes(r4.checkpoint.cursor_state.as_bytes()).unwrap();
+        assert_eq!(cursor.inode_index, 0);
     }
 
     #[test]
-    fn service_empty_inode_list_completes_immediately() {
+    fn service_empty_inode_list_stays_active_for_future_scans() {
         let store = Box::new(MockStore::new(vec![], HashMap::new()));
         let mut svc = OnlineDefragService::new(JobId(3), store, 4096);
         let result = svc.step(WorkBudget::UNBOUNDED);
-        assert!(result.is_complete);
+        assert!(!result.is_complete);
         assert_eq!(svc.stats().inodes_scanned, 0);
     }
 
@@ -1185,7 +1174,7 @@ mod tests {
 
         let mut svc = OnlineDefragService::new(JobId(4), store, 4096);
         let result = svc.step(WorkBudget::UNBOUNDED);
-        assert!(result.is_complete);
+        assert!(!result.is_complete);
         assert_eq!(svc.stats().inodes_scanned, 3);
         assert_eq!(svc.stats().inodes_defragmented, 1);
     }
@@ -1238,23 +1227,41 @@ mod tests {
     }
 
     #[test]
-    fn service_paused_budget_processes_none() {
+    fn service_unbounded_budget_finishes_pass_but_keeps_rescan_active() {
         let inodes = vec![1];
         let mut maps = HashMap::new();
         maps.insert(1, make_fragmented_map(&[(0, 1000, 1), (1000, 1000, 1)]));
         let store = Box::new(MockStore::new(inodes, maps));
 
         let mut svc = OnlineDefragService::new(JobId(5), store, 4096);
-        let result = svc.step(WorkBudget::PAUSED);
-        assert!(result.is_complete);
-    }
-    #[test]
-    fn service_step_after_complete_returns_complete() {
-        let store = Box::new(MockStore::new(vec![], HashMap::new()));
-        let mut svc = OnlineDefragService::new(JobId(6), store, 4096);
-        svc.step(WorkBudget::UNBOUNDED);
         let result = svc.step(WorkBudget::UNBOUNDED);
-        assert!(result.is_complete);
+        assert!(!result.is_complete);
+        assert_eq!(svc.stats().inodes_scanned, 1);
+    }
+
+    #[test]
+    fn service_rescans_inode_list_between_full_passes() {
+        let store = Arc::new(MockStore::new(
+            vec![1],
+            HashMap::from([(1, make_fragmented_map(&[(0, 1000, 1), (1000, 1000, 1)]))]),
+        ));
+
+        let mut svc = OnlineDefragService::new(JobId(6), Box::new(Arc::clone(&store)), 4096);
+
+        let first = svc.step(WorkBudget::UNBOUNDED);
+        assert!(!first.is_complete);
+        assert_eq!(svc.stats().inodes_scanned, 1);
+        assert_eq!(svc.stats().inodes_defragmented, 1);
+
+        store.insert_inode(
+            2,
+            make_fragmented_map(&[(0, 1000, 2), (1000, 1000, 2), (2000, 1000, 2)]),
+        );
+
+        let result = svc.step(WorkBudget::UNBOUNDED);
+        assert!(!result.is_complete);
+        assert_eq!(svc.stats().inodes_scanned, 3);
+        assert_eq!(svc.stats().inodes_defragmented, 2);
     }
 
     #[test]
