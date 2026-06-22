@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tidefs_cache_coherency::CoherencyEventBus;
+use tidefs_cache_coherency::{
+    CacheInvalidationMessage, CacheInvalidationReason, CoherencyEventBus,
+    InvalidationResult, InvalidationWaitPolicy,
+};
 use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseError, LeaseGrant, LeaseLifecycle};
-use tidefs_lease::{LeaseMessage, LeaseMessageCodec, LeaseProtocolError};
+use tidefs_lease::{
+    CacheInvalidationPayload, InvalidationAckPayload, LeaseMessage,
+    LeaseMessageCodec, LeaseProtocolError,
+};
 use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 /// Configuration for the distributed lease manager.
@@ -16,6 +22,11 @@ pub struct LeaseManagerConfig {
     pub max_leases_per_holder: usize,
     pub renewal_advance_fraction: u8,
     pub priority_inheritance_enabled: bool,
+    /// Timeout in milliseconds for waiting on invalidation acknowledgments
+    /// before proceeding (for WaitForCleanEviction / WaitForDirtyDrain).
+    pub invalidation_wait_timeout_millis: u64,
+    /// Maximum retries for invalidation dispatch before fencing.
+    pub invalidation_max_retries: usize,
     pub current_mount_identity: DatasetMountIdentity,
 }
 
@@ -29,6 +40,8 @@ impl Default for LeaseManagerConfig {
             max_leases_per_holder: 4096,
             renewal_advance_fraction: 4,
             priority_inheritance_enabled: true,
+            invalidation_wait_timeout_millis: 5_000,
+            invalidation_max_retries: 3,
             current_mount_identity: DatasetMountIdentity::ZERO,
         }
     }
@@ -51,6 +64,10 @@ pub enum LeaseManagerError {
     HolderAtCapacity(MemberId, usize),
     #[error("conflict with existing lease {0}")]
     Conflict(u64),
+    #[error("invalidation fenced: dirty pages still pending for dataset {0} inode {1}")]
+    InvalidationFenced(u64, u64),
+    #[error("invalidation timeout for dataset {0} inode {1} after {2} retries")]
+    InvalidationTimeout(u64, u64, usize),
     #[error(transparent)]
     Lease(#[from] LeaseError),
 }
@@ -65,6 +82,10 @@ pub struct ManagerStats {
     pub expirations_total: u64,
     pub node_failure_revocations: u64,
     pub conflicts_detected: u64,
+    pub invalidations_dispatched: u64,
+    pub invalidations_acked: u64,
+    pub invalidations_fenced: u64,
+    pub invalidations_timed_out: u64,
 }
 
 /// Distributed lease manager with GRANT/REVOKE/RENEW lifecycle.
@@ -81,6 +102,9 @@ pub struct LeaseManager {
     /// Optional coherency event bus for dispatching cache invalidation
     /// when leases are revoked (mmap coherency integration).
     coherency_bus: Option<Arc<CoherencyEventBus>>,
+    /// Per-dataset/inode range generation tracking for conflict gating.
+    /// Maps (dataset_id, inode_id) to the current range generation.
+    range_generations: BTreeMap<(u64, u64), u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -142,6 +166,7 @@ impl LeaseManager {
             current_mount_identity: mount,
             stats: ManagerStats::default(),
             coherency_bus: None,
+            range_generations: BTreeMap::new(),
         }
     }
 
@@ -188,6 +213,37 @@ impl LeaseManager {
     }
 
     /// Grant a new lease with quorum-acknowledged acquisition.
+    /// Dispatch cache invalidation for a domain and optionally wait for
+    /// clean eviction or dirty drain according to the wait policy.
+    ///
+    /// Used before granting a conflicting write lease to ensure the old
+    /// holder's clean cache mirrors are invalidated and dirty/writeback
+    /// overlap is resolved.
+    pub fn invalidate_cache_for_domain(
+        &mut self,
+        grant: &LeaseGrant,
+        wait_policy: InvalidationWaitPolicy,
+    ) -> Result<InvalidationResult, LeaseManagerError> {
+        if let Some(ref bus) = self.coherency_bus {
+            let msg = self.build_invalidation_message(
+                grant,
+                CacheInvalidationReason::ConflictingWriteLease,
+                wait_policy,
+            );
+            if let Some(ref msg) = msg {
+                let result = bus.dispatch_invalidation_message(msg);
+                self.stats.invalidations_dispatched += 1;
+                Ok(result)
+            } else {
+                // Domain doesn't map to page-cache invalidation; ok.
+                Ok(InvalidationResult::clean(0))
+            }
+        } else {
+            Ok(InvalidationResult::clean(0))
+        }
+    }
+
+
     pub fn grant(
         &mut self,
         lease_class: LeaseClass,
@@ -358,6 +414,118 @@ impl LeaseManager {
 
     /// Revoke a lease (authoritative action, not holder-initiated).
 
+    // ── Generation tracking (issue #754) ────────────────────────────
+
+    /// Get the current range generation for a dataset/inode pair.
+    pub fn current_generation(&self, dataset_id: u64, inode_id: u64) -> u64 {
+        self.range_generations
+            .get(&(dataset_id, inode_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Advance the range generation for a dataset/inode pair and return the new value.
+    pub fn advance_generation(&mut self, dataset_id: u64, inode_id: u64) -> u64 {
+        let gen = self
+            .range_generations
+            .entry((dataset_id, inode_id))
+            .or_insert(0);
+        *gen = gen.wrapping_add(1);
+        *gen
+    }
+
+    /// Build a [`CacheInvalidationMessage`] from a lease grant and its revocation context.
+    fn build_invalidation_message(
+        &self,
+        grant: &LeaseGrant,
+        reason: CacheInvalidationReason,
+        wait_policy: InvalidationWaitPolicy,
+    ) -> Option<CacheInvalidationMessage> {
+        let (dataset_id, inode_id, scope) = match &grant.domain {
+            LeaseDomain::ByteRange {
+                dataset_id,
+                ino,
+                start,
+                end,
+            } => (
+                *dataset_id,
+                *ino,
+                tidefs_cache_coherency::CacheInvalidationScope::Range {
+                    start: *start,
+                    end: *end,
+                },
+            ),
+            LeaseDomain::Inode { dataset_id, ino } => (
+                *dataset_id,
+                *ino,
+                tidefs_cache_coherency::CacheInvalidationScope::Inode,
+            ),
+            LeaseDomain::Subtree { dataset_id, .. } => (
+                *dataset_id,
+                0u64,
+                tidefs_cache_coherency::CacheInvalidationScope::Dataset,
+            ),
+            // Other lease domains (EpochTransition, MembershipReconfig, etc.)
+            // do not map to page-cache invalidation.
+            _ => return None,
+        };
+
+        let old_gen = self.current_generation(dataset_id, inode_id);
+        let new_gen = old_gen.wrapping_add(1);
+
+        Some(CacheInvalidationMessage {
+            dataset_id,
+            mount_session_id: grant.dataset_mount_id,
+            inode_id,
+            inode_generation: grant.version,
+            scope,
+            old_range_generation: old_gen,
+            new_range_generation: new_gen,
+            lease_epoch: grant.epoch.0,
+            membership_epoch: self.current_epoch.0,
+            reason,
+            wait_policy,
+        })
+    }
+
+    /// Handle an incoming cache invalidation from a remote node.
+    fn handle_incoming_invalidation(
+        &mut self,
+        payload: &CacheInvalidationPayload,
+    ) -> Result<LeaseMessage, LeaseProtocolError> {
+        let msg = payload.clone().into_coherency();
+        self.stats.invalidations_dispatched += 1;
+
+        if let Some(ref bus) = self.coherency_bus {
+            let result = bus.dispatch_invalidation_message(&msg);
+            let ack = InvalidationAckPayload {
+                dataset_id: msg.dataset_id,
+                inode_id: msg.inode_id,
+                clean_evicted: result.clean_evicted as u64,
+                dirty_remaining: result.dirty_remaining as u64,
+                dirty_drained: result.dirty_drained,
+                needs_retry: result.needs_retry,
+            };
+            if !result.dirty_drained && msg.requires_dirty_drain() {
+                self.stats.invalidations_fenced += 1;
+            } else {
+                self.stats.invalidations_acked += 1;
+            }
+            Ok(LeaseMessage::InvalidateAck(ack))
+        } else {
+            // No coherency bus configured: ack with zero counts.
+            Ok(LeaseMessage::InvalidateAck(InvalidationAckPayload {
+                dataset_id: msg.dataset_id,
+                inode_id: msg.inode_id,
+                clean_evicted: 0,
+                dirty_remaining: 0,
+                dirty_drained: true,
+                needs_retry: false,
+            }))
+        }
+    }
+
+
     /// Dispatch cache invalidation for a revoked lease's domain.
     ///
     /// When a lease is revoked (due to conflict, node failure, expiry, or
@@ -366,21 +534,15 @@ impl LeaseManager {
     /// authoritative data from the new lease holder.
     fn dispatch_invalidation_for_grant(&self, grant: &LeaseGrant) {
         if let Some(ref bus) = self.coherency_bus {
-            match &grant.domain {
-                LeaseDomain::ByteRange {
-                    dataset_id: _,
-                    ino,
-                    start,
-                    end,
-                } => {
-                    bus.dispatch_range_invalidation(*ino, *start, *end);
-                }
-                LeaseDomain::Inode { dataset_id: _, ino } => {
-                    bus.dispatch_inode_invalidation(*ino);
-                }
-                // Subtree and EpochTransition leases don't map to
-                // byte-range cache invalidation; skip them.
-                _ => {}
+            // Build a full invalidation message with generation tracking.
+            let msg = self.build_invalidation_message(
+                grant,
+                CacheInvalidationReason::LeaseRevoked,
+                InvalidationWaitPolicy::Advisory,
+            );
+            if let Some(ref msg) = msg {
+                let _result = bus.dispatch_invalidation_message(msg);
+                // Advisory policy: fire-and-forget; result is not awaited.
             }
         }
     }
@@ -581,6 +743,22 @@ impl LeaseManager {
                 }),
                 Err(e) => self.map_manager_error(e),
             },
+            LeaseMessage::Invalidate(payload) => {
+                // Process incoming cache invalidation: dispatch to local
+                // coherency bus and return an ack with eviction counts.
+                self.handle_incoming_invalidation(payload)
+            }
+            LeaseMessage::InvalidateAck(ack) => {
+                // Process invalidation ack from a remote node.
+                // Currently a no-op at the manager level; stats are updated
+                // by the caller (transport dispatch layer).
+                self.stats.invalidations_acked += 1;
+                Ok(LeaseMessage::Acknowledge {
+                    lease_id: 0,
+                    success: true,
+                    detail: "invalidation-ack-received".into(),
+                })
+            }
             LeaseMessage::Acknowledge { .. } => {
                 // Server does not process acknowledgements.
                 Err(LeaseProtocolError::NotFound(0))
@@ -608,6 +786,12 @@ impl LeaseManager {
             LeaseManagerError::InsufficientWitnesses(..) => LeaseProtocolError::NotFound(0),
             LeaseManagerError::HolderAtCapacity(..) => LeaseProtocolError::NotFound(0),
             LeaseManagerError::Conflict(id) => LeaseProtocolError::NotFound(id),
+            LeaseManagerError::InvalidationFenced(ds, ino) => {
+                LeaseProtocolError::InvalidationRejected(ds, ino)
+            }
+            LeaseManagerError::InvalidationTimeout(ds, ino, retries) => {
+                LeaseProtocolError::InvalidationRetry(ds, ino, retries as u64)
+            }
             LeaseManagerError::Lease(le) => match le {
                 LeaseError::NotFound { lease_id } => LeaseProtocolError::NotFound(lease_id),
                 LeaseError::AlreadyTerminal { lease_id, state } => {
