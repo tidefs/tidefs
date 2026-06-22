@@ -145,13 +145,21 @@ explicit non-support: BMAP returns a physical block-device address, while the
 daemon has no stable block-device address authority. FIEMAP remains the
 supported extent-query surface.
 
+Issue #1081 refreshed this section from the current
+`FuseVfsAdapter` daemon callback surface. Rows below classify adapter behavior,
+including deliberately limited command sets, instead of carrying historical
+stub placeholders.
+
 ### 3.1 Required and adapter-exposed opcodes
 
 | Opcode | fuser method | Status | Notes |
 |---|---|---|---|
+| `FUSE_INIT` | `init()` | **Implemented** | Negotiates required and performance capabilities through `KernelConfig` |
 | `FUSE_LOOKUP` | `lookup()` | **Implemented** | Byte-native names required (§5) |
-| `FUSE_FORGET` | `forget()` | **Implemented** | Inline or batched |
+| `FUSE_FORGET` | `forget()` | **Implemented** | Inline forget-ref dispatch |
+| `FUSE_BATCH_FORGET` | `batch_forget()` | **Implemented** | Batched forget entries are dispatched through the same forget-ref path |
 | `FUSE_GETATTR` | `getattr()` | **Implemented** | TTL-aware |
+| `FUSE_ACCESS` | `access()` | **Implemented** | Adapter permission checks against inode metadata |
 | `FUSE_SETATTR` | `setattr()` | **Implemented** | chmod/chown/truncate/utimens |
 | `FUSE_READLINK` | `readlink()` | **Implemented** | Byte output |
 | `FUSE_SYMLINK` | `symlink()` | **Implemented** | Byte target |
@@ -159,9 +167,11 @@ supported extent-query surface.
 | `FUSE_MKDIR` | `mkdir()` | **Implemented** | |
 | `FUSE_UNLINK` | `unlink()` | **Implemented** | |
 | `FUSE_RMDIR` | `rmdir()` | **Implemented** | |
-| `FUSE_RENAME` | `rename()` | **Implemented** | |
-| `FUSE_RENAME2` | `rename2()` | **Partially implemented** | `RENAME_EXCHANGE`/`RENAME_NOREPLACE` implemented; `RENAME_WHITEOUT` intentionally unsupported until overlay/whiteout semantics enter the POSIX subset |
+| `FUSE_RENAME` | `rename()` | **Partially implemented** | Normal rename, `RENAME_NOREPLACE`, and `RENAME_EXCHANGE` are implemented; `RENAME_WHITEOUT` intentionally returns `EINVAL` until overlay/whiteout semantics enter the POSIX subset |
+| `FUSE_RENAME2` | `rename(... flags)` | **Partially implemented** | fuser passes rename flags through `rename()` rather than a separate `rename2()` callback |
+| `FUSE_EXCHANGE` | `exchange()` | **Implemented** | Linux 6.13+/macOS exchange callback dispatches through `dispatch_exchange_entry()` as an additional exchange surface |
 | `FUSE_LINK` | `link()` | **Implemented** | |
+| `FUSE_OPEN` | `open()` | **Implemented** | `O_TMPFILE` is handled as an open-flag adjunct through `dispatch_tmpfile()`, not a distinct fuser callback |
 | `FUSE_READ` | `read()` | **Implemented** | |
 | `FUSE_WRITE` | `write()` | **Implemented** | Bounded by dirty-window budget |
 | `FUSE_STATFS` | `statfs()` | **Implemented** | |
@@ -181,24 +191,24 @@ supported extent-query surface.
 | `FUSE_GETLK` | `getlk()` | **Implemented** | Advisory lock surface (PC-007) |
 | `FUSE_SETLK` | `setlk()` | **Implemented** | Advisory lock surface (PC-007) |
 | `FUSE_SETLKW` | `setlkw()` | **Implemented** | Blocking lock (queue_class_6) |
-| `FUSE_FALLOCATE` | `fallocate()` | **Implemented** | mode 0, PUNCH_HOLE, ZERO_RANGE, KEEP_SIZE |
+| `FUSE_FLOCK` | `flock()` | **Implemented** | BSD whole-file advisory lock surface |
+| `FUSE_FALLOCATE` | `fallocate()` | **Implemented** | mode 0, KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE |
 | `FUSE_LSEEK` | `lseek()` | **Implemented** | SEEK_SET/END/CUR/DATA/HOLE (PC-004B) |
-| `FUSE_IOCTL` | `ioctl()` | **Implemented** | FS_IOC_FIEMAP wired |
-| `FUSE_COPY_FILE_RANGE` | `copy_file_range()` | **Explicitly unsupported** | Outside the current POSIX subset; the daemon does not claim clone/copy offload support |
+| `FUSE_IOCTL` | `ioctl()` | **Partial-boundary** | `FS_IOC_FIEMAP`, `FS_IOC_FSGETXATTR`, and `TIDEFS_IOC_DEFRAG` are wired; other commands return `EOPNOTSUPP` |
+| `FUSE_POLL` | `poll()` | **Implemented** | Regular-file readiness and schedule-notify registration bookkeeping |
+| `FUSE_COPY_FILE_RANGE` | `copy_file_range()` | **Implemented** | Engine copy path plus writeback-cache fallback |
+| `FUSE_SYNCFS` | `syncfs()` | **Implemented** | Mount-wide dirty-page, engine syncfs, and txg barrier |
+| `FUSE_STATX` | `statx()` | **Implemented** | Encodes `ReplyStatx` from adapter metadata projection |
 | `FUSE_BMAP` | `bmap()` | **Explicitly unsupported** | Current userspace adapter returns `EOPNOTSUPP`; FIEMAP is the supported extent-query surface, and BMAP support would require a real block-device address mapping |
 | `FUSE_DESTROY` | `destroy()` | **Implemented** | |
-| `FUSE_INTERRUPT` | (internal to fuser) | **Implemented** | Routed through queue_class_0 |
-| `FUSE_BATCH_FORGET` | (internal to fuser) | **Implemented** | |
+| `FUSE_INTERRUPT` | (internal to fuser) | **Binding-internal** | No TideFS daemon callback; blocking `setlk(..., sleep = true)` observes fuser's abort handle |
 
 ### 3.2 Future opcodes (deferred)
 
 | Opcode | Protocol | Needed for | Deferral reason |
 |---|---|---|---|
-| `FUSE_TMPFILE` | ≥ 7.9 | xfstests O_TMPFILE | Not in POSIX subset |
-| `FUSE_COPY_FILE_RANGE` | ≥ 7.28 | xfstests file clone | Explicitly unsupported in the current POSIX subset |
-| `FUSE_COPY_FILE_RANGE_64` | ≥ 7.45 | Large file clone | Explicitly unsupported in the current POSIX subset |
-| `FUSE_STATX` | ≥ 7.33 | btime, mnt_id | Not in POSIX subset |
-| `FUSE_SYNCFS` | ≥ 7.32 | Full filesystem sync | Not in POSIX subset |
+| `FUSE_TMPFILE` | ≥ 7.9 | xfstests O_TMPFILE | No distinct fuser callback in the current daemon; `O_TMPFILE` is handled as an open-flag adjunct, while broader orphan-index lifecycle authority remains separate |
+| `FUSE_COPY_FILE_RANGE_64` | ≥ 7.45 | Large file clone | No distinct daemon callback in the current fuser surface; current `copy_file_range()` is implemented and tested |
 
 ---
 

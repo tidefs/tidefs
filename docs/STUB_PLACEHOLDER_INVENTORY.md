@@ -256,10 +256,11 @@ Follow-up scope: #789 tracks the 22 planned-authority surfaces and has split the
 ### 7.3 FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX maturity table
 
 - **Surface**: `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`
-  - Documents stub/implemented status for each FUSE operation.
+  - Documents implemented, partial-boundary, and explicitly unsupported status for each FUSE operation.
   - `FUSE_BMAP` was resolved by #786 as explicit non-support for the current userspace adapter boundary.
-- Classification: **Implement** — the matrix is current but any remaining non-BMAP stubs need resolution.
-- Follow-up issue: #797 resolves remaining non-BMAP FUSE operation stubs or documents intentional non-support.
+  - #797 closed the historical non-BMAP FUSE feature-matrix stub triage, and #1081 refreshed the current callback audit in `docs/FUSE_OPERATION_COVERAGE_MATRIX.md`.
+- Classification: **Resolved by matrix refresh** — source inspection of `FuseVfsAdapter` found no live daemon callback left as a fuser-default ENOSYS stub. Partial boundaries such as unsupported ioctl command numbers now live in the coverage matrix instead of this stub inventory.
+- Follow-up issue: none from this audit; new FUSE behavior work should get a fresh issue with a non-overlapping source write set.
 
 ---
 
@@ -334,7 +335,7 @@ These surfaces were identified as stub/placeholder during the audit but already 
 | #983 | Section 7.1 local-storage label retargeting | Implement | Local filesystem/object-store source, storage docs, and xtask storage gate paths |
 | #984 | Section 7.1 distributed/transport label retargeting | Implement | Membership, placement, replication, rebuild, rebalance, transport source and docs |
 | #985 | Section 7.1 validation/security/performance label retargeting | Implement | Validation, security, benchmarking, and `flake.nix` paths |
-| #797 | Section 7.3 (FUSE feature matrix stubs) | Implement | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` |
+| #797 | Section 7.3 (FUSE feature matrix stubs) | Resolved: #1081 refreshed current callback matrix | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`, `docs/FUSE_OPERATION_COVERAGE_MATRIX.md` |
 
 The Wave Zero wording removal and the planned-authority tracking issue are the highest-priority slices because they touch the broadest surfaces with the lowest implementation risk.
 
