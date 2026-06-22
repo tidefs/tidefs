@@ -349,6 +349,19 @@ Important 2026-06-01 findings:
   item 5 naming blocker without changing reclaim dispatch, rebake policy,
   orphan cleanup, storage format, or runtime behavior; issues #675 and #676
   still own implementation policy.
+
+- `TFR-005`: issue #688 splits VFS namespace revision counters `subtree_rev`
+  and `dir_rev` from `metadata_version` in the local-filesystem path.
+  `InodeRecord` gains a `subtree_rev` field, encode/decode persist both
+  counters via a backward-compatible tail extension, and
+  `InodeRecord::to_inode_attr()` projects from the stored counters instead of
+  `metadata_version`.  `apply_metadata_setattr_to_inode` advances
+  `subtree_rev` on metadata changes independently of `metadata_version`.
+  This resolves section 9 item 1 of
+  `docs/TIMESTAMP_GENERATION_AUTHORITY.md`.  Remaining TFR-005 blockers:
+  intent-log replay version projection, scrub/repair identity, send/receive
+  serialization, content-object reclaim identity, and format-golden/codec
+  surfaces.
 - `TFR-006`: Transform authority is still split across mounted-content
   compression, object-store device compression/encryption, helper compression
   and encryption crates, and inline content-addressed dedup. The
