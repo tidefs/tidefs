@@ -47,6 +47,9 @@ not from whichever transform frame happened to be convenient to scan.
   the bytes it handles.
 - metadata/raw-only: the path only handles media keys, counters, roots, sealed
   key records, or other storage metadata whose contract is explicitly raw.
+- validation-only raw staging: a private crash-recovery validation authority
+  constructs raw commit-boundary fixtures without exposing a mounted
+  production write/read path or enabling mounted device transforms.
 - blocked: the path still handles mounted filesystem data or recovery state
   through a raw handle and blocks device-level mounted transforms.
 - later receipt/placement issue: the path belongs to placement receipt,
@@ -61,7 +64,7 @@ Current `raw_primary_store()` and `raw_primary_store_mut()` matches:
 |---|---:|---|
 | `crates/tidefs-local-object-store/src/pool/mod.rs` | 7 | Pool accessors and `PoolStore` escape hatches. This is the lower object-store authority, not a mounted-filesystem proof. |
 | `crates/tidefs-local-filesystem/src/lib.rs` | 67 | Mounted production, recovery, reclaim, capacity, a pool-backed content-inspection diagnostic fallback, and raw drain/test assertions that remain blocked or raw-only as classified below. |
-| `crates/tidefs-local-filesystem/src/crash_recovery.rs` | 21 | Crash-matrix validation helpers stage raw commit-boundary objects. |
+| `crates/tidefs-local-filesystem/src/crash_recovery.rs` | 1 | `CrashMatrixRawStagingAuthority` owns validation-only raw commit-boundary staging. |
 | `crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7 | One production key-scan path plus six unit-test assertions. |
 | `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 6 | Live mounted VFS/admin paths plus encryption-feature tests. |
 
@@ -83,7 +86,7 @@ branch can pass the guard.
 | Intent log, fsync, commit, rollback | `sync_write_intent`, `namespace_create_intent`, `flush_intent_log_if_needed`, `fsync_*`, `sync_*`, `fdatasync_inode`, `do_commit`, `rollback_mutation_delta`, `selected_current_root_summary` | blocked | Durability barriers, replay anchors, and metadata-only namespace create intents still write and clear raw state/log objects. |
 | Directory/inode fallback reads | `inode`, `inode_record_only`, `ensure_inode_loaded_for_write` | blocked | These paths recover inode and directory records directly from raw store keys. |
 | Live dataset key administration | `live_dataset_seal_key`, `live_dataset_rotate_key` in `vfs_engine_impl.rs` | metadata/raw-only | These paths store sealed key records rather than file payloads, but the format still needs transform-authority review before it becomes a product encryption claim. |
-| Crash-matrix boundary staging | `src/crash_recovery.rs` | blocked validation fixture | This is not a mounted product write path, but it shows raw state construction is still required by validation. |
+| Crash-matrix boundary staging | `CrashMatrixRawStagingAuthority` in `src/crash_recovery.rs` | validation-only raw staging | This private helper stages raw commit-boundary objects for crash-matrix validation only. It is not a mounted product write path and does not authorize mounted device-level compression or encryption claims while production `blocked` rows remain. |
 | Placement, locator, rebuild, and default pool-media writes | #17, #18, #91 surfaces | later receipt/placement issue | This issue deliberately does not edit those write paths. |
 
 ## Scrub/Repair Identity Boundary

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tidefs_local_object_store::{
-    checksum64, DeviceIoClass, IntegrityDigest64, LocalObjectStore, StoreOptions,
+    checksum64, DeviceIoClass, IntegrityDigest64, LocalObjectStore, Pool, StoreOptions,
 };
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind, ROOT_INODE_ID};
 
@@ -102,12 +102,21 @@ pub(crate) fn run_crash_recovery_explicit_error_case(
     options: StoreOptions,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<CrashRecoveryExplicitErrorReport> {
-    let mut store = LocalObjectStore::open_with_options(root, options.clone())?;
-    for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
-        store.put(root_slot_object_key(slot), b"invalid root slot bytes")?;
+    // Use the same pool backend as probe_recovery so the corrupt root
+    // slots live in the block-device-backed store that the probe opens,
+    // rather than in a separate directory-based LocalObjectStore.
+    // Route through CrashMatrixRawStagingAuthority so the validation-only
+    // raw-store count stays at one authoritative call site.
+    let mut pool = LocalFileSystem::default_development_pool(root, &options, None, None)?;
+    {
+        let mut staging =
+            CrashMatrixRawStagingAuthority::validation_only(&mut pool, root_authentication_key);
+        for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
+            staging.raw_store().put(root_slot_object_key(slot), b"invalid root slot bytes")?;
+        }
     }
-    store.sync_all()?;
-    drop(store);
+    pool.sync_all()?;
+    drop(pool);
 
     let probe = LocalFileSystem::probe_recovery_with_root_authentication_key(
         root,
@@ -201,14 +210,15 @@ pub(crate) fn apply_crash_matrix_boundary(
     boundary: CrashInjectionBoundary,
 ) -> Result<CrashRecoveryExpectation> {
     let transaction_id = staged.generation.max(ROOT_COMMIT_MIN_TRANSACTION_ID);
+    let root_authentication_key = fs.root_authentication_key;
+    let mut raw_staging =
+        CrashMatrixRawStagingAuthority::validation_only(&mut fs.store, root_authentication_key);
     match boundary {
         CrashInjectionBoundary::NoCrash | CrashInjectionBoundary::AfterRootCommitSynced => {
-            write_crash_matrix_content(fs.store.raw_primary_store_mut(), staged, inode_id, bytes)?;
-            let observed = persist_state_until_boundary(
-                fs.store.raw_primary_store_mut(),
+            raw_staging.stage_content(staged, inode_id, bytes)?;
+            let observed = raw_staging.persist_until_boundary(
                 staged,
-                fs.root_authentication_key,
-                Some(FilesystemCommitBoundary::RootCommitSynced),
+                FilesystemCommitBoundary::RootCommitSynced,
             )?;
             if observed != FilesystemCommitBoundary::RootCommitSynced {
                 return Err(FileSystemError::CorruptState {
@@ -217,61 +227,35 @@ pub(crate) fn apply_crash_matrix_boundary(
             }
         }
         CrashInjectionBoundary::BeforeContentObjects => {
-            fs.store.sync_all()?;
+            raw_staging.sync_all()?;
         }
         CrashInjectionBoundary::AfterContentObjects => {
-            write_crash_matrix_content(fs.store.raw_primary_store_mut(), staged, inode_id, bytes)?;
-            fs.store.sync_all()?;
+            raw_staging.stage_content(staged, inode_id, bytes)?;
+            raw_staging.sync_all()?;
         }
         CrashInjectionBoundary::AfterTransactionInodes => {
-            write_crash_matrix_content(fs.store.raw_primary_store_mut(), staged, inode_id, bytes)?;
-            write_crash_matrix_transaction_inodes(
-                fs.store.raw_primary_store_mut(),
-                staged,
-                transaction_id,
-            )?;
-            fs.store.sync_all()?;
+            raw_staging.stage_content(staged, inode_id, bytes)?;
+            raw_staging.stage_transaction_inodes(staged, transaction_id)?;
+            raw_staging.sync_all()?;
         }
         CrashInjectionBoundary::AfterTransactionDirectories => {
-            write_crash_matrix_content(fs.store.raw_primary_store_mut(), staged, inode_id, bytes)?;
-            write_crash_matrix_transaction_inodes(
-                fs.store.raw_primary_store_mut(),
-                staged,
-                transaction_id,
-            )?;
-            write_crash_matrix_transaction_directories(
-                fs.store.raw_primary_store_mut(),
-                staged,
-                transaction_id,
-            )?;
-            fs.store.sync_all()?;
+            raw_staging.stage_content(staged, inode_id, bytes)?;
+            raw_staging.stage_transaction_inodes(staged, transaction_id)?;
+            raw_staging.stage_transaction_directories(staged, transaction_id)?;
+            raw_staging.sync_all()?;
         }
         CrashInjectionBoundary::AfterTransactionSuperblock => {
-            write_crash_matrix_content(fs.store.raw_primary_store_mut(), staged, inode_id, bytes)?;
-            write_crash_matrix_transaction_inodes(
-                fs.store.raw_primary_store_mut(),
-                staged,
-                transaction_id,
-            )?;
-            write_crash_matrix_transaction_directories(
-                fs.store.raw_primary_store_mut(),
-                staged,
-                transaction_id,
-            )?;
-            let _root = write_crash_matrix_transaction_superblock(
-                fs.store.raw_primary_store_mut(),
-                staged,
-                transaction_id,
-            )?;
-            fs.store.sync_all()?;
+            raw_staging.stage_content(staged, inode_id, bytes)?;
+            raw_staging.stage_transaction_inodes(staged, transaction_id)?;
+            raw_staging.stage_transaction_directories(staged, transaction_id)?;
+            let _root = raw_staging.stage_transaction_superblock(staged, transaction_id)?;
+            raw_staging.sync_all()?;
         }
         CrashInjectionBoundary::AfterTransactionObjectsSynced => {
-            write_crash_matrix_content(fs.store.raw_primary_store_mut(), staged, inode_id, bytes)?;
-            let observed = persist_state_until_boundary(
-                fs.store.raw_primary_store_mut(),
+            raw_staging.stage_content(staged, inode_id, bytes)?;
+            let observed = raw_staging.persist_until_boundary(
                 staged,
-                fs.root_authentication_key,
-                Some(FilesystemCommitBoundary::TransactionObjectsSynced),
+                FilesystemCommitBoundary::TransactionObjectsSynced,
             )?;
             if observed != FilesystemCommitBoundary::TransactionObjectsSynced {
                 return Err(FileSystemError::CorruptState {
@@ -280,46 +264,22 @@ pub(crate) fn apply_crash_matrix_boundary(
             }
         }
         CrashInjectionBoundary::AfterMalformedRootCommit => {
-            write_crash_matrix_content(fs.store.raw_primary_store_mut(), staged, inode_id, bytes)?;
-            write_crash_matrix_transaction_inodes(
-                fs.store.raw_primary_store_mut(),
-                staged,
-                transaction_id,
-            )?;
-            write_crash_matrix_transaction_directories(
-                fs.store.raw_primary_store_mut(),
-                staged,
-                transaction_id,
-            )?;
-            let root = write_crash_matrix_transaction_superblock(
-                fs.store.raw_primary_store_mut(),
-                staged,
-                transaction_id,
-            )?;
-            fs.store.put(
-                DeviceIoClass::Data,
-                root_slot_object_key(root.slot),
-                b"malformed root-slot bytes with a valid object-store checksum",
-            )?;
-            fs.store.sync_all()?;
+            raw_staging.stage_content(staged, inode_id, bytes)?;
+            raw_staging.stage_transaction_inodes(staged, transaction_id)?;
+            raw_staging.stage_transaction_directories(staged, transaction_id)?;
+            let root = raw_staging.stage_transaction_superblock(staged, transaction_id)?;
+            raw_staging.stage_malformed_root_commit(&root)?;
+            raw_staging.sync_all()?;
         }
         CrashInjectionBoundary::AfterRootCommitMissingTransaction => {
-            let (root, _superblock_bytes) =
-                crash_matrix_root_for_staged_state(staged, transaction_id);
-            publish_root_commit(
-                fs.store.raw_primary_store_mut(),
-                &root,
-                fs.root_authentication_key,
-            )?;
-            fs.store.sync_all()?;
+            raw_staging.stage_root_commit_without_transaction_objects(staged, transaction_id)?;
+            raw_staging.sync_all()?;
         }
         CrashInjectionBoundary::AfterRootCommitWritten => {
-            write_crash_matrix_content(fs.store.raw_primary_store_mut(), staged, inode_id, bytes)?;
-            let observed = persist_state_until_boundary(
-                fs.store.raw_primary_store_mut(),
+            raw_staging.stage_content(staged, inode_id, bytes)?;
+            let observed = raw_staging.persist_until_boundary(
                 staged,
-                fs.root_authentication_key,
-                Some(FilesystemCommitBoundary::RootCommitWritten),
+                FilesystemCommitBoundary::RootCommitWritten,
             )?;
             if observed != FilesystemCommitBoundary::RootCommitWritten {
                 return Err(FileSystemError::CorruptState {
@@ -331,73 +291,130 @@ pub(crate) fn apply_crash_matrix_boundary(
     Ok(boundary.expected_recovery())
 }
 
-pub(crate) fn write_crash_matrix_content(
-    store: &mut LocalObjectStore,
-    staged: &FileSystemState,
-    inode_id: InodeId,
-    bytes: &[u8],
-) -> Result<()> {
-    let record = staged
-        .inodes
-        .get(&inode_id)
-        .ok_or(FileSystemError::CorruptState {
-            reason: "crash matrix staged file has no inode record",
-        })?;
-    store.put(
-        content_object_key_for_version(inode_id, record.data_version),
-        &encode_content(record, bytes),
-    )?;
-    Ok(())
+struct CrashMatrixRawStagingAuthority<'a> {
+    pool: &'a mut Pool,
+    root_authentication_key: RootAuthenticationKey,
 }
 
-pub(crate) fn write_crash_matrix_transaction_inodes(
-    store: &mut LocalObjectStore,
-    staged: &FileSystemState,
-    transaction_id: u64,
-) -> Result<()> {
-    for inode in staged.inodes.values() {
-        store.put(
-            transaction_inode_object_key(transaction_id, inode.inode_id),
-            &encode_inode(inode),
-        )?;
-    }
-    Ok(())
-}
-
-pub(crate) fn write_crash_matrix_transaction_directories(
-    store: &mut LocalObjectStore,
-    staged: &FileSystemState,
-    transaction_id: u64,
-) -> Result<()> {
-    for inode in staged.inodes.values() {
-        if inode.kind() == NodeKind::Dir {
-            let directory =
-                staged
-                    .directories
-                    .get(&inode.inode_id)
-                    .ok_or(FileSystemError::CorruptState {
-                        reason: "crash matrix staged directory inode has no directory table",
-                    })?;
-            store.put(
-                transaction_directory_object_key(transaction_id, inode.inode_id),
-                &encode_directory(inode, directory),
-            )?;
+impl<'a> CrashMatrixRawStagingAuthority<'a> {
+    // Validation-only commit-boundary staging for the crash matrix. This does
+    // not authorize mounted device-level compression or encryption claims.
+    fn validation_only(pool: &'a mut Pool, root_authentication_key: RootAuthenticationKey) -> Self {
+        Self {
+            pool,
+            root_authentication_key,
         }
     }
-    Ok(())
-}
 
-pub(crate) fn write_crash_matrix_transaction_superblock(
-    store: &mut LocalObjectStore,
-    staged: &FileSystemState,
-    transaction_id: u64,
-) -> Result<RootCommitRecord> {
-    let (root, superblock_bytes) = crash_matrix_root_for_staged_state(staged, transaction_id);
-    store.put(
-        transaction_superblock_object_key(transaction_id),
-        &superblock_bytes,
-    )?;
-    Ok(root)
+    fn raw_store(&mut self) -> &mut LocalObjectStore {
+        self.pool.raw_primary_store_mut()
+    }
+
+    fn stage_content(
+        &mut self,
+        staged: &FileSystemState,
+        inode_id: InodeId,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let record = staged
+            .inodes
+            .get(&inode_id)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "crash matrix staged file has no inode record",
+            })?;
+        self.raw_store().put(
+            content_object_key_for_version(inode_id, record.data_version),
+            &encode_content(record, bytes),
+        )?;
+        Ok(())
+    }
+
+    fn stage_transaction_inodes(
+        &mut self,
+        staged: &FileSystemState,
+        transaction_id: u64,
+    ) -> Result<()> {
+        for inode in staged.inodes.values() {
+            self.raw_store().put(
+                transaction_inode_object_key(transaction_id, inode.inode_id),
+                &encode_inode(inode),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn stage_transaction_directories(
+        &mut self,
+        staged: &FileSystemState,
+        transaction_id: u64,
+    ) -> Result<()> {
+        for inode in staged.inodes.values() {
+            if inode.kind() == NodeKind::Dir {
+                let directory = staged.directories.get(&inode.inode_id).ok_or(
+                    FileSystemError::CorruptState {
+                        reason: "crash matrix staged directory inode has no directory table",
+                    },
+                )?;
+                self.raw_store().put(
+                    transaction_directory_object_key(transaction_id, inode.inode_id),
+                    &encode_directory(inode, directory),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn stage_transaction_superblock(
+        &mut self,
+        staged: &FileSystemState,
+        transaction_id: u64,
+    ) -> Result<RootCommitRecord> {
+        let (root, superblock_bytes) = crash_matrix_root_for_staged_state(staged, transaction_id);
+        self.raw_store().put(
+            transaction_superblock_object_key(transaction_id),
+            &superblock_bytes,
+        )?;
+        Ok(root)
+    }
+
+    fn persist_until_boundary(
+        &mut self,
+        staged: &FileSystemState,
+        stop_after: FilesystemCommitBoundary,
+    ) -> Result<FilesystemCommitBoundary> {
+        let root_authentication_key = self.root_authentication_key;
+        persist_state_until_boundary(
+            self.raw_store(),
+            staged,
+            root_authentication_key,
+            Some(stop_after),
+        )
+    }
+
+    fn stage_root_commit_without_transaction_objects(
+        &mut self,
+        staged: &FileSystemState,
+        transaction_id: u64,
+    ) -> Result<()> {
+        let (root, _superblock_bytes) = crash_matrix_root_for_staged_state(staged, transaction_id);
+        let root_authentication_key = self.root_authentication_key;
+        publish_root_commit(self.raw_store(), &root, root_authentication_key)?;
+        Ok(())
+    }
+
+    fn stage_malformed_root_commit(&mut self, root: &RootCommitRecord) -> Result<()> {
+        self.pool.put(
+            DeviceIoClass::Data,
+            root_slot_object_key(root.slot),
+            b"malformed root-slot bytes with a valid object-store checksum",
+        )?;
+        Ok(())
+    }
+
+    fn sync_all(&mut self) -> Result<()> {
+        self.pool.sync_all()?;
+        Ok(())
+    }
 }
 
 pub(crate) fn crash_matrix_root_for_staged_state(
