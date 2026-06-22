@@ -3,13 +3,15 @@
 //!
 //! Two complementary facilities:
 //!
-//! 1. **Segment compaction** ([`ReclaimScheduler`], [`ReclaimPlan`]):
-//!    waste-ratio-based compaction of partially-dead segments.
+//! 1. **Reclaim-to-cleaner/compaction handoff reporting**
+//!    ([`ReclaimHandoffReport`], [`ReclaimPlan`]): deterministic liveness
+//!    inputs for the cleaner and compaction authority. Reclaim does not choose
+//!    partial-segment merge policy.
 //!
 //! 2. **Reclaim-queue consumer** ([`drain_reclaim_queue_gated`],
 //!    [`ReclaimConsumerStats`]): drains entries populated by object
 //!    delete and overwrite, groups them by segment, computes per-segment
-//!    liveness, and returns fully-dead segments to the free pool.
+//!    liveness, and returns fully-dead segments to the cleaner/free path.
 //!
 //! # Architecture
 //!
@@ -33,17 +35,23 @@ use std::{
 use tidefs_reclaim_queue_core::DeadObjectReclaimQueue;
 use tidefs_types_reclaim_queue_core::{ObjectKey, ReclaimQueueEntry};
 
-/// Configuration for the reclaim pipeline.
+/// Configuration for the reclaim handoff compatibility surface.
+///
+/// Reclaim no longer owns partial-segment compaction policy. The historical
+/// fields remain so existing callers can be moved gradually, but only
+/// `batch_size` is used to bound deterministic handoff reports. Thresholds,
+/// cooldowns, trigger admission, and merge ordering belong to the compaction
+/// authority decided by `docs/COMPACTION_AUTHORITY.md`.
 #[derive(Debug, Clone)]
 pub struct ReclaimConfig {
-    /// Waste ratio threshold: segments with waste_ratio above this are
-    /// candidates for compaction. Default: 0.3 (30% waste).
+    /// Historical waste-ratio threshold retained for source compatibility.
+    /// Reclaim does not apply this as compaction admission policy.
     pub waste_threshold: f64,
-    /// Maximum number of segments to compact in one batch.
+    /// Maximum number of partial-live segment handoff records in one batch.
     /// Default: 8.
     pub batch_size: usize,
-    /// Minimum number of segment rotations between reclaim batches.
-    /// Prevents reclaim from triggering on every rotation in a tight loop.
+    /// Historical cooldown retained for source compatibility. Reclaim does
+    /// not use it to schedule compaction.
     /// Default: 4.
     pub cooldown_segments: usize,
 }
@@ -95,14 +103,14 @@ impl ReclaimSegment {
     }
 }
 
-/// A reclaim candidate selected for the next compaction batch.
+/// A partial-live segment handoff record for compaction consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReclaimCandidate {
-    /// Stable segment identifier to compact.
+    /// Stable segment identifier.
     pub segment_id: u64,
-    /// Bytes that must be copied forward before reclaiming the segment.
+    /// Bytes still live in the segment.
     pub live_bytes: u64,
-    /// Bytes expected to be released by reclaiming the segment.
+    /// Bytes known dead in the segment.
     pub reclaimable_bytes: u64,
 }
 
@@ -112,7 +120,7 @@ impl ReclaimCandidate {
         self.live_bytes as u128 + self.reclaimable_bytes as u128
     }
 
-    /// Fraction of the candidate segment expected to be reclaimed.
+    /// Fraction of the candidate segment known dead.
     pub fn waste_ratio(&self) -> f64 {
         let total_bytes = self.total_bytes();
         if total_bytes == 0 {
@@ -133,12 +141,12 @@ impl From<ReclaimSegment> for ReclaimCandidate {
     }
 }
 
-/// Deterministic reclaim plan for one compaction batch.
+/// Deterministic partial-live handoff batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReclaimPlan {
-    /// Ordered candidates selected for this batch.
+    /// Ordered partial-live segments handed to compaction consumers.
     pub candidates: Vec<ReclaimCandidate>,
-    /// Sum of reclaimable bytes across selected candidates.
+    /// Sum of dead bytes across selected handoff records.
     pub total_reclaimable_bytes: u128,
 }
 
@@ -154,12 +162,12 @@ impl ReclaimPlan {
     }
 }
 
-/// Reported result for one selected reclaim candidate.
+/// Reported result for one selected handoff candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReclaimCompletionOutcome {
-    /// The segment was reclaimed successfully.
+    /// The segment was released successfully by the cleaner/compaction path.
     Reclaimed { segment_id: u64 },
-    /// The segment could not be reclaimed and should remain retryable.
+    /// The segment could not be released and should remain retryable.
     Failed { segment_id: u64 },
 }
 
@@ -172,10 +180,10 @@ impl ReclaimCompletionOutcome {
     }
 }
 
-/// Deterministic accounting for one completed reclaim batch.
+/// Deterministic accounting for one completed handoff batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReclaimCompletionPlan {
-    /// Candidates reported as successfully reclaimed, in selected candidate order.
+    /// Candidates reported as successfully released, in selected candidate order.
     pub reclaimed_candidates: Vec<ReclaimCandidate>,
     /// Candidates reported as failed and retained, in selected candidate order.
     pub retained_failures: Vec<ReclaimCandidate>,
@@ -183,7 +191,7 @@ pub struct ReclaimCompletionPlan {
     pub pending_candidates: Vec<ReclaimCandidate>,
     /// Candidates that can be retried because they were not successfully reclaimed.
     pub retryable_candidates: Vec<ReclaimCandidate>,
-    /// Sum of reclaimable bytes for successfully reclaimed candidates.
+    /// Sum of dead bytes for successfully released candidates.
     pub total_reclaimed_bytes: u128,
 }
 
@@ -198,11 +206,11 @@ pub enum ReclaimCompletionPlanError {
     UnplannedOutcome { segment_id: u64 },
 }
 
-/// Account for reported completion outcomes after a reclaim batch was selected.
+/// Account for reported completion outcomes after a handoff batch was selected.
 ///
 /// The planner preserves selected candidate order in all output vectors. It
 /// does not mutate lower storage state; callers can use the accounting result
-/// to update scheduler and retry state after compaction attempts complete.
+/// to update retry state after cleaner/compaction attempts complete.
 pub fn plan_reclaim_completion(
     selected_candidates: impl IntoIterator<Item = ReclaimCandidate>,
     outcomes: impl IntoIterator<Item = ReclaimCompletionOutcome>,
@@ -261,11 +269,12 @@ pub fn plan_reclaim_completion(
     })
 }
 
-/// Select a deterministic batch of reclaim candidates.
+/// Select a deterministic batch of partial-live segment handoff records.
 ///
-/// Candidates must have non-zero reclaimable bytes and meet the configured
-/// waste threshold. Ordering prefers higher waste ratio, then higher reclaimable
-/// bytes, then lower segment id so repeated runs choose the same segments.
+/// Reclaim does not own the partial-segment merge policy, so this function
+/// does not apply waste-ratio admission or merge scoring. It only reports
+/// segments with both live and dead bytes in stable segment-id order, bounded
+/// by [`ReclaimConfig::batch_size`], for cleaner/compaction consumers.
 pub fn plan_reclaim_batch(
     config: &ReclaimConfig,
     segments: impl IntoIterator<Item = ReclaimSegment>,
@@ -291,39 +300,33 @@ pub fn plan_reclaim_batch(
 }
 
 fn is_reclaim_candidate(config: &ReclaimConfig, segment: &ReclaimSegment) -> bool {
-    segment.total_bytes() > 0
-        && segment.reclaimable_bytes > 0
-        && segment.waste_ratio() >= config.waste_threshold
+    let _ = config;
+    segment.total_bytes() > 0 && segment.live_bytes > 0 && segment.reclaimable_bytes > 0
 }
 
 fn compare_reclaim_candidates(left: &ReclaimCandidate, right: &ReclaimCandidate) -> Ordering {
-    let left_waste = left.reclaimable_bytes as u128 * right.total_bytes();
-    let right_waste = right.reclaimable_bytes as u128 * left.total_bytes();
-
-    right_waste
-        .cmp(&left_waste)
-        .then_with(|| right.reclaimable_bytes.cmp(&left.reclaimable_bytes))
-        .then_with(|| left.segment_id.cmp(&right.segment_id))
+    left.segment_id
+        .cmp(&right.segment_id)
         .then_with(|| left.live_bytes.cmp(&right.live_bytes))
+        .then_with(|| left.reclaimable_bytes.cmp(&right.reclaimable_bytes))
 }
 
-/// The reclaim scheduler.
+/// Retired reclaim-local compaction scheduler.
 ///
-/// Tracks reclaim state (active/inactive), batch accounting, and
-/// cooldown between batches. The actual compaction work is performed
-/// by the caller (usually `LocalObjectStore::rotate_segment`) which
-/// queries the scheduler for state and reports batch results.
+/// The type is retained as an inert source-compatibility shim for mounted
+/// callers that still carry a field named `ReclaimScheduler`. It deliberately
+/// never enters an active state and never authorizes partial-segment
+/// compaction; the real trigger admission and merge policy live in the
+/// compaction authority.
 #[derive(Debug)]
 pub struct ReclaimScheduler {
     config: ReclaimConfig,
     active: bool,
-    /// Count of segments reclaimed in the current pressure episode.
+    /// Compatibility count of segments reported through legacy completion calls.
     total_reclaimed: u64,
-    /// Count of reclaim batches executed in the current episode.
+    /// Compatibility count of legacy completion calls.
     batches: u64,
-    /// Segment id at which the last reclaim batch was initiated.
-    /// Used with [`ReclaimConfig::cooldown_segments`] to prevent
-    /// reclaim from triggering on every rotation.
+    /// Last segment id recorded through the retired compatibility surface.
     last_reclaim_at: u64,
 }
 
@@ -339,62 +342,58 @@ impl ReclaimScheduler {
         }
     }
 
-    /// Mark reclaim as active (entering space pressure).
+    /// Reset compatibility accounting without enabling reclaim-local compaction.
     pub fn activate(&mut self) {
-        self.active = true;
+        self.active = false;
         self.total_reclaimed = 0;
         self.batches = 0;
         self.last_reclaim_at = 0;
     }
 
-    /// Mark reclaim as inactive (exiting space pressure or compaction failure).
+    /// Keep the retired scheduler inactive.
     pub fn deactivate(&mut self) {
         self.active = false;
     }
 
-    /// Whether the reclaim pipeline is currently active.
+    /// Whether the retired scheduler is currently active.
     pub fn is_active(&self) -> bool {
         self.active
     }
 
-    /// Total segments reclaimed across all batches in the current episode.
+    /// Total segments reported through legacy completion calls.
     pub fn total_reclaimed(&self) -> u64 {
         self.total_reclaimed
     }
 
-    /// Number of reclaim batches executed in the current episode.
+    /// Number of legacy completion calls recorded.
     pub fn batches(&self) -> u64 {
         self.batches
     }
 
-    /// Record a completed batch: `segments_freed` segments were retired.
+    /// Record compatibility completion accounting.
     pub fn record_batch(&mut self, segments_freed: u64) {
         self.total_reclaimed += segments_freed;
         self.batches += 1;
     }
 
-    /// Whether reclaim is allowed at the given segment id, considering
-    /// the cooldown configured in [`ReclaimConfig::cooldown_segments`].
+    /// Reclaim no longer authorizes partial-segment compaction.
     pub fn can_reclaim(&self, current_segment_id: u64) -> bool {
-        if self.last_reclaim_at == 0 {
-            return true;
-        }
-        current_segment_id.wrapping_sub(self.last_reclaim_at)
-            >= self.config.cooldown_segments as u64
+        let _ = current_segment_id;
+        false
     }
 
-    /// Record that a reclaim batch was just initiated at the given
-    /// segment id for cooldown tracking.
+    /// Record the last segment id observed by the retired compatibility surface.
     pub fn mark_reclaimed(&mut self, segment_id: u64) {
         self.last_reclaim_at = segment_id;
     }
 
-    /// The configured waste ratio threshold.
+    /// A sentinel threshold that prevents legacy mounted callers from
+    /// triggering reclaim-owned partial-segment compaction.
     pub fn waste_threshold(&self) -> f64 {
-        self.config.waste_threshold
+        f64::INFINITY
     }
 
-    /// Select the next reclaim batch according to this scheduler's config.
+    /// Build a deterministic handoff batch without authorizing compaction.
     pub fn plan_batch(&self, segments: impl IntoIterator<Item = ReclaimSegment>) -> ReclaimPlan {
         plan_reclaim_batch(&self.config, segments)
     }
@@ -587,6 +586,92 @@ impl ReclaimConsumerStats {
     }
 }
 
+/// Downstream owner for liveness observed by reclaim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReclaimHandoffTarget {
+    /// Segment reached zero live references and may proceed through the
+    /// cleaner/free path once deadlist and pin-set clearance succeeds.
+    CleanerFullyDead,
+    /// Segment still has live references; reclaim only reports liveness input
+    /// for the compaction authority.
+    CompactionPartialLive,
+}
+
+/// Per-segment handoff entry emitted by reclaim drains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReclaimHandoffEntry {
+    /// Segment observed by reclaim.
+    pub segment_id: u64,
+    /// Live reference count after this drain's deltas are applied.
+    pub live_count: u64,
+    /// Number of negative-delta extents observed for this segment.
+    pub drained_extents: u64,
+    /// Downstream owner for this path.
+    pub target: ReclaimHandoffTarget,
+}
+
+impl ReclaimHandoffEntry {
+    #[must_use]
+    pub const fn new(
+        segment_id: u64,
+        live_count: u64,
+        drained_extents: u64,
+        target: ReclaimHandoffTarget,
+    ) -> Self {
+        Self {
+            segment_id,
+            live_count,
+            drained_extents,
+            target,
+        }
+    }
+
+    /// True when the entry belongs to the cleaner/free path.
+    #[must_use]
+    pub const fn is_fully_dead(self) -> bool {
+        matches!(self.target, ReclaimHandoffTarget::CleanerFullyDead)
+    }
+
+    /// True when the entry belongs to the compaction authority input path.
+    #[must_use]
+    pub const fn is_partially_live(self) -> bool {
+        matches!(self.target, ReclaimHandoffTarget::CompactionPartialLive)
+    }
+}
+
+/// Explicit reclaim-to-cleaner/compaction handoff report.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReclaimHandoffReport {
+    /// Segment entries in ascending segment-id order.
+    pub segments: Vec<ReclaimHandoffEntry>,
+}
+
+impl ReclaimHandoffReport {
+    #[must_use]
+    pub fn new(mut segments: Vec<ReclaimHandoffEntry>) -> Self {
+        segments.sort_by(|a, b| a.segment_id.cmp(&b.segment_id));
+        Self { segments }
+    }
+
+    /// True when no downstream handoff entries were produced.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Iterator over fully-dead cleaner/free path entries.
+    pub fn fully_dead(&self) -> impl Iterator<Item = &ReclaimHandoffEntry> {
+        self.segments.iter().filter(|entry| entry.is_fully_dead())
+    }
+
+    /// Iterator over partial-live compaction-authority input entries.
+    pub fn partially_live(&self) -> impl Iterator<Item = &ReclaimHandoffEntry> {
+        self.segments
+            .iter()
+            .filter(|entry| entry.is_partially_live())
+    }
+}
+
 /// Result of one receipt-bound dead-object drain.
 ///
 /// The consumer does not mutate the source [`DeadObjectReclaimQueue`]. After
@@ -597,6 +682,8 @@ impl ReclaimConsumerStats {
 pub struct ReceiptBoundDeadObjectDrain {
     /// Segment reclaim accounting for this drain.
     pub stats: ReclaimConsumerStats,
+    /// Explicit downstream handoff path for selected segment liveness.
+    pub handoff: ReclaimHandoffReport,
     /// Exact dead-object ids whose segment was reclaimed and may be
     /// acknowledged after queue persistence succeeds.
     pub ack_object_ids: Vec<ObjectKey>,
@@ -612,6 +699,7 @@ impl ReceiptBoundDeadObjectDrain {
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.stats.is_idle()
+            && self.handoff.is_empty()
             && self.ack_object_ids.is_empty()
             && self.reclaimed_segment_ids.is_empty()
             && self.receipt.is_none()
@@ -1073,6 +1161,8 @@ where
 pub struct GatedDrainResult {
     /// Segment reclaim accounting for this drain.
     pub stats: ReclaimConsumerStats,
+    /// Explicit downstream handoff path for segment liveness observed by this drain.
+    pub handoff: ReclaimHandoffReport,
     /// Reclaim receipt recording freed extents and clearance evidence.
     /// `None` if no extents were freed.
     pub receipt: Option<ReclaimReceipt>,
@@ -1082,8 +1172,72 @@ impl GatedDrainResult {
     /// Whether the drain freed no segments and recorded no extents.
     #[must_use]
     pub fn is_idle(&self) -> bool {
-        self.stats.is_idle() && self.receipt.as_ref().is_none_or(|r| r.is_empty())
+        self.stats.is_idle()
+            && self.handoff.is_empty()
+            && self.receipt.as_ref().is_none_or(|r| r.is_empty())
     }
+}
+
+fn build_reclaim_handoff_report(
+    segment_entries: &HashMap<u64, Vec<(ObjectKey, i64)>>,
+    live_counts: &SegmentLiveCounts,
+) -> ReclaimHandoffReport {
+    let segments = segment_entries
+        .iter()
+        .filter_map(|(&segment_id, entries)| {
+            let drained_extents = entries.iter().filter(|(_, delta)| *delta < 0).count() as u64;
+            if drained_extents == 0 {
+                return None;
+            }
+            let live_count = live_counts.live_count(segment_id);
+            let target = if live_count == 0 {
+                ReclaimHandoffTarget::CleanerFullyDead
+            } else {
+                ReclaimHandoffTarget::CompactionPartialLive
+            };
+            Some(ReclaimHandoffEntry::new(
+                segment_id,
+                live_count,
+                drained_extents,
+                target,
+            ))
+        })
+        .collect();
+    ReclaimHandoffReport::new(segments)
+}
+
+fn build_receipt_bound_handoff_report(
+    segment_entries: &HashMap<u64, Vec<ObjectKey>>,
+    fully_dead_segments: &[u64],
+    live_counts: &SegmentLiveCounts,
+) -> ReclaimHandoffReport {
+    let fully_dead: HashSet<u64> = fully_dead_segments.iter().copied().collect();
+    let segments = segment_entries
+        .iter()
+        .filter_map(|(&segment_id, entries)| {
+            if entries.is_empty() {
+                return None;
+            }
+            let is_fully_dead = fully_dead.contains(&segment_id);
+            let live_count = if is_fully_dead {
+                0
+            } else {
+                live_counts.live_count(segment_id)
+            };
+            let target = if is_fully_dead {
+                ReclaimHandoffTarget::CleanerFullyDead
+            } else {
+                ReclaimHandoffTarget::CompactionPartialLive
+            };
+            Some(ReclaimHandoffEntry::new(
+                segment_id,
+                live_count,
+                entries.len() as u64,
+                target,
+            ))
+        })
+        .collect();
+    ReclaimHandoffReport::new(segments)
 }
 
 /// Drain reclaim-queue entries, identify fully-dead segments, gate each
@@ -1138,6 +1292,7 @@ where
                 reclaim_queue_depth: 0,
                 ..ReclaimConsumerStats::ZERO
             },
+            handoff: ReclaimHandoffReport::default(),
             receipt: None,
         });
     }
@@ -1182,10 +1337,12 @@ where
         .filter(|sid| live_counts.is_dead(*sid))
         .collect();
     dead_segments.sort_unstable();
+    let handoff = build_reclaim_handoff_report(&segment_entries, live_counts);
 
     if dead_segments.is_empty() {
         return Ok(GatedDrainResult {
             stats,
+            handoff,
             receipt: None,
         });
     }
@@ -1260,7 +1417,11 @@ where
         None
     };
 
-    Ok(GatedDrainResult { stats, receipt })
+    Ok(GatedDrainResult {
+        stats,
+        handoff,
+        receipt,
+    })
 }
 /// Drain receipt-authorized dead objects into segment liveness accounting.
 ///
@@ -1300,6 +1461,7 @@ where
     if limit == 0 || queue.is_empty() {
         return Ok(ReceiptBoundDeadObjectDrain {
             stats,
+            handoff: ReclaimHandoffReport::default(),
             ack_object_ids: Vec::new(),
             reclaimed_segment_ids: Vec::new(),
             receipt: None,
@@ -1314,6 +1476,7 @@ where
     if entries.is_empty() {
         return Ok(ReceiptBoundDeadObjectDrain {
             stats,
+            handoff: ReclaimHandoffReport::default(),
             ack_object_ids: Vec::new(),
             reclaimed_segment_ids: Vec::new(),
             receipt: None,
@@ -1361,6 +1524,7 @@ where
         })
         .collect();
     dead_segments.sort_unstable();
+    let handoff = build_receipt_bound_handoff_report(&segment_entries, &dead_segments, live_counts);
 
     let mut freed_extents = Vec::new();
     let mut reclaimed_segment_ids = Vec::new();
@@ -1427,6 +1591,7 @@ where
 
     Ok(ReceiptBoundDeadObjectDrain {
         stats,
+        handoff,
         ack_object_ids,
         reclaimed_segment_ids,
         receipt,
@@ -1810,7 +1975,7 @@ mod tests {
         let mut s = ReclaimScheduler::new(ReclaimConfig::default());
         s.record_batch(3);
         s.activate();
-        assert!(s.is_active());
+        assert!(!s.is_active());
         assert_eq!(s.total_reclaimed(), 0);
         assert_eq!(s.batches(), 0);
     }
@@ -1841,31 +2006,32 @@ mod tests {
     }
 
     #[test]
-    fn can_reclaim_within_cooldown_denied() {
+    fn retired_scheduler_never_authorizes_compaction() {
         let mut s = ReclaimScheduler::new(ReclaimConfig::default());
         s.activate();
-        assert!(s.can_reclaim(100));
+        assert!(!s.is_active());
+        assert!(!s.can_reclaim(100));
         s.mark_reclaimed(100);
-        // cooldown_segments = 4, so 100+1..100+3 should be denied
         assert!(!s.can_reclaim(101));
         assert!(!s.can_reclaim(103));
-        assert!(s.can_reclaim(104)); // exactly 4 apart, allowed
+        assert!(!s.can_reclaim(104));
+        assert!(s.waste_threshold().is_infinite());
     }
 
     #[test]
-    fn activate_resets_cooldown() {
+    fn activate_preserves_retired_scheduler_inactive_state() {
         let mut s = ReclaimScheduler::new(ReclaimConfig::default());
         s.activate();
         s.mark_reclaimed(50);
         assert!(!s.can_reclaim(51));
-        // re-activate clears last_reclaim_at
         s.activate();
-        assert!(s.can_reclaim(1));
-        assert!(s.can_reclaim(51));
+        assert!(!s.is_active());
+        assert!(!s.can_reclaim(1));
+        assert!(!s.can_reclaim(51));
     }
 
     #[test]
-    fn candidate_plan_filters_below_threshold() {
+    fn candidate_plan_ignores_reclaim_threshold_policy() {
         let config = ReclaimConfig {
             waste_threshold: 0.5,
             batch_size: 8,
@@ -1881,8 +2047,8 @@ mod tests {
             ],
         );
 
-        assert_eq!(candidate_ids(&plan), vec![3, 2]);
-        assert_eq!(plan.total_reclaimable_bytes, 140);
+        assert_eq!(candidate_ids(&plan), vec![1, 2, 3]);
+        assert_eq!(plan.total_reclaimable_bytes, 170);
     }
 
     #[test]
@@ -1925,7 +2091,7 @@ mod tests {
             ],
         );
 
-        assert_eq!(candidate_ids(&plan), vec![5, 1, 2, 4]);
+        assert_eq!(candidate_ids(&plan), vec![1, 2, 4, 5]);
     }
 
     #[test]
@@ -1959,14 +2125,14 @@ mod tests {
             ],
         );
 
-        assert_eq!(candidate_ids(&forward), vec![10, 20, 30, 60]);
+        assert_eq!(candidate_ids(&forward), vec![10, 20, 30, 40]);
         assert_eq!(candidate_ids(&reversed), candidate_ids(&forward));
-        assert_eq!(forward.total_reclaimable_bytes, 290);
-        assert_eq!(reversed.total_reclaimable_bytes, 290);
+        assert_eq!(forward.total_reclaimable_bytes, 260);
+        assert_eq!(reversed.total_reclaimable_bytes, 260);
     }
 
     #[test]
-    fn candidate_plan_ignores_zero_byte_segments() {
+    fn candidate_plan_reports_only_partial_live_segments() {
         let config = ReclaimConfig {
             waste_threshold: 0.0,
             batch_size: 8,
@@ -1982,8 +2148,8 @@ mod tests {
             ],
         );
 
-        assert_eq!(candidate_ids(&plan), vec![3]);
-        assert_eq!(plan.total_reclaimable_bytes, 10);
+        assert!(plan.is_empty());
+        assert_eq!(plan.total_reclaimable_bytes, 0);
     }
 
     #[test]
@@ -2013,8 +2179,8 @@ mod tests {
             ReclaimSegment::new(12, 30, 70),
         ]);
 
-        assert_eq!(candidate_ids(&plan), vec![11]);
-        assert_eq!(plan.total_reclaimable_bytes, 80);
+        assert_eq!(candidate_ids(&plan), vec![10]);
+        assert_eq!(plan.total_reclaimable_bytes, 10);
     }
 
     #[test]
@@ -2677,6 +2843,15 @@ mod tests {
         assert_eq!(drain.stats.blocks_freed, 2);
         assert_eq!(drain.stats.reclaim_queue_depth, 1);
         assert_eq!(
+            drain.handoff.segments,
+            vec![ReclaimHandoffEntry::new(
+                100,
+                0,
+                2,
+                ReclaimHandoffTarget::CleanerFullyDead,
+            )]
+        );
+        assert_eq!(
             drain.receipt.as_ref().map(|receipt| (
                 receipt.freed_extents.clone(),
                 receipt.freed_segment_extents.clone(),
@@ -2735,6 +2910,15 @@ mod tests {
         assert_eq!(drain.stats.gate_segments_skipped, 1);
         assert_eq!(drain.stats.gate_extents_denied, 1);
         assert_eq!(drain.stats.reclaim_queue_depth, 2);
+        assert_eq!(
+            drain.handoff.segments,
+            vec![ReclaimHandoffEntry::new(
+                100,
+                0,
+                2,
+                ReclaimHandoffTarget::CleanerFullyDead,
+            )]
+        );
         assert!(drain.receipt.is_none());
         assert_eq!(live_counts.live_count(100), 2);
         assert!(freer.freed_segments().is_empty());
@@ -2772,6 +2956,15 @@ mod tests {
         assert_eq!(partial.stats.entries_processed, 1);
         assert_eq!(partial.stats.segments_reclaimed, 0);
         assert_eq!(partial.stats.reclaim_queue_depth, 2);
+        assert_eq!(
+            partial.handoff.segments,
+            vec![ReclaimHandoffEntry::new(
+                100,
+                2,
+                1,
+                ReclaimHandoffTarget::CompactionPartialLive,
+            )]
+        );
         assert!(partial.receipt.is_none());
         assert_eq!(live_counts.live_count(100), 2);
         assert!(freer.freed_segments().is_empty());
@@ -3796,6 +3989,15 @@ mod tests {
         assert_eq!(result.stats.segments_reclaimed, 2);
         assert_eq!(result.stats.gate_segments_skipped, 0);
         assert_eq!(result.stats.gate_extents_denied, 0);
+        assert_eq!(
+            result
+                .handoff
+                .fully_dead()
+                .map(|entry| entry.segment_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(result.handoff.partially_live().next().is_none());
         assert!(result.receipt.is_some());
         let receipt = result.receipt.unwrap();
         assert_eq!(receipt.freed_extents.len(), 2);
@@ -3841,6 +4043,15 @@ mod tests {
         assert_eq!(result.stats.segments_reclaimed, 0);
         assert_eq!(result.stats.gate_segments_skipped, 1);
         assert_eq!(result.stats.gate_extents_denied, 1);
+        assert_eq!(
+            result.handoff.segments,
+            vec![ReclaimHandoffEntry::new(
+                1,
+                0,
+                1,
+                ReclaimHandoffTarget::CleanerFullyDead,
+            )]
+        );
         assert!(freer.freed.is_empty());
         assert!(result.receipt.is_none());
         assert_eq!(live_counts.live_count(1), 2);
@@ -3877,6 +4088,15 @@ mod tests {
         assert_eq!(result.stats.segments_reclaimed, 0);
         assert_eq!(result.stats.gate_segments_skipped, 1);
         assert_eq!(result.stats.gate_extents_denied, 1);
+        assert_eq!(
+            result.handoff.segments,
+            vec![ReclaimHandoffEntry::new(
+                2,
+                0,
+                1,
+                ReclaimHandoffTarget::CleanerFullyDead,
+            )]
+        );
         assert!(freer.freed.is_empty());
         assert_eq!(live_counts.live_count(2), 1);
     }
@@ -3937,6 +4157,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.stats.segments_reclaimed, 0);
+        assert_eq!(
+            result.handoff.segments,
+            vec![ReclaimHandoffEntry::new(
+                5,
+                9,
+                1,
+                ReclaimHandoffTarget::CompactionPartialLive,
+            )]
+        );
         assert!(result.receipt.is_none());
     }
 
@@ -3944,6 +4173,7 @@ mod tests {
     fn gated_drain_result_is_idle_when_no_work() {
         let result = GatedDrainResult {
             stats: ReclaimConsumerStats::ZERO,
+            handoff: ReclaimHandoffReport::default(),
             receipt: None,
         };
         assert!(result.is_idle());

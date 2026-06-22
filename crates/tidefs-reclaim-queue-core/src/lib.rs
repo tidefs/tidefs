@@ -47,7 +47,8 @@ pub use writeback::{
 // Re-export segment liveness types at crate root.
 pub use segment_liveness::{
     ReclaimQueueStorage, SegmentLivenessDeserializeError, SegmentLivenessEntry,
-    SegmentLivenessPersistError, SegmentLivenessQueue,
+    SegmentLivenessHandoff, SegmentLivenessHandoffTarget, SegmentLivenessPersistError,
+    SegmentLivenessQueue, SegmentLivenessReport,
 };
 
 // Re-export dead-object queue types at crate root.
