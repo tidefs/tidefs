@@ -762,13 +762,13 @@ pub(crate) fn encode_inode(inode: &InodeRecord) -> Vec<u8> {
     push_i64(&mut out, inode.posix_time.mtime_ns);
     push_i64(&mut out, inode.posix_time.ctime_ns);
     push_i64(&mut out, inode.posix_time.btime_ns);
-    push_u64(&mut out, inode.subtree_rev);
-    push_u64(&mut out, inode.dir_rev);
     match inode.xattr_storage_kind {
         0 => encode_xattr_bundle_v1(&mut out, &inode.xattrs),
         1 => encode_xattr_btree_root_v1(&mut out, &inode.xattrs),
         _ => encode_xattr_bundle_v1(&mut out, &inode.xattrs),
     }
+    push_u64(&mut out, inode.subtree_rev);
+    push_u64(&mut out, inode.dir_rev);
     out
 }
 
