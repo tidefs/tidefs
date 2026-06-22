@@ -58,7 +58,10 @@ use crate::segment_builder::{FlushResult, SegmentBuilder};
 use crate::txg_manager::CommitGroupManager;
 use crate::*;
 use std::convert::Infallible;
-use tidefs_checksum_tree::{ChecksumTree, ChecksumTreeBuilder, DomainTag, ObjectDigest};
+use tidefs_checksum_tree::{
+    ChecksumTree, ChecksumTreeBuilder, ChecksumTreeVerifier, DomainTag, LocatorToken, ObjectDigest,
+    VerificationResult,
+};
 use tidefs_durability_layout::DurabilityLayoutV1;
 use tidefs_gc_pin_set::SnapshotExtentPinSet;
 use tidefs_pool_allocator::{PoolAllocator, PoolAllocatorError, SpacePressureEvent};
@@ -74,6 +77,7 @@ use tidefs_space_accounting::{
     DatasetSpaceUsage, Error as SpaceAccountingError, PoolCounters, SpaceBook, StatfsResult,
 };
 use tidefs_spacemap_allocator::{SegmentFreeMap, SpaceMapCheckpointV1};
+use tidefs_types_extent_map_core::{ExtentMapEntryV2, ExtentMapOps, LocatorId};
 use tidefs_types_reclaim_queue_core::{
     DeadObjectEntry, DeadObjectReplacementReceipt, ObjectKey as ReclaimObjectKey, QueueFamily,
     ReclaimQueueEntry,
@@ -102,6 +106,24 @@ const BLOCK_DATA_FORMAT_HEADER_SIZE: u64 = 64;
 const BLOCK_DATA_FORMAT_VERSION: u32 = 1;
 /// Well-known file name for the store format manifest (JSON).
 const FORMAT_MANIFEST_FILE_NAME: &str = "format_manifest";
+/// Well-known object name for committed compaction publication manifests.
+const COMPACTION_PUBLISH_MANIFEST_OBJECT_NAME: &str = "tidefs-compaction-publish-manifest";
+/// Prefix for hidden target objects staged by verified compaction rewrites.
+const COMPACTION_TARGET_KEY_PREFIX: [u8; 8] = *b"TFSCMPCT";
+const COMPACTION_MANIFEST_MAGIC: &[u8; 8] = b"TFSCMPM1";
+const COMPACTION_MANIFEST_VERSION: u32 = 1;
+const COMPACTION_MANIFEST_HEADER_LEN: usize = 8 + 4 + 4;
+const COMPACTION_MANIFEST_LOCATION_LEN: usize = 32 + 8 + 8 + 8 + 8 + 8 + 8;
+const COMPACTION_MANIFEST_EXTENT_LEN: usize = 8 + 8 + 1 + 1 + 8 + 32 + 8 + 15;
+const COMPACTION_MANIFEST_RECEIPT_LEN: usize =
+    tidefs_types_reclaim_queue_core::DeadObjectReplacementReceipt::ENCODED_SIZE;
+const COMPACTION_MANIFEST_ENTRY_LEN: usize = 8
+    + 32
+    + 16
+    + COMPACTION_MANIFEST_LOCATION_LEN
+    + COMPACTION_MANIFEST_LOCATION_LEN
+    + COMPACTION_MANIFEST_EXTENT_LEN
+    + COMPACTION_MANIFEST_RECEIPT_LEN;
 use crate::constants::{
     INDEX_BASE_FILE_NAME, INDEX_BASE_FORMAT_VERSION, INDEX_BASE_MAGIC, KEY_DERIVE_SEED,
 };
@@ -145,6 +167,47 @@ impl ReceiptBoundDeadObjectDrainPlan {
     fn current_segment_would_be_reclaimed(&self, current_segment_id: u64) -> bool {
         self.dead_segments.contains(&current_segment_id)
     }
+}
+
+/// One verified live-object relocation to publish at a compaction commit boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedCompactionRewrite {
+    pub key: ObjectKey,
+    pub logical_offset: u64,
+    pub old_extent: ExtentMapEntryV2,
+    pub target_payload: Vec<u8>,
+    pub dataset_uuid: [u8; 16],
+    pub replacement_receipt: DeadObjectReplacementReceipt,
+}
+
+/// Published state for one compaction relocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedCompactionRewrite {
+    pub key: ObjectKey,
+    pub old_location: ObjectLocation,
+    pub target_location: ObjectLocation,
+    pub new_extent: ExtentMapEntryV2,
+    pub checksum_root: [u8; 32],
+    pub receipt_generation: u64,
+}
+
+/// Result returned after a compaction batch reaches its commit boundary.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CompactionPublishReport {
+    pub committed_txg: u64,
+    pub committed_generation: u64,
+    pub rewrites: Vec<PublishedCompactionRewrite>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PersistedCompactionPublishEntry {
+    publish_txg: u64,
+    key: ObjectKey,
+    dataset_uuid: [u8; 16],
+    old_location: ObjectLocation,
+    target_location: ObjectLocation,
+    new_extent: ExtentMapEntryV2,
+    receipt: DeadObjectReplacementReceipt,
 }
 
 #[derive(Clone, Debug)]
@@ -490,8 +553,18 @@ fn committed_root_key() -> ObjectKey {
         .get_or_init(|| ObjectKey::from_name(crate::txg_manager::COMMITTED_ROOT_FILE.as_bytes()))
 }
 
-fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 5] {
-    static KEYS: OnceLock<[ObjectKey; 5]> = OnceLock::new();
+fn compaction_publish_manifest_key() -> ObjectKey {
+    static COMPACTION_PUBLISH_MANIFEST_KEY: OnceLock<ObjectKey> = OnceLock::new();
+    *COMPACTION_PUBLISH_MANIFEST_KEY
+        .get_or_init(|| ObjectKey::from_name(COMPACTION_PUBLISH_MANIFEST_OBJECT_NAME.as_bytes()))
+}
+
+fn is_compaction_target_key(key: ObjectKey) -> bool {
+    key.as_bytes()[..8] == COMPACTION_TARGET_KEY_PREFIX
+}
+
+fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 6] {
+    static KEYS: OnceLock<[ObjectKey; 6]> = OnceLock::new();
     KEYS.get_or_init(|| {
         [
             ObjectKey::from_name(RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
@@ -499,6 +572,7 @@ fn persistent_reclaim_metadata_keys() -> &'static [ObjectKey; 5] {
             ObjectKey::from_name(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME.as_bytes()),
             ObjectKey::from_name(RECLAIM_RECEIPTS_OBJECT_NAME.as_bytes()),
             ObjectKey::from_name(SNAPSHOT_EXTENT_PIN_SET_OBJECT_NAME.as_bytes()),
+            compaction_publish_manifest_key(),
         ]
     })
 }
@@ -511,12 +585,14 @@ fn is_stats_internal_key(key: ObjectKey) -> bool {
     key == committed_root_key()
         || is_persistent_reclaim_metadata_key(key)
         || crate::is_pool_placement_receipt_key(key)
+        || is_compaction_target_key(key)
 }
 
 fn is_public_scan_internal_key(key: ObjectKey) -> bool {
     key == committed_root_key()
         || is_persistent_reclaim_metadata_key(key)
         || crate::is_pool_placement_scan_internal_key(key)
+        || is_compaction_target_key(key)
 }
 
 fn stats_counted_index_len(index: &BTreeMap<ObjectKey, ObjectLocation>) -> usize {
@@ -532,6 +608,256 @@ fn stats_counted_index_bytes(index: &BTreeMap<ObjectKey, ObjectLocation>) -> u64
         .filter(|(key, _)| !is_stats_internal_key(**key))
         .map(|(_, loc)| loc.payload_len)
         .sum()
+}
+
+fn encode_compaction_location(buf: &mut Vec<u8>, location: ObjectLocation) {
+    buf.extend_from_slice(location.key.as_bytes());
+    buf.extend_from_slice(&location.segment_id.to_le_bytes());
+    buf.extend_from_slice(&location.record_offset.to_le_bytes());
+    buf.extend_from_slice(&location.payload_offset.to_le_bytes());
+    buf.extend_from_slice(&location.payload_len.to_le_bytes());
+    buf.extend_from_slice(&location.sequence.to_le_bytes());
+    buf.extend_from_slice(&location.payload_checksum.get().to_le_bytes());
+}
+
+fn encode_compaction_extent(buf: &mut Vec<u8>, extent: &ExtentMapEntryV2) {
+    buf.extend_from_slice(&extent.logical_offset.to_le_bytes());
+    buf.extend_from_slice(&extent.length.to_le_bytes());
+    buf.push(extent.extent_kind);
+    buf.push(extent.flags);
+    buf.extend_from_slice(&extent.locator_id.0.to_le_bytes());
+    buf.extend_from_slice(&extent.checksum);
+    buf.extend_from_slice(&extent.birth_commit_group.to_le_bytes());
+    buf.extend_from_slice(&extent.reserved);
+}
+
+fn compaction_take<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(StoreError::InvalidCompactionRewrite {
+            reason: "compaction publish manifest length overflow",
+        })?;
+    if end > bytes.len() {
+        return Err(StoreError::InvalidCompactionRewrite {
+            reason: "compaction publish manifest truncated",
+        });
+    }
+    let out = &bytes[*offset..end];
+    *offset = end;
+    Ok(out)
+}
+
+fn compaction_take_array<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<[u8; N]> {
+    let slice = compaction_take(bytes, offset, N)?;
+    let mut out = [0u8; N];
+    out.copy_from_slice(slice);
+    Ok(out)
+}
+
+fn compaction_take_u64(bytes: &[u8], offset: &mut usize) -> Result<u64> {
+    Ok(u64::from_le_bytes(compaction_take_array::<8>(
+        bytes, offset,
+    )?))
+}
+
+fn decode_compaction_location(bytes: &[u8], offset: &mut usize) -> Result<ObjectLocation> {
+    let key = ObjectKey::from_bytes(compaction_take_array::<32>(bytes, offset)?);
+    let segment_id = compaction_take_u64(bytes, offset)?;
+    let record_offset = compaction_take_u64(bytes, offset)?;
+    let payload_offset = compaction_take_u64(bytes, offset)?;
+    let payload_len = compaction_take_u64(bytes, offset)?;
+    let sequence = compaction_take_u64(bytes, offset)?;
+    let payload_checksum = IntegrityDigest64(compaction_take_u64(bytes, offset)?);
+    Ok(ObjectLocation {
+        key,
+        segment_id,
+        record_offset,
+        payload_offset,
+        payload_len,
+        sequence,
+        payload_checksum,
+    })
+}
+
+fn decode_compaction_extent(bytes: &[u8], offset: &mut usize) -> Result<ExtentMapEntryV2> {
+    let logical_offset = compaction_take_u64(bytes, offset)?;
+    let length = compaction_take_u64(bytes, offset)?;
+    let extent_kind = compaction_take(bytes, offset, 1)?[0];
+    let flags = compaction_take(bytes, offset, 1)?[0];
+    let locator_id = LocatorId(compaction_take_u64(bytes, offset)?);
+    let checksum = compaction_take_array::<32>(bytes, offset)?;
+    let birth_commit_group = compaction_take_u64(bytes, offset)?;
+    let reserved = compaction_take_array::<15>(bytes, offset)?;
+    Ok(ExtentMapEntryV2 {
+        logical_offset,
+        length,
+        extent_kind,
+        flags,
+        locator_id,
+        checksum,
+        birth_commit_group,
+        reserved,
+    })
+}
+
+fn encode_compaction_publish_manifest(
+    entries: &[PersistedCompactionPublishEntry],
+) -> Result<Vec<u8>> {
+    let count = u32::try_from(entries.len()).map_err(|_| StoreError::InvalidCompactionRewrite {
+        reason: "compaction publish manifest has too many entries",
+    })?;
+    let body_len = entries
+        .len()
+        .checked_mul(COMPACTION_MANIFEST_ENTRY_LEN)
+        .and_then(|len| len.checked_add(COMPACTION_MANIFEST_HEADER_LEN))
+        .ok_or(StoreError::InvalidCompactionRewrite {
+            reason: "compaction publish manifest length overflow",
+        })?;
+    let mut buf = Vec::with_capacity(body_len);
+    buf.extend_from_slice(COMPACTION_MANIFEST_MAGIC);
+    buf.extend_from_slice(&COMPACTION_MANIFEST_VERSION.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    for entry in entries {
+        buf.extend_from_slice(&entry.publish_txg.to_le_bytes());
+        buf.extend_from_slice(entry.key.as_bytes());
+        buf.extend_from_slice(&entry.dataset_uuid);
+        encode_compaction_location(&mut buf, entry.old_location);
+        encode_compaction_location(&mut buf, entry.target_location);
+        encode_compaction_extent(&mut buf, &entry.new_extent);
+        buf.extend_from_slice(&entry.receipt.encode());
+    }
+    Ok(buf)
+}
+
+fn decode_compaction_publish_manifest(
+    bytes: &[u8],
+) -> Result<Vec<PersistedCompactionPublishEntry>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut offset = 0usize;
+    let magic = compaction_take(bytes, &mut offset, COMPACTION_MANIFEST_MAGIC.len())?;
+    if magic != COMPACTION_MANIFEST_MAGIC {
+        return Err(StoreError::InvalidCompactionRewrite {
+            reason: "compaction publish manifest invalid magic",
+        });
+    }
+    let version = u32::from_le_bytes(compaction_take_array::<4>(bytes, &mut offset)?);
+    if version != COMPACTION_MANIFEST_VERSION {
+        return Err(StoreError::InvalidCompactionRewrite {
+            reason: "compaction publish manifest unsupported version",
+        });
+    }
+    let count = u32::from_le_bytes(compaction_take_array::<4>(bytes, &mut offset)?) as usize;
+    let expected_len = COMPACTION_MANIFEST_HEADER_LEN
+        .checked_add(count.checked_mul(COMPACTION_MANIFEST_ENTRY_LEN).ok_or(
+            StoreError::InvalidCompactionRewrite {
+                reason: "compaction publish manifest length overflow",
+            },
+        )?)
+        .ok_or(StoreError::InvalidCompactionRewrite {
+            reason: "compaction publish manifest length overflow",
+        })?;
+    if expected_len != bytes.len() {
+        return Err(StoreError::InvalidCompactionRewrite {
+            reason: "compaction publish manifest trailing bytes",
+        });
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let publish_txg = compaction_take_u64(bytes, &mut offset)?;
+        let key = ObjectKey::from_bytes(compaction_take_array::<32>(bytes, &mut offset)?);
+        let dataset_uuid = compaction_take_array::<16>(bytes, &mut offset)?;
+        let old_location = decode_compaction_location(bytes, &mut offset)?;
+        let target_location = decode_compaction_location(bytes, &mut offset)?;
+        let new_extent = decode_compaction_extent(bytes, &mut offset)?;
+        let receipt = DeadObjectReplacementReceipt::decode(&compaction_take_array::<
+            COMPACTION_MANIFEST_RECEIPT_LEN,
+        >(bytes, &mut offset)?)
+        .map_err(|_| StoreError::InvalidCompactionRewrite {
+            reason: "compaction publish manifest invalid receipt",
+        })?;
+        entries.push(PersistedCompactionPublishEntry {
+            publish_txg,
+            key,
+            dataset_uuid,
+            old_location,
+            target_location,
+            new_extent,
+            receipt,
+        });
+    }
+    Ok(entries)
+}
+
+fn compaction_reclaim_key(key: ObjectKey) -> ReclaimObjectKey {
+    ReclaimObjectKey(*key.as_bytes())
+}
+
+fn compaction_location_evidence(location: ObjectLocation, out: &mut Vec<u8>) {
+    out.extend_from_slice(location.key.as_bytes());
+    out.extend_from_slice(&location.segment_id.to_le_bytes());
+    out.extend_from_slice(&location.record_offset.to_le_bytes());
+    out.extend_from_slice(&location.payload_offset.to_le_bytes());
+    out.extend_from_slice(&location.payload_len.to_le_bytes());
+    out.extend_from_slice(&location.sequence.to_le_bytes());
+    out.extend_from_slice(&location.payload_checksum.get().to_le_bytes());
+}
+
+fn compaction_locator_evidence(
+    key: ObjectKey,
+    target_location: ObjectLocation,
+    receipt: DeadObjectReplacementReceipt,
+) -> Vec<u8> {
+    let mut evidence = Vec::with_capacity(32 + COMPACTION_MANIFEST_LOCATION_LEN + 128);
+    evidence.extend_from_slice(b"tidefs-compaction-locator-v1");
+    evidence.extend_from_slice(key.as_bytes());
+    compaction_location_evidence(target_location, &mut evidence);
+    evidence.extend_from_slice(&receipt.encode());
+    evidence
+}
+
+fn compaction_locator_id(
+    key: ObjectKey,
+    target_location: ObjectLocation,
+    receipt: DeadObjectReplacementReceipt,
+) -> LocatorId {
+    let evidence = compaction_locator_evidence(key, target_location, receipt);
+    let digest = blake3::hash(&evidence);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    let mut locator = u64::from_le_bytes(bytes);
+    if locator == 0 {
+        locator = 1;
+    }
+    LocatorId(locator)
+}
+
+fn compaction_target_key(
+    key: ObjectKey,
+    old_location: ObjectLocation,
+    publish_txg: u64,
+    ordinal: u64,
+) -> ObjectKey {
+    let mut evidence = Vec::with_capacity(32 + COMPACTION_MANIFEST_LOCATION_LEN + 16);
+    evidence.extend_from_slice(b"tidefs-compaction-target-v1");
+    evidence.extend_from_slice(key.as_bytes());
+    compaction_location_evidence(old_location, &mut evidence);
+    evidence.extend_from_slice(&publish_txg.to_le_bytes());
+    evidence.extend_from_slice(&ordinal.to_le_bytes());
+    let mut bytes = *blake3::hash(&evidence).as_bytes();
+    bytes[..COMPACTION_TARGET_KEY_PREFIX.len()].copy_from_slice(&COMPACTION_TARGET_KEY_PREFIX);
+    ObjectKey::from_bytes(bytes)
+}
+
+fn compaction_read_verify_digest(payload: &[u8]) -> ObjectDigest {
+    let domain_key = DomainTag::ReadVerify.derive_key();
+    ObjectDigest::compute(payload, &domain_key)
+}
+
+fn compaction_payload_digest(payload: &[u8]) -> [u8; 32] {
+    *blake3::hash(payload).as_bytes()
 }
 
 impl LocalObjectStore {
@@ -738,6 +1064,379 @@ impl LocalObjectStore {
         } else {
             None
         }
+    }
+
+    fn load_compaction_publish_manifest_entries(
+        &self,
+    ) -> Result<Vec<PersistedCompactionPublishEntry>> {
+        let Some(location) = self.index.get(&compaction_publish_manifest_key()).copied() else {
+            return Ok(Vec::new());
+        };
+        let bytes = self.read_location(location)?;
+        decode_compaction_publish_manifest(&bytes)
+    }
+
+    fn compaction_source_release_receipted(&self, key: ReclaimObjectKey) -> bool {
+        self.reclaim_receipts.iter().any(|receipt| {
+            receipt
+                .freed_segment_extents
+                .iter()
+                .any(|extent| extent.extent_key == key)
+        })
+    }
+
+    fn enqueue_compaction_source_release(
+        &mut self,
+        entry: &PersistedCompactionPublishEntry,
+        mark_dirty: bool,
+    ) {
+        let object_id = compaction_reclaim_key(entry.key);
+        if self.compaction_source_release_receipted(object_id) {
+            return;
+        }
+        let dead_entry = DeadObjectEntry::new(
+            object_id,
+            entry.dataset_uuid,
+            entry.publish_txg,
+            true,
+            entry.publish_txg,
+        )
+        .with_replacement_receipt(entry.receipt);
+        if self.dead_object_reclaim_queue.enqueue(dead_entry) && mark_dirty {
+            self.dead_object_reclaim_queue_dirty = true;
+        }
+    }
+
+    fn rebuild_reclaim_live_counts_from_index(&mut self) {
+        let mut live_counts = SegmentLiveCounts::new();
+        for (key, location) in &self.index {
+            if is_public_scan_internal_key(*key) {
+                continue;
+            }
+            let current = live_counts.live_count(location.segment_id);
+            live_counts.set_live_count(location.segment_id, current.saturating_add(1));
+        }
+        let config = self.reclaim_consumer.config().clone();
+        self.reclaim_consumer = ReclaimConsumerService::new(config, live_counts);
+    }
+
+    fn build_compaction_checksum_tree(
+        key: ObjectKey,
+        target_location: ObjectLocation,
+        receipt: DeadObjectReplacementReceipt,
+        payload: &[u8],
+    ) -> Result<ChecksumTree> {
+        let evidence = compaction_locator_evidence(key, target_location, receipt);
+        let token = LocatorToken::from_evidence(&evidence);
+        let mut builder = ChecksumTreeBuilder::new(tidefs_checksum_tree::DEFAULT_BLOCK_SIZE);
+        builder.set_locator(token);
+        builder.ingest(payload);
+        let tree = builder.finish();
+        if ChecksumTreeVerifier::new(tree.clone()).verify_full_with_locator(payload, Some(&token))
+            != VerificationResult::Verified
+        {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction target checksum verification failed",
+            });
+        }
+        Ok(tree)
+    }
+
+    fn verify_compaction_target_entry(
+        entry: &PersistedCompactionPublishEntry,
+        payload: &[u8],
+    ) -> Result<()> {
+        if !is_compaction_target_key(entry.target_location.key) {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction target location is not a hidden target key",
+            });
+        }
+        if entry.old_location.key != entry.key {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction source location does not match rewrite key",
+            });
+        }
+        if entry.new_extent.length != payload.len() as u64 {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction extent length does not match target payload",
+            });
+        }
+        if !entry.new_extent.is_finalized_data() || entry.new_extent.locator_id.is_none() {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction target extent is not finalized data",
+            });
+        }
+        if entry.receipt.payload_len != payload.len() as u64
+            || entry.receipt.payload_digest != compaction_payload_digest(payload)
+            || !entry
+                .receipt
+                .authorizes_reclaim_for(compaction_reclaim_key(entry.key))
+        {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction replacement receipt does not cover target payload",
+            });
+        }
+        let tree = Self::build_compaction_checksum_tree(
+            entry.key,
+            entry.target_location,
+            entry.receipt,
+            payload,
+        )?;
+        if tree.root_hash != entry.new_extent.checksum {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction target checksum root does not match manifest",
+            });
+        }
+        Ok(())
+    }
+
+    fn apply_persisted_compaction_publish_entry(
+        &mut self,
+        entry: &PersistedCompactionPublishEntry,
+        mark_queue_dirty: bool,
+    ) -> Result<Option<PublishedCompactionRewrite>> {
+        let payload = self.read_location(entry.target_location)?;
+        Self::verify_compaction_target_entry(entry, &payload)?;
+
+        let current_location = self.index.get(&entry.key).copied();
+        let mut visible_swap_applied = false;
+        match current_location {
+            Some(location) if location == entry.target_location => {
+                visible_swap_applied = true;
+            }
+            Some(location) if location == entry.old_location => {
+                self.index.insert(entry.key, entry.target_location);
+                visible_swap_applied = true;
+            }
+            Some(location) if location.sequence > entry.target_location.sequence => {}
+            None => {}
+            Some(_) => {}
+        }
+
+        if visible_swap_applied {
+            let versions = self.history.entry(entry.key).or_default();
+            if !versions.contains(&entry.target_location) {
+                versions.push(entry.target_location);
+            }
+            self.checksums
+                .insert(entry.key, compaction_read_verify_digest(&payload));
+        }
+        self.enqueue_compaction_source_release(entry, mark_queue_dirty);
+
+        Ok(visible_swap_applied.then(|| PublishedCompactionRewrite {
+            key: entry.key,
+            old_location: entry.old_location,
+            target_location: entry.target_location,
+            new_extent: entry.new_extent.clone(),
+            checksum_root: entry.new_extent.checksum,
+            receipt_generation: entry.receipt.receipt_generation,
+        }))
+    }
+
+    fn apply_committed_compaction_publish_manifest(&mut self) -> Result<()> {
+        let committed_txg = self.commit_group.committed_root().commit_group_id.0;
+        if committed_txg == 0 {
+            return Ok(());
+        }
+        for entry in self.load_compaction_publish_manifest_entries()? {
+            if entry.publish_txg <= committed_txg {
+                let _ = self.apply_persisted_compaction_publish_entry(&entry, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_verified_compaction_rewrite(
+        &mut self,
+        rewrite: VerifiedCompactionRewrite,
+        extent_map: &impl ExtentMapOps,
+        publish_txg: u64,
+        ordinal: u64,
+    ) -> Result<PersistedCompactionPublishEntry> {
+        if !rewrite.old_extent.is_finalized_data() {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction source extent is not finalized data",
+            });
+        }
+        if rewrite.old_extent.logical_offset != rewrite.logical_offset {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction logical offset does not match source extent",
+            });
+        }
+        if rewrite.target_payload.is_empty()
+            || rewrite.old_extent.length != rewrite.target_payload.len() as u64
+        {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction source extent length does not match target payload",
+            });
+        }
+
+        let source_location =
+            self.index
+                .get(&rewrite.key)
+                .copied()
+                .ok_or(StoreError::InvalidCompactionRewrite {
+                    reason: "compaction source key is not live",
+                })?;
+        if source_location.key != rewrite.key {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction source location does not match source key",
+            });
+        }
+        let current_payload =
+            self.get(rewrite.key)?
+                .ok_or(StoreError::InvalidCompactionRewrite {
+                    reason: "compaction source key disappeared during verification",
+                })?;
+        if current_payload != rewrite.target_payload {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction target payload differs from source payload",
+            });
+        }
+
+        let mapped = extent_map
+            .lookup_range(rewrite.old_extent.logical_offset, rewrite.old_extent.length)
+            .map_err(|_| StoreError::InvalidCompactionRewrite {
+                reason: "extent map rejected compaction source lookup",
+            })?;
+        if !mapped.iter().any(|entry| entry == &rewrite.old_extent) {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "extent map source extent does not match compaction rewrite",
+            });
+        }
+
+        let reclaim_key = compaction_reclaim_key(rewrite.key);
+        if rewrite.replacement_receipt.payload_len != rewrite.target_payload.len() as u64
+            || rewrite.replacement_receipt.payload_digest
+                != compaction_payload_digest(&rewrite.target_payload)
+            || !rewrite
+                .replacement_receipt
+                .authorizes_reclaim_for(reclaim_key)
+        {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction replacement receipt does not authorize source release",
+            });
+        }
+
+        if self.current_segment_id == source_location.segment_id {
+            self.rotate_segment()?;
+        }
+
+        let target_key = compaction_target_key(rewrite.key, source_location, publish_txg, ordinal);
+        self.put_direct(target_key, &rewrite.target_payload)?;
+        let target_location =
+            self.index
+                .get(&target_key)
+                .copied()
+                .ok_or(StoreError::InvalidCompactionRewrite {
+                    reason: "compaction target write did not produce a location",
+                })?;
+        if target_location.segment_id == source_location.segment_id {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction target must not share the source segment",
+            });
+        }
+        let tree = Self::build_compaction_checksum_tree(
+            rewrite.key,
+            target_location,
+            rewrite.replacement_receipt,
+            &rewrite.target_payload,
+        )?;
+        let locator_id =
+            compaction_locator_id(rewrite.key, target_location, rewrite.replacement_receipt);
+        let new_extent = ExtentMapEntryV2::new_data(
+            rewrite.old_extent.logical_offset,
+            rewrite.old_extent.length,
+            locator_id,
+            tree.root_hash,
+            publish_txg,
+        );
+
+        Ok(PersistedCompactionPublishEntry {
+            publish_txg,
+            key: rewrite.key,
+            dataset_uuid: rewrite.dataset_uuid,
+            old_location: source_location,
+            target_location,
+            new_extent,
+            receipt: rewrite.replacement_receipt,
+        })
+    }
+
+    pub fn publish_verified_compaction_rewrites(
+        &mut self,
+        rewrites: Vec<VerifiedCompactionRewrite>,
+        extent_map: &mut impl ExtentMapOps,
+    ) -> Result<CompactionPublishReport> {
+        self.ensure_writable("publish_verified_compaction_rewrites")?;
+        if rewrites.is_empty() {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction publish batch is empty",
+            });
+        }
+
+        let publish_txg = self.commit_group.current_id().0;
+        let mut prepared = Vec::with_capacity(rewrites.len());
+        let mut seen_keys = BTreeSet::new();
+        for (ordinal, rewrite) in rewrites.into_iter().enumerate() {
+            if !seen_keys.insert(rewrite.key) {
+                return Err(StoreError::InvalidCompactionRewrite {
+                    reason: "compaction publish batch contains duplicate source key",
+                });
+            }
+            prepared.push(self.prepare_verified_compaction_rewrite(
+                rewrite,
+                extent_map,
+                publish_txg,
+                ordinal as u64,
+            )?);
+        }
+
+        let mut manifest_entries = self.load_compaction_publish_manifest_entries()?;
+        manifest_entries.retain(|entry| {
+            !self.compaction_source_release_receipted(compaction_reclaim_key(entry.key))
+        });
+        manifest_entries.extend(prepared.iter().cloned());
+        let manifest_payload = encode_compaction_publish_manifest(&manifest_entries)?;
+        self.put(compaction_publish_manifest_key(), &manifest_payload)?;
+
+        for entry in &prepared {
+            let payload = self.read_location(entry.target_location)?;
+            self.checksums
+                .insert(entry.key, compaction_read_verify_digest(&payload));
+        }
+
+        self.sync_all()?;
+        let committed_txg = self.commit_group.committed_root().commit_group_id.0;
+        if committed_txg < publish_txg {
+            return Err(StoreError::InvalidCompactionRewrite {
+                reason: "compaction manifest did not reach the expected commit group",
+            });
+        }
+        let committed_generation = self.commit_group.commit_count();
+
+        let new_extents: Vec<ExtentMapEntryV2> = prepared
+            .iter()
+            .map(|entry| entry.new_extent.clone())
+            .collect();
+        extent_map.insert_extent(&new_extents).map_err(|_| {
+            StoreError::InvalidCompactionRewrite {
+                reason: "extent map rejected compaction locator swap",
+            }
+        })?;
+
+        let mut report = CompactionPublishReport {
+            committed_txg,
+            committed_generation,
+            rewrites: Vec::with_capacity(prepared.len()),
+        };
+        for entry in &prepared {
+            if let Some(published) = self.apply_persisted_compaction_publish_entry(entry, false)? {
+                report.rewrites.push(published);
+            }
+        }
+
+        Ok(report)
     }
 
     /// Open a block device or development regular file as a single-segment store.
@@ -1169,15 +1868,6 @@ impl LocalObjectStore {
             checksums: BTreeMap::new(),
             block_device_mode: false,
         };
-        // Initialize reclaim-queue consumer live counts from the index.
-        {
-            let lc = store.reclaim_consumer.live_counts_mut();
-            for loc in store.index.values() {
-                let seg = loc.segment_id;
-                let c = lc.live_count(seg);
-                lc.set_live_count(seg, c.saturating_add(1));
-            }
-        }
         // Restore persisted per-object checksums for read-path verification.
         store.checksums = load_checksums(&store.segments_dir);
         // Restore persisted reclaim-queue entries.
@@ -1189,6 +1879,10 @@ impl LocalObjectStore {
         // Restore snapshot extent pins before any reclaim authority observes
         // dead-object queue state.
         store.snapshot_extent_pin_set = load_snapshot_extent_pin_set(&store)?;
+        // Publish any compaction rewrites whose manifest reached a committed
+        // root before rebuilding reclaim liveness or replaying source release.
+        store.apply_committed_compaction_publish_manifest()?;
+        store.rebuild_reclaim_live_counts_from_index();
         // Reapply committed physical-reclaim receipts before open accepts the
         // allocator/free-map state reconstructed from stale checkpoints.
         store.replay_reclaim_receipts_on_open()?;
@@ -8396,6 +9090,253 @@ mod reclaim_queue_production_tests {
                 .dead_object_reclaim_queue
                 .receipt_bound_eligible_count_with_stable_generation(6, 1),
             0
+        );
+    }
+}
+
+#[cfg(test)]
+mod compaction_publish_tests {
+    use super::*;
+    use tidefs_extent_map::InlineExtentMap;
+
+    const DATASET_UUID: [u8; 16] = [0xC7; 16];
+
+    fn compaction_options() -> StoreOptions {
+        let mut options = StoreOptions::test_fast();
+        options.max_segment_bytes = 2048;
+        options.segment_count = tidefs_spacemap_allocator::DEFAULT_SEGMENT_GROUP_SEGMENTS;
+        options
+    }
+
+    fn compaction_payload(byte: u8) -> Vec<u8> {
+        let options = compaction_options();
+        vec![byte; options.max_object_bytes() as usize]
+    }
+
+    fn old_extent(payload: &[u8]) -> ExtentMapEntryV2 {
+        ExtentMapEntryV2::new_data(
+            0,
+            payload.len() as u64,
+            LocatorId(0x807),
+            compaction_payload_digest(payload),
+            1,
+        )
+    }
+
+    fn extent_map_with(entry: ExtentMapEntryV2) -> InlineExtentMap {
+        let mut extent_map = InlineExtentMap::new();
+        extent_map
+            .insert_extent(&[entry])
+            .expect("insert source extent");
+        extent_map
+    }
+
+    fn replacement_receipt(
+        key: ObjectKey,
+        payload: &[u8],
+        receipt_generation: u64,
+    ) -> DeadObjectReplacementReceipt {
+        DeadObjectReplacementReceipt::replicated(
+            compaction_reclaim_key(key),
+            7,
+            receipt_generation,
+            2,
+            payload.len() as u64,
+            compaction_payload_digest(payload),
+        )
+    }
+
+    fn rewrite(
+        key: ObjectKey,
+        entry: ExtentMapEntryV2,
+        payload: &[u8],
+        receipt_generation: u64,
+    ) -> VerifiedCompactionRewrite {
+        VerifiedCompactionRewrite {
+            key,
+            logical_offset: entry.logical_offset,
+            old_extent: entry,
+            target_payload: payload.to_vec(),
+            dataset_uuid: DATASET_UUID,
+            replacement_receipt: replacement_receipt(key, payload, receipt_generation),
+        }
+    }
+
+    #[test]
+    fn publish_verified_compaction_rewrite_swaps_extent_checksum_and_release_queue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = ObjectKey::from_name(b"compaction/publish/commit");
+        let payload = compaction_payload(0x5A);
+        let source_extent = old_extent(&payload);
+        let receipt = replacement_receipt(key, &payload, 1);
+        let mut extent_map = extent_map_with(source_extent.clone());
+        let mut store =
+            LocalObjectStore::open_with_options(dir.path(), compaction_options()).expect("open");
+
+        store.put(key, &payload).expect("put source");
+        let old_location = store.location_of(key).expect("source location");
+        let report = store
+            .publish_verified_compaction_rewrites(
+                vec![rewrite(
+                    key,
+                    source_extent,
+                    &payload,
+                    receipt.receipt_generation,
+                )],
+                &mut extent_map,
+            )
+            .expect("publish compaction rewrite");
+
+        assert_eq!(report.rewrites.len(), 1);
+        let published = &report.rewrites[0];
+        assert_eq!(published.key, key);
+        assert_eq!(published.old_location, old_location);
+        assert_ne!(
+            published.old_location.segment_id,
+            published.target_location.segment_id
+        );
+        assert!(is_compaction_target_key(published.target_location.key));
+        assert_eq!(store.location_of(key), Some(published.target_location));
+        assert_eq!(
+            store.get(key).expect("read published"),
+            Some(payload.clone())
+        );
+        assert_eq!(
+            store
+                .get_checksum_verified(key)
+                .expect("checksum verified read"),
+            Some(payload.clone())
+        );
+        assert_eq!(store.list_keys(), vec![key]);
+
+        let mapped = extent_map
+            .lookup_range(0, payload.len() as u64)
+            .expect("lookup swapped extent");
+        assert_eq!(mapped, vec![published.new_extent.clone()]);
+        assert_eq!(mapped[0].birth_commit_group, report.committed_txg);
+        assert_eq!(mapped[0].checksum, published.checksum_root);
+
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        let queued = store.dead_object_reclaim_queue.all_entries()[0];
+        assert_eq!(queued.object_id, compaction_reclaim_key(key));
+        assert_eq!(queued.dataset_uuid, DATASET_UUID);
+        assert_eq!(queued.death_commit_group, report.committed_txg);
+        assert_eq!(queued.replacement_receipt, Some(receipt));
+
+        let held = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(report.committed_txg + 1, 0, 16)
+            .expect("early drain remains held");
+        assert_eq!(held.entries_processed, 0);
+        assert_eq!(held.segments_reclaimed, 0);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+
+        let drained = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(
+                report.committed_txg + 1,
+                receipt.receipt_generation,
+                16,
+            )
+            .expect("stable drain");
+        assert_eq!(drained.entries_processed, 1);
+        assert_eq!(drained.segments_reclaimed, 1);
+        assert!(store.dead_object_reclaim_queue.is_empty());
+        assert!(store.free_map.is_free(old_location.segment_id));
+        assert_eq!(store.get(key).expect("read after drain"), Some(payload));
+    }
+
+    #[test]
+    fn crash_before_publish_hides_scratch_target_and_keeps_source_mapping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = ObjectKey::from_name(b"compaction/publish/before");
+        let payload = compaction_payload(0xA5);
+
+        {
+            let mut store = LocalObjectStore::open_with_options(dir.path(), compaction_options())
+                .expect("open");
+            store.put(key, &payload).expect("put source");
+            let old_location = store.location_of(key).expect("source location");
+            if store.current_segment_id == old_location.segment_id {
+                store.rotate_segment().expect("rotate away from source");
+            }
+            let target_key =
+                compaction_target_key(key, old_location, store.commit_group.current_id().0, 0);
+            store
+                .put_direct(target_key, &payload)
+                .expect("write hidden target");
+            let target_location = store.location_of(target_key).expect("target location");
+            assert_ne!(old_location.segment_id, target_location.segment_id);
+            store
+                .sync_all()
+                .expect("sync hidden target without manifest");
+        }
+
+        let reopened =
+            LocalObjectStore::open_with_options(dir.path(), compaction_options()).expect("reopen");
+        assert_eq!(reopened.get(key).expect("read old mapping"), Some(payload));
+        assert_eq!(reopened.list_keys(), vec![key]);
+        assert!(reopened.dead_object_reclaim_queue.is_empty());
+        assert!(reopened
+            .load_compaction_publish_manifest_entries()
+            .expect("load manifest")
+            .is_empty());
+        assert!(reopened
+            .list_keys_including_internal()
+            .into_iter()
+            .any(is_compaction_target_key));
+    }
+
+    #[test]
+    fn crash_after_publish_replays_swap_and_receipt_bound_source_release() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = ObjectKey::from_name(b"compaction/publish/after");
+        let payload = compaction_payload(0x3C);
+        let source_extent = old_extent(&payload);
+        let mut extent_map = extent_map_with(source_extent.clone());
+        let (report, old_location, target_location) = {
+            let mut store = LocalObjectStore::open_with_options(dir.path(), compaction_options())
+                .expect("open");
+            store.put(key, &payload).expect("put source");
+            let old_location = store.location_of(key).expect("source location");
+            let report = store
+                .publish_verified_compaction_rewrites(
+                    vec![rewrite(key, source_extent, &payload, 1)],
+                    &mut extent_map,
+                )
+                .expect("publish compaction rewrite");
+            let target_location = report.rewrites[0].target_location;
+            (report, old_location, target_location)
+        };
+
+        let mut reopened =
+            LocalObjectStore::open_with_options(dir.path(), compaction_options()).expect("reopen");
+        assert_eq!(reopened.location_of(key), Some(target_location));
+        assert_eq!(
+            reopened
+                .get_checksum_verified(key)
+                .expect("checksum verified read after replay"),
+            Some(payload.clone())
+        );
+        assert_eq!(reopened.list_keys(), vec![key]);
+        assert_eq!(reopened.dead_object_reclaim_queue.len(), 1);
+        assert!(!reopened.free_map.is_free(old_location.segment_id));
+
+        let held = reopened
+            .drain_receipt_bound_dead_objects_at_stable_generation(report.committed_txg + 1, 0, 16)
+            .expect("generation-unstable drain remains held");
+        assert_eq!(held.entries_processed, 0);
+        assert_eq!(held.segments_reclaimed, 0);
+        assert_eq!(reopened.dead_object_reclaim_queue.len(), 1);
+
+        let drained = reopened
+            .drain_receipt_bound_dead_objects_at_stable_generation(report.committed_txg + 1, 1, 16)
+            .expect("stable generation drain");
+        assert_eq!(drained.entries_processed, 1);
+        assert_eq!(drained.segments_reclaimed, 1);
+        assert!(reopened.dead_object_reclaim_queue.is_empty());
+        assert!(reopened.free_map.is_free(old_location.segment_id));
+        assert_eq!(
+            reopened.get(key).expect("read after replay drain"),
+            Some(payload)
         );
     }
 }
