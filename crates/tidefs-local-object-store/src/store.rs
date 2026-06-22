@@ -1107,18 +1107,6 @@ impl LocalObjectStore {
         }
     }
 
-    fn rebuild_reclaim_live_counts_from_index(&mut self) {
-        let mut live_counts = SegmentLiveCounts::new();
-        for (key, location) in &self.index {
-            if is_public_scan_internal_key(*key) {
-                continue;
-            }
-            let current = live_counts.live_count(location.segment_id);
-            live_counts.set_live_count(location.segment_id, current.saturating_add(1));
-        }
-        let config = self.reclaim_consumer.config().clone();
-        self.reclaim_consumer = ReclaimConsumerService::new(config, live_counts);
-    }
 
     fn build_compaction_checksum_tree(
         key: ObjectKey,
