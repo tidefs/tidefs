@@ -544,8 +544,16 @@ LockMethod:
 
 ### 15.1 Affected documentation
 
-- `docs/STATUS.md`: Design delivery entry added
-- `docs/FEATURE_MATRIX.md`: Node lifecycle row updated if applicable
+The imported delivery plan originally targeted deleted status/matrix docs.
+Treat those targets as historical residue, not current closeout instructions:
+
+- Historical plan residue: `docs/STATUS.md` design-delivery entry and
+  `docs/FEATURE_MATRIX.md` node-lifecycle row were old closeout targets and
+  must not be recreated or updated for this design.
+- Current coordination and evidence surfaces: GitHub issues and pull requests
+  record implementation follow-up and validation evidence. Broader TFR-019
+  documentation-authority classification belongs in
+  `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, not this design closeout note.
 
 ### 15.2 Residual risk
 
