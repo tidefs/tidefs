@@ -78,7 +78,7 @@ See also:
 
 | Op | Flags/Variants | Semantics | Errnos |
 |-----|---------------|-----------|--------|
-| bmap | — | Block map (optional; may return ENOSYS) | ENOSYS |
+| bmap | — | Explicitly unsupported by the userspace adapter; FIEMAP is the extent-query path | EOPNOTSUPP |
 | poll | — | Poll for events (optional) | — |
 | notify_reply | — | Reply to kernel notification (NOTIFY_PRUNE shim) | — |
 | destroy | — | Filesystem unmount; flush and sync all pending work | — |
@@ -135,11 +135,11 @@ Each op must document its behavior under each named profile:
 | removexattr | `removexattr` | Direct mapping |
 | getlk | — | Handled by `FuseVfsAdapter` internal lock tracking (not in VfsEngine) |
 | setlk/setlkw | — | Handled by `FuseVfsAdapter` internal lock tracking (not in VfsEngine) |
-| ioctl | — | FIEMAP/BMAP handled by adapter shim (not in VfsEngine) |
+| ioctl | — | FIEMAP handled by adapter shim (not in VfsEngine) |
 | lseek | — | Kernel-resolved; adapter receives seek offset in read/write |
 | copy_file_range | — | Adapter-level read+write loop (not in VfsEngine) |
 | statfs | `statfs` | Direct mapping (future VfsEngine addition) |
-| bmap | — | Optional; adapter-level synthetic block map |
+| bmap | — | Explicitly unsupported at the userspace adapter boundary |
 
 ---
 

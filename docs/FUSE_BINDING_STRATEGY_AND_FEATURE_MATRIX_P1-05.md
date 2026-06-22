@@ -139,9 +139,11 @@ This matrix records TideFS adapter behavior, not only whether the vendored
 say so directly, and rows that still need a product decision must name the
 follow-up issue that owns support vs intentional non-support.
 
-The #713 audit identified `FUSE_BMAP` as the remaining visible FUSE operation
-gap in this document. Issue #786 owns the behavior decision and any
-adapter implementation or explicit non-support change for that opcode.
+The #713 audit identified `FUSE_BMAP` as a visible FUSE operation gap in this
+document. Issue #786 resolved the current userspace adapter boundary as
+explicit non-support: BMAP returns a physical block-device address, while the
+daemon has no stable block-device address authority. FIEMAP remains the
+supported extent-query surface.
 
 ### 3.1 Required and adapter-exposed opcodes
 
@@ -183,7 +185,7 @@ adapter implementation or explicit non-support change for that opcode.
 | `FUSE_LSEEK` | `lseek()` | **Implemented** | SEEK_SET/END/CUR/DATA/HOLE (PC-004B) |
 | `FUSE_IOCTL` | `ioctl()` | **Implemented** | FS_IOC_FIEMAP wired |
 | `FUSE_COPY_FILE_RANGE` | `copy_file_range()` | **Explicitly unsupported** | Outside the current POSIX subset; the daemon does not claim clone/copy offload support |
-| `FUSE_BMAP` | `bmap()` | **Deferred to #786** | Current adapter has no BMAP implementation; the vendored `fuser` default returns `ENOSYS` until #786 resolves support vs intentional non-support |
+| `FUSE_BMAP` | `bmap()` | **Explicitly unsupported** | Current userspace adapter returns `EOPNOTSUPP`; FIEMAP is the supported extent-query surface, and BMAP support would require a real block-device address mapping |
 | `FUSE_DESTROY` | `destroy()` | **Implemented** | |
 | `FUSE_INTERRUPT` | (internal to fuser) | **Implemented** | Routed through queue_class_0 |
 | `FUSE_BATCH_FORGET` | (internal to fuser) | **Implemented** | |

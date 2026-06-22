@@ -71,12 +71,12 @@ These surfaces carry historical "Wave Zero" or pre-alpha stage language that no 
   - Classification: **Implement** — the `simple.rs` example is a vendored/demo harness, but the stub is the only available statfs reference implementation.
   - Follow-up issue: #785 implements real statfs in the example or wires the engine's statfs into the example path.
 
-### 2.3 FUSE_BMAP returning ENOSYS
+### 2.3 FUSE_BMAP explicit non-support decision
 
-- **Surface**: `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md:177`
-  - Documents `FUSE_BMAP` / `bmap()` as "Implemented" but "Stub returning ENOSYS".
-  - Classification: **Implement** — bmap support is a real POSIX surface gap.
-  - Follow-up issue: #786 implements bmap() in the FUSE adapter or classifies it as intentionally unsupported with a rationale doc.
+- **Surface**: `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`
+  - Resolution: #786 classifies `FUSE_BMAP` / `bmap()` as **Explicitly unsupported** for the current userspace adapter boundary.
+  - Rationale: BMAP reports physical block-device addresses, while the daemon has no stable block-device address mapping to expose. FIEMAP remains the supported extent-query surface.
+  - Classification: **Resolved** — no longer an unresolved ENOSYS/stub surface.
 
 ---
 
@@ -257,9 +257,9 @@ Follow-up scope: #789 tracks the 22 planned-authority surfaces and has split the
 
 - **Surface**: `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`
   - Documents stub/implemented status for each FUSE operation.
-  - `FUSE_BMAP` listed as stub returning ENOSYS.
-- Classification: **Implement** — the matrix is current but several stubs need resolution.
-- Follow-up issue: #797 resolves remaining FUSE operation stubs or documents intentional non-support.
+  - `FUSE_BMAP` was resolved by #786 as explicit non-support for the current userspace adapter boundary.
+- Classification: **Implement** — the matrix is current but any remaining non-BMAP stubs need resolution.
+- Follow-up issue: #797 resolves remaining non-BMAP FUSE operation stubs or documents intentional non-support.
 
 ---
 
@@ -317,7 +317,7 @@ These surfaces were identified as stub/placeholder during the audit but already 
 | #783 | Section 1 (Wave Zero labels in Cargo.toml, lib.rs, xtask, WHOLE_REPO_REVIEW.md) | Delete | 4-5 files |
 | #784 | Section 2.1 (algorithm stubs in daemon_topology.rs) | Implement | `apps/tidefs-posix-filesystem-adapter-daemon/src/runtime/daemon_topology.rs` |
 | #785 | Section 2.2 (statfs stub in simple.rs) | Implement | `crates/tidefs-fuser/examples/simple.rs` |
-| #786 | Section 2.3 (FUSE_BMAP ENOSYS) | Implement | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`, `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs`, `crates/tidefs-fuser/src/lib.rs` |
+| #786 | Section 2.3 (FUSE_BMAP explicit non-support) | Resolved: explicit non-support | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md`, `docs/FUSE_OPERATION_COVERAGE_MATRIX.md`, `apps/tidefs-posix-filesystem-adapter-daemon/src/fuse_vfs_adapter.rs` |
 | #787 | Section 3.1 (Claimed/NotReady test gates) | Implement | `apps/tidefs-posix-filesystem-adapter-daemon/tests/fuse_e2e_smoke.rs` |
 | #788 | Section 4.1 (Kbuild BLAKE3 stubs) | Implement | `crates/tidefs-kmod-posix-vfs/src/mount.rs`, `crates/tidefs-block-kmod/src/dispatch.rs` |
 | #799 | Section 4.2 (kernel VFS ENOSYS returns) | Implement | `crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_main.rs` |

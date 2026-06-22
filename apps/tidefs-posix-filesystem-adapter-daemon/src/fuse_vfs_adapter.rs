@@ -1281,17 +1281,10 @@ fn plan_vfs_copy_file_range_writeback_fallback(
     Ok(plan)
 }
 
-fn plan_vfs_bmap(file_size: u64, blocksize: u32, idx: u64) -> Result<u64, Errno> {
-    if blocksize == 0 {
-        return Err(Errno::EINVAL);
-    }
-
-    let offset = idx.saturating_mul(u64::from(blocksize));
-    if offset >= file_size {
-        return Ok(0);
-    }
-
-    Ok(idx)
+fn unsupported_vfs_bmap_errno() -> Errno {
+    // BMAP reports physical block-device addresses. The userspace adapter has
+    // no stable block-device address authority; FIEMAP is the extent query path.
+    Errno::EOPNOTSUPP
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10048,17 +10041,16 @@ impl Filesystem for FuseVfsAdapter {
         }
     }
 
-    fn bmap(&mut self, req: &Request<'_>, ino: u64, blocksize: u32, idx: u64, reply: ReplyBmap) {
+    fn bmap(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        _blocksize: u32,
+        _idx: u64,
+        reply: ReplyBmap,
+    ) {
         let _p5_02 = Self::classify_fuse_bmap(req.unique(), ino, req.uid(), req.gid(), req.pid());
-        let ctx = Self::ctx_from_req(req);
-        let engine = self.engine.lock().unwrap();
-        match engine
-            .getattr(InodeId::new(ino), None, &ctx)
-            .and_then(|attr| plan_vfs_bmap(attr.posix.size, blocksize, idx))
-        {
-            Ok(block) => reply.bmap(block),
-            Err(errno) => reply.reply_errno(errno),
-        }
+        reply.reply_errno(unsupported_vfs_bmap_errno());
     }
 
     fn ioctl(
@@ -21151,11 +21143,8 @@ mod tests {
     }
 
     #[test]
-    fn bmap_plan_reports_synthetic_blocks_and_eof() {
-        assert_eq!(plan_vfs_bmap(4096 * 3, 4096, 0), Ok(0));
-        assert_eq!(plan_vfs_bmap(4096 * 3, 4096, 2), Ok(2));
-        assert_eq!(plan_vfs_bmap(4096 * 3, 4096, 3), Ok(0));
-        assert_eq!(plan_vfs_bmap(4096 * 3, 0, 0), Err(Errno::EINVAL));
+    fn bmap_reports_explicit_adapter_non_support() {
+        assert_eq!(unsupported_vfs_bmap_errno(), Errno::EOPNOTSUPP);
     }
 
     #[test]
