@@ -1048,11 +1048,8 @@ mod tests {
         store.sync_all().expect("sync");
 
         let loaded = load_dead_object_reclaim_queue(&store);
-        let published = loaded
-            .all_entries()
-            .iter()
-            .find(|e| e.object_id == key)
-            .unwrap();
+        let entries = loaded.all_entries();
+        let published = entries.iter().find(|e| e.object_id == key).unwrap();
         assert_eq!(published.replacement_receipt, Some(receipt));
     }
 
@@ -1074,11 +1071,8 @@ mod tests {
 
         store.sync_all().expect("sync");
         let loaded = load_dead_object_reclaim_queue(&store);
-        let published = loaded
-            .all_entries()
-            .iter()
-            .find(|e| e.object_id == key)
-            .unwrap();
+        let entries = loaded.all_entries();
+        let published = entries.iter().find(|e| e.object_id == key).unwrap();
         assert_eq!(published.replacement_receipt, Some(receipt_gen10));
     }
 
@@ -1105,11 +1099,8 @@ mod tests {
 
         store.sync_all().expect("sync");
         let loaded = load_dead_object_reclaim_queue(&store);
-        let published = loaded
-            .all_entries()
-            .iter()
-            .find(|e| e.object_id == key)
-            .unwrap();
+        let entries = loaded.all_entries();
+        let published = entries.iter().find(|e| e.object_id == key).unwrap();
         assert_eq!(published.replacement_receipt, Some(receipt_gen5));
     }
 
@@ -1149,11 +1140,8 @@ mod tests {
         ));
 
         let loaded = load_dead_object_reclaim_queue(&store);
-        let entry = loaded
-            .all_entries()
-            .iter()
-            .find(|e| e.object_id == key)
-            .unwrap();
+        let entries = loaded.all_entries();
+        let entry = entries.iter().find(|e| e.object_id == key).unwrap();
         assert_eq!(entry.replacement_receipt, None);
     }
 

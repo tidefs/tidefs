@@ -1875,6 +1875,7 @@ mod tests {
         assert!(!both_ok.authorizes_reclaim_for_with_stable_generation(key, 6));
     }
 
+    #[test]
     fn dead_object_entry_receipt_bound_reclaim_requires_evidence() {
         let key = dead_object_key(0x35);
         let entry = DeadObjectEntry::new(key, [0u8; 16], 10, true, 9);
