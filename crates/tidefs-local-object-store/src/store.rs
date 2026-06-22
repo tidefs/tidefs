@@ -1882,7 +1882,15 @@ impl LocalObjectStore {
         // Publish any compaction rewrites whose manifest reached a committed
         // root before rebuilding reclaim liveness or replaying source release.
         store.apply_committed_compaction_publish_manifest()?;
-        store.rebuild_reclaim_live_counts_from_index();
+        // Initialize reclaim-queue consumer live counts from the index.
+        {
+            let lc = store.reclaim_consumer.live_counts_mut();
+            for loc in store.index.values() {
+                let seg = loc.segment_id;
+                let c = lc.live_count(seg);
+                lc.set_live_count(seg, c.saturating_add(1));
+            }
+        }
         // Reapply committed physical-reclaim receipts before open accepts the
         // allocator/free-map state reconstructed from stale checkpoints.
         store.replay_reclaim_receipts_on_open()?;
