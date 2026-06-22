@@ -13,7 +13,8 @@ use tidefs_cache_coherency::{
 };
 use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseGrant};
 use tidefs_lease::wire::CacheInvalidationPayload;
-use tidefs_lease_manager::{LeaseManager, LeaseManagerConfig};
+use tidefs_lease::LeaseMessage;
+use tidefs_lease_manager::{LeaseManager, LeaseManagerConfig, LeaseManagerError};
 use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 // ---------------------------------------------------------------------------
@@ -297,7 +298,7 @@ fn wait_for_clean_eviction_sees_blocking_flag() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn wait_for_dirty_drain_sees_dirty_pages() {
+fn wait_for_dirty_drain_times_out_when_dirty_pages_remain() {
     let sub = Arc::new(RecordingSubscriber::with_result(
         "dirty-sub",
         InvalidationResult::dirty_pending(3, 2),
@@ -305,12 +306,19 @@ fn wait_for_dirty_drain_sees_dirty_pages() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    let result = mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForDirtyDrain).unwrap();
+    let err = mgr
+        .invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForDirtyDrain)
+        .unwrap_err();
 
-    assert_eq!(result.clean_evicted, 3);
-    assert_eq!(result.dirty_remaining, 2);
-    assert!(!result.dirty_drained);
-    assert!(result.needs_retry);
+    match err {
+        LeaseManagerError::InvalidationTimeout(dataset_id, inode_id, retries) => {
+            assert_eq!(dataset_id, 5);
+            assert_eq!(inode_id, 42);
+            assert_eq!(retries, 3);
+        }
+        other => panic!("expected invalidation timeout, got {other:?}"),
+    }
+    assert_eq!(mgr.stats().invalidations_timed_out, 1);
 }
 
 #[test]
@@ -554,13 +562,32 @@ fn invalidation_ack_reflects_subscriber_result() {
     ));
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
-    let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    let result = mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForDirtyDrain).unwrap();
+    let msg = CacheInvalidationMessage::range(
+        5,
+        100,
+        42,
+        0,
+        0,
+        4096,
+        1,
+        2,
+        10,
+        20,
+        CacheInvalidationReason::ConflictingWriteLease,
+        InvalidationWaitPolicy::WaitForDirtyDrain,
+    );
+    let payload = CacheInvalidationPayload::from_coherency(&msg);
+    let response = mgr.process_message(&LeaseMessage::Invalidate(payload), 0).unwrap();
 
-    assert_eq!(result.clean_evicted, 7);
-    assert_eq!(result.dirty_remaining, 3);
-    assert!(!result.dirty_drained);
-    assert!(result.needs_retry);
+    match response {
+        LeaseMessage::InvalidateAck(ack) => {
+            assert_eq!(ack.clean_evicted, 7);
+            assert_eq!(ack.dirty_remaining, 3);
+            assert!(!ack.dirty_drained);
+            assert!(ack.needs_retry);
+        }
+        other => panic!("expected invalidation ack, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

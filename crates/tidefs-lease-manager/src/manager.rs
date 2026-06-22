@@ -231,9 +231,52 @@ impl LeaseManager {
                 wait_policy,
             );
             if let Some(ref msg) = msg {
-                let result = bus.dispatch_invalidation_message(msg);
+                let mut result = bus.dispatch_invalidation_message(msg);
                 self.stats.invalidations_dispatched += 1;
-                Ok(result)
+                match wait_policy {
+                    InvalidationWaitPolicy::Advisory
+                    | InvalidationWaitPolicy::WaitForCleanEviction => {
+                        self.stats.invalidations_acked += 1;
+                        Ok(result)
+                    }
+                    InvalidationWaitPolicy::WaitForDirtyDrain => {
+                        let mut retries = 0usize;
+                        while !result.dirty_drained
+                            && retries < self.config.invalidation_max_retries
+                        {
+                            retries += 1;
+                            result = bus.dispatch_invalidation_message(msg);
+                            self.stats.invalidations_dispatched += 1;
+                        }
+
+                        if result.dirty_drained {
+                            self.stats.invalidations_acked += 1;
+                            Ok(result)
+                        } else {
+                            self.stats.invalidations_timed_out += 1;
+                            Err(LeaseManagerError::InvalidationTimeout(
+                                msg.dataset_id,
+                                msg.inode_id,
+                                retries,
+                            ))
+                        }
+                    }
+                    InvalidationWaitPolicy::FenceAndError => {
+                        if result.dirty_remaining > 0
+                            || !result.dirty_drained
+                            || result.needs_retry
+                        {
+                            self.stats.invalidations_fenced += 1;
+                            Err(LeaseManagerError::InvalidationFenced(
+                                msg.dataset_id,
+                                msg.inode_id,
+                            ))
+                        } else {
+                            self.stats.invalidations_acked += 1;
+                            Ok(result)
+                        }
+                    }
+                }
             } else {
                 // Domain doesn't map to page-cache invalidation; ok.
                 Ok(InvalidationResult::clean(0))
