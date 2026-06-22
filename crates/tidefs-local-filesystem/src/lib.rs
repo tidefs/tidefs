@@ -3923,10 +3923,15 @@ impl LocalFileSystem {
             OrphanEntryFlags::NONE
         };
         let entry = OrphanEntry::new(inode_id.get(), generation, nlink, flags);
+        let _orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
         self.orphan_index
             .lock()
             .unwrap()
-            .insert(inode_id.get(), entry)
+            .insert(inode_id.get(), entry);
+        self.write_admission.release(_orphan_md_permit)
+            .map_err(|e| FileSystemError::CorruptState {
+                reason: format!("failed to release metadata admission permit: {}", e),
+            })?
     }
 
     /// Queue an already tracked orphan for deferred background reclamation.
@@ -6012,7 +6017,12 @@ impl LocalFileSystem {
         updated.metadata_version = tick;
         // If nlink transitions from 0 to 1, the inode is no longer orphaned.
         if updated.nlink == 1 {
+            let _orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
             self.orphan_index.lock().unwrap().remove(inode_id.get());
+            self.write_admission.release(_orphan_md_permit)
+                .map_err(|e| FileSystemError::CorruptState {
+                    reason: format!("failed to release metadata admission permit: {}", e),
+                })?;
         }
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated.clone());
         self.inode_cache.borrow_mut().invalidate(inode_id);
@@ -8777,10 +8787,15 @@ impl LocalFileSystem {
                 record.nlink,
                 orphan_flags,
             );
+            let _orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
             self.orphan_index
                 .lock()
                 .unwrap()
                 .insert(entry.inode_id.get(), orphan_entry);
+            self.write_admission.release(_orphan_md_permit)
+                .map_err(|e| FileSystemError::CorruptState {
+                    reason: format!("failed to release metadata admission permit: {}", e),
+                })?;
             // Record nlink=0 in state so record_reclaim_delta can iterate
             // chunk keys for dedup refcount decrement (#6167).
             if let Some(stored) = Arc::make_mut(&mut self.state.inodes).get_mut(&entry.inode_id) {
@@ -9001,6 +9016,12 @@ impl LocalFileSystem {
             crate::namespace::rename::acquire_lock_order(old_parent_id, new_parent_id);
         // ── Steps 3-5: Mutation + commit ───────────────────────────
 
+        // Acquire a metadata-mutation admission permit before the rename
+        // mutation.  Push into pending_permits so rollback_mutation_delta
+        // can release it on error.  After commit_mutation succeeds, pop and
+        // release explicitly.
+        let rename_md_permit = self.write_admission.try_admit_metadata_mutation()?;
+        self.pending_permits.push(rename_md_permit);
         self.begin_mutation();
         // Re-verify both parents exist after lock acquisition.
         if !self.state.inodes.contains_key(&old_parent_id)
@@ -9191,7 +9212,17 @@ impl LocalFileSystem {
         self.mark_inode_metadata_dirty(old_parent_id);
         self.mark_dir_dirty(new_parent_id);
         self.mark_inode_metadata_dirty(new_parent_id);
-        self.commit_mutation(())
+        self.commit_mutation(())?;
+
+        // Release the metadata admission permit now that the rename
+        // is durably committed.
+        if let Some(permit) = self.pending_permits.pop() {
+            self.write_admission.release(permit)
+                .map_err(|e| FileSystemError::CorruptState {
+                    reason: format!("failed to release metadata admission permit: {}", e),
+                })?;
+        }
+        Ok(())
     }
 
     /// Determine the xattr namespace from the name prefix.

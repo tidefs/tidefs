@@ -703,6 +703,23 @@ impl AdmissionCharge {
             admitted_tick,
         }
     }
+
+    /// Construct a metadata-mutation charge.
+    ///
+    /// Metadata mutations (rename, link, unlink, orphan-index insert/remove)
+    /// consume queue slots but do not contribute to dirty-byte or dirty-op
+    /// caps.  Each metadata mutation counts as exactly one op so that
+    /// [`BudgetedQueue`] and permit-count caps still budget the mutation.
+    #[must_use]
+    pub const fn metadata_mutation(admitted_tick: u64) -> Self {
+        Self {
+            work_class: WorkClass::MetadataMutation,
+            primary_domain: ResourceDomain::Metadata,
+            dirty_bytes: 0,
+            dirty_ops: 1,
+            admitted_tick,
+        }
+    }
 }
 
 /// A linear admission token. Release it or move it into a [`BudgetedQueue`].
@@ -860,6 +877,46 @@ impl WriteAdmissionState {
         let permit_id = self.next_permit_id;
         self.next_permit_id = self.next_permit_id.saturating_add(1);
         Ok(AdmissionPermit::new(permit_id, charge))
+    }
+
+    /// Try to admit a metadata-mutation charge.
+    ///
+    /// Metadata mutations are gated on permit count (and, when enqueued
+    /// into a [`BudgetedQueue`], on queue slots) but are *not* counted
+    /// against dirty-byte, dirty-op, or dirty-age caps.  This means
+    /// rename, link, unlink, and orphan-index operations can proceed
+    /// even when the dirty-write budget is fully consumed, so long as
+    /// the metadata-mutation queue has capacity.
+    pub fn try_admit_metadata(
+        &mut self,
+        admitted_tick: u64,
+    ) -> Result<AdmissionPermit, AdmissionError> {
+        let new_permits = self
+            .usage
+            .outstanding_permits
+            .checked_add(1)
+            .ok_or(AdmissionError::PermitOverflow)?;
+        if new_permits > self.config.hard_max_permits {
+            return Err(AdmissionError::PermitHardCap {
+                in_use: self.usage.outstanding_permits,
+                requested: 1,
+                cap: self.config.hard_max_permits,
+            });
+        }
+
+        let new_ops = self
+            .usage
+            .dirty_ops
+            .checked_add(1)
+            .ok_or(AdmissionError::DirtyOpsOverflow)?;
+        self.usage.dirty_ops = new_ops;
+        self.usage.outstanding_permits = new_permits;
+        if self.usage.oldest_dirty_tick.is_none() {
+            self.usage.oldest_dirty_tick = Some(admitted_tick);
+        }
+        let permit_id = self.next_permit_id;
+        self.next_permit_id = self.next_permit_id.saturating_add(1);
+        Ok(AdmissionPermit::new(permit_id, AdmissionCharge::metadata_mutation(admitted_tick)))
     }
 
     /// Release an admission permit and return the released charge.
