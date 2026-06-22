@@ -63,8 +63,8 @@ Cross-referenced against `VfsEngine` trait at `crates/tidefs-vfs-engine/src/lib.
 
 | splice_read | **Wired** | C shim `tidefs_posix_vfs_file_splice_read` | `kernel_read` -> `.read` -> engine | Registered in `file_operations`. Allocates pages, reads file data via `kernel_read`, pipes via `splice_to_pipe`. Preserves extent/hole semantics through `.read` dispatch. |
 | splice_write | **Wired** | C shim `tidefs_posix_vfs_file_splice_write` | `__splice_from_pipe` + actor -> `kernel_write` -> `.write` -> engine | Registered in `file_operations`. Reads pipe buffers, delegates to `kernel_write` (which calls `.write`). Preserves extent allocation and hole semantics. |
-| lock (getlk) | Implemented | `src/lock.rs:11` | `engine.getlk()` | Returns None or conflicting LockSpec |
-| lock (setlk) | Implemented | `src/lock.rs:22` | `engine.setlk()` | Non-blocking advisory lock |
+| lock (getlk) | Implemented | `src/lock.rs:11`, `tidefs_posix_vfs_main.rs` | `engine.getlk()` | KernelEngine keeps normalized per-inode advisory byte-range locks and returns None or a conflicting LockSpec |
+| lock (setlk) | Implemented | `src/lock.rs:22`, `tidefs_posix_vfs_main.rs` | `engine.setlk()` | Non-blocking advisory lock; conflicts return EAGAIN, F_UNLCK removes or splits same-owner ranges |
 | flock | **Implemented, runtime validation required** | `src/lock.rs:44` | `engine.setlk()`/`engine.setlkw()` | Whole-file flock(2) dispatch (LOCK_SH/LOCK_EX/LOCK_UN/LOCK_NB) with fd-as-owner mapping to LockSpec. The old cargo validation harness is retired; mounted-kernel validation remains required. |
 | setlkw | OutOfScope | -- | -- | Blocking lock explicitly out of scope (lib.rs:47) |
 | setlease | **Implemented** | `tidefs_posix_vfs_shim.c` setlease callback | `tidefs_posix_vfs_setlease_nosupport()` | Lease/delegation refusal contract (NEXT-KTFS-035): returns -EOPNOTSUPP on every fcntl(F_SETLEASE/F_GETLEASE). |

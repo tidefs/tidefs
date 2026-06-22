@@ -108,9 +108,9 @@ These surfaces carry historical "Wave Zero" or pre-alpha stage language that no 
 ### 4.2 ENOSYS returns in kernel VFS module
 
 - **Surface**: `crates/tidefs-kmod-posix-vfs/tidefs_posix_vfs_main.rs:4574, 5539, 5701, 5709, 6376, 6384, 6486`
-  - Multiple VFS operations return ENOSYS: fallocate, fiemap, some xattr paths, etc.
-- Classification: **Implement** — these are gaps in kernel VFS operation coverage. Some are intentionally deferred (noted in review register).
-- Follow-up issue: #799 resolves or explicitly classifies the kernel VFS ENOSYS-returning operation paths under TFR-018.
+  - Current source review for #799 found fallocate, fiemap, and xattr paths are already wired outside those stale audit line numbers. The remaining target-file ENOSYS sites were fail-closed state paths (`getattr`, `read`, `write`, and `syncfs`) plus the `getlk`/`setlk` lock stubs.
+- Classification: **Implement** — #799 resolves the current target-file ENOSYS sites by returning `ENODEV` for missing mounted pool or block-I/O authority and by backing `getlk`/`setlk` with a kernel-engine advisory byte-range lock table. Blocking `setlkw` remains explicitly out of scope in `crates/tidefs-kmod-posix-vfs/VFS-OPS-GAP-ANALYSIS.md`.
+- Follow-up issue: #799 carries the implementation and focused validation record under TFR-018.
 
 ### 4.3 Kernel intent writer no-op stub
 
@@ -303,7 +303,7 @@ These surfaces are intentionally non-production and preserved for signal collect
 These surfaces were identified as stub/placeholder during the audit but already have active follow-up issues or are tracked by existing registers.
 
 - **TFR-017 transport/cluster authority** — covers `apps/tidefs-storage-node` cluster authority gap and `crates/tidefs-cluster` scaffolding; #793 and #794 track the endpoint and orchestrator placeholder surfaces identified here.
-- **TFR-018 kernel VFS xfstests** — covers kernel VFS ENOSYS returns and mount-path stubs; #799 tracks the ENOSYS operation-surface follow-up.
+- **TFR-018 kernel VFS xfstests** — covers kernel VFS mount-path runtime coverage; #799 resolves the current ENOSYS operation-surface follow-up, while broader mounted-kernel runtime proof remains under TFR-018.
 - **TFR-011 operator UAPI** — covers CLI command classification and admission gaps; existing operator UAPI issues #657, #658, #659, #660, and #662 carry current slices.
 - **TFR-019 doc authority** — covers Forgejo references and unclassified imported docs; #689 tracks the remaining documentation authority queue.
 - **Issue #276** — already deleted scaffold-transitional package roots.

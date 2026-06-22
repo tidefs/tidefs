@@ -143,6 +143,14 @@ struct LiveCollapseCursor {
     logical_before: u64,
 }
 
+const ADVISORY_LOCK_SEEK_SET: u32 = 0;
+
+#[derive(Clone, Copy)]
+struct AdvisoryLockEntry {
+    inode: crate::tidefs_kmod_bridge::kernel_types::InodeId,
+    lock: crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+}
+
 struct KernelEngine {
     statfs: Option<KernelEngineStatfs>,
     /// Latest committed root set by mount/txg paths, used by txg_commit_barrier.
@@ -220,6 +228,9 @@ struct KernelEngine {
     /// Open file handle reference counts per inode (ino -> open_count).
     /// Drives open-unlink lifecycle: nlink==0 inodes with open handles stay alive.
     open_fds: RefCell<crate::tidefs_kmod_bridge::kernel_types::KmodVec<(u64, u32)>>,
+    /// Mounted-engine POSIX advisory byte-range locks.
+    advisory_locks:
+        RefCell<crate::tidefs_kmod_bridge::kernel_types::KmodVec<AdvisoryLockEntry>>,
     xattr_stores: RefCell<
         crate::tidefs_kmod_bridge::kernel_types::KmodVec<(
             u64,
@@ -255,6 +266,9 @@ impl KernelEngine {
             intent_log_tail: Cell::new(0),
             intent_buffer: RefCell::new(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()),
             open_fds: RefCell::new(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()),
+            advisory_locks: RefCell::new(
+                crate::tidefs_kmod_bridge::kernel_types::KmodVec::new(),
+            ),
             xattr_stores: RefCell::new(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()),
         }
     }
@@ -283,6 +297,9 @@ impl KernelEngine {
             xattr_stores: RefCell::new(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()),
             intent_buffer: RefCell::new(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()),
             open_fds: RefCell::new(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()),
+            advisory_locks: RefCell::new(
+                crate::tidefs_kmod_bridge::kernel_types::KmodVec::new(),
+            ),
         }
     }
 
@@ -319,6 +336,9 @@ impl KernelEngine {
             intent_log_tail: Cell::new(0),
             intent_buffer: RefCell::new(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()),
             open_fds: RefCell::new(crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()),
+            advisory_locks: RefCell::new(
+                crate::tidefs_kmod_bridge::kernel_types::KmodVec::new(),
+            ),
         }
     }
 
@@ -357,6 +377,162 @@ impl KernelEngine {
         stores.push((ino, crate::tidefs_kmod_bridge::kernel_types::KmodVec::new()));
 
         stores.len() - 1
+    }
+
+    fn normalize_advisory_lock(
+        lock: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+    ) -> crate::tidefs_kmod_bridge::kernel_types::LockSpec {
+        let mut normalized = *lock;
+        if normalized.end == 0 {
+            normalized.end = u64::MAX;
+        }
+        normalized
+    }
+
+    fn validate_advisory_lock(
+        lock: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        use crate::tidefs_kmod_bridge::kernel_types::{Errno, F_RDLCK, F_UNLCK, F_WRLCK};
+
+        match lock.typ {
+            F_RDLCK | F_WRLCK | F_UNLCK => {}
+            _ => return Err(Errno::EINVAL),
+        }
+        if lock.whence != ADVISORY_LOCK_SEEK_SET {
+            return Err(Errno::EINVAL);
+        }
+        if lock.end <= lock.start {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    fn advisory_lock_overlaps(
+        left: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+        right: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+    ) -> bool {
+        left.start < right.end && right.start < left.end
+    }
+
+    fn advisory_locks_conflict(
+        existing: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+        requested: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+    ) -> bool {
+        use crate::tidefs_kmod_bridge::kernel_types::{F_RDLCK, F_UNLCK};
+
+        existing.pid != requested.pid
+            && existing.typ != F_UNLCK
+            && requested.typ != F_UNLCK
+            && Self::advisory_lock_overlaps(existing, requested)
+            && !(existing.typ == F_RDLCK && requested.typ == F_RDLCK)
+    }
+
+    fn push_advisory_lock_entry(
+        out: &mut crate::tidefs_kmod_bridge::kernel_types::KmodVec<AdvisoryLockEntry>,
+        entry: AdvisoryLockEntry,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        let before = out.len();
+        out.push(entry);
+        if out.len() == before {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
+        }
+        Ok(())
+    }
+
+    fn find_advisory_lock_conflict(
+        &self,
+        inode: crate::tidefs_kmod_bridge::kernel_types::InodeId,
+        requested: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+    ) -> Option<crate::tidefs_kmod_bridge::kernel_types::LockSpec> {
+        self.advisory_locks
+            .borrow()
+            .iter()
+            .find(|entry| {
+                entry.inode == inode && Self::advisory_locks_conflict(&entry.lock, requested)
+            })
+            .map(|entry| entry.lock)
+    }
+
+    fn require_advisory_lock_inode(
+        &self,
+        inode: crate::tidefs_kmod_bridge::kernel_types::InodeId,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        use crate::tidefs_kmod_bridge::kernel_types::Errno;
+
+        let ino = inode.get();
+        if ino == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if self.find_inode(ino).is_some() {
+            return Ok(());
+        }
+
+        let Some(ref pool_core) = self.pool_core else {
+            return Err(Errno::ENODEV);
+        };
+        if !pool_core.is_mounted() {
+            return Err(Errno::ENODEV);
+        }
+        let io_ctx = pool_core.committed_root_io_ctx();
+        let Some(read_fn) = io_ctx.read_sectors_fn else {
+            return Err(Errno::ENODEV);
+        };
+        let ss = Self::valid_sector_size(io_ctx.sector_size)? as u64;
+        let record = self.read_inode_record(ino, &io_ctx, read_fn, ss)?;
+        if record.nlink == 0 && record.generation == 0 && record.mode == 0 {
+            return Err(Errno::ENOENT);
+        }
+        Ok(())
+    }
+
+    fn replace_advisory_lock_range(
+        &self,
+        inode: crate::tidefs_kmod_bridge::kernel_types::InodeId,
+        requested: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+        new_lock: Option<crate::tidefs_kmod_bridge::kernel_types::LockSpec>,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        let old = self.advisory_locks.borrow();
+        let mut next = crate::tidefs_kmod_bridge::kernel_types::KmodVec::new();
+
+        for entry in old.iter() {
+            if entry.inode != inode
+                || entry.lock.pid != requested.pid
+                || !Self::advisory_lock_overlaps(&entry.lock, requested)
+            {
+                Self::push_advisory_lock_entry(&mut next, *entry)?;
+                continue;
+            }
+
+            if entry.lock.start < requested.start {
+                let mut left = entry.lock;
+                left.end = requested.start;
+                Self::push_advisory_lock_entry(&mut next, AdvisoryLockEntry { inode, lock: left })?;
+            }
+
+            if requested.end < entry.lock.end {
+                let mut right = entry.lock;
+                right.start = requested.end;
+                Self::push_advisory_lock_entry(
+                    &mut next,
+                    AdvisoryLockEntry { inode, lock: right },
+                )?;
+            }
+        }
+        if let Some(lock) = new_lock {
+            Self::push_advisory_lock_entry(&mut next, AdvisoryLockEntry { inode, lock })?;
+        }
+        drop(old);
+
+        *self.advisory_locks.borrow_mut() = next;
+        Ok(())
+    }
+
+    fn unlock_advisory_lock_range(
+        &self,
+        inode: crate::tidefs_kmod_bridge::kernel_types::InodeId,
+        requested: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+    ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
+        self.replace_advisory_lock_range(inode, requested, None)
     }
     pub fn set_committed_root(&self, root: crate::tidefs_kmod_bridge::kernel_types::CommittedRoot) {
         self.committed_root.set(Some(root));
@@ -2520,6 +2696,9 @@ impl KernelEngine {
         self.open_fds
             .borrow_mut()
             .retain(|(open_ino, _)| *open_ino != ino);
+        self.advisory_locks
+            .borrow_mut()
+            .retain(|entry| entry.inode.get() != ino);
         let inode = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(ino);
         self.clear_live_extents_dirty(inode);
         self.invalidate_live_collapse_cursor(inode);
@@ -4570,8 +4749,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         let io_ctx = pool_core.committed_root_io_ctx();
         let Some(read_fn) = io_ctx.read_sectors_fn else {
             // Read callback not registered (cargo test path without C shim).
-            // Fall back to ENOSYS; tests use MockEngine, not KernelEngine.
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOSYS);
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
         };
 
         // Resolve VRBT pointers on first use (cached in Cell<u64>).
@@ -5536,7 +5714,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         };
         let io_ctx = pool_core.committed_root_io_ctx();
         let Some(read_fn) = io_ctx.read_sectors_fn else {
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOSYS);
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
         };
         let ss = io_ctx.sector_size as u64;
         let ino = fh.inode_id.get();
@@ -5692,13 +5870,13 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
             return self.stage_live_inode_write(fh.inode_id, offset, data);
         }
 
-        // Bootstrap-mode write path: when no block I/O callbacks are
-        // registered, stage writes in the in-memory write_buffer.
-        // This lets the kernel page-cache writeback path exercise
-        // dirty-page tracking and writepages dispatch without a
-        // real block device.
+        // Disk-backed writes require both block-device callbacks: write
+        // for data persistence and read for extent/inode-table metadata.
+        // Without those callbacks the engine is not mounted with usable
+        // storage authority, so fail closed instead of treating write as
+        // an unimplemented VFS operation.
         let Some(write_fn) = io_ctx.write_sectors_fn else {
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOSYS);
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
         };
         let ss = io_ctx.sector_size as u64;
 
@@ -5706,7 +5884,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         // Use the read callback for inode-table reads; the write path
         // needs the read-side to resolve extent metadata.
         let Some(read_fn) = io_ctx.read_sectors_fn else {
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOSYS);
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
         };
         let record = match self.read_inode_record(ino, &io_ctx, read_fn, ss) {
             Ok(rec) => rec,
@@ -6366,22 +6544,37 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
     }
     fn getlk(
         &self,
-        _inode: crate::tidefs_kmod_bridge::kernel_types::InodeId,
-        _lock: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+        inode: crate::tidefs_kmod_bridge::kernel_types::InodeId,
+        lock: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
         _ctx: &crate::tidefs_kmod_bridge::kernel_types::RequestCtx,
     ) -> core::result::Result<
         Option<crate::tidefs_kmod_bridge::kernel_types::LockSpec>,
         crate::tidefs_kmod_bridge::kernel_types::Errno,
     > {
-        Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOSYS)
+        let lock = Self::normalize_advisory_lock(lock);
+        Self::validate_advisory_lock(&lock)?;
+        self.require_advisory_lock_inode(inode)?;
+        if lock.typ == crate::tidefs_kmod_bridge::kernel_types::F_UNLCK {
+            return Ok(None);
+        }
+        Ok(self.find_advisory_lock_conflict(inode, &lock))
     }
     fn setlk(
         &self,
-        _inode: crate::tidefs_kmod_bridge::kernel_types::InodeId,
-        _lock: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
+        inode: crate::tidefs_kmod_bridge::kernel_types::InodeId,
+        lock: &crate::tidefs_kmod_bridge::kernel_types::LockSpec,
         _ctx: &crate::tidefs_kmod_bridge::kernel_types::RequestCtx,
     ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
-        Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOSYS)
+        let lock = Self::normalize_advisory_lock(lock);
+        Self::validate_advisory_lock(&lock)?;
+        self.require_advisory_lock_inode(inode)?;
+        if lock.typ == crate::tidefs_kmod_bridge::kernel_types::F_UNLCK {
+            return self.unlock_advisory_lock_range(inode, &lock);
+        }
+        if self.find_advisory_lock_conflict(inode, &lock).is_some() {
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EAGAIN);
+        }
+        self.replace_advisory_lock_range(inode, &lock, Some(lock))
     }
     /// Writeback dirty data through KernelPoolCore I/O authority.
     ///
@@ -6483,7 +6676,7 @@ impl crate::tidefs_kmod_bridge::kernel_types::VfsEngine for KernelEngine {
         _ctx: &crate::tidefs_kmod_bridge::kernel_types::RequestCtx,
     ) -> core::result::Result<(), crate::tidefs_kmod_bridge::kernel_types::Errno> {
         if !self.pool_is_mounted() {
-            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOSYS);
+            return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENODEV);
         }
         self.flush_live_write_buffer_to_storage(None, 0, 0)?;
         self.txg_commit_barrier()
@@ -6820,15 +7013,6 @@ pub extern "C" fn tidefs_posix_vfs_engine_sync_fs(wait: core::ffi::c_int) -> cor
         Ok(()) => {
             kernel::pr_info!(
                 "tidefs_posix_vfs: engine sync_fs: syncfs completed (wait={})\n",
-                wait,
-            );
-            0
-        }
-        Err(e) if !initialized && e == crate::tidefs_kmod_bridge::kernel_types::Errno::ENOSYS => {
-            let errno_val: u16 = e.0;
-            kernel::pr_info!(
-                "tidefs_posix_vfs: engine sync_fs: syncfs returned {} (tolerated; no dirty mounted engine state; wait={})\n",
-                errno_val,
                 wait,
             );
             0
