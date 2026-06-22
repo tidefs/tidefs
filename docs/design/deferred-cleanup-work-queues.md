@@ -539,13 +539,20 @@ Each Phase 4–7 wire-up issue should follow this charter:
 2. **Write set**: The crate(s) to be modified, with explicit file paths.
 4. **Dependencies**: All prerequisite issues must be closed before the wire-up
    issue leaves `codex:ready`.
-6. **Closeout**: Update `docs/STATUS.md` and `docs/FEATURE_MATRIX.md` when
-   capability state changes.
+6. **Closeout**: Record changed capability state on current authority surfaces:
+   the owning GitHub issue or pull request, relevant review/debt or
+   documentation-authority entries such as `docs/REVIEW_TODO_REGISTER.md`,
+   `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, or `docs/WHOLE_REPO_REVIEW.md`,
+   and claim/evidence records such as `validation/claims.toml` when
+   publishing-facing claims change. The old `docs/STATUS.md` and
+   `docs/FEATURE_MATRIX.md` closeout targets were historical plan residue;
+   those deleted files are not current closeout destinations.
 
 
 The xtask gate `tidefs-xtask check-deferred-cleanup` verifies:
 
-1. Spec, feature matrix, and status entries present.
+1. Spec authority, owning GitHub issue or pull-request evidence, and any
+   required review/debt, documentation-authority, or claims entries present.
 2. Phase 1 types compile with `no_std` + optional `alloc`.
 3. `CleanupWorkItemV1` round-trip: serialize → deserialize → assert equality.
 4. `CleanupQueue` operations: insert → dequeue → verify ordering.
