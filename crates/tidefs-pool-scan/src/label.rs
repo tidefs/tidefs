@@ -417,7 +417,7 @@ impl LabelReader {
             u64::from_le_bytes(buf[371..379].try_into().unwrap());
         let has_device_layout =
             features_compat & features::DEVICE_LAYOUT_V1 != 0;
-        let mut full = if has_device_layout {
+        let full = if has_device_layout {
             let mut v = buf.to_vec();
             v.resize(POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE, 0);
             if file
