@@ -9202,7 +9202,7 @@ impl LocalFileSystem {
             // ── Plain rename / RENAME_NOREPLACE ────────────────────
             // Handle overwritten destination
             if let Some(target) = new_entry {
-                let target_record = match self.inode(target.inode_id).cloned() {
+                let target_record = match self.inode(target.inode_id) {
                     Ok(record) => record,
                     Err(err) => {
                         self.rollback_mutation_delta_and_release_metadata_permit(
