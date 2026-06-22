@@ -10,8 +10,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use tidefs_types_pool_label_core::{
-    decode_label, verify_label_checksum, LabelError, PoolLabelV1, POOL_LABEL_MAGIC,
-    POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    decode_label, features, verify_label_checksum, LabelError, PoolLabelV1,
+    POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 
 use crate::{decode_completed_evacuations_label_extension, CompletedEvacuation};
@@ -393,6 +394,10 @@ impl LabelReader {
             return LabelReadOutcome::NoLabel;
         }
 
+        // Read base label bytes (up to POOL_LABEL_V1_EXT_WIRE_SIZE).
+        // If the DEVICE_LAYOUT_V1 compat bit is set, read the
+        // additional sidecar bytes so decode_label receives a
+        // complete buffer.
         let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         if file.read_exact(&mut buf).is_err() {
             return LabelReadOutcome::NoLabel;
@@ -408,8 +413,26 @@ impl LabelReader {
             return LabelReadOutcome::NoLabel;
         }
 
+        let features_compat =
+            u64::from_le_bytes(buf[371..379].try_into().unwrap());
+        let has_device_layout =
+            features_compat & features::DEVICE_LAYOUT_V1 != 0;
+        let mut full = if has_device_layout {
+            let mut v = buf.to_vec();
+            v.resize(POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE, 0);
+            if file
+                .read_exact(&mut v[POOL_LABEL_V1_EXT_WIRE_SIZE..])
+                .is_err()
+            {
+                return LabelReadOutcome::NoLabel;
+            }
+            v
+        } else {
+            buf.to_vec()
+        };
+
         // Attempt full decode (includes BLAKE3 checksum verification).
-        match decode_label(&buf) {
+        match decode_label(&full) {
             Ok(label) => {
                 // Double-check with standalone BLAKE3 verification.
                 // The decode_label function already verified, but we
@@ -440,6 +463,8 @@ impl LabelReader {
             return Ok(None);
         }
 
+        // Read base label bytes and, if DEVICE_LAYOUT_V1 is set, the
+        // sidecar extension so decode_label has a complete buffer.
         let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
         if file.read_exact(&mut buf).is_err() {
             return Ok(None);
@@ -452,10 +477,28 @@ impl LabelReader {
         if magic != POOL_LABEL_MAGIC {
             return Ok(None);
         }
-        decode_label(&buf).map_err(|e| format!("label decode failed: {e}"))?;
+        let features_compat =
+            u64::from_le_bytes(buf[371..379].try_into().unwrap());
+        let has_device_layout =
+            features_compat & features::DEVICE_LAYOUT_V1 != 0;
+        let wire_size = if has_device_layout {
+            POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
+        } else {
+            POOL_LABEL_V1_EXT_WIRE_SIZE
+        };
+        let mut full = buf.to_vec();
+        full.resize(wire_size, 0);
+        if has_device_layout
+            && file
+                .read_exact(&mut full[POOL_LABEL_V1_EXT_WIRE_SIZE..])
+                .is_err()
+        {
+            return Ok(None);
+        }
+        decode_label(&full).map_err(|e| format!("label decode failed: {e}"))?;
 
         let extension_len =
-            (self.config.label_area_bytes as usize).saturating_sub(POOL_LABEL_V1_EXT_WIRE_SIZE);
+            (self.config.label_area_bytes as usize).saturating_sub(wire_size);
         let mut extension = Vec::new();
         file.take(extension_len as u64)
             .read_to_end(&mut extension)
