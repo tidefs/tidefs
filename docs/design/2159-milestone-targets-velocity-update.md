@@ -1,8 +1,8 @@
 # Milestone Targets — Velocity-Based Update (#2159)
 
 **Issue**: [#2159](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2159)
-**Status**: design-spec
-**Maturity**: **design-spec** — milestone target refresh against current May 2026 velocity assessment
+**Imported status**: design-spec (historical May 2026 design state; not current TideFS status authority)
+**Imported maturity**: **design-spec** — historical milestone-target classification, not feature-matrix authority
 **Priority**: P2
 **Lane**: coordination / storage-core
 **Depends on**: #2116 (prior milestone targets), #2144 (prior status snapshot), #2054 (coordination pipeline)
@@ -340,13 +340,13 @@ runtime integration (7 downstream issues).
 
 | Field | Source | Update Cadence |
 |-------|--------|---------------|
-| `open_issues` | Forgejo API `/issues?state=open` | Per snapshot |
-| `design_completion_pct` | 11-layer matrix status | Per milestone-target refresh |
-| `impl_completion_pct` | FEATURE_MATRIX maturity | Per milestone-target refresh |
-| `closure_rate_daily` | STATUS.md diff between snapshots | Per coordination cycle |
+| `open_issues` | GitHub issue search/API for `tidefs/tidefs` | Per snapshot |
+| `design_completion_pct` | Current GitHub issue state plus repo docs classified as current authority | Per milestone-target refresh |
+| `impl_completion_pct` | Current GitHub issue/PR evidence, source evidence, and claim/repo-doc authority | Per milestone-target refresh |
+| `closure_rate_daily` | GitHub issue/PR close events between snapshots | Per coordination cycle |
 | `critical_path_depth` | Dependency graph traversal | Per milestone-target refresh |
-| `ready_issue_count` | Forgejo API (label filter) | Per snapshot |
-| `blocked_issue_count` | Forgejo API (label filter) | Per snapshot |
+| `ready_issue_count` | GitHub issue search/API using current readiness labels | Per snapshot |
+| `blocked_issue_count` | GitHub issue search/API using current blocker labels | Per snapshot |
 
 ### 7.2 Alert Thresholds
 
@@ -362,24 +362,39 @@ runtime integration (7 downstream issues).
 
 ## 8. Integration with Existing Artifacts
 
-### 8.1 STATUS.md
+### 8.1 Current Status Authority
 
-Each milestone-target refresh writes an entry into STATUS.md with:
+This imported May 2026 design modeled milestone-target refreshes as entries in
+the deleted `docs/STATUS.md`. That output path is historical only. Current
+TideFS coordination/status authority lives in GitHub issues and pull requests,
+with durable repo-doc classification recorded through
+`docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, `docs/REVIEW_TODO_REGISTER.md`, and
+other documents classified there as current policy or current spec.
+
+Any revived milestone-target refresh should publish through those current
+authorities with:
 - Current velocity assessment
 - Updated milestone table
 - Critical path status
 - Recommended next actions
 
-### 8.2 FEATURE_MATRIX.md
+### 8.2 Current Implementation Evidence Authority
 
-When a milestone gate passes, the FEATURE_MATRIX.md `Maturity` column advances
-in the gated layer set.
+This design also assumed the deleted `docs/FEATURE_MATRIX.md` as the milestone
+implementation-output surface. That maturity column is historical input only.
+Milestone gate evidence must now come from live GitHub issue/PR state, current
+source and validation evidence, and repo docs classified as current authority;
+do not advance or cite the deleted feature matrix as current implementation
+status.
 
-### 8.3 11-Layer Dependency Matrix
+### 8.3 Historical 11-Layer Dependency Matrix
 
-The matrix at `docs/design/11-layer-architecture-dependency-matrix.md` is the
-authoritative source for per-issue status. Milestone targets are derived from
-it; when the matrix is updated, milestone projections should be recalculated.
+In the imported model, the matrix at
+`docs/design/11-layer-architecture-dependency-matrix.md` acted as the per-issue
+status input. Current coordination authority is live GitHub issue/PR state plus
+repo docs that have been classified as current policy or current spec. Use the
+matrix as historical design input unless a later source and evidence review
+promotes the specific rows needed for current authority.
 
 ---
 
@@ -397,5 +412,5 @@ it; when the matrix is updated, milestone projections should be recalculated.
 ## 10. Gate
 
 - `cargo check --workspace` — passes (design document only; no Rust source changes).
-- Maturity: **design-spec**. Milestone targets set; Rust implementation deferred to wire-up issues.
+- Historical classification: imported **design-spec** milestone-target update. Current status authority for this document is `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`; Rust implementation remains deferred to follow-up GitHub issues and pull requests.
 - Closes: #2159
