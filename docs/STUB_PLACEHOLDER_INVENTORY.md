@@ -132,7 +132,7 @@ These are not stubs in the traditional sense (they contain real code and tests),
 | Package | Issue | Role | Lines (lib.rs) | Notes |
 | --- | --- | --- | ---: | --- |
 | `tidefs-anti-entropy-auditor` | [#815](https://github.com/tidefs/tidefs/issues/815) | product-code | 1425 | Merkle tree exchange, comparator, scan scheduler; needs runtime validation |
-| `tidefs-block-kmod` | [#816](https://github.com/tidefs/tidefs/issues/816) | adapter-operator | — | Kernel block adapter; needs kernel-build validation |
+| `tidefs-block-kmod` | [#816](https://github.com/tidefs/tidefs/issues/816) | adapter-operator | — | Authority established; kernel-build validation deferred to release gate |
 | `tidefs-compaction` | [#817](https://github.com/tidefs/tidefs/issues/817) | product-code | 2693 | Full compaction engine with checkpoint/resume; needs runtime validation |
 | `tidefs-crash-oracle` | [#818](https://github.com/tidefs/tidefs/issues/818) | proof-harness | 1827 | Model-only crash matrix and runtime report; needs runtime-matrix coverage |
 | `tidefs-data-cleaner` | [#819](https://github.com/tidefs/tidefs/issues/819) | product-code | 684 | Cleanup work queue integration; needs runtime validation |
