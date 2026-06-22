@@ -3,10 +3,10 @@
 /// and intent-log integration for the TideFS compaction engine.
 ///
 /// This module bridges the gap between the segment-cleaner's victim selection
-/// and the reclaim-queue's space reclamation.  It wraps [`CompactionRun`] with
-/// crash-safe checkpointing, a [`SegmentReclaimer`] that enqueues freed
-/// extents into the [`ReclaimQueueLedger`], and a [`CompactionDriver`] that
-/// orchestrates full compaction passes.
+/// and the reclaim-queue's space reclamation. It wraps [`CompactionRun`] with
+/// crash-safe checkpointing and records verified source-release candidates.
+/// [`SegmentReclaimer`] remains available for callers that already have real
+/// physical extents; the driver itself does not fabricate allocator records.
 use blake3::Hasher;
 
 use crate::{
@@ -38,7 +38,42 @@ pub struct CompactionCheckpoint {
     pub pass_number: u64,
 }
 
+/// Errors returned when decoding a durable [`CompactionCheckpoint`] record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompactionCheckpointDecodeError {
+    /// Encoded data length did not match the fixed checkpoint format.
+    InvalidLength { expected: usize, actual: usize },
+    /// The encoded checkpoint version is not supported by this crate.
+    UnsupportedVersion(u8),
+    /// The BLAKE3 integrity footer did not match the checkpoint body.
+    IntegrityMismatch,
+}
+
+impl core::fmt::Display for CompactionCheckpointDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidLength { expected, actual } => {
+                write!(
+                    f,
+                    "invalid compaction checkpoint length: expected {expected}, got {actual}"
+                )
+            }
+            Self::UnsupportedVersion(version) => {
+                write!(f, "unsupported compaction checkpoint version {version}")
+            }
+            Self::IntegrityMismatch => write!(f, "compaction checkpoint integrity mismatch"),
+        }
+    }
+}
+
 impl CompactionCheckpoint {
+    const WIRE_VERSION: u8 = 1;
+    const HASH_DOMAIN: &'static [u8] = b"TideFS compaction checkpoint v1";
+    const BODY_LEN: usize = 1 + (5 * 8);
+
+    /// Fixed encoded checkpoint length.
+    pub const ENCODED_LEN: usize = Self::BODY_LEN + 32;
+
     /// Create a fresh checkpoint at the start of a new pass.
     #[must_use]
     pub const fn new(pass_number: u64) -> Self {
@@ -65,12 +100,83 @@ impl CompactionCheckpoint {
         self.objects_relocated = self.objects_relocated.saturating_add(objects);
         self.bytes_relocated = self.bytes_relocated.saturating_add(bytes);
     }
+
+    /// Encode this checkpoint as a versioned BLAKE3-sealed byte record.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(Self::BODY_LEN);
+        body.push(Self::WIRE_VERSION);
+        body.extend_from_slice(&self.last_committed_segment.to_le_bytes());
+        body.extend_from_slice(&self.segments_processed.to_le_bytes());
+        body.extend_from_slice(&self.objects_relocated.to_le_bytes());
+        body.extend_from_slice(&self.bytes_relocated.to_le_bytes());
+        body.extend_from_slice(&self.pass_number.to_le_bytes());
+
+        let mut encoded = body.clone();
+        encoded.extend_from_slice(&Self::hash_body(&body));
+        encoded
+    }
+
+    /// Decode and verify a durable checkpoint record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactionCheckpointDecodeError`] when the record length,
+    /// version, or integrity footer does not match the checkpoint format.
+    pub fn decode(data: &[u8]) -> Result<Self, CompactionCheckpointDecodeError> {
+        if data.len() != Self::ENCODED_LEN {
+            return Err(CompactionCheckpointDecodeError::InvalidLength {
+                expected: Self::ENCODED_LEN,
+                actual: data.len(),
+            });
+        }
+        if data[0] != Self::WIRE_VERSION {
+            return Err(CompactionCheckpointDecodeError::UnsupportedVersion(data[0]));
+        }
+
+        let body = &data[..Self::BODY_LEN];
+        let expected_hash = &data[Self::BODY_LEN..];
+        let actual_hash = Self::hash_body(body);
+        if &actual_hash[..] != expected_hash {
+            return Err(CompactionCheckpointDecodeError::IntegrityMismatch);
+        }
+
+        let mut offset = 1usize;
+        let last_committed_segment = take_u64(body, &mut offset);
+        let segments_processed = take_u64(body, &mut offset);
+        let objects_relocated = take_u64(body, &mut offset);
+        let bytes_relocated = take_u64(body, &mut offset);
+        let pass_number = take_u64(body, &mut offset);
+
+        Ok(Self {
+            last_committed_segment,
+            segments_processed,
+            objects_relocated,
+            bytes_relocated,
+            pass_number,
+        })
+    }
+
+    fn hash_body(body: &[u8]) -> [u8; 32] {
+        let mut hasher = Hasher::new();
+        hasher.update(Self::HASH_DOMAIN);
+        hasher.update(body);
+        hasher.finalize().into()
+    }
 }
 
 impl Default for CompactionCheckpoint {
     fn default() -> Self {
         Self::zero()
     }
+}
+
+fn take_u64(bytes: &[u8], offset: &mut usize) -> u64 {
+    let mut word = [0u8; 8];
+    let next = offset.saturating_add(8);
+    word.copy_from_slice(&bytes[*offset..next]);
+    *offset = next;
+    u64::from_le_bytes(word)
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +372,11 @@ pub struct CompactionPassReport {
     pub candidates_considered: usize,
     /// Segments fully relocated and freed.
     pub segments_freed: u64,
+    /// Verified source segments that are release candidates after compaction.
+    ///
+    /// These are not allocator free extents. The cleaner/object-store commit
+    /// boundary owns physical release after it has concrete extent metadata.
+    pub source_release_candidates: Vec<u64>,
     /// Segments partially relocated (not fully freed).
     pub segments_partial: u64,
     /// Total objects relocated.
@@ -291,11 +402,12 @@ pub struct CompactionPassReport {
 // ---------------------------------------------------------------------------
 
 /// High-level driver that runs a complete compaction pass: selects
-/// candidate segments, relocates live objects, enqueues freed extents,
-/// and persists crash-safe checkpoints.
+/// candidate segments, relocates live objects, records verified
+/// source-release candidates, and advances crash-safe checkpoints.
 ///
 /// Wraps [`CompactionRun`] for the selection+relocation phase and
-/// [`SegmentReclaimer`] for the reclaim-queue bridge.
+/// keeps a [`SegmentReclaimer`] handle for callers that separately hold
+/// concrete physical extents.
 pub struct CompactionDriver<'q, S: CompactionStore> {
     run: CompactionRun<'q, S>,
     reclaimer: SegmentReclaimer<'q>,
@@ -331,6 +443,12 @@ impl<'q, S: CompactionStore> CompactionDriver<'q, S> {
         self
     }
 
+    /// Return the transaction group associated with generated reports.
+    #[must_use]
+    pub const fn current_txg(&self) -> u64 {
+        self.current_txg
+    }
+
     /// Resume from a previous [`CompactionCheckpoint`].
     #[must_use]
     pub fn with_checkpoint(mut self, checkpoint: CompactionCheckpoint) -> Self {
@@ -347,8 +465,8 @@ impl<'q, S: CompactionStore> CompactionDriver<'q, S> {
     ///
     /// 1. Select candidate segments.
     /// 2. For each candidate, relocate live objects via `CompactionRun`.
-    /// 3. Enqueue freed extents into the reclaim-queue ledger.
-    /// 4. Notify the filesystem layer of relocations.
+    /// 3. Record source segments that passed rewrite verification.
+    /// 4. Leave physical release to the cleaner/object-store boundary.
     /// 5. Advance the crash-safe checkpoint.
     ///
     /// Returns a [`CompactionPassReport`] summarizing the pass.
@@ -358,18 +476,7 @@ impl<'q, S: CompactionStore> CompactionDriver<'q, S> {
     ) -> CompactionPassReport {
         let tick_report = self.run.run_tick_with_trigger(trigger_input);
 
-        // Enqueue freed-segment extents into the reclaim-queue ledger.
-        let freed_count = tick_report.segments_freed;
-        for _ in 0..freed_count {
-            let extent = FreedExtent::new(
-                0,         // device_id — supplied by caller via store layer
-                0,         // physical_offset
-                0,         // length
-                [0u8; 32], // blake3_hash
-                self.current_txg,
-            );
-            self.reclaimer.enqueue_extent(extent);
-        }
+        let source_release_candidates = tick_report.source_release_candidates.clone();
 
         // Advance the checkpoint.
         self.checkpoint.pass_number = self.checkpoint.pass_number.saturating_add(1);
@@ -386,6 +493,9 @@ impl<'q, S: CompactionStore> CompactionDriver<'q, S> {
             .checkpoint
             .bytes_relocated
             .saturating_add(tick_report.bytes_relocated);
+        if let Some(last_committed) = source_release_candidates.last().copied() {
+            self.checkpoint.last_committed_segment = last_committed;
+        }
 
         let extents_enqueued = self.reclaimer.extents_enqueued;
         let bytes_enqueued = self.reclaimer.bytes_enqueued;
@@ -393,6 +503,7 @@ impl<'q, S: CompactionStore> CompactionDriver<'q, S> {
         CompactionPassReport {
             candidates_considered: tick_report.candidates_considered,
             segments_freed: tick_report.segments_freed,
+            source_release_candidates,
             segments_partial: tick_report.segments_partial,
             objects_relocated: tick_report.objects_relocated,
             bytes_relocated: tick_report.bytes_relocated,
@@ -597,6 +708,41 @@ mod tests {
         assert_eq!(cp1, cp2);
     }
 
+    #[test]
+    fn checkpoint_encode_decode_roundtrip() {
+        let mut cp = CompactionCheckpoint::new(7);
+        cp.advance(42, 5, 8192);
+
+        let encoded = cp.encode();
+        assert_eq!(encoded.len(), CompactionCheckpoint::ENCODED_LEN);
+        let decoded = CompactionCheckpoint::decode(&encoded).unwrap();
+        assert_eq!(decoded, cp);
+    }
+
+    #[test]
+    fn checkpoint_decode_rejects_corruption() {
+        let cp = CompactionCheckpoint::new(3);
+        let mut encoded = cp.encode();
+        encoded[12] ^= 0x80;
+
+        assert_eq!(
+            CompactionCheckpoint::decode(&encoded),
+            Err(CompactionCheckpointDecodeError::IntegrityMismatch)
+        );
+    }
+
+    #[test]
+    fn checkpoint_decode_rejects_unknown_version() {
+        let cp = CompactionCheckpoint::new(3);
+        let mut encoded = cp.encode();
+        encoded[0] = 2;
+
+        assert_eq!(
+            CompactionCheckpoint::decode(&encoded),
+            Err(CompactionCheckpointDecodeError::UnsupportedVersion(2))
+        );
+    }
+
     // ------------------------------------------------------------------
     // SegmentReclaimer tests
     // ------------------------------------------------------------------
@@ -768,8 +914,16 @@ mod tests {
         assert_eq!(report.candidates_considered, 3);
         assert_eq!(report.policy_report.admitted_reclaimable_bytes, 195_000);
         assert_eq!(report.segments_freed, 3);
+        assert_eq!(report.source_release_candidates.len(), 3);
         assert_eq!(report.objects_relocated, 3);
         assert!(report.errors == 0);
+        assert_eq!(
+            report.checkpoint.last_committed_segment,
+            *report.source_release_candidates.last().unwrap()
+        );
+        assert_eq!(report.extents_enqueued, 0);
+        assert_eq!(report.bytes_enqueued, 0);
+        assert_eq!(driver.reclaimer().ledger().len(), 0);
     }
 
     #[test]
@@ -782,15 +936,15 @@ mod tests {
         let config = CompactionConfig::default();
         let mut driver = CompactionDriver::new(&queue, store, &mut ledger, config);
 
-        let report = driver.run_compaction_pass_with_trigger(
-            CompactionTriggerInput::pressure_escalated(
+        let report =
+            driver.run_compaction_pass_with_trigger(CompactionTriggerInput::pressure_escalated(
                 crate::CompactionPressureLevel::Auto,
                 tidefs_types_incremental_job_core::WorkBudget::DEFAULT_TICK,
-            ),
-        );
+            ));
 
         assert_eq!(report.policy_report.candidates_admitted, 1);
         assert_eq!(report.segments_freed, 1);
+        assert_eq!(report.source_release_candidates, vec![10]);
         assert_eq!(report.objects_relocated, 1);
     }
 
@@ -805,6 +959,7 @@ mod tests {
         let report = driver.run_compaction_pass();
         assert_eq!(report.candidates_considered, 0);
         assert_eq!(report.segments_freed, 0);
+        assert!(report.source_release_candidates.is_empty());
         assert_eq!(report.objects_relocated, 0);
     }
 
@@ -862,7 +1017,8 @@ mod tests {
         let store = MockCompactionStore::new();
         let mut ledger = ReclaimQueueLedger::with_defaults();
         let config = CompactionConfig::default();
-        let _driver = CompactionDriver::new(&queue, store, &mut ledger, config).with_txg(42);
+        let driver = CompactionDriver::new(&queue, store, &mut ledger, config).with_txg(42);
+        assert_eq!(driver.current_txg(), 42);
     }
 
     #[test]
@@ -884,6 +1040,7 @@ mod tests {
         let report = CompactionPassReport::default();
         assert_eq!(report.candidates_considered, 0);
         assert_eq!(report.segments_freed, 0);
+        assert!(report.source_release_candidates.is_empty());
         assert_eq!(report.segments_partial, 0);
         assert_eq!(report.objects_relocated, 0);
         assert_eq!(report.bytes_relocated, 0);

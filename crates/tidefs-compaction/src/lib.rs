@@ -807,6 +807,11 @@ pub struct CompactionRunReport {
     pub candidates_considered: usize,
     /// Segments that were completely relocated and freed.
     pub segments_freed: u64,
+    /// Verified source segments that became release candidates.
+    ///
+    /// The compaction crate reports these as source-release candidates;
+    /// the cleaner/object-store publish boundary owns physical release.
+    pub source_release_candidates: Vec<u64>,
     /// Segments that were partially relocated (not freed).
     pub segments_partial: u64,
     /// Total objects relocated to new segments.
@@ -945,6 +950,7 @@ impl<'q, S: CompactionStore> CompactionRun<'q, S> {
         CompactionRunReport {
             candidates_considered,
             segments_freed: tick_freed,
+            source_release_candidates: all_freed,
             segments_partial: tick_partial,
             objects_relocated: self.relocator.objects_relocated,
             bytes_relocated: self.relocator.bytes_relocated,
@@ -2142,6 +2148,7 @@ mod tests {
         assert_eq!(report.policy_report.candidates_admitted, 3);
         assert_eq!(report.policy_report.rejected_write_amplification, 0);
         assert_eq!(report.segments_freed, 3); // All fully relocated
+        assert_eq!(report.source_release_candidates, vec![10, 30, 20]);
         assert_eq!(report.segments_partial, 0);
         assert_eq!(report.objects_relocated, 6);
         assert_eq!(report.errors, 0);
@@ -2188,6 +2195,7 @@ mod tests {
         let report = run.run_tick();
         assert_eq!(report.candidates_considered, 0);
         assert_eq!(report.segments_freed, 0);
+        assert!(report.source_release_candidates.is_empty());
         assert_eq!(report.objects_relocated, 0);
     }
 
@@ -2207,6 +2215,7 @@ mod tests {
         assert_eq!(report.policy_report.candidates_admitted, 0);
         assert_eq!(report.policy_report.rejected_write_amplification, 1);
         assert_eq!(report.segments_freed, 0);
+        assert!(report.source_release_candidates.is_empty());
         assert_eq!(report.objects_relocated, 0);
     }
 
@@ -2238,6 +2247,7 @@ mod tests {
         assert_eq!(report.candidates_considered, 1);
         // k1 relocated, k2 failed -> partial
         assert_eq!(report.segments_freed, 0);
+        assert!(report.source_release_candidates.is_empty());
         assert_eq!(report.segments_partial, 1);
         assert_eq!(report.objects_relocated, 1);
         assert_eq!(report.errors, 1);
@@ -2259,6 +2269,7 @@ mod tests {
         let report = CompactionRunReport::default();
         assert_eq!(report.candidates_considered, 0);
         assert_eq!(report.segments_freed, 0);
+        assert!(report.source_release_candidates.is_empty());
         assert_eq!(report.segments_partial, 0);
         assert_eq!(report.objects_relocated, 0);
         assert_eq!(report.bytes_relocated, 0);
@@ -2654,6 +2665,7 @@ mod tests {
         let report = run.run_tick();
         assert!(report.candidates_considered >= 5);
         assert_eq!(report.segments_freed, 5);
+        assert_eq!(report.source_release_candidates.len(), 5);
         assert_eq!(report.objects_relocated, 6);
         assert_eq!(report.relocation_entries.len(), 6);
 
