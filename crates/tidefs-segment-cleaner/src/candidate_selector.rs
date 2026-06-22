@@ -1,27 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Pin-set-aware candidate selection for segment cleaning.
+//! Pin-set-aware candidate filtering for segment cleaning.
 //!
 //! [`CandidateSelector`] extends the existing [`DeadObjectTracker`]-based
 //! victim selection with gc-pin-set exclusion: segments containing blocks
 //! reachable from pinned traversal roots (snapshots, in-progress destroy
-//! jobs, active transaction groups) are filtered out before ranking.
+//! jobs, active transaction groups) are filtered out before handoff.
 //!
-//! The selector produces a [`SegmentCandidate`] list ordered by
-//! descending dead-ratio, suitable for consumption by the cleaning loop.
+//! The selector produces a [`SegmentCandidate`] eligibility list. Fully-dead
+//! segments stay cleaner-owned; partial live/dead candidates are handoff
+//! records for the compaction authority, not a cleaner-local merge schedule.
 
 use std::collections::HashSet;
 
 use tidefs_gc_pin_set::GcPinSet;
 use tidefs_types_dataset_lifecycle_core::TraversalRoot;
 
-use crate::{DeadObjectTracker, PerSegmentLiveness, SegmentCleanerConfig};
+use crate::{DeadObjectTracker, PartialSegmentHandoff, PerSegmentLiveness, SegmentCleanerConfig};
 
 // ---------------------------------------------------------------------------
 // SegmentCandidate
 // ---------------------------------------------------------------------------
 
-/// A segment selected for potential cleaning, with liveness metadata
-/// and a computed reclaim score.
+/// A segment selected for potential cleaning, with liveness metadata.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SegmentCandidate {
     pub segment_id: u64,
@@ -61,14 +61,24 @@ impl SegmentCandidate {
     pub fn meets_threshold(&self, min_ratio: f64) -> bool {
         self.dead_ratio >= min_ratio && self.dead_bytes > 0
     }
+
+    #[must_use]
+    pub fn partial_handoff(&self) -> Option<PartialSegmentHandoff> {
+        PartialSegmentHandoff::new(
+            self.segment_id,
+            self.live_bytes,
+            self.dead_bytes,
+            self.creation_commit_group,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
 // CandidateSelector
 // ---------------------------------------------------------------------------
 
-/// Selects segment-compaction candidates from [`DeadObjectTracker`]
-/// liveness data, excluding pinned segments and ranking by reclaim yield.
+/// Selects segment-cleaner candidates from [`DeadObjectTracker`] liveness
+/// data, excluding pinned segments.
 ///
 /// Pin-set exclusion operates in two modes:
 ///
@@ -105,9 +115,10 @@ impl CandidateSelector {
     /// Select candidate segments from the tracker, excluding any
     /// segments whose id appears in `pinned_segments`.
     ///
-    /// Candidates are ranked: fully-dead segments first, then by
-    /// descending dead-bytes, descending dead-ratio, and ascending
-    /// segment-id. The result is capped at `max_candidates`.
+    /// Candidates are ordered by cleaner ownership only: fully-dead segments
+    /// first, then by segment id for deterministic handoff. The result is
+    /// capped at `max_candidates`. Partial merge ordering belongs to
+    /// `tidefs-compaction`.
     ///
     /// Segments that fail the `min_dead_ratio` threshold or are too
     /// young (below `min_segment_age_txg`) are excluded. Fully-dead
@@ -134,17 +145,11 @@ impl CandidateSelector {
             .map(SegmentCandidate::from_liveness)
             .collect();
 
-        // Rank: fully-dead first, then by dead_bytes desc, dead_ratio
-        // desc, then by segment_id asc for determinism.
+        // Cleaner-owned freeing first, then stable handoff order. This is not
+        // a partial merge ranking policy.
         candidates.sort_by(|a, b| {
             b.is_fully_dead
                 .cmp(&a.is_fully_dead)
-                .then_with(|| b.dead_bytes.cmp(&a.dead_bytes))
-                .then_with(|| {
-                    b.dead_ratio
-                        .partial_cmp(&a.dead_ratio)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
                 .then_with(|| a.segment_id.cmp(&b.segment_id))
         });
 
@@ -315,10 +320,10 @@ mod tests {
         assert!(candidates.is_empty());
     }
 
-    // -- Sorting: descending dead-ratio --
+    // -- Handoff ordering --
 
     #[test]
-    fn candidates_sorted_descending_by_dead_ratio() {
+    fn partial_candidates_use_stable_handoff_order() {
         let t = tracker_with_segments(&[
             (1, 900, 100, 0), // ratio 0.10
             (2, 500, 500, 0), // ratio 0.50
@@ -334,9 +339,8 @@ mod tests {
         );
         let candidates = s.select(&t, 0, &HashSet::new());
         assert_eq!(candidates.len(), 3);
-        assert!(candidates[0].dead_ratio >= candidates[1].dead_ratio);
-        assert!(candidates[1].dead_ratio >= candidates[2].dead_ratio);
-        assert_eq!(candidates[0].segment_id, 3);
+        let ids: Vec<u64> = candidates.iter().map(|c| c.segment_id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     // -- Empty sets --
@@ -479,14 +483,14 @@ mod tests {
         assert!(ids.contains(&3));
     }
 
-    // -- Tiebreaking --
+    // -- Stable partial handoff order --
 
     #[test]
-    fn tiebreak_by_dead_bytes_then_segment_id() {
+    fn partial_handoff_order_ignores_merge_policy_scores() {
         let t = tracker_with_segments(&[
             (50, 500, 500, 0), // ratio 0.50, dead 500
             (10, 500, 500, 0), // ratio 0.50, dead 500
-            (20, 200, 800, 0), // ratio 0.80, dead 800 — should be first
+            (20, 200, 800, 0), // ratio 0.80, dead 800
         ]);
         let s = CandidateSelector::new(
             SegmentCleanerConfig {
@@ -497,9 +501,8 @@ mod tests {
             32,
         );
         let candidates = s.select(&t, 0, &HashSet::new());
-        assert_eq!(candidates[0].segment_id, 20, "highest dead_bytes");
-        assert_eq!(candidates[1].segment_id, 10, "same dead_bytes, lower id");
-        assert_eq!(candidates[2].segment_id, 50);
+        let ids: Vec<u64> = candidates.iter().map(|c| c.segment_id).collect();
+        assert_eq!(ids, vec![10, 20, 50]);
     }
 
     // -- GcPinSet bridge --

@@ -22,8 +22,8 @@
 //! ## Model Architecture
 //!
 //! [`SegmentCleanerService`] implements [`IncrementalJob`] to identify dead
-//! segments, compact live records from fragmented segments, and free
-//! fully-dead segments back to the pool allocator.
+//! segments, free fully-dead segments back to the pool allocator, and hand
+//! partially live/dead segments to the compaction authority.
 //!
 //! ## Resume limitation
 //!
@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 
 use tidefs_cleanup_queue_core::CleanupQueue;
 use tidefs_incremental_job_core::IncrementalJob;
-use tidefs_reclaim_queue_core::SegmentLivenessQueue;
+use tidefs_reclaim_queue_core::{SegmentLivenessEntry, SegmentLivenessQueue};
 use tidefs_types_incremental_job_core::{
     Checkpoint, CursorState, JobError, JobId, JobKind, JobProgress, StepResult, WorkBudget,
 };
@@ -92,6 +92,68 @@ impl BlockRef {
     }
 }
 
+/// Cleaner-produced handoff for a partially live segment.
+///
+/// This is the explicit boundary between the segment cleaner and the
+/// compaction authority. The cleaner may prove pressure eligibility,
+/// liveness accounting, and pin-filtered reachability before creating this
+/// record, but it does not rank, group, relocate, or publish partial live
+/// segment merges.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PartialSegmentHandoff {
+    pub segment_id: u64,
+    pub live_bytes: u64,
+    pub dead_bytes: u64,
+    pub total_bytes: u64,
+    pub dead_ratio: f64,
+    pub creation_commit_group: u64,
+}
+
+impl PartialSegmentHandoff {
+    #[must_use]
+    pub fn new(
+        segment_id: u64,
+        live_bytes: u64,
+        dead_bytes: u64,
+        creation_commit_group: u64,
+    ) -> Option<Self> {
+        if live_bytes == 0 || dead_bytes == 0 {
+            return None;
+        }
+        let total_bytes = live_bytes.saturating_add(dead_bytes);
+        if total_bytes == 0 {
+            return None;
+        }
+        Some(Self {
+            segment_id,
+            live_bytes,
+            dead_bytes,
+            total_bytes,
+            dead_ratio: dead_bytes as f64 / total_bytes as f64,
+            creation_commit_group,
+        })
+    }
+
+    #[must_use]
+    pub fn from_liveness_entry(entry: &SegmentLivenessEntry) -> Option<Self> {
+        Self::new(
+            entry.segment_id,
+            entry.live_bytes,
+            entry.dead_bytes,
+            entry.creation_commit_group,
+        )
+    }
+
+    #[must_use]
+    pub fn estimated_write_amplification(self) -> f64 {
+        if self.dead_bytes == 0 {
+            f64::INFINITY
+        } else {
+            self.total_bytes as f64 / self.dead_bytes as f64
+        }
+    }
+}
+
 pub trait BlockIndex {
     type Error: core::fmt::Debug + core::fmt::Display;
     fn blocks_in_segment(&self, segment_id: u64) -> Result<Vec<BlockRef>, Self::Error>;
@@ -139,8 +201,10 @@ impl Default for SegmentCleanerConfig {
 pub struct SegmentCleanerStats {
     pub segments_scanned: u64,
     pub segments_compacted: u64,
+    pub partial_segments_handed_off: u64,
     pub segments_freed: u64,
     pub bytes_compacted: u64,
+    pub bytes_handed_to_compaction: u64,
     pub bytes_freed: u64,
 }
 
@@ -148,11 +212,13 @@ impl fmt::Display for SegmentCleanerStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "scanned={} compacted={} freed={} bytes_compacted={} bytes_freed={}",
+            "scanned={} compacted={} handed_off={} freed={} bytes_compacted={} bytes_handed_to_compaction={} bytes_freed={}",
             self.segments_scanned,
             self.segments_compacted,
+            self.partial_segments_handed_off,
             self.segments_freed,
             self.bytes_compacted,
+            self.bytes_handed_to_compaction,
             self.bytes_freed
         )
     }
@@ -161,7 +227,7 @@ impl fmt::Display for SegmentCleanerStats {
 #[derive(Clone, Debug, Default)]
 struct SegmentCleanerCursor {
     last_segment_id: u64,
-    tick_bytes_compacted: u64,
+    tick_bytes_handed_off: u64,
     phase: u8,
     current_candidate: u64,
 }
@@ -170,7 +236,7 @@ impl SegmentCleanerCursor {
     fn to_bytes(&self) -> Vec<u8> {
         let mut buf = vec![0u8; 32];
         buf[0..8].copy_from_slice(&self.last_segment_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.tick_bytes_compacted.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.tick_bytes_handed_off.to_le_bytes());
         buf[16] = self.phase;
         buf[17..25].copy_from_slice(&self.current_candidate.to_le_bytes());
         buf
@@ -182,7 +248,7 @@ impl SegmentCleanerCursor {
         }
         Some(Self {
             last_segment_id: u64::from_le_bytes(data[0..8].try_into().ok()?),
-            tick_bytes_compacted: u64::from_le_bytes(data[8..16].try_into().ok()?),
+            tick_bytes_handed_off: u64::from_le_bytes(data[8..16].try_into().ok()?),
             phase: data[16],
             current_candidate: u64::from_le_bytes(data[17..25].try_into().ok()?),
         })
@@ -196,8 +262,51 @@ impl SegmentCleanerCursor {
 pub trait SegmentStore {
     fn liveness_queue(&self) -> &SegmentLivenessQueue;
     fn liveness_queue_mut(&mut self) -> &mut SegmentLivenessQueue;
+    fn handoff_partial_segment(
+        &mut self,
+        victim: PartialSegmentHandoff,
+    ) -> Result<(), SegmentCleanerError> {
+        Err(SegmentCleanerError::CompactionHandoffFailed {
+            segment_id: victim.segment_id,
+            reason: "compaction authority handoff is not configured".into(),
+        })
+    }
     fn compact_segment(&mut self, segment_id: u64) -> Result<u64, SegmentCleanerError>;
     fn free_segment(&mut self, segment_id: u64) -> Result<(), SegmentCleanerError>;
+}
+
+fn cleaner_candidate_batch_from_queue(
+    queue: &SegmentLivenessQueue,
+    min_dead_ratio: f64,
+    current_commit_group: u64,
+    min_age_commit_groups: u64,
+    limit: usize,
+) -> Vec<u64> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<&SegmentLivenessEntry> = queue
+        .entries()
+        .filter(|e| {
+            e.dead_ratio() >= min_dead_ratio
+                && e.dead_bytes > 0
+                && (e.is_fully_dead()
+                    || e.is_old_enough(current_commit_group, min_age_commit_groups))
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        b.is_fully_dead()
+            .cmp(&a.is_fully_dead())
+            .then_with(|| a.segment_id.cmp(&b.segment_id))
+    });
+
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|e| e.segment_id)
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,6 +314,7 @@ pub enum SegmentCleanerError {
     SegmentNotFound(u64),
     CompactionFailed(u64),
     FreeFailed(u64),
+    CompactionHandoffFailed { segment_id: u64, reason: String },
     /// A block read, write, or index update failed during relocation.
     RelocationFailed(String),
 }
@@ -215,6 +325,12 @@ impl fmt::Display for SegmentCleanerError {
             Self::SegmentNotFound(id) => write!(f, "segment {id} not found"),
             Self::CompactionFailed(id) => write!(f, "compaction failed for segment {id}"),
             Self::FreeFailed(id) => write!(f, "free failed for segment {id}"),
+            Self::CompactionHandoffFailed { segment_id, reason } => {
+                write!(
+                    f,
+                    "compaction handoff failed for segment {segment_id}: {reason}"
+                )
+            }
             Self::RelocationFailed(msg) => write!(f, "relocation failed: {msg}"),
         }
     }
@@ -268,17 +384,38 @@ impl<S: SegmentStore> SegmentCleanerService<S> {
     }
     #[must_use]
     pub fn select_segment(&self) -> Option<u64> {
-        self.store().liveness_queue().next_candidate_with_age(
+        cleaner_candidate_batch_from_queue(
+            self.store().liveness_queue(),
             self.config.min_dead_ratio,
             self.current_commit_group,
             self.config.min_segment_age_txg,
+            1,
         )
+        .into_iter()
+        .next()
     }
-    fn do_compact(&mut self, segment_id: u64) -> Result<u64, SegmentCleanerError> {
-        let bytes = self.store_mut().compact_segment(segment_id)?;
-        self.stats.segments_compacted = self.stats.segments_compacted.saturating_add(1);
-        self.stats.bytes_compacted = self.stats.bytes_compacted.saturating_add(bytes);
-        Ok(bytes)
+    fn do_handoff(
+        &mut self,
+        segment_id: u64,
+    ) -> Result<PartialSegmentHandoff, SegmentCleanerError> {
+        let victim = self
+            .store()
+            .liveness_queue()
+            .get(segment_id)
+            .and_then(PartialSegmentHandoff::from_liveness_entry)
+            .ok_or_else(|| SegmentCleanerError::CompactionHandoffFailed {
+                segment_id,
+                reason: "candidate is not a partial live/dead segment".into(),
+            })?;
+
+        self.store_mut().handoff_partial_segment(victim)?;
+        self.stats.partial_segments_handed_off =
+            self.stats.partial_segments_handed_off.saturating_add(1);
+        self.stats.bytes_handed_to_compaction = self
+            .stats
+            .bytes_handed_to_compaction
+            .saturating_add(victim.live_bytes);
+        Ok(victim)
     }
     fn do_free(&mut self, segment_id: u64) -> Result<(), SegmentCleanerError> {
         let dead_bytes = self
@@ -309,9 +446,11 @@ impl<S: SegmentStore + Send> IncrementalJob for SegmentCleanerService<S> {
                     config: SegmentCleanerConfig::default(),
                     stats: SegmentCleanerStats {
                         segments_scanned: cp.progress.items_processed,
-                        segments_compacted: cp.progress.items_total_estimate,
+                        segments_compacted: 0,
+                        partial_segments_handed_off: cp.progress.items_total_estimate,
                         segments_freed: 0,
-                        bytes_compacted: cp.progress.bytes_processed,
+                        bytes_compacted: 0,
+                        bytes_handed_to_compaction: cp.progress.bytes_processed,
                         bytes_freed: 0,
                     },
                     cursor,
@@ -334,9 +473,21 @@ impl<S: SegmentStore + Send> IncrementalJob for SegmentCleanerService<S> {
         } else {
             self.config.max_compaction_budget
         };
+        let candidate_limit = if budget.max_items > 0 {
+            budget.max_items as usize
+        } else {
+            self.store().liveness_queue().len()
+        };
+        let candidates = cleaner_candidate_batch_from_queue(
+            self.store().liveness_queue(),
+            self.config.min_dead_ratio,
+            self.current_commit_group,
+            self.config.min_segment_age_txg,
+            candidate_limit,
+        );
         let mut items_processed: u64 = 0;
         let mut tick_bytes: u64 = 0;
-        loop {
+        for segment_id in candidates {
             // Respect max_items budget
             if budget.max_items > 0 && items_processed >= budget.max_items {
                 break;
@@ -345,10 +496,6 @@ impl<S: SegmentStore + Send> IncrementalJob for SegmentCleanerService<S> {
             if effective_max_bytes > 0 && tick_bytes >= effective_max_bytes {
                 break;
             }
-            let segment_id = match self.select_segment() {
-                Some(id) => id,
-                None => break,
-            };
             self.stats.segments_scanned = self.stats.segments_scanned.saturating_add(1);
             items_processed = items_processed.saturating_add(1);
             self.cursor.current_candidate = segment_id;
@@ -365,16 +512,11 @@ impl<S: SegmentStore + Send> IncrementalJob for SegmentCleanerService<S> {
                     Err(_) => break,
                 }
             } else {
-                match self.do_compact(segment_id) {
-                    Ok(compacted_bytes) => {
-                        tick_bytes = tick_bytes.saturating_add(compacted_bytes);
-                        self.cursor.tick_bytes_compacted = tick_bytes;
+                match self.do_handoff(segment_id) {
+                    Ok(victim) => {
+                        tick_bytes = tick_bytes.saturating_add(victim.live_bytes);
+                        self.cursor.tick_bytes_handed_off = tick_bytes;
                         self.cursor.last_segment_id = segment_id;
-                        if let Some(e) = self.store().liveness_queue().get(segment_id) {
-                            if e.is_fully_dead() {
-                                let _ = self.do_free(segment_id);
-                            }
-                        }
                     }
                     Err(_) => break,
                 }
@@ -388,8 +530,8 @@ impl<S: SegmentStore + Send> IncrementalJob for SegmentCleanerService<S> {
             cursor_state: CursorState(self.cursor.to_bytes()),
             progress: JobProgress {
                 items_processed: self.stats.segments_scanned,
-                items_total_estimate: 0,
-                bytes_processed: self.stats.bytes_compacted,
+                items_total_estimate: self.stats.partial_segments_handed_off,
+                bytes_processed: self.stats.bytes_handed_to_compaction,
                 bytes_total_estimate: 0,
                 elapsed_ms: 0,
             },
@@ -420,9 +562,12 @@ impl<S: SegmentStore + Send> IncrementalJob for SegmentCleanerService<S> {
     }
 }
 
-/// Executes the compaction of a single segment: enumerates live blocks,
-/// reads each one, rewrites them to a fresh segment, and updates the
-/// block index.
+/// Low-level relocation helper retained for tests and future
+/// compaction-authority callers.
+///
+/// [`SegmentCleanerService`] and [`SegmentCleanerDriver`] do not call this for
+/// partially live victims. Production partial rewrites must enter through the
+/// explicit [`SegmentStore::handoff_partial_segment`] boundary.
 pub struct CompactExecutor;
 
 impl CompactExecutor {
@@ -666,11 +811,12 @@ impl Default for BackgroundVictimConfig {
     }
 }
 
-/// Selects victim segments from a [`DeadObjectTracker`] based on
-/// configurable dead-byte-ratio threshold and age weighting.
+/// Selects cleaner-attention candidates from a [`DeadObjectTracker`].
 ///
 /// Fully-dead segments (live_bytes=0, dead_bytes>0) are always
 /// selected first regardless of age constraints.
+/// Partially live candidates are returned only as compaction-authority
+/// handoff records; their order is not a merge-policy decision.
 pub struct BackgroundVictimSelector {
     config: BackgroundVictimConfig,
 }
@@ -683,11 +829,9 @@ impl BackgroundVictimSelector {
 
     /// Select victim segments above the dead-byte-ratio threshold.
     ///
-    /// Returns a vector of `(segment_id, dead_ratio)` pairs sorted by:
-    /// 1. Fully-dead segments first
-    /// 2. Highest dead ratio
-    /// 3. Highest dead bytes
-    /// 4. Lowest segment ID
+    /// Returns `(segment_id, dead_ratio)` pairs sorted only by cleaner
+    /// ownership: fully-dead segments first, then by segment id for a
+    /// stable handoff order. `tidefs-compaction` owns partial merge ordering.
     #[must_use]
     pub fn select(
         &self,
@@ -704,16 +848,11 @@ impl BackgroundVictimSelector {
             })
             .collect();
 
-        // Sort: fully-dead first, then by dead ratio desc, dead bytes desc, segment id asc
+        // Sort by cleaner-owned work first. Partial ordering is intentionally
+        // not a compaction policy; it is only a stable handoff order.
         candidates.sort_by(|a, b| {
             b.is_fully_dead()
                 .cmp(&a.is_fully_dead())
-                .then_with(|| {
-                    b.dead_ratio()
-                        .partial_cmp(&a.dead_ratio())
-                        .unwrap_or(core::cmp::Ordering::Equal)
-                })
-                .then_with(|| b.dead_bytes.cmp(&a.dead_bytes))
                 .then_with(|| a.segment_id.cmp(&b.segment_id))
         });
 
@@ -857,10 +996,14 @@ impl<S: SegmentStore> SegmentCleanerDriver<S> {
         &mut self.cleanup_queue
     }
 
-    /// Run one cleaning tick: select victims and dispatch
-    /// `compact_segment` or `free_segment` calls.
+    /// Run one cleaning tick.
     ///
-    /// Returns the number of victim segments processed (compacted or freed).
+    /// Fully-dead victims are enqueued in the cleaner cleanup queue and
+    /// freed. Partially live victims are handed to the compaction authority
+    /// and are not enqueued for source release until compaction publishes a
+    /// verified relocation.
+    ///
+    /// Returns the number of victim segments processed (handed off or freed).
     ///
     /// # Errors
     ///
@@ -880,26 +1023,46 @@ impl<S: SegmentStore> SegmentCleanerDriver<S> {
                 .map(|e| e.is_fully_dead())
                 .unwrap_or(false);
 
-            // Enqueue segment in persistent cleanup queue for crash safety.
-            // Uses segment_id as inode_id surrogate and SegmentCleanup kind.
-            let item = tidefs_cleanup_queue_core::make_segment_cleanup_item(
-                *seg_id,
-                self.current_commit_group,
-            );
-            let entry_id = self.cleanup_queue.enqueue(item);
-
             if is_fully_dead {
+                // Enqueue segment in persistent cleanup queue for crash safety.
+                // Uses segment_id as inode_id surrogate and SegmentCleanup kind.
+                let item = tidefs_cleanup_queue_core::make_segment_cleanup_item(
+                    *seg_id,
+                    self.current_commit_group,
+                );
+                let entry_id = self.cleanup_queue.enqueue(item);
+
                 self.store.free_segment(*seg_id)?;
                 self.tracker.remove(*seg_id);
                 self.stats.segments_freed = self.stats.segments_freed.saturating_add(1);
+
+                // Mark the persistent queue entry as completed.
+                self.cleanup_queue.mark_complete(entry_id);
             } else {
-                let compacted = self.store.compact_segment(*seg_id)?;
-                self.stats.segments_compacted = self.stats.segments_compacted.saturating_add(1);
-                self.stats.bytes_compacted = self.stats.bytes_compacted.saturating_add(compacted);
+                let victim = self
+                    .tracker
+                    .get(*seg_id)
+                    .and_then(|e| {
+                        PartialSegmentHandoff::new(
+                            e.segment_id,
+                            e.live_bytes,
+                            e.dead_bytes,
+                            e.creation_commit_group,
+                        )
+                    })
+                    .ok_or_else(|| SegmentCleanerError::CompactionHandoffFailed {
+                        segment_id: *seg_id,
+                        reason: "candidate is not a partial live/dead segment".into(),
+                    })?;
+                self.store.handoff_partial_segment(victim)?;
+                self.stats.partial_segments_handed_off =
+                    self.stats.partial_segments_handed_off.saturating_add(1);
+                self.stats.bytes_handed_to_compaction = self
+                    .stats
+                    .bytes_handed_to_compaction
+                    .saturating_add(victim.live_bytes);
             }
 
-            // Mark the persistent queue entry as completed.
-            self.cleanup_queue.mark_complete(entry_id);
             processed = processed.saturating_add(1);
         }
 
@@ -915,7 +1078,9 @@ mod tests {
     struct MockSegmentStore {
         liveness: SegmentLivenessQueue,
         compact_results: BTreeMap<u64, Result<u64, SegmentCleanerError>>,
+        handoff_results: BTreeMap<u64, Result<(), SegmentCleanerError>>,
         free_results: BTreeMap<u64, Result<(), SegmentCleanerError>>,
+        handoffs: Vec<PartialSegmentHandoff>,
         blocks: BTreeMap<u64, Vec<BlockRef>>,
         block_data: BTreeMap<([u8; 32], u64), Vec<u8>>,
         next_segment_id: u64,
@@ -926,7 +1091,9 @@ mod tests {
             Self {
                 liveness: SegmentLivenessQueue::new(),
                 compact_results: BTreeMap::new(),
+                handoff_results: BTreeMap::new(),
                 free_results: BTreeMap::new(),
+                handoffs: Vec::new(),
                 blocks: BTreeMap::new(),
                 block_data: BTreeMap::new(),
                 next_segment_id: 1000,
@@ -969,6 +1136,16 @@ mod tests {
         }
         fn liveness_queue_mut(&mut self) -> &mut SegmentLivenessQueue {
             &mut self.liveness
+        }
+        fn handoff_partial_segment(
+            &mut self,
+            victim: PartialSegmentHandoff,
+        ) -> Result<(), SegmentCleanerError> {
+            let result = self.handoff_results.remove(&victim.segment_id).unwrap_or(Ok(()));
+            if result.is_ok() {
+                self.handoffs.push(victim);
+            }
+            result
         }
         fn compact_segment(&mut self, segment_id: u64) -> Result<u64, SegmentCleanerError> {
             let result = self.compact_results.remove(&segment_id).unwrap_or(Ok(0));
@@ -1040,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn select_highest_dead_ratio() {
+    fn select_lowest_eligible_segment_id() {
         let mut s = MockSegmentStore::new();
         s.add_segment(0, 30, 70);
         s.add_segment(1, 70, 30);
@@ -1067,24 +1244,31 @@ mod tests {
         assert_eq!(make_svc(MockSegmentStore::new()).select_segment(), None);
     }
     #[test]
-    fn compaction_updates_stats() {
+    fn partial_handoff_updates_stats() {
         let mut s = MockSegmentStore::new();
         s.add_segment(0, 4096, 8192);
-        s.compact_results.insert(0, Ok(4096));
-        let mut svc = make_svc(s);
-        svc.step(WorkBudget::UNBOUNDED).unwrap();
-        assert_eq!(svc.stats().segments_compacted, 1);
-        assert_eq!(svc.stats().bytes_compacted, 4096);
-    }
-    #[test]
-    fn compaction_failure_preserves_stats() {
-        let mut s = MockSegmentStore::new();
-        s.add_segment(0, 4096, 8192);
-        s.compact_results
-            .insert(0, Err(SegmentCleanerError::CompactionFailed(0)));
         let mut svc = make_svc(s);
         svc.step(WorkBudget::UNBOUNDED).unwrap();
         assert_eq!(svc.stats().segments_compacted, 0);
+        assert_eq!(svc.stats().partial_segments_handed_off, 1);
+        assert_eq!(svc.stats().bytes_handed_to_compaction, 4096);
+        assert_eq!(svc.store.as_ref().unwrap().handoffs.len(), 1);
+    }
+    #[test]
+    fn partial_handoff_failure_preserves_stats() {
+        let mut s = MockSegmentStore::new();
+        s.add_segment(0, 4096, 8192);
+        s.handoff_results.insert(
+            0,
+            Err(SegmentCleanerError::CompactionHandoffFailed {
+                segment_id: 0,
+                reason: "authority queue unavailable".into(),
+            }),
+        );
+        let mut svc = make_svc(s);
+        svc.step(WorkBudget::UNBOUNDED).unwrap();
+        assert_eq!(svc.stats().segments_compacted, 0);
+        assert_eq!(svc.stats().partial_segments_handed_off, 0);
     }
     #[test]
     fn fully_dead_segment_freed() {
@@ -1097,15 +1281,14 @@ mod tests {
         assert_eq!(svc.stats().bytes_freed, 100);
     }
     #[test]
-    fn compact_then_free_after_compaction() {
+    fn partial_handoff_does_not_free_after_dispatch() {
         let mut s = MockSegmentStore::new();
         s.add_segment(0, 4096, 8192);
-        s.compact_results.insert(0, Ok(4096));
         s.free_results.insert(0, Ok(()));
         let mut svc = make_svc(s);
         svc.step(WorkBudget::UNBOUNDED).unwrap();
-        assert!(svc.stats().segments_compacted >= 1);
-        assert!(svc.stats().segments_freed >= 1);
+        assert_eq!(svc.stats().partial_segments_handed_off, 1);
+        assert_eq!(svc.stats().segments_freed, 0);
     }
     #[test]
     fn free_failure_does_not_update_stats() {
@@ -1123,7 +1306,6 @@ mod tests {
         let mut s = MockSegmentStore::new();
         for i in 0..5u64 {
             s.add_segment(i, 30, 70);
-            s.compact_results.insert(i, Ok(30));
         }
         let mut svc = make_svc(s);
         svc.step(WorkBudget {
@@ -1137,24 +1319,20 @@ mod tests {
     fn budget_bytes_exhausted() {
         let mut s = MockSegmentStore::new();
         s.add_segment(0, 500, 500);
-        s.compact_results.insert(0, Ok(500));
         s.add_segment(1, 500, 500);
-        s.compact_results.insert(1, Ok(500));
         let mut svc = make_svc(s);
         svc.step(WorkBudget {
             max_bytes: 400,
             ..WorkBudget::default()
         })
         .unwrap();
-        assert_eq!(svc.stats().segments_compacted, 1);
+        assert_eq!(svc.stats().partial_segments_handed_off, 1);
     }
     #[test]
     fn config_budget_caps_unbounded() {
         let mut s = MockSegmentStore::new();
         s.add_segment(0, 1000, 1000);
-        s.compact_results.insert(0, Ok(1000));
         s.add_segment(1, 1000, 1000);
-        s.compact_results.insert(1, Ok(1000));
         let mut svc = SegmentCleanerService::new(
             JobId(1),
             s,
@@ -1165,7 +1343,7 @@ mod tests {
             },
         );
         svc.step(WorkBudget::UNBOUNDED).unwrap();
-        assert_eq!(svc.stats().segments_compacted, 1);
+        assert_eq!(svc.stats().partial_segments_handed_off, 1);
     }
     #[test]
     fn empty_pool_no_work() {
@@ -1199,7 +1377,7 @@ mod tests {
     fn cursor_roundtrip() {
         let c = SegmentCleanerCursor {
             last_segment_id: 42,
-            tick_bytes_compacted: 8192,
+            tick_bytes_handed_off: 8192,
             phase: 2,
             current_candidate: 7,
         };
@@ -1227,6 +1405,16 @@ mod tests {
         assert!(!format!("{}", SegmentCleanerError::SegmentNotFound(1)).is_empty());
         assert!(!format!("{}", SegmentCleanerError::CompactionFailed(2)).is_empty());
         assert!(!format!("{}", SegmentCleanerError::FreeFailed(3)).is_empty());
+        assert!(
+            !format!(
+                "{}",
+                SegmentCleanerError::CompactionHandoffFailed {
+                    segment_id: 4,
+                    reason: "test".into()
+                }
+            )
+            .is_empty()
+        );
         assert!(!format!("{}", SegmentCleanerError::RelocationFailed("test".into())).is_empty());
     }
     #[test]
@@ -1234,8 +1422,10 @@ mod tests {
         let s = SegmentCleanerStats {
             segments_scanned: 10,
             segments_compacted: 3,
+            partial_segments_handed_off: 4,
             segments_freed: 2,
             bytes_compacted: 4096,
+            bytes_handed_to_compaction: 2048,
             bytes_freed: 8192,
         };
         assert!(format!("{s}").contains("scanned=10"));
@@ -1340,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_then_free_victim_segment() {
+    fn service_hands_partial_victim_to_compaction_authority() {
         let mut store = MockSegmentStore::new();
         let key = [99u8; 32];
         store.add_block(key, 7, 0, &[0xCC; 256]);
@@ -1357,7 +1547,10 @@ mod tests {
         );
         let result = svc.step(WorkBudget::UNBOUNDED);
         assert!(result.is_ok());
-        assert!(svc.stats().segments_compacted >= 1);
+        assert_eq!(svc.stats().segments_compacted, 0);
+        assert_eq!(svc.stats().partial_segments_handed_off, 1);
+        assert_eq!(svc.store.as_ref().unwrap().handoffs[0].segment_id, 7);
+        assert_eq!(svc.store.as_ref().unwrap().handoffs[0].live_bytes, 256);
     }
 
     #[test]
@@ -1532,7 +1725,6 @@ mod tests {
         let mut s = MockSegmentStore::new();
         s.liveness.record_write_at_commit_group(0, 100, 5);
         s.liveness.record_overwrite(0, 70);
-        s.compact_results.insert(0, Ok(70));
         let mut svc = SegmentCleanerService::new(JobId(1), s, SegmentCleanerConfig::default());
         svc.advance_commit_group(5);
         assert_eq!(svc.select_segment(), None);
@@ -1745,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn victim_selector_sorts_by_dead_ratio_desc() {
+    fn victim_selector_uses_stable_handoff_order_for_partials() {
         let t = tracker_with_segments(&[(1, 10, 90, 0), (2, 50, 50, 0), (3, 20, 80, 0)]);
         let s = BackgroundVictimSelector::new(BackgroundVictimConfig {
             dead_byte_ratio_threshold: 0.0,
@@ -1753,13 +1945,12 @@ mod tests {
         });
         let victims = s.select(&t, 0);
         assert_eq!(victims.len(), 3);
-        assert_eq!(victims[0].0, 1);
-        assert_eq!(victims[1].0, 3);
-        assert_eq!(victims[2].0, 2);
+        let ids: Vec<u64> = victims.iter().map(|(segment_id, _)| *segment_id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]
-    fn victim_selector_tiebreak_by_dead_bytes_then_lower_id() {
+    fn victim_selector_ignores_dead_bytes_for_partial_handoff_order() {
         let t = tracker_with_segments(&[(50, 500, 500, 0), (10, 250, 250, 0), (20, 500, 500, 0)]);
         let s = BackgroundVictimSelector::new(BackgroundVictimConfig {
             dead_byte_ratio_threshold: 0.0,
@@ -1767,9 +1958,8 @@ mod tests {
         });
         let victims = s.select(&t, 0);
         assert_eq!(victims.len(), 3);
-        assert_eq!(victims[0].0, 20);
-        assert_eq!(victims[1].0, 50);
-        assert_eq!(victims[2].0, 10);
+        let ids: Vec<u64> = victims.iter().map(|(segment_id, _)| *segment_id).collect();
+        assert_eq!(ids, vec![10, 20, 50]);
     }
 
     #[test]
@@ -1837,9 +2027,8 @@ mod tests {
     }
 
     #[test]
-    fn driver_tick_compacts_partially_dead_segment() {
-        let mut s = MockSegmentStore::new();
-        s.compact_results.insert(1, Ok(1024));
+    fn driver_tick_hands_partial_segment_to_compaction_authority() {
+        let s = MockSegmentStore::new();
         let mut driver = SegmentCleanerDriver::new(
             s,
             BackgroundVictimConfig {
@@ -1851,14 +2040,16 @@ mod tests {
         driver.tracker_mut().record_overwrite(1, 2048);
         let processed = driver.tick().unwrap();
         assert_eq!(processed, 1);
-        assert_eq!(driver.stats().segments_compacted, 1);
-        assert_eq!(driver.stats().bytes_compacted, 1024);
+        assert_eq!(driver.stats().segments_compacted, 0);
+        assert_eq!(driver.stats().partial_segments_handed_off, 1);
+        assert_eq!(driver.stats().bytes_handed_to_compaction, 2048);
+        assert_eq!(driver.cleanup_queue().len(), 0);
+        assert_eq!(driver.store.handoffs[0].segment_id, 1);
     }
 
     #[test]
     fn driver_advance_txg_enables_age_gated_segments() {
-        let mut s = MockSegmentStore::new();
-        s.compact_results.insert(1, Ok(500));
+        let s = MockSegmentStore::new();
         let mut driver = SegmentCleanerDriver::new(s, BackgroundVictimConfig::default());
         driver
             .tracker_mut()

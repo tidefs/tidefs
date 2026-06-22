@@ -1,23 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Liveness-ratio victim selection for segment compaction.
+//! Liveness-based cleaner candidate selection.
 //!
 //! [`VictimSelector`] wraps a [`SegmentLivenessQueue`] and
-//! [`SegmentCleanerConfig`] to produce ordered candidate lists
-//! ranked by dead-byte ratio, suitable for driving the segment
-//! cleaner's main compaction loop.
+//! [`SegmentCleanerConfig`] to produce cleaner-owned fully-dead candidates
+//! and partial live/dead handoff records for the compaction authority.
 
 use core::fmt;
 
 use tidefs_reclaim_queue_core::SegmentLivenessQueue;
 
-use crate::SegmentCleanerConfig;
+use crate::{PartialSegmentHandoff, SegmentCleanerConfig};
 
 // ---------------------------------------------------------------------------
-// VictimCandidate -- a scored candidate for compaction
+// VictimCandidate -- cleaner eligibility record
 // ---------------------------------------------------------------------------
 
-/// A segment identified as a compaction candidate, together with
-/// its liveness metadata and computed score.
+/// A segment identified as a cleaner candidate, together with
+/// its liveness metadata.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VictimCandidate {
     /// Segment identifier.
@@ -75,6 +74,16 @@ impl VictimCandidate {
     pub fn meets_threshold(&self, min_ratio: f64) -> bool {
         self.dead_ratio >= min_ratio && self.dead_bytes > 0
     }
+
+    #[must_use]
+    pub fn partial_handoff(&self) -> Option<PartialSegmentHandoff> {
+        PartialSegmentHandoff::new(
+            self.segment_id,
+            self.live_bytes,
+            self.dead_bytes,
+            self.creation_commit_group,
+        )
+    }
 }
 
 impl fmt::Display for VictimCandidate {
@@ -91,12 +100,11 @@ impl fmt::Display for VictimCandidate {
 // VictimSelector
 // ---------------------------------------------------------------------------
 
-/// Selects segment-compaction victims by liveness ratio.
+/// Selects segment-cleaner victims by liveness eligibility.
 ///
-/// Uses a [`SegmentLivenessQueue`] to score segments and returns
-/// candidates ordered from highest to lowest dead-byte fraction.
-/// Ties are broken by higher dead bytes, then by lower segment id
-/// for deterministic selection.
+/// Fully-dead segments are cleaner-owned free work. Partially live segments
+/// are returned as compaction-authority handoff records and are ordered by
+/// segment id only to avoid local merge-policy ownership.
 #[derive(Clone, Debug)]
 pub struct VictimSelector {
     /// The liveness queue to query.
@@ -113,35 +121,47 @@ impl VictimSelector {
         Self { queue, config }
     }
 
-    /// Select the single best candidate above the configured
+    /// Select the first eligible candidate above the configured
     /// `min_dead_ratio`, respecting the minimum segment age.
     ///
     /// Returns `None` when no segment meets the criteria.
     #[must_use]
     pub fn select(&self, current_commit_group: u64) -> Option<u64> {
-        self.queue.next_candidate_with_age(
-            self.config.min_dead_ratio,
-            current_commit_group,
-            self.config.min_segment_age_txg,
-        )
+        self.select_batch(current_commit_group, 1).into_iter().next()
     }
 
-    /// Select up to `limit` candidates ordered by descending
-    /// dead ratio, respecting the configured thresholds and
-    /// minimum segment age.
+    /// Select up to `limit` candidates in cleaner-owned order, respecting
+    /// the configured thresholds and minimum segment age.
     ///
     /// Returns an empty vector when no segment qualifies.
     #[must_use]
     pub fn select_batch(&self, current_commit_group: u64, limit: usize) -> Vec<u64> {
-        self.queue.candidate_batch_with_age(
-            self.config.min_dead_ratio,
-            limit,
-            current_commit_group,
-            self.config.min_segment_age_txg,
-        )
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut candidates: Vec<_> = self
+            .queue
+            .entries()
+            .filter(|e| {
+                e.dead_ratio() >= self.config.min_dead_ratio
+                    && e.dead_bytes > 0
+                    && (e.is_fully_dead()
+                        || e.is_old_enough(current_commit_group, self.config.min_segment_age_txg))
+            })
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.is_fully_dead()
+                .cmp(&a.is_fully_dead())
+                .then_with(|| a.segment_id.cmp(&b.segment_id))
+        });
+        candidates
+            .into_iter()
+            .take(limit)
+            .map(|e| e.segment_id)
+            .collect()
     }
 
-    /// Return the best candidate together with its full liveness
+    /// Return the first eligible candidate together with its full liveness
     /// metadata. Useful for logging and metrics.
     #[must_use]
     pub fn select_with_metadata(&self, current_commit_group: u64) -> Option<VictimCandidate> {
@@ -177,7 +197,19 @@ impl VictimSelector {
             .collect()
     }
 
-    /// Return all candidates (up to a safety limit) sorted by dead ratio.
+    #[must_use]
+    pub fn partial_handoffs(
+        &self,
+        current_commit_group: u64,
+        limit: usize,
+    ) -> Vec<PartialSegmentHandoff> {
+        self.select_batch_with_metadata(current_commit_group, limit)
+            .into_iter()
+            .filter_map(|candidate| candidate.partial_handoff())
+            .collect()
+    }
+
+    /// Return all candidates (up to a safety limit) in cleaner-owned order.
     ///
     /// The limit prevents unbounded memory use. The default value
     /// (1024) covers practical pool sizes.
@@ -239,7 +271,7 @@ mod tests {
     // -- Single candidate selection --
 
     #[test]
-    fn select_highest_dead_ratio() {
+    fn select_lowest_partial_segment_id() {
         let mut q = SegmentLivenessQueue::new();
         // seg 10: 900 live, 100 dead (ratio 0.10)
         q.record_write(10, 1000);
@@ -252,7 +284,19 @@ mod tests {
         q.record_overwrite(30, 900);
 
         let s = VictimSelector::new(q, make_config(0.0, 0));
-        assert_eq!(s.select(0), Some(30));
+        assert_eq!(s.select(0), Some(10));
+    }
+
+    #[test]
+    fn select_fully_dead_before_partial_handoffs() {
+        let mut q = SegmentLivenessQueue::new();
+        q.record_write(10, 1000);
+        q.record_overwrite(10, 900);
+        q.record_write(50, 500);
+        q.record_delete(50, 500);
+
+        let s = VictimSelector::new(q, make_config(0.0, 0));
+        assert_eq!(s.select(0), Some(50));
     }
 
     #[test]
@@ -287,7 +331,7 @@ mod tests {
     // -- Tiebreaking --
 
     #[test]
-    fn select_tiebreak_by_higher_dead_then_lower_id() {
+    fn select_ignores_partial_dead_ratio_for_handoff_order() {
         let mut q = SegmentLivenessQueue::new();
         // Same dead ratio (0.50), same dead bytes
         q.record_write(50, 1000);
@@ -298,7 +342,7 @@ mod tests {
         let s = VictimSelector::new(q, make_config(0.0, 0));
         assert_eq!(s.select(0), Some(10)); // lower id wins
 
-        // Now seg 50 has more dead bytes
+        // Now seg 50 has more dead bytes, but partial ordering stays stable.
         let mut q2 = SegmentLivenessQueue::new();
         q2.record_write(10, 1000);
         q2.record_overwrite(10, 500); // ratio 0.5, dead 500
@@ -306,7 +350,7 @@ mod tests {
         q2.record_overwrite(50, 900); // ratio 0.9, dead 900
 
         let s2 = VictimSelector::new(q2, make_config(0.0, 0));
-        assert_eq!(s2.select(0), Some(50)); // higher ratio wins first
+        assert_eq!(s2.select(0), Some(10));
     }
 
     // -- Batch selection --
@@ -327,7 +371,7 @@ mod tests {
 
         let s = VictimSelector::new(q, make_config(0.0, 0));
         let batch = s.select_batch(0, 3);
-        assert_eq!(batch, vec![1, 4, 3]);
+        assert_eq!(batch, vec![1, 2, 3]);
     }
 
     #[test]
@@ -444,11 +488,13 @@ mod tests {
         let s = VictimSelector::new(q, make_config(0.0, 0));
         let batch = s.select_batch_with_metadata(0, 4);
         assert_eq!(batch.len(), 3);
-        // Verify descending dead ratio
-        for w in batch.windows(2) {
-            assert!(w[0].dead_ratio >= w[1].dead_ratio);
-        }
-        assert_eq!(batch[0].segment_id, 1);
+        assert_eq!(
+            batch
+                .iter()
+                .map(|candidate| candidate.segment_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -469,8 +515,7 @@ mod tests {
         let s = VictimSelector::new(q, make_config(0.0, 0));
         let all = s.all_candidates(0);
         assert_eq!(all.len(), 5);
-        // Highest ratio first (seg 4 with 500 dead)
-        assert_eq!(all[0], 4);
+        assert_eq!(all, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -558,10 +603,11 @@ mod tests {
 
         let s = VictimSelector::new(q, make_config(0.30, 2));
 
-        // At commit_group 5: segs 0-4 are old enough (5-3=2 >= 2), 0 has highest ratio
+        // At commit_group 5: segs 0-4 are old enough (5-3=2 >= 2);
+        // segment 0 is the lowest eligible partial segment id.
         assert_eq!(s.select(5), Some(0));
 
-        // At commit_group 5 batch returns top 3
+        // At commit_group 5 batch returns the first 3 eligible ids.
         let batch = s.select_batch(5, 3);
         assert_eq!(batch, vec![0, 1, 2]);
 
