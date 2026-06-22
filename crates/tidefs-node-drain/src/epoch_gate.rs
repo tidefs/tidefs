@@ -7,7 +7,110 @@
 //! lives in `tidefs-membership-live` without creating a circular dependency.
 
 use std::fmt;
-use tidefs_membership_epoch::MemberId;
+use tidefs_membership_epoch::{EpochAdvanceError, EpochId, EpochTransitionBarrier, MemberId};
+
+// ---------------------------------------------------------------------------
+// DrainFenceEpochTransition
+// ---------------------------------------------------------------------------
+
+/// Membership-epoch transition requested by a forced drain fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrainFenceEpochTransition {
+    node_id: MemberId,
+    from_epoch: EpochId,
+    to_epoch: EpochId,
+}
+
+impl DrainFenceEpochTransition {
+    /// Build the next membership-epoch transition for a forced drain fence.
+    #[must_use]
+    pub fn next(node_id: MemberId, from_epoch: EpochId) -> Self {
+        Self {
+            node_id,
+            from_epoch,
+            to_epoch: from_epoch.next(),
+        }
+    }
+
+    /// Build a transition with an explicit target epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EpochAdvanceError::NonMonotonic`] when `to_epoch` is not
+    /// strictly greater than `from_epoch`.
+    pub fn with_target(
+        node_id: MemberId,
+        from_epoch: EpochId,
+        to_epoch: EpochId,
+    ) -> Result<Self, EpochAdvanceError> {
+        if to_epoch <= from_epoch {
+            return Err(EpochAdvanceError::NonMonotonic {
+                current: from_epoch,
+                proposed: to_epoch,
+            });
+        }
+        Ok(Self {
+            node_id,
+            from_epoch,
+            to_epoch,
+        })
+    }
+
+    #[must_use]
+    pub fn node_id(self) -> MemberId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub fn from_epoch(self) -> EpochId {
+        self.from_epoch
+    }
+
+    #[must_use]
+    pub fn to_epoch(self) -> EpochId {
+        self.to_epoch
+    }
+
+    /// Acquire the membership-epoch transition barrier for this fence.
+    ///
+    /// The returned hold is proof that lease acquisition is blocked before
+    /// node-drain records the fence and proposes the epoch transition.
+    pub fn acquire(
+        self,
+        barrier: &mut EpochTransitionBarrier,
+    ) -> Result<DrainFenceBarrierHold, EpochAdvanceError> {
+        barrier.acquire(self.to_epoch)?;
+        Ok(DrainFenceBarrierHold { transition: self })
+    }
+}
+
+/// Proof that the membership-epoch transition barrier was acquired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrainFenceBarrierHold {
+    transition: DrainFenceEpochTransition,
+}
+
+impl DrainFenceBarrierHold {
+    #[must_use]
+    pub fn transition(self) -> DrainFenceEpochTransition {
+        self.transition
+    }
+
+    #[must_use]
+    pub fn node_id(self) -> MemberId {
+        self.transition.node_id()
+    }
+
+    #[must_use]
+    pub fn from_epoch(self) -> EpochId {
+        self.transition.from_epoch()
+    }
+
+    #[must_use]
+    pub fn to_epoch(self) -> EpochId {
+        self.transition.to_epoch()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // EpochGateState
@@ -712,5 +815,33 @@ mod tests {
 
         let state = gate.drive(&mut ops, &voters, 0).unwrap();
         assert_eq!(state, EpochGateState::Committed);
+    }
+
+    #[test]
+    fn drain_fence_transition_acquires_membership_barrier() {
+        let mut barrier = EpochTransitionBarrier::new();
+        let transition = DrainFenceEpochTransition::next(nid(42), EpochId::new(7));
+
+        let hold = transition.acquire(&mut barrier).unwrap();
+
+        assert_eq!(hold.node_id(), nid(42));
+        assert_eq!(hold.from_epoch(), EpochId::new(7));
+        assert_eq!(hold.to_epoch(), EpochId::new(8));
+        assert!(barrier.is_blocked());
+        assert_eq!(barrier.pending_epoch(), Some(EpochId::new(8)));
+    }
+
+    #[test]
+    fn drain_fence_transition_rejects_non_monotonic_target() {
+        let result =
+            DrainFenceEpochTransition::with_target(nid(43), EpochId::new(9), EpochId::new(9));
+
+        assert_eq!(
+            result.unwrap_err(),
+            EpochAdvanceError::NonMonotonic {
+                current: EpochId::new(9),
+                proposed: EpochId::new(9),
+            }
+        );
     }
 }
