@@ -1485,10 +1485,6 @@ pub struct LocalFileSystem {
     /// same [`Arc`] held by [`FileSystemState::extent_maps`], so defrag
     /// results are committed directly to the canonical extent maps.
     extent_maps_shared: Option<Arc<Mutex<BTreeMap<InodeId, tidefs_extent_map::ExtentMap>>>>,
-    /// Shared inode records (for file_size lookups by the defrag adapter).
-    /// Uses the same [`Arc`] as [`FileSystemState::inodes`] so file-size
-    /// data is always up-to-date.
-    inodes_shared: Option<Arc<BTreeMap<InodeId, InodeRecord>>>,
     /// Shared statistics published by the online defrag job after each tick.
     online_defrag_stats: Option<Arc<Mutex<DefragStats>>>,
     feature_flags: FeatureFlags,
@@ -3304,7 +3300,6 @@ impl LocalFileSystem {
         // defrag adapter modifies the same in-memory extent maps that the
         // filesystem uses.
         let extent_maps_shared = Arc::clone(&state.extent_maps);
-        let inodes_shared = Arc::clone(&state.inodes);
         let online_defrag_stats = Arc::new(Mutex::new(DefragStats::default()));
 
         let mut fs = Self {
@@ -3360,7 +3355,6 @@ impl LocalFileSystem {
             content_compression_policy: ContentCompressionPolicy::default(),
             pending_orphan_deletions: Arc::new(Mutex::new(Vec::new())),
             extent_maps_shared: Some(extent_maps_shared), // Arc::clone of state.extent_maps
-            inodes_shared: Some(inodes_shared), // Arc::clone of state.inodes
             online_defrag_stats: Some(Arc::clone(&online_defrag_stats)),
             background_scheduler: None,
             scrub_repair_schedule: None,
@@ -3459,13 +3453,8 @@ impl LocalFileSystem {
             // Online extent-map defragmentation runs at BestEffort priority
             // (mapped from JobKind::Defrag). It never starves critical,
             // latency-sensitive, or throughput-priority lanes.
-            if let (Some(ref em_shared), Some(ref inodes_shared)) =
-                (&fs.extent_maps_shared, &fs.inodes_shared)
-            {
-                let defrag_store = FilesystemExtentMapStore::new(
-                    Arc::clone(inodes_shared),
-                    Arc::clone(em_shared),
-                );
+            if let Some(ref em_shared) = fs.extent_maps_shared {
+                let defrag_store = FilesystemExtentMapStore::new(Arc::clone(em_shared));
                 let defrag_svc = OnlineDefragService::new(
                     JobId(200),
                     Box::new(defrag_store),
@@ -12811,11 +12800,9 @@ mod orphan_index_integration_tests {
             extent_map.allocate(0, 4096).expect("first extent");
             extent_map.allocate(8192, 4096).expect("second extent");
 
-            let inodes = Arc::new(BTreeMap::new());
             let extent_maps = Arc::new(Mutex::new(BTreeMap::from([(inode, extent_map)])));
             let stats = Arc::new(Mutex::new(DefragStats::default()));
-            let store =
-                FilesystemExtentMapStore::new(Arc::clone(&inodes), Arc::clone(&extent_maps));
+            let store = FilesystemExtentMapStore::new(Arc::clone(&extent_maps));
             let defrag_svc = OnlineDefragService::new(JobId(200), Box::new(store), 4096)
                 .with_stats_sink(Arc::clone(&stats));
 
@@ -12851,6 +12838,23 @@ mod orphan_index_integration_tests {
             assert_eq!(stats.inodes_defragmented, 0);
             assert_eq!(stats.extents_before, 2);
             assert_eq!(stats.extents_after, 2);
+        }
+
+        #[test]
+        fn online_defrag_adapter_uses_extent_map_file_size() {
+            let inode = InodeId::new(43);
+            let mut extent_map = tidefs_extent_map::ExtentMap::new();
+            extent_map.allocate(4096, 4096).expect("extent");
+            let extent_maps = Arc::new(Mutex::new(BTreeMap::from([(inode, extent_map)])));
+            let store = FilesystemExtentMapStore::new(Arc::clone(&extent_maps));
+
+            let loaded = tidefs_online_defrag::ExtentMapStore::load_extent_map(
+                &store,
+                inode.get(),
+            )
+            .expect("load extent map");
+
+            assert_eq!(loaded.header.file_size, 8192);
         }
 
         #[test]

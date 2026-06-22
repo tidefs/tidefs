@@ -3,11 +3,10 @@
 //! [`tidefs_online_defrag::ExtentMapStore`] trait to live filesystem
 //! extent maps.
 //!
-//! The adapter holds shared handles to the filesystem's inode records
-//! (for file sizes) and extent maps. On [`save_extent_map`], the adapter
-//! calls [`ExtentMap::defrag`] directly on the production extent map,
-//! which merges adjacent same-locator extents without changing logical
-//! offsets or locator assignments.
+//! The adapter holds the shared extent-map handle used by the mounted
+//! filesystem. On [`save_extent_map`], the adapter calls [`ExtentMap::defrag`]
+//! directly on the production extent map, which merges adjacent same-locator
+//! extents without changing logical offsets or locator assignments.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -19,33 +18,19 @@ use tidefs_types_extent_map_core::{ExtentMapError, ExtentMapEntryV2, ExtentMapV1
 /// Shared-handle adapter that connects the online-defrag service to
 /// the filesystem's in-memory extent maps.
 ///
-/// Held fields:
-/// - `inodes`: shared inode records (read-only), used to read `file_size`
-///   for the [`InlineExtentMap`] header.
-/// - `extent_maps`: shared extent maps. Reads produce a temporary
-///   [`InlineExtentMap`] for fragmentation scoring; writes call
-///   [`ExtentMap::defrag`] directly on the production map.
+/// Reads produce a temporary [`InlineExtentMap`] for fragmentation scoring;
+/// writes call [`ExtentMap::defrag`] directly on the production map.
 pub struct FilesystemExtentMapStore {
-    inodes: Arc<BTreeMap<InodeId, InodeRecord>>,
     extent_maps: Arc<Mutex<BTreeMap<InodeId, ExtentMap>>>,
 }
 
-// Local type aliases matching what the filesystem uses internally.
-// We don't re-export these; they're just for the adapter's private use.
-use crate::types::InodeRecord;
 use tidefs_types_vfs_core::InodeId;
 
 impl FilesystemExtentMapStore {
     /// Create a new adapter backed by the given shared handles.
     #[must_use]
-    pub fn new(
-        inodes: Arc<BTreeMap<InodeId, InodeRecord>>,
-        extent_maps: Arc<Mutex<BTreeMap<InodeId, ExtentMap>>>,
-    ) -> Self {
-        Self {
-            inodes,
-            extent_maps,
-        }
+    pub fn new(extent_maps: Arc<Mutex<BTreeMap<InodeId, ExtentMap>>>) -> Self {
+        Self { extent_maps }
     }
 }
 
@@ -68,18 +53,13 @@ impl ExtentMapStore for FilesystemExtentMapStore {
             .get(&InodeId::new(ino))
             .ok_or(ExtentMapError::NotFound)?;
 
+        let file_size = em.inner().file_size();
+
         let entries: Vec<ExtentMapEntryV2> = em
             .lookup_range(0, u64::MAX)
             .map_err(|_| ExtentMapError::Corrupt)?;
 
-        // inodes is a read-only Arc<BTreeMap<>>, no lock needed.
         drop(em_guard);
-
-        let file_size = self
-            .inodes
-            .get(&InodeId::new(ino))
-            .map(|rec| rec.size)
-            .unwrap_or(0);
 
         let alloc_bytes: u64 = entries
             .iter()
