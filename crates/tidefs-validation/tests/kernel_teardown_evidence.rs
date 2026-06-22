@@ -7,23 +7,28 @@
 
 use tidefs_validation::kernel_teardown_evidence::{
     validate_kernel_teardown_no_work_after_artifact_json,
+    KERNEL_TEARDOWN_NO_WORK_AFTER_ARTIFACT_VERSION,
     KERNEL_TEARDOWN_NO_WORK_AFTER_V1_CLAIM_ID,
     KERNEL_TEARDOWN_NO_WORK_AFTER_EVIDENCE_CLASS,
+    KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID,
+    KERNEL_TEARDOWN_NO_WORK_AFTER_VALIDATION_TIER,
     KERNEL_TEARDOWN_NO_WORK_AFTER_VERIFIER,
 };
 
 fn minimal_pass_json() -> String {
     r#"{
-        "report_version": 1,
+        "artifact_version": 1,
         "generated_by": "kernel-teardown-validation",
         "claim_id": "kernel.teardown.no_work_after.v1",
         "evidence_class": "runtime-kernel-teardown-no-work-after-artifact",
         "workflow_run_id": "1234567890",
+        "workflow_run_attempt": 1,
         "workflow_name": "Kernel Teardown Validation",
+        "workflow_job": "kernel teardown mounted vfs",
         "source_ref": "refs/heads/master",
         "source_sha": "abc123def456",
         "validation_tier": "mounted-kernel-vfs",
-        "target_id": "kmod-xfstests-smoke",
+        "target_id": "kernel-teardown-mounted-vfs",
         "kernel_release": "6.8.0-tidefs+",
         "module_name": "tidefs",
         "module_digest": "sha256:deadbeef",
@@ -75,7 +80,7 @@ fn integration_pass_artifact_validates() {
     assert_eq!(summary.fail_closed_count, 0);
     assert_eq!(summary.phase_count, 9);
     assert_eq!(summary.refusal_observation_count, 1);
-    assert_eq!(summary.target_id, "kmod-xfstests-smoke");
+    assert_eq!(summary.target_id, KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID);
     assert_eq!(summary.source_ref, "refs/heads/master");
 }
 
@@ -85,7 +90,7 @@ fn integration_pass_artifact_validates() {
 fn integration_missing_workflow_run_id_fails() {
     // Omit everything except header fields
     let json = r#"{
-        "report_version": 1,
+        "artifact_version": 1,
         "generated_by": "test",
         "claim_id": "kernel.teardown.no_work_after.v1",
         "evidence_class": "runtime-kernel-teardown-no-work-after-artifact"
@@ -101,18 +106,21 @@ fn integration_missing_workflow_run_id_fails() {
 #[test]
 fn integration_missing_claim_id_fails() {
     let json = r#"{
-        "report_version": 1,
+        "artifact_version": 1,
         "generated_by": "test",
         "claim_id": "",
         "evidence_class": "runtime-kernel-teardown-no-work-after-artifact",
         "workflow_run_id": "1",
+        "workflow_run_attempt": 1,
         "workflow_name": "test",
+        "workflow_job": "kernel teardown mounted vfs",
         "source_ref": "ref",
         "source_sha": "abc",
-        "validation_tier": "t5",
-        "target_id": "t",
+        "validation_tier": "mounted-kernel-vfs",
+        "target_id": "kernel-teardown-mounted-vfs",
         "kernel_release": "6.8",
         "module_name": "tidefs",
+        "module_digest": "sha256:abc",
         "teardown_phases": [],
         "workqueue_trace_source": "a",
         "workqueue_trace_artifact_path": "a",
@@ -160,6 +168,23 @@ fn integration_unknown_field_rejected() {
 // ── Source/target/tier mismatch ──────────────────────────────────────────
 
 #[test]
+fn integration_artifact_version_mismatch_fails() {
+    let mut json_val: serde_json::Value =
+        serde_json::from_str(&minimal_pass_json()).unwrap();
+    json_val
+        .as_object_mut()
+        .unwrap()
+        .insert("artifact_version".into(), serde_json::json!(2));
+    let json = serde_json::to_string_pretty(&json_val).unwrap();
+    let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("artifact_version"),
+        "should reject wrong artifact_version: {msg}"
+    );
+}
+
+#[test]
 fn integration_empty_source_ref_fails() {
     let mut json_val: serde_json::Value =
         serde_json::from_str(&minimal_pass_json()).unwrap();
@@ -174,31 +199,40 @@ fn integration_empty_source_ref_fails() {
 }
 
 #[test]
-fn integration_empty_target_id_fails() {
+fn integration_target_id_mismatch_fails() {
     let mut json_val: serde_json::Value =
         serde_json::from_str(&minimal_pass_json()).unwrap();
     json_val
         .as_object_mut()
         .unwrap()
-        .insert("target_id".into(), serde_json::Value::String(String::new()));
+        .insert(
+            "target_id".into(),
+            serde_json::Value::String("wrong-target".into()),
+        );
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("target_id"), "should reject empty target_id: {msg}");
+    assert!(msg.contains("target_id"), "should reject wrong target_id: {msg}");
 }
 
 #[test]
-fn integration_empty_validation_tier_fails() {
+fn integration_validation_tier_mismatch_fails() {
     let mut json_val: serde_json::Value =
         serde_json::from_str(&minimal_pass_json()).unwrap();
     json_val
         .as_object_mut()
         .unwrap()
-        .insert("validation_tier".into(), serde_json::Value::String(String::new()));
+        .insert(
+            "validation_tier".into(),
+            serde_json::Value::String("qemu-guest".into()),
+        );
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("validation_tier"), "should reject empty validation_tier: {msg}");
+    assert!(
+        msg.contains("validation_tier"),
+        "should reject wrong validation_tier: {msg}"
+    );
 }
 
 // ── Trace / refusal omission ─────────────────────────────────────────────
@@ -352,8 +386,17 @@ fn integration_blocked_with_reasons_passes() {
 
 #[test]
 fn integration_constants_are_non_empty() {
+    assert_eq!(KERNEL_TEARDOWN_NO_WORK_AFTER_ARTIFACT_VERSION, 1);
     assert!(!KERNEL_TEARDOWN_NO_WORK_AFTER_V1_CLAIM_ID.is_empty());
     assert!(!KERNEL_TEARDOWN_NO_WORK_AFTER_EVIDENCE_CLASS.is_empty());
+    assert_eq!(
+        KERNEL_TEARDOWN_NO_WORK_AFTER_VALIDATION_TIER,
+        "mounted-kernel-vfs"
+    );
+    assert_eq!(
+        KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID,
+        "kernel-teardown-mounted-vfs"
+    );
     assert!(!KERNEL_TEARDOWN_NO_WORK_AFTER_VERIFIER.is_empty());
 }
 
