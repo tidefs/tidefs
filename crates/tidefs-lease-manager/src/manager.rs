@@ -224,7 +224,7 @@ impl LeaseManager {
         grant: &LeaseGrant,
         wait_policy: InvalidationWaitPolicy,
     ) -> Result<InvalidationResult, LeaseManagerError> {
-        if let Some(ref bus) = self.coherency_bus {
+        if let Some(bus) = self.coherency_bus.clone() {
             let msg = self.build_invalidation_message(
                 grant,
                 CacheInvalidationReason::ConflictingWriteLease,
@@ -436,7 +436,7 @@ impl LeaseManager {
 
     /// Build a [`CacheInvalidationMessage`] from a lease grant and its revocation context.
     fn build_invalidation_message(
-        &self,
+        &mut self,
         grant: &LeaseGrant,
         reason: CacheInvalidationReason,
         wait_policy: InvalidationWaitPolicy,
@@ -471,7 +471,7 @@ impl LeaseManager {
         };
 
         let old_gen = self.current_generation(dataset_id, inode_id);
-        let new_gen = old_gen.wrapping_add(1);
+        let new_gen = self.advance_generation(dataset_id, inode_id);
 
         Some(CacheInvalidationMessage {
             dataset_id,
@@ -532,8 +532,8 @@ impl LeaseManager {
     /// epoch advancement), any cached pages in the lease's byte range must
     /// be invalidated so that subsequent accesses fault and fetch
     /// authoritative data from the new lease holder.
-    fn dispatch_invalidation_for_grant(&self, grant: &LeaseGrant) {
-        if let Some(ref bus) = self.coherency_bus {
+    fn dispatch_invalidation_for_grant(&mut self, grant: &LeaseGrant) {
+        if let Some(bus) = self.coherency_bus.clone() {
             // Build a full invalidation message with generation tracking.
             let msg = self.build_invalidation_message(
                 grant,
