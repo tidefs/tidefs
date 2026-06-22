@@ -393,7 +393,9 @@ use tidefs_local_object_store::{
     IoClass, LocalObjectStore, ObjectKey, ObjectLocation, Pool, PoolConfig, PoolProperties,
     StoreEncryptionKey, StoreError, StoreOptions, DEFAULT_MAX_SEGMENT_BYTES, RECORD_OVERHEAD_BYTES,
 };
-use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
+use tidefs_orphan_index::{
+    OrphanEntry, OrphanEntryFlags, OrphanIndex, OrphanIndexAdmissionError,
+};
 use tidefs_performance_contract::AdmissionPermit;
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
 use tidefs_reserve_ledger::{BudgetDomain, ReserveClass};
@@ -3905,11 +3907,26 @@ impl LocalFileSystem {
         self.reclaim_queue.lock().unwrap().insert(entry);
     }
 
+    fn orphan_index_admission_error(_err: OrphanIndexAdmissionError) -> FileSystemError {
+        FileSystemError::CorruptState {
+            reason: "orphan-index metadata admission rejected permit",
+        }
+    }
+
+    fn release_metadata_admission_permit(&mut self, permit: AdmissionPermit) -> Result<()> {
+        self.write_admission
+            .release(permit)
+            .map(|_| ())
+            .map_err(|_e| FileSystemError::CorruptState {
+                reason: "failed to release metadata admission permit",
+            })
+    }
+
     /// Mark an inode as orphaned after its namespace link count reaches zero.
     ///
     /// Returns `true` when the inode was newly inserted into the persistent
     /// orphan index and `false` when it was already tracked.
-    pub fn track_orphan(&self, inode_id: InodeId) -> bool {
+    pub fn track_orphan(&mut self, inode_id: InodeId) -> Result<bool> {
         let (generation, nlink, is_dir) = {
             if let Some(record) = self.state.inodes.get(&inode_id) {
                 (record.generation.get(), record.nlink, record.is_directory())
@@ -3924,14 +3941,19 @@ impl LocalFileSystem {
         };
         let entry = OrphanEntry::new(inode_id.get(), generation, nlink, flags);
         let _orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
-        self.orphan_index
-            .lock()
-            .unwrap()
-            .insert(inode_id.get(), entry);
-        self.write_admission.release(_orphan_md_permit)
-            .map_err(|e| FileSystemError::CorruptState {
-                reason: format!("failed to release metadata admission permit: {}", e),
-            })?
+        let insert_result = {
+            let mut orphan_index = self.orphan_index.lock().unwrap();
+            orphan_index.insert_admitted(inode_id.get(), entry, &_orphan_md_permit)
+        };
+        let inserted = match insert_result {
+            Ok(inserted) => inserted,
+            Err(err) => {
+                self.release_metadata_admission_permit(_orphan_md_permit)?;
+                return Err(Self::orphan_index_admission_error(err));
+            }
+        };
+        self.release_metadata_admission_permit(_orphan_md_permit)?;
+        Ok(inserted)
     }
 
     /// Queue an already tracked orphan for deferred background reclamation.
@@ -6018,11 +6040,15 @@ impl LocalFileSystem {
         // If nlink transitions from 0 to 1, the inode is no longer orphaned.
         if updated.nlink == 1 {
             let _orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
-            self.orphan_index.lock().unwrap().remove(inode_id.get());
-            self.write_admission.release(_orphan_md_permit)
-                .map_err(|e| FileSystemError::CorruptState {
-                    reason: format!("failed to release metadata admission permit: {}", e),
-                })?;
+            let remove_result = {
+                let mut orphan_index = self.orphan_index.lock().unwrap();
+                orphan_index.remove_admitted(inode_id.get(), &_orphan_md_permit)
+            };
+            if let Err(err) = remove_result {
+                self.release_metadata_admission_permit(_orphan_md_permit)?;
+                return Err(Self::orphan_index_admission_error(err));
+            }
+            self.release_metadata_admission_permit(_orphan_md_permit)?;
         }
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated.clone());
         self.inode_cache.borrow_mut().invalidate(inode_id);
@@ -8788,14 +8814,19 @@ impl LocalFileSystem {
                 orphan_flags,
             );
             let _orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
-            self.orphan_index
-                .lock()
-                .unwrap()
-                .insert(entry.inode_id.get(), orphan_entry);
-            self.write_admission.release(_orphan_md_permit)
-                .map_err(|e| FileSystemError::CorruptState {
-                    reason: format!("failed to release metadata admission permit: {}", e),
-                })?;
+            let insert_result = {
+                let mut orphan_index = self.orphan_index.lock().unwrap();
+                orphan_index.insert_admitted(
+                    entry.inode_id.get(),
+                    orphan_entry,
+                    &_orphan_md_permit,
+                )
+            };
+            if let Err(err) = insert_result {
+                self.release_metadata_admission_permit(_orphan_md_permit)?;
+                return Err(Self::orphan_index_admission_error(err));
+            }
+            self.release_metadata_admission_permit(_orphan_md_permit)?;
             // Record nlink=0 in state so record_reclaim_delta can iterate
             // chunk keys for dedup refcount decrement (#6167).
             if let Some(stored) = Arc::make_mut(&mut self.state.inodes).get_mut(&entry.inode_id) {
@@ -9217,10 +9248,7 @@ impl LocalFileSystem {
         // Release the metadata admission permit now that the rename
         // is durably committed.
         if let Some(permit) = self.pending_permits.pop() {
-            self.write_admission.release(permit)
-                .map_err(|e| FileSystemError::CorruptState {
-                    reason: format!("failed to release metadata admission permit: {}", e),
-                })?;
+            self.release_metadata_admission_permit(permit)?;
         }
         Ok(())
     }
@@ -12816,12 +12844,18 @@ mod orphan_index_integration_tests {
 
     #[test]
     fn public_orphan_reclaim_api_tracks_and_releases() {
-        let (_root, fs) = make_test_fs("oi_test_public_api").expect("open");
+        let (_root, mut fs) = make_test_fs("oi_test_public_api").expect("open");
         let inode_id = InodeId::new(88_001);
         assert!(fs.reclaim_stats().is_idle());
 
-        assert!(fs.track_orphan(inode_id), "first track inserts orphan");
-        assert!(!fs.track_orphan(inode_id), "second track is idempotent");
+        assert!(
+            fs.track_orphan(inode_id).expect("track orphan"),
+            "first track inserts orphan"
+        );
+        assert!(
+            !fs.track_orphan(inode_id).expect("track orphan again"),
+            "second track is idempotent"
+        );
         let stats = fs.reclaim_stats();
         assert_eq!(stats.orphan_index_entries, 1);
         assert_eq!(stats.pending_orphan_deletions, 0);

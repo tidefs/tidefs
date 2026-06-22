@@ -17,6 +17,7 @@ tidefs-commit_group = { path = "../tidefs-commit_group" }
 tidefs-types-orphan-index-core = { path = "../tidefs-types-orphan-index-core" }
 tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
 tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+tidefs-performance-contract = { path = "../tidefs-performance-contract" }
 blake3 = { version = "1", default-features = false }
 
 [dev-dependencies]

@@ -707,16 +707,15 @@ impl AdmissionCharge {
     /// Construct a metadata-mutation charge.
     ///
     /// Metadata mutations (rename, link, unlink, orphan-index insert/remove)
-    /// consume queue slots but do not contribute to dirty-byte or dirty-op
-    /// caps.  Each metadata mutation counts as exactly one op so that
-    /// [`BudgetedQueue`] and permit-count caps still budget the mutation.
+    /// consume permits and queue slots but do not contribute to dirty-byte,
+    /// dirty-op, or dirty-age caps.
     #[must_use]
     pub const fn metadata_mutation(admitted_tick: u64) -> Self {
         Self {
             work_class: WorkClass::MetadataMutation,
             primary_domain: ResourceDomain::Metadata,
             dirty_bytes: 0,
-            dirty_ops: 1,
+            dirty_ops: 0,
             admitted_tick,
         }
     }
@@ -904,16 +903,7 @@ impl WriteAdmissionState {
             });
         }
 
-        let new_ops = self
-            .usage
-            .dirty_ops
-            .checked_add(1)
-            .ok_or(AdmissionError::DirtyOpsOverflow)?;
-        self.usage.dirty_ops = new_ops;
         self.usage.outstanding_permits = new_permits;
-        if self.usage.oldest_dirty_tick.is_none() {
-            self.usage.oldest_dirty_tick = Some(admitted_tick);
-        }
         let permit_id = self.next_permit_id;
         self.next_permit_id = self.next_permit_id.saturating_add(1);
         Ok(AdmissionPermit::new(permit_id, AdmissionCharge::metadata_mutation(admitted_tick)))
@@ -1628,6 +1618,42 @@ mod tests {
     }
 
     #[test]
+    fn metadata_admission_conserves_only_permit_slots() {
+        let config = WriteAdmissionConfig::new(0, 0, 0, 2);
+        let mut state = WriteAdmissionState::new(config);
+
+        let first = state
+            .try_admit_metadata(10)
+            .expect("metadata admission ignores dirty caps");
+        let second = state
+            .try_admit_metadata(11)
+            .expect("metadata admission consumes permit slots");
+
+        assert_eq!(first.charge(), AdmissionCharge::metadata_mutation(10));
+        assert_eq!(state.usage().dirty_bytes, 0);
+        assert_eq!(state.usage().dirty_ops, 0);
+        assert_eq!(state.usage().outstanding_permits, 2);
+        assert_eq!(state.usage().oldest_dirty_tick, None);
+        assert!(!state.dirty_age_over_cap(u64::MAX));
+
+        let err = state
+            .try_admit_metadata(12)
+            .expect_err("metadata admission still respects permit cap");
+        assert!(matches!(
+            err,
+            AdmissionError::PermitHardCap {
+                in_use: 2,
+                requested: 1,
+                cap: 2,
+            }
+        ));
+
+        state.release(first).expect("release first metadata permit");
+        state.release(second).expect("release second metadata permit");
+        assert_eq!(state.usage(), WriteAdmissionUsage::default());
+    }
+
+    #[test]
     fn budgeted_queue_requires_and_returns_permits() {
         let config = WriteAdmissionConfig::new(4096, 4, 8, 4);
         let mut state = WriteAdmissionState::new(config);
@@ -1650,6 +1676,39 @@ mod tests {
         let (item, permit) = queued.into_parts();
         assert_eq!(item, "dirty extent");
         state.release(permit).expect("release queued permit");
+        assert_eq!(state.usage(), WriteAdmissionUsage::default());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn budgeted_queue_accounts_metadata_by_slot_only() {
+        let config = WriteAdmissionConfig::new(0, 0, 0, 1);
+        let mut state = WriteAdmissionState::new(config);
+        let metadata = QueueMetadata {
+            id: "local_fs.metadata_mutation_admission",
+            work_class: WorkClass::MetadataMutation,
+            primary_domain: ResourceDomain::Metadata,
+            service_curve: ServiceCurve::new(
+                WorkClass::MetadataMutation,
+                ResourceDomain::Metadata,
+                1,
+                0,
+                1,
+            ),
+        };
+        let mut queue = BudgetedQueue::new(metadata);
+
+        let permit = state
+            .try_admit_metadata(0)
+            .expect("metadata permit admitted");
+        queue.push("rename", permit).expect("metadata queued");
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.queued_dirty_bytes(), 0);
+        assert_eq!(queue.queued_dirty_ops(), 0);
+
+        let (_, permit) = queue.pop().expect("queued item").into_parts();
+        state.release(permit).expect("release metadata permit");
         assert_eq!(state.usage(), WriteAdmissionUsage::default());
         assert!(queue.is_empty());
     }

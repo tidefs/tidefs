@@ -17,14 +17,15 @@ blocked_claim_ids = [
   "local.vfs.rename_atomic_crash.v1",
 ]
 non_claims = [
-  "This receipt records source and registry coverage for rename and orphan-index metadata-mutation admission wiring.",
+  "This receipt records source and registry coverage for rename and active orphan-index metadata-mutation admission wiring.",
+  "Active local-filesystem orphan-index insert/remove paths call OrphanIndex::insert_admitted/remove_admitted with a metadata AdmissionPermit.",
   "This receipt does not by itself satisfy queue-depth-runtime-artifact evidence.",
   "Mount-time orphan-index log recovery (recover_from_log) and background orphan reclamation (tick_background_services) are not admission-gated in this slice.",
   "Existing issue #498 dirty-write smoke queue-depth evidence does not exercise rename/orphan-index metadata-mutation paths.",
 ]
 
 [reviewer]
-name = "gpt5"
+name = "gpt0"
 role = "managed TideFS Codex session"
 
 [tool]
