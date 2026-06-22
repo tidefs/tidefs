@@ -293,6 +293,7 @@
 pub mod admission;
 mod allocation;
 mod background_cleaner;
+pub mod background_compaction;
 mod background_orphan_reclamation;
 pub mod capacity_authority;
 mod checksum;

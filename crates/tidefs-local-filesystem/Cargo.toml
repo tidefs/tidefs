@@ -45,6 +45,7 @@ tidefs-send-stream = { path = "../tidefs-send-stream" }
 tidefs-receive-stream = { path = "../tidefs-receive-stream" }
 
 tidefs-background-scheduler = { path = "../tidefs-background-scheduler" }
+tidefs-compaction = { path = "../tidefs-compaction" }
 tidefs-scrub-core = { path = "../tidefs-scrub-core" }
 tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
 tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
