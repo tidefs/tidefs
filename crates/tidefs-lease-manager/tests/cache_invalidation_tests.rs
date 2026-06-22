@@ -5,18 +5,15 @@
 //! membership epoch transition fencing, generation tracking, and wait-policy
 //! gating.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tidefs_cache_coherency::{
     CacheInvalidationMessage, CacheInvalidationReason, CacheInvalidationScope,
     CacheInvalidationSubscriber, CoherencyEventBus, InvalidationResult,
     InvalidationWaitPolicy,
 };
-use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseGrant, LeaseLifecycle};
+use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseGrant};
 use tidefs_lease::wire::CacheInvalidationPayload;
-use tidefs_lease_manager::{
-    LeaseManager, LeaseManagerConfig, LeaseManagerError,
-};
+use tidefs_lease_manager::{LeaseManager, LeaseManagerConfig};
 use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
 // ---------------------------------------------------------------------------
@@ -45,10 +42,6 @@ impl RecordingSubscriber {
             messages: Mutex::new(Vec::new()),
             result: Mutex::new(result),
         }
-    }
-
-    fn set_result(&self, r: InvalidationResult) {
-        *self.result.lock().unwrap() = r;
     }
 
     fn received_count(&self) -> usize {
@@ -136,7 +129,7 @@ fn make_inode_grant(lease_id: u64, dataset_id: u64, ino: u64) -> LeaseGrant {
 #[test]
 fn advisory_invalidation_dispatches_message_to_subscriber() {
     let sub = Arc::new(RecordingSubscriber::new("advisory-test"));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
     mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
@@ -147,7 +140,7 @@ fn advisory_invalidation_dispatches_message_to_subscriber() {
 #[test]
 fn advisory_invalidation_carries_full_metadata() {
     let sub = Arc::new(RecordingSubscriber::new("metadata-test"));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
     mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
@@ -164,7 +157,7 @@ fn advisory_invalidation_carries_full_metadata() {
 #[test]
 fn advisory_invalidation_range_scope_correct() {
     let sub = Arc::new(RecordingSubscriber::new("scope-test"));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 4096, 8192);
     mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
@@ -182,7 +175,7 @@ fn advisory_invalidation_range_scope_correct() {
 #[test]
 fn advisory_invalidation_inode_scope_correct() {
     let sub = Arc::new(RecordingSubscriber::new("inode-test"));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_inode_grant(2, 5, 99);
     mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
@@ -276,7 +269,7 @@ fn invalidation_message_includes_generation_delta() {
 #[test]
 fn wait_for_clean_eviction_is_blocking() {
     let sub = Arc::new(RecordingSubscriber::new("clean-evict"));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
     let result = mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForCleanEviction).unwrap();
@@ -289,7 +282,7 @@ fn wait_for_clean_eviction_is_blocking() {
 #[test]
 fn wait_for_clean_eviction_sees_blocking_flag() {
     let sub = Arc::new(RecordingSubscriber::new("blocking-flag"));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
     mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForCleanEviction).unwrap();
@@ -309,7 +302,7 @@ fn wait_for_dirty_drain_sees_dirty_pages() {
         "dirty-sub",
         InvalidationResult::dirty_pending(3, 2),
     ));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
     let result = mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForDirtyDrain).unwrap();
@@ -323,7 +316,7 @@ fn wait_for_dirty_drain_sees_dirty_pages() {
 #[test]
 fn wait_for_dirty_drain_requires_dirty_flag() {
     let sub = Arc::new(RecordingSubscriber::new("dirty-flag"));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
     mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForDirtyDrain).unwrap();
@@ -340,7 +333,7 @@ fn wait_for_dirty_drain_requires_dirty_flag() {
 #[test]
 fn fence_and_error_is_not_blocking() {
     let sub = Arc::new(RecordingSubscriber::new("fence-sub"));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
     let _result = mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::FenceAndError).unwrap();
@@ -428,7 +421,7 @@ fn epoch_advance_noop_for_equal_or_lesser_epoch() {
 #[test]
 fn stats_track_invalidation_dispatches() {
     let sub = Arc::new(RecordingSubscriber::new("stats-sub"));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
     mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
@@ -559,7 +552,7 @@ fn invalidation_ack_reflects_subscriber_result() {
             needs_retry: true,
         },
     ));
-    let (mgr, _bus) = manager_with_bus(sub.clone());
+    let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
     let result = mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForDirtyDrain).unwrap();
