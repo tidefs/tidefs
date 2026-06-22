@@ -38,6 +38,11 @@
 //! prevents callers from accidentally treating an inherited or default
 //! property value as live mounted content-transform policy.
 //!
+//! `space.quota` follows the same property-library boundary.  Use
+//! [`resolve_space_quota_for_capacity_authority`] to project the inherited
+//! property metadata into a typed capacity-authority input; mounted quota
+//! enforcement remains in the gated capacity authority closeout slice.
+//!
 //! # Key types
 //!
 //! - [`PropertyType`] — wire-type discriminant for property values.
@@ -48,10 +53,15 @@
 //! - [`PropertySet`] — per-dataset BTreeMap of property entries.
 //! - [`PropertyDefinitionV1`] — compile-time registry entry.
 //! - [`resolve_effective`] — walk the parent chain to resolve a property value.
+//! - [`resolve_space_quota_for_capacity_authority`] — typed `space.quota`
+//!   projection for the capacity authority input boundary.
 //! - [`validate_set`] — check a proposed value against the registry and constraints.
 
 use std::collections::BTreeMap;
 use std::fmt;
+
+/// Canonical property name for the dataset capacity quota.
+pub const SPACE_QUOTA_PROPERTY_NAME: &str = "space.quota";
 
 // ---------------------------------------------------------------------------
 // PropertyType — wire-type discriminant
@@ -458,6 +468,31 @@ impl PropertyEntryV1 {
 }
 
 // ---------------------------------------------------------------------------
+// CapacityAuthorityQuotaInput — typed resolved space.quota projection
+// ---------------------------------------------------------------------------
+
+/// Resolved `space.quota` input for the mounted capacity authority boundary.
+///
+/// This is a typed projection of dataset-property metadata, not runtime quota
+/// enforcement.  A value of [`None`] means no quota was set locally or inherited
+/// and the authority should treat the property input as unset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapacityAuthorityQuotaInput {
+    /// Effective quota limit in bytes.
+    pub quota_bytes: Option<u64>,
+    /// Provenance of the resolved `space.quota` value.
+    pub source: PropertySource,
+}
+
+impl CapacityAuthorityQuotaInput {
+    /// Whether a concrete quota limit is present.
+    #[must_use]
+    pub const fn is_set(&self) -> bool {
+        self.quota_bytes.is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PropertySet — per-dataset property collection
 // ---------------------------------------------------------------------------
 
@@ -488,7 +523,14 @@ impl PropertySet {
         value: PropertyValue,
         source: PropertySource,
     ) {
-        self.entries.insert(key, PropertyEntryV1 { value, source, mounted_write_authority: MountedWriteAuthority::Authoritative });
+        self.entries.insert(
+            key,
+            PropertyEntryV1 {
+                value,
+                source,
+                mounted_write_authority: MountedWriteAuthority::Authoritative,
+            },
+        );
     }
 
     /// Get a property entry by key.
@@ -865,6 +907,65 @@ pub fn resolve_effective(
     }
 }
 
+/// Return the canonical `space.quota` property key.
+#[must_use]
+pub fn space_quota_property_key() -> PropertyKey {
+    PropertyKey::new(SPACE_QUOTA_PROPERTY_NAME)
+}
+
+/// Return the standard `space.quota` property definition.
+#[must_use]
+pub fn space_quota_definition() -> PropertyDefinitionV1 {
+    PropertyDefinitionV1 {
+        name: space_quota_property_key(),
+        value_type: PropertyType::Size,
+        default_value: PropertyValue::None,
+        inheritance: InheritanceMode::Parent,
+        change_policy: ChangePolicy::Always,
+        scope: PropertyScope::Dataset,
+        family: PropertyFamily::Space,
+        feature_flag: None,
+        cross_constraints: Vec::new(),
+        range: Some((0, i64::MAX as u64)),
+        is_content_transform: false,
+    }
+}
+
+/// Resolve `space.quota` into a typed input for the capacity authority.
+///
+/// The helper preserves the property-library boundary: it only resolves,
+/// validates, and projects inherited property metadata.  Mounted runtime quota
+/// enforcement belongs to the gated capacity authority closeout slice.
+///
+/// `parent_sets` is ordered from immediate parent to root ancestor.
+pub fn resolve_space_quota_for_capacity_authority(
+    local_set: &PropertySet,
+    parent_sets: &[&PropertySet],
+) -> Result<CapacityAuthorityQuotaInput, ValidationError> {
+    let key = space_quota_property_key();
+    let def = space_quota_definition();
+    let resolved = resolve_effective(&key, local_set, parent_sets, &def);
+
+    validate_set(&key, &resolved.value, &def, local_set)?;
+
+    let quota_bytes = match resolved.value {
+        PropertyValue::None => None,
+        PropertyValue::Size(bytes) | PropertyValue::U64(bytes) => Some(bytes),
+        other => {
+            return Err(ValidationError::TypeMismatch {
+                property: key,
+                expected: PropertyType::Size,
+                actual: other.property_type(),
+            });
+        }
+    };
+
+    Ok(CapacityAuthorityQuotaInput {
+        quota_bytes,
+        source: resolved.source,
+    })
+}
+
 /// Propagate a property change from a parent to a child dataset.
 ///
 /// If the child has a local override, the change is NOT propagated.
@@ -1113,19 +1214,7 @@ pub fn build_registry() -> Vec<PropertyDefinitionV1> {
             is_content_transform: true,
         },
         // -- Space family --
-        PropertyDefinitionV1 {
-            name: PropertyKey::new("space.quota"),
-            value_type: PropertyType::Size,
-            default_value: PropertyValue::None,
-            inheritance: InheritanceMode::Parent,
-            change_policy: ChangePolicy::Always,
-            scope: PropertyScope::Dataset,
-            family: PropertyFamily::Space,
-            feature_flag: None,
-            cross_constraints: Vec::new(),
-            range: Some((0, i64::MAX as u64)),
-            is_content_transform: false,
-        },
+        space_quota_definition(),
         // -- Snapshot family --
         PropertyDefinitionV1 {
             name: PropertyKey::new("snapshot.retention"),
@@ -1647,6 +1736,90 @@ mod tests {
 
         let result = resolve_effective(&key, &local, &[&parent], &def);
         assert_eq!(result.value, PropertyValue::Bool(true));
+    }
+
+    #[test]
+    fn resolve_space_quota_for_capacity_authority_uses_local_value() {
+        let mut local = PropertySet::new();
+        let key = space_quota_property_key();
+        local.set_local(key.clone(), PropertyValue::Size(16 * 1024 * 1024));
+
+        let mut parent = PropertySet::new();
+        parent.set_local(key, PropertyValue::Size(8 * 1024 * 1024));
+
+        let result = resolve_space_quota_for_capacity_authority(&local, &[&parent]).unwrap();
+
+        assert_eq!(result.quota_bytes, Some(16 * 1024 * 1024));
+        assert!(result.is_set());
+        assert!(matches!(result.source, PropertySource::Local));
+    }
+
+    #[test]
+    fn resolve_space_quota_for_capacity_authority_uses_inherited_value() {
+        let local = PropertySet::new();
+        let mut parent = PropertySet::new();
+        parent.set_local(space_quota_property_key(), PropertyValue::Size(64 * 1024));
+
+        let result = resolve_space_quota_for_capacity_authority(&local, &[&parent]).unwrap();
+
+        assert_eq!(result.quota_bytes, Some(64 * 1024));
+        assert_eq!(
+            result.source,
+            PropertySource::Inherited {
+                parent_dataset_id: 0
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_space_quota_for_capacity_authority_reports_unset_default() {
+        let local = PropertySet::new();
+        let parent = PropertySet::new();
+
+        let result = resolve_space_quota_for_capacity_authority(&local, &[&parent]).unwrap();
+
+        assert_eq!(result.quota_bytes, None);
+        assert!(!result.is_set());
+        assert!(matches!(result.source, PropertySource::Default));
+    }
+
+    #[test]
+    fn resolve_space_quota_for_capacity_authority_rejects_wrong_type() {
+        let mut local = PropertySet::new();
+        local.set_local(
+            space_quota_property_key(),
+            PropertyValue::String("not-a-size".into()),
+        );
+
+        let err = resolve_space_quota_for_capacity_authority(&local, &[]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ValidationError::TypeMismatch {
+                expected: PropertyType::Size,
+                actual: PropertyType::String,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_space_quota_for_capacity_authority_rejects_out_of_range_value() {
+        let mut local = PropertySet::new();
+        let value = i64::MAX as u64 + 1;
+        local.set_local(space_quota_property_key(), PropertyValue::U64(value));
+
+        let err = resolve_space_quota_for_capacity_authority(&local, &[]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ValidationError::Range {
+                value: rejected,
+                min: 0,
+                max,
+                ..
+            } if rejected == value && max == i64::MAX as u64
+        ));
     }
 
     // ── propagate_change ──────────────────────────────────────
