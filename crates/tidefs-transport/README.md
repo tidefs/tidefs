@@ -29,11 +29,11 @@ are validated at build time; invalid combinations are refused with a
 
 ```rust
 use std::net::SocketAddr;
-use tidefs_transport::config::{TransportConfigBuilder, TransportEndpoint};
+use tidefs_transport::{config::TransportConfigBuilder, TransportAddr};
 
 let addr: SocketAddr = "192.168.1.10:9090".parse().unwrap();
 let config = TransportConfigBuilder::default()
-    .endpoint(TransportEndpoint::Tcp(addr))
+    .endpoint(TransportAddr::Tcp(addr))
     .connect_timeout_secs(10)
     .send_buffer_size(128 * 1024)
     .max_concurrent_streams(512)
@@ -45,7 +45,7 @@ let config = TransportConfigBuilder::default()
 
 | Field | Default | Notes |
 |---|---|---|
-| Endpoint | TCP 127.0.0.1:9090 | Placeholder until #5787 lands |
+| Endpoint | TCP 127.0.0.1:9090 | Canonical `TransportAddr` default |
 | `connect_timeout` | 30 s | TCP handshake ceiling |
 | `idle_timeout` | 300 s | Connection idle before keepalive probing |
 | `read_timeout` | 30 s | Per-read operation ceiling |
@@ -69,9 +69,9 @@ let config = TransportConfigBuilder::default()
 
 ### Follow-on
 
-Wire `TransportConfig` into the connection lifecycle state machine (#5788)
-and replace the local `TransportEndpoint` placeholder with the canonical
-`TransportAddr` from #5787.
+Wire the remaining `TransportConfig` fields deeper into the connection
+lifecycle state machine. Endpoint typing now uses the canonical
+`TransportAddr` authority resolved by GitHub issue #793.
 
 
 ## TransportAddr — Unified Endpoint Address

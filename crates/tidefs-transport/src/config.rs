@@ -11,13 +11,11 @@
 //!
 //! ```ignore
 //! use std::net::SocketAddr;
-//! use tidefs_transport::config::{
-//!     TransportConfigBuilder, TransportEndpoint,
-//! };
+//! use tidefs_transport::{config::TransportConfigBuilder, TransportAddr};
 //!
 //! let addr: SocketAddr = "192.168.1.10:9090".parse().unwrap();
 //! let config = TransportConfigBuilder::default()
-//!     .endpoint(TransportEndpoint::Tcp(addr))
+//!     .endpoint(TransportAddr::Tcp(addr))
 //!     .connect_timeout_secs(10)
 //!     .send_buffer_size(128 * 1024)
 //!     .max_concurrent_streams(512)
@@ -25,31 +23,12 @@
 //!     .expect("valid config");
 //! ```
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::addr::TransportAddr;
 use crate::flow_control::ReceiveWindowConfig;
 use crate::receive_flow::ReceiveFlowConfig;
 use crate::send_scheduler::SendSchedulerConfig;
-
-// ---------------------------------------------------------------------------
-// Placeholder endpoint type -- will be replaced by the canonical
-// TransportAddr from #5787.  The variants are designed to be a
-// straightforward substitution target.
-// ---------------------------------------------------------------------------
-
-/// Placeholder endpoint address.  Once #5787 lands, this will be replaced
-/// by the canonical `TransportAddr` enum.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TransportEndpoint {
-    /// TCP socket address (host:port).
-    Tcp(SocketAddr),
-    /// RDMA address -- opaque string until the RDMA address type stabilises.
-    Rdma(String),
-    /// Unix domain socket path.
-    Unix(PathBuf),
-}
 
 // ---------------------------------------------------------------------------
 // Timeout configuration
@@ -143,7 +122,7 @@ impl Default for ResponseTrackerConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportConfig {
-    endpoint: TransportEndpoint,
+    endpoint: TransportAddr,
     timeouts: TimeoutConfig,
     buffers: BufferConfig,
     stream_limits: StreamLimits,
@@ -162,7 +141,7 @@ pub struct TransportConfig {
 
 impl TransportConfig {
     /// Endpoint address for this transport connection.
-    pub fn endpoint(&self) -> &TransportEndpoint {
+    pub fn endpoint(&self) -> &TransportAddr {
         &self.endpoint
     }
 
@@ -325,8 +304,8 @@ impl std::error::Error for ConfigError {}
 // ---------------------------------------------------------------------------
 
 /// Production-safe defaults.
-fn default_endpoint() -> TransportEndpoint {
-    TransportEndpoint::Tcp("127.0.0.1:9090".parse().unwrap())
+fn default_endpoint() -> TransportAddr {
+    TransportAddr::Tcp("127.0.0.1:9090".parse().unwrap())
 }
 
 fn default_timeouts() -> TimeoutConfig {
@@ -394,7 +373,7 @@ impl Default for TransportConfig {
 /// configuration.
 #[derive(Clone, Debug)]
 pub struct TransportConfigBuilder {
-    endpoint: TransportEndpoint,
+    endpoint: TransportAddr,
     timeouts: TimeoutConfig,
     buffers: BufferConfig,
     stream_limits: StreamLimits,
@@ -442,7 +421,7 @@ impl TransportConfigBuilder {
         }
     }
 
-    pub fn endpoint(mut self, e: TransportEndpoint) -> Self {
+    pub fn endpoint(mut self, e: TransportAddr) -> Self {
         self.endpoint = e;
         self
     }
@@ -715,7 +694,7 @@ mod tests {
     fn builder_round_trip_all_fields() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080);
         let cfg = TransportConfigBuilder::default()
-            .endpoint(TransportEndpoint::Tcp(addr))
+            .endpoint(TransportAddr::Tcp(addr))
             .connect_timeout_secs(10)
             .idle_timeout_secs(600)
             .read_timeout_secs(60)
@@ -730,7 +709,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(*cfg.endpoint(), TransportEndpoint::Tcp(addr));
+        assert_eq!(*cfg.endpoint(), TransportAddr::Tcp(addr));
         assert_eq!(cfg.timeouts().connect_timeout, Duration::from_secs(10));
         assert_eq!(cfg.timeouts().idle_timeout, Duration::from_secs(600));
         assert_eq!(cfg.timeouts().read_timeout, Duration::from_secs(60));
@@ -878,7 +857,7 @@ mod tests {
     fn from_config_round_trip() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1)), 9000);
         let original = TransportConfigBuilder::default()
-            .endpoint(TransportEndpoint::Tcp(addr))
+            .endpoint(TransportAddr::Tcp(addr))
             .connect_timeout_secs(5)
             .build()
             .unwrap();
@@ -892,10 +871,10 @@ mod tests {
     fn accessors_match_inner() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)), 7000);
         let cfg = TransportConfigBuilder::default()
-            .endpoint(TransportEndpoint::Tcp(addr))
+            .endpoint(TransportAddr::Tcp(addr))
             .build()
             .unwrap();
-        assert_eq!(*cfg.endpoint(), TransportEndpoint::Tcp(addr));
+        assert_eq!(*cfg.endpoint(), TransportAddr::Tcp(addr));
         assert_eq!(cfg.timeouts().connect_timeout, Duration::from_secs(30));
         assert_eq!(cfg.buffers().send_buffer_size, 64 * 1024);
     }
@@ -903,12 +882,14 @@ mod tests {
     #[test]
     fn unix_endpoint_round_trip() {
         let cfg = TransportConfigBuilder::default()
-            .endpoint(TransportEndpoint::Unix(PathBuf::from("/tmp/tidefs.sock")))
+            .endpoint(TransportAddr::Unix(std::path::PathBuf::from(
+                "/tmp/tidefs.sock",
+            )))
             .build()
             .unwrap();
         assert_eq!(
             *cfg.endpoint(),
-            TransportEndpoint::Unix(PathBuf::from("/tmp/tidefs.sock"))
+            TransportAddr::Unix(std::path::PathBuf::from("/tmp/tidefs.sock"))
         );
     }
 
