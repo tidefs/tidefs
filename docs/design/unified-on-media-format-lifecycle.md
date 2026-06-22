@@ -101,7 +101,7 @@ phase transitions**, not a linear pipeline — a proposal can be in Phase 3
 | `GATED` | Feature flag gates the format | Mount algorithm handles the flag | Unit tests cover all mount scenarios |
 | `EVOLVING` | TLV encode/decode live | TLV type in registry, old-reader skip passes | TLV ordering + size limits enforced |
 | `MIGRATING` | Rebake converting old→new | Scanner detects old-format records | Atomic CoW swap verified, crash-recovery tested |
-| `DONE` | Format change is production-ready | All exit criteria met | Issue closed, `docs/STATUS.md` updated |
+| `DONE` | Format change is production-ready | All exit criteria met | Implementing PR merged; linked GitHub issue/PR record and any issue-named current repo-doc authority updated |
 
 ### Phase transition rules
 
@@ -117,9 +117,11 @@ phase transitions**, not a linear pipeline — a proposal can be in Phase 3
 
 ### State tracking
 
-The lifecycle state of each format change is tracked in Forgejo labels and
-the issue body checklist. There is no runtime lifecycle registry; the
-design-time process is enforced by the issue template and code review.
+The lifecycle state of each format change is tracked in the GitHub issue and
+pull request record described by `docs/GITHUB_PR_DEVELOPMENT.md`, primarily
+through the issue body checklist and PR review/merge state. There is no runtime
+lifecycle registry; the design-time process is enforced by the issue template
+and code review.
 
 
 
