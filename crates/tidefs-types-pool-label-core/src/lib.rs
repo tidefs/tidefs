@@ -727,7 +727,6 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
     let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
     let has_health = features_compat & features::DEVICE_HEALTH_STATE != 0;
     let has_policy = features_compat & features::POOL_REDUNDANCY_POLICY != 0;
-    let has_layout = features_compat & features::DEVICE_LAYOUT_V1 != 0;
     // If health extension bit is set but the buffer is too short for the
     // extended label, reject early before slicing past the buffer.
     if has_health && buf.len() < POOL_LABEL_V1_HEALTH_WIRE_SIZE {
