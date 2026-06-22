@@ -1459,6 +1459,56 @@ impl VfsLocalFileSystem {
         gid: u32,
         parent_default_acl_entries: Option<&tidefs_posix_acl::PosixAcl>,
     ) -> std::result::Result<InodeRecord, Errno> {
+        self.create_empty_regular_file_with_inode(
+            None,
+            parent_id,
+            parent_path,
+            child_path,
+            name,
+            mode,
+            uid,
+            gid,
+            parent_default_acl_entries,
+        )
+    }
+
+    fn create_empty_regular_file_at_inode(
+        &self,
+        inode_id: InodeId,
+        parent_id: InodeId,
+        parent_path: &str,
+        child_path: &str,
+        name: &[u8],
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        parent_default_acl_entries: Option<&tidefs_posix_acl::PosixAcl>,
+    ) -> std::result::Result<InodeRecord, Errno> {
+        self.create_empty_regular_file_with_inode(
+            Some(inode_id),
+            parent_id,
+            parent_path,
+            child_path,
+            name,
+            mode,
+            uid,
+            gid,
+            parent_default_acl_entries,
+        )
+    }
+
+    fn create_empty_regular_file_with_inode(
+        &self,
+        fixed_inode_id: Option<InodeId>,
+        parent_id: InodeId,
+        parent_path: &str,
+        child_path: &str,
+        name: &[u8],
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        parent_default_acl_entries: Option<&tidefs_posix_acl::PosixAcl>,
+    ) -> std::result::Result<InodeRecord, Errno> {
         let mut fs = self.fs.borrow_mut();
         if fs
             .dir_entry_by_inode(parent_id, name, parent_path)
@@ -1500,7 +1550,16 @@ impl VfsLocalFileSystem {
         }
 
         let tick = fs.bump_generation();
-        let inode_id = fs.allocate_inode_id();
+        let inode_id = if let Some(inode_id) = fixed_inode_id {
+            if fs.state.inodes.contains_key(&inode_id) {
+                fs.rollback_mutation_delta();
+                return Err(Errno::EIO);
+            }
+            fs.state.observe_explicit_inode_id(inode_id);
+            inode_id
+        } else {
+            fs.allocate_inode_id()
+        };
         let generation = Generation::new(tick);
         let mut new_mode = mode;
         let mut xattrs = BTreeMap::new();
@@ -4486,7 +4545,7 @@ impl VfsEngine for VfsLocalFileSystem {
         target: InodeId,
         new_parent: InodeId,
         new_name: &[u8],
-        ctx: &RequestCtx,
+        _ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
         self.ensure_writable()?;
         // Materialize anonymous tmpfiles: when an O_TMPFILE inode is
@@ -4495,13 +4554,12 @@ impl VfsEngine for VfsLocalFileSystem {
         // then remap the handle table so the open fd stays valid.
         let is_anonymous_tmpfile = self.anonymous_tmpfiles.borrow().contains_key(&target);
         if is_anonymous_tmpfile {
+            let new_parent_path = self.inode_path(new_parent)?;
+            let new_path = build_child_path(&new_parent_path, new_name)?;
+
             // Check for duplicate before calling create().
-            {
-                let new_parent_path = self.inode_path(new_parent)?;
-                let new_path_check = build_child_path(&new_parent_path, new_name)?;
-                if self.fs.borrow().stat(&new_path_check).is_ok() {
-                    return Err(Errno::EEXIST);
-                }
+            if self.fs.borrow().stat(&new_path).is_ok() {
+                return Err(Errno::EEXIST);
             }
 
             // Remove from persistent orphan index: the inode is no longer
@@ -4516,12 +4574,22 @@ impl VfsEngine for VfsLocalFileSystem {
                 .remove(&target)
                 .ok_or(Errno::EIO)?;
 
-            // Use create() to allocate a proper filesystem inode with a
-            // directory entry.  With flags=0, this creates-or-opens the
-            // file — the duplicate check above ensures we only create.
-            let (_new_attr, new_fh) =
-                self.create(new_parent, new_name, tmpfile.attr.posix.mode, 0, ctx)?;
-            let new_ino = _new_attr.inode_id;
+            // Publish the existing anonymous inode into the namespace rather
+            // than creating an alias with a fresh inode id.  Open handles and
+            // read/write paths use the tmpfile inode id after linkat.
+            let linked_record = self.create_empty_regular_file_at_inode(
+                target,
+                new_parent,
+                &new_parent_path,
+                &new_path,
+                new_name,
+                tmpfile.attr.posix.mode,
+                tmpfile.attr.posix.uid,
+                tmpfile.attr.posix.gid,
+                None,
+            )?;
+            let new_ino = linked_record.inode_id;
+            let new_fh = self.register_file_handle(new_ino, 0, false)?;
 
             if tmpfile.attr.posix.size > 0 {
                 let mut size_attr = SetAttr::new();
@@ -4543,8 +4611,6 @@ impl VfsEngine for VfsLocalFileSystem {
 
             // Add path cache entry for the original tmpfile inode so
             // that lookups by the FUSE kernel can find the path.
-            let new_parent_path = self.inode_path(new_parent)?;
-            let new_path = build_child_path(&new_parent_path, new_name)?;
             self.path_cache.borrow_mut().insert(target, new_path);
 
             // Return attributes with the original inode ID.
