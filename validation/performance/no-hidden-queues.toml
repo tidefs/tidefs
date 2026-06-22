@@ -43,6 +43,25 @@ hard_caps = [
 ]
 
 [[queue_roots]]
+id = "local_fs.metadata_mutation_admission"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/admission.rs"
+symbol = "LocalWriteAdmission"
+work_class = "metadata-mutation"
+resource_domains = [
+  "metadata",
+  "queue-slots",
+]
+admission = "AdmissionPermit"
+service_curve = "ServiceCurve"
+hard_caps = [
+  "dirty-bytes",
+  "dirty-operations",
+  "dirty-age",
+  "queue-slots",
+]
+
+[[queue_roots]]
 id = "local_fs.write_buffers"
 package = "tidefs-local-filesystem"
 path = "crates/tidefs-local-filesystem/src/lib.rs"

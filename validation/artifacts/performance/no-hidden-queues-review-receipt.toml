@@ -71,6 +71,14 @@ symbol = "LocalWriteAdmission"
 source_root = "crates/tidefs-local-filesystem/src"
 coverage = "registered-source-marker-present"
 
+
+[[queue_root_coverage]]
+id = "local_fs.metadata_mutation_admission"
+package = "tidefs-local-filesystem"
+path = "crates/tidefs-local-filesystem/src/admission.rs"
+symbol = "LocalWriteAdmission"
+source_root = "crates/tidefs-local-filesystem/src"
+coverage = "registered-source-marker-present"
 [[queue_root_coverage]]
 id = "local_fs.write_buffers"
 package = "tidefs-local-filesystem"

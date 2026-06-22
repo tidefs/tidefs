@@ -1,13 +1,13 @@
 receipt_version = 1
 evidence_class = "no-hidden-queues-review-receipt"
 evidence_tier = "source-registry-review"
-issue = 597
+issue = 720
 registry_path = "validation/performance/no-hidden-queues.toml"
 registry_schema_version = 1
 source_coverage_kind = "recursive-source-registry-review"
 runtime_artifact_boundary = "source-registry-review-only-does-not-satisfy-queue-depth-runtime-artifact"
 decision = "claims-remain-blocked"
-reviewed_at = "2026-06-20"
+reviewed_at = "2026-06-22"
 affected_claim_ids = [
   "namespace.rename.atomicity.v1",
   "local.vfs.rename_atomic_crash.v1",
@@ -17,16 +17,15 @@ blocked_claim_ids = [
   "local.vfs.rename_atomic_crash.v1",
 ]
 non_claims = [
-  "This receipt records source and registry coverage for rename namespace and orphan-index paths.",
+  "This receipt records source and registry coverage for rename and active orphan-index metadata-mutation admission wiring.",
+  "Active local-filesystem orphan-index insert/remove and O_TMPFILE insert/remove-on-link paths call admitted OrphanIndex APIs with a metadata AdmissionPermit.",
   "This receipt does not by itself satisfy queue-depth-runtime-artifact evidence.",
-  "Existing issue #498 queue-depth evidence is bounded dirty-write smoke evidence only; it is not rename/orphan-index runtime admission proof.",
-  "Rename namespace modules (link, unlink, rename) are currently #[allow(dead_code)] and not wired into active FUSE dispatch.",
-  "Active rename path in local-filesystem lib.rs routes through begin_mutation() rollback snapshots without admission-permit gating; this gap is tracked by issue #720.",
-  "This receipt does not validate distributed transport fairness or RDMA readiness.",
+  "Mount-time orphan-index log recovery (recover_from_log) and background orphan reclamation (tick_background_services) are not admission-gated in this slice.",
+  "Existing issue #498 dirty-write smoke queue-depth evidence does not exercise rename/orphan-index metadata-mutation paths.",
 ]
 
 [reviewer]
-name = "gpt5"
+name = "gpt0"
 role = "managed TideFS Codex session"
 
 [tool]
@@ -47,15 +46,15 @@ path = "crates/tidefs-local-filesystem/src"
 scan = "recursive-rust-source-review"
 
 [[scanned_roots]]
-name = "transport-src"
-package = "tidefs-transport"
-path = "crates/tidefs-transport/src"
-scan = "recursive-rust-source-review"
-
-[[scanned_roots]]
 name = "orphan-index-src"
 package = "tidefs-orphan-index"
 path = "crates/tidefs-orphan-index/src"
+scan = "recursive-rust-source-review"
+
+[[scanned_roots]]
+name = "transport-src"
+package = "tidefs-transport"
+path = "crates/tidefs-transport/src"
 scan = "recursive-rust-source-review"
 
 [[scanned_roots]]
@@ -80,7 +79,6 @@ symbol = "LocalWriteAdmission"
 source_root = "crates/tidefs-local-filesystem/src"
 coverage = "registered-source-marker-present"
 
-
 [[queue_root_coverage]]
 id = "local_fs.metadata_mutation_admission"
 package = "tidefs-local-filesystem"
@@ -88,6 +86,7 @@ path = "crates/tidefs-local-filesystem/src/admission.rs"
 symbol = "LocalWriteAdmission"
 source_root = "crates/tidefs-local-filesystem/src"
 coverage = "registered-source-marker-present"
+
 [[queue_root_coverage]]
 id = "local_fs.write_buffers"
 package = "tidefs-local-filesystem"
@@ -137,11 +136,10 @@ source_root = "crates/tidefs-orphan-index/src"
 coverage = "registered-source-marker-present"
 
 [[out_of_scope]]
-root = "namespace-rename-dead-code"
-reason = "Rename namespace modules (link.rs, unlink.rs, rename.rs) are #[allow(dead_code)] and not wired into active FUSE dispatch. They do not produce hidden work until integrated."
-owner_issue = 597
+root = "mount-time-orphan-recovery"
+reason = "Mount-time orphan-index log recovery (recover_from_log) operates during filesystem initialization before LocalWriteAdmission is available. Runtime admission gating is not applicable."
+owner_issue = 720
 claim_ids = [
-  "namespace.rename.atomicity.v1",
   "local.vfs.rename_atomic_crash.v1",
 ]
 does_not_satisfy_evidence_classes = [
@@ -149,13 +147,11 @@ does_not_satisfy_evidence_classes = [
 ]
 
 [[out_of_scope]]
-root = "active-rename-orphan-runtime-admission-gap"
-reason = "Active rename path in lib.rs (renameat2/rename/rename_exchange) routes through begin_mutation() rollback snapshots without acquiring an AdmissionPermit through write_admission, and orphan-index insert/remove/recover mutations are registry-only in this slice. Runtime admission proof or fixes are owned by issue #720."
+root = "background-orphan-reclamation"
+reason = "Background orphan reclamation in tick_background_services operates outside user-facing mutation paths and does not produce hidden queue-depth risk in the active rename/orphan-index admission path."
 owner_issue = 720
 claim_ids = [
-  "namespace.rename.atomicity.v1",
   "local.vfs.rename_atomic_crash.v1",
-  "perf.local.no_unbounded_dirty_debt.v1",
 ]
 does_not_satisfy_evidence_classes = [
   "queue-depth-runtime-artifact",
@@ -163,7 +159,7 @@ does_not_satisfy_evidence_classes = [
 
 [[out_of_scope]]
 root = "existing-dirty-write-queue-depth-boundary"
-reason = "Issue #498 records bounded dirty-write smoke queue-depth evidence; it does not exercise rename/orphan-index metadata mutations and does not satisfy this receipt's rename/orphan runtime admission boundary."
+reason = "Issue #498 records bounded dirty-write smoke queue-depth evidence; it does not exercise rename/orphan-index metadata mutations."
 owner_issue = 498
 claim_ids = [
   "namespace.rename.atomicity.v1",

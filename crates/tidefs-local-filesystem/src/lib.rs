@@ -393,7 +393,9 @@ use tidefs_local_object_store::{
     IoClass, LocalObjectStore, ObjectKey, ObjectLocation, Pool, PoolConfig, PoolProperties,
     StoreEncryptionKey, StoreError, StoreOptions, DEFAULT_MAX_SEGMENT_BYTES, RECORD_OVERHEAD_BYTES,
 };
-use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
+use tidefs_orphan_index::{
+    OrphanEntry, OrphanEntryFlags, OrphanIndex, OrphanIndexAdmissionError,
+};
 use tidefs_performance_contract::AdmissionPermit;
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
 use tidefs_reserve_ledger::{BudgetDomain, ReserveClass};
@@ -3905,11 +3907,70 @@ impl LocalFileSystem {
         self.reclaim_queue.lock().unwrap().insert(entry);
     }
 
+    fn orphan_index_admission_error(_err: OrphanIndexAdmissionError) -> FileSystemError {
+        FileSystemError::CorruptState {
+            reason: "orphan-index metadata admission rejected permit",
+        }
+    }
+
+    fn hard_link_public_error(err: FileSystemError) -> FileSystemError {
+        match err {
+            FileSystemError::Unsupported {
+                operation: "link",
+                reason,
+            } => FileSystemError::Unsupported {
+                operation: "hard link",
+                reason,
+            },
+            err => err,
+        }
+    }
+
+    fn rename_exchange_public_error(err: FileSystemError) -> FileSystemError {
+        match err {
+            FileSystemError::Unsupported {
+                operation: "renameat2",
+                reason,
+            } => FileSystemError::Unsupported {
+                operation: "rename_exchange",
+                reason,
+            },
+            err => err,
+        }
+    }
+
+    fn release_metadata_admission_permit(&mut self, permit: AdmissionPermit) -> Result<()> {
+        self.write_admission
+            .release(permit)
+            .map(|_| ())
+            .map_err(|_e| FileSystemError::CorruptState {
+                reason: "failed to release metadata admission permit",
+            })
+    }
+
+    fn release_optional_metadata_admission_permit(
+        &mut self,
+        permit: Option<AdmissionPermit>,
+    ) -> Result<()> {
+        if let Some(permit) = permit {
+            self.release_metadata_admission_permit(permit)?;
+        }
+        Ok(())
+    }
+
+    fn rollback_mutation_delta_and_release_metadata_permit(
+        &mut self,
+        permit: &mut Option<AdmissionPermit>,
+    ) -> Result<()> {
+        self.rollback_mutation_delta();
+        self.release_optional_metadata_admission_permit(permit.take())
+    }
+
     /// Mark an inode as orphaned after its namespace link count reaches zero.
     ///
     /// Returns `true` when the inode was newly inserted into the persistent
     /// orphan index and `false` when it was already tracked.
-    pub fn track_orphan(&self, inode_id: InodeId) -> bool {
+    pub fn track_orphan(&mut self, inode_id: InodeId) -> Result<bool> {
         let (generation, nlink, is_dir) = {
             if let Some(record) = self.state.inodes.get(&inode_id) {
                 (record.generation.get(), record.nlink, record.is_directory())
@@ -3923,10 +3984,67 @@ impl LocalFileSystem {
             OrphanEntryFlags::NONE
         };
         let entry = OrphanEntry::new(inode_id.get(), generation, nlink, flags);
-        self.orphan_index
-            .lock()
-            .unwrap()
-            .insert(inode_id.get(), entry)
+        let _orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
+        let insert_result = {
+            let mut orphan_index = self.orphan_index.lock().unwrap();
+            orphan_index.insert_admitted(inode_id.get(), entry, &_orphan_md_permit)
+        };
+        let inserted = match insert_result {
+            Ok(inserted) => inserted,
+            Err(err) => {
+                self.release_metadata_admission_permit(_orphan_md_permit)?;
+                return Err(Self::orphan_index_admission_error(err));
+            }
+        };
+        self.release_metadata_admission_permit(_orphan_md_permit)?;
+        Ok(inserted)
+    }
+
+    /// Mark an anonymous O_TMPFILE inode as orphaned at creation time.
+    pub fn track_tmpfile_orphan(
+        &mut self,
+        inode_id: InodeId,
+        generation: u64,
+        creating_pid: u32,
+    ) -> Result<bool> {
+        let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
+        let insert_result = {
+            let mut orphan_index = self.orphan_index.lock().unwrap();
+            orphan_index.insert_tmpfile_admitted(
+                inode_id.get(),
+                generation,
+                creating_pid,
+                0,
+                &orphan_md_permit,
+            )
+        };
+        let inserted = match insert_result {
+            Ok(inserted) => inserted,
+            Err(err) => {
+                self.release_metadata_admission_permit(orphan_md_permit)?;
+                return Err(Self::orphan_index_admission_error(err));
+            }
+        };
+        self.release_metadata_admission_permit(orphan_md_permit)?;
+        Ok(inserted)
+    }
+
+    /// Remove an anonymous O_TMPFILE inode from the orphan index after linkat.
+    pub fn remove_tmpfile_orphan_on_link(&mut self, inode_id: InodeId) -> Result<bool> {
+        let orphan_md_permit = self.write_admission.try_admit_metadata_mutation()?;
+        let remove_result = {
+            let mut orphan_index = self.orphan_index.lock().unwrap();
+            orphan_index.remove_on_link_admitted(inode_id.get(), 0, &orphan_md_permit)
+        };
+        let removed = match remove_result {
+            Ok(removed) => removed,
+            Err(err) => {
+                self.release_metadata_admission_permit(orphan_md_permit)?;
+                return Err(Self::orphan_index_admission_error(err));
+            }
+        };
+        self.release_metadata_admission_permit(orphan_md_permit)?;
+        Ok(removed)
     }
 
     /// Queue an already tracked orphan for deferred background reclamation.
@@ -5972,7 +6090,8 @@ impl LocalFileSystem {
             &self.state.directories,
             existing_path,
             new_path,
-        )?;
+        )
+        .map_err(Self::hard_link_public_error)?;
         let inode_id = pre.target_inode_id;
         let parent_id = pre.new_parent_id;
         let name = pre.new_name;
@@ -5986,10 +6105,18 @@ impl LocalFileSystem {
                 reason: "this MVP only hard-links regular files",
             });
         }
+        let mut orphan_md_permit = if source_record.nlink == 0 {
+            Some(self.write_admission.try_admit_metadata_mutation()?)
+        } else {
+            None
+        };
         self.begin_mutation();
         // Re-verify parent exists after lock acquisition
         if !self.state.inodes.contains_key(&parent_id) {
+            let release_result =
+                self.release_optional_metadata_admission_permit(orphan_md_permit.take());
             self.rollback_mutation_delta();
+            release_result?;
             return Err(FileSystemError::NotFound {
                 path: new_path.to_string(),
             });
@@ -6012,7 +6139,23 @@ impl LocalFileSystem {
         updated.metadata_version = tick;
         // If nlink transitions from 0 to 1, the inode is no longer orphaned.
         if updated.nlink == 1 {
-            self.orphan_index.lock().unwrap().remove(inode_id.get());
+            let orphan_md_permit =
+                orphan_md_permit
+                    .take()
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "missing orphan-index metadata admission permit",
+                    })?;
+            let remove_result = {
+                let mut orphan_index = self.orphan_index.lock().unwrap();
+                orphan_index.remove_admitted(inode_id.get(), &orphan_md_permit)
+            };
+            if let Err(err) = remove_result {
+                let release_result = self.release_metadata_admission_permit(orphan_md_permit);
+                self.rollback_mutation_delta();
+                release_result?;
+                return Err(Self::orphan_index_admission_error(err));
+            }
+            self.release_metadata_admission_permit(orphan_md_permit)?;
         }
         Arc::make_mut(&mut self.state.inodes).insert(inode_id, updated.clone());
         self.inode_cache.borrow_mut().invalidate(inode_id);
@@ -8697,6 +8840,11 @@ impl LocalFileSystem {
         }
 
         let was_multilinked = record.nlink > 1;
+        let mut orphan_md_permit = if was_multilinked {
+            None
+        } else {
+            Some(self.write_admission.try_admit_metadata_mutation()?)
+        };
 
         self.begin_mutation(); // was: let previous_state = self.state.clone()
                                // Accumulate space delta for unlink only when this removes the last link.
@@ -8726,7 +8874,10 @@ impl LocalFileSystem {
         }
         // Re-verify parent exists after lock acquisition
         if !self.state.inodes.contains_key(&parent_id) {
+            let release_result =
+                self.release_optional_metadata_admission_permit(orphan_md_permit.take());
             self.rollback_mutation_delta();
+            release_result?;
             return Err(FileSystemError::NotFound {
                 path: path_for_error.to_string(),
             });
@@ -8748,7 +8899,10 @@ impl LocalFileSystem {
         self.mark_dir_dirty(parent_id);
         self.mark_inode_metadata_dirty(parent_id);
         if let Err(err) = self.remove_directory_entry(parent_id, name, tick) {
+            let release_result =
+                self.release_optional_metadata_admission_permit(orphan_md_permit.take());
             self.rollback_mutation_delta();
+            release_result?;
             return Err(err);
         }
         self.update_parent_metadata_timestamps(parent_id, tick);
@@ -8777,10 +8931,27 @@ impl LocalFileSystem {
                 record.nlink,
                 orphan_flags,
             );
-            self.orphan_index
-                .lock()
-                .unwrap()
-                .insert(entry.inode_id.get(), orphan_entry);
+            let orphan_md_permit =
+                orphan_md_permit
+                    .take()
+                    .ok_or(FileSystemError::CorruptState {
+                        reason: "missing orphan-index metadata admission permit",
+                    })?;
+            let insert_result = {
+                let mut orphan_index = self.orphan_index.lock().unwrap();
+                orphan_index.insert_admitted(
+                    entry.inode_id.get(),
+                    orphan_entry,
+                    &orphan_md_permit,
+                )
+            };
+            if let Err(err) = insert_result {
+                let release_result = self.release_metadata_admission_permit(orphan_md_permit);
+                self.rollback_mutation_delta();
+                release_result?;
+                return Err(Self::orphan_index_admission_error(err));
+            }
+            self.release_metadata_admission_permit(orphan_md_permit)?;
             // Record nlink=0 in state so record_reclaim_delta can iterate
             // chunk keys for dedup refcount decrement (#6167).
             if let Some(stored) = Arc::make_mut(&mut self.state.inodes).get_mut(&entry.inode_id) {
@@ -8914,6 +9085,7 @@ impl LocalFileSystem {
     ) -> Result<()> {
         use crate::namespace::rename::RenameAt2Flags;
         self.renameat2(old_path, new_path, RenameAt2Flags::EXCHANGE)
+            .map_err(Self::rename_exchange_public_error)
     }
 
     /// Perform a `renameat2`-style atomic rename with flags.
@@ -9001,12 +9173,17 @@ impl LocalFileSystem {
             crate::namespace::rename::acquire_lock_order(old_parent_id, new_parent_id);
         // ── Steps 3-5: Mutation + commit ───────────────────────────
 
+        // Acquire a metadata-mutation admission permit before the rename
+        // mutation, but keep it separate from dirty-write pending permits:
+        // dirty permits survive until SYNC, while this slot-only metadata
+        // permit is released when this mutation finishes or rolls back.
+        let mut rename_md_permit = Some(self.write_admission.try_admit_metadata_mutation()?);
         self.begin_mutation();
         // Re-verify both parents exist after lock acquisition.
         if !self.state.inodes.contains_key(&old_parent_id)
             || !self.state.inodes.contains_key(&new_parent_id)
         {
-            self.rollback_mutation_delta();
+            self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
             return Err(FileSystemError::NotFound {
                 path: old_path.to_string(),
             });
@@ -9024,9 +9201,17 @@ impl LocalFileSystem {
             // ── RENAME_EXCHANGE ────────────────────────────────────
             // Atomically swap the inode pointers of two directory entries.
 
-            let new_entry = new_entry.ok_or(FileSystemError::CorruptState {
-                reason: "exchange target missing despite pre-check",
-            })?;
+            let new_entry = match new_entry {
+                Some(entry) => entry,
+                None => {
+                    self.rollback_mutation_delta_and_release_metadata_permit(
+                        &mut rename_md_permit,
+                    )?;
+                    return Err(FileSystemError::CorruptState {
+                        reason: "exchange target missing despite pre-check",
+                    });
+                }
+            };
 
             let mut swapped_old = old_entry;
             swapped_old.name = new_name.clone();
@@ -9034,23 +9219,23 @@ impl LocalFileSystem {
             swapped_new.name = old_name.clone();
 
             if let Err(err) = self.remove_directory_entry(old_parent_id, &old_name, tick) {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
                 return Err(err);
             }
             if let Err(err) = self.remove_directory_entry(new_parent_id, &new_name, tick) {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
                 return Err(err);
             }
             if let Err(err) =
                 self.insert_directory_entry(old_parent_id, old_name.clone(), swapped_new, tick)
             {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
                 return Err(err);
             }
             if let Err(err) =
                 self.insert_directory_entry(new_parent_id, new_name.clone(), swapped_old, tick)
             {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
                 return Err(err);
             }
 
@@ -9064,10 +9249,20 @@ impl LocalFileSystem {
             // ── Plain rename / RENAME_NOREPLACE ────────────────────
             // Handle overwritten destination
             if let Some(target) = new_entry {
-                let target_record = self.inode(target.inode_id)?.clone();
+                let target_record = match self.inode(target.inode_id) {
+                    Ok(record) => record,
+                    Err(err) => {
+                        self.rollback_mutation_delta_and_release_metadata_permit(
+                            &mut rename_md_permit,
+                        )?;
+                        return Err(err);
+                    }
+                };
 
                 if let Err(err) = self.remove_directory_entry(new_parent_id, &new_name, tick) {
-                    self.rollback_mutation_delta();
+                    self.rollback_mutation_delta_and_release_metadata_permit(
+                        &mut rename_md_permit,
+                    )?;
                     return Err(err);
                 }
 
@@ -9139,7 +9334,9 @@ impl LocalFileSystem {
 
             // Remove source entry
             if let Err(err) = self.remove_directory_entry(old_parent_id, &old_name, tick) {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(
+                    &mut rename_md_permit,
+                )?;
                 return Err(err);
             }
 
@@ -9149,7 +9346,9 @@ impl LocalFileSystem {
             if let Err(err) =
                 self.insert_directory_entry(new_parent_id, new_name.clone(), renamed, tick)
             {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(
+                    &mut rename_md_permit,
+                )?;
                 return Err(err);
             }
 
@@ -9191,7 +9390,14 @@ impl LocalFileSystem {
         self.mark_inode_metadata_dirty(old_parent_id);
         self.mark_dir_dirty(new_parent_id);
         self.mark_inode_metadata_dirty(new_parent_id);
-        self.commit_mutation(())
+        let commit_result = self.commit_mutation(());
+        let release_result =
+            self.release_optional_metadata_admission_permit(rename_md_permit.take());
+        match (commit_result, release_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+        }
     }
 
     /// Determine the xattr namespace from the name prefix.
@@ -12785,12 +12991,18 @@ mod orphan_index_integration_tests {
 
     #[test]
     fn public_orphan_reclaim_api_tracks_and_releases() {
-        let (_root, fs) = make_test_fs("oi_test_public_api").expect("open");
+        let (_root, mut fs) = make_test_fs("oi_test_public_api").expect("open");
         let inode_id = InodeId::new(88_001);
         assert!(fs.reclaim_stats().is_idle());
 
-        assert!(fs.track_orphan(inode_id), "first track inserts orphan");
-        assert!(!fs.track_orphan(inode_id), "second track is idempotent");
+        assert!(
+            fs.track_orphan(inode_id).expect("track orphan"),
+            "first track inserts orphan"
+        );
+        assert!(
+            !fs.track_orphan(inode_id).expect("track orphan again"),
+            "second track is idempotent"
+        );
         let stats = fs.reclaim_stats();
         assert_eq!(stats.orphan_index_entries, 1);
         assert_eq!(stats.pending_orphan_deletions, 0);

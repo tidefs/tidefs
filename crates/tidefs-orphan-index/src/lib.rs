@@ -17,12 +17,14 @@
 //! but do not block recovery of intact entries.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::vec::Vec;
 
 use tidefs_binary_schema_checksum::blake3_domain_digest;
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
 use tidefs_btree::{BPlusTree, BTreeError};
 use tidefs_commit_group::store::CommitGroupStore;
+use tidefs_performance_contract::{AdmissionPermit, ResourceDomain, WorkClass};
 use tidefs_types_orphan_index_core::{
     OrphanCursor, OrphanKey, OrphanLogIncompleteTail, OrphanLogRecoveryReport,
     OrphanRecoveryBudget, OrphanRecoveryOutcome, OrphanRecoveryStats, OrphanReplayWatermark,
@@ -227,6 +229,59 @@ impl OrphanEntry {
     }
 }
 
+/// Orphan-index admission permit validation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrphanIndexAdmissionError {
+    WrongWorkClass {
+        expected: WorkClass,
+        actual: WorkClass,
+    },
+    WrongResourceDomain {
+        expected: ResourceDomain,
+        actual: ResourceDomain,
+    },
+}
+
+impl fmt::Display for OrphanIndexAdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongWorkClass { expected, actual } => {
+                write!(
+                    f,
+                    "orphan-index admission expected work class {expected}, got {actual}"
+                )
+            }
+            Self::WrongResourceDomain { expected, actual } => {
+                write!(
+                    f,
+                    "orphan-index admission expected resource domain {expected}, got {actual}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for OrphanIndexAdmissionError {}
+
+fn validate_orphan_index_permit(
+    permit: &AdmissionPermit,
+) -> Result<(), OrphanIndexAdmissionError> {
+    let charge = permit.charge();
+    if charge.work_class != WorkClass::MetadataMutation {
+        return Err(OrphanIndexAdmissionError::WrongWorkClass {
+            expected: WorkClass::MetadataMutation,
+            actual: charge.work_class,
+        });
+    }
+    if charge.primary_domain != ResourceDomain::Metadata {
+        return Err(OrphanIndexAdmissionError::WrongResourceDomain {
+            expected: ResourceDomain::Metadata,
+            actual: charge.primary_domain,
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // OrphanIndex
 // ---------------------------------------------------------------------------
@@ -314,6 +369,17 @@ impl OrphanIndex {
         is_new
     }
 
+    /// Insert an inode entry after validating an orphan-index metadata permit.
+    pub fn insert_admitted(
+        &mut self,
+        inode_id: u64,
+        entry: OrphanEntry,
+        permit: &AdmissionPermit,
+    ) -> Result<bool, OrphanIndexAdmissionError> {
+        validate_orphan_index_permit(permit)?;
+        Ok(self.insert(inode_id, entry))
+    }
+
     /// Remove an inode from the orphan index after successful cleanup.
     ///
     /// Returns `true` if the inode was present and removed.
@@ -324,6 +390,16 @@ impl OrphanIndex {
             self.dirty = true;
         }
         was_present
+    }
+
+    /// Remove an inode entry after validating an orphan-index metadata permit.
+    pub fn remove_admitted(
+        &mut self,
+        inode_id: u64,
+        permit: &AdmissionPermit,
+    ) -> Result<bool, OrphanIndexAdmissionError> {
+        validate_orphan_index_permit(permit)?;
+        Ok(self.remove(inode_id))
     }
 
     // -- lookup --
@@ -386,6 +462,19 @@ impl OrphanIndex {
         self.insert(inode_id, entry)
     }
 
+    /// Insert an O_TMPFILE entry after validating an orphan-index metadata permit.
+    pub fn insert_tmpfile_admitted(
+        &mut self,
+        inode_id: u64,
+        generation: u64,
+        creating_pid: u32,
+        txg: u64,
+        permit: &AdmissionPermit,
+    ) -> Result<bool, OrphanIndexAdmissionError> {
+        validate_orphan_index_permit(permit)?;
+        Ok(self.insert_tmpfile(inode_id, generation, creating_pid, txg))
+    }
+
     /// Remove a tmpfile entry from the orphan index when it is linked into
     /// the namespace via .
     ///
@@ -396,6 +485,17 @@ impl OrphanIndex {
     /// Returns  if the inode was present and removed.
     pub fn remove_on_link(&mut self, inode_id: u64, _txg: u64) -> bool {
         self.remove(inode_id)
+    }
+
+    /// Remove an O_TMPFILE entry after validating an orphan-index metadata permit.
+    pub fn remove_on_link_admitted(
+        &mut self,
+        inode_id: u64,
+        txg: u64,
+        permit: &AdmissionPermit,
+    ) -> Result<bool, OrphanIndexAdmissionError> {
+        validate_orphan_index_permit(permit)?;
+        Ok(self.remove_on_link(inode_id, txg))
     }
 
     /// Scan for O_TMPFILE entries whose creating process has exited.
@@ -964,6 +1064,80 @@ mod tests {
         assert!(idx.contains(42));
         assert!(!idx.contains(99));
         assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn admitted_insert_and_remove_accept_metadata_permits() {
+        let mut state = tidefs_performance_contract::WriteAdmissionState::new(
+            tidefs_performance_contract::WriteAdmissionConfig::new(0, 0, 0, 2),
+        );
+        let mut idx = OrphanIndex::new();
+
+        let insert_permit = state
+            .try_admit_metadata(0)
+            .expect("metadata permit admitted");
+        assert!(idx
+            .insert_admitted(42, make_entry(42), &insert_permit)
+            .expect("insert admitted"));
+        state.release(insert_permit).expect("release insert permit");
+
+        let remove_permit = state
+            .try_admit_metadata(1)
+            .expect("metadata permit admitted");
+        assert!(idx
+            .remove_admitted(42, &remove_permit)
+            .expect("remove admitted"));
+        state.release(remove_permit).expect("release remove permit");
+    }
+
+    #[test]
+    fn admitted_tmpfile_insert_and_remove_accept_metadata_permits() {
+        let mut state = tidefs_performance_contract::WriteAdmissionState::new(
+            tidefs_performance_contract::WriteAdmissionConfig::new(0, 0, 0, 2),
+        );
+        let mut idx = OrphanIndex::new();
+
+        let insert_permit = state
+            .try_admit_metadata(0)
+            .expect("metadata permit admitted");
+        assert!(idx
+            .insert_tmpfile_admitted(42, 7, 1234, 0, &insert_permit)
+            .expect("tmpfile insert admitted"));
+        state.release(insert_permit).expect("release insert permit");
+
+        let remove_permit = state
+            .try_admit_metadata(1)
+            .expect("metadata permit admitted");
+        assert!(idx
+            .remove_on_link_admitted(42, 0, &remove_permit)
+            .expect("tmpfile remove admitted"));
+        state.release(remove_permit).expect("release remove permit");
+    }
+
+    #[test]
+    fn admitted_insert_rejects_non_metadata_permit() {
+        let mut state = tidefs_performance_contract::WriteAdmissionState::new(
+            tidefs_performance_contract::WriteAdmissionConfig::new(1024, 1, 8, 1),
+        );
+        let dirty_permit = state
+            .try_admit(tidefs_performance_contract::AdmissionCharge::dirty_write(
+                1, 1, 0,
+            ))
+            .expect("dirty permit admitted");
+        let mut idx = OrphanIndex::new();
+
+        let err = idx
+            .insert_admitted(42, make_entry(42), &dirty_permit)
+            .expect_err("dirty permit must not admit orphan-index metadata");
+
+        assert_eq!(
+            err,
+            OrphanIndexAdmissionError::WrongWorkClass {
+                expected: WorkClass::MetadataMutation,
+                actual: WorkClass::ForegroundWrite,
+            }
+        );
+        state.release(dirty_permit).expect("release dirty permit");
     }
 
     #[test]

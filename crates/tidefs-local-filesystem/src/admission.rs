@@ -114,6 +114,24 @@ impl LocalWriteAdmission {
         Ok(permit)
     }
 
+    /// Try to admit a metadata-mutation charge for rename, link, unlink,
+    /// or orphan-index operations.
+    ///
+    /// tidefs-queue-root: local_fs.metadata_mutation_admission
+    /// admission: AdmissionPermit  service_curve: ServiceCurve
+    ///
+    /// Metadata mutations are gated on permit count; they do not consume
+    /// dirty-byte or dirty-op caps.  The returned [`AdmissionPermit`]
+    /// should be pushed into a [`BudgetedQueue`] or released after the
+    /// metadata mutation is durably committed.
+    pub fn try_admit_metadata_mutation(
+        &mut self,
+    ) -> Result<AdmissionPermit, AdmissionError> {
+        let permit = self.state.try_admit_metadata(self.current_tick)?;
+        self.update_peaks();
+        Ok(permit)
+    }
+
     /// Release an admission permit, returning the released charge.
     ///
     /// Call this after the dirty work represented by the permit has
