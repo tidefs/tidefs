@@ -1,101 +1,67 @@
 # TideFS Workspace Structure
 
-## Types-Core Layer
+## Authority Boundary
 
-The types-core layer sits at the bottom of the TideFS dependency graph. This
-document is historical review input; current package authority is
-`cargo metadata --no-deps` plus `docs/WHOLE_REPO_REVIEW.md`.
+This document is historical review input for a prior types-core consolidation
+review. It is not the current workspace-membership, package-role, or deletion
+authority.
 
-### Architecture
+Use the current authorities instead:
 
-The types-core layer is anchored by two hub crates:
+- Root `Cargo.toml` or `cargo metadata --no-deps` for live workspace members.
+- `docs/workspace-package-classification.md` for package roles and the
+  workspace-selection authority checked by `check-workspace-policy`.
+- `docs/WHOLE_REPO_REVIEW.md` for repo-review evidence about package cleanup.
 
-- **tidefs-types-control-plane-core** (13 consumers, 2,135 lines): Control-plane
-  identifiers, digests, policy recipes, and receipt types. Serves as the
-  dependency root for 10 other types-core crates and 13 non-types crates
-  including the FUSE adapter stack, secret-key-policy, and schema codecs.
-  **Note**: this crate is classified as product-transitional scaffold in
-  `docs/ARCHITECTURE.md`; it is in the workspace only because workspace
-  members still depend on it.
+Issue #276 deleted the retired scaffold type roots
+`tidefs-types-control-plane-core`,
+`tidefs-types-publication-pipeline-core`, and
+`tidefs-types-response-registry-core`. The current package-classification
+authority records those roots as deleted, not reclassified. Their surviving
+control-plane, publication-pipeline, and response-registry record definitions
+now live in `tidefs-types-vfs-core`.
 
-- **tidefs-types-vfs-core** (21 consumers, 8,118 lines): VFS inode identifiers,
-  generation counters, node kinds, extent descriptors, and filesystem constants.
-  Serves 3 types-core crates and 18 non-types crates including the local
-  filesystem, kmod bridge, block allocator, and namespace.
+## Current Types Package Shape
 
-All types-core crates are `no_std` and depend only on other types-core crates
-plus external crates (`core`, `alloc`, `serde`). No types-core crate depends
-upward on a non-types `tidefs-*` crate.
+The live types package family is the set of `crates/tidefs-types-*` entries in
+root `Cargo.toml` and `docs/workspace-package-classification.md`. As of the
+current authority, `tidefs-types-vfs-core` is the shared VFS and record
+definition root for the deleted control-plane/publication/response package
+material. Other live types packages cover bounded domains such as cache
+lattices, claim ledgers, dataset flags and lifecycle, deferred cleanup,
+extent maps, incremental jobs, orphan indexes, package profiles, polymorphic
+directory and xattr data, POSIX adapter types, pool labels, reclaim queues,
+secret-key policy, space accounting, transport sessions, and VFS-owned data.
 
-### Dependency Graph
+This section is a reader map only. If this prose and the package authority
+disagree, treat `docs/workspace-package-classification.md` and current Cargo
+metadata as authoritative.
 
-```
-tidefs-types-control-plane-core ─────────────────────────────
-  ├── tidefs-types-claim-ledger-core ─── also → vfs-core
-  ├── tidefs-types-posix-filesystem-adapter-core
-  ├── tidefs-types-publication-pipeline-core
-  ├── tidefs-types-response-registry-core
-  └── tidefs-types-secret-key-policy-core
+## Historical Dependency Evidence
 
-tidefs-types-vfs-core ───────────────────────────────────────
-  ├── tidefs-types-cache-lattice-core
-  ├── tidefs-types-claim-ledger-core ─── also → control-plane-core
-  └── tidefs-types-vfs-owned
+The prior consolidation review modeled
+`tidefs-types-control-plane-core` as a hub crate and listed
+`tidefs-types-publication-pipeline-core` and
+`tidefs-types-response-registry-core` as dependent type roots. That material is
+retained here only as evidence for why the deleted roots were reviewed; it does
+not describe current workspace structure.
 
-The old archive-control, observe, policy-authority, truth-view, and
-shadow-pilot split crates were deleted from the fresh TideFS checkout after
-reverse-reference review. Their surviving record surfaces live in
-`tidefs-types-vfs-core` or product-local modules.
+The same historical review found that the older archive-control, observe,
+policy-authority, truth-view, and shadow-pilot split crates were deleted from
+the fresh TideFS checkout after reverse-reference review. Their surviving
+record surfaces live in current packages such as `tidefs-types-vfs-core` or in
+product-local modules.
 
-Independent (no types-core deps):
-  tidefs-types-continuity-charter
-  tidefs-types-dataset-feature-flags-core
-  │    └── tidefs-types-deferred-cleanup-core
-  tidefs-types-dataset-lifecycle-core
-  tidefs-types-extent-map-core
-  tidefs-types-incremental-job-core
-  tidefs-types-orphan-index-core
-  tidefs-types-package-profile-catalog
-  tidefs-types-polymorphic-directory-index-core
-  tidefs-types-polymorphic-xattr-core
-  tidefs-types-pool-label-core
-  tidefs-types-reclaim-queue-core
-  tidefs-types-space-accounting-core
-  tidefs-types-transport-session
-```
+## Consolidation Status
 
-### Crate Justifications
+For current package cleanup status, start with
+`docs/workspace-package-classification.md`. It records that the prior
+scaffold-transitional and archive-delete-candidate roles are retired, no
+current package root uses those roles, and future archive/delete work requires
+an issue-backed plan.
 
-Each remaining types-core split exists because the types serve multiple
-heterogeneous consumers that would not benefit from inlining.
-
-**Hub crates** (control-plane-core, vfs-core): Foundation types used by 20+
-consumers across the entire stack. Must remain separate as the bottom of the
-dependency graph.
-
-**Domain crates** (3-8 consumers): Each represents a coherent bounded context:
-pool labels for device/pool management, extent maps for block allocation,
-incremental jobs for background work scheduling, reclaim queues for space
-reclamation, dataset lifecycle/flags for dataset management, POSIX adapter
-types for the FUSE surface, and publication pipeline types for commit
-orchestration.
-
-**Transport-session**: The only 2-consumer crate that remains justified because
-its consumers (tidefs-transport and tidefs-replicated-object-store) sit at
-different stack layers; folding would create an undesirable dependency
-direction.
-
-### Consolidation Status
-
-A consolidation review ([types-core-consolidation-plan.md](types-core-consolidation-plan.md))
-identified 3 dead splits, 1 orphan, and 4 near-dead splits. The plan
-recommends removing 7 crates through phased implementation issues.
-
-Executed consolidations:
-- #5939: Merged tidefs-policy-authority client-core-runtime triplication into
-  tidefs-policy-authority (separate issue, in progress).
-
-Pending (see consolidation plan):
-- Fold 3 single-consumer dead splits into their consumers
-- Review remaining near-dead splits against current Cargo metadata before
-  deciding whether to fold, keep, or delete them.
+The older consolidation plan
+([types-core-consolidation-plan.md](types-core-consolidation-plan.md)) remains
+historical evidence for the review that led to package cleanup. Before using
+any row from that plan for new work, re-check it against current Cargo metadata
+and the package-classification authority.
