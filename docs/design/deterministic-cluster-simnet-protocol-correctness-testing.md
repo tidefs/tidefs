@@ -789,7 +789,10 @@ Phase-gated implementation matching the old Python → Rust port order:
 17. Run all scenarios with fixed seeds; capture golden fingerprints.
 18. Add golden-file regression tests (compare fingerprint against committed
     golden values).
-19. Document scenario coverage matrix in `docs/FEATURE_MATRIX.md`.
+19. Record implemented scenario coverage as scoped test-signal evidence in
+    `docs/TEST_SIGNAL_AUDIT.md`; if a scenario backs a registered claim, attach
+    claim-specific evidence artifacts using the manifest path described in
+    `validation/README.md` and the tier rules in `docs/CLAIMS_GATE_POLICY.md`.
 
 ---
 
