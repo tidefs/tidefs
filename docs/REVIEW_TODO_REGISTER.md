@@ -396,8 +396,8 @@ Important 2026-06-01 findings:
 - `TFR-006`: issue #218 adds the checked raw-store inventory at
   `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`. The source check
   guards current `raw_primary_store()` and `raw_primary_store_mut()` matches:
-  `crates/tidefs-local-filesystem/src/lib.rs` has 89,
-  `crates/tidefs-local-filesystem/src/crash_recovery.rs` has 21,
+  `crates/tidefs-local-filesystem/src/lib.rs` has 67,
+  `crates/tidefs-local-filesystem/src/crash_recovery.rs` has 1,
   `crates/tidefs-local-filesystem/src/journal_cleaner.rs` has 7,
   `crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` has 6, and
   `crates/tidefs-local-object-store/src/pool/mod.rs` has 7 lower accessor or
@@ -408,6 +408,15 @@ Important 2026-06-01 findings:
   identity. The device-level encryption/compression API surface remains unsafe
   to treat as an end-to-end mounted filesystem transform while blocked rows
   remain.
+- `TFR-006`: issue #692 isolates crash-matrix raw commit-boundary staging
+  behind the private `CrashMatrixRawStagingAuthority` in
+  `crates/tidefs-local-filesystem/src/crash_recovery.rs`. The helper stages
+  validation-only content, transaction inode, directory, superblock,
+  malformed root-slot, and missing-transaction root-commit objects without
+  exposing a mounted production write/read path or authorizing mounted
+  device-level compression/encryption claims. Production blocked rows for
+  content reads/writes, scrub/repair, send/receive, reclaim, intent-log, and
+  directory/inode fallback recovery remain open.
 - `TFR-006`: commit `8b5b0f70` makes the mounted local-filesystem
   device-transform helpers fail closed instead of silently claiming end-to-end
   encryption or compression. `LocalFileSystem` now rejects open configs with

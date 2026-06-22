@@ -4248,7 +4248,7 @@ pub fn check_poolstore_compression_current_workspace() -> Result<(), StorageChec
 const MOUNTED_TRANSFORM_RAW_STORE_COUNTS: &[(&str, usize)] = &[
     ("crates/tidefs-local-object-store/src/pool/mod.rs", 7),
     ("crates/tidefs-local-filesystem/src/lib.rs", 67),
-    ("crates/tidefs-local-filesystem/src/crash_recovery.rs", 21),
+    ("crates/tidefs-local-filesystem/src/crash_recovery.rs", 1),
     ("crates/tidefs-local-filesystem/src/journal_cleaner.rs", 7),
     ("crates/tidefs-local-filesystem/src/vfs_engine_impl.rs", 6),
 ];
@@ -4290,13 +4290,25 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
             "MountedCommittedRootRepairAuthority",
             "transform-aware in raw-only mode",
             "metadata/raw-only through transform-aware authority",
+            "validation-only raw staging",
+            "CrashMatrixRawStagingAuthority",
             "MetadataRawOnlyNoDeviceTransforms",
             "Mounted local-filesystem device-level compression and encryption are blocked",
             "must fail closed while any production `blocked` row remains",
             "`crates/tidefs-local-filesystem/src/lib.rs` | 67",
-            "`crates/tidefs-local-filesystem/src/crash_recovery.rs` | 21",
+            "`crates/tidefs-local-filesystem/src/crash_recovery.rs` | 1",
             "`crates/tidefs-local-filesystem/src/journal_cleaner.rs` | 7",
             "`crates/tidefs-local-filesystem/src/vfs_engine_impl.rs` | 6",
+        ],
+        &mut missing,
+    );
+    check_source_markers(
+        &root,
+        "crates/tidefs-local-filesystem/src/crash_recovery.rs",
+        &[
+            "CrashMatrixRawStagingAuthority",
+            "Validation-only commit-boundary staging for the crash matrix",
+            "not authorize mounted device-level compression or encryption claims",
         ],
         &mut missing,
     );
