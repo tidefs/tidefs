@@ -11,6 +11,14 @@ containment strategy for coordinator-sourced issues
 **Depends on**: #1738 (design seal), #1838 (health advancement strategy), #1753 (roadmap priorities)
 **Blocks**: All deferred cluster-service wire-up implementation issues
 
+> Authority note (2026-06-22): this imported May 2026 status update is
+> retained as historical design input. It is not current coordination/status
+> authority. Current work state lives in GitHub issues and pull requests, the
+> issue/branch/worktree/PR workflow lives in `docs/GITHUB_PR_DEVELOPMENT.md`,
+> imported-document authority classification lives in
+> `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, and validated claim evidence
+> lives in `validation/claims.toml`.
+
 ## Abstract
 
 This document updates the coordination pipeline status as of the early May 2026
@@ -21,10 +29,10 @@ confirmed. Three active implementation lanes remain: cleanup/reclaim queues
 deferred), and P8-03 distributed runtime (9/9 canonical component crates
 implemented). End-to-end 3-node cluster bootstrapping, cross-node state machine
 advancement, and production distributed runtime integration remain deferred to
-child GAP issues. The document serves as the authoritative human-readable snapshot
-of coordination pipeline health, building on the architecture defined in #1738,
-the health monitoring framework defined in #1838, and the roadmap priorities
-defined in #1753.
+child GAP issues. The document is retained as a historical human-readable
+snapshot of coordination pipeline health, building on the architecture defined
+in #1738, the health monitoring framework defined in #1838, and the roadmap
+priorities defined in #1753.
 
 ---
 
@@ -519,33 +527,37 @@ Each wire-up issue must satisfy the gate criteria defined in §4 of #1738:
 
 ## 8. Integration Contracts
 
-### 8.1 STATUS.md Update Contract
+### 8.1 Retired STATUS.md Contract (Historical)
 
-Every coordination pipeline status update must:
+The imported #1839 design expected each coordination pipeline status update to
+query Forgejo, parse the previous Coordination Status entry from `STATUS.md`,
+compute deltas, prepend a new entry, and close the triggering Forgejo issue.
+That contract is retired: `docs/STATUS.md` no longer exists, and current lane,
+branch, pull request, and issue state belongs in live GitHub issues and pull
+requests under the workflow in `docs/GITHUB_PR_DEVELOPMENT.md`.
 
-1. Query Forgejo API for current lane state before writing
-2. Parse the previous Coordination Status entry from STATUS.md
-3. Compute deltas between previous and current state
-4. Include: lane status, overall project metrics, pipeline health narrative,
-   velocity assessment, proliferation analysis, and roadmap priorities
-5. Prepend the new entry at the top of STATUS.md
-6. Close the Forgejo issue that triggered the update
+### 8.2 Retired FEATURE_MATRIX.md Contract (Historical)
 
-### 8.2 FEATURE_MATRIX.md Update Contract
-
-When a capability's maturity changes:
+The imported #1839 design used `FEATURE_MATRIX.md` maturity entries such as:
 
 - `design-sealed`: Design finalized, no further design changes expected
 - `implemented-source`: Core types and protocols implemented in crates
 
-### 8.3 Cross-Document Consistency Contract
+That matrix contract is retired: `docs/FEATURE_MATRIX.md` no longer exists.
+Current imported-document authority is recorded in
+`docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, current validation-backed claim
+evidence is recorded in `validation/claims.toml`, and review/debt follow-up is
+recorded in `docs/REVIEW_TODO_REGISTER.md`.
 
-| Document | Consistency Rule |
-|----------|-----------------|
-| `docs/STATUS.md` | Most recent entry reflects current Forgejo state |
-| `docs/FEATURE_MATRIX.md` | Row maturity matches crate implementation state |
-| `docs/design/*.md` | Design docs reference correct issue numbers and status |
-| Forgejo labels | Issue labels match documented maturity state |
+### 8.3 Current Coordination Consistency Surfaces
+
+| Surface | Consistency Rule |
+|---------|-----------------|
+| GitHub issues and pull requests | Current issue, lane, branch, pull request, and implementation coordination state lives in GitHub. |
+| `docs/GITHUB_PR_DEVELOPMENT.md` | Current issue/branch/worktree/PR workflow policy. |
+| `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` | Current authority classification for imported documents. |
+| `validation/claims.toml` | Current validation-backed claim evidence registry. |
+| `docs/design/*.md` | Design docs are current only where classified by the authority register or by a focused current issue/PR. |
 
 ---
 
@@ -572,8 +584,15 @@ When a capability's maturity changes:
 - `docs/design/coordination-pipeline-cluster-services-design-seal.md` — #1738 design phase seal
 - `docs/design/coordination-pipeline-health-advancement-strategy.md` — #1838 health monitoring framework
 - `docs/design/coordination-review-roadmap-priorities-update.md` — #1753 roadmap priorities
-- `docs/STATUS.md` — live coordination pipeline status
-- `docs/FEATURE_MATRIX.md` — implemented-source capability matrix
+- `docs/STATUS.md` (deleted) — historical status surface referenced by the
+  imported #1839 design; not current authority
+- `docs/FEATURE_MATRIX.md` (deleted) — historical capability matrix referenced
+  by the imported #1839 design; not current authority
+- `docs/GITHUB_PR_DEVELOPMENT.md` — current GitHub issue/branch/worktree/PR
+  workflow policy
+- `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` — current imported-document
+  authority classification register
+- `validation/claims.toml` — current validation-backed claim evidence registry
 - `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` — deferred production gates
 - `docs/design/cluster-security-identity-model.md` — sealed security architecture
 - `docs/design/cluster-wide-distributed-lock-service-design.md` — lock service architecture
@@ -591,16 +610,13 @@ When a capability's maturity changes:
 
 ---
 
-**Coordination pipeline status update (#1839) complete.** This document
-serves as the current authoritative coordination pipeline status snapshot,
-building on the design seal (#1738), health monitoring framework (#1838),
-and roadmap priorities (#1753). The design phase for cluster-wide services
-is substantially complete; active implementation lanes (cleanup/reclaim,
-spacemap, P8-03) are advancing; and the deferred wire-up strategy enables
-parallel implementation against sealed interface contracts with MEMBERSHIP
-(#1209) as the critical-path blocker.
+**Coordination pipeline status update (#1839) complete.** This imported
+document is retained as historical design input for the May 2026 coordination
+status snapshot. It no longer serves as current coordination/status authority;
+use live GitHub issues and pull requests plus the repo authority surfaces named
+above for current workflow, document-authority, and claim-evidence state.
 
-**Gate**: `cargo check --workspace` passes. Design-only document; no code
-changes.
+**Historical gate recorded by the imported document**: `cargo check
+--workspace` passes. Design-only document; no code changes.
 
 **Closes**: #1839
