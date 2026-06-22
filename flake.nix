@@ -215,6 +215,23 @@
             ];
           };
 
+          tidefsXtaskRuntime = import ./nix/packages/tidefs.nix {
+            inherit (pkgs) lib pkg-config;
+            inherit (pkgs) fuse3 rdma-core;
+            rustPlatform = rustPlatform;
+            src = tidefsCtlSrc;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+            cargoBuildFlags = [
+              "-p" "tidefs-xtask"
+              "--bin" "tidefs-xtask"
+            ];
+            workspaceBins = [
+              "tidefs-xtask"
+            ];
+          };
+
           tidefsFuseRuntime = import ./nix/packages/tidefs.nix {
             inherit (pkgs) lib pkg-config;
             inherit (pkgs) fuse3 rdma-core;
@@ -3118,6 +3135,7 @@ EOF
           kernelTeardownValidation = import ./nix/vm/kernel-teardown-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
+            tidefsXtaskRuntime = tidefsXtaskRuntime;
           };
 
           kernelCrossPathEquivalence = import ./nix/vm/kernel-cross-path-equivalence.nix {
@@ -4298,6 +4316,7 @@ EOF
             pkgs.b3sum
             self.packages.${system}.kernelTeardownValidation
             self.packages.${system}.tidefsPosixVfsKmod
+            self.packages.${system}.tidefsXtaskRuntime
           ] ''
             exec ${self.packages.${system}.kernelTeardownValidation}/bin/tidefs-kmod-teardown-validation \
               --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"

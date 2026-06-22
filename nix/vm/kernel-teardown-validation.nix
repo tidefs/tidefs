@@ -14,6 +14,7 @@
 {
   pkgs,
   linuxKernel_7_0,
+  tidefsXtaskRuntime,
 }:
 
 let
@@ -27,8 +28,11 @@ let
     KERNEL_IMG="${linuxKernel_7_0}/bzImage"
     CPIO="${pkgs.cpio}/bin/cpio"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
+    KERNEL_RELEASE="${linuxKernel_7_0.version}"
     POSIX_VFS_KO="''${TIDEFS_KERNEL_VFS_MODULE_KO:-}"
     B3SUM="${pkgs.b3sum}/bin/b3sum"
+    JQ="${pkgs.jq}/bin/jq"
+    VALIDATOR="${tidefsXtaskRuntime}/bin/tidefs-xtask"
 
     TMPDIR="''${TIDEFS_TEARDOWN_TMPDIR:-/tmp/tidefs-teardown-validation}"
     TIMEOUT_SEC="''${TIDEFS_TEARDOWN_TIMEOUT:-600}"
@@ -76,7 +80,7 @@ EOF
     echo "  Output:    $OUTPUT_DIR"
     echo ""
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$B3SUM" "$JQ" "$VALIDATOR"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -153,6 +157,27 @@ fail() { FAILED=$((FAILED + 1)); echo "FAIL: $*"; }
 blocked() { BLOCKED=$((BLOCKED + 1)); echo "BLOCKED: $*"; }
 skip() { SKIPPED=$((SKIPPED + 1)); echo "SKIP: $*"; }
 
+count_matches() {
+  local pattern="$1"
+  local file="$2"
+  local count
+  count=$(grep -c "$pattern" "$file" 2>/dev/null || true)
+  printf '%s' "''${count:-0}"
+}
+
+emit_artifact() {
+  local label="$1"
+  local path="$2"
+
+  echo "BEGIN_ARTIFACT:$label"
+  if [ -f "$path" ]; then
+    cat "$path" 2>/dev/null || true
+  else
+    echo "artifact source missing: $path"
+  fi
+  echo "END_ARTIFACT:$label"
+}
+
 setup_ftrace() {
   if [ -d /sys/kernel/tracing ]; then
     echo 0 > /sys/kernel/tracing/tracing_on 2>/dev/null || true
@@ -187,9 +212,9 @@ capture_dmesg() {
 check_dmesg_signal() {
   local dmesg_file="$1"
   local signal_count=0
-  for pattern in "WARNING:" "BUG:" "Oops:" "lockdep:" "KASAN:" "KCSAN:" "hung_task" "Call Trace:" "RIP:" "Modules linked in:"; do
+  for pattern in "WARNING:" "BUG:" "Oops:" "lockdep:" "KASAN:" "KCSAN:" "hung_task" "Call Trace:" "RIP:"; do
     local count
-    count=$(grep -c "$pattern" "$dmesg_file" 2>/dev/null || echo 0)
+    count=$(count_matches "$pattern" "$dmesg_file")
     if [ "$count" -gt 0 ]; then
       echo "  DMESG_SIGNAL: $pattern x$count"
       signal_count=$((signal_count + count))
@@ -340,9 +365,9 @@ log_phase "cleanup" "start" "dmesg check and trace capture"
 capture_dmesg "$EVDIR/dmesg_final.txt"
 
 # Check dmesg for warnings
-DMESG_WARN=$(grep -c "WARNING:" "$EVDIR/dmesg_final.txt" 2>/dev/null || echo 0)
-DMESG_BUG=$(grep -c "BUG:" "$EVDIR/dmesg_final.txt" 2>/dev/null || echo 0)
-DMESG_OOPS=$(grep -c "Oops:" "$EVDIR/dmesg_final.txt" 2>/dev/null || echo 0)
+DMESG_WARN=$(count_matches "WARNING:" "$EVDIR/dmesg_final.txt")
+DMESG_BUG=$(count_matches "BUG:" "$EVDIR/dmesg_final.txt")
+DMESG_OOPS=$(count_matches "Oops:" "$EVDIR/dmesg_final.txt")
 echo "INFO: dmesg WARNING=$DMESG_WARN BUG=$DMESG_BUG Oops=$DMESG_OOPS"
 
 dmesg_signal=0
@@ -378,6 +403,9 @@ fi
 capture_dmesg "$EVDIR/dmesg_post_reload.txt"
 capture_ftrace "$EVDIR/ftrace_final.txt"
 
+emit_artifact "ftrace_workqueue" "$EVDIR/ftrace_final.txt"
+emit_artifact "dmesg_callbacks" "$EVDIR/dmesg_post_reload.txt"
+
 echo ""
 echo "============================================================"
 echo "=== KERNEL TEARDOWN VALIDATION SUMMARY ==="
@@ -407,34 +435,77 @@ INITSCRIPT
     echo ""
     echo "--- QEMU exited ---"
 
-    PASS_COUNT=$(grep -c "^PASS:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    FAIL_COUNT=$(grep -c "^FAIL:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    BLOCKED_COUNT=$(grep -c "^BLOCKED:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    SKIP_COUNT=$(grep -c "^SKIP:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
+    count_log_matches() {
+      local pattern="$1"
+      local file="$2"
+      local count
+      count=$(grep -E -c "$pattern" "$file" 2>/dev/null || true)
+      printf '%s' "''${count:-0}"
+    }
+
+    PASS_COUNT=$(count_log_matches "^PASS:" "$RUN_DIR/qemu.log")
+    FAIL_COUNT=$(count_log_matches "^FAIL:" "$RUN_DIR/qemu.log")
+    BLOCKED_COUNT=$(count_log_matches "^BLOCKED:" "$RUN_DIR/qemu.log")
+    SKIP_COUNT=$(count_log_matches "^SKIP:" "$RUN_DIR/qemu.log")
 
     echo "=== RESULTS ==="
     echo "PASS: $PASS_COUNT  FAIL: $FAIL_COUNT  BLOCKED: $BLOCKED_COUNT  SKIP: $SKIP_COUNT"
 
     mkdir -p "$OUTPUT_DIR"
 
-    # Extract phase log from QEMU output
-    grep '^PHASE:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^PHADE://' > "$OUTPUT_DIR/phase_log.txt" || true
+    # Extract phase log and guest-emitted trace snippets from QEMU output.
+    grep '^PHASE:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^PHASE://' > "$OUTPUT_DIR/phase_log.txt" || true
     grep '\[teardown-phase\]' "$RUN_DIR/qemu.log" 2>/dev/null > "$OUTPUT_DIR/phase_log_raw.txt" || true
 
-    # Copy trace artifacts from the run directory
     cp "$RUN_DIR/qemu.log" "$OUTPUT_DIR/qemu.log"
+
+    extract_guest_artifact() {
+      local label="$1"
+      local path="$2"
+      awk -v begin="BEGIN_ARTIFACT:$label" -v end="END_ARTIFACT:$label" '
+        $0 == begin { emit = 1; next }
+        $0 == end { emit = 0; next }
+        emit { print }
+      ' "$RUN_DIR/qemu.log" > "$OUTPUT_DIR/$path" || true
+    }
+
+    WQ_TRACE_PATH="ftrace_workqueue.log"
+    CB_TRACE_PATH="dmesg_callbacks.log"
+    extract_guest_artifact "ftrace_workqueue" "$WQ_TRACE_PATH"
+    extract_guest_artifact "dmesg_callbacks" "$CB_TRACE_PATH"
+
+    TRACE_ERRORS_FILE="$OUTPUT_DIR/trace_artifact_errors.txt"
+    : > "$TRACE_ERRORS_FILE"
+    if [ ! -s "$OUTPUT_DIR/$WQ_TRACE_PATH" ] || grep -q "artifact source missing" "$OUTPUT_DIR/$WQ_TRACE_PATH" 2>/dev/null; then
+      echo "trace artifact missing or empty: $WQ_TRACE_PATH" >> "$TRACE_ERRORS_FILE"
+    fi
+    if [ ! -s "$OUTPUT_DIR/$CB_TRACE_PATH" ] || grep -q "artifact source missing" "$OUTPUT_DIR/$CB_TRACE_PATH" 2>/dev/null; then
+      echo "trace artifact missing or empty: $CB_TRACE_PATH" >> "$TRACE_ERRORS_FILE"
+    fi
 
     # ── Generate run identity ───────────────────────────────────────
     GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     RUN_ID="''${GITHUB_RUN_ID:-unknown}"
-    SOURCE_REF="''${GITHUB_SHA:-unknown}"
+    RUN_ATTEMPT="''${GITHUB_RUN_ATTEMPT:-1}"
+    case "$RUN_ATTEMPT" in
+      ""|*[!0-9]*) RUN_ATTEMPT=1 ;;
+    esac
+    WORKFLOW_NAME="''${GITHUB_WORKFLOW:-QEMU Smoke}"
+    WORKFLOW_JOB="''${GITHUB_JOB:-kernel-teardown-validation}"
+    SOURCE_REF="''${GITHUB_REF:-unknown}"
+    SOURCE_SHA="''${GITHUB_SHA:-unknown}"
     SOURCE_REPO="''${GITHUB_REPOSITORY:-tidefs/tidefs}"
-    WORKFLOW_REF="''${GITHUB_WORKFLOW_REF:-tidefs/tidefs/.github/workflows/qemu-smoke.yml}"
     VALIDATION_TIER="mounted-kernel-vfs"
     TARGET_ID="kernel-teardown-mounted-vfs"
 
+    DMESG_FINAL_WARN=$(count_log_matches "WARNING:" "$OUTPUT_DIR/qemu.log")
+    DMESG_FINAL_BUG=$(count_log_matches "BUG:" "$OUTPUT_DIR/qemu.log")
+    DMESG_FINAL_OOPS=$(count_log_matches "Oops:" "$OUTPUT_DIR/qemu.log")
+    DMESG_DANGER_COUNT=$(count_log_matches "WARNING:|BUG:|Oops:|lockdep:|KASAN:|KCSAN:|hung_task|Call Trace:|RIP:" "$OUTPUT_DIR/qemu.log")
+    TRACE_ERROR_COUNT=$(count_log_matches "." "$TRACE_ERRORS_FILE")
+
     # ── Determine overall status ─────────────────────────────────────
-    if [ "$FAIL_COUNT" -gt 0 ]; then
+    if [ "$FAIL_COUNT" -gt 0 ] || [ "$DMESG_DANGER_COUNT" -gt 0 ] || [ "$TRACE_ERROR_COUNT" -gt 0 ]; then
       TEARDOWN_STATUS="fail"
     elif [ "$BLOCKED_COUNT" -gt 0 ]; then
       TEARDOWN_STATUS="blocked"
@@ -443,124 +514,181 @@ INITSCRIPT
     fi
 
     # ── Build fail_closed_reasons ────────────────────────────────────
-    FAIL_REASONS_JSON="[]"
-    if [ "$TEARDOWN_STATUS" != "pass" ]; then
-      REASONS=""
-      grep "^FAIL:" "$RUN_DIR/qemu.log" 2>/dev/null | while IFS= read -r line; do
-        echo "$line"
-      done > "$OUTPUT_DIR/fail_lines.txt"
+    if [ "$TEARDOWN_STATUS" = "pass" ]; then
+      FAIL_REASONS_JSON="$("$JQ" -n '[]')"
+    else
+      {
+        grep -E "^(FAIL|BLOCKED):" "$RUN_DIR/qemu.log" 2>/dev/null || true
+        cat "$TRACE_ERRORS_FILE"
+        if [ "$DMESG_DANGER_COUNT" -gt 0 ]; then
+          echo "dmesg danger signals observed: WARNING=$DMESG_FINAL_WARN BUG=$DMESG_FINAL_BUG Oops=$DMESG_FINAL_OOPS total=$DMESG_DANGER_COUNT"
+        fi
+      } > "$OUTPUT_DIR/fail_lines.txt"
+      if [ -s "$OUTPUT_DIR/fail_lines.txt" ]; then
+        FAIL_REASONS_JSON="$("$JQ" -R -s 'split("\n") | map(select(length > 0))' "$OUTPUT_DIR/fail_lines.txt")"
+      else
+        FAIL_REASONS_JSON="$("$JQ" -n --arg reason "status=$TEARDOWN_STATUS without pass evidence" '[$reason]')"
+      fi
     fi
 
-    # ── Write kernel-teardown-runtime.json ───────────────────────────
-    # Build teardown phases JSON array from phase log
-    PHASES_JSON="[]"
-    if [ -f "$OUTPUT_DIR/phase_log.txt" ]; then
-      PHASES_JSON="["
-      first=true
-      while IFS= read -r line; do
-        phase_name=$(echo "$line" | awk '{print $1}')
-        phase_status=$(echo "$line" | sed -n 's/.*status=\([^ ]*\).*/\1/p')
-        phase_ts=$(echo "$line" | sed -n 's/.*ts=\([^ ]*\).*/\1/p')
-        phase_notes=$(echo "$line" | sed -n 's/.*notes=\(.*\)/\1/p')
-        if [ "$first" = true ]; then first=false; else PHASES_JSON="$PHASES_JSON,"; fi
-        PHASES_JSON="$PHASES_JSON{\"phase\":\"$phase_name\",\"status\":\"$phase_status\",\"timestamp\":$phase_ts,\"notes\":\"$phase_notes\"}"
-      done < "$OUTPUT_DIR/phase_log.txt"
-      PHASES_JSON="$PHASES_JSON]"
+    # ── Build teardown phases JSON array from phase log ──────────────
+    if [ -s "$OUTPUT_DIR/phase_log.txt" ]; then
+      PHASES_JSON="$(
+        awk '
+          {
+            phase=$1; status=""; ts=""; notes="";
+            for (i=2; i<=NF; i++) {
+              if ($i ~ /^status=/) {
+                status=substr($i, 8);
+              } else if ($i ~ /^ts=/) {
+                ts=substr($i, 4);
+              } else if ($i ~ /^notes=/) {
+                notes=substr($i, 7);
+                for (j=i+1; j<=NF; j++) {
+                  notes=notes " " $j;
+                }
+                break;
+              }
+            }
+            printf "%s\t%s\t%s\t%s\n", phase, status, ts, notes;
+          }
+        ' "$OUTPUT_DIR/phase_log.txt" \
+          | "$JQ" -R -s 'split("\n") | map(select(length > 0) | split("\t") | {phase: .[0], status: .[1], start_timestamp: .[2], notes: .[3]})'
+      )"
+    else
+      PHASES_JSON="$("$JQ" -n '[]')"
     fi
 
     # Build refusal observations
-    REFUSAL_JSON="[]"
-    REFUSAL_LINES=$(grep "^PASS: refusal_\|^FAIL: refusal_" "$RUN_DIR/qemu.log" 2>/dev/null || true)
-    if [ -n "$REFUSAL_LINES" ]; then
-      REFUSAL_JSON="["
-      first=true
-      while IFS= read -r line; do
-        op=$(echo "$line" | sed -n 's/.*refusal_\([^: ]*\).*/\1/p')
-        observed=$(echo "$line" | cut -d' ' -f3-)
-        result=$(echo "$line" | grep -q "^PASS:" && echo "pass" || echo "fail")
-        if [ "$first" = true ]; then first=false; else REFUSAL_JSON="$REFUSAL_JSON,"; fi
-        REFUSAL_JSON="$REFUSAL_JSON{\"operation\":\"$op\",\"expected_refusal\":true,\"observed_result\":\"$observed\",\"result\":\"$result\",\"new_work_enqueued\":false}"
-      done <<< "$REFUSAL_LINES"
-      REFUSAL_JSON="$REFUSAL_JSON]"
+    REFUSAL_LINES="$OUTPUT_DIR/refusal_lines.txt"
+    grep -E "^(PASS|FAIL): refusal_" "$RUN_DIR/qemu.log" 2>/dev/null > "$REFUSAL_LINES" || true
+    if [ -s "$REFUSAL_LINES" ]; then
+      REFUSAL_JSON="$(
+        awk '
+          {
+            status=$1; sub(/:$/, "", status);
+            operation=$2; sub(/^refusal_/, "", operation);
+            observed=$0; sub(/^[^ ]+ [^ ]+ /, "", observed);
+            new_work = status == "FAIL" ? "true" : "false";
+            printf "%s\t%s\t%s\n", operation, observed, new_work;
+          }
+        ' "$REFUSAL_LINES" \
+          | "$JQ" -R -s 'split("\n") | map(select(length > 0) | split("\t") | {operation: .[0], expected_refusal: true, observed_result: .[1], new_work_enqueued_or_started: (.[2] == "true")})'
+      )"
+    else
+      REFUSAL_JSON="$("$JQ" -n '[]')"
     fi
 
-    # Workqueue trace artifact (write an empty placeholder if ftrace not captured)
-    WQ_TRACE_PATH="ftrace_workqueue.log"
-    WQ_TRACE_DIGEST="blake3:0000000000000000000000000000000000000000000000000000000000000000"
     WQ_TRACE_SOURCE="ftrace:/sys/kernel/tracing/events/workqueue/*"
-    echo "ftrace workqueue trace: captured in qemu.log" > "$OUTPUT_DIR/$WQ_TRACE_PATH"
     WQ_TRACE_DIGEST="blake3:$("$B3SUM" "$OUTPUT_DIR/$WQ_TRACE_PATH" | awk '{print $1}')"
-
-    # Callback trace artifact (dmesg-based)
-    CB_TRACE_PATH="dmesg_callbacks.log"
-    CB_TRACE_DIGEST="blake3:0000000000000000000000000000000000000000000000000000000000000000"
-    CB_TRACE_SOURCE="dmesg kernel log"
-    grep -i "tidefs\|workqueue\|worker\|teardown\|vfs" "$OUTPUT_DIR/qemu.log" > "$OUTPUT_DIR/$CB_TRACE_PATH" 2>/dev/null || echo "no callback trace captured" > "$OUTPUT_DIR/$CB_TRACE_PATH"
+    CB_TRACE_SOURCE="dmesg kernel log emitted by guest"
     CB_TRACE_DIGEST="blake3:$("$B3SUM" "$OUTPUT_DIR/$CB_TRACE_PATH" | awk '{print $1}')"
 
     # Cleanup outcome
-    DMESG_FINAL_WARN=$(grep -c "WARNING:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    DMESG_FINAL_BUG=$(grep -c "BUG:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
     if [ "$DMESG_FINAL_WARN" -eq 0 ] && [ "$DMESG_FINAL_BUG" -eq 0 ]; then
       CLEANUP_DMESG="clean"
     else
       CLEANUP_DMESG="dmesg WARNING=$DMESG_FINAL_WARN BUG=$DMESG_FINAL_BUG"
     fi
+    UNMOUNT_OUTCOME="$(grep -Eq "^PASS: unmount_ok|^PASS: unmount_lazy" "$RUN_DIR/qemu.log" && echo "success" || echo "failed")"
+    RMMOD_OUTCOME="$(grep -Eq "^PASS: rmmod_ok" "$RUN_DIR/qemu.log" && echo "success" || echo "failed")"
+    RELOAD_OUTCOME="$(grep -Eq "^PASS: reload_remount" "$RUN_DIR/qemu.log" && echo "success" || echo "failed")"
+    REMAINING_WORK="$([ "$TEARDOWN_STATUS" = "pass" ] && echo "none observed" || echo "unknown; validation did not pass")"
 
-    cat > "$OUTPUT_DIR/kernel-teardown-runtime.json" << TEARDOWNEOF
-{
-  "manifest_version": 1,
-  "claim_id": "kernel.teardown.no_work_after.v1",
-  "evidence_class": "runtime-kernel-teardown-validation",
-  "workflow_run_id": "$RUN_ID",
-  "source_ref": "$SOURCE_REF",
-  "source_repo": "$SOURCE_REPO",
-  "validation_tier": "$VALIDATION_TIER",
-  "target_id": "$TARGET_ID",
-  "module_name": "tidefs_posix_vfs",
-  "module_digest": "blake3:$MODULE_DIGEST",
-  "teardown_phases": $PHASES_JSON,
-  "workqueue_trace_source": "$WQ_TRACE_SOURCE",
-  "workqueue_trace_artifact_path": "$WQ_TRACE_PATH",
-  "workqueue_trace_digest": "$WQ_TRACE_DIGEST",
-  "callback_trace_source": "$CB_TRACE_SOURCE",
-  "callback_trace_artifact_path": "$CB_TRACE_PATH",
-  "callback_trace_digest": "$CB_TRACE_DIGEST",
-  "post_final_teardown_refusal_observations": $REFUSAL_JSON,
-  "cleanup_outcome": {
-    "unmount": "$(grep -q "^PASS: unmount_ok\|^PASS: unmount_lazy" "$RUN_DIR/qemu.log" && echo "ok" || echo "failed")",
-    "rmmod": "$(grep -q "^PASS: rmmod_ok" "$RUN_DIR/qemu.log" && echo "ok" || echo "failed")",
-    "reload_probe": "$(grep -q "^PASS: reload_remount" "$RUN_DIR/qemu.log" && echo "ok" || echo "failed")",
-    "dmesg_state": "$CLEANUP_DMESG",
-    "tidefs_work_after_teardown": "$([ "$TEARDOWN_STATUS" = "pass" ] && echo "none" || echo "unknown")"
-  },
-  "status": "$TEARDOWN_STATUS",
-  "fail_closed_reasons": []
-}
-TEARDOWNEOF
+    "$JQ" -n \
+      --arg generated_by "kernel-teardown-validation" \
+      --arg claim_id "kernel.teardown.no_work_after.v1" \
+      --arg evidence_class "runtime-kernel-teardown-no-work-after-artifact" \
+      --arg workflow_run_id "$RUN_ID" \
+      --argjson workflow_run_attempt "$RUN_ATTEMPT" \
+      --arg workflow_name "$WORKFLOW_NAME" \
+      --arg workflow_job "$WORKFLOW_JOB" \
+      --arg source_ref "$SOURCE_REF" \
+      --arg source_sha "$SOURCE_SHA" \
+      --arg validation_tier "$VALIDATION_TIER" \
+      --arg target_id "$TARGET_ID" \
+      --arg kernel_release "$KERNEL_RELEASE" \
+      --arg module_name "tidefs_posix_vfs" \
+      --arg module_digest "blake3:$MODULE_DIGEST" \
+      --argjson teardown_phases "$PHASES_JSON" \
+      --arg workqueue_trace_source "$WQ_TRACE_SOURCE" \
+      --arg workqueue_trace_artifact_path "$WQ_TRACE_PATH" \
+      --arg workqueue_trace_digest "$WQ_TRACE_DIGEST" \
+      --arg callback_trace_source "$CB_TRACE_SOURCE" \
+      --arg callback_trace_artifact_path "$CB_TRACE_PATH" \
+      --arg callback_trace_digest "$CB_TRACE_DIGEST" \
+      --argjson refusal_observations "$REFUSAL_JSON" \
+      --arg unmount "$UNMOUNT_OUTCOME" \
+      --arg rmmod "$RMMOD_OUTCOME" \
+      --arg reload_remount_probe "$RELOAD_OUTCOME" \
+      --arg dmesg_state "$CLEANUP_DMESG" \
+      --arg remaining_tidefs_work_observations "$REMAINING_WORK" \
+      --arg status "$TEARDOWN_STATUS" \
+      --argjson fail_closed_reasons "$FAIL_REASONS_JSON" \
+      '{
+        artifact_version: 1,
+        generated_by: $generated_by,
+        claim_id: $claim_id,
+        evidence_class: $evidence_class,
+        workflow_run_id: $workflow_run_id,
+        workflow_run_attempt: $workflow_run_attempt,
+        workflow_name: $workflow_name,
+        workflow_job: $workflow_job,
+        source_ref: $source_ref,
+        source_sha: $source_sha,
+        validation_tier: $validation_tier,
+        target_id: $target_id,
+        kernel_release: $kernel_release,
+        module_name: $module_name,
+        module_digest: $module_digest,
+        teardown_phases: $teardown_phases,
+        workqueue_trace_source: $workqueue_trace_source,
+        workqueue_trace_artifact_path: $workqueue_trace_artifact_path,
+        workqueue_trace_digest: $workqueue_trace_digest,
+        callback_trace_source: $callback_trace_source,
+        callback_trace_artifact_path: $callback_trace_artifact_path,
+        callback_trace_digest: $callback_trace_digest,
+        post_final_teardown_refusal_observations: $refusal_observations,
+        cleanup_outcome: {
+          unmount: $unmount,
+          rmmod: $rmmod,
+          reload_remount_probe: $reload_remount_probe,
+          dmesg_state: $dmesg_state,
+          remaining_tidefs_work_observations: $remaining_tidefs_work_observations
+        },
+        status: $status,
+        fail_closed_reasons: $fail_closed_reasons
+      }' > "$OUTPUT_DIR/kernel-teardown-runtime.json"
 
     echo "## kernel-teardown-runtime.json written" >> /dev/stderr
 
     # ── Write evidence-manifest.json ─────────────────────────────────
     ARTIFACT_PATH="kernel-teardown-runtime.json"
     ARTIFACT_DIGEST="blake3:$("$B3SUM" "$OUTPUT_DIR/$ARTIFACT_PATH" | awk '{print $1}')"
-    EVIDENCE_CLASS="runtime-kernel-teardown-validation"
+    EVIDENCE_CLASS="runtime-kernel-teardown-no-work-after-artifact"
     SOURCE_LABEL="qemu-smoke-kernel-teardown-validation"
-    SCOPE="kernel-teardown-mounted-vfs source=qemu-smoke run=$RUN_ID ref=$SOURCE_REF"
+    SCOPE="kernel-teardown-mounted-vfs source=qemu-smoke run=$RUN_ID ref=$SOURCE_REF sha=$SOURCE_SHA repo=$SOURCE_REPO"
 
-    cat > "$OUTPUT_DIR/evidence-manifest.json" << MANIFESTEOF
-{
-  "manifest_version": 1,
-  "claim_id": "kernel.teardown.no_work_after.v1",
-  "evidence_class": "$EVIDENCE_CLASS",
-  "validation_tier": "$VALIDATION_TIER",
-  "source": "$SOURCE_LABEL",
-  "scope": "$SCOPE",
-  "artifact_path": "$ARTIFACT_PATH",
-  "content_digest": "$ARTIFACT_DIGEST",
-  "generated_at": "$GENERATED_AT"
-}
-MANIFESTEOF
+    "$JQ" -n \
+      --arg claim_id "kernel.teardown.no_work_after.v1" \
+      --arg evidence_class "$EVIDENCE_CLASS" \
+      --arg validation_tier "$VALIDATION_TIER" \
+      --arg source "$SOURCE_LABEL" \
+      --arg scope "$SCOPE" \
+      --arg artifact_path "$ARTIFACT_PATH" \
+      --arg content_digest "$ARTIFACT_DIGEST" \
+      --arg generated_at "$GENERATED_AT" \
+      '{
+        manifest_version: 1,
+        claim_id: $claim_id,
+        evidence_class: $evidence_class,
+        validation_tier: $validation_tier,
+        source: $source,
+        scope: $scope,
+        artifact_path: $artifact_path,
+        content_digest: $content_digest,
+        generated_at: $generated_at
+      }' > "$OUTPUT_DIR/evidence-manifest.json"
 
     echo "## evidence-manifest.json written" >> /dev/stderr
 
@@ -570,47 +698,13 @@ MANIFESTEOF
 
     VALIDATION_ERRORS=0
 
-    check_field() {
-      local field="$1"
-      local label="$2"
-      if ! grep -q "\"$field\":" "$OUTPUT_DIR/kernel-teardown-runtime.json" 2>/dev/null; then
-        echo "VALIDATE FAIL: missing required field '$field' ($label)"
-        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
-      fi
-    }
-
-    check_field "claim_id" "claim identifier"
-    check_field "validation_tier" "validation tier"
-    check_field "target_id" "target identifier"
-    check_field "module_name" "module name"
-    check_field "module_digest" "module digest"
-    check_field "teardown_phases" "teardown phases"
-    check_field "workqueue_trace_source" "workqueue trace source"
-    check_field "workqueue_trace_artifact_path" "workqueue trace artifact path"
-    check_field "workqueue_trace_digest" "workqueue trace digest"
-    check_field "callback_trace_source" "callback trace source"
-    check_field "callback_trace_artifact_path" "callback trace artifact path"
-    check_field "callback_trace_digest" "callback trace digest"
-    check_field "post_final_teardown_refusal_observations" "refusal observations"
-    check_field "cleanup_outcome" "cleanup outcome"
-    check_field "status" "status"
-    check_field "fail_closed_reasons" "fail closed reasons"
-
-    # Check that status matches observed results
-    if grep -q '"status": "pass"' "$OUTPUT_DIR/kernel-teardown-runtime.json" 2>/dev/null; then
-      if [ "$FAIL_COUNT" -gt 0 ]; then
-        echo "VALIDATE FAIL: status=pass but FAIL_COUNT=$FAIL_COUNT"
-        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
-      fi
-      if [ "$DMESG_FINAL_WARN" -gt 0 ] || [ "$DMESG_FINAL_BUG" -gt 0 ]; then
-        echo "VALIDATE FAIL: status=pass but dmesg has WARNING/BUG"
-        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
-      fi
+    if ! "$VALIDATOR" validate-kernel-teardown-runtime-artifact "$OUTPUT_DIR/kernel-teardown-runtime.json"; then
+      echo "VALIDATE FAIL: xtask teardown artifact validator rejected kernel-teardown-runtime.json"
+      VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
     fi
 
-    # Check for dmesg kernel danger signals
-    if check_dmesg_signal "$OUTPUT_DIR/qemu.log"; then
-      echo "VALIDATE FAIL: dmesg contains kernel danger signals"
+    if [ "$TEARDOWN_STATUS" = "pass" ] && { [ "$FAIL_COUNT" -gt 0 ] || [ "$DMESG_DANGER_COUNT" -gt 0 ] || [ "$TRACE_ERROR_COUNT" -gt 0 ]; }; then
+      echo "VALIDATE FAIL: status=pass but fail/dmesg/trace counters are non-zero"
       VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
     fi
 
