@@ -11,6 +11,12 @@
 **Related**: #1232 (snapshot deadlist), #1215 (space accounting), #1289 (polymorphic directory index),
   #1373 (core types), #1383 (OrphanIndexRoot)
 
+**Documentation authority note**: This document is retained as persistent
+orphan-index design context. It is not current implementation-status or release
+matrix authority; use `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`,
+`docs/REVIEW_TODO_REGISTER.md`, and live GitHub issues/PRs for current
+documentation classification, review debt, and work status.
+
 ---
 
 ## Abstract
@@ -532,8 +538,13 @@ tree depth shallow even for millions of orphans.
 - `crates/tidefs-orphan-index`
 - `crates/tidefs-orphan-recovery-job-core`
 
-**Feature matrix** (`docs/FEATURE_MATRIX.md`):
-- Persistent orphan index → `implemented-types` orphan_index
+**Historical matrix context**:
+- The imported design previously mapped "Persistent orphan index" to the
+  retired feature-matrix row `implemented-types` / `orphan_index`.
+- Current authority for whether this document is status-bearing lives in
+  `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`; current review debt and open
+  implementation limits live in `docs/REVIEW_TODO_REGISTER.md` and linked
+  GitHub issues/PRs.
 
 ### 8.2 Deferred to wire-up issues
 
@@ -569,9 +580,12 @@ tree depth shallow even for millions of orphans.
 ---
 
 
-The xtask gate `tidefs-xtask check-orphan-index` will verify:
+The historical xtask gate plan `tidefs-xtask check-orphan-index` recorded here
+is design context, not current xtask policy. If revived, its documentation
+checks must use current authority docs instead of deleted feature-matrix or
+status surfaces. The intended checks were:
 
-1. Spec, feature matrix, and status entries present
+1. Design classification and current authority references present
 2. Core crate compiles with `no_std` + optional `alloc`
 3. `batch_recover()` passes deterministic tests: empty index, single orphan,
    mixed stale/real, budget exhaustion, cursor resume, crash simulation
