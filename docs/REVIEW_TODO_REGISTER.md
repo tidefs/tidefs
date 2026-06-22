@@ -10,7 +10,7 @@ OpenZFS/Ceph-class claims.
 | TFR-003 | Todo hygiene | Debt was previously scattered through docs, comments, and issue-era markers. | Keep all durable debt here; convert inline notes to register pointers only. |
 | TFR-004 | Dataset/inode authority | Dataset/mount identity and inode ownership need deep review; earlier audit suspected root-level inode list behavior. | Use `docs/INODE_NAMESPACE_AUTHORITY.md`: a dedicated dataset-scoped inode authority owns allocation, persisted IDs, root identity, and recovery seeding while namespace, FUSE lookup state, and inode-table registries remain projections. Implement the non-overlapping follow-ups #664, #665, #666, and #667 before closing this item. |
 | TFR-005 | Timestamp/revision/on-disk format | POSIX timestamps, storage version fields, content object keys, scrub identity, replay ticks, rename metadata stamps, and serialized format fields are coupled. | Specify one authority model for POSIX time, generation, txg, object-version, and on-disk compatibility before changing behavior. |
-| TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Consolidate transform ordering, checksums, key handling, and raw-store visibility. |
+| TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Use `docs/TRANSFORM_PIPELINE_AUTHORITY.md` as the #1063 boundary decision and close its non-overlapping follow-up map before claiming runtime conformance. |
 | TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Use `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` as the boundary decision and close the linked follow-up issue map. |
 | TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` for the dirty/writeback durability contract and `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` for the invalidation trigger, stale-generation, and FUSE/kernel/cluster lease model; then prove and test the end-to-end durability and cache-coherency contract. |
 | TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Unify snapshot lifecycle, object protection, deadlists, and stream formats. |
@@ -408,19 +408,6 @@ Important 2026-06-01 findings:
   identity. The device-level encryption/compression API surface remains unsafe
   to treat as an end-to-end mounted filesystem transform while blocked rows
   remain.
-- `TFR-006`: issue #1063 expands
-  `docs/TRANSFORM_PIPELINE_AUTHORITY.md` from the #712 ordering decision into
-  the transform-authority boundary decision record. The document now lists the
-  surveyed compression, encryption, checksum, verification, raw object-store,
-  intent-log, secret-key-policy, mounted content, and dedup surfaces; compares
-  the device-wrapper, lower-pool dispatcher, mounted-content, and
-  verification-only authority models; chooses the lower
-  `tidefs-local-object-store::pool` dispatcher surfaced through `PoolStore` and
-  `PoolStoreMut`; records compression-before-encryption, checksum-over-stored
-  frame, and transform metadata persistence requirements; and maps follow-up
-  implementation slices with non-overlapping write sets. This documentation
-  slice does not close TFR-006: #779 and the follow-up rows in
-  `docs/TRANSFORM_PIPELINE_AUTHORITY.md` still own runtime conformance.
 - `TFR-006`: commit `8b5b0f70` makes the mounted local-filesystem
   device-transform helpers fail closed instead of silently claiming end-to-end
   encryption or compression. `LocalFileSystem` now rejects open configs with
