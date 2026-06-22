@@ -20,6 +20,8 @@ use crate::encode_changed_record_export;
 use crate::error::FileSystemError;
 use crate::Result;
 
+pub use tidefs_send_stream::{SenderAuthority, SenderAuthorityEvidence};
+
 /// Identity of a content block being scrubbed.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ScrubBlockId {
@@ -52,7 +54,8 @@ pub struct MountedContentChecksumEvidence {
 
 impl MountedContentChecksumEvidence {
     pub fn matches_expected(&self) -> bool {
-        self.expected.map_or(true, |expected| expected == self.actual)
+        self.expected
+            .map_or(true, |expected| expected == self.actual)
     }
 }
 
@@ -1487,6 +1490,14 @@ impl ChangedRecordExport {
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         decode_changed_record_export(bytes)
+    }
+
+    /// VFSSEND1 changed-record exports carry no distributed sender authority.
+    ///
+    /// Distributed senders must use VFSSEND2 sender-authority evidence instead
+    /// of interpreting a changed-record stream as cross-pool authority.
+    pub const fn sender_authority(&self) -> SenderAuthorityEvidence {
+        SenderAuthorityEvidence::AbsentLocalOnly
     }
 
     pub const fn production_recovery_requires_operator_repair(&self) -> bool {

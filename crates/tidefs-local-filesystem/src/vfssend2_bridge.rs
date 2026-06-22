@@ -31,6 +31,10 @@
 //!
 //! - This module does **not** own pool-id or dataset-id authority; callers
 //!   must provide those from pool/dataset metadata.
+//! - VFSSEND1 [`ChangedRecordExport`] streams remain local-only. Distributed
+//!   senders must attach [`SenderAuthority`] while converting to VFSSEND2, and
+//!   VFSSEND2 streams carrying sender authority are rejected by the current
+//!   receive-to-VFSSEND1 bridge until receive authorization is implemented.
 //! - The VFSSEND2 stream is **not** yet carried over transport; the
 //!   send-stream session adapter (`tidefs-send-stream` with `transport`
 //!   feature) handles network delivery separately (#6087).
@@ -42,7 +46,8 @@
 use std::collections::BTreeSet;
 
 use tidefs_send_stream::{
-    Bytes32, DeltaObject, Id128, ObjectKind, SendBuilder, SendStreamHeader, SnapshotDelta,
+    Bytes32, DeltaObject, Id128, ObjectKind, SendBuilder, SendStreamHeader, SenderAuthority,
+    SnapshotDelta,
 };
 
 use crate::error::FileSystemError;
@@ -59,7 +64,28 @@ pub fn export_vfssend2_from_changed_records(
     pool_id: Id128,
     dataset_id: Id128,
 ) -> crate::Result<Vec<u8>> {
-    let (header, snapshots) = build_header_and_snapshots(export, pool_id, dataset_id)?;
+    encode_full_changed_records_as_vfssend2(export, pool_id, dataset_id, None)
+}
+
+/// Convert a local VFSSEND1 export into a VFSSEND2 stream carrying sender
+/// authority evidence.
+pub fn export_vfssend2_from_changed_records_with_sender_authority(
+    export: &ChangedRecordExport,
+    pool_id: Id128,
+    dataset_id: Id128,
+    sender_authority: SenderAuthority,
+) -> crate::Result<Vec<u8>> {
+    encode_full_changed_records_as_vfssend2(export, pool_id, dataset_id, Some(sender_authority))
+}
+
+fn encode_full_changed_records_as_vfssend2(
+    export: &ChangedRecordExport,
+    pool_id: Id128,
+    dataset_id: Id128,
+    sender_authority: Option<SenderAuthority>,
+) -> crate::Result<Vec<u8>> {
+    let (header, snapshots) =
+        build_header_and_snapshots(export, pool_id, dataset_id, sender_authority)?;
 
     let builder =
         SendBuilder::full(header, snapshots).map_err(|e| FileSystemError::LifecycleError {
@@ -89,6 +115,31 @@ pub fn export_incremental_vfssend2_from_changed_records(
     pool_id: Id128,
     dataset_id: Id128,
 ) -> crate::Result<Vec<u8>> {
+    encode_incremental_changed_records_as_vfssend2(export, pool_id, dataset_id, None)
+}
+
+/// Convert a local incremental VFSSEND1 export into a VFSSEND2 stream carrying
+/// sender authority evidence.
+pub fn export_incremental_vfssend2_from_changed_records_with_sender_authority(
+    export: &ChangedRecordExport,
+    pool_id: Id128,
+    dataset_id: Id128,
+    sender_authority: SenderAuthority,
+) -> crate::Result<Vec<u8>> {
+    encode_incremental_changed_records_as_vfssend2(
+        export,
+        pool_id,
+        dataset_id,
+        Some(sender_authority),
+    )
+}
+
+fn encode_incremental_changed_records_as_vfssend2(
+    export: &ChangedRecordExport,
+    pool_id: Id128,
+    dataset_id: Id128,
+    sender_authority: Option<SenderAuthority>,
+) -> crate::Result<Vec<u8>> {
     if !export.incremental {
         return Err(FileSystemError::LifecycleError {
             reason: "export_incremental_vfssend2: export is not incremental".into(),
@@ -103,7 +154,8 @@ pub fn export_incremental_vfssend2_from_changed_records(
 
     let from_snapshot_id = make_snapshot_id(from_root.transaction_id, from_root.generation);
 
-    let (header, snapshots) = build_header_and_snapshots(export, pool_id, dataset_id)?;
+    let (header, snapshots) =
+        build_header_and_snapshots(export, pool_id, dataset_id, sender_authority)?;
     let header = header.incremental_from(from_snapshot_id);
 
     let builder = SendBuilder::incremental(header, snapshots, std::collections::BTreeMap::new())
@@ -124,12 +176,16 @@ fn build_header_and_snapshots(
     export: &ChangedRecordExport,
     pool_id: Id128,
     dataset_id: Id128,
+    sender_authority: Option<SenderAuthority>,
 ) -> crate::Result<(SendStreamHeader, Vec<SnapshotDelta>)> {
     let to_snapshot_id = make_snapshot_id(
         export.current_root.transaction_id,
         export.current_root.generation,
     );
-    let header = SendStreamHeader::new(pool_id, dataset_id, to_snapshot_id);
+    let mut header = SendStreamHeader::new(pool_id, dataset_id, to_snapshot_id);
+    if let Some(sender_authority) = sender_authority {
+        header = header.with_sender_authority(sender_authority);
+    }
     let mut snapshots: Vec<SnapshotDelta> = Vec::with_capacity(export.roots.len());
     for root in &export.roots {
         let delta = changed_record_root_to_snapshot_delta(root)?;
@@ -272,6 +328,97 @@ mod tests {
 
         // Verify VFSSEND2 magic bytes at stream start
         assert_eq!(&encoded[0..8], tidefs_send_stream::STREAM_MAGIC);
+    }
+
+    #[test]
+    fn sender_authority_is_carried_in_vfssend2_header() {
+        let summary = make_test_root_summary(1, 100);
+        let object_key = ObjectKey::from_bytes32([3u8; 32]);
+        let record = ChangedObjectRecord {
+            role: ChangedRecordObjectRole::TransactionInode,
+            object_key,
+            checksum: IntegrityDigest64(42),
+            payload: vec![10, 20, 30],
+        };
+        let root = ChangedRecordRoot {
+            source_root: summary.clone(),
+            records: vec![record],
+        };
+        let export = ChangedRecordExport {
+            spec: "test",
+            stream_version: 1,
+            current_root: summary,
+            roots: vec![root],
+            total_records: 1,
+            payload_bytes: 3,
+            production_fsck_required: false,
+            from_root: None,
+            incremental: false,
+            placement_epoch: None,
+        };
+        assert!(export.sender_authority().is_absent_local_only());
+
+        let pool_id = [1u8; 16];
+        let dataset_id = [2u8; 16];
+        let sender_authority = tidefs_send_stream::SenderAuthority::new(pool_id, 7, 11).unwrap();
+        let encoded = export_vfssend2_from_changed_records_with_sender_authority(
+            &export,
+            pool_id,
+            dataset_id,
+            sender_authority,
+        )
+        .unwrap();
+
+        let (header, _records) = tidefs_send_stream::SendStreamHeader::decode(&encoded).unwrap();
+        assert_eq!(
+            header.sender_authority.distributed(),
+            Some(sender_authority)
+        );
+    }
+
+    #[test]
+    fn receive_bridge_rejects_vfssend2_sender_authority_before_conversion() {
+        let summary = make_test_root_summary(1, 100);
+        let object_key = ObjectKey::from_bytes32([3u8; 32]);
+        let record = ChangedObjectRecord {
+            role: ChangedRecordObjectRole::TransactionInode,
+            object_key,
+            checksum: IntegrityDigest64(42),
+            payload: vec![10, 20, 30],
+        };
+        let root = ChangedRecordRoot {
+            source_root: summary.clone(),
+            records: vec![record],
+        };
+        let export = ChangedRecordExport {
+            spec: "test",
+            stream_version: 1,
+            current_root: summary,
+            roots: vec![root],
+            total_records: 1,
+            payload_bytes: 3,
+            production_fsck_required: false,
+            from_root: None,
+            incremental: false,
+            placement_epoch: None,
+        };
+        let pool_id = [1u8; 16];
+        let dataset_id = [2u8; 16];
+        let sender_authority = tidefs_send_stream::SenderAuthority::new(pool_id, 7, 11).unwrap();
+        let encoded = export_vfssend2_from_changed_records_with_sender_authority(
+            &export,
+            pool_id,
+            dataset_id,
+            sender_authority,
+        )
+        .unwrap();
+
+        let err = receive_vfssend2_to_changed_records(&encoded).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::FileSystemError::LifecycleError { reason }
+                if reason.contains("sender authority")
+        ));
     }
 
     #[test]
@@ -449,6 +596,12 @@ pub fn receive_vfssend2_to_changed_records(
             reason: format!("VFSSEND2 header decode: {e}"),
         }
     })?;
+    if !header.sender_authority.is_absent_local_only() {
+        return Err(crate::FileSystemError::LifecycleError {
+            reason: "VFSSEND2 sender authority is not accepted by the local-only receive bridge"
+                .into(),
+        });
+    }
 
     let dataset_id = header.source_dataset_id;
 
