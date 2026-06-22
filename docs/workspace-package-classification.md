@@ -77,7 +77,7 @@ one-line justification. The table keeps the five machine-checked columns so
 | `apps/tidefs-storage-node` | `tidefs-storage-node` | `workspace-member` | `adapter-operator` | operator entrypoint for storage-node experiments; cluster authority remains TFR-017. |
 | `apps/tidefs-store-demo` | `tidefs-store-demo` | `workspace-member` | `proof-harness` | demo entrypoint and proof harness; non-production Local Object Store exercise only. |
 | `apps/tidefsctl` | `tidefsctl` | `workspace-member` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
-| `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `workspace-member` | `product-code` | planned authority surface; follow-up issue #815 required before release claims. |
+| `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `workspace-member` | `product-code` | current anti-entropy audit component; issue #815 evidence covers Merkle proof validation, comparison-history accounting, repair-trigger receipts, SuspectLog feeding, and scrub admission while release claims remain limited by the review register. |
 | `crates/tidefs-auth` | `tidefs-auth` | `workspace-member` | `policy-tooling` | current policy/tooling surface; not a production-readiness claim. |
 | `crates/tidefs-background-scheduler` | `tidefs-background-scheduler` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-binary_schema-checksum` | `tidefs-binary_schema-checksum` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -244,7 +244,7 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `apps/tidefs-storage-node` | `tidefs-storage-node` | `adapter-operator` | operator entrypoint for storage-node experiments; cluster authority remains TFR-017. |
 | `apps/tidefs-store-demo` | `tidefs-store-demo` | `proof-harness` | demo entrypoint and proof harness; non-production Local Object Store exercise only. |
 | `apps/tidefsctl` | `tidefsctl` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
-| `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `product-code` | planned authority surface; follow-up issue #815 required before release claims. |
+| `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `product-code` | current anti-entropy audit component; zero reverse dependencies reflect service-integration boundaries, not placeholder status; issue #815 records focused Merkle-to-repair validation evidence. |
 | `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue #816 required before release claims. |
 | `crates/tidefs-compaction` | `tidefs-compaction` | `product-code` | planned authority surface; follow-up issue #817 required before release claims. |
 | `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `proof-harness` | planned authority surface for model-only crash oracle validation; follow-up issue #818 required before it can support runtime release claims. |
