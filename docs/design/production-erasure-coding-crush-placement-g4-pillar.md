@@ -749,7 +749,7 @@ TideCRUSH provides the following guarantees:
 - [#1215] Space accounting — rebake frees ingest space after EC placement
 - Ceph CRUSH paper: Weil, S.A., et al. "CRUSH: Controlled, Scalable, Decentralized Placement of Replicated Data." SC 2006.
 - [#1249] Earlier erasure-coding placement design (superseded by this document)
-- [#35] Erasure-coded layout model OW-306 — single-parity XOR stripe model
+- Erasure-coded layout model OW-306 — single-parity XOR stripe model
 - Straw2 algorithm: Sage Weil. "Straw2: Improving Data Distribution in CRUSH." 2014.
 - `docs/design/shard-groups-replicas-rebake-pathway.md`
 - `docs/design/rebake-architecture-ingest-journal-to-base-shard-conversion.md`

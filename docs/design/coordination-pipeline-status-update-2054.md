@@ -384,7 +384,7 @@ subsystem specifications:
 |-----------|-------|------------|
 | Design completeness | 16/16 cluster services sealed + 40+ subsystem designs sealed | Design phase substantially complete |
 | Active implementation lanes | 3 lanes advancing | Cleanup/reclaim, spacemap, P8-03 |
-| Blocked work | 1 tracking issue (OW-000) | No design or implementation blockers |
+| Blocked work | none | No design or implementation blockers |
 | Issue stockpile | 50+ coordinator-sourced `codex:ready` issues | Proliferation ratio 7.5× vs closure rate |
 | Duplication severity | Moderate | Many generational duplicates already identified and sealed |
 | Velocity | ~40 design-seal closures in recent wave | Design velocity high; wire-up velocity near zero |
@@ -449,10 +449,10 @@ implementation issues:
 | Atomic snapshot coordination | 9 | #1662 | #1738 |
 | Admin proxy model | 9 | #1698 | #1738 |
 | P8-03 distributed runtime | 10 | OW-304 | — (9/9 crates implemented) |
-| Rebuild/backfill/rebalance | 10 | OW-305 | #1738 |
-| Erasure-coded layout | 10 | OW-306 | #1738 |
+| Rebuild/backfill/rebalance | 10 | OW-305 | — |
+| Erasure-coded layout | 10 | OW-306 | — |
 | Cleanup/reclaim queues | 10 | #1881 | #1907, #1929, #1933 |
-| Operator truth surfaces | 11 | OW-307 | #1738 |
+| Operator truth surfaces | 11 | OW-307 | — |
 | Cache-lattice views | 9 | #1909 | #1988 |
 
 ### 4.4 Proliferation Status

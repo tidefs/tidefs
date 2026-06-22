@@ -3057,7 +3057,7 @@ impl Transport {
 
             // Record the carrier fallback disclosure for operator observability.
             // This ensures the runtime validation never claims RDMA when TCP
-            // fallback has occurred (per NEXT-MN-018).
+            // fallback has occurred (per OW-308).
             {
                 let peer_node = session.peer_node;
                 let disclosure = CarrierDisclosure::from_runtime_fallback(
@@ -3140,7 +3140,7 @@ impl Transport {
             session.fallback_to_tcp();
 
             // Record the carrier fallback disclosure for operator observability
-            // (per NEXT-MN-018).
+            // (per OW-308).
             {
                 let peer_node = session.peer_node;
                 let disclosure = CarrierDisclosure::from_runtime_fallback(

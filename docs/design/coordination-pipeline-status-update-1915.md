@@ -38,7 +38,7 @@ duplicate and stale entries that clutter the Forgejo register.
 |-----------|-------|------------|
 | Design completeness | 16/16 cluster services sealed | All major designs finalized |
 | Active implementation lanes | 3 lanes advancing | Cleanup/reclaim, spacemap, P8-03 |
-| Blocked work | 1 tracking issue (OW-000) | No design or implementation blockers |
+| Blocked work | none | No design or implementation blockers |
 | Issue stockpile | 12 coordination issues open | Coordinator cadence > worker capacity |
 | Velocity | 1-2 coordination issues closed/week | Sustainable for doc maintenance, insufficient for code wire-up |
 
@@ -74,7 +74,6 @@ auto-generation. Three sub-lanes are active:
 
 | State | Count | Issues |
 |-------|-------|--------|
-| `codex:blocked` (tracking) | 1 | #1 (OW-000 Forgejo register) |
 | `codex:claimed` | 4 | #1792, #1820, #1911, #1923 (closed) |
 | `codex:needs-review` | 3 | #1694, #1728, #1763 |
 | Deferred/no label | 4 | #1804, #1848, #1873, #1875 |

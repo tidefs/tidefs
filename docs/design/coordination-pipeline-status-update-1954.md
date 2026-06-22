@@ -41,7 +41,7 @@ are redundant with already-closed design work.
 |-----------|-------|------------|
 | Design completeness | 16/16 cluster services sealed + 40+ subsystem designs sealed | All major and subsystem designs finalized |
 | Active implementation lanes | 3 lanes advancing | Cleanup/reclaim, spacemap, P8-03 |
-| Blocked work | 1 tracking issue (OW-000) | No design or implementation blockers |
+| Blocked work | none | No design or implementation blockers |
 | Issue stockpile | 50+ coordinator-sourced `codex:ready` issues | Proliferation rate > closure rate |
 | Duplication severity | High | Many #1966–#2021 issues are generational duplicates of sealed designs |
 | Velocity | ~40 design-seal closures in recent wave | Design velocity high; implementation wire-up velocity zero |

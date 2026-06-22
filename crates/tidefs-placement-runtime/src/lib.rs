@@ -4,10 +4,10 @@
 //! Placement runtime engine.
 //!
 //! Executes deterministic placement plans across nodes. The deterministic
-//! placement model (OW-303, #613) produces verdicts about which nodes SHOULD
+//! placement model (OW-303) produces verdicts about which nodes SHOULD
 //! hold which chunks.  The placement runtime is the engine that actually
 //! executes them: reserving target capacity, placing objects on nodes,
-//! tracking placement state, and feeding the transfer orchestrator (#901)
+//! tracking placement state, and feeding the transfer orchestrator
 //! with the work needed to make verdicts reality.
 //!
 //! ## Comparison to ZFS / Ceph
