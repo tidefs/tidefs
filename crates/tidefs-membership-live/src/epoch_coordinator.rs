@@ -340,6 +340,16 @@ impl EpochAdvanceCoordinator {
             return None;
         }
 
+        // Suppress transitions that would not change the member set: a Leave
+        // for a non-member or a Join for a current member is a no-op at the
+        // coordinator level.
+        let current_view = self.current_view.as_ref()?;
+        match change.new_status {
+            PeerLivenessStatus::Dead if !current_view.contains(change.member_id) => return None,
+            PeerLivenessStatus::Alive if current_view.contains(change.member_id) => return None,
+            _ => {}
+        }
+
         let transition = match change.new_status {
             PeerLivenessStatus::Alive => AuthorityTransition::Join(change.member_id),
             PeerLivenessStatus::Dead => AuthorityTransition::Leave(change.member_id),
@@ -836,9 +846,9 @@ mod tests {
     }
 
     #[test]
-    fn propose_already_present_alive_uses_authority_empty_delta_join() {
+    fn propose_already_present_alive_suppresses_noop_join() {
         let coord = new_coordinator_with_members(vec![MemberId::new(1), MemberId::new(2)]);
-        let current = coord.current_view().unwrap();
+        let current = coord.current_view().unwrap().clone();
 
         let change = PeerLivenessChange::new(
             MemberId::new(1),
@@ -847,15 +857,16 @@ mod tests {
             now_ms(),
         );
 
-        let view = coord.propose_epoch_view(current, &change).unwrap();
-        assert_eq!(view.epoch_number, EpochId::new(1));
-        assert_eq!(view.member_set, current.member_set);
+        assert!(coord.propose_epoch_view(&current, &change).is_none());
+        assert_eq!(coord.epoch_counter(), 0);
+        assert_eq!(coord.current_view().unwrap(), &current);
+        assert_projection_matches_authority(&coord);
     }
 
     #[test]
-    fn propose_dead_non_member_uses_authority_empty_delta_leave() {
+    fn propose_dead_non_member_suppresses_noop_leave() {
         let coord = new_coordinator_with_members(vec![MemberId::new(1), MemberId::new(2)]);
-        let current = coord.current_view().unwrap();
+        let current = coord.current_view().unwrap().clone();
 
         let change = PeerLivenessChange::new(
             MemberId::new(99),
@@ -864,9 +875,10 @@ mod tests {
             now_ms(),
         );
 
-        let view = coord.propose_epoch_view(current, &change).unwrap();
-        assert_eq!(view.epoch_number, EpochId::new(1));
-        assert_eq!(view.member_set, current.member_set);
+        assert!(coord.propose_epoch_view(&current, &change).is_none());
+        assert_eq!(coord.epoch_counter(), 0);
+        assert_eq!(coord.current_view().unwrap(), &current);
+        assert_projection_matches_authority(&coord);
     }
 
     #[test]
