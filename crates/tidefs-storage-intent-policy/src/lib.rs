@@ -618,6 +618,8 @@ pub fn compile_prefetch_residency_policy(
         }
     }
 
+    flags = flags.union(infer_action_evidence_flags(actions));
+
     let before_evidence = actions;
     let evidence_refusal = apply_evidence_state(
         flags,
@@ -765,9 +767,7 @@ fn apply_evidence_state(
     }
 
     if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_FRESH_MEDIA_CAPABILITY)
-        && (!state.fresh_media_capability
-            || !evidence_ref_has_id(refs.compiled_policy_ref)
-            || !evidence_ref_has_id(refs.decision_frontier_ref))
+        && (!state.fresh_media_capability || !evidence_ref_has_id(refs.media_capability_ref))
     {
         *actions = mask_intersection(*actions, PrefetchResidencyActionMask::LOW_RISK_PREFETCH);
         refusal = StorageIntentRefusalReason::MissingMediaCapabilityEvidence;
@@ -797,7 +797,7 @@ fn apply_evidence_state(
     if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_CAPACITY_RESERVE)
         && (!state.capacity_reserve || !evidence_ref_has_id(refs.capacity_reserve_ref))
     {
-        *actions = remove_authority_movement(*actions);
+        *actions = remove_capacity_spending_actions(*actions);
         refusal = StorageIntentRefusalReason::EvidenceNotUsable;
     }
 
@@ -846,6 +846,79 @@ fn apply_evidence_state(
     refusal
 }
 
+fn infer_action_evidence_flags(
+    actions: PrefetchResidencyActionMask,
+) -> PrefetchResidencyPolicyFlags {
+    let mut flags = PrefetchResidencyPolicyFlags::EMPTY;
+
+    if mask_overlaps(actions, ACTIVE_PREFETCH_ACTIONS) {
+        flags = flags
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_SERVICE_OBJECTIVE)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_EVIDENCE_QUERY)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_SCHEDULER_ADMISSION)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_TENANT_ISOLATION);
+    }
+
+    if mask_overlaps(actions, MEDIA_STAGING_ACTIONS) {
+        flags = flags
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_FRESH_MEDIA_CAPABILITY)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_COST_WEAR_EVIDENCE)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_CAPACITY_RESERVE)
+            .union(PrefetchResidencyPolicyFlags::PROTECT_FLASH_LIFETIME);
+    }
+
+    if mask_overlaps(actions, AUTHORITY_MOVEMENT_ACTIONS) {
+        flags = flags.union(MOVEMENT_EVIDENCE_FLAGS);
+    }
+
+    if mask_overlaps(actions, REMOTE_OR_ARCHIVE_ACTIONS) {
+        flags = flags
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_FRESH_MEDIA_CAPABILITY)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_EGRESS_RESTORE_EVIDENCE)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_TRANSPORT_BUDGET)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_TRUST_DOMAIN)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_CAPACITY_RESERVE);
+    }
+
+    flags
+}
+
+const ACTIVE_PREFETCH_ACTIONS: PrefetchResidencyActionMask = PrefetchResidencyActionMask::EMPTY
+    .with(PrefetchResidencyCandidateClass::BoundedReadahead)
+    .with(PrefetchResidencyCandidateClass::StridedVectorPrefetch)
+    .with(PrefetchResidencyCandidateClass::MetadataNamespacePrefetch)
+    .with(PrefetchResidencyCandidateClass::SmallRandomHotsetTrial)
+    .with(PrefetchResidencyCandidateClass::ManifestIndexPrefetch)
+    .with(PrefetchResidencyCandidateClass::SnapshotClonePrefetch)
+    .with(PrefetchResidencyCandidateClass::DegradedReadPrefetch)
+    .with(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch)
+    .with(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage)
+    .with(PrefetchResidencyCandidateClass::CacheOnlyTrial)
+    .with(PrefetchResidencyCandidateClass::VolatileRamTrial)
+    .with(PrefetchResidencyCandidateClass::IntentBackedRam)
+    .with(PrefetchResidencyCandidateClass::PmemDurable)
+    .with(PrefetchResidencyCandidateClass::FlashHotServing)
+    .with(PrefetchResidencyCandidateClass::HddLocalityOptimized)
+    .with(PrefetchResidencyCandidateClass::AuthorityPromotionCandidate)
+    .with(PrefetchResidencyCandidateClass::DemotionCandidate);
+
+const MEDIA_STAGING_ACTIONS: PrefetchResidencyActionMask = PrefetchResidencyActionMask::EMPTY
+    .with(PrefetchResidencyCandidateClass::IntentBackedRam)
+    .with(PrefetchResidencyCandidateClass::PmemDurable)
+    .with(PrefetchResidencyCandidateClass::FlashHotServing)
+    .with(PrefetchResidencyCandidateClass::AuthorityPromotionCandidate)
+    .with(PrefetchResidencyCandidateClass::DemotionCandidate);
+
+const AUTHORITY_MOVEMENT_ACTIONS: PrefetchResidencyActionMask = PrefetchResidencyActionMask::EMPTY
+    .with(PrefetchResidencyCandidateClass::IntentBackedRam)
+    .with(PrefetchResidencyCandidateClass::PmemDurable)
+    .with(PrefetchResidencyCandidateClass::AuthorityPromotionCandidate)
+    .with(PrefetchResidencyCandidateClass::DemotionCandidate);
+
+const REMOTE_OR_ARCHIVE_ACTIONS: PrefetchResidencyActionMask = PrefetchResidencyActionMask::EMPTY
+    .with(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch)
+    .with(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage);
+
 const fn mask_intersection(
     left: PrefetchResidencyActionMask,
     right: PrefetchResidencyActionMask,
@@ -858,6 +931,13 @@ const fn mask_without(
     right: PrefetchResidencyActionMask,
 ) -> PrefetchResidencyActionMask {
     PrefetchResidencyActionMask(left.0 & !right.0)
+}
+
+const fn mask_overlaps(
+    left: PrefetchResidencyActionMask,
+    right: PrefetchResidencyActionMask,
+) -> bool {
+    (left.0 & right.0) != 0
 }
 
 const fn min_u64_nonzero(left: u64, right: u64) -> u64 {
@@ -903,6 +983,19 @@ fn mask_without_flash_or_pmem(actions: PrefetchResidencyActionMask) -> PrefetchR
         PrefetchResidencyActionMask::from_candidate(
             PrefetchResidencyCandidateClass::FlashHotServing,
         ),
+    )
+}
+
+fn remove_capacity_spending_actions(
+    actions: PrefetchResidencyActionMask,
+) -> PrefetchResidencyActionMask {
+    mask_without(
+        remove_authority_movement(actions),
+        PrefetchResidencyActionMask::from_candidate(
+            PrefetchResidencyCandidateClass::FlashHotServing,
+        )
+        .with(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch)
+        .with(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage),
     )
 }
 
@@ -956,6 +1049,7 @@ mod tests {
             service_objective_ref: evidence(StorageIntentEvidenceKind::ServiceObjectiveEvidence, 2),
             evidence_query_ref: evidence(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 3),
             decision_frontier_ref: evidence(StorageIntentEvidenceKind::DecisionFrontierEvidence, 4),
+            media_capability_ref: evidence(StorageIntentEvidenceKind::MediaCapabilityEvidence, 15),
             scheduler_admission_ref: evidence(
                 StorageIntentEvidenceKind::SchedulerAdmissionRecord,
                 5,
@@ -1330,6 +1424,160 @@ mod tests {
             .envelope
             .allowed_actions
             .contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
+    }
+
+    #[test]
+    fn flash_serving_infers_media_evidence_floors() {
+        let mut sources = baseline_sources(DATASET_A);
+        sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::FlashHotServing,
+            ),
+        );
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        assert_eq!(result.status, StorageIntentPolicyCompileStatus::Compiled);
+        assert!(result
+            .envelope
+            .flags
+            .contains_all(PrefetchResidencyPolicyFlags::REQUIRE_COST_WEAR_EVIDENCE));
+        assert!(result
+            .envelope
+            .flags
+            .contains_all(PrefetchResidencyPolicyFlags::REQUIRE_FRESH_MEDIA_CAPABILITY));
+        assert!(result
+            .envelope
+            .flags
+            .contains_all(PrefetchResidencyPolicyFlags::REQUIRE_CAPACITY_RESERVE));
+        assert!(result
+            .envelope
+            .flags
+            .contains_all(PrefetchResidencyPolicyFlags::PROTECT_FLASH_LIFETIME));
+    }
+
+    #[test]
+    fn missing_media_capability_ref_lowers_media_actions() {
+        let mut sources = baseline_sources(DATASET_A);
+        sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::FlashHotServing,
+            ),
+        );
+        sources.evidence_refs.media_capability_ref = StorageIntentEvidenceRef::default();
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        assert_eq!(result.status, StorageIntentPolicyCompileStatus::Lowered);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        );
+        assert!(!result
+            .envelope
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
+        assert!(result
+            .envelope
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::NeedMoreEvidence));
+    }
+
+    #[test]
+    fn missing_wear_lowers_flash_even_without_source_flag() {
+        let mut sources = baseline_sources(DATASET_A);
+        sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::FlashHotServing,
+            ),
+        );
+        sources.evidence_state.cost_wear = false;
+        sources.evidence_refs.cost_wear_ref = StorageIntentEvidenceRef::default();
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        assert_eq!(result.status, StorageIntentPolicyCompileStatus::Lowered);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::FlashWearBudgetExceeded
+        );
+        assert!(!result
+            .envelope
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
+        assert!(result
+            .envelope
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::NeedMoreEvidence));
+    }
+
+    #[test]
+    fn wan_and_archive_actions_infer_remote_cost_floors() {
+        let mut sources = baseline_sources(DATASET_A);
+        sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch,
+            )
+            .with(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage),
+        );
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        assert_eq!(result.status, StorageIntentPolicyCompileStatus::Compiled);
+        assert!(result
+            .envelope
+            .flags
+            .contains_all(PrefetchResidencyPolicyFlags::REQUIRE_EGRESS_RESTORE_EVIDENCE));
+        assert!(result
+            .envelope
+            .flags
+            .contains_all(PrefetchResidencyPolicyFlags::REQUIRE_TRANSPORT_BUDGET));
+        assert!(result
+            .envelope
+            .flags
+            .contains_all(PrefetchResidencyPolicyFlags::REQUIRE_TRUST_DOMAIN));
+        assert!(result
+            .envelope
+            .flags
+            .contains_all(PrefetchResidencyPolicyFlags::REQUIRE_CAPACITY_RESERVE));
+    }
+
+    #[test]
+    fn missing_egress_cost_lowers_remote_staging_without_source_flag() {
+        let mut sources = baseline_sources(DATASET_A);
+        sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch,
+            )
+            .with(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage),
+        );
+        sources.evidence_state.egress_restore_cost = false;
+        sources.evidence_refs.egress_restore_cost_ref = StorageIntentEvidenceRef::default();
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        assert_eq!(result.status, StorageIntentPolicyCompileStatus::Lowered);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(!result
+            .envelope
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch));
+        assert!(!result
+            .envelope
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage));
+        assert!(result
+            .envelope
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::NeedMoreEvidence));
     }
 
     #[test]
