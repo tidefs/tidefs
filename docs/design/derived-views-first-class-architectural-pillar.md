@@ -839,8 +839,8 @@ This design does not cover:
 - `crates/tidefs_dir_index/src/lib.rs` — Runtime polymorphic directory index (micro-list / B+tree)
 - `docs/design/cache-lattice-views.md` — Cache-lattice views design (#1176)
 - `docs/design/prefetch-readahead-budgeted-speculative-io.md` — Prefetch/readahead architecture (#1247)
-- `docs/STATUS.md` — Current implementation status
-- `docs/FEATURE_MATRIX.md` — Feature maturity matrix
+- `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` — Current document authority classification register; this design remains historical input unless classified there
+- GitHub issues and pull requests — Current implementation coordination and status surface
 - Issue #1173 — Directory change streams (authoritative feed for incremental refresh)
 - Issue #1237 — Unified resource governor (budget integration)
 - Issue #1239 — Universal incremental cursor framework (rebuild job model)
