@@ -14,8 +14,9 @@
 //!
 //! ## Solution
 //!
-//! [`MembershipEpochFence`] holds the current committed epoch and the active
-//! member set. Before dispatch, each inbound [`MembershipMessage`] is checked:
+//! [`MembershipEpochFence`] holds the current committed membership-epoch view
+//! and the active member set. Before dispatch, each inbound
+//! [`MembershipMessage`] is checked:
 //!
 //! 1. The sender must be in the current member set.
 //! 2. If the message carries an epoch, it must be >= the current fence epoch
@@ -266,6 +267,9 @@ impl EpochCommitSubscriber for MembershipEpochFence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::epoch_coordinator::{
+        EpochAdvanceCoordinator, PeerLivenessChange, PeerLivenessStatus,
+    };
 
     fn mid(id: u64) -> MemberId {
         MemberId::new(id)
@@ -344,6 +348,38 @@ mod tests {
 
         assert_eq!(fence.current_epoch(), EpochId::new(7));
         assert_eq!(fence.member_count(), 2);
+    }
+
+    #[test]
+    fn fence_consumes_coordinator_committed_membership_epoch_state() {
+        let fence = MembershipEpochFence::new();
+        let mut coordinator = EpochAdvanceCoordinator::new(1);
+        coordinator.initialize(vec![mid(1), mid(2)], 1000);
+
+        fence.update_from_view(coordinator.current_view().unwrap());
+        assert!(fence.check(mid(2), Some(0)).is_ok());
+
+        let committed = coordinator
+            .on_liveness_change(PeerLivenessChange::new(
+                mid(2),
+                PeerLivenessStatus::Alive,
+                PeerLivenessStatus::Dead,
+                2000,
+            ))
+            .unwrap();
+        EpochCommitSubscriber::on_epoch_committed(&fence, &committed);
+
+        assert_eq!(fence.current_epoch(), EpochId::new(1));
+        assert_eq!(fence.member_ids(), vec![mid(1)]);
+        assert!(matches!(
+            fence.check(mid(2), Some(1)),
+            Err(FenceError::NotInRoster { .. })
+        ));
+        assert!(matches!(
+            fence.check(mid(1), Some(0)),
+            Err(FenceError::StaleEpoch { .. })
+        ));
+        assert!(fence.check(mid(1), Some(1)).is_ok());
     }
 
     // ------------------------------------------------------------------

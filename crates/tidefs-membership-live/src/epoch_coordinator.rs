@@ -13,7 +13,9 @@
 //! - Liveness changes arrive as [`PeerLivenessChange`] values: a member id,
 //!   previous status, new status, and timestamp.
 //! - The coordinator tracks the current [`EpochView`] (member set + epoch
-//!   number) and advances it when a transition changes the member set.
+//!   number) as a projection of
+//!   [`tidefs_membership_epoch::EpochStateMachine`], which owns epoch
+//!   identity, monotonic advancement, and member-set transition law.
 //!
 //! ## Output contract
 //!
@@ -40,10 +42,13 @@
 //! - [`crate::event_bridge::MembershipEventPublisher`]: subscriber dispatch
 //!   that epoch views flow into for transport notification.
 //! - Transport epoch-gate enforcement (#5889): downstream consumer of
-//!   committed epoch views for stale-epoch rejection.
+//!   committed membership-epoch views for stale-epoch rejection.
 
 use std::collections::BTreeMap;
-use tidefs_membership_epoch::{EpochId, MemberId};
+use tidefs_membership_epoch::{
+    EpochId, EpochMemberSet, EpochStateMachine as MembershipEpochStateMachine, MemberId,
+    NodeIdentity,
+};
 
 // ---------------------------------------------------------------------------
 // PeerLivenessStatus
@@ -192,8 +197,8 @@ pub trait EpochCommitSubscriber: Send + Sync {
 pub struct EpochAdvanceCoordinator {
     /// The current committed epoch view (None before initialization).
     current_view: Option<EpochView>,
-    /// Monotonic epoch counter; incremented on each commit.
-    epoch_counter: u64,
+    /// Deterministic membership-epoch authority backing the committed view.
+    epoch_state: Option<MembershipEpochStateMachine>,
     /// Known peer liveness statuses.
     peer_status: BTreeMap<MemberId, PeerLivenessStatus>,
     /// Minimum number of members required for a valid epoch view.
@@ -213,7 +218,7 @@ impl EpochAdvanceCoordinator {
     pub fn new(min_members: usize) -> Self {
         Self {
             current_view: None,
-            epoch_counter: 0,
+            epoch_state: None,
             peer_status: BTreeMap::new(),
             min_members: min_members.max(1),
             subscribers: Vec::new(),
@@ -227,10 +232,13 @@ impl EpochAdvanceCoordinator {
     ///
     /// All members are initially considered Alive.
     pub fn initialize(&mut self, members: Vec<MemberId>, now_ms: u64) {
-        let epoch = EpochId::new(self.epoch_counter);
-        let view = EpochView::new(epoch, members.clone(), now_ms);
+        let epoch_state = MembershipEpochStateMachine::bootstrap(Self::epoch_member_set(members));
+        let view = Self::view_from_epoch_state(&epoch_state, now_ms);
         self.current_view = Some(view);
-        for m in &members {
+        self.epoch_state = Some(epoch_state);
+        self.peer_status.clear();
+        self.last_change.clear();
+        for m in &self.current_view.as_ref().unwrap().member_set {
             self.peer_status.insert(*m, PeerLivenessStatus::Alive);
         }
     }
@@ -253,7 +261,8 @@ impl EpochAdvanceCoordinator {
     ///
     /// Evaluates whether the change triggers an epoch view update.
     /// Returns the new [`EpochView`] if one was committed, or `None` if
-    /// the change was suppressed or did not alter the member set.
+    /// the change was suppressed, the coordinator is not initialized, or the
+    /// deterministic authority rejects the resulting view.
     ///
     /// # Idempotency
     ///
@@ -277,65 +286,43 @@ impl EpochAdvanceCoordinator {
 
         self.last_change.insert(change.member_id, change.clone());
 
-        // Update tracked status
+        let (epoch_state, new_view) = self.epoch_state_for_liveness_change(&change)?;
+
+        // Update tracked status only after the deterministic authority accepts
+        // the transition.
         self.peer_status.insert(change.member_id, change.new_status);
 
-        let current_view = self.current_view.as_ref()?;
-
-        // Propose new view
-        let new_view = self.propose_epoch_view(current_view, &change)?;
-
-        // Commit it
-        Some(self.commit_epoch(new_view))
+        Some(self.commit_epoch_state(epoch_state, new_view))
     }
 
-    /// Compute the new epoch view given the current view and a liveness
-    /// change.
+    /// Compute the new epoch view by applying a liveness transition to the
+    /// deterministic membership-epoch state machine.
     ///
     /// Returns `None` if:
     /// - The resulting member set would drop below `min_members`.
-    /// - The member set is unchanged by this transition.
+    /// - The supplied current view is not the committed authority projection.
     pub fn propose_epoch_view(
         &self,
         current: &EpochView,
         change: &PeerLivenessChange,
     ) -> Option<EpochView> {
-        let mut new_members = current.member_set.clone();
-
-        match change.new_status {
-            PeerLivenessStatus::Dead => {
-                new_members.retain(|m| *m != change.member_id);
-            }
-            PeerLivenessStatus::Alive => {
-                if !new_members.contains(&change.member_id) {
-                    new_members.push(change.member_id);
-                }
-            }
-        }
-
-        // Quorum guard: do not produce a view below min_members
-        if new_members.len() < self.min_members {
+        if Some(current) != self.current_view.as_ref() {
             return None;
         }
-
-        // No change to member set: no new view needed
-        if new_members == current.member_set {
-            return None;
-        }
-
-        let new_epoch = EpochId::new(self.epoch_counter + 1);
-        Some(EpochView::new(
-            new_epoch,
-            new_members,
-            change.timestamp_millis,
-        ))
+        self.epoch_state_for_liveness_change(change)
+            .map(|(_, view)| view)
     }
 
-    /// Commit an epoch view: increment the counter, store as current,
-    /// notify subscribers, and return the committed view.
-    fn commit_epoch(&mut self, view: EpochView) -> EpochView {
-        self.epoch_counter += 1;
+    /// Commit an epoch state projection, notify subscribers, and return the
+    /// committed view.
+    fn commit_epoch_state(
+        &mut self,
+        epoch_state: MembershipEpochStateMachine,
+        view: EpochView,
+    ) -> EpochView {
         let committed = view;
+        self.epoch_state = Some(epoch_state);
+        self.sync_peer_status_to_view(&committed);
 
         for sub in &self.subscribers {
             sub.on_epoch_committed(&committed);
@@ -345,11 +332,109 @@ impl EpochAdvanceCoordinator {
         committed
     }
 
+    fn epoch_state_for_liveness_change(
+        &self,
+        change: &PeerLivenessChange,
+    ) -> Option<(MembershipEpochStateMachine, EpochView)> {
+        if !change.is_transition() {
+            return None;
+        }
+
+        let transition = match change.new_status {
+            PeerLivenessStatus::Alive => AuthorityTransition::Join(change.member_id),
+            PeerLivenessStatus::Dead => AuthorityTransition::Leave(change.member_id),
+        };
+        self.epoch_state_after_transition(transition, change.timestamp_millis)
+    }
+
+    fn epoch_state_after_transition(
+        &self,
+        transition: AuthorityTransition,
+        now_ms: u64,
+    ) -> Option<(MembershipEpochStateMachine, EpochView)> {
+        let mut candidate = self.epoch_state.as_ref()?.clone();
+        Self::apply_authority_transition(&mut candidate, transition);
+        let view = Self::view_from_epoch_state(&candidate, now_ms);
+        if view.member_count() < self.min_members {
+            return None;
+        }
+        Some((candidate, view))
+    }
+
+    fn epoch_member_set(members: Vec<MemberId>) -> EpochMemberSet {
+        EpochMemberSet::new(members.into_iter().map(|m| NodeIdentity::new(m.0)))
+    }
+
+    fn view_from_epoch_state(
+        epoch_state: &MembershipEpochStateMachine,
+        created_at_millis: u64,
+    ) -> EpochView {
+        let epoch = epoch_state.current_epoch();
+        let members = epoch
+            .members
+            .iter()
+            .map(|member| MemberId::new(member.node_id))
+            .collect();
+        EpochView::new(EpochId::new(epoch.epoch_id), members, created_at_millis)
+    }
+
+    fn apply_authority_transition(
+        epoch_state: &mut MembershipEpochStateMachine,
+        transition: AuthorityTransition,
+    ) {
+        match transition {
+            AuthorityTransition::Join(member_id) => {
+                epoch_state.join(NodeIdentity::new(member_id.0));
+            }
+            AuthorityTransition::Leave(member_id) => {
+                epoch_state.leave(NodeIdentity::new(member_id.0));
+            }
+            AuthorityTransition::Increment => {
+                epoch_state.increment();
+            }
+        }
+    }
+
+    fn normalized_member_set(member_set: &[MemberId]) -> Vec<MemberId> {
+        let mut members = member_set.to_vec();
+        members.sort();
+        members.dedup();
+        members
+    }
+
+    fn member_set_delta(
+        current_members: &[MemberId],
+        target_members: &[MemberId],
+    ) -> (Vec<MemberId>, Vec<MemberId>) {
+        let added = target_members
+            .iter()
+            .copied()
+            .filter(|member| !current_members.contains(member))
+            .collect();
+        let removed = current_members
+            .iter()
+            .copied()
+            .filter(|member| !target_members.contains(member))
+            .collect();
+        (added, removed)
+    }
+
+    fn sync_peer_status_to_view(&mut self, view: &EpochView) {
+        for status in self.peer_status.values_mut() {
+            *status = PeerLivenessStatus::Dead;
+        }
+        for member in &view.member_set {
+            self.peer_status.insert(*member, PeerLivenessStatus::Alive);
+        }
+    }
+
     // ----- Accessors -----
 
     /// The current epoch counter.
     pub fn epoch_counter(&self) -> u64 {
-        self.epoch_counter
+        self.epoch_state
+            .as_ref()
+            .map_or(0, |epoch_state| epoch_state.current_epoch().epoch_id)
     }
 
     /// The current epoch view, if initialized.
@@ -371,30 +456,60 @@ impl EpochAdvanceCoordinator {
     pub fn min_members(&self) -> usize {
         self.min_members
     }
-    /// Force an epoch advance to the given epoch number with the given
-    /// member set, even when no liveness change drives the transition.
+
+    /// Advance to the given epoch number with the given member set by applying
+    /// the smallest deterministic membership-epoch transition that produces
+    /// that committed view.
     ///
     /// This is used by catch-up replay when an epoch transition had no
     /// net membership change (e.g., a no-op administrative epoch). It
-    /// increments the epoch counter, stores the new view, and notifies
-    /// subscribers.
+    /// stores the new view and notifies subscribers only after
+    /// [`tidefs_membership_epoch::EpochStateMachine`] has produced the target
+    /// epoch and roster.
     ///
     /// Returns `None` if not initialized or the epoch number doesn't
-    /// match `epoch_counter + 1`.
+    /// match the next authority epoch. Returns `None` when the requested
+    /// member set would drop below `min_members`, change more than one member,
+    /// or diverge from the deterministic authority result.
     pub fn force_advance_epoch(
         &mut self,
         epoch_number: u64,
         member_set: &[MemberId],
         now_ms: u64,
     ) -> Option<EpochView> {
-        self.current_view.as_ref()?;
-        if epoch_number != self.epoch_counter + 1 {
+        let current_epoch = self.epoch_counter();
+        if epoch_number != current_epoch + 1 {
             return None;
         }
-        let new_epoch = EpochId::new(epoch_number);
-        let view = EpochView::new(new_epoch, member_set.to_vec(), now_ms);
-        Some(self.commit_epoch(view))
+
+        let current_members = self.current_view.as_ref()?.member_set.clone();
+        let target_members = Self::normalized_member_set(member_set);
+        if target_members.len() < self.min_members {
+            return None;
+        }
+
+        let (added, removed) = Self::member_set_delta(&current_members, &target_members);
+        let transition = match (added.as_slice(), removed.as_slice()) {
+            ([], []) => AuthorityTransition::Increment,
+            ([member], []) => AuthorityTransition::Join(*member),
+            ([], [member]) => AuthorityTransition::Leave(*member),
+            _ => return None,
+        };
+
+        let (epoch_state, view) = self.epoch_state_after_transition(transition, now_ms)?;
+        if view.epoch_number != EpochId::new(epoch_number) || view.member_set != target_members {
+            return None;
+        }
+
+        Some(self.commit_epoch_state(epoch_state, view))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthorityTransition {
+    Join(MemberId),
+    Leave(MemberId),
+    Increment,
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +556,28 @@ mod tests {
         c
     }
 
+    fn authority_members(coord: &EpochAdvanceCoordinator) -> Vec<MemberId> {
+        coord
+            .epoch_state
+            .as_ref()
+            .unwrap()
+            .current_epoch()
+            .members
+            .iter()
+            .map(|member| MemberId::new(member.node_id))
+            .collect()
+    }
+
+    fn assert_projection_matches_authority(coord: &EpochAdvanceCoordinator) {
+        let epoch_state = coord.epoch_state.as_ref().unwrap();
+        let view = coord.current_view().unwrap();
+        assert_eq!(
+            view.epoch_number,
+            EpochId::new(epoch_state.current_epoch().epoch_id)
+        );
+        assert_eq!(view.member_set, authority_members(coord));
+    }
+
     // ----- Dead peer removal -----
 
     #[test]
@@ -476,6 +613,7 @@ mod tests {
 
         // Coordinator state updated
         assert_eq!(coord.epoch_counter(), 1);
+        assert_projection_matches_authority(&coord);
         assert_eq!(
             coord.peer_status(MemberId::new(3)),
             Some(PeerLivenessStatus::Dead)
@@ -502,6 +640,7 @@ mod tests {
         assert_eq!(view.member_count(), 3);
         assert!(view.contains(MemberId::new(3)));
         assert_eq!(coord.epoch_counter(), 1);
+        assert_projection_matches_authority(&coord);
     }
 
     // ----- No-op transitions -----
@@ -697,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn propose_already_present_alive_is_noop() {
+    fn propose_already_present_alive_uses_authority_empty_delta_join() {
         let coord = new_coordinator_with_members(vec![MemberId::new(1), MemberId::new(2)]);
         let current = coord.current_view().unwrap();
 
@@ -708,13 +847,13 @@ mod tests {
             now_ms(),
         );
 
-        // Member 1 is already in the set → no change
-        let result = coord.propose_epoch_view(current, &change);
-        assert!(result.is_none());
+        let view = coord.propose_epoch_view(current, &change).unwrap();
+        assert_eq!(view.epoch_number, EpochId::new(1));
+        assert_eq!(view.member_set, current.member_set);
     }
 
     #[test]
-    fn propose_dead_non_member_is_noop() {
+    fn propose_dead_non_member_uses_authority_empty_delta_leave() {
         let coord = new_coordinator_with_members(vec![MemberId::new(1), MemberId::new(2)]);
         let current = coord.current_view().unwrap();
 
@@ -725,9 +864,25 @@ mod tests {
             now_ms(),
         );
 
-        // Member 99 is not in the set → no change
-        let result = coord.propose_epoch_view(current, &change);
-        assert!(result.is_none());
+        let view = coord.propose_epoch_view(current, &change).unwrap();
+        assert_eq!(view.epoch_number, EpochId::new(1));
+        assert_eq!(view.member_set, current.member_set);
+    }
+
+    #[test]
+    fn stale_current_view_cannot_propose_from_local_copy() {
+        let coord = new_coordinator_with_members(vec![MemberId::new(1), MemberId::new(2)]);
+        let mut stale = coord.current_view().unwrap().clone();
+        stale.epoch_number = EpochId::new(7);
+
+        let change = PeerLivenessChange::new(
+            MemberId::new(3),
+            PeerLivenessStatus::Dead,
+            PeerLivenessStatus::Alive,
+            now_ms(),
+        );
+
+        assert!(coord.propose_epoch_view(&stale, &change).is_none());
     }
 
     // ----- Subscriber lifecycle -----
@@ -808,6 +963,7 @@ mod tests {
         assert_eq!(view.member_set, vec![MemberId::new(1), MemberId::new(2)]);
         assert_eq!(coord.epoch_counter(), 0);
         assert_eq!(coord.peer_count(), 2);
+        assert_projection_matches_authority(&coord);
     }
 
     #[test]
@@ -914,6 +1070,7 @@ mod tests {
         assert_eq!(view.epoch_number, EpochId::new(1));
         assert_eq!(view.member_set, vec![MemberId::new(1), MemberId::new(2)]);
         assert_eq!(coord.epoch_counter(), 1);
+        assert_projection_matches_authority(&coord);
 
         // Subscriber was notified
         assert_eq!(TestSubscriber::views(&handle).len(), 1);
@@ -927,6 +1084,19 @@ mod tests {
         let result = coord.force_advance_epoch(5, &[MemberId::new(1)], now_ms());
         assert!(result.is_none());
         assert_eq!(coord.epoch_counter(), 0);
+    }
+
+    #[test]
+    fn force_advance_epoch_rejects_reused_epoch_id() {
+        let mut coord = new_coordinator_with_members(vec![MemberId::new(1), MemberId::new(2)]);
+        assert!(coord
+            .force_advance_epoch(1, &[MemberId::new(1), MemberId::new(2)], now_ms())
+            .is_some());
+
+        let result = coord.force_advance_epoch(1, &[MemberId::new(1), MemberId::new(2)], now_ms());
+        assert!(result.is_none());
+        assert_eq!(coord.epoch_counter(), 1);
+        assert_projection_matches_authority(&coord);
     }
 
     #[test]
@@ -951,6 +1121,62 @@ mod tests {
         assert_eq!(view.epoch_number, EpochId::new(1));
         assert!(view.contains(MemberId::new(3)));
         assert_eq!(view.member_count(), 3);
+        assert_projection_matches_authority(&coord);
+    }
+
+    #[test]
+    fn force_advance_epoch_rejects_multi_member_divergence() {
+        let mut coord = new_coordinator_with_members(vec![MemberId::new(1), MemberId::new(2)]);
+
+        let result = coord.force_advance_epoch(
+            1,
+            &[MemberId::new(1), MemberId::new(3), MemberId::new(4)],
+            now_ms(),
+        );
+
+        assert!(result.is_none());
+        assert_eq!(coord.epoch_counter(), 0);
+        assert_eq!(
+            coord.current_view().unwrap().member_set,
+            vec![MemberId::new(1), MemberId::new(2)]
+        );
+        assert_projection_matches_authority(&coord);
+    }
+
+    #[test]
+    fn coordinator_sequence_matches_membership_epoch_state_machine() {
+        let mut coord = new_coordinator_with_members(vec![
+            MemberId::new(1),
+            MemberId::new(2),
+            MemberId::new(3),
+        ]);
+        let mut expected =
+            MembershipEpochStateMachine::bootstrap(EpochAdvanceCoordinator::epoch_member_set(
+                vec![MemberId::new(1), MemberId::new(2), MemberId::new(3)],
+            ));
+
+        let leave = PeerLivenessChange::new(
+            MemberId::new(3),
+            PeerLivenessStatus::Alive,
+            PeerLivenessStatus::Dead,
+            now_ms(),
+        );
+        let committed = coord.on_liveness_change(leave).unwrap();
+        expected.leave(NodeIdentity::new(3));
+        let expected_view = EpochAdvanceCoordinator::view_from_epoch_state(&expected, now_ms());
+        assert_eq!(committed, expected_view);
+
+        let join = PeerLivenessChange::new(
+            MemberId::new(4),
+            PeerLivenessStatus::Dead,
+            PeerLivenessStatus::Alive,
+            now_ms() + 1,
+        );
+        let committed = coord.on_liveness_change(join).unwrap();
+        expected.join(NodeIdentity::new(4));
+        let expected_view = EpochAdvanceCoordinator::view_from_epoch_state(&expected, now_ms() + 1);
+        assert_eq!(committed, expected_view);
+        assert_projection_matches_authority(&coord);
     }
 
     // ----- Epoch counter advances monotonically -----
@@ -974,6 +1200,7 @@ mod tests {
         coord.on_liveness_change(c1);
         assert_eq!(coord.epoch_counter(), 1);
         assert_eq!(coord.current_view().unwrap().epoch_number, EpochId::new(1));
+        assert_projection_matches_authority(&coord);
 
         // Remove member 4
         let c2 = PeerLivenessChange::new(
@@ -985,5 +1212,6 @@ mod tests {
         coord.on_liveness_change(c2);
         assert_eq!(coord.epoch_counter(), 2);
         assert_eq!(coord.current_view().unwrap().epoch_number, EpochId::new(2));
+        assert_projection_matches_authority(&coord);
     }
 }
