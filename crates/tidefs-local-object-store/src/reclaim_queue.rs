@@ -464,7 +464,7 @@ mod tests {
     use crate::store::LocalObjectStore;
     use tidefs_reclaim::ReclaimReceiptExtent;
     use tidefs_types_reclaim_queue_core::{
-        DeadObjectEntry, DeadObjectReplacementReceipt, ObjectKey,
+        DeadObjectEntry, DeadObjectReceiptPolicy, DeadObjectReplacementReceipt, ObjectKey,
     };
 
     fn temp_store() -> (LocalObjectStore, tempfile::TempDir) {
@@ -493,6 +493,20 @@ mod tests {
         let key = dead_object_key(byte);
         DeadObjectEntry::new(key, [byte; 16], 5, true, 5)
             .with_replacement_receipt(receipt_for(key, byte as u64 + 1))
+    }
+
+    fn temp_store_with_dead_object_entry(
+        entry: DeadObjectEntry,
+    ) -> (LocalObjectStore, tempfile::TempDir) {
+        let (mut store, dir) = temp_store();
+        let mut queue = DeadObjectReclaimQueue::new();
+        assert!(queue.enqueue(entry));
+        store_dead_object_reclaim_queue(&queue, &mut store).expect("store dead-object queue");
+        store.sync_all().expect("sync dead-object queue");
+        drop(store);
+
+        let store = LocalObjectStore::open(dir.path()).expect("reopen store");
+        (store, dir)
     }
 
     #[test]
@@ -1016,5 +1030,137 @@ mod tests {
                 "corruption at byte {pos} should not yield original queue"
             );
         }
+    }
+
+    // -- publish_dead_object_replacement_receipt tests --
+
+    #[test]
+    fn publish_replacement_receipt_attaches_when_none_present() {
+        let key = dead_object_key(0xA1);
+        let entry = DeadObjectEntry::new(key, [0xA1; 16], 10, true, 9);
+        let (mut store, _dir) = temp_store_with_dead_object_entry(entry);
+
+        let receipt = receipt_for(key, 10);
+        let updated = store
+            .publish_dead_object_replacement_receipt(&key, receipt)
+            .expect("publish receipt");
+        assert!(updated);
+        store.sync_all().expect("sync");
+
+        let loaded = load_dead_object_reclaim_queue(&store);
+        let entries = loaded.all_entries();
+        let published = entries.iter().find(|e| e.object_id == key).unwrap();
+        assert_eq!(published.replacement_receipt, Some(receipt));
+    }
+
+    #[test]
+    fn publish_replacement_receipt_replaces_lower_generation() {
+        let key = dead_object_key(0xA2);
+        let entry = DeadObjectEntry::new(key, [0xA2; 16], 10, true, 9);
+        let (mut store, _dir) = temp_store_with_dead_object_entry(entry);
+
+        let receipt_gen5 = receipt_for(key, 5);
+        assert!(store
+            .publish_dead_object_replacement_receipt(&key, receipt_gen5)
+            .expect("publish gen5"));
+
+        let receipt_gen10 = receipt_for(key, 10);
+        assert!(store
+            .publish_dead_object_replacement_receipt(&key, receipt_gen10)
+            .expect("publish gen10"));
+
+        store.sync_all().expect("sync");
+        let loaded = load_dead_object_reclaim_queue(&store);
+        let entries = loaded.all_entries();
+        let published = entries.iter().find(|e| e.object_id == key).unwrap();
+        assert_eq!(published.replacement_receipt, Some(receipt_gen10));
+    }
+
+    #[test]
+    fn publish_replacement_receipt_ignores_equal_or_lower_generation() {
+        let key = dead_object_key(0xA3);
+        let entry = DeadObjectEntry::new(key, [0xA3; 16], 10, true, 9);
+        let (mut store, _dir) = temp_store_with_dead_object_entry(entry);
+
+        let receipt_gen5 = receipt_for(key, 5);
+        assert!(store
+            .publish_dead_object_replacement_receipt(&key, receipt_gen5)
+            .expect("publish gen5"));
+
+        let receipt_gen3 = receipt_for(key, 3);
+        assert!(!store
+            .publish_dead_object_replacement_receipt(&key, receipt_gen3)
+            .expect("ignore gen3"));
+
+        let receipt_gen5_dup = receipt_for(key, 5);
+        assert!(!store
+            .publish_dead_object_replacement_receipt(&key, receipt_gen5_dup)
+            .expect("ignore duplicate gen5"));
+
+        store.sync_all().expect("sync");
+        let loaded = load_dead_object_reclaim_queue(&store);
+        let entries = loaded.all_entries();
+        let published = entries.iter().find(|e| e.object_id == key).unwrap();
+        assert_eq!(published.replacement_receipt, Some(receipt_gen5));
+    }
+
+    #[test]
+    fn publish_replacement_receipt_missing_entry_returns_false() {
+        let (mut store, _dir) = temp_store();
+        let key = dead_object_key(0xA4);
+        let receipt = receipt_for(key, 1);
+        assert!(!store
+            .publish_dead_object_replacement_receipt(&key, receipt)
+            .expect("missing entry is not an error"));
+    }
+
+    #[test]
+    fn publish_replacement_receipt_rejects_epoch_zero() {
+        let key = dead_object_key(0xA5);
+        let entry = DeadObjectEntry::new(key, [0xA5; 16], 10, true, 9);
+        let (mut store, _dir) = temp_store_with_dead_object_entry(entry);
+        let receipt = DeadObjectReplacementReceipt::new(
+            key,
+            0,
+            5,
+            DeadObjectReceiptPolicy::Replicated { copies: 2 },
+            4096,
+            digest(0xA5),
+            2,
+        );
+
+        let err = store
+            .publish_dead_object_replacement_receipt(&key, receipt)
+            .expect_err("epoch-zero receipt must be rejected");
+        assert!(matches!(
+            err,
+            StoreError::InvalidDeadObjectReceipt {
+                reason: "replacement receipt does not authorize this object"
+            }
+        ));
+
+        let loaded = load_dead_object_reclaim_queue(&store);
+        let entries = loaded.all_entries();
+        let entry = entries.iter().find(|e| e.object_id == key).unwrap();
+        assert_eq!(entry.replacement_receipt, None);
+    }
+
+    #[test]
+    fn receipt_bound_enqueue_rejects_epoch_zero() {
+        let (mut store, _dir) = temp_store();
+        let key = dead_object_key(0xA6);
+        let epoch_zero_receipt = DeadObjectReplacementReceipt::new(
+            key,
+            0, // epoch = 0
+            5, // generation > 0
+            DeadObjectReceiptPolicy::Replicated { copies: 2 },
+            4096,
+            digest(0xA6),
+            2,
+        );
+        let epoch_zero_entry = DeadObjectEntry::new(key, [0xA6; 16], 10, true, 9)
+            .with_replacement_receipt(epoch_zero_receipt);
+        let result = store.enqueue_receipt_bound_dead_object(epoch_zero_entry);
+        assert!(result.is_err());
     }
 }

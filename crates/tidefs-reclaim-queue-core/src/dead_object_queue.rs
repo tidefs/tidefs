@@ -28,7 +28,7 @@ use tidefs_types_reclaim_queue_core::{
 /// Reason a shared placement receipt reference cannot authorize dead-object reclaim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlacementReceiptRefReclaimError {
-    /// Generation-zero compatibility receipts are not durable placement authority.
+    /// Generation- or epoch-zero compatibility receipts are not durable placement authority.
     SyntheticReceipt,
     /// The shared receipt describes a different object key than the retired object.
     ObjectKeyMismatch {
@@ -99,7 +99,7 @@ pub fn replacement_receipt_from_placement_ref(
     retired_object_key: ObjectKey,
     placement_ref: PlacementReceiptRef,
 ) -> Result<DeadObjectReplacementReceipt, PlacementReceiptRefReclaimError> {
-    if placement_ref.is_synthetic() {
+    if placement_ref.is_synthetic() || placement_ref.receipt_epoch.0 == 0 {
         return Err(PlacementReceiptRefReclaimError::SyntheticReceipt);
     }
 
@@ -559,6 +559,9 @@ impl DeadObjectReclaimQueue {
         object_id: &ObjectKey,
         receipt: DeadObjectReplacementReceipt,
     ) -> bool {
+        if !receipt.authorizes_reclaim_for(*object_id) {
+            return false;
+        }
         if let Some(entry) = self.entries.get_mut(object_id) {
             let accept = match entry.replacement_receipt {
                 Some(existing) => receipt.receipt_generation > existing.receipt_generation,
@@ -928,7 +931,7 @@ mod tests {
         PlacementReceiptRef {
             object_id: u64::from(key.0[0]),
             object_key: key.0,
-            receipt_epoch: Default::default(),
+            receipt_epoch: PlacementReceiptRef::default().receipt_epoch.next(),
             receipt_generation: generation,
             redundancy_policy,
             payload_len: 4096,
@@ -1308,7 +1311,7 @@ mod tests {
             dead_object_entry_with_placement_ref(entry, placement_ref).expect("bridge receipt");
         assert_eq!(
             bridged.replacement_receipt.unwrap(),
-            DeadObjectReplacementReceipt::replicated(key, 0, 9, 2, 4096, digest(0x70))
+            DeadObjectReplacementReceipt::replicated(key, 1, 9, 2, 4096, digest(0x70))
         );
 
         let mut q = DeadObjectReclaimQueue::new();
@@ -1326,6 +1329,27 @@ mod tests {
 
         let err = dead_object_entry_with_placement_ref(entry, synthetic)
             .expect_err("synthetic ref must not authorize reclaim");
+        assert_eq!(err, PlacementReceiptRefReclaimError::SyntheticReceipt);
+
+        let mut q = DeadObjectReclaimQueue::new();
+        q.enqueue(entry);
+        assert!(q.dequeue_receipt_bound_batch(10, 6).is_empty());
+    }
+
+    #[test]
+    fn placement_ref_bridge_rejects_epoch_zero_receipts() {
+        let key = oid(0x74);
+        let entry = DeadObjectEntry::new(key, [0x74; 16], 5, true, 4);
+        let mut epoch_zero = placement_ref(
+            key,
+            10,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            2,
+        );
+        epoch_zero.receipt_epoch = Default::default();
+
+        let err = dead_object_entry_with_placement_ref(entry, epoch_zero)
+            .expect_err("epoch-zero ref must not authorize reclaim");
         assert_eq!(err, PlacementReceiptRefReclaimError::SyntheticReceipt);
 
         let mut q = DeadObjectReclaimQueue::new();
@@ -1901,6 +1925,23 @@ mod tests {
         assert!(q.publish_replacement_receipt(&key, receipt));
 
         // Now reclaimable
+        assert_eq!(q.receipt_bound_eligible_count(10), 1);
+    }
+
+    #[test]
+    fn rebake_publish_rejects_non_authorizing_receipt() {
+        let mut q = DeadObjectReclaimQueue::new();
+        let key = oid(41);
+        q.enqueue(DeadObjectEntry::new(key, [41; 16], 5, true, 5));
+
+        let epoch_zero =
+            DeadObjectReplacementReceipt::replicated(key, 0, 1, 2, 4096, digest_for_key(key));
+        assert!(!q.publish_replacement_receipt(&key, epoch_zero));
+        assert_eq!(q.receipt_bound_eligible_count(10), 0);
+
+        let valid =
+            DeadObjectReplacementReceipt::replicated(key, 7, 1, 2, 4096, digest_for_key(key));
+        assert!(q.publish_replacement_receipt(&key, valid));
         assert_eq!(q.receipt_bound_eligible_count(10), 1);
     }
 

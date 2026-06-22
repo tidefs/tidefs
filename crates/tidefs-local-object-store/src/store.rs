@@ -64,8 +64,8 @@ use tidefs_gc_pin_set::SnapshotExtentPinSet;
 use tidefs_pool_allocator::{PoolAllocator, PoolAllocatorError, SpacePressureEvent};
 use tidefs_reclaim::{
     ClearanceEvidence, DrainError, GateDecision, GateDenyReason, ReclaimConfig,
-    ReclaimConsumerConfig, ReclaimConsumerService, ReclaimGate, ReclaimReceipt,
-    ReclaimScheduler, SegmentLiveCounts,
+    ReclaimConsumerConfig, ReclaimConsumerService, ReclaimGate, ReclaimReceipt, ReclaimScheduler,
+    SegmentLiveCounts,
 };
 use tidefs_reclaim_queue_core::{
     BPlusTreeReclaimQueue, DeadObjectReclaimQueue, SegmentLivenessQueue,
@@ -75,7 +75,8 @@ use tidefs_space_accounting::{
 };
 use tidefs_spacemap_allocator::{SegmentFreeMap, SpaceMapCheckpointV1};
 use tidefs_types_reclaim_queue_core::{
-    DeadObjectEntry, ObjectKey as ReclaimObjectKey, QueueFamily, ReclaimQueueEntry,
+    DeadObjectEntry, DeadObjectReplacementReceipt, ObjectKey as ReclaimObjectKey, QueueFamily,
+    ReclaimQueueEntry,
 };
 
 use tidefs_reserve_ledger::{ReserveLedger, WritePriority};
@@ -2231,13 +2232,11 @@ impl LocalObjectStore {
         extent_keys.iter().all(|extent_key| {
             let store_key = ObjectKey::from_bytes(extent_key.0);
             let live_location = self.index.get(&store_key).copied();
-            self.history
-                .get(&store_key)
-                .is_some_and(|locations| {
-                    locations.iter().any(|location| {
-                        location.segment_id == segment_id && Some(*location) != live_location
-                    })
+            self.history.get(&store_key).is_some_and(|locations| {
+                locations.iter().any(|location| {
+                    location.segment_id == segment_id && Some(*location) != live_location
                 })
+            })
         })
     }
 
@@ -2302,6 +2301,38 @@ impl LocalObjectStore {
             self.dead_object_reclaim_queue_dirty = true;
         }
         Ok(inserted)
+    }
+
+    /// Publish a replacement/base placement receipt for a dead-object entry
+    /// already queued for receipt-bound reclaim.
+    ///
+    /// This is the rebake pathway: after rebake converts ingest extents to
+    /// base shards and the replacement receipt is durably committed, callers
+    /// attach the receipt so the queue can authorize obsolete-ingest trim.
+    ///
+    /// The receipt must authorize this object before it is attached. A valid
+    /// receipt is accepted only when no existing receipt is present or when
+    /// its generation strictly exceeds the current receipt's generation
+    /// (monotonic progression). Returns true if the receipt was attached
+    /// or replaced.
+    pub fn publish_dead_object_replacement_receipt(
+        &mut self,
+        object_id: &ReclaimObjectKey,
+        receipt: DeadObjectReplacementReceipt,
+    ) -> Result<bool> {
+        self.ensure_writable("publish_dead_object_replacement_receipt")?;
+        if !receipt.authorizes_reclaim_for(*object_id) {
+            return Err(StoreError::InvalidDeadObjectReceipt {
+                reason: "replacement receipt does not authorize this object",
+            });
+        }
+        let updated = self
+            .dead_object_reclaim_queue
+            .publish_replacement_receipt(object_id, receipt);
+        if updated {
+            self.dead_object_reclaim_queue_dirty = true;
+        }
+        Ok(updated)
     }
 
     /// Drain receipt-authorized dead objects at caller-supplied stable
@@ -8121,8 +8152,9 @@ mod reclaim_queue_production_tests {
             assert_eq!(reopened.get(key).unwrap(), Some(new_payload.clone()));
         }
 
-        let reopened_again = LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
-            .expect("repeated reopen replays receipt idempotently");
+        let reopened_again =
+            LocalObjectStore::open_with_options(dir.path(), receipt_replay_options())
+                .expect("repeated reopen replays receipt idempotently");
         assert!(reopened_again.free_map.is_free(old_segment_id));
         assert!(!segment_path(&segments_dir, old_segment_id).exists());
         assert!(segment_path(&segments_dir, replacement_segment_id).exists());

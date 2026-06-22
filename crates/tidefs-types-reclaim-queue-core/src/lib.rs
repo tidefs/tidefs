@@ -818,6 +818,7 @@ impl DeadObjectReplacementReceipt {
     #[must_use]
     pub fn authorizes_reclaim_for(self, object_key: ObjectKey) -> bool {
         !self.is_synthetic()
+            && self.receipt_epoch > 0
             && self.object_key.0 == object_key.0
             && self.redundancy_policy.is_well_formed()
             && self.target_count >= self.redundancy_policy.target_width()
@@ -836,6 +837,7 @@ impl DeadObjectReplacementReceipt {
         stable_committed_generation: u64,
     ) -> bool {
         self.receipt_generation > 0
+            && self.receipt_epoch > 0
             && self.receipt_generation <= stable_committed_generation
             && self.authorizes_reclaim_for(object_key)
     }
@@ -1798,6 +1800,79 @@ mod tests {
         assert!(!synthetic.authorizes_reclaim_for(key));
         assert!(!malformed.authorizes_reclaim_for(key));
         assert!(!under_width.authorizes_reclaim_for(key));
+    }
+
+    #[test]
+    fn receipt_epoch_zero_rejects_reclaim_authorization() {
+        let key = dead_object_key(0x36);
+        let digest = [0xCD; 32];
+        // Epoch zero is the synthetic/compatibility sentinel for epoch,
+        // just as generation zero is for generation.
+        let epoch_zero = DeadObjectReplacementReceipt::new(
+            key,
+            0, // epoch = 0
+            1, // generation > 0 so is_synthetic() would pass alone
+            DeadObjectReceiptPolicy::Replicated { copies: 2 },
+            4096,
+            digest,
+            2,
+        );
+        assert!(!epoch_zero.authorizes_reclaim_for(key));
+        assert!(!epoch_zero.authorizes_reclaim_for_with_stable_generation(key, 10));
+    }
+
+    #[test]
+    fn receipt_authorization_requires_positive_epoch_and_generation() {
+        let key = dead_object_key(0x37);
+        let digest = [0xEF; 32];
+        // Both epoch and generation must be > 0
+        let epoch_and_gen_zero = DeadObjectReplacementReceipt::new(
+            key,
+            0,
+            0,
+            DeadObjectReceiptPolicy::Replicated { copies: 2 },
+            4096,
+            digest,
+            2,
+        );
+        assert!(!epoch_and_gen_zero.authorizes_reclaim_for(key));
+
+        let epoch_ok_gen_zero = DeadObjectReplacementReceipt::new(
+            key,
+            7,
+            0,
+            DeadObjectReceiptPolicy::Replicated { copies: 2 },
+            4096,
+            digest,
+            2,
+        );
+        assert!(!epoch_ok_gen_zero.authorizes_reclaim_for(key));
+
+        let epoch_zero_gen_ok = DeadObjectReplacementReceipt::new(
+            key,
+            0,
+            7,
+            DeadObjectReceiptPolicy::Replicated { copies: 2 },
+            4096,
+            digest,
+            2,
+        );
+        assert!(!epoch_zero_gen_ok.authorizes_reclaim_for(key));
+
+        let both_ok = DeadObjectReplacementReceipt::new(
+            key,
+            7,
+            7,
+            DeadObjectReceiptPolicy::Replicated { copies: 2 },
+            4096,
+            digest,
+            2,
+        );
+        assert!(both_ok.authorizes_reclaim_for(key));
+
+        // generation stability: generation must be <= stable
+        assert!(both_ok.authorizes_reclaim_for_with_stable_generation(key, 7));
+        assert!(!both_ok.authorizes_reclaim_for_with_stable_generation(key, 6));
     }
 
     #[test]
