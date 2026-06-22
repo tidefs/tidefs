@@ -1,10 +1,19 @@
-# Human terminology authority
+# Human terminology history
 
-Maturity: **design-law** naming authority for preview-facing source and docs.
+Status: **historical input**, not current workspace or source authority.
 
-TideFS uses human-readable architecture names as the primary source and documentation language. Opaque compact family labels are not acceptable for preview-facing source, package names, CLI output, docs, or new public APIs.
+`docs/DOCUMENTATION_AUTHORITY_REGISTER.md` classifies this file as imported
+historical input. It preserves useful terminology history, but crate paths,
+workspace membership, and implementation status below must be checked against
+the current workspace and `docs/workspace-package-classification.md` before
+they are used as source authority.
 
-## Current implemented architecture names
+The imported naming note preferred human-readable architecture names over
+opaque compact family labels in preview-facing source, package names, CLI
+output, docs, and new public APIs. Treat that rule as terminology history
+unless another current policy or spec promotes the same boundary.
+
+## Imported architecture-name map
 
 | Human name | Rust/package locator | Plain-English role |
 |---|---|---|
@@ -23,14 +32,21 @@ TideFS uses human-readable architecture names as the primary source and document
 | Claim/Reserve/Witness Kernel | `claim_reserve_witness` | Future claim, reserve, witness, repair, escrow, and quorum family. |
 | Response Normalizer | `response_normalizer` | Future response-language and charter-rendering family. |
 
-## Current source examples
+## Historical source examples
+
+The following examples are retained for terminology history, not as a current
+crate map. `docs/workspace-package-classification.md` records that
+`tidefs-types-control-plane-core`,
+`tidefs-types-publication-pipeline-core`, and
+`tidefs-types-response-registry-core` were deleted after their live record
+definitions already existed in `crates/tidefs-types-vfs-core`.
 
 Human package paths:
 
 ```text
-crates/tidefs-types-control-plane-core
-crates/tidefs-types-publication-pipeline-core
-crates/tidefs-types-response-registry-core
+crates/tidefs-types-control-plane-core (deleted historical root; see crates/tidefs-types-vfs-core)
+crates/tidefs-types-publication-pipeline-core (deleted historical root; see crates/tidefs-types-vfs-core)
+crates/tidefs-types-response-registry-core (deleted historical root; see crates/tidefs-types-vfs-core)
 crates/tidefs-types-posix-filesystem-adapter-core
 crates/tidefs-types-secret-key-policy-core
 crates/tidefs-schema-codec-posix-filesystem-adapter
@@ -54,21 +70,30 @@ LocalObjectStoreFormatRule
 
 ## Stable locators
 
-Readable locators such as `control_plane`, `policy_authority`, and `schema_codec` may appear in crate imports, stable IDs, and wire strings. They are allowed because they remain understandable English labels.
+Readable locators such as `control_plane`, `policy_authority`, and
+`schema_codec` appeared in the imported naming guidance as examples of
+understandable English labels for crate imports, stable IDs, and wire strings.
 
-The rule is not “never use a compact string.” The rule is: **never introduce opaque family labels when a human-readable locator can be used instead.**
+The imported rule was not "never use a compact string." It was: **never
+introduce opaque family labels when a human-readable locator can be used
+instead.**
 
 ## Storage naming rule
 
-The Local Object Store and Local Filesystem already follow the preferred naming pattern:
+The imported note cited the Local Object Store and Local Filesystem naming
+pattern:
 
 ```text
 crates/tidefs-local-object-store
 crates/tidefs-local-filesystem
 ```
 
-Future storage, userspace, kernelspace, and distributed components should follow this pattern.
+Future storage, userspace, kernelspace, and distributed components should use
+current workspace and documentation authority before treating this historical
+pattern as binding.
 
 
-and source names must not make runtime-output trees, packets, or historical
-closeout labels part of the current product surface.
+The imported note also warned that source names must not make runtime-output
+trees, packets, or historical closeout labels part of the current product
+surface; current product-surface authority must come from current specs and
+source evidence.
