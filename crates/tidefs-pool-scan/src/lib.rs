@@ -51,8 +51,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use tidefs_types_pool_label_core::{
-    decode_label, DeviceClass, LabelError, PoolLabelV1, PoolRedundancyPolicy, PoolState,
-    POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    decode_label, DeviceClass, features, LabelError, PoolLabelV1,
+    PoolRedundancyPolicy, PoolState, POOL_LABEL_MAGIC, POOL_LABEL_SIZE,
+    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 
 pub mod device_removal;
@@ -784,21 +785,43 @@ impl PoolLabelReader {
                 msg: format!("seek: {e}"),
             })?;
 
-        let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-        if file.read_exact(&mut buf).is_err() {
+        // Read base label bytes (up to POOL_LABEL_V1_EXT_WIRE_SIZE).
+        // If the DEVICE_LAYOUT_V1 compat bit is set, read the
+        // additional sidecar bytes so decode_label receives a
+        // complete buffer.
+        let mut prefix = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
+        if file.read_exact(&mut prefix).is_err() {
             return Ok(None);
         }
 
         // Quick magic check before full decode.
-        let magic: [u8; 4] = buf[0..4].try_into().unwrap();
+        let magic: [u8; 4] = prefix[0..4].try_into().unwrap();
         if magic != POOL_LABEL_MAGIC {
             return Ok(None);
         }
 
-        match decode_label(&buf) {
+        let features_compat =
+            u64::from_le_bytes(prefix[371..379].try_into().unwrap());
+        let has_device_layout =
+            features_compat & features::DEVICE_LAYOUT_V1 != 0;
+        let wire_size = if has_device_layout {
+            POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
+        } else {
+            POOL_LABEL_V1_EXT_WIRE_SIZE
+        };
+        let mut full = prefix.to_vec();
+        full.resize(wire_size, 0);
+        if has_device_layout
+            && file
+                .read_exact(&mut full[POOL_LABEL_V1_EXT_WIRE_SIZE..])
+                .is_err()
+        {
+            return Ok(None);
+        }
+        match decode_label(&full) {
             Ok(label) => {
                 let mut extension = Vec::new();
-                let extension_len = POOL_LABEL_SIZE.saturating_sub(POOL_LABEL_V1_EXT_WIRE_SIZE);
+                let extension_len = POOL_LABEL_SIZE.saturating_sub(wire_size);
                 file.take(extension_len as u64)
                     .read_to_end(&mut extension)
                     .map_err(|e| ScanError::Io {
