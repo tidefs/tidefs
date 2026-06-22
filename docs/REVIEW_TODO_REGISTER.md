@@ -408,6 +408,19 @@ Important 2026-06-01 findings:
   identity. The device-level encryption/compression API surface remains unsafe
   to treat as an end-to-end mounted filesystem transform while blocked rows
   remain.
+- `TFR-006`: issue #1063 expands
+  `docs/TRANSFORM_PIPELINE_AUTHORITY.md` from the #712 ordering decision into
+  the transform-authority boundary decision record. The document now lists the
+  surveyed compression, encryption, checksum, verification, raw object-store,
+  intent-log, secret-key-policy, mounted content, and dedup surfaces; compares
+  the device-wrapper, lower-pool dispatcher, mounted-content, and
+  verification-only authority models; chooses the lower
+  `tidefs-local-object-store::pool` dispatcher surfaced through `PoolStore` and
+  `PoolStoreMut`; records compression-before-encryption, checksum-over-stored
+  frame, and transform metadata persistence requirements; and maps follow-up
+  implementation slices with non-overlapping write sets. This documentation
+  slice does not close TFR-006: #779 and the follow-up rows in
+  `docs/TRANSFORM_PIPELINE_AUTHORITY.md` still own runtime conformance.
 - `TFR-006`: commit `8b5b0f70` makes the mounted local-filesystem
   device-transform helpers fail closed instead of silently claiming end-to-end
   encryption or compression. `LocalFileSystem` now rejects open configs with
