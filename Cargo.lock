@@ -2308,7 +2308,6 @@ dependencies = [
  "tidefs-incremental-job-core",
  "tidefs-reclaim",
  "tidefs-reclaim-queue-core",
- "tidefs-spacemap-allocator",
  "tidefs-types-incremental-job-core",
  "tidefs-types-reclaim-queue-core",
 ]
