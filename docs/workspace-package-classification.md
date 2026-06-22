@@ -85,7 +85,7 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-binary_schema-core/fuzz` | `tidefs-binary_schema-core-fuzz` | `workspace-excluded` | `standalone-fuzz` | standalone-checkable fuzz package; keep mirrored in workspace.exclude until restored or made an issue-backed archive/delete candidate. |
 | `crates/tidefs-binary_schema-framing` | `tidefs-binary_schema-framing` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-block-allocator` | `tidefs-block-allocator` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
-| `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `workspace-member` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue #816 required before release claims. |
+| `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
 | `crates/tidefs-block-volume-adapter-core` | `tidefs-block-volume-adapter-core` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
 | `crates/tidefs-block-volume-adapter-ublk-control-runtime` | `tidefs-block-volume-adapter-ublk-control-runtime` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
 | `crates/tidefs-btree` | `tidefs-btree` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -245,7 +245,7 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `apps/tidefs-store-demo` | `tidefs-store-demo` | `proof-harness` | demo entrypoint and proof harness; non-production Local Object Store exercise only. |
 | `apps/tidefsctl` | `tidefsctl` | `adapter-operator` | operator entrypoint for CLI/UAPI work; TFR-011 and TFR-019 remain open. |
 | `crates/tidefs-anti-entropy-auditor` | `tidefs-anti-entropy-auditor` | `product-code` | current anti-entropy audit component; zero reverse dependencies reflect service-integration boundaries, not placeholder status; issue #815 records focused Merkle-to-repair validation evidence. |
-| `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `adapter-operator` | planned authority surface for adapter or kernel work; follow-up issue #816 required before release claims. |
+| `crates/tidefs-block-kmod` | `tidefs-block-kmod` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
 | `crates/tidefs-compaction` | `tidefs-compaction` | `product-code` | planned authority surface; follow-up issue #817 required before release claims. |
 | `crates/tidefs-crash-oracle` | `tidefs-crash-oracle` | `proof-harness` | planned authority surface for model-only crash oracle validation; follow-up issue #818 required before it can support runtime release claims. |
 | `crates/tidefs-data-cleaner` | `tidefs-data-cleaner` | `product-code` | planned authority surface; follow-up issue #819 required before release claims. |
