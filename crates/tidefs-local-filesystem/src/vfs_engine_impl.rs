@@ -4545,7 +4545,7 @@ impl VfsEngine for VfsLocalFileSystem {
         target: InodeId,
         new_parent: InodeId,
         new_name: &[u8],
-        _ctx: &RequestCtx,
+        ctx: &RequestCtx,
     ) -> std::result::Result<InodeAttr, Errno> {
         self.ensure_writable()?;
         // Materialize anonymous tmpfiles: when an O_TMPFILE inode is
