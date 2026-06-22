@@ -467,6 +467,7 @@ mod tests {
             xattr_storage_kind: 0,
             xattrs: BTreeMap::new(),
             dir_rev: 0,
+            subtree_rev: 0,
         };
         state.observe_explicit_inode_id(orphan_id);
         state.inodes = Arc::new({
@@ -518,6 +519,7 @@ mod tests {
             xattr_storage_kind: 0,
             xattrs: BTreeMap::new(),
             dir_rev: 0,
+            subtree_rev: 0,
         };
         state.observe_explicit_inode_id(live_id);
         state.inodes = Arc::new({

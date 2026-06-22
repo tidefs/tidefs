@@ -696,6 +696,7 @@ mod tests {
             xattr_storage_kind: 0,
             xattrs: BTreeMap::new(),
             dir_rev: 0,
+            subtree_rev: 0,
         }
     }
 
@@ -721,6 +722,7 @@ mod tests {
             xattr_storage_kind: 0,
             xattrs: BTreeMap::new(),
             dir_rev: 0,
+            subtree_rev: 0,
         }
     }
 

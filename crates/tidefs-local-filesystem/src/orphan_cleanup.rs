@@ -364,6 +364,7 @@ mod tests {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         let mut inodes = BTreeMap::new();
         inodes.insert(root_inode_id, root);
@@ -461,6 +462,7 @@ mod tests {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         Arc::make_mut(&mut state.inodes).insert(orphan_inode_id, orphan_inode);
         state.observe_explicit_inode_id(orphan_inode_id);
@@ -506,6 +508,7 @@ mod tests {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         Arc::make_mut(&mut state.inodes).insert(orphan_inode_id, orphan_inode);
         state.observe_explicit_inode_id(orphan_inode_id);
@@ -566,6 +569,7 @@ mod tests {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         Arc::make_mut(&mut state.inodes)
             .get_mut(&ROOT_INODE_ID)
@@ -628,6 +632,7 @@ mod tests {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         Arc::make_mut(&mut state.inodes).insert(orphan_inode_id, orphan_inode);
         state.observe_explicit_inode_id(orphan_inode_id);

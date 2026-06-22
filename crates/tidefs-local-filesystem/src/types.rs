@@ -2245,6 +2245,10 @@ pub struct InodeRecord {
     /// Monotonic directory revision counter bumped on every entry mutation.
     /// Always 0 for non-directory inodes.
     pub dir_rev: u64,
+    /// Monotonic subtree revision counter advanced on any attribute or content
+    /// change.  Owned by the VFS namespace revision authority (see
+    /// docs/TIMESTAMP_GENERATION_AUTHORITY.md section 2.6).
+    pub subtree_rev: u64,
     /// Device number for block/character device nodes (major << 8 | minor).
     /// Zero for regular files, directories, symlinks, FIFOs, and sockets.
     pub rdev: u32,
@@ -2322,8 +2326,8 @@ impl InodeRecord {
                 blksize: 4096,
             },
             flags: InodeFlags::default(),
-            subtree_rev: self.metadata_version,
-            dir_rev: self.metadata_version,
+            subtree_rev: self.subtree_rev,
+            dir_rev: self.dir_rev,
         }
     }
 }

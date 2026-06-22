@@ -46,6 +46,7 @@ pub(crate) fn initial_state() -> FileSystemState {
         dir_storage_kind: 0,
         xattr_storage_kind: 0,
         dir_rev: 0,
+        subtree_rev: 0,
     };
     let mut inodes = BTreeMap::new();
     inodes.insert(root_inode_id, root);
@@ -2425,6 +2426,7 @@ mod receipt_validation_tests {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         }
     }
 

@@ -289,6 +289,7 @@ proptest! {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         let encoded = encode_content_chunk(&record, chunk_index, &payload, &ContentCompressionPolicy::zstd_default());
         let decoded = decode_content_chunk(&encoded)

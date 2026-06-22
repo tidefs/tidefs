@@ -551,6 +551,7 @@ mod tests {
                 dir_storage_kind: 0,
                 xattr_storage_kind: 0,
                 dir_rev: 0,
+                subtree_rev: 0,
             },
             directory: None,
         }

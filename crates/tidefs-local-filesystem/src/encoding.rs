@@ -762,6 +762,8 @@ pub(crate) fn encode_inode(inode: &InodeRecord) -> Vec<u8> {
     push_i64(&mut out, inode.posix_time.mtime_ns);
     push_i64(&mut out, inode.posix_time.ctime_ns);
     push_i64(&mut out, inode.posix_time.btime_ns);
+    push_u64(&mut out, inode.subtree_rev);
+    push_u64(&mut out, inode.dir_rev);
     match inode.xattr_storage_kind {
         0 => encode_xattr_bundle_v1(&mut out, &inode.xattrs),
         1 => encode_xattr_btree_root_v1(&mut out, &inode.xattrs),
@@ -845,6 +847,19 @@ pub(crate) fn decode_inode(bytes: &[u8]) -> Result<InodeRecord> {
             })
         }
     };
+    // Backward-compatible tail extension: if at least 16 bytes remain after
+    // the xattrs block, read subtree_rev and dir_rev.  Records written by
+    // FILESYSTEM_FORMAT_VERSION 6 before this extension have no tail bytes,
+    // so both counters default to 0 (which is correct: they will be advanced
+    // on the next mount first mutation).
+    let (subtree_rev, dir_rev) = if decoder.remaining() >= 16 {
+        (
+            decoder.read_u64().unwrap_or(0),
+            decoder.read_u64().unwrap_or(0),
+        )
+    } else {
+        (0, 0)
+    };
     Ok(InodeRecord {
         inode_id,
         generation,
@@ -860,7 +875,8 @@ pub(crate) fn decode_inode(bytes: &[u8]) -> Result<InodeRecord> {
         xattrs,
         dir_storage_kind,
         xattr_storage_kind,
-        dir_rev: 0,
+        subtree_rev,
+        dir_rev,
         rdev,
     })
 }

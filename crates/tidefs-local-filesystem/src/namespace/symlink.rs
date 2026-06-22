@@ -167,6 +167,7 @@ fn apply_symlink(
         xattr_storage_kind: 0,
         xattrs: BTreeMap::new(),
         dir_rev: 0,
+        subtree_rev: 0,
         rdev: 0,
     };
     inodes.insert(symlink_ino, symlink_inode.clone());
@@ -286,6 +287,7 @@ mod tests {
             xattr_storage_kind: 0,
             xattrs: BTreeMap::new(),
             dir_rev: 0,
+            subtree_rev: 0,
             rdev: 0,
         }
     }
