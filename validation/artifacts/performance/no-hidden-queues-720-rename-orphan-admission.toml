@@ -52,6 +52,12 @@ path = "crates/tidefs-orphan-index/src"
 scan = "recursive-rust-source-review"
 
 [[scanned_roots]]
+name = "transport-src"
+package = "tidefs-transport"
+path = "crates/tidefs-transport/src"
+scan = "recursive-rust-source-review"
+
+[[scanned_roots]]
 name = "local-filesystem-namespace"
 package = "tidefs-local-filesystem"
 path = "crates/tidefs-local-filesystem/src/namespace"
@@ -111,6 +117,14 @@ package = "tidefs-local-filesystem"
 path = "crates/tidefs-local-filesystem/src/page_cache/mod.rs"
 symbol = "lru"
 source_root = "crates/tidefs-local-filesystem/src"
+coverage = "registered-source-marker-present"
+
+[[queue_root_coverage]]
+id = "transport.send_queue_depth"
+package = "tidefs-transport"
+path = "crates/tidefs-transport/src/send_queue_depth.rs"
+symbol = "SendQueueDepth"
+source_root = "crates/tidefs-transport/src"
 coverage = "registered-source-marker-present"
 
 [[queue_root_coverage]]
