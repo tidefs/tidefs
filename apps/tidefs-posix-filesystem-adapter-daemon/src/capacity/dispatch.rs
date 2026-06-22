@@ -11,7 +11,7 @@ use tidefs_types_posix_filesystem_adapter_core::{
 };
 
 #[cfg(test)]
-use super::{CapacityFacade, StatfsReply};
+use super::StatfsReply;
 
 /// Synthetic dispatch result for a FUSE `STATFS` request.
 #[derive(Clone, Copy, Debug)]
@@ -25,7 +25,7 @@ pub struct StatfsDispatch {
     pub payload: [u8; StatfsReply::ENCODED_LEN],
 }
 
-/// Classify and answer a FUSE `STATFS` request from the capacity facade.
+/// Classify and answer a FUSE `STATFS` request with a precomputed reply.
 #[must_use]
 #[cfg(test)]
 pub fn dispatch_statfs(
@@ -34,7 +34,7 @@ pub fn dispatch_statfs(
     uid: u32,
     gid: u32,
     pid: u32,
-    capacity: &CapacityFacade,
+    statfs: StatfsReply,
 ) -> StatfsDispatch {
     let opcode = opcode::FUSE_STATFS;
     let request_class = classify_fuse_request(opcode);
@@ -50,7 +50,6 @@ pub fn dispatch_statfs(
         shard_key_policy,
         0,
     );
-    let statfs = capacity.statfs();
     let payload = statfs.as_fuse_bytes();
     let commit = commit_small_reply(unique, 0, StatfsReply::ENCODED_LEN as u32);
 
@@ -1483,20 +1482,23 @@ pub fn dispatch_tmpfile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_block_allocator::{BlockAllocator, Region};
     use tidefs_types_posix_filesystem_adapter_core::{
         PosixFilesystemAdapterReplyClass, PosixFilesystemAdapterRequestClass,
         PosixFilesystemAdapterShardKeyPolicy,
     };
 
-    fn capacity() -> CapacityFacade {
-        let allocator = BlockAllocator::with_root_reserve(
-            128,
-            4096,
-            Region::new(0, BlockAllocator::required_bitmap_bytes(128)),
-            8,
-        );
-        CapacityFacade::new(allocator)
+    fn statfs_reply() -> StatfsReply {
+        StatfsReply {
+            blocks: 128,
+            bfree: 128,
+            bavail: 120,
+            bsize: 4096,
+            frsize: 4096,
+            files: 0,
+            ffree: 0,
+            favail: 0,
+            namemax: 255,
+        }
     }
 
     fn rename_request(
@@ -1536,7 +1538,7 @@ mod tests {
 
     #[test]
     fn statfs_dispatch_classifies_and_commits_small_reply() {
-        let dispatch = dispatch_statfs(99, 1, 1000, 1000, 42, &capacity());
+        let dispatch = dispatch_statfs(99, 1, 1000, 1000, 42, statfs_reply());
 
         assert_eq!(dispatch.context.unique, 99);
         assert_eq!(dispatch.context.opcode, opcode::FUSE_STATFS);
@@ -1559,7 +1561,7 @@ mod tests {
 
     #[test]
     fn statfs_dispatch_payload_preserves_allocator_capacity() {
-        let dispatch = dispatch_statfs(99, 1, 1000, 1000, 42, &capacity());
+        let dispatch = dispatch_statfs(99, 1, 1000, 1000, 42, statfs_reply());
         let read_u64 = |offset: usize| -> u64 {
             u64::from_le_bytes(
                 dispatch.payload[offset..offset + 8]
@@ -1577,7 +1579,7 @@ mod tests {
 
     #[test]
     fn statfs_dispatch_context_includes_uid_gid_pid() {
-        let dispatch = dispatch_statfs(99, 1, 500, 501, 123, &capacity());
+        let dispatch = dispatch_statfs(99, 1, 500, 501, 123, statfs_reply());
 
         assert_eq!(dispatch.context.uid, 500);
         assert_eq!(dispatch.context.gid, 501);
@@ -1586,7 +1588,7 @@ mod tests {
 
     #[test]
     fn statfs_dispatch_shard_key_policy_is_session() {
-        let dispatch = dispatch_statfs(100, 0x42, 0, 0, 0, &capacity());
+        let dispatch = dispatch_statfs(100, 0x42, 0, 0, 0, statfs_reply());
 
         assert_eq!(
             dispatch.context.shard_key_policy,
@@ -1598,7 +1600,7 @@ mod tests {
 
     #[test]
     fn statfs_dispatch_payload_has_nonzero_block_size() {
-        let dispatch = dispatch_statfs(1, 1, 0, 0, 0, &capacity());
+        let dispatch = dispatch_statfs(1, 1, 0, 0, 0, statfs_reply());
         let read_u64 = |offset: usize| -> u64 {
             u64::from_le_bytes(
                 dispatch.payload[offset..offset + 8]

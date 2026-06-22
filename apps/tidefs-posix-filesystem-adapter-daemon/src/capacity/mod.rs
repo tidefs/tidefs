@@ -7,8 +7,9 @@
 //! [`tidefs_local_filesystem::capacity_authority::CapacityAuthority`].
 //!
 //! The retired adapter-local `CapacityFacade`, reservation lifecycle, and
-//! tracker are quarantined under `#[cfg(test)]` so release validation cannot
-//! import them as the capacity API.
+//! tracker have been removed from this module. Tests that need `STATFS`
+//! dispatch coverage pass an explicit [`StatfsReply`] instead of rebuilding a
+//! second capacity API.
 //!
 //! # Public modules
 //!
@@ -19,17 +20,6 @@
 
 pub mod dispatch;
 pub mod statfs_reply;
-
-// ── Test-only legacy capacity fixtures ────────────────────────────────────
-// CapacityFacade, admission, and tracker are retired from the production
-// capacity path. They remain under cfg(test) so their own unit tests still
-// compile and run without exporting a production capacity API.
-#[cfg(test)]
-pub mod admission;
-#[cfg(test)]
-pub mod facade;
-#[cfg(test)]
-pub mod tracker;
 
 // ── Public re-exports ─────────────────────────────────────────────────────
 
@@ -55,6 +45,3 @@ pub use statfs_reply::StatfsReply;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub use dispatch::{dispatch_statfs, StatfsDispatch};
-#[cfg(test)]
-#[allow(unused_imports)]
-pub use facade::CapacityFacade;
