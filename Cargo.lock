@@ -2772,6 +2772,7 @@ dependencies = [
  "tidefs-space-accounting",
  "tidefs-spacemap-allocator",
  "tidefs-types-incremental-job-core",
+ "tidefs-types-extent-map-core",
  "tidefs-types-pool-label-core",
  "tidefs-types-reclaim-queue-core",
  "tracing",
