@@ -12,6 +12,15 @@ containment strategy for coordinator-sourced issues
 advancement strategy), #1753 (roadmap priorities)
 **Blocks**: All deferred cluster-service wire-up implementation issues
 
+> **Historical input (TFR-019 authority classification):** This document was
+> imported from a Forgejo-era coordination-pipeline status update (#2054).
+> It records design-phase closure for cluster-wide services as of May 2026.
+> Sections that reference deleted `docs/STATUS.md`, `docs/FEATURE_MATRIX.md`,
+> or `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` are historical Forgejo-era
+> contracts. Do not treat these as current TideFS documentation authority.
+> Current TideFS coordination status lives in GitHub issues and pull requests,
+> not in serialized status-document files.
+
 ## Abstract
 
 This document updates the coordination pipeline status as of the May 2026
@@ -504,8 +513,8 @@ well-scoped protocol (#1209) with a clear design spec.
 | Content hash | Catches all duplicates regardless of title | Expensive; requires full body retrieval; false positives on distinct issues citing same design doc |
 
 **Decision**: Title Levenshtein distance ≤ 3. The coordinator's auto-generation
-produces titles with consistent patterns (e.g., "Update STATUS.md with latest
-coordination pipeline status"); title-based dedup catches these efficiently.
+produces titles with consistent patterns (e.g., a Forgejo-era "Update STATUS.md with latest
+coordination pipeline status" auto-generated title); title-based dedup catches these efficiently.
 For edge cases, manual review during health assessment catches remaining
 duplicates.
 
@@ -582,8 +591,12 @@ In priority order:
 
 ## 8. Integration Contracts
 
-### 8.1 STATUS.md Update Contract
+### 8.1 STATUS.md Update Contract (historical Forgejo-era)
 
+
+> **Historical:** This section describes a Forgejo-era contract for updating
+> `docs/STATUS.md`, which no longer exists. It is retained as design context
+> only and must not be treated as a current documentation workflow.
 Every coordination pipeline status update must:
 
 1. Query Forgejo API for current lane state before writing
@@ -594,14 +607,21 @@ Every coordination pipeline status update must:
 5. Prepend the new entry at the top of STATUS.md
 6. Close the Forgejo issue that triggered the update
 
-### 8.2 FEATURE_MATRIX.md Update Contract
+### 8.2 FEATURE_MATRIX.md Update Contract (historical Forgejo-era)
 
+
+> **Historical:** This section names a Forgejo-era `docs/FEATURE_MATRIX.md`
+> contract for a now-deleted file. It is retained as design context only.
 When a capability's maturity changes:
 
 - `design-sealed`: Design finalized, no further design changes expected
 - `implemented-source`: Core types and protocols implemented in crates
 
 ### 8.3 Cross-Document Consistency Contract
+
+> **Historical:** The consistency table below describes Forgejo-era
+> cross-document rules referencing now-deleted files. It is design context
+> and not current TideFS documentation authority.
 
 | Document | Consistency Rule |
 |----------|-----------------|
@@ -637,9 +657,9 @@ When a capability's maturity changes:
 - `docs/design/coordination-pipeline-status-update-1954.md` — #1954 prior status update
 - `docs/design/coordination-pipeline-status-update-1915.md` — #1915 prior status update
 - `docs/design/coordination-review-roadmap-priorities-update.md` — #1753 roadmap priorities
-- `docs/STATUS.md` — live coordination pipeline status
-- `docs/FEATURE_MATRIX.md` — implemented-source capability matrix
-- `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` — deferred production gates
+- `docs/STATUS.md` — live coordination pipeline status **(deleted; Forgejo-era artifact)**
+- `docs/FEATURE_MATRIX.md` — implemented-source capability matrix **(deleted; Forgejo-era artifact)**
+- `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` — deferred production gates **(deleted; Forgejo-era artifact)**
 - `docs/design/cluster-security-identity-model.md` — sealed security architecture
 - `docs/design/cluster-wide-distributed-lock-service-design.md` — lock service architecture
 - `docs/design/cluster-bulk-plane-protocol.md` — BULK plane protocol
