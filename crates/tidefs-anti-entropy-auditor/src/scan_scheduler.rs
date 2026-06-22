@@ -237,6 +237,12 @@ impl ScanScheduler {
         };
         self.next_scan_eligible_ns = now_ns.saturating_add(interval);
     }
+
+    /// Return the scheduler's next eligible scan timestamp.
+    #[must_use]
+    pub fn next_scan_eligible_ns(&self) -> u64 {
+        self.next_scan_eligible_ns
+    }
 }
 
 /// Decision returned by `should_scan`.

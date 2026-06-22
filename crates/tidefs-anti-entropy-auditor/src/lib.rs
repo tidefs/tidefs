@@ -384,11 +384,10 @@ impl AntiEntropyAuditor {
     /// Updates the comparison progress in the state machine and collects
     /// divergence records. Returns the new divergence count.
     pub fn record_comparisons(&mut self, results: &[ComparisonResult], _now_ns: u64) -> usize {
-        let mut new_divergences = 0;
+        let mut new_records = Vec::new();
 
         for result in results {
             if let Some(class) = result.divergence_class {
-                new_divergences += 1;
                 let record = DivergenceRecord::new(
                     result.subject_ref,
                     result.target_node,
@@ -406,9 +405,11 @@ impl AntiEntropyAuditor {
                         .register_degraded(result.subject_ref);
                 }
 
-                self.current_divergences.push(record);
+                new_records.push(record);
             }
         }
+
+        let new_divergences = new_records.len();
 
         // Update comparison progress in state
         if let AntiEntropyState::Compare {
@@ -421,8 +422,8 @@ impl AntiEntropyAuditor {
             *divergences_found += new_divergences as u64;
         }
 
-        self.divergence_history
-            .extend(self.current_divergences.iter().cloned());
+        self.divergence_history.extend(new_records.iter().cloned());
+        self.current_divergences.extend(new_records);
 
         new_divergences
     }
@@ -643,7 +644,7 @@ impl AntiEntropyAuditor {
 
         self.state = AntiEntropyState::Idle {
             last_scan_completed_ns: now_ns,
-            next_scan_eligible_ns: now_ns + self.scheduler.policy.min_scan_interval_ns,
+            next_scan_eligible_ns: self.scheduler.next_scan_eligible_ns(),
         };
     }
 
