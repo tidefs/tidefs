@@ -217,11 +217,34 @@ Follow-up scope: #789 tracks the 22 planned-authority surfaces and has split the
 
 ### 7.1 Issue-era labels (OW-*, PC-*, NEXT-*) in source and docs
 
-- **Surface**: ~297 source references and ~550 total references (including docs) to OW-*, PC-*, NEXT-* design-document labels.
-  - These are references to design spec documents (e.g., OW-101, PC-003, NEXT-204), not anonymous debt markers.
-  - However, many originate from the Forgejo era and reference issue numbers that are not GitHub-valid.
-- Classification: **Implement** — these labels are design-document cross-references, not stubs. However, the broader renaming from Forgejo-era labels should be tracked.
-- Follow-up issue: #796 audits OW/PC/NEXT label references for stale Forgejo links; reclassify or update as needed.
+- **Surface**: issue #796 refreshed the repository scan at `92ed488a`
+  with `rg -o "\b(?:OW|PC|NEXT)-[A-Z0-9][A-Z0-9-]*" .`.
+  The active tree contains 153 files with 785 references: 556 `OW-*`, 160
+  `PC-*`, and 69 `NEXT-*`.
+  - `OW-*`: mixed current/historical design cross-references. Keep only where a
+    scoped current spec/policy row, claim id, or GitHub issue now provides the
+    authority; imported docs classified as historical input keep the label only
+    as provenance, not current behavior evidence.
+  - `PC-*`: mixed current/historical design cross-references. Current source
+    gates may keep the label only when it names a current package, policy, or
+    claim authority. Imported closeout docs classified as historical input must
+    not be promoted by the label alone.
+  - `NEXT-*`: stale Forgejo-era or stage-gate residue by default. Preserve only
+    in historical input where the surrounding doc is explicitly historical;
+    retarget or remove active source, harness, benchmark, flake, and security
+    references through focused cleanup issues.
+- Classification: **Implement** — the labels are not anonymous debt markers,
+  but issue #796 confirms that the write set is too broad for one source edit.
+  This slice records the classification and splits the retarget/removal work.
+- Follow-up issues:
+  - #980 covers block-volume and ublk adapter label retargeting.
+  - #982 covers kernel/FUSE/POSIX adapter label retargeting.
+  - #983 covers local-filesystem, local-object-store, and storage xtask label
+    retargeting.
+  - #984 covers distributed, placement, replication, rebuild, rebalance, and
+    transport label retargeting.
+  - #985 covers validation, security, benchmarking, and `flake.nix` label
+    retargeting.
 
 ### 7.2 Forgejo references in unclassified docs
 
@@ -305,7 +328,12 @@ These surfaces were identified as stub/placeholder during the audit but already 
 | #793 | Section 6.4 (transport placeholder endpoint) | Implement | `crates/tidefs-transport/src/config.rs` |
 | #794 | Section 6.5 (cluster orchestrator scaffolding) | Implement | `crates/tidefs-cluster/src/pool_orchestrator.rs` |
 | #795 | Section 6.7 (synthetic placeholder receipts) | Implement | `crates/tidefs-rebuild-runtime/` |
-| #796 | Section 7.1 (issue-era labels) | Implement | Multiple files |
+| #796 | Section 7.1 (issue-era label audit and split) | Implement | `docs/STUB_PLACEHOLDER_INVENTORY.md`, `docs/REVIEW_TODO_REGISTER.md` |
+| #980 | Section 7.1 block-volume and ublk label retargeting | Implement | Block-volume/ublk source, docs, and xtask block gate paths |
+| #982 | Section 7.1 kernel/FUSE/POSIX label retargeting | Implement | Kernel/FUSE/POSIX adapter source and docs |
+| #983 | Section 7.1 local-storage label retargeting | Implement | Local filesystem/object-store source, storage docs, and xtask storage gate paths |
+| #984 | Section 7.1 distributed/transport label retargeting | Implement | Membership, placement, replication, rebuild, rebalance, transport source and docs |
+| #985 | Section 7.1 validation/security/performance label retargeting | Implement | Validation, security, benchmarking, and `flake.nix` paths |
 | #797 | Section 7.3 (FUSE feature matrix stubs) | Implement | `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` |
 
 The Wave Zero wording removal and the planned-authority tracking issue are the highest-priority slices because they touch the broadest surfaces with the lowest implementation risk.
@@ -314,8 +342,12 @@ The Wave Zero wording removal and the planned-authority tracking issue are the h
 
 ## Verification
 
-- Source/doc inspection completed against `origin/master` at `9372d6b1`.
-- `git diff --check` passes (this document only).
-- No runtime, build, or test validation required for this inventory slice.
+- Source/doc inspection completed against `origin/master` at `92ed488a`.
+- Issue #796 refreshed section 7.1 and split the broad label-retargeting work
+  into #980, #982, #983, #984, and #985.
+- `git diff --check` passes for this inventory plus
+  `docs/REVIEW_TODO_REGISTER.md`.
+- No runtime, build, or test validation required for this docs-only inventory
+  and classification slice.
 - This inventory does not duplicate the `docs/workspace-package-classification.md` package-role audit; it focuses on non-package stub surfaces and package-level placeholder behavior the role table does not resolve.
 - All 22 planned-authority-surface crates are enumerated for completeness; the role table already classifies them, but this inventory records their placeholder status for TFR-013 tracking.
