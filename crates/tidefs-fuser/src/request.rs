@@ -14,6 +14,8 @@ use std::convert::TryFrom;
 #[cfg(feature = "abi-7-28")]
 use std::convert::TryInto;
 use std::path::Path;
+use std::sync::{Mutex, Once, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::channel::ChannelSender;
 use crate::ll::Request as _;
@@ -23,6 +25,214 @@ use crate::reply::{Reply, ReplyDirectory, ReplySender};
 use crate::session::{Session, SessionACL};
 use crate::Filesystem;
 use crate::{ll, KernelConfig};
+
+const SLOW_REQUEST_DIAGNOSTICS_ENV: &str = "TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS";
+const SLOW_REQUEST_THRESHOLD_ENV: &str = "TIDEFS_FUSE_SLOW_REQUEST_MS";
+const SLOW_REQUEST_REPORT_ENV: &str = "TIDEFS_FUSE_SLOW_REQUEST_REPORT_MS";
+const DEFAULT_SLOW_REQUEST_THRESHOLD_MS: u64 = 1_000;
+const DEFAULT_SLOW_REQUEST_REPORT_MS: u64 = 5_000;
+
+static SLOW_REQUEST_CONFIG: OnceLock<SlowRequestDiagnosticsConfig> = OnceLock::new();
+static SLOW_REQUEST_WATCHDOG: Once = Once::new();
+static ACTIVE_SLOW_REQUEST: Mutex<Option<ActiveSlowRequest>> = Mutex::new(None);
+
+struct SlowRequestDiagnosticsConfig {
+    enabled: bool,
+    threshold: Duration,
+    report_interval: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveSlowRequest {
+    unique: u64,
+    opcode: u32,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    pid: u32,
+    started: Instant,
+    last_reported: Option<Instant>,
+}
+
+struct SlowRequestGuard {
+    enabled: bool,
+    unique: u64,
+    opcode: u32,
+    inode: u64,
+    started: Instant,
+}
+
+impl SlowRequestGuard {
+    fn new(unique: u64, opcode: u32, inode: u64, uid: u32, gid: u32, pid: u32) -> Self {
+        let started = Instant::now();
+        let config = slow_request_config();
+        if !config.enabled {
+            return Self {
+                enabled: false,
+                unique,
+                opcode,
+                inode,
+                started,
+            };
+        }
+
+        start_slow_request_watchdog(config);
+        match ACTIVE_SLOW_REQUEST.lock() {
+            Ok(mut active) => {
+                *active = Some(ActiveSlowRequest {
+                    unique,
+                    opcode,
+                    inode,
+                    uid,
+                    gid,
+                    pid,
+                    started,
+                    last_reported: None,
+                });
+            }
+            Err(_) => {
+                eprintln!(
+                    "tidefs-diagnostic: fuse slow_request state=poisoned phase=start unique={} opcode={} ino={}",
+                    unique,
+                    opcode_name(opcode),
+                    inode,
+                );
+            }
+        }
+
+        Self {
+            enabled: true,
+            unique,
+            opcode,
+            inode,
+            started,
+        }
+    }
+}
+
+impl Drop for SlowRequestGuard {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+
+        match ACTIVE_SLOW_REQUEST.lock() {
+            Ok(mut active) => {
+                let clear_active = active
+                    .as_ref()
+                    .map(|state| state.unique == self.unique)
+                    .unwrap_or(false);
+                if clear_active {
+                    *active = None;
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "tidefs-diagnostic: fuse slow_request state=poisoned phase=end unique={} opcode={} ino={}",
+                    self.unique,
+                    opcode_name(self.opcode),
+                    self.inode,
+                );
+            }
+        }
+
+        let elapsed = self.started.elapsed();
+        let config = slow_request_config();
+        if elapsed >= config.threshold {
+            eprintln!(
+                "tidefs-diagnostic: fuse slow_request state=complete unique={} opcode={} ino={} elapsed_ms={} threshold_ms={}",
+                self.unique,
+                opcode_name(self.opcode),
+                self.inode,
+                elapsed.as_millis(),
+                config.threshold.as_millis(),
+            );
+        }
+    }
+}
+
+fn slow_request_config() -> &'static SlowRequestDiagnosticsConfig {
+    SLOW_REQUEST_CONFIG.get_or_init(|| SlowRequestDiagnosticsConfig {
+        enabled: env_switch_enabled(SLOW_REQUEST_DIAGNOSTICS_ENV),
+        threshold: env_duration_ms(
+            SLOW_REQUEST_THRESHOLD_ENV,
+            DEFAULT_SLOW_REQUEST_THRESHOLD_MS,
+        ),
+        report_interval: env_duration_ms(SLOW_REQUEST_REPORT_ENV, DEFAULT_SLOW_REQUEST_REPORT_MS),
+    })
+}
+
+fn env_switch_enabled(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    )
+}
+
+fn env_duration_ms(name: &str, default_ms: u64) -> Duration {
+    let millis = std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_ms);
+    Duration::from_millis(millis)
+}
+
+fn start_slow_request_watchdog(config: &'static SlowRequestDiagnosticsConfig) {
+    SLOW_REQUEST_WATCHDOG.call_once(|| {
+        if !config.enabled {
+            return;
+        }
+        let threshold = config.threshold;
+        let report_interval = config.report_interval;
+        let spawn_result = std::thread::Builder::new()
+            .name("tidefs-fuse-slow-request-watchdog".to_owned())
+            .spawn(move || loop {
+                std::thread::sleep(report_interval);
+                report_active_slow_request(threshold, report_interval);
+            });
+        if let Err(err) = spawn_result {
+            eprintln!("tidefs-diagnostic: fuse slow_request watchdog_spawn_failed error={err}");
+        }
+    });
+}
+
+fn report_active_slow_request(threshold: Duration, report_interval: Duration) {
+    let now = Instant::now();
+    match ACTIVE_SLOW_REQUEST.lock() {
+        Ok(mut active) => {
+            let Some(state) = active.as_mut() else {
+                return;
+            };
+            let elapsed = now.duration_since(state.started);
+            if elapsed < threshold {
+                return;
+            }
+            let report_due = state
+                .last_reported
+                .map(|last| now.duration_since(last) >= report_interval)
+                .unwrap_or(true);
+            if !report_due {
+                return;
+            }
+            state.last_reported = Some(now);
+            eprintln!(
+                "tidefs-diagnostic: fuse slow_request state=active unique={} opcode={} ino={} pid={} uid={} gid={} elapsed_ms={} threshold_ms={}",
+                state.unique,
+                opcode_name(state.opcode),
+                state.inode,
+                state.pid,
+                state.uid,
+                state.gid,
+                elapsed.as_millis(),
+                threshold.as_millis(),
+            );
+        }
+        Err(_) => {
+            eprintln!("tidefs-diagnostic: fuse slow_request state=poisoned phase=watchdog");
+        }
+    }
+}
 
 /// Request data structure
 pub struct Request<'a> {
@@ -76,6 +286,14 @@ impl<'a> Request<'a> {
         let unique = self.request.unique();
         let opcode = self.request.opcode();
         let inode: u64 = self.request.nodeid().into();
+        let _slow_request_guard = SlowRequestGuard::new(
+            unique.into(),
+            opcode,
+            inode,
+            self.request.uid(),
+            self.request.gid(),
+            self.request.pid(),
+        );
 
         // Per-opcode tracing span (gated behind fuse-tracing feature)
         #[cfg(feature = "fuse-tracing")]

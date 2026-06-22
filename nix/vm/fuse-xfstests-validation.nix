@@ -439,6 +439,9 @@ daemon_read_only=""
 daemon_coherency="writeback"
 daemon_writeback_cache="1"
 daemon_content_capacity_bytes="2147483648"
+daemon_slow_request_diagnostics="''${TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS:-1}"
+daemon_slow_request_ms="''${TIDEFS_FUSE_SLOW_REQUEST_MS:-1000}"
+daemon_slow_request_report_ms="''${TIDEFS_FUSE_SLOW_REQUEST_REPORT_MS:-5000}"
 merge_mount_opts() {
     old_ifs="$IFS"
     IFS=,
@@ -518,10 +521,25 @@ daemon_log="/tmp/tidefs-daemon-$log_tag.log"
     echo "tidefs-preview: daemon_coherency=$daemon_coherency"
     echo "tidefs-preview: daemon_writeback_cache=$daemon_writeback_cache"
     echo "tidefs-preview: daemon_content_capacity_bytes=$daemon_content_capacity_bytes"
+    echo "tidefs-preview: daemon_slow_request_diagnostics=$daemon_slow_request_diagnostics"
+    echo "tidefs-preview: daemon_slow_request_ms=$daemon_slow_request_ms"
+    echo "tidefs-preview: daemon_slow_request_report_ms=$daemon_slow_request_report_ms"
     echo "tidefs-preview: daemon_log=$daemon_log"
 } > "$helper_log"
 mkdir -p "$store"
-setsid /bin/tidefs-posix-filesystem-adapter-daemon mount-vfs     --store "$store" --mount "$mnt"     --fs-name "$dev"     --coherency "$daemon_coherency"     --writeback-cache     --content-capacity-bytes "$daemon_content_capacity_bytes"     --options "$daemon_opts"     $daemon_read_only     --root-auth-key-hex "$AUTH"     >"$daemon_log" 2>&1 &
+TIDEFS_FUSE_SLOW_REQUEST_DIAGNOSTICS="$daemon_slow_request_diagnostics" \
+TIDEFS_FUSE_SLOW_REQUEST_MS="$daemon_slow_request_ms" \
+TIDEFS_FUSE_SLOW_REQUEST_REPORT_MS="$daemon_slow_request_report_ms" \
+setsid /bin/tidefs-posix-filesystem-adapter-daemon mount-vfs \
+    --store "$store" --mount "$mnt" \
+    --fs-name "$dev" \
+    --coherency "$daemon_coherency" \
+    --writeback-cache \
+    --content-capacity-bytes "$daemon_content_capacity_bytes" \
+    --options "$daemon_opts" \
+    $daemon_read_only \
+    --root-auth-key-hex "$AUTH" \
+    >"$daemon_log" 2>&1 &
 daemon_pid=$!
 echo "tidefs-preview: daemon_pid=$daemon_pid" >> "$helper_log"
 report_mount_failure() {
