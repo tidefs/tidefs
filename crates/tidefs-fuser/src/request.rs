@@ -42,7 +42,7 @@ struct SlowRequestDiagnosticsConfig {
     report_interval: Duration,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ActiveSlowRequest {
     unique: u64,
     opcode: u32,
@@ -52,6 +52,7 @@ struct ActiveSlowRequest {
     pid: u32,
     started: Instant,
     last_reported: Option<Instant>,
+    detail: Option<String>,
 }
 
 struct SlowRequestGuard {
@@ -60,10 +61,19 @@ struct SlowRequestGuard {
     opcode: u32,
     inode: u64,
     started: Instant,
+    detail: Option<String>,
 }
 
 impl SlowRequestGuard {
-    fn new(unique: u64, opcode: u32, inode: u64, uid: u32, gid: u32, pid: u32) -> Self {
+    fn new(
+        unique: u64,
+        opcode: u32,
+        inode: u64,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+        detail: Option<String>,
+    ) -> Self {
         let started = Instant::now();
         let config = slow_request_config();
         if !config.enabled {
@@ -73,6 +83,7 @@ impl SlowRequestGuard {
                 opcode,
                 inode,
                 started,
+                detail: None,
             };
         }
 
@@ -88,6 +99,7 @@ impl SlowRequestGuard {
                     pid,
                     started,
                     last_reported: None,
+                    detail: detail.clone(),
                 });
             }
             Err(_) => {
@@ -106,6 +118,7 @@ impl SlowRequestGuard {
             opcode,
             inode,
             started,
+            detail,
         }
     }
 }
@@ -140,12 +153,13 @@ impl Drop for SlowRequestGuard {
         let config = slow_request_config();
         if elapsed >= config.threshold {
             eprintln!(
-                "tidefs-diagnostic: fuse slow_request state=complete unique={} opcode={} ino={} elapsed_ms={} threshold_ms={}",
+                "tidefs-diagnostic: fuse slow_request state=complete unique={} opcode={} ino={} elapsed_ms={} threshold_ms={}{}",
                 self.unique,
                 opcode_name(self.opcode),
                 self.inode,
                 elapsed.as_millis(),
                 config.threshold.as_millis(),
+                self.detail.as_deref().unwrap_or(""),
             );
         }
     }
@@ -217,7 +231,7 @@ fn report_active_slow_request(threshold: Duration, report_interval: Duration) {
             }
             state.last_reported = Some(now);
             eprintln!(
-                "tidefs-diagnostic: fuse slow_request state=active unique={} opcode={} ino={} pid={} uid={} gid={} elapsed_ms={} threshold_ms={}",
+                "tidefs-diagnostic: fuse slow_request state=active unique={} opcode={} ino={} pid={} uid={} gid={} elapsed_ms={} threshold_ms={}{}",
                 state.unique,
                 opcode_name(state.opcode),
                 state.inode,
@@ -226,11 +240,33 @@ fn report_active_slow_request(threshold: Duration, report_interval: Duration) {
                 state.gid,
                 elapsed.as_millis(),
                 threshold.as_millis(),
+                state.detail.as_deref().unwrap_or(""),
             );
         }
         Err(_) => {
             eprintln!("tidefs-diagnostic: fuse slow_request state=poisoned phase=watchdog");
         }
+    }
+}
+
+fn slow_request_detail(op: &ll::Operation<'_>) -> Option<String> {
+    match op {
+        ll::Operation::Write(write) => {
+            let lock_owner = write
+                .lock_owner()
+                .map(|owner| owner.0.to_string())
+                .unwrap_or_else(|| "none".to_owned());
+            Some(format!(
+                " fh={} offset={} len={} write_flags={:#x} flags={:#x} lock_owner={}",
+                write.file_handle().0,
+                write.offset(),
+                write.data().len(),
+                write.write_flags(),
+                write.flags(),
+                lock_owner,
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -286,6 +322,14 @@ impl<'a> Request<'a> {
         let unique = self.request.unique();
         let opcode = self.request.opcode();
         let inode: u64 = self.request.nodeid().into();
+        let slow_request_detail = if slow_request_config().enabled {
+            self.request
+                .operation()
+                .ok()
+                .and_then(|op| slow_request_detail(&op))
+        } else {
+            None
+        };
         let _slow_request_guard = SlowRequestGuard::new(
             unique.into(),
             opcode,
@@ -293,6 +337,7 @@ impl<'a> Request<'a> {
             self.request.uid(),
             self.request.gid(),
             self.request.pid(),
+            slow_request_detail,
         );
 
         // Per-opcode tracing span (gated behind fuse-tracing feature)
