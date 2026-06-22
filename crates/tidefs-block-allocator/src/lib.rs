@@ -4,8 +4,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-//! Block-level allocation mechanism: free-block bitmap, allocation admission,
-//! per-inode quota gating, statfs accumulation, and dirty-bitmap flush.
+//! Block-level allocation mechanism: free-block bitmap, allocator-local
+//! reservation bookkeeping, physical placement diagnostics, commit-epoch
+//! allocation fences, TRIM input, and dirty-bitmap flush.
 //!
 //! # Authority
 //!
@@ -18,14 +19,21 @@
 //! The block allocator does not make pool-level or device-level placement
 //! decisions.
 //!
+//! Mounted quota, mounted write admission, and production POSIX/FUSE `statfs`
+//! authority live above this crate, as recorded in
+//! `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` for TFR-007. This crate provides
+//! lower physical free-block placement, allocator-local reservation
+//! bookkeeping, root-reserve/free-space diagnostics, commit-epoch fencing, and
+//! trim input.
+//!
 //! # Position in the TideFS block stack
 //!
 //! The block allocator sits between the extent map and the object store,
-//! answering "here are N free blocks" or ENOSPC. It gates write-path
-//! admission at the block level: before a write can proceed the caller must
-//! reserve, allocate, and commit blocks through this crate. Segment-level
-//! placement and pool-wide space-accounting decisions flow through the
-//! pool allocator above this component.
+//! answering "here are N free blocks" or ENOSPC for lower physical placement.
+//! Callers that use this allocator reserve, allocate, and commit blocks here
+//! after their mounted capacity/admission policy has been resolved above this
+//! crate. Segment-level placement and pool-wide space-accounting decisions flow
+//! through the pool allocator above this component.
 //!
 //! ```text
 //! FUSE handler / ublk target
@@ -40,7 +48,7 @@
 //! ```
 //!
 //! Consumers include:
-//! - `tidefs-block-volume-adapter-core` — block-device write-path admission.
+//! - `tidefs-block-volume-adapter-core` — block-device placement/reservation.
 //! - `tidefs-local-filesystem` — file-extent allocation in the FUSE path.
 //! - `tidefs-local-object-store` — object-storage block provisioning.
 //! - `tidefs-validation` — deterministic allocation replay in test harnesses.
@@ -49,11 +57,12 @@
 //!
 //! # Allocation state machine
 //!
-//! Every write goes through a three-phase lifecycle:
+//! Allocator callers use a three-phase lifecycle:
 //!
 //! 1. **Reserve** — call [`BlockAllocator::reserve`] to claim blocks against
-//!    the inode's quota. Fails with [`AllocError::QuotaExceeded`] if the
-//!    inode's hard limit would be breached. No bitmap mutation occurs yet.
+//!    the allocator-local inode reservation table. Fails with
+//!    [`AllocError::QuotaExceeded`] if the caller-supplied hard limit would be
+//!    breached. No bitmap mutation occurs yet.
 //!
 //! 2. **Allocate** — call one of the `alloc*` / `allocate*` methods to obtain
 //!    concrete block addresses from the free-block bitmap. May return
@@ -61,9 +70,9 @@
 //!    fragmentation analysis. On success, the selected blocks are marked used
 //!    and the spacemap is updated.
 //!
-//! 3. **Commit** — call [`BlockAllocator::commit`] to move the reserved quota
-//!    from "reserved" to "committed" (counted against the inode's hard limit).
-//!    The commit boundary also marks the bitmap dirty so the next
+//! 3. **Commit** — call [`BlockAllocator::commit`] to move the reserved blocks
+//!    from "reserved" to "committed" in allocator bookkeeping. The commit
+//!    boundary also marks the bitmap dirty so the next
 //!    [`BlockAllocator::flush`] or [`BlockAllocator::flush_to`] call persists
 //!    the new state.
 //!

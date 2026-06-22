@@ -7,9 +7,10 @@ license.workspace = true
 authors.workspace = true
 
 description = """
-Userspace block allocator: free-block bitmap tracking, contiguous/near-contiguous
-allocation, per-inode quota gating, statfs accumulation, and dirty-bitmap flush.
-Pacing component that gates all write-path work.
+Userspace physical block allocator for lower storage placement:
+free-block bitmap, allocator-local reservation bookkeeping,
+commit-epoch allocation fences, root-reserve/free-space diagnostics,
+TRIM input, and dirty-bitmap flush.
 """
 
 [dependencies]
