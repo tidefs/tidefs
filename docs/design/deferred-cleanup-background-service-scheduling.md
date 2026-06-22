@@ -597,17 +597,23 @@ The Phase 7 wire‑up issue will implement:
 8. Integration with FUSE daemon main loop
 10. TickLog records for operator visibility
 
-### 8.3 Write set
+### 8.3 Write surfaces
 
-| File | Change |
+This imported plan no longer uses the retired tracker-era status and
+feature-matrix ledgers as Phase 7 update targets. Current status, evidence, and
+documentation-authority changes live on the GitHub coordination surface and the
+repo authority registers.
+
+| Surface | Change |
 |---|---|
 | `crates/tidefs-cleanup-job-core/src/lib.rs` | Add `CleanupSchedulerAdapter`, budget constants |
 | `crates/tidefs-types-deferred-cleanup-core/src/lib.rs` | Add `CleanupSchedulingState` |
 | `crates/tidefs-background-scheduler/src/lib.rs` | Add ENOSPC pressure detection, priority boosting to `plan_cycle()` |
 | `crates/tidefs-local-filesystem/src/lib.rs` | Wire `CleanupSchedulerAdapter` into per‑dataset lifecycle (serial write surface — requires claim) |
 | active POSIX adapter runtime/daemon boundary | Integrate scheduling into the FUSE daemon main loop; the old standalone scheduler shard is not present |
-| `docs/STATUS.md` | Update cleanup scheduling status |
-| `docs/FEATURE_MATRIX.md` | Update cleanup capability row |
+| GitHub implementation issue and pull request | Record Phase 7 completion status, validation evidence, and residual risk on the live coordination surface |
+| `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` | Classify this design through the documentation-authority workflow before citing it as current status |
+| `docs/REVIEW_TODO_REGISTER.md` | Add a TFR entry only if Phase 7 leaves durable cleanup-scheduling review debt |
 
 ---
 
