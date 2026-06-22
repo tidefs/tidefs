@@ -835,7 +835,7 @@ Phase C: Scheduler registration added
   ↓
 Phase D: Crash-recovery integration test passes
   ↓
-Phase E: FEATURE_MATRIX.md updated to implemented-source
+Phase E: Closeout recorded in the wire-up GitHub issue/PR and, when document authority changes, docs/DOCUMENTATION_AUTHORITY_REGISTER.md
   ↓
 Phase F: Wire-up issue closed
 ```
