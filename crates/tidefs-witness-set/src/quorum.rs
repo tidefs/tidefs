@@ -615,12 +615,20 @@ impl QuorumEvaluator {
 #[cfg(test)]
 mod evaluator_tests {
     use super::*;
+    use tidefs_membership_epoch::{EpochId, MemberId};
+
+    fn add_voters(ws: &mut WitnessSet, ids: &[u64]) {
+        let voter_ids: Vec<MemberId> = ids.iter().copied().map(MemberId::new).collect();
+        ws.install_voter_ids_for_epoch(EpochId::new(ws.epoch()), &voter_ids);
+        for id in ids {
+            assert!(ws.add_witness(*id), "voter {id} must be accepted");
+        }
+    }
 
     fn make_ws(count: usize, threshold: QuorumThreshold) -> WitnessSet {
         let mut ws = WitnessSet::new(threshold);
-        for id in 1..=count as u64 {
-            ws.add_witness(id);
-        }
+        let ids: Vec<u64> = (1..=count as u64).collect();
+        add_voters(&mut ws, &ids);
         ws
     }
 

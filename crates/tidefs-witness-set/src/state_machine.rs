@@ -195,6 +195,13 @@ impl WitnessStateMachine {
                 "no pending additions to commit".into(),
             ));
         }
+        for &node_id in &self.pending_additions {
+            if let Err(err) = self.witness_set.validate_witness_eligibility(node_id) {
+                return Err(TransitionError::InvariantViolation(format!(
+                    "pending witness {node_id} is not eligible in current membership epoch: {err}"
+                )));
+            }
+        }
         // Validate the transition before consuming the pending list.
         self.apply(Transition::CommitExpand)?;
         for &node_id in &self.pending_additions {
@@ -308,12 +315,25 @@ impl WitnessStateMachine {
 mod tests {
     use super::*;
     use crate::witness_set::QuorumThreshold;
+    use tidefs_membership_epoch::{EpochId, MemberId};
+
+    fn add_voters(ws: &mut WitnessSet, ids: &[u64]) {
+        let voter_ids: Vec<MemberId> = ids.iter().copied().map(MemberId::new).collect();
+        ws.install_voter_ids_for_epoch(EpochId::new(ws.epoch()), &voter_ids);
+        for id in ids {
+            assert!(ws.add_witness(*id), "voter {id} must be accepted");
+        }
+    }
+
+    fn install_voters(ws: &mut WitnessSet, ids: &[u64]) {
+        let voter_ids: Vec<MemberId> = ids.iter().copied().map(MemberId::new).collect();
+        ws.install_voter_ids_for_epoch(EpochId::new(ws.epoch()), &voter_ids);
+    }
 
     fn make_ws(count: usize) -> WitnessSet {
         let mut ws = WitnessSet::new(QuorumThreshold::StrictMajority);
-        for id in 1..=count as u64 {
-            ws.add_witness(id);
-        }
+        let ids: Vec<u64> = (1..=count as u64).collect();
+        add_voters(&mut ws, &ids);
         ws
     }
 
@@ -347,6 +367,7 @@ mod tests {
     #[test]
     fn test_expand_add_and_commit() {
         let mut sm = WitnessStateMachine::new(make_ws(3));
+        install_voters(sm.witness_set_mut(), &[1, 2, 3, 10, 20]);
         sm.begin_add_witness(10).unwrap();
         sm.begin_add_witness(20).unwrap();
         assert_eq!(sm.state(), WitnessState::Expanding);
@@ -437,6 +458,7 @@ mod tests {
         assert_eq!(sm.state(), WitnessState::Active);
         sm.witness_went_offline(1).unwrap();
         assert_eq!(sm.state(), WitnessState::Degraded);
+        install_voters(sm.witness_set_mut(), &[1, 2, 3, 10]);
         sm.begin_add_witness(10).unwrap();
         sm.commit_additions().unwrap();
         assert_eq!(sm.state(), WitnessState::Active);
@@ -450,6 +472,7 @@ mod tests {
         let mut sm = WitnessStateMachine::new(make_ws(3));
         sm.witness_went_offline(1).unwrap();
         assert_eq!(sm.state(), WitnessState::Degraded);
+        install_voters(sm.witness_set_mut(), &[1, 2, 3, 10]);
         sm.begin_add_witness(10).unwrap();
         assert_eq!(sm.state(), WitnessState::Expanding);
         sm.commit_additions().unwrap();
