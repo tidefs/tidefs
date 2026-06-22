@@ -123,12 +123,12 @@ fn make_report(
     let mut digest_bytes = [0u8; 32];
     digest_bytes.copy_from_slice(digest.as_bytes());
     let first_eight = u64::from_le_bytes(digest_bytes[..8].try_into().unwrap());
+    let receipt_key = ObjectKey::from_name(subject.to_le_bytes());
+    let placement_receipt_ref = receipt_ref_for_payload(subject, receipt_key, payload, 1);
 
     DegradedReplicaReport {
         subject_ref: ReplicatedSubjectId::new(subject),
-        placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
-            ReplicatedSubjectId::new(subject),
-        ),
+        placement_receipt_ref,
         healthy_sources: vec![MemberId::new(source)],
         missing_targets: missing.iter().map(|&m| MemberId::new(m)).collect(),
         movement_class: class,
@@ -141,23 +141,10 @@ fn make_report(
 
 fn populate_source(
     store: &mut MemStore,
-    subject: u64,
-    digest: ObjectDigest,
+    placement_receipt_ref: PlacementReceiptRef,
     data: &[u8],
 ) -> ObjectKey {
-    let key = task_object_key(&BackfillTask::new(BackfillTaskInit {
-        subject_ref: ReplicatedSubjectId::new(subject),
-        placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
-            ReplicatedSubjectId::new(subject),
-        ),
-        source_member: MemberId::new(10),
-        target_member: MemberId::new(20),
-        movement_class: ReplicaMovementClass::BackfillLaggedCopy,
-        payload_digest: digest,
-        payload_len: data.len() as u64,
-        created_at_ns: 0,
-        deadline_ns: 0,
-    }));
+    let key = ObjectKey::from_bytes32(placement_receipt_ref.object_key);
     store.put(key, data).unwrap();
     key
 }
@@ -213,7 +200,7 @@ fn full_pipeline_single_object() {
     );
 
     // Populate source store with the object
-    populate_source(&mut source_store, 42, report.payload_digest, data);
+    populate_source(&mut source_store, report.placement_receipt_ref, data);
 
     // Schedule the backfill
     let mut scheduler = BackfillScheduler::new();
@@ -278,7 +265,7 @@ fn scheduler_dedup_prevents_duplicate_work() {
         2000,
     );
 
-    populate_source(&mut source_store, 99, report1.payload_digest, data);
+    populate_source(&mut source_store, report1.placement_receipt_ref, data);
 
     let mut scheduler = BackfillScheduler::new();
     scheduler.ingest(&[report1, report2]);
@@ -316,7 +303,7 @@ fn quorum_rejects_expired_lease() {
         data,
         0,
     );
-    populate_source(&mut source_store, 7, report.payload_digest, data);
+    populate_source(&mut source_store, report.placement_receipt_ref, data);
 
     let mut scheduler = BackfillScheduler::new();
     scheduler.ingest(&[report]);
@@ -369,8 +356,8 @@ fn backfill_with_node_capacity_enforcement() {
         ),
     ];
 
-    for (i, r) in reports.iter().enumerate() {
-        populate_source(&mut source_store, (i + 1) as u64, r.payload_digest, data);
+    for r in &reports {
+        populate_source(&mut source_store, r.placement_receipt_ref, data);
     }
 
     let mut scheduler = BackfillScheduler::new();
@@ -491,21 +478,11 @@ fn engine_verifies_source_and_destination_checksums() {
     let mut source = MemStore::default();
     let mut target = MemStore::default();
 
-    let task = BackfillTask::new(BackfillTaskInit {
-        subject_ref: ReplicatedSubjectId::new(99),
-        placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
-            ReplicatedSubjectId::new(99),
-        ),
-        source_member: MemberId::new(10),
-        target_member: MemberId::new(20),
-        movement_class: ReplicaMovementClass::BackfillLaggedCopy,
-        payload_digest: ObjectDigest::new(0xDEAD),
-        payload_len: data.len() as u64,
-        created_at_ns: 1000,
-        deadline_ns: 5000,
-    });
+    let receipt_key = ObjectKey::from_bytes32([0xB9; 32]);
+    let receipt = receipt_ref_for_payload(99, receipt_key, data, 2);
+    let task = task_from_receipt(receipt, 10, 20);
 
-    populate_source(&mut source, 99, ObjectDigest::new(0xDEAD), data);
+    populate_source(&mut source, task.placement_receipt_ref, data);
 
     let engine = DataMovementEngine::new();
     let mut progress = BackfillProgress::new(task.payload_len, 3);
@@ -543,7 +520,7 @@ fn receipt_source_execution_uses_receipt_key_not_logical_object_id() {
 
     source.insert(receipt_key, data);
     target
-        .put(object_id_key, b"receiptless target bytes")
+        .put(object_id_key, b"wrong-key target bytes")
         .unwrap();
     progress.schedule().unwrap();
 
@@ -564,7 +541,7 @@ fn receipt_source_execution_uses_receipt_key_not_logical_object_id() {
     assert_eq!(target.get(&receipt_key).unwrap(), Some(data.to_vec()));
     assert_eq!(
         target.get(&object_id_key).unwrap(),
-        Some(b"receiptless target bytes".to_vec())
+        Some(b"wrong-key target bytes".to_vec())
     );
     assert_eq!(progress.state, TaskState::Complete);
 }

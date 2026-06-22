@@ -13,6 +13,8 @@
 //! returns the existing flow state rather than creating a duplicate.
 
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use tidefs_membership_epoch::MemberId;
@@ -92,8 +94,8 @@ pub struct AffectedSubject {
 /// subjects from placement receipt references.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiptIngestionError {
-    /// The caller supplied a synthetic placeholder instead of a durable local
-    /// placement receipt.
+    /// The caller supplied a synthetic source receipt instead of durable local
+    /// placement evidence.
     SyntheticReceiptRef { object_id: u64 },
     /// The receipt carries a redundancy policy that cannot describe legal
     /// placement.
@@ -106,6 +108,31 @@ pub enum ReceiptIngestionError {
         actual: u16,
     },
 }
+
+impl fmt::Display for ReceiptIngestionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SyntheticReceiptRef { object_id } => write!(
+                f,
+                "rebuild admission for object {object_id} requires a durable source placement receipt"
+            ),
+            Self::MalformedReceiptPolicy { object_id } => write!(
+                f,
+                "source placement receipt for object {object_id} has malformed redundancy policy"
+            ),
+            Self::InsufficientReceiptTargets {
+                object_id,
+                required,
+                actual,
+            } => write!(
+                f,
+                "source placement receipt for object {object_id} records {actual} target(s), required {required}"
+            ),
+        }
+    }
+}
+
+impl Error for ReceiptIngestionError {}
 
 fn receipt_digest_to_object_digest(payload_digest: [u8; 32]) -> ObjectDigest {
     ObjectDigest::new(u64::from_le_bytes(
@@ -160,8 +187,8 @@ impl LossRecord {
     /// `placement_receipt_refs` is intentionally the same compact model
     /// returned by `tidefs_local_object_store::Pool::placement_receipt_refs`.
     /// Synthetic receipt refs are rejected here so rebuild admission cannot
-    /// accidentally treat receiptless placeholders as durable source placement
-    /// authority.
+    /// accidentally treat receiptless task identifiers as durable source
+    /// placement authority.
     pub fn from_placement_receipt_refs(
         lost_members: Vec<MemberId>,
         healthy_sources: Vec<MemberId>,
@@ -589,6 +616,9 @@ mod tests {
             err,
             ReceiptIngestionError::SyntheticReceiptRef { object_id: 77 }
         );
+        assert!(err
+            .to_string()
+            .contains("durable source placement receipt"));
     }
 
     #[test]
