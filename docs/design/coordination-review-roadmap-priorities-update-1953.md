@@ -9,6 +9,10 @@ status, and roadmap priority framework for Q2 2026
 **Lane**: storage-core / coordination (Layers 8–11)
 **Depends on**: #1914 (prior coordination review), #1738 (coordination pipeline design seal), #1903 (dataset lifecycle design seal)
 **Blocks**: All deferred cluster-service wire-up implementation issues
+**Authority note**: This imported roadmap is historical input. Current
+coordination and documentation-authority status lives in GitHub issues, pull
+requests, `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, and `docs/INDEX.md`,
+not in the deleted `docs/STATUS.md` or `docs/FEATURE_MATRIX.md` outputs.
 
 ## Abstract
 
@@ -498,13 +502,14 @@ Issues must be split more finely than natural decomposition warrants.
 **Mitigation**: Priority dequeue (3.4) schedules in dependency order.
 explicit carve-outs and may proceed without claiming the serial surface.
 
-### 4.5 Coordinator Auto-Generation vs. Manual Triage
+### 4.5 Historical Coordinator Auto-Generation vs. Manual Triage
 
-**Tradeoff**: Automatic issue generation from STATUS.md ensures currency but
-risks proliferating near-duplicate issues.
+**Tradeoff**: The historical pipeline generated issues from `STATUS.md` to keep
+then-current roadmap entries synchronized, but that model risked proliferating
+near-duplicate issues.
 
-**Benefit**: Every STATUS.md entry has a corresponding issue. The design
-pipeline is fully mirrored in Forgejo.
+**Benefit**: In that historical model, every `STATUS.md` entry had a
+corresponding issue and the design pipeline was mirrored in Forgejo.
 
 **Cost**: Unbounded issue growth. Worker confusion from near-identical issues.
 Signal dilution makes genuine `codex:ready` issues harder to find.
@@ -531,7 +536,9 @@ coordination issues are closed immediately upon detection.
 ### Phase 1: Maintenance (current)
 - Close stale `codex:needs-review` items (>30 days)
 - Close duplicate coordination issues
-- Maintain STATUS.md and FEATURE_MATRIX.md currency
+- Preserve this review as historical input; use GitHub issues, pull requests,
+  `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, and `docs/INDEX.md` for current
+  coordination and doc-authority status.
 - Reduce coordinator auto-generation cadence
 
 ### Phase 2: Critical
@@ -578,8 +585,8 @@ coordination issues are closed immediately upon detection.
 
 - `docs/design/coordination-pipeline-cluster-services-design-seal.md` — #1738 design phase seal
 - `docs/design/coordination-review-roadmap-priorities-update.md` — #1914 prior review
-- `docs/STATUS.md` — live coordination pipeline status
-- `docs/FEATURE_MATRIX.md` — implemented-source capability matrix
+- `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` — current authority classification for imported docs; classifies this roadmap as historical input
+- `docs/INDEX.md` — current documentation entry points and authority scoping
 - `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` — deferred production gates
 - `docs/design/dataset-lifecycle-state-machine.md` — #1903 design seal
 - `docs/design/shard-groups-replicas-rebake-design-spec.md` — #2030/#1964 shard/replicas/rebake
