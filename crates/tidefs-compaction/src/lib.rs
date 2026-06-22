@@ -30,8 +30,15 @@ use tidefs_types_incremental_job_core::{
 
 pub mod compaction;
 pub mod merge_planner;
+pub mod policy;
 pub mod rewrite_engine;
 pub mod verification;
+
+pub use policy::{
+    CompactionAdmissionDecision, CompactionCandidateDecision, CompactionPolicy,
+    CompactionPolicyCandidate, CompactionPolicyReport, CompactionPressureLevel, CompactionTrigger,
+    CompactionTriggerInput, WriteAmplification,
+};
 // ---------------------------------------------------------------------------
 // PageType
 // ---------------------------------------------------------------------------
@@ -209,11 +216,11 @@ impl CompactionCursor {
 /// rate-limiting for live-object relocation runs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionConfig {
-    /// Maximum liveness ratio for a segment to be a compaction candidate.
+    /// Legacy maximum liveness ratio retained for older callers.
     ///
-    /// A segment with `live_bytes / total_bytes < liveness_threshold`
-    /// is sufficiently fragmented to be worth compacting.
-    /// Default: 0.5 (segments that are more dead than live).
+    /// Segment merge admission is now owned by [`CompactionPolicy`] and
+    /// its explicit write-amplification cap. The default value remains
+    /// equivalent to the scheduled 2.0x cap for compatibility.
     pub liveness_threshold: f64,
 
     /// Minimum live bytes a segment must have to be compacted.
@@ -257,15 +264,15 @@ impl Default for CompactionConfig {
 
 /// Selects segments for compaction from a [`SegmentLivenessQueue`].
 ///
-/// Unlike the segment cleaner which targets high-dead-ratio segments,
-/// the candidate selector finds segments with moderate fragmentation
-/// (below the liveness threshold) that still contain live objects
-/// worth relocating.
+/// Fully-dead segments stay with the cleaner-only free path. Partial
+/// live/dead segments are admitted by [`CompactionPolicy`] using the
+/// active trigger's write-amplification cap and deterministic ordering.
 ///
 /// [`SegmentLivenessQueue`]: tidefs_reclaim_queue_core::SegmentLivenessQueue
 pub struct CompactionCandidateSelector<'q> {
     queue: &'q tidefs_reclaim_queue_core::SegmentLivenessQueue,
     config: CompactionConfig,
+    trigger_input: CompactionTriggerInput,
 }
 
 impl<'q> CompactionCandidateSelector<'q> {
@@ -275,16 +282,38 @@ impl<'q> CompactionCandidateSelector<'q> {
         queue: &'q tidefs_reclaim_queue_core::SegmentLivenessQueue,
         config: CompactionConfig,
     ) -> Self {
-        Self { queue, config }
+        Self {
+            queue,
+            config,
+            trigger_input: CompactionTriggerInput::default(),
+        }
     }
 
-    /// Select up to `batch_size` candidate segments whose liveness
-    /// ratio is below `liveness_threshold` and whose live bytes
-    /// meet the `min_live_bytes` floor.
+    /// Create a selector for an explicit trigger input.
+    #[must_use]
+    pub fn new_with_trigger(
+        queue: &'q tidefs_reclaim_queue_core::SegmentLivenessQueue,
+        config: CompactionConfig,
+        trigger_input: CompactionTriggerInput,
+    ) -> Self {
+        Self {
+            queue,
+            config,
+            trigger_input,
+        }
+    }
+
+    /// Return the policy report that backs this selector.
+    #[must_use]
+    pub fn policy_report(&self) -> CompactionPolicyReport {
+        CompactionPolicy::new(self.config.clone()).evaluate_queue(self.queue, self.trigger_input)
+    }
+
+    /// Select up to `batch_size` admitted partial-live candidates.
     ///
-    /// Returns segment IDs sorted by lowest liveness ratio first
-    /// (most fragmented), then by highest live bytes, then by
-    /// lowest segment ID for deterministic ordering.
+    /// Returns segment IDs in policy order: lowest write amplification,
+    /// highest reclaimable bytes, oldest creation commit group, then lowest
+    /// segment ID.
     #[must_use]
     pub fn select_candidates(&self) -> Vec<u64> {
         self.select_candidates_with_limit(self.config.batch_size)
@@ -300,36 +329,11 @@ impl<'q> CompactionCandidateSelector<'q> {
             return Vec::new();
         }
 
-        let mut candidates: Vec<_> = self
-            .queue
-            .entries()
-            .filter(|e| {
-                let total = e.total_bytes();
-                if total == 0 {
-                    return false;
-                }
-                let liveness = e.live_bytes as f64 / total as f64;
-                liveness < self.config.liveness_threshold
-                    && e.live_bytes >= self.config.min_live_bytes
-            })
-            .collect();
-
-        // Sort by lowest liveness first (most fragmented), then highest
-        // live bytes (biggest win), then lowest segment ID (deterministic).
-        candidates.sort_by(|a, b| {
-            let a_live = a.live_bytes as f64 / a.total_bytes() as f64;
-            let b_live = b.live_bytes as f64 / b.total_bytes() as f64;
-            a_live
-                .partial_cmp(&b_live)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| b.live_bytes.cmp(&a.live_bytes))
-                .then_with(|| a.segment_id.cmp(&b.segment_id))
-        });
-
-        candidates
+        self.policy_report()
+            .admitted_candidates
             .into_iter()
             .take(limit)
-            .map(|e| e.segment_id)
+            .map(|candidate| candidate.segment_id)
             .collect()
     }
 }
@@ -707,41 +711,29 @@ impl CompactionPlanner {
         &self,
         entries: &[tidefs_reclaim_queue_core::SegmentLivenessEntry],
     ) -> Vec<CompactionRequest> {
-        let inline_data: Vec<&tidefs_reclaim_queue_core::SegmentLivenessEntry> = entries
-            .iter()
-            .filter(|e| {
-                let total = e.total_bytes();
-                if total == 0 {
-                    return false;
-                }
-                let liveness = e.live_bytes as f64 / total as f64;
-                liveness < self.config.liveness_threshold
-                    && e.live_bytes >= self.config.min_live_bytes
-            })
-            .collect();
+        self.plan_with_trigger(entries, CompactionTriggerInput::default())
+    }
 
-        if inline_data.len() < 2 {
+    #[must_use]
+    pub fn plan_with_trigger(
+        &self,
+        entries: &[tidefs_reclaim_queue_core::SegmentLivenessEntry],
+        trigger_input: CompactionTriggerInput,
+    ) -> Vec<CompactionRequest> {
+        let report = CompactionPolicy::new(self.config.clone())
+            .evaluate_entries(entries, trigger_input);
+
+        if report.admitted_candidates.len() < 2 {
             return Vec::new();
         }
-
-        let mut sorted: Vec<&&tidefs_reclaim_queue_core::SegmentLivenessEntry> =
-            inline_data.iter().collect();
-        sorted.sort_by(|a, b| {
-            let a_l = a.live_bytes as f64 / a.total_bytes() as f64;
-            let b_l = b.live_bytes as f64 / b.total_bytes() as f64;
-            a_l.partial_cmp(&b_l)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| b.live_bytes.cmp(&a.live_bytes))
-                .then_with(|| a.segment_id.cmp(&b.segment_id))
-        });
 
         let mut requests: Vec<CompactionRequest> = Vec::new();
         let mut current_group: Vec<u64> = Vec::new();
         let mut current_live_sum: u64 = 0;
         let target = self.config.target_segment_size;
 
-        for e in sorted {
-            let projected = current_live_sum.saturating_add(e.live_bytes);
+        for candidate in report.admitted_candidates {
+            let projected = current_live_sum.saturating_add(candidate.live_bytes);
             if !current_group.is_empty() && projected > target {
                 if current_group.len() >= 2 {
                     requests.push(CompactionRequest::new(
@@ -753,8 +745,8 @@ impl CompactionPlanner {
                 }
                 current_live_sum = 0;
             }
-            current_group.push(e.segment_id);
-            current_live_sum = current_live_sum.saturating_add(e.live_bytes);
+            current_group.push(candidate.segment_id);
+            current_live_sum = current_live_sum.saturating_add(candidate.live_bytes);
         }
         if current_group.len() >= 2 {
             requests.push(CompactionRequest::new(current_group, current_live_sum));
@@ -826,6 +818,8 @@ pub struct CompactionRunReport {
     /// Per-object relocation entries with BLAKE3-256 hashes for
     /// post-compaction integrity verification.
     pub relocation_entries: Vec<RelocationEntry>,
+    /// Authoritative policy decisions for this tick.
+    pub policy_report: CompactionPolicyReport,
 }
 
 // ---------------------------------------------------------------------------
@@ -872,20 +866,37 @@ impl<'q, S: CompactionStore> CompactionRun<'q, S> {
         }
     }
 
-    /// Execute one compaction tick.
+    /// Execute one scheduled compaction tick.
+    pub fn run_tick(&mut self) -> CompactionRunReport {
+        self.run_tick_with_trigger(CompactionTriggerInput::default())
+    }
+
+    /// Execute one compaction tick with explicit trigger input.
     ///
     /// 1. Select candidate segments via [`CompactionCandidateSelector`].
     /// 2. For each candidate, relocate live objects via [`LiveObjectRelocator`].
     /// 3. Track which segments were fully freed vs. partially relocated.
     ///
     /// Returns a [`CompactionRunReport`] summarizing the tick.
-    pub fn run_tick(&mut self) -> CompactionRunReport {
-        let selector = CompactionCandidateSelector::new(self.queue, self.config.clone());
+    pub fn run_tick_with_trigger(
+        &mut self,
+        trigger_input: CompactionTriggerInput,
+    ) -> CompactionRunReport {
+        let selector = CompactionCandidateSelector::new_with_trigger(
+            self.queue,
+            self.config.clone(),
+            trigger_input,
+        );
 
         // Reset per-tick counters on the relocator.
         self.relocator.reset_stats();
 
-        let candidates = selector.select_candidates();
+        let policy_report = selector.policy_report();
+        let candidates: Vec<_> = policy_report
+            .admitted_candidates
+            .iter()
+            .map(|candidate| candidate.segment_id)
+            .collect();
         let candidates_considered = candidates.len();
 
         let mut tick_freed = 0u64;
@@ -939,6 +950,7 @@ impl<'q, S: CompactionStore> CompactionRun<'q, S> {
             bytes_relocated: self.relocator.bytes_relocated,
             errors: self.relocator.relocation_errors,
             relocation_entries: all_entries,
+            policy_report,
         }
     }
 
@@ -1675,19 +1687,17 @@ mod tests {
 
     #[test]
     fn candidate_selector_tiebreak_by_live_bytes() {
-        // Same liveness ratio, but seg 2 has more live bytes (50K vs 30K)
-        // More live bytes = bigger compaction win, should come first.
+        // seg 1 has lower write amplification. seg 2 sits exactly at the
+        // scheduled 2.0x cap and is still admitted after seg 1.
         let q = make_queue_with(&[
             (1, 30_000, 70_000), // liveness 0.30, 30K live
-            (2, 50_000, 50_000), // liveness 0.50, wait — total=100K, live=50K -> 0.50
+            (2, 50_000, 50_000), // write amplification = 2.0
         ]);
-        // seg 1: liveness = 0.30, seg 2: liveness = 0.50
-        // Both below 0.5? seg 1: yes (0.30<0.5), seg 2: no (0.50 not < 0.50)
-        // Fix: only seg 1 is below liveness_threshold (0.50 is not < 0.50)
         let selector = CompactionCandidateSelector::new(&q, CompactionConfig::default());
         let candidates = selector.select_candidates();
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0], 1);
+        assert_eq!(candidates[1], 2);
     }
 
     #[test]
@@ -1717,17 +1727,17 @@ mod tests {
 
     #[test]
     fn candidate_selector_strict_liveness_boundary() {
-        // seg 1: liveness exactly 0.50 (not below threshold)
-        // seg 2: liveness 0.499... (below threshold)
+        // seg 1: write amplification exactly 2.0 (admitted by the cap)
+        // seg 2: write amplification just below 2.0 (ordered first)
         let q = make_queue_with(&[
-            (1, 50_000, 50_000), // liveness = 0.50 exactly
-            (2, 49_999, 50_001), // liveness = 0.49999...
+            (1, 50_000, 50_000),
+            (2, 49_999, 50_001),
         ]);
         let selector = CompactionCandidateSelector::new(&q, CompactionConfig::default());
         let candidates = selector.select_candidates();
-        // Only seg 2 is strictly below 0.5
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0], 2);
+        assert_eq!(candidates[1], 1);
     }
 
     // -- CompactionStore + LiveObjectRelocator tests --
@@ -2129,6 +2139,8 @@ mod tests {
 
         let report = run.run_tick();
         assert_eq!(report.candidates_considered, 3);
+        assert_eq!(report.policy_report.candidates_admitted, 3);
+        assert_eq!(report.policy_report.rejected_write_amplification, 0);
         assert_eq!(report.segments_freed, 3); // All fully relocated
         assert_eq!(report.segments_partial, 0);
         assert_eq!(report.objects_relocated, 6);
@@ -2233,6 +2245,7 @@ mod tests {
         assert_eq!(report.bytes_relocated, 0);
         assert_eq!(report.errors, 0);
         assert!(report.relocation_entries.is_empty());
+        assert!(report.policy_report.decisions.is_empty());
     }
 
     // -- CompactionRequest + CompactionPlanner + BLAKE3 relocation tests --

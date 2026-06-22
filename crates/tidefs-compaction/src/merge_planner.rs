@@ -12,7 +12,10 @@
 
 use blake3::Hasher;
 
-use crate::CompactionConfig;
+use crate::{
+    CompactionConfig, CompactionPolicy, CompactionPolicyCandidate, CompactionTriggerInput,
+    WriteAmplification,
+};
 use tidefs_reclaim_queue_core::SegmentLivenessEntry;
 
 /// Domain string for BLAKE3 domain separation.
@@ -35,6 +38,10 @@ pub struct MergeCandidate {
     pub live_bytes: u64,
     /// Bytes eligible for reclamation.
     pub dead_bytes: u64,
+    /// Transaction group when this segment was first written.
+    pub creation_commit_group: u64,
+    /// Exact estimated write amplification.
+    pub write_amplification: WriteAmplification,
     /// Ratio of live data to total (0.0 = all dead, 1.0 = all live).
     pub live_ratio: f64,
     /// Compaction desirability score in [0.0, 1.0]; higher is better.
@@ -57,6 +64,33 @@ impl MergeCandidate {
             segment_id: entry.segment_id,
             live_bytes: entry.live_bytes,
             dead_bytes: entry.dead_bytes,
+            creation_commit_group: entry.creation_commit_group,
+            write_amplification: WriteAmplification::from_live_dead(
+                entry.live_bytes,
+                entry.dead_bytes,
+            )
+            .unwrap_or_else(|| WriteAmplification::whole(u64::MAX)),
+            live_ratio,
+            score,
+        }
+    }
+
+    /// Create a merge candidate from an admitted policy candidate.
+    #[must_use]
+    pub fn from_policy_candidate(candidate: CompactionPolicyCandidate) -> Self {
+        let total = candidate.total_bytes;
+        let live_ratio = if total == 0 {
+            0.0
+        } else {
+            candidate.live_bytes as f64 / total as f64
+        };
+        let score = (1.0 - live_ratio).clamp(0.0, 1.0);
+        Self {
+            segment_id: candidate.segment_id,
+            live_bytes: candidate.live_bytes,
+            dead_bytes: candidate.dead_bytes,
+            creation_commit_group: candidate.creation_commit_group,
+            write_amplification: candidate.write_amplification,
             live_ratio,
             score,
         }
@@ -230,8 +264,8 @@ impl MergePlan {
 /// Builds a [`MergePlan`] from segment-liveness data.
 ///
 /// The planner performs three phases:
-/// 1. **Candidate selection**: filter segments below the liveness threshold
-///    and score them by dead ratio.
+/// 1. **Candidate selection**: delegate trigger admission and ordering to
+///    [`CompactionPolicy`].
 /// 2. **Group formation**: pack candidates into groups whose combined live
 ///    bytes fit within `target_segment_size`.
 /// 3. **Plan sealing**: produce a BLAKE3-verified [`MergePlan`].
@@ -255,37 +289,27 @@ impl MergePlanner {
 
     /// Select and score candidate segments from liveness entries.
     ///
-    /// Filters out segments whose live ratio is at or above
-    /// `liveness_threshold`, or whose live bytes are below
-    /// `min_live_bytes`. Returns candidates sorted by score descending
-    /// (highest priority first), ties broken by live bytes descending,
-    /// then by segment ID ascending for determinism.
+    /// Returns candidates in policy order: lowest write amplification,
+    /// highest reclaimable bytes, oldest creation commit group, then lowest
+    /// segment ID.
     #[must_use]
     pub fn select_candidates(&self, entries: &[SegmentLivenessEntry]) -> Vec<MergeCandidate> {
-        let mut candidates: Vec<MergeCandidate> = entries
-            .iter()
-            .filter(|e| {
-                let total = e.total_bytes();
-                if total == 0 {
-                    return false;
-                }
-                let liveness = e.live_bytes as f64 / total as f64;
-                liveness < self.config.liveness_threshold
-                    && e.live_bytes >= self.config.min_live_bytes
-            })
-            .map(MergeCandidate::from_entry)
-            .collect();
+        self.select_candidates_with_trigger(entries, CompactionTriggerInput::default())
+    }
 
-        candidates.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| b.live_bytes.cmp(&a.live_bytes))
-                .then_with(|| a.segment_id.cmp(&b.segment_id))
-        });
-
-        candidates.truncate(self.config.batch_size);
-        candidates
+    /// Select and score candidates for an explicit trigger input.
+    #[must_use]
+    pub fn select_candidates_with_trigger(
+        &self,
+        entries: &[SegmentLivenessEntry],
+        trigger_input: CompactionTriggerInput,
+    ) -> Vec<MergeCandidate> {
+        CompactionPolicy::new(self.config.clone())
+            .evaluate_entries(entries, trigger_input)
+            .admitted_candidates
+            .into_iter()
+            .map(MergeCandidate::from_policy_candidate)
+            .collect()
     }
 
     /// Form merge groups from scored candidates.
@@ -318,20 +342,23 @@ impl MergePlanner {
             groups.push(current);
         }
 
-        groups.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| b.total_live_bytes.cmp(&a.total_live_bytes))
-        });
-
         groups
     }
 
-    /// Produce a full BLAKE3-verified [`MergePlan`] from liveness entries.
+    /// Produce a full BLAKE3-verified scheduled [`MergePlan`] from liveness entries.
     #[must_use]
     pub fn plan(&self, entries: &[SegmentLivenessEntry]) -> MergePlan {
-        let candidates = self.select_candidates(entries);
+        self.plan_with_trigger(entries, CompactionTriggerInput::default())
+    }
+
+    /// Produce a full BLAKE3-verified [`MergePlan`] for an explicit trigger.
+    #[must_use]
+    pub fn plan_with_trigger(
+        &self,
+        entries: &[SegmentLivenessEntry],
+        trigger_input: CompactionTriggerInput,
+    ) -> MergePlan {
+        let candidates = self.select_candidates_with_trigger(entries, trigger_input);
         let groups = self.form_groups(&candidates);
         let plan_hash = MergePlan::compute_plan_hash(&groups);
 
@@ -454,7 +481,7 @@ mod tests {
     // --- select_candidates ---
 
     #[test]
-    fn select_candidates_filters_by_liveness_threshold() {
+    fn select_candidates_filters_by_write_amplification_cap() {
         let planner = default_planner();
         let entries = vec![
             entry(1, 20_000, 80_000),
@@ -705,18 +732,20 @@ mod tests {
     }
 
     #[test]
-    fn plan_with_custom_liveness_threshold() {
-        let cfg = CompactionConfig {
-            liveness_threshold: 0.75,
-            ..CompactionConfig::default()
-        };
-        let planner = MergePlanner::new(cfg);
+    fn pressure_plan_uses_pressure_write_amplification_cap() {
+        let planner = default_planner();
         let entries = vec![
             entry(1, 60_000, 40_000),
             entry(2, 70_000, 30_000),
             entry(3, 80_000, 20_000),
         ];
-        let plan = planner.plan(&entries);
+        let plan = planner.plan_with_trigger(
+            &entries,
+            CompactionTriggerInput::pressure_escalated(
+                crate::CompactionPressureLevel::Auto,
+                tidefs_types_incremental_job_core::WorkBudget::DEFAULT_TICK,
+            ),
+        );
         assert_eq!(plan.total_source_segments, 2);
         let ids: Vec<u64> = plan
             .groups

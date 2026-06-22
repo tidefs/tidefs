@@ -9,7 +9,10 @@
 /// orchestrates full compaction passes.
 use blake3::Hasher;
 
-use crate::{CompactionConfig, CompactionRun, CompactionStore, RelocationEntry};
+use crate::{
+    CompactionConfig, CompactionPolicyReport, CompactionPressureLevel, CompactionRun,
+    CompactionStore, CompactionTriggerInput, RelocationEntry,
+};
 
 use tidefs_reclaim_queue_core::{FreedExtent, ReclaimQueueLedger, SegmentLivenessQueue};
 
@@ -277,6 +280,8 @@ pub struct CompactionPassReport {
     pub errors: u64,
     /// Per-object relocation entries with BLAKE3-256 hashes.
     pub relocation_entries: Vec<RelocationEntry>,
+    /// Authoritative policy decisions for this pass.
+    pub policy_report: CompactionPolicyReport,
     /// The final checkpoint after this pass.
     pub checkpoint: CompactionCheckpoint,
 }
@@ -333,7 +338,12 @@ impl<'q, S: CompactionStore> CompactionDriver<'q, S> {
         self
     }
 
-    /// Run one full compaction pass.
+    /// Run one full scheduled compaction pass.
+    pub fn run_compaction_pass(&mut self) -> CompactionPassReport {
+        self.run_compaction_pass_with_trigger(CompactionTriggerInput::default())
+    }
+
+    /// Run one full compaction pass with explicit trigger input.
     ///
     /// 1. Select candidate segments.
     /// 2. For each candidate, relocate live objects via `CompactionRun`.
@@ -342,8 +352,11 @@ impl<'q, S: CompactionStore> CompactionDriver<'q, S> {
     /// 5. Advance the crash-safe checkpoint.
     ///
     /// Returns a [`CompactionPassReport`] summarizing the pass.
-    pub fn run_compaction_pass(&mut self) -> CompactionPassReport {
-        let tick_report = self.run.run_tick();
+    pub fn run_compaction_pass_with_trigger(
+        &mut self,
+        trigger_input: CompactionTriggerInput,
+    ) -> CompactionPassReport {
+        let tick_report = self.run.run_tick_with_trigger(trigger_input);
 
         // Enqueue freed-segment extents into the reclaim-queue ledger.
         let freed_count = tick_report.segments_freed;
@@ -387,6 +400,7 @@ impl<'q, S: CompactionStore> CompactionDriver<'q, S> {
             bytes_enqueued,
             errors: tick_report.errors,
             relocation_entries: tick_report.relocation_entries.clone(),
+            policy_report: tick_report.policy_report,
             checkpoint: self.checkpoint.clone(),
         }
     }
@@ -723,6 +737,7 @@ mod tests {
 
         let report = driver.run_compaction_pass();
         assert_eq!(report.candidates_considered, 1);
+        assert_eq!(report.policy_report.candidates_admitted, 1);
         assert_eq!(report.segments_freed, 1);
         assert_eq!(report.objects_relocated, 2);
         assert_eq!(report.bytes_relocated, 64 + 128);
@@ -751,9 +766,32 @@ mod tests {
 
         let report = driver.run_compaction_pass();
         assert_eq!(report.candidates_considered, 3);
+        assert_eq!(report.policy_report.admitted_reclaimable_bytes, 195_000);
         assert_eq!(report.segments_freed, 3);
         assert_eq!(report.objects_relocated, 3);
         assert!(report.errors == 0);
+    }
+
+    #[test]
+    fn driver_pressure_pass_uses_pressure_cap() {
+        let queue = make_queue(&[(10, 60_000, 40_000)]);
+        let mut store = MockCompactionStore::new();
+        store.add_segment(10, &[make_key(1)], &[64]);
+
+        let mut ledger = ReclaimQueueLedger::with_defaults();
+        let config = CompactionConfig::default();
+        let mut driver = CompactionDriver::new(&queue, store, &mut ledger, config);
+
+        let report = driver.run_compaction_pass_with_trigger(
+            CompactionTriggerInput::pressure_escalated(
+                CompactionPressureLevel::Auto,
+                tidefs_types_incremental_job_core::WorkBudget::DEFAULT_TICK,
+            ),
+        );
+
+        assert_eq!(report.policy_report.candidates_admitted, 1);
+        assert_eq!(report.segments_freed, 1);
+        assert_eq!(report.objects_relocated, 1);
     }
 
     #[test]
@@ -853,6 +891,7 @@ mod tests {
         assert_eq!(report.bytes_enqueued, 0);
         assert_eq!(report.errors, 0);
         assert!(report.relocation_entries.is_empty());
+        assert!(report.policy_report.decisions.is_empty());
         assert_eq!(report.checkpoint, CompactionCheckpoint::zero());
     }
 }
