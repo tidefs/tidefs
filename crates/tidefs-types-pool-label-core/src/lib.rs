@@ -333,6 +333,9 @@ pub mod features {
     /// Pool-wide redundancy policy extension fields are present in the label.
     /// Compat bit 9.
     pub const POOL_REDUNDANCY_POLICY: u64 = 1 << 9;
+    /// A DeviceLayoutV1 record is appended to the pool label header.
+    /// Compat bit 10.
+    pub const DEVICE_LAYOUT_V1: u64 = 1 << 10;
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +401,9 @@ pub struct PoolLabelV1 {
     pub checksum: [u8; 32],
 }
 
+/// Encoded DeviceLayoutV1 payload stored in a pool label.
+pub type DeviceLayoutV1Bytes = [u8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+
 // ---------------------------------------------------------------------------
 // Wire format constants
 // ---------------------------------------------------------------------------
@@ -431,7 +437,8 @@ pub struct PoolLabelV1 {
 // 406    1   redundancy_policy_second (0 or parity_shards)
 // 407    1   redundancy_policy_reserved
 // 408   32   checksum (BLAKE3-256)
-// 440  end   (total: 440 bytes)
+// 440  124   optional DeviceLayoutV1 record
+// 564  end   (total with DeviceLayoutV1: 564 bytes)
 
 /// Total wire size of a PoolLabelV1 in bytes.
 pub const POOL_LABEL_V1_WIRE_SIZE: usize = 411;
@@ -442,6 +449,16 @@ pub const POOL_LABEL_V1_HEALTH_WIRE_SIZE: usize = 436;
 
 /// Extended wire size including device health and pool-wide redundancy policy.
 pub const POOL_LABEL_V1_EXT_WIRE_SIZE: usize = 440;
+
+/// Encoded size of a DeviceLayoutV1 record embedded in the pool label header.
+pub const POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE: usize = 124;
+
+/// Offset of the optional DeviceLayoutV1 record inside the pool label header.
+pub const POOL_LABEL_DEVICE_LAYOUT_V1_OFFSET: usize = POOL_LABEL_V1_EXT_WIRE_SIZE;
+
+/// Extended wire size including the optional DeviceLayoutV1 record.
+pub const POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE: usize =
+    POOL_LABEL_DEVICE_LAYOUT_V1_OFFSET + POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE;
 
 /// Offset of the checksum field in the wire format.
 /// Original checksum offset for labels without health extension.
@@ -557,22 +574,34 @@ impl fmt::Display for CommittedRootState {
 // Encode / Decode
 // ---------------------------------------------------------------------------
 
-/// Encode a `PoolLabelV1` into `buf`, which must be at least
-/// [`POOL_LABEL_V1_EXT_WIRE_SIZE`] bytes. The checksum field in `label` is
-/// zeroed before hashing and then written out as the BLAKE3-256 of all other
-/// fields.
-/// Encode a `PoolLabelV1` into `buf`.  The buffer must be at least
-/// [`POOL_LABEL_V1_WIRE_SIZE`] bytes.  When at least
-/// [`POOL_LABEL_V1_EXT_WIRE_SIZE`] bytes are available, device health
-/// fields are included at offsets 379–403 and the checksum covers
-/// bytes 0–403.  Otherwise a backward-compatible 411-byte label is
-/// written with checksum over bytes 0–378.
+/// Encode a `PoolLabelV1` into `buf`.
+///
+/// The buffer must be at least [`POOL_LABEL_V1_WIRE_SIZE`] bytes. When at
+/// least [`POOL_LABEL_V1_EXT_WIRE_SIZE`] bytes are available, device health
+/// and redundancy-policy fields are included and the checksum covers bytes
+/// 0-407. Otherwise a backward-compatible 411-byte label is written with the
+/// checksum over bytes 0-378.
 pub fn encode_label(label: &PoolLabelV1, buf: &mut [u8]) -> Result<(), LabelError> {
+    encode_label_with_device_layout(label, None, buf)
+}
+
+/// Encode a `PoolLabelV1` and optionally append a DeviceLayoutV1 record at
+/// offset [`POOL_LABEL_DEVICE_LAYOUT_V1_OFFSET`].
+pub fn encode_label_with_device_layout(
+    label: &PoolLabelV1,
+    device_layout_v1: Option<&DeviceLayoutV1Bytes>,
+    buf: &mut [u8],
+) -> Result<(), LabelError> {
     if buf.len() < POOL_LABEL_V1_WIRE_SIZE {
+        return Err(LabelError::BufferTooSmall);
+    }
+    if device_layout_v1.is_some() && buf.len() < POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE {
         return Err(LabelError::BufferTooSmall);
     }
     let health_ext = buf.len() >= POOL_LABEL_V1_HEALTH_WIRE_SIZE;
     let policy_ext = buf.len() >= POOL_LABEL_V1_EXT_WIRE_SIZE;
+    let layout_ext =
+        buf.len() >= POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE && device_layout_v1.is_some();
 
     // Write fixed fields (little-endian).
     buf[0..4].copy_from_slice(&label.magic);
@@ -593,13 +622,18 @@ pub fn encode_label(label: &PoolLabelV1, buf: &mut [u8]) -> Result<(), LabelErro
     buf[347..355].copy_from_slice(&label.system_area_size.to_le_bytes());
     buf[355..363].copy_from_slice(&label.features_incompat.to_le_bytes());
     buf[363..371].copy_from_slice(&label.features_ro_compat.to_le_bytes());
-    let mut features_compat_wire =
-        label.features_compat & !(features::DEVICE_HEALTH_STATE | features::POOL_REDUNDANCY_POLICY);
+    let mut features_compat_wire = label.features_compat
+        & !(features::DEVICE_HEALTH_STATE
+            | features::POOL_REDUNDANCY_POLICY
+            | features::DEVICE_LAYOUT_V1);
     if health_ext {
         features_compat_wire |= features::DEVICE_HEALTH_STATE;
     }
     if policy_ext {
         features_compat_wire |= features::POOL_REDUNDANCY_POLICY;
+    }
+    if layout_ext {
+        features_compat_wire |= features::DEVICE_LAYOUT_V1;
     }
     buf[371..379].copy_from_slice(&features_compat_wire.to_le_bytes());
 
@@ -635,6 +669,11 @@ pub fn encode_label(label: &PoolLabelV1, buf: &mut [u8]) -> Result<(), LabelErro
     hasher.update(&buf[0..cksum_off]);
     let digest = hasher.finalize();
     buf[cksum_off..cksum_end].copy_from_slice(digest.as_bytes());
+
+    if layout_ext {
+        buf[POOL_LABEL_DEVICE_LAYOUT_V1_OFFSET..POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE]
+            .copy_from_slice(device_layout_v1.unwrap());
+    }
 
     Ok(())
 }
@@ -688,6 +727,7 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
     let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
     let has_health = features_compat & features::DEVICE_HEALTH_STATE != 0;
     let has_policy = features_compat & features::POOL_REDUNDANCY_POLICY != 0;
+    let has_layout = features_compat & features::DEVICE_LAYOUT_V1 != 0;
     // If health extension bit is set but the buffer is too short for the
     // extended label, reject early before slicing past the buffer.
     if has_health && buf.len() < POOL_LABEL_V1_HEALTH_WIRE_SIZE {
@@ -701,6 +741,9 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
         });
     }
     if has_policy && buf.len() < POOL_LABEL_V1_EXT_WIRE_SIZE {
+        return Err(LabelError::BufferTooSmall);
+    }
+    if has_layout && buf.len() < POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE {
         return Err(LabelError::BufferTooSmall);
     }
     if has_policy && buf[407] != 0 {
@@ -747,7 +790,6 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
         POOL_LABEL_V1_WIRE_SIZE
     };
     let checksum: [u8; 32] = buf[checksum_offset..checksum_end].try_into().unwrap();
-
     // Verify checksum: hash everything before the checksum field.
     let mut hasher = blake3::Hasher::new();
     hasher.update(&buf[0..checksum_offset]);
@@ -791,20 +833,57 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
 
 /// Convenience: encode and compute a fresh checksum, returning the label with
 /// an up-to-date checksum field.
-pub fn seal_label(mut label: PoolLabelV1) -> Result<PoolLabelV1, LabelError> {
-    let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
+pub fn seal_label(label: PoolLabelV1) -> Result<PoolLabelV1, LabelError> {
+    seal_label_with_device_layout(label, None)
+}
+
+/// Seal a label while optionally committing a DeviceLayoutV1 sidecar record.
+pub fn seal_label_with_device_layout(
+    mut label: PoolLabelV1,
+    device_layout_v1: Option<&DeviceLayoutV1Bytes>,
+) -> Result<PoolLabelV1, LabelError> {
+    let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
     label.checksum = [0u8; 32];
-    encode_label(&label, &mut buf)?;
+    if device_layout_v1.is_some() {
+        label.features_compat |= features::DEVICE_LAYOUT_V1;
+    } else {
+        label.features_compat &= !features::DEVICE_LAYOUT_V1;
+    }
+    encode_label_with_device_layout(&label, device_layout_v1, &mut buf)?;
     label
         .checksum
         .copy_from_slice(&buf[POOL_LABEL_V1_CHECKSUM_OFFSET..POOL_LABEL_V1_EXT_WIRE_SIZE]);
     Ok(label)
 }
 
+/// Return the optional DeviceLayoutV1 bytes appended to an encoded label.
+pub fn decode_device_layout_v1_bytes(
+    buf: &[u8],
+) -> Result<Option<DeviceLayoutV1Bytes>, LabelError> {
+    if buf.len() < POOL_LABEL_V1_WIRE_SIZE {
+        return Err(LabelError::BufferTooSmall);
+    }
+    let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
+    if features_compat & features::DEVICE_LAYOUT_V1 == 0 {
+        return Ok(None);
+    }
+    if buf.len() < POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE {
+        return Err(LabelError::BufferTooSmall);
+    }
+    Ok(Some(
+        buf[POOL_LABEL_DEVICE_LAYOUT_V1_OFFSET..POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE]
+            .try_into()
+            .unwrap(),
+    ))
+}
+
 /// Verify a label's checksum in-place (without allocating a separate buffer).
 pub fn verify_label_checksum(label: &PoolLabelV1) -> bool {
-    let mut buf = [0u8; POOL_LABEL_V1_EXT_WIRE_SIZE];
-    if encode_label(label, &mut buf).is_err() {
+    let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+    let dummy_layout = [0u8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+    let device_layout_v1 =
+        (label.features_compat & features::DEVICE_LAYOUT_V1 != 0).then_some(&dummy_layout);
+    if encode_label_with_device_layout(label, device_layout_v1, &mut buf).is_err() {
         return false;
     }
     buf[POOL_LABEL_V1_CHECKSUM_OFFSET..POOL_LABEL_V1_EXT_WIRE_SIZE] == label.checksum
@@ -1101,6 +1180,22 @@ mod tests {
         assert_eq!(decoded.pool_name_str(), "testpool");
         assert_eq!(decoded.pool_state, PoolState::Active);
         assert_eq!(decoded.checksum, sealed.checksum);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_with_device_layout_sidecar() {
+        let layout = [0x5Au8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let label = make_label("layout");
+        let sealed = seal_label_with_device_layout(label, Some(&layout)).unwrap();
+
+        let mut buf = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+        encode_label_with_device_layout(&sealed, Some(&layout), &mut buf).unwrap();
+
+        let decoded = decode_label(&buf).unwrap();
+        assert!(decoded.features_compat & features::DEVICE_LAYOUT_V1 != 0);
+        assert_eq!(decoded.checksum, sealed.checksum);
+        assert_eq!(decode_device_layout_v1_bytes(&buf).unwrap(), Some(layout));
+        assert!(verify_label_checksum(&decoded));
     }
 
     #[test]
@@ -1756,6 +1851,23 @@ mod tests {
         let mut short = [0u8; 439];
         short.copy_from_slice(&full_buf[..439]);
         assert_eq!(decode_label(&short), Err(LabelError::BufferTooSmall));
+    }
+
+    #[test]
+    fn decode_layout_flag_requires_full_sidecar() {
+        let layout = [0xA5u8; POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        let sealed = seal_label_with_device_layout(make_label("layoutext"), Some(&layout)).unwrap();
+        let mut full = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+        encode_label_with_device_layout(&sealed, Some(&layout), &mut full).unwrap();
+
+        let mut short = [0u8; POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE - 1];
+        let short_len = short.len();
+        short.copy_from_slice(&full[..short_len]);
+        assert_eq!(decode_label(&short), Err(LabelError::BufferTooSmall));
+        assert_eq!(
+            decode_device_layout_v1_bytes(&short),
+            Err(LabelError::BufferTooSmall)
+        );
     }
 
     #[test]
