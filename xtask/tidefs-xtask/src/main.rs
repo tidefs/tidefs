@@ -887,8 +887,15 @@ fn main() {
             ) {
                 Ok(manifest) => {
                     println!(
-                        "evidence manifest validated: claim_id={} evidence_class={} source={} scope={}",
-                        manifest.claim_id, manifest.evidence_class, manifest.source, manifest.scope
+                        "evidence manifest validated: claim_id={} evidence_class={} tier={} outcome={} run_id={} source_ref={} source={} scope={}",
+                        manifest.claim_id,
+                        manifest.evidence_class,
+                        manifest.validation_tier,
+                        manifest.outcome.label(),
+                        manifest.run_id,
+                        manifest.source_ref,
+                        manifest.source,
+                        manifest.scope
                     );
                 }
                 Err(err) => {

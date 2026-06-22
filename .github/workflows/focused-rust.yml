@@ -78,20 +78,25 @@ jobs:
           NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           STEP_OUTCOME="${{ steps.focused-tests.outcome }}"
           SUMMARY_STATUS=missing
+          SOURCE_LABEL="github-actions/focused-rust"
 
           if [[ -f "$SUMMARY_FILE" ]]; then
             SUMMARY_STATUS=present
           fi
 
-          # Determine result status. A missing summary is never a pass claim.
+          # Determine the shared evidence outcome. A missing summary is never a pass claim.
           if [[ "$SUMMARY_STATUS" == "missing" ]]; then
-            RESULT="fail"
+            OUTCOME="harness-fail"
           elif [[ "$STEP_OUTCOME" == "success" ]]; then
-            RESULT="pass"
+            OUTCOME="pass"
           elif [[ "$STEP_OUTCOME" == "failure" ]]; then
-            RESULT="fail"
+            OUTCOME="product-fail"
+          elif [[ "$STEP_OUTCOME" == "cancelled" ]]; then
+            OUTCOME="harness-fail"
+          elif [[ "$STEP_OUTCOME" == "skipped" ]]; then
+            OUTCOME="skip"
           else
-            RESULT="$STEP_OUTCOME"
+            OUTCOME="harness-fail"
           fi
 
           # Compute content digest or use sentinel when summary is missing
@@ -107,19 +112,25 @@ jobs:
           if [[ -n "$PR_NUMBER" ]]; then
             TRIGGER="${EVENT_NAME}#${PR_NUMBER}"
           fi
-          SCOPE="workflow=${WORKFLOW_NAME} run_id=${RUN_ID} run_attempt=${RUN_ATTEMPT} source_ref=${SOURCE_REF} crates=${FOCUSED_CRATES} cargo_test_args=${CARGO_TEST_ARGS} result=${RESULT} step_outcome=${STEP_OUTCOME} summary=${SUMMARY_STATUS} trigger=${TRIGGER}"
+          EVIDENCE_RUN_ID="${RUN_ID}/${RUN_ATTEMPT}"
+          SCOPE="focused Rust crate tests; crates=${FOCUSED_CRATES}; cargo_test_args=${CARGO_TEST_ARGS}; trigger=${TRIGGER}; ref=${SOURCE_REF}; summary=${SUMMARY_STATUS}; step_outcome=${STEP_OUTCOME}"
+          RESIDUAL_RISK="Focused Rust covers cargo/unit validation for crates=${FOCUSED_CRATES}; it does not provide mounted runtime, QEMU, kernel, xfstests, RDMA, or release-candidate evidence."
 
           nix develop .#ci --command jq -n \
-            --arg manifest_version 1 \
+            --arg manifest_version 2 \
             --arg claim_id "focused-rust.crate-tests.v1" \
             --arg evidence_class "focused-rust-crate-tests" \
             --arg validation_tier "cargo-unit" \
-            --arg source "$SOURCE_SHA" \
-            --argjson scope "$(printf '%s' "$SCOPE" | jq -Rs .)" \
+            --arg source "$SOURCE_LABEL" \
+            --arg scope "$SCOPE" \
             --arg artifact_path "$SUMMARY_FILE" \
             --arg content_digest "$CONTENT_DIGEST" \
+            --arg run_id "$EVIDENCE_RUN_ID" \
+            --arg source_ref "$SOURCE_SHA" \
+            --arg outcome "$OUTCOME" \
+            --arg residual_risk "$RESIDUAL_RISK" \
             --arg generated_at "$NOW" \
-            '{manifest_version: ($manifest_version | tonumber), claim_id: $claim_id, evidence_class: $evidence_class, validation_tier: $validation_tier, source: $source, scope: $scope, artifact_path: $artifact_path, content_digest: $content_digest, generated_at: $generated_at}' \
+            '{manifest_version: ($manifest_version | tonumber), claim_id: $claim_id, evidence_class: $evidence_class, validation_tier: $validation_tier, scope: $scope, artifact_path: $artifact_path, content_digest: $content_digest, run_id: $run_id, source_ref: $source_ref, outcome: $outcome, residual_risk: $residual_risk, source: $source, generated_at: $generated_at, blocking_issues: []}' \
             > "$MANIFEST_FILE"
 
           echo "Evidence manifest written to $MANIFEST_FILE"

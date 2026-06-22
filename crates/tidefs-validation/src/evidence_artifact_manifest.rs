@@ -12,8 +12,9 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::validation_schema::ValidationTier;
+use crate::validation_status::ValidationStatus;
 
-pub const EVIDENCE_ARTIFACT_MANIFEST_VERSION: u32 = 1;
+pub const EVIDENCE_ARTIFACT_MANIFEST_VERSION: u32 = 2;
 pub const EVIDENCE_ARTIFACT_DIGEST_ALGORITHM: &str = "blake3";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -23,14 +24,21 @@ pub struct EvidenceArtifactManifest {
     pub claim_id: String,
     pub evidence_class: String,
     pub validation_tier: ValidationTier,
-    pub source: String,
     pub scope: String,
     pub artifact_path: String,
     pub content_digest: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub generated_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_id: String,
+    pub source_ref: String,
+    pub outcome: ValidationStatus,
+    pub residual_risk: String,
+    pub source: String,
+    pub generated_at: String,
     pub blocking_issues: Vec<BlockingIssueRef>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct EvidenceArtifactManifestVersionProbe {
+    manifest_version: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -97,14 +105,23 @@ impl EvidenceArtifactManifest {
         if self.evidence_class.trim().is_empty() {
             failures.push("evidence_class must not be empty".to_string());
         }
-        if self.source.trim().is_empty() {
-            failures.push("source must not be empty".to_string());
-        }
         if self.scope.trim().is_empty() {
             failures.push("scope must not be empty".to_string());
         }
         validate_relative_artifact_path(&self.artifact_path, &mut failures);
         validate_content_digest(&self.content_digest, &mut failures);
+        validate_required_text("run_id", &self.run_id, &mut failures);
+        validate_required_text("source_ref", &self.source_ref, &mut failures);
+        validate_required_text("residual_risk", &self.residual_risk, &mut failures);
+        validate_required_text("source", &self.source, &mut failures);
+        validate_generated_at(&self.generated_at, &mut failures);
+        validate_outcome_tier_combination(
+            self.outcome,
+            self.validation_tier,
+            &self.content_digest,
+            &self.blocking_issues,
+            &mut failures,
+        );
 
         for issue in &self.blocking_issues {
             if issue.number == 0 {
@@ -168,6 +185,24 @@ impl EvidenceArtifactManifest {
 pub fn parse_evidence_artifact_manifest_json(
     text: &str,
 ) -> Result<EvidenceArtifactManifest, EvidenceArtifactManifestError> {
+    let version = serde_json::from_str::<EvidenceArtifactManifestVersionProbe>(text)
+        .map_err(|error| {
+            EvidenceArtifactManifestError::single(format!(
+                "manifest JSON does not include a supported manifest_version: {error}"
+            ))
+        })?
+        .manifest_version;
+    if version < EVIDENCE_ARTIFACT_MANIFEST_VERSION {
+        return Err(EvidenceArtifactManifestError::single(format!(
+            "manifest_version {version} is retired pre-standardization input; regenerate as manifest_version {EVIDENCE_ARTIFACT_MANIFEST_VERSION} with explicit run_id, source_ref, outcome, residual_risk, generated_at, and blocking_issues before using it for claim closure"
+        )));
+    }
+    if version > EVIDENCE_ARTIFACT_MANIFEST_VERSION {
+        return Err(EvidenceArtifactManifestError::single(format!(
+            "manifest_version must be {EVIDENCE_ARTIFACT_MANIFEST_VERSION}, found {version}"
+        )));
+    }
+
     let manifest = serde_json::from_str::<EvidenceArtifactManifest>(text).map_err(|error| {
         EvidenceArtifactManifestError::single(format!(
             "manifest JSON does not match schema: {error}"
@@ -210,6 +245,20 @@ fn validate_relative_artifact_path(path: &str, failures: &mut Vec<String>) {
         failures.push("artifact_path must not be empty".to_string());
         return;
     }
+    if path.contains("://") {
+        failures.push("artifact_path must be workspace-relative, not a URL".to_string());
+    }
+    if path.starts_with('~') {
+        failures.push("artifact_path must not use a home-directory shortcut".to_string());
+    }
+    if is_windows_absolute_path(path) {
+        failures.push("artifact_path must be relative".to_string());
+    }
+    if path.contains('$') || path.contains('`') {
+        failures.push(
+            "artifact_path must not contain shell interpolation or secret expressions".to_string(),
+        );
+    }
 
     let path = Path::new(path);
     if path.is_absolute() {
@@ -234,6 +283,53 @@ fn validate_relative_artifact_path(path: &str, failures: &mut Vec<String>) {
     }
 }
 
+fn validate_required_text(field: &str, value: &str, failures: &mut Vec<String>) {
+    if value.trim().is_empty() {
+        failures.push(format!("{field} must not be empty"));
+    }
+    if value.contains("${{ secrets.") || value.contains("secrets.") {
+        failures.push(format!("{field} must not contain runner secret references"));
+    }
+}
+
+fn validate_generated_at(generated_at: &str, failures: &mut Vec<String>) {
+    validate_required_text("generated_at", generated_at, failures);
+    if !generated_at.trim().is_empty()
+        && (!generated_at.contains('T')
+            || !(generated_at.ends_with('Z') || generated_at.contains('+')))
+    {
+        failures.push(
+            "generated_at must be a reviewable RFC3339-style timestamp such as 2026-06-22T13:00:00Z"
+                .to_string(),
+        );
+    }
+}
+
+fn validate_outcome_tier_combination(
+    outcome: ValidationStatus,
+    validation_tier: ValidationTier,
+    content_digest: &str,
+    blocking_issues: &[BlockingIssueRef],
+    failures: &mut Vec<String>,
+) {
+    if outcome == ValidationStatus::Pass && !blocking_issues.is_empty() {
+        failures.push("outcome `pass` must not carry blocking_issues".to_string());
+    }
+    if outcome == ValidationStatus::Pass && is_zero_content_digest(content_digest) {
+        failures.push("outcome `pass` requires a non-placeholder content_digest".to_string());
+    }
+    if outcome == ValidationStatus::EnvironmentRefusal
+        && matches!(
+            validation_tier,
+            ValidationTier::SourceModel | ValidationTier::CargoUnit
+        )
+    {
+        failures.push(format!(
+            "outcome `environment-refusal` is invalid for validation_tier `{validation_tier}`"
+        ));
+    }
+}
+
 fn validate_content_digest(digest: &str, failures: &mut Vec<String>) {
     let Some(hex) = digest.strip_prefix(&format!("{EVIDENCE_ARTIFACT_DIGEST_ALGORITHM}:")) else {
         failures.push(format!(
@@ -248,6 +344,162 @@ fn validate_content_digest(digest: &str, failures: &mut Vec<String>) {
     }
 }
 
+fn is_zero_content_digest(digest: &str) -> bool {
+    let Some(hex) = digest.strip_prefix(&format!("{EVIDENCE_ARTIFACT_DIGEST_ALGORITHM}:")) else {
+        return false;
+    };
+    hex.bytes().all(|b| b == b'0')
+}
+
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
 fn canonical_content_digest(digest: &str) -> String {
     digest.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_manifest() -> EvidenceArtifactManifest {
+        EvidenceArtifactManifest {
+            manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+            claim_id: "local.vfs.write_fsync_crash.v1".to_string(),
+            evidence_class: "claims-gate-review".to_string(),
+            validation_tier: ValidationTier::CargoUnit,
+            scope: "claims-gate parser fixture".to_string(),
+            artifact_path: "validation/artifacts/example/summary.json".to_string(),
+            content_digest: content_digest_for_bytes(b"artifact bytes"),
+            run_id: "123456789/1".to_string(),
+            source_ref: "774b48046851ee844284b62a484573597c96a013".to_string(),
+            outcome: ValidationStatus::Pass,
+            residual_risk: "Fixture covers schema validation only; it is not runtime proof."
+                .to_string(),
+            source: "tidefs-validation-test".to_string(),
+            generated_at: "2026-06-22T13:00:00Z".to_string(),
+            blocking_issues: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn version_two_manifest_round_trips_with_common_fields() {
+        let manifest = valid_manifest();
+        let json = manifest.to_json_pretty().expect("serialize manifest");
+        assert!(json.contains("\"run_id\""));
+        assert!(json.contains("\"source_ref\""));
+        assert!(json.contains("\"outcome\""));
+        assert!(json.contains("\"residual_risk\""));
+        assert!(json.contains("\"blocking_issues\""));
+
+        let parsed = parse_evidence_artifact_manifest_json(&json).expect("parse manifest");
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn missing_common_field_fails_closed() {
+        let mut value = serde_json::to_value(valid_manifest()).expect("manifest to json value");
+        value
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("run_id");
+        let err = parse_evidence_artifact_manifest_json(&value.to_string())
+            .expect_err("missing run_id must fail");
+        assert!(err
+            .failures()
+            .iter()
+            .any(|failure| failure.contains("missing field `run_id`")));
+    }
+
+    #[test]
+    fn version_one_manifest_is_retired_pre_standardization_input() {
+        let json = r#"{
+            "manifest_version": 1,
+            "claim_id": "local.vfs.write_fsync_crash.v1",
+            "evidence_class": "claims-gate-review",
+            "validation_tier": "source-model",
+            "source": "claims-gate",
+            "scope": "old scope with hidden run data",
+            "artifact_path": "validation/artifacts/crash-oracle/claims-gate-review.toml",
+            "content_digest": "blake3:1111111111111111111111111111111111111111111111111111111111111111"
+        }"#;
+
+        let err = parse_evidence_artifact_manifest_json(json).expect_err("v1 manifests must fail");
+        assert!(err
+            .failures()
+            .iter()
+            .any(|failure| failure.contains("retired pre-standardization input")));
+    }
+
+    #[test]
+    fn pass_outcome_cannot_carry_blocking_issues() {
+        let mut manifest = valid_manifest();
+        manifest.blocking_issues.push(BlockingIssueRef {
+            repo: Some("tidefs/tidefs".to_string()),
+            number: 809,
+            reason: Some("fixture blocker".to_string()),
+        });
+
+        let err = manifest.validate().expect_err("pass with blockers fails");
+        assert!(err
+            .failures()
+            .iter()
+            .any(|failure| failure.contains("outcome `pass` must not carry blocking_issues")));
+    }
+
+    #[test]
+    fn environment_refusal_is_invalid_for_source_model() {
+        let mut manifest = valid_manifest();
+        manifest.validation_tier = ValidationTier::SourceModel;
+        manifest.outcome = ValidationStatus::EnvironmentRefusal;
+
+        let err = manifest
+            .validate()
+            .expect_err("source-model environment refusal fails");
+        assert!(err
+            .failures()
+            .iter()
+            .any(|failure| failure.contains("environment-refusal")));
+    }
+
+    #[test]
+    fn pass_outcome_requires_non_placeholder_digest() {
+        let mut manifest = valid_manifest();
+        manifest.content_digest =
+            "blake3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+
+        let err = manifest
+            .validate()
+            .expect_err("pass with placeholder digest fails");
+        assert!(err
+            .failures()
+            .iter()
+            .any(|failure| failure.contains("non-placeholder content_digest")));
+    }
+
+    #[test]
+    fn artifact_path_rejects_host_urls_and_shell_interpolation() {
+        for path in [
+            "/tmp/summary.json",
+            "https://github.com/tidefs/tidefs/actions/runs/1",
+            "~/summary.json",
+            "C:\\Users\\runner\\summary.json",
+            "artifacts/$SECRET/summary.json",
+        ] {
+            let mut manifest = valid_manifest();
+            manifest.artifact_path = path.to_string();
+            let err = manifest.validate().expect_err("path must fail");
+            assert!(
+                err.failures()
+                    .iter()
+                    .any(|failure| failure.contains("artifact_path")),
+                "missing artifact_path failure for {path}: {err:?}"
+            );
+        }
+    }
 }
