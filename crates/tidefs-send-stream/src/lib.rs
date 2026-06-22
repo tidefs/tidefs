@@ -68,6 +68,8 @@ const CURSOR_DIGEST_CONTEXT: &str = "TideFS VFSSEND2 cursor digest v1";
 const LINEAGE_ROOT_DIGEST_CONTEXT: &str = "TideFS VFSSEND2 lineage root digest v1";
 const LINEAGE_MANIFEST_DIGEST_CONTEXT: &str = "TideFS VFSSEND2 lineage manifest digest v1";
 const LINEAGE_MANIFEST_BASE_PRESENT: u16 = 1 << 0;
+const SENDER_AUTHORITY_EXTENSION_MAGIC: [u8; 8] = *b"VFSAUTH\0";
+const SENDER_AUTHORITY_EXTENSION_VERSION: u16 = 1;
 
 const HEADER_FIXED_LEN: usize = 8 + 2 + 2 + 16 + 16 + 16 + 16 + 8 + 8 + 8 + 4 + 4 + 4;
 const RECORD_HEADER_LEN: usize = 2 + 2 + 4 + 8 + 32;
@@ -81,6 +83,79 @@ pub type Id128 = [u8; 16];
 
 /// Stable 256-bit object id and BLAKE3 digest.
 pub type Bytes32 = [u8; 32];
+
+/// Sender-pool authority carried by distributed VFSSEND2 streams.
+///
+/// This is identity evidence, not an authentication secret or operator
+/// authorization token. Receive authorization is a separate local-filesystem
+/// policy gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SenderAuthority {
+    pub sender_pool_uuid: Id128,
+    pub sender_pool_epoch: u64,
+    pub sender_membership_generation: u64,
+}
+
+impl SenderAuthority {
+    /// Construct validated sender authority evidence.
+    pub fn new(
+        sender_pool_uuid: Id128,
+        sender_pool_epoch: u64,
+        sender_membership_generation: u64,
+    ) -> Result<Self, SendStreamError> {
+        let authority = Self {
+            sender_pool_uuid,
+            sender_pool_epoch,
+            sender_membership_generation,
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
+    fn validate(self) -> Result<(), SendStreamError> {
+        if self.sender_pool_uuid == [0; 16] {
+            return Err(SendStreamError::InvalidHeader(
+                "sender authority pool uuid must be non-zero",
+            ));
+        }
+        if self.sender_pool_epoch == 0 {
+            return Err(SendStreamError::InvalidHeader(
+                "sender authority pool epoch must be non-zero",
+            ));
+        }
+        if self.sender_membership_generation == 0 {
+            return Err(SendStreamError::InvalidHeader(
+                "sender authority membership generation must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Sender authority state decoded from a stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SenderAuthorityEvidence {
+    /// No sender-authority block is present; the stream is local-only until a
+    /// caller supplies an explicit distributed authority surface.
+    AbsentLocalOnly,
+    /// A distributed stream authority block is present.
+    Distributed(SenderAuthority),
+}
+
+impl SenderAuthorityEvidence {
+    #[must_use]
+    pub const fn is_absent_local_only(self) -> bool {
+        matches!(self, Self::AbsentLocalOnly)
+    }
+
+    #[must_use]
+    pub const fn distributed(self) -> Option<SenderAuthority> {
+        match self {
+            Self::AbsentLocalOnly => None,
+            Self::Distributed(authority) => Some(authority),
+        }
+    }
+}
 
 /// Stream flags from the VFSSEND2 header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,6 +242,7 @@ pub struct SendStreamHeader {
     pub source_dataset_id: Id128,
     pub from_snapshot_id: Id128,
     pub to_snapshot_id: Id128,
+    pub sender_authority: SenderAuthorityEvidence,
     pub flags: StreamFlags,
     pub features_compat: u64,
     pub features_ro_compat: u64,
@@ -185,6 +261,7 @@ impl SendStreamHeader {
             source_dataset_id,
             from_snapshot_id: [0; 16],
             to_snapshot_id,
+            sender_authority: SenderAuthorityEvidence::AbsentLocalOnly,
             flags: StreamFlags::RESUMABLE,
             features_compat: 0,
             features_ro_compat: 0,
@@ -203,6 +280,13 @@ impl SendStreamHeader {
         self
     }
 
+    /// Attach validated sender authority evidence to the header.
+    #[must_use]
+    pub fn with_sender_authority(mut self, authority: SenderAuthority) -> Self {
+        self.sender_authority = SenderAuthorityEvidence::Distributed(authority);
+        self
+    }
+
     /// Encode the header in canonical little-endian form.
     pub fn encode(&self) -> Result<Vec<u8>, SendStreamError> {
         if self.checkpoint_interval_records == 0 {
@@ -215,9 +299,10 @@ impl SendStreamHeader {
                 "max record payload must be non-zero",
             ));
         }
-        let ext_len = u32::try_from(self.header_extension.len())
+        let header_extension = encode_header_extension(self)?;
+        let ext_len = u32::try_from(header_extension.len())
             .map_err(|_| SendStreamError::LengthOverflow("header extension"))?;
-        let mut out = Vec::with_capacity(HEADER_FIXED_LEN + self.header_extension.len());
+        let mut out = Vec::with_capacity(HEADER_FIXED_LEN + header_extension.len());
         out.extend_from_slice(&STREAM_MAGIC);
         push_u16(&mut out, STREAM_VERSION);
         push_u16(&mut out, self.flags.bits());
@@ -231,7 +316,7 @@ impl SendStreamHeader {
         push_u32(&mut out, self.checkpoint_interval_records);
         push_u32(&mut out, self.max_record_payload);
         push_u32(&mut out, ext_len);
-        out.extend_from_slice(&self.header_extension);
+        out.extend_from_slice(&header_extension);
         Ok(out)
     }
 
@@ -254,7 +339,8 @@ impl SendStreamHeader {
         let checkpoint_interval_records = decoder.read_u32()?;
         let max_record_payload = decoder.read_u32()?;
         let ext_len = decoder.read_len_u32()?;
-        let header_extension = decoder.read_bytes(ext_len)?.to_vec();
+        let raw_header_extension = decoder.read_bytes(ext_len)?;
+        let (sender_authority, header_extension) = decode_header_extension(raw_header_extension)?;
         if checkpoint_interval_records == 0 {
             return Err(SendStreamError::InvalidHeader(
                 "checkpoint interval must be non-zero",
@@ -271,6 +357,7 @@ impl SendStreamHeader {
                 source_dataset_id,
                 from_snapshot_id,
                 to_snapshot_id,
+                sender_authority,
                 flags,
                 features_compat,
                 features_ro_compat,
@@ -2678,6 +2765,62 @@ fn blake3_digest(bytes: &[u8]) -> Bytes32 {
     *blake3::hash(bytes).as_bytes()
 }
 
+fn encode_header_extension(header: &SendStreamHeader) -> Result<Vec<u8>, SendStreamError> {
+    match header.sender_authority {
+        SenderAuthorityEvidence::AbsentLocalOnly => Ok(header.header_extension.clone()),
+        SenderAuthorityEvidence::Distributed(authority) => {
+            authority.validate()?;
+            let opaque_len = u32::try_from(header.header_extension.len())
+                .map_err(|_| SendStreamError::LengthOverflow("header extension"))?;
+            let mut out = Vec::with_capacity(48 + header.header_extension.len());
+            out.extend_from_slice(&SENDER_AUTHORITY_EXTENSION_MAGIC);
+            push_u16(&mut out, SENDER_AUTHORITY_EXTENSION_VERSION);
+            push_u16(&mut out, 0);
+            out.extend_from_slice(&authority.sender_pool_uuid);
+            push_u64(&mut out, authority.sender_pool_epoch);
+            push_u64(&mut out, authority.sender_membership_generation);
+            push_u32(&mut out, opaque_len);
+            out.extend_from_slice(&header.header_extension);
+            Ok(out)
+        }
+    }
+}
+
+fn decode_header_extension(
+    raw: &[u8],
+) -> Result<(SenderAuthorityEvidence, Vec<u8>), SendStreamError> {
+    if !raw.starts_with(&SENDER_AUTHORITY_EXTENSION_MAGIC) {
+        return Ok((SenderAuthorityEvidence::AbsentLocalOnly, raw.to_vec()));
+    }
+
+    let mut decoder = Decoder::new(raw);
+    decoder.expect_magic(&SENDER_AUTHORITY_EXTENSION_MAGIC)?;
+    let version = decoder.read_u16()?;
+    if version != SENDER_AUTHORITY_EXTENSION_VERSION {
+        return Err(SendStreamError::InvalidHeader(
+            "unsupported sender authority extension version",
+        ));
+    }
+    if decoder.read_u16()? != 0 {
+        return Err(SendStreamError::InvalidHeader(
+            "sender authority extension reserved field is non-zero",
+        ));
+    }
+    let sender_pool_uuid = decoder.read_id128()?;
+    let sender_pool_epoch = decoder.read_u64()?;
+    let sender_membership_generation = decoder.read_u64()?;
+    let opaque_len = decoder.read_len_u32()?;
+    let opaque = decoder.read_bytes(opaque_len)?.to_vec();
+    decoder.finish()?;
+
+    let authority = SenderAuthority::new(
+        sender_pool_uuid,
+        sender_pool_epoch,
+        sender_membership_generation,
+    )?;
+    Ok((SenderAuthorityEvidence::Distributed(authority), opaque))
+}
+
 fn push_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
 }
@@ -2992,6 +3135,61 @@ mod tests {
         assert!(rest.is_empty());
         assert_eq!(decoded, header);
         assert!(decoded.flags.contains(StreamFlags::INCREMENTAL));
+    }
+
+    #[test]
+    fn header_sender_authority_round_trips_through_extension() {
+        let authority = SenderAuthority::new(id(1), 7, 11).unwrap();
+        let mut header = header().with_sender_authority(authority);
+        header.header_extension = b"opaque-resume-cursor".to_vec();
+
+        let encoded = header.encode().unwrap();
+        let (decoded, rest) = SendStreamHeader::decode(&encoded).unwrap();
+
+        assert!(rest.is_empty());
+        assert_eq!(decoded.sender_authority.distributed(), Some(authority));
+        assert_eq!(decoded.header_extension, b"opaque-resume-cursor");
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn header_sender_authority_rejects_zero_identity_fields() {
+        assert_eq!(
+            SenderAuthority::new([0; 16], 7, 11).unwrap_err(),
+            SendStreamError::InvalidHeader("sender authority pool uuid must be non-zero")
+        );
+        assert_eq!(
+            SenderAuthority::new(id(1), 0, 11).unwrap_err(),
+            SendStreamError::InvalidHeader("sender authority pool epoch must be non-zero")
+        );
+        assert_eq!(
+            SenderAuthority::new(id(1), 7, 0).unwrap_err(),
+            SendStreamError::InvalidHeader(
+                "sender authority membership generation must be non-zero"
+            )
+        );
+    }
+
+    #[test]
+    fn header_sender_authority_rejects_malformed_extension_fields() {
+        let authority = SenderAuthority::new(id(1), 7, 11).unwrap();
+        let header = header().with_sender_authority(authority);
+        let encoded = header.encode().unwrap();
+        let extension_start = HEADER_FIXED_LEN;
+
+        let mut zero_pool = encoded.clone();
+        zero_pool[extension_start + 12..extension_start + 28].fill(0);
+        assert_eq!(
+            SendStreamHeader::decode(&zero_pool).unwrap_err(),
+            SendStreamError::InvalidHeader("sender authority pool uuid must be non-zero")
+        );
+
+        let mut reserved = encoded;
+        reserved[extension_start + 10] = 1;
+        assert_eq!(
+            SendStreamHeader::decode(&reserved).unwrap_err(),
+            SendStreamError::InvalidHeader("sender authority extension reserved field is non-zero")
+        );
     }
 
     #[test]
