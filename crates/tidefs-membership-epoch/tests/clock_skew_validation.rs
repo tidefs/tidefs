@@ -12,8 +12,8 @@
 //! 4. **Recovery after skew**: once the skewed node is corrected, it can catch
 //!    up to the healthy chain through consecutive epoch transitions.
 //!
-//! These tests validate the safety properties required by #6480
-//! (NEXT-MN-025): clock skew must cause the system to fail closed — rejecting
+//! These tests validate the safety property that clock skew must cause the
+//! system to fail closed — rejecting
 //! invalid proposals — rather than corrupting epoch state or allowing split-brain.
 
 use tidefs_membership_epoch::agreement::{AgreementState, MembershipEpochAgreement, QuorumMode};

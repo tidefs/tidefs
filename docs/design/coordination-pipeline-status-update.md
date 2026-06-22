@@ -155,7 +155,7 @@ pub struct IssueSummary {
     /// Forgejo issue number.
     pub number: u32,
 
-    /// Short descriptive tag (e.g., "[OW-000]").
+    /// Short descriptive tag (e.g., "OW-302").
     pub tag: Option<String>,
 
     /// One-line description.
