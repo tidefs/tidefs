@@ -1,28 +1,45 @@
 # Crate Dependency Graph and Ownership Boundaries
 
 **Issue**: [#2100](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2100)
-**Status**: design-spec
+**Status**: historical-input
 **Priority**: P1
 **Lane**: docs
-**Kind**: implementation
+**Kind**: documentation
 **Last updated**: 2026-05-05
 
-> Review debt TFR-002/TFR-019: this imported design spec is stale package
-> inventory, not current workspace authority. Use `docs/WHOLE_REPO_REVIEW.md`
-> and Cargo metadata for the current member set until this document is fully
-> regenerated.
+> **HISTORICAL DESIGN INPUT — NOT CURRENT AUTHORITY**
+>
+> This document is a stale snapshot of a historical workspace (177 crates,
+> Forgejo issue #2100). Several type-root crates it references as active
+> foundation types have been retired, consolidated, or deleted:
+> `tidefs-types-control-plane-core`,
+> `tidefs-types-response-registry-core`,
+> `tidefs-types-publication-pipeline-core`,
+> `tidefs-types-continuity-charter`,
+> `tidefs-types-shadow-pilot`,
+> `tidefs-types-locator-table-core`, and others.
+>
+> **Current authority**: [`docs/workspace-package-classification.md`](../workspace-package-classification.md)
+> for the active package-role table, [`docs/WHOLE_REPO_REVIEW.md`](../WHOLE_REPO_REVIEW.md)
+> for the current member set, and
+> [`docs/crates/types-core-consolidation-plan.md`](../crates/types-core-consolidation-plan.md)
+> for the consolidation rationale. Use `cargo metadata --no-deps` for live
+> dependency edges.
+>
+> TFR-002 / TFR-019 / issue #1019.
 
 ## Abstract
 
-This document records the full crate-level dependency graph for the TideFS Rust
-workspace (177 `tidefs-*` crates), defines ownership boundaries for each crate
-group, and identifies serial write surfaces. It serves as the single source of
-truth for understanding which crate owns which concern and how crates depend on
-each other.
+This is a **historical design document** that recorded the crate-level
+dependency graph for a past TideFS Rust workspace snapshot. It is preserved as
+design input for the consolidation work tracked in
+[`docs/crates/types-core-consolidation-plan.md`](../crates/types-core-consolidation-plan.md).
+Do not cite its tables or dependency edges as current workspace authority.
 
-Companion document: [`docs/design/11-layer-architecture-dependency-matrix.md`](11-layer-architecture-dependency-matrix.md)
-covers DESIGN-issue-level layering and milestone sequencing. This document
-covers the Rust crate manifest structure.
+The companion document
+[`docs/design/11-layer-architecture-dependency-matrix.md`](11-layer-architecture-dependency-matrix.md)
+covers DESIGN-issue-level layering and milestone sequencing and shares the same
+historical-input status.
 
 ---
 
@@ -60,6 +77,12 @@ Daemon Binaries   ←  depends on Runtime + everything below
 ---
 
 ## 2. Ownership Boundaries
+
+> **HISTORICAL**: The crate inventory, dependency counts, and foundation-types
+> table below reflect a past workspace snapshot. Several listed crates
+> (`tidefs-types-control-plane-core`, `tidefs-types-response-registry-core`,
+> `tidefs-types-publication-pipeline-core`, and others) have been retired or
+> consolidated. See the document header for current authority pointers.
 
 Each crate group "owns" a specific architectural concern. The ownership boundary
 defines what a crate is allowed to contain and what it must delegate to
@@ -281,6 +304,10 @@ tidefs-specific dependencies. These are the foundation of the dependency graph.
 
 ---
 
+> **HISTORICAL**: The dependency graph below reflects a past workspace
+> snapshot. Many referenced crates no longer exist or have been consolidated.
+> See the document header for current authority pointers.
+
 ## 3. Dependency Graph by Layer (Depth)
 
 Crates are organized into dependency depth layers. Layer 1 crates have no
@@ -379,6 +406,9 @@ one active issue at a time:
 
 ### 4.1 High Fan-Out Crates (coordination-sensitive)
 
+> **HISTORICAL**: The fan-out counts and crate names below reflect a past
+> workspace snapshot. Several listed crates are retired.
+
 Crates with many dependents require extra care when changing their public API:
 
 | Crate | Dependent Count | Change Impact |
@@ -427,10 +457,14 @@ be preserved by all changes:
 
 ## 7. Relationship to DESIGN Issue Matrix
 
+> **HISTORICAL**: The layer-to-crate mapping below is a past snapshot. Several
+> referenced crates (`tidefs-types-locator-table-core` and others) no longer
+> exist.
+
 The 11-layer DESIGN issue matrix (`docs/design/11-layer-architecture-dependency-matrix.md`)
 covers issue-level sequencing for 71 DESIGN issues across 4 milestones. The
-crate graph documented here is the *implementation* artifact that realizes
-those designs in Rust.
+crate graph documented here is the *historical implementation* artifact that
+realized those designs in Rust at the time of writing.
 
 | DESIGN Layer | Primary Crates |
 |-------------|----------------|
@@ -451,9 +485,20 @@ those designs in Rust.
 
 ## 8. State and Maintenance
 
-- This document is regenerated from `cargo metadata` when the workspace
-  membership or dependency structure changes.
-- The Forgejo issue #2100 tracks the creation and maintenance of this document.
-- Companion document `docs/design/11-layer-architecture-dependency-matrix.md`
-  is authoritative for DESIGN-issue-level sequencing.
-- The `crates/README.md` provides a human-readable index of active crate groups.
+- **Current status**: historical-input (demoted 2026-06-22 per issue #1019).
+  This document is no longer regenerated and must not be cited as workspace
+  authority.
+- The original Forgejo issue #2100 tracked the creation of this document in a
+  prior workspace; it is closed history.
+- **Current authority for package classification**:
+  [`docs/workspace-package-classification.md`](../workspace-package-classification.md)
+  (enforced by `cargo run -p tidefs-xtask -- check-workspace-policy`).
+- **Current authority for the workspace member set**:
+  [`docs/WHOLE_REPO_REVIEW.md`](../WHOLE_REPO_REVIEW.md) and live
+  `cargo metadata --no-deps`.
+- **Consolidation rationale**: [`docs/crates/types-core-consolidation-plan.md`](../crates/types-core-consolidation-plan.md)
+  documents which type-root crates were retired and why.
+- The companion document `docs/design/11-layer-architecture-dependency-matrix.md`
+  shares the same historical-input status.
+- The `crates/README.md` provides a human-readable index of active crate groups;
+  consult it for current structure.
