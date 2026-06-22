@@ -562,6 +562,15 @@ pub fn compile_prefetch_residency_policy(
         return result;
     }
 
+    if !explicit_unsafe_opt_in && actions_contain_volatile(actions) {
+        let before = actions;
+        actions = remove_volatile_or_hidden_unsafe(actions);
+        if before.0 != actions.0 {
+            result.status = StorageIntentPolicyCompileStatus::Lowered;
+            result.refusal = StorageIntentRefusalReason::MissingAuthorization;
+        }
+    }
+
     if sources.caller_flags.durable_floor() {
         source_mask = source_mask.with(StorageIntentPolicySourceClass::CallerFlags);
         let before = actions;
@@ -575,7 +584,7 @@ pub fn compile_prefetch_residency_policy(
         }
     }
 
-    if sources.caller_flags.cache_bypass {
+    if sources.caller_flags.direct || sources.caller_flags.cache_bypass {
         source_mask = source_mask.with(StorageIntentPolicySourceClass::CallerFlags);
         actions = mask_intersection(
             actions,
@@ -870,6 +879,10 @@ fn remove_volatile_or_hidden_unsafe(
             PrefetchResidencyCandidateClass::VolatileRamTrial,
         ),
     )
+}
+
+fn actions_contain_volatile(actions: PrefetchResidencyActionMask) -> bool {
+    actions.contains_candidate(PrefetchResidencyCandidateClass::VolatileRamTrial)
 }
 
 fn remove_authority_movement(actions: PrefetchResidencyActionMask) -> PrefetchResidencyActionMask {
@@ -1182,6 +1195,54 @@ mod tests {
     }
 
     #[test]
+    fn volatile_mode_requires_explicit_operator_opt_in() {
+        let mut sources = baseline_sources(DATASET_A);
+        sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::VolatileRamTrial,
+            ),
+        );
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        assert_eq!(result.status, StorageIntentPolicyCompileStatus::Refused);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MissingAuthorization
+        );
+        assert!(!result
+            .envelope
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::VolatileRamTrial));
+    }
+
+    #[test]
+    fn explicit_unsafe_opt_in_is_visible_when_volatile_mode_remains() {
+        let mut sources = baseline_sources(DATASET_A);
+        sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::VolatileRamTrial,
+            )
+            .with(PrefetchResidencyCandidateClass::NoPrefetch),
+        )
+        .with_explicit_unsafe_opt_in();
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        assert_eq!(
+            result.status,
+            StorageIntentPolicyCompileStatus::UnsafeVisible
+        );
+        assert!(result.explicit_unsafe_opt_in);
+        assert!(result
+            .envelope
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::VolatileRamTrial));
+    }
+
+    #[test]
     fn durable_caller_flags_refuse_hidden_volatile_mode() {
         let mut sources = baseline_sources(DATASET_A);
         sources.dataset = PrefetchResidencyPolicySource::new(
@@ -1208,6 +1269,39 @@ mod tests {
             .envelope
             .allowed_actions
             .contains_candidate(PrefetchResidencyCandidateClass::VolatileRamTrial));
+    }
+
+    #[test]
+    fn direct_io_flag_disables_cache_warming_actions() {
+        let mut sources = baseline_sources(DATASET_A);
+        sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH
+                .with(PrefetchResidencyCandidateClass::CacheOnlyTrial)
+                .with(PrefetchResidencyCandidateClass::FlashHotServing),
+        );
+        sources.caller_flags = CallerRequestFlags {
+            direct: true,
+            ..CallerRequestFlags::default()
+        };
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        assert_eq!(result.status, StorageIntentPolicyCompileStatus::Lowered);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(result
+            .source_mask
+            .contains(StorageIntentPolicySourceClass::CallerFlags));
+        assert_eq!(
+            result.envelope.allowed_actions,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::NoPrefetch
+            )
+            .with(PrefetchResidencyCandidateClass::Refused)
+        );
     }
 
     #[test]
