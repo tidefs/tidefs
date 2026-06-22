@@ -2,9 +2,9 @@
 //! Cleaning policy and backpressure signalling for the segment cleaner.
 //!
 //! [`CleaningPolicy`] selects the cleaning aggressiveness mode based on
-//! the current space-pressure state. [`SegmentScorer`] computes a
-//! cost-benefit score for each segment candidate to guide the cleaning
-//! schedule order.
+//! the current space-pressure state. [`SegmentScorer`] keeps the cleaner's
+//! cost vocabulary available for pressure evidence; `tidefs-compaction` owns
+//! partial segment admission and merge ordering.
 
 // ---------------------------------------------------------------------------
 // CleaningPolicy
@@ -119,18 +119,18 @@ impl CleanerBackpressure {
 }
 
 // ---------------------------------------------------------------------------
-// SegmentScorer -- cost-benefit ranking for cleaning candidates
+// SegmentScorer -- cleaner cost vocabulary
 // ---------------------------------------------------------------------------
 
-/// Computes a cost-benefit score for a segment candidate.
+/// Computes cost vocabulary for a segment candidate.
 ///
-/// Score = reclaimable_dead_bytes / (1 + live_bytes_to_relocate).
-/// Higher scores indicate more efficient cleaning (more dead bytes
-/// reclaimed per live byte relocated).
+/// These helpers are evidence inputs only. They do not authorize the segment
+/// cleaner to rank, group, or relocate partial live/dead segments; the
+/// compaction authority owns those policy decisions.
 pub struct SegmentScorer;
 
 impl SegmentScorer {
-    /// Score a segment by dead-byte yield vs. live-byte relocation cost.
+    /// Compute a cost signal from dead-byte yield and live-byte relocation cost.
     ///
     /// Returns a floating-point score. Higher is better. Fully-dead
     /// segments receive a bonus multiplier.

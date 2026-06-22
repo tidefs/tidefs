@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! Segment cleaning decision engine: consumes [`SegmentLivenessQueue`]
-//! dead/live byte accounting, ranks sealed segments by reclaimable-byte
-//! yield, and emits an ordered [`CleaningCandidate`] schedule for
-//! downstream relocation.
+//! dead/live byte accounting and emits cleaner-owned fully-dead work plus
+//! partial live/dead handoff records for the compaction authority.
 //!
 //! # Persistence
 //!
@@ -15,18 +14,14 @@ use tidefs_reclaim_queue_core::{
     ReclaimQueueStorage, SegmentLivenessEntry, SegmentLivenessPersistError, SegmentLivenessQueue,
 };
 
-use crate::SegmentCleanerConfig;
+use crate::{PartialSegmentHandoff, SegmentCleanerConfig};
 
 // ---------------------------------------------------------------------------
 // CleaningCandidate -- a single entry in the cleaning schedule
 // ---------------------------------------------------------------------------
 
-/// A segment identified for cleaning, together with its liveness
-/// metadata and reclaimable-byte yield.
-///
-/// The cleaning schedule is ordered from highest to lowest reclaimable
-/// yield. Downstream compaction/relocation engines consume this schedule
-/// to decide which segments to compact or free next.
+/// A segment identified for cleaning or compaction-authority handoff,
+/// together with its liveness metadata and reclaimable-byte yield.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CleaningCandidate {
     pub segment_id: u64,
@@ -61,6 +56,16 @@ impl CleaningCandidate {
     #[must_use]
     pub const fn meets_threshold(&self, min_reclaimable_bytes: u64) -> bool {
         self.reclaimable_bytes >= min_reclaimable_bytes && self.reclaimable_bytes > 0
+    }
+
+    #[must_use]
+    pub fn partial_handoff(&self) -> Option<PartialSegmentHandoff> {
+        PartialSegmentHandoff::new(
+            self.segment_id,
+            self.live_bytes,
+            self.dead_bytes,
+            self.creation_commit_group,
+        )
     }
 }
 
@@ -129,16 +134,21 @@ impl SegmentCleaner {
         candidates.sort_by(|a, b| {
             b.is_fully_dead
                 .cmp(&a.is_fully_dead)
-                .then_with(|| b.dead_bytes.cmp(&a.dead_bytes))
-                .then_with(|| {
-                    b.dead_ratio
-                        .partial_cmp(&a.dead_ratio)
-                        .unwrap_or(core::cmp::Ordering::Equal)
-                })
                 .then_with(|| a.segment_id.cmp(&b.segment_id))
         });
 
         candidates
+    }
+
+    #[must_use]
+    pub fn partial_compaction_handoffs(
+        &self,
+        current_commit_group: u64,
+    ) -> Vec<PartialSegmentHandoff> {
+        self.plan_cleaning(current_commit_group)
+            .into_iter()
+            .filter_map(|candidate| candidate.partial_handoff())
+            .collect()
     }
 
     #[must_use]
@@ -236,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_cleaning_returns_ranked_schedule() {
+    fn plan_cleaning_returns_cleaner_owned_handoff_order() {
         let cleaner = SegmentCleaner::new(populated_queue(), make_config(0.0, 0), 0);
         let schedule = cleaner.plan_cleaning(0);
         assert_eq!(schedule.len(), 5);
@@ -246,6 +256,16 @@ mod tests {
         assert_eq!(schedule[2].segment_id, 3);
         assert_eq!(schedule[3].segment_id, 4);
         assert_eq!(schedule[4].segment_id, 5);
+    }
+
+    #[test]
+    fn partial_compaction_handoffs_exclude_fully_dead_segments() {
+        let cleaner = SegmentCleaner::new(populated_queue(), make_config(0.0, 0), 0);
+        let handoffs = cleaner.partial_compaction_handoffs(0);
+        let ids: Vec<u64> = handoffs.iter().map(|handoff| handoff.segment_id).collect();
+        assert_eq!(ids, vec![1, 3, 4, 5]);
+        assert!(handoffs.iter().all(|handoff| handoff.live_bytes > 0));
+        assert!(handoffs.iter().all(|handoff| handoff.dead_bytes > 0));
     }
 
     #[test]

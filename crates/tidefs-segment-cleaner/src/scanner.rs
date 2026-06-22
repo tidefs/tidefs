@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Segment liveness scanner: computes per-segment live-byte ratios from a
-//! segment-index reference, ranks segments by compaction efficiency
-//! (highest dead-byte yield, lowest live-byte relocation cost), and
-//! exposes a stateful [`SegmentLivenessScanner::next_candidate`] iterator
-//! for the compaction engine.
+//! Segment liveness scanner: computes per-segment live/dead byte ratios from
+//! a segment-index reference and exposes stable cleaner-owned eligibility
+//! records for the compaction authority.
 // ---------------------------------------------------------------------------
-// CompactionCandidate -- ranked candidate for compaction
+// CompactionCandidate -- cleaner eligibility record
 // ---------------------------------------------------------------------------
 
-use crate::{DeadObjectTracker, PerSegmentLiveness};
+use crate::{DeadObjectTracker, PartialSegmentHandoff, PerSegmentLiveness};
 /// A segment identified for potential compaction, together with its
-/// liveness metadata and computed reclaim efficiency.
+/// liveness metadata and computed reclaim ratio.
 ///
-/// Candidates are ranked: highest dead-byte yield first, with tie-breaking
-/// on lowest live-byte relocation cost.
+/// Fully-dead candidates remain cleaner-owned free work. Partially live
+/// candidates can be turned into [`PartialSegmentHandoff`] records for the
+/// compaction authority.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CompactionCandidate {
     /// Segment identifier.
@@ -56,34 +55,40 @@ impl CompactionCandidate {
     pub const fn has_reclaimable(&self) -> bool {
         self.dead_bytes > 0
     }
+
+    #[must_use]
+    pub fn partial_handoff(&self) -> Option<PartialSegmentHandoff> {
+        PartialSegmentHandoff::new(
+            self.segment_id,
+            self.live_bytes,
+            self.dead_bytes,
+            self.creation_commit_group,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
-// CandidateRanker -- sorts candidates by compaction efficiency
+// CandidateRanker -- stable cleaner-owned handoff order
 // ---------------------------------------------------------------------------
 
-/// Ranks compaction candidates by descending dead-byte yield, with
-/// tie-breaking on ascending live bytes (minimize relocation cost)
-/// and then ascending segment id for deterministic ordering.
+/// Orders candidates by cleaner ownership.
+///
+/// Fully-dead segments are returned first for the cleaner free path. Partial
+/// live/dead candidates are ordered by segment id only so this crate does not
+/// own merge priority, grouping, or write-amplification policy.
 pub struct CandidateRanker;
 
 impl CandidateRanker {
-    /// Sort `candidates` in-place by compaction priority:
-    ///
-    /// 1. Higher `dead_bytes` first (maximize reclaim yield)
-    /// 2. Lower `live_bytes` first (minimize relocation cost)
-    /// 3. Lower `segment_id` first (deterministic tie-break)
+    /// Sort `candidates` in-place by cleaner-owned handoff order.
     pub fn rank(candidates: &mut [CompactionCandidate]) {
         candidates.sort_by(|a, b| {
-            b.dead_bytes
-                .cmp(&a.dead_bytes)
-                .then_with(|| a.live_bytes.cmp(&b.live_bytes))
+            b.is_fully_dead()
+                .cmp(&a.is_fully_dead())
                 .then_with(|| a.segment_id.cmp(&b.segment_id))
         });
     }
 
-    /// Rank and truncate to `max_candidates`, returning the ranked
-    /// subset.
+    /// Order and truncate to `max_candidates`, returning the selected subset.
     #[must_use]
     pub fn rank_top(
         mut candidates: Vec<CompactionCandidate>,
@@ -171,9 +176,8 @@ impl LivenessSource for DeadObjectTracker {
 // SegmentLivenessScanner -- stateful candidate iterator
 // ---------------------------------------------------------------------------
 
-/// Scans a liveness data source, ranks segments by compaction
-/// efficiency, and exposes a stateful [`next_candidate`] method
-/// for the compaction engine to consume.
+/// Scans a liveness data source and exposes a stateful [`next_candidate`]
+/// method for cleaner-owned freeing or compaction-authority handoff.
 ///
 /// [`next_candidate`]: SegmentLivenessScanner::next_candidate
 ///
@@ -185,11 +189,11 @@ impl LivenessSource for DeadObjectTracker {
 /// let config = ScannerConfig::default();
 /// let mut scanner = SegmentLivenessScanner::new(&tracker, config);
 /// while let Some(candidate) = scanner.next_candidate(0) {
-///     println!("compact segment {}", candidate.segment_id);
+///     println!("candidate segment {}", candidate.segment_id);
 /// }
 /// ```
 pub struct SegmentLivenessScanner<'a> {
-    /// Ranked candidates ready for iteration.
+    /// Ordered candidates ready for iteration.
     candidates: Vec<CompactionCandidate>,
     /// Current position in the candidate list.
     position: usize,
@@ -219,12 +223,12 @@ impl<'a> SegmentLivenessScanner<'a> {
         }
     }
 
-    /// Return the next compaction candidate, or `None` when all
+    /// Return the next cleaner candidate, or `None` when all
     /// qualifying candidates have been returned.
     ///
     /// On the first call, this scans the liveness source, filters
-    /// segments against the configured thresholds, ranks them by
-    /// compaction efficiency, and caches the result.
+    /// segments against the configured thresholds, orders fully-dead
+    /// candidates before partial handoffs, and caches the result.
     ///
     /// `current_commit_group` is used for age-gating; segments younger
     /// than `min_segment_age_txg` commit groups are excluded unless
@@ -284,7 +288,7 @@ impl<'a> SegmentLivenessScanner<'a> {
         &self.config
     }
 
-    /// Perform the initial scan: collect, filter, rank, and cache
+    /// Perform the initial scan: collect, filter, order, and cache
     /// candidates.
     fn scan(&mut self, current_commit_group: u64) {
         let mut raw: Vec<CompactionCandidate> = Vec::new();
@@ -408,35 +412,33 @@ mod tests {
     }
 
     #[test]
-    fn rank_by_dead_bytes_desc() {
+    fn rank_fully_dead_before_partial_handoffs() {
         let mut cs = vec![
-            make_candidate(1, 100, 200),
+            make_candidate(9, 100, 200),
             make_candidate(2, 100, 800),
-            make_candidate(3, 100, 400),
+            make_candidate(7, 0, 400),
         ];
         CandidateRanker::rank(&mut cs);
-        assert_eq!(cs[0].segment_id, 2); // dead=800
-        assert_eq!(cs[1].segment_id, 3); // dead=400
-        assert_eq!(cs[2].segment_id, 1); // dead=200
+        assert_eq!(cs[0].segment_id, 7);
+        assert_eq!(cs[1].segment_id, 2);
+        assert_eq!(cs[2].segment_id, 9);
     }
 
     #[test]
-    fn rank_tiebreak_by_live_bytes_asc() {
-        // Same dead bytes; lower live bytes (cheaper relocation) wins
+    fn rank_partial_handoffs_by_segment_id() {
         let mut cs = vec![
             make_candidate(1, 900, 100),
             make_candidate(2, 100, 100),
             make_candidate(3, 500, 100),
         ];
         CandidateRanker::rank(&mut cs);
-        assert_eq!(cs[0].segment_id, 2); // live=100
-        assert_eq!(cs[1].segment_id, 3); // live=500
-        assert_eq!(cs[2].segment_id, 1); // live=900
+        assert_eq!(cs[0].segment_id, 1);
+        assert_eq!(cs[1].segment_id, 2);
+        assert_eq!(cs[2].segment_id, 3);
     }
 
     #[test]
     fn rank_tiebreak_by_segment_id_asc() {
-        // Same dead and live; lower segment id wins
         let mut cs = vec![
             make_candidate(50, 100, 500),
             make_candidate(10, 100, 500),
@@ -467,12 +469,12 @@ mod tests {
         let cs = vec![
             make_candidate(1, 100, 200),
             make_candidate(2, 100, 800),
-            make_candidate(3, 100, 400),
+            make_candidate(3, 0, 400),
         ];
         let ranked = CandidateRanker::rank_top(cs, 2);
         assert_eq!(ranked.len(), 2);
-        assert_eq!(ranked[0].segment_id, 2);
-        assert_eq!(ranked[1].segment_id, 3);
+        assert_eq!(ranked[0].segment_id, 3);
+        assert_eq!(ranked[1].segment_id, 1);
     }
 
     #[test]
@@ -506,13 +508,13 @@ mod tests {
     }
 
     #[test]
-    fn scanner_returns_ranked_candidates() {
+    fn scanner_returns_handoff_ordered_candidates() {
         let tracker = make_tracker(&[(1, 100, 900, 0), (2, 200, 800, 0), (3, 900, 100, 0)]);
         let config = ScannerConfig::default();
         let mut scanner = SegmentLivenessScanner::new(&tracker, config);
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 1); // dead=900
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 2); // dead=800
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 3); // dead=100
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 1);
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 2);
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 3);
         assert_eq!(scanner.next_candidate(0), None);
     }
 
@@ -543,10 +545,10 @@ mod tests {
             ..ScannerConfig::default()
         };
         let mut scanner = SegmentLivenessScanner::new(&tracker, config);
-        // seg 1: dead=100 < 1000 → excluded
+        // seg 1: dead=100 < 1000 -> excluded
         // seg 2: dead=5000, seg 3: dead=9000
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 3);
         assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 2);
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 3);
         assert_eq!(scanner.next_candidate(0), None);
     }
 
@@ -562,8 +564,8 @@ mod tests {
             ..ScannerConfig::default()
         };
         let mut scanner = SegmentLivenessScanner::new(&tracker, config);
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 3); // dead=800
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 2); // dead=500
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 2);
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 3);
         assert_eq!(scanner.next_candidate(0), None);
     }
 
@@ -579,8 +581,8 @@ mod tests {
             ..ScannerConfig::default()
         };
         let mut scanner = SegmentLivenessScanner::new(&tracker, config);
-        // seg 2: ratio 0.90 < 0.95 → excluded
-        // seg 1: fully dead → bypasses thresholds
+        // seg 2: ratio 0.90 < 0.95 -> excluded
+        // seg 1: fully dead -> bypasses thresholds
         assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 1);
         assert_eq!(scanner.next_candidate(0), None);
     }
@@ -596,7 +598,7 @@ mod tests {
             ..ScannerConfig::default()
         };
         let mut scanner = SegmentLivenessScanner::new(&tracker, config);
-        // At commit_group 101: seg 1 is only 1 txg old → excluded
+        // At commit_group 101: seg 1 is only 1 txg old -> excluded.
         assert_eq!(scanner.next_candidate(101).unwrap().segment_id, 2);
         assert_eq!(scanner.next_candidate(101), None);
     }
@@ -612,7 +614,7 @@ mod tests {
             ..ScannerConfig::default()
         };
         let mut scanner = SegmentLivenessScanner::new(&tracker, config);
-        // seg 1 is fully dead → bypasses age, seg 2 is old enough (101-5=96≥50)
+        // seg 1 is fully dead -> bypasses age, seg 2 is old enough.
         assert_eq!(scanner.next_candidate(101).unwrap().segment_id, 1);
         assert_eq!(scanner.next_candidate(101).unwrap().segment_id, 2);
         assert_eq!(scanner.next_candidate(101), None);
@@ -676,8 +678,8 @@ mod tests {
         tracker.record_overwrite(2, 800);
 
         let mut scanner = SegmentLivenessScanner::new(&tracker, config);
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 1); // dead=900
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 2); // dead=800
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 1);
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 2);
         assert_eq!(scanner.next_candidate(0), None);
     }
 
@@ -713,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn scanner_mixed_segments_correct_ranking() {
+    fn scanner_mixed_segments_use_handoff_order() {
         let tracker = make_tracker(&[
             (1, 100, 100, 0), // dead=100, live=100
             (2, 500, 100, 0), // dead=100, live=500
@@ -722,12 +724,10 @@ mod tests {
         ]);
         let config = ScannerConfig::default();
         let mut scanner = SegmentLivenessScanner::new(&tracker, config);
-        // dead=500 segments first; tie-break by live asc
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 3); // dead=500, live=100
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 4); // dead=500, live=500
-                                                                      // dead=100 segments next; tie-break by live asc
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 1); // dead=100, live=100
-        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 2); // dead=100, live=500
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 1);
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 2);
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 3);
+        assert_eq!(scanner.next_candidate(0).unwrap().segment_id, 4);
         assert_eq!(scanner.next_candidate(0), None);
     }
 
