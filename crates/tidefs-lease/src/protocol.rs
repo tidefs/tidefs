@@ -88,7 +88,6 @@ pub enum LeaseMessage {
     /// eviction/dirty counts for wait-policy gating.
     InvalidateAck(InvalidationAckPayload),
 }
-}
 
 impl LeaseMessage {
     /// Return the lease_id associated with this message, if any.
