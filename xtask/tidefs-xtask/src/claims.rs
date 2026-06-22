@@ -574,9 +574,11 @@ pub fn check_current_workspace() -> Result<(), ClaimsGateCheckError> {
         &root,
         "crates/tidefs-cluster/src/pool_orchestrator.rs",
         &[
-            "Scaffolding note",
-            "**not** send or collect messages itself",
-            "Real transport dispatch belongs to Review debt TFR-017",
+            "caller-supplied [`PoolTransport`]",
+            "does not own membership, transport authentication",
+            "final distributed operator UAPI",
+            "TFR-017 remains open",
+            "crate-local boundary",
         ],
         &mut missing,
     );
