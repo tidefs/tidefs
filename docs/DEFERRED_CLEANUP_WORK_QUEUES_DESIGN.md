@@ -553,7 +553,8 @@ work queue:
 
 The xtask gate `tidefs-xtask check-deferred-cleanup` verifies:
 
-1. Spec, feature matrix, and status entries present
+1. Spec ownership and closeout authority are recorded in the current GitHub
+   issue or `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
 2. Phase 1 types compile with `no_std` + optional `alloc`
 3. `CleanupWorkItemV1` round-trip: serialize → deserialize → assert equality
 4. `CleanupQueue` operations: insert → dequeue → verify ordering
