@@ -33,11 +33,8 @@ pub enum EngineError {
     },
     /// An error from the underlying object store.
     StoreError(Box<dyn Error + Send + Sync>),
-    /// Receipt-bound execution was asked to use a synthetic placeholder.
+    /// Execution was asked to use a synthetic source placement receipt.
     SyntheticReceiptRef { object_id: u64 },
-    /// The receiptless object-store executor was asked to run a real
-    /// receipt-bound movement task.
-    ReceiptBoundTaskRequiresReceiptSource { object_id: u64 },
     /// The receipt source could not fetch bytes from the selected member.
     ReceiptSourceError {
         source_member: MemberId,
@@ -91,11 +88,7 @@ impl fmt::Display for EngineError {
             Self::StoreError(err) => write!(f, "object store error: {err}"),
             Self::SyntheticReceiptRef { object_id } => write!(
                 f,
-                "receipt-bound rebuild fetch for object {object_id} requires non-synthetic placement receipt"
-            ),
-            Self::ReceiptBoundTaskRequiresReceiptSource { object_id } => write!(
-                f,
-                "receipt-bound rebuild task for object {object_id} must use execute_from_receipt_source"
+                "rebuild task for object {object_id} requires a durable source placement receipt"
             ),
             Self::ReceiptSourceError {
                 source_member,
@@ -165,8 +158,9 @@ impl Error for EngineError {
 /// Compute the deterministic ObjectKey for a backfill task.
 ///
 /// Real placement receipt refs carry the source object key that the local pool
-/// made durable. Synthetic receipt refs fall back to the receiptless
-/// subject+digest derivation used by existing tests and scaffolding callers.
+/// made durable. Harness-only synthetic refs fall back to the receiptless
+/// subject+digest derivation so tests that exercise scheduler/quorum mechanics
+/// can still build stable keys without being accepted as rebuild evidence.
 ///
 /// For synthetic refs, the fallback key is the BLAKE3 hash of
 /// (subject_ref.0 || payload_digest.0) as little-endian bytes.
@@ -236,15 +230,15 @@ impl<S: ObjectStore> DataMovementEngine<S> {
         }
     }
 
-    /// Execute a synthetic receiptless backfill task through object stores.
+    /// Execute a durable receipt-bound backfill task through object stores.
     ///
-    /// This path is retained for local scaffolding that still uses synthetic
-    /// receipt refs. Real receipt-bound rebuild/backfill movement must use
-    /// [`Self::execute_from_receipt_source`] so source selection and payload
-    /// verification remain tied to the durable placement receipt.
+    /// The task must carry a non-synthetic source placement receipt. The source
+    /// store is read by the durable receipt object key, and the payload is
+    /// checked against the receipt length and BLAKE3 digest before the target
+    /// write is admitted.
     ///
-    /// 1. Read object data from `source_store` using the deterministic key.
-    /// 2. Verify the BLAKE3 checksum.
+    /// 1. Read object data from `source_store` using the receipt key.
+    /// 2. Verify the payload against the placement receipt.
     /// 3. Write the data to `target_store` in a single put, reporting
     ///    progress in `chunk_size` increments.
     /// 4. Read back from `target_store` and verify the BLAKE3 checksum.
@@ -256,9 +250,16 @@ impl<S: ObjectStore> DataMovementEngine<S> {
         target_store: &mut S,
         progress: &mut BackfillProgress,
     ) -> Result<(), EngineError> {
-        if !task.placement_receipt_ref.is_synthetic() {
-            return Err(EngineError::ReceiptBoundTaskRequiresReceiptSource {
+        if task.placement_receipt_ref.is_synthetic() {
+            return Err(EngineError::SyntheticReceiptRef {
                 object_id: task.placement_receipt_ref.object_id,
+            });
+        }
+        if task.payload_len != task.placement_receipt_ref.payload_len {
+            return Err(EngineError::ReceiptTaskLengthMismatch {
+                object_id: task.placement_receipt_ref.object_id,
+                task_len: task.payload_len,
+                receipt_len: task.placement_receipt_ref.payload_len,
             });
         }
         if task.payload_len == 0 {
@@ -273,25 +274,18 @@ impl<S: ObjectStore> DataMovementEngine<S> {
             .map_err(|e| EngineError::StoreError(Box::new(e)))?
             .ok_or(EngineError::ObjectNotFound(key))?;
 
-        // ── 2. Verify source checksum ────────────────────────────
-        let expected_hex = blake3_hex(&object_data);
-        let actual_hex = bytes_to_hex(blake3::hash(&object_data).as_bytes());
-        if expected_hex != actual_hex {
-            return Err(EngineError::SourceChecksumMismatch {
-                expected_hex,
-                actual_hex,
-            });
-        }
+        // ── 2. Verify source bytes against receipt ───────────────
+        self.verify_receipt_payload(task.placement_receipt_ref, &object_data)?;
 
         self.write_target_and_complete(key, object_data, target_store, progress)
     }
 
     /// Execute a backfill task using receipt-bound source bytes.
     ///
-    /// This is the distributed rebuild/backfill execution path. Unlike the
-    /// receiptless local-store executor, it refuses synthetic receipt refs and
-    /// asks the source to fetch by the exact `PlacementReceiptRef` carried by
-    /// the admitted task.
+    /// This is the distributed rebuild/backfill execution path. Like the local
+    /// object-store executor, it refuses synthetic receipt refs and asks the
+    /// source to fetch by the exact `PlacementReceiptRef` carried by the
+    /// admitted task.
     pub fn execute_from_receipt_source<R>(
         &self,
         task: &BackfillTask,
@@ -302,9 +296,6 @@ impl<S: ObjectStore> DataMovementEngine<S> {
     where
         R: ReceiptSegmentSource,
     {
-        if task.payload_len == 0 {
-            return Err(EngineError::EmptyPayload);
-        }
         if task.placement_receipt_ref.is_synthetic() {
             return Err(EngineError::SyntheticReceiptRef {
                 object_id: task.placement_receipt_ref.object_id,
@@ -316,6 +307,9 @@ impl<S: ObjectStore> DataMovementEngine<S> {
                 task_len: task.payload_len,
                 receipt_len: task.placement_receipt_ref.payload_len,
             });
+        }
+        if task.payload_len == 0 {
+            return Err(EngineError::EmptyPayload);
         }
 
         let object_data = source
@@ -467,17 +461,43 @@ mod tests {
         }
     }
 
-    fn test_task(payload_len: u64) -> BackfillTask {
+    fn receipt_ref_for_payload(
+        object_id: u64,
+        payload: &[u8],
+        generation: u64,
+    ) -> PlacementReceiptRef {
+        let mut object_key = [0xA5; 32];
+        object_key[..8].copy_from_slice(&object_id.to_le_bytes());
+        object_key[8..16].copy_from_slice(&generation.to_le_bytes());
+        PlacementReceiptRef::replicated(
+            object_id,
+            object_key,
+            tidefs_membership_epoch::EpochId::new(7),
+            generation,
+            2,
+            payload.len() as u64,
+            *blake3::hash(payload).as_bytes(),
+        )
+    }
+
+    fn object_digest_from_receipt(receipt: PlacementReceiptRef) -> ObjectDigest {
+        ObjectDigest::new(u64::from_le_bytes(
+            receipt.payload_digest[..8]
+                .try_into()
+                .expect("receipt digest prefix has 8 bytes"),
+        ))
+    }
+
+    fn test_task(payload: &[u8]) -> BackfillTask {
+        let placement_receipt_ref = receipt_ref_for_payload(1, payload, 1);
         BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(1),
-            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
-                ReplicatedSubjectId::new(1),
-            ),
+            placement_receipt_ref,
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
             movement_class: ReplicaMovementClass::BackfillLaggedCopy,
-            payload_digest: ObjectDigest::new(0xABCD),
-            payload_len,
+            payload_digest: object_digest_from_receipt(placement_receipt_ref),
+            payload_len: payload.len() as u64,
             created_at_ns: 1000,
             deadline_ns: 5000,
         })
@@ -494,7 +514,7 @@ mod tests {
     #[test]
     fn successful_transfer_and_verification() {
         let data = b"hello backfill world";
-        let task = test_task(data.len() as u64);
+        let task = test_task(data);
         let mut source = MemStore::default();
         let mut target = MemStore::default();
         let engine = DataMovementEngine::new();
@@ -518,7 +538,7 @@ mod tests {
 
     #[test]
     fn object_not_found_error() {
-        let task = test_task(32);
+        let task = test_task(b"missing source payload");
         let source = MemStore::default(); // empty
         let mut target = MemStore::default();
         let engine = DataMovementEngine::new();
@@ -534,7 +554,7 @@ mod tests {
 
     #[test]
     fn empty_payload_rejected() {
-        let task = test_task(0);
+        let task = test_task(b"");
         let source = MemStore::default();
         let mut target = MemStore::default();
         let engine = DataMovementEngine::new();
@@ -549,21 +569,12 @@ mod tests {
     }
 
     #[test]
-    fn receiptless_executor_rejects_real_receipt_ref() {
-        let data = b"receipt-bound task must use receipt source";
-        let receipt_key = ObjectKey::from_bytes32([0xA6; 32]);
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(blake3::hash(data).as_bytes());
+    fn object_store_executor_rejects_synthetic_receipt_ref() {
+        let data = b"synthetic receipt must not drive object-store execution";
         let task = BackfillTask::new(BackfillTaskInit {
             subject_ref: ReplicatedSubjectId::new(7003),
-            placement_receipt_ref: PlacementReceiptRef::replicated(
-                7003,
-                receipt_key.as_bytes32(),
-                tidefs_membership_epoch::EpochId::new(7),
-                1,
-                2,
-                data.len() as u64,
-                digest,
+            placement_receipt_ref: PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(7003),
             ),
             source_member: MemberId::new(10),
             target_member: MemberId::new(20),
@@ -578,7 +589,7 @@ mod tests {
         let engine = DataMovementEngine::new();
         let mut progress = BackfillProgress::new(task.payload_len, 3);
 
-        source.put(receipt_key, data).unwrap();
+        populate_source(&mut source, &task, data);
         progress.schedule().unwrap();
 
         let err = engine
@@ -587,7 +598,72 @@ mod tests {
 
         assert!(matches!(
             err,
-            EngineError::ReceiptBoundTaskRequiresReceiptSource { object_id: 7003 }
+            EngineError::SyntheticReceiptRef { object_id: 7003 }
+        ));
+        assert!(target.objects.is_empty());
+        assert_eq!(progress.state, TaskState::Scheduled);
+        assert_eq!(progress.bytes_transferred, 0);
+    }
+
+    #[test]
+    fn object_store_executor_rejects_receipt_payload_digest_mismatch() {
+        let data = b"durable receipt payload";
+        let task = test_task(data);
+        let mut source = MemStore::default();
+        let mut target = MemStore::default();
+        let engine = DataMovementEngine::new();
+        let mut progress = BackfillProgress::new(task.payload_len, 3);
+        let mut corrupt = data.to_vec();
+
+        corrupt[0] ^= 0xFF;
+        populate_source(&mut source, &task, &corrupt);
+        progress.schedule().unwrap();
+
+        let err = engine
+            .execute(&task, &source, &mut target, &mut progress)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            EngineError::ReceiptPayloadDigestMismatch { object_id: 1, .. }
+        ));
+        assert!(target.objects.is_empty());
+        assert_eq!(progress.state, TaskState::Scheduled);
+        assert_eq!(progress.bytes_transferred, 0);
+    }
+
+    #[test]
+    fn object_store_executor_rejects_task_length_mismatch_before_read() {
+        let data = b"receipt length payload";
+        let placement_receipt_ref = receipt_ref_for_payload(7004, data, 1);
+        let task = BackfillTask::new(BackfillTaskInit {
+            subject_ref: ReplicatedSubjectId::new(7004),
+            placement_receipt_ref,
+            source_member: MemberId::new(10),
+            target_member: MemberId::new(20),
+            movement_class: ReplicaMovementClass::RebuildLostOrSuspectCopy,
+            payload_digest: object_digest_from_receipt(placement_receipt_ref),
+            payload_len: data.len() as u64 + 1,
+            created_at_ns: 1000,
+            deadline_ns: 5000,
+        });
+        let source = MemStore::default();
+        let mut target = MemStore::default();
+        let engine = DataMovementEngine::new();
+        let mut progress = BackfillProgress::new(task.payload_len, 3);
+
+        progress.schedule().unwrap();
+        let err = engine
+            .execute(&task, &source, &mut target, &mut progress)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            EngineError::ReceiptTaskLengthMismatch {
+                object_id: 7004,
+                task_len,
+                receipt_len,
+            } if task_len == data.len() as u64 + 1 && receipt_len == data.len() as u64
         ));
         assert!(target.objects.is_empty());
         assert_eq!(progress.state, TaskState::Scheduled);
@@ -597,7 +673,7 @@ mod tests {
     #[test]
     fn large_object_chunked_progress() {
         let data: Vec<u8> = (0..200_000u64).map(|i| (i % 251) as u8).collect();
-        let task = test_task(data.len() as u64);
+        let task = test_task(&data);
         let mut source = MemStore::default();
         let mut target = MemStore::default();
         let engine = DataMovementEngine::<MemStore>::with_chunk_size(8192);

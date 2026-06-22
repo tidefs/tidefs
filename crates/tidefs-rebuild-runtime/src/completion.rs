@@ -4,6 +4,8 @@
 //! node/device loss.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use tidefs_membership_epoch::MemberId;
@@ -106,8 +108,8 @@ pub struct VerifiedReceiptCompletionRecord {
 /// Error returned when a repaired target receipt cannot prove task completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiptCompletionError {
-    /// The caller supplied a synthetic placeholder instead of a durable
-    /// repaired target placement receipt.
+    /// The caller supplied a synthetic repaired target receipt instead of
+    /// durable replacement placement evidence.
     SyntheticReceiptRef { object_id: u64 },
     /// The repaired receipt carries a redundancy policy that cannot describe
     /// legal placement.
@@ -135,6 +137,54 @@ pub enum ReceiptCompletionError {
     /// The repaired receipt is for a different payload digest.
     PayloadDigestMismatch { object_id: u64 },
 }
+
+impl fmt::Display for ReceiptCompletionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SyntheticReceiptRef { object_id } => write!(
+                f,
+                "verified rebuild completion for object {object_id} requires a durable repaired target placement receipt"
+            ),
+            Self::MalformedReceiptPolicy { object_id } => write!(
+                f,
+                "repaired target placement receipt for object {object_id} has malformed redundancy policy"
+            ),
+            Self::InsufficientReceiptTargets {
+                object_id,
+                required,
+                actual,
+            } => write!(
+                f,
+                "repaired target placement receipt for object {object_id} records {actual} target(s), required {required}"
+            ),
+            Self::ObjectIdMismatch {
+                task_object_id,
+                repaired_object_id,
+            } => write!(
+                f,
+                "repaired target placement receipt object id {repaired_object_id} does not match task object {task_object_id}"
+            ),
+            Self::ObjectKeyMismatch { object_id } => write!(
+                f,
+                "repaired target placement receipt for object {object_id} carries a different object key"
+            ),
+            Self::PayloadLengthMismatch {
+                object_id,
+                task_len,
+                repaired_len,
+            } => write!(
+                f,
+                "repaired target placement receipt for object {object_id} records length {repaired_len}, task requires {task_len}"
+            ),
+            Self::PayloadDigestMismatch { object_id } => write!(
+                f,
+                "repaired target placement receipt for object {object_id} carries a different payload digest"
+            ),
+        }
+    }
+}
+
+impl Error for ReceiptCompletionError {}
 
 /// Tracks rebuild completion across multiple members.
 #[derive(Clone, Debug, Default)]
@@ -815,6 +865,9 @@ mod tests {
             err,
             ReceiptCompletionError::SyntheticReceiptRef { object_id: 42 }
         );
+        assert!(err
+            .to_string()
+            .contains("durable repaired target placement receipt"));
         assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
     }
 
