@@ -211,6 +211,7 @@ use tidefs_receive_stream::receive_persistence::{
 struct StubPinLookup {
     pinned: Vec<[u8; 32]>,
     lineages: std::collections::HashMap<[u8; 32], [u8; 32]>,
+    completed: std::collections::HashMap<([u8; 32], [u8; 32]), u64>,
 }
 
 impl StubPinLookup {
@@ -218,12 +219,17 @@ impl StubPinLookup {
         Self {
             pinned: Vec::new(),
             lineages: std::collections::HashMap::new(),
+            completed: std::collections::HashMap::new(),
         }
     }
 
     fn add_pinned_with_lineage(&mut self, identity: [u8; 32], lineage: [u8; 32]) {
         self.pinned.push(identity);
         self.lineages.insert(identity, lineage);
+    }
+
+    fn mark_completed(&mut self, identity: [u8; 32], lineage: [u8; 32], generation: u64) {
+        self.completed.insert((identity, lineage), generation);
     }
 }
 
@@ -232,11 +238,18 @@ impl BaseRootPinLookup for StubPinLookup {
         self.pinned.contains(base_root_identity)
     }
 
-    fn dataset_lineage_for_base_root(
+    fn dataset_lineage_for_base_root(&self, base_root_identity: &[u8; 32]) -> Option<[u8; 32]> {
+        self.lineages.get(base_root_identity).copied()
+    }
+
+    fn latest_completed_receive_generation(
         &self,
         base_root_identity: &[u8; 32],
-    ) -> Option<[u8; 32]> {
-        self.lineages.get(base_root_identity).copied()
+        dataset_lineage_identity: &[u8; 32],
+    ) -> Option<u64> {
+        self.completed
+            .get(&(*base_root_identity, *dataset_lineage_identity))
+            .copied()
     }
 }
 
@@ -264,11 +277,12 @@ fn incremental_receive_with_valid_pinned_base_root() {
         receive_generation: 1,
     };
 
-    let mut bridge = ReceivePersistenceBridge::new(&mut store)
-        .with_incremental_contract(contract);
+    let mut bridge = ReceivePersistenceBridge::new(&mut store).with_incremental_contract(contract);
 
     // Validate before dispatching
-    bridge.validate_base_root_pin(&pin_lookup).expect("base root should be pinned");
+    bridge
+        .validate_base_root_pin(&pin_lookup)
+        .expect("base root should be pinned");
     assert!(bridge.has_validated_contract());
 
     let (objects, bytes) = receive_object(&wire, 0, &mut bridge).expect("receive+persist");
@@ -300,8 +314,7 @@ fn incremental_receive_blocked_without_validation() {
         receive_generation: 2,
     };
 
-    let mut bridge = ReceivePersistenceBridge::new(&mut store)
-        .with_incremental_contract(contract);
+    let mut bridge = ReceivePersistenceBridge::new(&mut store).with_incremental_contract(contract);
 
     // Do NOT call validate_base_root_pin — persistence should be blocked
     assert!(!bridge.has_validated_contract());
@@ -335,15 +348,12 @@ fn incremental_receive_rejects_missing_base_root() {
         receive_generation: 1,
     };
 
-    let mut bridge = ReceivePersistenceBridge::new(&mut store)
-        .with_incremental_contract(contract);
+    let mut bridge = ReceivePersistenceBridge::new(&mut store).with_incremental_contract(contract);
 
     // Pin lookup does NOT contain the missing base root
     let pin_lookup = StubPinLookup::new();
 
-    let err = bridge
-        .validate_base_root_pin(&pin_lookup)
-        .unwrap_err();
+    let err = bridge.validate_base_root_pin(&pin_lookup).unwrap_err();
     assert!(
         matches!(err, ReceivePersistenceError::BaseRootNotPinned { .. }),
         "expected BaseRootNotPinned, got: {err:?}"
@@ -386,12 +396,9 @@ fn incremental_receive_rejects_wrong_lineage() {
         receive_generation: 1,
     };
 
-    let mut bridge = ReceivePersistenceBridge::new(&mut store)
-        .with_incremental_contract(contract);
+    let mut bridge = ReceivePersistenceBridge::new(&mut store).with_incremental_contract(contract);
 
-    let err = bridge
-        .validate_base_root_pin(&pin_lookup)
-        .unwrap_err();
+    let err = bridge.validate_base_root_pin(&pin_lookup).unwrap_err();
     assert!(
         matches!(err, ReceivePersistenceError::DatasetLineageMismatch { .. }),
         "expected DatasetLineageMismatch, got: {err:?}"
@@ -436,10 +443,9 @@ fn full_receive_without_contract_succeeds() {
     assert_eq!(stored, payload);
 }
 
-/// Test: replay of a completed receive (same objects again) succeeds
-/// with a validated contract.
+/// Test: replay of a completed receive is rejected before persistence.
 #[test]
-fn replay_of_completed_receive_with_validated_contract() {
+fn replay_of_completed_receive_is_rejected_by_contract() {
     let (mut store, _path) = temp_store();
     let payload = b"replay data";
     let object_id = ObjectKey::from_content(payload).as_bytes32();
@@ -462,28 +468,40 @@ fn replay_of_completed_receive_with_validated_contract() {
 
     // First receive
     {
-        let mut bridge = ReceivePersistenceBridge::new(&mut store)
-            .with_incremental_contract(contract);
-        bridge.validate_base_root_pin(&pin_lookup).expect("validate");
+        let mut bridge =
+            ReceivePersistenceBridge::new(&mut store).with_incremental_contract(contract);
+        bridge
+            .validate_base_root_pin(&pin_lookup)
+            .expect("validate");
         receive_object(&wire, 0, &mut bridge).expect("first receive");
         assert_eq!(bridge.objects_persisted(), 1);
     }
+    pin_lookup.mark_completed(base_root, lineage, contract.receive_generation);
 
     // Second receive (replay) with fresh bridge, same contract
     {
-        let mut bridge2 = ReceivePersistenceBridge::new(&mut store)
-            .with_incremental_contract(contract);
-        bridge2.validate_base_root_pin(&pin_lookup).expect("validate replay");
-        let result = receive_object(&wire, 0, &mut bridge2);
-        // Content-addressed put may succeed (idempotent) or produce a key
-        // mismatch depending on store collision behavior
+        let mut bridge2 =
+            ReceivePersistenceBridge::new(&mut store).with_incremental_contract(contract);
+        let err = bridge2.validate_base_root_pin(&pin_lookup).unwrap_err();
         assert!(
-            result.is_ok() || format!("{}", result.as_ref().unwrap_err()).contains("mismatch"),
-            "unexpected error on replay: {result:?}"
+            matches!(
+                err,
+                ReceivePersistenceError::ReceiveGenerationReplayed {
+                    receive_generation: 1,
+                    completed_generation: 1
+                }
+            ),
+            "unexpected replay error: {err:?}"
         );
+        let dispatch_err = receive_object(&wire, 0, &mut bridge2).unwrap_err();
+        assert!(
+            format!("{dispatch_err}").contains("ContractNotValidated"),
+            "expected replay to leave bridge unvalidated, got: {dispatch_err}"
+        );
+        assert_eq!(bridge2.objects_persisted(), 0);
     }
 
-    // Verify the object is in the store
+    // Verify the original receive remains durable and no replay authority was promoted.
     let key = ObjectKey::from_content(payload);
     let stored = store.get(key).expect("get").expect("object present");
     assert_eq!(stored, payload);

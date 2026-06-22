@@ -7113,11 +7113,9 @@ fn make_incremental_receive_fixture(
     let baseline_root = source
         .selected_current_root_summary()
         .expect("baseline root");
-    if retain_base_snapshot {
-        source
-            .create_snapshot("baseline")
-            .expect("baseline snapshot");
-    }
+    source
+        .create_snapshot("baseline")
+        .expect("baseline snapshot");
     let baseline_export = source.export_changed_records().expect("baseline export");
 
     LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
@@ -7127,6 +7125,14 @@ fn make_incremental_receive_fixture(
         target_key,
     )
     .expect("receive baseline");
+    if !retain_base_snapshot {
+        let mut target =
+            LocalFileSystem::open_with_root_authentication_key(&target_root, options(), target_key)
+                .expect("open target to remove baseline snapshot");
+        target
+            .delete_snapshot("baseline")
+            .expect("remove target baseline snapshot");
+    }
 
     let modified_data: Vec<u8> = vec![0x33; 8192];
     source
@@ -7361,6 +7367,58 @@ fn incremental_receive_rejects_missing_from_root_without_selecting_new_root() {
 }
 
 #[test]
+fn incremental_receive_rejects_replayed_completed_generation() {
+    let fixture = make_incremental_receive_fixture("incr-replay-completed", true, None);
+    let report = LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+        &fixture.target_root,
+        options(),
+        &fixture.incremental_export,
+        fixture.target_key,
+    )
+    .expect("initial incremental receive");
+    assert_eq!(
+        report.selected_transaction_id,
+        fixture.incremental_export.current_root.transaction_id
+    );
+    let before_replay = selected_root_for_test(&fixture.target_root, fixture.target_key);
+
+    let err = LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+        &fixture.target_root,
+        options(),
+        &fixture.incremental_export,
+        fixture.target_key,
+    )
+    .expect_err("replayed completed receive must fail");
+    assert!(
+        err.to_string()
+            .contains("receive contract generation was already completed"),
+        "unexpected error: {err}"
+    );
+    let after_replay = selected_root_for_test(&fixture.target_root, fixture.target_key);
+    assert_eq!(after_replay, before_replay);
+
+    let target = LocalFileSystem::open_with_root_authentication_key(
+        &fixture.target_root,
+        options(),
+        fixture.target_key,
+    )
+    .expect("open target after replay rejection");
+    assert_eq!(
+        target
+            .read_file("/data/modified.bin")
+            .expect("read modified"),
+        fixture.modified_data
+    );
+    assert_eq!(
+        target.read_file("/data/new.bin").expect("read new"),
+        fixture.new_data
+    );
+
+    cleanup(&fixture.source_root);
+    cleanup(&fixture.target_root);
+}
+
+#[test]
 fn incremental_receive_rejects_target_missing_base_root() {
     let fixture = make_incremental_receive_fixture("incr-missing-base", true, None);
     let other_root = temp_root("incr-missing-base-other-target");
@@ -7461,8 +7519,10 @@ fn incremental_receive_rejects_missing_unchanged_content() {
     let fixture = make_incremental_receive_fixture("incr-missing-unchanged", true, None);
     let missing_key = omitted_incremental_content_key(&fixture.incremental_export);
     {
-        let mut store = LocalObjectStore::open_with_options(&fixture.target_root, options())
-            .expect("open target store");
+        let mut pool =
+            LocalFileSystem::default_development_pool(&fixture.target_root, &options(), None, None)
+                .expect("open target pool");
+        let store = pool.raw_primary_store_mut();
         assert!(
             store.delete(missing_key).expect("delete omitted content"),
             "omitted content key should exist before deletion"
@@ -8738,10 +8798,7 @@ fn root_dataset_catalog_decode_failure_fails_closed() {
     );
     match result {
         Err(FileSystemError::CorruptState { reason }) => {
-            assert!(
-                reason.contains("dataset catalog decode failed"),
-                "{reason}"
-            );
+            assert!(reason.contains("dataset catalog decode failed"), "{reason}");
         }
         Ok(_) => panic!("undecodable root dataset catalog must fail closed"),
         Err(other) => panic!("unexpected error: {other:?}"),
