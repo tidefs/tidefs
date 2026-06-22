@@ -69,9 +69,10 @@ use tidefs_types_posix_filesystem_adapter_core::PosixFilesystemAdapterWriteStagi
 use tidefs_types_vfs_core::{
     compose_posix_time_ns, split_posix_time_ns, DirEntry, EngineDirHandle, EngineFileHandle, Errno,
     FileHandleId, Generation, InodeAttr, InodeId, NodeKind, PosixAttrs, RequestCtx, SetAttr,
-    StatFs, FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, FATTR_ATIME,
-    FATTR_ATIME_NOW, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME,
-    FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID, F_UNLCK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
+    StatFs, FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_INSERT_RANGE, FALLOC_FL_KEEP_SIZE,
+    FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME,
+    FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE,
+    FATTR_UID, F_UNLCK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
 };
 use tidefs_vfs_engine::{LockSpec, LseekDataRange, VfsEngine, VfsEngineStatFs};
 
@@ -725,6 +726,150 @@ impl DentryInvalidationState {
     #[cfg(test)]
     fn parent_generation(&self, parent_inode: u64) -> Option<u64> {
         self.invalidated_parent_dirs.get(&parent_inode).copied()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DataCacheGenerationSnapshot {
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DataCacheRangeFence {
+    start: u64,
+    end: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DataCacheInvalidationState {
+    next_generation: u64,
+    inode_generations: BTreeMap<u64, u64>,
+    range_fences: BTreeMap<u64, Vec<DataCacheRangeFence>>,
+    read_cache_generations: BTreeMap<u64, u64>,
+    fuse_page_generations: BTreeMap<(u64, u64), u64>,
+}
+
+impl DataCacheInvalidationState {
+    const RANGE_FENCE_LIMIT_PER_INODE: usize = 1024;
+
+    fn next_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.next_generation
+    }
+
+    fn invalidate_inode(&mut self, ino: u64) -> u64 {
+        let generation = self.next_generation();
+        self.inode_generations.insert(ino, generation);
+        self.range_fences.remove(&ino);
+        self.read_cache_generations.remove(&ino);
+        self.fuse_page_generations
+            .retain(|(page_ino, _), _| *page_ino != ino);
+        generation
+    }
+
+    fn invalidate_range(&mut self, ino: u64, offset: u64, length: u64) -> u64 {
+        if length == 0 {
+            return self.current_generation(ino, offset, length);
+        }
+        if offset == 0 && length == u64::MAX {
+            return self.invalidate_inode(ino);
+        }
+
+        let generation = self.next_generation();
+        let end = offset.saturating_add(length);
+        let fences = self.range_fences.entry(ino).or_default();
+        fences.push(DataCacheRangeFence {
+            start: offset,
+            end,
+            generation,
+        });
+        if fences.len() > Self::RANGE_FENCE_LIMIT_PER_INODE {
+            self.inode_generations.insert(ino, generation);
+            self.range_fences.remove(&ino);
+        }
+        self.read_cache_generations.remove(&ino);
+        generation
+    }
+
+    fn current_generation(&self, ino: u64, offset: u64, length: u64) -> u64 {
+        let mut generation = self.inode_generations.get(&ino).copied().unwrap_or(0);
+        if length == 0 {
+            return generation;
+        }
+        let end = offset.saturating_add(length);
+        if let Some(fences) = self.range_fences.get(&ino) {
+            for fence in fences {
+                if fence.start < end && offset < fence.end {
+                    generation = generation.max(fence.generation);
+                }
+            }
+        }
+        generation
+    }
+
+    fn snapshot(&self, ino: u64, offset: u64, length: u64) -> DataCacheGenerationSnapshot {
+        DataCacheGenerationSnapshot {
+            generation: self.current_generation(ino, offset, length),
+        }
+    }
+
+    fn snapshot_allows_range(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+        snapshot: DataCacheGenerationSnapshot,
+    ) -> bool {
+        snapshot.generation >= self.current_generation(ino, offset, length)
+    }
+
+    fn record_read_cache_fill(&mut self, ino: u64, snapshot: DataCacheGenerationSnapshot) {
+        self.read_cache_generations.insert(ino, snapshot.generation);
+    }
+
+    fn read_cache_allows_range(&self, ino: u64, offset: u64, length: u64) -> bool {
+        self.read_cache_generations
+            .get(&ino)
+            .copied()
+            .is_some_and(|generation| generation >= self.current_generation(ino, offset, length))
+    }
+
+    fn forget_read_cache_fill(&mut self, ino: u64) {
+        self.read_cache_generations.remove(&ino);
+    }
+
+    fn record_fuse_page_fill(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+        page_size: u64,
+        snapshot: DataCacheGenerationSnapshot,
+    ) {
+        if length == 0 || page_size == 0 {
+            return;
+        }
+        let end = offset.saturating_add(length);
+        let mut page_offset = (offset / page_size) * page_size;
+        while page_offset < end {
+            self.fuse_page_generations
+                .insert((ino, page_offset), snapshot.generation);
+            page_offset = page_offset.saturating_add(page_size);
+        }
+    }
+
+    fn fuse_page_allows_range(&self, ino: u64, page_offset: u64, page_size: u64) -> bool {
+        self.fuse_page_generations
+            .get(&(ino, page_offset))
+            .copied()
+            .is_some_and(|generation| {
+                generation >= self.current_generation(ino, page_offset, page_size)
+            })
+    }
+
+    fn forget_fuse_page_fill(&mut self, ino: u64, page_offset: u64) {
+        self.fuse_page_generations.remove(&(ino, page_offset));
     }
 }
 
@@ -2537,6 +2682,7 @@ pub struct FuseVfsAdapter {
     dentry_policy: DentryPolicy,
     lock_dispatch: DaemonLockDispatch,
     dentry_invalidations: Mutex<DentryInvalidationState>,
+    data_cache_invalidations: Mutex<DataCacheInvalidationState>,
     negative_cache: Mutex<NegativeLookupCache>,
     poll_registrations: Mutex<PollRegistrationTable>,
     pub(crate) dirty_state: Mutex<BTreeMap<u64, DirtyRanges>>,
@@ -2672,6 +2818,7 @@ impl FuseVfsAdapter {
             base_dentry_policy,
             lock_dispatch: DaemonLockDispatch::new(),
             dentry_invalidations: Mutex::new(DentryInvalidationState::default()),
+            data_cache_invalidations: Mutex::new(DataCacheInvalidationState::default()),
             negative_cache: Mutex::new(NegativeLookupCache::new(256, Duration::from_millis(250))),
             poll_registrations: Mutex::new(PollRegistrationTable::default()),
             dirty_state: Mutex::new(BTreeMap::new()),
@@ -3377,6 +3524,151 @@ impl FuseVfsAdapter {
         }
     }
 
+    fn data_cache_generation_snapshot(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+    ) -> DataCacheGenerationSnapshot {
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .snapshot(ino, offset, length)
+    }
+
+    fn data_cache_snapshot_still_current(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+        snapshot: DataCacheGenerationSnapshot,
+    ) -> bool {
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .snapshot_allows_range(ino, offset, length, snapshot)
+    }
+
+    fn read_cache_hit_still_current(&self, ino: u64, offset: u64, length: u64) -> bool {
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .read_cache_allows_range(ino, offset, length)
+    }
+
+    fn forget_read_cache_generation(&self, ino: u64) {
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .forget_read_cache_fill(ino);
+    }
+
+    fn invalidate_read_cache_entry(&self, ino: u64) {
+        if let Ok(mut cache) = self.page_cache.lock() {
+            cache.invalidate(ino);
+        }
+        self.forget_read_cache_generation(ino);
+    }
+
+    fn record_read_cache_fill(&self, ino: u64, snapshot: DataCacheGenerationSnapshot) {
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .record_read_cache_fill(ino, snapshot);
+    }
+
+    fn record_fuse_read_cache_fill(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+        page_size: u64,
+        snapshot: DataCacheGenerationSnapshot,
+    ) {
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .record_fuse_page_fill(ino, offset, length, page_size, snapshot);
+    }
+
+    fn forget_fuse_read_cache_range(&self, ino: u64, offset: u64, length: u64, page_size: u64) {
+        if length == 0 || page_size == 0 {
+            return;
+        }
+        let end = offset.saturating_add(length);
+        let mut page_offset = (offset / page_size) * page_size;
+        let mut state = self.data_cache_invalidations.lock().unwrap();
+        while page_offset < end {
+            state.forget_fuse_page_fill(ino, page_offset);
+            page_offset = page_offset.saturating_add(page_size);
+        }
+    }
+
+    fn invalidate_fuse_read_cache_range(&self, ino: u64, offset: u64, length: u64) {
+        if length == 0 {
+            return;
+        }
+        if let Some(ref rd) = self.fuse_read_dispatch {
+            let page_size = rd.page_cache().page_size() as u64;
+            let end = offset.saturating_add(length);
+            rd.page_cache().invalidate_range(ino, offset, end);
+            self.forget_fuse_read_cache_range(ino, offset, length, page_size);
+        }
+    }
+
+    fn invalidate_fuse_read_cache_inode(&self, ino: u64) {
+        if let Some(ref rd) = self.fuse_read_dispatch {
+            rd.page_cache().remove_pages_for_inode(ino);
+        }
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .fuse_page_generations
+            .retain(|(page_ino, _), _| *page_ino != ino);
+    }
+
+    fn fuse_read_cache_hit_range_still_current(
+        &self,
+        rd: &FuseReadDispatch,
+        ino: u64,
+        offset: u64,
+        length: u64,
+    ) -> bool {
+        if length == 0 {
+            return true;
+        }
+        let page_size = rd.page_cache().page_size() as u64;
+        if page_size == 0 {
+            return false;
+        }
+        let end = offset.saturating_add(length);
+        let mut page_offset = (offset / page_size) * page_size;
+        while page_offset < end {
+            let page_present = rd.page_cache().lookup(ino, page_offset).is_some();
+            if page_present {
+                let page_current = self
+                    .data_cache_invalidations
+                    .lock()
+                    .unwrap()
+                    .fuse_page_allows_range(ino, page_offset, page_size);
+                if !page_current {
+                    rd.page_cache().invalidate_range(
+                        ino,
+                        page_offset,
+                        page_offset.saturating_add(page_size),
+                    );
+                    self.data_cache_invalidations
+                        .lock()
+                        .unwrap()
+                        .forget_fuse_page_fill(ino, page_offset);
+                    return false;
+                }
+            }
+            page_offset = page_offset.saturating_add(page_size);
+        }
+        true
+    }
+
     /// Best-effort kernel dentry invalidation with inotify notification
     /// for file deletion (`FUSE_NOTIFY_DELETE`).
     ///
@@ -3825,6 +4117,18 @@ impl FuseVfsAdapter {
             ctx,
             &mount_identity,
         )?;
+        let overwritten_target_attr = if flags
+            & tidefs_types_posix_filesystem_adapter_core::rename_flags::RENAME_EXCHANGE
+            == 0
+        {
+            match engine.lookup(new_parent, newname, ctx) {
+                Ok(attr) => Some(attr),
+                Err(Errno::ENOENT) => None,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         let result = self
             .rename_dispatch
             .dispatch_engine_with_flags(EngineRenameRequest {
@@ -3842,6 +4146,23 @@ impl FuseVfsAdapter {
 
         self.invalidate_inode_metadata_after_engine_write(parent);
         self.invalidate_inode_metadata_after_engine_write(newparent);
+        if result.is_ok() {
+            if let Some(overwritten) = overwritten_target_attr {
+                let overwritten_ino = overwritten.inode_id.get();
+                if overwritten.posix.nlink <= 1
+                    && self
+                        .file_handles
+                        .lock()
+                        .unwrap()
+                        .open_ref_count(overwritten_ino)
+                        == 0
+                {
+                    self.invalidate_caches_after_inode_data_unreachable(overwritten_ino);
+                } else {
+                    self.invalidate_inode_metadata_after_engine_write(overwritten_ino);
+                }
+            }
+        }
 
         result
     }
@@ -4241,6 +4562,8 @@ impl FuseVfsAdapter {
                         .insert(child_inode_for_delete.get(), entry);
                 }
             }
+        } else if child_attr.posix.nlink <= 1 {
+            self.invalidate_caches_after_inode_data_unreachable(child_inode_for_delete.get());
         }
 
         Ok(())
@@ -4813,6 +5136,8 @@ impl FuseVfsAdapter {
                 if new_sz < old_sz {
                     self.clear_dirty_for_deallocate_range(ino, new_sz, old_sz - new_sz)?;
                     data_invalidation_range = Some((new_sz, old_sz - new_sz));
+                } else if new_sz > old_sz {
+                    data_invalidation_range = Some((old_sz, new_sz - old_sz));
                 }
             } else {
                 // Path-based truncate (no open file handle): open, truncate, release.
@@ -4824,6 +5149,8 @@ impl FuseVfsAdapter {
                 if result.is_ok() && new_sz < current_size {
                     self.clear_dirty_for_deallocate_range(ino, new_sz, current_size - new_sz)?;
                     data_invalidation_range = Some((new_sz, current_size - new_sz));
+                } else if result.is_ok() && new_sz > current_size {
+                    data_invalidation_range = Some((current_size, new_sz - current_size));
                 }
                 let _ = e.release(&efh);
                 result?;
@@ -5473,6 +5800,8 @@ impl FuseVfsAdapter {
                 return Err(Errno::EINVAL);
             }
         }
+        let read_snapshot =
+            self.data_cache_generation_snapshot(ino, plan.offset, u64::from(plan.size));
         // ── fuse_read dispatch path (issue #3574) ────────────────────────
         //
         // When a FuseReadDispatch is configured, probe the PageCache
@@ -5484,7 +5813,14 @@ impl FuseVfsAdapter {
             if let Some(ref rd) = self.fuse_read_dispatch {
                 let page_size = rd.page_cache().page_size() as u64;
                 let probe_page = (plan.offset / page_size) * page_size;
-                if rd.page_cache().lookup(ino, probe_page).is_some() {
+                if rd.page_cache().lookup(ino, probe_page).is_some()
+                    && self.fuse_read_cache_hit_range_still_current(
+                        rd,
+                        ino,
+                        plan.offset,
+                        u64::from(plan.size),
+                    )
+                {
                     let file_size = {
                         let e = self.engine.lock().unwrap();
                         e.getattr(InodeId::new(ino), None, ctx)
@@ -5519,16 +5855,20 @@ impl FuseVfsAdapter {
         // volume adapter if available) and fills the cache after.
 
         if !fuse_direct_io && !writeback_write_only_cache_fill {
-            let cached = self
-                .page_cache
-                .lock()
-                .ok()
-                .and_then(|cache| cache.get_range(ino, plan.offset, plan.size));
-            if let Some(data) = cached {
-                if !data.is_empty() {
-                    self.finish_successful_read_atime(ino, ctx);
+            if self.read_cache_hit_still_current(ino, plan.offset, u64::from(plan.size)) {
+                let cached = self
+                    .page_cache
+                    .lock()
+                    .ok()
+                    .and_then(|cache| cache.get_range(ino, plan.offset, plan.size));
+                if let Some(data) = cached {
+                    if !data.is_empty() {
+                        self.finish_successful_read_atime(ino, ctx);
+                    }
+                    return Ok(data);
                 }
-                return Ok(data);
+            } else {
+                self.invalidate_read_cache_entry(ino);
             }
         }
 
@@ -5649,7 +5989,19 @@ impl FuseVfsAdapter {
             // If a FuseReadDispatch is configured, populate its
             // PageCache with the data just read from the engine.
             if let Some(ref rd) = self.fuse_read_dispatch {
-                rd.populate_cache(ino, plan.offset, &engine_data);
+                let fill_len = engine_data.len() as u64;
+                if self.data_cache_snapshot_still_current(ino, plan.offset, fill_len, read_snapshot)
+                {
+                    self.invalidate_fuse_read_cache_range(ino, plan.offset, fill_len);
+                    rd.populate_cache(ino, plan.offset, &engine_data);
+                    self.record_fuse_read_cache_fill(
+                        ino,
+                        plan.offset,
+                        fill_len,
+                        rd.page_cache().page_size() as u64,
+                        read_snapshot,
+                    );
+                }
             }
             if plan.offset == 0 && !engine_data.is_empty() {
                 let whole_file_size = {
@@ -5661,10 +6013,13 @@ impl FuseVfsAdapter {
                 if let Some(file_size) = whole_file_size {
                     let read_covers_whole_file =
                         engine_data.len() as u64 == file_size && plan.size as u64 >= file_size;
-                    if read_covers_whole_file {
+                    if read_covers_whole_file
+                        && self.data_cache_snapshot_still_current(ino, 0, file_size, read_snapshot)
+                    {
                         if let Ok(mut cache) = self.page_cache.lock() {
                             if cache.can_admit_len(engine_data.len()) {
                                 cache.insert(ino, engine_data.clone());
+                                self.record_read_cache_fill(ino, read_snapshot);
                             }
                             drop(cache);
                         }
@@ -5682,9 +6037,27 @@ impl FuseVfsAdapter {
                     // Sequential read: pre-fetch next pages
                     let ra_offset = plan.offset + plan.size as u64;
                     if let Some(ref rd) = self.fuse_read_dispatch {
+                        let ra_snapshot =
+                            self.data_cache_generation_snapshot(ino, ra_offset, u64::from(ra_size));
                         let e = self.engine.lock().unwrap();
                         if let Ok(ra_data) = e.read(&engine_fh, ra_offset, ra_size, ctx) {
-                            rd.populate_cache(ino, ra_offset, &ra_data);
+                            let fill_len = ra_data.len() as u64;
+                            if self.data_cache_snapshot_still_current(
+                                ino,
+                                ra_offset,
+                                fill_len,
+                                ra_snapshot,
+                            ) {
+                                self.invalidate_fuse_read_cache_range(ino, ra_offset, fill_len);
+                                rd.populate_cache(ino, ra_offset, &ra_data);
+                                self.record_fuse_read_cache_fill(
+                                    ino,
+                                    ra_offset,
+                                    fill_len,
+                                    rd.page_cache().page_size() as u64,
+                                    ra_snapshot,
+                                );
+                            }
                         }
                     }
                     true
@@ -5950,7 +6323,11 @@ impl FuseVfsAdapter {
                                         // read-after-write; flush/fsync/close publish
                                         // it instead of forcing every O_DIRECT write
                                         // through a committed-root cycle.
-                                        self.invalidate_caches_after_direct_write(ino);
+                                        self.invalidate_caches_after_direct_write(
+                                            ino,
+                                            effective_offset as u64,
+                                            u64::from(written),
+                                        );
                                     } else if clean_writeback_write_through && !sparse_zero_noop {
                                         self.record_clean_write_through_after_write(
                                             ino,
@@ -6137,7 +6514,11 @@ impl FuseVfsAdapter {
                                     // read-after-write; flush/fsync/close publish
                                     // it instead of forcing every O_DIRECT write
                                     // through a committed-root cycle.
-                                    self.invalidate_caches_after_direct_write(ino);
+                                    self.invalidate_caches_after_direct_write(
+                                        ino,
+                                        effective_offset as u64,
+                                        u64::from(written),
+                                    );
                                 } else if clean_plain_write_through {
                                     let written_len =
                                         usize::try_from(written).map_err(|_| Errno::EIO)?;
@@ -6246,18 +6627,8 @@ impl FuseVfsAdapter {
     /// O_DIRECT bypasses page-cache/writeback staging but still changes
     /// engine-visible file bytes and possibly size. Readers through another
     /// handle must not observe stale cached data.
-    fn invalidate_caches_after_direct_write(&self, ino: u64) {
-        if let Ok(mut cache) = self.page_cache.lock() {
-            cache.invalidate(ino);
-        }
-        if let Some(ref rd) = self.fuse_read_dispatch {
-            rd.page_cache().remove_pages_for_inode(ino);
-        }
-        {
-            let mut cache = self.getattr_cache.lock().unwrap();
-            cache.remove(&ino);
-        }
-        self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
+    fn invalidate_caches_after_direct_write(&self, ino: u64, offset: u64, length: u64) {
+        self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
     }
 
     /// Invalidate daemon read-side caches after an engine mutation changes
@@ -6267,17 +6638,39 @@ impl FuseVfsAdapter {
             return;
         }
         let end = offset.saturating_add(length);
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .invalidate_range(ino, offset, length);
         if let Some(ref wb_cache) = self.writeback_page_cache {
             wb_cache.invalidate_range(ino, offset, end);
         }
         self.write_page_cache.invalidate_range(ino, offset, end);
-        if let Ok(mut cache) = self.page_cache.lock() {
-            cache.invalidate(ino);
+        self.invalidate_read_cache_entry(ino);
+        self.invalidate_fuse_read_cache_range(ino, offset, length);
+        self.invalidate_inode_metadata_after_engine_write(ino);
+        self.try_inval_inode_range(ino, offset, length);
+    }
+
+    fn invalidate_caches_after_inode_data_unreachable(&self, ino: u64) {
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .invalidate_inode(ino);
+        self.invalidate_read_cache_entry(ino);
+        self.invalidate_fuse_read_cache_inode(ino);
+        let writeback_cache_aliases_write_page_cache = self
+            .writeback_page_cache
+            .as_ref()
+            .is_some_and(|wb_cache| Arc::ptr_eq(wb_cache, &self.write_page_cache));
+        if let Some(ref wb_cache) = self.writeback_page_cache {
+            let _ = wb_cache.unlink_invalidate(ino);
         }
-        if let Some(ref rd) = self.fuse_read_dispatch {
-            rd.page_cache().invalidate_range(ino, offset, end);
+        if !writeback_cache_aliases_write_page_cache {
+            let _ = self.write_page_cache.unlink_invalidate(ino);
         }
-        self.invalidate_inode_metadata_local(ino);
+        self.invalidate_inode_metadata_after_engine_write(ino);
+        self.try_inval_inode(ino);
     }
 
     /// Track dirty pages after a write: update writeback scheduler,
@@ -6314,6 +6707,10 @@ impl FuseVfsAdapter {
         let mut ds = self.dirty_state.lock().unwrap();
         ds.entry(ino).or_default().mark_dirty(offset, written);
         drop(ds);
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .invalidate_range(ino, offset, u64::from(written));
         let writeback_cache_aliases_write_page_cache = self
             .writeback_page_cache
             .as_ref()
@@ -6330,22 +6727,10 @@ impl FuseVfsAdapter {
                 pos = pos.saturating_add(page_size);
             }
         }
-        // Invalidate the read cache: writes change file contents
-        if let Ok(mut cache) = self.page_cache.lock() {
-            cache.invalidate(ino);
-        }
-        // Invalidate the FuseReadDispatch PageCache so a read through a
-        // different file handle does not return stale cached pages.
-        // This enforces close-to-open consistency at the daemon level.
-        if let Some(ref rd) = self.fuse_read_dispatch {
-            rd.page_cache().remove_pages_for_inode(ino);
-        }
-        // Invalidate the getattr cache: size may have changed
-        {
-            let mut cache = self.getattr_cache.lock().unwrap();
-            cache.remove(&ino);
-        }
-        self.path_lookup_cache.lock().unwrap().remove_by_ino(ino);
+        self.invalidate_read_cache_entry(ino);
+        self.invalidate_fuse_read_cache_range(ino, offset, u64::from(written));
+        self.invalidate_inode_metadata_after_engine_write(ino);
+        self.try_inval_inode_range(ino, offset, u64::from(written));
 
         // Mark dirty pages in the writeback PageCache so
         // flush/fsync can iterate them for writeback.
@@ -6432,15 +6817,8 @@ impl FuseVfsAdapter {
             return Ok(());
         }
 
-        if let Ok(mut cache) = self.page_cache.lock() {
-            cache.invalidate(ino);
-        }
-        if let Some(ref rd) = self.fuse_read_dispatch {
-            rd.page_cache().remove_pages_for_inode(ino);
-        }
-        self.invalidate_inode_metadata_local(ino);
-
         let length = u64::from(written);
+        self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
         let has_dirty_overlap = self.dirty_trackers_overlap_range(ino, offset, length)
             || self.dirty_page_caches_overlap_range(ino, offset, length);
         if has_dirty_overlap {
@@ -7320,6 +7698,9 @@ impl FuseVfsAdapter {
         let engine_start = std::time::Instant::now();
         let is_hole_or_zero =
             (mode & FALLOC_FL_PUNCH_HOLE) != 0 || (mode & FALLOC_FL_ZERO_RANGE) != 0;
+        let is_collapse = (mode & FALLOC_FL_COLLAPSE_RANGE) != 0;
+        let is_insert = (mode & FALLOC_FL_INSERT_RANGE) != 0;
+        let old_size = attr.posix.size;
         if diagnostic {
             eprintln!(
                 "tidefs-diagnostic: fuse fallocate engine start ino={} fh={} engine_fh={} mode=0x{:x} offset={} length={}",
@@ -7367,6 +7748,32 @@ impl FuseVfsAdapter {
                     );
                 }
                 self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
+            } else if is_collapse || is_insert {
+                let suffix_end = if is_insert {
+                    old_size.saturating_add(length)
+                } else {
+                    old_size
+                };
+                if suffix_end > offset {
+                    self.invalidate_caches_after_engine_data_mutation(
+                        ino,
+                        offset,
+                        suffix_end - offset,
+                    );
+                } else {
+                    self.invalidate_inode_metadata_after_engine_write(ino);
+                }
+            } else if mode & FALLOC_FL_KEEP_SIZE == 0 {
+                let end = offset.saturating_add(length);
+                if end > old_size {
+                    self.invalidate_caches_after_engine_data_mutation(
+                        ino,
+                        old_size,
+                        end - old_size,
+                    );
+                } else {
+                    self.invalidate_inode_metadata_after_engine_write(ino);
+                }
             } else {
                 self.invalidate_inode_metadata_after_engine_write(ino);
             }
@@ -7448,6 +7855,8 @@ impl FuseVfsAdapter {
         if result.is_ok() && size < old_size {
             self.clear_dirty_for_deallocate_range(ino, size, old_size - size)?;
             self.invalidate_caches_after_engine_data_mutation(ino, size, old_size - size);
+        } else if result.is_ok() && size > old_size {
+            self.invalidate_caches_after_engine_data_mutation(ino, old_size, size - old_size);
         } else if result.is_ok() {
             self.invalidate_inode_metadata_after_engine_write(ino);
         }
@@ -7485,6 +7894,12 @@ impl FuseVfsAdapter {
         if result.is_ok() && size < current_size {
             self.clear_dirty_for_deallocate_range(ino, size, current_size - size)?;
             self.invalidate_caches_after_engine_data_mutation(ino, size, current_size - size);
+        } else if result.is_ok() && size > current_size {
+            self.invalidate_caches_after_engine_data_mutation(
+                ino,
+                current_size,
+                size - current_size,
+            );
         } else if result.is_ok() {
             self.invalidate_inode_metadata_after_engine_write(ino);
         }
@@ -7800,9 +8215,7 @@ impl FuseVfsAdapter {
 
         // Invalidate the page cache unless the kernel asked to keep it.
         if !keep_cache {
-            if let Ok(mut cache) = self.page_cache.lock() {
-                cache.invalidate(ino);
-            }
+            self.invalidate_read_cache_entry(ino);
         }
 
         // Decrement the open-reference count and detect last-close.
@@ -7876,6 +8289,7 @@ impl FuseVfsAdapter {
                     let entry =
                         OrphanEntry::new(ino, attrs.generation.get(), 0, OrphanEntryFlags::NONE);
                     self.orphan_index.lock().unwrap().insert(ino, entry);
+                    self.invalidate_caches_after_inode_data_unreachable(ino);
                 }
             }
         }
@@ -10041,14 +10455,7 @@ impl Filesystem for FuseVfsAdapter {
         }
     }
 
-    fn bmap(
-        &mut self,
-        req: &Request<'_>,
-        ino: u64,
-        _blocksize: u32,
-        _idx: u64,
-        reply: ReplyBmap,
-    ) {
+    fn bmap(&mut self, req: &Request<'_>, ino: u64, _blocksize: u32, _idx: u64, reply: ReplyBmap) {
         let _p5_02 = Self::classify_fuse_bmap(req.unique(), ino, req.uid(), req.gid(), req.pid());
         reply.reply_errno(unsupported_vfs_bmap_errno());
     }
@@ -10562,9 +10969,9 @@ mod tests {
     };
     use tidefs_local_object_store::StoreOptions;
     use tidefs_types_vfs_core::{
-        DirHandleId, Generation, InodeFlags, PosixAttrs, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
-        FALLOC_FL_ZERO_RANGE, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFIFO, S_IFLNK, S_IFREG,
-        XATTR_CREATE, XATTR_REPLACE,
+        DirHandleId, Generation, InodeFlags, PosixAttrs, FALLOC_FL_COLLAPSE_RANGE,
+        FALLOC_FL_INSERT_RANGE, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
+        RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFIFO, S_IFLNK, S_IFREG, XATTR_CREATE, XATTR_REPLACE,
     };
 
     const VALID_MOUNT: MountIdentity = MountIdentity::new([0x41; 16], 1);
@@ -13736,6 +14143,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unlink_while_open_fences_data_only_on_last_close() {
+        let mut fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let root = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine.get_root_inode(&ctx).expect("root inode")
+        };
+        let create = fixture
+            .adapter
+            .dispatch_create_entry(
+                &ctx,
+                root.get(),
+                b"unlink-open-cache.bin",
+                0o644,
+                libc::O_RDWR as u32,
+            )
+            .expect("create open file");
+        let ino = create.attr.inode_id.get();
+        let open_snapshot = fixture.adapter.data_cache_generation_snapshot(ino, 0, 4096);
+        let dentry_generation_before_unlink = fixture
+            .adapter
+            .dentry_invalidations
+            .lock()
+            .unwrap()
+            .entry_generation(root.get(), b"unlink-open-cache.bin")
+            .unwrap_or(0);
+
+        fixture
+            .adapter
+            .dispatch_unlink_entry(&ctx, root.get(), b"unlink-open-cache.bin")
+            .expect("unlink while open");
+
+        let dentry_generation_after_unlink = fixture
+            .adapter
+            .dentry_invalidations
+            .lock()
+            .unwrap()
+            .entry_generation(root.get(), b"unlink-open-cache.bin")
+            .unwrap_or(0);
+        assert!(
+            dentry_generation_after_unlink > dentry_generation_before_unlink,
+            "unlink must invalidate the removed dentry"
+        );
+        assert!(
+            fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 0, 4096, open_snapshot),
+            "open-unlink keeps data cache valid through the live handle"
+        );
+
+        fixture
+            .adapter
+            .dispatch_release(ino, create.adapter_fh, 0, None, false)
+            .expect("release last open handle");
+
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 0, 4096, open_snapshot),
+            "orphan last close must fence the now-unreachable inode data"
+        );
+    }
+
     // ── dispatch_link_entry additional error-path tests ────────────────
 
     #[test]
@@ -14535,6 +15006,65 @@ mod tests {
             dentry.parent_generation(root.get()),
             Some(1),
             "new parent must be invalidated"
+        );
+    }
+
+    #[test]
+    fn rename_overwrite_fences_target_data_but_not_source_data() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (root, source_ino, target_ino) = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            let root = engine.get_root_inode(&ctx).expect("root inode");
+            let (source, source_fh) = engine
+                .create(root, b"rename-cache-src", 0o644, libc::O_RDWR as u32, &ctx)
+                .expect("create source");
+            engine
+                .write(&source_fh, 0, b"source bytes", &ctx)
+                .expect("write source");
+            engine.release(&source_fh).expect("release source");
+            let (target, target_fh) = engine
+                .create(root, b"rename-cache-dst", 0o644, libc::O_RDWR as u32, &ctx)
+                .expect("create target");
+            engine
+                .write(&target_fh, 0, b"target bytes", &ctx)
+                .expect("write target");
+            engine.release(&target_fh).expect("release target");
+            (root, source.inode_id.get(), target.inode_id.get())
+        };
+        let source_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(source_ino, 0, 4096);
+        let target_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(target_ino, 0, 4096);
+
+        fixture
+            .adapter
+            .dispatch_rename_entry(
+                &ctx,
+                root.get(),
+                b"rename-cache-src",
+                root.get(),
+                b"rename-cache-dst",
+                0,
+            )
+            .expect("rename over target");
+
+        assert!(
+            fixture
+                .adapter
+                .data_cache_snapshot_still_current(source_ino, 0, 4096, source_snapshot,),
+            "rename overwrite must not fence the source inode data"
+        );
+        assert!(
+            !fixture.adapter.data_cache_snapshot_still_current(
+                target_ino,
+                0,
+                4096,
+                target_snapshot,
+            ),
+            "rename overwrite must fence the overwritten target inode data"
         );
     }
 
@@ -17023,6 +17553,178 @@ mod tests {
                 .get_dirty_ranges(ino)
                 .is_empty(),
             "punch-hole must clear worker writeback dirty range"
+        );
+    }
+
+    #[test]
+    fn truncate_shrink_and_grow_advance_overlapping_data_cache_fences() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"truncate-data-cache-fence.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, &[0x44; 4096], &ctx)
+                .expect("seed file before truncate");
+        }
+
+        let prefix_snapshot = fixture.adapter.data_cache_generation_snapshot(ino, 0, 512);
+        let tail_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, 3072, 512);
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 2048)
+            .expect("truncate shrink");
+        assert!(
+            fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 0, 512, prefix_snapshot),
+            "truncate shrink should not fence an unaffected prefix range"
+        );
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 3072, 512, tail_snapshot),
+            "truncate shrink must fence the removed tail range"
+        );
+
+        let grow_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, 3072, 512);
+        fixture
+            .adapter
+            .dispatch_ftruncate_file(&ctx, ino, adapter_fh, 4096)
+            .expect("truncate grow");
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 3072, 512, grow_snapshot),
+            "truncate grow must fence the newly exposed zero range"
+        );
+    }
+
+    #[test]
+    fn fallocate_data_mutations_advance_range_and_suffix_fences() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"fallocate-data-cache-fence.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, &[0x77; 8192], &ctx)
+                .expect("seed file before fallocate");
+        }
+
+        let zero_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, 1024, 512);
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE,
+                1024,
+                512,
+            )
+            .expect("zero range");
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 1024, 512, zero_snapshot),
+            "zero range must fence the zeroed byte range"
+        );
+
+        let punch_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, 4096, 512);
+        fixture
+            .adapter
+            .dispatch_fallocate_file(
+                &ctx,
+                ino,
+                adapter_fh,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                4096,
+                512,
+            )
+            .expect("punch hole");
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 4096, 512, punch_snapshot),
+            "punch hole must fence the punched byte range"
+        );
+
+        let collapse_prefix = fixture.adapter.data_cache_generation_snapshot(ino, 0, 512);
+        let collapse_suffix = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, 4096, 512);
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, FALLOC_FL_COLLAPSE_RANGE, 2048, 1024)
+            .expect("collapse range");
+        assert!(
+            fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 0, 512, collapse_prefix),
+            "collapse range should not fence bytes before the collapse offset"
+        );
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 4096, 512, collapse_suffix),
+            "collapse range must fence the shifted suffix"
+        );
+
+        let insert_suffix = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, 4096, 512);
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, FALLOC_FL_INSERT_RANGE, 2048, 1024)
+            .expect("insert range");
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 4096, 512, insert_suffix),
+            "insert range must fence the shifted suffix"
+        );
+
+        let old_size = {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .getattr(inode, Some(&engine_fh), &ctx)
+                .expect("getattr before extending fallocate")
+                .posix
+                .size
+        };
+        let extend_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, old_size, 512);
+        fixture
+            .adapter
+            .dispatch_fallocate_file(&ctx, ino, adapter_fh, 0, old_size, 512)
+            .expect("extending fallocate");
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, old_size, 512, extend_snapshot),
+            "extending fallocate must fence the newly exposed range"
         );
     }
 
@@ -32138,6 +32840,54 @@ mod tests {
     }
 
     #[test]
+    fn forget_refcount_zero_does_not_invalidate_page_data() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode_id, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"forget-data-cache.txt",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode_id.get();
+        let snapshot = fixture.adapter.data_cache_generation_snapshot(ino, 0, 4096);
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert dirty page mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup dirty page mirror");
+            page.data_mut()[..11].copy_from_slice(b"dirty bytes");
+            page.mark_dirty();
+        }
+
+        fixture.adapter.bump_forget_refcount(ino);
+        assert!(
+            fixture.adapter.dispatch_forget(ino, 1),
+            "lookup refcount should reach zero"
+        );
+
+        assert!(
+            fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 0, 4096, snapshot),
+            "FUSE forget must not advance the page-data generation"
+        );
+        let page = fixture
+            .adapter
+            .write_page_cache
+            .lookup(ino, 0)
+            .expect("forget must preserve dirty page data");
+        assert!(page.is_dirty(), "forget must not clean dirty page data");
+        assert_eq!(&page.data()[..11], b"dirty bytes");
+    }
+
+    #[test]
     fn forget_refcount_independent_inodes() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -40296,6 +41046,63 @@ mod tests {
             data, pattern,
             "buffered read must see direct-io written data"
         );
+    }
+
+    #[test]
+    fn direct_io_write_fences_stale_legacy_read_cache_fill() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"direct-stale-read-cache.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let original = vec![0x11; 4096];
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, &original, &ctx)
+                .expect("seed original data");
+        }
+
+        let first = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0, original.len() as u32, None)
+            .expect("initial buffered read fills cache");
+        assert_eq!(first, original);
+        let stale_snapshot = fixture.adapter.data_cache_generation_snapshot(ino, 0, 512);
+
+        let direct_open = fixture
+            .adapter
+            .dispatch_open_entry(&ctx, ino, libc::O_RDWR as u32 | libc::O_DIRECT as u32)
+            .expect("open direct I/O writer");
+        let replacement = vec![0xAA; 512];
+        let written = fixture
+            .adapter
+            .dispatch_write(&ctx, ino, direct_open.adapter_fh, 0, &replacement, 0)
+            .expect("direct I/O overwrite");
+        assert_eq!(written, replacement.len() as u32);
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 0, 512, stale_snapshot),
+            "direct I/O write must advance the overlapping data-cache fence"
+        );
+
+        {
+            let mut cache = fixture.adapter.page_cache.lock().unwrap();
+            cache.insert(ino, original.clone());
+        }
+        fixture.adapter.record_read_cache_fill(ino, stale_snapshot);
+
+        let after = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0, original.len() as u32, None)
+            .expect("buffered read after stale cache reinsertion");
+        assert_eq!(&after[..replacement.len()], replacement.as_slice());
+        assert_eq!(&after[replacement.len()..], &original[replacement.len()..]);
     }
 
     #[test]
