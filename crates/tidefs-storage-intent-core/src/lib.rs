@@ -61,6 +61,9 @@ pub const STORAGE_INTENT_RECORD_VERSION: u16 = 1;
 /// Bounded evidence fan-in carried inline by a policy or receipt.
 pub const STORAGE_INTENT_INLINE_EVIDENCE_REFS: usize = 16;
 
+/// Bounded per-family freshness fan-in carried by an evidence query snapshot.
+pub const STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES: usize = StorageIntentEvidenceKind::COUNT;
+
 /// A compiled policy identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -440,6 +443,13 @@ impl StorageIntentEvidenceRef {
             version,
         }
     }
+
+    /// Returns true when this ref names a concrete non-empty artifact.
+    #[must_use]
+    pub const fn is_bound(self) -> bool {
+        self.kind as u16 != StorageIntentEvidenceKind::Unknown as u16
+            && !bytes32_are_zero(self.id.0)
+    }
 }
 
 /// Bounded inline evidence reference set.
@@ -535,17 +545,153 @@ pub enum EvidenceConsumerClass {
     ClaimGate = 8,
 }
 
+impl EvidenceConsumerClass {
+    /// Returns true when this consumer may change authority, claims, or proof state.
+    #[must_use]
+    pub const fn requires_complete_authority_cut(self) -> bool {
+        matches!(
+            self,
+            Self::Planner
+                | Self::Reconciler
+                | Self::ActionExecutor
+                | Self::MeasurementAttribution
+                | Self::PerformanceGate
+                | Self::FaultGate
+                | Self::ClaimGate
+        )
+    }
+}
+
+/// Request context that one evidence query snapshot answers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum EvidenceQueryContextClass {
+    #[default]
+    Unknown = 0,
+    RequestAdmission = 1,
+    ActionAdmission = 2,
+    ReadServing = 3,
+    CacheOnlyRead = 4,
+    Validation = 5,
+    OperatorExplanation = 6,
+    PerformanceRow = 7,
+    FaultRow = 8,
+    Claim = 9,
+    PrefetchResidency = 10,
+    MeasurementAttribution = 11,
+}
+
+/// Subject scope described by one evidence query snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum EvidenceQuerySubjectScopeClass {
+    #[default]
+    Unknown = 0,
+    Request = 1,
+    Action = 2,
+    ObjectRange = 3,
+    Dataset = 4,
+    Pool = 5,
+    Domain = 6,
+    Cluster = 7,
+    ValidationArtifact = 8,
+    Claim = 9,
+}
+
+/// Subject identity for one evidence query snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct EvidenceQuerySubjectScope {
+    pub scope_class: EvidenceQuerySubjectScopeClass,
+    pub object_scope: StorageIntentObjectScope,
+    pub pool_id: StorageIntentDomainId,
+    pub domain_id: StorageIntentDomainId,
+    pub request_ref: StorageIntentEvidenceRef,
+    pub action_ref: StorageIntentEvidenceRef,
+    pub validation_ref: StorageIntentEvidenceRef,
+}
+
 /// Completeness verdict for one lawful evidence cut.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[repr(u8)]
 pub enum EvidenceCompletenessVerdict {
     #[default]
-    Complete = 0,
-    Partial = 1,
-    Stale = 2,
-    Contradictory = 3,
-    Refused = 4,
+    UnknownEvidence = 0,
+    CompleteForPurpose = 1,
+    PartialAdmissible = 2,
+    DegradedVisible = 3,
+    Blocked = 4,
+    Refused = 5,
+    UnsafeVisible = 6,
+}
+
+impl EvidenceCompletenessVerdict {
+    /// Returns true when the cut is exact enough to change authority or claims.
+    #[must_use]
+    pub const fn is_complete_for_authority(self) -> bool {
+        matches!(self, Self::CompleteForPurpose)
+    }
+
+    /// Returns true when the cut may be shown but must not change authority.
+    #[must_use]
+    pub const fn is_visible_non_authority(self) -> bool {
+        matches!(self, Self::PartialAdmissible | Self::DegradedVisible)
+    }
+
+    /// Returns true when the verdict must block all authority-changing use.
+    #[must_use]
+    pub const fn blocks_authority(self) -> bool {
+        matches!(
+            self,
+            Self::UnknownEvidence | Self::Blocked | Self::Refused | Self::UnsafeVisible
+        )
+    }
+}
+
+/// Freshness state for one evidence family inside a query snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum EvidenceFamilyFreshnessState {
+    #[default]
+    Unknown = 0,
+    Fresh = 1,
+    Missing = 2,
+    Stale = 3,
+    Contradictory = 4,
+    Superseded = 5,
+    Redacted = 6,
+    Compacted = 7,
+    Unavailable = 8,
+    Refused = 9,
+}
+
+impl EvidenceFamilyFreshnessState {
+    /// Returns true when this family can support authority-changing decisions.
+    #[must_use]
+    pub const fn is_fresh_for_authority(self) -> bool {
+        matches!(self, Self::Fresh)
+    }
+
+    /// Returns true when this family cannot be silently consumed as authority.
+    #[must_use]
+    pub const fn blocks_authority(self) -> bool {
+        matches!(
+            self,
+            Self::Unknown
+                | Self::Missing
+                | Self::Stale
+                | Self::Contradictory
+                | Self::Superseded
+                | Self::Redacted
+                | Self::Compacted
+                | Self::Unavailable
+                | Self::Refused
+        )
+    }
 }
 
 /// Retention class for exact or summarized evidence.
@@ -564,36 +710,313 @@ pub enum EvidenceRetentionClass {
     Purgeable = 3,
 }
 
+/// Freshness and replay metadata for one evidence family in a query snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct EvidenceFamilyFreshness {
+    pub kind: StorageIntentEvidenceKind,
+    pub state: EvidenceFamilyFreshnessState,
+    pub source_index_generation: u64,
+    pub producer_generation: u64,
+    pub freshness_frontier_ms: u64,
+    pub allowed_staleness_ms: u64,
+    pub evidence_ref: StorageIntentEvidenceRef,
+}
+
+impl EvidenceFamilyFreshness {
+    pub const EMPTY: Self = Self {
+        kind: StorageIntentEvidenceKind::Unknown,
+        state: EvidenceFamilyFreshnessState::Unknown,
+        source_index_generation: 0,
+        producer_generation: 0,
+        freshness_frontier_ms: 0,
+        allowed_staleness_ms: 0,
+        evidence_ref: StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::Unknown,
+            id: StorageIntentEvidenceId::ZERO,
+            generation: 0,
+            version: 0,
+        },
+    };
+}
+
+impl Default for EvidenceFamilyFreshness {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+/// Bounded freshness table for families used by one evidence query snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct EvidenceFamilyFreshnessSet {
+    len: u8,
+    families: [EvidenceFamilyFreshness; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES],
+}
+
+impl EvidenceFamilyFreshnessSet {
+    pub const EMPTY: Self = Self {
+        len: 0,
+        families: [EvidenceFamilyFreshness::EMPTY; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES],
+    };
+
+    /// Return the backing array and valid length.
+    #[must_use]
+    pub const fn as_parts(
+        &self,
+    ) -> (
+        &[EvidenceFamilyFreshness; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES],
+        u8,
+    ) {
+        (&self.families, self.len)
+    }
+
+    /// Append a family freshness row if capacity remains.
+    pub fn push(&mut self, family: EvidenceFamilyFreshness) -> Result<(), EvidenceRefsError> {
+        if self.len as usize >= STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES {
+            return Err(EvidenceRefsError::Full);
+        }
+        self.families[self.len as usize] = family;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Returns true when a family row exists for the given kind.
+    #[must_use]
+    pub const fn contains_kind(&self, kind: StorageIntentEvidenceKind) -> bool {
+        let mut index = 0;
+        while index < self.len as usize {
+            if self.families[index].kind as u16 == kind as u16 {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// Return the recorded state for one family, or `Unknown` when absent.
+    #[must_use]
+    pub const fn state_for_kind(
+        &self,
+        kind: StorageIntentEvidenceKind,
+    ) -> EvidenceFamilyFreshnessState {
+        let mut index = 0;
+        while index < self.len as usize {
+            if self.families[index].kind as u16 == kind as u16 {
+                return self.families[index].state;
+            }
+            index += 1;
+        }
+        EvidenceFamilyFreshnessState::Unknown
+    }
+
+    /// Returns true when the family is explicitly fresh for authority use.
+    #[must_use]
+    pub const fn family_is_fresh_for_authority(&self, kind: StorageIntentEvidenceKind) -> bool {
+        self.state_for_kind(kind).is_fresh_for_authority()
+    }
+}
+
+impl Default for EvidenceFamilyFreshnessSet {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// One bounded, lawful evidence cut for a consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct StorageIntentEvidenceQuerySnapshot {
+    pub snapshot_id: StorageIntentEvidenceId,
     pub query_id: StorageIntentEvidenceId,
     pub consumer: EvidenceConsumerClass,
+    pub context: EvidenceQueryContextClass,
+    pub subject: EvidenceQuerySubjectScope,
     pub policy_id: StorageIntentPolicyId,
     pub policy_revision: StorageIntentPolicyRevision,
+    pub temporal_frontier_ms: u64,
     pub freshness_frontier_ms: u64,
+    pub allowed_staleness_ms: u64,
+    pub source_catalog_ref: StorageIntentEvidenceRef,
+    pub source_index_ref: StorageIntentEvidenceRef,
     pub source_index_generation: u64,
+    pub producer_generation: u64,
+    pub producer_watermark_ms: u64,
+    pub compaction_generation: u64,
+    pub redaction_generation: u64,
     pub included_refs: StorageIntentEvidenceRefs,
+    pub family_freshness: EvidenceFamilyFreshnessSet,
     pub completeness: EvidenceCompletenessVerdict,
     pub retention: EvidenceRetentionClass,
+    pub retention_ref: StorageIntentEvidenceRef,
     pub refusal: StorageIntentRefusalReason,
 }
 
 impl Default for StorageIntentEvidenceQuerySnapshot {
     fn default() -> Self {
         Self {
+            snapshot_id: StorageIntentEvidenceId::ZERO,
             query_id: StorageIntentEvidenceId::ZERO,
             consumer: EvidenceConsumerClass::Planner,
+            context: EvidenceQueryContextClass::Unknown,
+            subject: EvidenceQuerySubjectScope::default(),
             policy_id: StorageIntentPolicyId::ZERO,
             policy_revision: StorageIntentPolicyRevision(0),
+            temporal_frontier_ms: 0,
             freshness_frontier_ms: 0,
+            allowed_staleness_ms: 0,
+            source_catalog_ref: StorageIntentEvidenceRef::default(),
+            source_index_ref: StorageIntentEvidenceRef::default(),
             source_index_generation: 0,
+            producer_generation: 0,
+            producer_watermark_ms: 0,
+            compaction_generation: 0,
+            redaction_generation: 0,
             included_refs: StorageIntentEvidenceRefs::EMPTY,
-            completeness: EvidenceCompletenessVerdict::Complete,
+            family_freshness: EvidenceFamilyFreshnessSet::EMPTY,
+            completeness: EvidenceCompletenessVerdict::UnknownEvidence,
             retention: EvidenceRetentionClass::ExactRequired,
+            retention_ref: StorageIntentEvidenceRef::default(),
             refusal: StorageIntentRefusalReason::None,
         }
+    }
+}
+
+impl StorageIntentEvidenceQuerySnapshot {
+    /// Returns true when the snapshot and query identities are explicit.
+    #[must_use]
+    pub const fn has_query_identity(self) -> bool {
+        !bytes32_are_zero(self.snapshot_id.0) && !bytes32_are_zero(self.query_id.0)
+    }
+
+    /// Returns true when the snapshot is bound to one compiled policy revision.
+    #[must_use]
+    pub const fn has_policy_identity(self) -> bool {
+        !self.policy_id.is_zero() && self.policy_revision.0 > 0
+    }
+
+    /// Returns true when the snapshot names the subject it answers for.
+    #[must_use]
+    pub const fn has_subject_scope(self) -> bool {
+        match self.subject.scope_class {
+            EvidenceQuerySubjectScopeClass::Unknown => false,
+            EvidenceQuerySubjectScopeClass::Request => self.subject.request_ref.is_bound(),
+            EvidenceQuerySubjectScopeClass::Action => self.subject.action_ref.is_bound(),
+            EvidenceQuerySubjectScopeClass::ObjectRange => {
+                !self.subject.object_scope.dataset_id.is_zero()
+                    && !bytes32_are_zero(self.subject.object_scope.object_id.0)
+            }
+            EvidenceQuerySubjectScopeClass::Dataset => {
+                !self.subject.object_scope.dataset_id.is_zero()
+            }
+            EvidenceQuerySubjectScopeClass::Pool => !self.subject.pool_id.is_zero(),
+            EvidenceQuerySubjectScopeClass::Domain => !self.subject.domain_id.is_zero(),
+            EvidenceQuerySubjectScopeClass::Cluster => self.source_catalog_ref.is_bound(),
+            EvidenceQuerySubjectScopeClass::ValidationArtifact => {
+                self.subject.validation_ref.is_bound()
+            }
+            EvidenceQuerySubjectScopeClass::Claim => {
+                self.subject.request_ref.is_bound() || self.subject.validation_ref.is_bound()
+            }
+        }
+    }
+
+    /// Returns true when temporal and freshness frontiers are explicit.
+    #[must_use]
+    pub const fn has_frontiers(self) -> bool {
+        self.temporal_frontier_ms > 0 && self.freshness_frontier_ms > 0
+    }
+
+    /// Returns true when source index replay metadata is explicit.
+    #[must_use]
+    pub const fn has_source_replay_anchor(self) -> bool {
+        self.source_index_generation > 0
+            && self.producer_generation > 0
+            && self.source_catalog_ref.is_bound()
+            && self.source_index_ref.is_bound()
+    }
+
+    /// Returns true when the snapshot cites an included evidence kind.
+    #[must_use]
+    pub const fn contains_evidence_kind(self, kind: StorageIntentEvidenceKind) -> bool {
+        self.included_refs.contains_kind(kind)
+    }
+
+    /// Returns true when one included family is fresh enough for authority use.
+    #[must_use]
+    pub const fn contains_fresh_authority_family(self, kind: StorageIntentEvidenceKind) -> bool {
+        self.contains_evidence_kind(kind)
+            && self.family_freshness.family_is_fresh_for_authority(kind)
+    }
+
+    /// Returns true when media capability evidence is present and fresh.
+    #[must_use]
+    pub const fn has_fresh_media_capability(self) -> bool {
+        self.contains_fresh_authority_family(StorageIntentEvidenceKind::MediaCapabilityEvidence)
+    }
+
+    /// Returns true when the snapshot may be shown for cache-only or diagnostics use.
+    #[must_use]
+    pub const fn allows_non_authority_visibility(self) -> bool {
+        self.has_query_identity()
+            && self.has_policy_identity()
+            && self.has_subject_scope()
+            && self.has_frontiers()
+            && self.has_source_replay_anchor()
+            && self.refusal as u16 == StorageIntentRefusalReason::None as u16
+            && self.completeness.is_visible_non_authority()
+            && matches!(
+                self.consumer,
+                EvidenceConsumerClass::ReadPath
+                    | EvidenceConsumerClass::OperatorExplanation
+                    | EvidenceConsumerClass::PerformanceGate
+                    | EvidenceConsumerClass::FaultGate
+            )
+            && matches!(
+                self.context,
+                EvidenceQueryContextClass::CacheOnlyRead
+                    | EvidenceQueryContextClass::ReadServing
+                    | EvidenceQueryContextClass::OperatorExplanation
+                    | EvidenceQueryContextClass::Validation
+                    | EvidenceQueryContextClass::PrefetchResidency
+            )
+    }
+
+    /// Typed fail-closed admission result for authority-changing consumers.
+    #[must_use]
+    pub const fn authority_refusal(self) -> StorageIntentRefusalReason {
+        if self.refusal as u16 != StorageIntentRefusalReason::None as u16 {
+            return self.refusal;
+        }
+        if !self.has_query_identity()
+            || !self.has_policy_identity()
+            || !self.has_subject_scope()
+            || !self.has_frontiers()
+            || !self.has_source_replay_anchor()
+        {
+            return StorageIntentRefusalReason::EvidenceNotUsable;
+        }
+        if self.consumer.requires_complete_authority_cut()
+            && !self.completeness.is_complete_for_authority()
+        {
+            return StorageIntentRefusalReason::EvidenceNotUsable;
+        }
+        if self.completeness.blocks_authority() {
+            return StorageIntentRefusalReason::EvidenceNotUsable;
+        }
+        StorageIntentRefusalReason::None
+    }
+
+    /// Returns true when the snapshot may authorize authority-changing work.
+    #[must_use]
+    pub const fn is_authority_admissible(self) -> bool {
+        self.authority_refusal() as u16 == StorageIntentRefusalReason::None as u16
+    }
+
+    /// Returns true when the snapshot can authorize authority use of one family.
+    #[must_use]
+    pub const fn authorizes_fresh_evidence_kind(self, kind: StorageIntentEvidenceKind) -> bool {
+        self.is_authority_admissible() && self.contains_fresh_authority_family(kind)
     }
 }
 
@@ -3907,12 +4330,55 @@ impl_u8_canonical!(EvidenceConsumerClass, {
     ClaimGate = 8 => "claim-gate",
 });
 
+impl_u8_canonical!(EvidenceQueryContextClass, {
+    Unknown = 0 => "unknown",
+    RequestAdmission = 1 => "request-admission",
+    ActionAdmission = 2 => "action-admission",
+    ReadServing = 3 => "read-serving",
+    CacheOnlyRead = 4 => "cache-only-read",
+    Validation = 5 => "validation",
+    OperatorExplanation = 6 => "operator-explanation",
+    PerformanceRow = 7 => "performance-row",
+    FaultRow = 8 => "fault-row",
+    Claim = 9 => "claim",
+    PrefetchResidency = 10 => "prefetch-residency",
+    MeasurementAttribution = 11 => "measurement-attribution",
+});
+
+impl_u8_canonical!(EvidenceQuerySubjectScopeClass, {
+    Unknown = 0 => "unknown",
+    Request = 1 => "request",
+    Action = 2 => "action",
+    ObjectRange = 3 => "object-range",
+    Dataset = 4 => "dataset",
+    Pool = 5 => "pool",
+    Domain = 6 => "domain",
+    Cluster = 7 => "cluster",
+    ValidationArtifact = 8 => "validation-artifact",
+    Claim = 9 => "claim",
+});
+
 impl_u8_canonical!(EvidenceCompletenessVerdict, {
-    Complete = 0 => "complete",
-    Partial = 1 => "partial",
-    Stale = 2 => "stale",
-    Contradictory = 3 => "contradictory",
-    Refused = 4 => "refused",
+    UnknownEvidence = 0 => "unknown-evidence",
+    CompleteForPurpose = 1 => "complete-for-purpose",
+    PartialAdmissible = 2 => "partial-admissible",
+    DegradedVisible = 3 => "degraded-visible",
+    Blocked = 4 => "blocked",
+    Refused = 5 => "refused",
+    UnsafeVisible = 6 => "unsafe-visible",
+});
+
+impl_u8_canonical!(EvidenceFamilyFreshnessState, {
+    Unknown = 0 => "unknown",
+    Fresh = 1 => "fresh",
+    Missing = 2 => "missing",
+    Stale = 3 => "stale",
+    Contradictory = 4 => "contradictory",
+    Superseded = 5 => "superseded",
+    Redacted = 6 => "redacted",
+    Compacted = 7 => "compacted",
+    Unavailable = 8 => "unavailable",
+    Refused = 9 => "refused",
 });
 
 impl_u8_canonical!(EvidenceRetentionClass, {
@@ -5362,6 +5828,99 @@ mod tests {
     const DOMAIN_A: StorageIntentDomainId = StorageIntentDomainId([1_u8; 16]);
     const DOMAIN_B: StorageIntentDomainId = StorageIntentDomainId([2_u8; 16]);
 
+    fn evidence_ref(kind: StorageIntentEvidenceKind, byte: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            kind,
+            StorageIntentEvidenceId([byte; 32]),
+            u64::from(byte),
+            1,
+        )
+    }
+
+    fn freshness_row(
+        kind: StorageIntentEvidenceKind,
+        state: EvidenceFamilyFreshnessState,
+        byte: u8,
+    ) -> EvidenceFamilyFreshness {
+        EvidenceFamilyFreshness {
+            kind,
+            state,
+            source_index_generation: u64::from(byte),
+            producer_generation: u64::from(byte),
+            freshness_frontier_ms: 10_000 + u64::from(byte),
+            allowed_staleness_ms: 100,
+            evidence_ref: evidence_ref(kind, byte),
+        }
+    }
+
+    fn base_query_snapshot(
+        consumer: EvidenceConsumerClass,
+        context: EvidenceQueryContextClass,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        StorageIntentEvidenceQuerySnapshot {
+            snapshot_id: StorageIntentEvidenceId([40_u8; 32]),
+            query_id: StorageIntentEvidenceId([41_u8; 32]),
+            consumer,
+            context,
+            subject: EvidenceQuerySubjectScope {
+                scope_class: EvidenceQuerySubjectScopeClass::Dataset,
+                object_scope: StorageIntentObjectScope {
+                    dataset_id: DOMAIN_A,
+                    object_id: StorageIntentEvidenceId([42_u8; 32]),
+                    range_start: 0,
+                    range_len: 4096,
+                    generation: 7,
+                },
+                pool_id: StorageIntentDomainId([43_u8; 16]),
+                domain_id: DOMAIN_A,
+                request_ref: evidence_ref(StorageIntentEvidenceKind::LocalIntentRecord, 44),
+                action_ref: evidence_ref(StorageIntentEvidenceKind::ActionExecutionEvidence, 45),
+                validation_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 46),
+            },
+            policy_id: StorageIntentPolicyId([47_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(8),
+            temporal_frontier_ms: 20_000,
+            freshness_frontier_ms: 20_000,
+            allowed_staleness_ms: 100,
+            source_catalog_ref: evidence_ref(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                48,
+            ),
+            source_index_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 49),
+            source_index_generation: 10,
+            producer_generation: 11,
+            producer_watermark_ms: 19_999,
+            compaction_generation: 12,
+            redaction_generation: 13,
+            completeness: EvidenceCompletenessVerdict::CompleteForPurpose,
+            retention_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 50),
+            ..StorageIntentEvidenceQuerySnapshot::default()
+        }
+    }
+
+    fn snapshot_with_fresh_media(
+        consumer: EvidenceConsumerClass,
+        context: EvidenceQueryContextClass,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        let mut snapshot = base_query_snapshot(consumer, context);
+        snapshot
+            .included_refs
+            .push(evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                51,
+            ))
+            .unwrap();
+        snapshot
+            .family_freshness
+            .push(freshness_row(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+                51,
+            ))
+            .unwrap();
+        snapshot
+    }
+
     fn durable_policy() -> StorageIntentPolicy {
         StorageIntentPolicy {
             requested_guarantee: StorageIntentGuaranteeClass::LocalIntent,
@@ -5389,12 +5948,7 @@ mod tests {
     }
 
     fn media_evidence(byte: u8) -> StorageIntentEvidenceRef {
-        StorageIntentEvidenceRef::new(
-            StorageIntentEvidenceKind::MediaCapabilityEvidence,
-            StorageIntentEvidenceId([byte; 32]),
-            u64::from(byte),
-            1,
-        )
+        evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, byte)
     }
 
     fn durable_media_flags() -> MediaCapabilityFlags {
@@ -5448,13 +6002,183 @@ mod tests {
         }
     }
 
-    fn evidence_ref(kind: StorageIntentEvidenceKind, byte: u8) -> StorageIntentEvidenceRef {
-        StorageIntentEvidenceRef::new(
-            kind,
-            StorageIntentEvidenceId([byte; 32]),
-            u64::from(byte),
-            1,
-        )
+    #[test]
+    fn default_evidence_query_snapshot_fails_closed() {
+        let snapshot = StorageIntentEvidenceQuerySnapshot::default();
+
+        assert!(!snapshot.has_query_identity());
+        assert!(!snapshot.has_policy_identity());
+        assert_eq!(
+            snapshot.completeness,
+            EvidenceCompletenessVerdict::UnknownEvidence
+        );
+        assert_eq!(
+            snapshot.authority_refusal(),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(!snapshot.is_authority_admissible());
+        assert!(!snapshot.allows_non_authority_visibility());
+    }
+
+    #[test]
+    fn authority_snapshot_requires_replay_anchor_and_complete_cut() {
+        let snapshot = snapshot_with_fresh_media(
+            EvidenceConsumerClass::Planner,
+            EvidenceQueryContextClass::PrefetchResidency,
+        );
+
+        assert!(snapshot.has_query_identity());
+        assert!(snapshot.has_policy_identity());
+        assert!(snapshot.has_subject_scope());
+        assert!(snapshot.has_frontiers());
+        assert!(snapshot.has_source_replay_anchor());
+        assert!(snapshot.is_authority_admissible());
+        assert!(snapshot
+            .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+
+        let mut missing_source = snapshot;
+        missing_source.source_index_ref = StorageIntentEvidenceRef::default();
+        assert_eq!(
+            missing_source.authority_refusal(),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut missing_catalog = snapshot;
+        missing_catalog.source_catalog_ref = StorageIntentEvidenceRef::default();
+        assert_eq!(
+            missing_catalog.authority_refusal(),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut missing_subject = snapshot;
+        missing_subject.subject.scope_class = EvidenceQuerySubjectScopeClass::Unknown;
+        assert_eq!(
+            missing_subject.authority_refusal(),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut partial = snapshot;
+        partial.completeness = EvidenceCompletenessVerdict::PartialAdmissible;
+        assert_eq!(
+            partial.authority_refusal(),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn cache_only_visibility_requires_explicit_partial_context() {
+        let mut snapshot = base_query_snapshot(
+            EvidenceConsumerClass::ReadPath,
+            EvidenceQueryContextClass::CacheOnlyRead,
+        );
+        snapshot.completeness = EvidenceCompletenessVerdict::PartialAdmissible;
+
+        assert!(snapshot.allows_non_authority_visibility());
+        assert_eq!(
+            snapshot.authority_refusal(),
+            StorageIntentRefusalReason::None
+        );
+
+        let mut planner = snapshot;
+        planner.consumer = EvidenceConsumerClass::Planner;
+        planner.context = EvidenceQueryContextClass::PrefetchResidency;
+        assert!(!planner.allows_non_authority_visibility());
+        assert_eq!(
+            planner.authority_refusal(),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn claim_gate_blocks_refused_unknown_and_unsafe_cuts() {
+        let mut snapshot = snapshot_with_fresh_media(
+            EvidenceConsumerClass::ClaimGate,
+            EvidenceQueryContextClass::Claim,
+        );
+
+        assert!(snapshot.is_authority_admissible());
+
+        snapshot.completeness = EvidenceCompletenessVerdict::Refused;
+        assert_eq!(
+            snapshot.authority_refusal(),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        snapshot.completeness = EvidenceCompletenessVerdict::UnsafeVisible;
+        assert_eq!(
+            snapshot.authority_refusal(),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        snapshot.completeness = EvidenceCompletenessVerdict::CompleteForPurpose;
+        snapshot.refusal = StorageIntentRefusalReason::EvidenceNotUsable;
+        assert_eq!(
+            snapshot.authority_refusal(),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn media_capability_must_be_fresh_inside_the_snapshot_cut() {
+        let states = [
+            EvidenceFamilyFreshnessState::Missing,
+            EvidenceFamilyFreshnessState::Stale,
+            EvidenceFamilyFreshnessState::Contradictory,
+            EvidenceFamilyFreshnessState::Superseded,
+            EvidenceFamilyFreshnessState::Redacted,
+            EvidenceFamilyFreshnessState::Compacted,
+            EvidenceFamilyFreshnessState::Unavailable,
+            EvidenceFamilyFreshnessState::Refused,
+        ];
+
+        for (offset, state) in states.into_iter().enumerate() {
+            let mut snapshot = base_query_snapshot(
+                EvidenceConsumerClass::Planner,
+                EvidenceQueryContextClass::PrefetchResidency,
+            );
+            let byte = 60 + offset as u8;
+            snapshot
+                .included_refs
+                .push(evidence_ref(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    byte,
+                ))
+                .unwrap();
+            snapshot
+                .family_freshness
+                .push(freshness_row(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    state,
+                    byte,
+                ))
+                .unwrap();
+
+            assert!(snapshot.is_authority_admissible());
+            assert!(!snapshot.has_fresh_media_capability());
+            assert!(!snapshot.authorizes_fresh_evidence_kind(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence
+            ));
+        }
+    }
+
+    #[test]
+    fn free_floating_evidence_ref_does_not_satisfy_query_snapshot() {
+        let snapshot = base_query_snapshot(
+            EvidenceConsumerClass::Planner,
+            EvidenceQueryContextClass::PrefetchResidency,
+        );
+        let cache_guess = media_evidence(99);
+
+        assert_eq!(
+            cache_guess.kind,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence
+        );
+        assert!(snapshot.is_authority_admissible());
+        assert!(
+            !snapshot.contains_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence)
+        );
+        assert!(!snapshot
+            .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence));
     }
 
     fn workload_signal(
@@ -6162,6 +6886,19 @@ mod tests {
         assert_eq!(
             StorageIntentEvidenceKind::MediaCapabilityEvidence.as_str(),
             "media-capability-evidence"
+        );
+        assert_eq!(
+            EvidenceQueryContextClass::PrefetchResidency.as_str(),
+            "prefetch-residency"
+        );
+        assert_eq!(EvidenceQuerySubjectScopeClass::Dataset.to_discriminant(), 4);
+        assert_eq!(
+            EvidenceCompletenessVerdict::CompleteForPurpose.as_str(),
+            "complete-for-purpose"
+        );
+        assert_eq!(
+            EvidenceFamilyFreshnessState::Compacted.as_str(),
+            "compacted"
         );
         assert_eq!(
             StorageIntentActionClass::from_discriminant(5),
