@@ -65,6 +65,7 @@ fn explicit_test_file_record(inode_id: InodeId, generation: Generation) -> Inode
         dir_storage_kind: 0,
         xattr_storage_kind: 0,
         dir_rev: 0,
+        subtree_rev: 0,
     }
 }
 
@@ -286,6 +287,7 @@ fn stage_probe_file_state(
         dir_storage_kind: 0,
         xattr_storage_kind: 0,
         dir_rev: 0,
+        subtree_rev: 0,
     };
     Arc::make_mut(&mut staged.inodes).insert(inode_id, record.clone());
     let root_dir = Arc::make_mut(&mut staged.directories)
@@ -3637,6 +3639,7 @@ fn uncommitted_transaction_objects_are_ignored_on_reopen() {
         dir_storage_kind: 0,
         xattr_storage_kind: 0,
         dir_rev: 0,
+        subtree_rev: 0,
     };
     Arc::make_mut(&mut staged.inodes).insert(inode_id, record.clone());
     Arc::make_mut(&mut staged.directories).insert(inode_id, BTreeMap::new());
@@ -4482,6 +4485,7 @@ fn unreachable_inode_committed_root_is_skipped_before_mount_without_fsck() {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         },
     );
     Arc::make_mut(&mut bad.directories).insert(orphan_id, BTreeMap::new());
@@ -11056,6 +11060,7 @@ fn encode_decode_round_trip_preserves_separate_authorities() {
         xattr_storage_kind: 0,
         xattrs: BTreeMap::new(),
         dir_rev: 0,
+        subtree_rev: 0,
         rdev: 0,
     };
 
@@ -11139,6 +11144,7 @@ fn to_inode_attr_projects_authorities_separately() {
         xattr_storage_kind: 0,
         xattrs: BTreeMap::new(),
         dir_rev: 0,
+        subtree_rev: 0,
         rdev: 0,
     };
 
@@ -11325,4 +11331,136 @@ fn now_style_timestamp_update_uses_wall_clock() {
 
     // Generation must not be altered by a NOW-style timestamp update.
     assert_eq!(after.generation.get(), initial.generation.get());
+}
+
+#[test]
+fn encode_decode_round_trip_preserves_namespace_revisions() {
+    // Encode an InodeRecord with non-zero subtree_rev and dir_rev,
+    // decode it, and verify both counters survive independently of
+    // metadata_version.
+    let inode_id = tidefs_types_vfs_core::InodeId::new(100);
+    let generation = tidefs_types_vfs_core::Generation::new(3);
+    let subtree_rev: u64 = 17;
+    let dir_rev: u64 = 42;
+    let metadata_version: u64 = 5;
+
+    let record = InodeRecord {
+        dir_storage_kind: 0,
+        inode_id,
+        generation,
+        facets: tidefs_types_vfs_core::NodeKind::Dir.to_facets(),
+        mode: 0o755 | tidefs_types_vfs_core::S_IFDIR as u32,
+        uid: 0,
+        gid: 0,
+        nlink: 2,
+        size: 0,
+        data_version: 1,
+        metadata_version,
+        posix_time: crate::types::PosixTimeRecord::new(0, 0, 0, 0),
+        xattr_storage_kind: 0,
+        xattrs: BTreeMap::new(),
+        dir_rev,
+        subtree_rev,
+        rdev: 0,
+    };
+
+    let encoded = crate::encoding::encode_inode(&record);
+    let decoded = crate::encoding::decode_inode(&encoded).expect("decode round-trip");
+
+    assert_eq!(decoded.subtree_rev, subtree_rev, "subtree_rev round-trip");
+    assert_eq!(decoded.dir_rev, dir_rev, "dir_rev round-trip");
+    assert_ne!(decoded.subtree_rev, decoded.metadata_version,
+        "subtree_rev must not equal metadata_version after decoupling");
+    assert_ne!(decoded.dir_rev, decoded.metadata_version,
+        "dir_rev must not equal metadata_version after decoupling");
+
+    // to_inode_attr must use the stored revision counters, not metadata_version.
+    let attr = decoded.to_inode_attr();
+    assert_eq!(attr.subtree_rev, subtree_rev,
+        "InodeAttr subtree_rev must come from InodeRecord.subtree_rev");
+    assert_eq!(attr.dir_rev, dir_rev,
+        "InodeAttr dir_rev must come from InodeRecord.dir_rev");
+    assert_ne!(attr.subtree_rev, metadata_version,
+        "InodeAttr subtree_rev must not be metadata_version");
+    assert_ne!(attr.dir_rev, metadata_version,
+        "InodeAttr dir_rev must not be metadata_version");
+}
+
+#[test]
+fn old_format_inode_record_without_revision_tail_defaults_to_zero() {
+    // A v6 inode record written before the revision-counter tail extension
+    // must decode with subtree_rev == 0 and dir_rev == 0.
+    let record = InodeRecord {
+        dir_storage_kind: 0,
+        inode_id: tidefs_types_vfs_core::InodeId::new(1),
+        generation: tidefs_types_vfs_core::Generation::new(1),
+        facets: tidefs_types_vfs_core::NodeKind::File.to_facets(),
+        mode: 0o644 | tidefs_types_vfs_core::S_IFREG as u32,
+        uid: 0, gid: 0, nlink: 1,
+        size: 0,
+        data_version: 0,
+        metadata_version: 7,
+        posix_time: crate::types::PosixTimeRecord::new(0, 0, 0, 0),
+        xattr_storage_kind: 0,
+        xattrs: BTreeMap::new(),
+        dir_rev: 0,
+        subtree_rev: 0,
+        rdev: 0,
+    };
+    let encoded = crate::encoding::encode_inode(&record);
+    // Truncate off the 16-byte tail (subtree_rev + dir_rev) to simulate
+    // a record written before the tail extension.
+    let truncated = &encoded[..encoded.len() - 16];
+    let decoded = crate::encoding::decode_inode(truncated)
+        .expect("old-format decode must succeed");
+    assert_eq!(decoded.subtree_rev, 0,
+        "legacy record without tail must default subtree_rev to 0");
+    assert_eq!(decoded.dir_rev, 0,
+        "legacy record without tail must default dir_rev to 0");
+    // metadata_version remains untouched.
+    assert_eq!(decoded.metadata_version, 7);
+}
+
+#[test]
+fn metadata_version_bump_does_not_impersonate_dir_rev() {
+    // Construct an InodeRecord with distinct metadata_version and dir_rev,
+    // call to_inode_attr(), and prove the resulting InodeAttr does not
+    // conflate storage metadata versioning with namespace revision counters.
+    let metadata_version: u64 = 100;
+    let subtree_rev: u64 = 3;
+    let dir_rev: u64 = 7;
+
+    let record = InodeRecord {
+        dir_storage_kind: 0,
+        inode_id: tidefs_types_vfs_core::InodeId::new(1),
+        generation: tidefs_types_vfs_core::Generation::new(1),
+        facets: tidefs_types_vfs_core::NodeKind::Dir.to_facets(),
+        mode: 0o755 | tidefs_types_vfs_core::S_IFDIR as u32,
+        uid: 0, gid: 0, nlink: 2, size: 0,
+        data_version: 1,
+        metadata_version,
+        posix_time: crate::types::PosixTimeRecord::new(0, 0, 0, 0),
+        xattr_storage_kind: 0,
+        xattrs: BTreeMap::new(),
+        dir_rev,
+        subtree_rev,
+        rdev: 0,
+    };
+
+    let attr = record.to_inode_attr();
+
+    // The InodeAttr must use stored revision counters, not metadata_version.
+    assert_eq!(attr.subtree_rev, subtree_rev,
+        "subtree_rev must come from InodeRecord.subtree_rev, not metadata_version");
+    assert_eq!(attr.dir_rev, dir_rev,
+        "dir_rev must come from InodeRecord.dir_rev, not metadata_version");
+    assert_ne!(attr.subtree_rev, metadata_version,
+        "subtree_rev must not be equal to metadata_version");
+    assert_ne!(attr.dir_rev, metadata_version,
+        "dir_rev must not be equal to metadata_version");
+
+    // metadata_version is a separate authority and must not leak into
+    // namespace revision counters.
+    assert_eq!(record.metadata_version, metadata_version,
+        "record metadata_version unchanged");
 }

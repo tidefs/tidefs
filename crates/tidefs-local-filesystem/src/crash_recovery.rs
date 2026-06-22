@@ -172,6 +172,7 @@ pub(crate) fn stage_crash_matrix_file_state(
         dir_storage_kind: 0,
         xattr_storage_kind: 0,
         dir_rev: 0,
+        subtree_rev: 0,
     };
     Arc::make_mut(&mut staged.inodes).insert(inode_id, record.clone());
     let root_dir = Arc::make_mut(&mut staged.directories)
@@ -635,6 +636,7 @@ mod tests {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         let inode3 = InodeRecord {
             rdev: 0,
@@ -653,6 +655,7 @@ mod tests {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         Arc::make_mut(&mut staged.inodes).insert(InodeId::new(1), inode1);
         Arc::make_mut(&mut staged.inodes).insert(InodeId::new(3), inode3);
@@ -709,6 +712,7 @@ mod tests {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         Arc::make_mut(&mut staged.inodes).insert(InodeId::new(2), inode);
 

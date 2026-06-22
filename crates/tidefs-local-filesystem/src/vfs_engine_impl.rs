@@ -1168,6 +1168,7 @@ impl VfsLocalFileSystem {
         fs.begin_mutation();
         let tick = fs.bump_generation();
         updated.metadata_version = updated.metadata_version.max(tick);
+        updated.subtree_rev = updated.subtree_rev.saturating_add(1).max(1);
 
         fs.mark_inode_metadata_dirty(inode_id);
         Arc::make_mut(&mut fs.state.inodes).insert(inode_id, updated);
@@ -1265,6 +1266,7 @@ impl VfsLocalFileSystem {
             xattr_storage_kind: 0,
             xattrs,
             dir_rev: 0,
+            subtree_rev: 0,
             rdev,
         };
         let entry = NamespaceEntry {
@@ -1407,6 +1409,7 @@ impl VfsLocalFileSystem {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
 
         let name_vec = name.to_vec();
@@ -1594,6 +1597,7 @@ impl VfsLocalFileSystem {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
 
         let name_vec = name.to_vec();

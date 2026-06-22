@@ -6009,6 +6009,7 @@ impl LocalFileSystem {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         let entry = NamespaceEntry {
             name: name.clone(),
@@ -6254,6 +6255,7 @@ impl LocalFileSystem {
             dir_storage_kind: source_record.dir_storage_kind,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
 
         let (planned_entries, allocation_bytes, materialized_bytes) =
@@ -9918,6 +9920,7 @@ impl LocalFileSystem {
             dir_storage_kind: 0,
             xattr_storage_kind: 0,
             dir_rev: 0,
+            subtree_rev: 0,
         };
         let planned_entries = planned_chunk_allocation_entries_for_full_content(&record)?;
         self.ensure_content_capacity_with_planned_inode(None, planned_entries)?;
@@ -11515,6 +11518,7 @@ impl LocalFileSystem {
                             dir_storage_kind: 0,
                             xattr_storage_kind: 0,
                             dir_rev: 0,
+                            subtree_rev: 0,
                         }
                     })
             });
@@ -12894,6 +12898,7 @@ mod orphan_index_integration_tests {
             xattr_storage_kind: 0,
             xattrs: std::collections::BTreeMap::new(),
             dir_rev: 0,
+            subtree_rev: 0,
             rdev: 0,
         };
         fs.insert_inode_at(child, child_record);
@@ -14494,6 +14499,7 @@ mod orphan_index_integration_tests {
             xattr_storage_kind: 0,
             xattrs: std::collections::BTreeMap::new(),
             dir_rev: 0,
+            subtree_rev: 0,
             rdev,
         };
         fs.insert_inode_at(inode_id, record);
@@ -14563,6 +14569,7 @@ mod orphan_index_integration_tests {
             xattr_storage_kind: 0,
             xattrs: std::collections::BTreeMap::new(),
             dir_rev: 0,
+            subtree_rev: 0,
             rdev: 0,
         };
         fs.insert_inode_at(old.inode_id, record);

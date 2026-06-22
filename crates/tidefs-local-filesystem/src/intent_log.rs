@@ -3044,6 +3044,7 @@ mod tests {
             xattr_storage_kind: 0,
             xattrs: BTreeMap::new(),
             dir_rev: 0,
+            subtree_rev: 0,
         };
         Arc::make_mut(&mut state.inodes).insert(inode_id, record);
         state.observe_explicit_inode_id(inode_id);
@@ -3265,6 +3266,7 @@ mod tests {
             xattr_storage_kind: 0,
             xattrs: BTreeMap::new(),
             dir_rev: 0,
+            subtree_rev: 0,
         };
         Arc::make_mut(&mut state.inodes).insert(dir_id, dir_record);
         state.observe_explicit_inode_id(dir_id);
