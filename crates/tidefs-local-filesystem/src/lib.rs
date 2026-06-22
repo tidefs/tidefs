@@ -3913,6 +3913,32 @@ impl LocalFileSystem {
         }
     }
 
+    fn hard_link_public_error(err: FileSystemError) -> FileSystemError {
+        match err {
+            FileSystemError::Unsupported {
+                operation: "link",
+                reason,
+            } => FileSystemError::Unsupported {
+                operation: "hard link",
+                reason,
+            },
+            err => err,
+        }
+    }
+
+    fn rename_exchange_public_error(err: FileSystemError) -> FileSystemError {
+        match err {
+            FileSystemError::Unsupported {
+                operation: "renameat2",
+                reason,
+            } => FileSystemError::Unsupported {
+                operation: "rename_exchange",
+                reason,
+            },
+            err => err,
+        }
+    }
+
     fn release_metadata_admission_permit(&mut self, permit: AdmissionPermit) -> Result<()> {
         self.write_admission
             .release(permit)
@@ -3930,6 +3956,14 @@ impl LocalFileSystem {
             self.release_metadata_admission_permit(permit)?;
         }
         Ok(())
+    }
+
+    fn rollback_mutation_delta_and_release_metadata_permit(
+        &mut self,
+        permit: &mut Option<AdmissionPermit>,
+    ) -> Result<()> {
+        self.rollback_mutation_delta();
+        self.release_optional_metadata_admission_permit(permit.take())
     }
 
     /// Mark an inode as orphaned after its namespace link count reaches zero.
@@ -6009,7 +6043,8 @@ impl LocalFileSystem {
             &self.state.directories,
             existing_path,
             new_path,
-        )?;
+        )
+        .map_err(Self::hard_link_public_error)?;
         let inode_id = pre.target_inode_id;
         let parent_id = pre.new_parent_id;
         let name = pre.new_name;
@@ -9003,6 +9038,7 @@ impl LocalFileSystem {
     ) -> Result<()> {
         use crate::namespace::rename::RenameAt2Flags;
         self.renameat2(old_path, new_path, RenameAt2Flags::EXCHANGE)
+            .map_err(Self::rename_exchange_public_error)
     }
 
     /// Perform a `renameat2`-style atomic rename with flags.
@@ -9091,17 +9127,16 @@ impl LocalFileSystem {
         // ── Steps 3-5: Mutation + commit ───────────────────────────
 
         // Acquire a metadata-mutation admission permit before the rename
-        // mutation.  Push into pending_permits so rollback_mutation_delta
-        // can release it on error.  After commit_mutation succeeds, pop and
-        // release explicitly.
-        let rename_md_permit = self.write_admission.try_admit_metadata_mutation()?;
-        self.pending_permits.push(rename_md_permit);
+        // mutation, but keep it separate from dirty-write pending permits:
+        // dirty permits survive until SYNC, while this slot-only metadata
+        // permit is released when this mutation finishes or rolls back.
+        let mut rename_md_permit = Some(self.write_admission.try_admit_metadata_mutation()?);
         self.begin_mutation();
         // Re-verify both parents exist after lock acquisition.
         if !self.state.inodes.contains_key(&old_parent_id)
             || !self.state.inodes.contains_key(&new_parent_id)
         {
-            self.rollback_mutation_delta();
+            self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
             return Err(FileSystemError::NotFound {
                 path: old_path.to_string(),
             });
@@ -9119,9 +9154,17 @@ impl LocalFileSystem {
             // ── RENAME_EXCHANGE ────────────────────────────────────
             // Atomically swap the inode pointers of two directory entries.
 
-            let new_entry = new_entry.ok_or(FileSystemError::CorruptState {
-                reason: "exchange target missing despite pre-check",
-            })?;
+            let new_entry = match new_entry {
+                Some(entry) => entry,
+                None => {
+                    self.rollback_mutation_delta_and_release_metadata_permit(
+                        &mut rename_md_permit,
+                    )?;
+                    return Err(FileSystemError::CorruptState {
+                        reason: "exchange target missing despite pre-check",
+                    });
+                }
+            };
 
             let mut swapped_old = old_entry;
             swapped_old.name = new_name.clone();
@@ -9129,23 +9172,23 @@ impl LocalFileSystem {
             swapped_new.name = old_name.clone();
 
             if let Err(err) = self.remove_directory_entry(old_parent_id, &old_name, tick) {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
                 return Err(err);
             }
             if let Err(err) = self.remove_directory_entry(new_parent_id, &new_name, tick) {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
                 return Err(err);
             }
             if let Err(err) =
                 self.insert_directory_entry(old_parent_id, old_name.clone(), swapped_new, tick)
             {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
                 return Err(err);
             }
             if let Err(err) =
                 self.insert_directory_entry(new_parent_id, new_name.clone(), swapped_old, tick)
             {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
                 return Err(err);
             }
 
@@ -9159,10 +9202,20 @@ impl LocalFileSystem {
             // ── Plain rename / RENAME_NOREPLACE ────────────────────
             // Handle overwritten destination
             if let Some(target) = new_entry {
-                let target_record = self.inode(target.inode_id)?.clone();
+                let target_record = match self.inode(target.inode_id).cloned() {
+                    Ok(record) => record,
+                    Err(err) => {
+                        self.rollback_mutation_delta_and_release_metadata_permit(
+                            &mut rename_md_permit,
+                        )?;
+                        return Err(err);
+                    }
+                };
 
                 if let Err(err) = self.remove_directory_entry(new_parent_id, &new_name, tick) {
-                    self.rollback_mutation_delta();
+                    self.rollback_mutation_delta_and_release_metadata_permit(
+                        &mut rename_md_permit,
+                    )?;
                     return Err(err);
                 }
 
@@ -9234,7 +9287,9 @@ impl LocalFileSystem {
 
             // Remove source entry
             if let Err(err) = self.remove_directory_entry(old_parent_id, &old_name, tick) {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(
+                    &mut rename_md_permit,
+                )?;
                 return Err(err);
             }
 
@@ -9244,7 +9299,9 @@ impl LocalFileSystem {
             if let Err(err) =
                 self.insert_directory_entry(new_parent_id, new_name.clone(), renamed, tick)
             {
-                self.rollback_mutation_delta();
+                self.rollback_mutation_delta_and_release_metadata_permit(
+                    &mut rename_md_permit,
+                )?;
                 return Err(err);
             }
 
@@ -9286,14 +9343,14 @@ impl LocalFileSystem {
         self.mark_inode_metadata_dirty(old_parent_id);
         self.mark_dir_dirty(new_parent_id);
         self.mark_inode_metadata_dirty(new_parent_id);
-        self.commit_mutation(())?;
-
-        // Release the metadata admission permit now that the rename
-        // is durably committed.
-        if let Some(permit) = self.pending_permits.pop() {
-            self.release_metadata_admission_permit(permit)?;
+        let commit_result = self.commit_mutation(());
+        let release_result =
+            self.release_optional_metadata_admission_permit(rename_md_permit.take());
+        match (commit_result, release_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
         }
-        Ok(())
     }
 
     /// Determine the xattr namespace from the name prefix.
