@@ -3115,6 +3115,11 @@ EOF
           };
 
 
+          kernelTeardownValidation = import ./nix/vm/kernel-teardown-validation.nix {
+            inherit pkgs;
+            linuxKernel_7_0 = linuxKernel_7_0;
+          };
+
           kernelCrossPathEquivalence = import ./nix/vm/kernel-cross-path-equivalence.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
@@ -4282,6 +4287,19 @@ EOF
             exec ${self.packages.${system}.kernelMountNamespaceValidation}/bin/tidefs-kmod-mount-namespace-validation "$@"
           '';
 
+
+          kernel-teardown-validation = script "tidefs-kmod-teardown-validation" [
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.busybox
+            pkgs.kmod
+            pkgs.cpio
+            pkgs.qemu
+            pkgs.b3sum
+            self.packages.${system}.kernelTeardownValidation
+          ] ''
+            exec ${self.packages.${system}.kernelTeardownValidation}/bin/tidefs-kmod-teardown-validation "$@"
+          '';
           kernel-cross-path-equivalence = script "tidefs-kernel-cross-path-equivalence" [
             pkgs.bash
             pkgs.coreutils

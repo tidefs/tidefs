@@ -14,6 +14,7 @@ on:
           - kmod-xfstests-smoke
           - kernel-fsync-validation
           - kernel-mmap-validation
+          - kernel-teardown-validation
           - fuse-vm-test
           - qemu-ublk-smoke
           - all
@@ -39,6 +40,10 @@ jobs:
             name: kmod-xfstests-smoke
             command: nix run .#kmod-xfstests-smoke -- --timeout 1800
             output_dir: /tmp/tidefs-validation/kmod-xfstests-smoke
+          - id: kernel-teardown-validation
+            name: kernel-teardown-validation
+            command: nix run .#kernel-teardown-validation -- --timeout 600
+            output_dir: /tmp/tidefs-validation/kernel-teardown-validation
           - id: kernel-fsync-validation
             name: kernel-fsync-validation
             command: nix run .#kernel-fsync-validation -- --timeout 600 --pool-size 256
@@ -77,6 +82,7 @@ jobs:
         if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
         env:
           TIDEFS_FSYNC_SUMMARY_DIR: ${{ matrix.output_dir }}
+          TIDEFS_TEARDOWN_OUTPUT_DIR: ${{ matrix.output_dir }}
         run: timeout --foreground 7200s bash -lc '${{ matrix.command }}'
 
       - name: Write kernel-fsync evidence manifest (smoke)
