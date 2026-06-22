@@ -184,6 +184,8 @@ The claims gate checks the exact registry/admission table below against
 | `snapshot holds` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | inspect local snapshot and clone hold counts |
 | `snapshot prune` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | prune regular local snapshots by retention policy while excluding clones and bookmarks |
 | `snapshot destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy snapshots through the live owner or explicit offline devices |
+| `snapshot export` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | register runtime-pending read-only snapshot export mount surface |
+| `snapshot extract` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | register runtime-pending one-shot snapshot file extraction surface |
 | `snapshot rollback` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | roll back through the live owner or explicit offline devices |
 | `snapshot send` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | export snapshot streams through owner authority or explicit offline devices |
 | `snapshot receive` | `public-operator` | `live-owner` | `local-only` | `visible` | receive snapshot streams through the live owner; offline receive is unsupported |
@@ -256,9 +258,9 @@ UAPI authority boundaries; it is not a publishing-facing capability
 statement. The command classification/admission table it defines as source
 of truth is already consumed by this policy document and by
 `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`, both of which remain scanned.
-The authority document preserves all non-claims for production UAPI/ABI
-freeze, kernelspace readiness, final distributed operator UAPI, and
-runtime-fed policy authority that the claims gate enforces.
+The authority document records blocked operator-boundary topics for UAPI/ABI
+stability, kernel residency, distributed command scope, and runtime-fed policy
+authority that the claims gate enforces.
 
 ## Work-State Boundary
 
