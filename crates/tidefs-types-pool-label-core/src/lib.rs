@@ -743,9 +743,6 @@ pub fn decode_label(buf: &[u8]) -> Result<PoolLabelV1, LabelError> {
     if has_policy && buf.len() < POOL_LABEL_V1_EXT_WIRE_SIZE {
         return Err(LabelError::BufferTooSmall);
     }
-    if has_layout && buf.len() < POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE {
-        return Err(LabelError::BufferTooSmall);
-    }
     if has_policy && buf[407] != 0 {
         return Err(LabelError::BadRedundancyPolicy {
             kind: buf[404],
