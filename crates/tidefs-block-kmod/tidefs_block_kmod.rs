@@ -103,7 +103,6 @@ const DEFAULT_CAPACITY_SECTORS: u64 = 8192;  // 4 MiB
 
 /// Default number of blk-mq hardware queues: one per possible CPU for optimal
 /// CPU affinity.  Falls back gracefully if hotplugged CPUs are offline.
-/// Audited by NEXT-KBLK-018: multi-queue CPU affinity audit.
 
 /// Default blk-mq tag-set depth (max outstanding requests per queue).
 const DEFAULT_TAGSET_DEPTH: u32 = 64;

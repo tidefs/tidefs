@@ -67,15 +67,14 @@ tidefs-xtask check-block-volume-ublk-del-dev-cleanup-boundary
 
 ## Relationship To Parent Gates
 
-This follows #98 / OW-301Q. OW-301Q proves the first guarded ADD_DEV mutating
+This follows OW-301Q. OW-301Q proves the first guarded ADD_DEV mutating
 control boundary; OW-301R adds the paired guarded cleanup boundary so successful
 ADD_DEV execution does not leave an unmanaged ublk device pair.
 
-This remains below #30 / OW-301, #50 / PC-005, and #57 / PC-012. It is not a
+This remains below OW-301 and PC-012. It is not a
 block-device acceptance harness.
 
 ## Non-Claims
 
 This is not a ublk daemon, not a started Linux block-device export, not
-`UBLK_U_CMD_SET_PARAMS` execution, not `UBLK_U_CMD_START_DEV` execution, not
-#57.
+`UBLK_U_CMD_SET_PARAMS` execution, not `UBLK_U_CMD_START_DEV` execution.

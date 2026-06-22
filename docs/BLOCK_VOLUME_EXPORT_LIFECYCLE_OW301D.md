@@ -45,7 +45,7 @@ tidefs-xtask check-block-volume-export-lifecycle
 
 ## Relationship To Parent Gates
 
-This is a prerequisite for #30 / OW-301. It gives the block-volume model an
+This is a prerequisite for OW-301. It gives the block-volume model an
 explicit export lifecycle and quiesce boundary after queue admission and
 dispatch execution, before any Linux `ublk` surface is admitted.
 

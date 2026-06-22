@@ -39,9 +39,9 @@ claiming a live `ublk` export.
 
 ## Relationship To Parent Gates
 
-This is a prerequisite for #30 / OW-301. It gives the repository an executable
+This is a prerequisite for OW-301. It gives the repository an executable
 block-volume adapter family member before any Linux export surface is admitted.
 
 ## Non-Claims
 
-durability claim. It does not close #30, #50, or #57.
+durability claim.

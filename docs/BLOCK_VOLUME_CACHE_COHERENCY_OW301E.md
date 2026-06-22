@@ -36,7 +36,7 @@ tidefs-xtask check-block-volume-cache-coherency
 
 ## Relationship To Parent Gates
 
-This is a prerequisite for #30 / OW-301 and follows the P6-02 cache/flush/FUA
+This is a prerequisite for OW-301 and follows the P6-02 cache/flush/FUA
 law. It gives the block-volume model explicit cache coherency and barrier
 records before any Linux `ublk` surface is admitted.
 

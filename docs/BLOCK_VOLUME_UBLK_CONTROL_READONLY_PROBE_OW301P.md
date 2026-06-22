@@ -55,15 +55,14 @@ tidefs-xtask check-block-volume-ublk-control-readonly-probe
 
 ## Relationship To Parent Gates
 
-This follows #96 / OW-301O. OW-301O proves the real control-device open
+This follows OW-301O. OW-301O proves the real control-device open
 admission boundary; OW-301P adds the first admitted read-only ublk control
 uring_cmd boundary without creating or starting a device.
 
-This remains below #30 / OW-301, #50 / PC-005, and #57 / PC-012. It is not
+This remains below OW-301 and PC-012. It is not
 harness.
 
 ## Non-Claims
 
 This is not a ublk daemon, not a Linux block device, not `UBLK_CMD_ADD_DEV` or
-`UBLK_CMD_START_DEV` execution, not io_uring data-queue execution, not fio
-#30, #50, or #57.
+`UBLK_CMD_START_DEV` execution, not io_uring data-queue execution, not fio.

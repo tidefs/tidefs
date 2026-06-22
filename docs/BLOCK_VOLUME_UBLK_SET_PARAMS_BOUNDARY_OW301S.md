@@ -74,15 +74,14 @@ tidefs-xtask check-block-volume-ublk-set-params-boundary
 
 ## Relationship To Parent Gates
 
-This follows #99 / OW-301R. OW-301R proves guarded ADD_DEV cleanup; OW-301S
+This follows OW-301R. OW-301R proves guarded ADD_DEV cleanup; OW-301S
 adds the first guarded parameter-setting control command using the existing
 TideFS geometry parameters and preserves cleanup after successful ADD_DEV.
 
-This remains below #30 / OW-301, #50 / PC-005, and #57 / PC-012. It is not a
+This remains below OW-301 and PC-012. It is not a
 block-device acceptance harness.
 
 ## Non-Claims
 
 This is not a ublk daemon, not a started Linux block-device export, not
-`UBLK_U_CMD_START_DEV` execution, not io_uring data-queue execution, not fio
-does not close #30, #50, or #57.
+`UBLK_U_CMD_START_DEV` execution, not io_uring data-queue execution, not fio.

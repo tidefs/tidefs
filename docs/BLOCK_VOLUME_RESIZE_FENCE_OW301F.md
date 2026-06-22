@@ -40,7 +40,7 @@ tidefs-xtask check-block-volume-resize-fence
 
 ## Relationship To Parent Gates
 
-This is a prerequisite for #30 / OW-301. It binds resize/fence policy to source
+This is a prerequisite for OW-301. It binds resize/fence policy to source
 records after the lifecycle and cache gates, before any Linux `ublk` surface is
 admitted.
 

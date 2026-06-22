@@ -37,7 +37,7 @@ tidefs-xtask check-block-volume-dispatch-execution
 
 ## Relationship To Parent Gates
 
-This is a prerequisite for #30 / OW-301. It gives the block-volume model a
+This is a prerequisite for OW-301. It gives the block-volume model a
 deterministic execution step after queue admission and before any Linux `ublk`
 surface is admitted.
 

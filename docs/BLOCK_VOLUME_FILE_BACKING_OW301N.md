@@ -48,15 +48,14 @@ tidefs-xtask check-block-volume-file-backing
 
 ## Relationship To Parent Gates
 
-This follows #94 / OW-301M. OW-301M binds ublk descriptor intake, queue
+This follows OW-301M. OW-301M binds ublk descriptor intake, queue
 admission, dispatch, and completion rendering against the existing in-memory
 source image; OW-301N adds a durable userspace backing-file image surface that
 future live ublk work can use without changing the request semantics.
 
-This remains below #30 / OW-301, #50 / PC-005, and #57 / PC-012. It is not
+This remains below OW-301 and PC-012. It is not
 
 ## Non-Claims
 
 This is not a ublk daemon, not a Linux block device, not a `/dev/ublk-control`
-runtime, not `/dev/ublkcN` command execution, not io_uring queue execution, not
-It does not close #30, #50, or #57.
+runtime, not `/dev/ublkcN` command execution, not io_uring queue execution.
