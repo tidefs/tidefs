@@ -234,8 +234,8 @@ impl LeaseManager {
                 let mut result = bus.dispatch_invalidation_message(msg);
                 self.stats.invalidations_dispatched += 1;
                 match wait_policy {
-                    InvalidationWaitPolicy::Advisory
-                    | InvalidationWaitPolicy::WaitForCleanEviction => {
+                    InvalidationWaitPolicy::Advisory => Ok(result),
+                    InvalidationWaitPolicy::WaitForCleanEviction => {
                         self.stats.invalidations_acked += 1;
                         Ok(result)
                     }
