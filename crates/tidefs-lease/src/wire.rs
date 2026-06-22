@@ -445,28 +445,32 @@ impl LeaseWireCodec {
     /// Returns [`BinarySchemaError`] if the payload is invalid.
     pub fn decode(framed: &[u8]) -> Result<LeaseWireMessage, BinarySchemaError> {
         if framed.len() < HEADER_BYTES + DIGEST_BYTES {
-            return Err(BinarySchemaError::InvalidPayloadLength {
-                got: framed.len(),
-                min_expected: HEADER_BYTES + DIGEST_BYTES,
-            });
+            return Err(BinarySchemaError::BoundsViolation);
         }
 
-        let header = tidefs_binary_schema_framing::EnvelopeHeader::decode(
-            &framed[..HEADER_BYTES],
-        )?;
+        let header_buf: &[u8; HEADER_BYTES] = framed[..HEADER_BYTES]
+            .try_into()
+            .map_err(|_| BinarySchemaError::BoundsViolation)?;
+        let header = tidefs_binary_schema_framing::EnvelopeHeader::decode(header_buf)?;
 
-        if header.family() != LEASE_FAMILY
-            || header.schema_type() != LEASE_TYPE
-        {
-            return Err(BinarySchemaError::InvalidSchemaClass {
-                family: header.family().0,
-                typ: header.schema_type().0,
-            });
+        if header.family_id != LEASE_FAMILY || header.type_id != LEASE_TYPE {
+            return Err(BinarySchemaError::InvalidPayloadClass);
         }
 
-        let payload_len = (header.body_length() as usize).saturating_sub(DIGEST_BYTES);
+        let total_body = header.total_body_bytes as usize;
+        if total_body < DIGEST_BYTES {
+            return Err(BinarySchemaError::BoundsViolation);
+        }
+        let body_end = HEADER_BYTES + total_body;
+        if framed.len() < body_end {
+            return Err(BinarySchemaError::BoundsViolation);
+        }
+
+        let payload_len = total_body - DIGEST_BYTES;
         let payload = &framed[HEADER_BYTES..HEADER_BYTES + payload_len];
-        let digest = &framed[HEADER_BYTES + payload_len..HEADER_BYTES + payload_len + DIGEST_BYTES];
+        let digest: &[u8; DIGEST_BYTES] = framed[HEADER_BYTES + payload_len..body_end]
+            .try_into()
+            .map_err(|_| BinarySchemaError::BoundsViolation)?;
 
         let expected = blake3_domain_digest(
             payload,
@@ -476,11 +480,11 @@ impl LeaseWireCodec {
             LEASE_DOMAIN_TAG,
         );
 
-        if expected != digest {
+        if expected != *digest {
             return Err(BinarySchemaError::DigestMismatch);
         }
 
-        bincode::deserialize(payload).map_err(|_e| BinarySchemaError::InvalidPayloadEncoding)
+        bincode::deserialize(payload).map_err(|_e| BinarySchemaError::InvalidPayloadClass)
     }
 }
 

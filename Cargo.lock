@@ -2657,6 +2657,7 @@ dependencies = [
  "tidefs-binary_schema-checksum",
  "tidefs-binary_schema-core",
  "tidefs-binary_schema-framing",
+ "tidefs-cache-coherency",
  "tidefs-clock-timing",
  "tidefs-membership-epoch",
 ]
