@@ -306,6 +306,7 @@ mod dedup;
 mod dedup_refcount;
 pub mod dirty_page_tracker;
 mod encoding;
+pub mod export;
 mod extent_map_store_adapter;
 mod error;
 mod fsck;
@@ -3393,7 +3394,7 @@ impl LocalFileSystem {
         // the mutation intent log (tidefs-intent-log). This complements the
         // data-path intent log replay already performed by
         // load_latest_committed_state. If no segments exist, replay is a no-op.
-        {
+        if recovery_policy.allows_replay() {
             let intent_log_dir = root_path.join("intent_log");
             let applied_txg = recovered_generation;
             let vfs = crate::vfs_engine_impl::VfsLocalFileSystem::new(fs);
@@ -3443,7 +3444,7 @@ impl LocalFileSystem {
         // Build the background scheduler, register all services, and start
         // the runtime thread. The runtime drives BackgroundOrphanReclamation
         // and BackgroundScrubber under per-tick budget without blocking mount.
-        {
+        if recovery_policy.allows_any_mutation() {
             let mut scheduler = BackgroundScheduler::new(ServiceBudget::DEFAULT_TICK);
 
             let orphan_reclamation = BackgroundOrphanReclamation::new(
@@ -12428,6 +12429,10 @@ impl Drop for LocalFileSystem {
         self.stop_background_scheduler();
         if let Some(handle) = self.writeback_handle.take() {
             handle.shutdown();
+        }
+
+        if !self.recovery_policy.allows_any_mutation() {
+            return;
         }
 
         // Best-effort: commit dirty state and sync backing store.
