@@ -10,8 +10,8 @@
 use blake3::Hasher;
 
 use crate::{
-    CompactionConfig, CompactionPolicyReport, CompactionPressureLevel, CompactionRun,
-    CompactionStore, CompactionTriggerInput, RelocationEntry,
+    CompactionConfig, CompactionPolicyReport, CompactionRun, CompactionStore,
+    CompactionTriggerInput, RelocationEntry,
 };
 
 use tidefs_reclaim_queue_core::{FreedExtent, ReclaimQueueLedger, SegmentLivenessQueue};
@@ -784,7 +784,7 @@ mod tests {
 
         let report = driver.run_compaction_pass_with_trigger(
             CompactionTriggerInput::pressure_escalated(
-                CompactionPressureLevel::Auto,
+                crate::CompactionPressureLevel::Auto,
                 tidefs_types_incremental_job_core::WorkBudget::DEFAULT_TICK,
             ),
         );
