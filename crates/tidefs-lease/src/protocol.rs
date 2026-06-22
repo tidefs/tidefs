@@ -338,10 +338,6 @@ impl LeaseProtocol {
     ) -> Result<LeaseGrant, LeaseProtocolError> {
         if mount_identity != self.current_mount_identity {
             return Err(LeaseProtocolError::MountIdentityMismatch(
-    #[error("invalidation rejected for dataset {0} inode {1}: fenced")]
-    InvalidationRejected(u64, u64),
-    #[error("invalidation for dataset {0} inode {1} needs retry ({2} dirty remaining)")]
-    InvalidationRetry(u64, u64, u64),
                 mount_identity,
                 self.current_mount_identity,
             ));
@@ -402,10 +398,6 @@ impl LeaseProtocol {
             }
             if grant.mount_identity != self.current_mount_identity {
                 return Err(LeaseProtocolError::MountIdentityMismatch(
-    #[error("invalidation rejected for dataset {0} inode {1}: fenced")]
-    InvalidationRejected(u64, u64),
-    #[error("invalidation for dataset {0} inode {1} needs retry ({2} dirty remaining)")]
-    InvalidationRetry(u64, u64, u64),
                     grant.mount_identity,
                     self.current_mount_identity,
                 ));
@@ -1108,10 +1100,6 @@ mod tests {
         assert!(matches!(
             result,
             Err(LeaseProtocolError::MountIdentityMismatch(got, expected))
-    #[error("invalidation rejected for dataset {0} inode {1}: fenced")]
-    InvalidationRejected(u64, u64),
-    #[error("invalidation for dataset {0} inode {1} needs retry ({2} dirty remaining)")]
-    InvalidationRetry(u64, u64, u64),
                 if got == stale && expected == current
         ));
         assert_eq!(proto.active_count(), 0);
