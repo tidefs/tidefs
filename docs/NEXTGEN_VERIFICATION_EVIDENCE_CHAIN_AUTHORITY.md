@@ -56,8 +56,8 @@ cannot close a higher-tier claim.
 
 ## Common Evidence Format
 
-Each claim evidence record must carry these fields after the shared format
-follow-up lands:
+Each claim evidence record must use `EvidenceArtifactManifest`
+`manifest_version = 2` and carry these fields:
 
 | Field | Authority rule |
 | --- | --- |
@@ -65,20 +65,21 @@ follow-up lands:
 | `evidence_class` | Must match one required evidence class for that claim. |
 | `validation_tier` | Must use the canonical `ValidationTier` vocabulary. |
 | `scope` | Must name the bounded behavior, workload, model, or runtime path covered. |
-| `evidence_artifact` | Must identify the workspace-relative artifact path and content digest. |
+| `artifact_path` and `content_digest` | Must identify the workspace-relative artifact path and machine-checkable BLAKE3 digest. |
 | `run_id` | Must name the GitHub Actions run id/attempt or deterministic fixture/model run id. |
 | `source_ref` | Must name the commit SHA or source ref that produced the artifact. |
 | `outcome` | Must use the shared validation outcome vocabulary: pass, product fail, harness fail, environment refusal, or skip. |
 | `residual_risk` | Must state the limits that remain after the evidence, especially model-only or harness-only boundaries. |
-| `producer` | Must name the crate, workflow, or tool that emitted the artifact. |
-| `generated_at` | Must be a reviewable timestamp when available. |
-| `blocking_issues` | Must name unresolved issues that keep the evidence from closing the claim. |
+| `source` | Must name the crate, workflow, or tool that emitted the artifact. |
+| `generated_at` | Must be a reviewable generated timestamp. |
+| `blocking_issues` | Must explicitly list unresolved issues that keep the evidence from closing the claim, or an empty list when none are known. |
 
-The current `EvidenceArtifactManifest` already carries much of this shape:
-claim id, evidence class, validation tier, source, scope, artifact path,
-content digest, timestamp, and blocking issues. Issue #809 owns the explicit
-run/source/outcome/residual-risk extension so producers stop hiding those
-fields in ad hoc scope strings.
+Version-1 manifests are retired pre-standardization input: they may remain
+useful for review or historical comparison, but `validate-evidence-manifest`
+must reject them for future claim closure because they can hide run identity,
+source ref, outcome, residual risk, or blocking issue state in ad hoc strings.
+Producers that still emit version-1 manifests must regenerate version-2
+records before their artifacts can satisfy claim evidence.
 
 ## Producer Rules
 

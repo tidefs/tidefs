@@ -2,27 +2,29 @@
 use std::fs;
 
 use tidefs_validation::evidence_artifact_manifest::{
-    content_digest_for_bytes, parse_evidence_artifact_manifest_json, BlockingIssueRef,
-    EvidenceArtifactManifest,
+    content_digest_for_bytes, parse_evidence_artifact_manifest_json, EvidenceArtifactManifest,
+    EVIDENCE_ARTIFACT_MANIFEST_VERSION,
 };
 use tidefs_validation::validation_schema::ValidationTier;
+use tidefs_validation::validation_status::ValidationStatus;
 
 fn valid_manifest(payload: &[u8], artifact_path: impl Into<String>) -> EvidenceArtifactManifest {
     EvidenceArtifactManifest {
-        manifest_version: 1,
+        manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
         claim_id: "local.vfs.write_fsync_crash.v1".to_string(),
         evidence_class: "model-crash-matrix".to_string(),
         validation_tier: ValidationTier::SourceModel,
-        source: "tidefs-crash-oracle".to_string(),
         scope: "model-only".to_string(),
         artifact_path: artifact_path.into(),
         content_digest: content_digest_for_bytes(payload),
-        generated_at: Some("2026-06-18T00:00:00Z".to_string()),
-        blocking_issues: vec![BlockingIssueRef {
-            repo: Some("tidefs/tidefs".to_string()),
-            number: 486,
-            reason: Some("runtime crash evidence is owned separately".to_string()),
-        }],
+        run_id: "123456789/1".to_string(),
+        source_ref: "774b48046851ee844284b62a484573597c96a013".to_string(),
+        outcome: ValidationStatus::Pass,
+        residual_risk: "Fixture covers schema validation only; it is not runtime proof."
+            .to_string(),
+        source: "tidefs-crash-oracle".to_string(),
+        generated_at: "2026-06-18T00:00:00Z".to_string(),
+        blocking_issues: Vec::new(),
     }
 }
 
@@ -64,13 +66,19 @@ fn artifact_manifest_json_roundtrip_and_digest_verification() {
 #[test]
 fn artifact_manifest_rejects_missing_claim_id() {
     let json = r#"{
-      "manifest_version": 1,
+      "manifest_version": 2,
       "evidence_class": "model-crash-matrix",
       "validation_tier": "source-model",
       "source": "tidefs-crash-oracle",
       "scope": "model-only",
       "artifact_path": "validation/artifacts/crash-oracle/model-crash-matrices.json",
-      "content_digest": "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+      "content_digest": "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+      "run_id": "123456789/1",
+      "source_ref": "774b48046851ee844284b62a484573597c96a013",
+      "outcome": "pass",
+      "residual_risk": "Fixture covers schema validation only.",
+      "generated_at": "2026-06-18T00:00:00Z",
+      "blocking_issues": []
     }"#;
 
     assert_failure_contains(
@@ -98,14 +106,20 @@ fn artifact_manifest_rejects_empty_evidence_class() {
 #[test]
 fn artifact_manifest_rejects_unknown_validation_tier() {
     let json = r#"{
-      "manifest_version": 1,
+      "manifest_version": 2,
       "claim_id": "local.vfs.write_fsync_crash.v1",
       "evidence_class": "model-crash-matrix",
       "validation_tier": "runtime-ish",
       "source": "tidefs-crash-oracle",
       "scope": "model-only",
       "artifact_path": "validation/artifacts/crash-oracle/model-crash-matrices.json",
-      "content_digest": "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+      "content_digest": "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+      "run_id": "123456789/1",
+      "source_ref": "774b48046851ee844284b62a484573597c96a013",
+      "outcome": "pass",
+      "residual_risk": "Fixture covers schema validation only.",
+      "generated_at": "2026-06-18T00:00:00Z",
+      "blocking_issues": []
     }"#;
 
     assert_failure_contains(
@@ -123,8 +137,7 @@ fn artifact_manifest_rejects_digest_mismatch() {
     fs::write(&full_path, br#"{"report_version":1}"#).unwrap();
 
     let mut manifest = valid_manifest(b"different payload", artifact_path);
-    manifest.content_digest =
-        "blake3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+    manifest.content_digest = content_digest_for_bytes(b"different payload");
     let error = manifest
         .verify_artifact_digest(tempdir.path())
         .expect_err("digest mismatch should fail");

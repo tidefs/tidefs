@@ -24,21 +24,31 @@ receipts. The TideFS-owned schema lives in
 
 Each manifest records:
 
-- `manifest_version = 1`
+- `manifest_version = 2`
 - `claim_id`
 - `evidence_class`
 - `validation_tier`
-- `source`
 - `scope`
 - `artifact_path`
 - `content_digest` as `blake3:<64 hex>`
-- optional `generated_at`
+- `run_id`
+- `source_ref`
+- `outcome` as `pass`, `product-fail`, `harness-fail`,
+  `environment-refusal`, or `skip`
+- `residual_risk`
+- `source`
+- `generated_at`
 - `blocking_issues`
 
 The `artifact_path` must be relative to the repository or validation artifact
 root, and `content_digest` must match the bytes at that path. Use the
 manifest helpers in `tidefs-validation` to serialize, parse, and verify the
 record instead of parsing per-tool output shapes.
+
+Version-1 manifests are retired pre-standardization input. They can be read as
+historical review material, but `validate-evidence-manifest` rejects them for
+future claim closure because the run id, source ref, outcome, residual risk,
+and blocking issue state were not explicit common fields.
 
 Model-only artifacts must use a model tier such as `source-model` and a scope
 that names the model boundary. They are useful evidence, but they are not
