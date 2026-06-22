@@ -2,8 +2,9 @@
 //! Segment liveness tracking for dead-segment reclamation.
 //!
 //! Tracks each segment's live-byte and dead-byte counts, updated by
-//! overwrite and delete operations. Surfaces the highest-yield dead
-//! segments as candidates for the segment cleaner.
+//! overwrite and delete operations. It exposes deterministic liveness reports
+//! so the segment cleaner can own fully-dead freeing and the compaction
+//! authority can own partial-live rewrite policy.
 //!
 //! The queue is serializable so it can be persisted as a reclaim-queue
 //! segment in the local object store.
@@ -124,6 +125,78 @@ impl fmt::Display for SegmentLivenessEntry {
     }
 }
 
+/// Downstream path indicated by a liveness report entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentLivenessHandoffTarget {
+    /// Segment has no live bytes and may proceed through cleaner-owned free work.
+    CleanerFullyDead,
+    /// Segment has both live and dead bytes; it is input for compaction authority.
+    CompactionPartialLive,
+}
+
+/// Deterministic liveness handoff record for downstream consumers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentLivenessHandoff {
+    /// Stable segment identifier.
+    pub segment_id: u64,
+    /// Bytes still live in the segment.
+    pub live_bytes: u64,
+    /// Bytes known dead in the segment.
+    pub dead_bytes: u64,
+    /// Transaction group when this segment was first written.
+    pub creation_commit_group: u64,
+    /// Downstream owner for this liveness path.
+    pub target: SegmentLivenessHandoffTarget,
+}
+
+impl SegmentLivenessHandoff {
+    #[must_use]
+    pub const fn new(
+        segment_id: u64,
+        live_bytes: u64,
+        dead_bytes: u64,
+        creation_commit_group: u64,
+        target: SegmentLivenessHandoffTarget,
+    ) -> Self {
+        Self {
+            segment_id,
+            live_bytes,
+            dead_bytes,
+            creation_commit_group,
+            target,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_fully_dead(self) -> bool {
+        matches!(self.target, SegmentLivenessHandoffTarget::CleanerFullyDead)
+    }
+
+    #[must_use]
+    pub const fn is_partially_live(self) -> bool {
+        matches!(
+            self.target,
+            SegmentLivenessHandoffTarget::CompactionPartialLive
+        )
+    }
+}
+
+/// Fully-dead and partial-live liveness paths in stable segment-id order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SegmentLivenessReport {
+    /// Fully-dead segments for cleaner/free authority.
+    pub fully_dead: Vec<SegmentLivenessHandoff>,
+    /// Partial-live segments for compaction authority input.
+    pub partially_live: Vec<SegmentLivenessHandoff>,
+}
+
+impl SegmentLivenessReport {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fully_dead.is_empty() && self.partially_live.is_empty()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SegmentLivenessQueue
 // ---------------------------------------------------------------------------
@@ -131,9 +204,10 @@ impl fmt::Display for SegmentLivenessEntry {
 /// Persistent queue tracking segment liveness for dead-segment reclamation.
 ///
 /// Each segment known to the queue has live-byte and dead-byte counts.
-/// Overwrites transfer bytes from live to dead; deletes add dead bytes.
-/// `next_candidate` returns the segment with the highest dead fraction
-/// above a configurable threshold, ordered deterministically.
+/// Overwrites transfer bytes from live to dead; deletes add dead bytes. The
+/// authoritative cross-crate boundary is [`handoff_report`](Self::handoff_report):
+/// fully-dead entries feed cleaner/free authority, while partial-live entries
+/// feed compaction authority policy.
 ///
 /// # Persistence
 ///
@@ -199,6 +273,35 @@ impl SegmentLivenessQueue {
     /// Iterate over all tracked entries in segment-id order.
     pub fn entries(&self) -> impl Iterator<Item = &SegmentLivenessEntry> {
         self.segments.values()
+    }
+
+    /// Return fully-dead and partial-live liveness paths in segment-id order.
+    ///
+    /// This method performs no threshold admission and no merge scoring. It is
+    /// a deterministic handoff surface for cleaner and compaction consumers.
+    #[must_use]
+    pub fn handoff_report(&self) -> SegmentLivenessReport {
+        let mut report = SegmentLivenessReport::default();
+        for entry in self.segments.values() {
+            if entry.is_fully_dead() {
+                report.fully_dead.push(SegmentLivenessHandoff::new(
+                    entry.segment_id,
+                    entry.live_bytes,
+                    entry.dead_bytes,
+                    entry.creation_commit_group,
+                    SegmentLivenessHandoffTarget::CleanerFullyDead,
+                ));
+            } else if entry.live_bytes > 0 && entry.dead_bytes > 0 {
+                report.partially_live.push(SegmentLivenessHandoff::new(
+                    entry.segment_id,
+                    entry.live_bytes,
+                    entry.dead_bytes,
+                    entry.creation_commit_group,
+                    SegmentLivenessHandoffTarget::CompactionPartialLive,
+                ));
+            }
+        }
+        report
     }
 
     // ------------------------------------------------------------------
@@ -806,6 +909,71 @@ mod tests {
         assert_eq!(q.get(3).unwrap().dead_bytes, 1500);
         assert_eq!(q.get(5).unwrap().live_bytes, 0);
         assert_eq!(q.get(5).unwrap().dead_bytes, 5000);
+    }
+
+    #[test]
+    fn handoff_report_distinguishes_fully_dead_and_partial_live() {
+        let mut q = SegmentLivenessQueue::new();
+        q.segments
+            .insert(1, SegmentLivenessEntry::with_txg(1, 0, 4096, 10));
+        q.segments
+            .insert(2, SegmentLivenessEntry::with_txg(2, 2048, 2048, 11));
+        q.segments
+            .insert(3, SegmentLivenessEntry::with_txg(3, 4096, 0, 12));
+        q.segments
+            .insert(4, SegmentLivenessEntry::with_txg(4, 0, 0, 13));
+
+        let report = q.handoff_report();
+
+        assert_eq!(
+            report.fully_dead,
+            vec![SegmentLivenessHandoff::new(
+                1,
+                0,
+                4096,
+                10,
+                SegmentLivenessHandoffTarget::CleanerFullyDead,
+            )]
+        );
+        assert_eq!(
+            report.partially_live,
+            vec![SegmentLivenessHandoff::new(
+                2,
+                2048,
+                2048,
+                11,
+                SegmentLivenessHandoffTarget::CompactionPartialLive,
+            )]
+        );
+    }
+
+    #[test]
+    fn handoff_report_is_stable_by_segment_id() {
+        let mut q = SegmentLivenessQueue::new();
+        q.segments
+            .insert(30, SegmentLivenessEntry::new(30, 100, 900));
+        q.segments
+            .insert(10, SegmentLivenessEntry::new(10, 0, 1024));
+        q.segments.insert(20, SegmentLivenessEntry::new(20, 50, 50));
+
+        let report = q.handoff_report();
+
+        assert_eq!(
+            report
+                .fully_dead
+                .iter()
+                .map(|entry| entry.segment_id)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert_eq!(
+            report
+                .partially_live
+                .iter()
+                .map(|entry| entry.segment_id)
+                .collect::<Vec<_>>(),
+            vec![20, 30]
+        );
     }
 
     // -- next_candidate --
