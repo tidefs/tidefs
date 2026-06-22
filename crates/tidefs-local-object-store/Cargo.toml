@@ -22,6 +22,7 @@ tidefs-segment-cleaner = { path = "../tidefs-segment-cleaner" }
 tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
 tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
 tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
+tidefs-types-extent-map-core = { path = "../tidefs-types-extent-map-core" }
 tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
 tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
 tidefs-binary_schema-framing = { path = "../tidefs-binary_schema-framing" }
