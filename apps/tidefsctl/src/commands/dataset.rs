@@ -17,7 +17,9 @@ use tidefs_dataset_lifecycle::{
     DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
 };
 use tidefs_dataset_properties::{self, PropertyKey, PropertySet, PropertyValue};
-use tidefs_local_filesystem::{LocalFileSystem, RecoveryPolicy, RootAuthenticationKey};
+use tidefs_local_filesystem::{
+    FileSystemStatfs, LocalFileSystem, RecoveryPolicy, RootAuthenticationKey,
+};
 use tidefs_local_object_store::StoreOptions;
 use tidefs_types_dataset_feature_flags_core::{get_feature_class, FeatureClass, FeatureName};
 
@@ -94,6 +96,12 @@ struct DatasetListRow {
     used_bytes: Option<u64>,
     available_bytes: Option<u64>,
     mountpoint: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DatasetCapacityProjection {
+    used_bytes: Option<u64>,
+    available_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -760,7 +768,7 @@ fn dataset_rows_from_catalog(
     pool: &str,
     catalog: &DatasetCatalog,
     filter: Option<DatasetTypeArg>,
-    available_bytes: Option<u64>,
+    capacity: DatasetCapacityProjection,
 ) -> Vec<DatasetListRow> {
     catalog
         .list_all()
@@ -770,8 +778,8 @@ fn dataset_rows_from_catalog(
             pool: pool.to_string(),
             path,
             dataset_type,
-            used_bytes: None,
-            available_bytes,
+            used_bytes: capacity.used_bytes,
+            available_bytes: capacity.available_bytes,
             mountpoint: None,
         })
         .collect()
@@ -827,6 +835,14 @@ fn optional_bytes(value: Option<u64>) -> String {
 
 fn bytes_from_blocks(blocks: u64, block_size: u32) -> u64 {
     blocks.saturating_mul(u64::from(block_size))
+}
+
+fn dataset_capacity_projection_from_statfs(stats: FileSystemStatfs) -> DatasetCapacityProjection {
+    let used_blocks = stats.blocks.saturating_sub(stats.bfree);
+    DatasetCapacityProjection {
+        used_bytes: Some(bytes_from_blocks(used_blocks, stats.bsize)),
+        available_bytes: Some(bytes_from_blocks(stats.bavail, stats.bsize)),
+    }
 }
 
 fn list_pool_from_args(args: &DatasetListArgs) -> Option<String> {
@@ -1134,12 +1150,12 @@ fn handle_list(args: DatasetListArgs) {
             "type": args.dataset_type.map(|dataset_type| dataset_type.label()),
         }),
     );
-    let available_bytes = match fs.statfs() {
-        Ok(stats) => Some(bytes_from_blocks(stats.bavail, stats.bsize)),
-        Err(_) => None,
+    let capacity = match fs.statfs() {
+        Ok(stats) => dataset_capacity_projection_from_statfs(stats),
+        Err(_) => DatasetCapacityProjection::default(),
     };
     let catalog = fs.dataset_catalog();
-    let rows = dataset_rows_from_catalog(&pool, catalog, args.dataset_type, available_bytes);
+    let rows = dataset_rows_from_catalog(&pool, catalog, args.dataset_type, capacity);
     print_dataset_rows(Some(&pool), &rows, args.json);
 }
 fn handle_rename(args: DatasetRenameArgs) {
@@ -2153,8 +2169,15 @@ mod dataset_lifecycle_command_tests {
             ("vol", DatasetType::Volume),
         ]);
 
-        let rows =
-            dataset_rows_from_catalog("tank", &catalog, Some(DatasetTypeArg::Volume), Some(4096));
+        let rows = dataset_rows_from_catalog(
+            "tank",
+            &catalog,
+            Some(DatasetTypeArg::Volume),
+            DatasetCapacityProjection {
+                used_bytes: Some(8192),
+                available_bytes: Some(4096),
+            },
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "vol");
 
@@ -2162,9 +2185,29 @@ mod dataset_lifecycle_command_tests {
         assert_eq!(json[0]["pool"], "tank");
         assert_eq!(json[0]["name"], "tank/vol");
         assert_eq!(json[0]["type"], "volume");
-        assert_eq!(json[0]["used"], serde_json::Value::Null);
+        assert_eq!(json[0]["used"], serde_json::json!(8192));
         assert_eq!(json[0]["available"], serde_json::json!(4096));
         assert_eq!(json[0]["mountpoint"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn capacity_projection_reports_used_and_available_from_statfs() {
+        let stats = FileSystemStatfs {
+            blocks: 10,
+            bfree: 6,
+            bavail: 5,
+            files: 0,
+            ffree: 0,
+            bsize: 4096,
+            namelen: 0,
+            frsize: 4096,
+            fsid_hi: 0,
+            fsid_lo: 0,
+        };
+
+        let capacity = dataset_capacity_projection_from_statfs(stats);
+        assert_eq!(capacity.used_bytes, Some(16_384));
+        assert_eq!(capacity.available_bytes, Some(20_480));
     }
 
     #[test]
