@@ -12,6 +12,7 @@
 //! - `HeartbeatV1` / `HeartbeatAckV1`
 //! - `NodeDescriptorV1` / `DatasetViewV1` / `ClusterViewV1`
 //! - `MembershipTransition` / `MembershipTransitionRecord`
+//! - `MembershipEpochProofV1`
 //!
 //! Every type implements [`MembershipCodec`] for binary encode/decode
 //! with CRC32C checksums appended to every encoded message.
@@ -234,6 +235,143 @@ impl fmt::Display for MemberIdentity {
 }
 
 // ---------------------------------------------------------------------------
+// MembershipEpochProofV1
+// ---------------------------------------------------------------------------
+
+/// Wire-carried binding to a committed membership epoch proof.
+///
+/// `tidefs-membership-epoch` owns the authority that issues and validates
+/// `EpochToken` values. This wire type only carries the proof material that a
+/// receiver can compare against its current authority-issued token before
+/// higher-level membership state accepts a join, heartbeat, or view message.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MembershipEpochProofV1 {
+    /// The committed membership epoch observed by the sender.
+    pub committed_epoch: u64,
+    /// Generation from the authority-issued `EpochToken`.
+    pub token_generation: u64,
+}
+
+impl MembershipEpochProofV1 {
+    pub const GENESIS: Self = Self {
+        committed_epoch: 0,
+        token_generation: 0,
+    };
+
+    #[must_use]
+    pub const fn new(committed_epoch: u64, token_generation: u64) -> Self {
+        Self {
+            committed_epoch,
+            token_generation,
+        }
+    }
+
+    /// Compare this proof against the current authority-issued proof.
+    ///
+    /// This is a wire-layer freshness check only. The membership-epoch crate
+    /// remains responsible for deciding whether the current proof is valid.
+    pub fn validate_against(self, current: Self) -> Result<(), MembershipEpochProofError> {
+        if self.committed_epoch < current.committed_epoch {
+            return Err(MembershipEpochProofError::Stale {
+                current_epoch: current.committed_epoch,
+                received_epoch: self.committed_epoch,
+            });
+        }
+        if self.committed_epoch > current.committed_epoch {
+            return Err(MembershipEpochProofError::Future {
+                current_epoch: current.committed_epoch,
+                received_epoch: self.committed_epoch,
+            });
+        }
+        if self.token_generation != current.token_generation {
+            return Err(MembershipEpochProofError::TokenGenerationMismatch {
+                current_generation: current.token_generation,
+                received_generation: self.token_generation,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Wire-layer refusal reason for epoch-proof-gated membership messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipEpochProofError {
+    /// Sender proved an older committed epoch than the receiver currently trusts.
+    Stale {
+        current_epoch: u64,
+        received_epoch: u64,
+    },
+    /// Sender claimed a future epoch that the receiver has not committed.
+    Future {
+        current_epoch: u64,
+        received_epoch: u64,
+    },
+    /// Epoch matches, but the epoch-token generation does not.
+    TokenGenerationMismatch {
+        current_generation: u64,
+        received_generation: u64,
+    },
+    /// A message-local epoch field does not match the carried proof.
+    MessageEpochMismatch {
+        field: &'static str,
+        message_epoch: u64,
+        proof_epoch: u64,
+    },
+}
+
+impl fmt::Display for MembershipEpochProofError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stale {
+                current_epoch,
+                received_epoch,
+            } => write!(
+                f,
+                "membership epoch proof: stale epoch {received_epoch}, current {current_epoch}"
+            ),
+            Self::Future {
+                current_epoch,
+                received_epoch,
+            } => write!(
+                f,
+                "membership epoch proof: future epoch {received_epoch}, current {current_epoch}"
+            ),
+            Self::TokenGenerationMismatch {
+                current_generation,
+                received_generation,
+            } => write!(
+                f,
+                "membership epoch proof: token generation {received_generation}, current {current_generation}"
+            ),
+            Self::MessageEpochMismatch {
+                field,
+                message_epoch,
+                proof_epoch,
+            } => write!(
+                f,
+                "membership epoch proof: {field} epoch {message_epoch} does not match proof epoch {proof_epoch}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+fn require_epoch_binding(
+    proof: MembershipEpochProofV1,
+    field: &'static str,
+    message_epoch: u64,
+) -> Result<(), MembershipEpochProofError> {
+    if message_epoch != proof.committed_epoch {
+        return Err(MembershipEpochProofError::MessageEpochMismatch {
+            field,
+            message_epoch,
+            proof_epoch: proof.committed_epoch,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // MountMode
 // ---------------------------------------------------------------------------
 
@@ -281,6 +419,7 @@ pub struct JoinRequestV1 {
     pub mount_reports: alloc::vec::Vec<MountReportV1>,
     /// Optional full peer-capability advertisement for placement and transport selection.
     pub peer_capabilities: Option<PeerCapabilities>,
+    pub epoch_proof: MembershipEpochProofV1,
     pub nonce: u64,
 }
 
@@ -299,6 +438,7 @@ pub struct JoinResponseV1 {
     pub peer_descriptors: alloc::vec::Vec<NodeDescriptorV1>,
     pub cluster_view: Option<ClusterViewV1>,
     pub config_class: u8,
+    pub epoch_proof: MembershipEpochProofV1,
     pub nonce: u64,
 }
 
@@ -325,6 +465,7 @@ pub struct HeartbeatV1 {
     pub term: u64,
     pub mount_reports: alloc::vec::Vec<MountReportV1>,
     pub sequence: u64,
+    pub epoch_proof: MembershipEpochProofV1,
     pub nonce: u64,
 }
 
@@ -339,6 +480,7 @@ pub struct HeartbeatAckV1 {
     pub sequence: u64,
     pub accepted: bool,
     pub leader_hint: Option<u64>,
+    pub epoch_proof: MembershipEpochProofV1,
     pub nonce: u64,
 }
 
@@ -385,6 +527,7 @@ pub struct ClusterViewV1 {
     pub transitions: alloc::vec::Vec<MembershipTransitionRecord>,
     pub config_class: u8,
     pub sequence: u64,
+    pub epoch_proof: MembershipEpochProofV1,
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +586,8 @@ pub enum MembershipCodecError {
     Underflow,
     /// CRC32C checksum mismatch.
     ChecksumMismatch,
+    /// A decoder consumed a complete current-layout message but bytes remain.
+    TrailingBytes { remaining: usize },
     /// Invalid discriminant for an enum field.
     InvalidDiscriminant { field: &'static str, value: u8 },
     /// Invalid address family byte.
@@ -454,6 +599,9 @@ impl fmt::Display for MembershipCodecError {
         match self {
             Self::Underflow => f.write_str("membership codec: underflow"),
             Self::ChecksumMismatch => f.write_str("membership codec: CRC32C checksum mismatch"),
+            Self::TrailingBytes { remaining } => {
+                write!(f, "membership codec: {remaining} trailing bytes")
+            }
             Self::InvalidDiscriminant { field, value } => {
                 write!(
                     f,
@@ -792,9 +940,36 @@ pub(crate) fn verify_checksum(data: &[u8]) -> Result<(), MembershipCodecError> {
     Ok(())
 }
 
+fn ensure_fully_consumed(data: &[u8], pos: usize) -> Result<(), MembershipCodecError> {
+    if pos == data.len() {
+        Ok(())
+    } else {
+        Err(MembershipCodecError::TrailingBytes {
+            remaining: data.len() - pos,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MembershipCodec impls
 // ---------------------------------------------------------------------------
+
+impl MembershipCodec for MembershipEpochProofV1 {
+    #[cfg(feature = "alloc")]
+    fn encode(&self, buf: &mut alloc::vec::Vec<u8>) {
+        self.encode_body(buf);
+        push_checksum(buf);
+    }
+
+    fn decode(data: &[u8]) -> Result<Self, MembershipCodecError> {
+        verify_checksum(data)?;
+        let payload = &data[..data.len() - 4];
+        let mut pos = 0usize;
+        let proof = Self::decode_body(payload, &mut pos)?;
+        ensure_fully_consumed(payload, pos)?;
+        Ok(proof)
+    }
+}
 
 impl MembershipCodec for MountMode {
     #[cfg(feature = "alloc")]
@@ -867,6 +1042,7 @@ impl MembershipCodec for JoinRequestV1 {
             buf.push(0u8);
         }
 
+        self.epoch_proof.encode_body(buf);
         push_u64(buf, self.nonce);
         push_checksum(buf);
     }
@@ -895,7 +1071,9 @@ impl MembershipCodec for JoinRequestV1 {
             None
         };
 
+        let epoch_proof = MembershipEpochProofV1::decode_body(payload, &mut pos)?;
         let nonce = read_u64(payload, &mut pos)?;
+        ensure_fully_consumed(payload, pos)?;
         Ok(Self {
             node_id,
             cluster_addr,
@@ -904,6 +1082,7 @@ impl MembershipCodec for JoinRequestV1 {
             highest_epoch_seen,
             mount_reports,
             peer_capabilities,
+            epoch_proof,
             nonce,
         })
     }
@@ -934,6 +1113,7 @@ impl MembershipCodec for JoinResponseV1 {
         }
 
         push_u8(buf, self.config_class);
+        self.epoch_proof.encode_body(buf);
         push_u64(buf, self.nonce);
         push_checksum(buf);
     }
@@ -962,7 +1142,9 @@ impl MembershipCodec for JoinResponseV1 {
         };
 
         let config_class = read_u8(payload, &mut pos)?;
+        let epoch_proof = MembershipEpochProofV1::decode_body(payload, &mut pos)?;
         let nonce = read_u64(payload, &mut pos)?;
+        ensure_fully_consumed(payload, pos)?;
         Ok(Self {
             node_id,
             term,
@@ -972,6 +1154,7 @@ impl MembershipCodec for JoinResponseV1 {
             peer_descriptors,
             cluster_view,
             config_class,
+            epoch_proof,
             nonce,
         })
     }
@@ -1012,6 +1195,7 @@ impl MembershipCodec for HeartbeatV1 {
         }
 
         push_u64(buf, self.sequence);
+        self.epoch_proof.encode_body(buf);
         push_u64(buf, self.nonce);
         push_checksum(buf);
     }
@@ -1030,12 +1214,15 @@ impl MembershipCodec for HeartbeatV1 {
         }
 
         let sequence = read_u64(payload, &mut pos)?;
+        let epoch_proof = MembershipEpochProofV1::decode_body(payload, &mut pos)?;
         let nonce = read_u64(payload, &mut pos)?;
+        ensure_fully_consumed(payload, pos)?;
         Ok(Self {
             node_id,
             term,
             mount_reports,
             sequence,
+            epoch_proof,
             nonce,
         })
     }
@@ -1049,6 +1236,7 @@ impl MembershipCodec for HeartbeatAckV1 {
         push_u64(buf, self.sequence);
         push_bool(buf, self.accepted);
         push_opt_u64(buf, self.leader_hint);
+        self.epoch_proof.encode_body(buf);
         push_u64(buf, self.nonce);
         push_checksum(buf);
     }
@@ -1057,14 +1245,17 @@ impl MembershipCodec for HeartbeatAckV1 {
         verify_checksum(data)?;
         let payload = &data[..data.len() - 4];
         let mut pos = 0usize;
-        Ok(Self {
+        let decoded = Self {
             node_id: read_u64(payload, &mut pos)?,
             term: read_u64(payload, &mut pos)?,
             sequence: read_u64(payload, &mut pos)?,
             accepted: read_bool(payload, &mut pos)?,
             leader_hint: read_opt_u64(payload, &mut pos)?,
+            epoch_proof: MembershipEpochProofV1::decode_body(payload, &mut pos)?,
             nonce: read_u64(payload, &mut pos)?,
-        })
+        };
+        ensure_fully_consumed(payload, pos)?;
+        Ok(decoded)
     }
 }
 
@@ -1165,6 +1356,7 @@ impl MembershipCodec for ClusterViewV1 {
 
         push_u8(buf, self.config_class);
         push_u64(buf, self.sequence);
+        self.epoch_proof.encode_body(buf);
         push_checksum(buf);
     }
 
@@ -1196,6 +1388,8 @@ impl MembershipCodec for ClusterViewV1 {
 
         let config_class = read_u8(payload, &mut pos)?;
         let sequence = read_u64(payload, &mut pos)?;
+        let epoch_proof = MembershipEpochProofV1::decode_body(payload, &mut pos)?;
+        ensure_fully_consumed(payload, pos)?;
         Ok(Self {
             epoch,
             term,
@@ -1205,6 +1399,7 @@ impl MembershipCodec for ClusterViewV1 {
             transitions,
             config_class,
             sequence,
+            epoch_proof,
         })
     }
 }
@@ -1265,6 +1460,21 @@ impl MembershipCodec for MembershipTransitionRecord {
 // ---------------------------------------------------------------------------
 // Helper methods for nested encoding (without checksum)
 // ---------------------------------------------------------------------------
+
+impl MembershipEpochProofV1 {
+    #[cfg(feature = "alloc")]
+    fn encode_body(&self, buf: &mut alloc::vec::Vec<u8>) {
+        push_u64(buf, self.committed_epoch);
+        push_u64(buf, self.token_generation);
+    }
+
+    fn decode_body(data: &[u8], pos: &mut usize) -> Result<Self, MembershipCodecError> {
+        Ok(Self {
+            committed_epoch: read_u64(data, pos)?,
+            token_generation: read_u64(data, pos)?,
+        })
+    }
+}
 
 impl MountReportV1 {
     #[cfg(feature = "alloc")]
@@ -1382,6 +1592,7 @@ impl ClusterViewV1 {
 
         push_u8(buf, self.config_class);
         push_u64(buf, self.sequence);
+        self.epoch_proof.encode_body(buf);
     }
 
     fn decode_body(data: &[u8], pos: &mut usize) -> Result<Self, MembershipCodecError> {
@@ -1409,6 +1620,7 @@ impl ClusterViewV1 {
 
         let config_class = read_u8(data, pos)?;
         let sequence = read_u64(data, pos)?;
+        let epoch_proof = MembershipEpochProofV1::decode_body(data, pos)?;
         Ok(Self {
             epoch,
             term,
@@ -1418,7 +1630,77 @@ impl ClusterViewV1 {
             transitions,
             config_class,
             sequence,
+            epoch_proof,
         })
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl JoinRequestV1 {
+    pub fn validate_epoch_proof(
+        &self,
+        current: MembershipEpochProofV1,
+    ) -> Result<(), MembershipEpochProofError> {
+        self.epoch_proof.validate_against(current)?;
+        require_epoch_binding(
+            self.epoch_proof,
+            "JoinRequestV1::highest_epoch_seen",
+            self.highest_epoch_seen,
+        )
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl JoinResponseV1 {
+    pub fn validate_epoch_proof(
+        &self,
+        current: MembershipEpochProofV1,
+    ) -> Result<(), MembershipEpochProofError> {
+        self.epoch_proof.validate_against(current)?;
+        require_epoch_binding(
+            self.epoch_proof,
+            "JoinResponseV1::current_epoch",
+            self.current_epoch,
+        )?;
+        if let Some(cluster_view) = &self.cluster_view {
+            cluster_view.validate_epoch_proof(current)?;
+            require_epoch_binding(
+                self.epoch_proof,
+                "JoinResponseV1::cluster_view.epoch",
+                cluster_view.epoch,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl HeartbeatV1 {
+    pub fn validate_epoch_proof(
+        &self,
+        current: MembershipEpochProofV1,
+    ) -> Result<(), MembershipEpochProofError> {
+        self.epoch_proof.validate_against(current)
+    }
+}
+
+impl HeartbeatAckV1 {
+    pub fn validate_epoch_proof(
+        &self,
+        current: MembershipEpochProofV1,
+    ) -> Result<(), MembershipEpochProofError> {
+        self.epoch_proof.validate_against(current)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl ClusterViewV1 {
+    pub fn validate_epoch_proof(
+        &self,
+        current: MembershipEpochProofV1,
+    ) -> Result<(), MembershipEpochProofError> {
+        self.epoch_proof.validate_against(current)?;
+        require_epoch_binding(self.epoch_proof, "ClusterViewV1::epoch", self.epoch)
     }
 }
 
@@ -1850,6 +2132,79 @@ mod tests {
         assert_eq!(val, decoded, "roundtrip mismatch");
     }
 
+    fn epoch_proof(epoch: u64) -> MembershipEpochProofV1 {
+        MembershipEpochProofV1::new(epoch, epoch + 1000)
+    }
+
+    fn test_addr(octet: u8) -> core::net::SocketAddr {
+        core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::new(10, 0, 0, octet),
+            4200,
+        ))
+    }
+
+    fn append_checked_trailing_byte(mut buf: alloc::vec::Vec<u8>) -> alloc::vec::Vec<u8> {
+        let checksum_offset = buf.len() - 4;
+        buf.truncate(checksum_offset);
+        buf.push(0xAA);
+        push_checksum(&mut buf);
+        buf
+    }
+
+    fn legacy_join_request_without_epoch_proof() -> alloc::vec::Vec<u8> {
+        let mut buf = alloc::vec::Vec::new();
+        push_u64(&mut buf, 1);
+        push_socket_addr(&mut buf, test_addr(1));
+        push_failure_domain(&mut buf, FailureDomainVector::ZERO);
+        push_u64(&mut buf, 0xFFFF);
+        push_u64(&mut buf, 7);
+        push_u32(&mut buf, 0);
+        push_u8(&mut buf, 0);
+        push_u64(&mut buf, 999);
+        push_checksum(&mut buf);
+        buf
+    }
+
+    fn legacy_join_response_without_epoch_proof() -> alloc::vec::Vec<u8> {
+        let mut buf = alloc::vec::Vec::new();
+        push_u64(&mut buf, 2);
+        push_u64(&mut buf, 1);
+        push_u64(&mut buf, 1);
+        push_u64(&mut buf, 7);
+        push_socket_addr(&mut buf, test_addr(2));
+        push_u32(&mut buf, 0);
+        push_u8(&mut buf, 0);
+        push_u8(&mut buf, 0);
+        push_u64(&mut buf, 777);
+        push_checksum(&mut buf);
+        buf
+    }
+
+    fn legacy_heartbeat_without_epoch_proof() -> alloc::vec::Vec<u8> {
+        let mut buf = alloc::vec::Vec::new();
+        push_u64(&mut buf, 1);
+        push_u64(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u64(&mut buf, 5);
+        push_u64(&mut buf, 111);
+        push_checksum(&mut buf);
+        buf
+    }
+
+    fn legacy_cluster_view_without_epoch_proof() -> alloc::vec::Vec<u8> {
+        let mut buf = alloc::vec::Vec::new();
+        push_u64(&mut buf, 7);
+        push_u64(&mut buf, 1);
+        push_u64(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u8(&mut buf, 0);
+        push_u64(&mut buf, 0);
+        push_checksum(&mut buf);
+        buf
+    }
+
     #[test]
     fn mount_mode_roundtrip() {
         roundtrip(MountMode::ReadOnly);
@@ -1872,6 +2227,22 @@ mod tests {
     }
 
     #[test]
+    fn epoch_proof_roundtrip() {
+        roundtrip(MembershipEpochProofV1::new(7, 42));
+    }
+
+    #[test]
+    fn epoch_proof_checksum_corruption_detected() {
+        let mut buf = alloc::vec::Vec::new();
+        MembershipEpochProofV1::new(7, 42).encode(&mut buf);
+        buf[0] ^= 0xFF;
+        assert!(matches!(
+            MembershipEpochProofV1::decode(&buf),
+            Err(MembershipCodecError::ChecksumMismatch)
+        ));
+    }
+
+    #[test]
     fn join_request_roundtrip() {
         let addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::new(10, 0, 0, 1),
@@ -1891,6 +2262,7 @@ mod tests {
                     generation: 3,
                 }],
                 peer_capabilities: None,
+                epoch_proof: epoch_proof(100),
                 nonce: 999,
             },
         );
@@ -1920,6 +2292,7 @@ mod tests {
                 }],
                 cluster_view: None,
                 config_class: 0,
+                epoch_proof: epoch_proof(5),
                 nonce: 777,
             },
         );
@@ -1951,6 +2324,7 @@ mod tests {
                 term: 1,
                 mount_reports: alloc::vec![],
                 sequence: 0,
+                epoch_proof: epoch_proof(1),
                 nonce: 111,
             },
         );
@@ -1964,6 +2338,7 @@ mod tests {
             sequence: 5,
             accepted: true,
             leader_hint: Some(3),
+            epoch_proof: epoch_proof(1),
             nonce: 222,
         });
     }
@@ -1976,6 +2351,7 @@ mod tests {
             sequence: 5,
             accepted: false,
             leader_hint: None,
+            epoch_proof: epoch_proof(1),
             nonce: 333,
         };
         roundtrip(ack);
@@ -2037,8 +2413,177 @@ mod tests {
                 transitions: alloc::vec![],
                 config_class: 0,
                 sequence: 0,
+                epoch_proof: epoch_proof(1),
             },
         );
+    }
+
+    #[test]
+    fn current_epoch_proofs_validate_for_membership_messages() {
+        let current = epoch_proof(7);
+        let addr = test_addr(7);
+        let join_request = JoinRequestV1 {
+            node_id: 1,
+            cluster_addr: addr,
+            failure_domain: FailureDomainVector::ZERO,
+            capabilities: 0,
+            highest_epoch_seen: 7,
+            mount_reports: alloc::vec![],
+            peer_capabilities: None,
+            epoch_proof: current,
+            nonce: 1,
+        };
+        let cluster_view = ClusterViewV1 {
+            epoch: 7,
+            term: 1,
+            leader_node_id: 2,
+            nodes: alloc::vec![],
+            datasets: alloc::vec![],
+            transitions: alloc::vec![],
+            config_class: 0,
+            sequence: 1,
+            epoch_proof: current,
+        };
+        let join_response = JoinResponseV1 {
+            node_id: 2,
+            term: 1,
+            incarnation: Incarnation::new(1),
+            current_epoch: 7,
+            leader_addr: addr,
+            peer_descriptors: alloc::vec![],
+            cluster_view: Some(cluster_view.clone()),
+            config_class: 0,
+            epoch_proof: current,
+            nonce: 2,
+        };
+        let heartbeat = HeartbeatV1 {
+            node_id: 1,
+            term: 1,
+            mount_reports: alloc::vec![],
+            sequence: 3,
+            epoch_proof: current,
+            nonce: 3,
+        };
+        let ack = HeartbeatAckV1 {
+            node_id: 2,
+            term: 1,
+            sequence: 3,
+            accepted: true,
+            leader_hint: None,
+            epoch_proof: current,
+            nonce: 4,
+        };
+
+        assert_eq!(join_request.validate_epoch_proof(current), Ok(()));
+        assert_eq!(join_response.validate_epoch_proof(current), Ok(()));
+        assert_eq!(cluster_view.validate_epoch_proof(current), Ok(()));
+        assert_eq!(heartbeat.validate_epoch_proof(current), Ok(()));
+        assert_eq!(ack.validate_epoch_proof(current), Ok(()));
+    }
+
+    #[test]
+    fn stale_epoch_proof_is_rejected_before_membership_state() {
+        let heartbeat = HeartbeatV1 {
+            node_id: 1,
+            term: 1,
+            mount_reports: alloc::vec![],
+            sequence: 1,
+            epoch_proof: epoch_proof(6),
+            nonce: 1,
+        };
+
+        assert!(matches!(
+            heartbeat.validate_epoch_proof(epoch_proof(7)),
+            Err(MembershipEpochProofError::Stale {
+                current_epoch: 7,
+                received_epoch: 6,
+            })
+        ));
+    }
+
+    #[test]
+    fn token_generation_mismatch_is_rejected() {
+        let ack = HeartbeatAckV1 {
+            node_id: 2,
+            term: 1,
+            sequence: 1,
+            accepted: true,
+            leader_hint: None,
+            epoch_proof: MembershipEpochProofV1::new(7, 1),
+            nonce: 1,
+        };
+
+        assert!(matches!(
+            ack.validate_epoch_proof(MembershipEpochProofV1::new(7, 2)),
+            Err(MembershipEpochProofError::TokenGenerationMismatch {
+                current_generation: 2,
+                received_generation: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn message_epoch_mismatch_is_rejected() {
+        let view = ClusterViewV1 {
+            epoch: 6,
+            term: 1,
+            leader_node_id: 1,
+            nodes: alloc::vec![],
+            datasets: alloc::vec![],
+            transitions: alloc::vec![],
+            config_class: 0,
+            sequence: 1,
+            epoch_proof: epoch_proof(7),
+        };
+
+        assert!(matches!(
+            view.validate_epoch_proof(epoch_proof(7)),
+            Err(MembershipEpochProofError::MessageEpochMismatch {
+                field: "ClusterViewV1::epoch",
+                message_epoch: 6,
+                proof_epoch: 7,
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_epoch_proof_legacy_layouts_are_rejected() {
+        assert!(matches!(
+            JoinRequestV1::decode(&legacy_join_request_without_epoch_proof()),
+            Err(MembershipCodecError::Underflow)
+        ));
+        assert!(matches!(
+            JoinResponseV1::decode(&legacy_join_response_without_epoch_proof()),
+            Err(MembershipCodecError::Underflow)
+        ));
+        assert!(matches!(
+            HeartbeatV1::decode(&legacy_heartbeat_without_epoch_proof()),
+            Err(MembershipCodecError::Underflow)
+        ));
+        assert!(matches!(
+            ClusterViewV1::decode(&legacy_cluster_view_without_epoch_proof()),
+            Err(MembershipCodecError::Underflow)
+        ));
+    }
+
+    #[test]
+    fn proof_bearing_layout_rejects_checked_trailing_bytes() {
+        let mut buf = alloc::vec::Vec::new();
+        HeartbeatV1 {
+            node_id: 1,
+            term: 1,
+            mount_reports: alloc::vec![],
+            sequence: 1,
+            epoch_proof: epoch_proof(7),
+            nonce: 1,
+        }
+        .encode(&mut buf);
+        let buf = append_checked_trailing_byte(buf);
+
+        assert!(matches!(
+            HeartbeatV1::decode(&buf),
+            Err(MembershipCodecError::TrailingBytes { remaining: 1 })
+        ));
     }
 
     #[test]
@@ -2141,6 +2686,7 @@ mod tests {
                 },
             ],
             peer_capabilities: None,
+            epoch_proof: epoch_proof(200),
             nonce: 42,
         }
         .encode(&mut buf);
@@ -2326,6 +2872,7 @@ mod tests {
             sequence: 0,
             accepted: true,
             leader_hint: Some(0),
+            epoch_proof: epoch_proof(1),
             nonce: 42,
         };
         roundtrip(ack);
@@ -2339,6 +2886,7 @@ mod tests {
             sequence: 0,
             accepted: true,
             leader_hint: Some(u64::MAX),
+            epoch_proof: epoch_proof(1),
             nonce: 42,
         };
         roundtrip(ack);
@@ -2364,6 +2912,7 @@ mod tests {
                     },
                 ],
                 sequence: 7,
+                epoch_proof: epoch_proof(7),
                 nonce: 999,
             },
         );
@@ -2378,6 +2927,7 @@ mod tests {
                 term: 1,
                 mount_reports: alloc::vec![],
                 sequence: seq,
+                epoch_proof: epoch_proof(7),
                 nonce: 1,
             }
             .encode(&mut buf);
@@ -2420,8 +2970,10 @@ mod tests {
                     transitions: alloc::vec![],
                     config_class: 0,
                     sequence: 0,
+                    epoch_proof: epoch_proof(5),
                 }),
                 config_class: 0,
+                epoch_proof: epoch_proof(5),
                 nonce: 42,
             },
         );
@@ -2459,6 +3011,7 @@ mod tests {
                     },
                 ],
                 peer_capabilities: None,
+                epoch_proof: epoch_proof(100),
                 nonce: 888,
             },
         );
@@ -2523,6 +3076,7 @@ mod tests {
                 ],
                 config_class: 1,
                 sequence: 42,
+                epoch_proof: epoch_proof(3),
             },
         );
     }
