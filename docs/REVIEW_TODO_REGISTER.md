@@ -685,6 +685,17 @@ Important 2026-06-01 findings:
   comparison, repair authority, rollback, and recovery semantics. The active
   non-doc short-label inventory is now 71 files: 9 `apps/`, 57 `crates/`, and
   5 `xtask/`.
+- `TFR-013`/`TFR-016`/`TFR-019`: issue #796 refreshes the `OW-*`, `PC-*`, and
+  `NEXT-*` label audit at `92ed488a`. The focused scan finds 153 files with
+  785 references: 556 `OW-*`, 160 `PC-*`, and 69 `NEXT-*`. `OW-*` and `PC-*`
+  are mixed current/historical design cross-references that must be backed by a
+  current authority row, claim id, or GitHub issue before they can be cited as
+  current evidence. `NEXT-*` is stale Forgejo-era or stage-gate residue unless
+  preserved inside a doc already classified as historical input. The write set
+  is too broad for one behavior-free edit, so the retarget/removal work is
+  split into #980, #982, #983, #984, and #985 with disjoint domain write sets;
+  issue #796 records the classification and split without changing runtime
+  behavior.
 - `TFR-014`: issue #508 completes the current package-metadata and Rust
   file-local notice audit. Root Cargo metadata reports all workspace packages
   as `GPL-2.0-only WITH Linux-syscall-note` except the vendored/patched
