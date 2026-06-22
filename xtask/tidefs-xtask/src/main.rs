@@ -973,6 +973,40 @@ fn main() {
                 process::exit(1);
             }
         }
+        Some("validate-kernel-teardown-runtime-artifact") => {
+            let artifact_path = match args.next() {
+                Some(path) => path,
+                None => {
+                    eprintln!("validate-kernel-teardown-runtime-artifact requires an artifact path");
+                    process::exit(2);
+                }
+            };
+            if let Some(extra) = args.next() {
+                eprintln!(
+                    "validate-kernel-teardown-runtime-artifact accepts one path, got extra argument `{extra}`"
+                );
+                process::exit(2);
+            }
+            match tidefs_validation::kernel_teardown_evidence::validate_kernel_teardown_no_work_after_artifact_path(
+                &artifact_path,
+            ) {
+                Ok(summary) => {
+                    println!(
+                        "kernel teardown no-work-after artifact validated: status={} fail_closed_count={} phases={} refusals={} target={} source_ref={}",
+                        summary.status,
+                        summary.fail_closed_count,
+                        summary.phase_count,
+                        summary.refusal_observation_count,
+                        summary.target_id,
+                        summary.source_ref
+                    );
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    process::exit(1);
+                }
+            }
+        }
         Some("check-stale-claims" | "check-stale-forgejo-claims") => {
             if let Err(err) = forgejo_work::check_stale_claims_current_workspace() {
                 eprintln!("{err}");
@@ -2226,6 +2260,7 @@ fn print_help() {
     println!("  check-no-hidden-queues  validate queue roots in touched implementation packages");
     println!("  validate-evidence-manifest <path> validate a claim evidence artifact manifest JSON against schema");
     println!("  validate-xfstests-evidence-manifest <path> validate an xfstests evidence manifest JSON against schema");
+    println!("  validate-kernel-teardown-runtime-artifact <path> validate a kernel teardown no-work-after artifact JSON against schema");
     println!(
         "  validate-no-hidden-queues-receipt <path> validate a source/registry queue review receipt"
     );

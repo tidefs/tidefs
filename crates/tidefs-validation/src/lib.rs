@@ -21,6 +21,7 @@ pub mod fuse_vm_test;
 pub mod host_validation_queue;
 pub mod kernel_dir_namespace_validation;
 pub mod kernel_fsync_evidence;
+pub mod kernel_teardown_evidence;
 pub mod kernel_pagecache_writeback_validation;
 pub mod kernel_readdir_validation;
 pub mod kernel_validation_matrix;
