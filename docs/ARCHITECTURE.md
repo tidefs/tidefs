@@ -315,41 +315,40 @@ included deleted scaffold roots and are no longer package authority.
 | tidefs-storage-node | Storage node daemon |
 | tidefs-scrub | Scrub/repair CLI |
 
-## Workspace Authority
+## Historical Workspace Authority Review
 
-> Review debt TFR-002/TFR-019: this section is stale and is not current
-> release authority. The active review in `docs/WHOLE_REPO_REVIEW.md` records
-> that package-classification docs still disagree with current Cargo metadata
-> and xtask policy results. Refresh this section before using it as package
-> truth.
+> Historical review input for TFR-002/TFR-019: this section is not current
+> package authority. Use `docs/workspace-package-classification.md` for current
+> workspace membership, package roles, and delete/archive classifications.
 
 This section was previously written as the controlling workspace authority for
-TideFS package families. It now remains review input until the `TFR-002`
-package classification is refreshed against current Cargo metadata and xtask
-behavior.
+TideFS package families. It now remains review input only. The current package
+authority records that the prior control-plane, publication-pipeline, and
+response-registry type roots were deleted rather than reclassified, and that
+the live record definitions are present in `tidefs-types-vfs-core`.
 
-### Package Family Classification
+### Historical Package Family Classification
 
-Each Rust crate belongs to exactly one package family:
+The table below is a historical family taxonomy, not a current package list:
 
-| Family | Classification | Workspace Status |
+| Family | Historical classification | Historical workspace status |
 |---|---|---|
 | Product core (`tidefs-*` storage, filesystem, integrity, permission layers) | Product-critical | In workspace |
 | Userspace harness (`tidefs-posix-filesystem-adapter-*`, `tidefs-block-volume-adapter-*`, daemons) | Product-critical | In workspace |
 | Operator/query utility (`tidefsctl`, CLI surfaces) | Product-critical | In workspace |
 | Bounded mirror (`apps/` demo, harness, and tool binaries) | Product-critical | In workspace |
 | Kernel bridge (`tidefs-kmod-*`, `tidefs-block-kmod`, `tidefs-kernel-cutover-runtime`) | Product-critical | In workspace |
-| Historical scaffold (`tidefs-control-plane-*`, `tidefs-policy-authority-*`, `tidefs-observe-core-*`, `tidefs-response-registry-*`, deleted `tidefs-types-*` scaffold roots) | Deleted or stale review input | Not in workspace |
-| Scaffold types via dependencies (`tidefs-types-control-plane-core`, `tidefs-types-publication-pipeline-core`, `tidefs-types-response-registry-core`) | Product-transitional | In workspace (pulled in by workspace-member path deps) |
+| Historical scaffold (`tidefs-control-plane-*`, `tidefs-policy-authority-*`, `tidefs-observe-core-*`, `tidefs-response-registry-*`, deleted `tidefs-types-*` scaffold roots) | Deleted or stale review input | Not current package authority |
+| Retired scaffold type roots (`tidefs-types-control-plane-core`, `tidefs-types-publication-pipeline-core`, `tidefs-types-response-registry-core`) | Deleted historical review input; current records live in `tidefs-types-vfs-core` | Deleted roots; see `docs/workspace-package-classification.md` |
 | Kernel implementation (`kmod/`) | Product-critical (separate Kbuild tree) | In workspace as path member only; compiled via out-of-tree Kbuild |
 
 ### Scaffold Crate Disposition
 
-The following crates were removed from normal workspace compilation.
-Unless otherwise noted, they remain on disk as historical scaffold for future
-reference but are not compiled by `cargo check`, `cargo build`, or `cargo test`
-at workspace level. Current metadata reports 148 workspace members after the
-standalone POSIX adapter runtime crate deletion.
+The following lists are retained as historical review input. Current package
+membership is not governed here; use `docs/workspace-package-classification.md`
+and Cargo metadata. Some older scaffold roots were removed from normal
+workspace compilation, and the retired type roots named below are deleted from
+the current checkout rather than active package authority.
 
 **Removed from workspace members:**
 
@@ -360,6 +359,9 @@ standalone POSIX adapter runtime crate deletion.
 **Deleted historical scaffold roots:**
 
 - `crates/tidefs-types-policy-authority-core`
+- `crates/tidefs-types-control-plane-core`
+- `crates/tidefs-types-publication-pipeline-core`
+- `crates/tidefs-types-response-registry-core`
 - `crates/tidefs-types-truth-view-core`
 - `crates/tidefs-types-shadow-pilot`
 - `crates/tidefs-types-archive-control-core`
@@ -378,28 +380,29 @@ TideFS checkout unless restored intentionally):**
 - `apps/tidefs-control-plane-daemon`
 
 
-### Scaffold Types Currently In Workspace
+### Retired Scaffold Type Evidence
 
-Three scaffold type crates remain in the workspace. These crates are classified
-as product-transitional: they are not product-critical, but cannot be removed
-from workspace compilation until remaining dependents are migrated or the
-explicit root membership is removed after review.
+Earlier versions of this section described the following scaffold type roots as
+product-transitional workspace members. Current repo evidence no longer supports
+that wording: the roots are absent from the current checkout and are not Cargo
+package roots. The current authority records the surviving control-plane,
+publication-pipeline, and response-registry record definitions in
+`tidefs-types-vfs-core`.
 
-| Crate | Workspace consumers (from `cargo metadata --no-deps`) |
+| Retired root | Current authority |
 |---|---|
-| `tidefs-types-publication-pipeline-core` | 0 direct workspace consumers |
-| `tidefs-types-response-registry-core` | 0 direct workspace consumers |
+| `tidefs-types-control-plane-core` | Deleted historical root; current control-plane records live in `tidefs-types-vfs-core`. |
+| `tidefs-types-publication-pipeline-core` | Deleted historical root; current publication-pipeline records live in `tidefs-types-vfs-core`. |
+| `tidefs-types-response-registry-core` | Deleted historical root; current response-registry records live in `tidefs-types-vfs-core`. |
 
-### Scaffold Dependencies in Product Crates
+### Retired Scaffold Dependency Evidence
 
-Several workspace members retain path dependencies on scaffold type crates.
-These dependencies are inherited from the scaffold era and will be removed in
-continuation mechanical cleanup issues once the dependency graph proves it is safe.
-The controlling authority decision is that these scaffold type crates are
-**not product-critical**; any type they provide that is still used by product
-code must be migrated into a product-core type crate or removed.
+The historical dependency chain below is not a current path-dependency claim.
+It records the scaffold-internal edges that made the old roots review targets
+after live consumers were removed. Use current Cargo metadata and
+`docs/workspace-package-classification.md` for active dependencies.
 
-Affected workspace members with scaffold type dependencies (from `cargo metadata --no-deps`):
+Historical scaffold-internal edges:
 
 - `tidefs-types-publication-pipeline-core` -> `tidefs-types-control-plane-core`
 - `tidefs-types-response-registry-core` -> `tidefs-types-control-plane-core`
@@ -408,9 +411,10 @@ Affected workspace members with scaffold type dependencies (from `cargo metadata
 
 No new crate may be added to the workspace under a historical-scaffold family
 prefix (`control-plane-*`, `policy-authority-*`, `observe-*`, `response-registry-*`,
-`truth-view-*`, `shadow-pilot-*`) without an explicit operator-approved issue
-reclassifying that family as product-critical. Expansion of scaffold surfaces
-is forbidden while this authority resolution is live.
+`truth-view-*`, `shadow-pilot-*`) without an explicit issue-backed package
+authority update in `docs/workspace-package-classification.md`. Historical
+review notes in this document do not authorize scaffold recovery.
+
 ## Comparison With ZFS
 
 ### Where TideFS is ahead
