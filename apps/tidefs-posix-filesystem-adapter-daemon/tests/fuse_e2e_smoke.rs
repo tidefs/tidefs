@@ -12,13 +12,6 @@
 //! operations that have committed adapter dispatch methods
 //! (e.g. rename, lookup).
 //!
-//! ## Feature gating
-//!
-//! Tests declare their minimum `FeatureGate`:
-//! - `Committed`: module is landed and wired; test runs unconditionally.
-//! - `Claimed`: module has an active implementation issue; test is a stub.
-//! - `NotReady`: module is not yet scoped; test is a stub.
-
 use std::cell::RefCell;
 
 use std::sync::Arc;
@@ -35,18 +28,6 @@ use tidefs_posix_filesystem_adapter_daemon::workers_meta::FuseAttrOut;
 use tidefs_vfs_engine::{
     EngineFileHandle, Errno, FileHandleId, InodeAttr, InodeId, RequestCtx, VfsEngine,
 };
-
-// ── Feature gate ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum FeatureGate {
-    Committed,
-    #[allow(dead_code)]
-    Claimed,
-    #[allow(dead_code)]
-    NotReady,
-}
 
 // ── Test harness ─────────────────────────────────────────────────────────
 
@@ -767,6 +748,29 @@ fn test_adapter_create_file_with_handle() {
         result.file_handle() > 0,
         "create must return a valid adapter file handle"
     );
+
+    let found = h
+        .lookup(&ctx, ROOT_INODE, b"created.bin")
+        .expect("created file must be visible through adapter lookup");
+    assert_eq!(
+        found.inode_id.get(),
+        result.inode(),
+        "lookup must resolve the inode returned by create"
+    );
+
+    let attr = h
+        .getattr(&ctx, result.inode())
+        .expect("created file must have adapter-visible attributes");
+    assert_eq!(
+        attr.attr.ino,
+        result.inode(),
+        "getattr must report the created inode"
+    );
+    assert_eq!(
+        attr.attr.mode & libc::S_IFMT,
+        libc::S_IFREG,
+        "created inode must be a regular file"
+    );
 }
 
 #[test]
@@ -817,8 +821,6 @@ fn test_adapter_getattr_roundtrip() {
         "getattr mode must indicate RegularFile"
     );
 }
-
-// ── Phase B stubs (gated behind Claimed / NotReady) ──────────────────────
 
 // ── Namespace-backed lookup tests ────────────────────────────────────────
 
@@ -983,10 +985,4 @@ fn test_namespace_lookup_invalid_name_rejected() {
         err == Errno::EINVAL || err == Errno::ENOENT,
         "invalid name lookup should return EINVAL or ENOENT, got {err:?}"
     );
-}
-
-#[test]
-fn test_create_gated_behind_claimed() {
-    let _gate = FeatureGate::Claimed;
-    eprintln!("SKIP: create dispatch not yet committed (see #3582)");
 }
