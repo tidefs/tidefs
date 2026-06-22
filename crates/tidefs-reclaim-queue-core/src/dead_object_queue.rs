@@ -559,6 +559,9 @@ impl DeadObjectReclaimQueue {
         object_id: &ObjectKey,
         receipt: DeadObjectReplacementReceipt,
     ) -> bool {
+        if !receipt.authorizes_reclaim_for(*object_id) {
+            return false;
+        }
         if let Some(entry) = self.entries.get_mut(object_id) {
             let accept = match entry.replacement_receipt {
                 Some(existing) => receipt.receipt_generation > existing.receipt_generation,
@@ -1901,6 +1904,23 @@ mod tests {
         assert!(q.publish_replacement_receipt(&key, receipt));
 
         // Now reclaimable
+        assert_eq!(q.receipt_bound_eligible_count(10), 1);
+    }
+
+    #[test]
+    fn rebake_publish_rejects_non_authorizing_receipt() {
+        let mut q = DeadObjectReclaimQueue::new();
+        let key = oid(41);
+        q.enqueue(DeadObjectEntry::new(key, [41; 16], 5, true, 5));
+
+        let epoch_zero =
+            DeadObjectReplacementReceipt::replicated(key, 0, 1, 2, 4096, digest_for_key(key));
+        assert!(!q.publish_replacement_receipt(&key, epoch_zero));
+        assert_eq!(q.receipt_bound_eligible_count(10), 0);
+
+        let valid =
+            DeadObjectReplacementReceipt::replicated(key, 7, 1, 2, 4096, digest_for_key(key));
+        assert!(q.publish_replacement_receipt(&key, valid));
         assert_eq!(q.receipt_bound_eligible_count(10), 1);
     }
 
