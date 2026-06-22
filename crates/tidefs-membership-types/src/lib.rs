@@ -1034,10 +1034,13 @@ impl MembershipCodec for JoinRequestV1 {
             mr.encode_body(buf);
         }
 
-        // Optional peer capabilities blob (presence byte + payload)
+        // Optional peer capabilities blob (presence byte + length-prefixed payload).
         if let Some(ref caps) = self.peer_capabilities {
             buf.push(1u8);
-            caps.encode(buf);
+            let mut caps_buf = alloc::vec::Vec::new();
+            caps.encode(&mut caps_buf);
+            push_u32(buf, caps_buf.len() as u32);
+            buf.extend_from_slice(&caps_buf);
         } else {
             buf.push(0u8);
         }
@@ -1066,7 +1069,13 @@ impl MembershipCodec for JoinRequestV1 {
         // Optional peer capabilities blob
         let has_caps = read_u8(payload, &mut pos)?;
         let peer_capabilities = if has_caps != 0 {
-            Some(PeerCapabilities::decode(&payload[pos..])?)
+            let caps_len = read_u32(payload, &mut pos)? as usize;
+            if pos + caps_len > payload.len() {
+                return Err(MembershipCodecError::Underflow);
+            }
+            let caps = PeerCapabilities::decode(&payload[pos..pos + caps_len])?;
+            pos += caps_len;
+            Some(caps)
         } else {
             None
         };
@@ -2264,6 +2273,25 @@ mod tests {
                 peer_capabilities: None,
                 epoch_proof: epoch_proof(100),
                 nonce: 999,
+            },
+        );
+    }
+
+    #[test]
+    fn join_request_peer_capabilities_roundtrip_with_epoch_proof() {
+        let addr = test_addr(11);
+        roundtrip_no_alloc_encode(
+            JoinRequestV1::encode,
+            JoinRequestV1 {
+                node_id: 11,
+                cluster_addr: addr,
+                failure_domain: FailureDomainVector::ZERO,
+                capabilities: 0xF0F0,
+                highest_epoch_seen: 11,
+                mount_reports: alloc::vec![],
+                peer_capabilities: Some(PeerCapabilities::new(1 << 30, 1 << 29)),
+                epoch_proof: epoch_proof(11),
+                nonce: 1234,
             },
         );
     }
