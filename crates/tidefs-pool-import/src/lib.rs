@@ -653,7 +653,8 @@ impl DeviceHandle {
 }
 
 const SUPPORTED_INCOMPAT_FEATURES: u64 = tidefs_types_pool_label_core::features::POOL_LABEL_V1
-    | tidefs_types_pool_label_core::features::ENCRYPTION_INCOMPAT;
+    | tidefs_types_pool_label_core::features::ENCRYPTION_INCOMPAT
+    | tidefs_types_pool_label_core::features::CLUSTER_POOL_INCOMPAT;
 const SUPPORTED_RO_COMPAT_FEATURES: u64 = 0;
 const SUPPORTED_COMPAT_FEATURES: u64 = tidefs_types_pool_label_core::features::DEVICE_CLASS_AWARE
     | tidefs_types_pool_label_core::features::SPARE_POLICY_SUPPORTED
