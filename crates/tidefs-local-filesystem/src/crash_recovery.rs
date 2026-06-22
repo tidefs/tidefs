@@ -102,12 +102,21 @@ pub(crate) fn run_crash_recovery_explicit_error_case(
     options: StoreOptions,
     root_authentication_key: RootAuthenticationKey,
 ) -> Result<CrashRecoveryExplicitErrorReport> {
-    let mut store = LocalObjectStore::open_with_options(root, options.clone())?;
-    for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
-        store.put(root_slot_object_key(slot), b"invalid root slot bytes")?;
+    // Use the same pool backend as probe_recovery so the corrupt root
+    // slots live in the block-device-backed store that the probe opens,
+    // rather than in a separate directory-based LocalObjectStore.
+    // Route through CrashMatrixRawStagingAuthority so the validation-only
+    // raw-store count stays at one authoritative call site.
+    let mut pool = LocalFileSystem::default_development_pool(root, &options, None, None)?;
+    {
+        let mut staging =
+            CrashMatrixRawStagingAuthority::validation_only(&mut pool, root_authentication_key);
+        for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
+            staging.raw_store().put(root_slot_object_key(slot), b"invalid root slot bytes")?;
+        }
     }
-    store.sync_all()?;
-    drop(store);
+    pool.sync_all()?;
+    drop(pool);
 
     let probe = LocalFileSystem::probe_recovery_with_root_authentication_key(
         root,
