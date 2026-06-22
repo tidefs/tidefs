@@ -955,6 +955,56 @@ impl StorageIntentEvidenceQuerySnapshot {
         self.contains_fresh_authority_family(StorageIntentEvidenceKind::MediaCapabilityEvidence)
     }
 
+    /// Returns true when service-objective evidence is present and fresh.
+    #[must_use]
+    pub const fn has_fresh_service_objective(self) -> bool {
+        self.contains_fresh_authority_family(StorageIntentEvidenceKind::ServiceObjectiveEvidence)
+    }
+
+    /// Returns true when the cut carries the fresh families #967 needs.
+    #[must_use]
+    pub const fn has_fresh_prefetch_residency_basis(self) -> bool {
+        matches!(self.context, EvidenceQueryContextClass::PrefetchResidency)
+            && self.has_fresh_service_objective()
+            && self.contains_fresh_authority_family(StorageIntentEvidenceKind::WorkloadEvidence)
+            && self.has_fresh_media_capability()
+            && self
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::ReadFreshnessEvidence)
+            && self.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            )
+            && self.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+            )
+            && self
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::TenantIsolationEvidence)
+            && self.contains_fresh_authority_family(StorageIntentEvidenceKind::TrustDomainEvidence)
+            && self
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::TransportPathEvidence)
+            && self.contains_fresh_authority_family(StorageIntentEvidenceKind::TemporalEvidence)
+            && self.contains_fresh_authority_family(StorageIntentEvidenceKind::MediaCostWearLedger)
+    }
+
+    /// Returns true when a prefetch/residency result can train or claim upward.
+    #[must_use]
+    pub const fn authorizes_prefetch_residency_feedback(self) -> bool {
+        matches!(
+            self.consumer,
+            EvidenceConsumerClass::MeasurementAttribution
+                | EvidenceConsumerClass::PerformanceGate
+                | EvidenceConsumerClass::ClaimGate
+        ) && self.is_authority_admissible()
+            && self.has_fresh_prefetch_residency_basis()
+            && self
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::ActionExecutionEvidence)
+            && self.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+            )
+            && self.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+            )
+    }
+
     /// Returns true when the snapshot may be shown for cache-only or diagnostics use.
     #[must_use]
     pub const fn allows_non_authority_visibility(self) -> bool {
@@ -5903,21 +5953,87 @@ mod tests {
         context: EvidenceQueryContextClass,
     ) -> StorageIntentEvidenceQuerySnapshot {
         let mut snapshot = base_query_snapshot(consumer, context);
+        push_family_freshness(
+            &mut snapshot,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            EvidenceFamilyFreshnessState::Fresh,
+            51,
+        );
+        snapshot
+    }
+
+    fn push_family_freshness(
+        snapshot: &mut StorageIntentEvidenceQuerySnapshot,
+        kind: StorageIntentEvidenceKind,
+        state: EvidenceFamilyFreshnessState,
+        byte: u8,
+    ) {
         snapshot
             .included_refs
-            .push(evidence_ref(
-                StorageIntentEvidenceKind::MediaCapabilityEvidence,
-                51,
-            ))
+            .push(evidence_ref(kind, byte))
             .unwrap();
         snapshot
             .family_freshness
-            .push(freshness_row(
+            .push(freshness_row(kind, state, byte))
+            .unwrap();
+    }
+
+    fn snapshot_with_prefetch_basis(
+        consumer: EvidenceConsumerClass,
+        service_objective_state: EvidenceFamilyFreshnessState,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        let mut snapshot =
+            base_query_snapshot(consumer, EvidenceQueryContextClass::PrefetchResidency);
+        let families = [
+            (
+                StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                service_objective_state,
+            ),
+            (
+                StorageIntentEvidenceKind::WorkloadEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+            ),
+            (
                 StorageIntentEvidenceKind::MediaCapabilityEvidence,
                 EvidenceFamilyFreshnessState::Fresh,
-                51,
-            ))
-            .unwrap();
+            ),
+            (
+                StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+            ),
+            (
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                EvidenceFamilyFreshnessState::Fresh,
+            ),
+            (
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+            ),
+            (
+                StorageIntentEvidenceKind::TenantIsolationEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+            ),
+            (
+                StorageIntentEvidenceKind::TrustDomainEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+            ),
+            (
+                StorageIntentEvidenceKind::TransportPathEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+            ),
+            (
+                StorageIntentEvidenceKind::TemporalEvidence,
+                EvidenceFamilyFreshnessState::Fresh,
+            ),
+            (
+                StorageIntentEvidenceKind::MediaCostWearLedger,
+                EvidenceFamilyFreshnessState::Fresh,
+            ),
+        ];
+
+        for (offset, (kind, state)) in families.into_iter().enumerate() {
+            push_family_freshness(&mut snapshot, kind, state, 70 + offset as u8);
+        }
         snapshot
     }
 
@@ -6159,6 +6275,87 @@ mod tests {
                 StorageIntentEvidenceKind::MediaCapabilityEvidence
             ));
         }
+    }
+
+    #[test]
+    fn service_objective_must_be_fresh_inside_the_snapshot_cut() {
+        let mut snapshot = snapshot_with_prefetch_basis(
+            EvidenceConsumerClass::Planner,
+            EvidenceFamilyFreshnessState::Fresh,
+        );
+
+        assert!(snapshot.is_authority_admissible());
+        assert!(snapshot.has_fresh_service_objective());
+        assert!(snapshot.has_fresh_prefetch_residency_basis());
+        assert!(snapshot
+            .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::ServiceObjectiveEvidence));
+
+        snapshot = snapshot_with_prefetch_basis(
+            EvidenceConsumerClass::Planner,
+            EvidenceFamilyFreshnessState::Stale,
+        );
+        assert!(snapshot.is_authority_admissible());
+        assert!(!snapshot.has_fresh_service_objective());
+        assert!(!snapshot.has_fresh_prefetch_residency_basis());
+        assert!(!snapshot
+            .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::ServiceObjectiveEvidence));
+    }
+
+    #[test]
+    fn prefetch_feedback_requires_same_fresh_replayable_cut() {
+        let mut snapshot = snapshot_with_prefetch_basis(
+            EvidenceConsumerClass::MeasurementAttribution,
+            EvidenceFamilyFreshnessState::Fresh,
+        );
+
+        assert!(snapshot.has_fresh_prefetch_residency_basis());
+        assert!(!snapshot.authorizes_prefetch_residency_feedback());
+
+        push_family_freshness(
+            &mut snapshot,
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            EvidenceFamilyFreshnessState::Fresh,
+            90,
+        );
+        push_family_freshness(
+            &mut snapshot,
+            StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+            EvidenceFamilyFreshnessState::Fresh,
+            91,
+        );
+        push_family_freshness(
+            &mut snapshot,
+            StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+            EvidenceFamilyFreshnessState::Fresh,
+            92,
+        );
+
+        assert!(snapshot.authorizes_prefetch_residency_feedback());
+
+        let mut stale_objective = snapshot_with_prefetch_basis(
+            EvidenceConsumerClass::MeasurementAttribution,
+            EvidenceFamilyFreshnessState::Stale,
+        );
+        push_family_freshness(
+            &mut stale_objective,
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            EvidenceFamilyFreshnessState::Fresh,
+            93,
+        );
+        push_family_freshness(
+            &mut stale_objective,
+            StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+            EvidenceFamilyFreshnessState::Fresh,
+            94,
+        );
+        push_family_freshness(
+            &mut stale_objective,
+            StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+            EvidenceFamilyFreshnessState::Fresh,
+            95,
+        );
+        assert!(!stale_objective.has_fresh_prefetch_residency_basis());
+        assert!(!stale_objective.authorizes_prefetch_residency_feedback());
     }
 
     #[test]
