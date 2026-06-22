@@ -45,6 +45,7 @@ with ftrace workqueue tracing and post-final refusal probes.
 Options:
   --timeout SECONDS    QEMU boot timeout (default: $TIMEOUT_SEC)
   --output-dir DIR     Artifact output directory (default: $OUTPUT_DIR)
+  --module PATH        Path to pre-built tidefs_posix_vfs.ko
   --keep-tmp           Do not remove temp directory on exit
   --help, -h           Show this message
 
@@ -60,6 +61,7 @@ EOF
       case "$1" in
         --timeout) TIMEOUT_SEC="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --module) POSIX_VFS_KO="$2"; shift 2 ;;
         --keep-tmp) KEEP_TMP=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;

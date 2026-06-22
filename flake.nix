@@ -4297,8 +4297,10 @@ EOF
             pkgs.qemu
             pkgs.b3sum
             self.packages.${system}.kernelTeardownValidation
+            self.packages.${system}.tidefsPosixVfsKmod
           ] ''
-            exec ${self.packages.${system}.kernelTeardownValidation}/bin/tidefs-kmod-teardown-validation "$@"
+            exec ${self.packages.${system}.kernelTeardownValidation}/bin/tidefs-kmod-teardown-validation \
+              --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"
           '';
           kernel-cross-path-equivalence = script "tidefs-kernel-cross-path-equivalence" [
             pkgs.bash
