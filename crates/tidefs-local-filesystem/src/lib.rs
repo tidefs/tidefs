@@ -6650,6 +6650,7 @@ impl LocalFileSystem {
         record.size = new_size;
         record.data_version = tick;
         record.metadata_version = tick;
+        Self::advance_subtree_revision(&mut record);
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
             let mut pool_store = self.store.pool_store_mut();
@@ -8148,6 +8149,7 @@ impl LocalFileSystem {
         let mut updated = record.clone();
         updated.data_version = tick;
         updated.metadata_version = tick;
+        Self::advance_subtree_revision(&mut updated);
 
         // Free logical extents in the extent allocator.
         let freed =
@@ -8277,6 +8279,7 @@ impl LocalFileSystem {
         let mut updated = record.clone();
         updated.data_version = tick;
         updated.metadata_version = tick;
+        Self::advance_subtree_revision(&mut updated);
         let mut pool_store = self.store.pool_store_mut();
         // Size is preserved (KEEP_SIZE semantics)
         punch_hole_content(PunchHoleContent {
@@ -8565,6 +8568,7 @@ impl LocalFileSystem {
         let mut updated = record.clone();
         updated.data_version = tick;
         updated.metadata_version = tick;
+        Self::advance_subtree_revision(&mut updated);
         let mut pool_store = self.store.pool_store_mut();
         updated.size = record_size;
         punch_hole_content(PunchHoleContent {
@@ -10082,6 +10086,7 @@ impl LocalFileSystem {
         dest_record.size = source_record.size;
         dest_record.data_version = tick;
         dest_record.metadata_version = tick;
+        Self::advance_subtree_revision(&mut dest_record);
 
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
@@ -10147,6 +10152,7 @@ impl LocalFileSystem {
         record.size = size;
         record.data_version = tick;
         record.metadata_version = tick;
+        Self::advance_subtree_revision(&mut record);
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
             let mut pool_store = self.store.pool_store_mut();
@@ -10285,6 +10291,7 @@ impl LocalFileSystem {
         record.size = new_size;
         record.data_version = tick;
         record.metadata_version = tick;
+        Self::advance_subtree_revision(&mut record);
         let result = {
             let mut dedup = self.dedup_index.borrow_mut();
             let mut pool_store = self.store.pool_store_mut();
@@ -10673,6 +10680,7 @@ impl LocalFileSystem {
         let tick = next_generation_after(self.state.generation);
         record.data_version = tick;
         record.metadata_version = tick;
+        Self::advance_subtree_revision(&mut record);
         self.update_inode_record(inode_id, record)?;
         // Mark dirty so do_commit() persists state then clears
         // the now-redundant intent log entries.
@@ -12518,6 +12526,21 @@ impl LocalFileSystem {
     }
     // ── Timestamp maintenance ─────────────────────────────────────────
 
+    pub(crate) fn advance_subtree_revision(record: &mut InodeRecord) {
+        record.subtree_rev = record.subtree_rev.saturating_add(1).max(1);
+    }
+
+    fn timestamp_update_advances_subtree_revision(
+        update: tidefs_inode_attributes::timestamp::TimestampUpdate,
+    ) -> bool {
+        matches!(
+            update,
+            tidefs_inode_attributes::timestamp::TimestampUpdate::Write
+                | tidefs_inode_attributes::timestamp::TimestampUpdate::Truncate
+                | tidefs_inode_attributes::timestamp::TimestampUpdate::MetadataChange
+        )
+    }
+
     /// Apply POSIX timestamp transition rules to the committed inode
     /// record for `inode_id`.
     ///
@@ -12560,6 +12583,9 @@ impl LocalFileSystem {
             posix.btime_ns,
         );
         updated.metadata_version = updated.metadata_version.max(self.state.generation);
+        if Self::timestamp_update_advances_subtree_revision(update) {
+            Self::advance_subtree_revision(&mut updated);
+        }
 
         self.mark_inode_metadata_dirty(inode_id);
         Arc::<BTreeMap<InodeId, InodeRecord>>::make_mut(&mut self.state.inodes)
@@ -12602,6 +12628,9 @@ impl LocalFileSystem {
             posix.btime_ns,
         );
         updated.metadata_version = updated.metadata_version.max(self.state.generation);
+        if Self::timestamp_update_advances_subtree_revision(update) {
+            Self::advance_subtree_revision(&mut updated);
+        }
 
         self.mark_inode_metadata_dirty(inode_id);
         Arc::<BTreeMap<InodeId, InodeRecord>>::make_mut(&mut self.state.inodes)
