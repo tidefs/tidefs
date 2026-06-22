@@ -748,7 +748,7 @@ impl LeaseManager {
                 // coherency bus and return an ack with eviction counts.
                 self.handle_incoming_invalidation(payload)
             }
-            LeaseMessage::InvalidateAck(ack) => {
+            LeaseMessage::InvalidateAck(_) => {
                 // Process invalidation ack from a remote node.
                 // Currently a no-op at the manager level; stats are updated
                 // by the caller (transport dispatch layer).
