@@ -175,7 +175,7 @@ pub(crate) fn cleanup_orphans(
         }
 
         // 3. Remove extent map if present.
-        if state.extent_maps.remove(&inode_id).is_some() {
+        if state.extent_maps.lock().unwrap().remove(&inode_id).is_some() {
             stats.extent_maps_freed += 1;
         }
         state.dirty_extent_maps.remove(&inode_id);
@@ -389,7 +389,7 @@ mod tests {
             },
             corrupted_inodes: Default::default(),
             change_streams: BTreeMap::new(),
-            extent_maps: BTreeMap::new(),
+            extent_maps: Arc::new(Mutex::new(BTreeMap::new())),
             dirty_extent_maps: Default::default(),
             last_extent_map_write_tx: BTreeMap::new(),
             content_compression_policy: ContentCompressionPolicy::default(),
@@ -696,7 +696,11 @@ mod tests {
         let orphan_inode_id = InodeId::new(33);
 
         let emap = tidefs_extent_map::ExtentMap::new();
-        state.extent_maps.insert(orphan_inode_id, emap);
+        state
+            .extent_maps
+            .lock()
+            .unwrap()
+            .insert(orphan_inode_id, emap);
         state.dirty_extent_maps.insert(orphan_inode_id);
 
         let orphan_index = Arc::new(Mutex::new({
@@ -710,7 +714,11 @@ mod tests {
             .expect("cleanup should succeed");
 
         assert_eq!(stats.extent_maps_freed, 1);
-        assert!(!state.extent_maps.contains_key(&orphan_inode_id));
+        assert!(!state
+            .extent_maps
+            .lock()
+            .unwrap()
+            .contains_key(&orphan_inode_id));
         assert!(!state.dirty_extent_maps.contains(&orphan_inode_id));
     }
 

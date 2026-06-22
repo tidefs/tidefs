@@ -4,7 +4,7 @@ use std::convert::TryFrom;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tidefs_extent_map::ExtentMap;
@@ -881,7 +881,7 @@ pub(crate) fn load_state_from_superblock_changed_records(
         known_inode_ids,
         corrupted_inodes: BTreeSet::new(),
         change_streams: BTreeMap::new(),
-        extent_maps,
+        extent_maps: Arc::new(Mutex::new(extent_maps)),
         dirty_extent_maps: BTreeSet::new(),
         last_extent_map_write_tx,
         content_compression_policy: ContentCompressionPolicy::default(),

@@ -9168,7 +9168,7 @@ fn extent_map_empty_round_trip() {
             .expect("load state")
             .expect("state should exist");
 
-        assert!(loaded.extent_maps.is_empty());
+        assert!(loaded.extent_maps.lock().unwrap().is_empty());
         assert!(loaded.dirty_extent_maps.is_empty());
     }
 

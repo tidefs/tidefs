@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tidefs_local_object_store::{
     checksum64, pool::Pool, CrashInjectionPoint, LocalObjectStore, ObjectKey, ObjectLocation,
@@ -71,7 +71,7 @@ pub(crate) fn initial_state() -> FileSystemState {
         },
         corrupted_inodes: BTreeSet::new(),
         change_streams: BTreeMap::new(),
-        extent_maps: BTreeMap::new(),
+        extent_maps: Arc::new(Mutex::new(BTreeMap::new())),
         dirty_extent_maps: BTreeSet::new(),
         last_extent_map_write_tx: BTreeMap::new(),
         content_compression_policy: ContentCompressionPolicy::default(),
@@ -1451,7 +1451,7 @@ pub(crate) fn load_state_from_superblock(
         last_inode_write_tx: BTreeMap::new(),
         last_dir_write_tx: BTreeMap::new(),
         change_streams: BTreeMap::new(),
-        extent_maps: BTreeMap::new(),
+        extent_maps: Arc::new(Mutex::new(BTreeMap::new())),
         dirty_extent_maps: BTreeSet::new(),
         last_extent_map_write_tx: BTreeMap::new(),
         content_compression_policy: ContentCompressionPolicy::default(),
@@ -1646,7 +1646,7 @@ pub(crate) fn load_state_from_superblock_incremental(
         last_inode_write_tx: BTreeMap::new(),
         last_dir_write_tx: BTreeMap::new(),
         change_streams: BTreeMap::new(),
-        extent_maps: BTreeMap::new(),
+        extent_maps: Arc::new(Mutex::new(BTreeMap::new())),
         dirty_extent_maps: BTreeSet::new(),
         last_extent_map_write_tx: BTreeMap::new(),
         content_compression_policy: ContentCompressionPolicy::default(),

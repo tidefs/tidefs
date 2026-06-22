@@ -304,6 +304,7 @@ mod dedup;
 mod dedup_refcount;
 pub mod dirty_page_tracker;
 mod encoding;
+mod extent_map_store_adapter;
 mod error;
 mod fsck;
 pub mod fuse_fsync;
@@ -411,7 +412,10 @@ use tidefs_types_vfs_core::{
 use tidefs_types_vfs_core::{LockConflict, LockRange, LockTracker};
 
 use background_orphan_reclamation::BackgroundOrphanReclamation;
+use extent_map_store_adapter::FilesystemExtentMapStore;
+use tidefs_online_defrag::{DefragStats, OnlineDefragService};
 use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
+use tidefs_types_incremental_job_core::JobId;
 pub use tidefs_recovery_loop::RecoveryPolicy;
 use tidefs_types_reclaim_queue_core::ObjectKey as ReclaimObjectKey;
 use tidefs_types_reclaim_queue_core::QueueFamily as ReclaimQueueFamily;
@@ -768,7 +772,7 @@ pub(crate) struct FileSystemState {
     change_streams: BTreeMap<InodeId, BTreeMap<u64, DirChangeRecord>>,
     /// Per-file extent maps for byte-range-to-physical mapping persistence.
     /// Keyed by InodeId; only populated for file-like inodes with allocated extents.
-    pub(crate) extent_maps: BTreeMap<InodeId, tidefs_extent_map::ExtentMap>,
+    pub(crate) extent_maps: Arc<Mutex<BTreeMap<InodeId, tidefs_extent_map::ExtentMap>>>,
     /// Tracks which extent maps are dirty and need persistence on next commit.
     pub(crate) dirty_extent_maps: BTreeSet<InodeId>,
     #[allow(dead_code)]
@@ -1477,6 +1481,12 @@ pub struct LocalFileSystem {
     space_pressure: SpacePressure,
     background_cleaner: BackgroundCleaner,
     orphan_index: Arc<Mutex<OrphanIndex>>,
+    /// Shared extent maps for background defrag service. This is the
+    /// same [`Arc`] held by [`FileSystemState::extent_maps`], so defrag
+    /// results are committed directly to the canonical extent maps.
+    extent_maps_shared: Option<Arc<Mutex<BTreeMap<InodeId, tidefs_extent_map::ExtentMap>>>>,
+    /// Shared statistics published by the online defrag job after each tick.
+    online_defrag_stats: Option<Arc<Mutex<DefragStats>>>,
     feature_flags: FeatureFlags,
     content_compression_policy: ContentCompressionPolicy,
     /// Tracks where the effective compression policy was resolved from.
@@ -3285,6 +3295,13 @@ impl LocalFileSystem {
         let pool_uuid = pool_uuid_from_path(&root_path);
         let dataset_mount_id = allocate_local_dataset_mount_id(pool_uuid);
 
+        // Share extent maps with the background online-defrag service.
+        // We clone the Arc (reference-count bump), not the map, so the
+        // defrag adapter modifies the same in-memory extent maps that the
+        // filesystem uses.
+        let extent_maps_shared = Arc::clone(&state.extent_maps);
+        let online_defrag_stats = Arc::new(Mutex::new(DefragStats::default()));
+
         let mut fs = Self {
             store,
             quorum_store: None,
@@ -3337,6 +3354,8 @@ impl LocalFileSystem {
             feature_flags: FeatureFlags::new(),
             content_compression_policy: ContentCompressionPolicy::default(),
             pending_orphan_deletions: Arc::new(Mutex::new(Vec::new())),
+            extent_maps_shared: Some(extent_maps_shared), // Arc::clone of state.extent_maps
+            online_defrag_stats: Some(Arc::clone(&online_defrag_stats)),
             background_scheduler: None,
             scrub_repair_schedule: None,
             scrub_corruption_detected: None,
@@ -3430,6 +3449,20 @@ impl LocalFileSystem {
                 Arc::clone(&fs.pending_orphan_deletions),
             );
             scheduler.register(Box::new(orphan_reclamation));
+
+            // Online extent-map defragmentation runs at BestEffort priority
+            // (mapped from JobKind::Defrag). It never starves critical,
+            // latency-sensitive, or throughput-priority lanes.
+            if let Some(ref em_shared) = fs.extent_maps_shared {
+                let defrag_store = FilesystemExtentMapStore::new(Arc::clone(em_shared));
+                let defrag_svc = OnlineDefragService::new(
+                    JobId(200),
+                    Box::new(defrag_store),
+                    4096, // min_extent_size: 4 KiB
+                )
+                .with_stats_sink(Arc::clone(&online_defrag_stats));
+                let _ = scheduler.register_incremental_job("online-defrag", defrag_svc);
+            }
 
             let scrub_interval_secs = options.background_scrub_interval_secs;
             if scrub_interval_secs > 0 {
@@ -3925,6 +3958,13 @@ impl LocalFileSystem {
     /// Return background cleaner statistics for observability.
     pub fn background_cleaner_stats(&self) -> &crate::background_cleaner::BackgroundCleanerStats {
         self.background_cleaner.stats()
+    }
+
+    /// Return the latest online defrag counters published by the background job.
+    pub fn online_defrag_stats(&self) -> Option<DefragStats> {
+        self.online_defrag_stats
+            .as_ref()
+            .and_then(|stats| stats.lock().ok().map(|stats| stats.clone()))
     }
 
     /// Access the page cache (interior mutability via RefCell).
@@ -5017,9 +5057,8 @@ impl LocalFileSystem {
         &mut self,
         ino: InodeId,
     ) -> std::result::Result<(u64, u64), FilesystemError> {
-        let em = self
-            .state
-            .extent_maps
+        let mut extent_maps = self.state.extent_maps.lock().unwrap();
+        let em = extent_maps
             .get_mut(&ino)
             .ok_or(FilesystemError::NotFound {
                 path: format!("inode:{}", ino.get()),
@@ -5045,9 +5084,8 @@ impl LocalFileSystem {
         ino: InodeId,
         offset: u64,
     ) -> std::result::Result<u64, FilesystemError> {
-        let em = self
-            .state
-            .extent_maps
+        let extent_maps = self.state.extent_maps.lock().unwrap();
+        let em = extent_maps
             .get(&ino)
             .ok_or_else(|| FilesystemError::NotFound {
                 path: format!("inode:{}", ino.get()),
@@ -5076,9 +5114,8 @@ impl LocalFileSystem {
         ino: InodeId,
         offset: u64,
     ) -> std::result::Result<u64, FilesystemError> {
-        let em = self
-            .state
-            .extent_maps
+        let extent_maps = self.state.extent_maps.lock().unwrap();
+        let em = extent_maps
             .get(&ino)
             .ok_or_else(|| FilesystemError::NotFound {
                 path: format!("inode:{}", ino.get()),
@@ -10930,7 +10967,7 @@ impl LocalFileSystem {
                 // so each allocate succeeds.
                 let _ = emap.allocate(entry.logical_offset, entry.length);
             }
-            self.state.extent_maps.insert(*inode_id, emap);
+            self.state.extent_maps.lock().unwrap().insert(*inode_id, emap);
         }
     }
 
@@ -11335,7 +11372,7 @@ impl LocalFileSystem {
         self.state.last_dir_write_tx.remove(&inode_id);
         self.state.last_extent_map_write_tx.remove(&inode_id);
         self.extent_allocator.remove_inode(inode_id.get());
-        self.state.extent_maps.remove(&inode_id);
+        self.state.extent_maps.lock().unwrap().remove(&inode_id);
         self.state.known_inode_ids.remove(&inode_id);
         self.obligation_ledger.release_claims_for_inode(inode_id);
         self.dirty_set.forget_inode(inode_id);
@@ -12747,6 +12784,80 @@ mod orphan_index_integration_tests {
         }
 
         #[test]
+        fn online_defrag_stats_are_exposed_on_open() {
+            let root = std::env::temp_dir().join("bs_test_online_defrag_stats");
+            if root.exists() {
+                let _ = std::fs::remove_dir_all(&root);
+            }
+            let fs = LocalFileSystem::open(&root).expect("open");
+            assert_eq!(fs.online_defrag_stats(), Some(DefragStats::default()));
+        }
+
+        #[test]
+        fn online_defrag_scheduler_tick_scans_shared_extent_map_and_stats() {
+            let inode = InodeId::new(42);
+            let mut extent_map = tidefs_extent_map::ExtentMap::new();
+            extent_map.allocate(0, 4096).expect("first extent");
+            extent_map.allocate(8192, 4096).expect("second extent");
+
+            let extent_maps = Arc::new(Mutex::new(BTreeMap::from([(inode, extent_map)])));
+            let stats = Arc::new(Mutex::new(DefragStats::default()));
+            let store = FilesystemExtentMapStore::new(Arc::clone(&extent_maps));
+            let defrag_svc = OnlineDefragService::new(JobId(200), Box::new(store), 4096)
+                .with_stats_sink(Arc::clone(&stats));
+
+            let mut scheduler = BackgroundScheduler::new(ServiceBudget::UNBOUNDED);
+            scheduler
+                .register_incremental_job("online-defrag", defrag_svc)
+                .expect("register online defrag");
+
+            let report = scheduler.run_cycle();
+            assert!(
+                report
+                    .per_service
+                    .iter()
+                    .any(|(name, _tick)| *name == "online-defrag"),
+                "scheduler report should include online-defrag"
+            );
+
+            let entries_after = extent_maps
+                .lock()
+                .unwrap()
+                .get(&inode)
+                .expect("extent map")
+                .lookup_range(0, 12288)
+                .expect("lookup scanned extents");
+            assert_eq!(
+                entries_after.len(),
+                2,
+                "non-contiguous extents should remain separate"
+            );
+
+            let stats = stats.lock().unwrap().clone();
+            assert_eq!(stats.inodes_scanned, 1);
+            assert_eq!(stats.inodes_defragmented, 0);
+            assert_eq!(stats.extents_before, 2);
+            assert_eq!(stats.extents_after, 2);
+        }
+
+        #[test]
+        fn online_defrag_adapter_uses_extent_map_file_size() {
+            let inode = InodeId::new(43);
+            let mut extent_map = tidefs_extent_map::ExtentMap::new();
+            extent_map.allocate(4096, 4096).expect("extent");
+            let extent_maps = Arc::new(Mutex::new(BTreeMap::from([(inode, extent_map)])));
+            let store = FilesystemExtentMapStore::new(Arc::clone(&extent_maps));
+
+            let loaded = tidefs_online_defrag::ExtentMapStore::load_extent_map(
+                &store,
+                inode.get(),
+            )
+            .expect("load extent map");
+
+            assert_eq!(loaded.header.file_size, 8192);
+        }
+
+        #[test]
         fn tick_background_services_runs_with_no_services() {
             let root = std::env::temp_dir().join("bs_test_tick_empty");
             if root.exists() {
@@ -13347,7 +13458,11 @@ mod orphan_index_integration_tests {
         fs.do_commit().expect("commit setup");
 
         assert!(
-            fs.state.extent_maps.contains_key(&replaced.inode_id),
+            fs.state
+                .extent_maps
+                .lock()
+                .unwrap()
+                .contains_key(&replaced.inode_id),
             "setup should persist the replaced inode extent map"
         );
         assert!(
@@ -13373,7 +13488,11 @@ mod orphan_index_integration_tests {
             "overwritten inode record must be removed from live state"
         );
         assert!(
-            !fs.state.extent_maps.contains_key(&replaced.inode_id),
+            !fs.state
+                .extent_maps
+                .lock()
+                .unwrap()
+                .contains_key(&replaced.inode_id),
             "overwritten inode extent map must be removed from committed state"
         );
         assert!(
