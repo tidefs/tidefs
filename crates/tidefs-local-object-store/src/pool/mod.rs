@@ -35,8 +35,8 @@ use crate::device::{
 };
 use crate::device_health::{DeviceHealth, DeviceHealthState, DeviceHealthTransition};
 use crate::device_layout::{
-    DeviceClassPolicy, DeviceLayoutPolicy, DeviceLayoutStats, DeviceLayoutV1,
-    DeviceMediaClass, WriteAllocator,
+    decode_device_layout_v1, encode_device_layout_v1, DeviceClassPolicy, DeviceLayoutPolicy,
+    DeviceLayoutStats, DeviceLayoutV1, DeviceMediaClass, WriteAllocator,
 };
 use crate::device_manager::{DeviceManager, SparePolicy};
 use crate::io_scheduler::IoClass as SchedClass;
@@ -1090,7 +1090,8 @@ impl Pool {
         let device_layouts: Vec<DeviceLayoutV1> = devices
             .iter()
             .map(|d| {
-                properties.layout_policy
+                properties
+                    .layout_policy
                     .compute(d.store().capacity_bytes())
                     .unwrap_or_else(|_| {
                         // Fall back to Slice0Small on any error.
@@ -1126,6 +1127,8 @@ impl Pool {
             locked: false,
         };
 
+        pool.persist_active_labels_if_needed()?;
+
         // Resume interrupted device removal if a pending marker exists.
         resume_device_removal_if_pending(&mut pool);
 
@@ -1155,6 +1158,7 @@ impl Pool {
         let mut saved_features_valid = false;
         let mut label_is_encrypted = false;
         let mut topology_generation: Option<u64> = None;
+        let mut label_device_layouts: Vec<DeviceLayoutV1> = Vec::new();
 
         // Attempt to read a label from each configured device path.
         for vc in &config.devices {
@@ -1191,6 +1195,18 @@ impl Pool {
             let label = pool_label::decode_label(&buf).map_err(|_| StoreError::InvalidOptions {
                 reason: "pool label corrupt or unreadable",
             })?;
+            let layout_bytes = pool_label::decode_device_layout_v1_bytes(&buf).map_err(|_| {
+                StoreError::InvalidOptions {
+                    reason: "pool label DeviceLayoutV1 record is truncated",
+                }
+            })?;
+            let layout_bytes = layout_bytes.ok_or(StoreError::InvalidOptions {
+                reason: "pool label missing DeviceLayoutV1 record",
+            })?;
+            let device_layout =
+                decode_device_layout_v1(&layout_bytes).map_err(|_| StoreError::InvalidOptions {
+                    reason: "pool label DeviceLayoutV1 record is corrupt",
+                })?;
             let recovered_redundancy_policy =
                 PoolRedundancyPolicy::from_label_policy(label.redundancy_policy);
             match label_redundancy_policy {
@@ -1203,6 +1219,7 @@ impl Pool {
                 Some(_) => {}
             }
             device_guids.push(label.device_guid);
+            label_device_layouts.push(device_layout);
             topology_generation = Some(
                 topology_generation
                     .unwrap_or(label.topology_generation)
@@ -1322,6 +1339,18 @@ impl Pool {
         let mut devices = open_devices(&config, options)?;
         let next_placement_receipt_generation =
             next_placement_receipt_generation_for_devices(&devices);
+        if label_device_layouts.len() != devices.len() {
+            return Err(StoreError::InvalidOptions {
+                reason: "pool label DeviceLayoutV1 count does not match devices",
+            });
+        }
+        for (device, layout) in devices.iter().zip(label_device_layouts.iter()) {
+            if layout.device_size_bytes != device.store().capacity_bytes() {
+                return Err(StoreError::InvalidOptions {
+                    reason: "pool label DeviceLayoutV1 device size mismatch",
+                });
+            }
+        }
 
         // Build device-class-aware layout state.
         let media_classes: Vec<DeviceMediaClass> =
@@ -1344,21 +1373,7 @@ impl Pool {
         // Open the log device writer if an IntentLog device is present.
         let log_device = open_log_device_for_devices(&config.devices)?;
 
-        // Recompute per-device layout records from the pool's layout policy.
-        // During import the previously persisted DeviceLayoutV1 records are
-        // not yet read back from the system area; recompute deterministically.
-        let device_layouts: Vec<DeviceLayoutV1> = devices
-            .iter()
-            .map(|d| {
-                properties.layout_policy
-                    .compute(d.store().capacity_bytes())
-                    .unwrap_or_else(|_| {
-                        DeviceLayoutPolicy::Slice0Small
-                            .compute(d.store().capacity_bytes())
-                            .expect("Slice0Small must succeed for non-zero device")
-                    })
-            })
-            .collect();
+        let device_layouts = label_device_layouts;
 
         let mut pool = Self {
             config,
@@ -1409,7 +1424,12 @@ impl Pool {
                     reason: "pool export missing device config",
                 })?;
             let label = self.build_label(i, device);
-            write_pool_label(config, label, "pool_export_write_label")?;
+            write_pool_label(
+                config,
+                label,
+                self.device_layouts.get(i),
+                "pool_export_write_label",
+            )?;
         }
         Ok(())
     }
@@ -1440,13 +1460,13 @@ impl Pool {
         self.health_transitions.len()
     }
 
-    /// Per-device health states, indexed by device position.
-    /// Return a copy of the per-device layout records.
+    /// Per-device layout records, indexed by device position.
     #[must_use]
     pub fn device_layouts(&self) -> &[DeviceLayoutV1] {
         &self.device_layouts
     }
 
+    /// Per-device health states, indexed by device position.
     pub fn device_health_states(&self) -> Vec<(usize, DeviceHealthState)> {
         self.devices
             .iter()
@@ -1544,7 +1564,16 @@ impl Pool {
             topology_generation: self.placement_epoch,
             device_count,
             device_class: runtime_class_to_label(self.classes.get(device_index).copied()),
-            features_compat: features::DEVICE_HEALTH_STATE,
+            device_capacity_bytes: device.store().capacity_bytes(),
+            system_area_pointer: self
+                .device_layouts
+                .get(device_index)
+                .map_or(0, |layout| layout.system_area_offset),
+            system_area_size: self
+                .device_layouts
+                .get(device_index)
+                .map_or(0, |layout| layout.system_area_len),
+            features_compat: features::DEVICE_HEALTH_STATE | features::DEVICE_LAYOUT_V1,
             features_incompat: {
                 let mut flags = features::POOL_LABEL_V1;
                 if self.devices.iter().any(|d| d.is_encrypted()) {
@@ -1577,7 +1606,12 @@ impl Pool {
                         reason: "pool device label persistence missing device config",
                     })?;
             let label = self.build_label_with_state(device_index, device, PoolState::Active);
-            write_pool_label(config, label, "pool_active_write_label")?;
+            write_pool_label(
+                config,
+                label,
+                self.device_layouts.get(device_index),
+                "pool_active_write_label",
+            )?;
         }
 
         self.persisted_label_epoch = Some(self.placement_epoch);
@@ -4126,16 +4160,27 @@ fn device_config_has_label_authority(config: &DeviceConfig) -> bool {
 fn write_pool_label(
     device_config: &DeviceConfig,
     label: PoolLabelV1,
+    device_layout: Option<&DeviceLayoutV1>,
     operation: &'static str,
 ) -> Result<()> {
-    let sealed = pool_label::seal_label(label).map_err(|_| StoreError::InvalidOptions {
-        reason: "label seal failed",
-    })?;
+    let layout_bytes = device_layout.map(|layout| {
+        let mut bytes = [0u8; pool_label::POOL_LABEL_DEVICE_LAYOUT_V1_WIRE_SIZE];
+        encode_device_layout_v1(layout, &mut bytes);
+        bytes
+    });
+    let sealed =
+        pool_label::seal_label_with_device_layout(label, layout_bytes.as_ref()).map_err(|_| {
+            StoreError::InvalidOptions {
+                reason: "label seal failed",
+            }
+        })?;
 
-    let mut buf = [0u8; pool_label::POOL_LABEL_V1_EXT_WIRE_SIZE];
-    pool_label::encode_label(&sealed, &mut buf).map_err(|_| StoreError::InvalidOptions {
-        reason: "label encode failed",
-    })?;
+    let mut buf = [0u8; pool_label::POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE];
+    pool_label::encode_label_with_device_layout(&sealed, layout_bytes.as_ref(), &mut buf).map_err(
+        |_| StoreError::InvalidOptions {
+            reason: "label encode failed",
+        },
+    )?;
 
     let device_root = device_root_path(device_config);
     if device_config.backing.uses_fixed_offset_pool_labels() {
@@ -6596,6 +6641,47 @@ mod tests {
     }
 
     #[test]
+    fn create_persists_device_layout_and_open_uses_label_record() {
+        let root = temp_dir("layout-label-reopen");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let mut options = test_options();
+        options.max_segment_bytes = 16 * 1024;
+        let custom_policy = DeviceLayoutPolicy::Custom {
+            data_segment_size: 2 * 1024 * 1024,
+            metadata_segment_size: 2 * 1024 * 1024,
+            journal_segment_size: 2 * 1024 * 1024,
+        };
+        let properties = PoolProperties {
+            layout_policy: custom_policy,
+            ..PoolProperties::default()
+        };
+
+        let pool = Pool::create(config.clone(), properties, &options).unwrap();
+        let created_layout = pool.device_layouts()[0];
+        assert_eq!(
+            created_layout.policy,
+            crate::device_layout::DeviceLayoutPolicyDiscriminant::Custom
+        );
+
+        let label_path = label_file_path(&device_root_path(&config.devices[0]));
+        let label_bytes = fs::read(&label_path).unwrap();
+        let label = pool_label::decode_label(&label_bytes).unwrap();
+        assert!(label.features_compat & features::DEVICE_LAYOUT_V1 != 0);
+        let layout_bytes = pool_label::decode_device_layout_v1_bytes(&label_bytes)
+            .unwrap()
+            .expect("layout sidecar");
+        let label_layout = decode_device_layout_v1(&layout_bytes).unwrap();
+        assert_eq!(label_layout, created_layout);
+        drop(pool);
+
+        let reopened = Pool::open(config, PoolProperties::default(), &options).unwrap();
+        assert_eq!(reopened.device_layouts()[0], created_layout);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn open_rejects_mismatched_label_redundancy_policy() {
         let root = temp_dir("label-policy-mismatch");
         let _ = std::fs::remove_dir_all(&root);
@@ -6607,6 +6693,7 @@ mod tests {
         };
 
         let pool = Pool::create(config.clone(), properties, &options).unwrap();
+        let device_layout = pool.device_layouts()[1];
         pool.export().unwrap();
         drop(pool);
 
@@ -6617,6 +6704,7 @@ mod tests {
         write_pool_label(
             &config.devices[1],
             label,
+            Some(&device_layout),
             "test_write_mismatched_redundancy_label",
         )
         .unwrap();
@@ -6652,8 +6740,12 @@ mod tests {
         let config = single_device_config(&root);
         let options = test_options();
         let pool1 = Pool::create(config.clone(), PoolProperties::default(), &options).unwrap();
+        let pool1_guid = pool1.pool_guid;
+        drop(pool1);
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
         let pool2 = Pool::create(config, PoolProperties::default(), &options).unwrap();
-        assert_ne!(pool1.pool_guid, pool2.pool_guid);
+        assert_ne!(pool1_guid, pool2.pool_guid);
         let _ = std::fs::remove_dir_all(&root);
     }
 

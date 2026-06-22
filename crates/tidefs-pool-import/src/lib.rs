@@ -314,6 +314,8 @@ struct LabelAgreementMember {
     features_ro_compat: u64,
     /// Compatible feature flags recorded in the label.
     features_compat: u64,
+    /// Encoded DeviceLayoutV1 record read from the label header.
+    device_layout_v1: Option<tidefs_types_pool_label_core::DeviceLayoutV1Bytes>,
     /// Pool state recorded in the label.
     pool_state: tidefs_types_pool_label_core::PoolState,
 }
@@ -428,25 +430,18 @@ pub fn pool_export(
         let mut new_label = old_label;
         new_label.pool_state = tidefs_types_pool_label_core::PoolState::Exported;
 
-        let sealed = match tidefs_types_pool_label_core::seal_label(new_label) {
-            Ok(sealed) => sealed,
+        let out_buf = match encode_label_update_preserving_device_layout(
+            new_label,
+            &old_buf,
+            &device_path,
+            "export",
+        ) {
+            Ok(out_buf) => out_buf,
             Err(e) => {
                 rollback_export_labels(&mut devices, &written_prior_labels);
-                return Err(ImportError::Io {
-                    device_path: Some(device_path),
-                    msg: format!("seal export label: {e}"),
-                });
+                return Err(e);
             }
         };
-
-        let mut out_buf = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
-        if let Err(e) = tidefs_types_pool_label_core::encode_label(&sealed, &mut out_buf) {
-            rollback_export_labels(&mut devices, &written_prior_labels);
-            return Err(ImportError::Io {
-                device_path: Some(device_path),
-                msg: format!("encode export label: {e}"),
-            });
-        }
 
         if let Err(err) = devices[device_idx].write_label_bytes(&out_buf) {
             let mut rollback_labels = written_prior_labels.clone();
@@ -502,19 +497,12 @@ pub fn pool_destroy(device_paths: &[PathBuf], zero_superblock: bool) -> Result<(
         let mut new_label = old_label;
         new_label.pool_state = tidefs_types_pool_label_core::PoolState::Destroyed;
 
-        let sealed =
-            tidefs_types_pool_label_core::seal_label(new_label).map_err(|e| ImportError::Io {
-                device_path: Some(device.device_path.clone()),
-                msg: format!("seal destroy label: {e}"),
-            })?;
-
-        let mut out_buf = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
-        tidefs_types_pool_label_core::encode_label(&sealed, &mut out_buf).map_err(|e| {
-            ImportError::Io {
-                device_path: Some(device.device_path.clone()),
-                msg: format!("encode destroy label: {e}"),
-            }
-        })?;
+        let out_buf = encode_label_update_preserving_device_layout(
+            new_label,
+            &old_buf,
+            &device.device_path,
+            "destroy",
+        )?;
 
         device.write_label_bytes(&out_buf)?;
 
@@ -632,8 +620,13 @@ impl DeviceHandle {
     /// reserved commit-record/system area that shares the label region.
     fn write_label_bytes(&mut self, buf: &[u8]) -> Result<(), ImportError> {
         debug_assert_eq!(buf.len(), tidefs_types_pool_label_core::POOL_LABEL_SIZE);
+        let features_compat = u64::from_le_bytes(buf[371..379].try_into().unwrap());
+        let has_device_layout =
+            features_compat & tidefs_types_pool_label_core::features::DEVICE_LAYOUT_V1 != 0;
         let write_len = if buf.iter().all(|b| *b == 0) {
             tidefs_types_pool_label_core::POOL_LABEL_SIZE
+        } else if has_device_layout {
+            tidefs_types_pool_label_core::POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
         } else {
             tidefs_types_pool_label_core::POOL_LABEL_V1_EXT_WIRE_SIZE
         };
@@ -652,6 +645,41 @@ impl DeviceHandle {
     }
 }
 
+fn encode_label_update_preserving_device_layout(
+    label: tidefs_types_pool_label_core::PoolLabelV1,
+    source_label_buf: &[u8],
+    device_path: &Path,
+    operation: &'static str,
+) -> Result<Vec<u8>, ImportError> {
+    let device_layout_v1 = tidefs_types_pool_label_core::decode_device_layout_v1_bytes(
+        source_label_buf,
+    )
+    .map_err(|e| ImportError::Io {
+        device_path: Some(device_path.to_path_buf()),
+        msg: format!("decode DeviceLayoutV1 during {operation}: {e}"),
+    })?;
+    let sealed = tidefs_types_pool_label_core::seal_label_with_device_layout(
+        label,
+        device_layout_v1.as_ref(),
+    )
+    .map_err(|e| ImportError::Io {
+        device_path: Some(device_path.to_path_buf()),
+        msg: format!("seal {operation} label: {e}"),
+    })?;
+
+    let mut out_buf = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
+    tidefs_types_pool_label_core::encode_label_with_device_layout(
+        &sealed,
+        device_layout_v1.as_ref(),
+        &mut out_buf,
+    )
+    .map_err(|e| ImportError::Io {
+        device_path: Some(device_path.to_path_buf()),
+        msg: format!("encode {operation} label: {e}"),
+    })?;
+    Ok(out_buf)
+}
+
 const SUPPORTED_INCOMPAT_FEATURES: u64 = tidefs_types_pool_label_core::features::POOL_LABEL_V1
     | tidefs_types_pool_label_core::features::ENCRYPTION_INCOMPAT
     | tidefs_types_pool_label_core::features::CLUSTER_POOL_INCOMPAT;
@@ -660,7 +688,8 @@ const SUPPORTED_COMPAT_FEATURES: u64 = tidefs_types_pool_label_core::features::D
     | tidefs_types_pool_label_core::features::SPARE_POLICY_SUPPORTED
     | tidefs_types_pool_label_core::features::DEVICE_HEALTH_STATE
     | tidefs_types_pool_label_core::features::CLUSTER_POOL_COMPAT
-    | tidefs_types_pool_label_core::features::POOL_REDUNDANCY_POLICY;
+    | tidefs_types_pool_label_core::features::POOL_REDUNDANCY_POLICY
+    | tidefs_types_pool_label_core::features::DEVICE_LAYOUT_V1;
 
 fn build_label_agreement_report_for_paths(
     device_paths: &[PathBuf],
@@ -673,7 +702,7 @@ fn build_label_agreement_report_for_paths(
             device_path: device_path.clone(),
             msg: e.to_string(),
         })?;
-        let label = read_member_label_from_file(&mut file, device_path)?;
+        let (label, device_layout_v1) = read_member_label_from_file(&mut file, device_path)?;
         ensure_supported_label_features(
             label.features_incompat,
             label.features_ro_compat,
@@ -683,6 +712,7 @@ fn build_label_agreement_report_for_paths(
         members.push(label_agreement_member(
             device_path.clone(),
             label,
+            device_layout_v1,
             committed_root,
         ));
     }
@@ -704,6 +734,13 @@ fn build_label_agreement_report_for_devices(
                 msg: format!("decode label: {e}"),
             }
         })?;
+        let device_layout_v1 = tidefs_types_pool_label_core::decode_device_layout_v1_bytes(
+            &label_buf,
+        )
+        .map_err(|e| ImportError::Io {
+            device_path: Some(device.device_path.clone()),
+            msg: format!("decode DeviceLayoutV1 from label: {e}"),
+        })?;
         ensure_supported_label_features(
             label.features_incompat,
             label.features_ro_compat,
@@ -714,6 +751,7 @@ fn build_label_agreement_report_for_devices(
         members.push(label_agreement_member(
             device.device_path.clone(),
             label,
+            device_layout_v1,
             committed_root,
         ));
     }
@@ -724,7 +762,13 @@ fn build_label_agreement_report_for_devices(
 fn read_member_label_from_file(
     file: &mut File,
     device_path: &Path,
-) -> Result<tidefs_types_pool_label_core::PoolLabelV1, ImportError> {
+) -> Result<
+    (
+        tidefs_types_pool_label_core::PoolLabelV1,
+        Option<tidefs_types_pool_label_core::DeviceLayoutV1Bytes>,
+    ),
+    ImportError,
+> {
     let mut label_buf = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
     file.seek(SeekFrom::Start(0)).map_err(|e| ImportError::Io {
         device_path: Some(device_path.to_path_buf()),
@@ -735,10 +779,17 @@ fn read_member_label_from_file(
             device_path: Some(device_path.to_path_buf()),
             msg: format!("read label 0: {e}"),
         })?;
-    tidefs_types_pool_label_core::decode_label(&label_buf).map_err(|e| ImportError::Io {
-        device_path: Some(device_path.to_path_buf()),
-        msg: format!("decode label: {e}"),
-    })
+    let label =
+        tidefs_types_pool_label_core::decode_label(&label_buf).map_err(|e| ImportError::Io {
+            device_path: Some(device_path.to_path_buf()),
+            msg: format!("decode label: {e}"),
+        })?;
+    let device_layout_v1 = tidefs_types_pool_label_core::decode_device_layout_v1_bytes(&label_buf)
+        .map_err(|e| ImportError::Io {
+            device_path: Some(device_path.to_path_buf()),
+            msg: format!("decode DeviceLayoutV1 from label: {e}"),
+        })?;
+    Ok((label, device_layout_v1))
 }
 
 fn recover_member_committed_root(
@@ -766,6 +817,7 @@ fn recover_member_committed_root(
 fn label_agreement_member(
     device_path: PathBuf,
     label: tidefs_types_pool_label_core::PoolLabelV1,
+    device_layout_v1: Option<tidefs_types_pool_label_core::DeviceLayoutV1Bytes>,
     committed_root: Option<CommittedRoot>,
 ) -> LabelAgreementMember {
     LabelAgreementMember {
@@ -782,6 +834,7 @@ fn label_agreement_member(
         features_incompat: label.features_incompat,
         features_ro_compat: label.features_ro_compat,
         features_compat: label.features_compat,
+        device_layout_v1,
         pool_state: label.pool_state,
     }
 }
@@ -810,6 +863,7 @@ fn verify_label_agreement(report: &LabelAgreementReport) -> Result<(), ImportErr
     ensure_redundancy_policies_agree(report)?;
     ensure_device_classes_agree(report)?;
     ensure_feature_flags_agree(report)?;
+    ensure_device_layout_records_match_feature_flags(report)?;
 
     Ok(())
 }
@@ -1061,6 +1115,28 @@ fn ensure_feature_flags_agree(report: &LabelAgreementReport) -> Result<(), Impor
         });
     }
     Ok(())
+}
+
+fn ensure_device_layout_records_match_feature_flags(
+    report: &LabelAgreementReport,
+) -> Result<(), ImportError> {
+    let missing: Vec<String> = report
+        .members
+        .iter()
+        .filter(|member| {
+            member.features_compat & tidefs_types_pool_label_core::features::DEVICE_LAYOUT_V1 != 0
+                && member.device_layout_v1.is_none()
+        })
+        .map(|member| member.device_path.display().to_string())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(ImportError::SuperblockDisagreement {
+            field: "device_layout_v1".to_string(),
+            values: missing,
+        })
+    }
 }
 
 fn committed_root_value(member: &LabelAgreementMember) -> String {
@@ -1577,19 +1653,12 @@ impl PoolImport {
             new_label.redundancy_policy = redundancy_policy;
 
             // Seal (compute checksum), encode, and write.
-            let sealed = tidefs_types_pool_label_core::seal_label(new_label).map_err(|e| {
-                ImportError::Io {
-                    device_path: Some(device.device_path.clone()),
-                    msg: format!("seal label: {e}"),
-                }
-            })?;
-            let mut out_buf = vec![0u8; tidefs_types_pool_label_core::POOL_LABEL_SIZE];
-            tidefs_types_pool_label_core::encode_label(&sealed, &mut out_buf).map_err(|e| {
-                ImportError::Io {
-                    device_path: Some(device.device_path.clone()),
-                    msg: format!("encode label: {e}"),
-                }
-            })?;
+            let out_buf = encode_label_update_preserving_device_layout(
+                new_label,
+                &old_buf,
+                &device.device_path,
+                "activate",
+            )?;
             device.write_label_bytes(&out_buf)?;
 
             // Write the initial VRBT committed-root block to the system area
