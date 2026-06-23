@@ -46,7 +46,7 @@ START_DEV after data-queue runtime ownership has been dropped.
 
 In short, the daemon does not submit START_DEV without ready data queues.
 
-not admitted, the command refuses before mutation and records
+If the host is not admitted, the command refuses before mutation and records
 `start_dev.uring_cmd_attempted=false`. On an admitted host where ADD_DEV and
 SET_PARAMS succeed but data queues are not ready, DEL_DEV cleanup is still
 attempted after ADD_DEV.
@@ -87,4 +87,4 @@ block-device acceptance harness.
 
 ## Non-Claims
 
-This is not a complete ublk daemon, not a started Linux block-device export, not
+This is not a complete ublk daemon, not a started Linux block-device export, not io_uring data-queue execution, not fio.

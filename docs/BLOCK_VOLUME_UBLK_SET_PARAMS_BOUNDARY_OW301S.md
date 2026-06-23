@@ -40,7 +40,7 @@ The daemon command keeps cleanup ordering explicit:
 10. submit `UBLK_U_CMD_DEL_DEV` for the returned device id, including when
     SET_PARAMS fails after ADD_DEV.
 
-not admitted, the command refuses before mutation and records
+If the host is not admitted, the command refuses before mutation and records
 `set_params.uring_cmd_attempted=false` and `del_dev.uring_cmd_attempted=false`.
 On an admitted host where ADD_DEV succeeds, DEL_DEV cleanup is attempted and any
 cleanup failure is reported explicitly as `control.cleanup_failed_after_add_dev`.
