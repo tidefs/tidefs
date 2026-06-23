@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Node join protocol: staged promotion with health gates — PC-010.4.
+//! Node join protocol: staged promotion with health gates.
 //!
 //! Implements a 3-phase staged join that safely onboards a new member
 //! into the cluster. Each promotion phase requires a health check gate.
@@ -41,7 +41,7 @@ use tidefs_types_pool_label_core::PoolLabelFingerprint;
 // ── Gate constant ───────────────────────────────────────────────────
 
 pub const NODE_JOIN_PROTOCOL_GATE_PC_010_4: &str =
-    "PC-010.4 node join protocol with p4→p2→p5 promotion phases and health gates";
+    "node join protocol with p4→p2→p5 promotion phases and health gates";
 
 // ── Error types ──────────────────────────────────────────────────────
 

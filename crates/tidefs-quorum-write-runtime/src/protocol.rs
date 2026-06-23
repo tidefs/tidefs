@@ -4,8 +4,8 @@
 //! Production replication protocol: fanout writes, collect quorum ACKs,
 //! handle partial failures, and commit through the flow commit coordinator.
 //!
-//! Implements PC-010.3 distributed replication with per-chunk-class quorum
-//! policies, receipt-backed completion, and transfer orchestrator integration.
+//! Implements distributed replication with per-chunk-class quorum policies,
+//! receipt-backed completion, and transfer orchestrator integration.
 
 use std::collections::BTreeMap;
 

@@ -38,7 +38,7 @@ pub struct PlacementRuntime {
     next_ticket_id: u64,
     pub planner: PlacementPlanner,
     pub health_tracker: PlacementHealthTracker,
-    /// Rebalance integration (PC-010.4): capacity skew detection, movement budget, epoch gating.
+    /// Rebalance integration: capacity skew detection, movement budget, epoch gating.
     pub rebalance: RebalanceIntegration,
 }
 
@@ -229,7 +229,7 @@ impl PlacementRuntime {
         }
 
         cycle.under_replicated.sort_by_key(|g| g.gap_class);
-        // ── Rebalance check (PC-010.4) ──────────────────────────────
+        // ── Rebalance check ────────────────────────────────────────
         // If we have a fresh cycle and capacity skew is detected, produce rebalance intents.
         if !cycle.has_gaps() || cycle.under_replicated.len() <= subjects.len() {
             // Collect per-member utilization for skew detection.

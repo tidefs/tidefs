@@ -6,7 +6,7 @@ publish.workspace = true
 license.workspace = true
 authors.workspace = true
 
-description = "Rebalance planner: capacity redistribution orchestration with movement budget, epoch gating, and anti-affinity preservation — PC-010.4"
+description = "Rebalance planner: capacity redistribution orchestration with movement budget, epoch gating, and anti-affinity preservation"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
