@@ -11,6 +11,18 @@ concern, and deferred wire-up strategy for cluster-wide services
 advancement strategy), #1723 (roadmap priorities)
 **Blocks**: All deferred cluster-service wire-up implementation issues
 
+
+> **Historical input (TFR-019 authority classification, GitHub issue #1234):**
+> This imported Forgejo-era #1954 coordination pipeline status snapshot records
+> retired lane-health machinery, coordinator-proliferation language,
+> cluster-service implementation-status statements, deferred-wire-up claims,
+> Forgejo API queries, and `STATUS.md`/`FEATURE_MATRIX.md` cross-document
+> consistency contracts. Current TideFS coordination state and worker scheduling
+> authority live in GitHub issues and pull requests plus active repo docs such as
+> `docs/INDEX.md` and `docs/GITHUB_PR_DEVELOPMENT.md`; this file is not current
+> policy, automation behavior, implementation status, release-readiness evidence,
+> or product authority.
+
 ## Abstract
 
 This document updates the coordination pipeline status as of the May 2026
@@ -627,11 +639,14 @@ implementation including the P8-03 3-node cluster bootstrap.
 
 ---
 
-**Coordination pipeline status update (#1954) complete.** This document
-supersedes #1915 as the current authoritative coordination pipeline status
-snapshot. The architecture, data structures, and algorithms defined in #1833
-and #1838 remain the governing frameworks. Future status updates should build
-on this document's lane state, proliferation assessment, and health metrics.
+**Historical coordination pipeline status update (#1954) recorded.** This
+document was a Forgejo-era snapshot that superseded #1915 as the then-current
+coordination pipeline status snapshot in its original context. The architecture,
+data structures, and algorithms defined in #1833 and #1838 remain the governing
+frameworks. It is historical input only; future status updates must not build
+on this document's lane state, proliferation assessment, or health metrics.
+Current TideFS coordination authority lives in GitHub issues and pull requests
+plus the active repo documentation entry points.
 
 **Gate**: `cargo check --workspace` passes. Design-only document; no code
 changes.
