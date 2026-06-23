@@ -196,6 +196,8 @@ const VALID_TIER_TARGET_PAIRS: &[(&str, &str)] = &[
         KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID,
     ),
 ];
+const NEWLINE_ONLY_BLAKE3_DIGEST: &str =
+    "blake3:295192ea1ec8566d563b1a7587e5f0198580cdbd043842f5090a4c197c20c67a";
 
 // ---------------------------------------------------------------------------
 // Validation entry point
@@ -372,6 +374,17 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
     for (name, value) in &trace_sources {
         if value.is_empty() {
             failures.push(format!("{name} is required"));
+        }
+    }
+    for (name, value) in [
+        ("workqueue_trace_digest", &artifact.workqueue_trace_digest),
+        ("callback_trace_digest", &artifact.callback_trace_digest),
+    ] {
+        if !value.is_empty() && !value.starts_with("blake3:") {
+            failures.push(format!("{name} must use a blake3 digest"));
+        }
+        if value == NEWLINE_ONLY_BLAKE3_DIGEST {
+            failures.push(format!("{name} must not be the empty trace digest"));
         }
     }
 

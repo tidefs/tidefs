@@ -215,35 +215,69 @@ POOL_DEV=/dev/vda
 POOL_NAME=t6_no_daemon_teardown_pool
 MODULE_PATH=/lib/modules/tidefs_posix_vfs.ko
 EVDIR=/validation
+mkdir -p "$EVDIR"
 
 # ── Infra: ftrace and dmesg capture ─────────────────────────────────
 setup_ftrace() {
-  if [ -d /sys/kernel/tracing ]; then
-    echo 0 > /sys/kernel/tracing/tracing_on 2>/dev/null || true
-    echo > /sys/kernel/tracing/trace 2>/dev/null || true
-    echo 1 > /sys/kernel/tracing/events/workqueue/workqueue_execute_start/enable 2>/dev/null || true
-    echo 1 > /sys/kernel/tracing/events/workqueue/workqueue_execute_end/enable 2>/dev/null || true
-    echo 1 > /sys/kernel/tracing/events/workqueue/workqueue_queue_work/enable 2>/dev/null || true
-    echo 1 > /sys/kernel/tracing/events/workqueue/workqueue_activate_work/enable 2>/dev/null || true
-    echo 1 > /sys/kernel/tracing/tracing_on 2>/dev/null || true
-    echo "[ftrace] workqueue tracing enabled"
+  mkdir -p /sys/kernel/tracing 2>/dev/null || true
+  if [ ! -f /sys/kernel/tracing/trace ]; then
+    mount -t tracefs tracefs /sys/kernel/tracing 2>/tmp/tracefs_mount.err || true
+  fi
+
+  if [ -f /sys/kernel/tracing/trace ]; then
+    local enabled=1
+    echo 0 > /sys/kernel/tracing/tracing_on 2>/dev/null || enabled=0
+    : > /sys/kernel/tracing/trace 2>/dev/null || enabled=0
+    for event in workqueue_execute_start workqueue_execute_end workqueue_queue_work workqueue_activate_work; do
+      if [ -e "/sys/kernel/tracing/events/workqueue/$event/enable" ]; then
+        echo 1 > "/sys/kernel/tracing/events/workqueue/$event/enable" 2>/dev/null || enabled=0
+      else
+        enabled=0
+      fi
+    done
+    echo 1 > /sys/kernel/tracing/tracing_on 2>/dev/null || enabled=0
+    if [ "$enabled" -eq 1 ]; then
+      pass "ftrace_workqueue_enabled"
+      echo "[ftrace] workqueue tracing enabled"
+    else
+      fail "ftrace_workqueue_enabled" "tracefs workqueue event enable failed"
+    fi
   else
-    echo "[ftrace] tracefs not available; dmesg-only trace capture"
+    local err
+    err=$(cat /tmp/tracefs_mount.err 2>/dev/null | head -1)
+    [ -n "$err" ] || err="tracefs trace file not available"
+    fail "ftrace_workqueue_enabled" "$err"
   fi
 }
 
 capture_ftrace() {
   local dest="$1"
+  mkdir -p "$(dirname "$dest")" 2>/dev/null || true
   if [ -f /sys/kernel/tracing/trace ]; then
-    cp /sys/kernel/tracing/trace "$dest" 2>/dev/null || true
-    echo "[ftrace] trace captured to $dest ($(wc -c < "$dest" 2>/dev/null || echo 0) bytes)"
+    if cp /sys/kernel/tracing/trace "$dest" 2>/tmp/ftrace_capture.err && [ -s "$dest" ]; then
+      echo "[ftrace] trace captured to $dest ($(wc -c < "$dest" 2>/dev/null || echo 0) bytes)"
+    else
+      local err
+      err=$(cat /tmp/ftrace_capture.err 2>/dev/null | head -1)
+      [ -n "$err" ] || err="trace capture missing or empty"
+      fail "ftrace_capture" "$err"
+    fi
+  else
+    fail "ftrace_capture" "tracefs trace file missing"
   fi
 }
 
 capture_dmesg() {
   local dest="$1"
-  dmesg > "$dest" 2>/dev/null || true
-  echo "[dmesg] captured to $dest ($(wc -c < "$dest" 2>/dev/null || echo 0) bytes)"
+  mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+  if dmesg > "$dest" 2>/tmp/dmesg_capture.err && [ -s "$dest" ]; then
+    echo "[dmesg] captured to $dest ($(wc -c < "$dest" 2>/dev/null || echo 0) bytes)"
+  else
+    local err
+    err=$(cat /tmp/dmesg_capture.err 2>/dev/null | head -1)
+    [ -n "$err" ] || err="dmesg capture missing or empty"
+    fail "dmesg_capture" "$err"
+  fi
 }
 
 check_dmesg_signal() {
@@ -796,15 +830,32 @@ PHASEEOF
     fi
 
     # Trace identity
+    artifact_body_missing() {
+      local body="$1"
+      if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+        return 0
+      fi
+      printf '%s\n' "$body" | grep -q '^artifact source missing:' && return 0
+      return 1
+    }
+
     WQ_TRACE_SOURCE="tracefs:/sys/kernel/tracing/events/workqueue/"
     WQ_TRACE_PATH="trace/ftrace_final.txt"
     WQ_TRACE_BODY=$(grep -A9999 '^BEGIN_ARTIFACT:ftrace_workqueue$' "$RUN_DIR/qemu.log" 2>/dev/null | grep -B9999 '^END_ARTIFACT:ftrace_workqueue$' | grep -v '^BEGIN_ARTIFACT\|^END_ARTIFACT' || echo "")
-    WQ_TRACE_DIGEST="blake3:$(echo "$WQ_TRACE_BODY" | "$B3SUM" | awk '{print $1}')"
+    if artifact_body_missing "$WQ_TRACE_BODY"; then
+      TEARDOWN_STATUS="fail"
+      append_fail_reason "workqueue_trace_artifact_empty"
+    fi
+    WQ_TRACE_DIGEST="blake3:$(printf '%s' "$WQ_TRACE_BODY" | "$B3SUM" | awk '{print $1}')"
 
     CB_TRACE_SOURCE="dmesg"
     CB_TRACE_PATH="trace/dmesg_callbacks.txt"
     CB_TRACE_BODY=$(grep -A9999 '^BEGIN_ARTIFACT:dmesg_callbacks$' "$RUN_DIR/qemu.log" 2>/dev/null | grep -B9999 '^END_ARTIFACT:dmesg_callbacks$' | grep -v '^BEGIN_ARTIFACT\|^END_ARTIFACT' || echo "")
-    CB_TRACE_DIGEST="blake3:$(echo "$CB_TRACE_BODY" | "$B3SUM" | awk '{print $1}')"
+    if artifact_body_missing "$CB_TRACE_BODY"; then
+      TEARDOWN_STATUS="fail"
+      append_fail_reason "callback_trace_artifact_empty"
+    fi
+    CB_TRACE_DIGEST="blake3:$(printf '%s' "$CB_TRACE_BODY" | "$B3SUM" | awk '{print $1}')"
 
     # Cleanup outcome
     UNMOUNT_OUTCOME="ok"
@@ -820,8 +871,8 @@ PHASEEOF
     # Write kernel-teardown-runtime.json
     mkdir -p "$OUTPUT_DIR/trace"
     cp "$RUN_DIR/qemu.log" "$OUTPUT_DIR/qemu.log" 2>/dev/null || true
-    printf '%s\n' "$WQ_TRACE_BODY" > "$OUTPUT_DIR/$WQ_TRACE_PATH"
-    printf '%s\n' "$CB_TRACE_BODY" > "$OUTPUT_DIR/$CB_TRACE_PATH"
+    printf '%s' "$WQ_TRACE_BODY" > "$OUTPUT_DIR/$WQ_TRACE_PATH"
+    printf '%s' "$CB_TRACE_BODY" > "$OUTPUT_DIR/$CB_TRACE_PATH"
 
     "$JQ" -n \
       --arg generated_by "$GENERATED_BY" \
