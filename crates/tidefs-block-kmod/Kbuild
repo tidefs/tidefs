@@ -31,7 +31,13 @@ obj-m := tidefs_block_kmod.o
 # linux/cleanup.h, linux/cpumask.h, and others) compare unsigned long
 # against int in guard macros and bitmask operations.  This is intentional
 # upstream style that we cannot fix in an out-of-tree module.
-subdir-ccflags-y := -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare
+#
+# -Wno-unused-command-line-argument is allowed because the kernel build
+# system passes flags (e.g. -fno-strict-overflow, -nostdlibinc) that
+# clang warns about as unused during compilation of certain object types
+# (modfinal .mod.o, .module-common.o).  These flags are set by Kbuild,
+# not by this module.
+subdir-ccflags-y := -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare -Wno-unused-command-line-argument
 
 # Treat Rust warnings as errors in kernel module builds.
 # Clippy lints are the primary Rust quality gate; -Dwarnings ensures the
