@@ -1068,12 +1068,12 @@ mod tests {
         let io = ObjectIo::with_chunk_size(4096);
 
         io.write(&mut map, &mut store, 0, b"hello world!").unwrap();
-        io.write(&mut map, &mut store, 3, b"XXXXX").unwrap();
+        io.write(&mut map, &mut store, 3, b"PATCH").unwrap();
 
         let mut buf = vec![0; 12];
         let read = io.read(&map, &store, 0, &mut buf).unwrap();
         assert_eq!(read, 12);
-        assert_eq!(&buf, b"helXXXXXrld!");
+        assert_eq!(&buf, b"helPATCHrld!");
         assert_eq!(map.entries.len(), 3);
     }
 

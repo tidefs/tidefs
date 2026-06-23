@@ -150,8 +150,8 @@ fn partial_overwrite_preserves_surrounding_bytes() {
         .expect("range exists");
     assert_eq!(slice, b"BBBB ");
 
-    // Overwrite the middle portion: "BBBB" -> "XXXX"
-    let updated = b"AAAA XXXX CCCC DDDD EEEE";
+    // Overwrite the middle portion: "BBBB" -> "ZZZZ"
+    let updated = b"AAAA ZZZZ CCCC DDDD EEEE";
     store.put(key, updated).expect("put overwrite");
 
     // Read back: overwritten region changed
@@ -165,7 +165,7 @@ fn partial_overwrite_preserves_surrounding_bytes() {
         "overwritten bytes must match new payload"
     );
     assert_eq!(&read2[0..5], b"AAAA ", "prefix unchanged");
-    assert_eq!(&read2[5..10], b"XXXX ", "middle overwritten");
+    assert_eq!(&read2[5..10], b"ZZZZ ", "middle overwritten");
     assert_eq!(&read2[10..], b"CCCC DDDD EEEE", "suffix unchanged");
 
     // Stats: still one live object (overwrite is append-only, not delete+insert)

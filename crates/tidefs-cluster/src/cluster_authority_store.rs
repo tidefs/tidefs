@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn bad_magic_rejected() {
         let mut buf = vec![0u8; CLUSTER_AUTHORITY_HEADER_SIZE];
-        buf[0..4].copy_from_slice(b"XXXX");
+        buf[0..4].copy_from_slice(b"BADC");
         let result = read_all_records_from_bytes(&buf);
         assert!(matches!(result, Err(AuthorityStoreError::BadMagic)));
     }

@@ -1271,7 +1271,7 @@ mod tests {
 
     #[test]
     fn polymorphic_serde_wrong_magic_rejected() {
-        let buf = b"XXXX".to_vec();
+        let buf = b"BADC".to_vec();
         let mut cursor = std::io::Cursor::new(&buf);
         let err = PolymorphicExtentMap::deserialize(&mut cursor).unwrap_err();
         assert_eq!(err, ExtentMapError::WrongVersion);

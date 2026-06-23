@@ -39,7 +39,7 @@ function run_test {
 
 run_test --features=libfuse 'with libfuse'
 
-# TODO: re-enable this test. It seems to hang on OSX
+# TFR-020: macOS auto-unmount row hangs in the imported FUSE harness.
 #run_test --features=libfuse 'with libfuse' --auto_unmount
 
 export TEST_EXIT_STATUS=0

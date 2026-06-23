@@ -1198,7 +1198,7 @@ mod tests {
     #[test]
     fn from_bytes_rejects_invalid_magic() {
         let mut data = vec![0u8; 12];
-        data[0..4].copy_from_slice(b"XXXX");
+        data[0..4].copy_from_slice(b"BADC");
         let result = SegmentLivenessQueue::from_bytes(&data);
         assert_eq!(result, Err(SegmentLivenessDeserializeError::InvalidMagic));
     }

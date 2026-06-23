@@ -2824,7 +2824,7 @@ mod tests {
     #[test]
     fn promote_on_name_bytes() {
         let mut idx = DirIndex::new(1, test_policy());
-        let long = b"this_is_a_very_long_filename_that_exceeds_name_bytes_threshold_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+        let long = b"this_is_a_very_long_filename_that_exceeds_name_bytes_threshold_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
         for i in 0..3 {
             let mut name = long.to_vec();
             name.extend_from_slice(alloc::format!("_{i}").as_bytes());

@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn tx_group_state_decode_rejects_wrong_magic() {
         let mut buf = vec![0u8; 45];
-        buf[0..4].copy_from_slice(b"XXXX");
+        buf[0..4].copy_from_slice(b"BADC");
         let result = TxGroupState::decode(&buf);
         assert!(result.is_err());
         match result {
@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn tx_group_state_verify_tampered_magic_does_not_affect_checksum() {
         let mut r = TxGroupState::new(1, TxGroupLifecycle::Open);
-        r.magic = *b"XXXX";
+        r.magic = *b"BADC";
         // Magic is verified during decode (not via checksum),
         // so tampering the in-memory struct field does not break verify.
         // The checksum uses the constant TX_GROUP_STATE_MAGIC as a type tag.

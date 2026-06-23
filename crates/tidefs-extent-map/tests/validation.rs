@@ -606,7 +606,7 @@ fn serialize_deserialize_preserves_free_regions() {
 #[test]
 fn deserialize_wrong_magic_rejected() {
     use std::io::Cursor;
-    let buf = b"XXXX".to_vec();
+    let buf = b"BADC".to_vec();
     let mut cursor = Cursor::new(&buf);
     assert_eq!(
         ExtentMap::deserialize(&mut cursor).unwrap_err(),

@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn rejection_frame_decode_rejects_wrong_magic() {
         let mut data = vec![0u8; RejectionFrame::WIRE_SIZE];
-        data[0..4].copy_from_slice(b"XXXX");
+        data[0..4].copy_from_slice(b"BADC");
         assert!(RejectionFrame::decode(&data).is_none());
     }
 

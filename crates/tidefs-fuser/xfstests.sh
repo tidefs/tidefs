@@ -25,99 +25,99 @@ cd /code/fuse-xfstests
 # requires OFD & POSIX locks. OFD locks are not supported by fuse
 echo "generic/478" >> xfs_excludes.txt
 
-# TODO: requires supporting orphaned files, that have an open file handle, but no links
+# TFR-011: open-unlink xfstests still need the public FUSE UAPI boundary.
 echo "generic/484" >> xfs_excludes.txt
 
 # Writes directly to scratch block dev
 echo "generic/062" >> xfs_excludes.txt
 
-# TODO: looks like it requires character file support
+# TFR-011: character-device rows need the public FUSE UAPI boundary.
 echo "generic/078" >> xfs_excludes.txt
 
-# TODO: takes > 10min
+# TFR-020: long-running harness rows need explicit signal classification.
 echo "generic/069" >> xfs_excludes.txt
 
-# TODO: needs fallocate which is missing from Linux FUSE driver (https://github.com/libfuse/libfuse/issues/395)
+# TFR-011: fallocate rows need the FUSE UAPI boundary recorded.
 echo "generic/263" >> xfs_excludes.txt
 
-# TODO: Passes, but takes ~30min
+# TFR-020: long-running harness rows need explicit signal classification.
 echo "generic/127" >> xfs_excludes.txt
 
-# TODO: requires more complete falloc support. Also fills up the entire hard disk...
+# TFR-011: fallocate coverage needs the public FUSE UAPI boundary.
 echo "generic/103" >> xfs_excludes.txt
 
-# TODO: requires support for mknod on character files
+# TFR-011: mknod character-file rows need the public FUSE UAPI boundary.
 echo "generic/184" >> xfs_excludes.txt
 echo "generic/401" >> xfs_excludes.txt
 
-# TODO: requires fifo support
+# TFR-011: fifo rows need the public FUSE UAPI boundary.
 echo "generic/423" >> xfs_excludes.txt
 echo "generic/434" >> xfs_excludes.txt
 
-# TODO: requires ulimit support for limiting file size
+# TFR-011: file-size limit rows need the public FUSE UAPI boundary.
 echo "generic/394" >> xfs_excludes.txt
 
 # requires BSD lock support, and checks /proc/locks. fuse locks don't seem to show up in /proc/locks
 echo "generic/504" >> xfs_excludes.txt
 
-# TODO: requires support for system.posix_acl_access xattr sync'ing to file permissions
+# TFR-011: POSIX ACL rows need one FUSE UAPI authority.
 # Some information about it linked from here: https://stackoverflow.com/questions/29569408/documentation-of-posix-acl-access-and-friends
 echo "generic/099" >> xfs_excludes.txt
 echo "generic/105" >> xfs_excludes.txt
 echo "generic/375" >> xfs_excludes.txt
 
-# TODO: requires support for mounting read-only
+# TFR-011: read-only mount rows need the public FUSE UAPI boundary.
 echo "generic/294" >> xfs_excludes.txt
 echo "generic/306" >> xfs_excludes.txt
 echo "generic/452" >> xfs_excludes.txt
 
-# TODO: requires atime support
+# TFR-005: atime rows need the POSIX timestamp authority.
 echo "generic/003" >> xfs_excludes.txt
 echo "generic/192" >> xfs_excludes.txt
 
-# TODO: Passes, but takes ~10min and writes > 20GB. Needs support for writing files with large holes,
+# TFR-008: sparse-hole rows need the writeback and durability boundary.
 # for this test to be fast
 echo "generic/130" >> xfs_excludes.txt
 
-# TODO: uses namespaces and inodes don't seem to get mapped properly
+# TFR-004: namespace and inode mapping rows need dataset-scoped authority.
 # this test ends up trying to chmod "/" (the root inode)
 echo "generic/317" >> xfs_excludes.txt
 
-# TODO: requires more complete ACL support
+# TFR-011: ACL rows need one public FUSE UAPI boundary.
 echo "generic/319" >> xfs_excludes.txt
 echo "generic/444" >> xfs_excludes.txt
 
-# TODO: Seems to cause a host OOM (even from inside Docker), when run with 84, 87, 88, 100, and 109
+# TFR-020: host-OOM harness rows need explicit signal classification.
 echo "generic/089" >> xfs_excludes.txt
 
-# TODO: very slow. Passes, but takes > 30min
+# TFR-020: long-running harness rows need explicit signal classification.
 echo "generic/074" >> xfs_excludes.txt
 
-# TODO: very slow. Ran for > 3hrs without completing
+# TFR-020: long-running harness rows need explicit signal classification.
 echo "generic/339" >> xfs_excludes.txt
 
-# TODO: Passes, but takes ~60min on CI
+# TFR-020: long-running harness rows need explicit signal classification.
 echo "generic/006" >> xfs_excludes.txt
 echo "generic/011" >> xfs_excludes.txt
 echo "generic/070" >> xfs_excludes.txt
 
-# TODO: very slow. Passes, but takes 20min
+# TFR-020: long-running harness rows need explicit signal classification.
 echo "generic/438" >> xfs_excludes.txt
 
-# TODO: seems to crash host
+# TFR-020: host-crash harness rows need explicit signal classification.
 echo "generic/476" >> xfs_excludes.txt
 
-# TODO: writing to /proc/sys/vm/drop_caches is not allowed inside Docker
+# TFR-020: Docker-only harness limits need explicit signal classification.
 echo "generic/086" >> xfs_excludes.txt
 echo "generic/391" >> xfs_excludes.txt
 echo "generic/426" >> xfs_excludes.txt
 echo "generic/467" >> xfs_excludes.txt
 echo "generic/477" >> xfs_excludes.txt
 
-# TODO: permission failure invoking FIBMAP
+# TFR-011: FIBMAP rows need one public FUSE UAPI boundary.
 echo "generic/519" >> xfs_excludes.txt
 
-# TODO: Tries to create 50k+ files, which OOMs
+# TFR-020: high-file-count harness rows need explicit signal classification.
 echo "generic/531" >> xfs_excludes.txt
 
 # Test requires mounting a loopback device

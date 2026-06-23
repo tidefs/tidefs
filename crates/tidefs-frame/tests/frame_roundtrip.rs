@@ -485,7 +485,7 @@ fn header_claims_u32_max_length() {
     // only 4 bytes. Decompress gracefully returns what's there.
     let mut buf = vec![0x00]; // uncompressed
     buf.extend_from_slice(&u32::MAX.to_le_bytes());
-    buf.extend_from_slice(b"XXXX"); // only 4 bytes, not u32::MAX
+    buf.extend_from_slice(b"BADC"); // only 4 bytes, not u32::MAX
     let result = decompress_frame(&buf);
     // Should not panic; returns the available payload.
     assert!(result.is_ok());

@@ -959,7 +959,7 @@ mod tests {
     fn corrupt_wrong_magic() {
         let mut storage = TestStorage::new(8, 512);
         let mut buf = [0u8; format::DIR_PAGE_SIZE];
-        buf[0..4].copy_from_slice(b"XXXX");
+        buf[0..4].copy_from_slice(b"BADC");
         storage.write_page(0, &buf);
         assert!(matches!(
             KernelRootDirReader::new(&storage, 0, 8),

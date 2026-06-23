@@ -1145,7 +1145,7 @@ mod tests {
             .open(&dev_path)
             .unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(b"XXXX").unwrap();
+        file.write_all(b"BADC").unwrap();
         file.sync_all().unwrap();
         drop(file);
         let mut file = File::open(&dev_path).unwrap();

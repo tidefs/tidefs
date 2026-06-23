@@ -691,7 +691,7 @@ mod tests {
     #[test]
     fn parse_page_header_wrong_magic() {
         let mut page = [0u8; 4096];
-        page[0..4].copy_from_slice(b"XXXX");
+        page[0..4].copy_from_slice(b"BADC");
         assert!(matches!(
             parse_page_header(&page),
             Err(PageError::WrongMagic)

@@ -1516,7 +1516,7 @@ impl Filesystem for SimpleFS {
             // if flags & FUSE_WRITE_KILL_PRIV as i32 != 0 {
             //     clear_suid_sgid(&mut attrs);
             // }
-            // XXX: In theory we should only need to do this when WRITE_KILL_PRIV is set for 7.31+
+            // TFR-011: WRITE_KILL_PRIV semantics need one public FUSE UAPI boundary.
             // However, xfstests fail in that case
             clear_suid_sgid(&mut attrs);
             self.write_inode(&attrs);
