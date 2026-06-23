@@ -7,9 +7,22 @@
 >
 > Readers evaluating current TideFS documentation authority should start
 > at `docs/INDEX.md` and `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
-> The register classifies documents as current policy, current spec,
-> historical input, or delete candidate; this file remains historical
-> input until a later classification commit promotes or removes it.
+>
+> **Register classification (2026-06-24)**: `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+> classifies this file as **historical input** under TFR-019 / GitHub issue
+> #1240. The Forgejo-era metadata below (issue #1240, P2 priority,
+> DESIGN-M4 milestone, lane/blocking claims, `STATUS.md`/`FEATURE_MATRIX.md`
+> references, and DEPENDS-ON links to retired Forgejo issues
+> #1173/#1176/#1237/#1239) is preserved only as historical design context.
+> Live source has a simpler `ValidityToken` (32-byte BLAKE3 opaque token
+> with `matches()`) in `tidefs-types-cache-lattice-core` and stub
+> `ViewClass`/`ViewBuildCost` enums without derived-view implementations,
+> but no multi-kind token dispatch, no six-view-type runtime, no incremental
+> delta refresh, and no budget-governor wiring. The cache-lattice,
+> cursor-framework, resource-governor, and WorkBudget architectural claims
+> in this document exceed current live-source and claim-registry evidence.
+> This file must not be cited as current TideFS implementation status,
+> release-readiness evidence, or product authority.
 >
 > The design material below is preserved for future review; it has not
 > been validated against current source behavior or claim-registry evidence.
