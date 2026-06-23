@@ -149,7 +149,7 @@ These are not stubs in the traditional sense (they contain real code and tests),
 | `tidefs-performance-contract` | [#830](https://github.com/tidefs/tidefs/issues/830) | product-code | 1745 | Authority established: 20 unit tests validate typed admission permit tokens, dirty-byte/operation accounting, budgeted queues with service curves, and deterministic scheduling-oracle signal; no_std with forbid(unsafe_code); runtime throughput claims remain separately gated |
 | `tidefs-posix-filesystem-adapter-reply` | [#831](https://github.com/tidefs/tidefs/issues/831) | adapter-operator | 2059 | Authority established: 61 unit tests validate FUSE reply commit lanes (small/bulk reply classes), directory-entry wire-format serialization (dirent/direntplus), reply encoding, wire-size constants, error mapping, and commit-record construction; consumed by tidefs-fuser; no_std with forbid(unsafe_code); mounted FUSE runtime claims remain separately gated |
 | `tidefs-posix-guarantee-verifier` | [#832](https://github.com/tidefs/tidefs/issues/832) | proof-harness | 706 | Authority established: 30 unit tests validate the full 5-strategy × 6-operation-class matrix, violation construction, counter tracking, violation_rate computation, and edge cases; zero reverse dependencies reflect proof-harness status; runtime integration claims remain separately gated |
-| `tidefs-secret-key-policy-runtime` | [#833](https://github.com/tidefs/tidefs/issues/833) | policy-tooling | — | Secret-key policy runtime (contains `CryptoPlaceholder` error variant); needs policy validation |
+| `tidefs-secret-key-policy-runtime` | [#833](https://github.com/tidefs/tidefs/issues/833) | policy-tooling | 3561 | Authority established: 65 unit tests validate all 10 P9-04 algorithms (classify, seal-mint, lease, manifest-assemble, publish, activate, rotate, rewrap, revoke, recover) plus transport-TLS, node-join-bootstrap, envelope-wrapping, and disclosure gating; CryptoPlaceholder removed by PR #947; forbid(unsafe_code); zero reverse dependencies reflect policy-tooling status; live KMS/HSM binding remains separately gated |
 | `tidefs-snapshot-pruner` | [#834](https://github.com/tidefs/tidefs/issues/834) | product-code | 1949 | Snapshot pruner; needs runtime validation |
 | `tidefs-two-node-harness` | [#835](https://github.com/tidefs/tidefs/issues/835) | proof-harness | — | Two-node cluster harness; needs QEMU validation |
 | `tidefs-vfs-rpc` | [#836](https://github.com/tidefs/tidefs/issues/836) | product-code | 2884 | VFS RPC protocol; needs runtime validation |
@@ -176,12 +176,12 @@ Follow-up scope: #789 tracks the 22 planned-authority surfaces and has split the
 - Classification: **Implement** — the model surface exists but physical reclaim is incomplete.
 - Follow-up issue: #791 completes the receipt-bound dead-object drain integration.
 
-### 6.3 CryptoPlaceholder error variant
+### 6.3 CryptoPlaceholder error variant (resolved by PR #947)
 
-- **Surface**: `crates/tidefs-secret-key-policy-runtime/src/lib.rs:122, 798`
-  - `CryptoPlaceholder` error variant and its emission path.
-- Classification: **Implement** — placeholder for real cryptographic policy enforcement.
-- Follow-up issue: #792 implements the cryptographic policy enforcement path; remove the placeholder error variant.
+- **Surface**: `crates/tidefs-secret-key-policy-runtime/src/lib.rs`
+  - The `CryptoPlaceholder` error variant and its emission path were removed by PR #947.
+- Classification: **Resolved by #947** — rotation crypto policy enforcement is now live; accepted successor policy material is validated before sealing.
+- See PR #947 (merged at b552114), issue #792.
 
 ### 6.4 Transport endpoint type authority
 
@@ -325,7 +325,7 @@ These surfaces were identified as stub/placeholder during the audit but already 
 | #789 | Section 5 (22 planned-authority-surface crates) | Implement | Tracking issue; individual crate follow-ups |
 | #790 | Section 6.1 (dedup crate) | Implement | `crates/tidefs-dedup/` |
 | #791 | Section 6.2 (segment cleaner) | Implement | `crates/tidefs-segment-cleaner/` |
-| #792 | Section 6.3 (CryptoPlaceholder) | Implement | `crates/tidefs-secret-key-policy-runtime/` |
+| #792 | Section 6.3 (CryptoPlaceholder) | Resolved: PR #947 | `crates/tidefs-secret-key-policy-runtime/` |
 | #793 | Section 6.4 (transport endpoint type authority) | Resolved: canonical `TransportAddr` | `crates/tidefs-transport/src/config.rs` |
 | #794 | Section 6.5 (cluster orchestrator scaffolding) | Implement | `crates/tidefs-cluster/src/pool_orchestrator.rs` |
 | #795 | Section 6.7 (synthetic placeholder receipts) | Implement | `crates/tidefs-rebuild-runtime/` |
