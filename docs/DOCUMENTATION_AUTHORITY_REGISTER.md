@@ -101,7 +101,6 @@ leftovers in
 `docs/design/coordination-pipeline-status-update-1767.md`,
 `docs/design/coordination-pipeline-status-update-1839.md`,
 `docs/design/coordination-pipeline-status-update-1915.md`,
-`docs/design/coordination-review-roadmap-priorities-update.md`,
 `docs/design/derived-views-first-class-architectural-pillar.md`,
 `docs/design/incremental-job-core-wire-up-deferred-design.md`, and
 `docs/design/unified-on-media-format-lifecycle.md` are left for a later
@@ -177,6 +176,26 @@ worker scheduling policy.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/design/coordination-pipeline-status-update-2054.md` | Historical input | Imported Forgejo-era #2054 coordination pipeline status snapshot from May 2026. It records design-phase closure for cluster-wide services, three active implementation lanes, deferred wire-up dependencies, coordinator-proliferation containment strategy, design-spec metadata, and `STATUS.md`/`FEATURE_MATRIX.md` references that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current automation policy, implementation status, release-readiness evidence, or worker scheduling authority.
+
+
+### Coordination Review Roadmap Priorities Update (TFR-019 / #1238)
+
+Classified for TFR-019 / GitHub issue #1238 on 2026-06-23 after reviewing this
+register's authority rule and review method, the TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, the imported roadmap priorities update document,
+`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, the already-classified #1164
+health-strategy, #1165 status-update-architecture, #1234 1954-snapshot, and
+#1236 2054-snapshot rows, and bounded lineage references from the
+`coordination-pipeline-status-update.md` architecture document and the
+`coordination-review-roadmap-priorities-update-1953.md` already-classified
+historical-input entry. This slice classifies exactly the roadmap priorities
+update file and does not classify the -1953 sibling, other coordination-pipeline
+snapshots, promote any current automation claim, or change Codex Nexus or worker
+scheduling policy.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/coordination-review-roadmap-priorities-update.md` | Historical input | Imported Forgejo-era #1914 (superseding #1753) coordination pipeline health review from June 2026. It records lane-health machinery, active-lane status statements, coordinator-proliferation audit data, priority-ordering data structures and scheduling algorithms, deferred-wire-up claims, Forgejo issue references (#1914, #1753, #1738, #1903, #1644, #1923), design-spec metadata, and `STATUS.md`/`FEATURE_MATRIX.md` references that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current policy, automation behavior, implementation status, release-readiness evidence, worker scheduling authority, or product authority. |
 
 ### Checksum and BLAKE3 Authority
 
