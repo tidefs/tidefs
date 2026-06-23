@@ -190,6 +190,62 @@ pub static HIST_METADATA: LazyLock<LatencyHistogram> = LazyLock::new(LatencyHist
 /// Scheduler cycle (background work dispatch) latency histogram.
 pub static HIST_BG_SCHEDULER: LazyLock<LatencyHistogram> = LazyLock::new(LatencyHistogram::new);
 
+/// Reason class recorded by the FUSE governor-admission boundary.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum FuseAdmissionReason {
+    /// The request was admitted at the FUSE boundary.
+    Accepted,
+    /// Soft pressure deferred a non-critical request.
+    SoftDeferred,
+    /// Hard pressure refused a mutating request.
+    HardRefusedMutating,
+    /// Hard pressure refused a request under the all-request policy.
+    HardRefusedAll,
+}
+
+static FUSE_ADMISSION_ACCEPTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FUSE_ADMISSION_SOFT_DEFERRED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FUSE_ADMISSION_HARD_REFUSED_MUTATING_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FUSE_ADMISSION_HARD_REFUSED_ALL_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Point-in-time snapshot of FUSE governor admission reason counters.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct FuseAdmissionReasonSnapshot {
+    pub accepted: u64,
+    pub soft_deferred: u64,
+    pub hard_refused_mutating: u64,
+    pub hard_refused_all: u64,
+}
+
+/// Record one FUSE governor-admission decision reason.
+pub fn record_fuse_admission_reason(reason: FuseAdmissionReason) {
+    match reason {
+        FuseAdmissionReason::Accepted => {
+            FUSE_ADMISSION_ACCEPTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        FuseAdmissionReason::SoftDeferred => {
+            FUSE_ADMISSION_SOFT_DEFERRED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        FuseAdmissionReason::HardRefusedMutating => {
+            FUSE_ADMISSION_HARD_REFUSED_MUTATING_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        FuseAdmissionReason::HardRefusedAll => {
+            FUSE_ADMISSION_HARD_REFUSED_ALL_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Return the current FUSE governor-admission reason counters.
+#[must_use]
+pub fn fuse_admission_reason_snapshot() -> FuseAdmissionReasonSnapshot {
+    FuseAdmissionReasonSnapshot {
+        accepted: FUSE_ADMISSION_ACCEPTED_TOTAL.load(Ordering::Relaxed),
+        soft_deferred: FUSE_ADMISSION_SOFT_DEFERRED_TOTAL.load(Ordering::Relaxed),
+        hard_refused_mutating: FUSE_ADMISSION_HARD_REFUSED_MUTATING_TOTAL.load(Ordering::Relaxed),
+        hard_refused_all: FUSE_ADMISSION_HARD_REFUSED_ALL_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shutdown summary emission
 // ---------------------------------------------------------------------------

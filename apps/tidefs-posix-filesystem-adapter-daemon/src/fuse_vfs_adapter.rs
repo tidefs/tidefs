@@ -50,6 +50,7 @@ use fuser::{
 use tidefs_background_scheduler::{BackgroundScheduler, BackgroundService};
 use tidefs_cache_core::page_cache::PageCache;
 use tidefs_cache_core::path_lookup_cache::PathLookupCache;
+use tidefs_cache_core::{BackpressureSignal, BudgetCategory, Governor, GovernorConfig};
 use tidefs_local_filesystem::fuse_fsync::DirtyFlush;
 use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex};
 use tidefs_permission::{
@@ -2674,6 +2675,183 @@ pub trait BlockVolumeWriteTarget {
     fn read_bytes(&self, offset: u64, len: u64) -> Result<Vec<u8>, Errno>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FuseAdmissionHardPolicy {
+    Mutating,
+    AllRequests,
+}
+
+impl Default for FuseAdmissionHardPolicy {
+    fn default() -> Self {
+        Self::Mutating
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FuseAdmissionClass {
+    Deferrable,
+    Mutating,
+    AlwaysAdmit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FuseAdmissionOp {
+    Access,
+    BatchForget,
+    Bmap,
+    CopyFileRange,
+    Create,
+    Exchange,
+    Fallocate,
+    Flock,
+    Flush,
+    Forget,
+    Fsync,
+    Fsyncdir,
+    Getattr,
+    Getlk,
+    Getxattr,
+    Ioctl,
+    Link,
+    Listxattr,
+    Lookup,
+    Lseek,
+    Mkdir,
+    Mknod,
+    Open,
+    Opendir,
+    Poll,
+    Read,
+    Readdir,
+    Readdirplus,
+    Readlink,
+    Release,
+    Releasedir,
+    Removexattr,
+    Rename,
+    Rmdir,
+    Setattr,
+    Setlk,
+    Setxattr,
+    Statfs,
+    Statx,
+    Symlink,
+    Syncfs,
+    Unlink,
+    Write,
+}
+
+impl FuseAdmissionOp {
+    fn class(self) -> FuseAdmissionClass {
+        match self {
+            Self::BatchForget
+            | Self::Flush
+            | Self::Forget
+            | Self::Fsync
+            | Self::Fsyncdir
+            | Self::Release
+            | Self::Releasedir
+            | Self::Syncfs => FuseAdmissionClass::AlwaysAdmit,
+            Self::CopyFileRange
+            | Self::Create
+            | Self::Exchange
+            | Self::Fallocate
+            | Self::Flock
+            | Self::Link
+            | Self::Mkdir
+            | Self::Mknod
+            | Self::Removexattr
+            | Self::Rename
+            | Self::Rmdir
+            | Self::Setattr
+            | Self::Setlk
+            | Self::Setxattr
+            | Self::Symlink
+            | Self::Unlink
+            | Self::Write => FuseAdmissionClass::Mutating,
+            Self::Access
+            | Self::Bmap
+            | Self::Getattr
+            | Self::Getlk
+            | Self::Getxattr
+            | Self::Ioctl
+            | Self::Listxattr
+            | Self::Lookup
+            | Self::Lseek
+            | Self::Open
+            | Self::Opendir
+            | Self::Poll
+            | Self::Read
+            | Self::Readdir
+            | Self::Readdirplus
+            | Self::Readlink
+            | Self::Statfs
+            | Self::Statx => FuseAdmissionClass::Deferrable,
+        }
+    }
+
+    fn category(self) -> BudgetCategory {
+        match self {
+            Self::Read => BudgetCategory::DataCache,
+            Self::Write | Self::Fallocate | Self::CopyFileRange => BudgetCategory::DirtyBytes,
+            Self::BatchForget
+            | Self::Flock
+            | Self::Forget
+            | Self::Getlk
+            | Self::Release
+            | Self::Releasedir
+            | Self::Setlk => BudgetCategory::InodeState,
+            Self::Access
+            | Self::Bmap
+            | Self::Create
+            | Self::Exchange
+            | Self::Flush
+            | Self::Fsync
+            | Self::Fsyncdir
+            | Self::Getattr
+            | Self::Getxattr
+            | Self::Ioctl
+            | Self::Link
+            | Self::Listxattr
+            | Self::Lookup
+            | Self::Lseek
+            | Self::Mkdir
+            | Self::Mknod
+            | Self::Open
+            | Self::Opendir
+            | Self::Poll
+            | Self::Readdir
+            | Self::Readdirplus
+            | Self::Readlink
+            | Self::Removexattr
+            | Self::Rename
+            | Self::Rmdir
+            | Self::Setattr
+            | Self::Setxattr
+            | Self::Statfs
+            | Self::Statx
+            | Self::Symlink
+            | Self::Syncfs
+            | Self::Unlink => BudgetCategory::MetaCache,
+        }
+    }
+}
+
+fn strongest_backpressure(
+    first: BackpressureSignal,
+    second: BackpressureSignal,
+) -> BackpressureSignal {
+    match (first, second) {
+        (BackpressureSignal::HardPressure, _) | (_, BackpressureSignal::HardPressure) => {
+            BackpressureSignal::HardPressure
+        }
+        (BackpressureSignal::SoftPressure, _) | (_, BackpressureSignal::SoftPressure) => {
+            BackpressureSignal::SoftPressure
+        }
+        _ => BackpressureSignal::None,
+    }
+}
+
 /// FUSE filesystem adapter backed by a `VfsEngine`.
 pub struct FuseVfsAdapter {
     pub(crate) engine: Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>,
@@ -2681,6 +2859,8 @@ pub struct FuseVfsAdapter {
     dir_handles: Mutex<AdapterDirHandleTable>,
     dentry_policy: DentryPolicy,
     lock_dispatch: DaemonLockDispatch,
+    governor: Governor,
+    fuse_admission_hard_policy: FuseAdmissionHardPolicy,
     dentry_invalidations: Mutex<DentryInvalidationState>,
     data_cache_invalidations: Mutex<DataCacheInvalidationState>,
     negative_cache: Mutex<NegativeLookupCache>,
@@ -2810,6 +2990,7 @@ impl FuseVfsAdapter {
         let engine = Arc::new(Mutex::new(engine));
         let timestamp_policy = TimestampPolicy::default();
         let base_dentry_policy = DentryPolicy::default();
+        let governor = Governor::new(GovernorConfig::default()).map_err(|_| Errno::EINVAL)?;
         Ok(Self {
             engine: Arc::clone(&engine),
             file_handles: Mutex::new(AdapterFileHandleTable::default()),
@@ -2817,6 +2998,8 @@ impl FuseVfsAdapter {
             dentry_policy: base_dentry_policy.for_timestamp_policy(timestamp_policy, false),
             base_dentry_policy,
             lock_dispatch: DaemonLockDispatch::new(),
+            governor,
+            fuse_admission_hard_policy: FuseAdmissionHardPolicy::default(),
             dentry_invalidations: Mutex::new(DentryInvalidationState::default()),
             data_cache_invalidations: Mutex::new(DataCacheInvalidationState::default()),
             negative_cache: Mutex::new(NegativeLookupCache::new(256, Duration::from_millis(250))),
@@ -2867,6 +3050,59 @@ impl FuseVfsAdapter {
 
     pub fn engine_handle(&self) -> crate::live_owner::LiveOwnerEngine {
         Arc::clone(&self.engine)
+    }
+
+    /// Replace the default daemon memory governor used by the FUSE admission boundary.
+    #[must_use]
+    pub fn with_governor(mut self, governor: Governor) -> Self {
+        self.governor = governor;
+        self
+    }
+
+    #[must_use]
+    fn with_fuse_admission_hard_policy(mut self, policy: FuseAdmissionHardPolicy) -> Self {
+        self.fuse_admission_hard_policy = policy;
+        self
+    }
+
+    /// Return the cloneable daemon memory governor handle.
+    #[must_use]
+    pub fn governor_handle(&self) -> Governor {
+        self.governor.clone()
+    }
+
+    fn admit_fuse_request(&self, op: FuseAdmissionOp) -> Result<(), Errno> {
+        use crate::observability::FuseAdmissionReason;
+
+        let signal = strongest_backpressure(
+            self.governor.backpressure(op.category()),
+            self.governor.global_backpressure(),
+        );
+        let class = op.class();
+
+        let rejection = match (signal, class, self.fuse_admission_hard_policy) {
+            (BackpressureSignal::HardPressure, FuseAdmissionClass::AlwaysAdmit, _) => None,
+            (BackpressureSignal::HardPressure, _, FuseAdmissionHardPolicy::AllRequests) => {
+                Some((FuseAdmissionReason::HardRefusedAll, Errno::ENOMEM))
+            }
+            (
+                BackpressureSignal::HardPressure,
+                FuseAdmissionClass::Mutating,
+                FuseAdmissionHardPolicy::Mutating,
+            ) => Some((FuseAdmissionReason::HardRefusedMutating, Errno::ENOMEM)),
+            (BackpressureSignal::SoftPressure, FuseAdmissionClass::Deferrable, _) => {
+                Some((FuseAdmissionReason::SoftDeferred, Errno::EAGAIN))
+            }
+            _ => None,
+        };
+
+        if let Some((reason, errno)) = rejection {
+            crate::observability::record_fuse_admission_reason(reason);
+            return Err(errno);
+        }
+
+        crate::observability::record_fuse_admission_reason(FuseAdmissionReason::Accepted);
+        Ok(())
     }
 
     pub fn with_block_volume(self, target: Box<dyn BlockVolumeWriteTarget + Send>) -> Self {
@@ -9654,16 +9890,22 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
+        let _ = self.admit_fuse_request(FuseAdmissionOp::Forget);
         self.dispatch_forget(ino, nlookup);
     }
 
     fn batch_forget(&mut self, _req: &Request<'_>, nodes: &[fuser::fuse_forget_one]) {
+        let _ = self.admit_fuse_request(FuseAdmissionOp::BatchForget);
         for node in nodes {
             self.dispatch_forget(node.nodeid, node.nlookup);
         }
     }
 
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Lookup) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         let ctx_mirror =
             Self::classify_fuse_lookup(req.unique(), parent, req.uid(), req.gid(), req.pid());
@@ -9683,6 +9925,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn getattr(&mut self, req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Getattr) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         match self.dispatch_getattr(&ctx, ino, req.unique(), None) {
             Ok(attr_out) => {
@@ -9695,6 +9941,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn access(&mut self, req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Access) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 = Self::classify_fuse_access(req.unique(), ino, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
         reply_empty_ok_or_errno(reply, self.dispatch_access_check(&ctx, ino, mask));
@@ -9718,6 +9968,10 @@ impl Filesystem for FuseVfsAdapter {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Setattr) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         let _p5_02 =
             Self::classify_fuse_setattr(req.unique(), ino, req.uid(), req.gid(), req.pid());
@@ -9758,6 +10012,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Readlink) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         // P5-02 classification (issue #3253): classify the incoming readlink
         // request for the multi-pool dispatch seam.
@@ -9777,6 +10035,10 @@ impl Filesystem for FuseVfsAdapter {
         rdev: u32,
         reply: ReplyEntry,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Mknod) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = RequestCtx {
             umask,
             ..Self::ctx_from_req(req)
@@ -9810,6 +10072,10 @@ impl Filesystem for FuseVfsAdapter {
         umask: u32,
         reply: ReplyEntry,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Mkdir) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = RequestCtx {
             umask,
             ..Self::ctx_from_req(req)
@@ -9833,6 +10099,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Unlink) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         // P5-02 classification (issue #3168): classify the incoming unlink
         // request for the multi-pool dispatch seam.
@@ -9842,6 +10112,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Rmdir) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         // P5-02 classification (issue #3192): classify the incoming rmdir
         // request for the multi-pool dispatch seam.
@@ -9858,6 +10132,10 @@ impl Filesystem for FuseVfsAdapter {
         link: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Symlink) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         // P5-02 classification (issue #3253): classify the incoming symlink
         // request for the multi-pool dispatch seam.
@@ -9878,6 +10156,10 @@ impl Filesystem for FuseVfsAdapter {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Rename) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         // P5-02 classification (issue #3123): classify the incoming rename
         // request for the multi-pool dispatch seam.  The classified context
@@ -9912,6 +10194,10 @@ impl Filesystem for FuseVfsAdapter {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Link) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         let _p5_02 = Self::classify_fuse_link(
             req.unique(),
@@ -9936,6 +10222,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Open) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 = Self::classify_fuse_open(req.unique(), ino, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
         match self.dispatch_open_entry(&ctx, ino, flags as u32) {
@@ -9955,6 +10245,10 @@ impl Filesystem for FuseVfsAdapter {
         lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Read) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         // P5-02 classification (issue #3478): classify the incoming read
         // request for the multi-pool dispatch seam.  The classified context
@@ -9996,6 +10290,12 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         let _start = std::time::Instant::now();
         let diagnostic = fuse_op_diagnostics_enabled();
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Write) {
+            crate::observability::HIST_WRITE.record(_start.elapsed());
+            crate::observability::FuseErrorCode::from_errno(errno, "write", ino).emit();
+            reply.reply_errno(errno);
+            return;
+        }
         if diagnostic {
             eprintln!(
                 "tidefs-diagnostic: fuse write start unique={} ino={} fh={} offset={} len={} write_flags=0x{:x} open_flags=0x{:x}",
@@ -10088,6 +10388,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn flush(&mut self, req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Flush) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_flush(req.unique(), ino, fh, req.uid(), req.gid(), req.pid());
         let _start = std::time::Instant::now();
@@ -10115,6 +10419,10 @@ impl Filesystem for FuseVfsAdapter {
         flush: bool,
         reply: ReplyEmpty,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Release) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_release(_req.unique(), ino, fh, _req.uid(), _req.gid(), _req.pid());
         let result = self.dispatch_release(ino, fh, flags as u32, lock_owner, flush);
@@ -10122,6 +10430,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn fsync(&mut self, req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Fsync) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_fsync(req.unique(), ino, fh, req.uid(), req.gid(), req.pid());
         self.workload_observer.observe_fsync();
@@ -10164,6 +10476,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn opendir(&mut self, req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Opendir) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         // P5-02 classification (issue #3163): classify the incoming opendir
         // request for the multi-pool dispatch seam.
@@ -10185,6 +10501,10 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         if offset < 0 {
             reply.reply_errno(Errno::EINVAL);
+            return;
+        }
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Readdir) {
+            reply.reply_errno(errno);
             return;
         }
         let ctx = Self::ctx_from_req(req);
@@ -10262,6 +10582,10 @@ impl Filesystem for FuseVfsAdapter {
             reply.reply_errno(Errno::EINVAL);
             return;
         }
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Readdirplus) {
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = Self::ctx_from_req(req);
         // P5-02 classification (issue #3163): classify the incoming readdirplus
         // request for the multi-pool dispatch seam.  The classified context
@@ -10331,6 +10655,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn releasedir(&mut self, req: &Request<'_>, ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Releasedir) {
+            reply.reply_errno(errno);
+            return;
+        }
         // P5-02 classification (issue #3163): classify the incoming releasedir
         // request for the multi-pool dispatch seam.
         let _p5_02 =
@@ -10346,6 +10674,10 @@ impl Filesystem for FuseVfsAdapter {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Fsyncdir) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_fsyncdir(req.unique(), ino, fh, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
@@ -10363,6 +10695,12 @@ impl Filesystem for FuseVfsAdapter {
         reply: ReplyCreate,
     ) {
         let _start = std::time::Instant::now();
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Create) {
+            crate::observability::HIST_CREATE.record(_start.elapsed());
+            crate::observability::FuseErrorCode::from_errno(errno, "create", parent).emit();
+            reply.reply_errno(errno);
+            return;
+        }
         let ctx = RequestCtx {
             umask,
             ..Self::ctx_from_req(req)
@@ -10407,6 +10745,10 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         let diagnostic = fuse_op_diagnostics_enabled();
         let start = std::time::Instant::now();
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Fallocate) {
+            reply.reply_errno(errno);
+            return;
+        }
         if diagnostic {
             eprintln!(
                 "tidefs-diagnostic: fuse fallocate start unique={} ino={} fh={} mode=0x{:x} offset={} length={}",
@@ -10446,6 +10788,10 @@ impl Filesystem for FuseVfsAdapter {
         whence: i32,
         reply: ReplyLseek,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Lseek) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_lseek(req.unique(), ino, fh, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
@@ -10456,6 +10802,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn bmap(&mut self, req: &Request<'_>, ino: u64, _blocksize: u32, _idx: u64, reply: ReplyBmap) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Bmap) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 = Self::classify_fuse_bmap(req.unique(), ino, req.uid(), req.gid(), req.pid());
         reply.reply_errno(unsupported_vfs_bmap_errno());
     }
@@ -10471,6 +10821,10 @@ impl Filesystem for FuseVfsAdapter {
         out_size: u32,
         reply: ReplyIoctl,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Ioctl) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_ioctl(req.unique(), ino, fh, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
@@ -10518,6 +10872,10 @@ impl Filesystem for FuseVfsAdapter {
         flags: u32,
         reply: ReplyPoll,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Poll) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_poll(_req.unique(), ino, fh, _req.uid(), _req.gid(), _req.pid());
         match self.dispatch_poll_file(ino, fh, kh, events, flags) {
@@ -10538,6 +10896,10 @@ impl Filesystem for FuseVfsAdapter {
         pid: u32,
         reply: ReplyLock,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Getlk) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_getlk(_req.unique(), ino, fh, _req.uid(), _req.gid(), _req.pid());
         use crate::fuse_posix_lock::{FusePosixLockDispatch, FusePosixLockRequest};
@@ -10582,6 +10944,10 @@ impl Filesystem for FuseVfsAdapter {
         sleep: bool,
         reply: ReplyEmpty,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Setlk) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_setlk(_req.unique(), ino, fh, _req.uid(), _req.gid(), _req.pid());
         // BSD flock detected via FUSE_LK_FLOCK bit in lk_flags.
@@ -10656,6 +11022,10 @@ impl Filesystem for FuseVfsAdapter {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Flock) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _ = flags; // FUSE_LK_FLOCK is implicit in the opcode
         let _p5_02 =
             Self::classify_fuse_flock(_req.unique(), ino, fh, _req.uid(), _req.gid(), _req.pid());
@@ -10682,6 +11052,10 @@ impl Filesystem for FuseVfsAdapter {
     ) {
         let diagnostic = fuse_op_diagnostics_enabled();
         let start = std::time::Instant::now();
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::CopyFileRange) {
+            reply.reply_errno(errno);
+            return;
+        }
         if diagnostic {
             eprintln!(
                 "tidefs-diagnostic: fuse copy_file_range start unique={} ino_in={} fh_in={} off_in={} ino_out={} fh_out={} off_out={} len={} flags=0x{:x}",
@@ -10812,6 +11186,10 @@ impl Filesystem for FuseVfsAdapter {
         size: u32,
         reply: ReplyXattr,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Getxattr) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_getxattr(req.unique(), ino, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
@@ -10839,6 +11217,10 @@ impl Filesystem for FuseVfsAdapter {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Setxattr) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_setxattr(req.unique(), ino, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
@@ -10848,6 +11230,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn listxattr(&mut self, req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Listxattr) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_listxattr(req.unique(), ino, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
@@ -10866,6 +11252,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn removexattr(&mut self, req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Removexattr) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_removexattr(req.unique(), ino, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
@@ -10873,6 +11263,10 @@ impl Filesystem for FuseVfsAdapter {
     }
 
     fn statfs(&mut self, req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Statfs) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 =
             Self::classify_fuse_statfs(req.unique(), _ino, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
@@ -10891,12 +11285,20 @@ impl Filesystem for FuseVfsAdapter {
         }
     }
     fn syncfs(&mut self, req: &Request<'_>, reply: ReplyEmpty) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Syncfs) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 = Self::classify_fuse_syncfs(req.unique(), 1, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
         reply_empty_ok_or_errno(reply, self.dispatch_syncfs(&ctx));
     }
 
     fn statx(&mut self, req: &Request<'_>, ino: u64, _flags: u32, mask: u32, reply: ReplyStatx) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Statx) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _p5_02 = Self::classify_fuse_statx(req.unique(), ino, req.uid(), req.gid(), req.pid());
         let ctx = Self::ctx_from_req(req);
         match self.dispatch_statx(&ctx, ino, mask) {
@@ -10923,6 +11325,10 @@ impl Filesystem for FuseVfsAdapter {
         options: u64,
         reply: ReplyEmpty,
     ) {
+        if let Err(errno) = self.admit_fuse_request(FuseAdmissionOp::Exchange) {
+            reply.reply_errno(errno);
+            return;
+        }
         let _ = options;
         let ctx = Self::ctx_from_req(req);
         let result = self.dispatch_exchange_entry(
@@ -11257,6 +11663,143 @@ mod tests {
         .expect("open local filesystem");
         let engine = VfsLocalFileSystem::new(local_fs);
         FuseVfsAdapter::new(Box::new(engine)).expect("create adapter")
+    }
+
+    fn governor_config_for_single_category(category: BudgetCategory) -> GovernorConfig {
+        let mut config = GovernorConfig {
+            total_budget_bytes: 1000,
+            data_cache_fraction: 0.0,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        };
+        match category {
+            BudgetCategory::DataCache => config.data_cache_fraction = 1.0,
+            BudgetCategory::MetaCache => config.meta_cache_fraction = 1.0,
+            BudgetCategory::DirtyBytes => config.dirty_bytes_fraction = 1.0,
+            BudgetCategory::InodeState => config.inode_state_fraction = 1.0,
+            BudgetCategory::ClusterQueues => config.cluster_queues_fraction = 1.0,
+            BudgetCategory::Misc => config.misc_fraction = 1.0,
+        }
+        config
+    }
+
+    fn governor_with_used(category: BudgetCategory, used: u64) -> Governor {
+        let governor =
+            Governor::new(governor_config_for_single_category(category)).expect("test governor");
+        governor.admit(category, used).expect("seed governor use");
+        governor
+    }
+
+    #[test]
+    fn fuse_admission_soft_pressure_defers_deferrable_request() {
+        let governor = governor_with_used(BudgetCategory::MetaCache, 701);
+        let adapter = fresh_test_adapter().with_governor(governor);
+        let before = crate::observability::fuse_admission_reason_snapshot();
+
+        assert_eq!(
+            adapter.admit_fuse_request(FuseAdmissionOp::Lookup),
+            Err(Errno::EAGAIN)
+        );
+
+        let after = crate::observability::fuse_admission_reason_snapshot();
+        assert!(after.soft_deferred >= before.soft_deferred + 1);
+    }
+
+    #[test]
+    fn fuse_admission_soft_pressure_still_admits_mutating_request() {
+        let governor = governor_with_used(BudgetCategory::MetaCache, 701);
+        let adapter = fresh_test_adapter().with_governor(governor);
+        let before = crate::observability::fuse_admission_reason_snapshot();
+
+        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Mkdir), Ok(()));
+
+        let after = crate::observability::fuse_admission_reason_snapshot();
+        assert!(after.accepted >= before.accepted + 1);
+    }
+
+    #[test]
+    fn fuse_admission_hard_pressure_refuses_mutating_request() {
+        let governor = governor_with_used(BudgetCategory::DirtyBytes, 950);
+        let adapter = fresh_test_adapter().with_governor(governor);
+        let before = crate::observability::fuse_admission_reason_snapshot();
+
+        assert_eq!(
+            adapter.admit_fuse_request(FuseAdmissionOp::Write),
+            Err(Errno::ENOMEM)
+        );
+
+        let after = crate::observability::fuse_admission_reason_snapshot();
+        assert!(after.hard_refused_mutating >= before.hard_refused_mutating + 1);
+    }
+
+    #[test]
+    fn fuse_admission_default_hard_policy_keeps_reads_admissible() {
+        let governor = governor_with_used(BudgetCategory::DirtyBytes, 950);
+        let adapter = fresh_test_adapter().with_governor(governor);
+
+        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Read), Ok(()));
+    }
+
+    #[test]
+    fn fuse_admission_all_request_hard_policy_refuses_deferrable_request() {
+        let governor = governor_with_used(BudgetCategory::MetaCache, 950);
+        let adapter = fresh_test_adapter()
+            .with_governor(governor)
+            .with_fuse_admission_hard_policy(FuseAdmissionHardPolicy::AllRequests);
+        let before = crate::observability::fuse_admission_reason_snapshot();
+
+        assert_eq!(
+            adapter.admit_fuse_request(FuseAdmissionOp::Getattr),
+            Err(Errno::ENOMEM)
+        );
+
+        let after = crate::observability::fuse_admission_reason_snapshot();
+        assert!(after.hard_refused_all >= before.hard_refused_all + 1);
+    }
+
+    #[test]
+    fn fuse_admission_pressure_clearing_admits_deferred_request() {
+        let governor = governor_with_used(BudgetCategory::MetaCache, 701);
+        let adapter = fresh_test_adapter().with_governor(governor.clone());
+
+        assert_eq!(
+            adapter.admit_fuse_request(FuseAdmissionOp::Lookup),
+            Err(Errno::EAGAIN)
+        );
+        governor.release(BudgetCategory::MetaCache, 701);
+        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Lookup), Ok(()));
+    }
+
+    #[test]
+    fn fuse_admission_forget_and_release_do_not_mutate_lookup_ownership() {
+        let governor = governor_with_used(BudgetCategory::MetaCache, 950);
+        let adapter = fresh_test_adapter()
+            .with_governor(governor)
+            .with_fuse_admission_hard_policy(FuseAdmissionHardPolicy::AllRequests);
+
+        assert!(adapter.forget_refcounts.lock().unwrap().is_empty());
+        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Forget), Ok(()));
+        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Release), Ok(()));
+        assert!(adapter.forget_refcounts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fuse_admission_governor_handle_uses_explicit_governor() {
+        let governor = Governor::new(governor_config_for_single_category(
+            BudgetCategory::MetaCache,
+        ))
+        .expect("test governor");
+        let adapter = fresh_test_adapter().with_governor(governor.clone());
+        let handle = adapter.governor_handle();
+
+        handle
+            .admit(BudgetCategory::MetaCache, 17)
+            .expect("admit through adapter handle");
+
+        assert_eq!(governor.category_used(BudgetCategory::MetaCache), 17);
     }
 
     fn root_dir_entry_names(
