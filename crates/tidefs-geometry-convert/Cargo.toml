@@ -17,6 +17,7 @@ Uses extent_id indirection so extent maps stay unchanged.
 """
 
 [dependencies]
+blake3 = "1"
 tidefs-types-incremental-job-core = { workspace = true, features = ["alloc"] }
 tidefs-locator-table = { workspace = true }
 tidefs-erasure-coding = { workspace = true }
