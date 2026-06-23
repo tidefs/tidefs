@@ -67,13 +67,18 @@ hardened build policy.
 Each Kbuild file sets:
 
 ```makefile
-subdir-ccflags-y := -Wall -Wextra -Werror -Wno-unused-parameter
+subdir-ccflags-y := -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare
 ```
 
 - `-Wall`: broad warning coverage standard across the kernel.
 - `-Wextra`: additional diagnostics beyond `-Wall`.
 - `-Werror`: promotes warnings to errors; the CI gate rejects any build
   that produces a warning.
+- `-Wno-sign-compare`: kernel headers (linux/spinlock.h, linux/cleanup.h,
+  linux/cpumask.h, and others) compare `unsigned long` against `int` in guard
+  macros and bitmask operations. This is intentional upstream style that
+  cannot be fixed in an out-of-tree module.  The diagnostic is suppressed to
+  avoid noise from kernel headers.
 - `-Wno-unused-parameter`: kernel APIs and Rust FFI shims routinely receive
   context parameters (e.g. `struct file *`, `struct inode *`,
   `struct block_device *`) that are forwarded to later layers and intentionally
@@ -175,7 +180,7 @@ warning or a Kbuild failure blocks the PR.
 ## Warning policy
 
 - All kernel module Kbuild and C source files must compile with zero
-  warnings under `-Wall -Wextra -Werror` (with the `-Wno-unused-parameter`
+  warnings under `-Wall -Wextra -Werror` (with the `-Wno-unused-parameter` and `-Wno-sign-compare`
   exception documented above).
 - Rust sources must compile with zero warnings under `-Dwarnings`.
 - New warnings introduced by a PR are treated as CI failures.
