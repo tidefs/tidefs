@@ -1229,6 +1229,17 @@ Important 2026-06-01 findings:
   design-subdir documents as historical input. TFR-019 remains open for any
   per-document source audit needed before promoting additional docs to current
   spec or policy.
+- `TFR-019`: GitHub issue #1164 classifies
+  `docs/design/coordination-pipeline-health-advancement-strategy.md` as
+  historical input after reviewing the documentation authority register,
+  `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and the file itself. The
+  retained Forgejo labels, lane/blocking claims, deleted `docs/STATUS.md` and
+  `docs/FEATURE_MATRIX.md` references, and health-score/dashboard machinery are
+  archival context only. They are not current TideFS automation policy,
+  implementation status, release-readiness evidence, or worker scheduling
+  authority. TFR-019 remains open for the other unclassified #952
+  status/matrix leftovers and any separate source/evidence review needed before
+  promoting a document to current policy or current spec.
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
   `xfstests-runner` as a diagnostic scoreboard wrapper, and sends output under
   runner help path no longer carries a bare `--per-test` command or duplicate

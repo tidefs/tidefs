@@ -1,24 +1,33 @@
 # Coordination Pipeline Health: Advancement Strategy and Monitoring Framework
 
-**Issue**: [#1838](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1838)
-**Status**: design-spec
-**Maturity**: **design-spec** — coordination pipeline health monitoring framework,
-advancement algorithms, stall-detection data structures, and cross-lane dependency
-health indicators
-**Priority**: P2
-**Lane**: storage-core / coordination (Layers 8-11)
-**Depends on**: #1738 (coordination pipeline design seal), #1753 (roadmap priorities)
-**Blocks**: All deferred cluster-service wire-up implementation issues
+**Documentation authority**: Historical input for TFR-019 / GitHub issue #1164.
+This file is not current TideFS policy, current spec, implementation status,
+release-readiness evidence, automation policy, or worker scheduling authority.
 
-**Authority note**: This imported design preserves Forgejo-era health-monitoring
-vocabulary as historical design context. Current TideFS coordination authority
-lives in GitHub issue and pull request state plus the repo documentation entry
-points in `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and
-`docs/DOCUMENTATION_AUTHORITY_REGISTER.md`. Deleted `docs/STATUS.md` and
-`docs/FEATURE_MATRIX.md` entries must not be recreated, updated, or cited as
-current implementation or coordination status.
+The body below preserves Forgejo-era health-monitoring vocabulary as historical
+design context. Current TideFS coordination authority lives in GitHub issue and
+pull-request state plus the repo documentation entry points in `docs/INDEX.md`,
+`docs/GITHUB_PR_DEVELOPMENT.md`, and
+`docs/DOCUMENTATION_AUTHORITY_REGISTER.md`. References below to Forgejo labels,
+`codex:*` issue states, `~/ai/bin/tidefs-claim`, active lanes, dependency
+blocking, health scores, dashboards, escalation comments, deleted
+`docs/STATUS.md`, or deleted `docs/FEATURE_MATRIX.md` are archival examples only
+and must not be recreated, updated, or cited as current TideFS coordination
+status.
 
-## Abstract
+## Historical Imported Metadata
+
+- Historical Forgejo issue:
+  [#1838](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1838)
+- Historical status/maturity: design-spec for a coordination pipeline health
+  monitoring framework, advancement algorithms, stall-detection data
+  structures, and cross-lane dependency health indicators.
+- Historical priority/lane: P2; storage-core / coordination (Layers 8-11).
+- Historical dependency/blocking claims: depended on #1738 and #1753 and claimed
+  to block deferred cluster-service wire-up issues. These are not current
+  GitHub issue gates.
+
+## Historical Abstract
 
 This document defines the coordination pipeline health monitoring framework: a
 structured approach to tracking the pipeline's advancement velocity, detecting
@@ -754,8 +763,7 @@ is implementation-tracked non-release (not implemented as a Rust crate).
 
 ---
 
-**Design complete.** The coordination pipeline health monitoring framework
-provides the advancement strategy, health scoring algorithms, stall detection
-data structures, and escalation procedures needed to keep the three active
-implementation lanes and sixteen deferred cluster-service designs advancing
-toward production.
+**Historical design draft complete.** The coordination pipeline health monitoring
+framework was imported as design context for advancement strategy, health scoring
+algorithms, stall detection data structures, and escalation procedures. It is
+not current TideFS coordination authority.

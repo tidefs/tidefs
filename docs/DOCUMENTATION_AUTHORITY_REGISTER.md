@@ -98,7 +98,6 @@ leftovers in
 `docs/design/1813-pool-import-export-device-topology-management-design.md`,
 `docs/design/1971-pool-import-export-7-phase-implementation-plan.md`,
 `docs/design/coordination-pipeline-cluster-services-design-seal.md`,
-`docs/design/coordination-pipeline-health-advancement-strategy.md`,
 `docs/design/coordination-pipeline-status-update.md`,
 `docs/design/coordination-pipeline-status-update-1767.md`,
 `docs/design/coordination-pipeline-status-update-1839.md`,
@@ -118,6 +117,18 @@ run or equivalent source inspection shows no remaining blocking live-doc drift
 for this issue family.
 
 ## Classified Authority Slices
+
+### Coordination Pipeline Health Strategy Authority
+
+Classified for TFR-019 / GitHub issue #1164 on 2026-06-23 after reviewing the
+authority rule and #952 status/matrix leftover list in this register,
+`docs/REVIEW_TODO_REGISTER.md` TFR-019 notes,
+`docs/design/coordination-pipeline-health-advancement-strategy.md`,
+`docs/INDEX.md`, and `docs/GITHUB_PR_DEVELOPMENT.md`.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/coordination-pipeline-health-advancement-strategy.md` | Historical input | Imported Forgejo-era coordination-health design. It preserves old issue labels, lane/blocking fields, health-score and dashboard models, and deleted status/matrix references only as historical design context. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current automation policy, implementation status, release-readiness evidence, or worker scheduling authority. |
 
 ### Checksum and BLAKE3 Authority
 
