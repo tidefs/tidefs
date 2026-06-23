@@ -305,7 +305,7 @@ mod crash_recovery;
 mod dedup;
 mod dedup_refcount;
 pub mod dirty_page_tracker;
-mod encoding;
+pub mod encoding;
 pub mod export;
 mod extent_map_store_adapter;
 mod error;

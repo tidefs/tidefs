@@ -12,7 +12,7 @@ pub const RECEIVE_MERGE_NO_COMMON_ANCESTOR_OPERATOR_ACTIONS: &str =
 const RECEIVE_MERGE_NO_COMMON_ANCESTOR_UNSUPPORTED_REASON: &str =
     "no_common_ancestor: no committed-root identity is present in both the stream lineage manifest and target recovery audit; delete-and-re-receive into a fresh target, or receive into a new empty target";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct ReceiveMergeRootIdentity {
     pub transaction_id: u64,
     pub generation: u64,
@@ -167,7 +167,7 @@ fn format_optional_txg(txg: Option<u64>) -> String {
 /// Governs how conflicting objects (as classified by the conflict inventory)
 /// are resolved into a binding merge plan.  Conflict-free objects (§2.3) are
 /// always auto-merged regardless of policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ReceiveMergePolicy {
     /// Keep the local (target) version of every conflicting object.
     KeepLocal,
@@ -184,7 +184,7 @@ pub enum ReceiveMergePolicy {
 }
 
 /// Per-object decision produced by the policy resolution engine.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ReceiveMergeDecision {
     /// Take the stream-side object version.
     KeepRemote,
@@ -346,6 +346,244 @@ pub fn resolve_merge_policy(
     })
 }
 
+// ── Manual conflict resolution surface (§5.1 item 5) ─────────────────────────
+
+/// A conflict inventory that has been resolved by the operator through the
+/// manual resolution surface (`tidefsctl merge resolve`).
+///
+/// Bundles the original conflict inventory with per-entry resolution decisions
+/// and anchoring metadata for staleness detection.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedConflictInventory {
+    /// The original conflict inventory this resolution applies to.
+    pub inventory: crate::encoding::ConflictInventory,
+    /// Per-entry resolution decisions.
+    ///
+    /// The `i`-th element corresponds to `inventory.entries[i]`.
+    /// `Some(decision)` means the operator resolved that entry;
+    /// `None` means the entry is still unresolved.
+    pub resolutions: Vec<Option<ReceiveMergeDecision>>,
+    /// Target committed-root identity at the time the inventory was produced.
+    /// Used for staleness detection when the resolved inventory is admitted
+    /// for receive.
+    pub anchored_at_target_identity: Option<ReceiveMergeRootIdentity>,
+}
+
+/// An error produced when loading or validating a resolved conflict inventory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedInventoryError {
+    /// The resolved inventory still has unresolved conflict entries.
+    UnresolvedEntries {
+        /// Indices of unresolved entries in the inventory.
+        unresolved_indices: Vec<usize>,
+        /// Count of unresolved entries.
+        unresolved_count: usize,
+    },
+    /// The inventory is stale: the target state has changed since the
+    /// inventory was produced.
+    StaleInventory {
+        /// Reason the inventory is considered stale.
+        reason: String,
+    },
+    /// An entry index is out of bounds.
+    EntryIndexOutOfBounds {
+        index: usize,
+        entry_count: usize,
+    },
+    /// An unrecognized conflict class name was provided.
+    UnknownConflictClass {
+        name: String,
+    },
+    /// An unrecognized resolution kind string was provided.
+    UnknownResolutionKind {
+        kind: String,
+    },
+}
+
+impl fmt::Display for ResolvedInventoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnresolvedEntries {
+                unresolved_indices,
+                unresolved_count,
+            } => {
+                write!(
+                    f,
+                    "resolved inventory still has {unresolved_count} unresolved entries: indices {unresolved_indices:?}"
+                )
+            }
+            Self::StaleInventory { reason } => {
+                write!(f, "stale conflict inventory: {reason}")
+            }
+            Self::EntryIndexOutOfBounds { index, entry_count } => {
+                write!(
+                    f,
+                    "entry index {index} out of bounds (inventory has {entry_count} entries)"
+                )
+            }
+            Self::UnknownConflictClass { name } => {
+                write!(f, "unknown conflict class: {name}")
+            }
+            Self::UnknownResolutionKind { kind } => {
+                write!(f, "unknown resolution kind: {kind}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolvedInventoryError {}
+
+impl ResolvedConflictInventory {
+    /// Create a new unresolved inventory from a conflict inventory.
+    #[must_use]
+    pub fn from_inventory(
+        inventory: crate::encoding::ConflictInventory,
+        target_identity: Option<ReceiveMergeRootIdentity>,
+    ) -> Self {
+        let resolution_count = inventory.entries.len();
+        Self {
+            inventory,
+            resolutions: vec![None; resolution_count],
+            anchored_at_target_identity: target_identity,
+        }
+    }
+
+    /// Resolve a single conflict entry by its index in the inventory.
+    pub fn resolve_entry(
+        &mut self,
+        index: usize,
+        decision: ReceiveMergeDecision,
+    ) -> Result<(), ResolvedInventoryError> {
+        if index >= self.resolutions.len() {
+            return Err(ResolvedInventoryError::EntryIndexOutOfBounds {
+                index,
+                entry_count: self.resolutions.len(),
+            });
+        }
+        self.resolutions[index] = Some(decision);
+        Ok(())
+    }
+
+    /// Resolve all conflict entries of a given conflict class.
+    pub fn resolve_by_class(
+        &mut self,
+        class: crate::encoding::ConflictClass,
+        decision: ReceiveMergeDecision,
+    ) {
+        for (i, entry) in self.inventory.entries.iter().enumerate() {
+            if entry.class == class {
+                self.resolutions[i] = Some(decision);
+            }
+        }
+    }
+
+    /// Validate that every conflict entry has a resolution.
+    pub fn validate_all_resolved(&self) -> Result<(), ResolvedInventoryError> {
+        let unresolved: Vec<usize> = self
+            .resolutions
+            .iter()
+            .enumerate()
+            .filter(|(_, resolution)| resolution.is_none())
+            .map(|(i, _)| i)
+            .collect();
+
+        if unresolved.is_empty() {
+            Ok(())
+        } else {
+            Err(ResolvedInventoryError::UnresolvedEntries {
+                unresolved_count: unresolved.len(),
+                unresolved_indices: unresolved,
+            })
+        }
+    }
+
+    /// Check whether the inventory has become stale relative to the current
+    /// target state.
+    pub fn validate_not_stale(
+        &self,
+        current_target_identity: &ReceiveMergeRootIdentity,
+    ) -> Result<(), ResolvedInventoryError> {
+        let Some(ref anchored) = self.anchored_at_target_identity else {
+            return Ok(());
+        };
+        if anchored != current_target_identity {
+            return Err(ResolvedInventoryError::StaleInventory {
+                reason: format!(
+                    "target identity mismatch: anchored at txg={} gen={} checksum={}, current txg={} gen={} checksum={}",
+                    anchored.transaction_id,
+                    anchored.generation,
+                    anchored.superblock_checksum,
+                    current_target_identity.transaction_id,
+                    current_target_identity.generation,
+                    current_target_identity.superblock_checksum,
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Serialize this resolved inventory to a stable JSON string.
+    pub fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize a resolved conflict inventory from a JSON string.
+    pub fn from_json(json: &str) -> serde_json::Result<Self> {
+        let resolved: Self = serde_json::from_str(json)?;
+        if resolved.resolutions.len() != resolved.inventory.entries.len() {
+            return Err(serde::de::Error::custom(format!(
+                "resolution count mismatch: {} entries vs {} resolutions",
+                resolved.inventory.entries.len(),
+                resolved.resolutions.len()
+            )));
+        }
+        Ok(resolved)
+    }
+
+    /// Return the total number of conflict entries.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.inventory.entries.len()
+    }
+
+    /// Return the number of resolved entries.
+    #[must_use]
+    pub fn resolved_count(&self) -> usize {
+        self.resolutions.iter().filter(|r| r.is_some()).count()
+    }
+
+    /// Return the number of unresolved entries.
+    #[must_use]
+    pub fn unresolved_count(&self) -> usize {
+        self.resolutions.iter().filter(|r| r.is_none()).count()
+    }
+}
+
+/// Parse a conflict class from its snake_case string representation.
+pub fn parse_conflict_class(name: &str) -> Result<crate::encoding::ConflictClass, ResolvedInventoryError> {
+    match name {
+        "inode_identity" => Ok(crate::encoding::ConflictClass::InodeIdentity),
+        "directory_entry" => Ok(crate::encoding::ConflictClass::DirectoryEntry),
+        "extent_map" => Ok(crate::encoding::ConflictClass::ExtentMap),
+        "snapshot_catalog" => Ok(crate::encoding::ConflictClass::SnapshotCatalog),
+        "generation_ordering" => Ok(crate::encoding::ConflictClass::GenerationOrdering),
+        _ => Err(ResolvedInventoryError::UnknownConflictClass {
+            name: name.to_string(),
+        }),
+    }
+}
+
+/// Parse a resolution kind from its string representation.
+pub fn parse_resolution_kind(kind: &str) -> Result<ReceiveMergeDecision, ResolvedInventoryError> {
+    match kind {
+        "keep_local" => Ok(ReceiveMergeDecision::KeepLocal),
+        "keep_remote" => Ok(ReceiveMergeDecision::KeepRemote),
+        "auto_merge" => Ok(ReceiveMergeDecision::AutoMerge),
+        _ => Err(ResolvedInventoryError::UnknownResolutionKind {
+            kind: kind.to_string(),
+        }),
+    }
+}
 // ── Conflict inventory builder ────────────────────────────────────────────────
 
 /// Bundled inputs for the conflict inventory builder.
@@ -1726,4 +1964,313 @@ mod tests {
         assert!(plan.is_empty());
     }
 
+
+    // ── Conflict inventory JSON serialization tests ────────────────────────
+
+    #[test]
+    fn conflict_inventory_json_roundtrip() {
+        let mut inventory = ConflictInventory::empty(42, 420);
+        inventory.entries.push(ConflictEntry {
+            class: ConflictClass::InodeIdentity,
+            divergence: ConflictDivergence::InodeIdentity(
+                InodeIdentityDivergence::DifferentFileType,
+            ),
+            stream_identity: "inode 1".into(),
+            target_identity: "inode 1".into(),
+            stream_txg: Some(10),
+            target_txg: Some(12),
+        });
+
+        let json = inventory.to_json().expect("serialize");
+        assert!(!json.is_empty());
+        let parsed = ConflictInventory::from_json(&json).expect("deserialize");
+        assert_eq!(inventory, parsed);
+    }
+
+    #[test]
+    fn conflict_inventory_empty_json_roundtrip() {
+        let inventory = ConflictInventory::empty(10, 100);
+        let json = inventory.to_json().expect("serialize");
+        let parsed = ConflictInventory::from_json(&json).expect("deserialize");
+        assert_eq!(inventory, parsed);
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn conflict_inventory_compact_json_roundtrip() {
+        let inventory = ConflictInventory::empty(7, 77);
+        let compact = inventory.to_json_compact().expect("serialize");
+        let parsed = ConflictInventory::from_json(&compact).expect("deserialize");
+        assert_eq!(inventory, parsed);
+    }
+
+    // ── Resolved conflict inventory tests ──────────────────────────────────
+
+    fn make_conflict_entry_for_test(class: ConflictClass) -> ConflictEntry {
+        ConflictEntry {
+            class,
+            divergence: ConflictDivergence::InodeIdentity(
+                InodeIdentityDivergence::DifferentFileType,
+            ),
+            stream_identity: "stream obj".into(),
+            target_identity: "target obj".into(),
+            stream_txg: None,
+            target_txg: None,
+        }
+    }
+
+    fn make_test_inventory(entries: Vec<ConflictEntry>) -> ConflictInventory {
+        ConflictInventory {
+            common_ancestor_transaction_id: 10,
+            common_ancestor_generation: 100,
+            entries,
+        }
+    }
+
+    #[test]
+    fn resolved_inventory_from_inventory_starts_all_unresolved() {
+        let inventory = make_test_inventory(vec![
+            make_conflict_entry_for_test(ConflictClass::InodeIdentity),
+            make_conflict_entry_for_test(ConflictClass::DirectoryEntry),
+        ]);
+        let resolved = ResolvedConflictInventory::from_inventory(inventory, None);
+        assert_eq!(resolved.entry_count(), 2);
+        assert_eq!(resolved.resolved_count(), 0);
+        assert_eq!(resolved.unresolved_count(), 2);
+    }
+
+    #[test]
+    fn resolve_single_entry_by_index() {
+        let inventory = make_test_inventory(vec![
+            make_conflict_entry_for_test(ConflictClass::InodeIdentity),
+            make_conflict_entry_for_test(ConflictClass::DirectoryEntry),
+        ]);
+        let mut resolved = ResolvedConflictInventory::from_inventory(inventory, None);
+        resolved
+            .resolve_entry(0, ReceiveMergeDecision::KeepLocal)
+            .expect("resolve entry 0");
+        assert_eq!(resolved.resolved_count(), 1);
+        assert_eq!(resolved.unresolved_count(), 1);
+        assert_eq!(resolved.resolutions[0], Some(ReceiveMergeDecision::KeepLocal));
+        assert_eq!(resolved.resolutions[1], None);
+    }
+
+    #[test]
+    fn resolve_entry_out_of_bounds() {
+        let inventory = make_test_inventory(vec![make_conflict_entry_for_test(
+            ConflictClass::InodeIdentity,
+        )]);
+        let mut resolved = ResolvedConflictInventory::from_inventory(inventory, None);
+        let err = resolved.resolve_entry(5, ReceiveMergeDecision::KeepLocal);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn resolve_by_class_applies_to_all_matching() {
+        let inventory = make_test_inventory(vec![
+            make_conflict_entry_for_test(ConflictClass::InodeIdentity),
+            make_conflict_entry_for_test(ConflictClass::DirectoryEntry),
+            make_conflict_entry_for_test(ConflictClass::InodeIdentity),
+        ]);
+        let mut resolved = ResolvedConflictInventory::from_inventory(inventory, None);
+        resolved.resolve_by_class(
+            ConflictClass::InodeIdentity,
+            ReceiveMergeDecision::KeepRemote,
+        );
+        assert_eq!(resolved.resolved_count(), 2);
+        assert_eq!(resolved.unresolved_count(), 1);
+        assert_eq!(resolved.resolutions[0], Some(ReceiveMergeDecision::KeepRemote));
+        assert_eq!(resolved.resolutions[1], None);
+        assert_eq!(resolved.resolutions[2], Some(ReceiveMergeDecision::KeepRemote));
+    }
+
+    #[test]
+    fn validate_all_resolved_passes_when_all_entries_resolved() {
+        let inventory = make_test_inventory(vec![
+            make_conflict_entry_for_test(ConflictClass::InodeIdentity),
+        ]);
+        let mut resolved = ResolvedConflictInventory::from_inventory(inventory, None);
+        resolved
+            .resolve_entry(0, ReceiveMergeDecision::KeepLocal)
+            .unwrap();
+        resolved.validate_all_resolved().expect("all resolved");
+    }
+
+    #[test]
+    fn validate_all_resolved_fails_with_unresolved_entries() {
+        let inventory = make_test_inventory(vec![
+            make_conflict_entry_for_test(ConflictClass::InodeIdentity),
+            make_conflict_entry_for_test(ConflictClass::DirectoryEntry),
+        ]);
+        let mut resolved = ResolvedConflictInventory::from_inventory(inventory, None);
+        resolved
+            .resolve_entry(0, ReceiveMergeDecision::KeepLocal)
+            .unwrap();
+        let err = resolved.validate_all_resolved().expect_err("missing resolution");
+        match err {
+            ResolvedInventoryError::UnresolvedEntries {
+                unresolved_count,
+                unresolved_indices,
+            } => {
+                assert_eq!(unresolved_count, 1);
+                assert_eq!(unresolved_indices, vec![1]);
+            }
+            _ => panic!("expected UnresolvedEntries, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_all_resolved_passes_for_empty_inventory() {
+        let inventory = ConflictInventory::empty(10, 100);
+        let resolved = ResolvedConflictInventory::from_inventory(inventory, None);
+        resolved.validate_all_resolved().expect("empty is trivially resolved");
+    }
+
+    // ── Staleness detection tests ──────────────────────────────────────────
+
+    fn root_identity(txg: u64, gen: u64, checksum: u64) -> ReceiveMergeRootIdentity {
+        ReceiveMergeRootIdentity {
+            transaction_id: txg,
+            generation: gen,
+            superblock_checksum: checksum,
+        }
+    }
+
+    #[test]
+    fn staleness_detection_passes_when_anchored_matches_current() {
+        let inventory = ConflictInventory::empty(10, 100);
+        let anchored = root_identity(5, 50, 0x500);
+        let resolved = ResolvedConflictInventory::from_inventory(
+            inventory,
+            Some(anchored),
+        );
+        let current = root_identity(5, 50, 0x500);
+        resolved
+            .validate_not_stale(&current)
+            .expect("matching identities");
+    }
+
+    #[test]
+    fn staleness_detection_fails_when_anchored_differs_from_current() {
+        let inventory = ConflictInventory::empty(10, 100);
+        let anchored = root_identity(5, 50, 0x500);
+        let resolved = ResolvedConflictInventory::from_inventory(
+            inventory,
+            Some(anchored),
+        );
+        let current = root_identity(6, 60, 0x600);
+        let err = resolved
+            .validate_not_stale(&current)
+            .expect_err("mismatched identities");
+        match err {
+            ResolvedInventoryError::StaleInventory { reason } => {
+                assert!(reason.contains("mismatch"));
+            }
+            _ => panic!("expected StaleInventory, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn staleness_detection_passes_without_anchor() {
+        let inventory = ConflictInventory::empty(10, 100);
+        let resolved = ResolvedConflictInventory::from_inventory(inventory, None);
+        let current = root_identity(5, 50, 0x500);
+        resolved
+            .validate_not_stale(&current)
+            .expect("no anchor always passes");
+    }
+
+    // ── Resolved inventory JSON roundtrip tests ────────────────────────────
+
+    #[test]
+    fn resolved_inventory_json_roundtrip() {
+        let inventory = make_test_inventory(vec![
+            make_conflict_entry_for_test(ConflictClass::InodeIdentity),
+            make_conflict_entry_for_test(ConflictClass::DirectoryEntry),
+        ]);
+        let anchored = root_identity(5, 50, 0x500);
+        let mut resolved = ResolvedConflictInventory::from_inventory(
+            inventory,
+            Some(anchored),
+        );
+        resolved
+            .resolve_entry(0, ReceiveMergeDecision::KeepLocal)
+            .unwrap();
+        resolved
+            .resolve_entry(1, ReceiveMergeDecision::KeepRemote)
+            .unwrap();
+
+        let json = resolved.to_json().expect("serialize");
+        let parsed = ResolvedConflictInventory::from_json(&json).expect("deserialize");
+        assert_eq!(resolved, parsed);
+        assert_eq!(parsed.resolved_count(), 2);
+    }
+
+    #[test]
+    fn resolved_inventory_json_roundtrip_with_null_resolutions() {
+        let inventory = make_test_inventory(vec![
+            make_conflict_entry_for_test(ConflictClass::InodeIdentity),
+        ]);
+        let resolved = ResolvedConflictInventory::from_inventory(inventory, None);
+        let json = resolved.to_json().expect("serialize");
+        let parsed = ResolvedConflictInventory::from_json(&json).expect("deserialize");
+        assert_eq!(resolved, parsed);
+        assert_eq!(parsed.resolved_count(), 0);
+    }
+
+    // ── Parser tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_conflict_class_accepts_snake_case_names() {
+        assert_eq!(
+            parse_conflict_class("inode_identity").unwrap(),
+            ConflictClass::InodeIdentity
+        );
+        assert_eq!(
+            parse_conflict_class("directory_entry").unwrap(),
+            ConflictClass::DirectoryEntry
+        );
+        assert_eq!(
+            parse_conflict_class("extent_map").unwrap(),
+            ConflictClass::ExtentMap
+        );
+        assert_eq!(
+            parse_conflict_class("snapshot_catalog").unwrap(),
+            ConflictClass::SnapshotCatalog
+        );
+        assert_eq!(
+            parse_conflict_class("generation_ordering").unwrap(),
+            ConflictClass::GenerationOrdering
+        );
+    }
+
+    #[test]
+    fn parse_conflict_class_rejects_unknown_names() {
+        assert!(parse_conflict_class("not_a_class").is_err());
+        assert!(parse_conflict_class("InodeIdentity").is_err());
+        assert!(parse_conflict_class("").is_err());
+    }
+
+    #[test]
+    fn parse_resolution_kind_accepts_valid_kinds() {
+        assert_eq!(
+            parse_resolution_kind("keep_local").unwrap(),
+            ReceiveMergeDecision::KeepLocal
+        );
+        assert_eq!(
+            parse_resolution_kind("keep_remote").unwrap(),
+            ReceiveMergeDecision::KeepRemote
+        );
+        assert_eq!(
+            parse_resolution_kind("auto_merge").unwrap(),
+            ReceiveMergeDecision::AutoMerge
+        );
+    }
+
+    #[test]
+    fn parse_resolution_kind_rejects_unknown_kinds() {
+        assert!(parse_resolution_kind("KeepLocal").is_err());
+        assert!(parse_resolution_kind("keep-local").is_err());
+        assert!(parse_resolution_kind("").is_err());
+    }
 }
