@@ -289,7 +289,8 @@ impl SpaceAccounting {
     /// This is the unified ENOSPC gate: it uses
     /// [`admission_check`](crate::admission_check) which checks quota
     /// (minus slop), physical capacity, and all committed consumption
-    /// including reserved, orphan, and pinned-snapshot bytes.
+    /// including reserved and orphan bytes. Snapshot-pinned bytes are tracked
+    /// separately because they are already a subset of logical used bytes.
     /// Returns `true` if the write should be refused with `ENOSPC`.
     #[must_use]
     pub fn check_enospc(&self, requested: u64) -> bool {
@@ -331,10 +332,12 @@ impl SpaceAccounting {
     /// Derive statfs(2) fields from committed counters via the unified
     /// capacity authority.
     ///
-    /// Uses [`total_consumed_bytes`] (logical_used + reserved + orphan +
-    /// pinned_snapshot) as the consumption baseline, matching
-    /// [`admission_check`] so that statfs never advertises bytes that
-    /// `check_enospc` would reject.
+    /// Uses [`total_consumed_bytes`] (logical_used + reserved + orphan) as
+    /// the consumption baseline, matching [`admission_check`] so that statfs
+    /// never advertises bytes that `check_enospc` would reject.
+    /// `pinned_snapshot_bytes` is intentionally excluded — it is a subset
+    /// of `logical_used_bytes` (#638, #649) and must not reduce POSIX
+    /// `f_bfree` / `f_bavail`.
     ///
     /// Distinguishes operator-visible free space (`blocks_free` / `f_bfree`)
     /// from allocation-admissible free space (`blocks_avail` / `f_bavail`):
@@ -1973,8 +1976,12 @@ impl SpaceDomainRegistry {
         self.domains.get(domain_id)
     }
 
-    /// Compute `statfs` for a domain, aggregating across all datasets in the
-    /// clone family.
+    /// Compute POSIX `statfs` for a domain, aggregating across all datasets in
+    /// the clone family.
+    ///
+    /// `pinned_snapshot_bytes` remains available on [`SpaceDomainCounters`] for
+    /// dataset/operator views, but it is a subset of logical used bytes and is
+    /// not a second POSIX statfs consumption term.
     ///
     /// Returns `None` if the domain does not exist.
     #[must_use]
@@ -1983,9 +1990,7 @@ impl SpaceDomainRegistry {
         let block_size = StatfsResult::DEFAULT_BLOCK_SIZE;
         let total_blocks = counters.domain_quota_bytes / block_size;
 
-        let consumed = counters
-            .domain_logical_used_bytes
-            .saturating_add(counters.domain_pinned_snapshot_bytes);
+        let consumed = counters.domain_alloc_bytes();
         let free_bytes = counters.domain_quota_bytes.saturating_sub(consumed);
         let free_blocks = free_bytes / block_size;
 
@@ -3549,7 +3554,8 @@ mod tests {
         counters.pinned_snapshot_bytes = 100_000_000;
         let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
         let s = sa.statfs();
-        let expected_free = (TEST_QUOTA_BYTES - 100_000_000) / 4096;
+        // pinned_snapshot_bytes excluded from total_consumed_bytes (#638, #649):
+        let expected_free = TEST_QUOTA_BYTES / 4096;
         assert_eq!(s.blocks_free, expected_free);
     }
 
@@ -3878,6 +3884,8 @@ mod tests {
         let mut counters = test_domain_counters();
         counters.domain_quota_bytes = 1_000_000;
         counters.domain_logical_used_bytes = 200_000;
+        counters.domain_reserved_bytes = 75_000;
+        counters.domain_orphan_bytes = 25_000;
         counters.domain_pinned_snapshot_bytes = 50_000;
         reg.create_domain(id, counters).unwrap();
 
@@ -3885,9 +3893,15 @@ mod tests {
         let block_size = StatfsResult::DEFAULT_BLOCK_SIZE;
         assert_eq!(statfs.block_size, block_size);
         assert_eq!(statfs.blocks, 1_000_000 / block_size);
-        // Free = quota - (used + pinned) = 1_000_000 - 250_000 = 750_000
-        let expected_free_blocks = 750_000 / block_size;
+        // Free = quota - (used + reserved + orphan) = 700_000.
+        // pinned_snapshot_bytes is tracked separately and does not reduce
+        // POSIX statfs free/available blocks (#638, #649).
+        let expected_free_blocks = 700_000 / block_size;
         assert_eq!(statfs.blocks_free, expected_free_blocks);
+        assert_eq!(
+            reg.get(&id).unwrap().domain_pinned_snapshot_bytes,
+            50_000
+        );
         // Avail = free - 5% reserved
         let reserved = (1_000_000 / block_size) / 20;
         assert_eq!(statfs.blocks_avail, expected_free_blocks - reserved);
@@ -3900,6 +3914,7 @@ mod tests {
         let mut counters = test_domain_counters();
         counters.domain_quota_bytes = u64::MAX;
         counters.domain_logical_used_bytes = u64::MAX - 10;
+        counters.domain_reserved_bytes = 100;
         counters.domain_pinned_snapshot_bytes = 100;
         reg.create_domain(id, counters).unwrap();
 
@@ -6608,26 +6623,36 @@ mod tests {
     // -- Snapshot-pinned bytes through unified authority --
 
     #[test]
-    fn check_enospc_rejects_when_pinned_snapshot_consumes_quota() {
+    fn pinned_snapshot_bytes_do_not_block_enospc() {
+        // pinned_snapshot_bytes is a subset of logical_used_bytes (#638, #649)
+        // and must not consume quota or gate ENOSPC.
         let mut counters = test_counters();
         counters.pinned_snapshot_bytes = TEST_QUOTA_BYTES;
         let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
-        assert!(sa.check_enospc(1));
+        // Admission must allow writes even when pinned_snapshot equals
+        // the entire quota, because it is already counted in logical_used.
+        assert!(!sa.check_enospc(1));
     }
 
     #[test]
-    fn statfs_and_check_enospc_agree_on_pinned_snapshot_bytes() {
+    fn pinned_snapshot_bytes_do_not_reduce_statfs_or_block_enospc() {
+        // pinned_snapshot_bytes is a subset of logical_used_bytes (#638, #649).
+        // Setting it alone (without logical_used_bytes) must not reduce statfs
+        // free blocks or gate ENOSPC — the counters treat logical_used=0,
+        // so the full quota remains available.
         let mut counters = test_counters();
-        // Use a block-aligned value so free_blocks * block_size == actual free.
         counters.pinned_snapshot_bytes = 4096 * 100; // 409_600
         let sa = SpaceAccounting::new(counters, SpaceDomainId::NONE);
         let s = sa.statfs();
         let free_blocks = s.blocks_free;
-        let free_bytes = free_blocks * 4096;
-        // check_enospc should admit writes up to free_bytes.
-        assert!(!sa.check_enospc(free_bytes));
-        // But refuse one block more.
-        assert!(sa.check_enospc(free_bytes + 4096));
+        // Full quota should still be free (pinned_snapshot excluded from
+        // total_consumed_bytes).
+        // Compare at block level: TEST_QUOTA_BYTES is not block-aligned,
+        // so free_blocks * 4096 would lose the remainder.
+        assert_eq!(free_blocks, TEST_QUOTA_BYTES / 4096);
+        // Admission must allow writes up to the full quota.
+        assert!(!sa.check_enospc(free_blocks * 4096));
+        assert!(sa.check_enospc(free_blocks * 4096 + 4096));
     }
 
     // -- Pending-delta commit boundaries --
@@ -6679,7 +6704,7 @@ mod tests {
         assert!(sa.check_enospc(999_500_001));
     }
 
-    // -- Combined consumption: reserved + orphan + pinned_snapshot --
+    // -- Combined consumption excludes snapshot-pinned classification --
 
     #[test]
     fn statfs_combines_all_counter_families() {
@@ -6689,17 +6714,21 @@ mod tests {
             .unwrap();
         sa.commit_delta(SpaceDelta::new_orphan_acquire(50_000))
             .unwrap();
-        // Also set pinned_snapshot.
+        // Set pinned_snapshot but it must not affect statfs consumption
+        // (it is a subset of logical_used, #638, #649).
         let snap = SnapshotSpaceRecord {
             state: SnapshotState::Active,
             deadlist_bytes: 30_000,
             ..Default::default()
         };
         sa.update_snapshot_pinned(&[snap]);
-        let total_consumed = 100_000 + 200_000 + 50_000 + 30_000;
+        // total_consumed = logical_used + reserved + orphan (excludes pinned).
+        let total_consumed = 100_000 + 200_000 + 50_000;
         let expected_free = (TEST_QUOTA_BYTES - total_consumed) / 4096;
         let s = sa.statfs();
         assert_eq!(s.blocks_free, expected_free);
+        // Verify pinned_snapshot_bytes is still tracked for operator views.
+        assert_eq!(sa.counters().pinned_snapshot_bytes, 30_000);
     }
 
     #[test]
@@ -6715,7 +6744,8 @@ mod tests {
             deadlist_bytes: 30_000,
             ..Default::default()
         }]);
-        let total_consumed = 100_000 + 200_000 + 50_000 + 30_000;
+        // total_consumed excludes pinned_snapshot (#638, #649).
+        let total_consumed = 100_000 + 200_000 + 50_000;
         let avail = TEST_QUOTA_BYTES - total_consumed;
         assert!(!sa.check_enospc(avail));
         assert!(sa.check_enospc(avail + 1));
