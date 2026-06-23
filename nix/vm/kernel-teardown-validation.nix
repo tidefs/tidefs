@@ -162,13 +162,20 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 mkdir -p /tmp /validation /mnt/tidefs /trace
-mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true
+mkdir -p /sys/kernel/debug 2>/dev/null || true
+mount -t tracefs tracefs /trace 2>/dev/null \
+  || mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null \
+  || true
+if [ ! -f /trace/trace ]; then
+  mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+fi
 
 # Redirect kernel messages to /validation/dmesg.log via serial
 MODULE_PATH=/lib/modules/tidefs_posix_vfs.ko
 MNT=/mnt/tidefs
 EVDIR=/validation
 TRACEDIR=/trace
+TRACE_ROOT=""
 POOL_DEV=/dev/vda
 POOL_NAME=qemu_teardown_pool
 
@@ -215,18 +222,35 @@ emit_artifact() {
   echo "END_ARTIFACT:$label"
 }
 
+find_trace_root() {
+  local candidate
+
+  if [ -n "$TRACE_ROOT" ] && [ -f "$TRACE_ROOT/trace" ]; then
+    return 0
+  fi
+
+  for candidate in "$TRACEDIR" /sys/kernel/tracing /sys/kernel/debug/tracing; do
+    if [ -f "$candidate/trace" ]; then
+      TRACE_ROOT="$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 setup_ftrace() {
-  if [ -d /sys/kernel/tracing ]; then
-    echo 0 > /sys/kernel/tracing/tracing_on 2>/dev/null || true
-    echo > /sys/kernel/tracing/trace 2>/dev/null || true
+  if find_trace_root; then
+    echo 0 > "$TRACE_ROOT/tracing_on" 2>/dev/null || true
+    echo > "$TRACE_ROOT/trace" 2>/dev/null || true
     # Enable workqueue trace events
-    echo 1 > /sys/kernel/tracing/events/workqueue/workqueue_execute_start/enable 2>/dev/null || true
-    echo 1 > /sys/kernel/tracing/events/workqueue/workqueue_execute_end/enable 2>/dev/null || true
+    echo 1 > "$TRACE_ROOT/events/workqueue/workqueue_execute_start/enable" 2>/dev/null || true
+    echo 1 > "$TRACE_ROOT/events/workqueue/workqueue_execute_end/enable" 2>/dev/null || true
     # Enable workqueue queue events
-    echo 1 > /sys/kernel/tracing/events/workqueue/workqueue_queue_work/enable 2>/dev/null || true
-    echo 1 > /sys/kernel/tracing/events/workqueue/workqueue_activate_work/enable 2>/dev/null || true
-    echo 1 > /sys/kernel/tracing/tracing_on 2>/dev/null || true
-    echo "[ftrace] workqueue tracing enabled"
+    echo 1 > "$TRACE_ROOT/events/workqueue/workqueue_queue_work/enable" 2>/dev/null || true
+    echo 1 > "$TRACE_ROOT/events/workqueue/workqueue_activate_work/enable" 2>/dev/null || true
+    echo 1 > "$TRACE_ROOT/tracing_on" 2>/dev/null || true
+    echo "[ftrace] workqueue tracing enabled at $TRACE_ROOT"
   else
     echo "[ftrace] tracefs not available; dmesg-only trace capture"
   fi
@@ -234,8 +258,8 @@ setup_ftrace() {
 
 capture_ftrace() {
   local dest="$1"
-  if [ -f /sys/kernel/tracing/trace ]; then
-    cp /sys/kernel/tracing/trace "$dest" 2>/dev/null || true
+  if find_trace_root; then
+    cp "$TRACE_ROOT/trace" "$dest" 2>/dev/null || true
     echo "[ftrace] trace captured to $dest ($(wc -c < "$dest" 2>/dev/null || echo 0) bytes)"
   fi
 }
@@ -539,9 +563,16 @@ INITSCRIPT
       local label="$1"
       local path="$2"
       awk -v begin="BEGIN_ARTIFACT:$label" -v end="END_ARTIFACT:$label" '
-        $0 == begin { emit = 1; next }
-        $0 == end { emit = 0; next }
-        emit { print }
+        {
+          line = $0;
+          sub(/\r$/, "", line);
+        }
+        line == begin { emit = 1; next }
+        line == end { emit = 0; next }
+        emit {
+          sub(/\r$/, "", $0);
+          print;
+        }
       ' "$RUN_DIR/qemu.log" > "$OUTPUT_DIR/$path" || true
     }
 
@@ -798,7 +829,7 @@ INITSCRIPT
     echo "  evidence-manifest.json"
     echo "  qemu.log"
 
-    if [ "$FAIL_COUNT" -gt 0 ] || [ "$VALIDATION_ERRORS" -gt 0 ]; then
+    if [ "$TEARDOWN_STATUS" != "pass" ] || [ "$VALIDATION_ERRORS" -gt 0 ]; then
       exit 1
     fi
     exit 0
