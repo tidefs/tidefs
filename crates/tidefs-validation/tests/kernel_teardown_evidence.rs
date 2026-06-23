@@ -306,6 +306,24 @@ fn integration_missing_callback_trace_fails() {
 }
 
 #[test]
+fn integration_newline_only_trace_digest_fails() {
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    json_val.as_object_mut().unwrap().insert(
+        "workqueue_trace_digest".into(),
+        serde_json::Value::String(
+            "blake3:295192ea1ec8566d563b1a7587e5f0198580cdbd043842f5090a4c197c20c67a".into(),
+        ),
+    );
+    let json = serde_json::to_string_pretty(&json_val).unwrap();
+    let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("empty trace digest"),
+        "should reject newline-only trace digest: {msg}"
+    );
+}
+
+#[test]
 fn integration_empty_refusal_observations_fails() {
     let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
     json_val.as_object_mut().unwrap().insert(
