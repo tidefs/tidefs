@@ -256,7 +256,7 @@ log_phase() {
   local ts
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   TEARDOWN_PHASE_LOG="''${TEARDOWN_PHASE_LOG}''${phase}|''${status}|''${ts}|''${note}"$'\n'
-  echo "PHASE_MARKER:${phase}|${status}|${ts}|${note}"
+  echo "PHASE_MARKER:''${phase}|''${status}|''${ts}|''${note}"
 }
 
 # ── Phase: module_load ──────────────────────────────────────────────
@@ -607,7 +607,7 @@ INITSCRIPT
     DMESG_DANGER_COUNT=0
     for pattern in "WARNING:" "BUG:" "Oops:" "lockdep:" "KASAN:" "KCSAN:" "hung_task" "Call Trace:" "RIP:"; do
       c=$(grep -c "$pattern" "$RUN_DIR/qemu.log" 2>/dev/null || true)
-      DMESG_DANGER_COUNT=$((DMESG_DANGER_COUNT + ${c:-0}))
+      DMESG_DANGER_COUNT=$((DMESG_DANGER_COUNT + ''${c:-0}))
     done
 
     TRACE_ERROR_COUNT=$(grep -c "trace.*error\|ftrace.*fail" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
