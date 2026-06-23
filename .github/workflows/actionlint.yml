@@ -1,0 +1,65 @@
+name: Actionlint
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/**'
+      - '.github/actionlint.yaml'
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.github/workflows/**'
+      - '.github/actionlint.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-workflows:
+    name: Lint GitHub Actions workflows
+    # Draft PRs are not integration candidates; save scarce self-hosted runner
+    # capacity for ready PRs, master pushes, and explicit dispatches.
+    if: ${{ (github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Record actionlint version
+        run: |
+          echo '### actionlint version' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          nix shell nixpkgs#actionlint --command actionlint -version 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run actionlint
+        id: lint
+        run: |
+          set +e
+          nix shell nixpkgs#actionlint --command actionlint \
+            -config-file .github/actionlint.yaml \
+            .github/workflows/*.yml \
+            > actionlint-output.txt 2>&1
+          lint_exit=$?
+          set -e
+
+          echo '### actionlint report' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat actionlint-output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${lint_exit}" -ne 0 ]]; then
+            echo "::error::actionlint found issues in workflow files (exit ${lint_exit})"
+            exit "${lint_exit}"
+          fi
+
+          echo "actionlint passed with no issues"
