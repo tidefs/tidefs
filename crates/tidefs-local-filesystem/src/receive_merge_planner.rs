@@ -642,11 +642,11 @@ fn compare_dir_entries(
                         s_entry.inode_id.0
                     ),
                     target_identity: format!(
-                stream_txg: None,
-                target_txg: None,
                         "dir {parent_id}/{name_str} -> inode {}",
                         t_entry.inode_id.0
                     ),
+                stream_txg: None,
+                target_txg: None,
                 });
             }
         }
@@ -789,11 +789,11 @@ fn classify_snapshot_catalog_conflicts(
                         s_rec.root.transaction_id, s_rec.root.generation
                     ),
                     target_identity: format!(
-                stream_txg: None,
-                target_txg: None,
                         "snapshot {name_str} root txg={} gen={}",
                         t_rec.root.transaction_id, t_rec.root.generation
                     ),
+                stream_txg: None,
+                target_txg: None,
                 });
                 continue;
             }
@@ -811,11 +811,11 @@ fn classify_snapshot_catalog_conflicts(
                         s_rec.hold_count
                     ),
                     target_identity: format!(
-                stream_txg: None,
-                target_txg: None,
                         "snapshot {name_str} hold_count={}",
                         t_rec.hold_count
                     ),
+                stream_txg: None,
+                target_txg: None,
                 });
             }
 
@@ -831,11 +831,11 @@ fn classify_snapshot_catalog_conflicts(
                         s_rec.kind, s_rec.origin
                     ),
                     target_identity: format!(
-                stream_txg: None,
-                target_txg: None,
                         "snapshot {name_str} kind={:?} origin={:?}",
                         t_rec.kind, t_rec.origin
                     ),
+                stream_txg: None,
+                target_txg: None,
                 });
             }
         }
@@ -903,10 +903,10 @@ fn classify_generation_ordering_conflicts(
                     "stream txg range [{ancestor_txg}..{stream_max_txg}]"
                 ),
                 target_identity: format!(
-            stream_txg: None,
-            target_txg: None,
                     "target txg range [{ancestor_txg}..{target_max_txg}]"
                 ),
+            stream_txg: None,
+            target_txg: None,
             });
         }
     }
