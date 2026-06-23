@@ -46,4 +46,5 @@ jobs:
             .#packages.x86_64-linux.default \
             .#packages.x86_64-linux.tidefsFuseRuntime \
             .#packages.x86_64-linux.tidefsUblkRuntime \
-            .#packages.x86_64-linux.tidefsPosixVfsKmod
+            .#packages.x86_64-linux.tidefsPosixVfsKmod \
+            .#packages.x86_64-linux.tidefsBlockKmod
