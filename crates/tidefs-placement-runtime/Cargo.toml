@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "Placement runtime engine: executes deterministic placement plans across nodes with budget tracking, plan conflict resolution, and 5-phase lifecycle"

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "TideFS local filesystem: userspace product core pending kernel extraction. Kernel-portable types (lock tracker, authority token, VFS scalars) are separated from userspace-only harness (std::fs, thread, background scheduler). Full-kernel mode requires extracting or guarding the userspace layer behind cfg(feature = 'userspace')."

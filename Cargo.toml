@@ -175,6 +175,8 @@ version = "0.421.0"
 edition = "2021"
 publish = false
 repository = "https://github.com/tidefs/tidefs"
+homepage = "https://github.com/tidefs/tidefs"
+documentation = "https://github.com/tidefs/tidefs"
 license = "GPL-2.0-only WITH Linux-syscall-note"
 authors = ["TideFS Contributors"]
 

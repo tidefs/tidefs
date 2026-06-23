@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "TideFS block-volume kernel module (c8 / kmod.block_volume_adapter.block.k0) — fixed-capacity block device export consuming the s2 bridge"

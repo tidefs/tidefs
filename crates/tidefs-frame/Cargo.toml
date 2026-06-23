@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "Per-object compression frame format: 5-byte header, zstd/LZ4 encode/decode (shared between tidefs-compression and tidefs-local-object-store)"

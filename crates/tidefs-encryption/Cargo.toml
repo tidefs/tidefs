@@ -5,6 +5,9 @@ edition = "2021"
 description = "Transparent ChaCha20-Poly1305 AEAD encryption wrapper for the TideFS local object store"
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 
 [dependencies]
 tidefs-local-object-store = { path = "../tidefs-local-object-store" }

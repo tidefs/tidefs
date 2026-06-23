@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "Runtime quorum write coordinator that wires the deterministic PREPARE-TRANSFER-COMMIT-WITNESS protocol into the LocalFileSystem I/O path"

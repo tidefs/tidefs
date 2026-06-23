@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "Atomic coordination strategy switching protocol with epoch fencing: quiesce-drain-verify-switch-publish lifecycle for all 5 contention levels"

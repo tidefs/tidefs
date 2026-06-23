@@ -5,6 +5,9 @@ edition = "2021"
 description = "Cauchy Reed-Solomon erasure coding engine over GF(2^8) with replication-model integration"
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 
 [dependencies]
 tidefs-replication-model = { path = "../tidefs-replication-model" }

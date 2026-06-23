@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 description = "P9-02 authentication/authorization/audit model: Ed25519 node identity, mutual attestation, principal model, session grants, authorization pipeline, override machinery, audit chain seals"
 
