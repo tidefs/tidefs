@@ -154,7 +154,6 @@ pub struct VfsLocalFileSystem {
     active_dir_handles: RefCell<BTreeMap<DirHandleId, InodeId>>,
     next_dir_handle_id: RefCell<u64>,
     anonymous_tmpfiles: RefCell<BTreeMap<InodeId, AnonymousTmpfile>>,
-    next_anonymous_inode_id: RefCell<u64>,
     /// Optional inode table for metadata prefetch during readdir.
     /// When set, `readdir` issues a best-effort `prefetch_batch` call
     /// to prime the in-memory attribute cache for listed entries.
@@ -491,7 +490,6 @@ impl VfsLocalFileSystem {
             active_dir_handles: RefCell::new(BTreeMap::new()),
             next_dir_handle_id: RefCell::new(1),
             anonymous_tmpfiles: RefCell::new(BTreeMap::new()),
-            next_anonymous_inode_id: RefCell::new(1_u64 << 63),
             dataset_root_path: None,
             inode_table: None,
             timestamp_policy: TimestampPolicy::Relatime,
@@ -625,13 +623,9 @@ impl VfsLocalFileSystem {
     // allocate_file_handle_id replaced by FileHandleTable::register()
 
     fn allocate_anonymous_inode_id(&self) -> std::result::Result<InodeId, Errno> {
-        let mut next = self.next_anonymous_inode_id.borrow_mut();
-        let id = *next;
-        if id == 0 {
-            return Err(Errno::EIO);
-        }
-        *next = next.checked_add(1).unwrap_or(0);
-        Ok(InodeId::new(id))
+        // Reserve from the normal inode authority so linkat can publish the
+        // same inode number without inflating the persistent allocation bitmap.
+        Ok(self.fs.borrow_mut().reserve_inode_id())
     }
 
     fn anonymous_attr(inode_id: InodeId, mode: u32, ctx: &RequestCtx) -> InodeAttr {

@@ -816,6 +816,10 @@ impl FileSystemState {
         inode_id
     }
 
+    pub(crate) fn reserve_inode_id(&mut self) -> InodeId {
+        self.inode_authority.allocate()
+    }
+
     pub(crate) fn observe_explicit_inode_id(&mut self, inode_id: InodeId) {
         self.inode_authority.observe_explicit_inode(inode_id);
         if inode_id.get() != 0 {
@@ -12530,6 +12534,10 @@ impl LocalFileSystem {
 
     fn allocate_inode_id(&mut self) -> InodeId {
         self.state.allocate_inode_id()
+    }
+
+    fn reserve_inode_id(&mut self) -> InodeId {
+        self.state.reserve_inode_id()
     }
 
     fn bump_generation(&mut self) -> u64 {

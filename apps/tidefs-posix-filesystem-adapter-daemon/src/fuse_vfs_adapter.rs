@@ -30456,13 +30456,33 @@ mod tests {
             .expect("read back tmpfile");
         assert_eq!(readback, payload, "readback must match written data");
 
-        // Linking an anonymous tmpfile is not yet supported by the engine;
-        // the engine requires an on-disk path to create the hard link.
-        let link_err = fixture
+        let linked = fixture
             .adapter
             .dispatch_link_entry(&ctx, ino, root.get(), b"linked-tmpfile")
-            .unwrap_err();
-        assert_eq!(link_err, Errno::ENOENT);
+            .expect("link tmpfile into namespace");
+        assert_eq!(linked.inode_id.get(), ino);
+        assert_eq!(linked.kind, NodeKind::File);
+        assert_eq!(linked.posix.nlink, 1);
+        assert_eq!(linked.posix.size, payload.len() as u64);
+
+        let lookup = fixture
+            .adapter
+            .dispatch_lookup(&ctx, root.get(), b"linked-tmpfile")
+            .expect("lookup linked tmpfile");
+        assert_eq!(lookup.inode_id.get(), ino);
+
+        let readback_after_link = fixture
+            .adapter
+            .dispatch_read(
+                &ctx,
+                ino,
+                dispatch.adapter_fh,
+                0,
+                payload.len() as u32,
+                None,
+            )
+            .expect("read linked tmpfile through original handle");
+        assert_eq!(readback_after_link, payload);
     }
 
     #[test]
