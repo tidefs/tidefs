@@ -304,6 +304,10 @@ impl FuseReadDispatch {
                         // Cannot cache; serve data without populating.
                         false
                     }
+                    Err(InsertError::Budget(_)) => {
+                        // Governor rejected cache admission; serve data without populating.
+                        false
+                    }
                 };
                 let _ = inserted; // observability hook
 
@@ -424,6 +428,7 @@ impl FuseReadDispatch {
                     }
                     Err(InsertError::AlreadyExists) => {}
                     Err(InsertError::AtCapacityNoCleanPages) => {}
+                    Err(InsertError::Budget(_)) => {}
                 }
 
                 let available = effective_page.len().saturating_sub(in_page_offset);
