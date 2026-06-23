@@ -276,7 +276,7 @@ main() {
             if echo "$all_crates" | grep -qxF "$name"; then
                 crates+=("$name")
             else
-                echo "ci-test-runner: warning: crate '$name' not found in workspace, skipping" >&2
+                die "unknown crate '$name' not found in workspace"
             fi
         done
     else
