@@ -14,7 +14,8 @@
 //! Defines `DurabilityPolicy`, `ConversionScope`, `GeometryConversionProgress`,
 //! the `GeometryConversionJob` as an `IncrementalJob`, and a mock `ExtentStore`
 //! for unit testing the conversion algorithm. Real locator-table and erasure-coding
-//! integration occurs in Phase 2.
+//! integration remains Phase 2 work; this crate's current authority is the
+//! standalone cursor, budget, progress, and fail-stop conversion contract.
 
 #![forbid(unsafe_code)]
 
@@ -305,6 +306,8 @@ pub struct ConversionCursor {
     pub bytes_converted: u64,
     pub started_epoch: u64,
     pub cancelled: bool,
+    pub failed: bool,
+    pub last_error: Option<String>,
 }
 
 impl ConversionCursor {
@@ -333,6 +336,16 @@ impl ConversionCursor {
         buf.extend_from_slice(&self.bytes_converted.to_le_bytes());
         buf.extend_from_slice(&self.started_epoch.to_le_bytes());
         buf.push(if self.cancelled { 1u8 } else { 0u8 });
+        buf.push(if self.failed { 1u8 } else { 0u8 });
+        match &self.last_error {
+            Some(error) => {
+                let bytes = error.as_bytes();
+                let len = bytes.len().min(u32::MAX as usize) as u32;
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(&bytes[..len as usize]);
+            }
+            None => buf.extend_from_slice(&0u32.to_le_bytes()),
+        }
         buf
     }
 
@@ -358,7 +371,7 @@ impl ConversionCursor {
         pos = npos;
         let (new_policy, npos) = decode_policy(data, pos)?;
         pos = npos;
-        if data.len() < pos + 38 {
+        if data.len() < pos + 40 {
             return None;
         }
         let last_converted_locator = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
@@ -371,7 +384,31 @@ impl ConversionCursor {
         pos += 8;
         let started_epoch = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
         pos += 8;
-        let cancelled = pos < data.len() && data[pos] != 0; // pos increment not needed since last field
+        let cancelled = pos < data.len() && data[pos] != 0;
+        if pos < data.len() {
+            pos += 1;
+        }
+        let failed = pos < data.len() && data[pos] != 0;
+        if pos < data.len() {
+            pos += 1;
+        }
+        let last_error = if pos < data.len() {
+            if data.len() < pos + 4 {
+                return None;
+            }
+            let len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+            pos += 4;
+            if len == 0 {
+                None
+            } else {
+                if data.len() < pos + len {
+                    return None;
+                }
+                Some(String::from_utf8(data[pos..pos + len].to_vec()).ok()?)
+            }
+        } else {
+            None
+        };
         Some(Self {
             scope,
             old_policy,
@@ -382,6 +419,8 @@ impl ConversionCursor {
             bytes_converted,
             started_epoch,
             cancelled,
+            failed,
+            last_error,
         })
     }
 }
@@ -535,6 +574,8 @@ impl<S: ExtentStore> GeometryConversionJob<S> {
                 bytes_converted: 0,
                 started_epoch: 1,
                 cancelled: false,
+                failed: false,
+                last_error: None,
             },
             epoch: 1,
         }
@@ -553,6 +594,16 @@ impl<S: ExtentStore> GeometryConversionJob<S> {
         self.cursor.bytes_converted += bytes;
         self.cursor.last_converted_locator = entry.locator_id.0;
         Ok(bytes)
+    }
+
+    #[must_use]
+    pub const fn is_failed(&self) -> bool {
+        self.cursor.failed
+    }
+
+    #[must_use]
+    pub fn last_error(&self) -> Option<&str> {
+        self.cursor.last_error.as_deref()
     }
 
     fn max_entries_for_budget(&self, budget: WorkBudget) -> u64 {
@@ -612,7 +663,10 @@ impl<S: ExtentStore + 'static> IncrementalJob for GeometryConversionJob<S> {
     }
 
     fn step(&mut self, budget: WorkBudget) -> StepResult {
-        if self.cursor.cancelled || self.cursor.entries_converted >= self.cursor.entries_total {
+        if self.cursor.cancelled
+            || self.cursor.failed
+            || self.cursor.entries_converted >= self.cursor.entries_total
+        {
             return StepResult {
                 checkpoint: self.make_checkpoint(),
                 is_complete: true,
@@ -639,9 +693,17 @@ impl<S: ExtentStore + 'static> IncrementalJob for GeometryConversionJob<S> {
             };
         }
         for entry in &batch {
-            let _ = self.convert_one(entry);
+            if let Err(error) = self.convert_one(entry) {
+                self.cursor.failed = true;
+                self.cursor.last_error = Some(format!(
+                    "locator {} conversion failed: {error}",
+                    entry.locator_id
+                ));
+                break;
+            }
         }
-        let is_complete = self.cursor.entries_converted >= self.cursor.entries_total
+        let is_complete = self.cursor.failed
+            || self.cursor.entries_converted >= self.cursor.entries_total
             || batch.len() < max_entries as usize;
         StepResult {
             checkpoint: self.make_checkpoint(),
@@ -692,13 +754,7 @@ impl<S: ExtentStore> fmt::Debug for GeometryConversionJob<S> {
 // ---------------------------------------------------------------------------
 
 fn blake3_digest(data: &[u8]) -> [u8; 32] {
-    let mut hash = [0u8; 32];
-    let mut acc: u64 = 0x9AE16A3B2F90404F;
-    for &byte in data {
-        acc = acc.wrapping_mul(31).wrapping_add(byte as u64);
-    }
-    hash[..8].copy_from_slice(&acc.to_le_bytes());
-    hash
+    blake3::hash(data).into()
 }
 
 // ---------------------------------------------------------------------------
@@ -714,6 +770,9 @@ mod tests {
     struct MockStore {
         entries: HashMap<u64, LocatorEntry>,
         next_locator_id: u64,
+        fail_read_locator: Option<u64>,
+        fail_write_locator: Option<u64>,
+        fail_update_locator: Option<u64>,
     }
 
     impl MockStore {
@@ -721,6 +780,9 @@ mod tests {
             Self {
                 entries: HashMap::new(),
                 next_locator_id: 1,
+                fail_read_locator: None,
+                fail_write_locator: None,
+                fail_update_locator: None,
             }
         }
 
@@ -772,6 +834,9 @@ mod tests {
 
         fn read_payload(&self, value: &LocatorValueV1) -> Result<Vec<u8>, String> {
             let lid = value.locator_id.0;
+            if self.fail_read_locator == Some(lid) {
+                return Err("mock read failure".to_string());
+            }
             Ok((0..value.payload_bytes as usize)
                 .map(|i| (lid.wrapping_add(i as u64) % 256) as u8)
                 .collect())
@@ -784,6 +849,9 @@ mod tests {
             payload: &[u8],
             _digest: [u8; 32],
         ) -> Result<Vec<ReplicaPlacement>, String> {
+            if self.fail_write_locator == Some(locator_id.0) {
+                return Err("mock write failure".to_string());
+            }
             let count = new_policy.total_shards();
             Ok((0..count)
                 .map(|i| {
@@ -804,6 +872,9 @@ mod tests {
             new_placements: Vec<ReplicaPlacement>,
             new_policy: &DurabilityPolicy,
         ) -> Result<LocatorValueV1, String> {
+            if self.fail_update_locator == Some(locator_id.0) {
+                return Err("mock update failure".to_string());
+            }
             let entry = self.entries.get_mut(&locator_id.0).ok_or("not found")?;
             entry.value.locator_rev += 1;
             entry.value.replica_placement = new_placements;
@@ -903,6 +974,8 @@ mod tests {
             bytes_converted: 42000,
             started_epoch: 5,
             cancelled: false,
+            failed: false,
+            last_error: None,
         };
         let enc = cursor.encode();
         let dec = ConversionCursor::decode(&enc).expect("roundtrip");
@@ -915,6 +988,8 @@ mod tests {
         assert_eq!(dec.bytes_converted, 42000);
         assert_eq!(dec.started_epoch, 5);
         assert!(!dec.cancelled);
+        assert!(!dec.failed);
+        assert_eq!(dec.last_error, None);
     }
 
     #[test]
@@ -933,6 +1008,8 @@ mod tests {
             bytes_converted: 800_000,
             started_epoch: 2,
             cancelled: true,
+            failed: false,
+            last_error: None,
         };
         let enc = cursor.encode();
         let dec = ConversionCursor::decode(&enc).expect("roundtrip");
@@ -941,6 +1018,30 @@ mod tests {
         assert_eq!(
             dec.new_policy,
             DurabilityPolicy::Mirror { replica_count: 3 }
+        );
+    }
+
+    #[test]
+    fn cursor_roundtrip_records_failure() {
+        let cursor = ConversionCursor {
+            scope: ConversionScope::Pool(9),
+            old_policy: DurabilityPolicy::Mirror { replica_count: 2 },
+            new_policy: DurabilityPolicy::Mirror { replica_count: 3 },
+            last_converted_locator: 4,
+            entries_total: 10,
+            entries_converted: 4,
+            bytes_converted: 16_384,
+            started_epoch: 3,
+            cancelled: false,
+            failed: true,
+            last_error: Some("locator 5 conversion failed: mock write failure".to_string()),
+        };
+        let enc = cursor.encode();
+        let dec = ConversionCursor::decode(&enc).expect("roundtrip");
+        assert!(dec.failed);
+        assert_eq!(
+            dec.last_error.as_deref(),
+            Some("locator 5 conversion failed: mock write failure")
         );
     }
 
@@ -1190,5 +1291,58 @@ mod tests {
         let r = job.step(tight_budget);
         assert!(!r.is_complete);
         assert!(job.cursor.entries_converted <= 5);
+    }
+
+    #[test]
+    fn conversion_write_failure_is_checkpointed_without_progress() {
+        let mut store = MockStore::new(11);
+        let lid = store.add_entry(&vec![0u8; 1024], 2);
+        store.fail_write_locator = Some(lid.0);
+        let mut job = GeometryConversionJob::new(
+            store,
+            ConversionScope::Pool(11),
+            DurabilityPolicy::Mirror { replica_count: 2 },
+            DurabilityPolicy::Mirror { replica_count: 3 },
+        );
+        let r = job.step(WorkBudget::DEFAULT_TICK);
+        assert!(r.is_complete);
+        assert!(job.is_failed());
+        assert_eq!(job.cursor.entries_converted, 0);
+        assert_eq!(job.cursor.last_converted_locator, 0);
+        assert_eq!(
+            job.last_error(),
+            Some("locator 1 conversion failed: mock write failure")
+        );
+        let cp = job.persist_checkpoint();
+        let cursor = ConversionCursor::decode(cp.cursor_state.as_bytes()).expect("cursor");
+        assert!(cursor.failed);
+        assert_eq!(cursor.entries_converted, 0);
+        assert_eq!(
+            cursor.last_error.as_deref(),
+            Some("locator 1 conversion failed: mock write failure")
+        );
+    }
+
+    #[test]
+    fn conversion_update_failure_preserves_completed_prefix() {
+        let mut store = MockStore::new(12);
+        store.add_entry(&vec![1u8; 1024], 2);
+        let second = store.add_entry(&vec![2u8; 1024], 2);
+        store.fail_update_locator = Some(second.0);
+        let mut job = GeometryConversionJob::new(
+            store,
+            ConversionScope::Pool(12),
+            DurabilityPolicy::Mirror { replica_count: 2 },
+            DurabilityPolicy::Mirror { replica_count: 3 },
+        );
+        let r = job.step(WorkBudget::DEFAULT_TICK);
+        assert!(r.is_complete);
+        assert!(job.is_failed());
+        assert_eq!(job.cursor.entries_converted, 1);
+        assert_eq!(job.cursor.last_converted_locator, 1);
+        assert_eq!(
+            job.last_error(),
+            Some("locator 2 conversion failed: mock update failure")
+        );
     }
 }
