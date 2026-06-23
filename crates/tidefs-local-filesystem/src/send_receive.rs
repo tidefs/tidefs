@@ -28,6 +28,7 @@ use crate::fs_io_error;
 use crate::load_state_from_transaction;
 use crate::object_keys::*;
 use crate::persist_transaction_objects;
+use crate::receive_merge_planner::{locate_common_ancestor, ReceiveMergeStreamLineageManifest};
 use crate::records::*;
 use crate::root_commit_from_summary;
 use crate::roots_with_snapshot_roots;
@@ -1648,6 +1649,8 @@ pub(crate) fn receive_incremental_changed_records(
         root_authentication_key,
     )?;
     let audit = existing.recovery_audit()?;
+    let stream_lineage = ReceiveMergeStreamLineageManifest::from_changed_record_export(export);
+    let _common_ancestor = locate_common_ancestor(&stream_lineage, &audit)?;
     let authorized_base = verify_incremental_base_root_authority(&existing, &audit, from_root)?;
     validate_local_incremental_receive_contract(&existing, &audit, &authorized_base, export)?;
     let placement_verified_stable = incremental_receive_placement_verified_stable(

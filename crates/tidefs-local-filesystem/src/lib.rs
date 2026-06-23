@@ -333,6 +333,7 @@ mod quota;
 mod readahead;
 mod records;
 mod recovery;
+pub mod receive_merge_planner;
 pub mod release_dispatch;
 mod repair;
 mod scrub;

@@ -7234,6 +7234,28 @@ fn assert_incremental_receive_base_root_conflict(
     }
 }
 
+fn assert_receive_merge_no_common_ancestor(err: FileSystemError) {
+    let message = err.to_string();
+    match err {
+        FileSystemError::Unsupported { operation, reason } => {
+            assert_eq!(operation, "receive merge planning");
+            assert!(
+                reason.contains("no_common_ancestor")
+                    && reason.contains("delete-and-re-receive")
+                    && reason.contains("fresh target"),
+                "reason must name no_common_ancestor operator actions: {reason}"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert!(
+        message.contains("unsupported receive merge planning")
+            && message.contains("no_common_ancestor")
+            && message.contains("fresh target"),
+        "message must surface classified no_common_ancestor guidance: {message}"
+    );
+}
+
 fn omitted_incremental_content_key(export: &ChangedRecordExport) -> ObjectKey {
     for root in &export.roots {
         let manifest_record = root
@@ -7508,16 +7530,7 @@ fn incremental_receive_rejects_target_missing_base_root() {
         fixture.target_key,
     )
     .expect_err("missing base must fail");
-    assert_incremental_receive_base_root_conflict(
-        err,
-        fixture
-            .incremental_export
-            .from_root
-            .as_ref()
-            .expect("incremental fixture has from_root"),
-        false,
-        false,
-    );
+    assert_receive_merge_no_common_ancestor(err);
     let after = selected_root_for_test(&other_root, fixture.target_key);
     assert_eq!(after, before);
 
