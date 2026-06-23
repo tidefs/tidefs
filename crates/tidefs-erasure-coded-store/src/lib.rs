@@ -285,16 +285,17 @@ impl ErasureCodedStore {
                 let shard_key = shard_object_key(key, s, shard.index);
                 let shard_record =
                     encode_verified_shard(&object_prefix, s, shard.index, &shard.bytes)?;
-                match self.stores[shard.index].put(shard_key, &shard_record) {
+                let store_idx = mapped_store_index(&self.shard_to_store, shard.index, sw);
+                match self.stores[store_idx].put(shard_key, &shard_record) {
                     Ok(_) => {
                         bytes_stored += shard_record.len() as u64;
                         shards_written += 1;
                     }
                     Err(e) => {
-                        store_healthy[shard.index] = false;
+                        store_healthy[store_idx] = false;
                         eprintln!(
-                            "store {} write failed for stripe {s} shard {}: {e}",
-                            shard.index, shard.index,
+                            "store {store_idx} write failed for stripe {s} shard {}: {e}",
+                            shard.index,
                         );
                     }
                 }
@@ -329,7 +330,7 @@ impl ErasureCodedStore {
         };
 
         // Probe all stores for stripe count. Returns 0 if no store has the object.
-        let num_stripes = probe_stripe_count_all(&self.stores, key, sw);
+        let num_stripes = probe_stripe_count_all(&self.stores, key, sw, &self.shard_to_store);
         if num_stripes == 0 {
             return Ok(None);
         }
@@ -360,7 +361,8 @@ impl ErasureCodedStore {
 
             for i in 0..sw {
                 let sk = shard_object_key(key, s, i);
-                match self.stores[i].get(sk) {
+                let store_idx = mapped_store_index(&self.shard_to_store, i, sw);
+                match self.stores[store_idx].get(sk) {
                     Ok(Some(record)) => {
                         increment_cell(&self.stats.shards_read);
                         match decode_verified_shard(&object_prefix, s, i, &record) {
@@ -379,7 +381,9 @@ impl ErasureCodedStore {
                             }
                             Err(e) => {
                                 increment_cell(&self.stats.shard_verification_failures);
-                                eprintln!("store {i} shard verify failed for stripe {s}: {e}");
+                                eprintln!(
+                                    "store {store_idx} shard {i} verify failed for stripe {s}: {e}"
+                                );
                                 available.push(None);
                                 degraded = true;
                             }
@@ -391,7 +395,7 @@ impl ErasureCodedStore {
                         increment_cell(&self.stats.missing_shard_fallbacks);
                     }
                     Err(e) => {
-                        eprintln!("store {i} read failed for stripe {s}: {e}");
+                        eprintln!("store {store_idx} read failed for stripe {s} shard {i}: {e}");
                         available.push(None);
                         degraded = true;
                         increment_cell(&self.stats.missing_shard_fallbacks);
@@ -414,6 +418,7 @@ impl ErasureCodedStore {
                     for i in 0..sw {
                         if available[i].is_none() {
                             let shard_key = shard_object_key(key, s, i);
+                            let store_index = mapped_store_index(&self.shard_to_store, i, sw);
                             if let Ok(shard_record) = encode_verified_shard(
                                 &object_prefix,
                                 s,
@@ -421,7 +426,7 @@ impl ErasureCodedStore {
                                 &encoded.shards[i].bytes,
                             ) {
                                 self.repair_queue.borrow_mut().push(PendingEcRepair {
-                                    store_index: i,
+                                    store_index,
                                     shard_key,
                                     shard_record,
                                 });
@@ -458,7 +463,7 @@ impl ErasureCodedStore {
     pub fn delete_named(&mut self, name: impl AsRef<[u8]>) -> Result<bool, String> {
         let key = ObjectKey::from_name(&name);
         let sw = self.config.store_count();
-        let num_stripes = probe_stripe_count_all(&self.stores, key, sw);
+        let num_stripes = probe_stripe_count_all(&self.stores, key, sw, &self.shard_to_store);
         if num_stripes == 0 {
             // Also try to clean up any orphaned length metadata from all stores.
             for i in 0..sw {
@@ -470,7 +475,8 @@ impl ErasureCodedStore {
         for s in 0..num_stripes {
             for i in 0..sw {
                 let sk = shard_object_key(key, s, i);
-                let _ = self.stores[i].delete(sk);
+                let store_idx = mapped_store_index(&self.shard_to_store, i, sw);
+                let _ = self.stores[store_idx].delete(sk);
             }
         }
 
@@ -555,23 +561,25 @@ impl ErasureCodedStore {
 
         for prefix in &all_prefixes {
             // Determine stripe count: probe all stores for stripe 0 of their own shard.
-            let mut healthy_store: Option<usize> = None;
+            let mut healthy_shard: Option<usize> = None;
             for i in 0..sw {
                 let probe_key = shard_key_from_prefix(prefix, 0, i);
-                if let Ok(Some(_)) = self.stores[i].get(probe_key) {
-                    healthy_store = Some(i);
+                let store_idx = mapped_store_index(&self.shard_to_store, i, sw);
+                if let Ok(Some(_)) = self.stores[store_idx].get(probe_key) {
+                    healthy_shard = Some(i);
                     break;
                 }
             }
-            let h = match healthy_store {
+            let h = match healthy_shard {
                 Some(i) => i,
                 None => continue,
             };
+            let healthy_store = mapped_store_index(&self.shard_to_store, h, sw);
 
             let mut num_stripes = 1usize;
             loop {
                 let probe_key = shard_key_from_prefix(prefix, num_stripes, h);
-                match self.stores[h].get(probe_key) {
+                match self.stores[healthy_store].get(probe_key) {
                     Ok(Some(_)) => num_stripes += 1,
                     _ => break,
                 }
@@ -582,7 +590,8 @@ impl ErasureCodedStore {
                 let mut available: Vec<Option<ErasureShard>> = Vec::with_capacity(sw);
                 for i in 0..sw {
                     let sk = shard_key_from_prefix(prefix, s, i);
-                    match self.stores[i].get(sk) {
+                    let store_idx = mapped_store_index(&self.shard_to_store, i, sw);
+                    match self.stores[store_idx].get(sk) {
                         Ok(Some(record)) => match decode_verified_shard(prefix, s, i, &record) {
                             Ok(bytes) => {
                                 increment_cell(&self.stats.shards_verified);
@@ -599,7 +608,9 @@ impl ErasureCodedStore {
                             }
                             Err(e) => {
                                 increment_cell(&self.stats.shard_verification_failures);
-                                eprintln!("store {i} shard verify failed for stripe {s}: {e}");
+                                eprintln!(
+                                    "store {store_idx} shard {i} verify failed for stripe {s}: {e}"
+                                );
                                 available.push(None);
                             }
                         },
@@ -609,11 +620,13 @@ impl ErasureCodedStore {
 
                 if let Some(recon) = reconstruct(&stripe_config, &available, None) {
                     for rebuilt in &recon.rebuilt_shards {
-                        if rebuilt.index == store_index {
+                        let target_store =
+                            mapped_store_index(&self.shard_to_store, rebuilt.index, sw);
+                        if target_store == store_index {
                             let sk = shard_key_from_prefix(prefix, s, rebuilt.index);
                             let shard_record =
                                 encode_verified_shard(prefix, s, rebuilt.index, &rebuilt.bytes)?;
-                            self.stores[store_index]
+                            self.stores[target_store]
                                 .put(sk, &shard_record)
                                 .map_err(|e| {
                                     format!("repair write failed for shard {}: {e}", rebuilt.index,)
@@ -922,16 +935,19 @@ fn shard_key_from_prefix(prefix: &[u8; 16], stripe: usize, shard: usize) -> Obje
     ObjectKey::from_bytes(out)
 }
 
-/// Probe all stores for each store's own shard of stripe 0.
-/// Each store i holds shard i of stripe 0. Returns stripe count, or 0 if
-/// no store has its shard.
-fn probe_stripe_count_all(stores: &[LocalObjectStore], key: ObjectKey, sw: usize) -> usize {
-    // Each store i holds shard i of stripe 0.
-    // Probe each store for its own shard to find a surviving store.
+/// Probe all mapped stores for stripe 0. Returns stripe count, or 0 if
+/// no store has one of the object's logical shards.
+fn probe_stripe_count_all(
+    stores: &[LocalObjectStore],
+    key: ObjectKey,
+    sw: usize,
+    shard_to_store: &HashMap<usize, usize>,
+) -> usize {
     let mut healthy: Option<usize> = None;
     for i in 0..sw {
+        let store_idx = mapped_store_index(shard_to_store, i, sw);
         let probe_key = shard_object_key(key, 0, i);
-        match stores[i].get(probe_key) {
+        match stores[store_idx].get(probe_key) {
             Ok(Some(_)) => {
                 healthy = Some(i);
                 break;
@@ -943,12 +959,13 @@ fn probe_stripe_count_all(stores: &[LocalObjectStore], key: ObjectKey, sw: usize
         Some(i) => i,
         None => return 0,
     };
+    let healthy_store = mapped_store_index(shard_to_store, h, sw);
 
     // Count stripes from the found healthy store using its shard index.
     let mut n = 1usize;
     loop {
         let probe_key = shard_object_key(key, n, h);
-        match stores[h].get(probe_key) {
+        match stores[healthy_store].get(probe_key) {
             Ok(Some(_)) => n += 1,
             _ => break,
         }
@@ -975,12 +992,28 @@ fn collect_base_keys(
     keys
 }
 
+fn mapped_store_index(
+    shard_to_store: &HashMap<usize, usize>,
+    shard_index: usize,
+    store_count: usize,
+) -> usize {
+    let mapped = shard_to_store
+        .get(&shard_index)
+        .copied()
+        .unwrap_or(shard_index);
+    if mapped < store_count {
+        mapped
+    } else {
+        shard_index
+    }
+}
+
 /// Compute the shard_index → store_index mapping from placement config.
 ///
 /// When `failure_domain` and `device_candidates` are both `Some`, uses
 /// [`PlacementPlan::assign_devices`] to determine which device (and thus
-/// which store) receives each shard.  Falls back to identity mapping
-/// (`shard i → store i`) when placement info is missing.
+/// which store) receives each shard. Falls back to identity mapping
+/// (`shard i → store i`) when placement info is missing or incomplete.
 fn compute_shard_to_store(config: &ErasureCodedStoreConfig) -> HashMap<usize, usize> {
     let total = config.store_count();
     let mut map: HashMap<usize, usize> = (0..total).map(|i| (i, i)).collect();
@@ -988,23 +1021,33 @@ fn compute_shard_to_store(config: &ErasureCodedStoreConfig) -> HashMap<usize, us
     if let (Some(ref fd), Some(ref candidates)) =
         (&config.failure_domain, &config.device_candidates)
     {
-        let layout = tidefs_durability_layout::DurabilityLayoutV1::erasure(
-            config.data_shards as u8,
-            config.parity_shards as u8,
-        );
-        if let Ok(layout) = layout {
-            let plan = PlacementPlan::from_layout(layout, *fd);
-            if let Ok(assignments) = plan.assign_devices(candidates) {
-                let device_to_store: HashMap<u64, usize> = candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, dc)| (dc.device_id, idx))
-                    .collect();
+        if candidates.len() == total {
+            let layout = tidefs_durability_layout::DurabilityLayoutV1::erasure(
+                config.data_shards as u8,
+                config.parity_shards as u8,
+            );
+            if let Ok(layout) = layout {
+                let plan = PlacementPlan::from_layout(layout, *fd);
+                if let Ok(assignments) = plan.assign_devices(candidates) {
+                    let device_to_store: HashMap<u64, usize> = candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, dc)| (dc.device_id, idx))
+                        .collect();
 
-                map.clear();
-                for a in &assignments {
-                    if let Some(&store_idx) = device_to_store.get(&a.device_id) {
-                        map.insert(a.shard_index as usize, store_idx);
+                    let mut mapped = HashMap::with_capacity(total);
+                    for a in &assignments {
+                        let shard_idx = a.shard_index as usize;
+                        if shard_idx < total {
+                            if let Some(&store_idx) = device_to_store.get(&a.device_id) {
+                                if store_idx < total {
+                                    mapped.insert(shard_idx, store_idx);
+                                }
+                            }
+                        }
+                    }
+                    if mapped.len() == total {
+                        map = mapped;
                     }
                 }
             }
@@ -1141,11 +1184,7 @@ impl EcWritePath {
                     )
                     .map_err(EcStoreError::Internal)?;
 
-                    let store_idx = s
-                        .shard_to_store
-                        .get(&shard.index)
-                        .copied()
-                        .unwrap_or(shard.index);
+                    let store_idx = mapped_store_index(&s.shard_to_store, shard.index, sw);
                     match s.stores[store_idx].put(shard_key, &shard_record) {
                         Ok(_) => {
                             shards_dispatched += 1;
@@ -1210,7 +1249,7 @@ impl EcReadPath {
             };
 
             // Probe stripe count from all stores
-            let num_stripes = probe_stripe_count_all(&s.stores, key, sw);
+            let num_stripes = probe_stripe_count_all(&s.stores, key, sw, &s.shard_to_store);
             if num_stripes == 0 {
                 return Ok(None);
             }
@@ -1243,7 +1282,8 @@ impl EcReadPath {
 
                 for i in 0..sw {
                     let sk = shard_object_key(key, stripe_idx, i);
-                    match s.stores[i].get(sk) {
+                    let store_idx = mapped_store_index(&s.shard_to_store, i, sw);
+                    match s.stores[store_idx].get(sk) {
                         Ok(Some(record)) => {
                             shards_read += 1;
                             match decode_verified_shard(&object_prefix, stripe_idx, i, &record) {
@@ -1263,7 +1303,7 @@ impl EcReadPath {
                                 Err(e) => {
                                     increment_cell(&s.stats.shard_verification_failures);
                                     eprintln!(
-                                        "store {i} shard verify failed for stripe {stripe_idx}: {e}"
+                                        "store {store_idx} shard {i} verify failed for stripe {stripe_idx}: {e}"
                                     );
                                     available.push(None);
                                     degraded = true;
@@ -1278,7 +1318,9 @@ impl EcReadPath {
                             increment_cell(&s.stats.missing_shard_fallbacks);
                         }
                         Err(e) => {
-                            eprintln!("store {i} read failed for stripe {stripe_idx}: {e}");
+                            eprintln!(
+                                "store {store_idx} read failed for stripe {stripe_idx} shard {i}: {e}"
+                            );
                             available.push(None);
                             degraded = true;
                             fallbacks_used += 1;
@@ -1364,23 +1406,25 @@ impl EcRepairPath {
             let mut repaired = 0usize;
 
             for prefix in &all_prefixes {
-                let mut healthy_store: Option<usize> = None;
+                let mut healthy_shard: Option<usize> = None;
                 for i in 0..sw {
                     let probe_key = shard_key_from_prefix(prefix, 0, i);
-                    if let Ok(Some(_)) = s.stores[i].get(probe_key) {
-                        healthy_store = Some(i);
+                    let store_idx = mapped_store_index(&s.shard_to_store, i, sw);
+                    if let Ok(Some(_)) = s.stores[store_idx].get(probe_key) {
+                        healthy_shard = Some(i);
                         break;
                     }
                 }
-                let h = match healthy_store {
+                let h = match healthy_shard {
                     Some(i) => i,
                     None => continue,
                 };
+                let healthy_store = mapped_store_index(&s.shard_to_store, h, sw);
 
                 let mut num_stripes = 1usize;
                 loop {
                     let probe_key = shard_key_from_prefix(prefix, num_stripes, h);
-                    match s.stores[h].get(probe_key) {
+                    match s.stores[healthy_store].get(probe_key) {
                         Ok(Some(_)) => num_stripes += 1,
                         _ => break,
                     }
@@ -1391,7 +1435,8 @@ impl EcRepairPath {
                         Vec::with_capacity(sw);
                     for i in 0..sw {
                         let sk = shard_key_from_prefix(prefix, stripe_idx, i);
-                        match s.stores[i].get(sk) {
+                        let store_idx = mapped_store_index(&s.shard_to_store, i, sw);
+                        match s.stores[store_idx].get(sk) {
                             Ok(Some(record)) => {
                                 match decode_verified_shard(
                                     prefix,
@@ -1417,7 +1462,7 @@ impl EcRepairPath {
                                             &s.stats.shard_verification_failures,
                                         );
                                         eprintln!(
-                                            "store {i} shard verify failed for stripe {stripe_idx}: {e}"
+                                            "store {store_idx} shard {i} verify failed for stripe {stripe_idx}: {e}"
                                         );
                                         available.push(None);
                                     }
@@ -1429,7 +1474,9 @@ impl EcRepairPath {
 
                     if let Some(recon) = reconstruct(&stripe_config, &available, None) {
                         for rebuilt in &recon.rebuilt_shards {
-                            if rebuilt.index == store_index {
+                            let target_store =
+                                mapped_store_index(&s.shard_to_store, rebuilt.index, sw);
+                            if target_store == store_index {
                                 let sk = shard_key_from_prefix(
                                     prefix,
                                     stripe_idx,
@@ -1442,7 +1489,7 @@ impl EcRepairPath {
                                     &rebuilt.bytes,
                                 )
                                 .map_err(EcStoreError::Internal)?;
-                                s.stores[store_index]
+                                s.stores[target_store]
                                     .put(sk, &shard_record)
                                     .map_err(|e| {
                                         EcStoreError::RepairFailed {
@@ -1476,6 +1523,7 @@ impl EcRepairPath {
 mod tests {
     use super::*;
     use std::fs;
+    use tidefs_durability_layout::{FailureDomainLevel, FailureDomainV1};
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tidefs-ec-{label}-{}", std::process::id()));
@@ -1491,6 +1539,15 @@ mod tests {
 
     fn make_paths(n: usize, label: &str) -> Vec<PathBuf> {
         (0..n).map(|i| temp_dir(&format!("{label}-r{i}"))).collect()
+    }
+
+    fn device_candidate(device_id: u64) -> DeviceCandidate {
+        DeviceCandidate {
+            device_id,
+            node_id: None,
+            rack_id: None,
+            datacenter_id: None,
+        }
     }
 
     // --- 2+1 basic put/get ---
@@ -1711,6 +1768,87 @@ mod tests {
         // Read should now be clean
         let data = store.get_named("r").unwrap();
         assert_eq!(data, Some(b"repair-me".to_vec()));
+
+        cleanup_dirs(&paths);
+    }
+
+    #[test]
+    fn placement_mapping_routes_sync_read_repair_and_delete() {
+        let paths = make_paths(3, "placed");
+        let cfg = ErasureCodedStoreConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 64,
+            store_options: StoreOptions::test_fast(),
+            failure_domain: Some(FailureDomainV1::new(FailureDomainLevel::Device, 3).unwrap()),
+            device_candidates: Some(vec![
+                device_candidate(30),
+                device_candidate(20),
+                device_candidate(10),
+            ]),
+        };
+        let mut store = ErasureCodedStore::open(&paths, cfg).unwrap();
+
+        assert_eq!(store.shard_to_store.get(&0), Some(&2));
+        assert_eq!(store.shard_to_store.get(&1), Some(&1));
+        assert_eq!(store.shard_to_store.get(&2), Some(&0));
+
+        let name = b"placed-object";
+        let key = ObjectKey::from_name(name);
+        let payload = b"placement-backed erasure coded payload".to_vec();
+        store.put_named(name, &payload).unwrap();
+
+        assert!(store.stores[2]
+            .get(shard_object_key(key, 0, 0))
+            .unwrap()
+            .is_some());
+        assert!(store.stores[0]
+            .get(shard_object_key(key, 0, 2))
+            .unwrap()
+            .is_some());
+        assert!(store.stores[0]
+            .get(shard_object_key(key, 0, 0))
+            .unwrap()
+            .is_none());
+
+        let physical_store_2_keys: Vec<_> = store.stores[2].list_keys();
+        for key in &physical_store_2_keys {
+            store.stores[2].delete(*key).unwrap();
+        }
+
+        assert_eq!(store.get_named(name).unwrap(), Some(payload.clone()));
+        assert!(store.stats().degraded_reads.get() >= 1);
+
+        let flushed = store.flush_repairs();
+        assert!(flushed >= 1);
+        assert!(store.stores[2]
+            .get(shard_object_key(key, 0, 0))
+            .unwrap()
+            .is_some());
+
+        let physical_store_2_keys: Vec<_> = store.stores[2].list_keys();
+        for key in &physical_store_2_keys {
+            store.stores[2].delete(*key).unwrap();
+        }
+
+        let repaired = store.repair_store(2).unwrap();
+        assert!(repaired >= 1);
+        assert!(store.stores[2]
+            .get(shard_object_key(key, 0, 0))
+            .unwrap()
+            .is_some());
+        assert_eq!(store.get_named(name).unwrap(), Some(payload));
+
+        assert!(store.delete_named(name).unwrap());
+        assert_eq!(store.get_named(name).unwrap(), None);
+        assert!(store.stores[2]
+            .get(shard_object_key(key, 0, 0))
+            .unwrap()
+            .is_none());
+        assert!(store.stores[0]
+            .get(shard_object_key(key, 0, 2))
+            .unwrap()
+            .is_none());
 
         cleanup_dirs(&paths);
     }
