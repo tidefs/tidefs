@@ -58,7 +58,7 @@ pub struct RdmaDevice {
     _device: *mut ffi::ibv_device, // kept alive for context lifetime
 }
 
-// Safety: ibv_context is thread-safe per the libibverbs spec.
+// SAFETY: ibv_context is thread-safe per the libibverbs spec.
 unsafe impl Send for RdmaDevice {}
 unsafe impl Sync for RdmaDevice {}
 
@@ -66,7 +66,7 @@ impl RdmaDevice {
     /// Open the first available RDMA device in the system.
     pub fn open_first_available() -> Result<Self, String> {
         let mut num_devices: c_int = 0;
-        // Safety: ibv_get_device_list is thread-safe, returns NULL-terminated array.
+        // SAFETY: ibv_get_device_list is thread-safe, returns NULL-terminated array.
         let device_list = unsafe { ffi::ibv_get_device_list(&mut num_devices) };
 
         if device_list.is_null() || num_devices == 0 {
@@ -83,7 +83,7 @@ impl RdmaDevice {
             return Err("device list entry is null".into());
         }
 
-        // Safety: first_device is a valid pointer from ibv_get_device_list.
+        // SAFETY: first_device is a valid pointer from ibv_get_device_list.
         let ctx = unsafe { ffi::ibv_open_device(first_device) };
         if ctx.is_null() {
             // SAFETY: device_list is valid; freeing after failed open is proper
@@ -109,7 +109,7 @@ impl RdmaDevice {
 
     /// Return device name.
     pub fn name(&self) -> String {
-        // Safety: ibv_get_device_name returns a static string tied to the device's lifetime,
+        // SAFETY: ibv_get_device_name returns a static string tied to the device's lifetime,
         // which outlives the context (we hold context and device).
         unsafe {
             let name_ptr = ffi::ibv_get_device_name(self._device);
@@ -331,7 +331,7 @@ impl CompletionQueue {
     pub fn poll(&self, max_count: usize) -> Result<Vec<ffi::ibv_wc>, String> {
         let count = max_count.min(256) as c_int;
         let mut wcs: Vec<ffi::ibv_wc> = Vec::with_capacity(count as usize);
-        // Safety: poll reads into a pre-sized buffer.
+        // SAFETY: poll reads into a pre-sized buffer.
         let n = unsafe {
             // Use a zeroed array on the stack to avoid allocation overhead.
             let mut arr = [std::mem::zeroed::<ffi::ibv_wc>(); 16];

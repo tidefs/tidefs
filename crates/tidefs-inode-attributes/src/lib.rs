@@ -614,7 +614,7 @@ impl InodeAttributeStore for MemInodeAttributeStore {
 /// This is the translation layer consumable by the FUSE adapter.
 #[must_use]
 pub fn to_stat(ino: u64, posix: &PosixAttrs) -> libc::stat {
-    // Safety: zero-initialize the C struct, then fill every field.
+    // SAFETY: zero-initialize the C struct, then fill every field.
     // We never expose padding bytes to safe code; the struct is
     // consumed by the FUSE reply layer.
     #[allow(unsafe_code)]

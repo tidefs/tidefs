@@ -8398,7 +8398,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_replay_extent_lookup(
 // without creating a fresh unbound engine each time.
 
 /// Static engine instance set during mount, used by sync_fs/commit barriers.
-/// Safety: all mounted-engine access is serialized by MOUNTED_ENGINE_LOCK.
+/// SAFETY: all mounted-engine access is serialized by MOUNTED_ENGINE_LOCK.
 static mut MOUNTED_ENGINE: Option<KernelEngine> = None;
 static ENGINE_INITIALIZED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);

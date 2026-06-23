@@ -1166,7 +1166,7 @@ fn blkgetsize64_from_path(path: &Path) -> Option<u64> {
     let file = OpenOptions::new().read(true).open(path).ok()?;
     let fd = file.as_raw_fd();
     let mut size: u64 = 0;
-    // Safety: BLKGETSIZE64 is a well-known Linux block ioctl that writes
+    // SAFETY: BLKGETSIZE64 is a well-known Linux block ioctl that writes
     // exactly 8 bytes into the provided u64 buffer.  The file descriptor
     // is valid (opened above).
     let ret = unsafe { ioctl(fd, BLKGETSIZE64 as std::os::raw::c_ulong, &mut size) };
