@@ -10,6 +10,18 @@ implementation lane status, and roadmap priority framework
 **Depends on**: #1738 (coordination pipeline design seal), #1903 (dataset lifecycle state machine design seal), #1644 (refcount delta cleanup queues implemented-source), #1923 (STATUS.md pipeline status update)
 **Blocks**: All deferred cluster-service wire-up implementation issues
 
+
+> **Historical input (TFR-019 authority classification, GitHub issue #1238):**
+> This imported Forgejo-era coordination pipeline health review (#1914,
+> superseding #1753) records retired lane-health machinery, active-lane status
+> statements, coordinator-proliferation audit data, priority-ordering data
+> structures and scheduling algorithms, deferred-wire-up claims, and
+> `STATUS.md`/`FEATURE_MATRIX.md` references. Current TideFS coordination
+> authority lives in GitHub issues and pull requests plus active repo docs such
+> as `docs/INDEX.md` and `docs/GITHUB_PR_DEVELOPMENT.md`; this file is not
+> current policy, automation behavior, implementation status, release-readiness
+> evidence, worker scheduling authority, or product authority.
+
 ## Abstract
 
 This document performs a coordination pipeline health review and formalizes the
