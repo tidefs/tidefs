@@ -4891,6 +4891,18 @@ impl LocalFileSystem {
         self.hot_read_cache.borrow().report()
     }
 
+    /// Attach cache-governor accounting to the local hot-read and inode caches.
+    ///
+    /// Hot-read resident bytes charge L1 [`tidefs_cache_core::BudgetCategory::DataCache`],
+    /// while inode-record and directory-associated state charges
+    /// [`tidefs_cache_core::BudgetCategory::InodeState`].
+    pub fn set_cache_governor(&self, governor: tidefs_cache_core::Governor) {
+        self.hot_read_cache
+            .borrow_mut()
+            .set_governor(governor.clone());
+        self.inode_cache.borrow_mut().set_governor(governor);
+    }
+
     pub const fn allocator_policy(&self) -> LocalStorageAllocatorPolicy {
         self.allocator_policy
     }

@@ -12,11 +12,15 @@ authors.workspace = true
 
 description = "Cache lattice runtime: registry, eviction, invalidation, and cache-lattice view management (P4-02 Phase 2)"
 
+[features]
+default = []
+adapter-workers-io = ["dep:tidefs-posix-filesystem-adapter-workers-io"]
+
 [dependencies]
 blake3 = { version = "1", default-features = false }
 tidefs-types-cache-lattice-core = { workspace = true }
 tidefs-cache-coherency = { workspace = true }
-tidefs-posix-filesystem-adapter-workers-io = { workspace = true }
+tidefs-posix-filesystem-adapter-workers-io = { workspace = true, optional = true }
 
 [dev-dependencies]
 tidefs-types-cache-lattice-core = { workspace = true }

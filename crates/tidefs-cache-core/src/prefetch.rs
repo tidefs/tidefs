@@ -7,6 +7,10 @@
 
 use std::collections::HashMap;
 
+use crate::{
+    budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor,
+};
+
 /// Tracks recent read offsets per file handle to classify access patterns.
 ///
 /// Each handle maintains a bounded ring of the last N read offsets.
@@ -462,6 +466,8 @@ pub struct PrefetchService {
     stats: PrefetchStats,
     /// Last planned readahead window per handle: (start_offset, window_bytes).
     planned: std::collections::HashMap<u64, (u64, u64)>,
+    /// Optional resource governor for L2 prefetch/read-ahead window budgets.
+    governor: Option<Governor>,
 }
 
 impl PrefetchService {
@@ -477,7 +483,13 @@ impl PrefetchService {
             planner,
             stats: PrefetchStats::new(),
             planned: std::collections::HashMap::new(),
+            governor: None,
         }
+    }
+
+    /// Attach resource-governor accounting for planned L2 prefetch windows.
+    pub fn set_governor(&mut self, governor: Governor) {
+        self.governor = Some(governor);
     }
 
     /// Feed a read at `offset` on `handle_id` into the detector.
@@ -492,6 +504,10 @@ impl PrefetchService {
     pub fn on_read(&mut self, handle_id: u64, offset: u64) -> Option<(u64, u64)> {
         self.detector.record_read(handle_id, offset);
         let window = self.planner.plan(&self.detector, handle_id)?;
+        self.release_planned_window(handle_id);
+        if !self.admit_window_budget(window.1) {
+            return None;
+        }
         self.stats.record_sequential_detection();
         self.planned.insert(handle_id, window);
         Some(window)
@@ -510,20 +526,21 @@ impl PrefetchService {
     /// This updates statistics and removes the planned window for the handle.
     pub fn on_prefetch_hit(&mut self, handle_id: u64) {
         self.stats.record_prefetch_hit();
-        let _ = self.planned.remove(&handle_id);
+        self.release_planned_window(handle_id);
     }
 
     /// Record a prefetch miss: a demand read arrived before prefetch
     /// completed for this handle.
     pub fn on_prefetch_miss(&mut self, handle_id: u64) {
         self.stats.record_prefetch_miss();
-        let _ = self.planned.remove(&handle_id);
+        self.release_planned_window(handle_id);
     }
 
     /// Record wasted bytes: `bytes` of prefetched data were evicted
     /// from cache before being read.
-    pub fn on_prefetch_wasted(&mut self, _handle_id: u64, bytes: u64) {
+    pub fn on_prefetch_wasted(&mut self, handle_id: u64, bytes: u64) {
         self.stats.record_wasted_bytes(bytes);
+        self.release_planned_window(handle_id);
     }
 
     /// Record that a prefetch IO of `bytes` was issued.
@@ -542,7 +559,7 @@ impl PrefetchService {
     pub fn on_file_closed(&mut self, handle_id: u64) {
         self.stats.record_file_untracked();
         self.detector.clear(handle_id);
-        self.planned.remove(&handle_id);
+        self.release_planned_window(handle_id);
     }
 
     /// Return a shared reference to the statistics collector.
@@ -568,6 +585,36 @@ impl PrefetchService {
     pub fn planned_count(&self) -> usize {
         self.planned.len()
     }
+
+    fn budget_category() -> BudgetCategory {
+        budget_category_for_cache_level(CacheBudgetLevel::L2PrefetchReadAhead)
+    }
+
+    fn admit_window_budget(&mut self, bytes: u64) -> bool {
+        if let Some(ref governor) = self.governor {
+            return governor.admit(Self::budget_category(), bytes).is_ok();
+        }
+        true
+    }
+
+    fn release_window_budget(&self, bytes: u64) {
+        if let Some(ref governor) = self.governor {
+            governor.release(Self::budget_category(), bytes);
+        }
+    }
+
+    fn release_planned_window(&mut self, handle_id: u64) {
+        if let Some((_, bytes)) = self.planned.remove(&handle_id) {
+            self.release_window_budget(bytes);
+        }
+    }
+}
+
+impl Drop for PrefetchService {
+    fn drop(&mut self) {
+        let bytes: u64 = self.planned.values().map(|(_, bytes)| *bytes).sum();
+        self.release_window_budget(bytes);
+    }
 }
 // ---------------------------------------------------------------------------
 // Tests
@@ -576,6 +623,19 @@ impl PrefetchService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn data_governor() -> Governor {
+        Governor::new(crate::GovernorConfig {
+            total_budget_bytes: 1024 * 1024,
+            data_cache_fraction: 1.0,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
+    }
 
     // ── Sequential detection ─────────────────────────────────────────
 
@@ -1267,6 +1327,26 @@ mod tests {
         // Hit on 110 clears its plan
         svc.on_prefetch_hit(110);
         assert_eq!(svc.planned_count(), 1);
+    }
+
+    #[test]
+    fn service_governor_charges_planned_readahead_to_data_cache() {
+        let det = SequentialDetector::new(8, 3);
+        let planner = ReadaheadPlanner::new(65536, 2.0, 4096);
+        let governor = data_governor();
+        let mut svc = PrefetchService::new(det, planner);
+        svc.set_governor(governor.clone());
+
+        svc.on_read(120, 0);
+        svc.on_read(120, 4096);
+        let (_, window_bytes) = svc.on_read(120, 8192).unwrap();
+        assert_eq!(
+            governor.category_used(BudgetCategory::DataCache),
+            window_bytes
+        );
+
+        svc.on_prefetch_hit(120);
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
     }
 
     #[test]

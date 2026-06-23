@@ -12,6 +12,7 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use tidefs_types_cache_lattice_core::{CacheClass, CacheEntryHeader};
 
 // ── Budget categories ────────────────────────────────────────────────────
 
@@ -44,6 +45,88 @@ impl fmt::Display for BudgetCategory {
             Self::ClusterQueues => write!(f, "cluster_queues"),
             Self::Misc => write!(f, "misc"),
         }
+    }
+}
+
+// ── Cache-level mapping ─────────────────────────────────────────────────
+
+/// Concrete cache level whose allocations must be charged to the governor.
+///
+/// This is the centralized cache-level-to-budget-category mapping from
+/// `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`.  Concrete cache callers use
+/// these variants instead of selecting budget categories from local strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CacheBudgetLevel {
+    /// L1 hot read cache: frequently-read payload bytes.
+    L1HotRead,
+    /// L2 speculative prefetch or read-ahead bytes.
+    L2PrefetchReadAhead,
+    /// L2ARC-like secondary read cache metadata and resident payload handles.
+    L2Arc,
+    /// L3 decoded metadata nodes and authority read mirrors.
+    L3DecodedMetadata,
+    /// L4 directory listing cache.
+    L4DirectoryListing,
+    /// L4 path/dentry lookup cache.
+    L4PathLookup,
+    /// L4 decoded namespace/view cache.
+    L4DecodedView,
+    /// L5 dirty/writeback page buffers.
+    L5DirtyWriteback,
+    /// Per-inode runtime state and inode-record cache.
+    InodeState,
+    /// Cluster/session/transport queue state.
+    ClusterQueue,
+    /// Miscellaneous bounded runtime cache or scratch state.
+    Misc,
+}
+
+/// Return the governor category for a concrete cache level.
+#[must_use]
+pub const fn budget_category_for_cache_level(level: CacheBudgetLevel) -> BudgetCategory {
+    match level {
+        CacheBudgetLevel::L1HotRead
+        | CacheBudgetLevel::L2PrefetchReadAhead
+        | CacheBudgetLevel::L2Arc => BudgetCategory::DataCache,
+        CacheBudgetLevel::L3DecodedMetadata
+        | CacheBudgetLevel::L4DirectoryListing
+        | CacheBudgetLevel::L4PathLookup
+        | CacheBudgetLevel::L4DecodedView => BudgetCategory::MetaCache,
+        CacheBudgetLevel::L5DirtyWriteback => BudgetCategory::DirtyBytes,
+        CacheBudgetLevel::InodeState => BudgetCategory::InodeState,
+        CacheBudgetLevel::ClusterQueue => BudgetCategory::ClusterQueues,
+        CacheBudgetLevel::Misc => BudgetCategory::Misc,
+    }
+}
+
+/// Return the governor category for cache-lattice classes that flow through
+/// [`crate::CacheLatticeRegistry`].
+#[must_use]
+pub const fn budget_category_for_cache_class(class: CacheClass) -> BudgetCategory {
+    match class {
+        CacheClass::AuthorityReadMirror | CacheClass::AllocatorHotSummary => {
+            BudgetCategory::MetaCache
+        }
+        CacheClass::PosixNamespaceMirror => BudgetCategory::MetaCache,
+        CacheClass::PublicationStaging => BudgetCategory::DirtyBytes,
+        CacheClass::PosixPageWriteback => BudgetCategory::DataCache,
+        CacheClass::BlockVolumeMappingQueue => BudgetCategory::DirtyBytes,
+        CacheClass::ProductRuntime | CacheClass::ValidationObserve => BudgetCategory::Misc,
+        CacheClass::SessionFence => BudgetCategory::ClusterQueues,
+    }
+}
+
+/// Return the governor category for a concrete cache-lattice entry.
+///
+/// Dirty entries are charged to [`BudgetCategory::DirtyBytes`] regardless of
+/// cache class, because L5 dirty/writeback bytes must drain through writeback
+/// and must not be treated as clean evictable cache.
+#[must_use]
+pub fn budget_category_for_entry(header: &CacheEntryHeader) -> BudgetCategory {
+    if header.dirty_state.is_dirty() {
+        BudgetCategory::DirtyBytes
+    } else {
+        budget_category_for_cache_class(header.cache_class)
     }
 }
 
@@ -363,19 +446,70 @@ impl Governor {
     pub fn release(&self, category: BudgetCategory, size: u64) {
         let mut inner = self.inner.lock().unwrap();
         let idx = Self::category_index(category);
-        let soft_watermark = inner.category_configs[idx].soft_watermark;
-        let cap = inner.category_configs[idx].cap;
 
         let released = inner.categories[idx].used.min(size);
         inner.categories[idx].used -= released;
         inner.total_used = inner.total_used.saturating_sub(released);
 
-        // Recompute pressure signals.
-        let used = inner.categories[idx].used;
-        let (soft_pressure, hard_pressure) =
-            Self::pressure_flags(used, cap, soft_watermark);
-        inner.categories[idx].hard_pressure = hard_pressure;
-        inner.categories[idx].soft_pressure = soft_pressure;
+        Self::refresh_pressure_locked(&mut inner, idx);
+    }
+
+    /// Move an already-admitted allocation between categories without changing
+    /// total daemon memory usage.
+    ///
+    /// This keeps page-cache clean/dirty transitions atomic from the governor's
+    /// perspective: a clean page can become dirty by transferring bytes from
+    /// `DataCache` to `DirtyBytes`, and a successful writeback can transfer
+    /// them back to clean cache.
+    pub fn transfer(
+        &self,
+        from: BudgetCategory,
+        to: BudgetCategory,
+        size: u64,
+    ) -> Result<(), BudgetError> {
+        if from == to || size == 0 {
+            return Ok(());
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+        let from_idx = Self::category_index(from);
+        let to_idx = Self::category_index(to);
+        let used_from = inner.categories[from_idx].used;
+        if used_from < size {
+            return Err(BudgetError::OverBudget {
+                category: from,
+                requested: size,
+                available: used_from,
+            });
+        }
+        let total_after_release = inner.total_used.saturating_sub(size);
+        let total_after_transfer = total_after_release.saturating_add(size);
+        let total_budget = inner.config.total_budget_bytes;
+
+        if total_after_transfer > total_budget {
+            return Err(BudgetError::GlobalOverBudget {
+                requested: size,
+                available: total_budget.saturating_sub(total_after_release),
+            });
+        }
+
+        let hard_limit = inner.category_configs[to_idx].hard_limit;
+        let used_to = inner.categories[to_idx].used;
+        let new_used_to = used_to.saturating_add(size);
+        if new_used_to > hard_limit {
+            return Err(BudgetError::OverBudget {
+                category: to,
+                requested: size,
+                available: hard_limit.saturating_sub(used_to),
+            });
+        }
+
+        inner.categories[from_idx].used = used_from - size;
+        inner.categories[to_idx].used = new_used_to;
+        inner.total_used = total_after_transfer;
+        Self::refresh_pressure_locked(&mut inner, from_idx);
+        Self::refresh_pressure_locked(&mut inner, to_idx);
+        Ok(())
     }
 
     /// Return the backpressure signal for a specific category.
@@ -459,6 +593,16 @@ impl Governor {
         let soft_pressure = used >= soft_watermark;
         (soft_pressure, hard_pressure)
     }
+
+    fn refresh_pressure_locked(inner: &mut GovernorInner, idx: usize) {
+        let used = inner.categories[idx].used;
+        let cap = inner.category_configs[idx].cap;
+        let soft_watermark = inner.category_configs[idx].soft_watermark;
+        let (soft_pressure, hard_pressure) =
+            Self::pressure_flags(used, cap, soft_watermark);
+        inner.categories[idx].hard_pressure = hard_pressure;
+        inner.categories[idx].soft_pressure = soft_pressure;
+    }
 }
 
 impl fmt::Debug for Governor {
@@ -488,6 +632,9 @@ impl fmt::Debug for Governor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_types_cache_lattice_core::{
+        DirtyStateClass, MemoryDomain, PosixWritebackState, RebuildCostClass,
+    };
 
     fn test_config() -> GovernorConfig {
         GovernorConfig::default()
@@ -779,5 +926,100 @@ mod tests {
     fn budget_category_display() {
         assert_eq!(format!("{}", BudgetCategory::DataCache), "data_cache");
         assert_eq!(format!("{}", BudgetCategory::MetaCache), "meta_cache");
+    }
+
+    #[test]
+    fn cache_level_mapping_matches_governor_categories() {
+        assert_eq!(
+            budget_category_for_cache_level(CacheBudgetLevel::L1HotRead),
+            BudgetCategory::DataCache
+        );
+        assert_eq!(
+            budget_category_for_cache_level(CacheBudgetLevel::L2PrefetchReadAhead),
+            BudgetCategory::DataCache
+        );
+        assert_eq!(
+            budget_category_for_cache_level(CacheBudgetLevel::L4DirectoryListing),
+            BudgetCategory::MetaCache
+        );
+        assert_eq!(
+            budget_category_for_cache_level(CacheBudgetLevel::L5DirtyWriteback),
+            BudgetCategory::DirtyBytes
+        );
+        assert_eq!(
+            budget_category_for_cache_level(CacheBudgetLevel::InodeState),
+            BudgetCategory::InodeState
+        );
+    }
+
+    #[test]
+    fn cache_entry_mapping_uses_class_and_dirty_override() {
+        let mut header = CacheEntryHeader::new(
+            CacheClass::PosixNamespaceMirror,
+            MemoryDomain::AdapterServingHot,
+            1,
+            "path_lookup",
+            RebuildCostClass::Cheap,
+            1,
+        );
+        assert_eq!(budget_category_for_entry(&header), BudgetCategory::MetaCache);
+
+        header.cache_class = CacheClass::PosixPageWriteback;
+        assert_eq!(budget_category_for_entry(&header), BudgetCategory::DataCache);
+
+        header.dirty_state = DirtyStateClass::PosixWriteback(PosixWritebackState::DirtyOpen);
+        assert_eq!(budget_category_for_entry(&header), BudgetCategory::DirtyBytes);
+    }
+
+    #[test]
+    fn transfer_moves_usage_between_categories_without_changing_total() {
+        let config = GovernorConfig {
+            total_budget_bytes: 1000,
+            data_cache_fraction: 0.5,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.5,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        };
+        let g = Governor::new(config).unwrap();
+        g.admit(BudgetCategory::DataCache, 256).unwrap();
+
+        g.transfer(BudgetCategory::DataCache, BudgetCategory::DirtyBytes, 256)
+            .unwrap();
+
+        assert_eq!(g.category_used(BudgetCategory::DataCache), 0);
+        assert_eq!(g.category_used(BudgetCategory::DirtyBytes), 256);
+        assert_eq!(g.total_used(), 256);
+    }
+
+    #[test]
+    fn transfer_rejects_missing_source_bytes_without_changing_usage() {
+        let config = GovernorConfig {
+            total_budget_bytes: 1000,
+            data_cache_fraction: 0.5,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.5,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        };
+        let g = Governor::new(config).unwrap();
+        g.admit(BudgetCategory::DataCache, 128).unwrap();
+
+        let err = g
+            .transfer(BudgetCategory::DataCache, BudgetCategory::DirtyBytes, 256)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BudgetError::OverBudget {
+                category: BudgetCategory::DataCache,
+                requested: 256,
+                available: 128,
+            }
+        );
+        assert_eq!(g.category_used(BudgetCategory::DataCache), 128);
+        assert_eq!(g.category_used(BudgetCategory::DirtyBytes), 0);
+        assert_eq!(g.total_used(), 128);
     }
 }

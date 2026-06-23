@@ -89,7 +89,11 @@ use tidefs_types_cache_lattice_core::{
 pub use weighted_arc::{ArcList, ArcWeightStats, WeightedArc, WeightedArcEntry};
 
 // Re-exports from governor
-pub use governor::{AdmissionTicket, BackpressureSignal, BudgetCategory, BudgetError, Governor, GovernorConfig};
+pub use governor::{
+    budget_category_for_cache_class, budget_category_for_cache_level, budget_category_for_entry,
+    AdmissionTicket, BackpressureSignal, BudgetCategory, BudgetError, CacheBudgetLevel, Governor,
+    GovernorConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Entry weight for ARC eviction
@@ -723,7 +727,10 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
     /// Release bytes for an evicted or invalidated entry.
     fn release_entry(&self, entry: &CacheEntry<V>) {
         if let Some(ref gov) = self.governor {
-            gov.release(BudgetCategory::DataCache, entry.header.entry_size_bytes);
+            gov.release(
+                budget_category_for_entry(&entry.header),
+                entry.header.entry_size_bytes,
+            );
         }
     }
 
@@ -789,6 +796,7 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
         entry: CacheEntry<V>,
     ) -> Option<CacheEntry<V>> {
         let size = entry.header.entry_size_bytes;
+        let category = budget_category_for_entry(&entry.header);
         let replaced = if self.governor.is_some() {
             self.stores
                 .get_mut(&class)
@@ -803,19 +811,22 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
         // Governor-aware admission with pressure shedding and one eviction
         // retry on OverBudget.
         if let Some(ref gov) = self.governor {
-            let pressure = gov.backpressure(BudgetCategory::DataCache);
+            let pressure = gov.backpressure(category);
             if matches!(
                 pressure,
                 BackpressureSignal::SoftPressure | BackpressureSignal::HardPressure
             ) {
                 if let Some(store) = self.stores.get_mut(&class) {
                     if let Some(victim) = store.evict_one() {
-                        gov.release(BudgetCategory::DataCache, victim.header.entry_size_bytes);
+                        gov.release(
+                            budget_category_for_entry(&victim.header),
+                            victim.header.entry_size_bytes,
+                        );
                         self.total_evictions += 1;
                     }
                 }
             }
-            match gov.admit(BudgetCategory::DataCache, size) {
+            match gov.admit(category, size) {
                 Ok(_ticket) => {} // granted
                 Err(BudgetError::OverBudget { .. })
                 | Err(BudgetError::GlobalOverBudget { .. }) => {
@@ -823,14 +834,14 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
                     if let Some(store) = self.stores.get_mut(&class) {
                         if let Some(victim) = store.evict_one() {
                             gov.release(
-                                BudgetCategory::DataCache,
+                                budget_category_for_entry(&victim.header),
                                 victim.header.entry_size_bytes,
                             );
                             self.total_evictions += 1;
                         }
                     }
                     // Retry admission after eviction.
-                    if gov.admit(BudgetCategory::DataCache, size).is_err() {
+                    if gov.admit(category, size).is_err() {
                         if replaced.is_some() {
                             self.total_evictions += 1;
                         }
@@ -1220,15 +1231,22 @@ mod tests {
         h
     }
 
-    fn data_cache_governor(total_budget_bytes: u64) -> Governor {
+    fn single_category_governor(category: BudgetCategory, total_budget_bytes: u64) -> Governor {
+        let fraction = |candidate| {
+            if category == candidate {
+                1.0
+            } else {
+                0.0
+            }
+        };
         Governor::new(GovernorConfig {
             total_budget_bytes,
-            data_cache_fraction: 1.0,
-            meta_cache_fraction: 0.0,
-            dirty_bytes_fraction: 0.0,
-            inode_state_fraction: 0.0,
-            cluster_queues_fraction: 0.0,
-            misc_fraction: 0.0,
+            data_cache_fraction: fraction(BudgetCategory::DataCache),
+            meta_cache_fraction: fraction(BudgetCategory::MetaCache),
+            dirty_bytes_fraction: fraction(BudgetCategory::DirtyBytes),
+            inode_state_fraction: fraction(BudgetCategory::InodeState),
+            cluster_queues_fraction: fraction(BudgetCategory::ClusterQueues),
+            misc_fraction: fraction(BudgetCategory::Misc),
         })
         .unwrap()
     }
@@ -1374,7 +1392,7 @@ mod tests {
 
     #[test]
     fn registry_governor_releases_budget_on_invalidation() {
-        let governor = data_cache_governor(1000);
+        let governor = single_category_governor(BudgetCategory::MetaCache, 1000);
         let mut reg: CacheLatticeRegistry<u64, String> = CacheLatticeRegistry::new();
         reg.set_governor(governor.clone());
         reg.register_cache(CacheClass::PosixNamespaceMirror, 10, EvictionPolicyKind::Lru);
@@ -1389,19 +1407,19 @@ mod tests {
             );
         }
 
-        assert_eq!(governor.category_used(BudgetCategory::DataCache), 500);
+        assert_eq!(governor.category_used(BudgetCategory::MetaCache), 500);
         let count = reg.invalidate_by_key_prefix(CacheClass::PosixNamespaceMirror, |k| *k < 3);
         assert_eq!(count, 3);
-        assert_eq!(governor.category_used(BudgetCategory::DataCache), 200);
+        assert_eq!(governor.category_used(BudgetCategory::MetaCache), 200);
 
         let count = reg.invalidate_all(CacheClass::PosixNamespaceMirror);
         assert_eq!(count, 2);
-        assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
+        assert_eq!(governor.category_used(BudgetCategory::MetaCache), 0);
     }
 
     #[test]
     fn registry_governor_replacement_releases_before_admission() {
-        let governor = data_cache_governor(100);
+        let governor = single_category_governor(BudgetCategory::MetaCache, 100);
         let mut reg: CacheLatticeRegistry<u64, String> = CacheLatticeRegistry::new();
         reg.set_governor(governor.clone());
         reg.register_cache(CacheClass::PosixNamespaceMirror, 10, EvictionPolicyKind::Lru);
@@ -1414,7 +1432,7 @@ mod tests {
             1,
             CacheEntry::new(old_header, "old".into()),
         );
-        assert_eq!(governor.category_used(BudgetCategory::DataCache), 100);
+        assert_eq!(governor.category_used(BudgetCategory::MetaCache), 100);
 
         let mut new_header = make_servable_header(1);
         new_header.entry_size_bytes = 100;
@@ -1426,7 +1444,7 @@ mod tests {
         );
 
         assert_eq!(evicted.unwrap().value, "old");
-        assert_eq!(governor.category_used(BudgetCategory::DataCache), 100);
+        assert_eq!(governor.category_used(BudgetCategory::MetaCache), 100);
         assert_eq!(
             reg.get(CacheClass::PosixNamespaceMirror, &1)
                 .unwrap()
@@ -1437,7 +1455,7 @@ mod tests {
 
     #[test]
     fn registry_governor_consumes_soft_pressure_on_insert() {
-        let governor = data_cache_governor(1000);
+        let governor = single_category_governor(BudgetCategory::MetaCache, 1000);
         let mut reg: CacheLatticeRegistry<u64, String> = CacheLatticeRegistry::new();
         reg.set_governor(governor.clone());
         reg.register_cache(CacheClass::PosixNamespaceMirror, 10, EvictionPolicyKind::Lru);
@@ -1450,7 +1468,7 @@ mod tests {
             CacheEntry::new(first, "first".into()),
         );
         assert_eq!(
-            governor.backpressure(BudgetCategory::DataCache),
+            governor.backpressure(BudgetCategory::MetaCache),
             BackpressureSignal::SoftPressure
         );
 
@@ -1463,7 +1481,7 @@ mod tests {
         );
 
         assert_eq!(reg.eviction_count(), 1);
-        assert_eq!(governor.category_used(BudgetCategory::DataCache), 50);
+        assert_eq!(governor.category_used(BudgetCategory::MetaCache), 50);
         assert!(reg.get(CacheClass::PosixNamespaceMirror, &1).is_none());
         assert!(reg.get(CacheClass::PosixNamespaceMirror, &2).is_some());
     }

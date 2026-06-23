@@ -8,6 +8,9 @@
 //!
 use std::collections::BTreeMap;
 
+use tidefs_cache_core::{
+    budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor,
+};
 use tidefs_types_vfs_core::InodeId;
 
 use tidefs_types_cache_lattice_core::{
@@ -74,6 +77,7 @@ pub(crate) struct InodeCache {
     admission_rejected_dirty_state: u64,
     poisoned_on_validate: u64,
     monotonic_counter: u64,
+    governor: Option<Governor>,
 }
 
 fn approx_entry_size(cached: &CachedInode) -> u64 {
@@ -133,6 +137,42 @@ impl InodeCache {
             admission_rejected_dirty_state: 0,
             poisoned_on_validate: 0,
             monotonic_counter: 0,
+            governor: None,
+        }
+    }
+
+    /// Attach resource-governor accounting for per-inode cache state.
+    pub(crate) fn set_governor(&mut self, governor: Governor) {
+        self.governor = Some(governor);
+    }
+
+    fn budget_category() -> BudgetCategory {
+        budget_category_for_cache_level(CacheBudgetLevel::InodeState)
+    }
+
+    fn admit_budget(&mut self, bytes: u64) -> bool {
+        if let Some(ref governor) = self.governor {
+            if governor.admit(Self::budget_category(), bytes).is_err() {
+                self.admission_rejected_budget =
+                    self.admission_rejected_budget.saturating_add(1);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release_budget(&self, bytes: u64) {
+        if let Some(ref governor) = self.governor {
+            governor.release(Self::budget_category(), bytes);
+        }
+    }
+
+    fn resize_budget(&mut self, old_bytes: u64, new_bytes: u64) -> bool {
+        if new_bytes > old_bytes {
+            self.admit_budget(new_bytes - old_bytes)
+        } else {
+            self.release_budget(old_bytes - new_bytes);
+            true
         }
     }
 
@@ -283,6 +323,7 @@ impl InodeCache {
             }
             self.resident_bytes = self.resident_bytes.saturating_sub(len);
             self.evictions = self.evictions.saturating_add(1);
+            self.release_budget(len);
             self.enforce_ghost_cap();
             self.enforce_ghost_entry_cap();
             return Some(len);
@@ -338,6 +379,9 @@ impl InodeCache {
         // Check T1 — promote to T2
         if let Some(idx) = self.t1.iter().position(|e| e.inode_id == inode_id) {
             let old_size = approx_entry_size(&self.t1[idx].cached);
+            if !self.resize_budget(old_size, entry_size) {
+                return;
+            }
             self.resident_bytes = self.resident_bytes.saturating_sub(old_size);
             self.t1.remove(idx);
             let hdr = self.header(entry_size);
@@ -356,6 +400,9 @@ impl InodeCache {
         // Check T2 — update in-place
         if let Some(idx) = self.t2.iter().position(|e| e.inode_id == inode_id) {
             let old_size = approx_entry_size(&self.t2[idx].cached);
+            if !self.resize_budget(old_size, entry_size) {
+                return;
+            }
             self.resident_bytes = self.resident_bytes.saturating_sub(old_size);
             self.t2.remove(idx);
             let hdr = self.header(entry_size);
@@ -391,6 +438,9 @@ impl InodeCache {
 
         // Admit to T1 — header is constructed first to avoid borrow conflict
         let hdr = self.header(entry_size);
+        if !self.admit_budget(entry_size) {
+            return;
+        }
         self.resident_bytes = self.resident_bytes.saturating_add(entry_size);
         self.t1.insert(
             0,
@@ -410,12 +460,14 @@ impl InodeCache {
             let s = approx_entry_size(&self.t1[idx].cached);
             self.resident_bytes = self.resident_bytes.saturating_sub(s);
             self.t1.remove(idx);
+            self.release_budget(s);
             return;
         }
         if let Some(idx) = self.t2.iter().position(|e| e.inode_id == inode_id) {
             let s = approx_entry_size(&self.t2[idx].cached);
             self.resident_bytes = self.resident_bytes.saturating_sub(s);
             self.t2.remove(idx);
+            self.release_budget(s);
             return;
         }
         self.b1.retain(|(k, _w)| *k != inode_id);
@@ -428,6 +480,7 @@ impl InodeCache {
     }
 
     pub(crate) fn clear(&mut self) {
+        self.release_budget(self.resident_bytes);
         self.t1.clear();
         self.t2.clear();
         self.b1.clear();
@@ -562,6 +615,39 @@ mod tests {
             max_entries: 16,
             max_bytes: 1024 * 1024,
         }
+    }
+
+    fn inode_governor() -> Governor {
+        Governor::new(tidefs_cache_core::GovernorConfig {
+            total_budget_bytes: 4096,
+            data_cache_fraction: 0.0,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 1.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn governor_charges_inode_entries_to_inode_state() {
+        let governor = inode_governor();
+        let mut cache = InodeCache::new(policy());
+        cache.set_governor(governor.clone());
+        let id = InodeId::new(1);
+        let entry = cached(1);
+        let entry_size = approx_entry_size(&entry);
+
+        cache.insert(id, entry);
+        assert_eq!(
+            governor.category_used(BudgetCategory::InodeState),
+            entry_size
+        );
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
+
+        cache.invalidate(id);
+        assert_eq!(governor.category_used(BudgetCategory::InodeState), 0);
     }
 
     #[test]

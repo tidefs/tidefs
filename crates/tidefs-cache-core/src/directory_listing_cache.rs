@@ -14,7 +14,7 @@ use tidefs_types_cache_lattice_core::{
     CacheClass, CacheEntryHeader, MemoryDomain, RebuildCostClass, ValidityToken,
 };
 
-use crate::{initial_entry_weight, CacheEntry, CacheLatticeRegistry};
+use crate::{initial_entry_weight, CacheEntry, CacheLatticeRegistry, Governor};
 
 // ---------------------------------------------------------------------------
 // DirListingEntry
@@ -120,6 +120,14 @@ impl DirectoryListingCache {
             registry: CacheLatticeRegistry::new(),
             stats: DirectoryListingCacheStats::default(),
         }
+    }
+
+    /// Attach a resource governor for directory-listing cache admission.
+    ///
+    /// Directory listings are L4 namespace metadata and are charged through
+    /// the centralized cache-core mapping as [`crate::BudgetCategory::MetaCache`].
+    pub fn set_governor(&mut self, governor: Governor) {
+        self.registry.set_governor(governor);
     }
 
     /// Look up a cached directory listing for `dir_ino`.
@@ -269,6 +277,36 @@ mod tests {
             token,
             1700000000000,
         )
+    }
+
+    fn meta_governor() -> Governor {
+        Governor::new(crate::GovernorConfig {
+            total_budget_bytes: 4096,
+            data_cache_fraction: 0.0,
+            meta_cache_fraction: 1.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn governor_charges_directory_listing_to_meta_cache() {
+        let governor = meta_governor();
+        let mut cache = DirectoryListingCache::new();
+        cache.set_governor(governor.clone());
+        let token = ValidityToken::compute(1, b"dir_v1");
+        let listing = sample_listing(token);
+        let size = listing.size_bytes;
+
+        cache.insert(42, listing);
+        assert_eq!(governor.category_used(crate::BudgetCategory::MetaCache), size);
+        assert_eq!(governor.category_used(crate::BudgetCategory::DataCache), 0);
+
+        cache.invalidate(42);
+        assert_eq!(governor.category_used(crate::BudgetCategory::MetaCache), 0);
     }
 
     // ── basic insert and get ───────────────────────────────────────
