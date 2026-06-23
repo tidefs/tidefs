@@ -285,6 +285,83 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
             return Ok(entries);
         }
     }
+    if allow_holes && old_record.size != new_record.size && !overlay_bytes.is_empty() {
+        if let crate::records::ContentLayout::Chunked(ref manifest) = old_layout {
+            let new_chunk_count = content_chunk_count(new_record.size)?;
+            for old_ref in &manifest.chunks {
+                if old_ref.is_hole() || old_ref.chunk_index >= new_chunk_count {
+                    continue;
+                }
+                let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+                let chunk_start = content_chunk_start(old_ref.chunk_index)?;
+                let chunk_end = chunk_start.checked_add(u64::from(new_len)).ok_or(
+                    FileSystemError::SizeOverflow {
+                        requested: u64::MAX,
+                    },
+                )?;
+                if range_intersects_overlay(chunk_start, chunk_end, overlay_offset, overlay_bytes)?
+                {
+                    continue;
+                }
+
+                let data_version = if old_ref.len == new_len {
+                    old_ref.data_version
+                } else {
+                    new_record.data_version
+                };
+                let grains = allocation_grains_for_len(u64::from(new_len))?;
+                debug_assert!(
+                    grains % content_chunk_size() as u64 == 0,
+                    "retained sparse size-changing overlay chunk allocation grains must be grain-aligned"
+                );
+                entries.insert(
+                    content_chunk_object_key_for_version(
+                        new_record.inode_id,
+                        data_version,
+                        old_ref.chunk_index,
+                    ),
+                    grains,
+                );
+            }
+            if let Some((first_overlay_chunk, last_overlay_chunk)) =
+                overlay_chunk_index_bounds(new_record.size, overlay_offset, overlay_bytes.len())?
+            {
+                for chunk_index in first_overlay_chunk..=last_overlay_chunk {
+                    let len = content_chunk_len(new_record.size, chunk_index)?;
+                    let old_chunk_is_sparse_zero =
+                        match find_chunk_in_manifest(manifest, chunk_index) {
+                            Some(chunk_ref) => chunk_ref.is_hole(),
+                            None => true,
+                        };
+                    if old_chunk_is_sparse_zero
+                        && overlay_chunk_writes_only_zeros(
+                            chunk_index,
+                            len,
+                            overlay_offset,
+                            overlay_bytes,
+                        )?
+                    {
+                        continue;
+                    }
+
+                    let grains = allocation_grains_for_len(u64::from(len))?;
+                    debug_assert!(
+                        grains % content_chunk_size() as u64 == 0,
+                        "new sparse size-changing overlay chunk allocation grains must be grain-aligned"
+                    );
+                    entries.insert(
+                        content_chunk_object_key_for_version(
+                            new_record.inode_id,
+                            new_record.data_version,
+                            chunk_index,
+                        ),
+                        grains,
+                    );
+                }
+            }
+            return Ok(entries);
+        }
+    }
     for chunk_index in 0..content_chunk_count(new_record.size)? {
         if let Some(retained) = retained_content_chunk_ref(
             &old_layout,
@@ -788,5 +865,76 @@ pub(crate) fn queue_extent_keys_for_reclaim(
             -1,
             QueueFamily::Extent,
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tidefs_types_vfs_core::{Generation, NodeKind};
+
+    fn temp_store(label: &str) -> LocalObjectStore {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-allocation-{label}-{nanos}-{}",
+            std::process::id()
+        ));
+        LocalObjectStore::open(root).expect("open temp object store")
+    }
+
+    fn test_record(inode_id: u64, data_version: u64, size: u64) -> InodeRecord {
+        InodeRecord {
+            dir_storage_kind: 0,
+            inode_id: InodeId::new(inode_id),
+            generation: Generation(1),
+            facets: NodeKind::File.to_facets(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size,
+            data_version,
+            metadata_version: data_version,
+            posix_time: PosixTimeRecord::now(),
+            xattr_storage_kind: 0,
+            xattrs: BTreeMap::new(),
+            dir_rev: 0,
+            subtree_rev: 0,
+            rdev: 0,
+        }
+    }
+
+    #[test]
+    fn sparse_size_changing_overlay_allocation_plans_only_touched_far_chunk() {
+        let store = temp_store("far-sparse-overlay-plan");
+        let old_record = test_record(42, 1, 0);
+        let far_chunk_index = 100_000_000_u64;
+        let chunk_size = u64::from(content_chunk_size());
+        let offset_in_chunk = 123_u64;
+        let overlay_offset = far_chunk_index * chunk_size + offset_in_chunk;
+        let payload = b"generic-013-fsstress-write".to_vec();
+        let new_record = test_record(42, 2, overlay_offset + payload.len() as u64);
+
+        let entries = planned_chunk_allocation_entries_for_overlay(
+            &store,
+            &old_record,
+            &new_record,
+            overlay_offset,
+            &payload,
+            true,
+        )
+        .expect("plan far sparse overlay allocation");
+
+        let expected_key =
+            content_chunk_object_key_for_version(new_record.inode_id, 2, far_chunk_index);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries.get(&expected_key).copied(),
+            Some(u64::from(content_chunk_size()))
+        );
     }
 }
