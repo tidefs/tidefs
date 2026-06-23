@@ -5,6 +5,7 @@
     "ublk.qid_tag.exactly_once_completion.v1"
   ],
   "evidence_class": "qid-tag-state-model",
+  "validation_tier": "source-model",
   "evidence_scope": "bounded pure uBLK qid/tag lifecycle model; no uBLK daemon, ioctl, or product block I/O runtime behavior",
   "runtime_claim_boundary": "the runtime-ublk-completion-artifact class remains required before TideFS may strengthen this claim beyond model evidence",
   "contract_boundary": "legal read, write, flush, and discard submissions refine into tidefs-types-vfs-core block RequestEnvelope records and terminal TideCompletion records",

@@ -9,6 +9,7 @@ authors.workspace = true
 description = "Pure FUSE lifecycle environment model for TideFS adapter contract traces"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 tidefs-model-core = { path = "../tidefs-model-core" }
 tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
 

@@ -57,8 +57,8 @@ pub use receipt::{
     checked_combined_safety_invariants, missing_required_combined_invariants,
     DistributedSafetyBounds, DistributedSafetyInvariantReceipt, DistributedSafetyOutcome,
     DistributedSafetyReceipt, DistributedSafetyReceiptError, DistributedSafetyViolationReceipt,
-    DISTRIBUTED_COMBINED_SAFETY_EVIDENCE_CLASS, DISTRIBUTED_COMBINED_SAFETY_VALIDATION_TIER,
-    REQUIRED_COMBINED_INVARIANT_IDS,
+    DISTRIBUTED_COMBINED_SAFETY_CLAIM_ID, DISTRIBUTED_COMBINED_SAFETY_EVIDENCE_CLASS,
+    DISTRIBUTED_COMBINED_SAFETY_VALIDATION_TIER, REQUIRED_COMBINED_INVARIANT_IDS,
 };
 
 /// Maximum number of nodes in a model-check scenario (keeps state space bounded).

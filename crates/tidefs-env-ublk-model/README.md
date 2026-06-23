@@ -33,7 +33,7 @@ bounds.
 
 ### Evidence tier
 
-This fixture is **model-tier evidence** only. It does not satisfy
+This fixture is **source-model evidence** only. It does not satisfy
 `runtime-ublk-started-export-admission-artifact`. No uBLK daemon, qemu, fio,
 mkfs, or mount behavior is exercised or claimed. The fixture demonstrates the
 model's coverage of the service-loop lifecycle but does not prove live daemon
@@ -42,3 +42,8 @@ correctness.
 See the `started_export` module documentation and the generated fixture at
 `validation/artifacts/ublk/started-export-service-loop-model.json` for the
 deterministic receipt output.
+
+Unified v2 evidence manifests for the qid/tag state model and started-export
+service-loop model live beside those fixtures under `validation/artifacts/ublk/`.
+They classify the fixtures as `source-model` evidence and do not replace the
+qemu/runtime evidence classes.

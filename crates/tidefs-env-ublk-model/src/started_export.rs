@@ -7,7 +7,7 @@
 //!
 //! The receipt records qid/tag generation, queue bounds, completion outcomes,
 //! and unsupported-opcode handling for evidence-tier classification. It is
-//! model-tier evidence and remains insufficient for
+//! source-model evidence and remains insufficient for
 //! `runtime-ublk-started-export-admission-artifact`.
 
 use std::collections::BTreeMap;
@@ -35,11 +35,11 @@ pub const STARTED_EXPORT_MODEL_CLAIM_ID: &str = "ublk.started_export.live_servic
 /// Evidence class for the started-export model receipt.
 pub const STARTED_EXPORT_MODEL_EVIDENCE_CLASS: &str = "started-export-service-loop-model";
 
-/// Evidence tier: this fixture is model-tier, not runtime-tier.
-pub const STARTED_EXPORT_MODEL_EVIDENCE_TIER: &str = "model";
+/// Evidence tier: this fixture is source-model evidence, not runtime-tier.
+pub const STARTED_EXPORT_MODEL_EVIDENCE_TIER: &str = "source-model";
 
 /// Boundary statement: the fixture does not satisfy runtime admission.
-pub const STARTED_EXPORT_RUNTIME_BOUNDARY: &str = "This is model-tier evidence only; \
+pub const STARTED_EXPORT_RUNTIME_BOUNDARY: &str = "This is source-model evidence only; \
      runtime-ublk-started-export-admission-artifact remains required \
      for live daemon proof.";
 
@@ -781,7 +781,7 @@ mod tests {
     fn receipt_declares_model_tier_and_runtime_boundary() {
         let r =
             generate_started_export_receipt(FIXTURE_Q, FIXTURE_D, FIXTURE_SEED).expect("receipt");
-        assert_eq!(r.evidence_tier, "model");
+        assert_eq!(r.evidence_tier, "source-model");
         assert!(r
             .runtime_admission_boundary
             .contains("runtime-ublk-started-export-admission-artifact"));

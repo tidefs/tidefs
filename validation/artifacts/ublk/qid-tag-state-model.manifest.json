@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "ublk.qid_tag.exactly_once_completion.v1",
+  "evidence_class": "qid-tag-state-model",
+  "validation_tier": "source-model",
+  "scope": "bounded pure uBLK qid/tag lifecycle source model for read, write, flush, discard, completion, abort, timeout, and timeout reissue; no uBLK daemon, ioctl, or product block I/O runtime behavior",
+  "artifact_path": "validation/artifacts/ublk/qid-tag-state-model.json",
+  "content_digest": "blake3:556af60914b83cb362c4d9cf7062325ffe5b06d32ff8a4d99c26e41ceaa4a03b",
+  "run_id": "deterministic-fixture:ublk-qid-tag-state-model-v1",
+  "source_ref": "refs/heads/gpt2/issue-811-model-evidence-manifests",
+  "outcome": "pass",
+  "residual_risk": "The qid/tag fixture is source-model evidence only. It does not prove uBLK daemon runtime behavior, qemu execution, fio or mkfs workload breadth, crash durability, production block-device readiness, or broader uBLK ABI coverage.",
+  "source": "tidefs-env-ublk-model",
+  "generated_at": "2026-06-23T00:05:35Z",
+  "blocking_issues": []
+}

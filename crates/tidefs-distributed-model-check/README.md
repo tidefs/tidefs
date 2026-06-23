@@ -23,6 +23,12 @@ active lease records, quorum write records, placement receipt records, rebuild
 attempts, and pending network messages for the scenario under check.
 
 The fixture at
-`validation/artifacts/distributed/combined-safety-receipt.json` is bounded
-model evidence only. Distributed runtime claims remain blocked on future
-storage-node, transport, multi-process, production cluster, and RDMA evidence.
+`validation/artifacts/distributed/combined-safety-receipt.json` is
+`source-model` evidence only. Distributed runtime claims remain blocked on
+future storage-node, transport, multi-process, production cluster, and RDMA
+evidence.
+
+The corresponding v2 evidence manifest is
+`validation/artifacts/distributed/combined-safety-receipt.manifest.json`.
+It feeds the claims gate as bounded model evidence without claiming runtime
+distributed behavior.

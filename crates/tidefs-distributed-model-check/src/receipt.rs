@@ -12,7 +12,8 @@ use super::{
 };
 
 pub const DISTRIBUTED_COMBINED_SAFETY_EVIDENCE_CLASS: &str = "distributed-combined-safety-model";
-pub const DISTRIBUTED_COMBINED_SAFETY_VALIDATION_TIER: &str = "bounded-model-only";
+pub const DISTRIBUTED_COMBINED_SAFETY_CLAIM_ID: &str = "distributed.combined_safety.model.v1";
+pub const DISTRIBUTED_COMBINED_SAFETY_VALIDATION_TIER: &str = "source-model";
 
 pub const REQUIRED_COMBINED_INVARIANT_IDS: [&str; 5] = [
     "no_stale_epoch_commit",
@@ -111,7 +112,7 @@ impl DistributedSafetyReceipt {
                 "bounded deterministic model-check evidence for epoch, lease, quorum, and placement safety invariants",
             runtime_boundary:
                 "model evidence only; this does not validate storage-node runtime, transport, RDMA, production cluster, cluster CLI, or multi-process behavior",
-            related_claim_ids: Vec::new(),
+            related_claim_ids: vec![DISTRIBUTED_COMBINED_SAFETY_CLAIM_ID],
             blocking_issues: vec![
                 "GitHub issue #538 owns this model-check receipt slice.",
                 "Runtime distributed evidence remains missing: no storage-node, transport, RDMA, production cluster, or multi-process runtime artifact is validated by this report.",

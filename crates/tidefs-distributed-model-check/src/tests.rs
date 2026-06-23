@@ -630,7 +630,11 @@ mod bounded_model_tests {
             .checked_invariants
             .iter()
             .any(|invariant| { invariant.family == "placement" }));
-        assert_eq!(receipt.validation_tier, "bounded-model-only");
+        assert_eq!(receipt.validation_tier, "source-model");
+        assert_eq!(
+            receipt.related_claim_ids,
+            vec!["distributed.combined_safety.model.v1"]
+        );
     }
 
     #[test]
