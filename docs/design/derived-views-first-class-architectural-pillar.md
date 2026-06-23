@@ -1,5 +1,19 @@
 # Derived Views as First-Class Architectural Pillar: ValidityToken Contract, Rebuildability, and Budgeted Incremental Refresh
 
+> **Document authority**: This file is imported/historical design input
+> from the pre-GitHub Forgejo-era TideFS repository. It is **not** current
+> policy, current specification, implementation-status evidence,
+> release-readiness evidence, or worker scheduling authority.
+>
+> Readers evaluating current TideFS documentation authority should start
+> at `docs/INDEX.md` and `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+> The register classifies documents as current policy, current spec,
+> historical input, or delete candidate; this file remains historical
+> input until a later classification commit promotes or removes it.
+>
+> The design material below is preserved for future review; it has not
+> been validated against current source behavior or claim-registry evidence.
+
 **Issue**: [#1240](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1240)
 **Status**: design-spec
 **Priority**: P2
