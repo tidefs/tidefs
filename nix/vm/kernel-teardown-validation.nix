@@ -27,6 +27,8 @@ let
     BUSYBOX="${pkgs.busybox}/bin/busybox"
     KERNEL_IMG="${linuxKernel_7_0}/bzImage"
     CPIO="${pkgs.cpio}/bin/cpio"
+    GZIP="${pkgs.gzip}/bin/gzip"
+    LDD_BIN="${pkgs.lib.getBin pkgs.glibc}/bin/ldd"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     KERNEL_RELEASE="${linuxKernel_7_0.version}"
     POSIX_VFS_KO="''${TIDEFS_KERNEL_VFS_MODULE_KO:-}"
@@ -80,7 +82,7 @@ EOF
     echo "  Output:    $OUTPUT_DIR"
     echo ""
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$B3SUM" "$JQ" "$VALIDATOR"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$LDD_BIN" "$B3SUM" "$JQ" "$VALIDATOR"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -110,9 +112,33 @@ EOF
 
     cp "$BUSYBOX" "$RUN_DIR/bin/busybox"
     chmod +x "$RUN_DIR/bin/busybox"
+
+    copy_elf_deps() {
+      local elf="$1"
+      local deps dep dep_dir ld_so ld_dir
+
+      deps=$("$LDD_BIN" "$elf" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
+      for dep in $deps; do
+        if [ -f "$dep" ]; then
+          dep_dir=$(dirname "$dep")
+          mkdir -p "$RUN_DIR$dep_dir"
+          cp "$dep" "$RUN_DIR$dep" 2>/dev/null || true
+        fi
+      done
+
+      ld_so=$("$LDD_BIN" "$elf" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
+      if [ -n "$ld_so" ] && [ -f "$ld_so" ]; then
+        ld_dir=$(dirname "$ld_so")
+        mkdir -p "$RUN_DIR$ld_dir"
+        cp "$ld_so" "$RUN_DIR$ld_so" 2>/dev/null || true
+        chmod +x "$RUN_DIR$ld_so" 2>/dev/null || true
+      fi
+    }
+    copy_elf_deps "$BUSYBOX"
+
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff reboot \
       mknod mkdir rmdir dd stat cp mv rm touch find wc head tail sync cut dirname basename \
-      printf test xargs seq awk tr sort uniq md5sum date; do
+      printf test xargs seq awk tr sort uniq md5sum date umount lsmod; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
@@ -419,7 +445,10 @@ INITSCRIPT
     chmod +x "$RUN_DIR/init"
 
     echo "--- Building initramfs ---"
-    (cd "$RUN_DIR" && find . | cpio -o -H newc) | gzip > "$RUN_DIR/initramfs.gz"
+    INITRAMFS_TMP="$RUN_DIR/../initramfs-$$.gz"
+    (cd "$RUN_DIR" && find . -path ./initramfs.gz -prune -o -print | "$CPIO" -o -H newc 2>/dev/null | "$GZIP" -n) > "$INITRAMFS_TMP"
+    mv "$INITRAMFS_TMP" "$RUN_DIR/initramfs.gz"
+    echo "  Initramfs: $(du -h "$RUN_DIR/initramfs.gz" | cut -f1)"
 
     echo "--- Booting QEMU ---"
     timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
