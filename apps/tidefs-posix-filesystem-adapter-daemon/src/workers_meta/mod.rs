@@ -89,7 +89,8 @@ use tidefs_types_vfs_core::{
     FATTR_ATIME as VFS_FATTR_ATIME, FATTR_ATIME_NOW as VFS_FATTR_ATIME_NOW,
     FATTR_CTIME as VFS_FATTR_CTIME, FATTR_GID as VFS_FATTR_GID, FATTR_MODE as VFS_FATTR_MODE,
     FATTR_MTIME as VFS_FATTR_MTIME, FATTR_MTIME_NOW as VFS_FATTR_MTIME_NOW,
-    FATTR_SIZE as VFS_FATTR_SIZE, FATTR_UID as VFS_FATTR_UID, S_ISGID as VFS_S_ISGID,
+    FATTR_SIZE as VFS_FATTR_SIZE, FATTR_UID as VFS_FATTR_UID, S_IFBLK, S_IFCHR, S_IFDIR,
+    S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID as VFS_S_ISGID,
     S_ISUID as VFS_S_ISUID, XATTR_CREATE, XATTR_REPLACE,
 };
 
@@ -1607,10 +1608,15 @@ const fn ns_to_sec_nsec(ns: i64) -> (u64, u32) {
 /// format. It mirrors the logic in `InodeAttributeStore::to_stat` but produces
 /// `fuse_attr` directly instead of `libc::stat`.
 #[must_use]
-pub fn posix_attrs_to_fuse_attr(ino: u64, posix: &PosixAttrs, _kind: NodeKind) -> FuseAttr {
+pub fn posix_attrs_to_fuse_attr(ino: u64, posix: &PosixAttrs, kind: NodeKind) -> FuseAttr {
     let (atime, atimensec) = ns_to_sec_nsec(posix.atime_ns);
     let (mtime, mtimensec) = ns_to_sec_nsec(posix.mtime_ns);
     let (ctime, ctimensec) = ns_to_sec_nsec(posix.ctime_ns);
+    let mode = if posix.mode & S_IFMT == 0 {
+        posix.mode | mode_type_bits_for_kind(kind)
+    } else {
+        posix.mode
+    };
 
     FuseAttr {
         ino,
@@ -1622,13 +1628,26 @@ pub fn posix_attrs_to_fuse_attr(ino: u64, posix: &PosixAttrs, _kind: NodeKind) -
         atimensec,
         mtimensec,
         ctimensec,
-        mode: posix.mode,
+        mode,
         nlink: posix.nlink,
         uid: posix.uid,
         gid: posix.gid,
         rdev: posix.rdev,
         blksize: posix.blksize,
         padding: 0,
+    }
+}
+
+fn mode_type_bits_for_kind(kind: NodeKind) -> u32 {
+    match kind {
+        NodeKind::Dir => S_IFDIR,
+        NodeKind::File => S_IFREG,
+        NodeKind::Symlink => S_IFLNK,
+        NodeKind::CharDev => S_IFCHR,
+        NodeKind::BlockDev => S_IFBLK,
+        NodeKind::Fifo => S_IFIFO,
+        NodeKind::Socket => S_IFSOCK,
+        NodeKind::Whiteout => 0,
     }
 }
 
@@ -3327,6 +3346,18 @@ mod tests {
         assert_eq!(attr.ctime, 3);
         assert_eq!(attr.ctimensec, 500_000_000);
         assert_eq!(attr.padding, 0);
+    }
+
+    #[test]
+    fn posix_attrs_to_fuse_attr_backfills_missing_type_bits() {
+        let posix = PosixAttrs {
+            mode: 0o755,
+            nlink: 2,
+            blksize: 4096,
+            ..Default::default()
+        };
+        let attr = posix_attrs_to_fuse_attr(42, &posix, NodeKind::Dir);
+        assert_eq!(attr.mode, S_IFDIR | 0o755);
     }
 
     #[test]
