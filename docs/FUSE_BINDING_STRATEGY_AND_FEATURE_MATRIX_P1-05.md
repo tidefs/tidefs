@@ -1,8 +1,13 @@
 # FUSE binding strategy and capability feature matrix (P1-05) (v0.422)
 
-Maturity: **production-design** specification closing issue #1233.
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 
-This document is the canonical FUSE binding strategy for tidefs. It answers:
+Maturity: imported production-design FUSE binding note from tracker-era issue
+#1233.
+
+This document is historical design input for the TideFS FUSE binding strategy.
+Current adapter authority comes from issue-scoped source audits and the
+documentation authority register. It answers:
 
 1. Which Rust FUSE binding is chosen and why.
 2. Which protocol capabilities are required, which are tracked as future,
@@ -218,7 +223,8 @@ stub placeholders.
 
 `FUSE_NOTIFY_PRUNE` (protocol ≥ 7.45, Linux 7.0+) allows the daemon to proactively
 request that the kernel shrink its inode/dentry caches for a specific subtree. This is
-critical for daemon memory pressure handling (issue #1211, v0.262 §19.1).
+critical for daemon memory pressure handling (tracker-era issue #1211,
+v0.262 §19.1).
 
 `fuser` v0.14 does not expose `FUSE_NOTIFY_PRUNE`. The `Notifier` type provides
 `inval_inode`, `inval_entry`, and `inval_delete`, but not `notify_prune`.

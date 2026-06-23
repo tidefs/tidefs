@@ -2,9 +2,14 @@
 
 > TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 
-This document is the production-depth source-of-truth for the posix_filesystem_adapter page-cache, writeback, and mmap contract on Linux 7.0.
+This document is historical design input for the posix_filesystem_adapter
+page-cache, writeback, and mmap contract on Linux 7.0. Current page-cache,
+writeback, and invalidation authority lives in
+`docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md`,
+`docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md`, and TFR-008.
 
-For cluster mmap coherency across nodes, see Forgejo #1259 (`[DESIGN] mmap cluster coherency`).
+For historical cluster mmap coherency provenance across nodes, see Forgejo
+#1259 (`[DESIGN] mmap cluster coherency`).
 
 It answers the question:
 
@@ -16,11 +21,11 @@ See also:
 - `docs/BLOCK_VOLUME_PROJECTION_CHARTER_BLOCK_VOLUME_ADAPTER.md`
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
-- `docs/CLUSTER_TRANSPORT_BOUNDEDNESS_DESIGN.md` (cluster BULK-plane foundation for #1259 remote page faulting)
+- `docs/CLUSTER_TRANSPORT_BOUNDEDNESS_DESIGN.md` (historical cluster BULK-plane foundation for Forgejo #1259 remote page faulting)
 
-## OW-204 implemented-source binding
+## Historical OW-204 implemented-source binding
 
-Forgejo issue `#28` / `OW-204` binds this law into source through
+Forgejo issue `#28` / `OW-204` recorded this law as source-bound through
 `PAGE_CACHE_WRITEBACK_MMAP_SPEC`,
 `PAGE_CACHE_WRITEBACK_MMAP_ACCEPTANCE_CASES`, and
 `page_cache_writeback_mmap_acceptance_cases()` in
@@ -34,9 +39,9 @@ The implementation-tracked non-release cases cover:
 - direct-I/O reconciliation against cached windows;
 - `fsync`/`fdatasync`/`O_SYNC` durability beyond clean page-cache state.
 
-This is an implemented-source specification gate. It does not claim live mmap
-support, direct-I/O support, production Linux kernel integration, or POSIX
-completion.
+This remains historical input, not a current implemented-source authority. It
+does not claim live mmap support, direct-I/O support, production Linux kernel
+integration, or POSIX completion.
 
 ## Metrics snapshot
 
@@ -365,7 +370,7 @@ Still completed later, but now on explicit rails:
 - exact zero-copy / DMA / pin broker mechanics (`P4-04`)
 - exact block queue / ublk interaction details (`P6-01`, `P6-02`)
 - kernel locking / RCU / workqueue law (`P7-03`)
-- cluster mmap coherency design settled in #1259; runtime implementation deferred to (`P6-03`, `P6-04`)
+- cluster mmap coherency design provenance recorded in Forgejo #1259; runtime implementation deferred to (`P6-03`, `P6-04`)
 
 ## 11. Production consequences
 
@@ -373,4 +378,4 @@ With this pass settled:
 - posix_filesystem_adapter worker topology (`P5-02`) now has a lawful byte-residency and dirty/writeback partner model
 - cache and pressure law (`P4-02`, `P4-03`) now connect directly to page-cache and mmap behavior
 - the remaining design risk is narrowed from the broad "how do buffered I/O and mmap fit into the runtime?" question to the exact **zero-copy / pinning / page-loan law** (`P4-04`) and the **block_volume_adapter queue topology / flush semantics** (`P6-01`, `P6-02`)
-- the cluster mmap coherency extension (#1259) has a documented target design; multi-node page-level lease-gated consistency, remote page faulting via BULK plane, cacheline-granularity RDMA transfer, and false-sharing mitigation are on explicit rails for implementation but remain non-claims until runtime and comparator evidence prove them
+- the historical cluster mmap coherency extension (Forgejo #1259) has a documented target design; multi-node page-level lease-gated consistency, remote page faulting via BULK plane, cacheline-granularity RDMA transfer, and false-sharing mitigation remain non-claims until runtime and comparator evidence prove them

@@ -1,14 +1,16 @@
 # POSIX ACL Xattr Codec and ACL Evaluation Design (P2 spec) — **SUPERSEDED**
 
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 > ⚠️ **This document has been superseded** by the consolidated design-spec at
 > [`docs/design/posix-acl-xattr-codec-and-evaluation-design.md`](design/posix-acl-xattr-codec-and-evaluation-design.md)
-> which closes Forgejo issue #2032.
+> with historical Forgejo issue #2032 provenance.
 
 
 Maturity: **design-spec** for the POSIX ACL xattr encode/decode layer,
 canonical ACL evaluation algorithm, and mode↔ACL synchronisation.
 
-This document closes Forgejo issue #1199.
+This document carries historical Forgejo issue #1199 provenance.
 
 ## 1. Motivation
 
@@ -379,11 +381,11 @@ this design spec only provides the building blocks.
 
 | Issue | Relationship |
 |---|---|
-| #1290 (Polymorphic xattr storage) | ACL xattrs are stored through the polymorphic xattr layer. The codec described here is a consumer of that storage. |
-| #1213 (VFS Engine API contract) | ACL xattrs travel through the same `getxattr`/`setxattr`/`listxattr`/`removexattr` ops. No new engine ops are required. |
-| #1145 (FUSE daemon topology) | ACL evaluation (§3.4) is part of the permission enforcement the daemon must perform. |
-| #1156 (xfstests matrix) | ACL tests are part of the xfstests baseline; this spec provides the algorithmic building blocks. |
-| #1233 (FUSE binding strategy) | ACL evaluation runs in the daemon process and is subject to the same coherency profile constraints. |
+| Tracker-era #1290 (Polymorphic xattr storage) | ACL xattrs are stored through the polymorphic xattr layer. The codec described here is a consumer of that storage. |
+| Tracker-era #1213 (VFS Engine API contract) | ACL xattrs travel through the same `getxattr`/`setxattr`/`listxattr`/`removexattr` ops. No new engine ops are required. |
+| Tracker-era #1145 (FUSE daemon topology) | ACL evaluation (§3.4) is part of the permission enforcement the daemon must perform. |
+| Tracker-era #1156 (xfstests matrix) | ACL tests are part of the xfstests baseline; this spec provides the algorithmic building blocks. |
+| Tracker-era #1233 (FUSE binding strategy) | ACL evaluation runs in the daemon process and is subject to the same coherency profile constraints. |
 
 ## 9. Deferred to implementation issues
 
@@ -416,5 +418,5 @@ this design spec only provides the building blocks.
 | 7 | ACL eval wire-up in FUSE adapter permission check | FUSE adapter |
 
 Phases 1-4 deliver the self-contained `tidefs-posix-acl` crate with full unit
-test coverage. Phases 5-8 are wire-up and integration, each a separate Forgejo
-issue.
+test coverage. Phases 5-8 were planned as wire-up and integration, each a
+separate tracker-era issue.

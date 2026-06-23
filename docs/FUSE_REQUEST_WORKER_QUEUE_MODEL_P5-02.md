@@ -2,9 +2,10 @@
 
 > TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 
-This document settles `P5-02` at production depth.
+This imported note recorded a production-depth `P5-02` design target.
 
-It is the source-of-truth for the live userspace **posix_filesystem_adapter** runtime on Linux 7.0:
+It is historical design input for the userspace **posix_filesystem_adapter**
+runtime on Linux 7.0:
 - request classes
 - queue families
 - worker pools

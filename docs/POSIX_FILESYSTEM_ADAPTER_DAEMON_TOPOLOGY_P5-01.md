@@ -2,11 +2,12 @@
 
 > TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 
-This is the active human-named authority document.
+This imported document is historical design input for the human-named adapter
+topology.
 
 
-This document is the source-of-truth for the production-depth `posix_filesystem_adapter` runtime and
-process topology.
+It records a production-depth `posix_filesystem_adapter` runtime and process
+topology target.
 
 The active production reading is now requirement-aligned: steady-state
 production `posix_filesystem_adapter` residency is kernel-hosted, while any FUSE/userspace runtime

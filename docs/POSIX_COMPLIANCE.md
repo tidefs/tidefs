@@ -157,31 +157,18 @@ Status: DONE = implemented and tested, GAP = implemented with known issues,
 4. **O_APPEND**: Implemented at VFS engine level but no xfstests coverage
    for atomic append semantics across multiple writers.
 
-5. **xfstests coverage**: The current #6582 and #6584 smoke tranches
-   through #6598 tranches (`generic/051`-`generic/418`) have QEMU/KVM FUSE
-   preconditions, #6588/#6592/#6594 teardown busy failures, and the #6596
-   `generic/346` hard hang. The #6596 failures include read-only/special-node
-   expected-output drift, ACL and timestamp update drift, 600s timeout hangs,
-   truncate-down timestamp drift, ACL inheritance/userns errno drift, and
-   ENOSPC/ftruncate/file-exists behavior. The #6598 failures add
-   ENOSPC/ftruncate/file-exists behavior, missing temp cleanup after checksum,
-   a direct-I/O timeout hang, ftruncate EIO/ENOSPC behavior,
-   special-node/find-by-type setup drift, and checksum read EIO; the
+5. **xfstests coverage**: Historical tracker-era smoke tranches for
+   `generic/051`-`generic/418` recorded QEMU/KVM FUSE preconditions,
+   teardown-busy failures, a `generic/346` hard hang, ACL/timestamp/userns
+   drift, ENOSPC/ftruncate/file-exists behavior, direct-I/O timeout behavior,
+   and mounted-kernel VFS pass/fail/unsupported/skip matrices. The
    `generic/375` ACL/SGID drift was rechecked on 2026-06-04 with adapter
    file/directory regressions plus direct mounted FUSE reproduction and is no
-   longer carried as an expected ACL failure. The #6587, #6589, #6591, #6593,
-   #6595, #6597, and #6599 mounted-kernel VFS
-   23 pass rows, 11 product failures, 12 unsupported rows, and 4 skipped rows;
-   #6589 has 14 pass rows, 3 product failures, 29 unsupported rows, and 4
-   skipped rows; #6591 has 4 pass rows, no product failures, 43 unsupported
-   rows, and 3 skipped rows; #6593 has 5 pass rows, 7 product failures, 36
-   unsupported rows, and 2 skipped rows; #6595 has 3 pass rows, 7 product
-   failures, 38 unsupported rows, and 2 skipped rows; #6597 has 13 pass rows,
-   11 product failures, 21 unsupported rows, and 5 skipped rows; and #6599 has
-   8 pass rows, 8 product failures, 32 unsupported rows, and 20 skipped rows.
-   None of the accepted K7
-   matrices has deferred, harness-fail, or environment-refusal rows. The
-   broader xfstests suite is not yet integrated as a release gate.
+   longer carried as an expected ACL failure. None of the accepted K7 matrices
+   has deferred, harness-fail, or environment-refusal rows. Current xfstests
+   authority lives in GitHub issues, PR validation evidence, and
+   `docs/GITHUB_CI.md`; the broader xfstests suite is not yet integrated as a
+   release gate.
 
 6. **POSIX ACL enforcement**: ACLs are encoded/decoded and structurally
    needs broader coverage.

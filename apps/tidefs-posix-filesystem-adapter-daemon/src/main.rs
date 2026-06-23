@@ -581,7 +581,7 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
     );
 
     // Refuse idmapped mounts: TideFS does not support idmapped mount
-    // UID/GID translation (#6418, NEXT-FUSE-015).
+    // UID/GID translation in the current FUSE adapter boundary.
     tidefs_posix_filesystem_adapter_daemon::check_idmapped_mount(&config.mountpoint)?;
 
     // ── Clean shutdown via SIGINT/SIGTERM ─────────────────────────
@@ -1354,8 +1354,8 @@ fn run_xfstests_harness(config: &xfstests_harness::XfstestsConfig) -> Result<(),
 ///
 /// Phase 1:  first mount -> create/write/read data,
 ///          POSIX mutations (symlink, unlink, rmdir, rename),
-///          xattr operations (NEXT-FUSE-014),
-///          open-unlink and rename-over-open soak (NEXT-FUSE-018)
+///          xattr operations,
+///          open-unlink and rename-over-open soak
 /// Phase 2: clean teardown (unmount + kill daemon)
 /// Phase 3: remount -> verify data persisted
 /// Phase 4: stale-handle test (open file, hard-kill daemon, verify old fd errors)
@@ -2082,9 +2082,9 @@ fn run_smoke_mount(config: SmokeMountConfig) -> Result<(), String> {
     });
 
     // ── Phase 1d: open-unlink and rename-over-open soak ──────────────
-    // NEXT-FUSE-018: Exercise POSIX open-unlink (fd survives unlink),
-    // rename-over-open (fd survives rename), and rename-overwrite-open
-    // (fd survives overwrite rename) semantics.
+    // Exercise POSIX open-unlink (fd survives unlink), rename-over-open
+    // (fd survives rename), and rename-overwrite-open (fd survives overwrite
+    // rename) semantics.
     eprintln!("=== Phase 1d: open-unlink and rename-over-open soak ===");
 
     let open_unlink_file = format!("{mountpoint}/smoke-open-unlink.txt");
@@ -3969,7 +3969,7 @@ fn print_help() {
     println!();
     println!("Idmapped mounts: TideFS FUSE does not support idmapped mounts");
     println!("(UID/GID translation via mount_setattr). The daemon will refuse");
-    println!("to operate when an idmapped mount is detected. See #6418.");
+    println!("to operate when an idmapped mount is detected.");
 }
 
 #[cfg(feature = "receipt-demo")]

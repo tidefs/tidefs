@@ -1,6 +1,8 @@
 # FUSE Operation Coverage Matrix (v0.422)
 
-Maturity: **design** specification closing issue #1292.
+> TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
+Maturity: imported design specification from tracker-era issue #1292.
 
 Current adapter audit: issue #1081 refreshed this matrix from source inspection
 of `FuseVfsAdapter` in
@@ -9,8 +11,8 @@ reply helper crate. The table below records the daemon callback surface as of
 `origin/master` at `0882e2e402926eda45ee2e9e3dea8bac007a99cf`; it is a
 documentation-only classification and does not change runtime behavior.
 
-This document is the xfstests-grade specification for every FUSE operation
-tidefs must support. It serves as:
+This imported document records an xfstests-grade target for every FUSE
+operation TideFS expected to support. It serves as historical input for:
 
 - The implementation checklist for the FUSE daemon
 - The xfstests coverage tracker (which tests exercise which ops)
@@ -18,8 +20,8 @@ tidefs must support. It serves as:
 
 See also:
 
-- `docs/VFS_ENGINE_API_CONTRACT.md` (#1213) — VfsEngine 29-op contract
-- `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` (#1233) — binding strategy
+- `docs/VFS_ENGINE_API_CONTRACT.md` (tracker-era #1213) — VfsEngine 29-op contract
+- `docs/FUSE_BINDING_STRATEGY_AND_FEATURE_MATRIX_P1-05.md` (tracker-era #1233) — binding strategy
 - `docs/PREVIEW_POSIX_SUBSET.md` — POSIX subset matrix
 
 ---
@@ -226,9 +228,9 @@ Each op must document its behavior under each named profile:
 
 ## 10. Dependencies
 
-- Depends on: #1213 (VFS Engine API — op contract definition), #1233 (FUSE binding strategy)
-- Blocks: #1145 (FUSE daemon implementation), #1127 (FUSE worker queue model)
-- Related: #1235 (trace emission contract — FUSE ops generate traces)
+- Historical tracker dependencies: #1213 (VFS Engine API — op contract definition), #1233 (FUSE binding strategy)
+- Historical tracker blockers: #1145 (FUSE daemon implementation), #1127 (FUSE worker queue model)
+- Historical tracker related item: #1235 (trace emission contract — FUSE ops generate traces)
 
 ---
 
@@ -238,13 +240,13 @@ All acknowledged FUSE write paths that modify file data must route through
 `LocalFileSystem::apply_timestamp_update()` (or `TimestampUpdate::Write` in
 the engine `write()` path) to advance `mtime` and `ctime` uniformly.
 
-### Audited paths (issue #6543)
+### Audited paths (tracker-era issue #6543)
 
 | Write path | VfsEngine method | Timestamp authority | Status |
 |---|---|---|---|
-| FUSE write (normal, writeback-cache, O_DIRECT, O_SYNC/O_DSYNC) | `write()` | `apply_timestamp_update(…, Write)` after flush | Covered (#6156) |
-| FUSE fallocate (PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE, default extend) | `fallocate()` | `apply_timestamp_update(…, Write)` after data mutation | Covered (#6543) |
-| FUSE fallocate (KEEP_SIZE only) | `fallocate()` | `apply_timestamp_update(…, MetadataChange)` | Covered (#6543) |
+| FUSE write (normal, writeback-cache, O_DIRECT, O_SYNC/O_DSYNC) | `write()` | `apply_timestamp_update(…, Write)` after flush | Covered in tracker-era #6156 provenance |
+| FUSE fallocate (PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE, default extend) | `fallocate()` | `apply_timestamp_update(…, Write)` after data mutation | Covered in tracker-era #6543 provenance |
+| FUSE fallocate (KEEP_SIZE only) | `fallocate()` | `apply_timestamp_update(…, MetadataChange)` | Covered in tracker-era #6543 provenance |
 | FUSE copy_file_range | `copy_file_range()` → `write()` | Chained through `write()` → `apply_timestamp_update(…, Write)` | Covered |
 | FUSE setattr/FATTR_SIZE (truncate, mounted engine path) | `setattr()` → engine truncate + `apply_metadata_setattr()` | Engine metadata is authoritative; namespace attrs are mirrored only after successful engine mutation | Covered |
 | FUSE setattr/FATTR_SIZE (namespace-only fallback) | namespace layer | Namespace metadata updates are used only when the engine cannot resolve the inode | **Fallback**: legacy namespace-only test surfaces remain supported, but mounted mutations must not use stale namespace attrs as the permission or timestamp authority. |

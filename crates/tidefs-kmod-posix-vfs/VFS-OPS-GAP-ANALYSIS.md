@@ -1,7 +1,7 @@
 # TideFS kmod-posix-vfs VFS Operation Dispatch Gap Analysis
 
 Baseline: crate `tidefs-kmod-posix-vfs` (32 source files, ~4800 lines, 282 lib tests + integration tests).
-Audit date: 2026-05-24 (updated: #6398 NEXT-KTFS-035 wired setlease refusal contract returning -EOPNOTSUPP on both regular and directory file_operations; Kbuild validation — tidefs_posix_vfs.ko built against Linux 7.0; Tier 0 bootstrap mount, Tier 1 fail-closed, Tier 2 engine-backed mount wired through C shim via label parse + committed-root selection; #6144 adds a fixed-table mounted basic-ops QEMU pass; #6225 publishes mounted VCRL committed-root ledgers and proves remount selects the advanced txg; #6646 KTFS-REMAP-001 wired remap_file_range refusal contract returning -EOPNOTSUPP). Target: Linux 7.0 VFS operation contracts.
+Audit date: 2026-05-24 (updated with the setlease refusal contract returning -EOPNOTSUPP on both regular and directory file_operations; Kbuild validation -- tidefs_posix_vfs.ko built against Linux 7.0; Tier 0 bootstrap mount, Tier 1 fail-closed, Tier 2 engine-backed mount wired through C shim via label parse + committed-root selection; fixed-table mounted basic-ops QEMU pass; mounted VCRL committed-root ledgers proving remount selects the advanced txg; remap_file_range refusal contract returning -EOPNOTSUPP). Target: Linux 7.0 VFS operation contracts.
 Cross-referenced against `VfsEngine` trait at `crates/tidefs-vfs-engine/src/lib.rs:136`.
 
 ## Classification Legend
@@ -67,7 +67,7 @@ Cross-referenced against `VfsEngine` trait at `crates/tidefs-vfs-engine/src/lib.
 | lock (setlk) | Implemented | `src/lock.rs:22`, `tidefs_posix_vfs_main.rs` | `engine.setlk()` | Non-blocking advisory lock; conflicts return EAGAIN, F_UNLCK removes or splits same-owner ranges |
 | flock | **Implemented, runtime validation required** | `src/lock.rs:44` | `engine.setlk()`/`engine.setlkw()` | Whole-file flock(2) dispatch (LOCK_SH/LOCK_EX/LOCK_UN/LOCK_NB) with fd-as-owner mapping to LockSpec. The old cargo validation harness is retired; mounted-kernel validation remains required. |
 | setlkw | OutOfScope | -- | -- | Blocking lock explicitly out of scope (lib.rs:47) |
-| setlease | **Implemented** | `tidefs_posix_vfs_shim.c` setlease callback | `tidefs_posix_vfs_setlease_nosupport()` | Lease/delegation refusal contract (NEXT-KTFS-035): returns -EOPNOTSUPP on every fcntl(F_SETLEASE/F_GETLEASE). |
+| setlease | **Implemented** | `tidefs_posix_vfs_shim.c` setlease callback | `tidefs_posix_vfs_setlease_nosupport()` | Lease/delegation refusal contract: returns -EOPNOTSUPP on every fcntl(F_SETLEASE/F_GETLEASE). |
 | flush | Implemented | `src/flush.rs:8` | `engine.flush()` | Per-fd dirty data push |
 | readahead | **Implemented** | `src/file.rs:119-129` | `engine.readahead()` | Forwards nonzero readahead hints to VfsEngine::readahead() with error tolerance and zero-length skip (9 unit tests). File-operation hint forwarding exists; kernel address_space_ops callback registration blocked on #6622. |
 | readdir | Implemented | `src/readdir.rs:94` | `engine.readdir()` | Full dirent64 packing with cookie-based pagination and resume-offset support |
@@ -152,7 +152,7 @@ dispatch and must not be treated as product validation.
 | releasedir | Implemented | `src/dir.rs:17` | `engine.releasedir()` | Handle release |
 | readdir | Implemented, runtime validation required | `src/dir.rs:12` + `src/readdir.rs:94` | `engine.readdir()` | Engine-level iteration (dir.rs); kernel dirent64 packing (readdir.rs). The old cargo validation harness is retired; fresh mounted-kernel validation must verify behavior. |
 | fsyncdir | Implemented | `src/fsync.rs:26` | `engine.fsyncdir()` | Directory metadata flush |
-| setlease | **Implemented** | `tidefs_posix_vfs_shim.c` setlease callback | `tidefs_posix_vfs_setlease_nosupport()` | Lease/delegation refusal contract (NEXT-KTFS-035): returns -EOPNOTSUPP on F_SETLEASE/F_GETLEASE. |
+| setlease | **Implemented** | `tidefs_posix_vfs_shim.c` setlease callback | `tidefs_posix_vfs_setlease_nosupport()` | Lease/delegation refusal contract: returns -EOPNOTSUPP on F_SETLEASE/F_GETLEASE. |
 
 ---
 

@@ -8,9 +8,8 @@
 
 This document describes historical tracker item 104 by defining the first
 userspace FUSE contract before any mount implementation claims POSIX
-capability. The source of truth is `current_posix_subset_entries()` in
-`crates/tidefs-local-filesystem/src/lib.rs`; this document explains the same
-matrix in human terms.
+capability. Its OW/PC labels are retained as historical provenance for this
+imported matrix, not as current mounted-runtime authority.
 
 The v0.409 code has a userspace FUSE adapter wired through
 `docs/FUSE_MOUNT.md`. Rows marked "included in first FUSE current" are
@@ -31,9 +30,9 @@ v0.417 adds OW-109 changed-record send/receive without expanding the supported
 syscall matrix.
 PC-004B adds a bounded dense-file `lseek` surface for the userspace FUSE
 current without claiming a POSIX-complete sparse extent map.
-OW-204 now source-binds the page-cache/writeback/mmap law, but live mmap
-coherency remains deferred until runtime implementation and live mmap tests
-exist.
+Historical OW-204 provenance records the page-cache/writeback/mmap law, but
+live mmap coherency remains deferred until runtime implementation and live mmap
+tests exist.
 
 
 ```text
