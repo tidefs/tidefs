@@ -206,7 +206,7 @@ result_object() {
 
 write_summary() {
     local mode="$1" base_ref="$2" json_output="$3" result_dir="$4" selected_file="$5" ws_root="$6"
-    local generated_at head_sha selected_json results_json failures total selected_count
+    local generated_at head_sha selected_json results_json results_file failures total selected_count
 
     generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     head_sha="$(git -C "$ws_root" rev-parse HEAD)"
@@ -219,6 +219,9 @@ write_summary() {
         results_json="[]"
     fi
 
+    results_file="$tmpdir/results.json"
+    printf '%s' "$results_json" > "$results_file"
+
     failures="$(jq '[.[] | select(.status != "pass")] | length' <<< "$results_json")"
     total="$(jq 'length' <<< "$results_json")"
     selected_count="$(jq 'length' <<< "$selected_json")"
@@ -230,7 +233,7 @@ write_summary() {
         --arg base_ref "$base_ref" \
         --arg head_sha "$head_sha" \
         --argjson selected_crates "$selected_json" \
-        --argjson results "$results_json" \
+        --slurpfile results "$results_file" \
         --argjson total "$total" \
         --argjson selected_count "$selected_count" \
         --argjson failures "$failures" \
@@ -246,7 +249,7 @@ write_summary() {
             checked_crates: $total,
             failures: $failures
           },
-          results: $results
+          results: $results[0]
         }' > "$json_output"
 
     echo "clippy-baseline: checked $total crate(s), failures=$failures"
