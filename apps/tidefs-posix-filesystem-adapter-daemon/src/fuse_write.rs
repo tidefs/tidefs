@@ -508,6 +508,14 @@ impl FuseWriteDispatch {
                     total_written += take as u32;
                     continue;
                 }
+                Err(InsertError::Budget(_)) => {
+                    // Governor rejected cache admission; skip caching but
+                    // still count the bytes as written.
+                    cursor += take as u64;
+                    remaining = &remaining[take..];
+                    total_written += take as u32;
+                    continue;
+                }
             }
 
             // Acquire page handle and copy data in.
