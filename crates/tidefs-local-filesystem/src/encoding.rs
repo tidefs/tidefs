@@ -1709,6 +1709,14 @@ pub struct ConflictEntry {
     pub stream_identity: String,
     /// Human-readable identity of the object on the target side.
     pub target_identity: String,
+    /// Transaction-group id of the last change on the stream side, if known.
+    ///
+    /// Used by merge-latest policy for per-object txg comparison.
+    pub stream_txg: Option<u64>,
+    /// Transaction-group id of the last change on the target side, if known.
+    ///
+    /// Used by merge-latest policy for per-object txg comparison.
+    pub target_txg: Option<u64>,
 }
 
 /// Machine-readable conflict inventory produced by the merge planner.

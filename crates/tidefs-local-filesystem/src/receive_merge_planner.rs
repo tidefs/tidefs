@@ -160,6 +160,192 @@ fn format_optional_txg(txg: Option<u64>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+// ── Operator merge policy and resolution engine ───────────────────────────────
+
+/// Operator merge policy for the receive merge planner.
+///
+/// Governs how conflicting objects (as classified by the conflict inventory)
+/// are resolved into a binding merge plan.  Conflict-free objects (§2.3) are
+/// always auto-merged regardless of policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiveMergePolicy {
+    /// Keep the local (target) version of every conflicting object.
+    KeepLocal,
+    /// Keep the remote (stream) version of every conflicting object.
+    KeepRemote,
+    /// For each conflict, compare per-object txg metadata on each side and
+    /// keep the object with the higher txg.  On equal txg or when txg
+    /// information is unavailable, the target wins (target-wins tiebreak).
+    MergeLatest,
+    /// Refuse to produce a merge plan.  The caller receives the conflict
+    /// inventory for operator resolution through the manual resolution
+    /// surface (`tidefsctl merge resolve`, planned follow-up).
+    Manual,
+}
+
+/// Per-object decision produced by the policy resolution engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiveMergeDecision {
+    /// Take the stream-side object version.
+    KeepRemote,
+    /// Take the target-side object version.
+    KeepLocal,
+    /// No conflict — the object is conflict-free and will be auto-merged
+    /// regardless of policy.
+    AutoMerge,
+}
+
+/// Binding merge plan produced by the policy resolution engine.
+///
+/// Maps each conflict entry in the inventory to a resolution decision.
+/// Objects not listed in the plan are conflict-free and auto-merged.
+/// A plan with `requires_operator: true` carries no decisions; the operator
+/// must resolve every conflict before the receive may proceed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiveMergePlan {
+    /// The policy that produced this plan.
+    pub policy: ReceiveMergePolicy,
+    /// Common-ancestor transaction-group identity.
+    pub common_ancestor_transaction_id: u64,
+    /// Common-ancestor generation.
+    pub common_ancestor_generation: u64,
+    /// Per-conflict decisions in the same order as the conflict inventory
+    /// entries.
+    pub decisions: Vec<ReceiveMergeDecision>,
+    /// Whether this plan requires operator intervention.
+    ///
+    /// Always true for `Manual` policy; false for other policies when the
+    /// plan was successfully resolved.
+    pub requires_operator: bool,
+}
+
+impl ReceiveMergePlan {
+    /// Create an empty plan anchored at the given inventory.
+    ///
+    /// Empty plans are valid for conflict-free inventories under any policy.
+    #[must_use]
+    pub fn empty(policy: ReceiveMergePolicy, inventory: &crate::encoding::ConflictInventory) -> Self {
+        Self {
+            policy,
+            common_ancestor_transaction_id: inventory.common_ancestor_transaction_id,
+            common_ancestor_generation: inventory.common_ancestor_generation,
+            decisions: Vec::new(),
+            requires_operator: policy == ReceiveMergePolicy::Manual,
+        }
+    }
+
+    /// Number of conflict-resolution decisions in the plan.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.decisions.len()
+    }
+
+    /// True when the plan contains no decisions (empty inventory, or manual
+    /// policy).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.decisions.is_empty()
+    }
+}
+
+/// Errors returned by the policy resolution engine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReceiveMergePolicyError {
+    /// The `Manual` policy was selected.  The conflict inventory is returned
+    /// for operator review; no automatic merge plan is produced.
+    ManualPolicy {
+        conflict_count: usize,
+        guidance: &'static str,
+    },
+}
+
+const RECEIVE_MERGE_MANUAL_POLICY_GUIDANCE: &str =
+    "manual policy: use tidefsctl merge resolve to inspect the conflict inventory and provide per-object or per-class resolution instructions before receiving";
+
+impl fmt::Display for ReceiveMergePolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ManualPolicy { conflict_count, guidance } => {
+                write!(
+                    f,
+                    "manual merge policy: {conflict_count} conflicts require operator resolution; {guidance}",
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReceiveMergePolicyError {}
+
+impl From<ReceiveMergePolicyError> for FileSystemError {
+    fn from(err: ReceiveMergePolicyError) -> Self {
+        match err {
+            ReceiveMergePolicyError::ManualPolicy { .. } => Self::Unsupported {
+                operation: "receive merge planning",
+                reason: RECEIVE_MERGE_MANUAL_POLICY_GUIDANCE,
+            },
+        }
+    }
+}
+
+/// Apply an operator merge policy to a conflict inventory and produce a
+/// binding merge plan.
+///
+/// # Policy semantics
+///
+/// - `KeepLocal`: every conflict resolves to `KeepLocal` (target wins).
+/// - `KeepRemote`: every conflict resolves to `KeepRemote` (stream wins).
+/// - `MergeLatest`: per-entry txg comparison.  When both `stream_txg` and
+///   `target_txg` are populated, the higher-txg side wins.  On tie or
+///   missing txg, the target wins (target-wins tiebreak).
+/// - `Manual`: returns [`ReceiveMergePolicyError::ManualPolicy`] with the
+///   conflict inventory for operator resolution.  No merge plan is produced.
+///
+/// Conflict-free objects (those not present in the inventory) are always
+/// auto-merged regardless of policy (§2.3).
+pub fn resolve_merge_policy(
+    inventory: &crate::encoding::ConflictInventory,
+    policy: ReceiveMergePolicy,
+) -> Result<ReceiveMergePlan, ReceiveMergePolicyError> {
+    if policy == ReceiveMergePolicy::Manual {
+        return Err(ReceiveMergePolicyError::ManualPolicy {
+            conflict_count: inventory.len(),
+            guidance: RECEIVE_MERGE_MANUAL_POLICY_GUIDANCE,
+        });
+    }
+
+    let decisions: Vec<ReceiveMergeDecision> = inventory
+        .entries
+        .iter()
+        .map(|entry| match policy {
+            ReceiveMergePolicy::KeepLocal => ReceiveMergeDecision::KeepLocal,
+            ReceiveMergePolicy::KeepRemote => ReceiveMergeDecision::KeepRemote,
+            ReceiveMergePolicy::MergeLatest => {
+                // Compare per-object txg metadata from the conflict entry.
+                match (entry.stream_txg, entry.target_txg) {
+                    (Some(s), Some(t)) if s > t => ReceiveMergeDecision::KeepRemote,
+                    // Target wins on tie or when target has higher txg.
+                    (Some(_s), Some(_t)) => ReceiveMergeDecision::KeepLocal,
+                    // Missing txg: conservative, target wins.
+                    _ => ReceiveMergeDecision::KeepLocal,
+                }
+            }
+            ReceiveMergePolicy::Manual => {
+                // Already handled above; unreachable here.
+                ReceiveMergeDecision::KeepLocal
+            }
+        })
+        .collect();
+
+    Ok(ReceiveMergePlan {
+        policy,
+        common_ancestor_transaction_id: inventory.common_ancestor_transaction_id,
+        common_ancestor_generation: inventory.common_ancestor_generation,
+        decisions,
+        requires_operator: false,
+    })
+}
+
 // ── Conflict inventory builder ────────────────────────────────────────────────
 
 /// Bundled inputs for the conflict inventory builder.
@@ -274,6 +460,8 @@ fn classify_inode_identity_conflicts(
                         divergence: ConflictDivergence::InodeIdentity(div),
                         stream_identity: format!("inode {inode_id}"),
                         target_identity: format!("inode {inode_id}"),
+                        stream_txg: None,
+                        target_txg: None,
                     });
                 }
             }
@@ -356,6 +544,8 @@ fn classify_directory_entry_conflicts(
                         ),
                         stream_identity: format!("dir {parent_id}/{name}"),
                         target_identity: format!("dir {parent_id} (absent in target)"),
+                        stream_txg: None,
+                        target_txg: None,
                     });
                 }
             }
@@ -371,6 +561,8 @@ fn classify_directory_entry_conflicts(
                         ),
                         stream_identity: format!("dir {parent_id} (absent in stream)"),
                         target_identity: format!("dir {parent_id}/{name}"),
+                        stream_txg: None,
+                        target_txg: None,
                     });
                 }
             }
@@ -410,6 +602,8 @@ fn compare_dir_entries(
                 ),
                 stream_identity: format!("dir {parent_id}/{name_str}"),
                 target_identity: format!("dir {parent_id} (absent in target)"),
+                stream_txg: None,
+                target_txg: None,
             });
         }
     }
@@ -427,6 +621,8 @@ fn compare_dir_entries(
                 ),
                 stream_identity: format!("dir {parent_id} (absent in stream)"),
                 target_identity: format!("dir {parent_id}/{name_str}"),
+                stream_txg: None,
+                target_txg: None,
             });
         }
     }
@@ -449,6 +645,8 @@ fn compare_dir_entries(
                         "dir {parent_id}/{name_str} -> inode {}",
                         t_entry.inode_id.0
                     ),
+                stream_txg: None,
+                target_txg: None,
                 });
             }
         }
@@ -488,6 +686,8 @@ fn classify_extent_map_conflicts(
                         divergence: ConflictDivergence::ExtentMap(div),
                         stream_identity: format!("inode {inode_id} extent map"),
                         target_identity: format!("inode {inode_id} extent map"),
+                        stream_txg: None,
+                        target_txg: None,
                     });
                 }
             }
@@ -549,6 +749,8 @@ fn classify_snapshot_catalog_conflicts(
                 ),
                 stream_identity: format!("snapshot {name_str}"),
                 target_identity: String::from("(absent in target)"),
+                stream_txg: None,
+                target_txg: None,
             });
         }
     }
@@ -566,6 +768,8 @@ fn classify_snapshot_catalog_conflicts(
                 ),
                 stream_identity: String::from("(absent in stream)"),
                 target_identity: format!("snapshot {name_str}"),
+                stream_txg: None,
+                target_txg: None,
             });
         }
     }
@@ -588,6 +792,8 @@ fn classify_snapshot_catalog_conflicts(
                         "snapshot {name_str} root txg={} gen={}",
                         t_rec.root.transaction_id, t_rec.root.generation
                     ),
+                stream_txg: None,
+                target_txg: None,
                 });
                 continue;
             }
@@ -608,6 +814,8 @@ fn classify_snapshot_catalog_conflicts(
                         "snapshot {name_str} hold_count={}",
                         t_rec.hold_count
                     ),
+                stream_txg: None,
+                target_txg: None,
                 });
             }
 
@@ -626,6 +834,8 @@ fn classify_snapshot_catalog_conflicts(
                         "snapshot {name_str} kind={:?} origin={:?}",
                         t_rec.kind, t_rec.origin
                     ),
+                stream_txg: None,
+                target_txg: None,
                 });
             }
         }
@@ -695,6 +905,8 @@ fn classify_generation_ordering_conflicts(
                 target_identity: format!(
                     "target txg range [{ancestor_txg}..{target_max_txg}]"
                 ),
+            stream_txg: None,
+            target_txg: None,
             });
         }
     }
@@ -706,7 +918,7 @@ mod tests {
     use super::*;
     use tidefs_local_object_store::IntegrityDigest64;
     use crate::encoding::{
-        ConflictClass, ConflictDivergence,
+        ConflictClass, ConflictDivergence, ConflictEntry, ConflictInventory,
         DirectoryEntryDivergence, ExtentMapDivergence, GenerationOrderingDivergence,
         InodeIdentityDivergence, SnapshotCatalogDivergence,
     };
@@ -1345,6 +1557,173 @@ mod tests {
             .entries
             .iter()
             .all(|e| e.class != ConflictClass::GenerationOrdering));
+    }
+
+    // ── Operator policy resolution tests ────────────────────────────────────
+
+    fn make_inventory(txg: u64, gen: u64) -> ConflictInventory {
+        ConflictInventory::empty(txg, gen)
+    }
+
+    fn make_entry(
+        class: ConflictClass,
+        stream_txg: Option<u64>,
+        target_txg: Option<u64>,
+    ) -> ConflictEntry {
+        ConflictEntry {
+            class,
+            divergence: ConflictDivergence::InodeIdentity(
+                InodeIdentityDivergence::DifferentContentIdentity,
+            ),
+            stream_identity: "inode 42".into(),
+            target_identity: "inode 42".into(),
+            stream_txg,
+            target_txg,
+        }
+    }
+
+    #[test]
+    fn policy_keep_local_all_decisions_keep_local() {
+        let mut inventory = make_inventory(10, 100);
+        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
+        inventory.entries.push(make_entry(ConflictClass::DirectoryEntry, Some(16), Some(21)));
+
+        let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::KeepLocal).unwrap();
+        assert_eq!(plan.policy, ReceiveMergePolicy::KeepLocal);
+        assert_eq!(plan.len(), 2);
+        assert!(!plan.requires_operator);
+        for decision in &plan.decisions {
+            assert_eq!(*decision, ReceiveMergeDecision::KeepLocal);
+        }
+    }
+
+    #[test]
+    fn policy_keep_remote_all_decisions_keep_remote() {
+        let mut inventory = make_inventory(10, 100);
+        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
+
+        let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::KeepRemote).unwrap();
+        assert_eq!(plan.policy, ReceiveMergePolicy::KeepRemote);
+        assert_eq!(plan.len(), 1);
+        assert!(!plan.requires_operator);
+        assert_eq!(plan.decisions[0], ReceiveMergeDecision::KeepRemote);
+    }
+
+    #[test]
+    fn policy_merge_latest_stream_higher_txg_wins() {
+        let mut inventory = make_inventory(10, 100);
+        // target_txg=5, stream_txg=15: stream is higher -> KeepRemote
+        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(5)));
+
+        let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::MergeLatest).unwrap();
+        assert_eq!(plan.policy, ReceiveMergePolicy::MergeLatest);
+        assert_eq!(plan.decisions[0], ReceiveMergeDecision::KeepRemote);
+    }
+
+    #[test]
+    fn policy_merge_latest_target_higher_or_equal_txg_wins() {
+        let mut inventory = make_inventory(10, 100);
+        // target_txg=20, stream_txg=15: target is higher -> KeepLocal
+        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
+        // equal txg -> target wins (KeepLocal)
+        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(10), Some(10)));
+
+        let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::MergeLatest).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.decisions[0], ReceiveMergeDecision::KeepLocal);
+        assert_eq!(plan.decisions[1], ReceiveMergeDecision::KeepLocal);
+    }
+
+    #[test]
+    fn policy_merge_latest_missing_txg_falls_back_to_keep_local() {
+        let mut inventory = make_inventory(10, 100);
+        // No txg info: conservative, target wins
+        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, None, None));
+        // Only one side has txg: still falls back to target
+        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), None));
+        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, None, Some(20)));
+
+        let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::MergeLatest).unwrap();
+        assert_eq!(plan.len(), 3);
+        for decision in &plan.decisions {
+            assert_eq!(*decision, ReceiveMergeDecision::KeepLocal);
+        }
+    }
+
+    #[test]
+    fn policy_manual_refuses_to_produce_plan() {
+        let mut inventory = make_inventory(10, 100);
+        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
+
+        let err = resolve_merge_policy(&inventory, ReceiveMergePolicy::Manual).unwrap_err();
+        match err {
+            ReceiveMergePolicyError::ManualPolicy {
+                conflict_count,
+                guidance: _,
+            } => {
+                assert_eq!(conflict_count, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn policy_manual_empty_inventory_reports_zero_conflicts() {
+        let inventory = make_inventory(10, 100);
+        let err = resolve_merge_policy(&inventory, ReceiveMergePolicy::Manual).unwrap_err();
+        match err {
+            ReceiveMergePolicyError::ManualPolicy {
+                conflict_count,
+                guidance: _,
+            } => {
+                assert_eq!(conflict_count, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn policy_keep_local_empty_inventory_produces_empty_plan() {
+        let inventory = make_inventory(10, 100);
+        let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::KeepLocal).unwrap();
+        assert!(plan.is_empty());
+        assert_eq!(plan.len(), 0);
+        assert!(!plan.requires_operator);
+        assert_eq!(plan.policy, ReceiveMergePolicy::KeepLocal);
+    }
+
+    #[test]
+    fn policy_merge_latest_empty_inventory_produces_empty_plan() {
+        let inventory = make_inventory(10, 100);
+        let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::MergeLatest).unwrap();
+        assert!(plan.is_empty());
+        assert!(!plan.requires_operator);
+    }
+
+    #[test]
+    fn plan_anchored_at_common_ancestor_identity() {
+        let inventory = make_inventory(42, 420);
+        let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::KeepLocal).unwrap();
+        assert_eq!(plan.common_ancestor_transaction_id, 42);
+        assert_eq!(plan.common_ancestor_generation, 420);
+    }
+
+    #[test]
+    fn plan_empty_constructor_matches_resolved_empty_plan() {
+        let inventory = make_inventory(10, 100);
+        let resolved = resolve_merge_policy(&inventory, ReceiveMergePolicy::KeepLocal).unwrap();
+        let empty = ReceiveMergePlan::empty(ReceiveMergePolicy::KeepLocal, &inventory);
+        assert_eq!(resolved.policy, empty.policy);
+        assert_eq!(resolved.common_ancestor_transaction_id, empty.common_ancestor_transaction_id);
+        assert_eq!(resolved.common_ancestor_generation, empty.common_ancestor_generation);
+        assert_eq!(resolved.decisions, empty.decisions);
+        assert_eq!(resolved.requires_operator, empty.requires_operator);
+    }
+
+    #[test]
+    fn plan_empty_with_manual_sets_requires_operator() {
+        let inventory = make_inventory(10, 100);
+        let plan = ReceiveMergePlan::empty(ReceiveMergePolicy::Manual, &inventory);
+        assert!(plan.requires_operator);
+        assert!(plan.is_empty());
     }
 
 }
