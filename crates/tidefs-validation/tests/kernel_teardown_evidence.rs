@@ -7,11 +7,10 @@
 
 use tidefs_validation::kernel_teardown_evidence::{
     validate_kernel_teardown_no_work_after_artifact_json,
-    KERNEL_TEARDOWN_NO_WORK_AFTER_ARTIFACT_VERSION,
-    KERNEL_TEARDOWN_NO_WORK_AFTER_V1_CLAIM_ID,
-    KERNEL_TEARDOWN_NO_WORK_AFTER_EVIDENCE_CLASS,
-    KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID,
-    KERNEL_TEARDOWN_NO_WORK_AFTER_VALIDATION_TIER,
+    KERNEL_TEARDOWN_NO_WORK_AFTER_ARTIFACT_VERSION, KERNEL_TEARDOWN_NO_WORK_AFTER_EVIDENCE_CLASS,
+    KERNEL_TEARDOWN_NO_WORK_AFTER_FULL_KERNEL_NO_DAEMON_TIER,
+    KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID, KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID,
+    KERNEL_TEARDOWN_NO_WORK_AFTER_V1_CLAIM_ID, KERNEL_TEARDOWN_NO_WORK_AFTER_VALIDATION_TIER,
     KERNEL_TEARDOWN_NO_WORK_AFTER_VERIFIER,
 };
 
@@ -69,6 +68,20 @@ fn minimal_pass_json() -> String {
     }"#.to_string()
 }
 
+fn no_daemon_pass_json() -> String {
+    let mut value: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    let obj = value.as_object_mut().unwrap();
+    obj.insert(
+        "validation_tier".into(),
+        serde_json::Value::String(KERNEL_TEARDOWN_NO_WORK_AFTER_FULL_KERNEL_NO_DAEMON_TIER.into()),
+    );
+    obj.insert(
+        "target_id".into(),
+        serde_json::Value::String(KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID.into()),
+    );
+    serde_json::to_string_pretty(&value).unwrap()
+}
+
 // ── Passthrough validation ───────────────────────────────────────────────
 
 #[test]
@@ -82,6 +95,18 @@ fn integration_pass_artifact_validates() {
     assert_eq!(summary.refusal_observation_count, 1);
     assert_eq!(summary.target_id, KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID);
     assert_eq!(summary.source_ref, "refs/heads/master");
+}
+
+#[test]
+fn integration_full_kernel_no_daemon_artifact_validates() {
+    let json = no_daemon_pass_json();
+    let summary = validate_kernel_teardown_no_work_after_artifact_json(&json)
+        .expect("full-kernel-no-daemon artifact should validate");
+    assert_eq!(summary.status, "pass");
+    assert_eq!(
+        summary.target_id,
+        KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID
+    );
 }
 
 // ── Missing required field ───────────────────────────────────────────────
@@ -150,8 +175,7 @@ fn integration_missing_claim_id_fails() {
 
 #[test]
 fn integration_unknown_field_rejected() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
     json_val
         .as_object_mut()
         .unwrap()
@@ -169,8 +193,7 @@ fn integration_unknown_field_rejected() {
 
 #[test]
 fn integration_artifact_version_mismatch_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
     json_val
         .as_object_mut()
         .unwrap()
@@ -186,46 +209,43 @@ fn integration_artifact_version_mismatch_fails() {
 
 #[test]
 fn integration_empty_source_ref_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
-    json_val
-        .as_object_mut()
-        .unwrap()
-        .insert("source_ref".into(), serde_json::Value::String(String::new()));
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    json_val.as_object_mut().unwrap().insert(
+        "source_ref".into(),
+        serde_json::Value::String(String::new()),
+    );
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("source_ref"), "should reject empty source_ref: {msg}");
+    assert!(
+        msg.contains("source_ref"),
+        "should reject empty source_ref: {msg}"
+    );
 }
 
 #[test]
 fn integration_target_id_mismatch_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
-    json_val
-        .as_object_mut()
-        .unwrap()
-        .insert(
-            "target_id".into(),
-            serde_json::Value::String("wrong-target".into()),
-        );
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    json_val.as_object_mut().unwrap().insert(
+        "target_id".into(),
+        serde_json::Value::String("wrong-target".into()),
+    );
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("target_id"), "should reject wrong target_id: {msg}");
+    assert!(
+        msg.contains("target_id"),
+        "should reject wrong target_id: {msg}"
+    );
 }
 
 #[test]
 fn integration_validation_tier_mismatch_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
-    json_val
-        .as_object_mut()
-        .unwrap()
-        .insert(
-            "validation_tier".into(),
-            serde_json::Value::String("qemu-guest".into()),
-        );
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    json_val.as_object_mut().unwrap().insert(
+        "validation_tier".into(),
+        serde_json::Value::String("qemu-guest".into()),
+    );
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
@@ -235,16 +255,31 @@ fn integration_validation_tier_mismatch_fails() {
     );
 }
 
+#[test]
+fn integration_tier_target_pair_mismatch_fails() {
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    json_val.as_object_mut().unwrap().insert(
+        "validation_tier".into(),
+        serde_json::Value::String(KERNEL_TEARDOWN_NO_WORK_AFTER_FULL_KERNEL_NO_DAEMON_TIER.into()),
+    );
+    let json = serde_json::to_string_pretty(&json_val).unwrap();
+    let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("allowed pair"),
+        "should reject mismatched tier/target pair: {msg}"
+    );
+}
+
 // ── Trace / refusal omission ─────────────────────────────────────────────
 
 #[test]
 fn integration_missing_workqueue_trace_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
-    json_val
-        .as_object_mut()
-        .unwrap()
-        .insert("workqueue_trace_source".into(), serde_json::Value::String(String::new()));
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    json_val.as_object_mut().unwrap().insert(
+        "workqueue_trace_source".into(),
+        serde_json::Value::String(String::new()),
+    );
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
@@ -256,12 +291,11 @@ fn integration_missing_workqueue_trace_fails() {
 
 #[test]
 fn integration_missing_callback_trace_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
-    json_val
-        .as_object_mut()
-        .unwrap()
-        .insert("callback_trace_source".into(), serde_json::Value::String(String::new()));
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    json_val.as_object_mut().unwrap().insert(
+        "callback_trace_source".into(),
+        serde_json::Value::String(String::new()),
+    );
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
@@ -273,15 +307,11 @@ fn integration_missing_callback_trace_fails() {
 
 #[test]
 fn integration_empty_refusal_observations_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
-    json_val
-        .as_object_mut()
-        .unwrap()
-        .insert(
-            "post_final_teardown_refusal_observations".into(),
-            serde_json::Value::Array(vec![]),
-        );
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    json_val.as_object_mut().unwrap().insert(
+        "post_final_teardown_refusal_observations".into(),
+        serde_json::Value::Array(vec![]),
+    );
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
@@ -295,8 +325,7 @@ fn integration_empty_refusal_observations_fails() {
 
 #[test]
 fn integration_cleanup_unmount_empty_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
     json_val
         .as_object_mut()
         .unwrap()
@@ -308,13 +337,15 @@ fn integration_cleanup_unmount_empty_fails() {
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("unmount"), "should reject empty cleanup.unmount: {msg}");
+    assert!(
+        msg.contains("unmount"),
+        "should reject empty cleanup.unmount: {msg}"
+    );
 }
 
 #[test]
 fn integration_cleanup_rmmod_empty_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
     json_val
         .as_object_mut()
         .unwrap()
@@ -326,15 +357,17 @@ fn integration_cleanup_rmmod_empty_fails() {
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("rmmod"), "should reject empty cleanup.rmmod: {msg}");
+    assert!(
+        msg.contains("rmmod"),
+        "should reject empty cleanup.rmmod: {msg}"
+    );
 }
 
 // ── Fail-closed status cases ─────────────────────────────────────────────
 
 #[test]
 fn integration_pass_with_reasons_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
     let obj = json_val.as_object_mut().unwrap();
     obj.insert(
         "fail_closed_reasons".into(),
@@ -351,11 +384,13 @@ fn integration_pass_with_reasons_fails() {
 
 #[test]
 fn integration_fail_without_reasons_fails() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
     let obj = json_val.as_object_mut().unwrap();
     obj.insert("status".into(), serde_json::Value::String("fail".into()));
-    obj.insert("fail_closed_reasons".into(), serde_json::Value::Array(vec![]));
+    obj.insert(
+        "fail_closed_reasons".into(),
+        serde_json::Value::Array(vec![]),
+    );
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();
@@ -367,8 +402,7 @@ fn integration_fail_without_reasons_fails() {
 
 #[test]
 fn integration_blocked_with_reasons_passes() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
     let obj = json_val.as_object_mut().unwrap();
     obj.insert("status".into(), serde_json::Value::String("blocked".into()));
     obj.insert(
@@ -397,6 +431,14 @@ fn integration_constants_are_non_empty() {
         KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID,
         "kernel-teardown-mounted-vfs"
     );
+    assert_eq!(
+        KERNEL_TEARDOWN_NO_WORK_AFTER_FULL_KERNEL_NO_DAEMON_TIER,
+        "full-kernel-no-daemon"
+    );
+    assert_eq!(
+        KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID,
+        "kernel-teardown-no-daemon"
+    );
     assert!(!KERNEL_TEARDOWN_NO_WORK_AFTER_VERIFIER.is_empty());
 }
 
@@ -404,14 +446,10 @@ fn integration_constants_are_non_empty() {
 
 #[test]
 fn integration_invalid_status_rejected() {
-    let mut json_val: serde_json::Value =
-        serde_json::from_str(&minimal_pass_json()).unwrap();
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
     let obj = json_val.as_object_mut().unwrap();
     obj.insert("status".into(), serde_json::Value::String("bogus".into()));
-    obj.insert(
-        "fail_closed_reasons".into(),
-        serde_json::json!(["reason"]),
-    );
+    obj.insert("fail_closed_reasons".into(), serde_json::json!(["reason"]));
     let json = serde_json::to_string_pretty(&json_val).unwrap();
     let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
     let msg = err.to_string();

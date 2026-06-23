@@ -2871,6 +2871,7 @@ EOF
           kernelNoDaemonTeardownValidation = import ./nix/vm/kernel-no-daemon-teardown-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
+            tidefsPackage = tidefsCtlRuntime;
             tidefsXtaskRuntime = tidefsXtaskRuntime;
           };
 

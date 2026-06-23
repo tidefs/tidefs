@@ -3,8 +3,8 @@
 # QEMU Validation target for T6 full-kernel-no-daemon teardown stress.
 # Loads tidefs_posix_vfs.ko with zero userspace daemons (no FUSE daemon,
 # no ublk daemon, no policy/control daemon, no transport helper, no
-# usermode worker), mounts the bootstrap VFS through kernel-resident
-# paths only, exercises mount/write/sync, executes begin-teardown and
+# usermode worker), creates and mounts an explicit virtio pool member through
+# kernel-resident paths only, exercises mount/write/sync, executes begin-teardown and
 # final-teardown/unmount, unloads the module, probes post-final
 # operation refusal, captures Linux workqueue and callback trace
 # evidence through ftrace and dmesg, performs no-daemon crash/recovery
@@ -17,6 +17,7 @@
 {
   pkgs,
   linuxKernel_7_0,
+  tidefsPackage,
   tidefsXtaskRuntime,
 }:
 
@@ -30,9 +31,11 @@ let
     BUSYBOX="${pkgs.busybox}/bin/busybox"
     KERNEL_IMG="${linuxKernel_7_0}/bzImage"
     CPIO="${pkgs.cpio}/bin/cpio"
+    LDD_BIN="${pkgs.lib.getBin pkgs.glibc}/bin/ldd"
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     KERNEL_RELEASE="${linuxKernel_7_0.version}"
     POSIX_VFS_KO="''${TIDEFS_KERNEL_VFS_MODULE_KO:-}"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
     B3SUM="${pkgs.b3sum}/bin/b3sum"
     JQ="${pkgs.jq}/bin/jq"
     VALIDATOR="${tidefsXtaskRuntime}/bin/tidefs-xtask"
@@ -84,7 +87,7 @@ EOF
     echo "  Output:    $OUTPUT_DIR"
     echo ""
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$B3SUM" "$JQ" "$VALIDATOR"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$LDD_BIN" "$TIDEFSCTL" "$B3SUM" "$JQ" "$VALIDATOR"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -110,17 +113,55 @@ EOF
 
     RUN_DIR="$TMPDIR/validation-$$"
     INITRAMFS="$TMPDIR/initramfs-$$.cpio"
-    mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,validation,trace}
-    trap 'if [ -z "''${KEEP_TMP:-}" ]; then rm -rf "$RUN_DIR" "$INITRAMFS"; fi' EXIT
+    POOL_IMG="$TMPDIR/configured-pool-member-$$.img"
+    mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,validation,trace,var/lib/tidefs,run/tidefs/import,etc,usr/bin}
+    trap 'if [ -z "''${KEEP_TMP:-}" ]; then rm -rf "$RUN_DIR" "$INITRAMFS" "$POOL_IMG"; fi' EXIT
 
     cp "$BUSYBOX" "$RUN_DIR/bin/busybox"
     chmod +x "$RUN_DIR/bin/busybox"
+
+    # Nix-built BusyBox is dynamically linked and records absolute /nix/store
+    # interpreter/library paths. Copy those exact paths so /init can execute.
+    BUSYBOX_DEPS=$("$LDD_BIN" "$BUSYBOX" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
+    for lib in $BUSYBOX_DEPS; do
+      if [ -f "$lib" ]; then
+        lib_dir=$(dirname "$lib")
+        mkdir -p "$RUN_DIR$lib_dir"
+        cp "$lib" "$RUN_DIR$lib" 2>/dev/null || true
+      fi
+    done
+    BUSYBOX_LD_SO=$("$LDD_BIN" "$BUSYBOX" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
+    if [ -n "$BUSYBOX_LD_SO" ] && [ -f "$BUSYBOX_LD_SO" ]; then
+      ld_dir=$(dirname "$BUSYBOX_LD_SO")
+      mkdir -p "$RUN_DIR$ld_dir"
+      cp "$BUSYBOX_LD_SO" "$RUN_DIR$BUSYBOX_LD_SO" 2>/dev/null || true
+      chmod +x "$RUN_DIR$BUSYBOX_LD_SO" 2>/dev/null || true
+    fi
+
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff reboot \
       mknod mkdir rmdir dd stat cp mv rm touch find wc head tail sync cut dirname basename \
       printf test xargs seq awk tr sort uniq md5sum date ps umount lsmod mountpoint uname \
       true false; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
+
+    cp "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
+    chmod +x "$RUN_DIR/bin/tidefsctl"
+    TIDEFSCTL_DEPS=$("$LDD_BIN" "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*' | sort -u || true)
+    for lib in $TIDEFSCTL_DEPS; do
+      if [ -f "$lib" ]; then
+        lib_dir=$(dirname "$lib")
+        mkdir -p "$RUN_DIR$lib_dir"
+        cp "$lib" "$RUN_DIR$lib" 2>/dev/null || true
+      fi
+    done
+    TIDEFSCTL_LD_SO=$("$LDD_BIN" "$TIDEFSCTL" 2>/dev/null | grep -o '/nix/store/[^ ]*ld-linux[^ ]*' | head -1 || true)
+    if [ -n "$TIDEFSCTL_LD_SO" ] && [ -f "$TIDEFSCTL_LD_SO" ]; then
+      ld_dir=$(dirname "$TIDEFSCTL_LD_SO")
+      mkdir -p "$RUN_DIR$ld_dir"
+      cp "$TIDEFSCTL_LD_SO" "$RUN_DIR$TIDEFSCTL_LD_SO" 2>/dev/null || true
+      chmod +x "$RUN_DIR$TIDEFSCTL_LD_SO" 2>/dev/null || true
+    fi
 
     cp "$POSIX_VFS_KO" "$RUN_DIR/lib/modules/tidefs_posix_vfs.ko"
 
@@ -170,7 +211,8 @@ emit_artifact() {
 }
 
 MNT=/mnt/tidefs
-POOL_DIR=/var/lib/tidefs/pool
+POOL_DEV=/dev/vda
+POOL_NAME=t6_no_daemon_teardown_pool
 MODULE_PATH=/lib/modules/tidefs_posix_vfs.ko
 EVDIR=/validation
 
@@ -287,25 +329,58 @@ fi
 
 verify_no_daemon "module_load"
 
-# ── Phase: mount (bootstrap, no-daemon) ─────────────────────────────
-log_phase "mount" "start" "mount -t tidefs -o bootstrap (no-daemon)"
+# ── Phase: mount (configured pool member, no-daemon) ────────────────
+log_phase "mount" "start" "create and mount configured pool member (no-daemon)"
 echo "--- Phase: mount ---"
-mkdir -p "$POOL_DIR"
-dd if=/dev/zero of="$POOL_DIR/pool.img" bs=1M count=128 2>/dev/null || true
 
-if [ -f "$POOL_DIR/pool.img" ]; then
-  pass "pool_image"
+POOL_DEVICE_READY=0
+POOL_READY=0
+echo "Waiting for virtio pool member $POOL_DEV..."
+for _ in $(seq 1 30); do
+  [ -b "$POOL_DEV" ] && break
+  sleep 1
+done
+if [ -b "$POOL_DEV" ]; then
+  POOL_DEVICE_READY=1
+  pass "configured_pool_device_present"
 else
-  blocked "pool_image" "could not create pool backing file"
+  blocked "configured_pool_device_present" "$POOL_DEV missing"
+fi
+
+if [ "$POOL_DEVICE_READY" -eq 1 ] && command -v tidefsctl >/dev/null 2>&1; then
+  echo "tidefsctl pool create $POOL_NAME --devices $POOL_DEV --json"
+  COUT=$(tidefsctl pool create "$POOL_NAME" --devices "$POOL_DEV" --json 2>&1); RC=$?
+  echo "  create exit=$RC"
+  if [ "$RC" -eq 0 ]; then
+    pass "configured_pool_member_created"
+    SOUT=$(tidefsctl pool scan --devices "$POOL_DEV" 2>&1); SRC=$?
+    if [ "$SRC" -eq 0 ] && echo "$SOUT" | grep -qi "label"; then
+      pass "configured_pool_label_verified"
+      POOL_READY=1
+    else
+      fail "configured_pool_label_verified" "$SOUT"
+    fi
+  else
+    fail "configured_pool_member_created" "$COUT"
+  fi
+else
+  if [ "$POOL_DEVICE_READY" -eq 0 ]; then
+    blocked "configured_pool_member_created" "virtio pool device missing"
+  else
+    blocked "configured_pool_member_created" "tidefsctl not found in initramfs"
+  fi
+  blocked "configured_pool_label_verified" "pool member was not created"
 fi
 
 mkdir -p "$MNT"
-if mount -t tidefs -o bootstrap none "$MNT" 2>/tmp/mount.err; then
-  pass "mount_bootstrap"
-  log_phase "mount" "pass" "bootstrap mount ok (no-daemon)"
+if [ "$POOL_READY" -eq 1 ] && mount -t tidefs "$POOL_DEV" "$MNT" 2>/tmp/mount.err; then
+  pass "configured_pool_mount"
+  log_phase "mount" "pass" "configured pool member mount ok (no-daemon)"
 else
-  fail "mount_bootstrap" "$(cat /tmp/mount.err | head -1)"
-  log_phase "mount" "fail" "$(cat /tmp/mount.err | head -1)"
+  MOUNT_ERR=$(cat /tmp/mount.err 2>/dev/null | head -1)
+  [ -n "$MOUNT_ERR" ] || MOUNT_ERR="configured pool member not ready"
+  fail "configured_pool_mount" "$MOUNT_ERR"
+  log_phase "mount" "fail" "$MOUNT_ERR"
   poweroff -f
 fi
 
@@ -422,7 +497,7 @@ REFUSAL1_EXPECTED=true
 REFUSAL1_RESULT=""
 REFUSAL1_NEW_WORK=false
 
-if mount -t tidefs -o bootstrap none "$MNT" 2>/dev/null; then
+if mount -t tidefs "$POOL_DEV" "$MNT" 2>/dev/null; then
   REFUSAL1_RESULT="mount_unexpectedly_succeeded"
   fail "refusal_mount" "mount succeeded after module unload"
   umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
@@ -476,7 +551,7 @@ log_phase "reload_probe" "start" "re-insmod and remount (no-daemon)"
 echo "--- Phase: reload_probe ---"
 if insmod "$MODULE_PATH" 2>/tmp/reinsmod.err; then
   pass "reload_insmod"
-  if mount -t tidefs -o bootstrap none "$MNT" 2>/dev/null; then
+  if mount -t tidefs "$POOL_DEV" "$MNT" 2>/dev/null; then
     pass "reload_remount"
     ls "$MNT" >/dev/null 2>&1 && pass "reload_readdir" || fail "reload_readdir" "readdir failed"
     umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
@@ -507,14 +582,13 @@ else
 fi
 
 # Remount and verify
-if mount -t tidefs -o bootstrap none "$MNT" 2>/dev/null; then
+if mount -t tidefs "$POOL_DEV" "$MNT" 2>/dev/null; then
   pass "recovery_remount"
   # Check if previous data survived
   if [ -f "$MNT/teardown_test.txt" ]; then
     pass "recovery_data_survived"
   else
-    # Bootstrap pool may be fresh after unmount+rmmod
-    skip "recovery_data_survived" "bootstrap pool fresh after reload"
+    skip "recovery_data_survived" "pool member did not retain test file after reload"
   fi
   # Write new data to verify operation
   if echo "recovery-write-ok" > "$MNT/recovery_test.txt" 2>/dev/null; then
@@ -559,6 +633,10 @@ INITSCRIPT
 
     chmod +x "$RUN_DIR/init"
 
+    echo "--- Creating configured pool member disk image ---"
+    dd if=/dev/zero of="$POOL_IMG" bs=1M count=128 2>/dev/null
+    echo "  Pool member image: $POOL_IMG ($(du -h "$POOL_IMG" | cut -f1))"
+
     # Build initramfs outside the archived tree so the kernel sees a stable /init.
     (cd "$RUN_DIR" && find . -print0 | "$CPIO" -0 -o -H newc) > "$INITRAMFS" 2>/dev/null
 
@@ -569,9 +647,10 @@ INITSCRIPT
     timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
       -kernel "$KERNEL_IMG" \
       -initrd "$INITRAMFS" \
+      -drive file="$POOL_IMG",format=raw,if=virtio,index=0 \
       -append "console=ttyS0 quiet init=/init panic=10 panic_on_oops=1" \
       -nographic \
-      -m 512M \
+      -m 1024M \
       -no-reboot \
       2>&1 | tee "$RUN_DIR/qemu.log"
     QEMU_EXIT="''${PIPESTATUS[0]}"
