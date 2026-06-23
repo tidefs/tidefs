@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-// Metadata-heavy workload baseline harness for NEXT-PERF-004.
+// Metadata-heavy workload baseline harness.
 //
 // Measures create, stat, rename, and unlink operations on a mounted
 // filesystem path, producing ops/sec throughput and per-operation latency

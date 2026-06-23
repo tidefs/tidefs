@@ -500,7 +500,7 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Sparse file + dedup interaction (NEXT-FUSE-026)
+    // Sparse file + dedup interaction
     // ═══════════════════════════════════════════════════════════════════
 
     /// Write duplicate content through FUSE into a sparse layout

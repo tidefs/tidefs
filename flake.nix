@@ -520,7 +520,7 @@ EOF
               machine.wait_until_succeeds(f"mountpoint {mount_dir}", timeout=60)
               record("fuse_mount", "pass", mount_dir)
 
-              # --- FUSE fio benchmarks (NEXT-PERF-001: baseline sweep) ---
+              # --- FUSE fio baseline sweep ---
               fio_testfile = f"{mount_dir}/tidefs-fio-benchmark-file"
               fio_common = "--output-format=json --group_reporting --norandommap --randrepeat=0 --refill_buffers --direct=0"
 
@@ -1274,7 +1274,7 @@ EOF
               record("fio_verify", "pass", "zero data corruption")
 
               # ================================================================
-              # Queue-depth latency budget measurement (NEXT-UBLK-014)
+              # Queue-depth latency budget measurement
               # ================================================================
               # Run fio at varying queue depths (iodepth 1..64) with a consistent
               # randrw workload and capture latency percentiles + throughput KPIs.
@@ -1360,7 +1360,7 @@ EOF
               validation["queue_depth_latency_kpis"] = qd_latency_kpis
 
               # ================================================================
-              # Discard and write-zeroes guest filesystem matrix (NEXT-UBLK-011)
+              # Discard and write-zeroes guest filesystem matrix
               # ================================================================
 
               # Phase D1: Verify discard support advertised in sysfs

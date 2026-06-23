@@ -1,7 +1,8 @@
-# Module owners and invariants (PC-002)
+# Module owners and invariants scaffold
 
-Maturity: **implemented-source** navigation for current module ownership and
-invariant boundaries.
+Maturity: **delete-candidate scaffold**. `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`
+classifies this file as a delete candidate, so it is not current module
+ownership authority.
 
 This is a source map, not a production-completeness claim. Owner means the
 names the checks that keep the owner row tied to implementation.
@@ -21,5 +22,5 @@ names the checks that keep the owner row tied to implementation.
 
 ## Gate
 
-`tidefs-xtask check-module-owners` verifies that this PC-002 owner map contains
-non-claims, and that the publishing-facing docs link to it.
+The active `tidefs-xtask check-module-owners` gate is tracked outside this
+delete-candidate scaffold.

@@ -128,8 +128,8 @@ The acceptance matrix also defines `profile.block_acceptance_profile_3.oracle`
 (differential) and `profile.block_acceptance_profile_4.soak` (sustained stress)
 which are out of scope for these fio profiles and belong to separate harnesses.
 
-These benchmarking profiles are distinct from the PC-005C ublk verify job
-files in `validation/fio/`, which target correctness verification rather than
+These benchmarking profiles are distinct from the ublk fio verification jobs in
+`validation/fio/`, which target correctness verification rather than
 throughput/latency characterisation.
 
 ## Adding a new profile

@@ -1,7 +1,7 @@
 # Unified Storage Encryption Threat Model and Product Path Audit
 
 Last updated: 2026-05-23
-Issue: #6486 (NEXT-SEC-007)
+Historical issue: Forgejo #6486
 
 This document is the consolidated threat model for TideFS storage encryption.
 It inventories every encryption-related claim, maps each claim to specific
@@ -236,7 +236,7 @@ records.
 | Element | Value |
 |---|---|
 | Code path | `crates/tidefs-auth/src/audit.rs` |
-| Owning gaps | #6490 (NEXT-SEC-011) |
+| Owning gaps | Audit-log durability; historical Forgejo #6490 |
 
 ### 3.13 Integrity -- BLAKE3 Content Addressing
 
@@ -270,7 +270,7 @@ invariants.
 |---|---|
 | Code path | `crates/tidefs-block-kmod/`, `crates/tidefs-posix-vfs-kmod/` |
 | Audit | `docs/security/security-audit-2026-04-30.md` -- 41 of 42 production crates forbid unsafe; 1 exception with documented SAFETY invariants |
-| Owning gaps | #6492 (NEXT-SEC-013) -- kernel unsafe boundary consolidated review |
+| Owning gaps | Kernel unsafe boundary consolidated review; historical Forgejo #6492 |
 
 ### 3.16 No Message-Local Crypto Proof Markers
 
