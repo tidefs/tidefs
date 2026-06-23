@@ -1257,7 +1257,7 @@ mod tests {
         // from the transport.send path.
         assert!(
             result.is_err() || result.is_ok(),
-            "chunk shipping during partition completes (filter not yet wired into send path)"
+"chunk shipping via transport.send bypasses partition filter (by design: use state_transfer_a_to_b which routes through the filter for partition-aware sends)"
         );
     }
 
