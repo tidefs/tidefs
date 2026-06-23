@@ -2867,9 +2867,16 @@ pub struct FuseVfsAdapter {
     poll_registrations: Mutex<PollRegistrationTable>,
     pub(crate) dirty_state: Mutex<BTreeMap<u64, DirtyRanges>>,
     namespace: Option<Arc<Namespace>>,
+    /// Adapter-local FUSE kernel lookup references. This is the #665
+    /// projection state for the #655 dataset inode authority decision, not
+    /// durable inode lifetime; #664 owns the allocator authority extraction.
     forget_refcounts: Mutex<BTreeMap<u64, u64>>,
     /// Per-inode lookup frequency counter for reclaim hotness classification.
+    /// This is adapter hotness only and must not allocate or preserve inodes.
     lookup_counts: Mutex<BTreeMap<u64, u64>>,
+    /// Zero-TTL attributes for inodes removed while the kernel still owns
+    /// lookup references. Entries are served only while `forget_refcounts`
+    /// has a live projected reference for the same inode.
     removed_lookup_attrs: Mutex<BTreeMap<u64, InodeAttr>>,
     block_volume: Mutex<Option<Box<dyn BlockVolumeWriteTarget + Send>>>,
     /// Non-authoritative LRU read cache with byte-size limit.
@@ -4672,6 +4679,10 @@ impl FuseVfsAdapter {
     }
 
     fn removed_lookup_attr_out(&self, ino: u64) -> Option<FuseAttrOut> {
+        if !self.has_forget_refcount(ino) {
+            self.removed_lookup_attrs.lock().unwrap().remove(&ino);
+            return None;
+        }
         let attr = self
             .removed_lookup_attrs
             .lock()
@@ -9466,10 +9477,13 @@ impl FuseVfsAdapter {
 
     /// Decrement the kernel lookup reference count for `ino` by `nlookup`.
     ///
-    /// When the count reaches zero, the inode is eligible for reclaim.
-    /// Returns `true` if the count reached zero (reclaim-eligible),
-    /// `false` otherwise.
+    /// When the count reaches zero, lookup-scoped adapter caches may be
+    /// dropped. Durable inode reclaim remains owned by the mounted engine.
+    /// Returns `true` if the projected count reached zero, `false` otherwise.
     pub fn dispatch_forget(&self, ino: u64, nlookup: u64) -> bool {
+        if nlookup == 0 {
+            return false;
+        }
         let reached_zero = {
             let mut refs = self.forget_refcounts.lock().unwrap();
             if let Some(count) = refs.get_mut(&ino) {
@@ -26135,8 +26149,13 @@ mod tests {
         assert_eq!(getattr_out.attr.gid, expected.gid);
         assert_eq!(getattr_out.attr.rdev, expected.rdev);
         assert_eq!(getattr_out.attr.blksize, expected.blksize);
-        // Also verify the attribute cache validity is non-zero.
-        assert!(getattr_out.attr_valid > 0);
+        // GETATTR must follow the active adapter coherency policy.  The
+        // default test fixture uses RelativeAtime, which intentionally disables
+        // positive attr TTLs so lookup/getattr cannot hide atime updates.
+        assert_eq!(
+            fuse_attr_out_ttl(&getattr_out),
+            fixture.adapter.dentry_policy.positive_attr_ttl
+        );
     }
 
     #[test]
@@ -33295,6 +33314,25 @@ mod tests {
     }
 
     #[test]
+    fn forget_refcount_zero_nlookup_is_noop() {
+        let fixture = adapter_fixture();
+        let ctx = root_ctx();
+        let (inode_id, _adapter_fh, _engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"forget-zero.txt",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode_id.get();
+
+        fixture.adapter.bump_forget_refcount(ino);
+        let eligible = fixture.adapter.dispatch_forget(ino, 0);
+        assert!(!eligible);
+        let refs = fixture.adapter.forget_refcounts.lock().unwrap();
+        assert_eq!(refs.get(&ino), Some(&1));
+    }
+
+    #[test]
     fn forget_refcount_multiple_lookups_then_forget() {
         let fixture = adapter_fixture();
         let ctx = root_ctx();
@@ -36526,10 +36564,16 @@ mod tests {
 
         let child_ino = attr.inode_id.get();
 
-        // Verify via namespace
-        let ns_attrs = ns.get_attrs(child_ino).expect("ns get_attrs");
-        assert_eq!(ns_attrs.nlink, 2);
-        assert_eq!(ns_attrs.mode & 0o170000, 0o040000); // S_IFDIR
+        let lookup_attr = fixture
+            .adapter
+            .dispatch_lookup(&ctx, root_ino, b"mydir")
+            .expect("lookup engine-created directory through adapter");
+        assert_eq!(lookup_attr.inode_id.get(), child_ino);
+        assert_eq!(lookup_attr.kind, NodeKind::Dir);
+        assert!(
+            ns.get_attrs(child_ino).is_none(),
+            "engine-authoritative mkdir must not make the namespace projection own child lifetime"
+        );
     }
 
     #[test]
