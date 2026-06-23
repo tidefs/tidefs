@@ -2506,6 +2506,7 @@ dependencies = [
 name = "tidefs-geometry-convert"
 version = "0.421.0"
 dependencies = [
+ "blake3",
  "tidefs-erasure-coding",
  "tidefs-locator-table",
  "tidefs-types-incremental-job-core",
