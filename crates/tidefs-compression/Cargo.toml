@@ -5,6 +5,9 @@ edition = "2021"
 description = "Transparent per-object zstd + LZ4 compression wrapper for the TideFS local object store"
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 
 [dependencies]
 tidefs-local-object-store = { path = "../tidefs-local-object-store" }

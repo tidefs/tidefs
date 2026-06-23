@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "TideFS Rust-for-Linux common bridge substrate (stratum s2 / c6) — shared kernel-boundary trait contracts, opaque Linux object facades, lock/pin/workqueue glue, and kernel-compatible VFS type definitions for downstream kernel leaf modules"

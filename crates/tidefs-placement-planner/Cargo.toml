@@ -5,6 +5,9 @@ edition = "2021"
 description = "P8-03 data_copy_0: replica target computation from placement policy, failure domains, and tier goals"
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

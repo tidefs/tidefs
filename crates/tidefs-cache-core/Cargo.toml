@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "Cache lattice runtime: registry, eviction, invalidation, and cache-lattice view management (P4-02 Phase 2)"

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "P5-02 FUSE read/writeback worker pool (queue_class_4.file_read, queue_class_5.file_writeback)"

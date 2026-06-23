@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "Deterministic 4-phase quorum write protocol model: PREPARE-TRANSFER-COMMIT-WITNESS with 3 durability modes (quorum_full, quorum_witness, quorum_chain)"

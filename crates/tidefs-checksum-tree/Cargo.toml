@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "Incremental Merkle checksum tree with BLAKE3 for partial-read integrity, scrub acceleration, and send/receive integrity (G3 phase 1)"

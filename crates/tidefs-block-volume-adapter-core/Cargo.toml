@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
+
+description = "TideFS block-volume adapter core: shared trait contracts and type definitions for ublk/kernel block adapters"
 
 [dependencies]
 tidefs-block-allocator = { path = "../tidefs-block-allocator" }

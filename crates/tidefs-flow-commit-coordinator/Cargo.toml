@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "P8-03 data_copy_7 flow commit coordinator: receipt emission and state advancement layer bridging verification, rebuild, relocation, and replication flows"

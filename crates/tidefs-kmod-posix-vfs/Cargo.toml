@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "TideFS kernel POSIX VFS adapter (stratum s3 / c7) — clean-read namespace seam (K7-05). Delegates Linux VFS operations to the canonical VfsEngine trait through the kmod-bridge substrate."

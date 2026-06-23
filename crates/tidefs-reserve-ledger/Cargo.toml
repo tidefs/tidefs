@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 authors.workspace = true
 
 description = "Reserve ledger and budget domain runtime: named resource pools with reserve guarantees, pressure state machine, and domain governance for Design rule Rule 3"
