@@ -2,6 +2,7 @@
 name = "tidefs-namespace"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,17 +18,17 @@ that the FUSE adapter and higher-level filesystem consumers call.
 """
 
 [dependencies]
-tidefs-btree = { path = "../tidefs-btree" }
-tidefs-dir-index = { path = "../tidefs-dir-index" }
-tidefs-types-polymorphic-directory-index-core = { path = "../tidefs-types-polymorphic-directory-index-core", features = ["alloc"] }
-tidefs-orphan-index = { path = "../tidefs-orphan-index" }
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
-tidefs-intent-log = { path = "../tidefs-intent-log" }
+tidefs-btree = { workspace = true }
+tidefs-dir-index = { workspace = true }
+tidefs-types-polymorphic-directory-index-core = { workspace = true, features = ["alloc"] }
+tidefs-orphan-index = { workspace = true }
+tidefs-types-vfs-core = { workspace = true }
+tidefs-intent-log = { workspace = true }
 fxhash = "0.2"
-tidefs-local-filesystem = { path = "../tidefs-local-filesystem", optional = true }
+tidefs-local-filesystem = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [features]
 default = ["in-memory-dir-index"]

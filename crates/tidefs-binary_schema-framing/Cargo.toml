@@ -2,6 +2,7 @@
 name = "tidefs-binary_schema-framing"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,11 +13,11 @@ authors.workspace = true
 description = "Canonical binary schema framing: envelope, section, and chunk header encode/decode per P2-03 §2"
 
 [dependencies]
-tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
-tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
+tidefs-binary_schema-core = { workspace = true }
+tidefs-binary_schema-checksum = { workspace = true }
 
 [dev-dependencies]
-tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+tidefs-binary_schema-core = { workspace = true }
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
 
 [features]

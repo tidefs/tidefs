@@ -2,6 +2,7 @@
 name = "tidefs-binary_schema-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -22,5 +23,5 @@ proptest = { version = "=1.9.0", default-features = false, features = ["std"], o
 
 [dev-dependencies]
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
-tidefs-binary_schema-framing = { path = "../tidefs-binary_schema-framing" }
-tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
+tidefs-binary_schema-framing = { workspace = true }
+tidefs-binary_schema-checksum = { workspace = true }

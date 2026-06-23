@@ -1,18 +1,21 @@
 [package]
 name = "tidefs-placement-planner"
-version = "0.421.0"
-edition = "2021"
-description = "P8-03 data_copy_0: replica target computation from placement policy, failure domains, and tier goals"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
+authors.workspace = true
+
+description = "P8-03 data_copy_0: replica target computation from placement policy, failure domains, and tier goals"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
-tidefs-durability-layout = { path = "../tidefs-durability-layout" }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-durability-layout = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
+tidefs-replication-model = { workspace = true }
 blake3 = "1"

@@ -2,6 +2,7 @@
 name = "tidefs-intent-log"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -18,10 +19,11 @@ TxgCoordinator drains during two-phase commit.
 """
 
 [dependencies]
-tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+tidefs-binary_schema-core = { workspace = true }
 blake3 = { version = "1", default-features = false }
-tidefs-kernel-storage-io = { path = "../tidefs-kernel-storage-io", optional = true }
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core", optional = true }
+tidefs-kernel-storage-io = { workspace = true, optional = true }
+tidefs-types-vfs-core = { workspace = true, optional = true }
+tidefs-transport = { workspace = true, optional = true }
 
 [lib]
 path = "src/lib.rs"
@@ -31,7 +33,3 @@ default = ["std"]
 std = ["blake3/std"]
 kernel-io = ["tidefs-kernel-storage-io", "tidefs-types-vfs-core"]
 replication = ["std", "tidefs-transport"]
-
-[dependencies.tidefs-transport]
-path = "../tidefs-transport"
-optional = true

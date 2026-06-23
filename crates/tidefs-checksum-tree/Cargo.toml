@@ -2,6 +2,7 @@
 name = "tidefs-checksum-tree"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,11 +14,11 @@ description = "Incremental Merkle checksum tree with BLAKE3 for partial-read int
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
-tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
+tidefs-binary_schema-core = { workspace = true }
 serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
-serde_json = "1"
+serde_json = { workspace = true }
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
 
 [features]

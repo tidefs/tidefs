@@ -2,6 +2,7 @@
 name = "tidefs-device-removal"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,20 +17,20 @@ fencing, and committed-root anchoring for crash-safe resume.
 """
 
 [dependencies]
-tidefs-pool-scan = { path = "../tidefs-pool-scan" }
-tidefs-locator-table = { path = "../tidefs-locator-table" }
-tidefs-block-allocator = { path = "../tidefs-block-allocator" }
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
-tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core" }
+tidefs-pool-scan = { workspace = true }
+tidefs-locator-table = { workspace = true }
+tidefs-block-allocator = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+tidefs-replication-model = { workspace = true }
+tidefs-types-pool-label-core = { workspace = true }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { workspace = true }
 blake3 = "=1.5.5"
 thiserror = "2"
 
 [dev-dependencies]
-tempfile = "3"
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tempfile = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
 
 
 [lib]

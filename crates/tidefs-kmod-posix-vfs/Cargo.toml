@@ -2,6 +2,7 @@
 name = "tidefs-kmod-posix-vfs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,25 +13,25 @@ authors.workspace = true
 description = "TideFS kernel POSIX VFS adapter (stratum s3 / c7) — clean-read namespace seam (K7-05). Delegates Linux VFS operations to the canonical VfsEngine trait through the kmod-bridge substrate."
 
 [dependencies]
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
-tidefs-vfs-engine = { path = "../tidefs-vfs-engine" }
-tidefs-kmod-bridge = { path = "../../kmod" }
-tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core" }
-tidefs-kernel-storage-io = { path = "../tidefs-kernel-storage-io" }
-tidefs-commit_group = { path = "../tidefs-commit_group", features = ["kernel-storage"] }
-tidefs-xattr-storage = { path = "../tidefs-xattr-storage" }
-tidefs-types-extent-map-core = { path = "../tidefs-types-extent-map-core" }
+tidefs-types-vfs-core = { workspace = true }
+tidefs-vfs-engine = { workspace = true }
+tidefs-kmod-bridge = { workspace = true }
+tidefs-types-pool-label-core = { workspace = true }
+tidefs-kernel-storage-io = { workspace = true }
+tidefs-commit_group = { workspace = true, features = ["kernel-storage"] }
+tidefs-xattr-storage = { workspace = true }
+tidefs-types-extent-map-core = { workspace = true }
 blake3 = "1"
 
 [dev-dependencies]
 
 blake3 = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tidefs-local-filesystem = { path = "../tidefs-local-filesystem" }
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-tidefs-trace-oracle = { path = "../tidefs-trace-oracle" }
-tempfile = "3"
+serde_json = { workspace = true }
+tidefs-local-filesystem = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+tidefs-trace-oracle = { workspace = true }
+tempfile = { workspace = true }
 base64 = "0.22"
 
 

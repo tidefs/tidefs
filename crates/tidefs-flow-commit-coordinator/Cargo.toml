@@ -2,6 +2,7 @@
 name = "tidefs-flow-commit-coordinator"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,16 +13,16 @@ authors.workspace = true
 description = "P8-03 data_copy_7 flow commit coordinator: receipt emission and state advancement layer bridging verification, rebuild, relocation, and replication flows"
 
 [dependencies]
-tidefs-replication-model = { path = "../tidefs-replication-model" }
-tidefs-rebuild-runtime = { path = "../tidefs-rebuild-runtime" }
-tidefs-rebuild-planner = { path = "../tidefs-rebuild-planner" }
-tidefs-relocation-planner = { path = "../tidefs-relocation-planner" }
-tidefs-verification-engine = { path = "../tidefs-verification-engine" }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-replication-model = { workspace = true }
+tidefs-rebuild-runtime = { workspace = true }
+tidefs-rebuild-planner = { workspace = true }
+tidefs-relocation-planner = { workspace = true }
+tidefs-verification-engine = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-serde_json = "1"
+serde_json = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

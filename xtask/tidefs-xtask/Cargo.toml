@@ -2,6 +2,7 @@
 name = "tidefs-xtask"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,20 +14,20 @@ description = "Workspace summary xtask for tidefs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { workspace = true }
 toml = "0.8"
 ureq = { version = "3", default-features = false, features = ["json"] }
-tidefs-types-package-profile-catalog = { path = "../../crates/tidefs-types-package-profile-catalog" }
-tidefs-trace-oracle = { path = "../../crates/tidefs-trace-oracle" }
-tidefs-crash-oracle = { path = "../../crates/tidefs-crash-oracle" }
-tidefs-types-dataset-feature-flags-core = { path = "../../crates/tidefs-types-dataset-feature-flags-core" }
-tidefs-schema-codec-vfs = { path = "../../crates/tidefs-schema-codec-vfs" }
-tidefs-schema-codec-posix-filesystem-adapter = { path = "../../crates/tidefs-schema-codec-posix-filesystem-adapter" }
-tidefs-validation = { path = "../../crates/tidefs-validation", default-features = false }
-tidefs-types-vfs-core = { path = "../../crates/tidefs-types-vfs-core" }
-tidefs-types-posix-filesystem-adapter-core = { path = "../../crates/tidefs-types-posix-filesystem-adapter-core" }
-sha2 = "0.10"
-hex = "0.4"
+tidefs-types-package-profile-catalog = { workspace = true }
+tidefs-trace-oracle = { workspace = true }
+tidefs-crash-oracle = { workspace = true }
+tidefs-types-dataset-feature-flags-core = { workspace = true }
+tidefs-schema-codec-vfs = { workspace = true }
+tidefs-schema-codec-posix-filesystem-adapter = { workspace = true }
+tidefs-validation = { workspace = true, default-features = false }
+tidefs-types-vfs-core = { workspace = true }
+tidefs-types-posix-filesystem-adapter-core = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 
 [[bin]]
@@ -34,4 +35,4 @@ name = "tidefs-xtask"
 path = "src/main.rs"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }

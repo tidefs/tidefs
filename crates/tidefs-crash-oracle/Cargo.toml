@@ -2,6 +2,7 @@
 name = "tidefs-crash-oracle"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,9 +14,10 @@ description = "Model-first crash oracle for bounded TideFS persistence-boundary 
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tidefs-model-core = { path = "../tidefs-model-core" }
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+serde_json = { workspace = true }
+tidefs-model-core = { workspace = true }
+tidefs-types-vfs-core = { workspace = true }
+tidefs-intent-log = { workspace = true, optional = true }
 
 [lib]
 path = "src/lib.rs"
@@ -26,7 +28,3 @@ path = "src/main.rs"
 
 [features]
 intent-log-replay = ["tidefs-intent-log"]
-
-[dependencies.tidefs-intent-log]
-path = "../tidefs-intent-log"
-optional = true

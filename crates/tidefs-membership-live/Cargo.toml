@@ -2,12 +2,14 @@
 name = "tidefs-membership-live"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
+
 description = "P8-02 live membership runtime: SWIM failure detection, 3-phase epoch transitions, heartbeat protocol"
 
 [features]
@@ -16,31 +18,31 @@ loopback = ["tidefs-transport/loopback"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-ed25519-dalek = { version = "1", features = ["serde"] }
+ed25519-dalek = { workspace = true, features = ["serde"] }
 rand = "0.7"
 thiserror = "2"
-hex = "0.4"
-bincode = "1"
-serde_json = "1"
+hex = { workspace = true }
+bincode = { workspace = true }
+serde_json = { workspace = true }
 blake3 = { version = "1", default-features = false }
-tokio = { version = "1", features = ["sync"] }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
-tidefs-membership-types = { path = "../tidefs-membership-types", features = ["serde"] }
-tidefs-transport = { path = "../tidefs-transport" }
-tidefs-auth = { path = "../tidefs-auth" }
-tidefs-placement-runtime = { path = "../tidefs-placement-runtime" }
-tidefs-durability-layout = { path = "../tidefs-durability-layout" }
-tidefs-placement-planner = { path = "../tidefs-placement-planner" }
-tidefs-node-drain = { path = "../tidefs-node-drain" }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
-tidefs-cluster = { path = "../tidefs-cluster" }
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tokio = { workspace = true, features = ["sync"] }
+tidefs-membership-epoch = { workspace = true }
+tidefs-membership-types = { workspace = true, features = ["serde"] }
+tidefs-transport = { workspace = true }
+tidefs-auth = { workspace = true }
+tidefs-placement-runtime = { workspace = true }
+tidefs-durability-layout = { workspace = true }
+tidefs-placement-planner = { workspace = true }
+tidefs-node-drain = { workspace = true }
+tidefs-replication-model = { workspace = true }
+tidefs-cluster = { workspace = true }
+tidefs-local-object-store = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "macros"] }
-serde_json = "1"
-tempfile = "3"
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tidefs-local-object-store = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

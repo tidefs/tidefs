@@ -2,6 +2,7 @@
 name = "tidefs-block-volume-adapter-ublk-control-runtime"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,5 +16,5 @@ description = "Runtime ublk control-device read-only probe boundary for the Tide
 libc = "0.2"
 
 io-uring = "0.7.12"
-tidefs-ublk-abi = { path = "../tidefs-ublk-abi" }
+tidefs-ublk-abi = { workspace = true }
 blake3 = "1.5"

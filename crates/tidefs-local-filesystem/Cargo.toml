@@ -2,6 +2,7 @@
 name = "tidefs-local-filesystem"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,58 +16,58 @@ description = "TideFS local filesystem: userspace product core pending kernel ex
 blake3 = "=1.5.5"
 zstd = { version = "0.13", default-features = false }
 lz4_flex = "0.11"
-tidefs-dataset-feature-flags = { path = "../tidefs-dataset-feature-flags" }
-tidefs-extent-map = { path = "../tidefs-extent-map" }
-tidefs-dir-index = { path = "../tidefs-dir-index" }
-tidefs-types-extent-map-core = { path = "../tidefs-types-extent-map-core" }
-tidefs-block-allocator = { path = "../tidefs-block-allocator" }
-tidefs-types-dataset-feature-flags-core = { path = "../tidefs-types-dataset-feature-flags-core" }
-tidefs-dataset-lifecycle = { path = "../tidefs-dataset-lifecycle" }
-tidefs-dataset-properties = { path = "../tidefs-dataset-properties" }
-tidefs-dedup = { path = "../tidefs-dedup" }
-tidefs-types-cache-lattice-core = { path = "../tidefs-types-cache-lattice-core" }
-tidefs-types-space-accounting-core = { path = "../tidefs-types-space-accounting-core" }
-tidefs-space-accounting = { path = "../tidefs-space-accounting" }
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-tidefs-durability-layout = { path = "../tidefs-durability-layout" }
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core", features = ["alloc"] }
-tidefs-vfs-engine = { path = "../tidefs-vfs-engine" }
-tidefs-types-vfs-owned = { path = "../tidefs-types-vfs-owned" }
-tidefs-types-claim-ledger-core = { path = "../tidefs-types-claim-ledger-core" }
-tidefs-reserve-ledger = { path = "../tidefs-reserve-ledger" }
-tidefs-claim-ledger = { path = "../tidefs-claim-ledger" }
-tidefs-erasure-coding = { path = "../tidefs-erasure-coding" }
-tidefs-performance-contract = { path = "../tidefs-performance-contract", features = ["alloc"] }
-tidefs-types-polymorphic-xattr-core = { path = "../tidefs-types-polymorphic-xattr-core", features = ["alloc"] }
-tidefs-posix-acl = { path = "../tidefs-posix-acl", features = ["alloc"] }
-tidefs-inode-table = { path = "../tidefs-inode-table" }
-tidefs-inode-attributes = { path = "../tidefs-inode-attributes" }
-tidefs-commit_group = { path = "../tidefs-commit_group" }
-tidefs-cleanup-engine = { path = "../tidefs-cleanup-engine" }
-tidefs-intent-log = { path = "../tidefs-intent-log" }
-tidefs-recovery-loop = { path = "../tidefs-recovery-loop" }
-tidefs-send-stream = { path = "../tidefs-send-stream" }
-tidefs-receive-stream = { path = "../tidefs-receive-stream" }
+tidefs-dataset-feature-flags = { workspace = true }
+tidefs-extent-map = { workspace = true }
+tidefs-dir-index = { workspace = true }
+tidefs-types-extent-map-core = { workspace = true }
+tidefs-block-allocator = { workspace = true }
+tidefs-types-dataset-feature-flags-core = { workspace = true }
+tidefs-dataset-lifecycle = { workspace = true }
+tidefs-dataset-properties = { workspace = true }
+tidefs-dedup = { workspace = true }
+tidefs-types-cache-lattice-core = { workspace = true }
+tidefs-types-space-accounting-core = { workspace = true }
+tidefs-space-accounting = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+tidefs-durability-layout = { workspace = true }
+tidefs-types-vfs-core = { workspace = true, features = ["alloc"] }
+tidefs-vfs-engine = { workspace = true }
+tidefs-types-vfs-owned = { workspace = true }
+tidefs-types-claim-ledger-core = { workspace = true }
+tidefs-reserve-ledger = { workspace = true }
+tidefs-claim-ledger = { workspace = true }
+tidefs-erasure-coding = { workspace = true }
+tidefs-performance-contract = { workspace = true, features = ["alloc"] }
+tidefs-types-polymorphic-xattr-core = { workspace = true, features = ["alloc"] }
+tidefs-posix-acl = { workspace = true, features = ["alloc"] }
+tidefs-inode-table = { workspace = true }
+tidefs-inode-attributes = { workspace = true }
+tidefs-commit_group = { workspace = true }
+tidefs-cleanup-engine = { workspace = true }
+tidefs-intent-log = { workspace = true }
+tidefs-recovery-loop = { workspace = true }
+tidefs-send-stream = { workspace = true }
+tidefs-receive-stream = { workspace = true }
 
-tidefs-background-scheduler = { path = "../tidefs-background-scheduler" }
-tidefs-compaction = { path = "../tidefs-compaction" }
-tidefs-scrub-core = { path = "../tidefs-scrub-core" }
-tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
-tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
-tidefs-online-defrag = { path = "../tidefs-online-defrag" }
-tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
+tidefs-background-scheduler = { workspace = true }
+tidefs-compaction = { workspace = true }
+tidefs-scrub-core = { workspace = true }
+tidefs-reclaim-queue-core = { workspace = true }
+tidefs-types-reclaim-queue-core = { workspace = true }
+tidefs-online-defrag = { workspace = true }
+tidefs-types-incremental-job-core = { workspace = true }
 
-tidefs-orphan-index = { path = "../tidefs-orphan-index" }
-tidefs-types-orphan-index-core = { path = "../tidefs-types-orphan-index-core" }
-tidefs-posix-semantics = { path = "../tidefs-posix-semantics" }
+tidefs-orphan-index = { workspace = true }
+tidefs-types-orphan-index-core = { workspace = true }
+tidefs-posix-semantics = { workspace = true }
 
-tidefs-quorum-write-runtime = { path = "../tidefs-quorum-write-runtime" }
+tidefs-quorum-write-runtime = { workspace = true }
 rand = "0.8"
-tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core" }
-tidefs-pool-scan = { path = "../tidefs-pool-scan" }
-tidefs-encryption = { path = "../tidefs-encryption", optional = true }
+tidefs-types-pool-label-core = { workspace = true }
+tidefs-pool-scan = { workspace = true }
+tidefs-encryption = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { workspace = true }
 thiserror = "2"
 
 [features]
@@ -75,13 +76,13 @@ encryption = ["dep:tidefs-encryption"]
 path = "src/lib.rs"
 
 [dev-dependencies]
-tempfile = "3"
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-criterion = "0.4"
+tempfile = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+criterion = { workspace = true }
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
-tidefs-types-dataset-lifecycle-core = { path = "../tidefs-types-dataset-lifecycle-core" }
-tidefs-reclaim = { path = "../tidefs-reclaim" }
+tidefs-replication-model = { workspace = true }
+tidefs-types-dataset-lifecycle-core = { workspace = true }
+tidefs-reclaim = { workspace = true }
 
 [[bench]]
 name = "filesystem"

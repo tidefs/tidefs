@@ -2,6 +2,7 @@
 name = "tidefs-placement-runtime"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,19 +16,19 @@ description = "Placement runtime engine: executes deterministic placement plans 
 serde = { version = "1", features = ["derive"] }
 blake3 = "1"
 thiserror = "2"
-tidefs-block-allocator = { path = "../tidefs-block-allocator" }
-tidefs-lease = { path = "../tidefs-lease" }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
-tidefs-placement-planner = { path = "../tidefs-placement-planner" }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
-tidefs-flow-commit-coordinator = { path = "../tidefs-flow-commit-coordinator" }
-tidefs-rebalance-planner = { path = "../tidefs-rebalance-planner" }
-tidefs-node-join = { path = "../tidefs-node-join" }
-tidefs-rebuild-planner = { path = "../tidefs-rebuild-planner" }
-tidefs-replica-health = { path = "../tidefs-replica-health" }
-tidefs-durability-layout = { path = "../tidefs-durability-layout" }
-tidefs-device-removal = { path = "../tidefs-device-removal" }
-tidefs-locator-table = { path = "../tidefs-locator-table" }
+tidefs-block-allocator = { workspace = true }
+tidefs-lease = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
+tidefs-placement-planner = { workspace = true }
+tidefs-replication-model = { workspace = true }
+tidefs-flow-commit-coordinator = { workspace = true }
+tidefs-rebalance-planner = { workspace = true }
+tidefs-node-join = { workspace = true }
+tidefs-rebuild-planner = { workspace = true }
+tidefs-replica-health = { workspace = true }
+tidefs-durability-layout = { workspace = true }
+tidefs-device-removal = { workspace = true }
+tidefs-locator-table = { workspace = true }
 
 [dev-dependencies]
 

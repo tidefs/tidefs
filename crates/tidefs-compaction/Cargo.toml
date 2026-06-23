@@ -2,6 +2,7 @@
 name = "tidefs-compaction"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,9 +13,9 @@ authors.workspace = true
 description = "CompactionService incremental background job: compacts derived catalog and refcount B-tree pages during idle periods"
 
 [dependencies]
-tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
-tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core" }
-tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
+tidefs-types-incremental-job-core = { workspace = true }
+tidefs-incremental-job-core = { workspace = true }
+tidefs-reclaim-queue-core = { workspace = true }
 blake3 = "1"
 constant_time_eq = "0.3"
 

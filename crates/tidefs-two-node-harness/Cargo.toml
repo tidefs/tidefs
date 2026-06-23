@@ -2,12 +2,14 @@
 name = "tidefs-two-node-harness"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
+
 description = "Deterministic two-node transport harness with storage+transport scenario: loopback, QEMU, BLAKE3-authenticated session, chunk verification, and VFSSEND2 state transfer"
 
 [features]
@@ -16,27 +18,27 @@ qemu = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
+bincode = { workspace = true }
 blake3 = { version = "1", default-features = false }
-tidefs-send-stream = { path = "../tidefs-send-stream" }
-tidefs-transport = { path = "../tidefs-transport" }
-tidefs-auth = { path = "../tidefs-auth" }
-tidefs-chunk-shipper = { path = "../tidefs-chunk-shipper" }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
-tidefs-placement-planner = { path = "../tidefs-placement-planner" }
-tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+tidefs-send-stream = { workspace = true }
+tidefs-transport = { workspace = true }
+tidefs-auth = { workspace = true }
+tidefs-chunk-shipper = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
+tidefs-placement-planner = { workspace = true }
+tidefs-durability-layout = { workspace = true }
 
 [dev-dependencies]
-tidefs-cluster = { path = "../tidefs-cluster" }
-tidefs-partition-runtime = { path = "../tidefs-partition-runtime" }
-tidefs-rebuild-runtime = { path = "../tidefs-rebuild-runtime" }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
-tidefs-receive-stream = { path = "../tidefs-receive-stream" }
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-tidefs-membership-live = { path = "../tidefs-membership-live" }
-tidefs-membership-types = { path = "../tidefs-membership-types" }
-serde_json = "1"
-tempfile = "3"
+tidefs-cluster = { workspace = true }
+tidefs-partition-runtime = { workspace = true }
+tidefs-rebuild-runtime = { workspace = true }
+tidefs-replication-model = { workspace = true }
+tidefs-receive-stream = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+tidefs-membership-live = { workspace = true }
+tidefs-membership-types = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

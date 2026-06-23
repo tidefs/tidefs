@@ -2,6 +2,7 @@
 name = "tidefs-quorum-write"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,7 +16,7 @@ description = "Deterministic 4-phase quorum write protocol model: PREPARE-TRANSF
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-serde_json = "1"
+serde_json = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

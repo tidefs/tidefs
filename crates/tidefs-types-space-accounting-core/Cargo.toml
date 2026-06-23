@@ -2,12 +2,14 @@
 name = "tidefs-types-space-accounting-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
+
 description = "TideFS space accounting authority type definitions: logical/physical counters, space domains, snapshot deadlist records, and admission control"
 
 [features]

@@ -2,6 +2,7 @@
 name = "tidefs-model-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,8 +14,8 @@ description = "Pure deterministic VFS semantics model for TideFS trace and oracl
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+serde_json = { workspace = true }
+tidefs-types-vfs-core = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

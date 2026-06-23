@@ -2,6 +2,7 @@
 name = "tidefs-replica-health"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,15 +13,15 @@ authors.workspace = true
 description = "Per-chunk replica health tracking with adaptive failure detection, lag computation, and flap suppression — P8-03 data_copy_3"
 
 [dependencies]
-tidefs-replication-model = { path = "../tidefs-replication-model" }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-replication-model = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 blake3 = "1"
 getrandom = "0.2"
 
 [dev-dependencies]
-serde_json = "1"
+serde_json = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

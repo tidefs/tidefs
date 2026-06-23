@@ -2,6 +2,7 @@
 name = "tidefs-pool-allocator"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,7 +18,7 @@ free-segment tracker (G1 Phase 6 completion).
 """
 
 [dependencies]
-tidefs-spacemap-allocator = { path = "../tidefs-spacemap-allocator" }
+tidefs-spacemap-allocator = { workspace = true }
 
 [dev-dependencies]
 

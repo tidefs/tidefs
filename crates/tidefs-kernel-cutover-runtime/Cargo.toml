@@ -2,12 +2,14 @@
 name = "tidefs-kernel-cutover-runtime"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
+
 description = "Userspace kernel-cutover runtime: state-machine executor, fence manager, dry-run gate evaluator, and rollback engine"
 [lib]
 name = "tidefs_kernel_cutover_runtime"

@@ -2,6 +2,7 @@
 name = "tidefs-commit_group"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,20 +18,20 @@ and stable storage.
 """
 
 [dependencies]
-tidefs-intent-log = { path = "../tidefs-intent-log", optional = true }
-tidefs-types-extent-map-core = { path = "../tidefs-types-extent-map-core", optional = true }
-tidefs-extent-map = { path = "../tidefs-extent-map", optional = true }
-tidefs-checksum-tree = { path = "../tidefs-checksum-tree", optional = true }
-tidefs-kernel-storage-io = { path = "../tidefs-kernel-storage-io", optional = true }
-tidefs-vfs-engine = { path = "../tidefs-vfs-engine", optional = true }
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core", optional = true }
+tidefs-intent-log = { workspace = true, optional = true }
+tidefs-types-extent-map-core = { workspace = true, optional = true }
+tidefs-extent-map = { workspace = true, optional = true }
+tidefs-checksum-tree = { workspace = true, optional = true }
+tidefs-kernel-storage-io = { workspace = true, optional = true }
+tidefs-vfs-engine = { workspace = true, optional = true }
+tidefs-types-vfs-core = { workspace = true, optional = true }
 blake3 = { version = "=1.5.5", default-features = false }
 serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
-serde_json = "1"
-tempfile = "3"
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tidefs-local-object-store = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

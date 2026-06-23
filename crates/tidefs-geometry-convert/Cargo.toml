@@ -2,6 +2,7 @@
 name = "tidefs-geometry-convert"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,8 +17,8 @@ Uses extent_id indirection so extent maps stay unchanged.
 """
 
 [dependencies]
-tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core", features = ["alloc"] }
-tidefs-locator-table = { path = "../tidefs-locator-table" }
-tidefs-erasure-coding = { path = "../tidefs-erasure-coding" }
+tidefs-types-incremental-job-core = { workspace = true, features = ["alloc"] }
+tidefs-locator-table = { workspace = true }
+tidefs-erasure-coding = { workspace = true }
 
 [dev-dependencies]

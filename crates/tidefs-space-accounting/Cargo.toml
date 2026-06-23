@@ -2,6 +2,7 @@
 name = "tidefs-space-accounting"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,7 +16,7 @@ integration, delta accumulation, and pool-level capacity gating.
 """
 
 [dependencies]
-tidefs-types-space-accounting-core = { path = "../tidefs-types-space-accounting-core" }
+tidefs-types-space-accounting-core = { workspace = true }
 hashbrown = { version = "0.15", default-features = false, features = ["inline-more", "default-hasher"] }
 
 [features]

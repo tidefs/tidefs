@@ -2,6 +2,7 @@
 name = "tidefs-dataset-catalog"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,11 +17,11 @@ survive renames.
 """
 
 [dependencies]
-tidefs-btree = { path = "../tidefs-btree" }
-tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
-tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
+tidefs-btree = { workspace = true }
+tidefs-binary_schema-core = { workspace = true }
+tidefs-binary_schema-checksum = { workspace = true }
 blake3 = { version = "1", default-features = false }
-tidefs-dataset-properties = { path = "../tidefs-dataset-properties" }
+tidefs-dataset-properties = { workspace = true }
 
 [dev-dependencies]
 

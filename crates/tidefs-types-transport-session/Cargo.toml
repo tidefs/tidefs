@@ -2,6 +2,7 @@
 name = "tidefs-types-transport-session"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,7 +16,7 @@ description = "Deterministic transport_session_cohort_graph model: endpoint fami
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 
 [dev-dependencies]
-serde_json = "1"
+serde_json = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

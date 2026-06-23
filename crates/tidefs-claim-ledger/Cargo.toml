@@ -2,6 +2,7 @@
 name = "tidefs-claim-ledger"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,8 +16,8 @@ description = "Claim ledger runtime: authority-tracked resource consumption, cla
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tidefs-types-claim-ledger-core = { path = "../tidefs-types-claim-ledger-core" }
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+tidefs-types-claim-ledger-core = { workspace = true }
+tidefs-types-vfs-core = { workspace = true }
 
 [dev-dependencies]
 proptest = "=1.9.0"

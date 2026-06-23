@@ -2,6 +2,7 @@
 name = "tidefs-gc-pin-set"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -24,5 +25,5 @@ alloc = ["tidefs-types-dataset-lifecycle-core/alloc"]
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
 
 [dependencies]
-tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core", default-features = false }
-tidefs-types-dataset-lifecycle-core = { path = "../tidefs-types-dataset-lifecycle-core", default-features = false }
+tidefs-types-reclaim-queue-core = { workspace = true, default-features = false }
+tidefs-types-dataset-lifecycle-core = { workspace = true, default-features = false }

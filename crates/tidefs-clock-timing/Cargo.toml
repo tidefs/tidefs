@@ -2,6 +2,7 @@
 name = "tidefs-clock-timing"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -19,4 +20,4 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
-serde_json = "1"
+serde_json = { workspace = true }

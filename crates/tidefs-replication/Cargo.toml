@@ -2,6 +2,7 @@
 name = "tidefs-replication"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,15 +15,15 @@ description = "Replication protocol: fanout write, quorum ACK collection, degrad
 [dependencies]
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
-tidefs-transport = { path = "../tidefs-transport" }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
-tidefs-quorum-write = { path = "../tidefs-quorum-write" }
-tidefs-flow-commit-coordinator = { path = "../tidefs-flow-commit-coordinator" }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
+tidefs-transport = { workspace = true }
+tidefs-replication-model = { workspace = true }
+tidefs-quorum-write = { workspace = true }
+tidefs-flow-commit-coordinator = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
 
 
-tidefs-local-object-store = { path = "../tidefs-local-object-store", optional = true }
-tidefs-placement-runtime = { path = "../tidefs-placement-runtime", optional = true }
+tidefs-local-object-store = { workspace = true, optional = true }
+tidefs-placement-runtime = { workspace = true, optional = true }
 
 
 [features]
@@ -34,4 +35,4 @@ placement-adapter = ["tidefs-placement-runtime"]
 path = "src/lib.rs"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }

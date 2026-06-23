@@ -2,12 +2,14 @@
 name = "tidefs-transport"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
+
 description = "Transport/session layer: TCP transport backend, session cohort graph, 5-lane multiplexing, chunk shipper, reconnection"
 
 [features]
@@ -18,48 +20,48 @@ tdma = ["tidefs-tdma-scheduler"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "macros"] }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
 bytes = "1"
 thiserror = "2"
-tracing = "0.1"
+tracing = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"], optional = true }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
-tidefs-membership-types = { path = "../tidefs-membership-types" }
-tidefs-clock-timing = { path = "../tidefs-clock-timing" }
-tidefs-types-transport-session = { path = "../tidefs-types-transport-session" }
-tidefs-tdma-scheduler = { path = "../tidefs-tdma-scheduler", optional = true }
-bincode = "1"
-ed25519-dalek = { version = "1", features = ["serde"] }
+tidefs-membership-epoch = { workspace = true }
+tidefs-membership-types = { workspace = true }
+tidefs-clock-timing = { workspace = true }
+tidefs-types-transport-session = { workspace = true }
+tidefs-tdma-scheduler = { workspace = true, optional = true }
+bincode = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["serde"] }
 rand = "0.7"
 blake3 = "1"
-tidefs-auth = { path = "../tidefs-auth" }
+tidefs-auth = { workspace = true }
 crc32c = "0.6"
-tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
-tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
-tidefs-binary_schema-framing = { path = "../tidefs-binary_schema-framing" }
-tidefs-lease = { path = "../tidefs-lease" }
-tidefs-lock-service = { path = "../tidefs-lock-service" }
-tidefs-cluster = { path = "../tidefs-cluster" }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
-tidefs-placement-planner = { path = "../tidefs-placement-planner" }
-tidefs-durability-layout = { path = "../tidefs-durability-layout" }
-chacha20poly1305 = "0.10"
-hmac = "0.12"
-sha2 = "0.10"
+tidefs-binary_schema-checksum = { workspace = true }
+tidefs-binary_schema-core = { workspace = true }
+tidefs-binary_schema-framing = { workspace = true }
+tidefs-lease = { workspace = true }
+tidefs-lock-service = { workspace = true }
+tidefs-cluster = { workspace = true }
+tidefs-replication-model = { workspace = true }
+tidefs-placement-planner = { workspace = true }
+tidefs-durability-layout = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 libc = "0.2"
 lz4_flex = "0.11"
 zstd = "0.13"
 
 [dev-dependencies]
-tidefs-placement-planner = { path = "../tidefs-placement-planner" }
-tidefs-durability-layout = { path = "../tidefs-durability-layout" }
-tidefs-lease = { path = "../tidefs-lease" }
-tidefs-cluster = { path = "../tidefs-cluster" }
+tidefs-placement-planner = { workspace = true }
+tidefs-durability-layout = { workspace = true }
+tidefs-lease = { workspace = true }
+tidefs-cluster = { workspace = true }
 tokio-test = "0.4"
-tempfile = "3"
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-criterion = "0.4"
+tempfile = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+criterion = { workspace = true }
 
 [[bench]]
 name = "throughput"

@@ -2,6 +2,7 @@
 name = "tidefs-segment-cleaner"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,13 +17,13 @@ and frees fully-dead segments back to the pool allocator.
 """
 
 [dependencies]
-tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core" }
-tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core" }
-tidefs-reclaim-queue-core = { path = "../tidefs-reclaim-queue-core" }
-tidefs-gc-pin-set = { path = "../tidefs-gc-pin-set" }
-tidefs-types-dataset-lifecycle-core = { path = "../tidefs-types-dataset-lifecycle-core" }
-tidefs-cleanup-queue-core = { path = "../tidefs-cleanup-queue-core" }
-tidefs-commit_group = { path = "../tidefs-commit_group" }
-tidefs-reclaim = { path = "../tidefs-reclaim" }
-tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
+tidefs-types-incremental-job-core = { workspace = true }
+tidefs-incremental-job-core = { workspace = true }
+tidefs-reclaim-queue-core = { workspace = true }
+tidefs-gc-pin-set = { workspace = true }
+tidefs-types-dataset-lifecycle-core = { workspace = true }
+tidefs-cleanup-queue-core = { workspace = true }
+tidefs-commit_group = { workspace = true }
+tidefs-reclaim = { workspace = true }
+tidefs-types-reclaim-queue-core = { workspace = true }
 blake3 = "1"

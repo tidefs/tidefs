@@ -2,22 +2,24 @@
 name = "tidefs-node-drain"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
+
 description = "Staged node drain with resource migration, forced fencing, and decommission"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 blake3 = "1"
-bincode = "1"
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
-tidefs-lease = { path = "../tidefs-lease" }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
+bincode = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
+tidefs-lease = { workspace = true }
+tidefs-replication-model = { workspace = true }
 
 [dev-dependencies]
 
