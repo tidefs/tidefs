@@ -13,7 +13,7 @@ OpenZFS/Ceph-class claims.
 | TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Use `docs/TRANSFORM_PIPELINE_AUTHORITY.md` as the #1063 boundary decision and close its non-overlapping follow-up map before claiming runtime conformance. |
 | TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Use `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` as the boundary decision and close the linked follow-up issue map. |
 | TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` for the integrated recovery/fsync/writeback/mmap durability boundary and follow-up map, and `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` for the invalidation trigger, stale-generation, and FUSE/kernel/cluster lease model; then prove and test the end-to-end durability and cache-coherency contract. |
-| TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Unify snapshot lifecycle, object protection, deadlists, and stream formats. |
+| TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Authority doc created at `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` (issue #1246). Deadlist integration and distributed snapshot shipping remain open design items. |
 | TFR-011 | Operator CLI/UAPI | CLI, FUSE, ublk, kernel UAPI, and docs can describe different truths. | Define one public operator/UAPI boundary and keep internal crates behind it. |
 | TFR-013 | Stub/placeholder stage | Several crates and docs still look like stage scaffolding rather than product behavior. | Classify placeholders explicitly and delete or implement them. |
 | TFR-014 | Licensing/provenance | Fresh TideFS import must preserve Linux-style GPLv2+syscall-note licensing and third-party provenance. | Audit all package metadata and file-local notices after rename. |
@@ -596,6 +596,10 @@ Important 2026-06-01 findings:
   publishing a new selected root. These paths are not unified with deadlist
   accounting, placement receipts, distributed send/receive authority, conflict
   resolution, or integrated snapshot reclaim.
+
+  TFR-010 investigation outcome (issue #1246): `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`
+  records the live snapshot/clone/send-receive behavior and cross-subsystem contracts.
+  Deadlist integration and distributed snapshot shipping remain open design gaps.
 - `TFR-011`: Operator/UAPI authority is not yet one boundary.
   Commit `7dbb0759` removes the fake `pool list` parser surface instead of
   accepting a command whose handler only said scaffolding had been removed, and
