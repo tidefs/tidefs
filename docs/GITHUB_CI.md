@@ -155,3 +155,13 @@ the event bridge after runner maintenance, confirm that the NixOS system
 profile still exposes the relay signer tools on each runner, dispatch the
 `Codex Nexus Relay` workflow against the target branch, and confirm the local
 dashboard event log records a signed `workflow_dispatch` event.
+
+- `Kernel no-daemon teardown validation` is a manual self-hosted QEMU Smoke
+  target for the T6 full-kernel-no-daemon teardown and recovery runtime
+  evidence row. It runs `.#kernel-no-daemon-teardown-validation` against the
+  selected branch, exercises mount/write/sync/teardown/unmount/module-unload
+  lifecycle with ftrace workqueue tracing, zero userspace daemons, post-final
+  refusal probes, and no-daemon crash/recovery cycles, and uploads
+  `kernel-teardown-runtime.json` and `evidence-manifest.json` under
+  `kernel-no-daemon-teardown-validation`. It does not update claim registry
+  status or generated claim docs.
