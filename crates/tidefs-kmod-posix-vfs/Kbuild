@@ -20,10 +20,16 @@ OBJECT_FILES_NON_STANDARD_tidefs_posix_vfs_main.o := y
 
 # Strict warning policy: -Wall -Wextra enables broad diagnostics; -Werror
 # promotes warnings to errors so the CI gate catches regressions.
+#
 # -Wno-unused-parameter is allowed because kernel APIs and Rust FFI shims
 # routinely receive context parameters (e.g. struct file *, struct inode *)
 # that are forwarded to later layers and intentionally unused here.
-subdir-ccflags-y := -Wall -Wextra -Werror -Wno-unused-parameter
+#
+# -Wno-sign-compare is allowed because kernel headers (linux/spinlock.h,
+# linux/cleanup.h, linux/cpumask.h, and others) compare unsigned long
+# against int in guard macros and bitmask operations.  This is intentional
+# upstream style that we cannot fix in an out-of-tree module.
+subdir-ccflags-y := -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare
 
 # Treat Rust warnings as errors in kernel module builds.
 # Clippy lints are the primary Rust quality gate; -Dwarnings ensures the
