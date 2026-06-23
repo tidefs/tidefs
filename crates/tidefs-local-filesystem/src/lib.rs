@@ -5724,6 +5724,7 @@ impl LocalFileSystem {
     /// decisions (keep-local, keep-remote) instead of failing closed on
     /// conflicting non-empty targets.  See
     /// `docs/RECEIVE_MERGE_PLANNER_DESIGN.md` §5.1 item 4.
+    #[allow(clippy::too_many_arguments)]
     pub fn receive_incremental_changed_records_with_root_authentication_key(
         root: impl AsRef<Path>,
         options: StoreOptions,
