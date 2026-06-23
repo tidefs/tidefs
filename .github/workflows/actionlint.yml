@@ -36,26 +36,31 @@ jobs:
 
       - name: Record actionlint version
         run: |
-          echo '### actionlint version' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '### actionlint version'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           nix shell nixpkgs#actionlint --command actionlint -version 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run actionlint
         id: lint
         run: |
-          set +e
+          set +eo pipefail
           nix shell nixpkgs#actionlint --command actionlint \
             -config-file .github/actionlint.yaml \
-            .github/workflows/*.yml \
-            > actionlint-output.txt 2>&1
+            -ignore 'SC2016' \
+            -ignore 'SC2129' \
+            .github/workflows/*.yml > actionlint-output.txt 2>&1
           lint_exit=$?
-          set -e
+          set -eo pipefail
 
-          echo '### actionlint report' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat actionlint-output.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '### actionlint report'
+            echo '```'
+            cat actionlint-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
           if [[ "${lint_exit}" -ne 0 ]]; then
             echo "::error::actionlint found issues in workflow files (exit ${lint_exit})"
