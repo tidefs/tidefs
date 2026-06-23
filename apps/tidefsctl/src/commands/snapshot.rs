@@ -794,8 +794,8 @@ pub struct SnapshotRollbackArgs {
     pub devices: Option<Vec<PathBuf>>,
 }
 
-/// `snapshot export <snapshot-name> <export-path>`
-/// Parse arguments for the runtime-pending read-only snapshot export surface.
+/// `snapshot export <snapshot-name> <export-path> [--store <path>]`
+/// Open a read-only FUSE session backed by a named snapshot.
 /// Snapshot names follow the `@` prefix convention, e.g. `mypool@mysnap`.
 #[derive(Args, Debug)]
 pub struct SnapshotExportArgs {
@@ -806,12 +806,20 @@ pub struct SnapshotExportArgs {
     )]
     pub snapshot_name: String,
 
-    /// Mount path reserved for the future read-only FUSE export session
+    /// Mount path for the read-only FUSE export session
     #[arg(
         value_name = "EXPORT_PATH",
-        help = "Filesystem path reserved for the future read-only snapshot view"
+        help = "Filesystem path where the snapshot is mounted read-only"
     )]
     pub export_path: PathBuf,
+
+    /// Pool store root directory (the directory containing the TideFS store)
+    #[arg(
+        long = "store",
+        value_name = "STORE_PATH",
+        help = "Pool store root directory; required when the pool has no reachable live FUSE owner"
+    )]
+    pub store_path: Option<PathBuf>,
 }
 
 /// `snapshot extract <snapshot-name> <file-path>`
@@ -1770,15 +1778,67 @@ fn handle_rollback(args: SnapshotRollbackArgs) {
 
 fn handle_export(args: SnapshotExportArgs) {
     let _guard = super::authz::require_local_only("snapshot export");
-    let _ = args;
-    eprintln!(
-        concat!(
-            "tidefsctl snapshot export: runtime snapshot export is not yet implemented; ",
-            "issue #765 will wire the read-only export session and issue #766 ",
-            "will add export holds"
-        )
-    );
-    process::exit(1);
+
+    // Parse pool@snapshot name convention.
+    let (pool_name, snapshot_name) = match args.snapshot_name.split_once('@') {
+        Some((pool, snap)) if !pool.is_empty() && !snap.is_empty() => {
+            (pool.to_string(), snap.to_string())
+        }
+        _ => {
+            eprintln!(
+                "tidefsctl snapshot export: invalid snapshot name '{}'; expected pool@snapshot form (e.g. mypool@mysnap)",
+                args.snapshot_name
+            );
+            process::exit(1);
+        }
+    };
+
+    // Resolve the backing directory: explicit --store or route through the
+    // live owner. When no live owner is reachable, --store is required.
+    let backing_dir = if let Some(ref store_path) = args.store_path {
+        super::live_owner::route_if_owner_exists_for_backing_dir_with_args(
+            "snapshot",
+            "export",
+            store_path,
+            serde_json::json!({
+                "export_path": args.export_path.display().to_string(),
+                "snapshot_name": &snapshot_name,
+            }),
+        );
+        store_path.clone()
+    } else {
+        eprintln!(
+            "tidefsctl snapshot export: no --store path provided and no live owner reachable for pool '{}'",
+            pool_name
+        );
+        eprintln!(
+            "tidefsctl snapshot export: provide --store <path> to the pool's TideFS store root directory"
+        );
+        process::exit(1);
+    };
+
+    let config = tidefs_posix_filesystem_adapter_daemon::MountConfig {
+        encryption: None,
+        backing_dir,
+        mountpoint: args.export_path.clone(),
+        pool_name: Some(pool_name),
+        pool_uuid: None,
+        foreground: true,
+        debug: false,
+        writeback_cache: false,
+        coherency_profile:
+            tidefs_posix_filesystem_adapter_daemon::coherency_profile::CoherencyProfile::Writeback,
+        block_devices: None,
+        dataset_path: None,
+        snapshot_name: Some(snapshot_name),
+        mount_authority:
+            tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone(),
+    };
+
+    if let Err(err) = tidefs_posix_filesystem_adapter_daemon::run_mount(config) {
+        eprintln!("tidefsctl snapshot export: {err}");
+        process::exit(1);
+    }
 }
 
 fn handle_extract(args: SnapshotExtractArgs) {
@@ -2243,6 +2303,7 @@ mod tests {
         let args = SnapshotExportArgs {
             snapshot_name: "mypool@mysnap".into(),
             export_path: PathBuf::from("/mnt/snap"),
+            store_path: None,
         };
         assert_eq!(args.snapshot_name, "mypool@mysnap");
         assert_eq!(args.export_path, PathBuf::from("/mnt/snap"));
@@ -2275,6 +2336,7 @@ mod tests {
         let cmd = SnapshotCommand::Export(SnapshotExportArgs {
             snapshot_name: "mypool@snap1".into(),
             export_path: PathBuf::from("/mnt/snap"),
+            store_path: None,
         });
         match cmd {
             SnapshotCommand::Export(args) => {
