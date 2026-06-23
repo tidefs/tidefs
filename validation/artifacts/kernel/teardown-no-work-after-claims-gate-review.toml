@@ -1,24 +1,27 @@
 artifact_version = 1
 evidence_class = "claims-gate-review"
-source = "tidefs-kernel-cutover-runtime"
-scope = "kernel-teardown-source-model-boundary-review"
-issue = 536
+source = "tidefs-kernel-teardown-claims-review"
+scope = "kernel-teardown-runtime-acceptance-review"
+issue = 909
+reviewed_at = "2026-06-23"
 
 claim_id = "kernel.teardown.no_work_after.v1"
 reviewed_claim_ids = [
   "kernel.teardown.no_work_after.v1",
 ]
 
-validation_tier = "T4 source/model claims-gate review"
+validation_tier = "claims-gate review over source-model and runtime acceptance state"
 source_model_evidence = true
 mounted_linux_runtime_evidence = false
-runtime_evidence_status = "mounted-linux-runtime-evidence-missing"
-decision = "blocked-until-mounted-kernel-runtime-evidence"
+runtime_evidence_status = "no-accepted-t5-or-t6-runtime-artifacts"
+decision = "claim-remains-blocked-fail-closed"
 
 source_artifact = "validation/artifacts/kernel/teardown-race-proof-artifact.json"
 source_artifact_evidence_class = "teardown-race-proof-artifact"
 source_artifact_digest_algorithm = "sha256"
 source_artifact_digest = "af34e9e782ff656690d84990b3f5cb339744e206c0f5c0702af012bfe8f1f6ed"
+source_model_proof_name = "kernel context-token teardown race proof"
+source_model_review_artifact = "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.toml"
 
 token_states_covered = [
   "accepting generation accepts modeled work",
@@ -34,20 +37,50 @@ forbidden_post_teardown_work_cases = [
   "teardown callback enqueue of normal deferred work",
 ]
 
+accepted_t5_mounted_kernel_artifacts = []
+accepted_t6_full_kernel_no_daemon_artifacts = []
+
+[[candidate_runtime_evidence]]
+tier = "T5 mounted-kernel-vfs"
+issue = 907
+pull_request = 1114
+artifact_path = "kernel-teardown-runtime.json"
+workflow = "QEMU Smoke"
+workflow_run = "https://github.com/tidefs/tidefs/actions/runs/27996677864"
+head = "e471e93fe27de8a9f43d89838b476334c5c587f3"
+conclusion = "failure"
+accepted = false
+reason = "current-head focused QEMU Smoke dispatch failed; no accepted mounted-kernel runtime artifact is available to cite"
+
+[[candidate_runtime_evidence]]
+tier = "T6 full-kernel-no-daemon"
+issue = 908
+pull_request = 1130
+artifact_path = "kernel-teardown-runtime.json"
+workflow = "QEMU Smoke"
+workflow_run = "https://github.com/tidefs/tidefs/actions/runs/27996071711"
+head = "b05b1c1952fb798f09301ad4fd7cdcd2b50e39d2"
+conclusion = "failure"
+accepted = false
+reason = "current-head focused QEMU Smoke dispatch failed; no accepted full-kernel/no-daemon runtime artifact is available to cite"
+
 boundary_review = [
   "The receipt records source/model proof evidence for the kernel teardown token state machine only.",
   "The helper rejects modeled work once teardown begins and rejects stale token generations after final teardown increments the generation.",
   "The source proof artifact reports no explored schedule starts modeled work after final teardown.",
-  "This review does not exercise a mounted Linux kernel module, Linux workqueue execution, mounted filesystem I/O, QEMU, xfstests, mmap, syncfs, or crash/recovery runtime rows.",
+  "The current T5 candidate mounted-kernel-vfs runtime artifact is not accepted because its current-head focused QEMU Smoke dispatch failed.",
+  "The current T6 candidate full-kernel/no-daemon runtime artifact is not accepted because its current-head focused QEMU Smoke dispatch failed.",
+  "This review does not exercise a mounted Linux kernel module, Linux workqueue execution, mounted filesystem I/O, QEMU, xfstests, mmap, syncfs, or crash/recovery runtime rows itself.",
 ]
 
 missing_runtime_evidence = [
-  "T5 mounted-kernel teardown stress with Linux workqueue and callback activity tracing",
-  "T6 mounted kernel I/O teardown and recovery rows across the filesystem runtime",
+  "accepted T5 mounted-kernel teardown stress with Linux workqueue and callback activity tracing",
+  "accepted T6 full-kernel/no-daemon teardown and recovery rows across the filesystem runtime",
 ]
 
 non_claims = [
   "This review does not validate mounted kernel I/O semantics.",
   "This review does not validate production kernel residency, crash recovery, mmap, writeback, syncfs, or unmount behavior.",
+  "This review does not accept the failed current-head T5 or T6 QEMU Smoke dispatches as claim evidence.",
   "This review does not move kernel.teardown.no_work_after.v1 to validated status.",
 ]
