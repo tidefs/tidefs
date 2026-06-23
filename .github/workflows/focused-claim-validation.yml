@@ -66,19 +66,36 @@ jobs:
 
       - name: Validate inputs
         id: inputs
+        env:
+          IN_MODE: ${{ inputs.mode }}
+          IN_CLAIM_ID: ${{ inputs.claim_id }}
+          IN_ARTIFACT_PATH: ${{ inputs.artifact_path }}
         run: |
-          MODE="${{ inputs.mode }}"
-          CLAIM_ID="${{ inputs.claim_id }}"
-          ARTIFACT_PATH="${{ inputs.artifact_path }}"
+          MODE="${IN_MODE}"
+          CLAIM_ID="${IN_CLAIM_ID}"
+          ARTIFACT_PATH="${IN_ARTIFACT_PATH}"
 
           reject() {
-            echo "## Input validation failed" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**Mode**: \`$MODE\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "**Reason**: $1" >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::$1"
+            printf '%s\n' '## Input validation failed' '' >> "$GITHUB_STEP_SUMMARY"
+            printf -- '- Mode: `%s`\n' "$MODE" >> "$GITHUB_STEP_SUMMARY"
+            printf -- '- Reason: %s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+            printf '::error::%s\n' "$1"
             exit 1
           }
+
+          # Reject free-text inputs containing literal newlines:
+          # these would break summary rendering and xtask argument parsing.
+          reject_newline() {
+            local val_name="$1"
+            local val="$2"
+            case "$val" in
+              *$'\n'*|*$'\r'*)
+                reject "${val_name} must not contain newline characters"
+                ;;
+            esac
+          }
+          reject_newline 'claim_id' "$CLAIM_ID"
+          reject_newline 'artifact_path' "$ARTIFACT_PATH"
 
           case "$MODE" in
             validate-claim)
@@ -110,84 +127,105 @@ jobs:
               ;;
           esac
 
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "claim_id=$CLAIM_ID" >> "$GITHUB_OUTPUT"
-          echo "artifact_path=$ARTIFACT_PATH" >> "$GITHUB_OUTPUT"
-
-          echo "## Input validation passed" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Mode: \`$MODE\`" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "mode=${MODE}" >> "$GITHUB_OUTPUT"
           if [[ -n "$CLAIM_ID" ]]; then
-            echo "- Claim ID: \`$CLAIM_ID\`" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "claim_id=${CLAIM_ID}" >> "$GITHUB_OUTPUT"
           fi
           if [[ -n "$ARTIFACT_PATH" ]]; then
-            echo "- Artifact path: \`$ARTIFACT_PATH\`" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "artifact_path=${ARTIFACT_PATH}" >> "$GITHUB_OUTPUT"
           fi
+
+          # Write accepted-input summary with safe quoting:
+          # variables are passed as printf data arguments (%s), never
+          # interpolated into the format string, so shell metacharacters,
+          # backticks, and $() in input values cannot execute.
+          {
+            printf '%s\n' '## Input validation passed' ''
+            printf -- '- Mode: `%s`\n' "$MODE"
+            if [[ -n "$CLAIM_ID" ]]; then
+              printf -- '- Claim ID: `%s`\n' "$CLAIM_ID"
+            fi
+            if [[ -n "$ARTIFACT_PATH" ]]; then
+              printf -- '- Artifact path: `%s`\n' "$ARTIFACT_PATH"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run validation
         id: run
+        env:
+          IN_MODE: ${{ steps.inputs.outputs.mode }}
+          IN_CLAIM_ID: ${{ steps.inputs.outputs.claim_id }}
+          IN_ARTIFACT_PATH: ${{ steps.inputs.outputs.artifact_path }}
+          TIDEFS_FOCUSED_CLAIM_VALIDATION_MODE: ${{ inputs.mode }}
         run: |
-          MODE="${{ steps.inputs.outputs.mode }}"
-          CLAIM_ID="${{ steps.inputs.outputs.claim_id }}"
-          ARTIFACT_PATH="${{ steps.inputs.outputs.artifact_path }}"
+          MODE="${IN_MODE}"
+          CLAIM_ID="${IN_CLAIM_ID}"
+          ARTIFACT_PATH="${IN_ARTIFACT_PATH}"
 
-          echo "## Validation run" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          {
+            printf '%s\n' '## Validation run' ''
+          } >> "$GITHUB_STEP_SUMMARY"
 
           case "$MODE" in
             validate-claim)
-              echo "- Command: \`cargo run -p tidefs-xtask -- validate-claim '$CLAIM_ID'\`" >> "$GITHUB_STEP_SUMMARY"
+              printf -- '- Command: `%s`\n' \
+                "cargo run -p tidefs-xtask -- validate-claim '${CLAIM_ID}'" \
+                >> "$GITHUB_STEP_SUMMARY"
               set +e
               output=$(nix develop .#ci --command cargo run -p tidefs-xtask -- validate-claim "$CLAIM_ID" 2>&1)
               claim_exit=$?
               set -e
               printf '%s\n' "$output"
               claim_status=$(printf '%s\n' "$output" | awk '/^status:[[:space:]]+[A-Z]+/ { print $2; found=1; exit } END { if (!found) print "UNKNOWN" }')
-              echo "claim_status=$claim_status" >> "$GITHUB_OUTPUT"
+              printf '%s\n' "claim_status=${claim_status}" >> "$GITHUB_OUTPUT"
               if [[ "$claim_exit" -ne 0 ]]; then
                 exit "$claim_exit"
               fi
               ;;
             check-claims-gate)
-              echo "- Command: \`cargo run -p tidefs-xtask -- check-claims-gate\`" >> "$GITHUB_STEP_SUMMARY"
+              printf -- '- Command: `%s`\n' \
+                'cargo run -p tidefs-xtask -- check-claims-gate' \
+                >> "$GITHUB_STEP_SUMMARY"
               nix develop .#ci --command cargo run -p tidefs-xtask -- check-claims-gate
               ;;
             check-no-hidden-queues)
-              echo "- Command: \`cargo run -p tidefs-xtask -- check-no-hidden-queues\`" >> "$GITHUB_STEP_SUMMARY"
+              printf -- '- Command: `%s`\n' \
+                'cargo run -p tidefs-xtask -- check-no-hidden-queues' \
+                >> "$GITHUB_STEP_SUMMARY"
               nix develop .#ci --command cargo run -p tidefs-xtask -- check-no-hidden-queues
               ;;
             validate-evidence-manifest)
-              echo "- Command: \`cargo run -p tidefs-xtask -- validate-evidence-manifest '$ARTIFACT_PATH'\`" >> "$GITHUB_STEP_SUMMARY"
+              printf -- '- Command: `%s`\n' \
+                "cargo run -p tidefs-xtask -- validate-evidence-manifest '${ARTIFACT_PATH}'" \
+                >> "$GITHUB_STEP_SUMMARY"
               nix develop .#ci --command cargo run -p tidefs-xtask -- validate-evidence-manifest "$ARTIFACT_PATH"
               ;;
             validate-ublk-completion)
-              echo "- Command: \`cargo run -p tidefs-xtask -- validate-ublk-completion-artifact '$ARTIFACT_PATH'\`" >> "$GITHUB_STEP_SUMMARY"
+              printf -- '- Command: `%s`\n' \
+                "cargo run -p tidefs-xtask -- validate-ublk-completion-artifact '${ARTIFACT_PATH}'" \
+                >> "$GITHUB_STEP_SUMMARY"
               nix develop .#ci --command cargo run -p tidefs-xtask -- validate-ublk-completion-artifact "$ARTIFACT_PATH"
               ;;
             validate-ublk-started-export)
-              echo "- Command: \`cargo run -p tidefs-xtask -- validate-ublk-started-export-admission-artifact '$ARTIFACT_PATH'\`" >> "$GITHUB_STEP_SUMMARY"
+              printf -- '- Command: `%s`\n' \
+                "cargo run -p tidefs-xtask -- validate-ublk-started-export-admission-artifact '${ARTIFACT_PATH}'" \
+                >> "$GITHUB_STEP_SUMMARY"
               nix develop .#ci --command cargo run -p tidefs-xtask -- validate-ublk-started-export-admission-artifact "$ARTIFACT_PATH"
               ;;
           esac
-        env:
-          TIDEFS_FOCUSED_CLAIM_VALIDATION_MODE: ${{ inputs.mode }}
 
       - name: Report result
         if: always()
         run: |
           claim_status="${{ steps.run.outputs.claim_status }}"
           if [[ "$claim_status" == "BLOCKED" ]]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**Result**: blocked" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' '' '**Result**: blocked' >> "$GITHUB_STEP_SUMMARY"
           elif [[ "$claim_status" == "PASS" ]]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**Result**: passed" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' '' '**Result**: passed' >> "$GITHUB_STEP_SUMMARY"
           elif [[ "${{ steps.run.outcome }}" == "success" ]]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**Result**: passed" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' '' '**Result**: passed' >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**Result**: failed" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' '' '**Result**: failed' >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Clean cargo target
