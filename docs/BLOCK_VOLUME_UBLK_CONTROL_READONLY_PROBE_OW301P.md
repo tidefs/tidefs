@@ -27,7 +27,7 @@ runtime boundary:
 - require a successful `OpenOptions::new().read(true).write(true)` open;
 - submit only the read-only `GET_FEATURES` uring_cmd after those gates pass.
 
-not admitted, the command refuses before opening the control device and records
+If the host is not admitted, the command refuses before opening the control device and records
 `probe.uring_cmd_attempted=false`. On a suitable host, it can submit `GET_FEATURES`
 and map the returned feature mask into the typed `tidefs-ublk-abi` feature
 flags.
@@ -59,8 +59,7 @@ This follows OW-301O. OW-301O proves the real control-device open
 admission boundary; OW-301P adds the first admitted read-only ublk control
 uring_cmd boundary without creating or starting a device.
 
-This remains below OW-301 and PC-012. It is not
-harness.
+This remains below OW-301 and PC-012. It is not a block-device acceptance harness.
 
 ## Non-Claims
 

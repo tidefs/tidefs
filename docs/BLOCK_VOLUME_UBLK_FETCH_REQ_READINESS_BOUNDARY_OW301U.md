@@ -67,4 +67,4 @@ block-device acceptance harness.
 
 ## Non-Claims
 
-This is not a complete ublk daemon, not a started Linux block-device export, not
+This is not a complete ublk daemon, not a started Linux block-device export, not `UBLK_U_CMD_START_DEV` execution, not fio.

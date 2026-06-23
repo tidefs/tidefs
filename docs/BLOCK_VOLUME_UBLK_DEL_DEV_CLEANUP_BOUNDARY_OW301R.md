@@ -37,7 +37,7 @@ The daemon command keeps cleanup ordering explicit:
 7. submit `UBLK_U_CMD_ADD_DEV`;
 8. submit `UBLK_U_CMD_DEL_DEV` for the returned device id.
 
-not admitted, the command refuses before mutation and records
+If the host is not admitted, the command refuses before mutation and records
 `add_dev.uring_cmd_attempted=false` and `del_dev.uring_cmd_attempted=false`. On
 an admitted host where ADD_DEV succeeds, DEL_DEV cleanup is attempted and any
 cleanup failure is reported explicitly as `control.cleanup_failed_after_add_dev`.
