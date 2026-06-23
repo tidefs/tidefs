@@ -27,7 +27,7 @@ The registry blockers are still correct:
   mounted Linux runtime evidence;
 - T5 mounted-kernel teardown stress with Linux workqueue and callback activity
   tracing is missing;
-- T6 mounted kernel I/O teardown and recovery rows across the filesystem
+- T6 full-kernel/no-daemon teardown and recovery rows across the filesystem
   runtime are missing.
 
 No current claim wording may say that TideFS has mounted Linux, full-kernel, or

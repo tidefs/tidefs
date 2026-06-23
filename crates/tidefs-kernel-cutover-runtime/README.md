@@ -82,4 +82,4 @@ The receipt is T4 source/model evidence only. It deliberately records
 additional T5/T6 evidence exists:
 
 - T5 mounted-kernel teardown stress with Linux workqueue and callback activity tracing.
-- T6 mounted kernel I/O teardown and recovery rows across the filesystem runtime.
+- T6 full-kernel/no-daemon teardown and recovery rows across the filesystem runtime.

@@ -41,7 +41,7 @@ fn receipt_records_claim_scope_and_runtime_boundary() {
     assert!(receipt
         .missing_runtime_evidence
         .iter()
-        .any(|item| item.contains("T6 mounted kernel")));
+        .any(|item| item.contains("T6 full-kernel/no-daemon")));
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn fixture_and_claim_registry_cite_review_receipt_without_validation() {
     assert!(fixture.contains(TEARDOWN_PROOF_VALIDATION_TIER));
     assert!(fixture.contains("mounted_linux_runtime_evidence = false"));
     assert!(fixture.contains("T5 mounted-kernel"));
-    assert!(fixture.contains("T6 mounted kernel"));
+    assert!(fixture.contains("T6 full-kernel/no-daemon"));
     assert!(claims.contains("id = \"kernel.teardown.no_work_after.v1\""));
     assert!(claims.contains("status = \"blocked\""));
     assert!(claims
