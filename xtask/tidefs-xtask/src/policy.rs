@@ -2675,7 +2675,26 @@ fn extract_all_dependency_names(manifest_path: &Path) -> Vec<String> {
             continue;
         }
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_target_section = dep_sections.contains(&trimmed);
+            in_target_section = dep_sections.contains(&trimmed)
+                || trimmed.starts_with("[dependencies.")
+                || trimmed.starts_with("[dev-dependencies.")
+                || trimmed.starts_with("[build-dependencies.");
+            if in_target_section && !dep_sections.contains(&trimmed) {
+                // Table-style entry such as [dependencies.crate-name]:
+                // extract the name from the section header.
+                if let Some(inner) = trimmed.strip_prefix("[dependencies.")
+                    .or_else(|| trimmed.strip_prefix("[dev-dependencies."))
+                    .or_else(|| trimmed.strip_prefix("[build-dependencies."))
+                {
+                    if let Some(name) = inner.strip_suffix(']') {
+                        if !name.is_empty()
+                            && name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+                        {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+            }
             continue;
         }
         if !in_target_section {
