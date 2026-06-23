@@ -1598,7 +1598,6 @@ pub(crate) fn decode_dedup_redirect(bytes: &[u8]) -> crate::Result<ObjectKey> {
 #[allow(dead_code)]
 /// Top-level conflict axis defined by the receive merge planner design §1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-#[allow(dead_code)]
 pub enum ConflictClass {
     /// Inode identity conflict (§1.1): same inode_id, different record fields.
     InodeIdentity = 1,
@@ -1614,7 +1613,7 @@ pub enum ConflictClass {
 
 /// Divergence sub-classification for inode identity conflicts (§1.1).
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::enum_variant_names)]
 pub enum InodeIdentityDivergence {
     /// Different file type (InodeRecord::kind mismatch).
     DifferentFileType,

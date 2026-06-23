@@ -398,7 +398,7 @@ fn compare_dir_entries(
         target_entries.iter().map(|e| (e.name.as_slice(), e)).collect();
 
     // Entries present in stream but not in target: added on stream side.
-    for (name, _entry) in &stream_map {
+    for name in stream_map.keys() {
         if !target_map.contains_key(name) {
             let name_str = String::from_utf8_lossy(name);
             inventory.entries.push(ConflictEntry {
@@ -415,7 +415,7 @@ fn compare_dir_entries(
     }
 
     // Entries present in target but not in stream: added on target side.
-    for (name, _entry) in &target_map {
+    for name in target_map.keys() {
         if !stream_map.contains_key(name) {
             let name_str = String::from_utf8_lossy(name);
             inventory.entries.push(ConflictEntry {
@@ -537,7 +537,7 @@ fn classify_snapshot_catalog_conflicts(
         .collect();
 
     // Snapshots present only in stream: different name sets.
-    for (name, _rec) in &stream_by_name {
+    for name in stream_by_name.keys() {
         if !target_by_name.contains_key(name) {
             let name_str = String::from_utf8_lossy(name);
             inventory.entries.push(ConflictEntry {
@@ -554,7 +554,7 @@ fn classify_snapshot_catalog_conflicts(
     }
 
     // Snapshots present only in target: different name sets.
-    for (name, _rec) in &target_by_name {
+    for name in target_by_name.keys() {
         if !stream_by_name.contains_key(name) {
             let name_str = String::from_utf8_lossy(name);
             inventory.entries.push(ConflictEntry {
@@ -860,7 +860,7 @@ mod tests {
             hold_count,
         }
     }
-
+    #[allow(clippy::too_many_arguments)]
     fn input_from(
         ancestor: &ReceiveMergeCommonAncestor,
         stream_inodes: BTreeMap<u64, crate::types::InodeRecord>,
