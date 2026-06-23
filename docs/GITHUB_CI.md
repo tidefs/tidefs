@@ -91,8 +91,9 @@ may use non-secret repository variables for scheduling gates, such as
   for the T5 mounted-kernel-vfs teardown runtime evidence row. It runs
   `.#kernel-teardown-validation` against the selected branch, creates a
   disposable configured pool member, exercises
-  mount/write/sync/teardown/unmount/module-unload lifecycle with ftrace
-  workqueue tracing and post-final refusal probes, and uploads
+  mount/write/sync/teardown/unmount/module-unload lifecycle with kernel-owned
+  workqueue/callback trace evidence through tracefs/ftrace when available or
+  TideFS lifecycle dmesg markers otherwise, and uploads
   `kernel-teardown-runtime.json` and `evidence-manifest.json` under
   `kernel-teardown-validation`. It does not cover T6 full-kernel/no-daemon rows
   and does not update claim registry status.

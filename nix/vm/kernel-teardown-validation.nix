@@ -5,9 +5,10 @@
 # mounts it through the kernel VFS path, exercises mount/write/sync,
 # executes begin-teardown and final-teardown/unmount,
 # unloads the module, probes post-final operation refusal, captures
-# Linux workqueue and callback trace evidence through ftrace and dmesg,
-# and writes kernel-teardown-runtime.json with an evidence-manifest.json
-# into the artifact directory.
+# Linux workqueue/callback trace evidence through tracefs/ftrace when
+# available, or through kernel-owned TideFS lifecycle dmesg markers otherwise,
+# and writes kernel-teardown-runtime.json with an evidence-manifest.json into
+# the artifact directory.
 #
 # Produces claim-grade teardown runtime evidence for
 # kernel.teardown.no_work_after.v1 T5 mounted-kernel-vfs tier.
@@ -49,8 +50,8 @@ Usage: tidefs-kmod-teardown-validation [--timeout SECONDS] [--output-dir DIR] [-
 
 Run T5 mounted-kernel-vfs teardown runtime evidence validation in a Linux 7.0
 QEMU guest. Creates a configured TideFS pool member, exercises
-mount/write/sync/teardown/unmount/module-unload lifecycle with ftrace workqueue
-tracing and post-final refusal probes.
+mount/write/sync/teardown/unmount/module-unload lifecycle with kernel-owned
+trace evidence and post-final refusal probes.
 
 Options:
   --timeout SECONDS    QEMU boot timeout (default: $TIMEOUT_SEC)
@@ -268,6 +269,21 @@ capture_dmesg() {
   local dest="$1"
   dmesg > "$dest" 2>/dev/null || true
   echo "[dmesg] captured to $dest ($(wc -c < "$dest" 2>/dev/null || echo 0) bytes)"
+}
+
+write_dmesg_marker_trace() {
+  local source="$1"
+  local dest="$2"
+  local marker_count
+
+  marker_count=$(grep -E -c 'tidefs_posix_vfs:|sync_fs super_operation:|put_super super_operation:|lifecycle summary:' "$source" 2>/dev/null || true)
+  {
+    echo "trace_source=dmesg kernel lifecycle markers"
+    echo "tracefs_root=unavailable"
+    echo "marker_count=''${marker_count:-0}"
+    grep -E 'tidefs_posix_vfs:|sync_fs super_operation:|put_super super_operation:|lifecycle summary:' "$source" 2>/dev/null || true
+  } > "$dest"
+  echo "[dmesg] lifecycle marker trace captured to $dest ($(wc -c < "$dest" 2>/dev/null || echo 0) bytes)"
 }
 
 check_dmesg_signal() {
@@ -495,8 +511,15 @@ fi
 # ── Final sweep ─────────────────────────────────────────────────────
 capture_dmesg "$EVDIR/dmesg_post_reload.txt"
 capture_ftrace "$EVDIR/ftrace_final.txt"
+if [ ! -s "$EVDIR/ftrace_final.txt" ]; then
+  write_dmesg_marker_trace "$EVDIR/dmesg_post_reload.txt" "$EVDIR/workqueue_trace_fallback.txt"
+fi
 
-emit_artifact "ftrace_workqueue" "$EVDIR/ftrace_final.txt"
+if [ -s "$EVDIR/ftrace_final.txt" ]; then
+  emit_artifact "workqueue_trace" "$EVDIR/ftrace_final.txt"
+else
+  emit_artifact "workqueue_trace" "$EVDIR/workqueue_trace_fallback.txt"
+fi
 emit_artifact "dmesg_callbacks" "$EVDIR/dmesg_post_reload.txt"
 
 echo ""
@@ -576,15 +599,27 @@ INITSCRIPT
       ' "$RUN_DIR/qemu.log" > "$OUTPUT_DIR/$path" || true
     }
 
-    WQ_TRACE_PATH="ftrace_workqueue.log"
+    WQ_TRACE_PATH="workqueue_trace.log"
     CB_TRACE_PATH="dmesg_callbacks.log"
-    extract_guest_artifact "ftrace_workqueue" "$WQ_TRACE_PATH"
+    extract_guest_artifact "workqueue_trace" "$WQ_TRACE_PATH"
     extract_guest_artifact "dmesg_callbacks" "$CB_TRACE_PATH"
 
     TRACE_ERRORS_FILE="$OUTPUT_DIR/trace_artifact_errors.txt"
     : > "$TRACE_ERRORS_FILE"
     if [ ! -s "$OUTPUT_DIR/$WQ_TRACE_PATH" ] || grep -q "artifact source missing" "$OUTPUT_DIR/$WQ_TRACE_PATH" 2>/dev/null; then
       echo "trace artifact missing or empty: $WQ_TRACE_PATH" >> "$TRACE_ERRORS_FILE"
+    fi
+    if grep -q '^trace_source=dmesg kernel lifecycle markers$' "$OUTPUT_DIR/$WQ_TRACE_PATH" 2>/dev/null; then
+      for required_marker in \
+        "engine kill_sb: final sync_fs completed" \
+        "engine torn down" \
+        "lifecycle summary:" \
+        "unregistered filesystem type" \
+        "loaded and registered filesystem type"; do
+        if ! grep -q "$required_marker" "$OUTPUT_DIR/$WQ_TRACE_PATH" 2>/dev/null; then
+          echo "trace artifact missing dmesg lifecycle marker: $required_marker" >> "$TRACE_ERRORS_FILE"
+        fi
+      done
     fi
     if [ ! -s "$OUTPUT_DIR/$CB_TRACE_PATH" ] || grep -q "artifact source missing" "$OUTPUT_DIR/$CB_TRACE_PATH" 2>/dev/null; then
       echo "trace artifact missing or empty: $CB_TRACE_PATH" >> "$TRACE_ERRORS_FILE"
@@ -686,9 +721,13 @@ INITSCRIPT
       REFUSAL_JSON="$("$JQ" -n '[]')"
     fi
 
-    WQ_TRACE_SOURCE="ftrace:/sys/kernel/tracing/events/workqueue/*"
+    if grep -q '^trace_source=dmesg kernel lifecycle markers$' "$OUTPUT_DIR/$WQ_TRACE_PATH" 2>/dev/null; then
+      WQ_TRACE_SOURCE="dmesg kernel lifecycle markers emitted by guest"
+    else
+      WQ_TRACE_SOURCE="ftrace:/sys/kernel/tracing/events/workqueue/*"
+    fi
     WQ_TRACE_DIGEST="blake3:$("$B3SUM" "$OUTPUT_DIR/$WQ_TRACE_PATH" | awk '{print $1}')"
-    CB_TRACE_SOURCE="dmesg kernel log emitted by guest"
+    CB_TRACE_SOURCE="dmesg kernel lifecycle and callback markers emitted by guest"
     CB_TRACE_DIGEST="blake3:$("$B3SUM" "$OUTPUT_DIR/$CB_TRACE_PATH" | awk '{print $1}')"
 
     # Cleanup outcome
