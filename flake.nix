@@ -198,6 +198,24 @@
             ];
           };
 
+          tidefsXtaskRuntime = import ./nix/packages/tidefs.nix {
+            inherit (pkgs) lib pkg-config;
+            inherit (pkgs) fuse3 rdma-core;
+            rustPlatform = rustPlatform;
+            src = tidefsCtlSrc;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+            cargoBuildFlags = [
+              "-p" "tidefs-xtask"
+              "--bin" "tidefs-xtask"
+            ];
+            workspaceBins = [
+              "tidefs-xtask"
+            ];
+          };
+
+
           tidefsCtlRuntime = import ./nix/packages/tidefs.nix {
             inherit (pkgs) lib pkg-config;
             inherit (pkgs) fuse3 rdma-core;
@@ -2850,6 +2868,13 @@ EOF
             linuxKernel_7_0 = linuxKernel_7_0;
           };
 
+          kernelNoDaemonTeardownValidation = import ./nix/vm/kernel-no-daemon-teardown-validation.nix {
+            inherit pkgs;
+            linuxKernel_7_0 = linuxKernel_7_0;
+            tidefsXtaskRuntime = tidefsXtaskRuntime;
+          };
+
+
 
           kernelLockdepKcsanKasanValidation = import ./nix/vm/kernel-lockdep-kcsan-kasan-validation.nix {
             inherit pkgs;
@@ -3683,6 +3708,23 @@ EOF
             fi
             echo "kernel_no_daemon_validation.result=${self.packages.${system}.kernelNoDaemonValidation}"
           '';
+
+          "kernel-no-daemon-teardown-validation" = script "tidefs-kmod-no-daemon-teardown-validation" [
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.busybox
+            pkgs.kmod
+            pkgs.cpio
+            pkgs.qemu
+            pkgs.b3sum
+            self.packages.${system}.kernelNoDaemonTeardownValidation
+            self.packages.${system}.tidefsPosixVfsKmod
+            self.packages.${system}.tidefsXtaskRuntime
+          ] ''
+            exec ${self.packages.${system}.kernelNoDaemonTeardownValidation}/bin/tidefs-kmod-no-daemon-teardown-validation \
+              --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"
+          '';
+
 
           "kernel-lockdep-kcsan-kasan-validation" = script "tidefs-kmod-lockdep-kcsan-kasan-validation" [
               pkgs.bash
