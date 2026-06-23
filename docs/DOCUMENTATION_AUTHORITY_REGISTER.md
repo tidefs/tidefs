@@ -101,8 +101,7 @@ leftovers in
 `docs/design/coordination-pipeline-status-update-1767.md`,
 `docs/design/coordination-pipeline-status-update-1839.md`,
 `docs/design/coordination-pipeline-status-update-1915.md`,
-`docs/design/incremental-job-core-wire-up-deferred-design.md` are left for a later
-planner turn because each needs its own expected write set and per-document
+are left for a later planner turn because each needs its own expected write set and per-document
 authority decision. Rewriting them here would recreate the broad docs sweep
 that #952 split into focused slices.
 
@@ -497,3 +496,22 @@ product source, or unrelated docs.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/design/unified-on-media-format-lifecycle.md` | Historical input | Imported Forgejo-era unified five-phase lifecycle design with old issue #1238 metadata (Forgejo on `172.16.106.12`), design-spec status, P1 priority, docs lane, and cross-references to old Forgejo-era issue numbers (#1220, #1223, #1225, #1222, #1224, #1185, #1235, #1236) whose current TideFS GitHub issue mapping is undefined under TFR-019. The file defines a meta-framework for on-media record format phases (record families, feature flags, TLV extensions, rebake, golden vectors, trace oracle, torn-commit recovery) that has no current live-source implementation evidence, no claim-registry coverage, and no current format-lifecycle policy authority in the active GitHub issue and PR coordination surface. The individual format docs referenced remain canonical for their own domains under separate register rows; this lifecycle file is preserved as design lineage material and must not be cited as current TideFS implementation status, release-readiness evidence, or format-lifecycle authority. |
+
+### IncrementalJob Core Wire-Up Deferred Design (TFR-019 / #1244)
+
+Classified for TFR-019 / GitHub issue #1244 on 2026-06-24 after reviewing this
+register's authority rule and review method, the TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, the imported incremental-job wire-up deferred
+design document, `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`,
+`docs/design/incremental-job-core-types-crate-design.md`,
+`docs/design/incremental-job-core-types-crate-design-sealed.md`, and bounded
+source/doc searches for IncrementalJob, tidefs-types-incremental-job-core,
+tidefs-incremental-job-core, Forgejo-era issue references, STATUS.md,
+FEATURE_MATRIX.md, lane, priority, design-sealed, deferred-wire-up, and
+subsystem-wire-up wording in the current source tree. This slice does not edit
+product source, Cargo manifests, the sealed types/trait design docs, other
+#952 leftover files, or unrelated documentation-authority files.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/incremental-job-core-wire-up-deferred-design.md` | Historical input | Imported Forgejo-era wire-up deferred design (old issue #2047, coordination seal #1930) with design-sealed status, design-spec maturity, storage-core lane, Forgejo-era URLs (`172.16.106.12/forgejo/forgeadmin`), and deferred wire-up claims for 14 background maintenance subsystems. The pre-existing "imported/historical design input" header annotation is consistent with this register's Historical input state: the annotation explicitly denies current policy, current spec, implementation-status evidence, release-readiness evidence, and worker scheduling authority. Live source has `tidefs-types-incremental-job-core` and `tidefs-incremental-job-core` crates implementing the sealed `IncrementalJob` trait contract, but the 14-subsystem wire-up deferral architecture, per-subsystem cursor schemas, schedule-priority table, observability contract, and subsystem-migration phases described in the document have no current live-source implementation evidence, no claim-registry coverage, and no current background-scheduler runtime authority in the active GitHub issue and PR coordination surface. The sibling sealed-types docs (`docs/design/incremental-job-core-types-crate-design.md`, `docs/design/incremental-job-core-types-crate-design-sealed.md`) remain under their own register rows. This file is preserved as lineage material for future incremental-job wire-up review and must not be cited as current TideFS implementation status, release-readiness evidence, or worker scheduling authority. |
