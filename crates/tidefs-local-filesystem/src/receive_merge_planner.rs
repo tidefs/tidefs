@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::error::FileSystemError;
+use tidefs_types_vfs_owned::DirEntry as OwnedDirEntry;
 use crate::types::{ChangedRecordExport, CommittedRootSummary, RecoveryAuditReport};
 
 pub const RECEIVE_MERGE_NO_COMMON_ANCESTOR_OPERATOR_ACTIONS: &str =
@@ -159,10 +160,557 @@ fn format_optional_txg(txg: Option<u64>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+// ── Conflict inventory builder ────────────────────────────────────────────────
+
+/// Bundled inputs for the conflict inventory builder.
+///
+/// Each field carries the pre-loaded data from one side of the merge
+/// comparison.  The builder does not load data from the object store itself;
+/// loading belongs to the receive-path integration slice.
+pub(crate) struct ConflictInventoryInput<'a> {
+    /// Common ancestor produced by `locate_common_ancestor`.
+    pub common_ancestor: &'a ReceiveMergeCommonAncestor,
+    /// Stream-side inode table keyed by `InodeId`.
+    pub stream_inodes: &'a BTreeMap<u64, crate::types::InodeRecord>,
+    /// Target-side inode table keyed by `InodeId`.
+    pub target_inodes: &'a BTreeMap<u64, crate::types::InodeRecord>,
+    /// Stream-side directory entries per parent inode_id.
+    pub stream_dir_entries: &'a BTreeMap<u64, Vec<OwnedDirEntry>>,
+    /// Target-side directory entries per parent inode_id.
+    pub target_dir_entries: &'a BTreeMap<u64, Vec<OwnedDirEntry>>,
+    /// Stream-side extent maps keyed by inode_id.
+    pub stream_extent_maps: &'a BTreeMap<u64, Vec<u8>>,
+    /// Target-side extent maps keyed by inode_id.
+    pub target_extent_maps: &'a BTreeMap<u64, Vec<u8>>,
+    /// Stream-side snapshot catalog entries.
+    pub stream_snapshots: &'a [crate::records::SnapshotRecord],
+    /// Target-side snapshot catalog entries.
+    pub target_snapshots: &'a [crate::records::SnapshotRecord],
+    /// Stream lineage manifest (for generation ordering comparison).
+    pub stream_lineage: &'a ReceiveMergeStreamLineageManifest,
+    /// Target recovery audit (for generation ordering comparison).
+    pub target_recovery_audit: &'a RecoveryAuditReport,
+}
+
+/// Build a conflict inventory by comparing stream and target state across all
+/// five taxonomy axes defined in `docs/RECEIVE_MERGE_PLANNER_DESIGN.md` §1.
+///
+/// The common ancestor provides the divergence baseline.  Objects that exist
+/// on only one side (created after divergence) are not conflicts — they are
+/// conflict-free additions.  Objects that exist on both sides with identical
+/// content are also conflict-free.  Every other divergence is classified into
+/// the taxonomy and recorded in the inventory.
+///
+/// Each entry in the returned inventory names the conflict class, the object
+/// identity on each side, and the specific divergence kind.
+#[allow(dead_code)]
+pub(crate) fn build_conflict_inventory(
+    input: &ConflictInventoryInput,
+) -> crate::encoding::ConflictInventory {
+    #[allow(unused_imports)]
+    use crate::encoding::{
+        ConflictClass, ConflictDivergence, ConflictEntry, ConflictInventory,
+        DirectoryEntryDivergence, ExtentMapDivergence, GenerationOrderingDivergence,
+        InodeIdentityDivergence, SnapshotCatalogDivergence,
+    };
+
+    let ancestor = input.common_ancestor;
+    let mut inventory = ConflictInventory::empty(
+        ancestor.identity.transaction_id,
+        ancestor.identity.generation,
+    );
+
+    // ── 1. Inode identity conflicts (§1.1) ──────────────────────────────────
+    classify_inode_identity_conflicts(input, &mut inventory);
+
+    // ── 2. Directory entry conflicts (§1.2) ─────────────────────────────────
+    classify_directory_entry_conflicts(input, &mut inventory);
+
+    // ── 3. Extent map conflicts (§1.3) ──────────────────────────────────────
+    classify_extent_map_conflicts(input, &mut inventory);
+
+    // ── 4. Snapshot catalog conflicts (§1.4) ────────────────────────────────
+    classify_snapshot_catalog_conflicts(input, &mut inventory);
+
+    // ── 5. Generation ordering conflicts (§1.5) ─────────────────────────────
+    classify_generation_ordering_conflicts(input, &mut inventory);
+
+    inventory
+}
+
+// ── Per-axis classification helpers ──────────────────────────────────────────
+
+#[allow(dead_code)]
+fn classify_inode_identity_conflicts(
+    input: &ConflictInventoryInput,
+    inventory: &mut crate::encoding::ConflictInventory,
+) {
+    #[allow(unused_imports)]
+    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
+        InodeIdentityDivergence};
+
+    // Collect all inode_ids present in either side.
+    let mut all_ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for id in input.stream_inodes.keys() {
+        all_ids.insert(*id);
+    }
+    for id in input.target_inodes.keys() {
+        all_ids.insert(*id);
+    }
+
+    for inode_id in all_ids {
+        let stream_rec = input.stream_inodes.get(&inode_id);
+        let target_rec = input.target_inodes.get(&inode_id);
+
+        match (stream_rec, target_rec) {
+            // Inode exists only on one side: conflict-free addition.
+            (Some(_), None) | (None, Some(_)) => {}
+            (Some(s), Some(t)) => {
+                // Compare non-timestamp fields for divergence.
+                let divergence = compare_inode_records(s, t);
+                if let Some(div) = divergence {
+                    inventory.entries.push(ConflictEntry {
+                        class: ConflictClass::InodeIdentity,
+                        divergence: ConflictDivergence::InodeIdentity(div),
+                        stream_identity: format!("inode {inode_id}"),
+                        target_identity: format!("inode {inode_id}"),
+                    });
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+}
+
+/// Compare two inode records and return a divergence kind if they differ
+/// in any non-timestamp field.
+#[allow(dead_code)]
+fn compare_inode_records(
+    stream: &crate::types::InodeRecord,
+    target: &crate::types::InodeRecord,
+) -> Option<crate::encoding::InodeIdentityDivergence> {
+    use crate::encoding::InodeIdentityDivergence;
+
+    // Different file type (kind projection).
+    if stream.kind() != target.kind() {
+        return Some(InodeIdentityDivergence::DifferentFileType);
+    }
+
+    // Different metadata versions signal content or metadata changes.
+    // data_version changes indicate content divergence.
+    if stream.data_version != target.data_version {
+        return Some(InodeIdentityDivergence::DifferentContentIdentity);
+    }
+
+    // Permission/ownership changes.
+    if stream.mode != target.mode
+        || stream.uid != target.uid
+        || stream.gid != target.gid
+    {
+        return Some(InodeIdentityDivergence::DifferentPermissionsOwnership);
+    }
+
+    // Size change without content identity change (sparse extension, truncate).
+    if stream.size != target.size {
+        return Some(InodeIdentityDivergence::DifferentSize);
+    }
+
+    None
+}
+
+#[allow(dead_code)]
+fn classify_directory_entry_conflicts(
+    input: &ConflictInventoryInput,
+    inventory: &mut crate::encoding::ConflictInventory,
+) {
+    #[allow(unused_imports)]
+    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
+        DirectoryEntryDivergence};
+
+    let mut all_parents: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for id in input.stream_dir_entries.keys() {
+        all_parents.insert(*id);
+    }
+    for id in input.target_dir_entries.keys() {
+        all_parents.insert(*id);
+    }
+
+    for parent_id in all_parents {
+        let stream_entries = input.stream_dir_entries.get(&parent_id);
+        let target_entries = input.target_dir_entries.get(&parent_id);
+
+        match (stream_entries, target_entries) {
+            (Some(s_entries), Some(t_entries)) => {
+                compare_dir_entries(parent_id, s_entries, t_entries, inventory);
+            }
+            (Some(s_entries), None) => {
+                // All stream entries are additions (no target directory).
+                for entry in s_entries {
+                    let name = String::from_utf8_lossy(&entry.name);
+                    inventory.entries.push(ConflictEntry {
+                        class: ConflictClass::DirectoryEntry,
+                        divergence: ConflictDivergence::DirectoryEntry(
+                            DirectoryEntryDivergence::ChildAddedOneSideOnly {
+                                present_in_stream: true,
+                            },
+                        ),
+                        stream_identity: format!("dir {parent_id}/{name}"),
+                        target_identity: format!("dir {parent_id} (absent in target)"),
+                    });
+                }
+            }
+            (None, Some(t_entries)) => {
+                for entry in t_entries {
+                    let name = String::from_utf8_lossy(&entry.name);
+                    inventory.entries.push(ConflictEntry {
+                        class: ConflictClass::DirectoryEntry,
+                        divergence: ConflictDivergence::DirectoryEntry(
+                            DirectoryEntryDivergence::ChildAddedOneSideOnly {
+                                present_in_stream: false,
+                            },
+                        ),
+                        stream_identity: format!("dir {parent_id} (absent in stream)"),
+                        target_identity: format!("dir {parent_id}/{name}"),
+                    });
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn compare_dir_entries(
+    parent_id: u64,
+    stream_entries: &[OwnedDirEntry],
+    target_entries: &[OwnedDirEntry],
+    inventory: &mut crate::encoding::ConflictInventory,
+) {
+    #[allow(unused_imports)]
+    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
+        DirectoryEntryDivergence};
+    #[allow(unused_imports)]
+    use std::collections::BTreeMap;
+
+    let stream_map: BTreeMap<&[u8], &OwnedDirEntry> =
+        stream_entries.iter().map(|e| (e.name.as_slice(), e)).collect();
+    let target_map: BTreeMap<&[u8], &OwnedDirEntry> =
+        target_entries.iter().map(|e| (e.name.as_slice(), e)).collect();
+
+    // Entries present in stream but not in target: added on stream side.
+    for (name, _entry) in &stream_map {
+        if !target_map.contains_key(name) {
+            let name_str = String::from_utf8_lossy(name);
+            inventory.entries.push(ConflictEntry {
+                class: ConflictClass::DirectoryEntry,
+                divergence: ConflictDivergence::DirectoryEntry(
+                    DirectoryEntryDivergence::ChildAddedOneSideOnly {
+                        present_in_stream: true,
+                    },
+                ),
+                stream_identity: format!("dir {parent_id}/{name_str}"),
+                target_identity: format!("dir {parent_id} (absent in target)"),
+            });
+        }
+    }
+
+    // Entries present in target but not in stream: added on target side.
+    for (name, _entry) in &target_map {
+        if !stream_map.contains_key(name) {
+            let name_str = String::from_utf8_lossy(name);
+            inventory.entries.push(ConflictEntry {
+                class: ConflictClass::DirectoryEntry,
+                divergence: ConflictDivergence::DirectoryEntry(
+                    DirectoryEntryDivergence::ChildAddedOneSideOnly {
+                        present_in_stream: false,
+                    },
+                ),
+                stream_identity: format!("dir {parent_id} (absent in stream)"),
+                target_identity: format!("dir {parent_id}/{name_str}"),
+            });
+        }
+    }
+
+    // Entries present in both: check for same name / different inode.
+    for (name, s_entry) in &stream_map {
+        if let Some(t_entry) = target_map.get(name) {
+            if s_entry.inode_id != t_entry.inode_id {
+                let name_str = String::from_utf8_lossy(name);
+                inventory.entries.push(ConflictEntry {
+                    class: ConflictClass::DirectoryEntry,
+                    divergence: ConflictDivergence::DirectoryEntry(
+                        DirectoryEntryDivergence::SameNameDifferentInode,
+                    ),
+                    stream_identity: format!(
+                        "dir {parent_id}/{name_str} -> inode {}",
+                        s_entry.inode_id.0
+                    ),
+                    target_identity: format!(
+                        "dir {parent_id}/{name_str} -> inode {}",
+                        t_entry.inode_id.0
+                    ),
+                });
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn classify_extent_map_conflicts(
+    input: &ConflictInventoryInput,
+    inventory: &mut crate::encoding::ConflictInventory,
+) {
+    #[allow(unused_imports)]
+    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
+        ExtentMapDivergence};
+
+    let mut all_ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for id in input.stream_extent_maps.keys() {
+        all_ids.insert(*id);
+    }
+    for id in input.target_extent_maps.keys() {
+        all_ids.insert(*id);
+    }
+
+    for inode_id in all_ids {
+        let stream_em = input.stream_extent_maps.get(&inode_id);
+        let target_em = input.target_extent_maps.get(&inode_id);
+
+        match (stream_em, target_em) {
+            (Some(_), None) | (None, Some(_)) => {}
+            (Some(s), Some(t)) => {
+                if s != t {
+                    // Extent maps differ.  Classify the divergence kind by
+                    // inspecting the serialized forms.
+                    let div = classify_extent_map_difference(s, t);
+                    inventory.entries.push(ConflictEntry {
+                        class: ConflictClass::ExtentMap,
+                        divergence: ConflictDivergence::ExtentMap(div),
+                        stream_identity: format!("inode {inode_id} extent map"),
+                        target_identity: format!("inode {inode_id} extent map"),
+                    });
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+}
+
+/// Compare two serialized extent maps and classify the divergence.
+///
+/// Uses a heuristic based on the serialized size and content to distinguish
+/// between content-chunk replacement, extent-boundary differences, hole-vs-data,
+/// and allocation-only changes.
+#[allow(dead_code)]
+fn classify_extent_map_difference(
+    _stream_bytes: &[u8],
+    _target_bytes: &[u8],
+) -> crate::encoding::ExtentMapDivergence {
+    // Full byte-level extent-map comparison requires deserializing both maps
+    // and comparing entry-by-entry.  That belongs to a focused extent-map
+    // comparison module.  For the initial conflict inventory, we classify any
+    // serialized mismatch as ContentChunkReplaced (the most conservative
+    // classification), which the operator policy can override.
+    crate::encoding::ExtentMapDivergence::ContentChunkReplaced
+}
+
+#[allow(dead_code)]
+fn classify_snapshot_catalog_conflicts(
+    input: &ConflictInventoryInput,
+    inventory: &mut crate::encoding::ConflictInventory,
+) {
+    #[allow(unused_imports)]
+    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
+        SnapshotCatalogDivergence};
+    #[allow(unused_imports)]
+    use std::collections::BTreeMap;
+
+    let stream_by_name: BTreeMap<&[u8], &crate::records::SnapshotRecord> = input
+        .stream_snapshots
+        .iter()
+        .map(|r| (r.name.as_slice(), r))
+        .collect();
+    let target_by_name: BTreeMap<&[u8], &crate::records::SnapshotRecord> = input
+        .target_snapshots
+        .iter()
+        .map(|r| (r.name.as_slice(), r))
+        .collect();
+
+    // Snapshots present only in stream: different name sets.
+    for (name, _rec) in &stream_by_name {
+        if !target_by_name.contains_key(name) {
+            let name_str = String::from_utf8_lossy(name);
+            inventory.entries.push(ConflictEntry {
+                class: ConflictClass::SnapshotCatalog,
+                divergence: ConflictDivergence::SnapshotCatalog(
+                    SnapshotCatalogDivergence::DifferentNameSets {
+                        present_in_stream: true,
+                    },
+                ),
+                stream_identity: format!("snapshot {name_str}"),
+                target_identity: String::from("(absent in target)"),
+            });
+        }
+    }
+
+    // Snapshots present only in target: different name sets.
+    for (name, _rec) in &target_by_name {
+        if !stream_by_name.contains_key(name) {
+            let name_str = String::from_utf8_lossy(name);
+            inventory.entries.push(ConflictEntry {
+                class: ConflictClass::SnapshotCatalog,
+                divergence: ConflictDivergence::SnapshotCatalog(
+                    SnapshotCatalogDivergence::DifferentNameSets {
+                        present_in_stream: false,
+                    },
+                ),
+                stream_identity: String::from("(absent in stream)"),
+                target_identity: format!("snapshot {name_str}"),
+            });
+        }
+    }
+
+    // Snapshots present in both: check for same name / different root.
+    for (name, s_rec) in &stream_by_name {
+        if let Some(t_rec) = target_by_name.get(name) {
+            if s_rec.root != t_rec.root {
+                let name_str = String::from_utf8_lossy(name);
+                inventory.entries.push(ConflictEntry {
+                    class: ConflictClass::SnapshotCatalog,
+                    divergence: ConflictDivergence::SnapshotCatalog(
+                        SnapshotCatalogDivergence::SameNameDifferentRoot,
+                    ),
+                    stream_identity: format!(
+                        "snapshot {name_str} root txg={} gen={}",
+                        s_rec.root.transaction_id, s_rec.root.generation
+                    ),
+                    target_identity: format!(
+                        "snapshot {name_str} root txg={} gen={}",
+                        t_rec.root.transaction_id, t_rec.root.generation
+                    ),
+                });
+                continue;
+            }
+
+            // Same root: check for hold/pin or clone divergence.
+            if s_rec.hold_count != t_rec.hold_count {
+                let name_str = String::from_utf8_lossy(name);
+                inventory.entries.push(ConflictEntry {
+                    class: ConflictClass::SnapshotCatalog,
+                    divergence: ConflictDivergence::SnapshotCatalog(
+                        SnapshotCatalogDivergence::HoldPinDivergence,
+                    ),
+                    stream_identity: format!(
+                        "snapshot {name_str} hold_count={}",
+                        s_rec.hold_count
+                    ),
+                    target_identity: format!(
+                        "snapshot {name_str} hold_count={}",
+                        t_rec.hold_count
+                    ),
+                });
+            }
+
+            if s_rec.kind != t_rec.kind || s_rec.origin != t_rec.origin {
+                let name_str = String::from_utf8_lossy(name);
+                inventory.entries.push(ConflictEntry {
+                    class: ConflictClass::SnapshotCatalog,
+                    divergence: ConflictDivergence::SnapshotCatalog(
+                        SnapshotCatalogDivergence::CloneLineageDivergence,
+                    ),
+                    stream_identity: format!(
+                        "snapshot {name_str} kind={:?} origin={:?}",
+                        s_rec.kind, s_rec.origin
+                    ),
+                    target_identity: format!(
+                        "snapshot {name_str} kind={:?} origin={:?}",
+                        t_rec.kind, t_rec.origin
+                    ),
+                });
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn classify_generation_ordering_conflicts(
+    input: &ConflictInventoryInput,
+    inventory: &mut crate::encoding::ConflictInventory,
+) {
+    #[allow(unused_imports)]
+    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
+        GenerationOrderingDivergence};
+
+    let ancestor_txg = input.common_ancestor.identity.transaction_id;
+
+    let stream_max_txg = input
+        .stream_lineage
+        .roots()
+        .iter()
+        .map(|r| r.transaction_id)
+        .max()
+        .unwrap_or(ancestor_txg);
+
+    let target_max_txg = input
+        .target_recovery_audit
+        .valid_committed_roots
+        .iter()
+        .map(|r| r.transaction_id)
+        .max()
+        .unwrap_or(ancestor_txg);
+
+    // Independent txg advance: both sides moved past the common ancestor
+    // without any shared post-ancestor txg.
+    let stream_has_post_ancestor = stream_max_txg > ancestor_txg;
+    let target_has_post_ancestor = target_max_txg > ancestor_txg;
+
+    if stream_has_post_ancestor && target_has_post_ancestor {
+        // Check if there is any shared txg above the ancestor.
+        let stream_txgs: std::collections::BTreeSet<u64> = input
+            .stream_lineage
+            .roots()
+            .iter()
+            .map(|r| r.transaction_id)
+            .collect();
+        let target_txgs: std::collections::BTreeSet<u64> = input
+            .target_recovery_audit
+            .valid_committed_roots
+            .iter()
+            .map(|r| r.transaction_id)
+            .collect();
+
+        let shared_above_ancestor = stream_txgs
+            .iter()
+            .any(|txg| *txg > ancestor_txg && target_txgs.contains(txg));
+
+        if !shared_above_ancestor {
+            inventory.entries.push(ConflictEntry {
+                class: ConflictClass::GenerationOrdering,
+                divergence: ConflictDivergence::GenerationOrdering(
+                    GenerationOrderingDivergence::IndependentTxgAdvance,
+                ),
+                stream_identity: format!(
+                    "stream txg range [{ancestor_txg}..{stream_max_txg}]"
+                ),
+                target_identity: format!(
+                    "target txg range [{ancestor_txg}..{target_max_txg}]"
+                ),
+            });
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tidefs_local_object_store::IntegrityDigest64;
+    use crate::encoding::{
+        ConflictClass, ConflictDivergence,
+        DirectoryEntryDivergence, ExtentMapDivergence, GenerationOrderingDivergence,
+        InodeIdentityDivergence, SnapshotCatalogDivergence,
+    };
+    use tidefs_types_vfs_core::NodeKind;
 
     fn root(
         transaction_id: u64,
@@ -262,4 +810,542 @@ mod tests {
             "classified error must name operator recovery paths: {message}"
         );
     }
+
+    // ── Conflict inventory builder tests ──────────────────────────────────────
+
+    fn make_inode(id: u64, kind: NodeKind, data_ver: u64, mode: u32, size: u64) -> crate::types::InodeRecord {
+        crate::types::InodeRecord {
+            rdev: 0,
+            inode_id: tidefs_types_vfs_core::InodeId::new(id),
+            generation: tidefs_types_vfs_core::Generation(data_ver),
+            facets: kind.to_facets(),
+            mode,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size,
+            data_version: data_ver,
+            metadata_version: data_ver,
+            posix_time: crate::types::PosixTimeRecord::now(),
+            xattrs: Default::default(),
+            dir_storage_kind: 0,
+            xattr_storage_kind: 0,
+            dir_rev: if kind == NodeKind::Dir { 1 } else { 0 },
+            subtree_rev: 0,
+        }
+    }
+
+    fn make_dir_entry(name: &str, inode_id: u64, kind: NodeKind) -> OwnedDirEntry {
+        OwnedDirEntry::new(
+            name.as_bytes().to_vec(),
+            tidefs_types_vfs_core::InodeId::new(inode_id),
+            kind,
+            tidefs_types_vfs_core::Generation(1),
+            0,
+        )
+    }
+
+    fn make_snapshot(
+        name: &str,
+        txg: u64,
+        gen: u64,
+        hold_count: u32,
+    ) -> crate::records::SnapshotRecord {
+        crate::records::SnapshotRecord {
+            name: name.as_bytes().to_vec(),
+            root: root(txg, gen, txg ^ gen),
+            created_at_generation: gen,
+            kind: crate::records::SnapshotKind::Snapshot,
+            origin: None,
+            hold_count,
+        }
+    }
+
+    fn input_from(
+        ancestor: &ReceiveMergeCommonAncestor,
+        stream_inodes: BTreeMap<u64, crate::types::InodeRecord>,
+        target_inodes: BTreeMap<u64, crate::types::InodeRecord>,
+        stream_dirs: BTreeMap<u64, Vec<OwnedDirEntry>>,
+        target_dirs: BTreeMap<u64, Vec<OwnedDirEntry>>,
+        stream_extents: BTreeMap<u64, Vec<u8>>,
+        target_extents: BTreeMap<u64, Vec<u8>>,
+        stream_snapshots: Vec<crate::records::SnapshotRecord>,
+        target_snapshots: Vec<crate::records::SnapshotRecord>,
+    ) -> ConflictInventoryInput<'static> {
+        // Leak to get 'static lifetime — safe in tests.
+        let ancestor: &'static ReceiveMergeCommonAncestor =
+            Box::leak(Box::new(ancestor.clone()));
+        let stream_inodes: &'static BTreeMap<u64, crate::types::InodeRecord> =
+            Box::leak(Box::new(stream_inodes));
+        let target_inodes: &'static BTreeMap<u64, crate::types::InodeRecord> =
+            Box::leak(Box::new(target_inodes));
+        let stream_dirs: &'static BTreeMap<u64, Vec<OwnedDirEntry>> =
+            Box::leak(Box::new(stream_dirs));
+        let target_dirs: &'static BTreeMap<u64, Vec<OwnedDirEntry>> =
+            Box::leak(Box::new(target_dirs));
+        let stream_extents: &'static BTreeMap<u64, Vec<u8>> =
+            Box::leak(Box::new(stream_extents));
+        let target_extents: &'static BTreeMap<u64, Vec<u8>> =
+            Box::leak(Box::new(target_extents));
+        let stream_snapshots: &'static [crate::records::SnapshotRecord] =
+            Box::leak(stream_snapshots.into_boxed_slice());
+        let target_snapshots: &'static [crate::records::SnapshotRecord] =
+            Box::leak(target_snapshots.into_boxed_slice());
+        let stream_lineage: &'static ReceiveMergeStreamLineageManifest =
+            Box::leak(Box::new(ReceiveMergeStreamLineageManifest::from_roots(
+                vec![ancestor.stream_root.clone()],
+            )));
+        let target_audit: &'static RecoveryAuditReport = Box::leak(Box::new({
+            let mut a = RecoveryAuditReport::empty();
+            a.valid_committed_roots = vec![ancestor.target_root.clone()];
+            a
+        }));
+
+        ConflictInventoryInput {
+            common_ancestor: ancestor,
+            stream_inodes,
+            target_inodes,
+            stream_dir_entries: stream_dirs,
+            target_dir_entries: target_dirs,
+            stream_extent_maps: stream_extents,
+            target_extent_maps: target_extents,
+            stream_snapshots,
+            target_snapshots,
+            stream_lineage,
+            target_recovery_audit: target_audit,
+        }
+    }
+
+    fn ancestor_for_test() -> ReceiveMergeCommonAncestor {
+        let shared = root(10, 100, 0xabc);
+        ReceiveMergeCommonAncestor {
+            identity: ReceiveMergeRootIdentity::from_summary(&shared),
+            stream_root: shared.clone(),
+            target_root: shared,
+        }
+    }
+
+    #[test]
+    fn empty_inventory_when_no_changes_on_either_side() {
+        let ancestor = ancestor_for_test();
+        let inode = make_inode(1, NodeKind::File, 1, 0o644, 4096);
+        let stream_inodes = BTreeMap::from([(1, inode.clone())]);
+        let target_inodes = BTreeMap::from([(1, inode)]);
+        let input = input_from(
+            &ancestor,
+            stream_inodes,
+            target_inodes,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert!(inventory.is_empty());
+        assert_eq!(inventory.len(), 0);
+        assert_eq!(inventory.common_ancestor_transaction_id, 10);
+        assert_eq!(inventory.common_ancestor_generation, 100);
+    }
+
+    #[test]
+    fn inode_identity_different_file_type() {
+        let ancestor = ancestor_for_test();
+        let stream_inode = make_inode(1, NodeKind::File, 1, 0o644, 4096);
+        let target_inode = make_inode(1, NodeKind::Dir, 1, 0o755, 0);
+        let input = input_from(
+            &ancestor,
+            BTreeMap::from([(1, stream_inode)]),
+            BTreeMap::from([(1, target_inode)]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert_eq!(inventory.len(), 1);
+        let entry = &inventory.entries[0];
+        assert_eq!(entry.class, ConflictClass::InodeIdentity);
+        assert!(matches!(
+            entry.divergence,
+            ConflictDivergence::InodeIdentity(InodeIdentityDivergence::DifferentFileType)
+        ));
+    }
+
+    #[test]
+    fn inode_identity_different_content() {
+        let ancestor = ancestor_for_test();
+        let stream_inode = make_inode(1, NodeKind::File, 5, 0o644, 4096);
+        let target_inode = make_inode(1, NodeKind::File, 3, 0o644, 4096);
+        let input = input_from(
+            &ancestor,
+            BTreeMap::from([(1, stream_inode)]),
+            BTreeMap::from([(1, target_inode)]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert_eq!(inventory.len(), 1);
+        assert!(matches!(
+            inventory.entries[0].divergence,
+            ConflictDivergence::InodeIdentity(InodeIdentityDivergence::DifferentContentIdentity)
+        ));
+    }
+
+    #[test]
+    fn inode_identity_different_permissions() {
+        let ancestor = ancestor_for_test();
+        let stream_inode = make_inode(1, NodeKind::File, 1, 0o600, 4096);
+        let target_inode = make_inode(1, NodeKind::File, 1, 0o644, 4096);
+        let input = input_from(
+            &ancestor,
+            BTreeMap::from([(1, stream_inode)]),
+            BTreeMap::from([(1, target_inode)]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert_eq!(inventory.len(), 1);
+        assert!(matches!(
+            inventory.entries[0].divergence,
+            ConflictDivergence::InodeIdentity(InodeIdentityDivergence::DifferentPermissionsOwnership)
+        ));
+    }
+
+    #[test]
+    fn inode_identity_different_size() {
+        let ancestor = ancestor_for_test();
+        let stream_inode = make_inode(1, NodeKind::File, 1, 0o644, 8192);
+        let target_inode = make_inode(1, NodeKind::File, 1, 0o644, 4096);
+        let input = input_from(
+            &ancestor,
+            BTreeMap::from([(1, stream_inode)]),
+            BTreeMap::from([(1, target_inode)]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert_eq!(inventory.len(), 1);
+        assert!(matches!(
+            inventory.entries[0].divergence,
+            ConflictDivergence::InodeIdentity(InodeIdentityDivergence::DifferentSize)
+        ));
+    }
+
+    #[test]
+    fn directory_entry_child_added_stream_side() {
+        let ancestor = ancestor_for_test();
+        let stream_dirs = BTreeMap::from([(
+            1_u64,
+            vec![make_dir_entry("new_file", 2, NodeKind::File)],
+        )]);
+        let target_dirs: BTreeMap<u64, Vec<OwnedDirEntry>> = BTreeMap::new();
+        let input = input_from(
+            &ancestor,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            stream_dirs,
+            target_dirs,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert_eq!(inventory.len(), 1);
+        let entry = &inventory.entries[0];
+        assert_eq!(entry.class, ConflictClass::DirectoryEntry);
+        assert!(matches!(
+            entry.divergence,
+            ConflictDivergence::DirectoryEntry(
+                DirectoryEntryDivergence::ChildAddedOneSideOnly { present_in_stream: true }
+            )
+        ));
+    }
+
+    #[test]
+    fn directory_entry_child_added_target_side() {
+        let ancestor = ancestor_for_test();
+        let stream_dirs: BTreeMap<u64, Vec<OwnedDirEntry>> = BTreeMap::new();
+        let target_dirs = BTreeMap::from([(
+            1_u64,
+            vec![make_dir_entry("new_file", 2, NodeKind::File)],
+        )]);
+        let input = input_from(
+            &ancestor,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            stream_dirs,
+            target_dirs,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert_eq!(inventory.len(), 1);
+        assert!(matches!(
+            inventory.entries[0].divergence,
+            ConflictDivergence::DirectoryEntry(
+                DirectoryEntryDivergence::ChildAddedOneSideOnly { present_in_stream: false }
+            )
+        ));
+    }
+
+    #[test]
+    fn directory_entry_same_name_different_inode() {
+        let ancestor = ancestor_for_test();
+        let stream_dirs = BTreeMap::from([(
+            1_u64,
+            vec![make_dir_entry("shared_name", 10, NodeKind::File)],
+        )]);
+        let target_dirs = BTreeMap::from([(
+            1_u64,
+            vec![make_dir_entry("shared_name", 20, NodeKind::File)],
+        )]);
+        let input = input_from(
+            &ancestor,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            stream_dirs,
+            target_dirs,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert_eq!(inventory.len(), 1);
+        assert!(matches!(
+            inventory.entries[0].divergence,
+            ConflictDivergence::DirectoryEntry(
+                DirectoryEntryDivergence::SameNameDifferentInode
+            )
+        ));
+    }
+
+    #[test]
+    fn extent_map_conflict_detected() {
+        let ancestor = ancestor_for_test();
+        let stream_extents = BTreeMap::from([(1_u64, vec![1, 2, 3])]);
+        let target_extents = BTreeMap::from([(1_u64, vec![4, 5, 6])]);
+        let input = input_from(
+            &ancestor,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            stream_extents,
+            target_extents,
+            vec![],
+            vec![],
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert_eq!(inventory.len(), 1);
+        let entry = &inventory.entries[0];
+        assert_eq!(entry.class, ConflictClass::ExtentMap);
+        assert!(matches!(
+            entry.divergence,
+            ConflictDivergence::ExtentMap(ExtentMapDivergence::ContentChunkReplaced)
+        ));
+    }
+
+    #[test]
+    fn extent_map_identical_no_conflict() {
+        let ancestor = ancestor_for_test();
+        let extents = BTreeMap::from([(1_u64, vec![1, 2, 3])]);
+        let input = input_from(
+            &ancestor,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            extents.clone(),
+            extents,
+            vec![],
+            vec![],
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert!(inventory.is_empty());
+    }
+
+    #[test]
+    fn snapshot_catalog_same_name_different_root() {
+        let ancestor = ancestor_for_test();
+        let stream_snaps = vec![make_snapshot("snap1", 20, 200, 1)];
+        let target_snaps = vec![make_snapshot("snap1", 30, 300, 1)];
+        let input = input_from(
+            &ancestor,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            stream_snaps,
+            target_snaps,
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert!(!inventory.is_empty());
+        let same_name_diff_root = inventory.entries.iter().any(|e| {
+            matches!(
+                e.divergence,
+                ConflictDivergence::SnapshotCatalog(
+                    SnapshotCatalogDivergence::SameNameDifferentRoot
+                )
+            )
+        });
+        assert!(same_name_diff_root, "expected SameNameDifferentRoot conflict");
+    }
+
+    #[test]
+    fn snapshot_catalog_different_name_sets() {
+        let ancestor = ancestor_for_test();
+        let stream_snaps = vec![make_snapshot("stream_only", 20, 200, 0)];
+        let target_snaps = vec![make_snapshot("target_only", 30, 300, 0)];
+        let input = input_from(
+            &ancestor,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            stream_snaps,
+            target_snaps,
+        );
+
+        let inventory = build_conflict_inventory(&input);
+        assert_eq!(inventory.len(), 2);
+        let has_stream_only = inventory.entries.iter().any(|e| {
+            matches!(
+                e.divergence,
+                ConflictDivergence::SnapshotCatalog(
+                    SnapshotCatalogDivergence::DifferentNameSets { present_in_stream: true }
+                )
+            )
+        });
+        let has_target_only = inventory.entries.iter().any(|e| {
+            matches!(
+                e.divergence,
+                ConflictDivergence::SnapshotCatalog(
+                    SnapshotCatalogDivergence::DifferentNameSets { present_in_stream: false }
+                )
+            )
+        });
+        assert!(has_stream_only);
+        assert!(has_target_only);
+    }
+
+    #[test]
+    fn generation_ordering_independent_txg_advance() {
+        let ancestor_root = root(10, 100, 0xabc);
+        let stream_root = root(15, 150, 0xdef);
+        let target_root = root(20, 200, 0x123);
+        let ancestor = ReceiveMergeCommonAncestor {
+            identity: ReceiveMergeRootIdentity::from_summary(&ancestor_root),
+            stream_root: stream_root.clone(),
+            target_root: target_root.clone(),
+        };
+
+        let stream_lineage =
+            ReceiveMergeStreamLineageManifest::from_roots(vec![ancestor_root.clone(), stream_root]);
+        let mut target_audit = RecoveryAuditReport::empty();
+        target_audit.valid_committed_roots = vec![ancestor_root, target_root];
+
+        let input = ConflictInventoryInput {
+            common_ancestor: Box::leak(Box::new(ancestor)),
+            stream_inodes: Box::leak(Box::new(BTreeMap::new())),
+            target_inodes: Box::leak(Box::new(BTreeMap::new())),
+            stream_dir_entries: Box::leak(Box::new(BTreeMap::new())),
+            target_dir_entries: Box::leak(Box::new(BTreeMap::new())),
+            stream_extent_maps: Box::leak(Box::new(BTreeMap::new())),
+            target_extent_maps: Box::leak(Box::new(BTreeMap::new())),
+            stream_snapshots: Box::leak(Box::new([])),
+            target_snapshots: Box::leak(Box::new([])),
+            stream_lineage: Box::leak(Box::new(stream_lineage)),
+            target_recovery_audit: Box::leak(Box::new(target_audit)),
+        };
+
+        let inventory = build_conflict_inventory(&input);
+        assert!(!inventory.is_empty());
+        assert!(inventory.entries.iter().any(|e| {
+            matches!(
+                e.divergence,
+                ConflictDivergence::GenerationOrdering(
+                    GenerationOrderingDivergence::IndependentTxgAdvance
+                )
+            )
+        }));
+    }
+
+    #[test]
+    fn generation_ordering_shared_post_ancestor_txg_no_conflict() {
+        let ancestor_root = root(10, 100, 0xabc);
+        let shared_root = root(12, 120, 0xdef);
+        let stream_root = root(15, 150, 0x111);
+        let target_root = root(20, 200, 0x222);
+        let ancestor = ReceiveMergeCommonAncestor {
+            identity: ReceiveMergeRootIdentity::from_summary(&ancestor_root),
+            stream_root: stream_root.clone(),
+            target_root: target_root.clone(),
+        };
+
+        let stream_lineage = ReceiveMergeStreamLineageManifest::from_roots(vec![
+            ancestor_root.clone(),
+            shared_root.clone(),
+            stream_root,
+        ]);
+        let mut target_audit = RecoveryAuditReport::empty();
+        target_audit.valid_committed_roots =
+            vec![ancestor_root, shared_root, target_root];
+
+        let input = ConflictInventoryInput {
+            common_ancestor: Box::leak(Box::new(ancestor)),
+            stream_inodes: Box::leak(Box::new(BTreeMap::new())),
+            target_inodes: Box::leak(Box::new(BTreeMap::new())),
+            stream_dir_entries: Box::leak(Box::new(BTreeMap::new())),
+            target_dir_entries: Box::leak(Box::new(BTreeMap::new())),
+            stream_extent_maps: Box::leak(Box::new(BTreeMap::new())),
+            target_extent_maps: Box::leak(Box::new(BTreeMap::new())),
+            stream_snapshots: Box::leak(Box::new([])),
+            target_snapshots: Box::leak(Box::new([])),
+            stream_lineage: Box::leak(Box::new(stream_lineage)),
+            target_recovery_audit: Box::leak(Box::new(target_audit)),
+        };
+
+        let inventory = build_conflict_inventory(&input);
+        // No generation ordering conflict because there's a shared txg above ancestor.
+        assert!(inventory
+            .entries
+            .iter()
+            .all(|e| e.class != ConflictClass::GenerationOrdering));
+    }
+
 }

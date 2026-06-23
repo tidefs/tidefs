@@ -1593,6 +1593,165 @@ pub(crate) fn decode_dedup_redirect(bytes: &[u8]) -> crate::Result<ObjectKey> {
     decoder.finish()?;
     Ok(ObjectKey::from_bytes32(key_bytes))
 }
+// ── Conflict inventory types for receive merge planner (§1 taxonomy) ────────
+
+#[allow(dead_code)]
+/// Top-level conflict axis defined by the receive merge planner design §1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[allow(dead_code)]
+pub enum ConflictClass {
+    /// Inode identity conflict (§1.1): same inode_id, different record fields.
+    InodeIdentity = 1,
+    /// Directory entry conflict (§1.2): per-directory child-namespace divergences.
+    DirectoryEntry = 2,
+    /// Extent map conflict (§1.3): per-inode byte-range layout divergences.
+    ExtentMap = 3,
+    /// Snapshot catalog conflict (§1.4): name/root/hold divergences.
+    SnapshotCatalog = 4,
+    /// Generation ordering conflict (§1.5): txg/generation sequence divergences.
+    GenerationOrdering = 5,
+}
+
+/// Divergence sub-classification for inode identity conflicts (§1.1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum InodeIdentityDivergence {
+    /// Different file type (InodeRecord::kind mismatch).
+    DifferentFileType,
+    /// Different content identity (content_manifest_id, extent layout, or checksum root).
+    DifferentContentIdentity,
+    /// Different permissions, uid, gid, or ACL fields.
+    DifferentPermissionsOwnership,
+    /// Different size with same content identity.
+    DifferentSize,
+}
+
+/// Divergence sub-classification for directory entry conflicts (§1.2).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum DirectoryEntryDivergence {
+    /// Child entry present in one namespace, absent in the other.
+    ChildAddedOneSideOnly { present_in_stream: bool },
+    /// Entry absent in one namespace, present in the other.
+    ChildDeletedOneSideOnly { present_in_stream: bool },
+    /// Same entry name maps to different inode_id on each side.
+    SameNameDifferentInode,
+    /// Both sides agree on the entry→inode mapping but the inode itself diverged.
+    SameNameSameInodeButInodeDiverged,
+    /// Same entries, different order (usually not a correctness conflict).
+    DirectoryEntryReordering,
+}
+
+/// Divergence sub-classification for extent map conflicts (§1.3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum ExtentMapDivergence {
+    /// Same logical offset, different content chunk identity.
+    ContentChunkReplaced,
+    /// Different Extent shape (offset, length, content ref).
+    ExtentBoundariesDiffer,
+    /// One side has a hole at an offset, the other has data.
+    HoleVsData,
+    /// Same content, different physical block locations.
+    AllocationOnlyDifference,
+}
+
+/// Divergence sub-classification for snapshot catalog conflicts (§1.4).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum SnapshotCatalogDivergence {
+    /// Same snapshot name maps to different committed-root digests.
+    SameNameDifferentRoot,
+    /// Side A has snapshots side B does not, or vice versa.
+    DifferentNameSets { present_in_stream: bool },
+    /// Clone origin or promotion state differs.
+    CloneLineageDivergence,
+    /// Different hold sets or lifecycle pin state for the same snapshot.
+    HoldPinDivergence,
+    /// Side A deleted a snapshot, side B still has it.
+    CatalogEntryLifespan { present_in_stream: bool },
+}
+
+/// Divergence sub-classification for generation ordering conflicts (§1.5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum GenerationOrderingDivergence {
+    /// Both pools accepted writes after divergence; no shared post-ancestor txg.
+    IndependentTxgAdvance,
+    /// A txg exists on both sides but commits different objects.
+    SameTxgDifferentContent,
+    /// The txg sequence has gaps relative to the other side's sequence.
+    MissingTxgStride,
+}
+
+/// Unified divergence wrapper carrying the axis-specific subclass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum ConflictDivergence {
+    InodeIdentity(InodeIdentityDivergence),
+    DirectoryEntry(DirectoryEntryDivergence),
+    ExtentMap(ExtentMapDivergence),
+    SnapshotCatalog(SnapshotCatalogDivergence),
+    GenerationOrdering(GenerationOrderingDivergence),
+}
+
+/// A single named entry in the conflict inventory.
+///
+/// Each entry names the conflict class, the object identity on each side,
+/// and the specific divergence kind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct ConflictEntry {
+    /// The conflict axis this entry belongs to.
+    pub class: ConflictClass,
+    /// Axis-specific divergence classification.
+    pub divergence: ConflictDivergence,
+    /// Human-readable identity of the object on the stream side.
+    pub stream_identity: String,
+    /// Human-readable identity of the object on the target side.
+    pub target_identity: String,
+}
+
+/// Machine-readable conflict inventory produced by the merge planner.
+///
+/// Classifies every divergent object into the five-axis taxonomy defined
+/// by `docs/RECEIVE_MERGE_PLANNER_DESIGN.md` §1.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct ConflictInventory {
+    /// Identity of the common ancestor transaction group.
+    pub common_ancestor_transaction_id: u64,
+    /// Identity of the common ancestor generation.
+    pub common_ancestor_generation: u64,
+    /// All classified conflict entries across all five axes.
+    pub entries: Vec<ConflictEntry>,
+}
+
+#[allow(dead_code)]
+impl ConflictInventory {
+    /// Create an empty inventory anchored at the given common-ancestor identity.
+    #[must_use]
+    pub fn empty(ancestor_transaction_id: u64, ancestor_generation: u64) -> Self {
+        Self {
+            common_ancestor_transaction_id: ancestor_transaction_id,
+            common_ancestor_generation: ancestor_generation,
+            entries: Vec::new(),
+        }
+    }
+
+    /// True when no conflicts were found.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Number of conflict entries in the inventory.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
