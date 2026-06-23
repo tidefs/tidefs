@@ -6,7 +6,7 @@ publish.workspace = true
 license.workspace = true
 authors.workspace = true
 
-description = "Continuous failure recovery loop: detect, scope, plan, execute, verify — PC-010.5"
+description = "Continuous failure recovery loop: detect, scope, plan, execute, verify"
 
 [dependencies]
 tidefs-commit_group = { path = "../tidefs-commit_group" }

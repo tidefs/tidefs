@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Continuous failure recovery loop: detect, scope, plan, execute, verify — PC-010.5.
+//! Continuous failure recovery loop: detect, scope, plan, execute, verify.
 //!
 //! The [`recovery_loop`] module provides committed-root-validated crash recovery
 //! with BLAKE3 chain verification, intent-log record replay dispatch, and
@@ -101,9 +101,9 @@ use tidefs_commit_group::{
 use tidefs_local_object_store::LocalObjectStore;
 use tidefs_vfs_engine::VfsEngine;
 
-/// Gate constant for PC-010.5 failure recovery loop.
+/// Gate constant for the failure recovery loop.
 pub const FAILURE_RECOVERY_LOOP_GATE_PC_010_5: &str =
-    "PC-010.5 failure recovery loop covers detect, scope, plan, execute, verify phases";
+    "failure recovery loop covers detect, scope, plan, execute, verify phases";
 
 // ── Recovery priority ────────────────────────────────────────────────
 

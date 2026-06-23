@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 //! Replication policy selector: assigns Critical / Standard / BestEffort
-//! quorum policies per chunk class as defined in PC-010.3.
+//! quorum policies per chunk class.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +50,7 @@ impl ReplicationPolicy {
     }
 }
 
-/// Chunk classes used for policy selection (PC-010.3).
+/// Chunk classes used for policy selection.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicationChunkClass {
     /// Metadata head chunk — requires all-target quorum.

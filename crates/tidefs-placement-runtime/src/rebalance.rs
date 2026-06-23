@@ -2,7 +2,7 @@
 //! Rebalance integration: wires the capacity rebalance planner into the
 //! placement runtime so that epoch transitions, capacity skew detection,
 //! and rebalance plan execution flow through the standard placement
-//! lifecycle (PC-010.4).
+//! lifecycle.
 
 use std::collections::BTreeMap;
 

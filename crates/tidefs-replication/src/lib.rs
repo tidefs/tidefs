@@ -4,8 +4,8 @@
 //! Production replication protocol: fanout writes, collect quorum ACKs,
 //! handle partial failures, and commit through the flow commit coordinator.
 //!
-//! Implements PC-010.3 distributed replication with per-chunk-class quorum
-//! policies, receipt-backed completion, and transfer orchestrator integration.
+//! Implements distributed replication with per-chunk-class quorum policies,
+//! receipt-backed completion, and transfer orchestrator integration.
 //!
 //! # Architecture
 //!
@@ -101,7 +101,7 @@ impl ReplicationPolicy {
     }
 }
 
-/// Chunk classes used for policy selection (PC-010.3).
+/// Chunk classes used for policy selection.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicationChunkClass {
     MetadataHead,
@@ -710,7 +710,7 @@ impl ReplicationProtocol {
         self.pending_writes.clear();
     }
 
-    /// Emit a transfer receipt for a completed transfer (PC-010.3).
+    /// Emit a transfer receipt for a completed transfer.
     #[must_use]
     pub fn emit_transfer_receipt(
         &self,
@@ -730,7 +730,7 @@ impl ReplicationProtocol {
         }
     }
 
-    /// Emit a verification receipt for a completed verification (PC-010.3).
+    /// Emit a verification receipt for a completed verification.
     #[must_use]
     pub fn emit_verification_receipt(
         &self,
@@ -822,7 +822,7 @@ impl ReplicationProtocol {
     }
 
     /// Update  whenever a fence frontier or
-    /// placement receipt advances (PC-010.3, P8-03 §10).
+    /// placement receipt advances (P8-03 §10).
     ///
     /// Computes the lag class based on  total and
     /// records the oldest missing receipt ref.
@@ -990,7 +990,7 @@ impl DegradedReadProtocol {
     }
 
     /// Try candidates in priority order and return the best available
-    /// degraded read visibility class (PC-010.3).
+    /// degraded read visibility class.
     ///
     /// Returns the visibility classification before attempting the read.
     /// - Local replica found → Exact

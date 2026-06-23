@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Rebalance planner: capacity redistribution orchestration — PC-010.4.
+//! Rebalance planner: capacity redistribution orchestration.
 //!
 //! The rebalance planner coordinates capacity-weighted, delta-based rebalancing
 //! across cluster members. It composes the capacity skew detection from
@@ -46,9 +46,9 @@ use tidefs_replica_health::NodeId;
 use tidefs_replication_model::{ReplicatedReceiptId, ReplicatedSubjectId};
 use tidefs_space_accounting::SpaceAccounting;
 
-/// Gate constant for PC-010.4 rebalance planner.
+/// Gate constant for the capacity rebalance planner.
 pub const REBALANCE_PLANNER_GATE_PC_010_4: &str =
-    "PC-010.4 rebalance planner covers capacity-weighted delta-based movement, movement budget, epoch gating, and anti-affinity preservation";
+    "rebalance planner covers capacity-weighted delta-based movement, movement budget, epoch gating, and anti-affinity preservation";
 
 /// Default rebalance threshold: trigger when max-min utilization > 20%.
 pub const DEFAULT_REBALANCE_THRESHOLD_PCT: u64 = 20;
