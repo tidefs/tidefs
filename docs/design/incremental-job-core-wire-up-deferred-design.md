@@ -1,5 +1,11 @@
 # IncrementalJob Core Wire-Up Deferred Design
 
+> **Documentation authority**: This file is imported/historical design input.
+> It is not current policy, current spec, implementation-status evidence,
+> release-readiness evidence, or worker scheduling authority. For current
+> documentation entry points, see `docs/INDEX.md` and
+> `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+
 **Issue**: [#2047](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/2047)
 **Canonical type design**: [`docs/design/incremental-job-core-types-crate-design.md`](./incremental-job-core-types-crate-design.md) (sealed design spec)
 **Seal document**: [`docs/design/incremental-job-core-types-crate-design-sealed.md`](./incremental-job-core-types-crate-design-sealed.md) (formal seal)
