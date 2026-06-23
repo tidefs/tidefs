@@ -124,6 +124,9 @@ NET_IPIP y
 STACKPROTECTOR y
 STACKPROTECTOR_STRONG y
 
+# Runtime buffer overflow detection
+FORTIFY_SOURCE y
+
 # ── ELF core / binaries ───────────────────────────────────────────────
 BINFMT_ELF y
 BINFMT_SCRIPT y
