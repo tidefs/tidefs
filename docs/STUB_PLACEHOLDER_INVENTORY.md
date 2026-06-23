@@ -139,7 +139,7 @@ These are not stubs in the traditional sense (they contain real code and tests),
 | `tidefs-distributed-model-check` | [#820](https://github.com/tidefs/tidefs/issues/820) | proof-harness | 173 | Deterministic distributed safety model checking; needs model coverage |
 | `tidefs-env-fuse-model` | [#821](https://github.com/tidefs/tidefs/issues/821) | proof-harness | — | FUSE lifecycle environment model; needs model evidence |
 | `tidefs-env-ublk-model` | [#822](https://github.com/tidefs/tidefs/issues/822) | proof-harness | — | uBLK qid/tag state model; needs model evidence |
-| `tidefs-erasure-coded-store` | [#823](https://github.com/tidefs/tidefs/issues/823) | product-code | 2199 | EC object storage; needs runtime validation |
+| `tidefs-erasure-coded-store` | [#823](https://github.com/tidefs/tidefs/issues/823) | product-code | 2199 | Authority established for local EC object storage: placement-backed shard routing, degraded reads, shard-digest verification, flush repair, and store rebuild now have focused runtime coverage. Pool receipt/recovery integration remains outside this placeholder-inventory row. |
 | `tidefs-geometry-convert` | [#824](https://github.com/tidefs/tidefs/issues/824) | product-code | 1194 | Pool geometry conversion (mirror/EC); needs runtime validation |
 | `tidefs-kernel-cutover-runtime` | [#825](https://github.com/tidefs/tidefs/issues/825) | product-code | 424 | Cutover state machine, fence manager; needs kernel-mode validation |
 | `tidefs-kmod-posix-vfs` | [#826](https://github.com/tidefs/tidefs/issues/826) | adapter-operator | — | Kernel VFS module; needs kernel-build xfstests validation |

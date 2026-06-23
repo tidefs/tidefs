@@ -48,8 +48,9 @@ boundaries.
   `DurabilityLevel::for_erasure_coded`, and `ErasureLayoutPolicy` for the
   OW-306 XOR model
 - `docs/workspace-package-classification.md` — classifies
-  `tidefs-erasure-coded-store` as planned authority surface requiring a
-  follow-up issue
+  `tidefs-erasure-coded-store` as a current local EC product component after
+  issue #823; broader pool receipt, recovery, scrub, and release claims remain
+  outside the row
 - `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` — TFR-019 classification
   framework for doc authority states
 
@@ -226,10 +227,13 @@ The EC store does not own:
 - recovery loop orchestration (recovery orchestrator, future);
 - erasure profile catalog management (catalog, future).
 
-The classification row in `docs/workspace-package-classification.md` can be
-updated from "planned authority surface; follow-up issue required" to
-"current product component; capability claims remain limited by the review
-register" once the follow-up implementation issues below are completed.
+Issue #823 updates the classification row in
+`docs/workspace-package-classification.md` from "planned authority surface;
+follow-up issue required" to a current product component for the local EC store
+after placement-backed shard routing and focused runtime validation evidence
+land. This is not a pool-level receipt, recovery-orchestrator, scrub, or
+release-grade claim; the follow-up implementation issues below remain blockers
+for those broader surfaces.
 
 ## Follow-Up Implementation Issues
 
@@ -241,11 +245,10 @@ worked sequentially or by non-overlapping owners.
    placement receipts. Expected write set: `crates/tidefs-pool/`,
    `crates/tidefs-erasure-coded-store/` (API changes only).
 
-2. **EC-store placement planner integration**: Replace the local
-   `compute_shard_to_store()` identity fallback with consumption of
-   placement-planner output for all EC store paths. Expected write set:
-   `crates/tidefs-erasure-coded-store/`, `crates/tidefs-placement-planner/`
-   (API extensions).
+2. **EC-store placement planner integration**: Issue #823 routes the local
+   sync and async EC store paths through the computed placement-planner shard
+   map. Residual pool-level keyed placement and receipt publication belong with
+   the receipt/pool follow-up rather than this local-store authority row.
 
 3. **EC-store repair-with-receipt integration**: Wire
    `ErasureCodedStore::repair_shard()` into `Pool::repair_with_receipt` so
