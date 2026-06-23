@@ -109,14 +109,16 @@ EOF
     echo "  Module digest: $MODULE_DIGEST"
 
     RUN_DIR="$TMPDIR/validation-$$"
+    INITRAMFS="$TMPDIR/initramfs-$$.cpio"
     mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,validation,trace}
-    trap 'if [ -z "''${KEEP_TMP:-}" ]; then rm -rf "$RUN_DIR"; fi' EXIT
+    trap 'if [ -z "''${KEEP_TMP:-}" ]; then rm -rf "$RUN_DIR" "$INITRAMFS"; fi' EXIT
 
     cp "$BUSYBOX" "$RUN_DIR/bin/busybox"
     chmod +x "$RUN_DIR/bin/busybox"
     for applet in sh ls cat echo mount grep insmod rmmod dmesg sleep poweroff reboot \
       mknod mkdir rmdir dd stat cp mv rm touch find wc head tail sync cut dirname basename \
-      printf test xargs seq awk tr sort uniq md5sum date ps; do
+      printf test xargs seq awk tr sort uniq md5sum date ps umount lsmod mountpoint uname \
+      true false; do
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
@@ -557,28 +559,40 @@ INITSCRIPT
 
     chmod +x "$RUN_DIR/init"
 
-    # Build initramfs
-    (cd "$RUN_DIR" && find . | cpio -o -H newc) | gzip > "$RUN_DIR/initramfs.gz"
+    # Build initramfs outside the archived tree so the kernel sees a stable /init.
+    (cd "$RUN_DIR" && find . -print0 | "$CPIO" -0 -o -H newc) > "$INITRAMFS" 2>/dev/null
 
     # Boot QEMU
     echo "--- Booting QEMU ---"
+    QEMU_EXIT=0
+    set +e
     timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
       -kernel "$KERNEL_IMG" \
-      -initrd "$RUN_DIR/initramfs.gz" \
-      -append "console=ttyS0 quiet" \
+      -initrd "$INITRAMFS" \
+      -append "console=ttyS0 quiet init=/init panic=10 panic_on_oops=1" \
       -nographic \
       -m 512M \
       -no-reboot \
-      2>&1 | tee "$RUN_DIR/qemu.log" || true
+      2>&1 | tee "$RUN_DIR/qemu.log"
+    QEMU_EXIT="''${PIPESTATUS[0]}"
+    set -e
 
     echo ""
-    echo "--- QEMU exited ---"
+    echo "--- QEMU exited with code $QEMU_EXIT ---"
 
     # Parse results
-    PASS_COUNT=$(grep -c "^PASS:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    FAIL_COUNT=$(grep -c "^FAIL:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    BLOCKED_COUNT=$(grep -c "^BLOCKED:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
-    SKIP_COUNT=$(grep -c "^SKIP:" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
+    log_count() {
+      local pattern="$1"
+      local count
+      count=$(grep -c "$pattern" "$RUN_DIR/qemu.log" 2>/dev/null || true)
+      printf '%s\n' "''${count:-0}"
+    }
+
+    PASS_COUNT=$(log_count "^PASS:")
+    FAIL_COUNT=$(log_count "^FAIL:")
+    BLOCKED_COUNT=$(log_count "^BLOCKED:")
+    SKIP_COUNT=$(log_count "^SKIP:")
+    BOOT_FAILURE_COUNT=$(grep -Ec "Failed to execute /init|No working init found|Kernel panic|VFS: Unable to mount root fs|not syncing" "$RUN_DIR/qemu.log" 2>/dev/null || true)
 
     echo ""
     echo "=== QEMU Guest Results ==="
@@ -606,29 +620,41 @@ INITSCRIPT
     # Count dmesg signals for fail-closed
     DMESG_DANGER_COUNT=0
     for pattern in "WARNING:" "BUG:" "Oops:" "lockdep:" "KASAN:" "KCSAN:" "hung_task" "Call Trace:" "RIP:"; do
-      c=$(grep -c "$pattern" "$RUN_DIR/qemu.log" 2>/dev/null || true)
+      c=$(log_count "$pattern")
       DMESG_DANGER_COUNT=$((DMESG_DANGER_COUNT + ''${c:-0}))
     done
 
-    TRACE_ERROR_COUNT=$(grep -c "trace.*error\|ftrace.*fail" "$RUN_DIR/qemu.log" 2>/dev/null || echo 0)
+    TRACE_ERROR_COUNT=$(log_count "trace.*error\|ftrace.*fail")
 
     # Determine teardown status
     TEARDOWN_STATUS="pass"
-    FAIL_REASONS="[]"
+    FAIL_REASONS="$("$JQ" -n -c '[]')"
+    append_fail_reason() {
+      FAIL_REASONS="$(printf '%s' "$FAIL_REASONS" | "$JQ" -c --arg reason "$1" '. + [$reason]')"
+    }
+
     if [ "$FAIL_COUNT" -gt 0 ]; then
       TEARDOWN_STATUS="fail"
-      FAIL_REASONS="[\"guest_fail_count=$FAIL_COUNT\"]"
+      append_fail_reason "guest_fail_count=$FAIL_COUNT"
     elif [ "$BLOCKED_COUNT" -gt 0 ]; then
       TEARDOWN_STATUS="blocked"
-      FAIL_REASONS="[\"guest_blocked_count=$BLOCKED_COUNT\"]"
+      append_fail_reason "guest_blocked_count=$BLOCKED_COUNT"
+    fi
+    if [ "$QEMU_EXIT" -ne 0 ]; then
+      TEARDOWN_STATUS="fail"
+      append_fail_reason "qemu_exit=$QEMU_EXIT"
+    fi
+    if [ "$BOOT_FAILURE_COUNT" -gt 0 ]; then
+      TEARDOWN_STATUS="fail"
+      append_fail_reason "boot_failure_count=$BOOT_FAILURE_COUNT"
     fi
     if [ "$DMESG_DANGER_COUNT" -gt 0 ]; then
       TEARDOWN_STATUS="fail"
-      if [ "$FAIL_REASONS" = "[]" ]; then
-        FAIL_REASONS="[\"dmesg_danger_count=$DMESG_DANGER_COUNT\"]"
-      else
-        FAIL_REASONS=$(echo "$FAIL_REASONS" | "$JQ" '. + ["dmesg_danger_count='"$DMESG_DANGER_COUNT"'"]')
-      fi
+      append_fail_reason "dmesg_danger_count=$DMESG_DANGER_COUNT"
+    fi
+    if [ "$TRACE_ERROR_COUNT" -gt 0 ]; then
+      TEARDOWN_STATUS="fail"
+      append_fail_reason "trace_error_count=$TRACE_ERROR_COUNT"
     fi
 
     # Extract teardown phases from QEMU log by parsing PHASE_MARKER lines
@@ -649,6 +675,27 @@ $(grep '^PHASE_MARKER:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^PHASE_MARKER:/
 PHASEEOF
 
     # Build refusal observations JSON
+    REFUSAL1_OP="mount"
+    REFUSAL1_EXPECTED=true
+    REFUSAL1_RESULT=""
+    REFUSAL1_NEW_WORK=false
+    if grep -q "^PASS: refusal_mount .*mount refused after module unload" "$RUN_DIR/qemu.log" 2>/dev/null; then
+      REFUSAL1_RESULT="mount_correctly_refused"
+    elif grep -q "^FAIL: refusal_mount .*mount succeeded after module unload" "$RUN_DIR/qemu.log" 2>/dev/null; then
+      REFUSAL1_RESULT="mount_unexpectedly_succeeded"
+      REFUSAL1_NEW_WORK=true
+    fi
+
+    REFUSAL2_OP="mount_check"
+    REFUSAL2_EXPECTED=true
+    REFUSAL2_RESULT=""
+    REFUSAL2_NEW_WORK=false
+    if grep -q "^PASS: refusal_mount_check .*no TideFS mount visible" "$RUN_DIR/qemu.log" 2>/dev/null; then
+      REFUSAL2_RESULT="no_tidefs_mount_visible"
+    elif grep -q "^FAIL: refusal_mount_check .*TideFS mount still visible after rmmod" "$RUN_DIR/qemu.log" 2>/dev/null; then
+      REFUSAL2_RESULT="tidefs_mount_still_visible"
+    fi
+
     REFUSAL_JSON="$("$JQ" -n '[]')"
     if [ -n "$REFUSAL1_RESULT" ]; then
       REFUSAL_JSON="$("$JQ" -n \
@@ -692,7 +739,10 @@ PHASEEOF
     fi
 
     # Write kernel-teardown-runtime.json
-    mkdir -p "$OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR/trace"
+    cp "$RUN_DIR/qemu.log" "$OUTPUT_DIR/qemu.log" 2>/dev/null || true
+    printf '%s\n' "$WQ_TRACE_BODY" > "$OUTPUT_DIR/$WQ_TRACE_PATH"
+    printf '%s\n' "$CB_TRACE_BODY" > "$OUTPUT_DIR/$CB_TRACE_PATH"
 
     "$JQ" -n \
       --arg generated_by "$GENERATED_BY" \
@@ -802,7 +852,7 @@ PHASEEOF
       VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
     fi
 
-    if [ "$TEARDOWN_STATUS" = "pass" ] && { [ "$FAIL_COUNT" -gt 0 ] || [ "$DMESG_DANGER_COUNT" -gt 0 ] || [ "$TRACE_ERROR_COUNT" -gt 0 ]; }; then
+    if [ "$TEARDOWN_STATUS" = "pass" ] && { [ "$QEMU_EXIT" -ne 0 ] || [ "$FAIL_COUNT" -gt 0 ] || [ "$BLOCKED_COUNT" -gt 0 ] || [ "$DMESG_DANGER_COUNT" -gt 0 ] || [ "$TRACE_ERROR_COUNT" -gt 0 ]; }; then
       echo "VALIDATE FAIL: status=pass but fail/dmesg/trace counters are non-zero"
       VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
     fi
@@ -821,7 +871,7 @@ PHASEEOF
     echo "  evidence-manifest.json"
     echo "  qemu.log"
 
-    if [ "$FAIL_COUNT" -gt 0 ] || [ "$VALIDATION_ERRORS" -gt 0 ]; then
+    if [ "$TEARDOWN_STATUS" != "pass" ] || [ "$VALIDATION_ERRORS" -gt 0 ]; then
       exit 1
     fi
     exit 0
