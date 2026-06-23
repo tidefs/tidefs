@@ -7,7 +7,7 @@ use tidefs_lease::{
     LeaseClass, LeaseDomain,
 };
 use tidefs_membership_epoch::{
-    ClusterMemberRecord, DomainId, EpochId, FailureDomainVector,
+    ClusterMemberRecord, DatasetMountIdentity, DomainId, EpochId, FailureDomainVector,
     HealthClass, MemberClass, MemberId,
 };
 
@@ -82,6 +82,7 @@ fuzz_target!(|data: &[u8]| {
                     },
                     requester_id: requester,
                     term_millis: Some(5_000 + (param_byte as u64 * 1_000)),
+                    mount_identity: DatasetMountIdentity::ZERO,
                 };
                 let result = authority.request_lease(request);
                 if matches!(result, LeaseIssuanceResult::Granted { .. }) {

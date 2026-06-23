@@ -25,6 +25,7 @@ tidefs-lease = { path = "../crates/tidefs-lease" }
 tidefs-witness-set = { path = "../crates/tidefs-witness-set" }
 tidefs-quorum-write = { path = "../crates/tidefs-quorum-write" }
 tidefs-membership-epoch = { path = "../crates/tidefs-membership-epoch" }
+tidefs-send-stream = { path = "../crates/tidefs-send-stream" }
 tidefs-transport = { path = "../crates/tidefs-transport" }
 tidefs-types-transport-session = { path = "../crates/tidefs-types-transport-session" }
 bincode = "1"
@@ -79,6 +80,12 @@ doc = false
 [[bin]]
 name = "quorum_write"
 path = "fuzz_targets/quorum_write.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "send_stream_segment_frame_decode"
+path = "fuzz_targets/send_stream_segment_frame_decode.rs"
 test = false
 doc = false
 

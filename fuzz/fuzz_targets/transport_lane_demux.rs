@@ -2,7 +2,64 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use tidefs_transport::codec::MessageCodec;
+use tidefs_transport::envelope::MessageFamily;
 use tidefs_transport::lane_demux::{LaneClass, LaneDemux, WriteResult};
+
+fn exercise_wire_header_cases(data: &[u8], demux: &mut LaneDemux) {
+    let codec = MessageCodec::with_max_frame_size(2048);
+    let _ = codec.decode(data);
+
+    if data.len() >= 5 {
+        let mut overclaimed = data[..data.len().min(2053)].to_vec();
+        let declared = overclaimed
+            .len()
+            .saturating_add(usize::from(data[0]))
+            .saturating_add(1) as u32;
+        overclaimed[..4].copy_from_slice(&declared.to_le_bytes());
+        let _ = codec.decode(&overclaimed);
+
+        let mut invalid_family = overclaimed;
+        invalid_family[4] = 0xff;
+        let _ = codec.decode(&invalid_family);
+    }
+
+    let families = MessageFamily::all();
+    let family = families[data.first().copied().unwrap_or(0) as usize % MessageFamily::COUNT];
+    let payload_start = data.len().min(2);
+    let payload_len = data
+        .get(1)
+        .map(|byte| usize::from(*byte).min(data.len().saturating_sub(payload_start)))
+        .unwrap_or(0)
+        .min(1024);
+    let payload = &data[payload_start..payload_start + payload_len];
+
+    if let Ok(frame) = codec.encode(family, payload) {
+        route_decoded_frame(&codec, &frame, demux);
+
+        for cut in 0..frame.len().min(5) {
+            let _ = codec.decode(&frame[..cut]);
+        }
+
+        let mut frame_with_tail = frame;
+        frame_with_tail.extend_from_slice(&data[..data.len().min(16)]);
+        route_decoded_frame(&codec, &frame_with_tail, demux);
+
+        let mut bad_len = frame_with_tail;
+        let declared = (payload_len as u32).saturating_add(1);
+        bad_len[..4].copy_from_slice(&declared.to_le_bytes());
+        let _ = codec.decode(&bad_len);
+    }
+}
+
+fn route_decoded_frame(codec: &MessageCodec, frame: &[u8], demux: &mut LaneDemux) {
+    if let Ok((family, payload)) = codec.decode(frame) {
+        let lane = family.preferred_lane();
+        demux.receive(lane, &payload);
+        let drained = demux.drain_read(lane);
+        assert_eq!(drained, payload);
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
@@ -10,6 +67,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let mut demux = LaneDemux::new();
+    exercise_wire_header_cases(data, &mut demux);
     let lanes = LaneClass::all();
 
     // Phase 1: Write messages to random lanes
