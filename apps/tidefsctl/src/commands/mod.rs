@@ -8,6 +8,7 @@ pub mod defrag;
 pub mod device;
 pub mod diag;
 pub mod kernel;
+pub mod merge;
 mod live_owner;
 pub mod mount;
 mod offline_pool;

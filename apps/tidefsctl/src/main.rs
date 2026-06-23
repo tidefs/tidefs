@@ -122,6 +122,12 @@ enum Command {
         cmd: commands::kernel::KernelCommand,
     },
 
+
+    /// Resolve merge conflicts for receive merge planner manual policy
+    Merge {
+        #[command(subcommand)]
+        cmd: commands::merge::MergeCommand,
+    },
     /// Collect a redacted support bundle
     Diag {
         /// Output directory for the support bundle JSON file
@@ -173,6 +179,7 @@ fn main() {
         } => commands::diag::handle_diag(output_dir, &devices, json),
         Command::Cluster { cmd } => commands::cluster::handle_cluster(cmd),
         Command::Kernel { cmd } => commands::kernel::handle_kernel(cmd),
+        Command::Merge { cmd } => commands::merge::handle_merge(cmd),
     }
 }
 

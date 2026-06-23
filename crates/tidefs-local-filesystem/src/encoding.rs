@@ -1597,7 +1597,7 @@ pub(crate) fn decode_dedup_redirect(bytes: &[u8]) -> crate::Result<ObjectKey> {
 
 #[allow(dead_code)]
 /// Top-level conflict axis defined by the receive merge planner design §1.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub enum ConflictClass {
     /// Inode identity conflict (§1.1): same inode_id, different record fields.
     InodeIdentity = 1,
@@ -1612,7 +1612,7 @@ pub enum ConflictClass {
 }
 
 /// Divergence sub-classification for inode identity conflicts (§1.1).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code, clippy::enum_variant_names)]
 pub enum InodeIdentityDivergence {
     /// Different file type (InodeRecord::kind mismatch).
@@ -1626,7 +1626,7 @@ pub enum InodeIdentityDivergence {
 }
 
 /// Divergence sub-classification for directory entry conflicts (§1.2).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub enum DirectoryEntryDivergence {
     /// Child entry present in one namespace, absent in the other.
@@ -1642,7 +1642,7 @@ pub enum DirectoryEntryDivergence {
 }
 
 /// Divergence sub-classification for extent map conflicts (§1.3).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub enum ExtentMapDivergence {
     /// Same logical offset, different content chunk identity.
@@ -1656,7 +1656,7 @@ pub enum ExtentMapDivergence {
 }
 
 /// Divergence sub-classification for snapshot catalog conflicts (§1.4).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub enum SnapshotCatalogDivergence {
     /// Same snapshot name maps to different committed-root digests.
@@ -1672,7 +1672,7 @@ pub enum SnapshotCatalogDivergence {
 }
 
 /// Divergence sub-classification for generation ordering conflicts (§1.5).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub enum GenerationOrderingDivergence {
     /// Both pools accepted writes after divergence; no shared post-ancestor txg.
@@ -1684,7 +1684,7 @@ pub enum GenerationOrderingDivergence {
 }
 
 /// Unified divergence wrapper carrying the axis-specific subclass.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub enum ConflictDivergence {
     InodeIdentity(InodeIdentityDivergence),
@@ -1698,7 +1698,7 @@ pub enum ConflictDivergence {
 ///
 /// Each entry names the conflict class, the object identity on each side,
 /// and the specific divergence kind.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ConflictEntry {
     /// The conflict axis this entry belongs to.
@@ -1723,7 +1723,7 @@ pub struct ConflictEntry {
 ///
 /// Classifies every divergent object into the five-axis taxonomy defined
 /// by `docs/RECEIVE_MERGE_PLANNER_DESIGN.md` §1.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ConflictInventory {
     /// Identity of the common ancestor transaction group.
@@ -1756,6 +1756,28 @@ impl ConflictInventory {
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Serialize this inventory to a stable JSON string.
+    ///
+    /// The output is a machine-readable, line-oriented JSON document suitable
+    /// for saving to disk, operator inspection, and `tidefsctl merge resolve`.
+    pub fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize a conflict inventory from a JSON string previously produced
+    /// by [`to_json`](Self::to_json).
+    ///
+    /// Returns an error if the JSON is malformed, missing required fields, or
+    /// contains unknown variant tags.
+    pub fn from_json(json: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(json)
+    }
+
+    /// Serialize this inventory as compact (single-line) JSON.
+    pub fn to_json_compact(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
     }
 }
 
