@@ -82,3 +82,6 @@ name = "tidefs_posix_filesystem_adapter_daemon"
 [[bin]]
 name = "tidefs-posix-filesystem-adapter-daemon"
 path = "src/main.rs"
+
+[lints.clippy]
+unsafe_code = "allow"

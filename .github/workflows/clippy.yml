@@ -1,0 +1,106 @@
+name: Clippy
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.github/workflows/clippy.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'apps/**'
+      - 'crates/**'
+      - 'kmod/**'
+      - 'xtask/**'
+      - 'scripts/clippy-baseline.sh'
+      - 'docs/CARGO_CLIPPY_BASELINE.md'
+      - 'docs/clippy-baseline.json'
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Clippy scope to run
+        required: true
+        default: changed
+        type: choice
+        options:
+          - changed
+          - workspace
+      base_ref:
+        description: Base ref for changed-crate detection
+        required: false
+        default: origin/master
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'changed' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}
+  RUST_BACKTRACE: 1
+
+jobs:
+  clippy:
+    name: Changed crate clippy
+    # Draft PRs are not integration candidates; manual dispatch remains
+    # available for draft-branch evidence.
+    if: ${{ (github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Prepare CI scratch
+        run: |
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+
+      - name: Run clippy baseline gate
+        env:
+          CLIPPY_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'changed' }}
+          CLIPPY_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || inputs.base_ref }}
+        run: |
+          set -euo pipefail
+          mode=check-changed
+          if [[ "$CLIPPY_SCOPE" == "workspace" ]]; then
+            mode=check-workspace
+          fi
+
+          args=("$mode" --json clippy-baseline-summary.json)
+          if [[ -n "${CLIPPY_BASE_REF:-}" && "$mode" == "check-changed" ]]; then
+            args+=(--base "$CLIPPY_BASE_REF")
+          fi
+
+          nix develop .#ci --command bash -c './scripts/clippy-baseline.sh "$@"' -- "${args[@]}"
+
+      - name: Upload clippy summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: clippy-baseline-summary
+          path: clippy-baseline-summary.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report summary
+        if: always()
+        run: |
+          if [[ -f clippy-baseline-summary.json ]]; then
+            echo '## Clippy Baseline Results' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            nix develop .#ci --command jq -c '{mode, head_sha, totals, failed_crates: [.results[] | select(.status != "pass") | {crate, status, warnings, baseline_warnings}]}' clippy-baseline-summary.json >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Clean cargo target
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"

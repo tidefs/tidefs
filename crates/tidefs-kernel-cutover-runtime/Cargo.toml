@@ -17,3 +17,6 @@ path = "src/lib.rs"
 [dependencies]
 [dev-dependencies]
 blake3 = "1"
+
+[lints.clippy]
+unsafe_code = "allow"
