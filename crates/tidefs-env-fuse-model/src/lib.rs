@@ -12,12 +12,16 @@
 //! adapter boundary. It translates semantic FUSE requests into the current
 //! TideFS request contract and replays those envelopes through
 //! `tidefs-model-core` without calling storage mutation APIs directly.
+//! Unified model evidence for this boundary lives at
+//! `validation/artifacts/fuse/adapter-lifecycle-model.json` with a v2 evidence
+//! manifest at `validation/artifacts/fuse/adapter-lifecycle-model.manifest.json`.
 
 pub mod adapter_guard;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
+use serde::Serialize;
 use tidefs_model_core::{
     ContractModelContext, ContractNameBinding, ContractNameContext, ModelFingerprint, ModelFs,
     ModelInvariantError, ModelPath,
@@ -323,6 +327,62 @@ pub struct FuseModelStep {
     pub completion: Option<TideCompletion>,
     pub capability_reports: Vec<CapabilityReport>,
     pub fingerprint: Option<ModelFingerprint>,
+}
+
+/// Claim id for the bounded FUSE adapter lifecycle model.
+pub const FUSE_ADAPTER_MODEL_CLAIM_ID: &str = "fuse.adapter.lifecycle_translation.model.v1";
+
+/// Evidence class emitted by the FUSE adapter lifecycle model receipt.
+pub const FUSE_ADAPTER_MODEL_EVIDENCE_CLASS: &str = "fuse-adapter-lifecycle-model";
+
+/// Canonical validation tier for the pure FUSE adapter model.
+pub const FUSE_ADAPTER_MODEL_VALIDATION_TIER: &str = "source-model";
+
+/// Deterministic fixture id for the committed issue #290 receipt.
+pub const FUSE_ADAPTER_MODEL_FIXTURE_ID: &str = "fuse-issue-290-acceptance-trace-v1";
+
+/// Residual runtime boundary for FUSE model evidence.
+pub const FUSE_ADAPTER_MODEL_RUNTIME_BOUNDARY: &str = "source-model evidence only; this does not mount FUSE, run xfstests, inject crashes, prove writeback durability, or validate mounted adapter runtime behavior";
+
+/// Adapter semantics boundary preserved by the environment model.
+pub const FUSE_ADAPTER_SEMANTICS_BOUNDARY: &str = "the FUSE adapter translates legal FUSE inputs into TideFS-owned request contract envelopes and does not own filesystem semantics or storage mutation authority";
+
+/// Reviewable receipt for the deterministic FUSE adapter model fixture.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FuseAdapterModelReceipt {
+    pub report_version: u32,
+    pub generated_by: &'static str,
+    pub claim_id: &'static str,
+    pub evidence_class: &'static str,
+    pub validation_tier: &'static str,
+    pub evidence_scope: &'static str,
+    pub runtime_boundary: &'static str,
+    pub adapter_semantics_boundary: &'static str,
+    pub deterministic_fixture_id: &'static str,
+    pub related_claim_ids: Vec<&'static str>,
+    pub bounds: FuseAdapterModelBounds,
+    pub checked_edges: Vec<&'static str>,
+    pub outcome: FuseAdapterModelOutcome,
+}
+
+/// Bounded dimensions covered by the deterministic FUSE model receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FuseAdapterModelBounds {
+    pub trace_steps: usize,
+    pub max_background: usize,
+    pub canonical_contract_requests: usize,
+    pub adapter_only_requests: usize,
+    pub unsupported_capability_events: usize,
+    pub terminal_completions: usize,
+    pub model_fingerprints: usize,
+}
+
+/// Deterministic outcome summary for the FUSE model receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FuseAdapterModelOutcome {
+    pub passed: bool,
+    pub violation_count: usize,
+    pub violations: Vec<String>,
 }
 
 /// Errors indicate illegal environment traces or internal model invariant
@@ -1045,6 +1105,95 @@ impl FuseModelStep {
     }
 }
 
+/// Build the deterministic issue #290 evidence receipt.
+///
+/// The receipt is source-model evidence only. It records the adapter lifecycle
+/// and translation boundary exercised by [`issue_290_acceptance_trace`] without
+/// claiming mounted FUSE runtime behavior.
+pub fn issue_290_evidence_receipt() -> Result<FuseAdapterModelReceipt, FuseModelError> {
+    let trace = issue_290_acceptance_trace()?;
+    Ok(FuseAdapterModelReceipt {
+        report_version: 1,
+        generated_by: "tidefs-env-fuse-model::issue_290_acceptance_trace-v1",
+        claim_id: FUSE_ADAPTER_MODEL_CLAIM_ID,
+        evidence_class: FUSE_ADAPTER_MODEL_EVIDENCE_CLASS,
+        validation_tier: FUSE_ADAPTER_MODEL_VALIDATION_TIER,
+        evidence_scope: "bounded deterministic FUSE adapter lifecycle model for init, queue saturation, interrupt, abort, reissue, writeback-cache sync, unsupported capability handling, daemon teardown, and destroy",
+        runtime_boundary: FUSE_ADAPTER_MODEL_RUNTIME_BOUNDARY,
+        adapter_semantics_boundary: FUSE_ADAPTER_SEMANTICS_BOUNDARY,
+        deterministic_fixture_id: FUSE_ADAPTER_MODEL_FIXTURE_ID,
+        related_claim_ids: vec![FUSE_ADAPTER_MODEL_CLAIM_ID],
+        bounds: FuseAdapterModelBounds::from_trace(&trace),
+        checked_edges: vec![
+            "connection init classifies supported and explicitly unsupported FUSE capabilities",
+            "adapter-only open/release requests do not become filesystem-semantic contract operations",
+            "canonical create/read/write/sync requests translate into TideFS-owned VFS request envelopes",
+            "background queue saturation records active and waiting request states",
+            "interrupt, abort, and reissue transitions preserve retry intent at the adapter boundary",
+            "writeback-cache writes require explicit sync before clean release and teardown",
+            "unsupported FIEMAP returns an explicit unsupported completion instead of a runtime claim",
+            "daemon teardown and destroy require no active, waiting, or dirty writeback work",
+        ],
+        outcome: FuseAdapterModelOutcome {
+            passed: true,
+            violation_count: 0,
+            violations: Vec::new(),
+        },
+    })
+}
+
+impl FuseAdapterModelBounds {
+    fn from_trace(trace: &[FuseModelStep]) -> Self {
+        Self {
+            trace_steps: trace.len(),
+            max_background: trace
+                .iter()
+                .map(|step| step.queue.max_background)
+                .max()
+                .unwrap_or_default(),
+            canonical_contract_requests: trace
+                .iter()
+                .filter(|step| {
+                    matches!(&step.request, Some(AdapterContractRequest::Canonical { .. }))
+                })
+                .count(),
+            adapter_only_requests: trace
+                .iter()
+                .filter(|step| step.placement == QueuePlacement::AdapterOnly)
+                .count(),
+            unsupported_capability_events: trace
+                .iter()
+                .map(unsupported_capability_event_count)
+                .sum(),
+            terminal_completions: trace
+                .iter()
+                .filter(|step| step.completion.is_some())
+                .count(),
+            model_fingerprints: trace
+                .iter()
+                .filter(|step| step.fingerprint.is_some())
+                .count(),
+        }
+    }
+}
+
+fn unsupported_capability_event_count(step: &FuseModelStep) -> usize {
+    let init_reports = step
+        .capability_reports
+        .iter()
+        .filter(|report| report.classification.is_unsupported())
+        .count();
+    let request_report = match &step.request {
+        Some(AdapterContractRequest::UnsupportedCapability { classification, .. })
+            if classification.is_unsupported() =>
+        {
+            1
+        }
+        _ => 0,
+    };
+    init_reports + request_report
+}
+
 /// Deterministic acceptance events for issue #290.
 #[must_use]
 pub fn issue_290_acceptance_events() -> Vec<FuseEvent> {
@@ -1365,7 +1514,9 @@ mod tests {
 
         let canonical = trace
             .iter()
-            .filter(|step| matches!(step.request, Some(AdapterContractRequest::Canonical { .. })));
+            .filter(|step| {
+                matches!(&step.request, Some(AdapterContractRequest::Canonical { .. }))
+            });
         assert!(canonical.count() >= 3);
 
         assert!(trace.iter().any(|step| {
@@ -1392,9 +1543,28 @@ mod tests {
         }));
 
         assert!(trace.iter().any(|step| {
-            matches!(step.request, Some(AdapterContractRequest::Canonical { .. }))
+            matches!(&step.request, Some(AdapterContractRequest::Canonical { .. }))
                 && step.completion.is_some()
         }));
+    }
+
+    #[test]
+    fn issue_290_evidence_receipt_records_model_boundary() {
+        let receipt = issue_290_evidence_receipt().expect("issue #290 receipt remains legal");
+
+        assert_eq!(receipt.claim_id, FUSE_ADAPTER_MODEL_CLAIM_ID);
+        assert_eq!(receipt.evidence_class, FUSE_ADAPTER_MODEL_EVIDENCE_CLASS);
+        assert_eq!(receipt.validation_tier, FUSE_ADAPTER_MODEL_VALIDATION_TIER);
+        assert!(receipt.outcome.passed);
+        assert_eq!(receipt.outcome.violation_count, 0);
+        assert_eq!(receipt.bounds.trace_steps, 16);
+        assert!(receipt.bounds.canonical_contract_requests >= 4);
+        assert!(receipt.bounds.adapter_only_requests >= 2);
+        assert!(receipt.bounds.unsupported_capability_events >= 3);
+        assert!(receipt.runtime_boundary.contains("does not mount FUSE"));
+        assert!(receipt
+            .adapter_semantics_boundary
+            .contains("does not own filesystem semantics"));
     }
 
     #[test]

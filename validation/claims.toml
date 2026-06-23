@@ -210,6 +210,24 @@ evidence_artifacts = [
 ]
 
 [[claims]]
+id = "fuse.adapter.lifecycle_translation.model.v1"
+status = "planned"
+scope = "FUSE adapter lifecycle translation source model"
+required_evidence_classes = [
+  "fuse-adapter-lifecycle-model",
+]
+evidence_requirements = [
+  { class = "fuse-adapter-lifecycle-model", path = "validation/artifacts/fuse/adapter-lifecycle-model.json", validation_tier = "source-model", manifest_path = "validation/artifacts/fuse/adapter-lifecycle-model.manifest.json", blocking_issues = [] },
+]
+blockers = [
+  "The FUSE adapter lifecycle receipt is bounded source-model evidence only; mounted FUSE adapter runtime behavior, xfstests, crash, and writeback durability evidence remain separate claim-gated work.",
+]
+generated_doc = "Planned FUSE adapter lifecycle translation model claim. The source-model fixture covers init, queue saturation, interrupt, abort, reissue, writeback-cache sync, unsupported capability handling, teardown, and destroy at the adapter boundary. It is not mounted FUSE runtime proof."
+evidence_artifacts = [
+  { class = "fuse-adapter-lifecycle-model", path = "validation/artifacts/fuse/adapter-lifecycle-model.json", source = "tidefs-env-fuse-model", scope = "source-model-fuse-adapter-lifecycle" },
+]
+
+[[claims]]
 id = "ublk.qid_tag.exactly_once_completion.v1"
 status = "planned"
 scope = "uBLK qid/tag request lifecycle"
@@ -219,7 +237,7 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "qid-tag-state-model", path = "validation/artifacts/ublk/qid-tag-state-model.json", validation_tier = "source-model", blocking_issues = ["#289", "#312"] },
+  { class = "qid-tag-state-model", path = "validation/artifacts/ublk/qid-tag-state-model.json", validation_tier = "source-model", manifest_path = "validation/artifacts/ublk/qid-tag-state-model.manifest.json", blocking_issues = ["#289", "#312"] },
   { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json", validation_tier = "qemu-guest", blocking_issues = ["#312"] },
   { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#312"] },
 ]
@@ -229,7 +247,7 @@ blockers = [
 ]
 generated_doc = "Planned uBLK qid/tag exactly-once completion claim. TideFS has bounded model evidence, a focused runtime completion artifact, and a claims-gate review; broader runtime coverage is still required before product wording can strengthen."
 evidence_artifacts = [
-  { class = "qid-tag-state-model", path = "validation/artifacts/ublk/qid-tag-state-model.json" },
+  { class = "qid-tag-state-model", path = "validation/artifacts/ublk/qid-tag-state-model.json", source = "tidefs-env-ublk-model", scope = "source-model-qid-tag-lifecycle" },
   { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json" },
   { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", source = "claims-gate", scope = "ublk-model-runtime-boundary-review" },
 ]
@@ -251,9 +269,28 @@ evidence_requirements = [
 blockers = []
 generated_doc = "Validated bounded uBLK started-export live service-loop claim. TideFS has started-export-service-loop-model, qid-tag-completion runtime, started-export-admission runtime (qemu-ublk-smoke), and claims-gate review evidence. This is not fio workload breadth, mkfs/mount acceptance, online resize, crash durability, or production block-device readiness."
 evidence_artifacts = [
+  { class = "started-export-service-loop-model", path = "validation/artifacts/ublk/started-export-service-loop-model.json", source = "tidefs-env-ublk-model", scope = "source-model-started-export-service-loop" },
   { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json", source = "qemu-ublk-smoke", scope = "qid-tag-completion" },
   { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", source = "claims-gate", scope = "ublk-model-runtime-boundary-review" },
   { class = "runtime-ublk-started-export-admission-artifact", path = "validation/artifacts/ublk/started-export-admission-runtime.json", source = "qemu-ublk-smoke", scope = "started-export-admission" },
+]
+
+[[claims]]
+id = "distributed.combined_safety.model.v1"
+status = "planned"
+scope = "bounded distributed model checker invariants"
+required_evidence_classes = [
+  "distributed-combined-safety-model",
+]
+evidence_requirements = [
+  { class = "distributed-combined-safety-model", path = "validation/artifacts/distributed/combined-safety-receipt.json", validation_tier = "source-model", manifest_path = "validation/artifacts/distributed/combined-safety-receipt.manifest.json", blocking_issues = [] },
+]
+blockers = [
+  "The combined safety receipt is bounded model-check evidence only; storage-node runtime, transport, multi-process, production cluster, RDMA, and runtime distributed evidence remain separate claim-gated work.",
+]
+generated_doc = "Planned bounded distributed model-check claim. The source-model fixture covers epoch, lease, quorum, placement receipt, and rebuild invariants under bounded model limits. It is not storage-node, transport, multi-process, production cluster, RDMA, or runtime proof."
+evidence_artifacts = [
+  { class = "distributed-combined-safety-model", path = "validation/artifacts/distributed/combined-safety-receipt.json", source = "tidefs-distributed-model-check", scope = "source-model-distributed-combined-safety" },
 ]
 
 [[claims]]

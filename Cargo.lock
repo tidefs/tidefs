@@ -2407,6 +2407,7 @@ dependencies = [
 name = "tidefs-env-fuse-model"
 version = "0.421.0"
 dependencies = [
+ "serde",
  "tidefs-model-core",
  "tidefs-types-vfs-core",
 ]

@@ -3,8 +3,8 @@
   "generated_by": "tidefs-env-ublk-model-rust-v0.421.0",
   "claim_id": "ublk.started_export.live_service_loop.v1",
   "evidence_class": "started-export-service-loop-model",
-  "evidence_tier": "model",
-  "runtime_admission_boundary": "This is model-tier evidence only; runtime-ublk-started-export-admission-artifact remains required for live daemon proof.",
+  "evidence_tier": "source-model",
+  "runtime_admission_boundary": "This is source-model evidence only; runtime-ublk-started-export-admission-artifact remains required for live daemon proof.",
   "config": {
     "queue_count": 2,
     "queue_depth": 3,

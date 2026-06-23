@@ -24,6 +24,8 @@ use tidefs_ublk_abi::{
 
 pub const UBLK_QID_TAG_MODEL_CLAIM_ID: &str = "ublk.qid_tag.exactly_once_completion.v1";
 pub const UBLK_QID_TAG_MODEL_EVIDENCE_CLASS: &str = "qid-tag-state-model";
+pub const UBLK_QID_TAG_MODEL_VALIDATION_TIER: &str = "source-model";
+pub const UBLK_QID_TAG_RUNTIME_BOUNDARY: &str = "source-model evidence only; this does not run a uBLK daemon, issue ioctls, submit block I/O, or prove block-volume runtime behavior";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct UblkSlotKey {

@@ -1,0 +1,38 @@
+{
+  "report_version": 1,
+  "generated_by": "tidefs-env-fuse-model::issue_290_acceptance_trace-v1",
+  "claim_id": "fuse.adapter.lifecycle_translation.model.v1",
+  "evidence_class": "fuse-adapter-lifecycle-model",
+  "validation_tier": "source-model",
+  "evidence_scope": "bounded deterministic FUSE adapter lifecycle model for init, queue saturation, interrupt, abort, reissue, writeback-cache sync, unsupported capability handling, daemon teardown, and destroy",
+  "runtime_boundary": "source-model evidence only; this does not mount FUSE, run xfstests, inject crashes, prove writeback durability, or validate mounted adapter runtime behavior",
+  "adapter_semantics_boundary": "the FUSE adapter translates legal FUSE inputs into TideFS-owned request contract envelopes and does not own filesystem semantics or storage mutation authority",
+  "deterministic_fixture_id": "fuse-issue-290-acceptance-trace-v1",
+  "related_claim_ids": [
+    "fuse.adapter.lifecycle_translation.model.v1"
+  ],
+  "bounds": {
+    "trace_steps": 16,
+    "max_background": 1,
+    "canonical_contract_requests": 7,
+    "adapter_only_requests": 4,
+    "unsupported_capability_events": 4,
+    "terminal_completions": 8,
+    "model_fingerprints": 4
+  },
+  "checked_edges": [
+    "connection init classifies supported and explicitly unsupported FUSE capabilities",
+    "adapter-only open/release requests do not become filesystem-semantic contract operations",
+    "canonical create/read/write/sync requests translate into TideFS-owned VFS request envelopes",
+    "background queue saturation records active and waiting request states",
+    "interrupt, abort, and reissue transitions preserve retry intent at the adapter boundary",
+    "writeback-cache writes require explicit sync before clean release and teardown",
+    "unsupported FIEMAP returns an explicit unsupported completion instead of a runtime claim",
+    "daemon teardown and destroy require no active, waiting, or dirty writeback work"
+  ],
+  "outcome": {
+    "passed": true,
+    "violation_count": 0,
+    "violations": []
+  }
+}

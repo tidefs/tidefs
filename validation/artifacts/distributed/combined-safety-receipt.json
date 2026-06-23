@@ -2,10 +2,12 @@
   "report_version": 1,
   "generated_by": "tidefs-distributed-model-check::combined_safety_receipt-v1",
   "evidence_class": "distributed-combined-safety-model",
-  "validation_tier": "bounded-model-only",
+  "validation_tier": "source-model",
   "evidence_scope": "bounded deterministic model-check evidence for epoch, lease, quorum, and placement safety invariants",
   "runtime_boundary": "model evidence only; this does not validate storage-node runtime, transport, RDMA, production cluster, cluster CLI, or multi-process behavior",
-  "related_claim_ids": [],
+  "related_claim_ids": [
+    "distributed.combined_safety.model.v1"
+  ],
   "blocking_issues": [
     "GitHub issue #538 owns this model-check receipt slice.",
     "Runtime distributed evidence remains missing: no storage-node, transport, RDMA, production cluster, or multi-process runtime artifact is validated by this report."

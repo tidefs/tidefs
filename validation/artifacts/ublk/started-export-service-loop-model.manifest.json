@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "ublk.started_export.live_service_loop.v1",
+  "evidence_class": "started-export-service-loop-model",
+  "validation_tier": "source-model",
+  "scope": "bounded pure uBLK started-export service-loop source model for queue/tag generation, queue bounds, completion outcomes, and unsupported opcode handling; no live daemon proof",
+  "artifact_path": "validation/artifacts/ublk/started-export-service-loop-model.json",
+  "content_digest": "blake3:4a99a9e4a5eb4024e2e91f1ebd73e932d385a86fe15b2c70fa323588a180f23d",
+  "run_id": "deterministic-fixture:ublk-started-export-service-loop-v1",
+  "source_ref": "refs/heads/gpt2/issue-811-model-evidence-manifests",
+  "outcome": "pass",
+  "residual_risk": "The started-export service-loop fixture is source-model evidence only. Runtime started-export admission, qemu execution, fio, mkfs or mount acceptance, online resize, crash durability, multi-queue scaling, and production block-device readiness remain outside this manifest.",
+  "source": "tidefs-env-ublk-model",
+  "generated_at": "2026-06-23T00:05:35Z",
+  "blocking_issues": []
+}
