@@ -188,6 +188,14 @@ fn concurrent_writer_reader_same_page_no_tearing() {
     // Insert initial page
     cache.insert(inode, offset).expect("initial insert");
 
+    // Write initial data so the reader thread never observes the
+    // zero-filled post-insert buffer and spuriously fails the inode-
+    // marker assertion below.
+    {
+        let mut rng = Rng::new(seed);
+        write_page_data(&cache, &mut rng, inode, offset);
+    }
+
     let cache_w = Arc::clone(&cache);
     let cache_r = Arc::clone(&cache);
 
