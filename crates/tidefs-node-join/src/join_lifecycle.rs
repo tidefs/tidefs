@@ -81,8 +81,56 @@ pub struct JoinToken {
     /// When the token expires (nanoseconds since some epoch).
     pub expires_at_ns: u64,
     /// The membership epoch this token authorizes the join under.
-    /// `None` for legacy tokens that predate epoch binding.
+    /// Unbound tokens are refused by epoch-bound join admission.
     pub epoch: Option<EpochId>,
+}
+
+/// Typed refusal recorded when a join token fails epoch admission.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub enum JoinTokenRefusal {
+    /// The token was not bound to an epoch.
+    MissingEpoch { current: EpochId },
+    /// The token was issued for an older membership epoch.
+    StaleEpoch { expected: EpochId, got: EpochId },
+    /// The token was issued for a non-current membership epoch.
+    EpochMismatch { expected: EpochId, got: EpochId },
+}
+
+impl JoinTokenRefusal {
+    fn validate(token_epoch: Option<EpochId>, current_epoch: EpochId) -> Result<EpochId, Self> {
+        match token_epoch {
+            None => Err(Self::MissingEpoch {
+                current: current_epoch,
+            }),
+            Some(epoch) if epoch == current_epoch => Ok(epoch),
+            Some(epoch) if epoch < current_epoch => Err(Self::StaleEpoch {
+                expected: current_epoch,
+                got: epoch,
+            }),
+            Some(epoch) => Err(Self::EpochMismatch {
+                expected: current_epoch,
+                got: epoch,
+            }),
+        }
+    }
+
+    fn as_join_error(&self) -> JoinError {
+        match self {
+            Self::MissingEpoch { current } => JoinError::MissingEpochEvidence(format!(
+                "join token missing epoch binding for current membership epoch {:?}",
+                current
+            )),
+            Self::StaleEpoch { expected, got } => JoinError::StaleEpoch {
+                session_epoch: *got,
+                current_epoch: *expected,
+                reason: "join token epoch is older than current membership epoch".into(),
+            },
+            Self::EpochMismatch { expected, got } => JoinError::EpochMismatch {
+                expected: *expected,
+                got: *got,
+            },
+        }
+    }
 }
 
 impl JoinToken {
@@ -171,6 +219,9 @@ pub struct NodeJoin {
     /// The join session epoch binding that authorizes this join.
     /// Set when the token is accepted or the join commit is validated.
     pub session_epoch: Option<crate::JoinSessionEpoch>,
+    /// The most recent typed token epoch refusal, if epoch admission failed.
+    #[serde(default)]
+    pub token_refusal: Option<JoinTokenRefusal>,
 }
 
 impl NodeJoin {
@@ -187,6 +238,7 @@ impl NodeJoin {
             current_epoch: epoch,
             bootstrap_peer: None,
             session_epoch: None,
+            token_refusal: None,
         }
     }
 
@@ -209,8 +261,9 @@ impl NodeJoin {
 
     /// Accept a join token and transition to Bootstrapping.
     ///
-    /// Validates that the token is for this member, not expired, and was
-    /// issued by the expected bootstrap peer.
+    /// Validates that the token is for this member, not expired, was
+    /// issued by the expected bootstrap peer, and is bound to the current
+    /// membership epoch.
     pub fn accept_token(&mut self, token: JoinToken, at_ns: u64) -> Result<(), JoinError> {
         if self.state != NodeJoinState::JoinRequested {
             return Err(JoinError::PreflightDenied(format!(
@@ -233,16 +286,20 @@ impl NodeJoin {
             ));
         }
 
-        // Record the session epoch binding from the token.
-        let join_epoch = token.epoch.unwrap_or(self.current_epoch);
+        let join_epoch =
+            JoinTokenRefusal::validate(token.epoch, self.current_epoch).map_err(|refusal| {
+                let err = refusal.as_join_error();
+                self.token_refusal = Some(refusal);
+                err
+            })?;
         self.session_epoch = Some(crate::JoinSessionEpoch::new(
             join_epoch,
             self.member_id,
             token.nonce,
         ));
-        self.current_epoch = join_epoch;
 
         self.token = Some(token);
+        self.token_refusal = None;
         self.state = NodeJoinState::Bootstrapping;
         self.state_entered_at_ns = at_ns;
         Ok(())
@@ -468,6 +525,7 @@ impl NodeJoin {
         self.state_entered_at_ns = at_ns;
         self.bootstrap_peer = Some(bootstrap_peer);
         self.current_epoch = commit.epoch;
+        self.token_refusal = None;
         Ok(())
     }
 
@@ -529,6 +587,17 @@ impl NodeJoin {
 mod tests {
     use super::*;
 
+    fn bound_token(
+        nonce: u64,
+        issued_to: MemberId,
+        bootstrap_peer: MemberId,
+        issued_at_ns: u64,
+        ttl_ns: u64,
+        epoch: EpochId,
+    ) -> JoinToken {
+        JoinToken::new(nonce, issued_to, bootstrap_peer, issued_at_ns, ttl_ns).with_epoch(epoch)
+    }
+
     #[test]
     fn join_lifecycle_idle_to_joined() {
         let mut join = NodeJoin::new(MemberId::new(42), EpochId::new(1), 1_000_000);
@@ -541,12 +610,13 @@ mod tests {
         assert_eq!(join.bootstrap_peer, Some(MemberId::new(1)));
 
         // Accept token → Bootstrapping
-        let token = JoinToken::new(
+        let token = bound_token(
             12345,
             MemberId::new(42),
             MemberId::new(1),
             1_500_000,
             10_000_000_000,
+            EpochId::new(1),
         );
         join.accept_token(token, 2_000_000).unwrap();
         assert_eq!(join.state, NodeJoinState::Bootstrapping);
@@ -583,7 +653,14 @@ mod tests {
         assert_eq!(join.bootstrap_peer, Some(MemberId::new(99)));
         assert_eq!(join.state, NodeJoinState::JoinRequested);
 
-        let token = JoinToken::new(1, MemberId::new(10), MemberId::new(99), 500, 60_000_000_000);
+        let token = bound_token(
+            1,
+            MemberId::new(10),
+            MemberId::new(99),
+            500,
+            60_000_000_000,
+            EpochId::new(3),
+        );
         join.accept_token(token, 1000).unwrap();
         assert_eq!(join.state, NodeJoinState::Bootstrapping);
 
@@ -595,7 +672,14 @@ mod tests {
     fn catch_up_zero_missed_txgs() {
         let mut join = NodeJoin::new(MemberId::new(10), EpochId::new(1), 0);
         join.request_join(MemberId::new(1), 1000).unwrap();
-        let token = JoinToken::new(1, MemberId::new(10), MemberId::new(1), 500, 60_000_000_000);
+        let token = bound_token(
+            1,
+            MemberId::new(10),
+            MemberId::new(1),
+            500,
+            60_000_000_000,
+            EpochId::new(1),
+        );
         join.accept_token(token, 1000).unwrap();
         join.bootstrap_complete(0, 2000).unwrap();
 
@@ -609,7 +693,14 @@ mod tests {
     fn catch_up_n_missed_txgs() {
         let mut join = NodeJoin::new(MemberId::new(10), EpochId::new(1), 0);
         join.request_join(MemberId::new(1), 1000).unwrap();
-        let token = JoinToken::new(1, MemberId::new(10), MemberId::new(1), 500, 60_000_000_000);
+        let token = bound_token(
+            1,
+            MemberId::new(10),
+            MemberId::new(1),
+            500,
+            60_000_000_000,
+            EpochId::new(1),
+        );
         join.accept_token(token, 1000).unwrap();
         join.bootstrap_complete(0, 2000).unwrap();
 
@@ -648,6 +739,104 @@ mod tests {
     }
 
     #[test]
+    fn current_epoch_bound_token_enters_bootstrapping() {
+        let mut join = NodeJoin::new(MemberId::new(10), EpochId::new(5), 0);
+        join.request_join(MemberId::new(1), 1000).unwrap();
+        let token = bound_token(
+            1,
+            MemberId::new(10),
+            MemberId::new(1),
+            500,
+            60_000_000_000,
+            EpochId::new(5),
+        );
+
+        join.accept_token(token, 1000).unwrap();
+
+        assert_eq!(join.state, NodeJoinState::Bootstrapping);
+        assert_eq!(join.current_epoch, EpochId::new(5));
+        assert_eq!(
+            join.session_epoch.as_ref().map(|session| session.epoch),
+            Some(EpochId::new(5))
+        );
+        assert!(join.token_refusal.is_none());
+    }
+
+    #[test]
+    fn missing_epoch_token_refused_before_bootstrap() {
+        let mut join = NodeJoin::new(MemberId::new(10), EpochId::new(5), 0);
+        join.request_join(MemberId::new(1), 1000).unwrap();
+        let token = JoinToken::new(1, MemberId::new(10), MemberId::new(1), 500, 60_000_000_000);
+
+        let err = join.accept_token(token, 1000).unwrap_err();
+
+        assert!(matches!(err, JoinError::MissingEpochEvidence(_)));
+        assert_eq!(join.state, NodeJoinState::JoinRequested);
+        assert!(join.session_epoch.is_none());
+        assert!(join.token.is_none());
+        assert_eq!(
+            join.token_refusal,
+            Some(JoinTokenRefusal::MissingEpoch {
+                current: EpochId::new(5)
+            })
+        );
+    }
+
+    #[test]
+    fn stale_epoch_token_refused_before_bootstrap() {
+        let mut join = NodeJoin::new(MemberId::new(10), EpochId::new(5), 0);
+        join.request_join(MemberId::new(1), 1000).unwrap();
+        let token = bound_token(
+            1,
+            MemberId::new(10),
+            MemberId::new(1),
+            500,
+            60_000_000_000,
+            EpochId::new(4),
+        );
+
+        let err = join.accept_token(token, 1000).unwrap_err();
+
+        assert!(matches!(err, JoinError::StaleEpoch { .. }));
+        assert_eq!(join.state, NodeJoinState::JoinRequested);
+        assert!(join.session_epoch.is_none());
+        assert_eq!(
+            join.token_refusal,
+            Some(JoinTokenRefusal::StaleEpoch {
+                expected: EpochId::new(5),
+                got: EpochId::new(4)
+            })
+        );
+    }
+
+    #[test]
+    fn mismatched_epoch_token_refused_before_bootstrap() {
+        let mut join = NodeJoin::new(MemberId::new(10), EpochId::new(5), 0);
+        join.request_join(MemberId::new(1), 1000).unwrap();
+        let token = bound_token(
+            1,
+            MemberId::new(10),
+            MemberId::new(1),
+            500,
+            60_000_000_000,
+            EpochId::new(7),
+        );
+
+        let err = join.accept_token(token, 1000).unwrap_err();
+
+        assert!(matches!(err, JoinError::EpochMismatch { .. }));
+        assert_eq!(join.state, NodeJoinState::JoinRequested);
+        assert!(join.session_epoch.is_none());
+        assert_eq!(
+            join.token_refusal,
+            Some(JoinTokenRefusal::EpochMismatch {
+                expected: EpochId::new(5),
+                got: EpochId::new(7)
+            })
+        );
+    }
+
+    #[test]
     fn join_during_partition_refused() {
         // Simulate that the join has progressed to CatchingUp, but
         // the bootstrap peer becomes unreachable. The join cannot
@@ -656,7 +845,14 @@ mod tests {
         // and then fails when the partition persists.
         let mut join = NodeJoin::new(MemberId::new(10), EpochId::new(1), 0);
         join.request_join(MemberId::new(1), 1000).unwrap();
-        let token = JoinToken::new(1, MemberId::new(10), MemberId::new(1), 500, 60_000_000_000);
+        let token = bound_token(
+            1,
+            MemberId::new(10),
+            MemberId::new(1),
+            500,
+            60_000_000_000,
+            EpochId::new(1),
+        );
         join.accept_token(token, 1000).unwrap();
         join.bootstrap_complete(4096, 2000).unwrap();
         join.catch_up_progress(3, true, 3000).unwrap();
@@ -684,7 +880,14 @@ mod tests {
         let mut join = NodeJoin::new(MemberId::new(10), EpochId::new(1), 0);
 
         // Try to accept token before requesting join
-        let token = JoinToken::new(1, MemberId::new(10), MemberId::new(1), 0, 60_000_000_000);
+        let token = bound_token(
+            1,
+            MemberId::new(10),
+            MemberId::new(1),
+            0,
+            60_000_000_000,
+            EpochId::new(1),
+        );
         assert!(join.accept_token(token.clone(), 1000).is_err());
 
         // Try to complete bootstrap before accepting token
@@ -726,12 +929,13 @@ mod tests {
         assert_eq!(join.stats.join_time_ms, 0);
 
         join.request_join(MemberId::new(1), 1_000_000).unwrap();
-        let token = JoinToken::new(
+        let token = bound_token(
             1,
             MemberId::new(10),
             MemberId::new(1),
             500_000,
             60_000_000_000,
+            EpochId::new(1),
         );
         join.accept_token(token, 1_500_000).unwrap();
         join.bootstrap_complete(2_097_152, 2_000_000).unwrap();

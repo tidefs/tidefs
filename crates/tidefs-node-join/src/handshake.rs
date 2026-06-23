@@ -212,9 +212,17 @@ impl NodeJoinHandshake {
         verifier: &dyn EpochVerifier,
         pool_epoch: EpochId,
     ) -> Result<(), RejectionReason> {
-        verifier.verify_join_epoch(self.target_epoch, pool_epoch)?;
-        self.epoch_verified = true;
-        Ok(())
+        match verifier.verify_join_epoch(self.target_epoch, pool_epoch) {
+            Ok(()) => {
+                self.epoch_verified = true;
+                self.rejection = None;
+                Ok(())
+            }
+            Err(reason) => {
+                self.reject(reason.clone());
+                Err(reason)
+            }
+        }
     }
 
     /// Decide whether to accept the join based on the current handshake
@@ -408,7 +416,12 @@ impl EpochVerifier for StrictEpochVerifier {
         joiner_epoch: EpochId,
         current_epoch: EpochId,
     ) -> Result<(), RejectionReason> {
-        if joiner_epoch != current_epoch {
+        if joiner_epoch < current_epoch {
+            Err(RejectionReason::EpochStale {
+                expected: current_epoch,
+                got: joiner_epoch,
+            })
+        } else if joiner_epoch != current_epoch {
             Err(RejectionReason::EpochMismatch {
                 expected: current_epoch,
                 got: joiner_epoch,
@@ -515,9 +528,18 @@ mod tests {
     fn strict_verifier_rejects_mismatched_epoch() {
         let verifier = StrictEpochVerifier::new(EpochId::new(10), 8, 3);
         let err = verifier
-            .verify_join_epoch(EpochId::new(5), EpochId::new(10))
+            .verify_join_epoch(EpochId::new(15), EpochId::new(10))
             .unwrap_err();
         assert!(matches!(err, RejectionReason::EpochMismatch { .. }));
+    }
+
+    #[test]
+    fn strict_verifier_rejects_stale_epoch() {
+        let verifier = StrictEpochVerifier::new(EpochId::new(10), 8, 3);
+        let err = verifier
+            .verify_join_epoch(EpochId::new(5), EpochId::new(10))
+            .unwrap_err();
+        assert!(matches!(err, RejectionReason::EpochStale { .. }));
     }
 
     #[test]
@@ -573,7 +595,8 @@ mod tests {
 
         let err = hs.verify_epoch(&verifier, EpochId::new(10)).unwrap_err();
         assert!(!hs.epoch_verified);
-        assert!(matches!(err, RejectionReason::EpochMismatch { .. }));
+        assert!(matches!(err, RejectionReason::EpochStale { .. }));
+        assert_eq!(hs.rejection, Some(err));
     }
 
     #[test]
@@ -793,7 +816,8 @@ mod tests {
         // Epoch verification fails
         let verifier = StrictEpochVerifier::new(EpochId::new(10), 8, 3);
         let err = hs.verify_epoch(&verifier, EpochId::new(10)).unwrap_err();
-        assert!(matches!(err, RejectionReason::EpochMismatch { .. }));
+        assert!(matches!(err, RejectionReason::EpochStale { .. }));
+        assert_eq!(hs.rejection, Some(err.clone()));
 
         // Build rejection response
         let resp = hs.build_reject_response(&err);
@@ -1003,7 +1027,7 @@ mod tests {
         // Epoch verification fails: joiner has epoch 5, pool has 10
         let verifier = StrictEpochVerifier::new(EpochId::new(10), 8, 3);
         let err = hs.verify_epoch(&verifier, EpochId::new(10)).unwrap_err();
-        assert!(matches!(err, RejectionReason::EpochMismatch { .. }));
+        assert!(matches!(err, RejectionReason::EpochStale { .. }));
 
         // Pool member sends rejection
         let join_req = hs
