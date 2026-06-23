@@ -3041,7 +3041,6 @@ static int tidefs_posix_vfs_iterate_shared(struct file *file,
 {
 	struct inode *inode = file_inode(file);
 	struct tidefs_posix_vfs_kernel_pool_core *pool;
-	bool replay_attempted = false;
 
 	pool = tidefs_posix_vfs_pool_core_from_sb(inode->i_sb);
 	if (IS_ERR(pool))
@@ -3122,7 +3121,6 @@ static int tidefs_posix_vfs_iterate_shared(struct file *file,
 				 * replay bridge. ctx->pos - 2 maps to the
 				 * DirPage entry cookie (pos 0,1 are dots). */
 				u32 cookie = (u32)(ctx->pos - 2);
-				replay_attempted = true;
 				while (1) {
 					struct tidefs_posix_vfs_replay_readdir_out ro;
 					int rr;
@@ -3195,7 +3193,7 @@ replay_done:
 	/*
 	 * Fallback: fixed-table iteration.
 	 * ctx->pos may have been advanced by the replay path above.
-	 * If replay_attempted and we reached here, it means either
+	 * If DirPage replay was attempted and we reach here, it means either
 	 * the DirPage was exhausted or the on-disk format wasn't VDIR.
 	 * Continue with the fixed table from the same ctx->pos.
 	 */
