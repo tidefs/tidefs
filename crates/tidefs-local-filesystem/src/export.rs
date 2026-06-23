@@ -23,7 +23,11 @@ pub struct SnapshotExportSummary {
 
 pub struct SnapshotExportSession {
     summary: SnapshotExportSummary,
-    engine: VfsLocalFileSystem,
+    engine: Option<VfsLocalFileSystem>,
+    /// Filesystem root path, stored for hold release on drop.
+    root: std::path::PathBuf,
+    /// Snapshot name, stored for hold release on drop.
+    snapshot_name: String,
 }
 
 impl SnapshotExportSession {
@@ -33,8 +37,27 @@ impl SnapshotExportSession {
     }
 
     #[must_use]
-    pub fn into_engine(self) -> VfsLocalFileSystem {
+    pub fn into_engine(mut self) -> VfsLocalFileSystem {
         self.engine
+            .take()
+            .expect("SnapshotExportSession engine already consumed")
+    }
+}
+
+impl Drop for SnapshotExportSession {
+    fn drop(&mut self) {
+        // Release the export hold. If the engine is still present
+        // (SnapshotExportSession dropped without into_engine()), close it
+        // first so the filesystem handle is released, then reopen to
+        // release the hold. If the engine was already consumed via
+        // into_engine(), skip the reopen attempt and leave the hold
+        // for stale-export-hold recovery on the next pool open.
+        if self.engine.take().is_some() {
+            // Engine dropped here (filesystem closed). Reopen to release.
+            if let Ok(mut fs) = LocalFileSystem::open(&self.root) {
+                let _ = fs.release_snapshot(&self.snapshot_name);
+            }
+        }
     }
 }
 
@@ -57,8 +80,10 @@ impl LocalFileSystem {
         config.recovery_policy = RecoveryPolicy::ReadOnly;
         config.log_device_device_path = None;
 
+        let root_path = root.to_path_buf();
+        let snapshot_name_owned = snapshot_name.to_string();
         let mut fs = Self::open_with_allocator_policy_and_root_authentication_key(root, config)?;
-        let snapshot = fs.snapshot_summary(snapshot_name)?;
+        let snapshot = fs.snapshot_summary(&snapshot_name_owned)?;
         let exported_root = snapshot.source_root.clone();
         let root = root_commit_from_summary(&exported_root);
         let exported_state = load_state_from_transaction(
@@ -67,6 +92,9 @@ impl LocalFileSystem {
             fs.root_authentication_key,
         )?;
 
+        // All fallible setup is complete. Acquire an export hold on the
+        // snapshot so deletion is blocked while the export session is active.
+        fs.hold_snapshot_tagged(&snapshot_name_owned, Some("export"))?;
         fs.stop_background_scheduler();
         fs.state = exported_state;
         fs.auto_commit = false;
@@ -84,7 +112,12 @@ impl LocalFileSystem {
         };
         let mut engine = VfsLocalFileSystem::new(fs).with_read_only();
         engine.set_timestamp_policy(TimestampPolicy::Noatime);
-        Ok(SnapshotExportSession { summary, engine })
+        Ok(SnapshotExportSession {
+            summary,
+            engine: Some(engine),
+            root: root_path,
+            snapshot_name: snapshot_name_owned,
+        })
     }
 }
 

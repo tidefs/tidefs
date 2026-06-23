@@ -29,6 +29,8 @@ pub(crate) struct SnapshotRecord {
     pub(crate) origin: Option<Vec<u8>>,
     /// Deletion is blocked while hold_count > 0.
     pub(crate) hold_count: u32,
+    /// Tag identifying the holding session purpose (e.g. "export").
+    pub(crate) hold_tag: Option<String>,
 }
 
 impl SnapshotRecord {

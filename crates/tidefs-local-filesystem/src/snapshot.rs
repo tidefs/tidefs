@@ -57,6 +57,7 @@ pub struct HoldInfo {
     pub snapshot_name: String,
     pub hold_count: u32,
     pub kind: SnapshotKind,
+    pub hold_tag: Option<String>,
 }
 
 /// Result of promoting a clone to an independent snapshot.
@@ -431,6 +432,7 @@ impl LocalFileSystem {
             kind: SnapshotKind::Clone,
             origin: Some(source_name_bytes),
             hold_count: 0,
+            hold_tag: None,
         };
 
         let summary = record.summary();
@@ -481,6 +483,7 @@ impl LocalFileSystem {
             return Err(FileSystemError::SnapshotHeld {
                 name: name.to_string(),
                 hold_count: record.hold_count,
+                hold_tag: record.hold_tag.clone(),
             });
         }
 
@@ -552,6 +555,7 @@ impl LocalFileSystem {
             kind: SnapshotKind::Snapshot,
             origin: None,
             hold_count: record.hold_count,
+            hold_tag: record.hold_tag.clone(),
         };
 
         self.state.snapshots.insert(name_bytes, promoted);
@@ -656,6 +660,7 @@ impl LocalFileSystem {
             kind: SnapshotKind::Bookmark,
             origin: Some(source_bytes),
             hold_count: 0,
+            hold_tag: None,
         };
 
         let summary = record.summary();
@@ -738,7 +743,16 @@ impl LocalFileSystem {
     /// while `hold_count > 0`.
     ///
     /// Bookmarks cannot be held — they are already lightweight.
-    pub fn hold_snapshot(&mut self, name: impl AsRef<str>) -> Result<HoldInfo> {
+    /// Place a hold with an optional descriptive tag.
+    ///
+    /// When `tag` is None, this is a general-purpose hold.
+    /// When `tag` is Some, the tag identifies the holding session
+    /// (e.g. "export") for diagnostics and crash recovery.
+    pub fn hold_snapshot_tagged(
+        &mut self,
+        name: impl AsRef<str>,
+        tag: Option<&str>,
+    ) -> Result<HoldInfo> {
         let name = name.as_ref();
         let name_bytes = snapshot_name_bytes(name)?;
         let record = self
@@ -761,10 +775,14 @@ impl LocalFileSystem {
 
         let mut updated = record;
         updated.hold_count += 1;
+        if tag.is_some() {
+            updated.hold_tag = tag.map(|t| t.to_string());
+        }
         let info = HoldInfo {
             snapshot_name: name.to_string(),
             hold_count: updated.hold_count,
             kind: updated.kind,
+            hold_tag: updated.hold_tag.clone(),
         };
 
         self.state.snapshots.insert(name_bytes, updated);
@@ -773,6 +791,11 @@ impl LocalFileSystem {
         self.commit_mutation(())?;
 
         Ok(info)
+    }
+
+    /// Place a general-purpose hold (no tag).
+    pub fn hold_snapshot(&mut self, name: impl AsRef<str>) -> Result<HoldInfo> {
+        self.hold_snapshot_tagged(name, None)
     }
 
     /// Release a previously placed hold.
@@ -809,10 +832,15 @@ impl LocalFileSystem {
 
         let mut updated = record;
         updated.hold_count -= 1;
+        // Clear the tag when all holds are released
+        if updated.hold_count == 0 {
+            updated.hold_tag = None;
+        }
         let info = HoldInfo {
             snapshot_name: name.to_string(),
             hold_count: updated.hold_count,
             kind: updated.kind,
+            hold_tag: updated.hold_tag.clone(),
         };
 
         self.state.snapshots.insert(name_bytes, updated);
@@ -836,6 +864,7 @@ impl LocalFileSystem {
             snapshot_name: name.as_ref().to_string(),
             hold_count: record.hold_count,
             kind: record.kind,
+            hold_tag: record.hold_tag.clone(),
         })
     }
 
@@ -849,6 +878,7 @@ impl LocalFileSystem {
                 snapshot_name: String::from_utf8_lossy(&r.name).into_owned(),
                 hold_count: r.hold_count,
                 kind: r.kind,
+                hold_tag: r.hold_tag.clone(),
             })
             .collect()
     }
@@ -867,6 +897,7 @@ impl LocalFileSystem {
             return Err(FileSystemError::SnapshotHeld {
                 name: name.as_ref().to_string(),
                 hold_count: record.hold_count,
+                hold_tag: record.hold_tag.clone(),
             });
         }
         Ok(())

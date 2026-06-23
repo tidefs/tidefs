@@ -3114,6 +3114,16 @@ impl LocalFileSystem {
         );
         let mut state = open_recovery.load_or_initialize_state()?;
 
+        // Clear any export holds that survived a crash. Export sessions
+        // cannot survive pool reopen, so any remaining export-tagged
+        // holds are stale and must be released.
+        for record in state.snapshots.values_mut() {
+            if record.hold_tag.as_deref() == Some("export") {
+                record.hold_count = record.hold_count.saturating_sub(1);
+                record.hold_tag = None;
+            }
+        }
+
         // Load intent log for operational use (crash replay was already
         // handled by load_latest_committed_state above).
         let mut intent_log = match open_recovery.load_operational_intent_log() {
@@ -5465,6 +5475,7 @@ impl LocalFileSystem {
             kind: SnapshotKind::Snapshot,
             origin: None,
             hold_count: 0,
+            hold_tag: None,
         };
         let summary = record.summary();
         self.state.snapshots.insert(name, record.clone());
@@ -5500,6 +5511,7 @@ impl LocalFileSystem {
             return Err(FileSystemError::SnapshotHeld {
                 name: String::from_utf8_lossy(&name).into_owned(),
                 hold_count: record.hold_count,
+                hold_tag: record.hold_tag.clone(),
             });
         }
         self.ensure_snapshot_authority_consistent()?;

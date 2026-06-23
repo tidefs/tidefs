@@ -1161,8 +1161,13 @@ fn snapshot_descriptor_line(descriptor: &SnapshotDescriptor) -> String {
 }
 
 fn hold_info_line(info: &HoldInfo) -> String {
+    let tag_part = info
+        .hold_tag
+        .as_ref()
+        .map(|t| format!(" tag={t}"))
+        .unwrap_or_default();
     format!(
-        "snapshot hold '{}' kind={} holds={}",
+        "snapshot hold '{}' kind={} holds={}{tag_part}",
         info.snapshot_name,
         snapshot_kind_label(info.kind),
         info.hold_count

@@ -1308,6 +1308,7 @@ mod tests {
             kind: crate::records::SnapshotKind::Snapshot,
             origin: None,
             hold_count,
+            hold_tag: None,
         }
     }
     #[allow(clippy::too_many_arguments)]
