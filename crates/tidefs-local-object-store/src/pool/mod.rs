@@ -15,6 +15,7 @@
 //!   pool-wide redundancy placement
 
 pub mod commit_group;
+pub mod transform_pipeline;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -3900,6 +3901,31 @@ impl<'a> PoolStore<'a> {
     pub fn raw_store(&self) -> &LocalObjectStore {
         self.pool.raw_primary_store()
     }
+
+    /// Read an object through the reverse transform pipeline.
+    ///
+    /// Reads the raw stored frame from the pool's primary data device and
+    /// applies checksum verification, decryption, and decompression in
+    /// that order.  The caller must supply the [`StoredFrameMetadata`] that
+    /// was recorded during the write pipeline.  Returns the recovered
+    /// plaintext on success.
+    ///
+    /// This is the preferred read path for objects written through
+    /// [`PoolStoreMut::transform_put`].
+    pub fn transform_get(
+        &self,
+        key: ObjectKey,
+        metadata: &transform_pipeline::StoredFrameMetadata,
+        pipeline: &transform_pipeline::TransformPipelineAuthority,
+    ) -> Result<Option<Vec<u8>>> {
+        match self.pool.raw_primary_store().get(key)? {
+            Some(stored_frame) => {
+                let plaintext = pipeline.read_frame(&stored_frame, metadata)?;
+                Ok(Some(plaintext))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3973,6 +3999,32 @@ impl<'a> PoolStoreMut<'a> {
     /// Immutable access to the underlying raw LocalObjectStore.
     pub fn raw_store(&self) -> &LocalObjectStore {
         self.pool.raw_primary_store()
+    }
+
+    /// Write a plaintext object through the transform pipeline, storing the
+    /// resulting frame directly in the pool's primary data device with
+    /// explicit compression, encryption, and checksum stages.
+    ///
+    /// The caller supplies a dedup decision and a configured
+    /// [`TransformPipelineAuthority`].  The pipeline applies compression,
+    /// optional encryption, and checksum before the frame is written to raw
+    /// media.  The returned [`StoredFrameMetadata`] must be persisted
+    /// alongside the object key or locator so the reverse read pipeline can
+    /// replay the same transform decisions.
+    ///
+    /// This is the preferred write path for mounted content payloads;
+    /// existing [`PoolStoreMut::put`] routes through device wrappers and
+    /// should be migrated to this pipeline over time.
+    pub fn transform_put(
+        &mut self,
+        key: ObjectKey,
+        plaintext: &[u8],
+        dedup: &transform_pipeline::DedupDecision,
+        pipeline: &transform_pipeline::TransformPipelineAuthority,
+    ) -> Result<(StoredObject, transform_pipeline::StoredFrameMetadata)> {
+        let (frame, meta) = pipeline.write_frame(plaintext, dedup)?;
+        let stored = self.pool.raw_primary_store_mut().put(key, &frame)?;
+        Ok((stored, meta))
     }
 }
 
