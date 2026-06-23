@@ -101,7 +101,6 @@ leftovers in
 `docs/design/coordination-pipeline-status-update-1767.md`,
 `docs/design/coordination-pipeline-status-update-1839.md`,
 `docs/design/coordination-pipeline-status-update-1915.md`,
-`docs/design/coordination-pipeline-status-update-2054.md`,
 `docs/design/coordination-review-roadmap-priorities-update.md`,
 `docs/design/derived-views-first-class-architectural-pillar.md`,
 `docs/design/incremental-job-core-wire-up-deferred-design.md`, and
@@ -152,12 +151,32 @@ register's authority rule and review method, the TFR-019 notes in
 health-strategy and #1165 status-update-architecture rows, and bounded lineage
 from the main `coordination-pipeline-status-update.md` architecture document.
 This slice classifies exactly the numbered 1954 snapshot and does not classify
-the -1767, -1839, -1915, or -2054 snapshots, promote any current automation
+the -1767, -1839, or -1915 snapshots, promote any current automation
 claim, or change Codex Nexus or worker scheduling policy.
 
 | Path | State | Classification note |
 |---|---|---|
 | `docs/design/coordination-pipeline-status-update-1954.md` | Historical input | Imported Forgejo-era #1954 coordination pipeline status snapshot from May 2026. It records lane-health machinery, coordinator-proliferation language, cluster-service implementation-status statements, deferred-wire-up claims, Forgejo API queries, and `STATUS.md`/`FEATURE_MATRIX.md` cross-document consistency contracts that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current automation policy, implementation status, release-readiness evidence, or worker scheduling authority. |
+
+
+### Coordination Pipeline Status Update 2054 Snapshot (TFR-019 / #1236)
+
+Classified for TFR-019 / GitHub issue #1236 on 2026-06-23 after reviewing this
+register's authority rule and review method, the TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, the imported 2054 status-update snapshot,
+`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, the already-classified #1164
+health-strategy, #1165 status-update-architecture, and #1234 1954-snapshot
+rows, and bounded lineage from the main
+`coordination-pipeline-status-update.md` architecture document. The pre-existing
+"Historical input" header annotation added by #1049 is preserved as-is because
+it matches the register classification. This slice classifies exactly the
+numbered 2054 snapshot and does not classify the -1767, -1839, or -1915
+snapshots, promote any current automation claim, or change Codex Nexus or
+worker scheduling policy.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/coordination-pipeline-status-update-2054.md` | Historical input | Imported Forgejo-era #2054 coordination pipeline status snapshot from May 2026. It records design-phase closure for cluster-wide services, three active implementation lanes, deferred wire-up dependencies, coordinator-proliferation containment strategy, design-spec metadata, and `STATUS.md`/`FEATURE_MATRIX.md` references that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current automation policy, implementation status, release-readiness evidence, or worker scheduling authority.
 
 ### Checksum and BLAKE3 Authority
 
