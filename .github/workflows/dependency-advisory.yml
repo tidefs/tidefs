@@ -197,4 +197,5 @@ jobs:
       - name: Enforce advisory policy
         if: ${{ steps.advisories.outputs.exit_code != '' && steps.advisories.outputs.exit_code != '0' }}
         run: |
+          # shellcheck disable=SC2242  # exit from cargo deny; always 0-255
           exit "${{ steps.advisories.outputs.exit_code }}"
