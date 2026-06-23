@@ -215,6 +215,23 @@
             ];
           };
 
+          tidefsXtaskRuntime = import ./nix/packages/tidefs.nix {
+            inherit (pkgs) lib pkg-config;
+            inherit (pkgs) fuse3 rdma-core;
+            rustPlatform = rustPlatform;
+            src = tidefsCtlSrc;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+            cargoBuildFlags = [
+              "-p" "tidefs-xtask"
+              "--bin" "tidefs-xtask"
+            ];
+            workspaceBins = [
+              "tidefs-xtask"
+            ];
+          };
+
           tidefsFuseRuntime = import ./nix/packages/tidefs.nix {
             inherit (pkgs) lib pkg-config;
             inherit (pkgs) fuse3 rdma-core;
@@ -3115,6 +3132,13 @@ EOF
           };
 
 
+          kernelTeardownValidation = import ./nix/vm/kernel-teardown-validation.nix {
+            inherit pkgs;
+            linuxKernel_7_0 = linuxKernel_7_0;
+            tidefsPackage = tidefsCtlRuntime;
+            tidefsXtaskRuntime = tidefsXtaskRuntime;
+          };
+
           kernelCrossPathEquivalence = import ./nix/vm/kernel-cross-path-equivalence.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
@@ -4282,6 +4306,23 @@ EOF
             exec ${self.packages.${system}.kernelMountNamespaceValidation}/bin/tidefs-kmod-mount-namespace-validation "$@"
           '';
 
+
+          kernel-teardown-validation = script "tidefs-kmod-teardown-validation" [
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.busybox
+            pkgs.kmod
+            pkgs.cpio
+            pkgs.qemu
+            pkgs.b3sum
+            self.packages.${system}.kernelTeardownValidation
+            self.packages.${system}.tidefsPosixVfsKmod
+            self.packages.${system}.tidefsCtlRuntime
+            self.packages.${system}.tidefsXtaskRuntime
+          ] ''
+            exec ${self.packages.${system}.kernelTeardownValidation}/bin/tidefs-kmod-teardown-validation \
+              --module ${self.packages.${system}.tidefsPosixVfsKmod}/tidefs_posix_vfs.ko "$@"
+          '';
           kernel-cross-path-equivalence = script "tidefs-kernel-cross-path-equivalence" [
             pkgs.bash
             pkgs.coreutils
