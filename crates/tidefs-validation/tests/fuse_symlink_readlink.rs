@@ -47,7 +47,9 @@ fn verify_target(target: &[u8], expected_hash: &[u8; 32]) -> bool {
 
 #[test]
 fn symlink_short_target_roundtrip() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "/usr/lib";
     let link = "short_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -62,7 +64,9 @@ fn symlink_short_target_roundtrip() {
 
 #[test]
 fn symlink_relative_target_roundtrip() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "../sibling/file.txt";
     let link = "relative_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -77,7 +81,9 @@ fn symlink_relative_target_roundtrip() {
 
 #[test]
 fn symlink_absolute_target_roundtrip() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "/absolute/path/to/somewhere/deep";
     let link = "absolute_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -92,7 +98,9 @@ fn symlink_absolute_target_roundtrip() {
 
 #[test]
 fn symlink_unicode_target_roundtrip() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "/mnt/donnees/depot/francais.txt";
     let link = "unicode_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -107,7 +115,9 @@ fn symlink_unicode_target_roundtrip() {
 
 #[test]
 fn symlink_target_with_spaces_and_special_chars() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "/path/with spaces/and-dashes_and.mixed!chars";
     let link = "special_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -124,7 +134,9 @@ fn symlink_target_with_spaces_and_special_chars() {
 
 #[test]
 fn symlink_target_at_pathmax_boundary() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = vec![b'/'; 4095];
     let target_path = Path::new(std::ffi::OsStr::from_bytes(&target));
     let link = "pathmax_link_4095";
@@ -140,7 +152,9 @@ fn symlink_target_at_pathmax_boundary() {
 
 #[test]
 fn symlink_target_one_under_pathmax() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = vec![b'x'; 4094];
     let target_path = Path::new(std::ffi::OsStr::from_bytes(&target));
     let link = "near_pathmax_link";
@@ -158,7 +172,9 @@ fn symlink_target_one_under_pathmax() {
 
 #[test]
 fn dangling_symlink_created_and_resolved() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "/nonexistent/path/that/does/not/exist";
     let link = "dangling_link";
     let expected_hash = hash_target(target.as_bytes());
@@ -174,7 +190,9 @@ fn dangling_symlink_created_and_resolved() {
 
 #[test]
 fn symlink_to_self() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let link = "self_link";
 
     harness.symlink("self_link", link).expect("symlink to self");
@@ -192,7 +210,9 @@ fn symlink_to_self() {
 
 #[test]
 fn symlink_chain_three_links() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let leaf_target = "/final/destination";
 
     harness.symlink("chain_b", "chain_a").expect("A->B");
@@ -214,7 +234,9 @@ fn symlink_chain_three_links() {
 
 #[test]
 fn symlink_chain_length_five() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let leaf = "/leaf";
 
     harness.symlink("l2", "l1").expect("1->2");
@@ -248,7 +270,9 @@ fn symlink_chain_length_five() {
 
 #[test]
 fn overwrite_existing_symlink() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let first_target = "/first/target";
     let second_target = "/second/target";
     let link = "overwrite_me";
@@ -273,7 +297,9 @@ fn overwrite_existing_symlink() {
 
 #[test]
 fn symlink_overwrite_via_unlink_then_create() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let link = "replace_me";
 
     for (i, target) in ["/t1", "/t2", "/t3"].iter().enumerate() {
@@ -296,7 +322,9 @@ fn symlink_overwrite_via_unlink_then_create() {
 
 #[test]
 fn symlink_inode_is_symlink_type() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "/some/target";
     let link = "type_check_link";
 
@@ -308,7 +336,9 @@ fn symlink_inode_is_symlink_type() {
 
 #[test]
 fn symlink_inode_size_equals_target_length() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "/a/target/path/of/known/length";
     let link = "size_check_link";
 
@@ -323,7 +353,9 @@ fn symlink_inode_size_equals_target_length() {
 
 #[test]
 fn symlink_inode_mode_defaults_to_0777() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "/target";
     let link = "mode_check_link";
 
@@ -339,7 +371,9 @@ fn symlink_inode_mode_defaults_to_0777() {
 
 #[test]
 fn symlink_inode_nlink_is_one() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "/target";
     let link = "nlink_check_link";
 
@@ -352,7 +386,9 @@ fn symlink_inode_nlink_is_one() {
 fn symlink_timestamps_set_on_creation() {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let target = "/timestamped";
     let link = "ts_link";
 
@@ -376,7 +412,9 @@ fn symlink_timestamps_set_on_creation() {
 
 #[test]
 fn multiple_symlinks_have_distinct_inodes() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let mut inodes = HashSet::new();
 
     for i in 0..5 {
@@ -395,7 +433,9 @@ fn multiple_symlinks_have_distinct_inodes() {
 
 #[test]
 fn readlink_on_nonexistent_path_returns_enoent() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let result = harness.readlink("no_such_symlink");
     assert!(result.is_err(), "readlink on nonexistent must fail");
     let err = result.unwrap_err();
@@ -409,7 +449,9 @@ fn readlink_on_nonexistent_path_returns_enoent() {
 
 #[test]
 fn readlink_on_regular_file_returns_einval() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness
         .create_file("regular.txt", b"contents\n")
         .expect("create file");
@@ -426,7 +468,9 @@ fn readlink_on_regular_file_returns_einval() {
 
 #[test]
 fn readlink_on_directory_returns_einval() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("adir").expect("mkdir");
 
     let result = harness.readlink("adir");
@@ -441,7 +485,9 @@ fn readlink_on_directory_returns_einval() {
 
 #[test]
 fn symlink_creation_under_nonexistent_parent_returns_enoent() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let result = harness.symlink("/t", "no_parent/link");
     assert!(
         result.is_err(),
@@ -457,7 +503,9 @@ fn symlink_creation_under_nonexistent_parent_returns_enoent() {
 
 #[test]
 fn symlink_creation_where_parent_is_file_returns_enotdir() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness
         .create_file("notadir", b"blocking\n")
         .expect("create file");
@@ -476,7 +524,10 @@ fn symlink_creation_where_parent_is_file_returns_enotdir() {
 
 #[test]
 fn concurrent_symlink_create_readlink_stress() {
-    let harness = Arc::new(MountHarness::new().expect("harness setup"));
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
+    let harness = Arc::new(harness);
     let mut handles = Vec::new();
 
     for tid in 0..6 {
@@ -532,7 +583,9 @@ fn blake3_domain_isolation() {
 
 #[test]
 fn comprehensive_target_integrity_matrix() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let cases: &[(&str, &str)] = &[
         ("a", "/t"),
@@ -574,7 +627,9 @@ fn comprehensive_target_integrity_matrix() {
 
 #[test]
 fn symlink_name_validation_via_fuse() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness.symlink("/t", "valid_name").expect("valid name");
     harness
@@ -593,7 +648,9 @@ fn symlink_name_validation_via_fuse() {
 
 #[test]
 fn symlink_persists_in_directory_listing() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let names: &[&str] = &["alink", "blink", "clink"];
     for name in names {
@@ -613,7 +670,9 @@ fn symlink_persists_in_directory_listing() {
 
 #[test]
 fn symlink_size_matches_target_length_varied() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let targets: &[&[u8]] = &[
         b"/",

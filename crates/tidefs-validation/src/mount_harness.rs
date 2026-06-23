@@ -209,6 +209,18 @@ impl MountHarness {
         })
     }
 
+    /// Return a mount harness when the daemon is available, or print the
+    /// established daemonless cargo-test skip message and let the caller return.
+    pub fn new_or_skip(scope: &str) -> Option<Self> {
+        match Self::new() {
+            Ok(harness) => Some(harness),
+            Err(e) => {
+                eprintln!("SKIP {scope}: daemon not available -- {e}");
+                None
+            }
+        }
+    }
+
     /// Create a [`MountHarnessBuilder`] for customised harness setup.
     ///
     /// Use the builder when you need to override the daemon binary path,

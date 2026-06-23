@@ -10132,12 +10132,6 @@ fn stress_multi_queue_user_data_uniqueness_across_256_entries() {
 }
 
 #[test]
-fn stress_multi_queue_buffer_isolation_adjacent_queues_no_overlap() {
-    // Deprecated: mmap data buffers removed in Linux 7.0.
-    // Per-queue command buffers are isolated by separate mmap calls.
-}
-
-#[test]
 fn stress_multi_queue_fetch_req_submission_spec_all_queues_valid() {
     // build_fetch_req_submission_spec must succeed for all queue IDs
     // up to nr_hw_queues.
@@ -10246,13 +10240,6 @@ fn managed_device_from_add_dev_outcome_sets_created_state_and_block_path() {
 }
 
 // ── UblkControlRuntime construction and query methods ─────────────────
-
-#[test]
-fn control_runtime_new_has_empty_device_registry() {
-    // On systems without /dev/ublk-control, `new()` will fail;
-    // this test validates the struct shape via the error injection
-    // and the add_device / remove_device tests below.
-}
 
 #[test]
 fn control_runtime_lookup_device_returns_none_for_unknown() {

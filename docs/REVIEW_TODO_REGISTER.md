@@ -44,6 +44,15 @@ Important 2026-06-01 findings:
   roots by product/invariant, harness/scaffold, and marker/stale signal. The
   audit records per-package counts, high-confidence marker/delete candidates,
   and claim-registry cross-references; it does not delete or refactor tests.
+- `TFR-020`: issue #691 deletes the high-confidence comment-only and ignored
+  non-Linux no-op tests named by the issue #500 marker/delete-candidate audit.
+  The removed tests had no `validation/claims.toml` references; the surviving
+  Linux FUSE validation tests continue to exercise mount lifecycle and basic
+  I/O product paths. The same slice keeps daemon-, tool-, and
+  runner-environment-dependent validation tests from reporting missing
+  prerequisites or transient runner contention as product failures. Broader
+  low-value fixture cleanup remains itemized by `docs/TEST_SIGNAL_AUDIT.md`
+  and should stay issue-scoped to the owning code.
 - `TFR-021`: issue #281 adds
   `docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md` as the current planning
   authority for the nextgen verification, performance, and offload chain. The

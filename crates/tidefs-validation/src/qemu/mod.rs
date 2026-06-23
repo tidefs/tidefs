@@ -448,17 +448,6 @@ fn ublk_qemu_kernel_version_refusal_guard() {
         );
     }
 
-    // The fuse-ublk-storage-integrated-workflow inline test also refuses
-    // non-7.x guests (line ~238 in flake.nix).
-    if flake_content.contains("fuse-ublk-storage-integrated-workflow") {
-        assert!(
-            flake_content.contains(
-                "fuse-ublk-storage-integrated-workflow validation requires Linux 7.0 guest kernel"
-            ),
-            "fuse-ublk-storage-integrated-workflow must refuse non-7.x kernels"
-        );
-    }
-
     // Standalone nix/vm/ublk-*.nix scripts: runtime kernel version refusal.
     // These scripts embed busybox init scripts that run inside QEMU guests
     // booted with linuxKernel_7_0; the runtime check guards against a

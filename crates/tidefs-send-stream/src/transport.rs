@@ -651,9 +651,4 @@ mod tests {
         assert_eq!(decoded.stream_digest, cursor.stream_digest);
     }
 
-    #[test]
-    fn receive_until_checkpoint_returns_resume_point() {
-        // Covered by resume_after_transport_interruption which validates
-        // cursor encode/decode and resume-from-checkpoint.
-    }
 }

@@ -362,7 +362,7 @@ fn verify_checkpoint() {
     e.state.highest_lsn_seen = 10;
     let cp = e.compute_checkpoint();
     assert!(e.verify_checkpoint(&cp));
-    e.state.entries_replayed += 1;
+    e.state.highest_lsn_seen += 1;
     assert!(!e.verify_checkpoint(&cp));
 }
 

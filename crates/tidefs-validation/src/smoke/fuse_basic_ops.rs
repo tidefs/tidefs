@@ -20,7 +20,9 @@ mod tests {
     ///   - integration test validates the full basic-ops cycle
     #[test]
     fn test_basic_ops_cycle_with_remount() {
-        let mut harness = MountHarness::new().expect("harness setup");
+        let Some(mut harness) = MountHarness::new_or_skip(module_path!()) else {
+            return;
+        };
 
         // ── mkdir ───────────────────────────────────────────────────
         harness.mkdir("testdir").expect("mkdir testdir");
@@ -58,17 +60,11 @@ mod tests {
             "file must not exist after unlink"
         );
         let entries = harness.readdir("testdir").expect("readdir after unlink");
-        assert!(
-            entries.is_empty(),
-            "testdir must be empty after unlink"
-        );
+        assert!(entries.is_empty(), "testdir must be empty after unlink");
 
         // ── rmdir ───────────────────────────────────────────────────
         harness.remove_dir("testdir").expect("rmdir testdir");
-        assert!(
-            !harness.exists("testdir"),
-            "dir must not exist after rmdir"
-        );
+        assert!(!harness.exists("testdir"), "dir must not exist after rmdir");
 
         // ── remount ─────────────────────────────────────────────────
         harness.remount().expect("remount");
@@ -88,7 +84,9 @@ mod tests {
     ///   - rename completes successfully via real FUSE mount
     #[test]
     fn test_rename_directory_with_remount() {
-        let mut harness = MountHarness::new().expect("harness setup");
+        let Some(mut harness) = MountHarness::new_or_skip(module_path!()) else {
+            return;
+        };
 
         // ── create source directory ─────────────────────────────────
         harness.mkdir("olddir").expect("mkdir olddir");
@@ -125,8 +123,7 @@ mod tests {
             .read_file("newdir/file.txt")
             .expect("read newdir/file.txt");
         assert_eq!(
-            read_back,
-            b"rename persistence",
+            read_back, b"rename persistence",
             "file content mismatch after rename"
         );
 
@@ -138,16 +135,12 @@ mod tests {
             !harness.exists("olddir"),
             "olddir must not exist after remount"
         );
-        assert!(
-            harness.exists("newdir"),
-            "newdir must exist after remount"
-        );
+        assert!(harness.exists("newdir"), "newdir must exist after remount");
         let read_back2 = harness
             .read_file("newdir/file.txt")
             .expect("read newdir/file.txt after remount");
         assert_eq!(
-            read_back2,
-            b"rename persistence",
+            read_back2, b"rename persistence",
             "file content mismatch after remount"
         );
     }
@@ -155,7 +148,9 @@ mod tests {
     /// Edge case: rmdir on a non-empty directory must fail.
     #[test]
     fn test_rmdir_nonempty_fails() {
-        let harness = MountHarness::new().expect("harness setup");
+        let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+            return;
+        };
 
         harness.mkdir("dir").expect("mkdir dir");
         harness
@@ -164,22 +159,18 @@ mod tests {
 
         let full_path = harness.mount_path().join("dir");
         let result = fs::remove_dir(&full_path);
-        assert!(
-            result.is_err(),
-            "rmdir on non-empty dir must fail"
-        );
+        assert!(result.is_err(), "rmdir on non-empty dir must fail");
     }
 
     /// Edge case: ENOENT on rmdir of non-existent directory.
     #[test]
     fn test_rmdir_nonexistent_fails() {
-        let harness = MountHarness::new().expect("harness setup");
+        let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+            return;
+        };
 
         let full_path = harness.mount_path().join("nonexistent");
         let result = fs::remove_dir(&full_path);
-        assert!(
-            result.is_err(),
-            "rmdir on non-existent dir must fail"
-        );
+        assert!(result.is_err(), "rmdir on non-existent dir must fail");
     }
 }

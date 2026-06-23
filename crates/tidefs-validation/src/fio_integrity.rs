@@ -625,9 +625,18 @@ mod tests {
     /// Verify the verifier can be constructed with a custom fio binary path.
     #[test]
     fn verifier_custom_fio_bin() {
+        let has_fio = Command::new("fio")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_fio {
+            eprintln!("SKIP verifier_custom_fio_bin: fio not found");
+            return;
+        }
+
         let tmp = tempfile::TempDir::new().expect("create temp dir");
-        let verifier =
-            FioCrc32cVerifier::new(tmp.path(), "1M", "test").with_fio_bin("/usr/bin/fio");
+        let verifier = FioCrc32cVerifier::new(tmp.path(), "1M", "test").with_fio_bin("fio");
 
         let result = verifier.run();
         assert!(

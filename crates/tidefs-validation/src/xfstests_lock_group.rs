@@ -235,9 +235,10 @@ mod tests {
                 if e.contains("readonly database")
                     || e.contains("read-only file system")
                     || e.contains("No such file or directory")
+                    || (e.contains("SQLite database") && e.contains("is busy"))
                 {
                     eprintln!(
-                        "SKIP: Nix daemon/store not writable in this \
+                        "SKIP: Nix daemon/store unavailable in this \
                          environment -- lock_test_group_scoreboard skipped\n  {e}"
                     );
                     return;

@@ -1,6 +1,6 @@
 # Test Signal Audit
 
-Issue #500 audit of the test roots named by `docs/TEST_SIGNAL_POLICY.md` and TFR-020. This is audit-only: no test behavior, fixtures, crate manifests, or validation artifacts were changed.
+Issue #500 audit of the test roots named by `docs/TEST_SIGNAL_POLICY.md` and TFR-020. Issue #691 removed the high-confidence marker/delete candidates from that audit without changing product behavior, crate manifests, or validation artifacts; it also made touched validation tests skip cleanly when their daemon, tool, or runner-environment prerequisites are absent or contended.
 
 ## Scope And Method
 
@@ -16,8 +16,8 @@ Issue #500 audit of the test roots named by `docs/TEST_SIGNAL_POLICY.md` and TFR
 | --- | ---: | --- |
 | Product/invariant signal | 30809 | Mounted/runtime product tests plus compact internal invariants. |
 | Harness/scaffold signal | 1712 | Harness, validation, artifact-verifier, and policy/tooling tests. |
-| Marker/stale/delete-candidate signal | 11 | High-confidence no-op/trivial/constructor-only tests listed below. |
-| Total scoped test functions | 32532 | Across 146 packages with in-scope tests. |
+| Marker/stale/delete-candidate signal | 0 | Issue #691 removed the high-confidence no-op/trivial/constructor-only tests from the original audit. |
+| Total scoped test functions | 32521 | Across 146 packages with in-scope tests. |
 
 ## Package Audit
 
@@ -36,7 +36,7 @@ Action keys: **K** keep/cite as product or invariant signal; **H** cite only as 
 | `tidefs-block-kmod` | `crates/tidefs-block-kmod/src/ (inline)` | 403 | 0 | 0 | K |
 | `tidefs-block-volume-adapter-core` | `crates/tidefs-block-volume-adapter-core/src/ (inline)`, `crates/tidefs-block-volume-adapter-core/tests/` | 176 | 0 | 0 | K |
 | `tidefs-block-volume-adapter-daemon` | `apps/tidefs-block-volume-adapter-daemon/tests/` | 59 | 0 | 0 | K |
-| `tidefs-block-volume-adapter-ublk-control-runtime` | `crates/tidefs-block-volume-adapter-ublk-control-runtime/src/ (inline)`, `crates/tidefs-block-volume-adapter-ublk-control-runtime/tests/` | 546 | 0 | 2 | K, M |
+| `tidefs-block-volume-adapter-ublk-control-runtime` | `crates/tidefs-block-volume-adapter-ublk-control-runtime/src/ (inline)`, `crates/tidefs-block-volume-adapter-ublk-control-runtime/tests/` | 546 | 0 | 0 | K |
 | `tidefs-btree` | `crates/tidefs-btree/src/ (inline)`, `crates/tidefs-btree/tests/` | 406 | 0 | 0 | K |
 | `tidefs-cache-coherency` | `crates/tidefs-cache-coherency/src/ (inline)` | 4 | 0 | 0 | K |
 | `tidefs-cache-core` | `crates/tidefs-cache-core/src/ (inline)`, `crates/tidefs-cache-core/tests/` | 484 | 55 | 0 | K, H |
@@ -122,7 +122,7 @@ Action keys: **K** keep/cite as product or invariant signal; **H** cite only as 
 | `tidefs-receive-stream` | `crates/tidefs-receive-stream/src/ (inline)`, `crates/tidefs-receive-stream/tests/` | 59 | 0 | 0 | K |
 | `tidefs-reclaim` | `crates/tidefs-reclaim/src/ (inline)` | 87 | 0 | 0 | K |
 | `tidefs-reclaim-queue-core` | `crates/tidefs-reclaim-queue-core/src/ (inline)` | 296 | 0 | 0 | K |
-| `tidefs-recovery-loop` | `crates/tidefs-recovery-loop/src/ (inline)` | 155 | 0 | 1 | K, M |
+| `tidefs-recovery-loop` | `crates/tidefs-recovery-loop/src/ (inline)` | 155 | 0 | 0 | K |
 | `tidefs-relocation-planner` | `crates/tidefs-relocation-planner/src/ (inline)` | 120 | 0 | 0 | K |
 | `tidefs-replica-health` | `crates/tidefs-replica-health/src/ (inline)`, `crates/tidefs-replica-health/tests/` | 269 | 3 | 0 | K, H |
 | `tidefs-replicated-object-store` | `crates/tidefs-replicated-object-store/src/ (inline)`, `crates/tidefs-replicated-object-store/tests/` | 116 | 0 | 0 | K |
@@ -134,7 +134,7 @@ Action keys: **K** keep/cite as product or invariant signal; **H** cite only as 
 | `tidefs-scrub-core` | `crates/tidefs-scrub-core/src/ (inline)`, `crates/tidefs-scrub-core/tests/` | 301 | 0 | 0 | K |
 | `tidefs-secret-key-policy-runtime` | `crates/tidefs-secret-key-policy-runtime/src/ (inline)` | 21 | 24 | 0 | K, H |
 | `tidefs-segment-cleaner` | `crates/tidefs-segment-cleaner/src/ (inline)` | 198 | 26 | 0 | K, H |
-| `tidefs-send-stream` | `crates/tidefs-send-stream/src/ (inline)`, `crates/tidefs-send-stream/tests/` | 164 | 0 | 1 | K, M |
+| `tidefs-send-stream` | `crates/tidefs-send-stream/src/ (inline)`, `crates/tidefs-send-stream/tests/` | 164 | 0 | 0 | K |
 | `tidefs-shard-group` | `crates/tidefs-shard-group/src/ (inline)` | 64 | 0 | 0 | K |
 | `tidefs-snapshot-pruner` | `crates/tidefs-snapshot-pruner/src/ (inline)` | 64 | 0 | 0 | K |
 | `tidefs-space-accounting` | `crates/tidefs-space-accounting/src/ (inline)` | 248 | 0 | 0 | K |
@@ -164,7 +164,7 @@ Action keys: **K** keep/cite as product or invariant signal; **H** cite only as 
 | `tidefs-types-vfs-core` | `crates/tidefs-types-vfs-core/src/ (inline)` | 81 | 0 | 0 | K |
 | `tidefs-types-vfs-owned` | `crates/tidefs-types-vfs-owned/src/ (inline)` | 32 | 0 | 0 | K |
 | `tidefs-ublk-abi` | `crates/tidefs-ublk-abi/src/ (inline)` | 40 | 0 | 0 | K |
-| `tidefs-validation` | `crates/tidefs-validation/src/ (inline)`, `crates/tidefs-validation/tests/` | 0 | 1272 | 7 | H, M |
+| `tidefs-validation` | `crates/tidefs-validation/src/ (inline)`, `crates/tidefs-validation/tests/` | 0 | 1272 | 0 | H |
 | `tidefs-verification-engine` | `crates/tidefs-verification-engine/src/ (inline)` | 60 | 0 | 0 | K |
 | `tidefs-vfs-engine` | `crates/tidefs-vfs-engine/src/ (inline)` | 384 | 0 | 0 | K |
 | `tidefs-vfs-rpc` | `crates/tidefs-vfs-rpc/src/ (inline)` | 14 | 0 | 0 | K |
@@ -174,21 +174,7 @@ Action keys: **K** keep/cite as product or invariant signal; **H** cite only as 
 
 ## Marker And Delete Candidates
 
-These are high-confidence marker/stale candidates. They are not deleted by this issue; the recommended action is to delete, merge into a stronger invariant, or rewrite as product/harness evidence when the owning code is touched.
-
-| Package | Test | Why Flagged | Recommended Action |
-| --- | --- | --- | --- |
-| `tidefs-recovery-loop` | `crates/tidefs-recovery-loop/src/replay.rs:801::vfs_replay_handler_constructs_with_root_ctx` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
-| `tidefs-block-volume-adapter-ublk-control-runtime` | `crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs:10134::stress_multi_queue_buffer_isolation_adjacent_queues_no_overlap` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
-| `tidefs-block-volume-adapter-ublk-control-runtime` | `crates/tidefs-block-volume-adapter-ublk-control-runtime/src/lib.rs:10250::control_runtime_new_has_empty_device_registry` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
-| `tidefs-send-stream` | `crates/tidefs-send-stream/src/transport.rs:654::receive_until_checkpoint_returns_resume_point` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
-| `tidefs-validation` | `crates/tidefs-validation/tests/mount_lifecycle.rs:44::mount_unmount_roundtrip` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
-| `tidefs-validation` | `crates/tidefs-validation/tests/mount_lifecycle.rs:112::mount_reject_double` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
-| `tidefs-validation` | `crates/tidefs-validation/tests/mount_lifecycle.rs:180::mount_unmount_stress` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
-| `tidefs-validation` | `crates/tidefs-validation/tests/basic_io.rs:71::create_stat_unlink` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
-| `tidefs-validation` | `crates/tidefs-validation/tests/basic_io.rs:120::write_read_verify_small` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
-| `tidefs-validation` | `crates/tidefs-validation/tests/basic_io.rs:220::write_read_sparse_hole` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
-| `tidefs-validation` | `crates/tidefs-validation/tests/basic_io.rs:300::concurrent_write_no_corruption` | explicit no-op/trivial or constructor-only marker | Delete or replace with an assertion that observes the intended invariant. |
+Issue #691 deleted the high-confidence marker/stale candidates found by the original audit. No active marker/delete-candidate rows remain in this scoped audit; broader low-value cleanup should still happen issue-by-issue with the owning code.
 
 ## Named Claim And Contract Cross-References
 
@@ -210,4 +196,4 @@ The rows below identify tests that prove named contracts or feed claim evidence.
 - The dominant signal is real product/invariant coverage, but several large crates still have enough scaffold history that future test work should name the claim being proved before adding volume.
 - `tidefs-validation` and `tidefs-two-node-harness` are useful harness evidence. They should not be cited as product proof unless paired with the runtime row or artifact named by the claim registry.
 - The claim-linked crash, ublk, performance, offload, and kernel tests mostly provide model, invariant, or artifact-verifier signal. `validation/claims.toml` remains the authority for whether that evidence is sufficient for product wording.
-- The marker/delete-candidate list is intentionally conservative. It flags only tests with high-confidence trivial or constructor-only bodies; broader low-value cleanup should happen issue-by-issue with the owning code.
+- The marker/delete-candidate cleanup is intentionally conservative. Issue #691 removed only tests with high-confidence trivial or constructor-only bodies; broader low-value cleanup should happen issue-by-issue with the owning code.

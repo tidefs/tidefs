@@ -21,7 +21,9 @@ use tidefs_validation::mount_harness::MountHarness;
 /// Attempting mkdir on an existing name must return EEXIST.
 #[test]
 fn mkdir_dup_returns_eexist() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("only_once").expect("first mkdir");
 
     let result = harness.mkdir("only_once");
@@ -51,7 +53,9 @@ fn mkdir_dup_returns_eexist() {
 /// Mkdir on a path whose parent has been removed must fail with ENOENT.
 #[test]
 fn mkdir_missing_parent_returns_enoent() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("parent").expect("mkdir parent");
     harness.remove_dir("parent").expect("rmdir parent");
 
@@ -69,7 +73,9 @@ fn mkdir_missing_parent_returns_enoent() {
 /// with ENOTDIR.
 #[test]
 fn mkdir_path_component_is_file_returns_enotdir() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness
         .create_file("not_a_dir", b"blocking\n")
         .expect("create file");
@@ -89,7 +95,9 @@ fn mkdir_path_component_is_file_returns_enotdir() {
 /// Rmdir on a path that is a regular file must fail with ENOTDIR.
 #[test]
 fn rmdir_on_file_returns_enotdir() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness
         .create_file("just_a_file.txt", b"not a dir\n")
         .expect("create file");
@@ -107,7 +115,9 @@ fn rmdir_on_file_returns_enotdir() {
 /// Rmdir on a nonexistent path must fail with ENOENT.
 #[test]
 fn rmdir_nonexistent_returns_enoent() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let result = harness.remove_dir("no_such_dir");
     assert!(result.is_err(), "rmdir on nonexistent must fail");
@@ -125,7 +135,9 @@ fn rmdir_nonexistent_returns_enoent() {
 /// and verify readdir returns all of them with correct d_type via stat.
 #[test]
 fn readdir_large_100_entries() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("bigdir").expect("mkdir bigdir");
 
     let n_files = 60usize;
@@ -205,7 +217,9 @@ fn readdir_large_100_entries() {
 /// times on a medium-sized directory (50 entries).
 #[test]
 fn readdir_idempotent() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("stable").expect("mkdir stable");
 
     for i in 0..50u32 {
@@ -229,7 +243,9 @@ fn readdir_idempotent() {
 /// of them with no duplicates or omissions, in sorted order.
 #[test]
 fn readdir_large_1000_entries() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("thousand").expect("mkdir thousand");
 
     let n = 1000usize;
@@ -270,7 +286,9 @@ fn readdir_large_1000_entries() {
 /// under the new path and the old path returns ENOENT.
 #[test]
 fn rename_nonempty_directory() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness.mkdir("src_dir").expect("mkdir src_dir");
     let file_data = b"inside a renamed directory\n";
@@ -337,7 +355,9 @@ fn rename_nonempty_directory() {
 /// is unchanged.
 #[test]
 fn rename_preserves_inode_number() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .create_file("inode_test.txt", b"inode preservation\n")
@@ -377,7 +397,9 @@ fn rename_preserves_inode_number() {
 /// re-verify offset stability and attribute correctness across remount.
 #[test]
 fn readdirplus_large_directory_offset_stability() {
-    let mut harness = MountHarness::new().expect("harness setup");
+    let Some(mut harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("rplus").expect("mkdir rplus");
 
     const N_FILES: usize = 440;
