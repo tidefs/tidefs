@@ -52,6 +52,7 @@ cargo check --workspace --locked
 
 ## Start Here
 
+- `CONTRIBUTING.md`
 - `docs/LICENSING.md`
 - `docs/TEST_SIGNAL_POLICY.md`
 - `docs/REVIEW_TODO_POLICY.md`
