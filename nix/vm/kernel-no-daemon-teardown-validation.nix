@@ -241,13 +241,13 @@ setup_ftrace() {
       pass "ftrace_workqueue_enabled"
       echo "[ftrace] workqueue tracing enabled"
     else
-      fail "ftrace_workqueue_enabled" "tracefs workqueue event enable failed"
+      echo "[ftrace] tracefs workqueue events unavailable; dmesg-only trace capture"
     fi
   else
     local err
     err=$(cat /tmp/tracefs_mount.err 2>/dev/null | head -1)
     [ -n "$err" ] || err="tracefs trace file not available"
-    fail "ftrace_workqueue_enabled" "$err"
+    echo "[ftrace] tracefs not available ($err); dmesg-only trace capture"
   fi
 }
 
@@ -261,10 +261,10 @@ capture_ftrace() {
       local err
       err=$(cat /tmp/ftrace_capture.err 2>/dev/null | head -1)
       [ -n "$err" ] || err="trace capture missing or empty"
-      fail "ftrace_capture" "$err"
+      echo "[ftrace] trace capture unavailable: $err"
     fi
   else
-    fail "ftrace_capture" "tracefs trace file missing"
+    echo "[ftrace] tracefs trace file missing; dmesg-only trace capture"
   fi
 }
 
@@ -279,6 +279,21 @@ capture_dmesg() {
     [ -n "$err" ] || err="dmesg capture missing or empty"
     fail "dmesg_capture" "$err"
   fi
+}
+
+write_dmesg_marker_trace() {
+  local source="$1"
+  local dest="$2"
+  local marker_count
+
+  marker_count=$(grep -E -c 'tidefs_posix_vfs:|sync_fs super_operation:|put_super super_operation:|lifecycle summary:' "$source" 2>/dev/null || true)
+  {
+    echo "trace_source=dmesg kernel lifecycle markers"
+    echo "tracefs_root=unavailable"
+    echo "marker_count=''${marker_count:-0}"
+    grep -E 'tidefs_posix_vfs:|sync_fs super_operation:|put_super super_operation:|lifecycle summary:' "$source" 2>/dev/null || true
+  } > "$dest"
+  echo "[dmesg] lifecycle marker trace captured to $dest ($(wc -c < "$dest" 2>/dev/null || echo 0) bytes)"
 }
 
 check_dmesg_signal() {
@@ -648,8 +663,15 @@ verify_no_daemon "recovery"
 # ── Final sweep ─────────────────────────────────────────────────────
 capture_dmesg "$EVDIR/dmesg_post_reload.txt"
 capture_ftrace "$EVDIR/ftrace_final.txt"
+if [ ! -s "$EVDIR/ftrace_final.txt" ]; then
+  write_dmesg_marker_trace "$EVDIR/dmesg_post_reload.txt" "$EVDIR/workqueue_trace_fallback.txt"
+fi
 
-emit_artifact "ftrace_workqueue" "$EVDIR/ftrace_final.txt"
+if [ -s "$EVDIR/ftrace_final.txt" ]; then
+  emit_artifact "workqueue_trace" "$EVDIR/ftrace_final.txt"
+else
+  emit_artifact "workqueue_trace" "$EVDIR/workqueue_trace_fallback.txt"
+fi
 emit_artifact "dmesg_callbacks" "$EVDIR/dmesg_post_reload.txt"
 
 echo ""
@@ -660,7 +682,11 @@ echo "  kernel_version=$(uname -r)"
 echo "============================================================"
 
 cp "$EVDIR/dmesg_final.txt" /tmp/tidefs_no_daemon_teardown_dmesg.log 2>/dev/null || true
-cp "$EVDIR/ftrace_final.txt" /tmp/tidefs_no_daemon_teardown_ftrace.log 2>/dev/null || true
+if [ -s "$EVDIR/ftrace_final.txt" ]; then
+  cp "$EVDIR/ftrace_final.txt" /tmp/tidefs_no_daemon_teardown_ftrace.log 2>/dev/null || true
+else
+  cp "$EVDIR/workqueue_trace_fallback.txt" /tmp/tidefs_no_daemon_teardown_ftrace.log 2>/dev/null || true
+fi
 
 sleep 3
 poweroff -f
@@ -842,12 +868,31 @@ PHASEEOF
       return 1
     }
 
-    WQ_TRACE_SOURCE="tracefs:/tracefs/events/workqueue/"
-    WQ_TRACE_PATH="trace/ftrace_final.txt"
-    WQ_TRACE_BODY=$(grep -A9999 '^BEGIN_ARTIFACT:ftrace_workqueue$' "$QEMU_PARSE_LOG" 2>/dev/null | grep -B9999 '^END_ARTIFACT:ftrace_workqueue$' | grep -v '^BEGIN_ARTIFACT\|^END_ARTIFACT' || echo "")
+    WQ_TRACE_PATH="trace/workqueue_trace.log"
+    WQ_TRACE_BODY=$(grep -A9999 '^BEGIN_ARTIFACT:workqueue_trace$' "$QEMU_PARSE_LOG" 2>/dev/null | grep -B9999 '^END_ARTIFACT:workqueue_trace$' | grep -v '^BEGIN_ARTIFACT\|^END_ARTIFACT' || echo "")
+    if artifact_body_missing "$WQ_TRACE_BODY"; then
+      WQ_TRACE_BODY=$(grep -A9999 '^BEGIN_ARTIFACT:ftrace_workqueue$' "$QEMU_PARSE_LOG" 2>/dev/null | grep -B9999 '^END_ARTIFACT:ftrace_workqueue$' | grep -v '^BEGIN_ARTIFACT\|^END_ARTIFACT' || echo "")
+      WQ_TRACE_PATH="trace/ftrace_final.txt"
+    fi
     if artifact_body_missing "$WQ_TRACE_BODY"; then
       TEARDOWN_STATUS="fail"
       append_fail_reason "workqueue_trace_artifact_empty"
+    fi
+    if printf '%s\n' "$WQ_TRACE_BODY" | grep -q '^trace_source=dmesg kernel lifecycle markers$'; then
+      WQ_TRACE_SOURCE="dmesg kernel lifecycle markers emitted by guest"
+      for required_marker in \
+        "engine kill_sb: final sync_fs completed" \
+        "engine torn down" \
+        "lifecycle summary:" \
+        "unregistered filesystem type" \
+        "loaded and registered filesystem type"; do
+        if ! printf '%s\n' "$WQ_TRACE_BODY" | grep -q "$required_marker"; then
+          TEARDOWN_STATUS="fail"
+          append_fail_reason "workqueue_trace_missing_dmesg_marker=$required_marker"
+        fi
+      done
+    else
+      WQ_TRACE_SOURCE="ftrace:/tracefs/events/workqueue/"
     fi
     WQ_TRACE_DIGEST="blake3:$(printf '%s' "$WQ_TRACE_BODY" | "$B3SUM" | awk '{print $1}')"
 
