@@ -41,3 +41,6 @@ path = "src/lib.rs"
 [lints.rust]
 # CONFIG_RUST is set by the Linux kernel Kbuild system; Cargo sees it as unexpected.
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(CONFIG_RUST)'] }
+
+[lints.clippy]
+unsafe_code = "allow"

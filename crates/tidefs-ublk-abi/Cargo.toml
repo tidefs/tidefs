@@ -14,3 +14,6 @@ description = "Typed Linux ublk userspace ABI constants and dry-run control plan
 
 [lib]
 path = "src/lib.rs"
+
+[lints.clippy]
+unsafe_code = "allow"

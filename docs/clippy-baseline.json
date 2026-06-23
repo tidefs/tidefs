@@ -1,0 +1,635 @@
+{
+  "command": "cargo clippy -p <crate> --locked --all-targets --message-format=json",
+  "generated_at": "2026-06-23T11:51:06Z",
+  "workspace_root": ".",
+  "crates": {
+    "fuser": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-anti-entropy-auditor": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-auth": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-background-scheduler": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-binary_schema-checksum": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-binary_schema-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-binary_schema-framing": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-block-allocator": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-block-kmod": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-block-volume-adapter-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-block-volume-adapter-daemon": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-block-volume-adapter-ublk-control-runtime": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-btree": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-cache-coherency": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-cache-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-checksum-tree": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-chunk-shipper": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-claim-ledger": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-cleanup-engine": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-cleanup-job-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-cleanup-queue-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-clock-timing": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-cluster": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-commit_group": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-compaction": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-compression": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-coordination-strategy": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-crash-oracle": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-data-cleaner": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-dataset-catalog": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-dataset-feature-flags": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-dataset-lifecycle": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-dataset-properties": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-dedup": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-derived-catalog": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-device-removal": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-dir-index": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-distributed-model-check": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-durability-layout": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-encryption": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-env-fuse-model": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-env-ublk-model": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-erasure-coded-store": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-erasure-coding": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-extent-map": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-filesystem-demo": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-flow-commit-coordinator": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-frame": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-gc-pin-set": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-geometry-convert": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-incremental-job-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-inode-attributes": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-inode-table": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-intent-log": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-invalidation-feed": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-kernel-cutover-runtime": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-kernel-storage-io": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-kmod-bridge": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-kmod-posix-vfs": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-lease": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-lease-manager": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-local-filesystem": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-local-object-store": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-locator-table": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-lock-service": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-membership-epoch": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-membership-live": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-membership-types": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-model-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-namespace": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-node-drain": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-node-join": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-object-io": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-offload-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-online-defrag": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-orphan-index": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-partition-runtime": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-performance-contract": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-permission": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-placement-planner": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-placement-runtime": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-pool-allocator": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-pool-import": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-pool-scan": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-posix-acl": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-posix-filesystem-adapter-daemon": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-posix-filesystem-adapter-reply": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-posix-filesystem-adapter-workers-io": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-posix-filesystem-adapter-workers-locks": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-posix-guarantee-verifier": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-posix-semantics": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-quorum-write": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-quorum-write-runtime": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-rebalance-planner": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-rebuild-planner": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-rebuild-runtime": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-receive-stream": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-reclaim": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-reclaim-queue-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-recovery-loop": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-relocation-planner": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-replica-health": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-replicated-object-store": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-replication": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-replication-model": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-reserve-ledger": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-schema-codec-posix-filesystem-adapter": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-schema-codec-vfs": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-scrub": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-scrub-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-secret-key-policy-runtime": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-segment-cleaner": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-send-stream": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-shard-group": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-snapshot-pruner": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-space-accounting": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-spacemap-allocator": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-storage-intent-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-storage-intent-local-media-capability": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-storage-intent-media-capability-refresh": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-storage-intent-policy": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-storage-intent-remote-media-capability": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-storage-node": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-store-demo": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-tdma-scheduler": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-trace-oracle": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-transport": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-two-node-harness": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-cache-lattice-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-claim-ledger-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-dataset-feature-flags-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-dataset-lifecycle-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-deferred-cleanup-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-extent-map-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-incremental-job-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-orphan-index-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-package-profile-catalog": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-polymorphic-directory-index-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-polymorphic-xattr-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-pool-label-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-posix-filesystem-adapter-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-reclaim-queue-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-secret-key-policy-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-space-accounting-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-transport-session": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-vfs-core": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-types-vfs-owned": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-ublk-abi": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-validation": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-verification-engine": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-vfs-engine": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-vfs-rpc": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-witness-set": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-workload": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-xattr-storage": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefs-xtask": {
+      "warnings": 0,
+      "exit_code": null
+    },
+    "tidefsctl": {
+      "warnings": 0,
+      "exit_code": null
+    }
+  }
+}

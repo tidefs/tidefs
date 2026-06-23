@@ -29,6 +29,13 @@ may use non-secret repository variables for scheduling gates, such as
   `tidefs-schema-codec-posix-filesystem-adapter`, and
   `tidefs-secret-key-policy-runtime`, plus a targeted `tidefs-transport`
   session test.
+- `Clippy` runs on the TideFS self-hosted runner VMs through the same repo
+  `.#ci` Nix development shell. On pull requests it selects changed workspace
+  crates, compares their clippy warning counts against
+  `docs/clippy-baseline.json`, and fails when a crate introduces warnings
+  above the recorded baseline. Manual dispatch can run either changed-crate or
+  full-workspace clippy checks against a feature branch and uploads
+  `clippy-baseline-summary`.
 - `Focused Rust` is a manual self-hosted workflow for issue-specific PR
   validation. Dispatch it against the feature branch with a comma-separated
   crate list and optional extra `cargo test` arguments when the acceptance

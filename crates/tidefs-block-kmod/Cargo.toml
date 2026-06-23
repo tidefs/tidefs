@@ -33,3 +33,6 @@ kernel-module = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(CONFIG_RUST)", "cfg(tidefs_block_kmod_bringup_backend)"] }
+
+[lints.clippy]
+unsafe_code = "allow"

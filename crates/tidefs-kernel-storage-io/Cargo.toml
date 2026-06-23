@@ -28,3 +28,6 @@ tidefs-vfs-engine = { workspace = true }
 [features]
 default = ["alloc"]
 alloc = []
+
+[lints.clippy]
+unsafe_code = "allow"
