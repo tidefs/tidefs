@@ -1275,6 +1275,22 @@ Important 2026-06-01 findings:
   reduces status/matrix drift but does not classify the numbered status-update
   snapshots or promote a current automation, implementation-status,
   release-readiness, or worker-scheduling claim.
+- `TFR-019`: GitHub issue #1234 classifies
+  `docs/design/coordination-pipeline-status-update-1954.md` as historical input
+  after reviewing the authority register, this TFR-019 note set, the imported
+  #1954 status-update snapshot, `docs/INDEX.md`,
+  `docs/GITHUB_PR_DEVELOPMENT.md`, the already-classified #1164 health-strategy
+  and #1165 status-update-architecture rows, and bounded lineage from the main
+  `coordination-pipeline-status-update.md` architecture document. The file's
+  `STATUS.md`, `FEATURE_MATRIX.md`, lane-health, coordinator-proliferation,
+  cluster-service implementation-status, deferred-wire-up, and Forgejo API/label
+  machinery are retired Forgejo-era snapshot artifacts only; current TideFS
+  coordination remains GitHub issues and pull requests plus the repo
+  documentation entry points. This reduces status/matrix drift but does not
+  classify the -1767, -1839, -1915, or -2054 snapshots or promote a current
+  automation, implementation-status, release-readiness, or worker-scheduling
+  claim.
+
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
   `xfstests-runner` as a diagnostic scoreboard wrapper, and sends output under
   runner help path no longer carries a bare `--per-test` command or duplicate

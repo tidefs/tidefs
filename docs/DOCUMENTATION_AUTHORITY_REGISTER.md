@@ -101,7 +101,6 @@ leftovers in
 `docs/design/coordination-pipeline-status-update-1767.md`,
 `docs/design/coordination-pipeline-status-update-1839.md`,
 `docs/design/coordination-pipeline-status-update-1915.md`,
-`docs/design/coordination-pipeline-status-update-1954.md`,
 `docs/design/coordination-pipeline-status-update-2054.md`,
 `docs/design/coordination-review-roadmap-priorities-update.md`,
 `docs/design/derived-views-first-class-architectural-pillar.md`,
@@ -142,6 +141,23 @@ change Codex Nexus or worker scheduling policy.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/design/coordination-pipeline-status-update.md` | Historical input | Imported Forgejo #1833 design for serialized `STATUS.md` coordination updates, `FEATURE_MATRIX.md` synchronization, lane summaries, health scoring, and Forgejo label-driven generation. Useful lineage for retired status-update architecture, but current TideFS coordination lives in GitHub issues and pull requests plus the active repo documentation entry points. It is not current automation policy, implementation status, release-readiness evidence, worker scheduling authority, `STATUS.md` authority, `FEATURE_MATRIX.md` authority, lane-health authority, or issue-label authority. |
+
+
+### Coordination Pipeline Status Update 1954 Snapshot (TFR-019 / #1234)
+
+Classified for TFR-019 / GitHub issue #1234 on 2026-06-23 after reviewing this
+register's authority rule and review method, the TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, the imported 1954 status-update snapshot,
+`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, the already-classified #1164
+health-strategy and #1165 status-update-architecture rows, and bounded lineage
+from the main `coordination-pipeline-status-update.md` architecture document.
+This slice classifies exactly the numbered 1954 snapshot and does not classify
+the -1767, -1839, -1915, or -2054 snapshots, promote any current automation
+claim, or change Codex Nexus or worker scheduling policy.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/coordination-pipeline-status-update-1954.md` | Historical input | Imported Forgejo-era #1954 coordination pipeline status snapshot from May 2026. It records lane-health machinery, coordinator-proliferation language, cluster-service implementation-status statements, deferred-wire-up claims, Forgejo API queries, and `STATUS.md`/`FEATURE_MATRIX.md` cross-document consistency contracts that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current automation policy, implementation status, release-readiness evidence, or worker scheduling authority. |
 
 ### Checksum and BLAKE3 Authority
 
