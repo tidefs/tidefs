@@ -213,7 +213,8 @@ write_summary() {
     selected_json="$(json_string_array_from_lines < "$selected_file")"
 
     if compgen -G "$result_dir/*.json" >/dev/null; then
-        results_json="$(jq -s '.' "$result_dir"/*.json)"
+        # Pipe via cat to avoid E2BIG when many result files exist
+        results_json="$(cat "$result_dir"/*.json | jq -s '.')"
     else
         results_json="[]"
     fi
@@ -301,7 +302,7 @@ main() {
     require_tool jq
     require_tool realpath
 
-    local ws_root tmpdir metadata selected_file result_dir
+    local ws_root metadata selected_file result_dir
     ws_root="$(find_workspace_root)" || die "could not find workspace root"
     baseline_file="$ws_root/$baseline_file"
 
@@ -310,7 +311,8 @@ main() {
     fi
 
     tmpdir="$(mktemp -d)"
-    trap 'rm -rf "$tmpdir"' EXIT
+    # Use ${tmpdir:-} so trap does not fail when tmpdir is unset
+    trap '[[ -n "${tmpdir:-}" ]] && rm -rf "$tmpdir"' EXIT
     metadata="$tmpdir/metadata.json"
     selected_file="$tmpdir/selected-crates.txt"
     result_dir="$tmpdir/results"
@@ -378,7 +380,16 @@ main() {
         fi
 
         if [[ "$rc" -ne 0 ]]; then
-            status="clippy_failed"
+            if [[ "$mode" != "snapshot" ]]; then
+                local baseline_exit
+                baseline_exit="$(jq -r --arg crate "$crate" '.crates[$crate].exit_code // 0' "$baseline_file")"
+                if [[ "$baseline_exit" -eq 0 ]]; then
+                    status="clippy_failed"
+                fi
+                # If baseline also had exit_code > 0, keep the warning-based status
+            else
+                status="clippy_failed"
+            fi
         fi
 
         stderr_excerpt="$(tail -n "${CLIPPY_BASELINE_ERROR_LINES:-80}" "$err_log" 2>/dev/null || true)"
