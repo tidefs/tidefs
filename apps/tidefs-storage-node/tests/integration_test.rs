@@ -533,6 +533,9 @@ fn send_receive_full_roundtrip_via_server() {
             StoreOptions::default(),
             &decoded,
             auth_key,
+            [0u8; 16],
+            [0u8; 16],
+            None,
         )
         .expect("receive into target");
 

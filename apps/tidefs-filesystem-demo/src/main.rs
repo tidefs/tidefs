@@ -690,6 +690,9 @@ fn run_send_receive_demo(source_key: RootAuthenticationKey) -> Result<(), Box<dy
             StoreOptions::test_fast(),
             &decoded,
             target_key,
+            [0u8; 16],
+            [0u8; 16],
+            None,
         )?;
     let mut received = LocalFilesystem::open_with_root_authentication_key(
         &target_root,
