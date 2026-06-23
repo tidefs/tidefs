@@ -1,8 +1,9 @@
 # TideFS: kernel mounted-VFS teardown runtime evidence validation.
 #
 # QEMU Validation target for T5 mounted-kernel-vfs teardown stress.
-# Loads tidefs_posix_vfs.ko, mounts the bootstrap VFS, exercises
-# mount/write/sync, executes begin-teardown and final-teardown/unmount,
+# Loads tidefs_posix_vfs.ko, creates a disposable configured pool member,
+# mounts it through the kernel VFS path, exercises mount/write/sync,
+# executes begin-teardown and final-teardown/unmount,
 # unloads the module, probes post-final operation refusal, captures
 # Linux workqueue and callback trace evidence through ftrace and dmesg,
 # and writes kernel-teardown-runtime.json with an evidence-manifest.json
@@ -14,6 +15,7 @@
 {
   pkgs,
   linuxKernel_7_0,
+  tidefsPackage,
   tidefsXtaskRuntime,
 }:
 
@@ -32,6 +34,7 @@ let
     MODULE_DIR="${linuxKernel_7_0}/lib/modules/${linuxKernel_7_0.version}"
     KERNEL_RELEASE="${linuxKernel_7_0.version}"
     POSIX_VFS_KO="''${TIDEFS_KERNEL_VFS_MODULE_KO:-}"
+    TIDEFSCTL="${tidefsPackage}/bin/tidefsctl"
     B3SUM="${pkgs.b3sum}/bin/b3sum"
     JQ="${pkgs.jq}/bin/jq"
     VALIDATOR="${tidefsXtaskRuntime}/bin/tidefs-xtask"
@@ -45,8 +48,9 @@ let
 Usage: tidefs-kmod-teardown-validation [--timeout SECONDS] [--output-dir DIR] [--keep-tmp]
 
 Run T5 mounted-kernel-vfs teardown runtime evidence validation in a Linux 7.0
-QEMU guest. Exercises mount/write/sync/teardown/unmount/module-unload lifecycle
-with ftrace workqueue tracing and post-final refusal probes.
+QEMU guest. Creates a configured TideFS pool member, exercises
+mount/write/sync/teardown/unmount/module-unload lifecycle with ftrace workqueue
+tracing and post-final refusal probes.
 
 Options:
   --timeout SECONDS    QEMU boot timeout (default: $TIMEOUT_SEC)
@@ -82,7 +86,7 @@ EOF
     echo "  Output:    $OUTPUT_DIR"
     echo ""
 
-    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$LDD_BIN" "$B3SUM" "$JQ" "$VALIDATOR"; do
+    for dep in "$QEMU_BIN" "$BUSYBOX" "$KERNEL_IMG" "$CPIO" "$GZIP" "$LDD_BIN" "$TIDEFSCTL" "$B3SUM" "$JQ" "$VALIDATOR"; do
       if [ ! -f "$dep" ] && [ ! -x "$dep" ]; then
         echo "ERROR: dependency not found: $dep" >&2
         exit 2
@@ -107,8 +111,9 @@ EOF
     echo "  Module digest: $MODULE_DIGEST"
 
     RUN_DIR="$TMPDIR/validation-$$"
-    mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,validation,trace}
+    mkdir -p "$RUN_DIR"/{bin,dev,proc,sys,tmp,lib/modules,mnt/tidefs,validation,trace,var/lib/tidefs,etc,run/tidefs/import}
     trap 'if [ -z "''${KEEP_TMP:-}" ]; then rm -rf "$RUN_DIR"; fi' EXIT
+    POOL_IMG="$RUN_DIR/configured-pool-member.img"
 
     cp "$BUSYBOX" "$RUN_DIR/bin/busybox"
     chmod +x "$RUN_DIR/bin/busybox"
@@ -142,6 +147,10 @@ EOF
       ln -sf busybox "$RUN_DIR/bin/$applet"
     done
 
+    cp "$TIDEFSCTL" "$RUN_DIR/bin/tidefsctl"
+    chmod +x "$RUN_DIR/bin/tidefsctl"
+    copy_elf_deps "$TIDEFSCTL"
+
     cp "$POSIX_VFS_KO" "$RUN_DIR/lib/modules/tidefs_posix_vfs.ko"
 
     # ── Init script ──────────────────────────────────────────────────
@@ -160,6 +169,8 @@ MODULE_PATH=/lib/modules/tidefs_posix_vfs.ko
 MNT=/mnt/tidefs
 EVDIR=/validation
 TRACEDIR=/trace
+POOL_DEV=/dev/vda
+POOL_NAME=qemu_teardown_pool
 
 PASSED=0
 FAILED=0
@@ -267,13 +278,45 @@ else
 fi
 
 # ── Phase: mount ────────────────────────────────────────────────────
-log_phase "mount" "start" "mount -t tidefs -o bootstrap"
-if mount -t tidefs -o bootstrap none "$MNT" 2>/tmp/mount.err; then
-  pass "mount_bootstrap"
-  log_phase "mount" "pass" "bootstrap mount ok"
+log_phase "mount" "start" "create configured pool and mount /dev/vda"
+POOL_READY=0
+for _ in $(seq 1 30); do
+  [ -b "$POOL_DEV" ] && break
+  sleep 1
+done
+
+if [ -b "$POOL_DEV" ]; then
+  pass "configured_pool_device_present"
 else
-  fail "mount_bootstrap" "$(cat /tmp/mount.err | head -1)"
-  log_phase "mount" "fail" "$(cat /tmp/mount.err | head -1)"
+  blocked "configured_pool_device_present" "$POOL_DEV missing"
+  log_phase "mount" "fail" "$POOL_DEV missing"
+  poweroff -f
+fi
+
+if command -v tidefsctl >/dev/null 2>&1; then
+  COUT=$(tidefsctl pool create "$POOL_NAME" --devices "$POOL_DEV" --json 2>&1); RC=$?
+  if [ "$RC" -eq 0 ]; then
+    pass "configured_pool_member_created"
+    SOUT=$(tidefsctl pool scan --devices "$POOL_DEV" 2>&1); SRC=$?
+    if [ "$SRC" -eq 0 ] && echo "$SOUT" | grep -qi "label"; then
+      pass "configured_pool_label_verified"
+      POOL_READY=1
+    else
+      fail "configured_pool_label_verified" "$SOUT"
+    fi
+  else
+    fail "configured_pool_member_created" "$COUT"
+  fi
+else
+  blocked "configured_pool_member_created" "tidefsctl not found in initramfs"
+fi
+
+if [ "$POOL_READY" -eq 1 ] && mount -t tidefs "$POOL_DEV" "$MNT" 2>/tmp/mount.err; then
+  pass "configured_pool_mount"
+  log_phase "mount" "pass" "configured pool mount ok"
+else
+  fail "configured_pool_mount" "$(cat /tmp/mount.err 2>/dev/null | head -1)"
+  log_phase "mount" "fail" "$(cat /tmp/mount.err 2>/dev/null | head -1)"
   poweroff -f
 fi
 
@@ -365,7 +408,7 @@ fi
 log_phase "post_final_refusal_probe" "start" "probe operations after teardown"
 
 # Probe 1: mount attempt should fail (no module)
-if mount -t tidefs -o bootstrap none "$MNT" 2>/dev/null; then
+if mount -t tidefs "$POOL_DEV" "$MNT" 2>/dev/null; then
   REFUSAL1="mount_unexpectedly_succeeded"
   fail "refusal_mount" "mount succeeded after module unload"
   umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
@@ -411,14 +454,14 @@ fi
 log_phase "reload_probe" "start" "re-insmod and remount"
 if insmod "$MODULE_PATH" 2>/tmp/reinsmod.err; then
   pass "reload_insmod"
-  if mount -t tidefs -o bootstrap none "$MNT" 2>/dev/null; then
+  if mount -t tidefs "$POOL_DEV" "$MNT" 2>/tmp/reload-mount.err; then
     pass "reload_remount"
     ls "$MNT" >/dev/null 2>&1 && pass "reload_readdir" || fail "reload_readdir" "readdir failed"
     umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
     log_phase "reload_probe" "pass" "reload and remount ok"
   else
-    fail "reload_remount" "remount after reload failed"
-    log_phase "reload_probe" "fail" "remount failed"
+    fail "reload_remount" "$(cat /tmp/reload-mount.err | head -1)"
+    log_phase "reload_probe" "fail" "$(cat /tmp/reload-mount.err | head -1)"
   fi
 else
   fail "reload_insmod" "$(cat /tmp/reinsmod.err | head -1)"
@@ -450,6 +493,10 @@ INITSCRIPT
     mv "$INITRAMFS_TMP" "$RUN_DIR/initramfs.gz"
     echo "  Initramfs: $(du -h "$RUN_DIR/initramfs.gz" | cut -f1)"
 
+    echo "--- Creating configured pool member disk image ---"
+    dd if=/dev/zero of="$POOL_IMG" bs=1M count=128 2>/dev/null
+    echo "  Pool disk: $POOL_IMG ($(du -h "$POOL_IMG" | cut -f1))"
+
     echo "--- Booting QEMU ---"
     timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
       -kernel "$KERNEL_IMG" \
@@ -458,6 +505,7 @@ INITSCRIPT
       -nographic \
       -m 512M \
       -no-reboot \
+      -drive file="$POOL_IMG",if=virtio,format=raw \
       2>&1 | tee "$RUN_DIR/qemu.log" || true
 
     echo ""

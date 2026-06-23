@@ -3135,6 +3135,7 @@ EOF
           kernelTeardownValidation = import ./nix/vm/kernel-teardown-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
+            tidefsPackage = tidefsCtlRuntime;
             tidefsXtaskRuntime = tidefsXtaskRuntime;
           };
 
@@ -4316,6 +4317,7 @@ EOF
             pkgs.b3sum
             self.packages.${system}.kernelTeardownValidation
             self.packages.${system}.tidefsPosixVfsKmod
+            self.packages.${system}.tidefsCtlRuntime
             self.packages.${system}.tidefsXtaskRuntime
           ] ''
             exec ${self.packages.${system}.kernelTeardownValidation}/bin/tidefs-kmod-teardown-validation \
