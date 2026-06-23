@@ -180,6 +180,7 @@ impl DirectoryListingCache {
         // anchor_vector_ref.  Directory listings are best-effort cached
         // views — set a non-zero anchor ref to satisfy the invariant.
         header.anchor_vector_ref = 1;
+        header.set_size(listing.size_bytes);
         let weight = initial_entry_weight(listing.size_bytes);
         let entry = CacheEntry::with_weight(header, listing, weight);
         self.registry
