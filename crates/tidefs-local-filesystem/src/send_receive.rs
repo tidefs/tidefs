@@ -324,6 +324,65 @@ pub(crate) fn export_changed_record_root(
     })
 }
 
+/// Validate sender authority evidence carried by a receive stream.
+///
+/// VFSSEND1 changed-record streams always carry [`SenderAuthorityEvidence::AbsentLocalOnly`]
+/// and pass through this gate unchanged.  When VFSSEND2 streams arrive with
+/// [`SenderAuthorityEvidence::Distributed`] evidence, this function performs the
+/// fail-closed cross-pool authorization check:
+///
+/// 1. Same-pool: sender UUID matches the local pool → proceed.
+/// 2. Cross-pool with authorization: every field must match the provided
+///    [`CrossPoolReceiveAuthorization`] exactly → proceed.
+/// 3. Cross-pool without authorization → [`FileSystemError::CrossPoolReceiveUnauthorized`].
+/// 4. Authorization mismatch → [`FileSystemError::CrossPoolReceiveAuthorizationMismatch`].
+///
+/// This check does not replace the existing full/incremental target classification,
+/// base-root, omitted-content, root-authentication, checksum, namespace, or publish
+/// validation — all of those remain required after authorization passes.
+pub(crate) fn validate_sender_authority_for_receive(
+    authority_evidence: SenderAuthorityEvidence,
+    target_pool_uuid: Id128,
+    target_dataset_uuid: Id128,
+    authorization: Option<&CrossPoolReceiveAuthorization>,
+) -> Result<()> {
+    match authority_evidence {
+        SenderAuthorityEvidence::AbsentLocalOnly => {
+            // Legacy local-only stream: no distributed claim, no authorization
+            // needed.  Proceed directly to existing receive validation.
+            Ok(())
+        }
+        SenderAuthorityEvidence::Distributed(sender) => {
+            // Same-pool shortcut: sender is the local pool.
+            if sender.sender_pool_uuid == target_pool_uuid {
+                return Ok(());
+            }
+            // Cross-pool: require exact per-receive authorization.
+            let auth = authorization.ok_or_else(|| {
+                FileSystemError::CrossPoolReceiveUnauthorized {
+                    sender_pool_uuid: sender.sender_pool_uuid,
+                }
+            })?;
+            if !auth.matches(&sender) {
+                // Determine which field mismatched for operator diagnostics.
+                let mismatch_field = if auth.sender_pool_uuid != sender.sender_pool_uuid {
+                    "sender_pool_uuid"
+                } else if auth.sender_pool_epoch != sender.sender_pool_epoch {
+                    "sender_pool_epoch"
+                } else {
+                    "sender_membership_generation"
+                };
+                return Err(FileSystemError::CrossPoolReceiveAuthorizationMismatch {
+                    field: mismatch_field,
+                });
+            }
+            // Cross-pool authorization matches; proceed to existing validation.
+            let _ = target_dataset_uuid;
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn validate_changed_record_export(
     export: &ChangedRecordExport,
     is_incremental: bool,
@@ -1462,6 +1521,9 @@ pub(crate) fn receive_changed_records_into_empty_root(
     options: StoreOptions,
     export: &ChangedRecordExport,
     root_authentication_key: RootAuthenticationKey,
+    target_pool_uuid: Id128,
+    target_dataset_uuid: Id128,
+    authorization: Option<&CrossPoolReceiveAuthorization>,
 ) -> Result<ChangedRecordImportReport> {
     if export.incremental || export.from_root.is_some() {
         return Err(FileSystemError::Unsupported {
@@ -1476,6 +1538,15 @@ pub(crate) fn receive_changed_records_into_empty_root(
         });
     }
     let prepared = validate_changed_record_export(export, false)?;
+
+    // Validate sender authority before staging any object payloads.
+    // VFSSEND1 streams are always AbsentLocalOnly and pass through.
+    validate_sender_authority_for_receive(
+        export.sender_authority(),
+        target_pool_uuid,
+        target_dataset_uuid,
+        authorization,
+    )?;
     let parent = root.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| fs_io_error("create_dir_all", parent, source))?;
     let staging = receive_staging_root(root)?;
@@ -1609,6 +1680,9 @@ pub(crate) fn receive_incremental_changed_records(
     options: StoreOptions,
     export: &ChangedRecordExport,
     root_authentication_key: RootAuthenticationKey,
+    target_pool_uuid: Id128,
+    target_dataset_uuid: Id128,
+    authorization: Option<&CrossPoolReceiveAuthorization>,
 ) -> Result<ChangedRecordImportReport> {
     // No staging directory and no checkpoint — this function persists
     // directly to the target object store.  Errors propagate without
@@ -1633,6 +1707,15 @@ pub(crate) fn receive_incremental_changed_records(
     }
 
     let prepared = validate_changed_record_export(export, true)?;
+
+    // Validate sender authority before staging any object payloads.
+    // VFSSEND1 streams are always AbsentLocalOnly and pass through.
+    validate_sender_authority_for_receive(
+        export.sender_authority(),
+        target_pool_uuid,
+        target_dataset_uuid,
+        authorization,
+    )?;
 
     let mut preflight_pool = LocalFileSystem::default_development_pool(root, &options, None, None)?;
     let preflight_store = preflight_pool.raw_primary_store_mut();
@@ -2615,7 +2698,7 @@ mod tests {
             opts.clone(),
             &export,
             auth_key,
-        )
+        [0; 16], [0; 16], None)
         .expect("receive bookmark-only export");
 
         let received =
@@ -2723,7 +2806,7 @@ mod tests {
                 opts.clone(),
                 &export,
                 target_key,
-            )
+            [0; 16], [0; 16], None)
             .expect("receive with stale checkpoint must succeed");
 
         assert_eq!(report.imported_records, export.total_records);
@@ -3022,7 +3105,7 @@ mod tests {
             opts.clone(),
             &decoded,
             auth_key,
-        )
+        [0; 16], [0; 16], None)
         .expect("import");
 
         // 6. Verify the import report carries placement_epoch.

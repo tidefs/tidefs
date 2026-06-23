@@ -195,6 +195,26 @@ pub enum FileSystemError {
     DirtyAdmissionRejected {
         reason: String,
     },
+    /// Distributed-stream sender authority fields are invalid or malformed
+    /// (zero pool UUID, zero epoch, or zero membership generation).
+    MalformedSenderAuthority {
+        reason: &'static str,
+    },
+    /// A distributed receive stream carries cross-pool sender authority but
+    /// no per-receive authorization was provided for that sender pool.
+    CrossPoolReceiveUnauthorized {
+        sender_pool_uuid: [u8; 16],
+    },
+    /// A cross-pool receive authorization was provided but one or more fields
+    /// do not match the stream's declared sender authority.
+    CrossPoolReceiveAuthorizationMismatch {
+        field: &'static str,
+    },
+    /// The sender membership generation or pool epoch is older than the
+    /// receiver can accept.
+    StaleSenderGeneration {
+        reason: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -319,6 +339,22 @@ impl fmt::Display for FileSystemError {
             Self::LifecycleError { reason } => write!(f, "mount refused by lifecycle: {reason}"),
             Self::DatasetLocked { reason } => write!(f, "dataset is locked: {reason}"),
             Self::DirtyAdmissionRejected { reason } => write!(f, "write admission rejected: {reason}"),
+            Self::MalformedSenderAuthority { reason } => {
+                write!(f, "malformed sender authority in receive stream: {reason}")
+            }
+            Self::CrossPoolReceiveUnauthorized { sender_pool_uuid } => {
+                write!(f, "cross-pool receive not authorized: sender pool UUID ")?;
+                for byte in sender_pool_uuid {
+                    write!(f, "{byte:02x}")?;
+                }
+                write!(f, " is not the local pool and no exact authorization was provided")
+            }
+            Self::CrossPoolReceiveAuthorizationMismatch { field } => {
+                write!(f, "cross-pool receive authorization mismatch: {field} does not match the stream sender authority")
+            }
+            Self::StaleSenderGeneration { reason } => {
+                write!(f, "stale sender generation: {reason}")
+            }
         }
     }
 }
