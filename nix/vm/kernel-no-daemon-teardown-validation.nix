@@ -215,27 +215,28 @@ POOL_DEV=/dev/vda
 POOL_NAME=t6_no_daemon_teardown_pool
 MODULE_PATH=/lib/modules/tidefs_posix_vfs.ko
 EVDIR=/validation
+TRACEFS=/tracefs
 mkdir -p "$EVDIR"
 
 # ── Infra: ftrace and dmesg capture ─────────────────────────────────
 setup_ftrace() {
-  mkdir -p /sys/kernel/tracing 2>/dev/null || true
-  if [ ! -f /sys/kernel/tracing/trace ]; then
-    mount -t tracefs tracefs /sys/kernel/tracing 2>/tmp/tracefs_mount.err || true
+  mkdir -p "$TRACEFS" 2>/dev/null || true
+  if [ ! -f "$TRACEFS/trace" ]; then
+    mount -t tracefs tracefs "$TRACEFS" 2>/tmp/tracefs_mount.err || true
   fi
 
-  if [ -f /sys/kernel/tracing/trace ]; then
+  if [ -f "$TRACEFS/trace" ]; then
     local enabled=1
-    echo 0 > /sys/kernel/tracing/tracing_on 2>/dev/null || enabled=0
-    : > /sys/kernel/tracing/trace 2>/dev/null || enabled=0
+    echo 0 > "$TRACEFS/tracing_on" 2>/dev/null || enabled=0
+    : > "$TRACEFS/trace" 2>/dev/null || enabled=0
     for event in workqueue_execute_start workqueue_execute_end workqueue_queue_work workqueue_activate_work; do
-      if [ -e "/sys/kernel/tracing/events/workqueue/$event/enable" ]; then
-        echo 1 > "/sys/kernel/tracing/events/workqueue/$event/enable" 2>/dev/null || enabled=0
+      if [ -e "$TRACEFS/events/workqueue/$event/enable" ]; then
+        echo 1 > "$TRACEFS/events/workqueue/$event/enable" 2>/dev/null || enabled=0
       else
         enabled=0
       fi
     done
-    echo 1 > /sys/kernel/tracing/tracing_on 2>/dev/null || enabled=0
+    echo 1 > "$TRACEFS/tracing_on" 2>/dev/null || enabled=0
     if [ "$enabled" -eq 1 ]; then
       pass "ftrace_workqueue_enabled"
       echo "[ftrace] workqueue tracing enabled"
@@ -253,8 +254,8 @@ setup_ftrace() {
 capture_ftrace() {
   local dest="$1"
   mkdir -p "$(dirname "$dest")" 2>/dev/null || true
-  if [ -f /sys/kernel/tracing/trace ]; then
-    if cp /sys/kernel/tracing/trace "$dest" 2>/tmp/ftrace_capture.err && [ -s "$dest" ]; then
+  if [ -f "$TRACEFS/trace" ]; then
+    if cp "$TRACEFS/trace" "$dest" 2>/tmp/ftrace_capture.err && [ -s "$dest" ]; then
       echo "[ftrace] trace captured to $dest ($(wc -c < "$dest" 2>/dev/null || echo 0) bytes)"
     else
       local err
@@ -692,12 +693,14 @@ INITSCRIPT
 
     echo ""
     echo "--- QEMU exited with code $QEMU_EXIT ---"
+    QEMU_PARSE_LOG="$RUN_DIR/qemu.parse.log"
+    tr -d '\r' < "$RUN_DIR/qemu.log" > "$QEMU_PARSE_LOG" 2>/dev/null || cp "$RUN_DIR/qemu.log" "$QEMU_PARSE_LOG"
 
     # Parse results
     log_count() {
       local pattern="$1"
       local count
-      count=$(grep -c "$pattern" "$RUN_DIR/qemu.log" 2>/dev/null || true)
+      count=$(grep -c "$pattern" "$QEMU_PARSE_LOG" 2>/dev/null || true)
       printf '%s\n' "''${count:-0}"
     }
 
@@ -705,7 +708,7 @@ INITSCRIPT
     FAIL_COUNT=$(log_count "^FAIL:")
     BLOCKED_COUNT=$(log_count "^BLOCKED:")
     SKIP_COUNT=$(log_count "^SKIP:")
-    BOOT_FAILURE_COUNT=$(grep -Ec "Failed to execute /init|No working init found|Kernel panic|VFS: Unable to mount root fs|not syncing" "$RUN_DIR/qemu.log" 2>/dev/null || true)
+    BOOT_FAILURE_COUNT=$(grep -Ec "Failed to execute /init|No working init found|Kernel panic|VFS: Unable to mount root fs|not syncing" "$QEMU_PARSE_LOG" 2>/dev/null || true)
 
     echo ""
     echo "=== QEMU Guest Results ==="
@@ -784,7 +787,7 @@ INITSCRIPT
         --argjson arr "$PHASES_JSON" \
         '$arr + [{"phase":$phase,"status":$status,"start_timestamp":$ts,"notes":$note}]')"
     done <<PHASEEOF
-$(grep '^PHASE_MARKER:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^PHASE_MARKER://' || true)
+$(grep '^PHASE_MARKER:' "$QEMU_PARSE_LOG" 2>/dev/null | sed 's/^PHASE_MARKER://' || true)
 PHASEEOF
 
     # Build refusal observations JSON
@@ -792,9 +795,9 @@ PHASEEOF
     REFUSAL1_EXPECTED=true
     REFUSAL1_RESULT=""
     REFUSAL1_NEW_WORK=false
-    if grep -q "^PASS: refusal_mount .*mount refused after module unload" "$RUN_DIR/qemu.log" 2>/dev/null; then
+    if grep -q "^PASS: refusal_mount .*mount refused after module unload" "$QEMU_PARSE_LOG" 2>/dev/null; then
       REFUSAL1_RESULT="mount_correctly_refused"
-    elif grep -q "^FAIL: refusal_mount .*mount succeeded after module unload" "$RUN_DIR/qemu.log" 2>/dev/null; then
+    elif grep -q "^FAIL: refusal_mount .*mount succeeded after module unload" "$QEMU_PARSE_LOG" 2>/dev/null; then
       REFUSAL1_RESULT="mount_unexpectedly_succeeded"
       REFUSAL1_NEW_WORK=true
     fi
@@ -803,9 +806,9 @@ PHASEEOF
     REFUSAL2_EXPECTED=true
     REFUSAL2_RESULT=""
     REFUSAL2_NEW_WORK=false
-    if grep -q "^PASS: refusal_mount_check .*no TideFS mount visible" "$RUN_DIR/qemu.log" 2>/dev/null; then
+    if grep -q "^PASS: refusal_mount_check .*no TideFS mount visible" "$QEMU_PARSE_LOG" 2>/dev/null; then
       REFUSAL2_RESULT="no_tidefs_mount_visible"
-    elif grep -q "^FAIL: refusal_mount_check .*TideFS mount still visible after rmmod" "$RUN_DIR/qemu.log" 2>/dev/null; then
+    elif grep -q "^FAIL: refusal_mount_check .*TideFS mount still visible after rmmod" "$QEMU_PARSE_LOG" 2>/dev/null; then
       REFUSAL2_RESULT="tidefs_mount_still_visible"
     fi
 
@@ -839,9 +842,9 @@ PHASEEOF
       return 1
     }
 
-    WQ_TRACE_SOURCE="tracefs:/sys/kernel/tracing/events/workqueue/"
+    WQ_TRACE_SOURCE="tracefs:/tracefs/events/workqueue/"
     WQ_TRACE_PATH="trace/ftrace_final.txt"
-    WQ_TRACE_BODY=$(grep -A9999 '^BEGIN_ARTIFACT:ftrace_workqueue$' "$RUN_DIR/qemu.log" 2>/dev/null | grep -B9999 '^END_ARTIFACT:ftrace_workqueue$' | grep -v '^BEGIN_ARTIFACT\|^END_ARTIFACT' || echo "")
+    WQ_TRACE_BODY=$(grep -A9999 '^BEGIN_ARTIFACT:ftrace_workqueue$' "$QEMU_PARSE_LOG" 2>/dev/null | grep -B9999 '^END_ARTIFACT:ftrace_workqueue$' | grep -v '^BEGIN_ARTIFACT\|^END_ARTIFACT' || echo "")
     if artifact_body_missing "$WQ_TRACE_BODY"; then
       TEARDOWN_STATUS="fail"
       append_fail_reason "workqueue_trace_artifact_empty"
@@ -850,7 +853,7 @@ PHASEEOF
 
     CB_TRACE_SOURCE="dmesg"
     CB_TRACE_PATH="trace/dmesg_callbacks.txt"
-    CB_TRACE_BODY=$(grep -A9999 '^BEGIN_ARTIFACT:dmesg_callbacks$' "$RUN_DIR/qemu.log" 2>/dev/null | grep -B9999 '^END_ARTIFACT:dmesg_callbacks$' | grep -v '^BEGIN_ARTIFACT\|^END_ARTIFACT' || echo "")
+    CB_TRACE_BODY=$(grep -A9999 '^BEGIN_ARTIFACT:dmesg_callbacks$' "$QEMU_PARSE_LOG" 2>/dev/null | grep -B9999 '^END_ARTIFACT:dmesg_callbacks$' | grep -v '^BEGIN_ARTIFACT\|^END_ARTIFACT' || echo "")
     if artifact_body_missing "$CB_TRACE_BODY"; then
       TEARDOWN_STATUS="fail"
       append_fail_reason "callback_trace_artifact_empty"
