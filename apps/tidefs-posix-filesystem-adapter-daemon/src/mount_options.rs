@@ -165,7 +165,7 @@ impl MountOptions {
                 other => {
                     // Explicitly refuse idmapped mount attempts.
                     // TideFS does not support idmapped mounts; this is the
-                    // user-facing refusal contract for #6418 (NEXT-FUSE-015).
+                    // user-facing refusal contract for idmapped mounts.
                     if other == "idmap" || other.starts_with("idmap=") {
                         return Err(
                             "TideFS does not support idmapped mounts.                              Mount refused -- idmapped mounts are not yet supported.".to_string()

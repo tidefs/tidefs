@@ -744,7 +744,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     eprintln!("Mounted TideFS at {}", config.mountpoint.display());
 
     // Refuse idmapped mounts: TideFS does not support idmapped mount
-    // UID/GID translation (#6418, NEXT-FUSE-015).
+    // UID/GID translation in the current FUSE adapter boundary.
     check_idmapped_mount(&config.mountpoint)?;
     let live_owner = match (&config.pool_name, config.pool_uuid) {
         (Some(pool_name), Some(pool_uuid)) => {

@@ -284,7 +284,7 @@ int tidefs_posix_vfs_engine_replay_readdir(
 	unsigned int cookie,
 	struct tidefs_posix_vfs_replay_readdir_out *out);
 
-/* Engine-backed readdir output struct (#6400 NEXT-KVFS-037). */
+/* Engine-backed readdir output struct for cookie-based directory iteration. */
 struct tidefs_posix_vfs_engine_readdir_out {
 	unsigned long long ino;
 	unsigned char entry_type;
@@ -381,7 +381,7 @@ int tidefs_posix_vfs_engine_fsync(
 	u64 end,
 	int datasync);
 
-/* Engine-backed llseek bridge for SEEK_DATA/SEEK_HOLE (NEXT-KVFS-026). */
+/* Engine-backed llseek bridge for SEEK_DATA/SEEK_HOLE. */
 int tidefs_posix_vfs_engine_llseek(
 	u64 fh_ino,
 	u64 fh_id,
@@ -515,7 +515,7 @@ int tidefs_posix_vfs_engine_setxattr(
 int tidefs_posix_vfs_engine_removexattr(
 	unsigned long long ino,
 	const unsigned char *name_buf, unsigned int name_len);
-/* NEXT-KVFS-021: inode generation lookup for exportfs file handles. */
+/* Inode generation lookup for exportfs file handles. */
 int tidefs_posix_vfs_engine_get_generation(
 	unsigned long long ino,
 	unsigned long long *out_generation);
@@ -582,7 +582,7 @@ int tidefs_posix_vfs_engine_readlink(
 	unsigned long long ino,
 	unsigned char *out_buf, unsigned int out_buf_size,
 	unsigned int *out_len);
-/* Engine-backed O_TMPFILE unnamed temporary file bridge (NEXT-KVFS-033). */
+/* Engine-backed O_TMPFILE unnamed temporary file bridge. */
 int tidefs_posix_vfs_engine_tmpfile(
 	unsigned long long parent_ino,
 	unsigned int mode, unsigned int flags,
@@ -2199,7 +2199,7 @@ static int tidefs_posix_vfs_create(struct mnt_idmap *idmap,
 	return 0;
 }
 /*
- * Engine-backed O_TMPFILE unnamed temporary file creation (NEXT-KVFS-033).
+ * Engine-backed O_TMPFILE unnamed temporary file creation.
  *
  * Creates an unnamed regular file in the parent directory.  No dentry name
  * is needed — d_tmpfile() links the resulting inode into the open file.
@@ -3054,7 +3054,7 @@ static int tidefs_posix_vfs_iterate_shared(struct file *file,
 	}
 
 	/*
-	 * Engine-backed readdir path (#6400 NEXT-KVFS-037): when the mount
+	 * Engine-backed readdir path: when the mount
 	 * context has engine_backed set, iterate directory entries through the
 	 * mounted KernelEngine.  This path supports large directories (no
 	 * fixed-table limit) and provides cookie-based seekdir stability.
@@ -3397,7 +3397,7 @@ fallback:
 fill:
 	generic_fillattr(idmap, request_mask, inode, stat);
 
-	/* NEXT-KVFS-036: Wire btime and attributes from replay path. */
+	/* Wire btime and attributes from the replay path. */
 	if (btime_secs_saved != 0 || btime_nsec_saved != 0) {
 		stat->btime.tv_sec = btime_secs_saved;
 		stat->btime.tv_nsec = btime_nsec_saved;
@@ -5087,7 +5087,7 @@ static ssize_t tidefs_posix_vfs_file_splice_write(struct pipe_inode_info *pipe,
 
 
 /*
- * Lease/delegation refusal contract (NEXT-KTFS-035): TideFS does not
+ * Lease/delegation refusal contract: TideFS does not
  * support kernel file leases or delegations.  Return -EOPNOTSUPP on
  * every fcntl(F_SETLEASE/F_GETLEASE) so callers get a clear and
  * consistent refusal instead of the kernel default -EINVAL.
@@ -5410,7 +5410,7 @@ static const struct file_operations tidefs_posix_vfs_file_operations = {
 	.setlease = tidefs_posix_vfs_setlease_nosupport,
 };
 /*
- * Dentry operations for dcache coherency (NEXT-KVFS-022).
+ * Dentry operations for dcache coherency.
  *
  * d_revalidate: checks positive and negative dentries against the live
  * engine namespace.
@@ -6528,7 +6528,7 @@ static void tidefs_posix_vfs_kill_sb(struct super_block *sb)
 
 
 /*
- * Export operations for NFS file-handle support (NEXT-KVFS-021).
+ * Export operations for NFS file-handle support.
  *
  * encode_fh: produces a file handle, encoding {ino, generation}
  *   plus optional parent inode for directory reconnection.

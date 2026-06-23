@@ -2,7 +2,7 @@
 
 > TFR-019 authority classification: Current policy (scoped). See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 
-Maturity: current guardrail for issue #290.
+Maturity: current guardrail for GitHub issue #290.
 
 The FUSE adapter is an environment boundary. It may parse kernel requests,
 manage FUSE connection/request lifecycle state, classify unsupported kernel
@@ -28,6 +28,6 @@ It scans production adapter-boundary source files for direct local-filesystem
 or object-store mutation authority. Test fixtures and daemon backend assembly
 remain allowed outside that scoped production request-handler set.
 
-This document does not close any #254 xfstests rows and does not claim broader
-FUSE/POSIX completeness. Runtime xfstests evidence stays owned by the focused
-runtime issues that dispatch those rows.
+This document does not close any GitHub issue #254 xfstests rows and does not
+claim broader FUSE/POSIX completeness. Runtime xfstests evidence stays owned
+by the focused runtime issues that dispatch those rows.

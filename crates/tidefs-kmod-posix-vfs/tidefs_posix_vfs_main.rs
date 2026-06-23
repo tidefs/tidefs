@@ -646,7 +646,7 @@ impl KernelEngine {
         None
     }
 
-    /// Look up the generation number for an inode (NEXT-KVFS-021).
+    /// Look up the generation number for an inode.
     /// Returns ENOENT if the inode is not found in the engine namespace.
     fn get_generation(
         &self,
@@ -8099,7 +8099,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_replay_lookup(
 //
 // Called from the C shim when `engine_backed` is true.
 
-// -- Extern "C" engine-backed readdir bridge (#6400 NEXT-KVFS-037) -------
+// -- Extern "C" engine-backed readdir bridge -----------------------------
 // Uses the mounted KernelEngine dir_entries for cookie-based directory
 // iteration. Returns one entry per call with a sequential cookie so the
 // C shim can loop without tracking engine handles.
@@ -9912,7 +9912,7 @@ pub extern "C" fn tidefs_posix_vfs_engine_setattr(
     0
 }
 
-/// C-visible bridge: engine-backed inode generation lookup (NEXT-KVFS-021).
+/// C-visible bridge: engine-backed inode generation lookup.
 ///
 /// Returns the generation number for an inode from the engine's in-memory
 /// InodeRecord table, or ENODEV if no engine is mounted.  The generation
