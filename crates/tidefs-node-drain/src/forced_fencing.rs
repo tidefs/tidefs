@@ -558,6 +558,12 @@ impl ForcedFencing {
         self.fenced_nodes.remove(&nid);
         // Keep consecutive_fences so repeated fences are counted even after clear
         // Keep the token in self.tokens so future fences increment from here
+        // Release the epoch barrier when the cleared node matches the active
+        // forced-fence transition, so subsequent fence attempts can acquire a
+        // fresh barrier.  (PR #1121 / Issue #1134)
+        if self.active_epoch_transition.map_or(false, |t| t.node_id() == node_id) {
+            self.release_epoch_barrier();
+        }
         Ok(())
     }
 
