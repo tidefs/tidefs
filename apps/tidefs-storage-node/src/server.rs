@@ -5257,7 +5257,7 @@ fn handle_frame_ctx(
             };
             let report = if decoded.incremental {
                 vfs::LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
-                    fs_root, StoreOptions::default(), &decoded, auth_key, [0u8; 16], [0u8; 16], None,
+                    fs_root, StoreOptions::default(), &decoded, auth_key, [0u8; 16], [0u8; 16], None, None,
                 )
             } else {
                 vfs::LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
@@ -5943,6 +5943,7 @@ fn handle_vsnp_push(
             auth_key,
             [0u8; 16],
             [0u8; 16],
+            None,
             None,
         )
     } else {
