@@ -16,8 +16,9 @@ data loss, reserved space guarantees, and a BACKGROUND-lane auto-pruner that
 incrementally destroys excess or expired snapshots without blocking user IO or
 stalling the transaction pipeline.
 
-This design integrates with six existing subsystems: snapshot creation and catalog
-(#1253 / OW-108), the interval-based deadlist pinning algorithm (#1232), logical
+This design integrates with six existing subsystems: local snapshot creation
+and catalog (historical #1253), the interval-based deadlist pinning algorithm
+(#1232), logical
 and physical space accounting including `pinned_snapshot_bytes` (#1215), the
 BACKGROUND scheduling lane (#1241), send/recv stream pinning (#1251), and
 cluster-wide snapshot coordination (#1258).
@@ -259,9 +260,9 @@ pub const SNAPSHOT_POLICY_PROPERTY: &str = "org.tidefs:snapshot_policy";
 
 ### 4.1 Snapshot create — pre-check
 
-The `create_snapshot` path (OW-108, #1253) is extended with a pre-creation
-check. This runs BEFORE the snapshot catalog entry is written, making the
-check atomic with respect to the creation commit_group.
+The `create_snapshot` path from the local snapshot design is extended with a
+pre-creation check. This runs BEFORE the snapshot catalog entry is written,
+making the check atomic with respect to the creation commit_group.
 
 ```
 fn create_snapshot_pre_check(

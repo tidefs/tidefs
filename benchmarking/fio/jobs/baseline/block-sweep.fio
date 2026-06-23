@@ -1,5 +1,5 @@
 ; Baseline: multi-block-size throughput/latency sweep
-; TideFS fio benchmarking — NEXT-PERF-001 baseline
+; TideFS fio benchmarking baseline
 ; Runs seq read/write, rand read/write, and sync write at 4 block sizes.
 
 [seq-read-4k]

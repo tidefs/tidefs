@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Fault injection scenario catalog (NEXT-VAL-012).
+//! Fault injection scenario catalog.
 //!
 //! Maps required failure scenarios to fault classes, crash injection points,
-//! scripts, Forgejo tickets, and release gates across every TideFS subsystem.
+//! scripts, historical ticket ids, and release gaps across every TideFS
+//! subsystem.
 //!
 //! This is a prerequisite/documentation artifact. It documents what fault
 //! injection coverage TideFS needs for release readiness, what already exists,
@@ -20,7 +21,8 @@
 //!
 //! This module defines the *scenario layer*: it binds fault classes and
 //! injection points into named, release-gate-mapped scenarios with concrete
-//! scripts and tickets so release readiness can be evaluated systematically.
+//! scripts and historical ticket ids so release readiness can be evaluated
+//! systematically.
 
 use serde::{Deserialize, Serialize};
 
@@ -45,7 +47,7 @@ pub struct FaultInjectionScenario {
     pub crash_injection_points: Vec<String>,
     /// Release gate(s) this scenario validates.
     pub release_gates: Vec<ReleaseGateRef>,
-    /// Existing Forgejo ticket(s) that own this scenario.
+    /// Existing historical ticket id(s) that own this scenario.
     pub tickets: Vec<u64>,
     /// Script path(s) that execute this scenario (Nix VM, shell, xtask).
     pub scripts: Vec<String>,
@@ -117,7 +119,7 @@ pub enum ScenarioCoverage {
     CargoCovered,
     /// Scenario has a Nix VM / QEMU script but runtime validation not yet recorded.
     ScriptExists,
-    /// Scenario is owned by an open Forgejo ticket.
+    /// Scenario is owned by a historical ticket id.
     TicketOwned,
     /// Scenario has runtime validation output (T3+).
     RuntimeValidation,

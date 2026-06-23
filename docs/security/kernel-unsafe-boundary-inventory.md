@@ -1,6 +1,8 @@
 # Kernel Unsafe Boundary Consolidated Inventory
 
-Issue: [#6492] [NEXT-SEC-013]
+Historical issue: Forgejo #6492
+Current authority: this inventory plus
+`docs/security/security-audit-2026-04-30.md`.
 Review date: 2026-05-23
 Head (origin/master at review): `27403b998`
 Branch: `agent-s6` (Nexus worktree)

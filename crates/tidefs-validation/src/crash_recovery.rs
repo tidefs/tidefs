@@ -570,7 +570,7 @@ mod tests {
     // Chaos soak campaign: multi-cycle crash-recover through FUSE mount
     // =================================================================
     //
-    // NEXT-STOR-040: Storage durability long-haul chaos soak.
+    // Storage durability long-haul chaos soak.
     // This Tier 3 test mounts a FUSE filesystem, writes a committed
     // baseline, then runs a multi-cycle crash+remount campaign,
     // verifying committed data integrity after every cycle.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! RDMA versus TCP carrier performance comparison (NEXT-PERF-007).
+//! RDMA versus TCP carrier performance comparison.
 //!
 //! Runs the same workload (deterministic loopback round-trip via
 //! tidefs-two-node-harness) and classifies the available transport carrier

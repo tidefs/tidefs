@@ -1,8 +1,10 @@
 # Operator Authentication and Authorization Boundary
 
-Issue: #6489
-Packet: NEXT-SEC-010
-documented and the LocalOnlyGuard is source-integrated; runtime
+Historical issue: Forgejo #6489
+Current authority: `docs/OPERATOR_UAPI_AUTHORITY.md` and the checked
+`tidefsctl` command classification/admission tables.
+
+The boundary is documented and the LocalOnlyGuard is source-integrated; runtime
 enforcement of remote authz is deferred to cluster operator path
 completion.
 

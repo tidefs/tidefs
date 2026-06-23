@@ -8,7 +8,7 @@
 **Lane**: storage-core (data path — Layer 10)
 **Milestone**: DESIGN-M4: Cluster Infrastructure (Layers 8-11)
 **Blocks**: multi-node mmap workloads, distributed shared buffer pools, cluster-wide shared memory semantics
-**Related**: #1184 (coherency profiles), #1213 (VFS Engine/FUSE daemon), #1234 (VFS_RPC), #1211 (daemon memory budget), #1280 (kernel module OW-201)
+**Related**: #1184 (coherency profiles), #1213 (VFS Engine/FUSE daemon), #1234 (VFS_RPC), #1211 (daemon memory budget), historical #1280 (kernel module optimization)
 
 ---
 
@@ -169,7 +169,7 @@ the commit-group boundary for the relevant local or clustered mode.
 
 ### Explicitly out of scope
 
-- Kernel module (OW-201) implementation (this is a future optimisation; the
+- Kernel module implementation (this is a future optimisation; the
   design documents the FUSE path with kernel-module hooks noted)
 - Block-volume (ublk) mmap surfaces (ublk uses its own generation-check path)
   transport/RDMA issue rules)
@@ -233,7 +233,7 @@ TideFS applies the three-tier lease hierarchy from #1248 to mmap'd pages:
 │  │  - Page fault handler → FUSE read_folio / writepages               │  │
 │  │  - Page cache (struct folio) → tagged with lease_epoch             │  │
 │  │  - FUSE_NOTIFY_INVAL_PAGE → page eviction + TLB shootdown          │  │
-│  │  - Future OW-201: direct kernel bypass                              │  │
+│  │  - Future kernel module: direct kernel bypass                       │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -713,7 +713,7 @@ FUSE notification carries the cacheline offset and data:
 ///
 /// Instead of evicting the entire page, the kernel updates only
 /// the affected cacheline in place. Requires a kernel patch or
-/// the OW-201 kernel module.
+/// a future kernel module.
 struct FuseNotifyCachelineUpdate {
     inode: u64,
     offset: u64,      // cacheline-aligned offset in file
@@ -900,17 +900,17 @@ backing-store writes for the intended media and topology. That remains a
 validation target; the lease still cannot be released until all writes are
 durable, which blocks the requesting node's write fault.
 
-### 9.5 FUSE path vs. kernel module (OW-201)
+### 9.5 FUSE path vs. kernel module
 
 The current design uses FUSE for all kernel interactions. This introduces
-~2–5µs of context-switch overhead per page fault. The future OW-201 kernel
+~2–5µs of context-switch overhead per page fault. The future kernel
 module would eliminate this by handling faults entirely in kernel space.
 
 **Tradeoff**: FUSE is available today on every Linux system and requires no
 kernel patches. The kernel module provides lower latency but requires a
 loadable kernel module with its own maintenance, compatibility, and
 distribution burden. The design explicitly targets FUSE for the initial
-implementation, with OW-201 as an optimisation path.
+implementation, with a kernel module as an optimisation path.
 
 ### 9.6 Sub-page tracking overhead at scale
 
@@ -1047,10 +1047,10 @@ parent dataset (#1256). No additional per-page encryption is applied.
 
 ## 13. Future Work
 
-### 13.1 Kernel module (OW-201)
+### 13.1 Kernel module
 
 The FUSE path introduces ~2–5µs of overhead per fault (context switch to
-userspace daemon). A kernel module (OW-201) would:
+userspace daemon). A kernel module would:
 
 - Handle page faults entirely in kernel space (no context switch).
 - Integrate the lease-epoch check directly into the kernel's PTE fault handler.
@@ -1091,4 +1091,4 @@ RDMA for every node pair.
 - [#1211] Daemon Memory Budget
 - [#1213] VFS Engine (FUSE daemon)
 - [#1234] VFS_RPC
-- OW-201: Kernel-space mmap coherency module (future)
+- Kernel-space mmap coherency module (future)

@@ -676,7 +676,7 @@ impl GateRunner {
             "two-node harness transport budget",
             transport_om,
         );
-        // RDMA vs TCP carrier performance comparison (NEXT-PERF-007).
+        // RDMA vs TCP carrier performance comparison.
         let carrier_report =
             carrier_comparison::compare_carriers(repo_root, target_dir, &r.commit_sha, None);
         let carrier_om = OpMix {
@@ -694,7 +694,7 @@ impl GateRunner {
             "RDMA vs TCP carrier performance comparison",
             carrier_om,
         );
-        // ublk queue-depth latency budget measurement (NEXT-UBLK-014).
+        // ublk queue-depth latency budget measurement.
         let ublk_om = OpMix {
             read_pct: 70,
             write_pct: 30,
@@ -708,7 +708,7 @@ impl GateRunner {
             "ublk queue-depth latency budget",
             ublk_om,
         );
-        // Metadata workload baseline (NEXT-PERF-004).
+        // Metadata workload baseline.
         let metadata_om = OpMix {
             read_pct: 0,
             write_pct: 0,

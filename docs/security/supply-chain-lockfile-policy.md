@@ -1,7 +1,7 @@
 # Supply-Chain Lockfile Policy
 
 Last updated: 2026-05-23
-Issue: #6493 (NEXT-SEC-014)
+Historical issue: Forgejo #6493
 
 ## Canonical Boundary
 
