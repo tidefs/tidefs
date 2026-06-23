@@ -63,4 +63,4 @@ block-device acceptance harness.
 
 This is not a complete ublk daemon, not a started Linux block-device export, not
 START_DEV submission, not START_DEV completion, not io_uring data-queue request
-production resize/failover runtime, and not production block-volume durability
+production resize/failover runtime, and not production block-volume durability.

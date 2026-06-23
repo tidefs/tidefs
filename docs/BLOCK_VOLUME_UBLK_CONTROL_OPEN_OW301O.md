@@ -18,7 +18,7 @@ file-backed image surface. It performs host admission in order:
   pass;
 - bind the report to the typed `tidefs-ublk-abi` control-plan request values.
 
-not admitted, the command refuses before opening the control device and records
+If the host is not admitted, the command refuses before opening the control device and records
 the exact refusal class. On a suitable host, it opens the real control device and
 immediately drops the handle after recording admission.
 
@@ -49,10 +49,9 @@ against a durable userspace backing file; OW-301O adds the real control-device
 admission/open boundary that a future live ublk runtime must pass before it can
 attempt attach/list/detach behavior.
 
-This remains below OW-301 and PC-012. It is not
-harness.
+This remains below OW-301 and PC-012. It is not a block-device acceptance harness.
 
 ## Non-Claims
 
 This is not a ublk daemon, not a Linux block device, not `UBLK_CMD_ADD_DEV` or
-`UBLK_CMD_START_DEV` execution, not read-only `UBLK_CMD_GET_FEATURES` execution,
+`UBLK_CMD_START_DEV` execution, not read-only `UBLK_CMD_GET_FEATURES` execution, not fio.
