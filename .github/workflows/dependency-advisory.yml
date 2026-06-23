@@ -36,8 +36,11 @@ jobs:
         id: advisories
         continue-on-error: true
         run: |
-          nix develop .#ci --command cargo deny check advisories --format json > advisories.json 2>advisories-stderr.txt
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set +e
+          nix develop .#ci --command cargo deny --format json check advisories > advisories.json 2>advisories-stderr.txt
+          exit_code="$?"
+          set -e
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
 
       - name: Report advisory summary
         if: always()
@@ -79,24 +82,40 @@ jobs:
               if [[ "$err_count" -gt 0 ]]; then
                 echo "### :x: Blocking Advisories (${err_count})"
                 echo ""
-                echo "| Package | Advisory | Severity |"
-                echo "|---------|----------|----------|"
+                echo "| Package | Advisory | Severity | Status |"
+                echo "|---------|----------|----------|--------|"
                 jq -r "
                   .advisories.errors[] |
-                  \"| \\(.advisory.package // .package // \"unknown\") | [\\(.advisory.id // .id // \"unknown\")](\\(.advisory.url // \"\")) | \\(.advisory.severity // \"unknown\") |\"
-                " advisories.json 2>/dev/null || echo "| *(parse error)* | | |"
+                  def marker:
+                    .advisory.id // .id // (
+                      if (((.kind // .type // .reason // \"\") | tostring | ascii_downcase) | contains(\"yank\")) then
+                        \"yanked\"
+                      else
+                        \"unknown\"
+                      end
+                    );
+                  \"| \\(.advisory.package // .package.name // .package // \"unknown\") | [\\(marker)](\\(.advisory.url // .url // \"\")) | \\(.advisory.severity // .severity // \"unknown\") | blocking |\"
+                " advisories.json 2>/dev/null || echo "| *(parse error)* | | | |"
                 echo ""
               fi
 
               if [[ "$warn_count" -gt 0 ]]; then
                 echo "### :warning: Warning Advisories (${warn_count})"
                 echo ""
-                echo "| Package | Advisory | Severity |"
-                echo "|---------|----------|----------|"
+                echo "| Package | Advisory | Severity | Status |"
+                echo "|---------|----------|----------|--------|"
                 jq -r "
                   .advisories.warnings[] |
-                  \"| \\(.advisory.package // .package // \"unknown\") | [\\(.advisory.id // .id // \"unknown\")](\\(.advisory.url // \"\")) | \\(.advisory.severity // \"unknown\") |\"
-                " advisories.json 2>/dev/null || echo "| *(parse error)* | | |"
+                  def marker:
+                    .advisory.id // .id // (
+                      if (((.kind // .type // .reason // \"\") | tostring | ascii_downcase) | contains(\"yank\")) then
+                        \"yanked\"
+                      else
+                        \"unknown\"
+                      end
+                    );
+                  \"| \\(.advisory.package // .package.name // .package // \"unknown\") | [\\(marker)](\\(.advisory.url // .url // \"\")) | \\(.advisory.severity // .severity // \"unknown\") | warning |\"
+                " advisories.json 2>/dev/null || echo "| *(parse error)* | | | |"
                 echo ""
               fi
 
