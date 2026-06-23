@@ -10,6 +10,16 @@ architecture, data model, diff algorithm, and tradeoffs
 and roadmap priorities update)
 **Blocks**: All future coordination pipeline STATUS.md entries
 
+> **Historical input (TFR-019 authority classification, GitHub issue #1165):**
+> This imported Forgejo-era #1833 design records a retired `STATUS.md`
+> coordination-status architecture. Its `STATUS.md`, `FEATURE_MATRIX.md`,
+> lane-summary, health-score, and Forgejo label/claim machinery is historical
+> design input only. Current TideFS coordination state and worker scheduling
+> authority live in GitHub issues and pull requests plus active repo docs such as
+> `docs/INDEX.md` and `docs/GITHUB_PR_DEVELOPMENT.md`; this file is not current
+> policy, automation behavior, implementation status, release-readiness evidence,
+> or product authority.
+
 ## Abstract
 
 This document defines the architecture, data structures, algorithms, and
@@ -900,9 +910,12 @@ negative signal) and activity (stale lanes are the most common failure mode).
 
 - `docs/design/coordination-pipeline-cluster-services-design-seal.md` — #1738 design phase seal
 - `docs/design/coordination-review-roadmap-priorities-update.md` — #1723 review and priorities
-- `docs/STATUS.md` — live coordination pipeline status register
-- `docs/FEATURE_MATRIX.md` — implemented-source capability matrix
-- `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` — deferred production gates
+- `docs/STATUS.md` — deleted historical Forgejo-era coordination status
+  register, not current TideFS coordination authority
+- `docs/FEATURE_MATRIX.md` — deleted historical Forgejo-era capability matrix,
+  not current implementation-status or release-readiness authority
+- `docs/CURRENT_VS_FUTURE_CAPABILITIES.md` — deleted historical production-gate
+  reference, not current release-readiness authority
 - `docs/CLAIMS_GATE_POLICY.md` — claim barrier policy
 - `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md` — serial write surface definitions
 - `docs/MEMBERSHIP_SERVICE_DESIGN.md` — membership protocol
@@ -912,8 +925,10 @@ negative signal) and activity (stale lanes are the most common failure mode).
 
 ---
 
-**Coordination pipeline STATUS.md update architecture defined.** The schema
-contract, data structures, and algorithms in this document govern all future
-Coordination Status entries. Phase 1 (schema formalization) is complete.
-Phases 2-4 (type implementation, coordinator integration, automated
-monitoring) are deferred to wire-up issues.
+**Historical coordination pipeline STATUS.md update architecture recorded.**
+In its Forgejo-era context, this document defined a schema contract, data
+structures, and algorithms for future Coordination Status entries. That
+machinery no longer governs current TideFS coordination. Current coordination
+state, implementation status, release readiness, and worker scheduling authority
+live in GitHub issues and pull requests plus the current documentation entry
+points.
