@@ -39,7 +39,7 @@ The daemon command keeps the admission order explicit:
 6. require `UBLK_F_CMD_IOCTL_ENCODE | UBLK_F_USER_COPY`;
 7. submit `UBLK_U_CMD_ADD_DEV`.
 
-not admitted, the command refuses before opening the control device and records
+If the host is not admitted, the command refuses before opening the control device and records
 `add_dev.uring_cmd_attempted=false`. On an admitted host, a successful ADD_DEV
 can create the kernel ublk device pair and returns the kernel-mutated
 `ublksrv_ctrl_dev_info`, including the allocated device id and owner uid/gid.

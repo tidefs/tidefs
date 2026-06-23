@@ -61,8 +61,7 @@ data-queue runtime; OW-301X uses that same live runtime plus a fetched and
 completed request to submit a guarded COMMIT_AND_FETCH_REQ that commits the
 result and fetches the next request.
 
-This remains below OW-301 and PC-012. It is not a
-acceptance harness.
+This remains below OW-301 and PC-012. It is not a block-device acceptance harness.
 
 ## Non-Claims
 
