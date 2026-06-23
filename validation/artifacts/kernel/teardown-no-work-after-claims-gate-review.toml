@@ -10,7 +10,7 @@ reviewed_claim_ids = [
   "kernel.teardown.no_work_after.v1",
 ]
 
-validation_tier = "claims-gate review over source-model and runtime acceptance state"
+validation_tier = "T4 source/model claims-gate review"
 source_model_evidence = true
 mounted_linux_runtime_evidence = false
 runtime_evidence_status = "no-accepted-t5-or-t6-runtime-artifacts"
