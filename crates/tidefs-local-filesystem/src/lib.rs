@@ -5653,6 +5653,9 @@ impl LocalFileSystem {
             options,
             export,
             default_root_authentication_key()?,
+            [0; 16],
+            [0; 16],
+            None,
         )
     }
 
@@ -5661,12 +5664,18 @@ impl LocalFileSystem {
         options: StoreOptions,
         export: &ChangedRecordExport,
         root_authentication_key: RootAuthenticationKey,
+        target_pool_uuid: Id128,
+        target_dataset_uuid: Id128,
+        authorization: Option<&CrossPoolReceiveAuthorization>,
     ) -> Result<ChangedRecordImportReport> {
         receive_changed_records_into_empty_root(
             root.as_ref(),
             options,
             export,
             root_authentication_key,
+            target_pool_uuid,
+            target_dataset_uuid,
+            authorization,
         )
     }
 
@@ -5682,6 +5691,9 @@ impl LocalFileSystem {
             options,
             export,
             default_root_authentication_key()?,
+            [0; 16],
+            [0; 16],
+            None,
         )
     }
 
@@ -5692,8 +5704,15 @@ impl LocalFileSystem {
         options: StoreOptions,
         export: &ChangedRecordExport,
         root_authentication_key: RootAuthenticationKey,
+        target_pool_uuid: Id128,
+        target_dataset_uuid: Id128,
+        authorization: Option<&CrossPoolReceiveAuthorization>,
     ) -> Result<ChangedRecordImportReport> {
-        receive_incremental_changed_records(root.as_ref(), options, export, root_authentication_key)
+        receive_incremental_changed_records(root.as_ref(), options, export, root_authentication_key,
+            target_pool_uuid,
+            target_dataset_uuid,
+            authorization,
+        )
     }
 
     pub fn lookup(&self, path: impl AsRef<str>) -> Result<InodeId> {

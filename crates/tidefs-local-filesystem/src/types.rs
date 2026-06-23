@@ -20,7 +20,40 @@ use crate::encode_changed_record_export;
 use crate::error::FileSystemError;
 use crate::Result;
 
-pub use tidefs_send_stream::{SenderAuthority, SenderAuthorityEvidence};
+pub use tidefs_send_stream::{Id128, SenderAuthority, SenderAuthorityEvidence};
+
+
+/// Per-receive authorization for a cross-pool receive stream.
+///
+/// The authorization names the exact sender pool identity tuple that the
+/// receiver operator trusts for this single receive operation.  It is not
+/// a persistent policy — each receive must carry its own authorization.
+///
+/// When the stream carries [`SenderAuthorityEvidence::Distributed`] whose
+/// sender pool does not match the local target pool, the receive is refused
+/// unless an exact-matching [`CrossPoolReceiveAuthorization`] is supplied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CrossPoolReceiveAuthorization {
+    /// UUID of the sender pool the operator authorizes for this receive.
+    pub sender_pool_uuid: Id128,
+    /// Sender pool epoch the operator authorizes for this receive.
+    pub sender_pool_epoch: u64,
+    /// Sender membership generation the operator authorizes for this receive.
+    pub sender_membership_generation: u64,
+    /// UUID of the sender dataset the operator authorizes for this receive.
+    pub sender_dataset_uuid: Id128,
+}
+
+impl CrossPoolReceiveAuthorization {
+    /// Return true when every field matches the evidence in `sender`.
+    #[must_use]
+    pub fn matches(&self, sender: &SenderAuthority) -> bool {
+        self.sender_pool_uuid == sender.sender_pool_uuid
+            && self.sender_pool_epoch == sender.sender_pool_epoch
+            && self.sender_membership_generation == sender.sender_membership_generation
+    }
+}
+
 
 /// Identity of a content block being scrubbed.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

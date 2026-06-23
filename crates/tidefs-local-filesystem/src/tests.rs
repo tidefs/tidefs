@@ -3020,7 +3020,7 @@ fn changed_record_send_receive_round_trips_current_root_and_snapshot() {
             options(),
             &wrong_spec,
             target_key,
-        )
+        [0; 16], [0; 16], None)
         .expect_err("wrong send/receive spec must be rejected");
     assert!(matches!(err, FileSystemError::Decode { .. }));
     assert!(
@@ -3034,7 +3034,7 @@ fn changed_record_send_receive_round_trips_current_root_and_snapshot() {
             options(),
             &decoded,
             target_key,
-        )
+        [0; 16], [0; 16], None)
         .expect("receive changed records");
     assert_eq!(report.spec, SEND_RECEIVE_CHANGED_RECORD_SPEC);
     assert_eq!(report.imported_roots, 2);
@@ -3118,7 +3118,7 @@ fn changed_record_send_receive_excludes_unlinked_extent_maps() {
             options(),
             &export,
             target_key,
-        )
+        [0; 16], [0; 16], None)
         .expect("receive changed records");
     assert_eq!(report.imported_records, export.total_records);
 
@@ -3175,7 +3175,7 @@ fn changed_record_import_rejects_corrupt_payload_before_publish() {
             options(),
             &export,
             key,
-        )
+        [0; 16], [0; 16], None)
         .expect_err("corrupt payload must be rejected");
     assert!(matches!(err, FileSystemError::Decode { .. }));
     assert!(
@@ -7018,7 +7018,7 @@ fn incremental_send_receive_skips_unchanged_objects() {
             options(),
             &full_export,
             target_key,
-        )
+        [0; 16], [0; 16], None)
         .expect("receive baseline");
     assert!(!report.production_recovery_requires_operator_repair());
 
@@ -7127,7 +7127,7 @@ fn make_incremental_receive_fixture(
         options(),
         &baseline_export,
         target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect("receive baseline");
     if !retain_base_snapshot {
         let mut target =
@@ -7331,7 +7331,7 @@ fn incremental_send_receive_end_to_end() {
         options(),
         &baseline_export,
         target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect("receive baseline");
 
     // Verify baseline data in target.
@@ -7382,7 +7382,7 @@ fn incremental_send_receive_end_to_end() {
         options(),
         &incremental_export,
         target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect("receive incremental");
     assert_eq!(report.stream_version, incremental_export.stream_version);
     assert_eq!(report.placement_epoch, None);
@@ -7436,7 +7436,7 @@ fn incremental_receive_rejects_missing_from_root_without_selecting_new_root() {
         options(),
         &export,
         fixture.target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect_err("missing from_root must fail");
     assert!(
         err.to_string()
@@ -7458,7 +7458,7 @@ fn incremental_receive_rejects_replayed_completed_generation() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect("initial incremental receive");
     assert_eq!(
         report.selected_transaction_id,
@@ -7471,7 +7471,7 @@ fn incremental_receive_rejects_replayed_completed_generation() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect_err("replayed completed receive must fail");
     assert!(
         err.to_string()
@@ -7528,7 +7528,7 @@ fn incremental_receive_rejects_target_missing_base_root() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect_err("missing base must fail");
     assert_receive_merge_no_common_ancestor(err);
     let after = selected_root_for_test(&other_root, fixture.target_key);
@@ -7549,7 +7549,7 @@ fn incremental_receive_rejects_loose_unprotected_base_root() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect_err("loose base root without snapshot authority must fail");
     assert_incremental_receive_base_root_conflict(
         err,
@@ -7584,7 +7584,7 @@ fn incremental_receive_rejects_divergent_base_root_identity() {
         options(),
         &export,
         fixture.target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect_err("divergent from_root identity must fail");
     assert!(
         err.to_string()
@@ -7619,7 +7619,7 @@ fn incremental_receive_rejects_missing_unchanged_content() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect_err("missing omitted content must fail");
     assert!(
         err.to_string().contains("missing")
@@ -7644,7 +7644,7 @@ fn full_receive_rejects_incremental_stream_for_empty_target() {
             options(),
             &fixture.incremental_export,
             fixture.target_key,
-        )
+        [0; 16], [0; 16], None)
         .expect_err("full receive must reject incremental stream");
     assert!(
         err.to_string()
@@ -7670,7 +7670,7 @@ fn incremental_receive_rejects_full_stream_for_existing_target() {
         options(),
         &full_export,
         fixture.target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect_err("incremental receive must reject full stream");
     assert!(
         err.to_string()
@@ -7691,7 +7691,7 @@ fn incremental_receive_reports_unknown_placement_without_target_epoch() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect("receive incremental with sender placement epoch");
     assert_eq!(report.placement_epoch, Some(42));
     assert!(
@@ -7830,7 +7830,7 @@ fn incremental_send_receive_chained_deltas() {
         options(),
         &full_export,
         target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect("receive full");
 
     {
@@ -7914,7 +7914,7 @@ fn debug_incremental_validate() {
         options(),
         &baseline_export,
         target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect("receive baseline");
 
     LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
@@ -7922,7 +7922,7 @@ fn debug_incremental_validate() {
         options(),
         &incr,
         target_key,
-    )
+    [0; 16], [0; 16], None)
     .expect("receive incremental");
 
     {
@@ -11594,4 +11594,201 @@ fn truncate_and_fallocate_advance_subtree_rev() {
     );
 
     cleanup(&root);
+}
+
+// ── Cross-pool receive authorization tests ──────────────────────────────
+
+#[test]
+fn cross_pool_authorization_matches_exact_tuple() {
+    let auth = crate::types::CrossPoolReceiveAuthorization {
+        sender_pool_uuid: [1u8; 16],
+        sender_pool_epoch: 5,
+        sender_membership_generation: 10,
+        sender_dataset_uuid: [2u8; 16],
+    };
+    let sender = tidefs_send_stream::SenderAuthority::new([1u8; 16], 5, 10).unwrap();
+    assert!(auth.matches(&sender));
+
+    // epoch mismatch
+    let sender2 = tidefs_send_stream::SenderAuthority::new([1u8; 16], 6, 10).unwrap();
+    assert!(!auth.matches(&sender2));
+
+    // generation mismatch
+    let sender3 = tidefs_send_stream::SenderAuthority::new([1u8; 16], 5, 11).unwrap();
+    assert!(!auth.matches(&sender3));
+
+    // uuid mismatch
+    let sender4 = tidefs_send_stream::SenderAuthority::new([9u8; 16], 5, 10).unwrap();
+    assert!(!auth.matches(&sender4));
+}
+
+#[test]
+fn validate_sender_authority_local_only_passes() {
+    use crate::send_receive::validate_sender_authority_for_receive;
+    use tidefs_send_stream::SenderAuthorityEvidence;
+
+    let result = validate_sender_authority_for_receive(
+        SenderAuthorityEvidence::AbsentLocalOnly,
+        [0u8; 16],
+        [0u8; 16],
+        None,
+    );
+    assert!(result.is_ok(), "local-only stream must pass without authorization");
+}
+
+#[test]
+fn validate_sender_authority_same_pool_passes() {
+    use crate::send_receive::validate_sender_authority_for_receive;
+    use tidefs_send_stream::SenderAuthorityEvidence;
+
+    let pool_uuid = [0xabu8; 16];
+    let sender = tidefs_send_stream::SenderAuthority::new(pool_uuid, 1, 1).unwrap();
+
+    // Same pool UUID — no authorization needed.
+    let result = validate_sender_authority_for_receive(
+        SenderAuthorityEvidence::Distributed(sender),
+        pool_uuid,
+        [0u8; 16],
+        None,
+    );
+    assert!(result.is_ok(), "same-pool receive must pass without authorization");
+}
+
+#[test]
+fn validate_sender_authority_cross_pool_unauthorized() {
+    use crate::send_receive::validate_sender_authority_for_receive;
+    use tidefs_send_stream::SenderAuthorityEvidence;
+
+    let sender = tidefs_send_stream::SenderAuthority::new([1u8; 16], 1, 1).unwrap();
+
+    // Different pool UUID, no authorization — must fail.
+    let result = validate_sender_authority_for_receive(
+        SenderAuthorityEvidence::Distributed(sender),
+        [2u8; 16], // different target pool
+        [0u8; 16],
+        None,
+    );
+    match result {
+        Err(crate::error::FileSystemError::CrossPoolReceiveUnauthorized { .. }) => {}
+        other => panic!("expected CrossPoolReceiveUnauthorized, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_sender_authority_cross_pool_with_matching_authorization() {
+    use crate::send_receive::validate_sender_authority_for_receive;
+    use crate::types::CrossPoolReceiveAuthorization;
+    use tidefs_send_stream::SenderAuthorityEvidence;
+
+    let sender = tidefs_send_stream::SenderAuthority::new([1u8; 16], 3, 7).unwrap();
+    let auth = CrossPoolReceiveAuthorization {
+        sender_pool_uuid: [1u8; 16],
+        sender_pool_epoch: 3,
+        sender_membership_generation: 7,
+        sender_dataset_uuid: [0xfeu8; 16],
+    };
+
+    let result = validate_sender_authority_for_receive(
+        SenderAuthorityEvidence::Distributed(sender),
+        [2u8; 16], // different target pool
+        [0u8; 16],
+        Some(&auth),
+    );
+    assert!(result.is_ok(), "matching cross-pool authorization must pass");
+}
+
+#[test]
+fn validate_sender_authority_cross_pool_authorization_mismatch_epoch() {
+    use crate::send_receive::validate_sender_authority_for_receive;
+    use crate::types::CrossPoolReceiveAuthorization;
+    use tidefs_send_stream::SenderAuthorityEvidence;
+
+    let sender = tidefs_send_stream::SenderAuthority::new([1u8; 16], 3, 7).unwrap();
+    let auth = CrossPoolReceiveAuthorization {
+        sender_pool_uuid: [1u8; 16],
+        sender_pool_epoch: 4, // mismatched
+        sender_membership_generation: 7,
+        sender_dataset_uuid: [0u8; 16],
+    };
+
+    let result = validate_sender_authority_for_receive(
+        SenderAuthorityEvidence::Distributed(sender),
+        [2u8; 16],
+        [0u8; 16],
+        Some(&auth),
+    );
+    match result {
+        Err(crate::error::FileSystemError::CrossPoolReceiveAuthorizationMismatch { field }) => {
+            assert_eq!(field, "sender_pool_epoch");
+        }
+        other => panic!("expected CrossPoolReceiveAuthorizationMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_sender_authority_cross_pool_authorization_mismatch_uuid() {
+    use crate::send_receive::validate_sender_authority_for_receive;
+    use crate::types::CrossPoolReceiveAuthorization;
+    use tidefs_send_stream::SenderAuthorityEvidence;
+
+    let sender = tidefs_send_stream::SenderAuthority::new([1u8; 16], 3, 7).unwrap();
+    let auth = CrossPoolReceiveAuthorization {
+        sender_pool_uuid: [9u8; 16], // mismatched
+        sender_pool_epoch: 3,
+        sender_membership_generation: 7,
+        sender_dataset_uuid: [0u8; 16],
+    };
+
+    let result = validate_sender_authority_for_receive(
+        SenderAuthorityEvidence::Distributed(sender),
+        [2u8; 16],
+        [0u8; 16],
+        Some(&auth),
+    );
+    match result {
+        Err(crate::error::FileSystemError::CrossPoolReceiveAuthorizationMismatch { field }) => {
+            assert_eq!(field, "sender_pool_uuid");
+        }
+        other => panic!("expected CrossPoolReceiveAuthorizationMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn error_display_cross_pool_unauthorized() {
+    let err = crate::error::FileSystemError::CrossPoolReceiveUnauthorized {
+        sender_pool_uuid: [0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("cross-pool receive not authorized"), "message must mention cross-pool: {msg}");
+    assert!(msg.contains("deadbeef"), "message must include sender pool UUID: {msg}");
+}
+
+#[test]
+fn error_display_authorization_mismatch() {
+    let err = crate::error::FileSystemError::CrossPoolReceiveAuthorizationMismatch {
+        field: "sender_pool_epoch",
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("cross-pool receive authorization mismatch"), "message must mention mismatch: {msg}");
+    assert!(msg.contains("sender_pool_epoch"), "message must name the field: {msg}");
+}
+
+#[test]
+fn error_display_malformed_sender_authority() {
+    let err = crate::error::FileSystemError::MalformedSenderAuthority {
+        reason: "sender pool uuid is zero",
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("malformed sender authority"), "message must mention malformed: {msg}");
+    assert!(msg.contains("sender pool uuid is zero"), "message must include reason: {msg}");
+}
+
+#[test]
+fn error_display_stale_sender_generation() {
+    let err = crate::error::FileSystemError::StaleSenderGeneration {
+        reason: "membership generation 3 is older than minimum 5",
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("stale sender generation"), "message must mention stale: {msg}");
+    assert!(msg.contains("membership generation"), "message must include reason: {msg}");
 }
