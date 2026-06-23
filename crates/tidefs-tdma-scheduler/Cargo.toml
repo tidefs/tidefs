@@ -2,6 +2,7 @@
 name = "tidefs-tdma-scheduler"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,12 +16,12 @@ description = "Per-object TDMA time-slot scheduler: fair round-robin allocation 
 blake3 = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tidefs-coordination-strategy = { path = "../tidefs-coordination-strategy" }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
-tidefs-clock-timing = { path = "../tidefs-clock-timing" }
+tidefs-coordination-strategy = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
+tidefs-clock-timing = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
 
 [dev-dependencies]
-serde_json = "1"
+serde_json = { workspace = true }

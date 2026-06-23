@@ -2,29 +2,31 @@
 name = "tidefs-cluster"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 authors.workspace = true
+
 description = "Deterministic cluster membership lease transitions with BLAKE3-verified state integrity for multi-node validation"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
+bincode = { workspace = true }
 blake3 = { version = "1", default-features = false }
 thiserror = "2"
-tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core" }
-tidefs-dataset-catalog = { path = "../tidefs-dataset-catalog" }
-tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
-tracing = "0.1"
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
+tidefs-types-pool-label-core = { workspace = true }
+tidefs-dataset-catalog = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
+tidefs-replication-model = { workspace = true }
 
 [dev-dependencies]
-serde_json = "1"
-tempfile = "3"
+serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

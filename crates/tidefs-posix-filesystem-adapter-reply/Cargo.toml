@@ -2,6 +2,7 @@
 name = "tidefs-posix-filesystem-adapter-reply"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,7 +13,7 @@ authors.workspace = true
 description = "P5-02 FUSE reply commit lanes (reply_class_0.small_reply, reply_class_1.bulk_reply)"
 
 [dependencies]
-tidefs-types-posix-filesystem-adapter-core = { path = "../tidefs-types-posix-filesystem-adapter-core" }
+tidefs-types-posix-filesystem-adapter-core = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

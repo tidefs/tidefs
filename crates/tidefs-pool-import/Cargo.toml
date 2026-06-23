@@ -2,6 +2,7 @@
 name = "tidefs-pool-import"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,18 +16,18 @@ dataset mount readiness, and pool activation. Phase 3 of pool import/export.
 """
 
 [dependencies]
-tidefs-auth = { path = "../tidefs-auth" }
-tidefs-pool-scan = { path = "../tidefs-pool-scan" }
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-tidefs-device-removal = { path = "../tidefs-device-removal" }
-tidefs-types-pool-label-core = { path = "../tidefs-types-pool-label-core", features = ["serde"] }
+tidefs-auth = { workspace = true }
+tidefs-pool-scan = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+tidefs-device-removal = { workspace = true }
+tidefs-types-pool-label-core = { workspace = true, features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
-tidefs-commit_group = { path = "../tidefs-commit_group" }
-tidefs-encryption = { path = "../tidefs-encryption" }
-tidefs-checksum-tree = { path = "../tidefs-checksum-tree" }
-tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
-tidefs-intent-log = { path = "../tidefs-intent-log" }
+tidefs-commit_group = { workspace = true }
+tidefs-encryption = { workspace = true }
+tidefs-checksum-tree = { workspace = true }
+tidefs-binary_schema-checksum = { workspace = true }
+tidefs-intent-log = { workspace = true }
 blake3 = "=1.5.5"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }

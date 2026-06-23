@@ -2,6 +2,7 @@
 name = "tidefs-types-deferred-cleanup-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,5 +18,5 @@ no_std / forbid(unsafe_code).
 """
 
 [dependencies]
-tidefs-types-dataset-feature-flags-core = { path = "../tidefs-types-dataset-feature-flags-core" }
+tidefs-types-dataset-feature-flags-core = { workspace = true }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }

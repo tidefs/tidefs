@@ -1,24 +1,27 @@
 [package]
 name = "tidefs-compression"
 version = "0.1.0"
-edition = "2021"
-description = "Transparent per-object zstd + LZ4 compression wrapper for the TideFS local object store"
+edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
+authors.workspace = true
+
+description = "Transparent per-object zstd + LZ4 compression wrapper for the TideFS local object store"
 
 [dependencies]
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-tidefs-frame = { path = "../tidefs-frame" }
+tidefs-local-object-store = { workspace = true }
+tidefs-frame = { workspace = true }
 lz4_flex = "0.11"
 
 [dev-dependencies]
-tidefs-frame = { path = "../tidefs-frame" }
+tidefs-frame = { workspace = true }
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
-criterion = "0.4"
-tempfile = "3"
+criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "compression_benchmarks"

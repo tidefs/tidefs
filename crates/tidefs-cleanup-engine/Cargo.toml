@@ -2,6 +2,7 @@
 name = "tidefs-cleanup-engine"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,9 +13,9 @@ authors.workspace = true
 description = "CleanupEngine: BLAKE3-verified deferred cleanup execution with progress checkpointing and intent-log crash safety"
 
 [dependencies]
-tidefs-cleanup-queue-core = { path = "../tidefs-cleanup-queue-core" }
-tidefs-cleanup-job-core = { path = "../tidefs-cleanup-job-core" }
-tidefs-types-deferred-cleanup-core = { path = "../tidefs-types-deferred-cleanup-core" }
+tidefs-cleanup-queue-core = { workspace = true }
+tidefs-cleanup-job-core = { workspace = true }
+tidefs-types-deferred-cleanup-core = { workspace = true }
 blake3 = { version = "1", default-features = false }
 
 [lib]

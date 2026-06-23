@@ -2,6 +2,7 @@
 name = "tidefs-block-kmod"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,13 +17,13 @@ name = "tidefs_block_kmod"
 path = "src/lib.rs"
 
 [dependencies]
-tidefs-kmod-bridge = { path = "../../kmod" }
-tidefs-vfs-engine = { path = "../tidefs-vfs-engine" }
+tidefs-kmod-bridge = { workspace = true }
+tidefs-vfs-engine = { workspace = true }
 blake3 = { version = "1", default-features = false }
-tidefs-kernel-storage-io = { path = "../tidefs-kernel-storage-io" }
+tidefs-kernel-storage-io = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [features]
 # Historical compatibility no-op. The Linux 7.0 .ko is built by Kbuild from

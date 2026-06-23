@@ -173,13 +173,160 @@ exclude = [
 [workspace.package]
 version = "0.421.0"
 edition = "2021"
+rust-version = "1.88.0"
 publish = false
 repository = "https://github.com/tidefs/tidefs"
-homepage = "https://github.com/tidefs/tidefs"
+homepage = "https://tidefs.org"
 documentation = "https://github.com/tidefs/tidefs"
 license = "GPL-2.0-only WITH Linux-syscall-note"
 authors = ["TideFS Contributors"]
 
+
+[workspace.dependencies]
+bincode = "1"
+chacha20poly1305 = "0.10"
+criterion = "0.4"
+ed25519-dalek = "1"
+hex = "0.4"
+hmac = "0.12"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = "1"
+tracing = "0.1"
+zeroize = "1"
+
+tidefs-auth = { path = "crates/tidefs-auth" }
+tidefs-background-scheduler = { path = "crates/tidefs-background-scheduler" }
+tidefs-binary_schema-checksum = { path = "crates/tidefs-binary_schema-checksum" }
+tidefs-binary_schema-core = { path = "crates/tidefs-binary_schema-core" }
+tidefs-binary_schema-framing = { path = "crates/tidefs-binary_schema-framing" }
+tidefs-block-allocator = { path = "crates/tidefs-block-allocator" }
+tidefs-block-volume-adapter-core = { path = "crates/tidefs-block-volume-adapter-core" }
+tidefs-block-volume-adapter-daemon = { path = "apps/tidefs-block-volume-adapter-daemon" }
+tidefs-block-volume-adapter-ublk-control-runtime = { path = "crates/tidefs-block-volume-adapter-ublk-control-runtime" }
+tidefs-btree = { path = "crates/tidefs-btree" }
+tidefs-cache-coherency = { path = "crates/tidefs-cache-coherency" }
+tidefs-cache-core = { path = "crates/tidefs-cache-core" }
+tidefs-checksum-tree = { path = "crates/tidefs-checksum-tree" }
+tidefs-chunk-shipper = { path = "crates/tidefs-chunk-shipper" }
+tidefs-claim-ledger = { path = "crates/tidefs-claim-ledger" }
+tidefs-cleanup-engine = { path = "crates/tidefs-cleanup-engine" }
+tidefs-cleanup-job-core = { path = "crates/tidefs-cleanup-job-core" }
+tidefs-cleanup-queue-core = { path = "crates/tidefs-cleanup-queue-core" }
+tidefs-clock-timing = { path = "crates/tidefs-clock-timing" }
+tidefs-cluster = { path = "crates/tidefs-cluster" }
+tidefs-commit_group = { path = "crates/tidefs-commit_group" }
+tidefs-compaction = { path = "crates/tidefs-compaction" }
+tidefs-compression = { path = "crates/tidefs-compression" }
+tidefs-coordination-strategy = { path = "crates/tidefs-coordination-strategy" }
+tidefs-crash-oracle = { path = "crates/tidefs-crash-oracle" }
+tidefs-dataset-catalog = { path = "crates/tidefs-dataset-catalog" }
+tidefs-dataset-feature-flags = { path = "crates/tidefs-dataset-feature-flags" }
+tidefs-dataset-lifecycle = { path = "crates/tidefs-dataset-lifecycle" }
+tidefs-dataset-properties = { path = "crates/tidefs-dataset-properties" }
+tidefs-dedup = { path = "crates/tidefs-dedup" }
+tidefs-derived-catalog = { path = "crates/tidefs-derived-catalog" }
+tidefs-device-removal = { path = "crates/tidefs-device-removal" }
+tidefs-dir-index = { path = "crates/tidefs-dir-index" }
+tidefs-durability-layout = { path = "crates/tidefs-durability-layout" }
+tidefs-encryption = { path = "crates/tidefs-encryption" }
+tidefs-erasure-coding = { path = "crates/tidefs-erasure-coding" }
+tidefs-extent-map = { path = "crates/tidefs-extent-map" }
+tidefs-flow-commit-coordinator = { path = "crates/tidefs-flow-commit-coordinator" }
+tidefs-frame = { path = "crates/tidefs-frame" }
+tidefs-gc-pin-set = { path = "crates/tidefs-gc-pin-set" }
+tidefs-incremental-job-core = { path = "crates/tidefs-incremental-job-core" }
+tidefs-inode-attributes = { path = "crates/tidefs-inode-attributes" }
+tidefs-inode-table = { path = "crates/tidefs-inode-table" }
+tidefs-intent-log = { path = "crates/tidefs-intent-log" }
+tidefs-invalidation-feed = { path = "crates/tidefs-invalidation-feed" }
+tidefs-kernel-storage-io = { path = "crates/tidefs-kernel-storage-io" }
+tidefs-kmod-bridge = { path = "kmod" }
+tidefs-lease = { path = "crates/tidefs-lease" }
+tidefs-lease-manager = { path = "crates/tidefs-lease-manager" }
+tidefs-local-filesystem = { path = "crates/tidefs-local-filesystem" }
+tidefs-local-object-store = { path = "crates/tidefs-local-object-store" }
+tidefs-locator-table = { path = "crates/tidefs-locator-table" }
+tidefs-lock-service = { path = "crates/tidefs-lock-service" }
+tidefs-membership-epoch = { path = "crates/tidefs-membership-epoch" }
+tidefs-membership-live = { path = "crates/tidefs-membership-live" }
+tidefs-membership-types = { path = "crates/tidefs-membership-types" }
+tidefs-model-core = { path = "crates/tidefs-model-core" }
+tidefs-namespace = { path = "crates/tidefs-namespace" }
+tidefs-node-drain = { path = "crates/tidefs-node-drain" }
+tidefs-node-join = { path = "crates/tidefs-node-join" }
+tidefs-object-io = { path = "crates/tidefs-object-io" }
+tidefs-online-defrag = { path = "crates/tidefs-online-defrag" }
+tidefs-orphan-index = { path = "crates/tidefs-orphan-index" }
+tidefs-partition-runtime = { path = "crates/tidefs-partition-runtime" }
+tidefs-performance-contract = { path = "crates/tidefs-performance-contract" }
+tidefs-permission = { path = "crates/tidefs-permission" }
+tidefs-placement-planner = { path = "crates/tidefs-placement-planner" }
+tidefs-placement-runtime = { path = "crates/tidefs-placement-runtime" }
+tidefs-pool-allocator = { path = "crates/tidefs-pool-allocator" }
+tidefs-pool-import = { path = "crates/tidefs-pool-import" }
+tidefs-pool-scan = { path = "crates/tidefs-pool-scan" }
+tidefs-posix-acl = { path = "crates/tidefs-posix-acl" }
+tidefs-posix-filesystem-adapter-daemon = { path = "apps/tidefs-posix-filesystem-adapter-daemon" }
+tidefs-posix-filesystem-adapter-reply = { path = "crates/tidefs-posix-filesystem-adapter-reply" }
+tidefs-posix-filesystem-adapter-workers-io = { path = "crates/tidefs-posix-filesystem-adapter-workers-io" }
+tidefs-posix-filesystem-adapter-workers-locks = { path = "crates/tidefs-posix-filesystem-adapter-workers-locks" }
+tidefs-posix-semantics = { path = "crates/tidefs-posix-semantics" }
+tidefs-quorum-write = { path = "crates/tidefs-quorum-write" }
+tidefs-quorum-write-runtime = { path = "crates/tidefs-quorum-write-runtime" }
+tidefs-rebalance-planner = { path = "crates/tidefs-rebalance-planner" }
+tidefs-rebuild-planner = { path = "crates/tidefs-rebuild-planner" }
+tidefs-rebuild-runtime = { path = "crates/tidefs-rebuild-runtime" }
+tidefs-receive-stream = { path = "crates/tidefs-receive-stream" }
+tidefs-reclaim = { path = "crates/tidefs-reclaim" }
+tidefs-reclaim-queue-core = { path = "crates/tidefs-reclaim-queue-core" }
+tidefs-recovery-loop = { path = "crates/tidefs-recovery-loop" }
+tidefs-relocation-planner = { path = "crates/tidefs-relocation-planner" }
+tidefs-replica-health = { path = "crates/tidefs-replica-health" }
+tidefs-replicated-object-store = { path = "crates/tidefs-replicated-object-store" }
+tidefs-replication = { path = "crates/tidefs-replication" }
+tidefs-replication-model = { path = "crates/tidefs-replication-model" }
+tidefs-reserve-ledger = { path = "crates/tidefs-reserve-ledger" }
+tidefs-schema-codec-posix-filesystem-adapter = { path = "crates/tidefs-schema-codec-posix-filesystem-adapter" }
+tidefs-schema-codec-vfs = { path = "crates/tidefs-schema-codec-vfs" }
+tidefs-scrub-core = { path = "crates/tidefs-scrub-core" }
+tidefs-segment-cleaner = { path = "crates/tidefs-segment-cleaner" }
+tidefs-send-stream = { path = "crates/tidefs-send-stream" }
+tidefs-shard-group = { path = "crates/tidefs-shard-group" }
+tidefs-space-accounting = { path = "crates/tidefs-space-accounting" }
+tidefs-spacemap-allocator = { path = "crates/tidefs-spacemap-allocator" }
+tidefs-storage-intent-core = { path = "crates/tidefs-storage-intent-core" }
+tidefs-tdma-scheduler = { path = "crates/tidefs-tdma-scheduler" }
+tidefs-trace-oracle = { path = "crates/tidefs-trace-oracle" }
+tidefs-transport = { path = "crates/tidefs-transport" }
+tidefs-two-node-harness = { path = "crates/tidefs-two-node-harness" }
+tidefs-types-cache-lattice-core = { path = "crates/tidefs-types-cache-lattice-core" }
+tidefs-types-claim-ledger-core = { path = "crates/tidefs-types-claim-ledger-core" }
+tidefs-types-dataset-feature-flags-core = { path = "crates/tidefs-types-dataset-feature-flags-core" }
+tidefs-types-dataset-lifecycle-core = { path = "crates/tidefs-types-dataset-lifecycle-core" }
+tidefs-types-deferred-cleanup-core = { path = "crates/tidefs-types-deferred-cleanup-core" }
+tidefs-types-extent-map-core = { path = "crates/tidefs-types-extent-map-core" }
+tidefs-types-incremental-job-core = { path = "crates/tidefs-types-incremental-job-core" }
+tidefs-types-orphan-index-core = { path = "crates/tidefs-types-orphan-index-core" }
+tidefs-types-package-profile-catalog = { path = "crates/tidefs-types-package-profile-catalog" }
+tidefs-types-polymorphic-directory-index-core = { path = "crates/tidefs-types-polymorphic-directory-index-core" }
+tidefs-types-polymorphic-xattr-core = { path = "crates/tidefs-types-polymorphic-xattr-core" }
+tidefs-types-pool-label-core = { path = "crates/tidefs-types-pool-label-core" }
+tidefs-types-posix-filesystem-adapter-core = { path = "crates/tidefs-types-posix-filesystem-adapter-core" }
+tidefs-types-reclaim-queue-core = { path = "crates/tidefs-types-reclaim-queue-core" }
+tidefs-types-secret-key-policy-core = { path = "crates/tidefs-types-secret-key-policy-core" }
+tidefs-types-space-accounting-core = { path = "crates/tidefs-types-space-accounting-core" }
+tidefs-types-transport-session = { path = "crates/tidefs-types-transport-session" }
+tidefs-types-vfs-core = { path = "crates/tidefs-types-vfs-core" }
+tidefs-types-vfs-owned = { path = "crates/tidefs-types-vfs-owned" }
+tidefs-ublk-abi = { path = "crates/tidefs-ublk-abi" }
+tidefs-validation = { path = "crates/tidefs-validation" }
+tidefs-verification-engine = { path = "crates/tidefs-verification-engine" }
+tidefs-vfs-engine = { path = "crates/tidefs-vfs-engine" }
+tidefs-witness-set = { path = "crates/tidefs-witness-set" }
+tidefs-workload = { path = "crates/tidefs-workload" }
+tidefs-xattr-storage = { path = "crates/tidefs-xattr-storage" }
 
 [workspace.lints.rust]
 dead_code = "deny"

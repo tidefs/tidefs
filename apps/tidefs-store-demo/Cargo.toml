@@ -2,6 +2,7 @@
 name = "tidefs-store-demo"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,7 +13,7 @@ authors.workspace = true
 description = "Minimal durable local object-store write/read/replay demo for TideFS"
 
 [dependencies]
-tidefs-local-object-store = { path = "../../crates/tidefs-local-object-store" }
+tidefs-local-object-store = { workspace = true }
 
 [[bin]]
 name = "tidefs-store-demo"

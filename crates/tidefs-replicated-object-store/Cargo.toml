@@ -2,6 +2,7 @@
 name = "tidefs-replicated-object-store"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,28 +13,28 @@ authors.workspace = true
 description = "N-replica replicated object store wrapping N LocalObjectStore instances with quorum write protocol I/O coordination"
 
 [dependencies]
-tidefs-flow-commit-coordinator = { path = "../tidefs-flow-commit-coordinator" }
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-tidefs-quorum-write = { path = "../tidefs-quorum-write" }
-tidefs-quorum-write-runtime = { path = "../tidefs-quorum-write-runtime" }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
-tidefs-replica-health = { path = "../tidefs-replica-health" }
-tidefs-rebuild-runtime = { path = "../tidefs-rebuild-runtime" }
-tidefs-transport = { path = "../tidefs-transport" }
-tidefs-replication = { path = "../tidefs-replication" }
-tidefs-replication-model = { path = "../tidefs-replication-model" }
-tidefs-verification-engine = { path = "../tidefs-verification-engine" }
-tidefs-types-transport-session = { path = "../tidefs-types-transport-session" }
-tracing = "0.1"
-bincode = "1"
+tidefs-flow-commit-coordinator = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+tidefs-quorum-write = { workspace = true }
+tidefs-quorum-write-runtime = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
+tidefs-replica-health = { workspace = true }
+tidefs-rebuild-runtime = { workspace = true }
+tidefs-transport = { workspace = true }
+tidefs-replication = { workspace = true }
+tidefs-replication-model = { workspace = true }
+tidefs-verification-engine = { workspace = true }
+tidefs-types-transport-session = { workspace = true }
+tracing = { workspace = true }
+bincode = { workspace = true }
 blake3 = "1"
-tidefs-witness-set = { path = "../tidefs-witness-set" }
+tidefs-witness-set = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-tempfile = "3"
-serde_json = "1"
-tidefs-durability-layout = { path = "../tidefs-durability-layout" }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+tidefs-durability-layout = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

@@ -2,6 +2,7 @@
 name = "tidefs-schema-codec-posix-filesystem-adapter"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,7 +13,7 @@ authors.workspace = true
 description = "schema_codec fixed-width LE codecs for the first posix_filesystem_adapter wake-receipt surface in tidefs"
 
 [dependencies]
-tidefs-types-posix-filesystem-adapter-core = { path = "../tidefs-types-posix-filesystem-adapter-core", features = ["wake-receipt"] }
+tidefs-types-posix-filesystem-adapter-core = { workspace = true, features = ["wake-receipt"] }
 
 [lib]
 path = "src/lib.rs"

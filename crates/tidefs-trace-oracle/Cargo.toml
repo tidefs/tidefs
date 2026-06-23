@@ -2,6 +2,7 @@
 name = "tidefs-trace-oracle"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,21 +14,21 @@ description = "Deterministic trace oracle for cross-implementation semantic regr
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 blake3 = "=1.5.5"
 base64 = "0.22"
-tempfile = "3"
-tidefs-local-filesystem = { path = "../tidefs-local-filesystem" }
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-tidefs-model-core = { path = "../tidefs-model-core" }
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+tempfile = { workspace = true }
+tidefs-local-filesystem = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+tidefs-model-core = { workspace = true }
+tidefs-types-vfs-core = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [[test]]
 name = "trace_io"

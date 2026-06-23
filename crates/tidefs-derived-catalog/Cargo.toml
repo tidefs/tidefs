@@ -2,6 +2,7 @@
 name = "tidefs-derived-catalog"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,10 +17,10 @@ entries, and serves cached lookups.
 """
 
 [dependencies]
-tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core", features = ["alloc"] }
-tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core", features = ["alloc"] }
-tidefs-dataset-catalog = { path = "../tidefs-dataset-catalog" }
-tidefs-types-polymorphic-directory-index-core = { path = "../tidefs-types-polymorphic-directory-index-core", features = ["alloc"] }
+tidefs-types-incremental-job-core = { workspace = true, features = ["alloc"] }
+tidefs-incremental-job-core = { workspace = true, features = ["alloc"] }
+tidefs-dataset-catalog = { workspace = true }
+tidefs-types-polymorphic-directory-index-core = { workspace = true, features = ["alloc"] }
 
 [lib]
 path = "src/lib.rs"

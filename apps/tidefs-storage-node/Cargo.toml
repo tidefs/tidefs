@@ -2,6 +2,7 @@
 name = "tidefs-storage-node"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,34 +13,34 @@ authors.workspace = true
 description = "Networked storage node daemon: bridges tidefs-transport with tidefs-replicated-object-store"
 
 [dependencies]
-tokio = { version = "1", features = ["rt"] }
-tidefs-transport = { path = "../../crates/tidefs-transport" }
-tidefs-replicated-object-store = { path = "../../crates/tidefs-replicated-object-store" }
-tidefs-local-object-store = { path = "../../crates/tidefs-local-object-store" }
-tidefs-local-filesystem = { path = "../../crates/tidefs-local-filesystem" }
-tidefs-membership-live = { path = "../../crates/tidefs-membership-live" }
-tidefs-membership-types = { path = "../../crates/tidefs-membership-types" }
-tidefs-membership-epoch = { path = "../../crates/tidefs-membership-epoch" }
+tokio = { workspace = true, features = ["rt"] }
+tidefs-transport = { workspace = true }
+tidefs-replicated-object-store = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+tidefs-local-filesystem = { workspace = true }
+tidefs-membership-live = { workspace = true }
+tidefs-membership-types = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tidefs-pool-import = { path = "../../crates/tidefs-pool-import" }
-tidefs-cluster = { path = "../../crates/tidefs-cluster" }
-tidefs-replication-model = { path = "../../crates/tidefs-replication-model" }
-tidefs-partition-runtime = { path = "../../crates/tidefs-partition-runtime" }
-bincode = "1"
+serde_json = { workspace = true }
+tidefs-pool-import = { workspace = true }
+tidefs-cluster = { workspace = true }
+tidefs-replication-model = { workspace = true }
+tidefs-partition-runtime = { workspace = true }
+bincode = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
-hex = "0.4"
+hex = { workspace = true }
 blake3 = "1"
-tidefs-pool-scan = { path = "../../crates/tidefs-pool-scan" }
-tidefs-node-join = { path = "../../crates/tidefs-node-join" }
-tidefs-types-pool-label-core = { path = "../../crates/tidefs-types-pool-label-core" }
-tidefs-rebuild-runtime = { path = "../../crates/tidefs-rebuild-runtime" }
-tidefs-rebuild-planner = { path = "../../crates/tidefs-rebuild-planner" }
-tidefs-durability-layout = { path = "../../crates/tidefs-durability-layout" }
+tidefs-pool-scan = { workspace = true }
+tidefs-node-join = { workspace = true }
+tidefs-types-pool-label-core = { workspace = true }
+tidefs-rebuild-runtime = { workspace = true }
+tidefs-rebuild-planner = { workspace = true }
+tidefs-durability-layout = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [[bin]]
 name = "tidefs-storage-node"

@@ -2,6 +2,7 @@
 name = "tidefs-dir-index"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,15 +16,15 @@ CRUD, ordered iteration, and hysteresis-driven representation switching.
 """
 
 [dependencies]
-tidefs-local-object-store = { path = "../tidefs-local-object-store", optional = true }
-tidefs-types-polymorphic-directory-index-core = { path = "../tidefs-types-polymorphic-directory-index-core", features = ["alloc"] }
+tidefs-local-object-store = { workspace = true, optional = true }
+tidefs-types-polymorphic-directory-index-core = { workspace = true, features = ["alloc"] }
 blake3 = { version = "1", default-features = false }
-tidefs-btree = { path = "../tidefs-btree" }
-tidefs-kernel-storage-io = { path = "../tidefs-kernel-storage-io", optional = true }
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core", optional = true }
+tidefs-btree = { workspace = true }
+tidefs-kernel-storage-io = { workspace = true, optional = true }
+tidefs-types-vfs-core = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
 
 [features]

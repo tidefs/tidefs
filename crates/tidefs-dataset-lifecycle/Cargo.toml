@@ -2,6 +2,7 @@
 name = "tidefs-dataset-lifecycle"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -25,10 +26,10 @@ alloc = [
 poison-gating = ["alloc"]
 
 [dependencies]
-tidefs-types-dataset-lifecycle-core = { path = "../tidefs-types-dataset-lifecycle-core", default-features = false }
-tidefs-gc-pin-set = { path = "../tidefs-gc-pin-set", default-features = false }
-tidefs-incremental-job-core = { path = "../tidefs-incremental-job-core", default-features = false }
-tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core", default-features = false }
-tidefs-types-reclaim-queue-core = { path = "../tidefs-types-reclaim-queue-core" }
-tidefs-dataset-catalog = { path = "../tidefs-dataset-catalog" }
-tidefs-derived-catalog = { path = "../tidefs-derived-catalog" }
+tidefs-types-dataset-lifecycle-core = { workspace = true, default-features = false }
+tidefs-gc-pin-set = { workspace = true, default-features = false }
+tidefs-incremental-job-core = { workspace = true, default-features = false }
+tidefs-types-incremental-job-core = { workspace = true, default-features = false }
+tidefs-types-reclaim-queue-core = { workspace = true }
+tidefs-dataset-catalog = { workspace = true }
+tidefs-derived-catalog = { workspace = true }

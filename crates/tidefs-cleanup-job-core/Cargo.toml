@@ -2,6 +2,7 @@
 name = "tidefs-cleanup-job-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,10 +14,10 @@ description = "CleanupJob: deferred cleanup IncrementalJob that drains work item
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core", features = ["serde"] }
-tidefs-types-deferred-cleanup-core = { path = "../tidefs-types-deferred-cleanup-core" }
-tidefs-cleanup-queue-core = { path = "../tidefs-cleanup-queue-core" }
+serde_json = { workspace = true }
+tidefs-types-incremental-job-core = { workspace = true, features = ["serde"] }
+tidefs-types-deferred-cleanup-core = { workspace = true }
+tidefs-cleanup-queue-core = { workspace = true }
 
 [dev-dependencies]
-tidefs-types-incremental-job-core = { path = "../tidefs-types-incremental-job-core", features = ["serde"] }
+tidefs-types-incremental-job-core = { workspace = true, features = ["serde"] }

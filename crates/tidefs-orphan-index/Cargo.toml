@@ -2,6 +2,7 @@
 name = "tidefs-orphan-index"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,12 +16,12 @@ with OrphanKey entries for crash-recovery-safe tracking of nlink==0 inodes.
 """
 
 [dependencies]
-tidefs-btree = { path = "../tidefs-btree" }
-tidefs-commit_group = { path = "../tidefs-commit_group" }
-tidefs-types-orphan-index-core = { path = "../tidefs-types-orphan-index-core" }
-tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
-tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
-tidefs-performance-contract = { path = "../tidefs-performance-contract" }
+tidefs-btree = { workspace = true }
+tidefs-commit_group = { workspace = true }
+tidefs-types-orphan-index-core = { workspace = true }
+tidefs-binary_schema-checksum = { workspace = true }
+tidefs-binary_schema-core = { workspace = true }
+tidefs-performance-contract = { workspace = true }
 blake3 = { version = "1", default-features = false }
 
 [dev-dependencies]

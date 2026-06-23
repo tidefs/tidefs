@@ -2,6 +2,7 @@
 name = "tidefs-types-cache-lattice-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,7 +15,7 @@ description = "Cache lattice types: memory domains, cache classes, entry headers
 [dependencies]
 blake3 = { version = "1", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive"] }
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+tidefs-types-vfs-core = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

@@ -2,6 +2,7 @@
 name = "tidefs-lease-manager"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,9 +14,9 @@ description = "Distributed lease manager: GRANT/REVOKE/RENEW lifecycle, quorum-a
 
 [dependencies]
 thiserror = "2"
-tidefs-lease = { path = "../tidefs-lease" }
-tidefs-membership-epoch = { path = "../tidefs-membership-epoch" }
-tidefs-cache-coherency = { path = "../tidefs-cache-coherency" }
+tidefs-lease = { workspace = true }
+tidefs-membership-epoch = { workspace = true }
+tidefs-cache-coherency = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

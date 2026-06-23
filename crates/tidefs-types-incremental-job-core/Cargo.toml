@@ -2,6 +2,7 @@
 name = "tidefs-types-incremental-job-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -25,4 +26,4 @@ serde = ["dep:serde", "alloc"]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
 
 [dev-dependencies]
-serde_json = "1"
+serde_json = { workspace = true }

@@ -2,6 +2,7 @@
 name = "tidefs-kmod-bridge"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -18,8 +19,8 @@ path = "src/lib.rs"
 [dependencies]
 # s0 core crates — used by kernel_types re-export under cargo (non-Kbuild).
 # Under Kbuild, the kernel_types module provides self-contained equivalents.
-tidefs-types-vfs-core = { path = "../crates/tidefs-types-vfs-core" }
-tidefs-vfs-engine = { path = "../crates/tidefs-vfs-engine" }
+tidefs-types-vfs-core = { workspace = true }
+tidefs-vfs-engine = { workspace = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(CONFIG_RUST)"] }

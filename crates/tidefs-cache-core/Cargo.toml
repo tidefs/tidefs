@@ -2,6 +2,7 @@
 name = "tidefs-cache-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,13 +14,13 @@ description = "Cache lattice runtime: registry, eviction, invalidation, and cach
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
-tidefs-types-cache-lattice-core = { path = "../tidefs-types-cache-lattice-core" }
-tidefs-cache-coherency = { path = "../tidefs-cache-coherency" }
-tidefs-posix-filesystem-adapter-workers-io = { path = "../tidefs-posix-filesystem-adapter-workers-io" }
+tidefs-types-cache-lattice-core = { workspace = true }
+tidefs-cache-coherency = { workspace = true }
+tidefs-posix-filesystem-adapter-workers-io = { workspace = true }
 
 [dev-dependencies]
-tidefs-types-cache-lattice-core = { path = "../tidefs-types-cache-lattice-core" }
-tidefs-cache-coherency = { path = "../tidefs-cache-coherency" }
+tidefs-types-cache-lattice-core = { workspace = true }
+tidefs-cache-coherency = { workspace = true }
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
 
 [lib]

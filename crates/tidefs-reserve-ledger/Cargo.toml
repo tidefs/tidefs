@@ -2,6 +2,7 @@
 name = "tidefs-reserve-ledger"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,8 +16,8 @@ description = "Reserve ledger and budget domain runtime: named resource pools wi
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 blake3 = { version = "1", default-features = false }
-tidefs-claim-ledger = { path = "../tidefs-claim-ledger" }
-tidefs-types-claim-ledger-core = { path = "../tidefs-types-claim-ledger-core" }
+tidefs-claim-ledger = { workspace = true }
+tidefs-types-claim-ledger-core = { workspace = true }
 
 [dev-dependencies]
 

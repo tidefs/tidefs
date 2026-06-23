@@ -2,6 +2,7 @@
 name = "tidefs-locator-table"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,11 +16,11 @@ mapping via open-addressing hash table persisted in the object store.
 """
 
 [dependencies]
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
-tidefs-types-extent-map-core = { path = "../tidefs-types-extent-map-core" }
+tidefs-local-object-store = { workspace = true }
+tidefs-types-extent-map-core = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

@@ -2,6 +2,7 @@
 name = "tidefs-env-ublk-model"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,10 +13,10 @@ authors.workspace = true
 description = "Bounded pure uBLK qid/tag lifecycle model for TideFS request contract evidence"
 
 [dependencies]
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
-tidefs-ublk-abi = { path = "../tidefs-ublk-abi" }
+tidefs-types-vfs-core = { workspace = true }
+tidefs-ublk-abi = { workspace = true }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

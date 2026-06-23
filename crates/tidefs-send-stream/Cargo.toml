@@ -2,6 +2,7 @@
 name = "tidefs-send-stream"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,13 +15,15 @@ description = "VFSSEND2 incremental dataset send stream framing with resumable c
 [dependencies]
 blake3 = "1"
 crc32c = { version = "0.6", default-features = false }
-tidefs-types-dataset-feature-flags-core = { path = "../tidefs-types-dataset-feature-flags-core" }
-tidefs-binary_schema-checksum = { path = "../tidefs-binary_schema-checksum" }
-tidefs-binary_schema-core = { path = "../tidefs-binary_schema-core" }
-tidefs-local-object-store = { path = "../tidefs-local-object-store" }
+tidefs-types-dataset-feature-flags-core = { workspace = true }
+tidefs-binary_schema-checksum = { workspace = true }
+tidefs-binary_schema-core = { workspace = true }
+tidefs-local-object-store = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["rt"] }
+tidefs-transport = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
@@ -28,11 +31,3 @@ path = "src/lib.rs"
 [features]
 default = []
 transport = ["tidefs-transport", "tokio"]
-
-[dependencies.tokio]
-version = "1"
-optional = true
-features = ["rt"]
-[dependencies.tidefs-transport]
-path = "../tidefs-transport"
-optional = true

@@ -2,6 +2,7 @@
 name = "tidefs-offload-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,7 +13,7 @@ authors.workspace = true
 description = "no_std non-authoritative offload ABI and CPU reference backend for TideFS"
 
 [dependencies]
-tidefs-types-vfs-core = { path = "../tidefs-types-vfs-core" }
+tidefs-types-vfs-core = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
