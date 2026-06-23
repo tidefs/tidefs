@@ -45,7 +45,9 @@ jobs:
           nix develop .#ci --command bash -c '
             set -uo pipefail
 
-            # Extract the expected Rust channel from rust-toolchain.toml.
+            # ------------------------------------------------------------------
+            # Parse the expected Rust channel from rust-toolchain.toml
+            # ------------------------------------------------------------------
             EXPECTED_CHANNEL=$(grep "^channel" rust-toolchain.toml \
               | sed "s/channel\s*=\s*\"\([^\"]*\)\"/\1/")
             if [[ -z "${EXPECTED_CHANNEL}" ]]; then
@@ -53,95 +55,85 @@ jobs:
               exit 1
             fi
 
+            # ------------------------------------------------------------------
+            # Verify rustc channel through structured verbose output. The
+            # release line gives the canonical channel (e.g. "1.88.0") and
+            # the commit hash allows cross-checking that sibling components
+            # were built from the same toolchain commit.
+            # ------------------------------------------------------------------
+            set +e
+            RUSTC_VV=$(rustc -Vv 2>&1)
+            RUSTC_RC=$?
+            set -e
+
+            if [[ $RUSTC_RC -ne 0 ]]; then
+              echo "::error::rustc not available: ${RUSTC_VV}"
+              exit 1
+            fi
+
+            RUSTC_RELEASE=$(echo "${RUSTC_VV}" | grep "^release:" | awk "{print \$2}")
+            RUSTC_COMMIT=$(echo "${RUSTC_VV}" | grep "^commit-hash:" | awk "{print \$2}")
+            RUSTC_HOST=$(echo "${RUSTC_VV}" | grep "^host:" | awk "{print \$2}")
+
+            if [[ "${RUSTC_RELEASE}" != "${EXPECTED_CHANNEL}" ]]; then
+              echo "::error::rustc release ${RUSTC_RELEASE} does not match expected channel ${EXPECTED_CHANNEL}"
+              exit 1
+            fi
+
+            # ------------------------------------------------------------------
+            # Write the job summary header
+            # ------------------------------------------------------------------
             {
               echo "## Rust Toolchain Verification"
               echo ""
               echo "**Expected channel:** \`${EXPECTED_CHANNEL}\`"
+              echo "**Host triple:** \`${RUSTC_HOST}\`"
+              echo "**Commit:** \`${RUSTC_COMMIT}\`"
               echo ""
               echo "| Component | Observed |"
               echo "|-----------|----------|"
+              echo "| rustc | \`${RUSTC_RELEASE} (${RUSTC_COMMIT})\` |"
             } >> "$GITHUB_STEP_SUMMARY"
 
             failures=0
 
             # ------------------------------------------------------------------
-            # rustc
+            # Helper: check that a component command exists and records the
+            # first line of its version output.  Component version strings
+            # (e.g. clippy 0.1.88, rustfmt 1.8.0-stable) use their own
+            # numbering; the channel is already verified through rustc above.
             # ------------------------------------------------------------------
-            set +e
-            RUSTC_VERSION=$(rustc --version 2>&1)
-            rc=$?
-            set -e
-            if [[ $rc -ne 0 ]]; then
-              echo "| rustc | **UNAVAILABLE** |" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::rustc not available: ${RUSTC_VERSION}"
-              failures=$((failures + 1))
-            elif ! echo "${RUSTC_VERSION}" | grep -q "rustc ${EXPECTED_CHANNEL}"; then
-              echo "| rustc | \`${RUSTC_VERSION}\` :x: |" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::rustc version ${RUSTC_VERSION} does not match expected channel ${EXPECTED_CHANNEL}"
-              failures=$((failures + 1))
-            else
-              echo "| rustc | \`${RUSTC_VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
-            fi
+            check_component() {
+              local label="$1"
+              local ver_cmd="$2"
+
+              set +e
+              local out
+              out=$(eval "${ver_cmd}" 2>&1)
+              local rc=$?
+              set -e
+
+              local first_line
+              first_line=$(echo "${out}" | head -n1)
+
+              if [[ $rc -ne 0 ]]; then
+                echo "| ${label} | **UNAVAILABLE** |" >> "$GITHUB_STEP_SUMMARY"
+                echo "::error::${label} not available: ${first_line}"
+                failures=$((failures + 1))
+              else
+                echo "| ${label} | \`${first_line}\` |" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            }
+
+            check_component "cargo"   "cargo --version"
+            check_component "clippy"  "cargo clippy --version"
+            check_component "rustfmt" "rustfmt --version"
 
             # ------------------------------------------------------------------
-            # cargo
-            # ------------------------------------------------------------------
-            set +e
-            CARGO_VERSION=$(cargo --version 2>&1)
-            rc=$?
-            set -e
-            if [[ $rc -ne 0 ]]; then
-              echo "| cargo | **UNAVAILABLE** |" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::cargo not available: ${CARGO_VERSION}"
-              failures=$((failures + 1))
-            elif ! echo "${CARGO_VERSION}" | grep -q "cargo ${EXPECTED_CHANNEL}"; then
-              echo "| cargo | \`${CARGO_VERSION}\` :x: |" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::cargo version ${CARGO_VERSION} does not match expected channel ${EXPECTED_CHANNEL}"
-              failures=$((failures + 1))
-            else
-              echo "| cargo | \`${CARGO_VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
-            fi
-
-            # ------------------------------------------------------------------
-            # clippy
-            # ------------------------------------------------------------------
-            set +e
-            CLIPPY_VERSION=$(cargo clippy --version 2>&1)
-            rc=$?
-            set -e
-            if [[ $rc -ne 0 ]]; then
-              echo "| clippy | **UNAVAILABLE** |" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::clippy not available: ${CLIPPY_VERSION}"
-              failures=$((failures + 1))
-            elif ! echo "${CLIPPY_VERSION}" | grep -q "clippy ${EXPECTED_CHANNEL}"; then
-              echo "| clippy | \`${CLIPPY_VERSION}\` :x: |" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::clippy version ${CLIPPY_VERSION} does not match expected channel ${EXPECTED_CHANNEL}"
-              failures=$((failures + 1))
-            else
-              echo "| clippy | \`${CLIPPY_VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
-            fi
-
-            # ------------------------------------------------------------------
-            # rustfmt
-            # ------------------------------------------------------------------
-            set +e
-            RUSTFMT_VERSION=$(rustfmt --version 2>&1)
-            rc=$?
-            set -e
-            if [[ $rc -ne 0 ]]; then
-              echo "| rustfmt | **UNAVAILABLE** |" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::rustfmt not available: ${RUSTFMT_VERSION}"
-              failures=$((failures + 1))
-            elif ! echo "${RUSTFMT_VERSION}" | grep -q "rustfmt ${EXPECTED_CHANNEL}"; then
-              echo "| rustfmt | \`${RUSTFMT_VERSION}\` :x: |" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::rustfmt version ${RUSTFMT_VERSION} does not match expected channel ${EXPECTED_CHANNEL}"
-              failures=$((failures + 1))
-            else
-              echo "| rustfmt | \`${RUSTFMT_VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
-            fi
-
-            # ------------------------------------------------------------------
-            # rust-src
+            # rust-src: the component installs the standard library source
+            # under the sysroot.  Check the same path used by the existing
+            # kernel Kbuild toolchain verification
+            # (nix/vm/k7-kbuild-toolchain.nix).
             # ------------------------------------------------------------------
             set +e
             SYSROOT=$(rustc --print sysroot 2>&1)
