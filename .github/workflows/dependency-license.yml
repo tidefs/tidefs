@@ -1,0 +1,72 @@
+name: Dependency License
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/dependency-license.yml'
+      - 'docs/adr/0006-license-compliance-cargo-deny.md'
+      - 'docs/DEPENDENCY_LICENSE_CI.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  license-check:
+    name: cargo-deny license check
+    if: ${{ (github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare CI scratch
+        run: mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+
+      - name: Check dependency licenses against deny.toml
+        id: deny-check
+        run: |
+          nix develop .#ci --command bash -c 'cargo deny check licenses'
+
+      - name: Record summary
+        if: always()
+        run: |
+          {
+            echo '# Dependency License Check'
+            echo ''
+            echo "**Ref**: ${{ github.ref }}"
+            echo "**SHA**: ${{ github.sha }}"
+            echo "**Command**: \`cargo deny check licenses\`"
+            echo "**Policy**: \`deny.toml\` per ADR-0006"
+            echo ''
+            if [[ '${{ steps.deny-check.outcome }}' == 'success' ]]; then
+              echo '**Outcome**: pass — all dependency licenses comply with the approved allowlist.'
+            else
+              echo '**Outcome**: fail — one or more dependencies carry a license outside the approved allowlist.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean cargo target
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"
