@@ -40,37 +40,110 @@ jobs:
           nix develop .#ci --command cargo deny --format json check advisories > advisories.json 2>advisories-stderr.txt
           exit_code="$?"
           set -e
+          if [[ -s advisories.json ]]; then
+            cp advisories.json advisories-report.json
+          elif [[ -s advisories-stderr.txt ]]; then
+            cp advisories-stderr.txt advisories-report.json
+          else
+            : > advisories-report.json
+          fi
           echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
 
       - name: Report advisory summary
         if: always()
         run: |
-          nix develop .#ci --command bash -c '
+          nix develop .#ci --command bash <<'BASH'
+          set -euo pipefail
+
+          report_file=advisories-report.json
+
+          emit_rows_object() {
+            local status="$1"
+            local jq_path="$2"
+            jq -r "
+              ${jq_path}[] |
+              def marker:
+                .advisory.id // .id // (
+                  if (((.kind // .type // .reason // \"\") | tostring | ascii_downcase) | contains(\"yank\")) then
+                    \"yanked\"
+                  else
+                    \"unknown\"
+                  end
+                );
+              def advisory_kind:
+                .advisory.cvss.severity // .advisory.informational // .advisory.severity // .code // .severity // \"unknown\";
+              \"| \\(.advisory.package // .package.name // .package // \"unknown\") | [\\(marker)](\\(.advisory.url // .url // \"\")) | \\(advisory_kind) | ${status} |\"
+            " "${report_file}" 2>/dev/null || echo "| *(parse error)* | | | |"
+          }
+
+          emit_rows_jsonl() {
+            local severity="$1"
+            local status="$2"
+            jq -sr "
+              .[] |
+              select(.type == \"diagnostic\" and ((.fields.severity // .severity // \"\") == \"${severity}\")) |
+              def marker:
+                .fields.advisory.id // .fields.id // .id // (
+                  if (((.fields.code // .code // .kind // .type // .reason // \"\") | tostring | ascii_downcase) | contains(\"yank\")) then
+                    \"yanked\"
+                  else
+                    \"unknown\"
+                  end
+                );
+              def advisory_kind:
+                .fields.advisory.cvss.severity // .fields.advisory.informational // .fields.code // .fields.severity // .severity // \"unknown\";
+              \"| \\(.fields.advisory.package // .fields.package.name // .fields.package // .package.name // .package // \"unknown\") | [\\(marker)](\\(.fields.advisory.url // .fields.url // .url // \"\")) | \\(advisory_kind) | ${status} |\"
+            " "${report_file}" 2>/dev/null || echo "| *(parse error)* | | | |"
+          }
+
+          if [[ -s "${report_file}" ]] && jq -e -s \
+            'length == 1 and (.[0] | type == "object" and has("advisories"))' \
+            "${report_file}" >/dev/null 2>&1; then
+            report_mode=object
+          elif [[ -s "${report_file}" ]] && jq -e -s \
+            'any(.[]; type == "object" and (.type == "diagnostic" or .type == "summary"))' \
+            "${report_file}" >/dev/null 2>&1; then
+            report_mode=jsonl
+          else
+            report_mode=none
+          fi
+
+          if [[ "${report_mode}" == object ]]; then
+            db_count=$(jq -r ".advisories.db[\"advisory-count\"] // 0" "${report_file}" 2>/dev/null || echo 0)
+            db_updated=$(jq -r ".advisories.db[\"last-updated\"] // \"unknown\"" "${report_file}" 2>/dev/null || echo unknown)
+            warn_count=$(jq -r ".advisories.warnings | length // 0" "${report_file}" 2>/dev/null || echo 0)
+            err_count=$(jq -r ".advisories.errors | length // 0" "${report_file}" 2>/dev/null || echo 0)
+          elif [[ "${report_mode}" == jsonl ]]; then
+            db_count=unknown
+            db_updated=unknown
+            warn_count=$(jq -sr '[.[] | select(.type == "diagnostic" and ((.fields.severity // .severity // "") == "warning"))] | length' "${report_file}" 2>/dev/null || echo 0)
+            err_count=$(jq -sr '[.[] | select(.type == "diagnostic" and ((.fields.severity // .severity // "") == "error"))] | length' "${report_file}" 2>/dev/null || echo 0)
+          else
+            db_count=unknown
+            db_updated=unknown
+            warn_count=0
+            err_count=0
+          fi
+
             {
               echo "## Dependency Advisory Check"
               echo ""
-              echo "Policy: [deny.toml](deny.toml) \\\`[advisories]\\\`"
+              echo 'Policy: [deny.toml](deny.toml) `[advisories]`'
               echo ""
 
-              if [[ ! -s advisories.json ]]; then
+              if [[ "${report_mode}" == none ]]; then
                 echo ":warning: No JSON output captured."
                 if [[ -s advisories-stderr.txt ]]; then
                   echo ""
                   echo "### stderr"
                   echo "\`\`\`"
-                  cat advisories-stderr.txt
+                  sed -n "1,80p" advisories-stderr.txt
                   echo "\`\`\`"
                 fi
                 exit 0
               fi
 
-              db_count=$(jq -r ".advisories.db[\"advisory-count\"] // 0" advisories.json 2>/dev/null || echo 0)
-              db_updated=$(jq -r ".advisories.db[\"last-updated\"] // \"unknown\"" advisories.json 2>/dev/null || echo unknown)
               echo "- Advisory database: ${db_count} advisories (updated ${db_updated})"
-
-              warn_count=$(jq -r ".advisories.warnings | length // 0" advisories.json 2>/dev/null || echo 0)
-              err_count=$(jq -r ".advisories.errors | length // 0" advisories.json 2>/dev/null || echo 0)
-
               echo "- Warnings: ${warn_count}  |  Errors: ${err_count}"
               echo ""
 
@@ -84,18 +157,11 @@ jobs:
                 echo ""
                 echo "| Package | Advisory | Severity | Status |"
                 echo "|---------|----------|----------|--------|"
-                jq -r "
-                  .advisories.errors[] |
-                  def marker:
-                    .advisory.id // .id // (
-                      if (((.kind // .type // .reason // \"\") | tostring | ascii_downcase) | contains(\"yank\")) then
-                        \"yanked\"
-                      else
-                        \"unknown\"
-                      end
-                    );
-                  \"| \\(.advisory.package // .package.name // .package // \"unknown\") | [\\(marker)](\\(.advisory.url // .url // \"\")) | \\(.advisory.severity // .severity // \"unknown\") | blocking |\"
-                " advisories.json 2>/dev/null || echo "| *(parse error)* | | | |"
+                if [[ "${report_mode}" == object ]]; then
+                  emit_rows_object "blocking" ".advisories.errors"
+                else
+                  emit_rows_jsonl "error" "blocking"
+                fi
                 echo ""
               fi
 
@@ -104,24 +170,17 @@ jobs:
                 echo ""
                 echo "| Package | Advisory | Severity | Status |"
                 echo "|---------|----------|----------|--------|"
-                jq -r "
-                  .advisories.warnings[] |
-                  def marker:
-                    .advisory.id // .id // (
-                      if (((.kind // .type // .reason // \"\") | tostring | ascii_downcase) | contains(\"yank\")) then
-                        \"yanked\"
-                      else
-                        \"unknown\"
-                      end
-                    );
-                  \"| \\(.advisory.package // .package.name // .package // \"unknown\") | [\\(marker)](\\(.advisory.url // .url // \"\")) | \\(.advisory.severity // .severity // \"unknown\") | warning |\"
-                " advisories.json 2>/dev/null || echo "| *(parse error)* | | | |"
+                if [[ "${report_mode}" == object ]]; then
+                  emit_rows_object "warning" ".advisories.warnings"
+                else
+                  emit_rows_jsonl "warning" "warning"
+                fi
                 echo ""
               fi
 
               echo "See [DEPENDENCY_ADVISORY_CI.md](docs/DEPENDENCY_ADVISORY_CI.md) for policy and remediation guidance."
             } >> "$GITHUB_STEP_SUMMARY"
-          '
+          BASH
 
       - name: Upload advisory report
         if: always()
@@ -129,6 +188,7 @@ jobs:
         with:
           name: dependency-advisory-report
           path: |
+            advisories-report.json
             advisories.json
             advisories-stderr.txt
           if-no-files-found: ignore

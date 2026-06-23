@@ -44,8 +44,10 @@ with:
 - Whether the finding is blocking (error) or a warning under the current
   `deny.toml` policy
 
-A raw JSON report (`advisories.json`) is uploaded as a 7-day artifact for
-offline inspection.
+The uploaded 7-day artifact includes `advisories-report.json`, the canonical
+JSON report consumed by the summary formatter. Raw stdout and stderr captures
+(`advisories.json` and `advisories-stderr.txt`) are included as well because
+cargo-deny versions may write JSON diagnostics to either stream.
 
 ## Relationship to Other CI Lanes
 
