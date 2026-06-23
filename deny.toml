@@ -1,13 +1,22 @@
-# cargo-deny configuration for TideFS dependency license compliance
-# Run: cargo deny check licenses
+# cargo-deny configuration for TideFS dependency policy
+#
+# Two CI lanes consume this file:
+#   cargo deny check advisories  (Dependency Advisory workflow)
+#   cargo deny check licenses    (future license-gate lane)
+#
+# Dependency remediation (version bumps, lockfile updates) must be done in a
+# separate, focused pull request; the advisory gate only reports drift.
 
 [graph]
 targets = ["x86_64-unknown-linux-gnu"]
 
 [advisories]
 version = 2
-unmaintained = "workspace"
+# Response to unmaintained-crate advisories: "deny" | "warn" | "allow"
+unmaintained = "warn"
+# Response to yanked-version advisories: "deny" | "warn" | "allow"
 yanked = "warn"
+# Advisory ids to ignore regardless of severity or policy setting
 ignore = []
 
 [licenses]
