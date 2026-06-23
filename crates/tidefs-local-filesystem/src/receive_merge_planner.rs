@@ -945,7 +945,6 @@ mod tests {
 
         let inventory = build_conflict_inventory(&input);
         assert!(inventory.is_empty());
-        assert_eq!(inventory.len(), 0);
         assert_eq!(inventory.common_ancestor_transaction_id, 10);
         assert_eq!(inventory.common_ancestor_generation, 100);
     }
