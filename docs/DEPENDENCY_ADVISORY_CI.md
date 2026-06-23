@@ -1,6 +1,6 @@
 # Dependency Advisory CI
 
-The `Dependency Advisory` workflow ([.github/workflows/dependency-advisory.yml](.github/workflows/dependency-advisory.yml))
+The `Dependency Advisory` workflow ([.github/workflows/dependency-advisory.yml](../.github/workflows/dependency-advisory.yml))
 runs `cargo deny check advisories` against the RustSec advisory database to detect
 dependency security drift and yanked crate usage. It is a validation-only gate:
 it reports findings but does not update `Cargo.lock`, bump dependency versions,

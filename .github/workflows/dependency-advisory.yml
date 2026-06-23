@@ -114,3 +114,8 @@ jobs:
             advisories-stderr.txt
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Enforce advisory policy
+        if: ${{ steps.advisories.outputs.exit_code != '' && steps.advisories.outputs.exit_code != '0' }}
+        run: |
+          exit "${{ steps.advisories.outputs.exit_code }}"
