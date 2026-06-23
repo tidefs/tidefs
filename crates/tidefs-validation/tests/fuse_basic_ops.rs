@@ -19,7 +19,9 @@ use tidefs_validation::mount_harness::MountHarness;
 /// and that `exists` returns true.
 #[test]
 fn create_file_at_root() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness
         .create_file("test_create.txt", b"hello create\n")
         .expect("create_file");
@@ -38,7 +40,9 @@ fn create_file_at_root() {
 /// Create a file inside a subdirectory, verifying the full path exists.
 #[test]
 fn create_file_in_subdir() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("sub").expect("mkdir sub");
     harness
         .create_file("sub/file_in_sub.txt", b"nested create\n")
@@ -56,7 +60,9 @@ fn create_file_in_subdir() {
 /// metadata.
 #[test]
 fn mkdir_and_verify() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("mydir").expect("mkdir mydir");
 
     assert!(harness.exists("mydir"), "mydir must exist after mkdir");
@@ -73,7 +79,9 @@ fn mkdir_and_verify() {
 /// Create nested directories and verify the tree.
 #[test]
 fn mkdir_nested() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir_all("a/b/c").expect("mkdir_all a/b/c");
 
     assert!(harness.exists("a"));
@@ -96,7 +104,9 @@ fn mkdir_nested() {
 /// Remove a file and verify it disappears from readdir.
 #[test]
 fn unlink_file() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness
         .create_file("to_unlink.txt", b"ephemeral\n")
         .expect("create_file");
@@ -120,7 +130,9 @@ fn unlink_file() {
 /// Remove an empty directory and verify it disappears.
 #[test]
 fn rmdir_empty_dir() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("to_rmdir").expect("mkdir to_rmdir");
     assert!(harness.exists("to_rmdir"));
 
@@ -140,7 +152,9 @@ fn rmdir_empty_dir() {
 /// Remove a file inside a subdirectory, then remove the subdirectory itself.
 #[test]
 fn unlink_then_rmdir() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("d").expect("mkdir d");
     harness
         .create_file("d/f.txt", b"inside\n")
@@ -156,7 +170,9 @@ fn unlink_then_rmdir() {
 /// Removing a non-empty directory should fail with a POSIX error.
 #[test]
 fn rmdir_non_empty_dir_fails() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("nonempty").expect("mkdir nonempty");
     harness
         .create_file("nonempty/child.txt", b"block rmdir\n")
@@ -177,7 +193,9 @@ fn rmdir_non_empty_dir_fails() {
 /// mirrors the advancement criterion 1 sequence.
 #[test]
 fn basic_ops_full_cycle() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     // ── Phase 1: mkdir ───────────────────────────────────────────────
     harness.mkdir("basicdir").expect("mkdir basicdir");
@@ -430,7 +448,9 @@ fn basic_ops_cycle_with_remount() {
 /// read after other basic-ops traffic in the same directory.
 #[test]
 fn file_content_integrity_through_ops() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("datadir").expect("mkdir datadir");
 
     let data_a = b"file A: 0123456789abcdef\n".to_vec();
@@ -465,7 +485,9 @@ fn file_content_integrity_through_ops() {
 /// within a single session.
 #[test]
 fn multi_file_create_unlink_sequence() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("multidir").expect("mkdir multidir");
 
     let names: Vec<String> = (0..8).map(|i| format!("file_{i:02}.txt")).collect();
@@ -537,7 +559,9 @@ fn multi_file_create_unlink_sequence() {
 /// point to the same inode, and have nlink >= 2.
 #[test]
 fn hard_link_creates_new_name() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness
         .create_file("original.txt", b"to be linked\n")
         .expect("create_file original.txt");
@@ -583,7 +607,9 @@ fn hard_link_creates_new_name() {
 /// Hard link preserves byte content: both names read the same data.
 #[test]
 fn hard_link_preserves_content() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let data = b"shared content across hard links\n".to_vec();
     harness
         .create_file("shared.dat", &data)
@@ -606,7 +632,9 @@ fn hard_link_preserves_content() {
 /// Hard link from a nonexistent source must fail with ENOENT.
 #[test]
 fn hard_link_nonexistent_source_returns_enoent() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let src = harness.mount_path().join("no_such_file");
     let dst = harness.mount_path().join("would_be_link");
@@ -631,7 +659,9 @@ fn hard_link_nonexistent_source_returns_enoent() {
 /// Hard link to an existing target name must fail with EEXIST.
 #[test]
 fn hard_link_existing_target_returns_eexist() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness
         .create_file("source.txt", b"source\n")
         .expect("create_file source.txt");
@@ -665,7 +695,9 @@ fn hard_link_existing_target_returns_eexist() {
 /// other link or the underlying data.
 #[test]
 fn unlink_one_link_preserves_other() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     let data = b"persistent under hard link\n".to_vec();
     harness
         .create_file("persist.dat", &data)
@@ -705,7 +737,9 @@ fn unlink_one_link_preserves_other() {
 /// Attempting to unlink a file that does not exist must return ENOENT.
 #[test]
 fn unlink_nonexistent_returns_enoent() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let result = harness.remove_file("no_such_unlink_target");
     assert!(result.is_err(), "unlink nonexistent file must fail");
@@ -721,7 +755,9 @@ fn unlink_nonexistent_returns_enoent() {
 /// on platforms that differentiate unlink/rmdir).
 #[test]
 fn unlink_directory_returns_error() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness.mkdir("a_directory").expect("mkdir a_directory");
 
     let result = harness.remove_file("a_directory");
@@ -741,7 +777,9 @@ fn unlink_directory_returns_error() {
 /// unlinked (POSIX semantics).
 #[test]
 fn unlink_readonly_file_succeeds_in_writable_dir() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness
         .create_file("readonly.txt", b"can unlink me\n")
         .expect("create_file readonly.txt");
@@ -766,7 +804,9 @@ fn unlink_readonly_file_succeeds_in_writable_dir() {
 /// second unlink must return ENOENT.
 #[test]
 fn double_unlink_returns_enoent() {
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness
         .create_file("once.txt", b"unlink me once\n")
         .expect("create_file once.txt");

@@ -286,25 +286,65 @@ where
 mod tests {
     use super::*;
     use std::env;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
 
-    fn test_gate_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join("tidefs-gate-test");
-        let _ = fs::create_dir_all(&dir);
-        dir
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct TestEnvGuard {
+        previous_gate_dir: Option<OsString>,
+        previous_max_capacity: Option<OsString>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl TestEnvGuard {
+        fn new() -> Self {
+            let previous_gate_dir = env::var_os("TIDEFS_HOST_VALIDATION_GATE_DIR");
+            let previous_max_capacity = env::var_os("TIDEFS_HOST_VALIDATION_MAX_CAPACITY");
+            let dir = tempfile::TempDir::new().expect("create gate test dir");
+
+            env::set_var(
+                "TIDEFS_HOST_VALIDATION_GATE_DIR",
+                dir.path().to_string_lossy().as_ref(),
+            );
+            env::set_var("TIDEFS_HOST_VALIDATION_MAX_CAPACITY", "2");
+
+            Self {
+                previous_gate_dir,
+                previous_max_capacity,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            restore_env_var(
+                "TIDEFS_HOST_VALIDATION_GATE_DIR",
+                self.previous_gate_dir.as_ref(),
+            );
+            restore_env_var(
+                "TIDEFS_HOST_VALIDATION_MAX_CAPACITY",
+                self.previous_max_capacity.as_ref(),
+            );
+        }
+    }
+
+    fn restore_env_var(name: &str, value: Option<&OsString>) {
+        match value {
+            Some(value) => env::set_var(name, value),
+            None => env::remove_var(name),
+        }
     }
 
     fn with_test_env<F: FnOnce()>(f: F) {
-        let dir = test_gate_dir();
-        env::set_var(
-            "TIDEFS_HOST_VALIDATION_GATE_DIR",
-            dir.to_string_lossy().as_ref(),
-        );
-        env::set_var("TIDEFS_HOST_VALIDATION_MAX_CAPACITY", "2");
-
-        // Clean any leftover slot files from previous runs.
-        for i in 0..4 {
-            let _ = fs::remove_file(dir.join(format!("slot-{i}")));
-        }
+        let _lock = test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = TestEnvGuard::new();
 
         f();
     }

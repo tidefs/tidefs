@@ -796,17 +796,6 @@ mod tests {
         assert!(names[1] < names[2]);
     }
 
-    // ── VfsReplayHandler ────────────────────────────────────────
-
-    #[test]
-    fn vfs_replay_handler_constructs_with_root_ctx() {
-        // We can't create a real VfsEngine without the full stack,
-        // but we can verify the struct construction compiles and
-        // the type is correct.
-        // This is a compilation-only test — the actual dispatch
-        // requires a real VfsEngine implementation.
-    }
-
     // ── ReplayEngine checkpoint ─────────────────────────────────
 
     #[test]

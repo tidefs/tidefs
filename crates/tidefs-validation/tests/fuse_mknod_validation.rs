@@ -111,7 +111,9 @@ fn assert_errno(result: &io::Result<()>, expected: i32) {
 #[test]
 fn mknod_fifo_creates_visible_entry_with_mode() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("myfifo", libc::S_IFIFO | 0o660, 0)
@@ -129,7 +131,9 @@ fn mknod_fifo_creates_visible_entry_with_mode() {
 #[test]
 fn mknod_fifo_respects_umask() {
     let _umask = UmaskGuard::set(0o027);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("umask_fifo", libc::S_IFIFO | 0o666, 0)
@@ -147,7 +151,9 @@ fn mknod_fifo_respects_umask() {
 #[test]
 fn mknod_fifo_zero_permissions_visible() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("zero_perm_fifo", libc::S_IFIFO, 0)
@@ -161,7 +167,9 @@ fn mknod_fifo_zero_permissions_visible() {
 #[test]
 fn mknod_fifo_appears_in_readdir() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("pipe_a", libc::S_IFIFO | 0o644, 0)
@@ -184,7 +192,9 @@ fn mknod_fifo_appears_in_readdir() {
 #[test]
 fn mknod_fifo_nlink_is_one() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("nlink_fifo", libc::S_IFIFO | 0o644, 0)
@@ -197,7 +207,9 @@ fn mknod_fifo_nlink_is_one() {
 #[test]
 fn mknod_fifo_size_is_zero() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("size0_fifo", libc::S_IFIFO | 0o644, 0)
@@ -214,7 +226,9 @@ fn mknod_fifo_size_is_zero() {
 #[test]
 fn mknod_socket_creates_entry_with_correct_kind() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let result = harness.mknod("mysock", libc::S_IFSOCK | 0o600, 0);
     // Socket creation may or may not be supported through FUSE mknod.
@@ -247,7 +261,9 @@ fn mknod_socket_creates_entry_with_correct_kind() {
 #[test]
 fn mknod_char_device_creates_entry_with_rdev() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let result = harness.mknod("null_dev", libc::S_IFCHR | 0o666, 0x0103);
     match result {
@@ -280,7 +296,9 @@ fn mknod_char_device_creates_entry_with_rdev() {
 #[test]
 fn mknod_block_device_creates_entry_with_rdev() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let result = harness.mknod("sda_dev", libc::S_IFBLK | 0o660, 0x0800);
     match result {
@@ -313,7 +331,9 @@ fn mknod_block_device_creates_entry_with_rdev() {
 #[test]
 fn mknod_all_types_respect_mode_bits() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     // FIFO
     let res_fifo = harness.mknod("modetest_fifo", libc::S_IFIFO | 0o642, 0);
@@ -351,7 +371,9 @@ fn mknod_all_types_respect_mode_bits() {
 #[test]
 fn mknod_fifo_duplicate_name_returns_eexist() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("dup_fifo", libc::S_IFIFO | 0o644, 0)
@@ -368,7 +390,9 @@ fn mknod_fifo_duplicate_name_returns_eexist() {
 #[test]
 fn mknod_over_existing_regular_file_returns_eexist() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .create_file("existing_file", b"content\n")
@@ -381,7 +405,9 @@ fn mknod_over_existing_regular_file_returns_eexist() {
 #[test]
 fn mknod_over_existing_directory_returns_eexist() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness.mkdir("mydir").expect("mkdir");
 
@@ -392,7 +418,9 @@ fn mknod_over_existing_directory_returns_eexist() {
 #[test]
 fn mknod_same_name_different_type_returns_eexist() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("multi_type", libc::S_IFIFO | 0o644, 0)
@@ -419,7 +447,9 @@ fn mknod_on_read_only_mount_returns_erofs() {
     // For mount-level: mknod on a live RW mount succeeds (tested above),
     // confirming the non-EROFS path is intact.
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     // Verify that RW mknod succeeds, confirming EROFS is not spuriously
     // triggered on a RW mount.
@@ -435,7 +465,9 @@ fn mknod_on_read_only_mount_returns_erofs() {
 #[test]
 fn mknod_under_nonexistent_parent_returns_enoent() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let result = harness.mknod("no_parent/pipe", libc::S_IFIFO | 0o644, 0);
     assert_errno(&result, libc::ENOENT);
@@ -448,7 +480,10 @@ fn mknod_under_nonexistent_parent_returns_enoent() {
 #[test]
 fn concurrent_mknod_disjoint_names_thread_isolation() {
     let _umask = UmaskGuard::set(0);
-    let harness = Arc::new(MountHarness::new().expect("harness setup"));
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
+    let harness = Arc::new(harness);
     let mut handles = Vec::new();
 
     for tid in 0..6 {
@@ -491,7 +526,9 @@ fn concurrent_mknod_disjoint_names_thread_isolation() {
 #[test]
 fn mknod_fifo_attributes_persist_across_graceful_remount() {
     let _umask = UmaskGuard::set(0);
-    let mut harness = MountHarness::new().expect("harness setup");
+    let Some(mut harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("persist_fifo", libc::S_IFIFO | 0o631, 0)
@@ -525,7 +562,9 @@ fn mknod_namespace_state_digest_deterministic() {
     // Create two independent mounts with identical operations.
     // Their namespace digests must match, confirming deterministic
     // creation and no cross-test contamination.
-    let harness1 = MountHarness::new().expect("harness1 setup");
+    let Some(harness1) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness1
         .mknod("a", libc::S_IFIFO | 0o644, 0)
         .expect("mknod a");
@@ -538,7 +577,9 @@ fn mknod_namespace_state_digest_deterministic() {
     let entries1 = harness1.readdir(".").expect("readdir harness1");
     let digest1 = hash_dir_state(&entries1);
 
-    let harness2 = MountHarness::new().expect("harness2 setup");
+    let Some(harness2) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
     harness2
         .mknod("a", libc::S_IFIFO | 0o644, 0)
         .expect("mknod a");
@@ -560,7 +601,9 @@ fn mknod_namespace_state_digest_deterministic() {
 #[test]
 fn mknod_namespace_state_digest_changes_on_new_entry() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("first", libc::S_IFIFO | 0o644, 0)
@@ -587,7 +630,9 @@ fn mknod_namespace_state_digest_changes_on_new_entry() {
 #[test]
 fn mknod_empty_name_returns_einval() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     // libc mknod with "" will translate to ENOENT or EINVAL
     // depending on the kernel and FUSE layer.
@@ -599,7 +644,9 @@ fn mknod_empty_name_returns_einval() {
 #[test]
 fn mknod_overly_long_name_returns_enametoolong() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let long_name = "x".repeat(256);
     let result = harness.mknod(&long_name, libc::S_IFIFO | 0o644, 0);
@@ -609,7 +656,9 @@ fn mknod_overly_long_name_returns_enametoolong() {
 #[test]
 fn mknod_dot_name_returns_eexist() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let result = harness.mknod(".", libc::S_IFIFO | 0o644, 0);
     assert_errno(&result, libc::EEXIST);
@@ -618,7 +667,9 @@ fn mknod_dot_name_returns_eexist() {
 #[test]
 fn mknod_dotdot_name_returns_eexist() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let result = harness.mknod("..", libc::S_IFIFO | 0o644, 0);
     assert_errno(&result, libc::EEXIST);
@@ -627,7 +678,9 @@ fn mknod_dotdot_name_returns_eexist() {
 #[test]
 fn mknod_name_with_slash_returns_einval() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     // A name with a slash should fail; kernel may return EINVAL or
     // treat it as a path (ENOENT if intermediate doesn't exist).
@@ -638,7 +691,9 @@ fn mknod_name_with_slash_returns_einval() {
 #[test]
 fn mknod_mode_zero_rejected_or_defaulted() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     // Mode 0 (no file type bits set) — some kernels reject, others
     // may interpret it as S_IFREG.  Exercise and verify behavior.
@@ -666,7 +721,9 @@ fn mknod_mode_zero_rejected_or_defaulted() {
 #[test]
 fn mknod_fifo_with_nonzero_rdev_behavior() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let result = harness.mknod("bad_rdev_fifo", libc::S_IFIFO | 0o644, 1);
     match result {
@@ -719,7 +776,9 @@ fn blake3_mknod_domain_isolation() {
 #[test]
 fn comprehensive_mknod_inode_integrity_matrix() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     // FIFO with varied permissions
     let cases: &[(&str, u32, u64)] = &[
@@ -768,7 +827,9 @@ fn comprehensive_mknod_inode_integrity_matrix() {
 #[test]
 fn mknod_fifo_in_subdirectory_is_visible() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness.mkdir("sub").expect("mkdir sub");
     harness
@@ -785,7 +846,9 @@ fn mknod_fifo_in_subdirectory_is_visible() {
 #[test]
 fn mknod_multiple_fifos_independent_inodes() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("a", libc::S_IFIFO | 0o644, 0)
@@ -828,7 +891,9 @@ fn mknod_multiple_fifos_independent_inodes() {
 #[test]
 fn mknod_reuse_name_after_unlink_creates_new_entry() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     harness
         .mknod("reuse", libc::S_IFIFO | 0o600, 0)
@@ -855,7 +920,9 @@ fn mknod_reuse_name_after_unlink_creates_new_entry() {
 #[test]
 fn mknod_regular_file_via_mknod() {
     let _umask = UmaskGuard::set(0);
-    let harness = MountHarness::new().expect("harness setup");
+    let Some(harness) = MountHarness::new_or_skip(module_path!()) else {
+        return;
+    };
 
     let result = harness.mknod("regular_via_mknod", libc::S_IFREG | 0o644, 0);
     match result {

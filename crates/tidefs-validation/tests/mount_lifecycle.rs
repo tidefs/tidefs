@@ -39,11 +39,6 @@ fn mount_unmount_roundtrip() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-#[test]
-#[ignore = "FUSE mount tests require Linux"]
-fn mount_unmount_roundtrip() {}
-
 // ── mount_reject_double ───────────────────────────────────────────────────
 
 /// Attempt to mount a second daemon on an already-mounted path.
@@ -107,11 +102,6 @@ fn mount_reject_double() {
     );
 }
 
-#[cfg(not(target_os = "linux"))]
-#[test]
-#[ignore = "FUSE mount tests require Linux"]
-fn mount_reject_double() {}
-
 // ── mount_unmount_stress ──────────────────────────────────────────────────
 
 /// Tight loop of mount/unmount (100 cycles) checking for resource
@@ -174,11 +164,6 @@ fn mount_unmount_stress() {
         );
     }
 }
-
-#[cfg(not(target_os = "linux"))]
-#[test]
-#[ignore = "FUSE mount tests require Linux"]
-fn mount_unmount_stress() {}
 
 #[cfg(target_os = "linux")]
 fn median(data: &[u64]) -> u64 {

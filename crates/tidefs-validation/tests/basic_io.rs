@@ -66,11 +66,6 @@ fn create_stat_unlink() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-#[test]
-#[ignore = "FUSE mount tests require Linux"]
-fn create_stat_unlink() {}
-
 // ── write_read_verify_small ─────────────────────────────────────────────
 
 /// Write 4 KiB of known pattern, read back byte-for-byte within a
@@ -114,11 +109,6 @@ fn write_read_verify_small() {
     );
     assert_eq!(got, expected, "byte-for-byte readback mismatch");
 }
-
-#[cfg(not(target_os = "linux"))]
-#[test]
-#[ignore = "FUSE mount tests require Linux"]
-fn write_read_verify_small() {}
 
 // ── write_read_sparse_hole ──────────────────────────────────────────────
 
@@ -215,11 +205,6 @@ fn write_read_sparse_hole() {
     );
 }
 
-#[cfg(not(target_os = "linux"))]
-#[test]
-#[ignore = "FUSE mount tests require Linux"]
-fn write_read_sparse_hole() {}
-
 // ── concurrent_write_no_corruption ──────────────────────────────────────
 
 /// Two threads write disjoint 4 KiB regions of the same file; after
@@ -294,11 +279,6 @@ fn concurrent_write_no_corruption() {
         "region B (offset 4KiB..8KiB) corrupted after concurrent write"
     );
 }
-
-#[cfg(not(target_os = "linux"))]
-#[test]
-#[ignore = "FUSE mount tests require Linux"]
-fn concurrent_write_no_corruption() {}
 
 // ── helpers ────────────────────────────────────────────────────────────
 
