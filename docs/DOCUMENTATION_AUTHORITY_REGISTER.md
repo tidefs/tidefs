@@ -101,7 +101,6 @@ leftovers in
 `docs/design/coordination-pipeline-status-update-1767.md`,
 `docs/design/coordination-pipeline-status-update-1839.md`,
 `docs/design/coordination-pipeline-status-update-1915.md`,
-`docs/design/derived-views-first-class-architectural-pillar.md`,
 `docs/design/incremental-job-core-wire-up-deferred-design.md`, and
 `docs/design/unified-on-media-format-lifecycle.md` are left for a later
 planner turn because each needs its own expected write set and per-document
@@ -466,3 +465,20 @@ larger than this documentation-authority cleanup.
 | `docs/design/v1-extent-map-tristate-model.md` | Historical input | Imported sealed architecture/design note for the V1 tristate extent model. It references current extent-map crates, but source/claims reconciliation for the full sparse-file, FIEMAP, fallocate, and stat-block contract remains out of scope here. |
 | `docs/design/v1-locator-table-inline-hash.md` | Historical input | Imported V1 locator-table inline-hash design that names `crates/tidefs-locator-table`. Promotion would require a focused locator-table source, validation, and claims-gate review. |
 | `docs/design/workload-adaptive-recordsize-and-extent-shaping.md` | Historical input | Imported workload-adaptive recordsize/extent-shaping design. It contains policy and performance implications that need storage allocator, extent, and claims evidence before becoming current authority. |
+
+### Derived-Views Architectural Pillar (TFR-019 / #1240)
+
+Classified for TFR-019 / GitHub issue #1240 on 2026-06-24 after reviewing this
+register's authority rule and review method, the TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, the imported derived-views pillar document,
+`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and bounded source/doc
+searches for ValidityToken, derived-view, ViewClass, ViewBuildCost, WorkBudget,
+cache-lattice, cursor-framework, resource-governor, and Forgejo-era
+lane/priority/milestone wording in the current source tree. This slice does not
+implement derived views, does not recreate deleted cache-lattice or
+cursor-framework design docs, and does not convert historical architectural
+design into current product claims.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/derived-views-first-class-architectural-pillar.md` | Historical input | Imported Forgejo-era derived-views architectural design with old issue #1240 metadata, P2 priority, DESIGN-M4 milestone, lane/blocking claims, `STATUS.md`/`FEATURE_MATRIX.md` references, DEPENDS-ON links to retired Forgejo issues #1173/#1176/#1237/#1239, and cache-lattice/cursor-framework/resource-governor design-spec wording. Live source has a simpler `ValidityToken` (32-byte BLAKE3 opaque token with `matches()`) in `tidefs-types-cache-lattice-core` and stub `ViewClass`/`ViewBuildCost` enums without derived-view implementations, but no multi-kind token dispatch, no six-view-type runtime, no incremental delta refresh, and no budget-governor wiring. The cache-lattice, cursor-framework, resource-governor, and WorkBudget architectural claims in the document exceed current live-source and claim-registry evidence. The file is preserved as lineage material for future review and must not be cited as current TideFS implementation status, release-readiness evidence, or product authority. |
