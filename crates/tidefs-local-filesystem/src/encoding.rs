@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
 
+use tidefs_extent_map::ExtentMap;
 use tidefs_local_object_store::{checksum64, IntegrityDigest64, ObjectKey};
 use tidefs_types_vfs_core::{Generation, InodeId, NodeKind};
 
@@ -549,15 +551,8 @@ pub(crate) fn decode_committed_root_summary(
 pub(crate) fn encode_changed_record_export(export: &ChangedRecordExport) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&SEND_RECEIVE_STREAM_MAGIC_BYTES);
-    // stream_version encoding:
-    //   full:     1 (none), 3 (with placement_epoch)
-    //   incremental: 2 (none), 4 (with placement_epoch)
-    let base_version: u16 = if export.incremental { 2 } else { 1 };
-    let stream_version: u16 = if export.placement_epoch.is_some() {
-        base_version + 2
-    } else {
-        base_version
-    };
+    let stream_version =
+        changed_record_stream_version(export.from_root.is_some(), export.placement_epoch.is_some());
     push_u16(&mut out, stream_version);
     push_u16(&mut out, 0); // reserved
     encode_committed_root_summary(&mut out, &export.current_root);
@@ -589,6 +584,7 @@ pub(crate) fn decode_changed_record_export(bytes: &[u8]) -> Result<ChangedRecord
     let mut decoder = Decoder::new("local filesystem send/receive stream", bytes);
     decoder.expect_magic(SEND_RECEIVE_STREAM_MAGIC_BYTES)?;
     let stream_version = decoder.read_u16()?;
+    let envelope = decode_changed_record_stream_version(stream_version)?;
     if decoder.read_u16()? != 0 {
         return Err(FileSystemError::Decode {
             object: "local filesystem send/receive stream",
@@ -596,14 +592,12 @@ pub(crate) fn decode_changed_record_export(bytes: &[u8]) -> Result<ChangedRecord
         });
     }
     let current_root = decode_committed_root_summary(&mut decoder)?;
-    // Decode optional from_root (versions 2 and 4 are incremental).
-    let from_root = if stream_version == 2 || stream_version == 4 {
+    let from_root = if envelope.incremental {
         Some(decode_committed_root_summary(&mut decoder)?)
     } else {
         None
     };
-    // Decode optional placement_epoch (versions 3 and 4 carry it).
-    let placement_epoch = if stream_version >= 3 {
+    let placement_epoch = if envelope.has_placement_epoch {
         Some(decoder.read_u64()?)
     } else {
         None
@@ -634,6 +628,7 @@ pub(crate) fn decode_changed_record_export(bytes: &[u8]) -> Result<ChangedRecord
             let checksum = IntegrityDigest64(decoder.read_u64()?);
             let payload_len = decoder.read_count()?;
             let payload = decoder.read_bytes(payload_len)?.to_vec();
+            validate_changed_record_payload(role, &payload)?;
             payload_bytes = payload_bytes.checked_add(payload.len() as u64).ok_or(
                 FileSystemError::SizeOverflow {
                     requested: u64::MAX,
@@ -666,6 +661,101 @@ pub(crate) fn decode_changed_record_export(bytes: &[u8]) -> Result<ChangedRecord
         incremental,
         placement_epoch,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChangedRecordEnvelopeVersion {
+    incremental: bool,
+    has_placement_epoch: bool,
+}
+
+fn changed_record_stream_version(incremental: bool, has_placement_epoch: bool) -> u16 {
+    match (incremental, has_placement_epoch) {
+        (false, false) => 1,
+        (true, false) => 2,
+        (false, true) => 3,
+        (true, true) => 4,
+    }
+}
+
+fn decode_changed_record_stream_version(
+    stream_version: u16,
+) -> Result<ChangedRecordEnvelopeVersion> {
+    let envelope = match stream_version {
+        1 => ChangedRecordEnvelopeVersion {
+            incremental: false,
+            has_placement_epoch: false,
+        },
+        2 => ChangedRecordEnvelopeVersion {
+            incremental: true,
+            has_placement_epoch: false,
+        },
+        3 => ChangedRecordEnvelopeVersion {
+            incremental: false,
+            has_placement_epoch: true,
+        },
+        4 => ChangedRecordEnvelopeVersion {
+            incremental: true,
+            has_placement_epoch: true,
+        },
+        _ => {
+            return Err(FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "unsupported stream version",
+            })
+        }
+    };
+    Ok(envelope)
+}
+
+fn validate_changed_record_payload(role: ChangedRecordObjectRole, payload: &[u8]) -> Result<()> {
+    match role {
+        ChangedRecordObjectRole::TransactionManifest => {
+            decode_transaction_manifest(payload)?;
+        }
+        ChangedRecordObjectRole::TransactionSuperblock => {
+            decode_superblock(payload)?;
+        }
+        ChangedRecordObjectRole::TransactionInode => {
+            decode_inode(payload)?;
+        }
+        ChangedRecordObjectRole::TransactionDirectory => {
+            decode_directory(payload)?;
+        }
+        ChangedRecordObjectRole::VersionedContent => {
+            if payload.starts_with(&CONTENT_MANIFEST_MAGIC)
+                || payload.starts_with(&CONTENT_MANIFEST_SPARSE_MAGIC)
+            {
+                decode_content_manifest(payload)?;
+            } else {
+                decode_content(payload)?;
+            }
+        }
+        ChangedRecordObjectRole::VersionedContentChunk => {
+            if is_dedup_redirect(payload) {
+                decode_dedup_redirect(payload)?;
+            } else {
+                decode_content_chunk(payload)?;
+            }
+        }
+        ChangedRecordObjectRole::TransactionSnapshotCatalogEntry => {
+            decode_snapshot_record(payload)?;
+        }
+        ChangedRecordObjectRole::TransactionExtentMap => {
+            let mut cursor = Cursor::new(payload);
+            ExtentMap::deserialize(&mut cursor).map_err(|_| FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "extent-map changed-record payload did not decode",
+            })?;
+            if cursor.position() != payload.len() as u64 {
+                return Err(FileSystemError::Decode {
+                    object: "local filesystem send/receive stream",
+                    reason: "extent-map changed-record payload has trailing bytes",
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Polymorphic xattr encode/decode ────────────────────────────────────────
@@ -1502,4 +1592,169 @@ pub(crate) fn decode_dedup_redirect(bytes: &[u8]) -> crate::Result<ObjectKey> {
     key_bytes.copy_from_slice(decoder.read_bytes(32)?);
     decoder.finish()?;
     Ok(ObjectKey::from_bytes32(key_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root_summary(transaction_id: u64) -> CommittedRootSummary {
+        CommittedRootSummary {
+            slot: 0,
+            transaction_id,
+            generation: transaction_id,
+            next_inode_id: 2,
+            inode_count: 1,
+            superblock_checksum: IntegrityDigest64(0x1000 + transaction_id),
+            has_transaction_manifest: true,
+            manifest_checksum: IntegrityDigest64(0x2000 + transaction_id),
+            manifest_entry_count: 0,
+            has_root_authentication: false,
+            root_authentication_policy_epoch: None,
+            root_authentication_algorithm_suite_id: None,
+            superblock_digest: None,
+            manifest_digest: None,
+            root_authentication_code: None,
+        }
+    }
+
+    fn changed_record_export(
+        from_root: Option<CommittedRootSummary>,
+        placement_epoch: Option<u64>,
+        records: Vec<ChangedObjectRecord>,
+    ) -> ChangedRecordExport {
+        let incremental = from_root.is_some();
+        let current_root = root_summary(2);
+        ChangedRecordExport {
+            spec: SEND_RECEIVE_CHANGED_RECORD_SPEC,
+            stream_version: 0,
+            current_root: current_root.clone(),
+            roots: vec![ChangedRecordRoot {
+                source_root: current_root,
+                records,
+            }],
+            total_records: 0,
+            payload_bytes: 0,
+            production_fsck_required: false,
+            from_root,
+            incremental,
+            placement_epoch,
+        }
+    }
+
+    fn encoded_stream_version(encoded: &[u8]) -> u16 {
+        u16::from_le_bytes(
+            encoded
+                [SEND_RECEIVE_STREAM_MAGIC_BYTES.len()..SEND_RECEIVE_STREAM_MAGIC_BYTES.len() + 2]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn changed_record_version_authority_derives_vfssend1_envelope_versions() {
+        for (from_root, placement_epoch, expected_version) in [
+            (None, None, 1),
+            (Some(root_summary(1)), None, 2),
+            (None, Some(7), 3),
+            (Some(root_summary(1)), Some(7), 4),
+        ] {
+            let export = changed_record_export(from_root.clone(), placement_epoch, Vec::new());
+            let encoded = encode_changed_record_export(&export);
+            assert_eq!(encoded_stream_version(&encoded), expected_version);
+
+            let decoded = decode_changed_record_export(&encoded).expect("decode export");
+            assert_eq!(decoded.stream_version, expected_version);
+            assert_eq!(decoded.incremental, from_root.is_some());
+            assert_eq!(decoded.from_root, from_root);
+            assert_eq!(decoded.placement_epoch, placement_epoch);
+        }
+    }
+
+    #[test]
+    fn changed_record_version_authority_rejects_unsupported_vfssend1_envelope_version() {
+        let export = changed_record_export(None, None, Vec::new());
+        let mut encoded = encode_changed_record_export(&export);
+        let version_offset = SEND_RECEIVE_STREAM_MAGIC_BYTES.len();
+        encoded[version_offset..version_offset + 2].copy_from_slice(&5_u16.to_le_bytes());
+
+        let err = decode_changed_record_export(&encoded).expect_err("unsupported version");
+        assert!(matches!(
+            err,
+            FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "unsupported stream version",
+            }
+        ));
+    }
+
+    #[test]
+    fn changed_record_version_authority_rejects_inode_payload_without_explicit_posix_timestamps() {
+        let payload = inode_payload_with_format_version(4);
+        let record = ChangedObjectRecord {
+            role: ChangedRecordObjectRole::TransactionInode,
+            object_key: ObjectKey::from_bytes32([3_u8; 32]),
+            checksum: checksum64(&payload),
+            payload,
+        };
+        let export = changed_record_export(None, None, vec![record]);
+        let encoded = encode_changed_record_export(&export);
+
+        let err = decode_changed_record_export(&encoded).expect_err("pre-v5 inode payload");
+        assert!(matches!(
+            err,
+            FileSystemError::Decode {
+                object: "local filesystem inode",
+                reason: "format version below 5 lacks explicit POSIX timestamps; re-create with current format",
+            }
+        ));
+    }
+
+    #[test]
+    fn changed_record_version_authority_rejects_extent_map_payload_trailing_bytes() {
+        let mut payload = Vec::new();
+        ExtentMap::default()
+            .serialize(&mut payload)
+            .expect("serialize empty extent map");
+        payload.push(0);
+        let record = ChangedObjectRecord {
+            role: ChangedRecordObjectRole::TransactionExtentMap,
+            object_key: ObjectKey::from_bytes32([4_u8; 32]),
+            checksum: checksum64(&payload),
+            payload,
+        };
+        let export = changed_record_export(None, None, vec![record]);
+        let encoded = encode_changed_record_export(&export);
+
+        let err = decode_changed_record_export(&encoded).expect_err("trailing extent-map bytes");
+        assert!(matches!(
+            err,
+            FileSystemError::Decode {
+                object: "local filesystem send/receive stream",
+                reason: "extent-map changed-record payload has trailing bytes",
+            }
+        ));
+    }
+
+    fn inode_payload_with_format_version(version: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&INODE_MAGIC);
+        push_u16(&mut out, version);
+        push_u16(&mut out, 0);
+        push_u64(&mut out, 42);
+        push_u64(&mut out, 77);
+        push_u32(&mut out, NodeKind::File.as_u32());
+        push_u32(&mut out, 0o100644);
+        push_u32(&mut out, 1000);
+        push_u32(&mut out, 1000);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, 0);
+        push_u64(&mut out, 0);
+        push_u64(&mut out, 17);
+        push_u64(&mut out, 23);
+        if version >= 4 {
+            push_u32(&mut out, 0);
+        }
+        out
+    }
 }
