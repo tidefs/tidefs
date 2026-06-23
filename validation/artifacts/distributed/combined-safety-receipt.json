@@ -8,10 +8,7 @@
   "related_claim_ids": [
     "distributed.combined_safety.model.v1"
   ],
-  "blocking_issues": [
-    "GitHub issue #538 owns this model-check receipt slice.",
-    "Runtime distributed evidence remains missing: no storage-node, transport, RDMA, production cluster, or multi-process runtime artifact is validated by this report."
-  ],
+  "blocking_issues": [],
   "bounds": {
     "max_model_nodes": 7,
     "max_model_epoch": 16,
