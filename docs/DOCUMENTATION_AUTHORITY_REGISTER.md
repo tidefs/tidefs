@@ -101,8 +101,7 @@ leftovers in
 `docs/design/coordination-pipeline-status-update-1767.md`,
 `docs/design/coordination-pipeline-status-update-1839.md`,
 `docs/design/coordination-pipeline-status-update-1915.md`,
-`docs/design/incremental-job-core-wire-up-deferred-design.md`, and
-`docs/design/unified-on-media-format-lifecycle.md` are left for a later
+`docs/design/incremental-job-core-wire-up-deferred-design.md` are left for a later
 planner turn because each needs its own expected write set and per-document
 authority decision. Rewriting them here would recreate the broad docs sweep
 that #952 split into focused slices.
@@ -482,3 +481,19 @@ design into current product claims.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/design/derived-views-first-class-architectural-pillar.md` | Historical input | Imported Forgejo-era derived-views architectural design with old issue #1240 metadata, P2 priority, DESIGN-M4 milestone, lane/blocking claims, `STATUS.md`/`FEATURE_MATRIX.md` references, DEPENDS-ON links to retired Forgejo issues #1173/#1176/#1237/#1239, and cache-lattice/cursor-framework/resource-governor design-spec wording. Live source has a simpler `ValidityToken` (32-byte BLAKE3 opaque token with `matches()`) in `tidefs-types-cache-lattice-core` and stub `ViewClass`/`ViewBuildCost` enums without derived-view implementations, but no multi-kind token dispatch, no six-view-type runtime, no incremental delta refresh, and no budget-governor wiring. The cache-lattice, cursor-framework, resource-governor, and WorkBudget architectural claims in the document exceed current live-source and claim-registry evidence. The file is preserved as lineage material for future review and must not be cited as current TideFS implementation status, release-readiness evidence, or product authority. |
+
+### Unified On-Media Format Lifecycle (TFR-019 / #1242)
+
+Classified for TFR-019 / GitHub issue #1242 on 2026-06-24 after reviewing this
+register's authority rule and review method, the TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, the imported unified-on-media-format-lifecycle
+document, `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`,
+`docs/design/on-media-format-strategy.md`, and bounded source/doc searches for
+Forgejo-era issue references, design-spec, status, lane, maturity, and priority
+metadata in the current documentation surface. This slice does not edit
+`docs/design/on-media-format-strategy.md`, other sibling #952 leftover files,
+product source, or unrelated docs.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/unified-on-media-format-lifecycle.md` | Historical input | Imported Forgejo-era unified five-phase lifecycle design with old issue #1238 metadata (Forgejo on `172.16.106.12`), design-spec status, P1 priority, docs lane, and cross-references to old Forgejo-era issue numbers (#1220, #1223, #1225, #1222, #1224, #1185, #1235, #1236) whose current TideFS GitHub issue mapping is undefined under TFR-019. The file defines a meta-framework for on-media record format phases (record families, feature flags, TLV extensions, rebake, golden vectors, trace oracle, torn-commit recovery) that has no current live-source implementation evidence, no claim-registry coverage, and no current format-lifecycle policy authority in the active GitHub issue and PR coordination surface. The individual format docs referenced remain canonical for their own domains under separate register rows; this lifecycle file is preserved as design lineage material and must not be cited as current TideFS implementation status, release-readiness evidence, or format-lifecycle authority. |
