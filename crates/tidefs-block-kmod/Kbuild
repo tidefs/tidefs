@@ -8,8 +8,9 @@
 #
 # The module defaults to pool-required backend selection and refuses to
 # register /dev/tidefs when /dev/tidefs_pool_member cannot be opened. Smoke
-# tests that intentionally need the in-memory backend must pass:
-#   RUSTFLAGS_MODULE=--cfg=tidefs_block_kmod_bringup_backend
+# tests that intentionally need the in-memory backend must keep the warning
+# gate and pass:
+#   RUSTFLAGS_MODULE='-Dwarnings --cfg=tidefs_block_kmod_bringup_backend'
 #
 # Prerequisites:
 #   - Linux 7.0 kernel build tree with CONFIG_RUST=y

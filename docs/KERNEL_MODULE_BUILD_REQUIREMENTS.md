@@ -148,27 +148,29 @@ make -j8 -C crates/tidefs-block-kmod \
   O=/path/to/linux-7.0-build \
   MO=/path/to/module-out/block-kmod \
   LLVM=1 \
-  RUSTFLAGS_MODULE='--cfg=tidefs_block_kmod_bringup_backend'
+  RUSTFLAGS_MODULE='-Dwarnings --cfg=tidefs_block_kmod_bringup_backend'
 ```
 
 The `RUSTFLAGS_MODULE` assignment on the command line overrides the Kbuild
-default (`-Dwarnings`) so the smoke-test cfg is the only flag. The warning
-gate is relaxed intentionally for bringup-only smoke builds.
+default, so the smoke-test cfg must include `-Dwarnings` explicitly to keep
+the warning policy active.
 
 ### Nix build (CI parity)
 
 ```sh
-nix build -L .#packages.x86_64-linux.tidefsPosixVfsKmod
+nix build -L \
+  .#packages.x86_64-linux.tidefsPosixVfsKmod \
+  .#packages.x86_64-linux.tidefsBlockKmod
 ```
 
-This builds the module against the Nix Linux 7.0 guest kernel and catches
+This builds both modules against the Nix Linux 7.0 guest kernel and catches
 any warning-as-error regression.
 
 ## CI gating
 
 The `Nix Checks` workflow (`.github/workflows/nix-checks.yml`) builds
-`tidefsPosixVfsKmod` as part of every PR. A non-zero warning or a Kbuild
-failure blocks the PR.
+`tidefsPosixVfsKmod` and `tidefsBlockKmod` as part of every PR. A non-zero
+warning or a Kbuild failure blocks the PR.
 
 ## Warning policy
 
