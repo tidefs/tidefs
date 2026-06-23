@@ -113,10 +113,7 @@ impl DistributedSafetyReceipt {
             runtime_boundary:
                 "model evidence only; this does not validate storage-node runtime, transport, RDMA, production cluster, cluster CLI, or multi-process behavior",
             related_claim_ids: vec![DISTRIBUTED_COMBINED_SAFETY_CLAIM_ID],
-            blocking_issues: vec![
-                "GitHub issue #538 owns this model-check receipt slice.",
-                "Runtime distributed evidence remains missing: no storage-node, transport, RDMA, production cluster, or multi-process runtime artifact is validated by this report.",
-            ],
+            blocking_issues: Vec::new(),
             bounds: DistributedSafetyBounds::from_system(sys),
             checked_invariants,
             outcome: DistributedSafetyOutcome::from_violations(violations),

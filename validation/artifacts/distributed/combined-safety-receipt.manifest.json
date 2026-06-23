@@ -5,12 +5,12 @@
   "validation_tier": "source-model",
   "scope": "bounded deterministic distributed source model for epoch, lease, quorum, placement receipt, and rebuild safety invariants; not storage-node, transport, multi-process, production cluster, RDMA, or runtime proof",
   "artifact_path": "validation/artifacts/distributed/combined-safety-receipt.json",
-  "content_digest": "blake3:c1637a5ba57fad54d64045c7b46338661a7ce5750fa102c63890697b997f4cba",
+  "content_digest": "blake3:00efb0cbe6d0ce9789b09f139f22181e31f64de979e11de6f74660b325b41a9f",
   "run_id": "deterministic-fixture:distributed-combined-safety-receipt-v1",
-  "source_ref": "refs/heads/gpt2/issue-811-model-evidence-manifests",
+  "source_ref": "refs/heads/gpt6/issue-820-distributed-model-check",
   "outcome": "pass",
   "residual_risk": "The combined safety receipt is bounded source-model evidence only. It does not validate storage-node runtime, distributed transport, multi-process execution, production cluster behavior, RDMA, or runtime fault recovery.",
   "source": "tidefs-distributed-model-check",
-  "generated_at": "2026-06-23T00:05:35Z",
+  "generated_at": "2026-06-23T04:02:59Z",
   "blocking_issues": []
 }
