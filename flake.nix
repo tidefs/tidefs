@@ -198,24 +198,6 @@
             ];
           };
 
-          tidefsXtaskRuntime = import ./nix/packages/tidefs.nix {
-            inherit (pkgs) lib pkg-config;
-            inherit (pkgs) fuse3 rdma-core;
-            rustPlatform = rustPlatform;
-            src = tidefsCtlSrc;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-            };
-            cargoBuildFlags = [
-              "-p" "tidefs-xtask"
-              "--bin" "tidefs-xtask"
-            ];
-            workspaceBins = [
-              "tidefs-xtask"
-            ];
-          };
-
-
           tidefsCtlRuntime = import ./nix/packages/tidefs.nix {
             inherit (pkgs) lib pkg-config;
             inherit (pkgs) fuse3 rdma-core;
