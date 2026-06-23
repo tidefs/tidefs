@@ -2698,7 +2698,13 @@ impl LocalFileSystem {
         let target_len =
             min_image_bytes.max(DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES);
         if len.len() < target_len {
-            file.set_len(target_len).map_err(|source| {
+            // Only size a freshly-created device file (len == 0).
+            // If the file already has content (a pre-existing pool),
+            // leave its size alone: the pool label on disk is the
+            // authority for the device capacity, and resizing the
+            // backing file behind the label's back causes a
+            // DeviceLayoutV1 device size mismatch on re-open.
+            if len.len() == 0 { file.set_len(target_len) } else { Ok(()) }.map_err(|source| {
                 FileSystemError::Store(StoreError::Io {
                     operation: "size_default_development_device_image",
                     path: device_path.clone(),
