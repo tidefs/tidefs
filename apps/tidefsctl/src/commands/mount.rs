@@ -564,6 +564,7 @@ pub fn handle_mount(args: PoolMountArgs) {
         block_devices: args.devices.clone(),
         dataset_path: Some(args.dataset.clone()),
         encryption: encryption_config,
+        snapshot_name: None,
         mount_authority,
     };
 

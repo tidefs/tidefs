@@ -435,6 +435,14 @@ pub struct MountConfig {
     /// When None, the root dataset is mounted.
     pub dataset_path: Option<String>,
 
+    /// Optional snapshot name for read-only snapshot-backed mounts.
+    /// When set, the mount opens the named snapshot's committed root
+    /// instead of the live committed root. The mount is forced read-only,
+    /// does not create a live-owner endpoint, and skips writeback, scrub,
+    /// reclaim, and intent-log configuration. Mutually exclusive with
+    /// cluster mount authority.
+
+    pub snapshot_name: Option<String>,
     /// Authority used to admit the mount as standalone/local or
     /// cluster-lease-authorized.
     pub mount_authority: MountAuthority,
@@ -577,12 +585,21 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     use tidefs_local_filesystem::vfs_engine_impl::VfsLocalFileSystem;
     use tidefs_local_filesystem::LocalFileSystem;
 
+    let snapshot_export = config.snapshot_name.is_some();
+    if snapshot_export && config.mount_authority.is_cluster_authorized() {
+        return Err(
+            "snapshot export mount is not supported with cluster mount authority".to_string()
+        );
+    }
+
     let cluster_lease_token = config
         .mount_authority
         .validate_for_pool(config.pool_uuid.as_ref())?;
 
-    fs::create_dir_all(&config.backing_dir)
-        .map_err(|e| format!("create backing dir {}: {e}", config.backing_dir.display()))?;
+    if !snapshot_export {
+        fs::create_dir_all(&config.backing_dir)
+            .map_err(|e| format!("create backing dir {}: {e}", config.backing_dir.display()))?;
+    }
     fs::create_dir_all(&config.mountpoint)
         .map_err(|e| format!("create mountpoint {}: {e}", config.mountpoint.display()))?;
 
@@ -590,106 +607,151 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
         .unwrap_or_else(|_| tidefs_local_filesystem::RootAuthenticationKey::demo_key());
 
     if config.debug {
-        eprintln!(
-            "tidefsctl: opening store at {}",
-            config.backing_dir.display()
-        );
+        if snapshot_export {
+            eprintln!(
+                "tidefsctl: opening snapshot export `{}` at {}",
+                config.snapshot_name.as_deref().unwrap_or("?"),
+                config.backing_dir.display()
+            );
+        } else {
+            eprintln!(
+                "tidefsctl: opening store at {}",
+                config.backing_dir.display()
+            );
+        }
     }
 
-    let mut lfs = if let Some(ref devices) = config.block_devices {
-        // Block-device-backed pool: use metadata dir + block devices.
+    let (base_engine, writeback_tracker, dataset_id) = if let Some(ref snapshot_name) = config.snapshot_name {
+        // Snapshot export: open the snapshot's committed root as a
+        // read-only namespace with no writeback, scrub, or reclaim.
+        use tidefs_local_filesystem::LocalStorageAllocatorPolicy;
+        use tidefs_local_filesystem::LocalFileSystemOpenConfig;
+        use tidefs_recovery_loop::RecoveryPolicy;
+
+        let open_config = LocalFileSystemOpenConfig {
+            options: StoreOptions::default(),
+            allocator_policy: LocalStorageAllocatorPolicy::default(),
+            root_authentication_key: root_auth_key,
+            encryption: None,
+            compression: None,
+            log_device_device_path: None,
+            recovery_policy: RecoveryPolicy::ReadOnly,
+            block_devices: config.block_devices.as_deref(),
+        };
+        let session =
+            LocalFileSystem::open_snapshot_export(&config.backing_dir, snapshot_name, open_config)
+                .map_err(|e| format!("open snapshot export `{snapshot_name}`: {e}"))?;
+        let summary = session.summary().clone();
         eprintln!(
-            "tidefsctl: opening block-device-backed pool with {} device(s)",
-            devices.len()
+            "tidefsctl: opened snapshot export `{}` at generation {} root inode {}",
+            summary.snapshot.name,
+            summary.generation,
+            summary.root_inode_id.get()
         );
-        if let Some(ref enc) = config.encryption {
+        let mut engine = session.into_engine();
+        engine.set_timestamp_policy(
+            tidefs_inode_attributes::timestamp::TimestampPolicy::Noatime,
+        );
+        engine = engine.with_read_only();
+        let dataset_id: Option<DatasetId> = None;
+        (engine, None, dataset_id)
+    } else {
+        let mut lfs = if let Some(ref devices) = config.block_devices {
+            // Block-device-backed pool: use metadata dir + block devices.
+            eprintln!(
+                "tidefsctl: opening block-device-backed pool with {} device(s)",
+                devices.len()
+            );
+            if let Some(ref enc) = config.encryption {
+                eprintln!("tidefsctl: encryption enabled (key fingerprint not logged)");
+                LocalFileSystem::open_with_block_devices_and_encryption(
+                    &config.backing_dir,
+                    devices,
+                    StoreOptions::default(),
+                    root_auth_key,
+                    enc.clone(),
+                )
+            } else {
+                LocalFileSystem::open_with_block_devices(
+                    &config.backing_dir,
+                    devices,
+                    StoreOptions::default(),
+                    root_auth_key,
+                )
+            }
+        } else if let Some(ref enc) = config.encryption {
             eprintln!("tidefsctl: encryption enabled (key fingerprint not logged)");
-            LocalFileSystem::open_with_block_devices_and_encryption(
+            LocalFileSystem::open_with_root_authentication_key_and_encryption(
                 &config.backing_dir,
-                devices,
                 StoreOptions::default(),
                 root_auth_key,
                 enc.clone(),
             )
         } else {
-            LocalFileSystem::open_with_block_devices(
+            LocalFileSystem::open_with_root_authentication_key(
                 &config.backing_dir,
-                devices,
                 StoreOptions::default(),
                 root_auth_key,
             )
         }
-    } else if let Some(ref enc) = config.encryption {
-        eprintln!("tidefsctl: encryption enabled (key fingerprint not logged)");
-        LocalFileSystem::open_with_root_authentication_key_and_encryption(
-            &config.backing_dir,
-            StoreOptions::default(),
-            root_auth_key,
-            enc.clone(),
-        )
-    } else {
-        LocalFileSystem::open_with_root_authentication_key(
-            &config.backing_dir,
-            StoreOptions::default(),
-            root_auth_key,
-        )
-    }
-    .map_err(|e| format!("open store: {e}"))?;
+        .map_err(|e| format!("open store: {e}"))?;
 
-    // Resolve dataset path through the canonical catalog.
-    let dataset_id: Option<DatasetId> = if let Some(ref ds_path) = config.dataset_path {
-        match lfs.dataset_catalog().snapshot_lookup(ds_path) {
-            Ok(id) => {
-                if config.debug {
-                    eprintln!("tidefsctl: resolved dataset \"{ds_path}\" -> {id}");
+        // Resolve dataset path through the canonical catalog.
+        let dataset_id: Option<DatasetId> = if let Some(ref ds_path) = config.dataset_path {
+            match lfs.dataset_catalog().snapshot_lookup(ds_path) {
+                Ok(id) => {
+                    if config.debug {
+                        eprintln!("tidefsctl: resolved dataset \"{ds_path}\" -> {id}");
+                    }
+                    Some(id)
                 }
-                Some(id)
+                Err(e) => {
+                    return Err(format!("dataset lookup \"{ds_path}\" failed: {e}"));
+                }
             }
-            Err(e) => {
-                return Err(format!("dataset lookup \"{ds_path}\" failed: {e}"));
+        } else {
+            None
+        };
+
+        // Lifecycle gate: refuse mount for non-Active datasets.
+        if let Some(ref ds_path) = config.dataset_path {
+            let lifecycle_state = lfs
+                .dataset_catalog()
+                .lifecycle_state(ds_path)
+                .map_err(|e| format!("dataset lifecycle check \"{ds_path}\" failed: {e}"))?;
+            if lifecycle_state != tidefs_dataset_catalog::LifecycleState::Active {
+                return Err(format!(
+                    "dataset \"{ds_path}\" is in {lifecycle_state} state and cannot be mounted"
+                ));
             }
         }
-    } else {
-        None
+        if let Some(ds_id) = dataset_id {
+            lfs.set_mounted_dataset_id(*ds_id.as_bytes());
+        }
+
+        lfs.set_write_buffer_flush_threshold_bytes(MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES);
+        lfs.set_auto_commit(false);
+        lfs.set_commit_group_throughput_profile();
+        lfs.set_max_uncommitted_mutations(MOUNT_MAX_UNCOMMITTED_MUTATIONS);
+
+        let tracker = Arc::clone(lfs.writeback_range_tracker());
+
+        // Build the base VfsLocalFileSystem, optionally scoped to a dataset root.
+        let mut engine = VfsLocalFileSystem::new(lfs);
+        // When mounting a non-root dataset, scope path resolution to the
+        // dataset directory within the pool so the FUSE mount root exposes
+        // only that dataset's contents.
+        if let Some(ref ds_path) = config.dataset_path {
+            if ds_path != "root" {
+                let dataset_fs_path = format!("/{ds_path}");
+                if config.debug {
+                    eprintln!("tidefsctl: dataset mount root: {ds_path} -> {dataset_fs_path}");
+                }
+                engine = engine.with_dataset_root(&dataset_fs_path);
+            }
+        }
+        (engine, Some(tracker), dataset_id)
     };
-
-    // Lifecycle gate: refuse mount for non-Active datasets.
-    if let Some(ref ds_path) = config.dataset_path {
-        let lifecycle_state = lfs
-            .dataset_catalog()
-            .lifecycle_state(ds_path)
-            .map_err(|e| format!("dataset lifecycle check \"{ds_path}\" failed: {e}"))?;
-        if lifecycle_state != tidefs_dataset_catalog::LifecycleState::Active {
-            return Err(format!(
-                "dataset \"{ds_path}\" is in {lifecycle_state} state and cannot be mounted"
-            ));
-        }
-    }
-    if let Some(ds_id) = dataset_id {
-        lfs.set_mounted_dataset_id(*ds_id.as_bytes());
-    }
-
-    lfs.set_write_buffer_flush_threshold_bytes(MOUNT_WRITE_BUFFER_FLUSH_THRESHOLD_BYTES);
-    lfs.set_auto_commit(false);
-    lfs.set_commit_group_throughput_profile();
-    lfs.set_max_uncommitted_mutations(MOUNT_MAX_UNCOMMITTED_MUTATIONS);
-
-    let writeback_tracker = Arc::clone(lfs.writeback_range_tracker());
-
-    // Build the base VfsLocalFileSystem, optionally scoped to a dataset root.
-    let mut base_engine = VfsLocalFileSystem::new(lfs);
-    // When mounting a non-root dataset, scope path resolution to the
-    // dataset directory within the pool so the FUSE mount root exposes
-    // only that dataset's contents.
-    if let Some(ref ds_path) = config.dataset_path {
-        if ds_path != "root" {
-            let dataset_fs_path = format!("/{ds_path}");
-            if config.debug {
-                eprintln!("tidefsctl: dataset mount root: {ds_path} -> {dataset_fs_path}");
-            }
-            base_engine = base_engine.with_dataset_root(&dataset_fs_path);
-        }
-    }
 
     // When cluster-authorized, wrap the engine in a placement-recording layer.
     let vfs_engine: Box<dyn tidefs_vfs_engine::VfsEngineStatFs + Send> =
@@ -715,10 +777,14 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
         adapter = adapter.with_dataset_id(ds_id);
     }
 
-    if config.writeback_cache {
+    if snapshot_export {
+        adapter = adapter.with_writeback_cache_disabled();
+    } else if config.writeback_cache {
         adapter = adapter
             .with_writeback_cache_enabled()
-            .with_writeback_range_tracker(writeback_tracker);
+            .with_writeback_range_tracker(
+                writeback_tracker.expect("writeback tracker must be present for live mount"),
+            );
     } else {
         adapter = adapter.with_writeback_cache_disabled();
     }
@@ -734,7 +800,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     if !config.foreground {
         options.push(fuser::MountOption::AllowOther);
     }
-    if config.writeback_cache {
+    if !snapshot_export && config.writeback_cache {
         options.push(fuser::MountOption::WritebackCache);
     }
 
@@ -746,23 +812,27 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     // Refuse idmapped mounts: TideFS does not support idmapped mount
     // UID/GID translation in the current FUSE adapter boundary.
     check_idmapped_mount(&config.mountpoint)?;
-    let live_owner = match (&config.pool_name, config.pool_uuid) {
-        (Some(pool_name), Some(pool_uuid)) => {
-            let runtime_dir = PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid));
-            let owner_config = live_owner::LiveOwnerConfig {
-                pool_name: pool_name.clone(),
-                pool_uuid,
-                backing_dir: config.backing_dir.clone(),
-                mountpoint: config.mountpoint.clone(),
-                runtime_dir,
-            };
-            Some(live_owner::start_fuse_owner(
-                owner_config,
-                live_owner_engine,
-                Arc::clone(&shutdown),
-            )?)
+    let live_owner = if snapshot_export {
+        None
+    } else {
+        match (&config.pool_name, config.pool_uuid) {
+            (Some(pool_name), Some(pool_uuid)) => {
+                let runtime_dir = PathBuf::from("/run/tidefs/pools").join(hex_uuid(&pool_uuid));
+                let owner_config = live_owner::LiveOwnerConfig {
+                    pool_name: pool_name.clone(),
+                    pool_uuid,
+                    backing_dir: config.backing_dir.clone(),
+                    mountpoint: config.mountpoint.clone(),
+                    runtime_dir,
+                };
+                Some(live_owner::start_fuse_owner(
+                    owner_config,
+                    live_owner_engine,
+                    Arc::clone(&shutdown),
+                )?)
+            }
+            _ => None,
         }
-        _ => None,
     };
 
     if config.debug {
@@ -775,28 +845,37 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
 
     crate::observability::emit_all_summaries();
     session.join();
-    if let Some(ref block_devices) = config.block_devices {
-        let lock_dir = PathBuf::from("/run/tidefs/import");
-        match tidefs_pool_import::pool_export(block_devices, &lock_dir, false) {
-            Ok(()) => {
-                if let Some(ref pool_name) = config.pool_name {
-                    eprintln!("tidefsctl: pool exported: {pool_name}");
-                } else {
-                    eprintln!("tidefsctl: block-device pool exported");
+    if !snapshot_export {
+        if let Some(ref block_devices) = config.block_devices {
+            let lock_dir = PathBuf::from("/run/tidefs/import");
+            match tidefs_pool_import::pool_export(block_devices, &lock_dir, false) {
+                Ok(()) => {
+                    if let Some(ref pool_name) = config.pool_name {
+                        eprintln!("tidefsctl: pool exported: {pool_name}");
+                    } else {
+                        eprintln!("tidefsctl: block-device pool exported");
+                    }
                 }
-            }
-            Err(err) => {
-                eprintln!("tidefsctl: warning: clean pool export failed during unmount: {err}");
+                Err(err) => {
+                    eprintln!("tidefsctl: warning: clean pool export failed during unmount: {err}");
+                }
             }
         }
     }
     if let Some(live_owner) = live_owner {
         live_owner.stop();
     }
-    eprintln!(
-        "tidefsctl: filesystem unmounted from {}",
-        config.mountpoint.display()
-    );
+    if snapshot_export {
+        eprintln!(
+            "tidefsctl: snapshot export unmounted from {}",
+            config.mountpoint.display()
+        );
+    } else {
+        eprintln!(
+            "tidefsctl: filesystem unmounted from {}",
+            config.mountpoint.display()
+        );
+    }
     Ok(())
 }
 

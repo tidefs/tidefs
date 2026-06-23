@@ -221,6 +221,7 @@ fn handle_mount(
         block_devices: None,
         dataset_path: Some(dataset),
         encryption: encryption_config,
+        snapshot_name: None,
         mount_authority: MountAuthority::standalone(),
     };
 
