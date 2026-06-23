@@ -54,9 +54,9 @@ jobs:
                 if [[ -s advisories-stderr.txt ]]; then
                   echo ""
                   echo "### stderr"
-                  echo '```'
+                  echo "\`\`\`"
                   cat advisories-stderr.txt
-                  echo '```'
+                  echo "\`\`\`"
                 fi
                 exit 0
               fi
