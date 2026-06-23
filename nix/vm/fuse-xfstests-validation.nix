@@ -1699,8 +1699,12 @@ echo "--- Phase 4: Unmount and stop daemon ---"
 if [ "$MOUNTED" -eq 1 ]; then
     # xfstests may leave nested TEST_DIR/SCRATCH_MNT mounts active; unmount
     # those before the parent FUSE mount so teardown failures stay meaningful.
-    if ! run_cleanup_xfstests_test_bounded "phase4" "teardown" "$RESULTS" /dev/null; then
-        fail "cleanup" "phase4 cleanup timed out"
+    if command -v run_cleanup_xfstests_test_bounded >/dev/null 2>&1; then
+        if ! run_cleanup_xfstests_test_bounded "phase4" "teardown" "$RESULTS" /dev/null; then
+            fail "cleanup" "phase4 cleanup timed out"
+        fi
+    else
+        echo "cleanup: xfstests cleanup helper unavailable; xfstests phase did not run"
     fi
     timeout -k 5s 10s umount "$MNT/xfstests-test" 2>/dev/null || timeout -k 5s 10s umount -l "$MNT/xfstests-test" 2>/dev/null || true
     timeout -k 5s 10s umount "$MNT/xfstests-scratch" 2>/dev/null || timeout -k 5s 10s umount -l "$MNT/xfstests-scratch" 2>/dev/null || true
