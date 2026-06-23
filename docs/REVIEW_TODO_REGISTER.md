@@ -760,6 +760,16 @@ Important 2026-06-01 findings:
   provenance is left untouched. `check-workspace-policy` now verifies these
   manifest, provenance, and Rust-header gates so future third-party imports or
   new exceptions must be documented before merge.
+- `TFR-014`: issue #690 re-ran the licensing hygiene audit after the workspace
+  metadata refresh. The focused manifest scan found 163 tracked `Cargo.toml`
+  files and no missing license fields: 156 inherit the workspace license, six
+  declare `GPL-2.0-only WITH Linux-syscall-note` explicitly, and
+  `crates/tidefs-fuser/Cargo.toml` preserves upstream `MIT` provenance. The
+  Rust source scan covered 1,664 `.rs` files under `apps/`, `crates/`,
+  `xtask/`, and `kmod/`; outside the documented vendored `fuser` exception,
+  every file starts with the expected TideFS SPDX header or one of the
+  documented kernel `GPL-2.0` module markers. No open provenance item remains
+  for this audit slice.
 - `TFR-014`/`TFR-019`: the active repo rename surface is clean at the literal
   source level: the focused legacy-name scan over `/root/tidefs` reports no
   active hits outside excluded build output, lockfiles, and the vendored

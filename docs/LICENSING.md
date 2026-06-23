@@ -24,6 +24,12 @@ License texts are stored in `COPYING`,
 package metadata, excluded fuzz harness manifests, registered file-local
 license/provenance markers, and first-line Rust SPDX file headers.
 
+The issue #690 audit confirmed that every tracked `Cargo.toml` carries license
+metadata: TideFS-owned workspace packages inherit the workspace
+`GPL-2.0-only WITH Linux-syscall-note` expression, standalone fuzz manifests
+declare that expression explicitly, and the vendored `fuser` package keeps its
+upstream `MIT` package license.
+
 ## Third-Party Code
 
 Vendored or imported third-party code keeps its own file-local license notices.
@@ -77,10 +83,12 @@ packages and now declare the same
 - `crates/tidefs-local-object-store/fuzz/Cargo.toml`
 - `crates/tidefs-validation/fuzz/Cargo.toml`
 
-All tracked non-vendored Rust source files likewise carry a first-line
+All tracked non-vendored Rust source files under `apps/`, `crates/`,
+`xtask/`, and `kmod/` likewise carry a first-line
 `GPL-2.0-only WITH Linux-syscall-note` SPDX header, except for the kernel
 module files listed above that intentionally use Linux-kernel `GPL-2.0` module
-notice text.
+notice text. Rust files under `crates/tidefs-fuser` remain governed by the
+vendored package license and preserved upstream notices listed above.
 
 `cargo run -p tidefs-xtask -- check-workspace-policy` verifies these excluded
 fuzz manifests keep explicit TideFS license declarations and rejects
