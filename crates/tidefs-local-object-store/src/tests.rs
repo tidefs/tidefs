@@ -729,7 +729,7 @@ fn corrupt_trailer_magic_rejected() {
             + RECORD_FOOTER_LEN_U64;
         file.seek(SeekFrom::Start(trailer_offset))
             .expect("seek trailer magic");
-        file.write_all(b"XXXXXXXX").expect("corrupt trailer magic");
+        file.write_all(b"BADMAGIC").expect("corrupt trailer magic");
     }
     match LocalObjectStore::open_with_options(&root, options()) {
         Err(StoreError::CorruptHeader {

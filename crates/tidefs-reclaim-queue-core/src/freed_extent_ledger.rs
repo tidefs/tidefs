@@ -1117,7 +1117,7 @@ mod tests {
     #[test]
     fn decode_rejects_invalid_magic() {
         let mut data = vec![0u8; 44];
-        data[0..4].copy_from_slice(b"XXXX");
+        data[0..4].copy_from_slice(b"BADC");
         let body = &data[..12];
         let digest = blake3_domain_digest(
             body,

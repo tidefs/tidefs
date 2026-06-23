@@ -387,7 +387,7 @@ fn enumerate_segments_bad_system_area_magic() {
 
     let mut sys_buf = vec![0u8; 512];
     // Write bad magic instead of VBSA.
-    sys_buf[0..4].copy_from_slice(b"XXXX");
+    sys_buf[0..4].copy_from_slice(b"BADC");
 
     let mut label = PoolLabelV1::new([0x70u8; 16], [0x71u8; 16], "badmagic");
     label.system_area_pointer = 4096;

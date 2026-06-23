@@ -3308,7 +3308,7 @@ mod tests {
     fn extent_map_serialize_wrong_magic_rejected() {
         use std::io::Cursor;
 
-        let buf = b"XXXX".to_vec();
+        let buf = b"BADC".to_vec();
         let mut cursor = Cursor::new(&buf);
         let err = ExtentMap::deserialize(&mut cursor).unwrap_err();
         assert_eq!(err, ExtentMapError::WrongVersion);
@@ -4121,7 +4121,7 @@ mod tests {
 
     #[test]
     fn inline_serde_wrong_magic_rejected() {
-        let buf = b"XXXX".to_vec();
+        let buf = b"BADC".to_vec();
         let mut cursor = std::io::Cursor::new(&buf);
         let err = InlineExtentMap::deserialize(&mut cursor).unwrap_err();
         assert_eq!(err, ExtentMapError::WrongVersion);

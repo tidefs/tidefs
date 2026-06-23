@@ -730,7 +730,7 @@ mod tests {
             [0u8; 32],
             0,
         );
-        rec.magic = *b"XXXX";
+        rec.magic = *b"BADC";
         rec = rec.seal();
 
         let verdict = validate_authority_record(&rec);

@@ -748,6 +748,11 @@ Important 2026-06-01 findings:
   split into #980, #982, #983, #984, and #985 with disjoint domain write sets;
   issue #796 records the classification and split without changing runtime
   behavior.
+- `TFR-016`: issue #679 converts the remaining anonymous inline debt comments
+  and active fixture/prose marker strings under `crates/` and `apps/` into
+  register-addressed notes or neutral fixture words. Post-conversion
+  `rg -c 'TODO|FIXME|HACK|XXX|TBD|CONTINUE' crates/ apps/` reports no matches,
+  confirming zero anonymous markers in the issue scope.
 - `TFR-014`: issue #508 completes the current package-metadata and Rust
   file-local notice audit. Root Cargo metadata reports all workspace packages
   as `GPL-2.0-only WITH Linux-syscall-note` except the vendored/patched

@@ -762,7 +762,7 @@ pub(crate) fn prepare_changed_record_root(
             });
         }
     }
-    // Allow extra records for canonical dedup objects (#XXX).
+    // TFR-010: canonical dedup records are extra send/receive state.
     // The transaction manifest tracks per-inode chunk keys, but
     // content-addressed dedup redirects reference canonical keys
     // that are not part of the manifest.  The sender includes

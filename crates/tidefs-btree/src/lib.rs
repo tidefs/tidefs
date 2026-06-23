@@ -3583,7 +3583,7 @@ mod tests {
         assert!(!format!("{e}").is_empty());
 
         let e = super::FromWalError::PageValidation(super::PageChecksumError::BadMagic {
-            got: *b"XXXX",
+            got: *b"BADC",
         });
         assert!(!format!("{e}").is_empty());
 

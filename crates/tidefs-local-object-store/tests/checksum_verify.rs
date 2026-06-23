@@ -198,7 +198,7 @@ fn corrupt_footer_prevents_replay() {
             .expect("open for footer corruption");
         f.seek(SeekFrom::Start(footer_offset))
             .expect("seek to footer");
-        f.write_all(b"XXXXXXXX") // was "VLOSEND2"
+        f.write_all(b"BADMAGIC") // was "VLOSEND2"
             .expect("corrupt footer magic");
         f.sync_all().expect("sync");
     }
@@ -232,7 +232,7 @@ fn corrupt_header_magic_prevents_reopen() {
             .write(true)
             .open(&segment_path)
             .expect("open segment for header corruption");
-        f.write_all(b"XXXXXXXX").expect("corrupt header magic");
+        f.write_all(b"BADMAGIC").expect("corrupt header magic");
         f.sync_all().expect("sync corrupted header");
     }
 

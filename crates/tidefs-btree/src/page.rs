@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn header_bad_magic_detected() {
         let h = PageHeader {
-            magic: *b"XXXX",
+            magic: *b"BADC",
             page_type: 0,
             generation: [0; 3],
             checksum: [0; 8],
@@ -705,7 +705,7 @@ mod tests {
     fn validate_detects_bad_magic() {
         let mut page = blank_page();
         let mut header = PageHeader::new(PageType::Leaf, 0);
-        header.magic = *b"XXXX";
+        header.magic = *b"BADC";
         write_header(&mut page, &header);
         assert!(matches!(
             validate_page(&page),

@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn header_bad_magic_detected() {
         let h = NodeHeader {
-            magic: *b"XXXX",
+            magic: *b"BADC",
             checksum: [0; 16],
             domain_tag: 0x10,
             reserved: [0; 3],

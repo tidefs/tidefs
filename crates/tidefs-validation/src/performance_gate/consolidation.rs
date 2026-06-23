@@ -350,7 +350,7 @@ impl ConsolidatedMatrix {
             let bc = BudgetClass {
                 ref_id: format!("budget.performance_budget_0.{}.general", lane.label()),
                 kpi_family: "kpi.performance_budget_0.throughput.floor".into(),
-                floor_description: "throughput floor TBD".into(),
+                floor_description: "pending throughput floor".into(),
                 release_blocking: true,
             };
             let mut entry = PerformanceGateEntry::pending(PendingPerformanceGateEntry {

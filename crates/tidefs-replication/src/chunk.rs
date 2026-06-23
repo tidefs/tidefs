@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn decode_bad_magic() {
         let mut buf = vec![0u8; CHUNK_HEADER_SIZE + 4];
-        buf[0..16].copy_from_slice(b"BAD_MAGIC_XXXXXX");
+        buf[0..16].copy_from_slice(b"BAD_MAGIC_BYTES!");
         buf[16..20].copy_from_slice(&1u32.to_le_bytes());
         buf[116..120].copy_from_slice(&0u32.to_le_bytes());
         let result = ReplicaChunk::decode(&buf);
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn ack_decode_bad_magic() {
         let mut buf = vec![0u8; CHUNK_ACK_FRAME_SIZE];
-        buf[0..4].copy_from_slice(b"XXXX");
+        buf[0..4].copy_from_slice(b"BADC");
         let result = ReplicaChunkAck::decode(&buf);
         assert!(matches!(result, Err(DecodeError::BadMagic)));
     }

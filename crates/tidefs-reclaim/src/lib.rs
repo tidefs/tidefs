@@ -4468,7 +4468,7 @@ mod reclaim_wire_tests {
     #[test]
     fn decode_rejects_bad_magic() {
         let mut data = vec![0u8; RECLAIM_WIRE_MIN_SIZE];
-        data[0..4].copy_from_slice(b"XXXX");
+        data[0..4].copy_from_slice(b"BADC");
         data[4..8].copy_from_slice(&RECLAIM_WIRE_VERSION.to_le_bytes());
         data[8..12].copy_from_slice(&0u32.to_le_bytes());
         let crc = tidefs_binary_schema_checksum::crc32c(&data[..12]);

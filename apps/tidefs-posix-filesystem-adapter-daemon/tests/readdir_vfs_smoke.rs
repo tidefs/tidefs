@@ -116,7 +116,7 @@ fn readdir_vfs_ls_la_populated_directory() {
         ("readme.txt", 0o644, b"hello world"),
         ("secret.dat", 0o600, b"classified"),
         ("script.sh", 0o755, b"#!/bin/sh\necho ok"),
-        ("notes.md", 0o640, b"# Notes\nTBD"),
+        ("notes.md", 0o640, b"# Notes\nPending"),
     ];
 
     let mut expected_names = BTreeSet::new();
