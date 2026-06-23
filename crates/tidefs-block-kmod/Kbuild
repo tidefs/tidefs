@@ -18,3 +18,15 @@
 #   - rustc 1.78+ with rust-src component
 
 obj-m := tidefs_block_kmod.o
+
+# Strict warning policy: -Wall -Wextra enables broad diagnostics; -Werror
+# promotes warnings to errors so the CI gate catches regressions.
+# -Wno-unused-parameter is allowed because kernel APIs and Rust FFI shims
+# routinely receive context parameters (e.g. struct block_device *) that
+# are forwarded to later layers and intentionally unused here.
+subdir-ccflags-y := -Wall -Wextra -Werror -Wno-unused-parameter
+
+# Treat Rust warnings as errors in kernel module builds.
+# Clippy lints are the primary Rust quality gate; -Dwarnings ensures the
+# build does not silently accrete new warnings.
+RUSTFLAGS_MODULE := -Dwarnings

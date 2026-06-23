@@ -3020,6 +3020,13 @@ EOF
             bindgen = rustBindgenLinuxKbuild;
           };
 
+          tidefsBlockKmod = import ./nix/packages/tidefs-kmod-block.nix {
+            inherit pkgs rustToolchain;
+            lib = pkgs.lib;
+            linuxKernel_7_0 = linuxKernel_7_0;
+            bindgen = rustBindgenLinuxKbuild;
+          };
+
           k7VfsXfstestsValidation = import ./nix/vm/k7-vfs-xfstests-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;

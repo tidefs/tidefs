@@ -17,3 +17,15 @@ tidefs_posix_vfs-y := tidefs_posix_vfs_main.o tidefs_posix_vfs_shim.o
 # Rust-generated code may trigger false-positive objtool fall-through
 # warnings. Suppress objtool on the Rust object until the toolchain matures.
 OBJECT_FILES_NON_STANDARD_tidefs_posix_vfs_main.o := y
+
+# Strict warning policy: -Wall -Wextra enables broad diagnostics; -Werror
+# promotes warnings to errors so the CI gate catches regressions.
+# -Wno-unused-parameter is allowed because kernel APIs and Rust FFI shims
+# routinely receive context parameters (e.g. struct file *, struct inode *)
+# that are forwarded to later layers and intentionally unused here.
+subdir-ccflags-y := -Wall -Wextra -Werror -Wno-unused-parameter
+
+# Treat Rust warnings as errors in kernel module builds.
+# Clippy lints are the primary Rust quality gate; -Dwarnings ensures the
+# build does not silently accrete new warnings.
+RUSTFLAGS_MODULE := -Dwarnings
