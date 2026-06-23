@@ -311,6 +311,9 @@ fn multiple_writers_disjoint_regions_no_interference() {
                             }
                             continue;
                         }
+                        Err(InsertError::Budget(_)) => {
+                            unreachable!("Budget rejection without governor configured");
+                        }
                     }
                 }
                 let expected = write_page_data(&cache, &mut rng, inode, offset);
