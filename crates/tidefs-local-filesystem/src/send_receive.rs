@@ -358,10 +358,8 @@ pub(crate) fn validate_sender_authority_for_receive(
                 return Ok(());
             }
             // Cross-pool: require exact per-receive authorization.
-            let auth = authorization.ok_or_else(|| {
-                FileSystemError::CrossPoolReceiveUnauthorized {
-                    sender_pool_uuid: sender.sender_pool_uuid,
-                }
+            let auth = authorization.ok_or(FileSystemError::CrossPoolReceiveUnauthorized {
+                sender_pool_uuid: sender.sender_pool_uuid,
             })?;
             if !auth.matches(&sender) {
                 // Determine which field mismatched for operator diagnostics.
