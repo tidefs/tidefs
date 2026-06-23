@@ -963,6 +963,97 @@ classify_notrun() {
 MNT=/mnt/tidefs
 STORE=/store/tidefs-store
 RESULTS=/tmp/xfstests-results
+SANITY_TIMEOUT=__XFSTESTS_PER_TEST_TIMEOUT__
+case "$SANITY_TIMEOUT" in
+    ""|*[!0-9]*) SANITY_TIMEOUT=180 ;;
+esac
+
+terminate_guest_process_tree() {
+    tree_pid="$1"
+    signal="$2"
+    for child_pid in $(pgrep -P "$tree_pid" 2>/dev/null || true); do
+        terminate_guest_process_tree "$child_pid" "$signal"
+    done
+    kill "-$signal" "$tree_pid" 2>/dev/null || true
+}
+
+dump_sanity_timeout_state() {
+    sanity_label="$1"
+    echo "--- sanity timeout diagnostics for $sanity_label ---"
+    echo "--- process table ---"
+    ps 2>/dev/null || true
+    echo "--- matching TideFS/FUSE processes ---"
+    for pattern in "tidefs-posix-filesystem-adapter-daemon" "tidefs-preview" "xfstests-check"; do
+        pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+        for pid in $pids; do
+            cmd=$(tr '\000' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+            state=$(sed -n 's/^State:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null || true)
+            wchan=$(cat "/proc/$pid/wchan" 2>/dev/null || true)
+            echo "process: pid=$pid state=$state wchan=$wchan cmd=$cmd"
+            if [ -d "/proc/$pid/task" ]; then
+                for task_dir in /proc/"$pid"/task/[0-9]*; do
+                    [ -d "$task_dir" ] || continue
+                    tid="''${task_dir##*/}"
+                    comm=$(cat "$task_dir/comm" 2>/dev/null || true)
+                    task_state=$(sed -n 's/^State:[[:space:]]*//p' "$task_dir/status" 2>/dev/null || true)
+                    task_wchan=$(cat "$task_dir/wchan" 2>/dev/null || true)
+                    schedstat=$(cat "$task_dir/schedstat" 2>/dev/null || true)
+                    echo "thread: pid=$pid tid=$tid comm=$comm state=$task_state wchan=$task_wchan schedstat=$schedstat"
+                done
+            fi
+        done
+    done
+    echo "--- mount table ---"
+    grep -E 'tidefs|fuse' /proc/mounts 2>/dev/null || true
+    echo "--- open fds under TideFS mount ---"
+    for proc_dir in /proc/[0-9]*; do
+        [ -d "$proc_dir/fd" ] || continue
+        pid="''${proc_dir#/proc/}"
+        cmd=$(tr '\000' ' ' <"$proc_dir/cmdline" 2>/dev/null || true)
+        for fd in "$proc_dir"/fd/*; do
+            target=$(readlink "$fd" 2>/dev/null || true)
+            case "$target" in
+                "$MNT"*)
+                    echo "open-fd: pid=$pid fd=$(basename "$fd") target=$target cmd=$cmd"
+                    ;;
+            esac
+        done
+    done
+    echo "--- TideFS helper logs ---"
+    if find /tmp -maxdepth 1 -type f \( -name 'tidefs-preview-*.log' -o -name 'tidefs-daemon-*.log' -o -name 'daemon-helper.log' -o -name 'mount-helper.log' \) -print | sort | grep . >/tmp/tidefs-sanity-log-files; then
+        while read -r f; do
+            echo "helper-log: $f"
+            echo "helper-log-bytes=$(wc -c <"$f" 2>/dev/null || true)"
+            grep -a "tidefs-diagnostic" "$f" 2>/dev/null || true
+            tail -200 "$f" 2>/dev/null || true
+        done </tmp/tidefs-sanity-log-files
+    else
+        echo "(none)"
+    fi
+}
+
+run_sanity_step_bounded() {
+    sanity_label="$1"
+    shift
+    sanity_timeout="$((SANITY_TIMEOUT / 3))"
+    [ "$sanity_timeout" -ge 20 ] || sanity_timeout=20
+    [ "$sanity_timeout" -le 60 ] || sanity_timeout=60
+    "$@" &
+    sanity_pid=$!
+    elapsed=0
+    while kill -0 "$sanity_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$sanity_timeout" ]; then
+            dump_sanity_timeout_state "$sanity_label"
+            terminate_guest_process_tree "$sanity_pid" TERM
+            sleep 2
+            terminate_guest_process_tree "$sanity_pid" KILL
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$sanity_pid"
+}
 
 STORE_DEV=""
 for candidate in /dev/vda /dev/sda /dev/hda; do
@@ -1062,32 +1153,60 @@ fi
 echo ""
 echo "--- Phase 2: Basic filesystem sanity ---"
 
+SANITY_ABORTED=0
 if [ "$MOUNTED" -eq 1 ]; then
+    sanity_mkdir() { mkdir "$MNT/xfstests-test"; }
+    sanity_write() { printf '%s\n' "hello_tidefs_xfstests" > "$MNT/xfstests-test/hello.txt"; }
+    sanity_read() { cat "$MNT/xfstests-test/hello.txt" > /tmp/fs_sanity_read.out; }
+    sanity_unlink() { rm "$MNT/xfstests-test/hello.txt"; }
+
     # Create a test directory
-    if mkdir "$MNT/xfstests-test" 2>/tmp/mkdir.err; then
+    if run_sanity_step_bounded "fs_sanity_mkdir" sanity_mkdir 2>/tmp/mkdir.err; then
         pass "fs_sanity_mkdir"
+    elif [ "$?" -eq 124 ]; then
+        SANITY_ABORTED=1
+        fail "fs_sanity_mkdir" "timed out during bounded sanity step; diagnostics dumped"
     else
         fail "fs_sanity_mkdir" "$(cat /tmp/mkdir.err)"
     fi
 
     # Write a test file
-    if echo "hello_tidefs_xfstests" > "$MNT/xfstests-test/hello.txt" 2>/tmp/write.err; then
+    if [ "$SANITY_ABORTED" -ne 0 ]; then
+        blocked "fs_sanity_write" "earlier sanity step timed out"
+    elif run_sanity_step_bounded "fs_sanity_write" sanity_write 2>/tmp/write.err; then
         pass "fs_sanity_write"
+    elif [ "$?" -eq 124 ]; then
+        SANITY_ABORTED=1
+        fail "fs_sanity_write" "timed out during bounded sanity step; diagnostics dumped"
     else
         fail "fs_sanity_write" "$(cat /tmp/write.err)"
     fi
 
     # Read it back
-    CONTENT=$(cat "$MNT/xfstests-test/hello.txt" 2>/dev/null)
-    if [ "$CONTENT" = "hello_tidefs_xfstests" ]; then
-        pass "fs_sanity_read"
+    if [ "$SANITY_ABORTED" -ne 0 ]; then
+        blocked "fs_sanity_read" "earlier sanity step timed out"
+    elif run_sanity_step_bounded "fs_sanity_read" sanity_read 2>/tmp/read.err; then
+        CONTENT=$(cat /tmp/fs_sanity_read.out 2>/dev/null || true)
+        if [ "$CONTENT" = "hello_tidefs_xfstests" ]; then
+            pass "fs_sanity_read"
+        else
+            fail "fs_sanity_read" "expected 'hello_tidefs_xfstests', got '$CONTENT'"
+        fi
+    elif [ "$?" -eq 124 ]; then
+        SANITY_ABORTED=1
+        fail "fs_sanity_read" "timed out during bounded sanity step; diagnostics dumped"
     else
-        fail "fs_sanity_read" "expected 'hello_tidefs_xfstests', got '$CONTENT'"
+        fail "fs_sanity_read" "$(cat /tmp/read.err)"
     fi
 
     # Remove it
-    if rm "$MNT/xfstests-test/hello.txt" 2>/tmp/rm.err; then
+    if [ "$SANITY_ABORTED" -ne 0 ]; then
+        blocked "fs_sanity_unlink" "earlier sanity step timed out"
+    elif run_sanity_step_bounded "fs_sanity_unlink" sanity_unlink 2>/tmp/rm.err; then
         pass "fs_sanity_unlink"
+    elif [ "$?" -eq 124 ]; then
+        SANITY_ABORTED=1
+        fail "fs_sanity_unlink" "timed out during bounded sanity step; diagnostics dumped"
     else
         fail "fs_sanity_unlink" "$(cat /tmp/rm.err)"
     fi
@@ -1101,7 +1220,9 @@ fi
 echo ""
 echo "--- Phase 3: xfstests smoke subset ---"
 
-if [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
+if [ "$MOUNTED" -eq 1 ] && [ "$SANITY_ABORTED" -ne 0 ]; then
+    blocked "xfstests_all" "filesystem sanity timed out before xfstests"
+elif [ "$MOUNTED" -eq 1 ] && [ -x /bin/xfstests-check ]; then
     mkdir -p "$RESULTS"
 
     # Run xfstests with FUSE type
