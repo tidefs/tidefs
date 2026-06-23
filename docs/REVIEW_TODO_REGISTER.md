@@ -1240,6 +1240,17 @@ Important 2026-06-01 findings:
   authority. TFR-019 remains open for the other unclassified #952
   status/matrix leftovers and any separate source/evidence review needed before
   promoting a document to current policy or current spec.
+- `TFR-019`: GitHub issue #1165 classifies
+  `docs/design/coordination-pipeline-status-update.md` as historical input after
+  reviewing the authority register, this TFR-019 note set, the imported #1833
+  design, `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and bounded lineage
+  from the numbered status-update snapshots. The file's `STATUS.md`,
+  `FEATURE_MATRIX.md`, lane-summary, health-score, and Forgejo label machinery
+  are retired design input only; current TideFS coordination remains GitHub
+  issues and pull requests plus the repo documentation entry points. This
+  reduces status/matrix drift but does not classify the numbered status-update
+  snapshots or promote a current automation, implementation-status,
+  release-readiness, or worker-scheduling claim.
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
   `xfstests-runner` as a diagnostic scoreboard wrapper, and sends output under
   runner help path no longer carries a bare `--per-test` command or duplicate

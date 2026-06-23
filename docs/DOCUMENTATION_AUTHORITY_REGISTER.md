@@ -98,7 +98,6 @@ leftovers in
 `docs/design/1813-pool-import-export-device-topology-management-design.md`,
 `docs/design/1971-pool-import-export-7-phase-implementation-plan.md`,
 `docs/design/coordination-pipeline-cluster-services-design-seal.md`,
-`docs/design/coordination-pipeline-status-update.md`,
 `docs/design/coordination-pipeline-status-update-1767.md`,
 `docs/design/coordination-pipeline-status-update-1839.md`,
 `docs/design/coordination-pipeline-status-update-1915.md`,
@@ -129,6 +128,20 @@ authority rule and #952 status/matrix leftover list in this register,
 | Path | State | Classification note |
 |---|---|---|
 | `docs/design/coordination-pipeline-health-advancement-strategy.md` | Historical input | Imported Forgejo-era coordination-health design. It preserves old issue labels, lane/blocking fields, health-score and dashboard models, and deleted status/matrix references only as historical design context. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current automation policy, implementation status, release-readiness evidence, or worker scheduling authority. |
+
+### Coordination Status Update Architecture (TFR-019 / #1165)
+
+Classified for TFR-019 / GitHub issue #1165 on 2026-06-23 after reviewing this
+register's authority rule and review method, the TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, the imported status-update architecture doc,
+`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and bounded lineage references
+from the numbered status-update snapshots. This slice does not classify the
+numbered snapshots, does not promote any current automation claim, and does not
+change Codex Nexus or worker scheduling policy.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/coordination-pipeline-status-update.md` | Historical input | Imported Forgejo #1833 design for serialized `STATUS.md` coordination updates, `FEATURE_MATRIX.md` synchronization, lane summaries, health scoring, and Forgejo label-driven generation. Useful lineage for retired status-update architecture, but current TideFS coordination lives in GitHub issues and pull requests plus the active repo documentation entry points. It is not current automation policy, implementation status, release-readiness evidence, worker scheduling authority, `STATUS.md` authority, `FEATURE_MATRIX.md` authority, lane-health authority, or issue-label authority. |
 
 ### Checksum and BLAKE3 Authority
 
