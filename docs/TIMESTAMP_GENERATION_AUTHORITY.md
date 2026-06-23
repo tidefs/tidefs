@@ -132,9 +132,9 @@ Callers that consume a concept must go through the defining crate's public API.
   mutations (setattr, link/unlink, rename, xattr changes) that do not
   necessarily change content.
 - **Wraparound**: Same as `data_version` (bounded by `u64`).
-- **Current coupling (debt)**: `InodeRecord::to_inode_attr()` projects
-  `metadata_version` into both `subtree_rev` and `dir_rev`. This is a known
-  coupling tracked as a remaining TFR-005 runtime site (see section 9.1).
+- **Resolved coupling (issue #688)**: `InodeRecord::to_inode_attr()` no longer projects
+  `metadata_version` into `subtree_rev` or `dir_rev`. Both counters are now
+  persisted and projected independently from their own stored fields.
 - **Authority boundary**: Owned by `tidefs-local-filesystem`; serialized in
   `InodeRecord`.
 
@@ -149,12 +149,15 @@ Callers that consume a concept must go through the defining crate's public API.
   (`.saturating_add(1).max(1)`).
 - **Epoch**: Initial value is 0 for new inodes.
 - **Authority boundary**: Defined in `tidefs-types-vfs-core` as fields on
-  `InodeAttr`. Currently projected from `metadata_version` in the local
-  filesystem's `InodeRecord::to_inode_attr()` — a coupling that needs its
-  own authority slice (see section 9.1).
+  `InodeAttr`. As of issue #688, the local filesystem projects both counters
+  from their own stored `InodeRecord` fields, persisted via a backward-compatible
+  tail extension in the encode/decode path. The coupling to `metadata_version`
+  described in section 9.1 is resolved.
 - **Ownership**: `tidefs-types-vfs-core` owns the field definitions.
-  `tidefs-local-filesystem` currently drives the values through
-  `metadata_version` projection and `update_anonymous_size`.
+  `tidefs-local-filesystem` drives the values through
+  stored `subtree_rev` and `dir_rev` counters, which are incremented
+  independently of `metadata_version` (see `advance_subtree_revision` and
+directory entry mutation paths).
 
 ### 2.7 Scrub Block Identity (`ScrubBlockId`)
 
@@ -238,11 +241,11 @@ content version has a distinct storage identity.
 **data_version to scrub identity**: `ScrubBlockId` uses `data_version` to
 identify which version of a content block is being checked.
 
-**metadata_version to subtree_rev / dir_rev (debt)**: Currently
-`InodeRecord::to_inode_attr()` sets both `subtree_rev` and `dir_rev` to
-`metadata_version`. This couples storage metadata versioning with VFS
-namespace revision semantics. A separate namespace-revision authority slice
-is needed to decouple these (see section 9.1).
+ **metadata_version to subtree_rev / dir_rev (resolved, issue #688)**:
+`InodeRecord::to_inode_attr()` projects both `subtree_rev` and `dir_rev` from
+their own stored `InodeRecord` fields (not `metadata_version`). Both counters are
+persisted via a backward-compatible encode/decode tail extension and advanced
+independently of `metadata_version` (see section 9.1).
 
 **Generation alongside data_version / metadata_version (during recovery)**:
 Crash recovery may initialize `generation`, `data_version`, and
@@ -270,8 +273,8 @@ the same fresh recovery tick into all three local fields:
   identity through `content_object_key_for_version()` and the content chunk /
   manifest records. Scrub consumes this value through `ScrubBlockId`.
 - `metadata_version` is the local metadata storage version. It orders durable
-  inode metadata changes and currently remains the source for the
-  `subtree_rev` / `dir_rev` projection debt tracked in section 9.1.
+  inode metadata changes. The `subtree_rev` and `dir_rev` counters are now
+  projected and advanced independently (section 9.1, resolved by issue #688).
 
 Using one recovery tick for all three fields is allowed only while recovery is
 materializing or replaying one coherent inode state. The tick is a recovery
@@ -373,9 +376,9 @@ When `FILESYSTEM_FORMAT_VERSION` is incremented:
 - `data_version` and `metadata_version` maintain their `u64` domain. Their
   semantics (monotonic, per-inode) are format-invariant.
 - `Generation` maintains its `u64` VFS inode generation semantics.
-- `subtree_rev` and `dir_rev` maintain their `u64` domain; decoupling them
-  from `metadata_version` (section 9.1) may change which field drives them
-  but not their serialized layout.
+- `subtree_rev` and `dir_rev` maintain their `u64` domain; they are now
+  projected from their own stored fields (not `metadata_version`), persisted
+  via a backward-compatible tail extension, with no serialized layout change.
 
 ## 5. Allowed Projections
 
@@ -483,19 +486,15 @@ validation where source behavior must change, or an explicit decision record
 where the current behavior is already the intended authority contract, before
 TFR-005 can close:
 
-1. **`metadata_version` to `subtree_rev` / `dir_rev` coupling**.
-   `InodeRecord::to_inode_attr()` projects `metadata_version` into both VFS
-   namespace revision counters. `subtree_rev` and `dir_rev` are VFS namespace
-   concepts owned by `tidefs-types-vfs-core`; they must not be sourced from a
-   storage metadata version field. A separate namespace-revision authority
-   slice is needed to:
-   - Define `subtree_rev` and `dir_rev` increment rules independently of
-     `metadata_version`.
-   - Persist `dir_rev` per-directory in `InodeRecord` (currently always
-     decoded as 0 in the encode/decode path, then overwritten by
-     `to_inode_attr`).
-   - Remove the `metadata_version` to `{subtree_rev, dir_rev}` projection
-     from `InodeRecord::to_inode_attr()`.
+1. **`metadata_version` to `subtree_rev` / `dir_rev` coupling (RESOLVED, issue #688).**
+   `InodeRecord::to_inode_attr()` now projects both counters from their own
+   stored fields instead of `metadata_version`. `subtree_rev` and `dir_rev`
+   are persisted via a backward-compatible encode/decode tail extension and
+   advanced independently: `advance_subtree_revision` for attribute/content
+   changes and directory entry mutation paths for `dir_rev`. Non-directory
+   inodes keep `dir_rev == 0`. The three sub-items above are satisfied:
+   increment rules are independent, `dir_rev` persists per-directory across
+   round trips, and the projection no longer uses `metadata_version`.
 
 2. **Intent-log replay and commit-group recovery**.
    Section 3.2 now specifies the recovery-generation drift contract: recovery
