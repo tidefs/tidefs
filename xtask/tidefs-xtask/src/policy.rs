@@ -2114,6 +2114,15 @@ fn parse_member(root: &Path, manifest_path: &Path) -> Result<Member, String> {
         if line.starts_with('[') && line.ends_with(']') {
             current_section.clear();
             current_section.push_str(line);
+            // Capture table-style dependency declarations like [dependencies.crate-name]
+            if current_section.starts_with("[dependencies.") && current_section.ends_with("]") {
+                let inner = &current_section["[dependencies.".len()..current_section.len() - 1];
+                if !inner.is_empty()
+                    && inner.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+                {
+                    dependencies.push(inner.to_string());
+                }
+            }
             continue;
         }
         if current_section == "[package]" && line.starts_with("name") {
