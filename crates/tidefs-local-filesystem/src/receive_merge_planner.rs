@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::error::FileSystemError;
+use tidefs_local_object_store::ObjectKey;
 use tidefs_types_vfs_owned::DirEntry as OwnedDirEntry;
 use crate::types::{ChangedRecordExport, CommittedRootSummary, RecoveryAuditReport};
 
@@ -217,6 +218,13 @@ pub struct ReceiveMergePlan {
     /// Always true for `Manual` policy; false for other policies when the
     /// plan was successfully resolved.
     pub requires_operator: bool,
+
+    /// Object keys for stream-side objects marked `KeepLocal` that must be
+    /// skipped during receive import.
+    ///
+    /// Populated by `resolve_merge_policy` from conflict entries whose
+    /// decisions are `KeepLocal` and that have a known `stream_object_key`.
+    pub keep_local_keys: BTreeSet<ObjectKey>,
 }
 
 impl ReceiveMergePlan {
@@ -231,6 +239,7 @@ impl ReceiveMergePlan {
             common_ancestor_generation: inventory.common_ancestor_generation,
             decisions: Vec::new(),
             requires_operator: policy == ReceiveMergePolicy::Manual,
+            keep_local_keys: BTreeSet::new(),
         }
     }
 
@@ -245,6 +254,13 @@ impl ReceiveMergePlan {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.decisions.is_empty()
+    }
+
+    /// Check whether the given object key should be skipped during receive
+    /// import because the merge plan has a `KeepLocal` decision for it.
+    #[must_use]
+    pub fn should_skip(&self, key: &ObjectKey) -> bool {
+        self.keep_local_keys.contains(key)
     }
 }
 
@@ -314,6 +330,7 @@ pub fn resolve_merge_policy(
         });
     }
 
+    let mut keep_local_keys: BTreeSet<ObjectKey> = BTreeSet::new();
     let decisions: Vec<ReceiveMergeDecision> = inventory
         .entries
         .iter()
@@ -337,12 +354,23 @@ pub fn resolve_merge_policy(
         })
         .collect();
 
+    // Populate keep-local skip set from conflict entries whose decision
+    // is `KeepLocal` and which have a known stream object key.
+    for (entry, decision) in inventory.entries.iter().zip(decisions.iter()) {
+        if *decision == ReceiveMergeDecision::KeepLocal {
+            if let Some(key) = entry.stream_object_key {
+                keep_local_keys.insert(key);
+            }
+        }
+    }
+
     Ok(ReceiveMergePlan {
         policy,
         common_ancestor_transaction_id: inventory.common_ancestor_transaction_id,
         common_ancestor_generation: inventory.common_ancestor_generation,
         decisions,
         requires_operator: false,
+        keep_local_keys,
     })
 }
 
@@ -700,6 +728,8 @@ fn classify_inode_identity_conflicts(
                         target_identity: format!("inode {inode_id}"),
                         stream_txg: None,
                         target_txg: None,
+                        stream_object_key: None,
+                        target_object_key: None,
                     });
                 }
             }
@@ -784,6 +814,8 @@ fn classify_directory_entry_conflicts(
                         target_identity: format!("dir {parent_id} (absent in target)"),
                         stream_txg: None,
                         target_txg: None,
+                        stream_object_key: None,
+                        target_object_key: None,
                     });
                 }
             }
@@ -801,6 +833,8 @@ fn classify_directory_entry_conflicts(
                         target_identity: format!("dir {parent_id}/{name}"),
                         stream_txg: None,
                         target_txg: None,
+                        stream_object_key: None,
+                        target_object_key: None,
                     });
                 }
             }
@@ -820,7 +854,7 @@ fn compare_dir_entries(
     use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
         DirectoryEntryDivergence};
     #[allow(unused_imports)]
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     let stream_map: BTreeMap<&[u8], &OwnedDirEntry> =
         stream_entries.iter().map(|e| (e.name.as_slice(), e)).collect();
@@ -842,6 +876,8 @@ fn compare_dir_entries(
                 target_identity: format!("dir {parent_id} (absent in target)"),
                 stream_txg: None,
                 target_txg: None,
+                stream_object_key: None,
+                target_object_key: None,
             });
         }
     }
@@ -861,6 +897,8 @@ fn compare_dir_entries(
                 target_identity: format!("dir {parent_id}/{name_str}"),
                 stream_txg: None,
                 target_txg: None,
+                stream_object_key: None,
+                target_object_key: None,
             });
         }
     }
@@ -885,6 +923,8 @@ fn compare_dir_entries(
                     ),
                 stream_txg: None,
                 target_txg: None,
+                stream_object_key: None,
+                target_object_key: None,
                 });
             }
         }
@@ -926,6 +966,8 @@ fn classify_extent_map_conflicts(
                         target_identity: format!("inode {inode_id} extent map"),
                         stream_txg: None,
                         target_txg: None,
+                        stream_object_key: None,
+                        target_object_key: None,
                     });
                 }
             }
@@ -961,7 +1003,7 @@ fn classify_snapshot_catalog_conflicts(
     use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
         SnapshotCatalogDivergence};
     #[allow(unused_imports)]
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     let stream_by_name: BTreeMap<&[u8], &crate::records::SnapshotRecord> = input
         .stream_snapshots
@@ -989,6 +1031,8 @@ fn classify_snapshot_catalog_conflicts(
                 target_identity: String::from("(absent in target)"),
                 stream_txg: None,
                 target_txg: None,
+                stream_object_key: None,
+                target_object_key: None,
             });
         }
     }
@@ -1008,6 +1052,8 @@ fn classify_snapshot_catalog_conflicts(
                 target_identity: format!("snapshot {name_str}"),
                 stream_txg: None,
                 target_txg: None,
+                stream_object_key: None,
+                target_object_key: None,
             });
         }
     }
@@ -1032,6 +1078,8 @@ fn classify_snapshot_catalog_conflicts(
                     ),
                 stream_txg: None,
                 target_txg: None,
+                stream_object_key: None,
+                target_object_key: None,
                 });
                 continue;
             }
@@ -1054,6 +1102,8 @@ fn classify_snapshot_catalog_conflicts(
                     ),
                 stream_txg: None,
                 target_txg: None,
+                stream_object_key: None,
+                target_object_key: None,
                 });
             }
 
@@ -1074,6 +1124,8 @@ fn classify_snapshot_catalog_conflicts(
                     ),
                 stream_txg: None,
                 target_txg: None,
+                stream_object_key: None,
+                target_object_key: None,
                 });
             }
         }
@@ -1145,6 +1197,8 @@ fn classify_generation_ordering_conflicts(
                 ),
             stream_txg: None,
             target_txg: None,
+            stream_object_key: None,
+            target_object_key: None,
             });
         }
     }
@@ -1818,6 +1872,8 @@ mod tests {
             target_identity: "inode 42".into(),
             stream_txg,
             target_txg,
+            stream_object_key: None,
+            target_object_key: None,
         }
     }
 
@@ -1980,6 +2036,8 @@ mod tests {
             target_identity: "inode 1".into(),
             stream_txg: Some(10),
             target_txg: Some(12),
+            stream_object_key: None,
+            target_object_key: None,
         });
 
         let json = inventory.to_json().expect("serialize");
@@ -2017,6 +2075,8 @@ mod tests {
             target_identity: "target obj".into(),
             stream_txg: None,
             target_txg: None,
+            stream_object_key: None,
+            target_object_key: None,
         }
     }
 

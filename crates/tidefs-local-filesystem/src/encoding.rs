@@ -1751,6 +1751,16 @@ pub struct ConflictEntry {
     ///
     /// Used by merge-latest policy for per-object txg comparison.
     pub target_txg: Option<u64>,
+    /// Object key of the stream-side object, when known.
+    ///
+    /// Populated by the conflict inventory builder so the receive execution
+    /// path can map per-object decisions (keep-local, keep-remote) to
+    /// concrete objects in the stream.
+    #[serde(default)]
+    pub stream_object_key: Option<ObjectKey>,
+    /// Object key of the target-side object, when known.
+    #[serde(default)]
+    pub target_object_key: Option<ObjectKey>,
 }
 
 /// Machine-readable conflict inventory produced by the merge planner.

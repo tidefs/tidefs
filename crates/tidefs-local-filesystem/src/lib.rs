@@ -334,6 +334,7 @@ mod readahead;
 mod records;
 mod recovery;
 pub mod receive_merge_planner;
+pub mod receive_persistence;
 pub mod release_dispatch;
 mod repair;
 mod scrub;
@@ -5712,11 +5713,17 @@ impl LocalFileSystem {
             [0; 16],
             [0; 16],
             None,
+            None,
         )
     }
 
     /// Receive an incremental changed-record stream with a custom root
-    /// authentication key.
+    /// authentication key and optional merge plan for conflicting targets.
+    ///
+    /// When `merge_plan` is `Some`, the receive path follows per-object
+    /// decisions (keep-local, keep-remote) instead of failing closed on
+    /// conflicting non-empty targets.  See
+    /// `docs/RECEIVE_MERGE_PLANNER_DESIGN.md` §5.1 item 4.
     pub fn receive_incremental_changed_records_with_root_authentication_key(
         root: impl AsRef<Path>,
         options: StoreOptions,
@@ -5725,11 +5732,13 @@ impl LocalFileSystem {
         target_pool_uuid: Id128,
         target_dataset_uuid: Id128,
         authorization: Option<&CrossPoolReceiveAuthorization>,
+        merge_plan: Option<&crate::receive_merge_planner::ReceiveMergePlan>,
     ) -> Result<ChangedRecordImportReport> {
         receive_incremental_changed_records(root.as_ref(), options, export, root_authentication_key,
             target_pool_uuid,
             target_dataset_uuid,
             authorization,
+            merge_plan,
         )
     }
 

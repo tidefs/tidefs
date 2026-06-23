@@ -29,6 +29,7 @@ use crate::load_state_from_transaction;
 use crate::object_keys::*;
 use crate::persist_transaction_objects;
 use crate::receive_merge_planner::{locate_common_ancestor, ReceiveMergeStreamLineageManifest};
+use crate::receive_persistence::{should_import_object};
 use crate::records::*;
 use crate::root_commit_from_summary;
 use crate::roots_with_snapshot_roots;
@@ -1681,6 +1682,7 @@ pub(crate) fn receive_incremental_changed_records(
     target_pool_uuid: Id128,
     target_dataset_uuid: Id128,
     authorization: Option<&CrossPoolReceiveAuthorization>,
+    merge_plan: Option<&crate::receive_merge_planner::ReceiveMergePlan>,
 ) -> Result<ChangedRecordImportReport> {
     // No staging directory and no checkpoint — this function persists
     // directly to the target object store.  Errors propagate without
@@ -1722,30 +1724,65 @@ pub(crate) fn receive_incremental_changed_records(
     }
     drop(preflight_pool);
 
-    // Verify the base root exists in the target filesystem and is protected
-    // by the local snapshot/catalog/lifecycle-pin authority.
-    let mut existing = LocalFileSystem::open_with_root_authentication_key(
-        root,
-        options.clone(),
-        root_authentication_key,
-    )?;
-    let audit = existing.recovery_audit()?;
-    let stream_lineage = ReceiveMergeStreamLineageManifest::from_changed_record_export(export);
-    let _common_ancestor = locate_common_ancestor(&stream_lineage, &audit)?;
-    let authorized_base = verify_incremental_base_root_authority(&existing, &audit, from_root)?;
-    validate_local_incremental_receive_contract(&existing, &audit, &authorized_base, export)?;
-    let placement_verified_stable = incremental_receive_placement_verified_stable(
-        existing.placement_epoch,
-        export.placement_epoch,
-    )?;
-    drop(existing);
+    // Determine whether the merge plan relaxes the fail-closed gate
+    // (`docs/RECEIVE_STREAM_MERGE_POLICY.md` §1.3).  When a merge plan is
+    // present, the receive proceeds with per-object decisions instead of
+    // requiring a pinned base root on the target.
+    let (authorized_base, placement_verified_stable) = if merge_plan.is_some() {
+        // Gate relaxed: use the merge plan's common-ancestor identity.
+        // The receive does not require the base root to be pinned on the
+        // target; per-object decisions from the merge plan govern which
+        // stream objects are imported.
+        let existing = LocalFileSystem::open_with_root_authentication_key(
+            root,
+            options.clone(),
+            root_authentication_key,
+        )?;
+        let placement_verified_stable = incremental_receive_placement_verified_stable(
+            existing.placement_epoch,
+            export.placement_epoch,
+        )?;
+        drop(existing);
+        // Use from_root from the export as the nominal base.  When the base
+        // root does not exist on the target, the import skips base-state
+        // validation and proceeds with merge-plan object-level control.
+        (from_root.clone(), placement_verified_stable)
+    } else {
+        // Fail-closed gate: verify the base root exists in the target
+        // filesystem and is protected by the local snapshot/catalog/
+        // lifecycle-pin authority.
+        let mut existing = LocalFileSystem::open_with_root_authentication_key(
+            root,
+            options.clone(),
+            root_authentication_key,
+        )?;
+        let audit = existing.recovery_audit()?;
+        let stream_lineage = ReceiveMergeStreamLineageManifest::from_changed_record_export(export);
+        let _common_ancestor = locate_common_ancestor(&stream_lineage, &audit)?;
+        let authorized_base = verify_incremental_base_root_authority(&existing, &audit, from_root)?;
+        validate_local_incremental_receive_contract(&existing, &audit, &authorized_base, export)?;
+        let placement_verified_stable = incremental_receive_placement_verified_stable(
+            existing.placement_epoch,
+            export.placement_epoch,
+        )?;
+        drop(existing);
+        (authorized_base, placement_verified_stable)
+    };
 
     // Prove base content first, then apply changed content and prove every
     // incoming manifest content reference before publishing a new root slot.
     let mut pool = LocalFileSystem::default_development_pool(root, &options, None, None)?;
     let store = pool.raw_primary_store_mut();
-    let base_root = root_commit_from_summary(&authorized_base);
-    let _base_state = load_state_from_transaction(store, &base_root, root_authentication_key)?;
+
+    // When the merge plan is present, the target may not hold the base root;
+    // base-state loading and omitted-content validation are skipped.  Object-
+    // level import decisions come from the merge plan instead.
+    let has_merge_plan = merge_plan.is_some();
+    if !has_merge_plan {
+        let base_root = root_commit_from_summary(&authorized_base);
+        let _base_state = load_state_from_transaction(store, &base_root, root_authentication_key)?;
+    }
+
     for root_rec in &prepared.roots {
         for record in root_rec.records.values() {
             if matches!(
@@ -1753,11 +1790,19 @@ pub(crate) fn receive_incremental_changed_records(
                 ChangedRecordObjectRole::VersionedContent
                     | ChangedRecordObjectRole::VersionedContentChunk
             ) {
+                // When a merge plan is present, consult it for per-object
+                // import decisions: skip objects marked KeepLocal so the
+                // target's existing version is preserved.
+                if !should_import_object(merge_plan, &record.object_key) {
+                    continue;
+                }
                 store.put(record.object_key, &record.payload)?;
             }
         }
     }
-    validate_incremental_target_content_objects(store, &prepared)?;
+    if !has_merge_plan {
+        validate_incremental_target_content_objects(store, &prepared)?;
+    }
 
     // Persist all roots (re-signing with the target's authentication key).
     let mut roots = prepared.roots.clone();

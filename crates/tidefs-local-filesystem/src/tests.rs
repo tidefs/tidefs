@@ -7382,7 +7382,7 @@ fn incremental_send_receive_end_to_end() {
         options(),
         &incremental_export,
         target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect("receive incremental");
     assert_eq!(report.stream_version, incremental_export.stream_version);
     assert_eq!(report.placement_epoch, None);
@@ -7436,7 +7436,7 @@ fn incremental_receive_rejects_missing_from_root_without_selecting_new_root() {
         options(),
         &export,
         fixture.target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect_err("missing from_root must fail");
     assert!(
         err.to_string()
@@ -7458,7 +7458,7 @@ fn incremental_receive_rejects_replayed_completed_generation() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect("initial incremental receive");
     assert_eq!(
         report.selected_transaction_id,
@@ -7471,7 +7471,7 @@ fn incremental_receive_rejects_replayed_completed_generation() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect_err("replayed completed receive must fail");
     assert!(
         err.to_string()
@@ -7528,7 +7528,7 @@ fn incremental_receive_rejects_target_missing_base_root() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect_err("missing base must fail");
     assert_receive_merge_no_common_ancestor(err);
     let after = selected_root_for_test(&other_root, fixture.target_key);
@@ -7549,7 +7549,7 @@ fn incremental_receive_rejects_loose_unprotected_base_root() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect_err("loose base root without snapshot authority must fail");
     assert_incremental_receive_base_root_conflict(
         err,
@@ -7584,7 +7584,7 @@ fn incremental_receive_rejects_divergent_base_root_identity() {
         options(),
         &export,
         fixture.target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect_err("divergent from_root identity must fail");
     assert!(
         err.to_string()
@@ -7619,7 +7619,7 @@ fn incremental_receive_rejects_missing_unchanged_content() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect_err("missing omitted content must fail");
     assert!(
         err.to_string().contains("missing")
@@ -7670,7 +7670,7 @@ fn incremental_receive_rejects_full_stream_for_existing_target() {
         options(),
         &full_export,
         fixture.target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect_err("incremental receive must reject full stream");
     assert!(
         err.to_string()
@@ -7691,7 +7691,7 @@ fn incremental_receive_reports_unknown_placement_without_target_epoch() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect("receive incremental with sender placement epoch");
     assert_eq!(report.placement_epoch, Some(42));
     assert!(
@@ -7922,7 +7922,7 @@ fn debug_incremental_validate() {
         options(),
         &incr,
         target_key,
-    [0; 16], [0; 16], None)
+    [0; 16], [0; 16], None, None)
     .expect("receive incremental");
 
     {
