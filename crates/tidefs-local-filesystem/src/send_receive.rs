@@ -29,7 +29,7 @@ use crate::load_state_from_transaction;
 use crate::object_keys::*;
 use crate::persist_transaction_objects;
 use crate::receive_merge_planner::{locate_common_ancestor, ReceiveMergeStreamLineageManifest};
-use crate::receive_persistence::{should_import_object};
+use crate::receive_persistence::should_import_object;
 use crate::records::*;
 use crate::root_commit_from_summary;
 use crate::roots_with_snapshot_roots;
@@ -1674,6 +1674,7 @@ fn is_receive_store_error_retryable(err: &StoreError) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn receive_incremental_changed_records(
     root: &Path,
     options: StoreOptions,
