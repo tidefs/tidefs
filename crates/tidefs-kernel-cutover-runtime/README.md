@@ -2,6 +2,19 @@
 
 Userspace-to-kernel transition state machine with fence management, gate evaluation, and rollback.
 
+## Authority Boundary
+
+This crate is the current source/model authority for kernel cutover mode
+sequencing, dry-run gate admission, cutover fence token lifecycle, rollback
+receipts, deterministic validation digests, and the T4 source/model teardown
+review receipt for `kernel.teardown.no_work_after.v1`.
+
+It is not mounted Linux runtime authority yet. Mounted-kernel cutover/fence
+evidence remains tracked by
+[#1186](https://github.com/tidefs/tidefs/issues/1186), and full kernel-mode
+product claims stay blocked until accepted T5/T6 runtime artifacts and
+claim-registry review justify them.
+
 ## Daemon Independence
 
 This crate has zero dependencies on any userspace daemon crates
@@ -69,4 +82,4 @@ The receipt is T4 source/model evidence only. It deliberately records
 additional T5/T6 evidence exists:
 
 - T5 mounted-kernel teardown stress with Linux workqueue and callback activity tracing.
-- T6 mounted kernel I/O teardown and recovery rows across the filesystem runtime.
+- T6 full-kernel/no-daemon teardown and recovery rows across the filesystem runtime.

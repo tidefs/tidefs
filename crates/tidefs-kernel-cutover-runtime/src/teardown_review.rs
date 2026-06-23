@@ -26,7 +26,7 @@ pub const TEARDOWN_PROOF_FORBIDDEN_WORK_CASES: &[TeardownWorkCase] = &[
 
 pub const TEARDOWN_PROOF_MISSING_RUNTIME_EVIDENCE: &[&str] = &[
     "T5 mounted-kernel teardown stress with Linux workqueue and callback activity tracing",
-    "T6 mounted kernel I/O teardown and recovery rows across the filesystem runtime",
+    "T6 full-kernel/no-daemon teardown and recovery rows across the filesystem runtime",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
