@@ -40,6 +40,13 @@ KBUILD_RUSTC_BOOTSTRAP_ARG := RUSTC_BOOTSTRAP=$(KBUILD_RUSTC_BOOTSTRAP)
 KBUILD_BINDGEN_ARG := BINDGEN=$(KBUILD_BINDGEN)
 KBUILD_RUST_LIB_SRC_ARG := $(if $(KBUILD_RUST_LIB_SRC),RUST_LIB_SRC=$(KBUILD_RUST_LIB_SRC),)
 
+# -Wno-unused-command-line-argument is needed because the kernel build system
+# passes flags (e.g. -fno-strict-overflow, -nostdlibinc) that clang treats as
+# unused during modfinal (.mod.o, .module-common.o) compilation.  ccflags-y
+# from the Kbuild does not survive to the modfinal sub-make; the flag must
+# reach it through KCFLAGS.
+KBUILD_KCFLAGS_ARG := KCFLAGS=-Wno-unused-command-line-argument
+
 default:
 	@# Regression gate: FS_ALLOW_IDMAP refused until Tier 7+ mounted-kernel
 	@# idmap validation output written (#6651). Re-admission requires:
@@ -58,7 +65,7 @@ default:
 		exit 1; \
 	fi
 	@if [ -n "$(MO)" ]; then mkdir -p "$(MO)"; fi
-	$(MAKE) -j$(KBUILD_JOBS) -C $(KDIR) $(KBUILD_LLVM_ARG) $(KBUILD_OUTPUT_ARG) M=$(CURDIR) $(KBUILD_MODULE_OUTPUT_ARG) $(KBUILD_CC_ARG) $(KBUILD_RUSTC_ARG) $(KBUILD_BINDGEN_ARG) $(KBUILD_RUST_LIB_SRC_ARG) $(KBUILD_RUSTC_BOOTSTRAP_ARG) modules
+	$(MAKE) -j$(KBUILD_JOBS) -C $(KDIR) $(KBUILD_LLVM_ARG) $(KBUILD_OUTPUT_ARG) M=$(CURDIR) $(KBUILD_MODULE_OUTPUT_ARG) $(KBUILD_CC_ARG) $(KBUILD_RUSTC_ARG) $(KBUILD_BINDGEN_ARG) $(KBUILD_RUST_LIB_SRC_ARG) $(KBUILD_RUSTC_BOOTSTRAP_ARG) $(KBUILD_KCFLAGS_ARG) modules
 
 clean:
 	@if [ -f "$(KDIR)/Makefile" ]; then \
