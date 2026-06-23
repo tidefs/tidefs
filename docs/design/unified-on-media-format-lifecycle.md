@@ -5,6 +5,13 @@
 **Lane**: docs
 **Maturity**: design-spec — meta-framework coordinating #1220, #1223, #1225, #1222, #1224, #1185, #1235, #1236
 
+
+**Documentation authority**: Historical input for TFR-019 / GitHub issue #1242.
+This file is not current TideFS policy, current spec, implementation status,
+release-readiness evidence, or format-lifecycle authority. Its Forgejo-era
+issue references, design-spec metadata, status/lane/maturity/priority headers,
+and cross-references to old issue numbers are retired historical artifacts.
+
 ## Abstract
 
 This document defines the unified five-phase lifecycle that governs every
