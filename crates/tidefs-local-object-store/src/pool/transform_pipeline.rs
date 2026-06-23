@@ -308,7 +308,7 @@ impl TransformPipelineAuthority {
             return Ok(stored_frame.to_vec());
         }
         match &self.encryption_config {
-            Some(config) => decrypt_object(&config.key, stored_frame).ok_or_else(|| {
+            Some(config) => decrypt_object(&config.key, stored_frame).ok_or({
                 StoreError::InvalidOptions {
                     reason: "transform pipeline: decryption failed (wrong key or corrupted data)",
                 }
