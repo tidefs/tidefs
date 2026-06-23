@@ -21,16 +21,20 @@ use std::path::Path;
 // Public constants
 // ---------------------------------------------------------------------------
 
-pub const KERNEL_TEARDOWN_NO_WORK_AFTER_V1_CLAIM_ID: &str =
-    "kernel.teardown.no_work_after.v1";
+pub const KERNEL_TEARDOWN_NO_WORK_AFTER_V1_CLAIM_ID: &str = "kernel.teardown.no_work_after.v1";
 pub const KERNEL_TEARDOWN_NO_WORK_AFTER_EVIDENCE_CLASS: &str =
     "runtime-kernel-teardown-no-work-after-artifact";
 pub const KERNEL_TEARDOWN_NO_WORK_AFTER_VERIFIER: &str =
     "tidefs-xtask validate-kernel-teardown-runtime-artifact";
-pub const KERNEL_TEARDOWN_NO_WORK_AFTER_VALIDATION_TIER: &str =
-    "mounted-kernel-vfs";
-pub const KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID: &str =
+pub const KERNEL_TEARDOWN_NO_WORK_AFTER_MOUNTED_KERNEL_VFS_TIER: &str = "mounted-kernel-vfs";
+pub const KERNEL_TEARDOWN_NO_WORK_AFTER_MOUNTED_KERNEL_VFS_TARGET_ID: &str =
     "kernel-teardown-mounted-vfs";
+pub const KERNEL_TEARDOWN_NO_WORK_AFTER_FULL_KERNEL_NO_DAEMON_TIER: &str = "full-kernel-no-daemon";
+pub const KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID: &str = "kernel-teardown-no-daemon";
+pub const KERNEL_TEARDOWN_NO_WORK_AFTER_VALIDATION_TIER: &str =
+    KERNEL_TEARDOWN_NO_WORK_AFTER_MOUNTED_KERNEL_VFS_TIER;
+pub const KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID: &str =
+    KERNEL_TEARDOWN_NO_WORK_AFTER_MOUNTED_KERNEL_VFS_TARGET_ID;
 pub const KERNEL_TEARDOWN_NO_WORK_AFTER_ARTIFACT_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -182,6 +186,16 @@ const REQUIRED_PHASES: &[&str] = &[
 ];
 
 const VALID_STATUSES: &[&str] = &["pass", "fail", "blocked", "no-result"];
+const VALID_TIER_TARGET_PAIRS: &[(&str, &str)] = &[
+    (
+        KERNEL_TEARDOWN_NO_WORK_AFTER_MOUNTED_KERNEL_VFS_TIER,
+        KERNEL_TEARDOWN_NO_WORK_AFTER_MOUNTED_KERNEL_VFS_TARGET_ID,
+    ),
+    (
+        KERNEL_TEARDOWN_NO_WORK_AFTER_FULL_KERNEL_NO_DAEMON_TIER,
+        KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID,
+    ),
+];
 
 // ---------------------------------------------------------------------------
 // Validation entry point
@@ -192,10 +206,11 @@ const VALID_STATUSES: &[&str] = &["pass", "fail", "blocked", "no-result"];
 pub fn validate_kernel_teardown_no_work_after_artifact_path(
     path: impl AsRef<Path>,
 ) -> Result<KernelTeardownNoWorkAfterSummary, KernelTeardownNoWorkAfterError> {
-    let raw = fs::read_to_string(path.as_ref()).map_err(|e| {
-        KernelTeardownNoWorkAfterError {
-            failures: vec![format!("cannot read artifact at {}: {e}", path.as_ref().display())],
-        }
+    let raw = fs::read_to_string(path.as_ref()).map_err(|e| KernelTeardownNoWorkAfterError {
+        failures: vec![format!(
+            "cannot read artifact at {}: {e}",
+            path.as_ref().display()
+        )],
     })?;
     validate_kernel_teardown_no_work_after_artifact_json(&raw)
 }
@@ -215,8 +230,7 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
     if artifact.artifact_version != KERNEL_TEARDOWN_NO_WORK_AFTER_ARTIFACT_VERSION {
         failures.push(format!(
             "artifact_version must be {}, got {}",
-            KERNEL_TEARDOWN_NO_WORK_AFTER_ARTIFACT_VERSION,
-            artifact.artifact_version
+            KERNEL_TEARDOWN_NO_WORK_AFTER_ARTIFACT_VERSION, artifact.artifact_version
         ));
     }
 
@@ -263,21 +277,42 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
         failures.push("source_sha is required".into());
     }
 
-    // --- validation tier ---
-    if artifact.validation_tier != KERNEL_TEARDOWN_NO_WORK_AFTER_VALIDATION_TIER {
+    // --- validation tier / target id ---
+    let validation_tier_known = VALID_TIER_TARGET_PAIRS
+        .iter()
+        .any(|(tier, _target)| artifact.validation_tier == *tier);
+    if !validation_tier_known {
         failures.push(format!(
-            "validation_tier must be `{}`, got `{}`",
-            KERNEL_TEARDOWN_NO_WORK_AFTER_VALIDATION_TIER,
+            "validation_tier must be one of {:?}, got `{}`",
+            VALID_TIER_TARGET_PAIRS
+                .iter()
+                .map(|(tier, _target)| *tier)
+                .collect::<Vec<_>>(),
             artifact.validation_tier
         ));
     }
 
-    // --- target id ---
-    if artifact.target_id != KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID {
+    let target_id_known = VALID_TIER_TARGET_PAIRS
+        .iter()
+        .any(|(_tier, target)| artifact.target_id == *target);
+    if !target_id_known {
         failures.push(format!(
-            "target_id must be `{}`, got `{}`",
-            KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID,
+            "target_id must be one of {:?}, got `{}`",
+            VALID_TIER_TARGET_PAIRS
+                .iter()
+                .map(|(_tier, target)| *target)
+                .collect::<Vec<_>>(),
             artifact.target_id
+        ));
+    }
+
+    let tier_target_pair_valid = VALID_TIER_TARGET_PAIRS
+        .iter()
+        .any(|(tier, target)| artifact.validation_tier == *tier && artifact.target_id == *target);
+    if validation_tier_known && target_id_known && !tier_target_pair_valid {
+        failures.push(format!(
+            "validation_tier `{}` and target_id `{}` are not an allowed pair",
+            artifact.validation_tier, artifact.target_id
         ));
     }
 
@@ -322,10 +357,16 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
     // --- trace sources ---
     let trace_sources = [
         ("workqueue_trace_source", &artifact.workqueue_trace_source),
-        ("workqueue_trace_artifact_path", &artifact.workqueue_trace_artifact_path),
+        (
+            "workqueue_trace_artifact_path",
+            &artifact.workqueue_trace_artifact_path,
+        ),
         ("workqueue_trace_digest", &artifact.workqueue_trace_digest),
         ("callback_trace_source", &artifact.callback_trace_source),
-        ("callback_trace_artifact_path", &artifact.callback_trace_artifact_path),
+        (
+            "callback_trace_artifact_path",
+            &artifact.callback_trace_artifact_path,
+        ),
         ("callback_trace_digest", &artifact.callback_trace_digest),
     ];
     for (name, value) in &trace_sources {
@@ -336,9 +377,7 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
 
     // --- refusal observations ---
     if artifact.post_final_teardown_refusal_observations.is_empty() {
-        failures.push(
-            "post_final_teardown_refusal_observations must be non-empty".into(),
-        );
+        failures.push("post_final_teardown_refusal_observations must be non-empty".into());
     } else {
         for (i, obs) in artifact
             .post_final_teardown_refusal_observations
@@ -374,9 +413,7 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
             failures.push("cleanup_outcome.dmesg_state is required".into());
         }
         if c.remaining_tidefs_work_observations.is_empty() {
-            failures.push(
-                "cleanup_outcome.remaining_tidefs_work_observations is required".into(),
-            );
+            failures.push("cleanup_outcome.remaining_tidefs_work_observations is required".into());
         }
     }
 
@@ -390,9 +427,7 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
 
     // --- fail-closed reasons ---
     if artifact.status == "pass" && !artifact.fail_closed_reasons.is_empty() {
-        failures.push(
-            "fail_closed_reasons must be empty when status is `pass`".into(),
-        );
+        failures.push("fail_closed_reasons must be empty when status is `pass`".into());
     }
     if artifact.status != "pass" && artifact.fail_closed_reasons.is_empty() {
         failures.push(format!(
@@ -409,9 +444,7 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
         status: artifact.status,
         fail_closed_count: artifact.fail_closed_reasons.len(),
         phase_count: artifact.teardown_phases.len(),
-        refusal_observation_count: artifact
-            .post_final_teardown_refusal_observations
-            .len(),
+        refusal_observation_count: artifact.post_final_teardown_refusal_observations.len(),
         target_id: artifact.target_id,
         source_ref: artifact.source_ref,
     })
@@ -503,13 +536,15 @@ mod tests {
         }"#;
         let err = validate_kernel_teardown_no_work_after_artifact_json(json).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("workflow"), "should complain about missing workflow fields: {msg}");
+        assert!(
+            msg.contains("workflow"),
+            "should complain about missing workflow fields: {msg}"
+        );
     }
 
     #[test]
     fn unknown_field_rejected() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         json_val
             .as_object_mut()
             .unwrap()
@@ -525,8 +560,7 @@ mod tests {
 
     #[test]
     fn artifact_version_mismatch_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         json_val
             .as_object_mut()
             .unwrap()
@@ -542,8 +576,7 @@ mod tests {
 
     #[test]
     fn workflow_run_attempt_zero_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         json_val
             .as_object_mut()
             .unwrap()
@@ -559,12 +592,11 @@ mod tests {
 
     #[test]
     fn workflow_job_empty_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert("workflow_job".into(), serde_json::Value::String(String::new()));
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "workflow_job".into(),
+            serde_json::Value::String(String::new()),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
@@ -576,29 +608,27 @@ mod tests {
 
     #[test]
     fn source_ref_empty_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert("source_ref".into(), serde_json::Value::String(String::new()));
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "source_ref".into(),
+            serde_json::Value::String(String::new()),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("source_ref"), "should complain about empty source_ref: {msg}");
+        assert!(
+            msg.contains("source_ref"),
+            "should complain about empty source_ref: {msg}"
+        );
     }
 
     #[test]
     fn target_id_mismatch_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "target_id".into(),
-                serde_json::Value::String("wrong-target".into()),
-            );
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "target_id".into(),
+            serde_json::Value::String("wrong-target".into()),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
@@ -610,15 +640,11 @@ mod tests {
 
     #[test]
     fn tier_mismatch_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "validation_tier".into(),
-                serde_json::Value::String("qemu-guest".into()),
-            );
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "validation_tier".into(),
+            serde_json::Value::String("qemu-guest".into()),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
@@ -630,12 +656,11 @@ mod tests {
 
     #[test]
     fn module_digest_empty_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert("module_digest".into(), serde_json::Value::String(String::new()));
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "module_digest".into(),
+            serde_json::Value::String(String::new()),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
@@ -647,8 +672,7 @@ mod tests {
 
     #[test]
     fn missing_teardown_phase_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         // Remove final_teardown from the phases array
         let phases = json_val
             .as_object_mut()
@@ -661,20 +685,19 @@ mod tests {
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("final_teardown"), "should complain about missing final_teardown phase: {msg}");
+        assert!(
+            msg.contains("final_teardown"),
+            "should complain about missing final_teardown phase: {msg}"
+        );
     }
 
     #[test]
     fn missing_refusal_observations_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "post_final_teardown_refusal_observations".into(),
-                serde_json::Value::Array(vec![]),
-            );
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "post_final_teardown_refusal_observations".into(),
+            serde_json::Value::Array(vec![]),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
@@ -686,15 +709,11 @@ mod tests {
 
     #[test]
     fn missing_trace_fields_fail() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "workqueue_trace_source".into(),
-                serde_json::Value::String(String::new()),
-            );
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "workqueue_trace_source".into(),
+            serde_json::Value::String(String::new()),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
@@ -706,8 +725,7 @@ mod tests {
 
     #[test]
     fn cleanup_unmount_empty_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         json_val
             .as_object_mut()
             .unwrap()
@@ -719,13 +737,15 @@ mod tests {
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("unmount"), "should complain about empty cleanup unmount: {msg}");
+        assert!(
+            msg.contains("unmount"),
+            "should complain about empty cleanup unmount: {msg}"
+        );
     }
 
     #[test]
     fn fail_status_without_reasons_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         let obj = json_val.as_object_mut().unwrap();
         obj.insert("status".into(), serde_json::Value::String("fail".into()));
         obj.insert(
@@ -743,8 +763,7 @@ mod tests {
 
     #[test]
     fn pass_status_with_reasons_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         let obj = json_val.as_object_mut().unwrap();
         obj.insert(
             "fail_closed_reasons".into(),
@@ -761,8 +780,7 @@ mod tests {
 
     #[test]
     fn blocked_status_with_reasons_passes() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         let obj = json_val.as_object_mut().unwrap();
         obj.insert("status".into(), serde_json::Value::String("blocked".into()));
         obj.insert(
@@ -778,10 +796,12 @@ mod tests {
 
     #[test]
     fn no_result_status_with_reasons_passes() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         let obj = json_val.as_object_mut().unwrap();
-        obj.insert("status".into(), serde_json::Value::String("no-result".into()));
+        obj.insert(
+            "status".into(),
+            serde_json::Value::String("no-result".into()),
+        );
         obj.insert(
             "fail_closed_reasons".into(),
             serde_json::json!(["harness timeout before teardown"]),
@@ -795,14 +815,10 @@ mod tests {
 
     #[test]
     fn invalid_status_rejected() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         let obj = json_val.as_object_mut().unwrap();
         obj.insert("status".into(), serde_json::Value::String("unknown".into()));
-        obj.insert(
-            "fail_closed_reasons".into(),
-            serde_json::json!(["reason"]),
-        );
+        obj.insert("fail_closed_reasons".into(), serde_json::json!(["reason"]));
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
@@ -821,29 +837,27 @@ mod tests {
 
     #[test]
     fn missing_module_name_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert("module_name".into(), serde_json::Value::String(String::new()));
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "module_name".into(),
+            serde_json::Value::String(String::new()),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("module_name"), "should complain about empty module_name: {msg}");
+        assert!(
+            msg.contains("module_name"),
+            "should complain about empty module_name: {msg}"
+        );
     }
 
     #[test]
     fn claim_id_mismatch_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "claim_id".into(),
-                serde_json::Value::String("wrong.claim.v1".into()),
-            );
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "claim_id".into(),
+            serde_json::Value::String("wrong.claim.v1".into()),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
@@ -855,15 +869,11 @@ mod tests {
 
     #[test]
     fn evidence_class_mismatch_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "evidence_class".into(),
-                serde_json::Value::String("wrong-class".into()),
-            );
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "evidence_class".into(),
+            serde_json::Value::String("wrong-class".into()),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
@@ -875,20 +885,16 @@ mod tests {
 
     #[test]
     fn refusal_observation_missing_operation_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
-        json_val
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "post_final_teardown_refusal_observations".into(),
-                serde_json::json!([{
-                    "operation": "",
-                    "expected_refusal": true,
-                    "observed_result": "EIO",
-                    "new_work_enqueued_or_started": false
-                }]),
-            );
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+        json_val.as_object_mut().unwrap().insert(
+            "post_final_teardown_refusal_observations".into(),
+            serde_json::json!([{
+                "operation": "",
+                "expected_refusal": true,
+                "observed_result": "EIO",
+                "new_work_enqueued_or_started": false
+            }]),
+        );
         let json = serde_json::to_string_pretty(&json_val).unwrap();
         let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
         let msg = err.to_string();
@@ -900,8 +906,7 @@ mod tests {
 
     #[test]
     fn teardown_phase_empty_status_fails() {
-        let mut json_val: serde_json::Value =
-            serde_json::from_str(&minimal_pass_json()).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
         let phases = json_val
             .as_object_mut()
             .unwrap()
