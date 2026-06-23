@@ -35,7 +35,10 @@ OBJECT_FILES_NON_STANDARD_tidefs_posix_vfs_main.o := y
 # clang warns about as unused during compilation of certain object types
 # (modfinal .mod.o, .module-common.o).  These flags are set by Kbuild,
 # not by this module.
-subdir-ccflags-y := -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare -Wno-unused-command-line-argument
+ccflags-y := -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare -Wno-unused-command-line-argument
+# Export so the modfinal sub-make (Makefile.modfinal) sees these flags
+# when it compiles .mod.o and .module-common.o.
+export ccflags-y
 
 # Treat Rust warnings as errors in kernel module builds.
 # Clippy lints are the primary Rust quality gate; -Dwarnings ensures the
