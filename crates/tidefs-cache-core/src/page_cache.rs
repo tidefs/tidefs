@@ -11,6 +11,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::Mutex;
 
+use crate::{
+    budget_category_for_cache_level, BudgetCategory, BudgetError, CacheBudgetLevel, Governor,
+};
+
 // ---------------------------------------------------------------------------
 // PageKey: (inode, page-aligned offset)
 // ---------------------------------------------------------------------------
@@ -120,13 +124,15 @@ impl fmt::Debug for Page {
 // ---------------------------------------------------------------------------
 
 /// Reasons an insert may fail.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InsertError {
     /// The page already exists in the cache.
     AlreadyExists,
     /// The cache is full and every page is dirty, writeback, or pinned —
     /// no clean page is available for eviction.
     AtCapacityNoCleanPages,
+    /// A resource governor rejected the page admission.
+    Budget(BudgetError),
 }
 
 impl fmt::Display for InsertError {
@@ -136,6 +142,7 @@ impl fmt::Display for InsertError {
             InsertError::AtCapacityNoCleanPages => {
                 write!(f, "cache full and no clean pages available for eviction")
             }
+            InsertError::Budget(e) => write!(f, "page cache budget admission failed: {e}"),
         }
     }
 }
@@ -198,6 +205,7 @@ struct PageCacheInner {
     writeback_count: u64,
     evictions: u64,
     inserts: u64,
+    governor: Option<Governor>,
 }
 
 impl PageCacheInner {
@@ -213,7 +221,52 @@ impl PageCacheInner {
             writeback_count: 0,
             evictions: 0,
             inserts: 0,
+            governor: None,
         }
+    }
+
+    fn clean_page_category() -> BudgetCategory {
+        budget_category_for_cache_level(CacheBudgetLevel::L1HotRead)
+    }
+
+    fn dirty_page_category() -> BudgetCategory {
+        budget_category_for_cache_level(CacheBudgetLevel::L5DirtyWriteback)
+    }
+
+    fn budget_category_for_page(page: &Page) -> BudgetCategory {
+        if page.is_dirty() {
+            Self::dirty_page_category()
+        } else {
+            Self::clean_page_category()
+        }
+    }
+
+    fn release_page_budget(&self, page: &Page) {
+        if let Some(ref governor) = self.governor {
+            governor.release(Self::budget_category_for_page(page), page.data.len() as u64);
+        }
+    }
+
+    fn admit_page_budget(&self, page: &Page) -> Result<(), InsertError> {
+        if let Some(ref governor) = self.governor {
+            governor
+                .admit(Self::budget_category_for_page(page), page.data.len() as u64)
+                .map(|_| ())
+                .map_err(InsertError::Budget)?;
+        }
+        Ok(())
+    }
+
+    fn transfer_page_budget(
+        &self,
+        from: BudgetCategory,
+        to: BudgetCategory,
+        size: u64,
+    ) -> Result<(), BudgetError> {
+        if let Some(ref governor) = self.governor {
+            governor.transfer(from, to, size)?;
+        }
+        Ok(())
     }
 
     /// Touch the page identified by `key`: move it to the MRU end.
@@ -263,10 +316,6 @@ impl PageCacheInner {
         if self.pages.contains_key(&key) {
             return Err(InsertError::AlreadyExists);
         }
-        if page.is_writeback() {
-            self.writeback_count += 1;
-        }
-
         // If at capacity, evict the oldest clean, unpinned page.
         let evicted = if self.pages.len() >= self.max_pages {
             match self.evict_one_inner() {
@@ -279,6 +328,11 @@ impl PageCacheInner {
         } else {
             None
         };
+
+        self.admit_page_budget(&page)?;
+        if page.is_writeback() {
+            self.writeback_count += 1;
+        }
 
         self.lru_order.push_back(key);
         self.pages.insert(key, page);
@@ -307,19 +361,35 @@ impl PageCacheInner {
             if page.is_writeback() {
                 self.writeback_count = self.writeback_count.saturating_sub(1);
             }
+            self.release_page_budget(page);
         }
         removed
     }
 
     /// Mark a page dirty by key.  Returns false if the page does not exist.
     fn mark_dirty_inner(&mut self, key: &PageKey) -> bool {
-        let became_dirty = if let Some(page) = self.pages.get_mut(key) {
-            let became_dirty = !page.is_dirty();
-            page.flags |= page_flags::DIRTY;
-            became_dirty
-        } else {
+        let Some((became_dirty, size)) = self
+            .pages
+            .get(key)
+            .map(|page| (!page.is_dirty(), page.data.len() as u64))
+        else {
             return false;
         };
+        if became_dirty {
+            if self
+                .transfer_page_budget(
+                    Self::clean_page_category(),
+                    Self::dirty_page_category(),
+                    size,
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+        if let Some(page) = self.pages.get_mut(key) {
+            page.flags |= page_flags::DIRTY;
+        }
         if became_dirty {
             self.record_dirty_page(*key);
         }
@@ -328,13 +398,28 @@ impl PageCacheInner {
 
     /// Clear the dirty flag on a page.  Returns false if the page does not exist.
     fn clear_dirty_inner(&mut self, key: &PageKey) -> bool {
-        let was_dirty = if let Some(page) = self.pages.get_mut(key) {
-            let was_dirty = page.is_dirty();
-            page.flags &= !page_flags::DIRTY;
-            was_dirty
-        } else {
+        let Some((was_dirty, size)) = self
+            .pages
+            .get(key)
+            .map(|page| (page.is_dirty(), page.data.len() as u64))
+        else {
             return false;
         };
+        if was_dirty {
+            if self
+                .transfer_page_budget(
+                    Self::dirty_page_category(),
+                    Self::clean_page_category(),
+                    size,
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+        if let Some(page) = self.pages.get_mut(key) {
+            page.flags &= !page_flags::DIRTY;
+        }
         if was_dirty {
             self.forget_dirty_page(*key);
         }
@@ -359,20 +444,16 @@ impl PageCacheInner {
     /// Complete writeback: clear writeback flag; if successful, also clear dirty.
     /// Unpins regardless of success.  Returns false if the page does not exist.
     fn complete_writeback_inner(&mut self, key: &PageKey, success: bool) -> bool {
-        let cleared_dirty = if let Some(page) = self.pages.get_mut(key) {
+        let clear_dirty = if let Some(page) = self.pages.get_mut(key) {
             page.flags &= !page_flags::WRITEBACK;
             page.flags &= !page_flags::PINNED;
             self.writeback_count = self.writeback_count.saturating_sub(1);
-            let cleared_dirty = success && page.is_dirty();
-            if success {
-                page.flags &= !page_flags::DIRTY;
-            }
-            cleared_dirty
+            success && page.is_dirty()
         } else {
             return false;
         };
-        if cleared_dirty {
-            self.forget_dirty_page(*key);
+        if clear_dirty && !self.clear_dirty_inner(key) {
+            return false;
         }
         true
     }
@@ -500,17 +581,21 @@ impl PageCacheInner {
         if dirty_count == 0 {
             return 0;
         }
-        let offsets = self.dirty_pages_by_inode.remove(&inode).unwrap_or_default();
-        let cleared = offsets
+        let offsets: Vec<u64> = self
+            .dirty_pages_by_inode
+            .get(&inode)
             .into_iter()
-            .filter_map(|offset| {
-                let key = PageKey { inode, offset };
-                let page = self.pages.get_mut(&key)?;
-                let was_dirty = page.is_dirty();
-                page.flags &= !page_flags::DIRTY;
-                was_dirty.then_some(())
-            })
-            .count();
+            .flat_map(|offsets| offsets.iter().copied())
+            .collect();
+        let mut cleared = 0usize;
+        for offset in offsets {
+            let key = PageKey { inode, offset };
+            if self.pages.get(&key).is_some_and(Page::is_dirty)
+                && self.clear_dirty_inner(&key)
+            {
+                cleared += 1;
+            }
+        }
         cleared
     }
 
@@ -538,7 +623,9 @@ impl PageCacheInner {
         let count = keys_to_remove.len();
         for key in &keys_to_remove {
             self.unlink_lru(key);
-            self.pages.remove(key);
+            if let Some(page) = self.pages.remove(key) {
+                self.release_page_budget(&page);
+            }
         }
         self.evictions += count as u64;
         count
@@ -594,6 +681,7 @@ impl PageCacheInner {
                     self.writeback_count = self.writeback_count.saturating_sub(1);
                 }
                 self.forget_dirty_page(*key);
+                self.release_page_budget(&page);
                 total += 1;
             }
         }
@@ -625,6 +713,7 @@ impl PageCacheInner {
                     self.writeback_count = self.writeback_count.saturating_sub(1);
                 }
                 self.forget_dirty_page(*key);
+                self.release_page_budget(&page);
                 total += 1;
             }
         }
@@ -644,7 +733,9 @@ impl PageCacheInner {
         let count = keys.len();
         for key in &keys {
             self.unlink_lru(key);
-            self.pages.remove(key);
+            if let Some(page) = self.pages.remove(key) {
+                self.release_page_budget(&page);
+            }
         }
         self.evictions += count as u64;
         count
@@ -818,6 +909,23 @@ impl PageCache {
         }
     }
 
+    /// Create a page cache with resource-governor accounting enabled.
+    #[must_use]
+    pub fn with_governor(max_pages: usize, page_size: usize, governor: Governor) -> Self {
+        let cache = Self::new(max_pages, page_size);
+        cache.set_governor(governor);
+        cache
+    }
+
+    /// Attach a resource governor for clean page and dirty byte accounting.
+    ///
+    /// Clean resident pages are charged to L1 hot-read [`BudgetCategory::DataCache`].
+    /// Dirty and writeback pages transfer to L5 [`BudgetCategory::DirtyBytes`]
+    /// until flush/writeback completion makes them clean again.
+    pub fn set_governor(&self, governor: Governor) {
+        self.inner.lock().unwrap().governor = Some(governor);
+    }
+
     // ── Insert ──────────────────────────────────────────────────────
 
     /// Insert a new page for the given inode and offset.
@@ -876,6 +984,10 @@ impl PageCache {
         if page.is_dirty() {
             inner.forget_dirty_page(key);
         }
+        if page.is_writeback() {
+            inner.writeback_count = inner.writeback_count.saturating_sub(1);
+        }
+        inner.release_page_budget(&page);
         Some(page)
     }
 
@@ -896,7 +1008,12 @@ impl PageCache {
         let count = keys.len();
         for key in &keys {
             inner.unlink_lru(key);
-            inner.pages.remove(key);
+            if let Some(page) = inner.pages.remove(key) {
+                if page.is_writeback() {
+                    inner.writeback_count = inner.writeback_count.saturating_sub(1);
+                }
+                inner.release_page_budget(&page);
+            }
         }
         inner.dirty_pages_by_inode.remove(&inode);
         count
@@ -956,7 +1073,6 @@ impl PageCache {
                             page.data[dst_start..dst_start + copy_len]
                                 .copy_from_slice(&data[src_start..src_start + copy_len]);
                             if page.is_dirty() {
-                                page.flags &= !page_flags::DIRTY;
                                 cleared_dirty.push(key);
                             }
                             patched = patched.saturating_add(1);
@@ -970,7 +1086,7 @@ impl PageCache {
         }
 
         for key in cleared_dirty {
-            inner.forget_dirty_page(key);
+            inner.clear_dirty_inner(&key);
         }
         patched
     }
@@ -1357,8 +1473,10 @@ impl PageCache {
 // ReadCache bridge for workers-io integration
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "adapter-workers-io")]
 use tidefs_posix_filesystem_adapter_workers_io::ReadCache;
 
+#[cfg(feature = "adapter-workers-io")]
 impl ReadCache for PageCache {
     fn lookup(&self, ino: u64, offset: u64, length: u64) -> Option<Vec<u8>> {
         // Align offset down to page size
@@ -1432,6 +1550,52 @@ mod tests {
 
     fn new_cache(cap: usize) -> PageCache {
         PageCache::new(cap, PAGE_SIZE)
+    }
+
+    fn data_dirty_governor() -> Governor {
+        Governor::new(crate::GovernorConfig {
+            total_budget_bytes: (PAGE_SIZE as u64) * 8,
+            data_cache_fraction: 0.5,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.5,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn governor_tracks_clean_dirty_and_unlink_release() {
+        let governor = data_dirty_governor();
+        let cache = PageCache::with_governor(4, PAGE_SIZE, governor.clone());
+
+        cache.insert(1, 0).unwrap();
+        assert_eq!(
+            governor.category_used(BudgetCategory::DataCache),
+            PAGE_SIZE as u64
+        );
+        assert_eq!(governor.category_used(BudgetCategory::DirtyBytes), 0);
+
+        assert!(cache.mark_dirty(1, 0));
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
+        assert_eq!(
+            governor.category_used(BudgetCategory::DirtyBytes),
+            PAGE_SIZE as u64
+        );
+
+        let token = cache.start_writeback_token(1, 0).unwrap();
+        cache.complete_writeback_with_token(token, true);
+        assert_eq!(
+            governor.category_used(BudgetCategory::DataCache),
+            PAGE_SIZE as u64
+        );
+        assert_eq!(governor.category_used(BudgetCategory::DirtyBytes), 0);
+
+        let (removed, dirty_removed) = cache.unlink_invalidate(1);
+        assert_eq!((removed, dirty_removed), (1, 0));
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
+        assert_eq!(governor.category_used(BudgetCategory::DirtyBytes), 0);
     }
 
     // ── Test 1: insert + lookup round-trip ───────────────────────────

@@ -15,6 +15,9 @@
 //!
 use tidefs_types_vfs_core::{InodeId, NodeKind};
 
+use tidefs_cache_core::{
+    budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor,
+};
 #[cfg(test)]
 use tidefs_types_cache_lattice_core::CacheLatticeReport;
 use tidefs_types_cache_lattice_core::{
@@ -145,6 +148,7 @@ pub(crate) struct HotReadCache {
     admission_rejected_dirty_state: u64,
     poisoned_on_validate: u64,
     monotonic_counter: u64, // global birth/hit counter
+    governor: Option<Governor>,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -194,6 +198,42 @@ impl HotReadCache {
             admission_rejected_dirty_state: 0,
             poisoned_on_validate: 0,
             monotonic_counter: 0,
+            governor: None,
+        }
+    }
+
+    /// Attach resource-governor accounting for L1 hot-read data bytes.
+    pub(crate) fn set_governor(&mut self, governor: Governor) {
+        self.governor = Some(governor);
+    }
+
+    fn budget_category() -> BudgetCategory {
+        budget_category_for_cache_level(CacheBudgetLevel::L1HotRead)
+    }
+
+    fn admit_budget(&mut self, bytes: u64) -> bool {
+        if let Some(ref governor) = self.governor {
+            if governor.admit(Self::budget_category(), bytes).is_err() {
+                self.admission_rejected_budget =
+                    self.admission_rejected_budget.saturating_add(1);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release_budget(&self, bytes: u64) {
+        if let Some(ref governor) = self.governor {
+            governor.release(Self::budget_category(), bytes);
+        }
+    }
+
+    fn resize_budget(&mut self, old_bytes: u64, new_bytes: u64) -> bool {
+        if new_bytes > old_bytes {
+            self.admit_budget(new_bytes - old_bytes)
+        } else {
+            self.release_budget(old_bytes - new_bytes);
+            true
         }
     }
 
@@ -358,6 +398,7 @@ impl HotReadCache {
                 self.evictions_from_t2 = self.evictions_from_t2.saturating_add(1);
                 self.b2.insert(0, (entry.key, len));
             }
+            self.release_budget(len);
             self.enforce_ghost_cap();
             self.enforce_ghost_entry_cap();
             return Some(len);
@@ -494,6 +535,9 @@ impl HotReadCache {
         // Already in T2: update data in place, move to MRU of T2.
         if let Some(idx) = find_in_residents(&self.t2, &key) {
             let old_len = self.t2[idx].bytes.len() as u64;
+            if !self.resize_budget(old_len, len) {
+                return;
+            }
             self.resident_bytes = self.resident_bytes.saturating_sub(old_len);
             self.t2[idx].bytes = bytes.to_vec();
             self.t2[idx].header.set_size(len);
@@ -508,6 +552,9 @@ impl HotReadCache {
         // Already in T1: update data in place, promote to T2 MRU.
         if let Some(idx) = find_in_residents(&self.t1, &key) {
             let old_len = self.t1[idx].bytes.len() as u64;
+            if !self.resize_budget(old_len, len) {
+                return;
+            }
             self.resident_bytes = self.resident_bytes.saturating_sub(old_len);
             let mut entry = self.t1.remove(idx);
             entry.bytes = bytes.to_vec();
@@ -559,6 +606,9 @@ impl HotReadCache {
             self.admission_bypasses = self.admission_bypasses.saturating_add(1);
             return;
         }
+        if !self.admit_budget(len) {
+            return;
+        }
 
         self.t1.insert(
             0,
@@ -575,11 +625,14 @@ impl HotReadCache {
     /// Invalidate all cache entries belonging to `inode_id`.
     pub(crate) fn invalidate_inode(&mut self, inode_id: InodeId) {
         let target = inode_id.get();
+        let mut released = 0u64;
         // Remove from T1.
         let _before = self.t1.len();
         self.t1.retain(|r| {
             if r.key.inode_id == target {
-                self.resident_bytes = self.resident_bytes.saturating_sub(r.bytes.len() as u64);
+                let len = r.bytes.len() as u64;
+                self.resident_bytes = self.resident_bytes.saturating_sub(len);
+                released = released.saturating_add(len);
                 self.invalidations = self.invalidations.saturating_add(1);
                 false
             } else {
@@ -589,13 +642,16 @@ impl HotReadCache {
         // Remove from T2.
         self.t2.retain(|r| {
             if r.key.inode_id == target {
-                self.resident_bytes = self.resident_bytes.saturating_sub(r.bytes.len() as u64);
+                let len = r.bytes.len() as u64;
+                self.resident_bytes = self.resident_bytes.saturating_sub(len);
+                released = released.saturating_add(len);
                 self.invalidations = self.invalidations.saturating_add(1);
                 false
             } else {
                 true
             }
         });
+        self.release_budget(released);
         // Remove from ghost lists.
         self.b1.retain(|(k, _w)| k.inode_id != target);
         self.b2.retain(|(k, _w)| k.inode_id != target);
@@ -607,6 +663,7 @@ impl HotReadCache {
         if total > 0 {
             self.invalidations = self.invalidations.saturating_add(total as u64);
         }
+        self.release_budget(self.resident_bytes);
         self.t1.clear();
         self.t2.clear();
         self.b1.clear();
@@ -719,6 +776,37 @@ mod tests {
             data_version: 1,
             size: 100,
         }
+    }
+
+    fn data_governor() -> Governor {
+        Governor::new(tidefs_cache_core::GovernorConfig {
+            total_budget_bytes: 4096,
+            data_cache_fraction: 1.0,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn governor_charges_hot_read_entries_to_data_cache() {
+        let governor = data_governor();
+        let mut cache = HotReadCache::new(policy());
+        cache.set_governor(governor.clone());
+        let data = b"hot file bytes";
+        let k = key(1);
+
+        cache.admit(k, data);
+        assert_eq!(
+            governor.category_used(BudgetCategory::DataCache),
+            data.len() as u64
+        );
+
+        cache.invalidate_inode(InodeId::new(k.inode_id));
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
     }
 
     #[test]

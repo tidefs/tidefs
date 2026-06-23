@@ -13,6 +13,10 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::{
+    budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor,
+};
+
 // ---------------------------------------------------------------------------
 // L2ArcKey — cache lookup key
 // ---------------------------------------------------------------------------
@@ -319,6 +323,8 @@ pub struct L2ArcWriter {
     config: L2ArcWriterConfig,
     /// Statistics.
     pub stats: L2ArcStats,
+    /// Optional resource governor for pending L2ARC data-cache bytes.
+    governor: Option<Governor>,
 }
 
 impl L2ArcWriter {
@@ -330,6 +336,7 @@ impl L2ArcWriter {
             batch_bytes: 0,
             config: L2ArcWriterConfig::default(),
             stats: L2ArcStats::default(),
+            governor: None,
         }
     }
 
@@ -341,7 +348,13 @@ impl L2ArcWriter {
             batch_bytes: 0,
             config,
             stats: L2ArcStats::default(),
+            governor: None,
         }
+    }
+
+    /// Attach resource-governor accounting for pending L2ARC write batches.
+    pub fn set_governor(&mut self, governor: Governor) {
+        self.governor = Some(governor);
     }
 
     /// Queue an evicted entry for L2ARC writeback.
@@ -350,7 +363,12 @@ impl L2ArcWriter {
     /// flushed; the caller must call [`flush`] explicitly.  This keeps the
     /// ARC eviction path non-blocking.
     pub fn queue_evicted(&mut self, entry: L2ArcEntry) {
-        self.batch_bytes += entry.record_len() as u64;
+        let record_len = entry.record_len() as u64;
+        if !self.admit_budget(record_len) {
+            self.stats.evict_truncations += 1;
+            return;
+        }
+        self.batch_bytes += record_len;
         self.batch.push(entry);
     }
 
@@ -389,9 +407,14 @@ impl L2ArcWriter {
         }
 
         let mut written = Vec::with_capacity(self.batch.len());
+        let governor = self.governor.clone();
+        let category = Self::budget_category();
 
         for entry in self.batch.drain(..) {
             let record_len = entry.record_len() as u64;
+            if let Some(ref governor) = governor {
+                governor.release(category, record_len);
+            }
 
             // Check if the device has room (with a safety margin).
             if record_len > device.capacity_bytes / 10 {
@@ -410,11 +433,34 @@ impl L2ArcWriter {
         self.batch_bytes = 0;
         written
     }
+
+    fn budget_category() -> BudgetCategory {
+        budget_category_for_cache_level(CacheBudgetLevel::L2Arc)
+    }
+
+    fn admit_budget(&self, bytes: u64) -> bool {
+        if let Some(ref governor) = self.governor {
+            return governor.admit(Self::budget_category(), bytes).is_ok();
+        }
+        true
+    }
+
+    fn release_budget(&self, bytes: u64) {
+        if let Some(ref governor) = self.governor {
+            governor.release(Self::budget_category(), bytes);
+        }
+    }
 }
 
 impl Default for L2ArcWriter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for L2ArcWriter {
+    fn drop(&mut self) {
+        self.release_budget(self.batch_bytes);
     }
 }
 
@@ -631,6 +677,19 @@ impl L2ArcStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn data_governor() -> Governor {
+        Governor::new(crate::GovernorConfig {
+            total_budget_bytes: 1024 * 1024,
+            data_cache_fraction: 1.0,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
+    }
 
     // ── L2ArcKey ──────────────────────────────────────────────────────
 
@@ -1044,6 +1103,26 @@ mod tests {
         assert_eq!(total_written, 20);
         assert_eq!(writer.stats.writes, 20);
         assert_eq!(index.len(), 20);
+    }
+
+    #[test]
+    fn writer_governor_charges_pending_batch_to_data_cache() {
+        let governor = data_governor();
+        let mut dev = L2ArcDevice::new(1, 100, 1, 65536);
+        let mut index = L2ArcIndex::new();
+        let mut writer = L2ArcWriter::new();
+        writer.set_governor(governor.clone());
+        let entry = L2ArcEntry::new(L2ArcKey::new(7, 0, 1), vec![0xAB; 128]);
+        let record_len = entry.record_len() as u64;
+
+        writer.queue_evicted(entry);
+        assert_eq!(
+            governor.category_used(BudgetCategory::DataCache),
+            record_len
+        );
+
+        writer.flush(&mut dev, &mut index);
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
     }
 
     // ── L2ArcStats ────────────────────────────────────────────────────

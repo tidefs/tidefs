@@ -25,6 +25,7 @@ tidefs-types-dataset-feature-flags-core = { workspace = true }
 tidefs-dataset-lifecycle = { workspace = true }
 tidefs-dataset-properties = { workspace = true }
 tidefs-dedup = { workspace = true }
+tidefs-cache-core = { workspace = true }
 tidefs-types-cache-lattice-core = { workspace = true }
 tidefs-types-space-accounting-core = { workspace = true }
 tidefs-space-accounting = { workspace = true }

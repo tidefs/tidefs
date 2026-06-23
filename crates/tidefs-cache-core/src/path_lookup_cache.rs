@@ -19,6 +19,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::{
+    budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor,
+};
+
 // ── PathLookupKey ───────────────────────────────────────────────────────
 
 /// Cache key: (parent_inode, child_name).
@@ -155,6 +159,8 @@ pub struct PathLookupCache<V: Clone> {
     negative_ttl: Duration,
     /// Aggregated statistics.
     stats: PathLookupCacheStats,
+    /// Optional resource governor for L4 path/dentry metadata accounting.
+    governor: Option<Governor>,
 }
 
 impl<V: Clone> PathLookupCache<V> {
@@ -175,7 +181,16 @@ impl<V: Clone> PathLookupCache<V> {
             negative_entries: HashMap::new(),
             negative_ttl: Duration::from_secs(5),
             stats: PathLookupCacheStats::default(),
+            governor: None,
         }
+    }
+
+    /// Attach a resource governor for path lookup cache admission.
+    ///
+    /// Positive and negative path lookup entries are L4 namespace metadata and
+    /// are charged through the centralized mapping as [`BudgetCategory::MetaCache`].
+    pub fn set_governor(&mut self, governor: Governor) {
+        self.governor = Some(governor);
     }
 
     /// Set the TTL for negative (ENOENT) cache entries.
@@ -236,8 +251,7 @@ impl<V: Clone> PathLookupCache<V> {
         // Check expiry without holding a long-lived borrow.
         let expired = self.entries.get(key).is_some_and(|e| !e.is_valid());
         if expired {
-            self.entries.remove(key);
-            self.unlink_lru(key);
+            self.remove_positive_entry(key);
             return true;
         }
         // Not expired: if key is present, it is valid.
@@ -274,8 +288,7 @@ impl<V: Clone> PathLookupCache<V> {
 
         let expired = self.entries.get(&key).is_some_and(|e| !e.is_valid());
         if expired {
-            self.entries.remove(&key);
-            self.unlink_lru(&key);
+            self.remove_positive_entry(&key);
             return None;
         }
 
@@ -299,7 +312,7 @@ impl<V: Clone> PathLookupCache<V> {
         match self.negative_entries.get(&key) {
             Some(expiry) if Instant::now() < *expiry => true,
             Some(_) => {
-                self.negative_entries.remove(&key);
+                self.remove_negative_entry(&key);
                 false
             }
             None => false,
@@ -313,8 +326,7 @@ impl<V: Clone> PathLookupCache<V> {
         let key = PathLookupKey::new(parent_ino, name);
         let expired = self.entries.get(&key).is_some_and(|e| !e.is_valid());
         if expired {
-            self.entries.remove(&key);
-            self.unlink_lru(&key);
+            self.remove_positive_entry(&key);
             false
         } else {
             self.entries.contains_key(&key)
@@ -332,7 +344,7 @@ impl<V: Clone> PathLookupCache<V> {
         let key = PathLookupKey::new(parent_ino, name);
 
         // Clear any negative entry for this key — the file now exists.
-        self.negative_entries.remove(&key);
+        self.remove_negative_entry(&key);
 
         // If key exists in positive cache, update in place + touch LRU.
         if self.entries.contains_key(&key) {
@@ -349,6 +361,9 @@ impl<V: Clone> PathLookupCache<V> {
             self.evict_one();
         }
 
+        if !self.admit_budget(Self::positive_budget_bytes(&key)) {
+            return;
+        }
         self.entries.insert(
             key.clone(),
             PathLookupEntry::new(ino, generation, value, self.default_ttl),
@@ -364,9 +379,13 @@ impl<V: Clone> PathLookupCache<V> {
         let key = PathLookupKey::new(parent_ino, name);
 
         // Remove any stale positive entry for this key.
-        self.entries.remove(&key);
-        self.unlink_lru(&key);
+        self.remove_positive_entry(&key);
 
+        if !self.negative_entries.contains_key(&key)
+            && !self.admit_budget(Self::negative_budget_bytes(&key))
+        {
+            return;
+        }
         self.negative_entries
             .insert(key, Instant::now() + self.negative_ttl);
     }
@@ -375,7 +394,7 @@ impl<V: Clone> PathLookupCache<V> {
     /// Returns `true` if a negative entry was present.
     pub fn remove_negative(&mut self, parent_ino: u64, name: &[u8]) -> bool {
         let key = PathLookupKey::new(parent_ino, name);
-        self.negative_entries.remove(&key).is_some()
+        self.remove_negative_entry(&key)
     }
 
     // ── Invalidation ────────────────────────────────────────────────────
@@ -383,9 +402,8 @@ impl<V: Clone> PathLookupCache<V> {
     /// Invalidate a specific `(parent_ino, name)` entry in both caches.
     pub fn invalidate_child(&mut self, parent_ino: u64, name: &[u8]) {
         let key = PathLookupKey::new(parent_ino, name);
-        let had_positive = self.entries.remove(&key).is_some();
-        self.unlink_lru(&key);
-        let had_negative = self.negative_entries.remove(&key).is_some();
+        let had_positive = self.remove_positive_entry(&key).is_some();
+        let had_negative = self.remove_negative_entry(&key);
         if had_positive || had_negative {
             self.stats.invalidations += 1;
         }
@@ -412,11 +430,10 @@ impl<V: Clone> PathLookupCache<V> {
         }
 
         for key in &pos_keys {
-            self.entries.remove(key);
-            self.unlink_lru(key);
+            self.remove_positive_entry(key);
         }
         for key in &neg_keys {
-            self.negative_entries.remove(key);
+            self.remove_negative_entry(key);
         }
     }
 
@@ -431,8 +448,7 @@ impl<V: Clone> PathLookupCache<V> {
             .collect();
         let count = keys_to_remove.len();
         for key in &keys_to_remove {
-            self.entries.remove(key);
-            self.unlink_lru(key);
+            self.remove_positive_entry(key);
         }
         if count > 0 {
             self.stats.invalidations += count as u64;
@@ -441,6 +457,13 @@ impl<V: Clone> PathLookupCache<V> {
 
     /// Remove all entries (positive and negative) from the cache.
     pub fn clear(&mut self) {
+        let released = self
+            .entries
+            .keys()
+            .map(Self::positive_budget_bytes)
+            .chain(self.negative_entries.keys().map(Self::negative_budget_bytes))
+            .sum();
+        self.release_budget(released);
         self.entries.clear();
         self.lru_order.clear();
         self.negative_entries.clear();
@@ -503,7 +526,49 @@ impl<V: Clone> PathLookupCache<V> {
     /// Evict the LRU positive entry (front of the deque).
     fn evict_one(&mut self) -> Option<PathLookupEntry<V>> {
         let key = self.lru_order.pop_front()?;
-        self.entries.remove(&key)
+        self.remove_positive_entry(&key)
+    }
+
+    fn budget_category() -> BudgetCategory {
+        budget_category_for_cache_level(CacheBudgetLevel::L4PathLookup)
+    }
+
+    fn positive_budget_bytes(key: &PathLookupKey) -> u64 {
+        (std::mem::size_of::<PathLookupEntry<V>>() + key.name.len()) as u64
+    }
+
+    fn negative_budget_bytes(key: &PathLookupKey) -> u64 {
+        (std::mem::size_of::<Instant>() + key.name.len()) as u64
+    }
+
+    fn admit_budget(&mut self, bytes: u64) -> bool {
+        if let Some(ref governor) = self.governor {
+            return governor.admit(Self::budget_category(), bytes).is_ok();
+        }
+        true
+    }
+
+    fn release_budget(&self, bytes: u64) {
+        if let Some(ref governor) = self.governor {
+            governor.release(Self::budget_category(), bytes);
+        }
+    }
+
+    fn remove_positive_entry(&mut self, key: &PathLookupKey) -> Option<PathLookupEntry<V>> {
+        let removed = self.entries.remove(key);
+        if removed.is_some() {
+            self.release_budget(Self::positive_budget_bytes(key));
+        }
+        self.unlink_lru(key);
+        removed
+    }
+
+    fn remove_negative_entry(&mut self, key: &PathLookupKey) -> bool {
+        let removed = self.negative_entries.remove(key).is_some();
+        if removed {
+            self.release_budget(Self::negative_budget_bytes(key));
+        }
+        removed
     }
 }
 
@@ -528,6 +593,45 @@ mod tests {
 
     fn new_cache(capacity: usize) -> TestCache {
         PathLookupCache::new(capacity, Duration::from_secs(60))
+    }
+
+    fn meta_governor() -> Governor {
+        Governor::new(crate::GovernorConfig {
+            total_budget_bytes: 4096,
+            data_cache_fraction: 0.0,
+            meta_cache_fraction: 1.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn governor_charges_positive_and_negative_entries_to_meta_cache() {
+        let governor = meta_governor();
+        let mut cache = new_cache(4);
+        cache.set_governor(governor.clone());
+        let key = PathLookupKey::new(1, b"child");
+        let positive_bytes = TestCache::positive_budget_bytes(&key);
+        let negative_bytes = TestCache::negative_budget_bytes(&key);
+
+        cache.insert(1, b"child", 2, 1, "attrs".to_string());
+        assert_eq!(
+            governor.category_used(BudgetCategory::MetaCache),
+            positive_bytes
+        );
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
+
+        cache.insert_negative(1, b"child");
+        assert_eq!(
+            governor.category_used(BudgetCategory::MetaCache),
+            negative_bytes
+        );
+
+        assert!(cache.remove_negative(1, b"child"));
+        assert_eq!(governor.category_used(BudgetCategory::MetaCache), 0);
     }
 
     // ── Positive cache tests (existing) ─────────────────────────────────
