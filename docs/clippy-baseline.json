@@ -1,6 +1,6 @@
 {
   "command": "cargo clippy -p <crate> --locked --all-targets --message-format=json",
-  "generated_at": "2026-06-23T15:00:24Z",
+  "generated_at": "2026-06-23T17:30:00Z",
   "workspace_root": ".",
   "crates": {
     "fuser": {
@@ -248,7 +248,7 @@
       "exit_code": 0
     },
     "tidefs-local-filesystem": {
-      "warnings": 160,
+      "warnings": 161,
       "exit_code": 0
     },
     "tidefs-local-object-store": {
