@@ -53,6 +53,13 @@ jobs:
         run: |
           mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
+      - name: Validate crate selection
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          FOCUSED_CRATES: ${{ inputs.crates }}
+          CARGO_TEST_ARGS: ${{ inputs.cargo_test_args }}
+        run: nix develop .#ci --command bash -c './scripts/ci-validate-focused-inputs.sh'
+
       - name: Run focused crate tests
         id: focused-tests
         continue-on-error: true
