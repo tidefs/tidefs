@@ -888,6 +888,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+ "tidefs-permission",
  "zeroize",
 ]
 
@@ -916,6 +917,7 @@ dependencies = [
 name = "tidefs-block-allocator"
 version = "0.421.0"
 dependencies = [
+ "tidefs-commit_group",
  "tidefs-spacemap-allocator",
  "tidefs-types-vfs-core",
 ]
@@ -926,6 +928,10 @@ version = "0.421.0"
 dependencies = [
  "blake3",
 ]
+
+[[package]]
+name = "tidefs-cache-coherency"
+version = "0.421.0"
 
 [[package]]
 name = "tidefs-checksum-tree"
@@ -977,6 +983,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tidefs-dataset-catalog",
  "tidefs-membership-epoch",
+ "tidefs-replication-model",
  "tidefs-types-pool-label-core",
  "tokio",
  "tracing",
@@ -1095,6 +1102,7 @@ dependencies = [
  "tidefs-membership-epoch",
  "tidefs-quorum-write",
  "tidefs-schema-codec-vfs",
+ "tidefs-send-stream",
  "tidefs-transport",
  "tidefs-types-transport-session",
  "tidefs-ublk-abi",
@@ -1106,6 +1114,7 @@ name = "tidefs-gc-pin-set"
 version = "0.421.0"
 dependencies = [
  "tidefs-types-dataset-lifecycle-core",
+ "tidefs-types-reclaim-queue-core",
 ]
 
 [[package]]
@@ -1133,6 +1142,7 @@ dependencies = [
  "tidefs-binary_schema-checksum",
  "tidefs-binary_schema-core",
  "tidefs-binary_schema-framing",
+ "tidefs-cache-coherency",
  "tidefs-clock-timing",
  "tidefs-membership-epoch",
 ]
@@ -1156,19 +1166,36 @@ dependencies = [
  "tidefs-durability-layout",
  "tidefs-erasure-coding",
  "tidefs-frame",
+ "tidefs-gc-pin-set",
+ "tidefs-membership-epoch",
+ "tidefs-placement-planner",
  "tidefs-pool-allocator",
  "tidefs-reclaim",
  "tidefs-reclaim-queue-core",
+ "tidefs-replication-model",
  "tidefs-reserve-ledger",
  "tidefs-segment-cleaner",
  "tidefs-space-accounting",
  "tidefs-spacemap-allocator",
+ "tidefs-types-extent-map-core",
  "tidefs-types-incremental-job-core",
  "tidefs-types-pool-label-core",
  "tidefs-types-reclaim-queue-core",
  "tracing",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "tidefs-lock-service"
+version = "0.421.0"
+dependencies = [
+ "bincode",
+ "blake3",
+ "serde",
+ "thiserror 2.0.18",
+ "tidefs-lease",
+ "tidefs-membership-epoch",
 ]
 
 [[package]]
@@ -1181,6 +1208,7 @@ dependencies = [
  "serde_json",
  "tidefs-auth",
  "tidefs-membership-types",
+ "tidefs-types-pool-label-core",
 ]
 
 [[package]]
@@ -1189,6 +1217,14 @@ version = "0.421.0"
 dependencies = [
  "crc32c",
  "serde",
+]
+
+[[package]]
+name = "tidefs-permission"
+version = "0.421.0"
+dependencies = [
+ "serde",
+ "tidefs-posix-acl",
 ]
 
 [[package]]
@@ -1211,6 +1247,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-posix-acl"
+version = "0.421.0"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
 name = "tidefs-quorum-write"
 version = "0.421.0"
 dependencies = [
@@ -1221,9 +1264,11 @@ dependencies = [
 name = "tidefs-reclaim"
 version = "0.421.0"
 dependencies = [
+ "blake3",
  "tidefs-binary_schema-checksum",
  "tidefs-dedup",
  "tidefs-pool-allocator",
+ "tidefs-reclaim-queue-core",
  "tidefs-types-reclaim-queue-core",
 ]
 
@@ -1235,6 +1280,8 @@ dependencies = [
  "tidefs-binary_schema-checksum",
  "tidefs-binary_schema-core",
  "tidefs-btree",
+ "tidefs-replication-model",
+ "tidefs-types-orphan-index-core",
  "tidefs-types-pool-label-core",
  "tidefs-types-reclaim-queue-core",
 ]
@@ -1275,9 +1322,23 @@ dependencies = [
  "tidefs-commit_group",
  "tidefs-gc-pin-set",
  "tidefs-incremental-job-core",
+ "tidefs-reclaim",
  "tidefs-reclaim-queue-core",
  "tidefs-types-dataset-lifecycle-core",
  "tidefs-types-incremental-job-core",
+ "tidefs-types-reclaim-queue-core",
+]
+
+[[package]]
+name = "tidefs-send-stream"
+version = "0.421.0"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "tidefs-binary_schema-checksum",
+ "tidefs-binary_schema-core",
+ "tidefs-local-object-store",
+ "tidefs-types-dataset-feature-flags-core",
 ]
 
 [[package]]
@@ -1329,9 +1390,11 @@ dependencies = [
  "tidefs-cluster",
  "tidefs-durability-layout",
  "tidefs-lease",
+ "tidefs-lock-service",
  "tidefs-membership-epoch",
  "tidefs-membership-types",
  "tidefs-placement-planner",
+ "tidefs-replication-model",
  "tidefs-types-transport-session",
  "tokio",
  "tracing",
@@ -1372,10 +1435,15 @@ name = "tidefs-types-incremental-job-core"
 version = "0.421.0"
 
 [[package]]
+name = "tidefs-types-orphan-index-core"
+version = "0.421.0"
+
+[[package]]
 name = "tidefs-types-pool-label-core"
 version = "0.421.0"
 dependencies = [
  "blake3",
+ "serde",
 ]
 
 [[package]]
