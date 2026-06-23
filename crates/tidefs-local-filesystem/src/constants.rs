@@ -87,6 +87,8 @@ pub const SNAPSHOT_CATALOG_MAGIC_ASCII: &str = "VFSSNAP1";
 pub const SNAPSHOT_CATALOG_MAGIC_BYTES: [u8; 8] = *b"VFSSNAP1";
 pub const SNAPSHOT_RECORD_V2_MAGIC_ASCII: &str = "VFSSNP20";
 pub const SNAPSHOT_RECORD_V2_MAGIC_BYTES: [u8; 8] = *b"VFSSNP20";
+pub const SNAPSHOT_RECORD_V3_MAGIC_ASCII: &str = "VFSSNP21";
+pub const SNAPSHOT_RECORD_V3_MAGIC_BYTES: [u8; 8] = *b"VFSSNP21";
 /// VFSSEND1 changed-record stream spec: the live storage-node daemon wire format
 /// for SEND/RECEIVE frames. The canonical send/receive format is VFSSEND2
 /// (defined in `tidefs-send-stream`) which is validated through the two-node

@@ -106,6 +106,7 @@ pub enum FileSystemError {
     SnapshotHeld {
         name: String,
         hold_count: u32,
+        hold_tag: Option<String>,
     },
 
     DirectoryNotEmpty {
@@ -267,7 +268,13 @@ impl fmt::Display for FileSystemError {
             Self::CloneOriginRequired { operation } => write!(f, "clone origin required for: {operation}"),
             Self::HoldOnBookmark { name } => write!(f, "cannot hold a bookmark: {name}"),
             Self::NotAClone { name } => write!(f, "not a clone: {name}"),
-            Self::SnapshotHeld { name, hold_count } => write!(f, "snapshot '{name}' is held ({hold_count} active hold(s))"),
+            Self::SnapshotHeld { name, hold_count, hold_tag } => {
+                if let Some(ref tag) = hold_tag {
+                    write!(f, "snapshot '{name}' is held by {tag} ({hold_count} active hold(s))")
+                } else {
+                    write!(f, "snapshot '{name}' is held ({hold_count} active hold(s))")
+                }
+            }
             Self::DirectoryNotEmpty { path } => write!(f, "directory is not empty: {path}"),
             Self::Unsupported { operation, reason } => {
                 write!(f, "unsupported {operation}: {reason}")

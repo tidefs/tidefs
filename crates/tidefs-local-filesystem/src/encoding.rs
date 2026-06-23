@@ -309,7 +309,7 @@ pub(crate) fn encode_snapshot_record(snapshot: &SnapshotRecord) -> Vec<u8> {
     out.extend_from_slice(&snapshot.name);
     push_u64(&mut out, snapshot.created_at_generation);
     encode_committed_root_summary(&mut out, &snapshot.root);
-    out.extend_from_slice(&SNAPSHOT_RECORD_V2_MAGIC_BYTES);
+    out.extend_from_slice(&SNAPSHOT_RECORD_V3_MAGIC_BYTES);
     push_u16(&mut out, snapshot.kind as u16);
     if let Some(ref origin) = snapshot.origin {
         push_u16(&mut out, 1);
@@ -319,6 +319,14 @@ pub(crate) fn encode_snapshot_record(snapshot: &SnapshotRecord) -> Vec<u8> {
         push_u16(&mut out, 0); // reserved
     }
     push_u32(&mut out, snapshot.hold_count);
+    // V3: write optional hold tag
+    if let Some(ref tag) = snapshot.hold_tag {
+        push_u16(&mut out, 1);
+        push_u32(&mut out, tag.len() as u32);
+        out.extend_from_slice(tag.as_bytes());
+    } else {
+        push_u16(&mut out, 0);
+    }
     out
 }
 
@@ -329,7 +337,32 @@ pub(crate) fn decode_snapshot_record(bytes: &[u8]) -> Result<SnapshotRecord> {
     validate_snapshot_name(&name)?;
     let created_at_generation = decoder.read_u64()?;
     let root = decode_committed_root_summary(&mut decoder)?;
-    let (kind, origin, hold_count) = if decoder.try_peek_magic(SNAPSHOT_RECORD_V2_MAGIC_BYTES) {
+    let (kind, origin, hold_count, hold_tag) = if decoder.try_peek_magic(SNAPSHOT_RECORD_V3_MAGIC_BYTES) {
+        // V3: includes hold_tag
+        decoder.expect_magic(SNAPSHOT_RECORD_V3_MAGIC_BYTES)?;
+        let kind_val = decoder.read_u16()?;
+        let kind = match kind_val {
+            0 => SnapshotKind::Snapshot,
+            1 => SnapshotKind::Clone,
+            2 => SnapshotKind::Bookmark,
+            _ => SnapshotKind::Snapshot,
+        };
+        let origin = if decoder.read_u16()? == 1 {
+            let origin_len = decoder.read_u32()? as usize;
+            Some(decoder.read_bytes(origin_len)?.to_vec())
+        } else {
+            None
+        };
+        let hold_count = decoder.read_u32()?;
+        let hold_tag = if decoder.read_u16()? == 1 {
+            let tag_len = decoder.read_u32()? as usize;
+            Some(String::from_utf8_lossy(decoder.read_bytes(tag_len)?).into_owned())
+        } else {
+            None
+        };
+        (kind, origin, hold_count, hold_tag)
+    } else if decoder.try_peek_magic(SNAPSHOT_RECORD_V2_MAGIC_BYTES) {
+        // V2: no hold_tag field
         decoder.expect_magic(SNAPSHOT_RECORD_V2_MAGIC_BYTES)?;
         let kind_val = decoder.read_u16()?;
         let kind = match kind_val {
@@ -345,9 +378,9 @@ pub(crate) fn decode_snapshot_record(bytes: &[u8]) -> Result<SnapshotRecord> {
             None
         };
         let hold_count = decoder.read_u32()?;
-        (kind, origin, hold_count)
+        (kind, origin, hold_count, None)
     } else {
-        (SnapshotKind::Snapshot, None, 0)
+        (SnapshotKind::Snapshot, None, 0, None)
     };
     decoder.finish()?;
     Ok(SnapshotRecord {
@@ -357,6 +390,7 @@ pub(crate) fn decode_snapshot_record(bytes: &[u8]) -> Result<SnapshotRecord> {
         kind,
         origin,
         hold_count,
+        hold_tag,
     })
 }
 
