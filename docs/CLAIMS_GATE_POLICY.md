@@ -116,6 +116,10 @@ A line may mention one of those topics only when it is clearly framed as one of:
 - future or aspirational work;
 - a goal or ambition rather than current product state.
 
+These frames also apply when policy prose preserves non-claims for future
+production UAPI freeze, absent today kernelspace readiness, not final distributed operator UAPI,
+or runtime-fed policy authority.
+
 ## Proof Before Stronger Claims
 
 Stronger wording requires all of the following:

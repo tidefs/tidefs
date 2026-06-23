@@ -14,6 +14,11 @@
 //! [`ChannelPoolTransport`](crate::channel_transport::ChannelPoolTransport)
 //! remains a harness transport for orchestrator tests.  TFR-017 remains open
 //! for end-to-end distributed authority beyond this crate-local boundary.
+//!
+//! Scaffolding note: this layer exposes the crate-local request/response
+//! boundary only. Real transport dispatch belongs to Review debt TFR-017 for
+//! end-to-end distributed authority beyond the caller-supplied [`PoolTransport`]
+//! used here.
 
 use std::collections::BTreeMap;
 
