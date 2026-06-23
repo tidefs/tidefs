@@ -4246,6 +4246,12 @@ impl VfsEngine for VfsLocalFileSystem {
         if let Some(file) = self.anonymous_tmpfiles.borrow().get(&inode) {
             return Ok(file.attr);
         }
+        // If the inode was a released tmpfile (no longer in anonymous_tmpfiles
+        // but still tracked in the orphan index), return ENOENT so the
+        // adapter sees the expected missing-inode error.
+        if self.fs.borrow().orphan_index.lock().unwrap().contains(inode.get()) {
+            return Err(Errno::ENOENT);
+        }
         if inode == ROOT_INODE_ID && self.dataset_root_path.is_some() {
             let root_path = self.root_path();
             let attr = self
