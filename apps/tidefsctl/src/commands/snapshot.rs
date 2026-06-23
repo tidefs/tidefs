@@ -766,6 +766,14 @@ pub struct SnapshotReceiveArgs {
 
     #[arg(long = "server-node-id", requires = "source_addr")]
     pub server_node_id: Option<u64>,
+
+    /// Operator merge policy for conflicting non-empty receive targets.
+    ///
+    /// Governs how diverged objects are resolved: keep-local (target wins),
+    /// keep-remote (stream wins), merge-latest (higher-txg wins, target-wins
+    /// tiebreak), or manual (refuse, report conflict inventory).
+    #[arg(long = "merge-policy", value_parser = ["keep-local", "keep-remote", "merge-latest", "manual"])]
+    pub merge_policy: Option<String>,
 }
 
 /// `snapshot rollback <pool> <name> [--devices <dev>...]`
@@ -2048,6 +2056,7 @@ fn snapshot_receive_live_args(args: &SnapshotReceiveArgs) -> serde_json::Value {
         "source_addr": args.source_addr.map(|addr| addr.to_string()),
         "node_id": args.node_id,
         "server_node_id": args.server_node_id,
+        "merge_policy": args.merge_policy,
     })
 }
 
@@ -2187,6 +2196,7 @@ mod tests {
             source_addr: None,
             node_id: None,
             server_node_id: None,
+            merge_policy: None,
         };
         assert_eq!(args.pool, "mypool");
         assert_eq!(args.backing_dir, None);
@@ -2203,6 +2213,7 @@ mod tests {
             source_addr: "127.0.0.1:9000".parse().ok(),
             node_id: Some(7),
             server_node_id: Some(9),
+            merge_policy: None,
         };
 
         let live_args = snapshot_receive_live_args(&args);
