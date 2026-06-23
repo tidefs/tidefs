@@ -12,8 +12,8 @@ targets = ["x86_64-unknown-linux-gnu"]
 
 [advisories]
 version = 2
-# Response to unmaintained-crate advisories: "deny" | "warn" | "allow"
-unmaintained = "warn"
+# Unmaintained-crate check scope: "all" | "workspace" | "transitive" | "none"
+unmaintained = "workspace"
 # Response to yanked-version advisories: "deny" | "warn" | "allow"
 yanked = "warn"
 # Advisory ids to ignore regardless of severity or policy setting
