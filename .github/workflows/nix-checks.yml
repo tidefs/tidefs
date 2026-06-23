@@ -24,7 +24,7 @@ jobs:
     name: Flake checks
     # Draft PRs are not integration candidates; save scarce self-hosted runner
     # capacity for ready PRs, master pushes, and explicit dispatches.
-    if: ${{ (github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && vars.TIDEFS_SELF_HOSTED_READY == '1' && github.event.pull_request.draft == false) }}
     runs-on: [self-hosted, linux, x64, tidefs, nix]
     timeout-minutes: 180
 
