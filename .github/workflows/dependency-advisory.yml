@@ -1,0 +1,200 @@
+name: Dependency Advisory
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'deny.toml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - '.github/workflows/dependency-advisory.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  advisories:
+    name: Dependency advisories
+    # Draft PRs are not integration candidates; save scarce self-hosted runner
+    # capacity for ready PRs, master pushes, and explicit dispatches.
+    if: ${{ (github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run cargo deny check advisories
+        id: advisories
+        continue-on-error: true
+        run: |
+          set +e
+          nix develop .#ci --command cargo deny --format json check advisories > advisories.json 2>advisories-stderr.txt
+          exit_code="$?"
+          set -e
+          if [[ -s advisories.json ]]; then
+            cp advisories.json advisories-report.json
+          elif [[ -s advisories-stderr.txt ]]; then
+            cp advisories-stderr.txt advisories-report.json
+          else
+            : > advisories-report.json
+          fi
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+
+      - name: Report advisory summary
+        if: always()
+        run: |
+          nix develop .#ci --command bash <<'BASH'
+          set -euo pipefail
+
+          report_file=advisories-report.json
+
+          emit_rows_object() {
+            local status="$1"
+            local jq_path="$2"
+            jq -r "
+              ${jq_path}[] |
+              def marker:
+                .advisory.id // .id // (
+                  if (((.kind // .type // .reason // \"\") | tostring | ascii_downcase) | contains(\"yank\")) then
+                    \"yanked\"
+                  else
+                    \"unknown\"
+                  end
+                );
+              def advisory_kind:
+                .advisory.cvss.severity // .advisory.informational // .advisory.severity // .code // .severity // \"unknown\";
+              \"| \\(.advisory.package // .package.name // .package // \"unknown\") | [\\(marker)](\\(.advisory.url // .url // \"\")) | \\(advisory_kind) | ${status} |\"
+            " "${report_file}" 2>/dev/null || echo "| *(parse error)* | | | |"
+          }
+
+          emit_rows_jsonl() {
+            local severity="$1"
+            local status="$2"
+            jq -sr "
+              .[] |
+              select(.type == \"diagnostic\" and ((.fields.severity // .severity // \"\") == \"${severity}\")) |
+              def marker:
+                .fields.advisory.id // .fields.id // .id // (
+                  if (((.fields.code // .code // .kind // .type // .reason // \"\") | tostring | ascii_downcase) | contains(\"yank\")) then
+                    \"yanked\"
+                  else
+                    \"unknown\"
+                  end
+                );
+              def advisory_kind:
+                .fields.advisory.cvss.severity // .fields.advisory.informational // .fields.code // .fields.severity // .severity // \"unknown\";
+              \"| \\(.fields.advisory.package // .fields.package.name // .fields.package // .package.name // .package // \"unknown\") | [\\(marker)](\\(.fields.advisory.url // .fields.url // .url // \"\")) | \\(advisory_kind) | ${status} |\"
+            " "${report_file}" 2>/dev/null || echo "| *(parse error)* | | | |"
+          }
+
+          if [[ -s "${report_file}" ]] && jq -e -s \
+            'length == 1 and (.[0] | type == "object" and has("advisories"))' \
+            "${report_file}" >/dev/null 2>&1; then
+            report_mode=object
+          elif [[ -s "${report_file}" ]] && jq -e -s \
+            'any(.[]; type == "object" and (.type == "diagnostic" or .type == "summary"))' \
+            "${report_file}" >/dev/null 2>&1; then
+            report_mode=jsonl
+          else
+            report_mode=none
+          fi
+
+          if [[ "${report_mode}" == object ]]; then
+            db_count=$(jq -r ".advisories.db[\"advisory-count\"] // 0" "${report_file}" 2>/dev/null || echo 0)
+            db_updated=$(jq -r ".advisories.db[\"last-updated\"] // \"unknown\"" "${report_file}" 2>/dev/null || echo unknown)
+            warn_count=$(jq -r ".advisories.warnings | length // 0" "${report_file}" 2>/dev/null || echo 0)
+            err_count=$(jq -r ".advisories.errors | length // 0" "${report_file}" 2>/dev/null || echo 0)
+          elif [[ "${report_mode}" == jsonl ]]; then
+            db_count=unknown
+            db_updated=unknown
+            warn_count=$(jq -sr '[.[] | select(.type == "diagnostic" and ((.fields.severity // .severity // "") == "warning"))] | length' "${report_file}" 2>/dev/null || echo 0)
+            err_count=$(jq -sr '[.[] | select(.type == "diagnostic" and ((.fields.severity // .severity // "") == "error"))] | length' "${report_file}" 2>/dev/null || echo 0)
+          else
+            db_count=unknown
+            db_updated=unknown
+            warn_count=0
+            err_count=0
+          fi
+
+            {
+              echo "## Dependency Advisory Check"
+              echo ""
+              echo 'Policy: [deny.toml](deny.toml) `[advisories]`'
+              echo ""
+
+              if [[ "${report_mode}" == none ]]; then
+                echo ":warning: No JSON output captured."
+                if [[ -s advisories-stderr.txt ]]; then
+                  echo ""
+                  echo "### stderr"
+                  echo "\`\`\`"
+                  sed -n "1,80p" advisories-stderr.txt
+                  echo "\`\`\`"
+                fi
+                exit 0
+              fi
+
+              echo "- Advisory database: ${db_count} advisories (updated ${db_updated})"
+              echo "- Warnings: ${warn_count}  |  Errors: ${err_count}"
+              echo ""
+
+              if [[ "$warn_count" -eq 0 && "$err_count" -eq 0 ]]; then
+                echo ":white_check_mark: **No dependency advisories found.**"
+                exit 0
+              fi
+
+              if [[ "$err_count" -gt 0 ]]; then
+                echo "### :x: Blocking Advisories (${err_count})"
+                echo ""
+                echo "| Package | Advisory | Severity | Status |"
+                echo "|---------|----------|----------|--------|"
+                if [[ "${report_mode}" == object ]]; then
+                  emit_rows_object "blocking" ".advisories.errors"
+                else
+                  emit_rows_jsonl "error" "blocking"
+                fi
+                echo ""
+              fi
+
+              if [[ "$warn_count" -gt 0 ]]; then
+                echo "### :warning: Warning Advisories (${warn_count})"
+                echo ""
+                echo "| Package | Advisory | Severity | Status |"
+                echo "|---------|----------|----------|--------|"
+                if [[ "${report_mode}" == object ]]; then
+                  emit_rows_object "warning" ".advisories.warnings"
+                else
+                  emit_rows_jsonl "warning" "warning"
+                fi
+                echo ""
+              fi
+
+              echo "See [DEPENDENCY_ADVISORY_CI.md](docs/DEPENDENCY_ADVISORY_CI.md) for policy and remediation guidance."
+            } >> "$GITHUB_STEP_SUMMARY"
+          BASH
+
+      - name: Upload advisory report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dependency-advisory-report
+          path: |
+            advisories-report.json
+            advisories.json
+            advisories-stderr.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Enforce advisory policy
+        if: ${{ steps.advisories.outputs.exit_code != '' && steps.advisories.outputs.exit_code != '0' }}
+        run: |
+          exit "${{ steps.advisories.outputs.exit_code }}"

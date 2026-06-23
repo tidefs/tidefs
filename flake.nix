@@ -3355,6 +3355,7 @@ EOF
           tidefsCiShell = pkgs.mkShell {
             packages = [
               rustToolchain
+              pkgs.cargo-deny
               pkgs.bash
               pkgs.coreutils
               pkgs.fuse3
