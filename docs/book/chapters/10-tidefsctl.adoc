@@ -152,6 +152,120 @@ exact owner or fails closed.
 The old `--pool <pool>` spelling is not the operator form. It must not be
 kept as a parallel control path for imported state.
 
+=== Storage Intent Explanation
+
+`tidefsctl storage-intent explain --input <json-bundle>` is a read-only,
+passive-diagnostic rendering surface. It consumes supplied
+`tidefs-storage-intent-core` records (policy, receipts, evidence-query
+snapshots, refusal records, data-shape, layout, relocation, cost/wear, and
+prefetch/residency decisions) and produces a source-qualified, evidence-cited
+operator explanation. It deliberately does not scan topology, reopen pool
+state, or infer missing producer evidence.
+
+==== Basic Usage
+
+....
+tidefsctl storage-intent explain --input evidence.json
+tidefsctl storage-intent explain --input evidence.json --dataset mypool/mydataset
+tidefsctl storage-intent explain --input evidence.json --file /data/example --range 0..4096
+tidefsctl storage-intent explain --input evidence.json --json | jq .
+....
+
+`--dataset`, `--file`, and `--range` supply subject labels when the input
+bundle does not carry its own subject declaration. `--json` emits a
+machine-parseable JSON report with sections, availability levels, and
+enumerated facts.
+
+==== Input Format
+
+The input is a single JSON object with optional fields:
+
+[source,json]
+....
+{
+  "subject": { "dataset": "mypool/myds", "file": "/data/example", "range": "0..4096" },
+  "policy": { /* StorageIntentPolicy */ },
+  "receipts": [ /* StorageIntentReceipt[], empty when none */ ],
+  "query_snapshot": { /* StorageIntentEvidenceQuerySnapshot */ },
+  "refusals": [ /* StorageIntentRefusal[], empty when none */ ],
+  "read_freshness": { /* ReadSourceFreshnessRecord */ },
+  "data_shape": { /* DataShapeRecord */ },
+  "layout": { /* LayoutAllocatorRecord */ },
+  "relocation": { /* RelocationLifecycleRecord */ },
+  "cost_wear": { /* CostWearRecord */ },
+  "prefetch_residency": { /* PrefetchResidencyDecisionRecord */ }
+}
+....
+
+Every field is optional and defaults to absent. When a field is absent, the
+corresponding output section renders as `unavailable` with a source-qualified
+note naming the expected producer or evidence family. The renderer must not
+infer placement, durability, or read-serving facts from local caches, device
+probes, or benchmarks.
+
+==== Output Format (Plain Text)
+
+The plain-text output renders one section per evidence family. Each section is
+prefixed with an availability tag (`available`, `limited`, `unavailable`,
+`degraded-visible`, `blocked`, `refused`, or `unsafe-visible`) and a source
+annotation:
+
+....
+storage-intent explanation
+  input-source: /path/to/evidence.json
+  subject: dataset=mypool/myds file=/data/example range=0..4096
+
+evidence-query-snapshot [available; source: #913 supplied StorageIntentEvidenceQuerySnapshot]
+  - snapshot-id: a1b2c3d4...
+  ...
+
+requested-policy [available; source: supplied StorageIntentPolicy]
+  - policy-id: ...
+  - requested-guarantee: local-intent
+  ...
+
+earned-acknowledgment [available; source: supplied StorageIntentReceipt set]
+  - receipt ... earned ack durable-intent-zero-lag ...
+  ...
+....
+
+When the input carries a `query_snapshot`, the renderer cites the #913
+snapshot identity, included evidence refs, per-family freshness state, and
+completeness verdict. Missing, stale, or refused snapshot families render their
+individual state. When no snapshot is supplied, the section renders
+`unavailable` with a note that multi-family explanation is non-authority and
+must not be replaced by topology scans.
+
+==== Evidence Families Rendered
+
+The renderer sections, in order:
+
+- `evidence-query-snapshot` -- #913 snapshot cut identity, completeness, per-family freshness
+- `requested-policy` -- compiled policy identity, guarantee class, durability/media/trust floor, workload prediction
+- `earned-acknowledgment` -- per-receipt ack class, policy revision, durability state, observed lag
+- `placement-receipts` -- per-receipt placement media/role/read-source and authority class
+- `read-serving` -- selected read source, freshness frontier, geo lag, prefetch/residency decision
+- `remote-rpo-lag` -- remote/geo receipt lag, read-source lag, durability-lag
+- `trust-domain` -- per-receipt trust flags, session security, key epoch, residency, sharing domain, compromise/quarantine
+- `volatility-loss` -- volatile receipt role/media explicit loss table
+- `pending-work` -- relocation/rebake/repair lifecycle state and skipped reasons
+- `data-shape` -- selected transform/EC/archive shape, compression/dedup/encryption state
+- `layout-allocator` -- fragmentation, free-run pressure, alignment, zone/write-pointer state
+- `prediction` -- shadow/trial/admitted move state, cooldown, payback, skipped reasons
+- `cache-authority` -- cache-only vs authoritative RAM/flash/durable placement class
+- `cost-wear-reserve` -- movement debt, write amplification, payback window, critical reserves
+- `refusals` -- explicit refusal records with reasons for each refused guarantee upgrade
+
+==== Non-Authority And Claims-Gate Boundary
+
+The explain surface is a read-only passive diagnostic. It does not execute
+placement, change acknowledgments, measure transport, or retire receipts.
+Output reflects receipt truth only; it does not make product, performance,
+durability, RAM, WAN, or wear-protection claims. Help text and docs that frame
+storage intent as a successor claim must be gated through #875 registered
+claim ids and fail closed until validated. The explain renderer never hides
+volatile or unsafe receipts from operator output or support bundles.
+
 === Kernel Runtime Inventory
 
 `tidefsctl kernel status` reports the declared kernel control endpoint and the
