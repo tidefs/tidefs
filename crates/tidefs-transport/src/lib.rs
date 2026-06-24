@@ -287,6 +287,7 @@ pub mod object_enumerator;
 pub mod object_list;
 pub mod object_transfer;
 pub mod outbound_send;
+pub mod path_evidence;
 pub mod peer_address_registry;
 pub mod peer_admission;
 pub mod peer_drain_coordinator;
@@ -598,6 +599,13 @@ pub use frame_governance::{
 pub use idle_timeout::{
     ActivitySource, IdleTimeoutConfig, IdleTimeoutController, IdleTimeoutEvent, IdleTimeoutRunner,
     IdleTimeoutSubscriber, IdleTracker,
+};
+pub use path_evidence::{
+    PathBandwidth, PathCarrierClass, PathCarrierFamily, PathEncryptionContext,
+    PathEvidenceConfidence, PathEvidenceGeneration, PathEvidenceStaleness,
+    PathFailureDomainRelation, PathLatency, PathLossClass, PathProximityDomain,
+    PathQueueState, TransportPathEvidence, TransportPathEvidenceRegistry,
+    WanInternetEvidence,
 };
 pub use peer_address_registry::PeerAddressRegistry;
 pub use peer_drain_coordinator::{
