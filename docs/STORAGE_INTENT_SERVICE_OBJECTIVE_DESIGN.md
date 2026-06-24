@@ -3,6 +3,7 @@
 Issue: #915
 Date: 2026-06-21
 Status: current design authority for storage-intent service-objective evidence
+Last updated: 2026-06-25 - model-projection gate slice
 
 This document narrows the service-objective part of storage intent into an
 implementation-ready contract. It defines the evidence that lets TideFS decide
@@ -94,6 +95,52 @@ a smaller model crate, these field groups remain the authority boundary.
 | `measurement_claim_refs` | #912 attribution refs, #850 performance row ids, #863 fault rows, #875 claim ids, #928 comparator-evidence refs, #931 legacy-claim audit refs, and allowed wording scope. |
 | `objective_state` | `satisfied`, `converging`, `degraded-visible`, `cache-only`, `unknown-evidence`, `blocked`, `refused`, or `unsafe-visible`, with typed reason refs. |
 
+## First Model Projection Contract
+
+The first source implementation may live in `tidefs-storage-intent-core` or a
+narrow #915 model crate, but the projection must behave as one compiled
+contract. Splitting fields across helper structs is fine only when the public
+record still carries enough identity, scope, evidence refs, and state to answer
+"what exact envelope was admitted, measured, refused, or claimed?"
+
+The model projection must encode these groups as typed values rather than free
+text:
+
+| Projection group | Required typed shape |
+| --- | --- |
+| Identity and scope | Objective id, policy id/revision, rollout/stage ref, producer, subject scope, generation, temporal ref, and evidence-query snapshot ref. |
+| Workload binding | Workload class, phase, request mix, range/object cohort, action class, prediction/confidence refs, and allowed missing-evidence state. |
+| Operation floor | Operation semantics, ack/durability floor, stable-write/FUA/barrier law, stale-read permission, RPO/RTO, partition/no-quorum treatment, and explicit volatile or unsafe-visible allowance when policy permits it. |
+| Latency and tail | Percentile targets, max queue/admission time, max device/transport dwell, jitter/variance, tail amplification, warmup/censoring, and breach state. |
+| Throughput and dwell | Floor, ceiling, foreground/background class, burst window, dwell window, batching/coalescing, dirty-window, and backpressure/refusal law. |
+| Scheduler and isolation | Scheduler lane/admission refs, protected p99 owner, tenant/budget owner, fair-share, borrow/debt, starvation, noisy-neighbor, reserve-exemption, and throttle/defer state. |
+| Environment | Media and topology profile, RAM/PMem/NVMe/SSD/HDD/object/archive class, rack/DC/WAN/internet scope, RDMA-present or RDMA-absent transport, thermal/health state, trust/domain refs, and media-capability refs. |
+| Cost and movement | Capacity/reserve refs, write-amplification, flash-wear, movement debt, egress, power, capacity, operator-money, payback, cooldown, source-retirement, and retention refs. |
+| Consumer refs | Decision-frontier, action-execution, result/refusal, performance-row, fault-row, measurement-attribution, comparator, claim, and evidence-retention refs. |
+| State and reasons | Satisfaction/refusal class plus typed reason refs for unknown, stale, contradicted, out-of-cut, degraded-visible, cache-only, blocked, refused, or unsafe-visible state. |
+
+Zero, absent, or unknown limits are not infinite limits. A missing p99 target,
+throughput bound, queue cap, cost budget, or comparator baseline is usable only
+when the objective state explicitly records that the dimension is
+policy-unconstrained for this scope. Otherwise the record must be unknown,
+blocked, degraded-visible, cache-only, unsafe-visible, or refused.
+
+The first predicates should return typed state, not a lossy boolean:
+
+| Predicate or query | Required meaning |
+| --- | --- |
+| `identity_is_bound` | Policy id/revision, objective id, subject scope, generation, and rollout/stage refs are all non-sentinel and internally consistent. |
+| `scope_matches` | Workload, phase, operation, tenant/budget owner, media/topology, transport, ack shape, and failure state match the candidate, row, attribution verdict, or claim. |
+| `has_required_evidence_cut` | The #913 snapshot contains complete-for-purpose fresh authority refs for every required field family and records typed state for missing or stale families. |
+| `can_gate_candidate` | A planner, scheduler, read-serving, relocation, or prefetch/residency candidate either satisfies the required envelope before scoring or gets a rejected/degraded/refused state with reason refs. |
+| `allows_performance_row` | A #850 row measures this objective id, workload/environment scope, operation semantics, and ack/degradation shape without inventing row-local semantics. |
+| `allows_attribution_transfer` | A #912 verdict may train, satisfy, cool down, or claim this objective only within its recorded scope and evidence cut. |
+| `allows_claim_wording` | A #875/#928/#931 claim may use successor, fast, low-latency, high-throughput, WAN, RAM, wear, or comparator wording only when objective, attribution, query, comparator, and claim refs all match. |
+
+These predicates are hard-gate helpers. They must not score an average
+throughput win, cache hit, fast local device, or incumbent-comparison row as a
+partial substitute for an unmet required objective.
+
 ## Access Pattern Pass
 
 The first design pass is the access pattern. TideFS must not optimize an
@@ -112,6 +159,24 @@ another pattern without #912 attribution and #913 query evidence.
 | Time-series/log aggregation | append locality, retention/TTL, compression value, cold-rollover shape, background compaction budget. | Rewriting flash repeatedly for short-lived data without payback proof. |
 | Analytics/ML training | sequential throughput, repeated scan epochs, cache pollution, object/archive restore cost, WAN egress. | Treating high bandwidth as permission to evict hot sync or RAM-serving work. |
 | Archive restore | restore RTO, request/egress cost, integrity refs, large-object shape, cold placement durability. | Calling object/archive storage durable POSIX or low-latency by label. |
+
+## Prefetch And Residency Action Floors
+
+#967 consumes service objectives but does not become authority here. The #915
+record must still express the minimum objective state for prefetch, residency,
+promotion, demotion, and source-retirement-adjacent decisions so #967 can fail
+closed instead of inferring legality from a warm cache or a cheap medium.
+
+| Action floor | Required #915 expression | Illegal shortcut |
+| --- | --- | --- |
+| No prefetch | Objective either has no latency/payback requirement for speculative fetch or policy refuses prefetch for this scope. | Treating absence of evidence as permission to cache or move data. |
+| Bounded readahead | Read/scan phase, range cohort, p99 or throughput target, cache-pollution budget, and droppable speculative lane. | Promoting one-pass scans into durable hot placement. |
+| Cache-only serving trial | Cache-only objective state, freshness law, hit dwell, eviction budget, and non-authority marker. | Claiming RAM/flash authority or comparator success from trial hits. |
+| Staged restore | Archive/object restore phase, restore latency/RPO, integrity verification, egress/cost budget, and handoff/refusal state. | Serving staged bytes as POSIX durable authority before replacement receipts. |
+| Persistent hot serving | Read-serving objective with authority/freshness refs, source media, target media, protected tenant budget, and dwell/cooldown law. | Letting another tenant's p99 pay for a hot-set promotion. |
+| Authority-changing promotion | Durable authority requirement, source/target media capability, ack/recovery floor, capacity reserve, wear/cost/payback refs, and action-execution refs. | Treating cache residency or prediction confidence as receipt replacement. |
+| Demotion | Coldness/payback objective, RPO/RTO and stale-read treatment, retention/lifecycle refs, and read-serving fallback state. | Moving data to slow/remote media while hiding foreground tail damage. |
+| Source-retirement-affecting movement | Replacement receipt, old-receipt retirement frontier, recovery/degradation refs, action-execution success, retention refs, and refusal law. | Retiring the source because the target benchmarked faster or cheaper. |
 
 ## Media And Topology Pass
 

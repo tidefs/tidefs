@@ -2747,6 +2747,14 @@ policy summary; that document is the current authority for record field groups,
 access-pattern envelopes, media/topology envelopes, operation/failure envelopes,
 consumer obligations, and runtime follow-up boundaries for #915.
 
+The first model projection must be one compiled contract even if the source
+implementation splits it across helper structs. A candidate, validation row,
+measurement-attribution verdict, operator explanation, prefetch/residency
+decision, relocation action, or claim must be able to cite the objective id,
+policy revision, subject scope, workload/operation phase, environment profile,
+evidence-query cut, and typed state that made the envelope satisfied, unknown,
+degraded-visible, cache-only, unsafe-visible, blocked, or refused.
+
 The key distinction is that a workload shape says what TideFS has observed or
 expects, while a service objective says which performance envelope is part of
 the policy for that subject and operation. A small-sync WAL, VM FUA workload,
@@ -2771,6 +2779,18 @@ Service-objective evidence must distinguish at least:
 | `decision_execution_ref` | Points to decision-frontier, scheduler admission, action-execution, evidence-retention, and query snapshot refs that selected, admitted, executed, or refused work under this objective. |
 | `attribution_claim_ref` | Names measurement-attribution refs, comparator baseline refs, transfer scope, claim ids, and allowed/refused uses for product or incumbent-comparison language. |
 | `objective_refusal_ref` | Gives typed missing-evidence, stale-envelope, impossible-latency, insufficient-throughput, tail-risk, budget-exhausted, degraded-only, unsupported-topology, or comparator-not-valid refusal/defer state. |
+
+Compiled projection gates are part of the policy authority, not optional
+consumer etiquette:
+
+| Gate | Required outcome |
+| --- | --- |
+| Candidate hard gate | Planning, scheduling, read serving, relocation, and prefetch/residency must reject, defer, degrade visibly, block, or refuse a candidate before scoring when the required objective envelope is not satisfied for the declared workload and environment. |
+| Performance row citation | #850 rows must cite an objective id and matching policy/workload/environment/operation scope; row-local labels cannot invent ad hoc SLO semantics. |
+| Attribution transfer | #912 may train, satisfy, cool down, or support a claim only for the objective scope named in its verdict and #913 evidence cut. |
+| Claim wording | #875/#928/#931 may use fast, low-latency, high-throughput, WAN, RAM, wear, successor, or comparator wording only when objective, attribution, query, comparator, and claim refs all match. |
+| Unknown dimensions | Missing p99, throughput, queue, cost, wear, comparator, media, trust, or attribution evidence is not zero and not infinite; it is an explicit unknown, blocked, degraded-visible, cache-only, unsafe-visible, or refused state. |
+| Unsafe downgrade prevention | Failure to meet an objective may throttle, defer, expose degraded-visible state, or return typed refusal; it must not silently downgrade durable sync, FUA, RAM authority, geo intent, or source-retirement semantics. |
 
 Objective families should be concrete enough for operators and tests to see the
 tradeoff being made:
