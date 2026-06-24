@@ -107,9 +107,7 @@ pub enum StorageIntentSatisfactionError {
 
 impl fmt::Display for StorageIntentSatisfactionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BufferFull => f.write_str("satisfaction inline buffer full"),
-        }
+        f.write_str("satisfaction inline buffer full")
     }
 }
 
@@ -497,7 +495,10 @@ impl StorageIntentSatisfactionReasonSet {
     }
 
     /// Append one row.
-    pub fn push(&mut self, row: StorageIntentSatisfactionReasonRecord) -> Result<(), StorageIntentSatisfactionError> {
+    pub fn push(
+        &mut self,
+        row: StorageIntentSatisfactionReasonRecord,
+    ) -> Result<(), StorageIntentSatisfactionError> {
         if self.len as usize >= STORAGE_INTENT_SATISFACTION_INLINE_REASONS {
             return Err(StorageIntentSatisfactionError::BufferFull);
         }
@@ -564,7 +565,10 @@ impl StorageIntentSatisfactionReceiptSet {
     }
 
     /// Append one receipt id.
-    pub fn push(&mut self, receipt: StorageIntentReceiptId) -> Result<(), StorageIntentSatisfactionError> {
+    pub fn push(
+        &mut self,
+        receipt: StorageIntentReceiptId,
+    ) -> Result<(), StorageIntentSatisfactionError> {
         if self.len as usize >= STORAGE_INTENT_SATISFACTION_INLINE_RECEIPTS {
             return Err(StorageIntentSatisfactionError::BufferFull);
         }
@@ -620,7 +624,10 @@ impl StorageIntentSatisfactionEvidenceSet {
     }
 
     /// Append one evidence ref if bound and not already present.
-    pub fn push_unique(&mut self, evidence_ref: StorageIntentEvidenceRef) -> Result<(), StorageIntentSatisfactionError> {
+    pub fn push_unique(
+        &mut self,
+        evidence_ref: StorageIntentEvidenceRef,
+    ) -> Result<(), StorageIntentSatisfactionError> {
         if !evidence_ref.is_bound() || self.contains(evidence_ref) {
             return Ok(());
         }
