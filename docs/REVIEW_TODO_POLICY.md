@@ -9,5 +9,6 @@ Rules:
 - Use stable ids with the `TFR-NNN` prefix.
 - Inline comments may only point to a register id, for example
   `Review debt TFR-005: ...`.
-- Do not add bare `TODO`, `FIXME`, `HACK`, "later", or "continuation" comments.
-  been updated.
+- Do not add bare `TODO`, `FIXME`, `HACK`, "later", or "continuation"
+  comments; when durable debt is found or touched, record it in the register
+  and point any inline note to a stable `TFR-NNN` id.
