@@ -1288,6 +1288,7 @@ fn write_sparse_size_change<S: ContentWriteStore>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
     dedup_enabled: bool,
     store: &mut S,
@@ -1377,10 +1378,8 @@ fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
     {
         for chunk_index in first_overlay_chunk..=last_overlay_chunk {
             let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
-            let old_chunk_is_sparse_zero = match find_chunk_in_manifest(old_manifest, chunk_index) {
-                Some(chunk_ref) => chunk_ref.is_hole(),
-                None => true,
-            };
+            let old_chunk_is_sparse_zero = find_chunk_in_manifest(old_manifest, chunk_index)
+                .is_none_or(ContentChunkRef::is_hole);
             if old_chunk_is_sparse_zero
                 && overlay_chunk_writes_only_zeros(
                     chunk_index,
