@@ -112,6 +112,7 @@ members = [
   "crates/tidefs-storage-intent-core",
   "crates/tidefs-storage-intent-workload-signals",
   "crates/tidefs-storage-intent-policy",
+  "crates/tidefs-storage-intent-read-serving",
   "crates/tidefs-storage-intent-local-media-capability",
   "crates/tidefs-storage-intent-remote-media-capability",
   "crates/tidefs-storage-intent-media-capability-refresh",

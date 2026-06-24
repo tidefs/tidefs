@@ -3513,6 +3513,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-storage-intent-read-serving"
+version = "0.421.0"
+dependencies = [
+ "serde",
+ "tidefs-storage-intent-core",
+]
+
+[[package]]
 name = "tidefs-storage-intent-remote-media-capability"
 version = "0.421.0"
 dependencies = [
