@@ -77,7 +77,7 @@ Command groups must not claim stronger stability than the class recorded here:
 | `snapshot prune` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | prune regular local snapshots by retention policy while excluding clones and bookmarks |
 | `snapshot destroy` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | destroy snapshots through the live owner or explicit offline devices |
 | `snapshot export` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | register runtime-pending read-only snapshot export mount surface |
-| `snapshot extract` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | register runtime-pending one-shot snapshot file extraction surface |
+| `snapshot extract` | `public-operator` | `live-owner` | `local-only` | `visible` | extract one regular file from a snapshot through the live owner |
 | `snapshot rollback` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | roll back through the live owner or explicit offline devices |
 | `snapshot send` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | export snapshot streams through owner authority or explicit offline devices |
 | `snapshot receive` | `public-operator` | `live-owner` | `local-only` | `visible` | receive snapshot streams through the live owner; offline receive is unsupported |

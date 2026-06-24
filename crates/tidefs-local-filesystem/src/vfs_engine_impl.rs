@@ -932,13 +932,7 @@ impl VfsLocalFileSystem {
         }
     }
 
-    fn move_cached_path(
-        &self,
-        inode_id: InodeId,
-        kind: NodeKind,
-        old_path: &str,
-        new_path: &str,
-    ) {
+    fn move_cached_path(&self, inode_id: InodeId, kind: NodeKind, old_path: &str, new_path: &str) {
         if kind.has_child_namespace() {
             self.rewrite_cached_path_subtree(old_path, new_path);
         }
@@ -1712,6 +1706,7 @@ impl VfsLocalFileSystem {
             ("snapshot", "list") => self.live_snapshot_list(wants_json),
             ("snapshot", "destroy") => self.live_snapshot_destroy(args),
             ("snapshot", "rollback") => self.live_snapshot_rollback(args),
+            ("snapshot", "extract") => self.live_snapshot_extract(args, wants_json),
             ("snapshot", "send") => self.live_snapshot_send(args, wants_json),
             ("pool", "get") => self.live_pool_get(args),
             ("pool", "set") => self.live_pool_set(args),
@@ -2752,6 +2747,77 @@ impl VfsLocalFileSystem {
         }
     }
 
+    fn live_snapshot_extract(&self, args: &Value, wants_json: bool) -> Vec<u8> {
+        let name = match live_admin_arg(args, "snapshot_name") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let file_path = match live_admin_arg(args, "file_path") {
+            Ok(value) => value,
+            Err(err) => return live_admin_error(2, err),
+        };
+        let normalized_path = match LocalFileSystem::normalize_snapshot_extract_path(file_path) {
+            Ok(path) => path,
+            Err(err) => {
+                return live_admin_error(
+                    1,
+                    format!("snapshot extract: invalid file path '{file_path}': {err}"),
+                )
+            }
+        };
+        let output = live_admin_optional_arg(args, "output").map(std::path::PathBuf::from);
+        let bytes = {
+            let mut fs = self.fs.borrow_mut();
+            match fs.extract_snapshot_file_from_open_pool(name, &normalized_path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    return live_admin_error(
+                        1,
+                        format!(
+                            "snapshot extract: failed to read '{normalized_path}' from snapshot '{name}': {err}"
+                        ),
+                    )
+                }
+            }
+        };
+
+        if let Some(output) = output {
+            if let Err(err) = std::fs::write(&output, &bytes) {
+                return live_admin_error(
+                    1,
+                    format!(
+                        "snapshot extract: failed to write output {}: {err}",
+                        output.display()
+                    ),
+                );
+            }
+            if wants_json {
+                return live_admin_ok_json(json!({
+                    "snapshot_name": name,
+                    "file_path": normalized_path,
+                    "output": output.display().to_string(),
+                    "bytes": bytes.len(),
+                }));
+            }
+            return live_admin_ok_text(format!(
+                "wrote {} bytes from snapshot '{name}' path '{normalized_path}' to {}",
+                bytes.len(),
+                output.display()
+            ));
+        }
+
+        if wants_json {
+            live_admin_ok_json(json!({
+                "snapshot_name": name,
+                "file_path": normalized_path,
+                "bytes": bytes.len(),
+                "bytes_hex": live_admin_hex_encode(&bytes),
+            }))
+        } else {
+            live_admin_ok_bytes_hex(&bytes)
+        }
+    }
+
     fn live_snapshot_send(&self, args: &Value, wants_json: bool) -> Vec<u8> {
         if live_admin_optional_arg(args, "target_addr").is_some() {
             return live_admin_error(
@@ -3566,6 +3632,15 @@ fn live_admin_ok_json(value: Value) -> Vec<u8> {
     }))
 }
 
+fn live_admin_ok_bytes_hex(bytes: &[u8]) -> Vec<u8> {
+    live_admin_encode(json!({
+        "ok": true,
+        "exit_code": 0,
+        "bytes_hex": live_admin_hex_encode(bytes),
+        "bytes": bytes.len(),
+    }))
+}
+
 fn live_admin_error(exit_code: i32, message: impl Into<String>) -> Vec<u8> {
     live_admin_encode(json!({
         "ok": false,
@@ -3578,6 +3653,16 @@ fn live_admin_encode(value: Value) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap_or_else(|_| {
         br#"{"ok":false,"exit_code":2,"error":"encode live admin response"}"#.to_vec()
     })
+}
+
+fn live_admin_hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[cfg(feature = "encryption")]
@@ -4334,10 +4419,7 @@ impl VfsEngine for VfsLocalFileSystem {
         let fh = match self.register_file_handle(inode_id, flags, true) {
             Ok(fh) => fh,
             Err(err) => {
-                let _ = self
-                    .fs
-                    .borrow_mut()
-                    .remove_tmpfile_orphan_on_link(inode_id);
+                let _ = self.fs.borrow_mut().remove_tmpfile_orphan_on_link(inode_id);
                 return Err(err);
             }
         };
@@ -6370,6 +6452,59 @@ mod tests {
             crate::ChangedRecordExport::decode(&encoded).expect("decode live send output");
         assert!(decoded.total_records > 0);
         assert!(decoded.payload_bytes > 0);
+    }
+
+    #[test]
+    fn live_snapshot_extract_reads_snapshot_file_and_output_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let mut fs = LocalFileSystem::open(&store).expect("open fs");
+        fs.create_file("/lost.txt", 0o644).expect("create file");
+        fs.write_file("/lost.txt", 0, b"snapshot bytes")
+            .expect("write file");
+        fs.create_snapshot("snap0").expect("create snapshot");
+        fs.write_file("/lost.txt", 0, b"live bytes")
+            .expect("mutate live file");
+        let engine = VfsLocalFileSystem::new(fs);
+
+        let stdout = live_snapshot_admin(
+            &engine,
+            "extract",
+            json!({
+                "snapshot_name": "snap0",
+                "file_path": "lost.txt",
+            }),
+            false,
+        );
+        assert_eq!(stdout["ok"], true, "extract response: {stdout}");
+        assert_eq!(stdout["bytes"], 14);
+        assert_eq!(stdout["bytes_hex"], "736e617073686f74206279746573");
+
+        let output = root.path().join("recovered.bin");
+        let written = live_snapshot_admin(
+            &engine,
+            "extract",
+            json!({
+                "snapshot_name": "snap0",
+                "file_path": "/lost.txt",
+                "output": output.display().to_string(),
+            }),
+            true,
+        );
+        assert_eq!(written["ok"], true, "extract output response: {written}");
+        assert_eq!(written["json"]["bytes"], 14);
+        assert_eq!(
+            std::fs::read(&output).expect("read recovered output"),
+            b"snapshot bytes"
+        );
+        assert_eq!(
+            engine
+                .fs
+                .borrow()
+                .read_file("/lost.txt")
+                .expect("read live file"),
+            b"live bytes"
+        );
     }
 
     #[cfg(feature = "encryption")]
@@ -14246,7 +14381,14 @@ mod tests {
         }
 
         engine
-            .rename(root, b"alpha.txt", root, b"beta.txt", RENAME_EXCHANGE, &ctx())
+            .rename(
+                root,
+                b"alpha.txt",
+                root,
+                b"beta.txt",
+                RENAME_EXCHANGE,
+                &ctx(),
+            )
             .unwrap();
 
         assert_eq!(

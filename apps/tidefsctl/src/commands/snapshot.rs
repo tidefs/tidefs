@@ -282,7 +282,7 @@ pub enum SnapshotCommand {
     Rollback(SnapshotRollbackArgs),
     /// Register the runtime-pending read-only snapshot export mount surface
     Export(SnapshotExportArgs),
-    /// Register the runtime-pending one-shot snapshot file extraction surface
+    /// Extract one file from a snapshot through the live owner
     Extract(SnapshotExtractArgs),
 }
 
@@ -831,7 +831,7 @@ pub struct SnapshotExportArgs {
 }
 
 /// `snapshot extract <snapshot-name> <file-path>`
-/// Parse arguments for the runtime-pending one-shot snapshot extraction surface.
+/// Extract a regular file from a named snapshot.
 /// Snapshot names follow the `@` prefix convention, e.g. `mypool@mysnap`.
 #[derive(Args, Debug)]
 pub struct SnapshotExtractArgs {
@@ -1306,12 +1306,9 @@ fn snapshot_backing_path(
             operation,
             serde_json::Value::Null,
         ),
-        (None, Some(pool_name), None) => super::live_owner::route_with_args(
-            "snapshot",
-            operation,
-            pool_name,
-            live_args,
-        ),
+        (None, Some(pool_name), None) => {
+            super::live_owner::route_with_args("snapshot", operation, pool_name, live_args)
+        }
         (None, None, None) => {
             eprintln!("tidefsctl snapshot send: POOL required");
             process::exit(1);
@@ -1844,8 +1841,7 @@ fn handle_export(args: SnapshotExportArgs) {
         block_devices: None,
         dataset_path: None,
         snapshot_name: Some(snapshot_name),
-        mount_authority:
-            tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone(),
+        mount_authority: tidefs_posix_filesystem_adapter_daemon::MountAuthority::standalone(),
     };
 
     if let Err(err) = tidefs_posix_filesystem_adapter_daemon::run_mount(config) {
@@ -1856,14 +1852,39 @@ fn handle_export(args: SnapshotExportArgs) {
 
 fn handle_extract(args: SnapshotExtractArgs) {
     let _guard = super::authz::require_local_only("snapshot extract");
-    let _ = args;
-    eprintln!(
-        concat!(
-            "tidefsctl snapshot extract: runtime snapshot extraction is not yet ",
-            "implemented; issue #925 will wire one-shot snapshot file reads"
-        )
+    let (pool_name, snapshot_name) = match args.snapshot_name.split_once('@') {
+        Some((pool, snap)) if !pool.is_empty() && !snap.is_empty() => {
+            (pool.to_string(), snap.to_string())
+        }
+        _ => {
+            eprintln!(
+                "tidefsctl snapshot extract: invalid snapshot name '{}'; expected pool@snapshot form (e.g. mypool@mysnap)",
+                args.snapshot_name
+            );
+            process::exit(1);
+        }
+    };
+    let file_path = match LocalFileSystem::normalize_snapshot_extract_path(&args.file_path) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!(
+                "tidefsctl snapshot extract: invalid file path '{}': {err}",
+                args.file_path
+            );
+            process::exit(1);
+        }
+    };
+
+    super::live_owner::route_with_args(
+        "snapshot",
+        "extract",
+        &pool_name,
+        serde_json::json!({
+            "snapshot_name": &snapshot_name,
+            "file_path": &file_path,
+            "output": args.output.as_ref().map(|path| path.display().to_string()),
+        }),
     );
-    process::exit(1);
 }
 
 fn handle_send(args: SnapshotSendArgs) {
