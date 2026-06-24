@@ -1341,7 +1341,7 @@ impl StorageIntentDecisionHardGateResult {
 }
 
 /// Bounded hard-gate result set for a decision frontier.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct StorageIntentDecisionHardGateResultSet {
     len: u8,
@@ -1358,6 +1358,12 @@ impl StorageIntentDecisionHardGateResultSet {
     #[must_use]
     pub const fn len(self) -> usize {
         decision_frontier_len(self.len)
+    }
+
+    /// Returns true when no hard-gate records are retained.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
     }
 
     /// Append a hard-gate record if capacity remains.
@@ -1384,12 +1390,6 @@ impl StorageIntentDecisionHardGateResultSet {
             index += 1;
         }
         false
-    }
-}
-
-impl Default for StorageIntentDecisionHardGateResultSet {
-    fn default() -> Self {
-        Self::EMPTY
     }
 }
 
@@ -1496,7 +1496,7 @@ impl StorageIntentDecisionScoreEntry {
 }
 
 /// Bounded score vector for one selected or scored candidate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct StorageIntentDecisionScoreVector {
     len: u8,
@@ -1513,6 +1513,12 @@ impl StorageIntentDecisionScoreVector {
     #[must_use]
     pub const fn len(self) -> usize {
         decision_frontier_len(self.len)
+    }
+
+    /// Returns true when no score entries are retained.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
     }
 
     /// Append a score entry if capacity remains.
@@ -1570,12 +1576,6 @@ impl StorageIntentDecisionScoreVector {
     }
 }
 
-impl Default for StorageIntentDecisionScoreVector {
-    fn default() -> Self {
-        Self::EMPTY
-    }
-}
-
 /// Required score dimensions for a policy or audit gate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -1607,7 +1607,7 @@ impl StorageIntentDecisionScoreRequirementMask {
 }
 
 /// One candidate retained by a decision frontier.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct StorageIntentDecisionCandidateRecord {
     pub candidate_id: StorageIntentEvidenceId,
@@ -1653,14 +1653,8 @@ impl StorageIntentDecisionCandidateRecord {
     }
 }
 
-impl Default for StorageIntentDecisionCandidateRecord {
-    fn default() -> Self {
-        Self::EMPTY
-    }
-}
-
 /// Bounded candidate frontier with stable digest and deterministic ordering.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct StorageIntentDecisionCandidateSet {
     len: u8,
@@ -1680,6 +1674,12 @@ impl StorageIntentDecisionCandidateSet {
     #[must_use]
     pub const fn len(self) -> usize {
         decision_frontier_len(self.len)
+    }
+
+    /// Returns true when no candidates are retained.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
     }
 
     /// Append a candidate if capacity remains.
@@ -1739,12 +1739,6 @@ impl StorageIntentDecisionCandidateSet {
             index += 1;
         }
         false
-    }
-}
-
-impl Default for StorageIntentDecisionCandidateSet {
-    fn default() -> Self {
-        Self::EMPTY
     }
 }
 
@@ -1875,7 +1869,7 @@ impl StorageIntentDecisionCounterfactualPaybackRecord {
 }
 
 /// Complete #905 decision-frontier evidence record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct StorageIntentDecisionEvidence {
     pub evidence_ref: StorageIntentEvidenceRef,
@@ -1897,32 +1891,6 @@ pub struct StorageIntentDecisionEvidence {
     pub counterfactual_payback: StorageIntentDecisionCounterfactualPaybackRecord,
     pub retention_ref: StorageIntentEvidenceRef,
     pub refusal: StorageIntentRefusalReason,
-}
-
-impl Default for StorageIntentDecisionEvidence {
-    fn default() -> Self {
-        Self {
-            evidence_ref: StorageIntentEvidenceRef::default(),
-            decision_id: StorageIntentEvidenceId::ZERO,
-            action_class: StorageIntentActionClass::QueuePrefetchTuning,
-            subject_scope: StorageIntentObjectScope::default(),
-            policy_id: StorageIntentPolicyId::ZERO,
-            policy_revision: StorageIntentPolicyRevision(0),
-            actor_component_ref: StorageIntentEvidenceRef::default(),
-            actor_version: 0,
-            decision_epoch: 0,
-            temporal_evidence_ref: StorageIntentEvidenceRef::default(),
-            evidence_query_snapshot_ref: StorageIntentEvidenceRef::default(),
-            authority_mode: StorageIntentDecisionAuthorityMode::Unknown,
-            candidates: StorageIntentDecisionCandidateSet::EMPTY,
-            hard_gates: StorageIntentDecisionHardGateResultSet::EMPTY,
-            score_vector: StorageIntentDecisionScoreVector::EMPTY,
-            selected_candidate: StorageIntentDecisionSelectionRecord::default(),
-            counterfactual_payback: StorageIntentDecisionCounterfactualPaybackRecord::default(),
-            retention_ref: StorageIntentEvidenceRef::default(),
-            refusal: StorageIntentRefusalReason::None,
-        }
-    }
 }
 
 impl StorageIntentDecisionEvidence {
