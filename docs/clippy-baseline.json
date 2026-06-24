@@ -487,6 +487,10 @@
       "warnings": 3,
       "exit_code": 0
     },
+    "tidefs-storage-intent-read-serving": {
+      "warnings": 3,
+      "exit_code": 0
+    },
     "tidefs-storage-intent-remote-media-capability": {
       "warnings": 1,
       "exit_code": 0
