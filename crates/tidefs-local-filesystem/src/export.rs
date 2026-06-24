@@ -157,6 +157,7 @@ impl LocalFileSystem {
         let file_path = Self::normalize_snapshot_extract_path(file_path)?;
         let (_summary, exported_state) = self.load_snapshot_export_state(snapshot_name)?;
 
+        let live_uncommitted_mutation_count = self.uncommitted_mutation_count;
         self.hold_snapshot_tagged(snapshot_name, Some("export"))?;
         self.stop_background_scheduler();
         let live_state = mem::replace(&mut self.state, exported_state);
@@ -179,6 +180,9 @@ impl LocalFileSystem {
         self.clear_snapshot_extract_caches();
 
         let release_result = self.release_snapshot(snapshot_name);
+        if release_result.is_ok() {
+            self.uncommitted_mutation_count = live_uncommitted_mutation_count;
+        }
         match (read_result, release_result) {
             (Ok(bytes), Ok(_)) => Ok(bytes),
             (Err(err), _) => Err(err),
@@ -371,6 +375,34 @@ mod tests {
             .extract_snapshot_file_from_open_pool("snap0", "/lost.txt")
             .expect("extract snapshot file");
         assert_eq!(extracted, b"snapshot payload");
+        assert_eq!(
+            fs.read_file("/lost.txt")
+                .expect("read live file after extract"),
+            b"live payloaddata"
+        );
+    }
+
+    #[test]
+    fn snapshot_extract_preserves_live_deferred_commit_counter() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut fs = LocalFileSystem::open_with_options(root.path(), StoreOptions::test_fast())
+            .expect("open filesystem");
+        fs.create_file("/lost.txt", 0o644).expect("create file");
+        fs.write_file("/lost.txt", 0, b"snapshot payload")
+            .expect("write snapshot file");
+        fs.create_snapshot("snap0").expect("create snapshot");
+
+        fs.set_auto_commit(false);
+        fs.write_file("/lost.txt", 0, b"live payloaddata")
+            .expect("mutate live file");
+        let before = fs.uncommitted_mutation_count();
+        assert!(before > 0, "setup should leave deferred live mutations");
+
+        let extracted = fs
+            .extract_snapshot_file_from_open_pool("snap0", "/lost.txt")
+            .expect("extract snapshot file");
+        assert_eq!(extracted, b"snapshot payload");
+        assert_eq!(fs.uncommitted_mutation_count(), before);
         assert_eq!(
             fs.read_file("/lost.txt")
                 .expect("read live file after extract"),
