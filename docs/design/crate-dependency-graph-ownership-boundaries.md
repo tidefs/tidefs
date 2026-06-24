@@ -461,10 +461,12 @@ be preserved by all changes:
 > referenced crates (`tidefs-types-locator-table-core` and others) no longer
 > exist.
 
-The 11-layer DESIGN issue matrix (`docs/design/11-layer-architecture-dependency-matrix.md`)
-covers issue-level sequencing for 71 DESIGN issues across 4 milestones. The
-crate graph documented here is the *historical implementation* artifact that
-realized those designs in Rust at the time of writing.
+In the same historical snapshot, the 11-layer DESIGN issue matrix
+(`docs/design/11-layer-architecture-dependency-matrix.md`) recorded
+issue-level sequencing for 71 DESIGN issues across 4 milestones. The crate
+graph documented here is the *historical implementation* artifact that realized
+those designs in Rust at the time of writing. Neither document is current
+GitHub scheduling authority or current product architecture policy.
 
 | DESIGN Layer | Primary Crates |
 |-------------|----------------|

@@ -65,4 +65,5 @@ execution), or `daemon` (binary).
 Design spec: `docs/design/crate-dependency-graph-ownership-boundaries.md`
 Related:
   `docs/design/11-layer-architecture-dependency-matrix.md`
+  (historical input only; not current scheduling or architecture authority)
   `crates/README.md`
