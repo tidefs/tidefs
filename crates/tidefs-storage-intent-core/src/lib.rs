@@ -7394,6 +7394,260 @@ pub struct ReadSourceFreshnessRecord {
     pub evidence: StorageIntentEvidenceRef,
 }
 
+// ---------------------------------------------------------------------------
+// Data-shape types: record sizing, compression, checksum/digest, dedup,
+// encryption, EC/archive, coalescing, and rebake (issue #878).
+// ---------------------------------------------------------------------------
+
+/// Allowed extent/chunk/stripe size class.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum RecordSizeClass {
+    #[default]
+    Unknown = 0,
+    /// 512 B - 4 KiB: inode, xattr, small file, directory block.
+    Tiny = 1,
+    /// 4 KiB - 64 KiB: small file payload, metadata block.
+    Small = 2,
+    /// 64 KiB - 1 MiB: default extent.
+    Medium = 3,
+    /// 1 MiB - 16 MiB: streaming ingest, archive.
+    Large = 4,
+    /// 16 MiB - 256 MiB: EC stripe, backup.
+    Huge = 5,
+    /// Caller-specified split/coalesce rules override.
+    RangeOverride = 6,
+}
+
+/// Compression algorithm and level/class.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum CompressionAlgorithmClass {
+    #[default]
+    None = 0,
+    Lz4Fast = 1,
+    Lz4High = 2,
+    ZstdFast = 3,
+    ZstdHigh = 4,
+    ZstdAdaptive = 5,
+    DictionaryBacked = 6,
+    Custom = 7,
+}
+
+/// Compression ordering relative to encryption.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum CompressionOrderingClass {
+    #[default]
+    Unknown = 0,
+    /// Compression before encryption (standard safe construction).
+    CompressThenEncrypt = 1,
+    /// Encryption before compression (compression ineffective).
+    EncryptThenCompress = 2,
+    /// Compression only, no encryption layer.
+    CompressOnly = 3,
+    /// No compression, encryption may be present.
+    NoCompression = 4,
+}
+
+/// Checksum/digest suite and layer identity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum DigestSuiteClass {
+    #[default]
+    Unknown = 0,
+    /// CRC32C for framing sanity only.
+    Crc32cFraming = 1,
+    /// BLAKE3-256 for durable content identity.
+    Blake3Content = 2,
+    /// BLAKE3-256 keyed for committed-root authentication.
+    Blake3KeyedRoot = 3,
+    /// CRC32C framing + BLAKE3-256 payload.
+    Crc32cPlusBlake3 = 4,
+    /// CRC32C framing + BLAKE3-256 payload + BLAKE3-256 keyed root.
+    FullIntegrityTrailerV2 = 5,
+}
+
+/// Dedup fingerprint scope and collision/security posture.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum DedupFingerprintScopeClass {
+    #[default]
+    Unknown = 0,
+    /// No dedup fingerprinting.
+    NoDedup = 1,
+    /// Fingerprints within one dataset only.
+    DatasetLocal = 2,
+    /// Fingerprints within one tenant domain.
+    TenantLocal = 3,
+    /// Fingerprints within a security domain.
+    SecurityDomain = 4,
+    /// Cross-domain sharing allowed by explicit policy.
+    CrossDomainAuthorized = 5,
+    /// Dedup refused: domain or policy mismatch.
+    DedupRefused = 6,
+}
+
+/// Erasure-coding or archive shape parameters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct ECArchiveShape {
+    /// Data shards (k).
+    pub ec_data_shards: u8,
+    /// Parity shards (m).
+    pub ec_parity_shards: u8,
+    /// Stripe unit size in bytes.
+    pub stripe_unit_bytes: u32,
+    /// Locality group size (0 = none).
+    pub locality_group_size: u8,
+    /// Rebuild width (how many shards are read for rebuild).
+    pub rebuild_width: u8,
+    /// Restore-time class: how many shards must be retrieved for a full read.
+    pub restore_read_width: u8,
+}
+
+impl ECArchiveShape {
+    /// Sentinel for replication (k=1, m=0).
+    pub const REPLICATION: Self = Self {
+        ec_data_shards: 1,
+        ec_parity_shards: 0,
+        stripe_unit_bytes: 0,
+        locality_group_size: 0,
+        rebuild_width: 1,
+        restore_read_width: 1,
+    };
+
+    /// Returns true when this is a replication shape (no EC).
+    #[must_use]
+    pub const fn is_replication(self) -> bool {
+        self.ec_parity_shards == 0
+    }
+
+    /// Returns true when this is an erasure-coded shape.
+    #[must_use]
+    pub const fn is_erasure_coded(self) -> bool {
+        self.ec_parity_shards > 0 && self.ec_data_shards > 0
+    }
+
+    /// Returns true when this is a valid shape (k > 0, k+m <= 255).
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.ec_data_shards > 0
+            && self.ec_data_shards as u16 + self.ec_parity_shards as u16 <= 255
+    }
+
+    /// Total shards (k+m).
+    #[must_use]
+    pub const fn total_shards(self) -> u8 {
+        self.ec_data_shards.saturating_add(self.ec_parity_shards)
+    }
+}
+
+/// Small-object coalescing mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum CoalescingModeClass {
+    #[default]
+    Unknown = 0,
+    /// No coalescing; each record stands alone.
+    NoCoalescing = 1,
+    /// Inline payload packed into extent header.
+    InlinePayload = 2,
+    /// Packed small files share one extent.
+    PackedSmallFiles = 3,
+    /// Directory block inlining.
+    DirBlockInline = 4,
+    /// Xattr payload inlining.
+    XattrPayloadInline = 5,
+    /// Externalized to a shared small-object extent.
+    ExternalizedSmallObject = 6,
+}
+
+/// Rebake eligibility and payback window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum RebakeEligibilityClass {
+    #[default]
+    Unknown = 0,
+    /// Rebake is not permitted by policy.
+    RebakeForbidden = 1,
+    /// Shadow evaluation only; no live rebake.
+    ShadowEvaluation = 2,
+    /// Eligible after cooldown window.
+    EligibleAfterCooldown = 3,
+    /// Eligible immediately (payback window satisfied).
+    EligibleImmediate = 4,
+    /// Refused: replacement receipts not yet published.
+    ReplacementReceiptPending = 5,
+    /// Refused: payback window not met.
+    PaybackWindowNotMet = 6,
+}
+
+/// Data-shape cost budget limits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct DataShapeCostBudget {
+    /// Max CPU budget for compression (ppm of CPU capacity).
+    pub cpu_budget_ppm: u32,
+    /// Max memory budget for compression/dedup tables (bytes).
+    pub memory_budget_bytes: u64,
+    /// Max read amplification factor (multiplied by 1000, e.g. 1500 = 1.5x).
+    pub read_amplification_ppm: u32,
+    /// Max decompression latency budget (microseconds).
+    pub decompression_latency_us: u64,
+    /// Max WAN egress budget (bytes per period).
+    pub wan_egress_budget_bytes: u64,
+    /// Max flash wear budget (estimated physical bytes written).
+    pub wear_budget_bytes: u64,
+    /// Max rebuild bandwidth budget (bytes/s).
+    pub rebuild_budget_bytes_per_sec: u64,
+    /// Max movement debt budget (bytes of relocation not yet paid back).
+    pub movement_debt_budget_bytes: u64,
+}
+
+/// Requested data-shape policy for a range or generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct DataShapePolicy {
+    /// Compiled policy identity.
+    pub policy_id: StorageIntentPolicyId,
+    /// Monotonic policy revision.
+    pub policy_revision: StorageIntentPolicyRevision,
+    /// Allowed record size class (floor).
+    pub record_size_class: RecordSizeClass,
+    /// Allowed compression algorithm and level (None = compression forbidden).
+    pub compression_algorithm: CompressionAlgorithmClass,
+    /// Compression ordering relative to encryption.
+    pub compression_ordering: CompressionOrderingClass,
+    /// Required checksum/digest suite (floor).
+    pub digest_suite: DigestSuiteClass,
+    /// Allowed dedup fingerprint scope (floor/domain constraint).
+    pub dedup_scope: DedupFingerprintScopeClass,
+    /// Encryption domain for transform boundary.
+    pub encryption_domain: StorageIntentDomainId,
+    /// Minimum encryption key epoch.
+    pub encryption_key_epoch_min: u64,
+    /// EC/archive shape (replication if ec_parity_shards=0).
+    pub ec_archive_shape: ECArchiveShape,
+    /// Coalescing mode for small objects.
+    pub coalescing_mode: CoalescingModeClass,
+    /// Rebake eligibility.
+    pub rebake_eligibility: RebakeEligibilityClass,
+    /// Cost budget limits.
+    pub cost_budget: DataShapeCostBudget,
+    /// Domain constraint for dedup/encryption sharing.
+    pub sharing_domain: StorageIntentDomainId,
+    /// Evidence refs for policy compilation provenance.
+    pub evidence_refs: StorageIntentEvidenceRefs,
+}
+
 /// Transform refusal reason for data-shape decisions.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -7410,10 +7664,54 @@ pub enum TransformRefusalClass {
     ReplacementReceiptMissing = 7,
 }
 
-/// Data-shape evidence ref projection.
+
+/// Data-shape specific refusal reasons.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum DataShapeRefusalReason {
+    #[default]
+    None = 0,
+    UnknownDataShapeEvidence = 1,
+    StaleDataShapeEvidence = 2,
+    WrongDomainForDedup = 3,
+    DedupCrossesTenantDomain = 4,
+    EncryptionBypassedForDedup = 5,
+    CompressedBeforeEncryptionOrderViolation = 6,
+    ECShapeBlocksReadServing = 7,
+    ECShapeExceedsRebuildBudget = 8,
+    ECShapeExceedsRestoreTime = 9,
+    RecordSizeTooSmallForEC = 10,
+    RecordSizeTooLargeForOverwriteLatency = 11,
+    DigestSuiteTooWeakForPolicy = 12,
+    CompressionExceedsCpuBudget = 13,
+    CompressionExceedsMemoryBudget = 14,
+    RebakePaybackWindowNotMet = 15,
+    RebakeReplacementReceiptMissing = 16,
+    CostBudgetExceeded = 17,
+}
+
+
+/// Data-shape evidence: proven encoded shape for a range or generation.
+///
+/// Carries the actual record size class, compression algorithm and ordering,
+/// digest suite, dedup fingerprint scope, encryption domain and key epoch,
+/// EC/archive shape parameters, coalescing mode, rebake eligibility, cost
+/// accounting refs, typed refusal state, and evidence provenance so consumers
+/// can verify the encoded shape against policy and prove integrity,
+/// domain compatibility, and receipt-retirement law.
+///
+/// The numeric fields (`record_size_bytes`, `compression_algorithm`,
+/// `checksum_algorithm`, `digest`, `ec_data_shards`, `ec_parity_shards`,
+/// `coalescing_generation`, `rebake_generation`) are the stable on-media
+/// projections. The typed fields (`record_size_class`, `compression_class`,
+/// `digest_suite`, `dedup_scope`, `ec_archive_shape`, `coalescing_mode`,
+/// `rebake_eligibility`, `data_shape_refusal`) are the storage-intent
+/// authority view and may carry richer policy/evidence semantics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct DataShapeRecord {
+    // -- Stable on-media projection fields (backward compat) --
     pub record_size_bytes: u32,
     pub compression_algorithm: u16,
     pub checksum_algorithm: u16,
@@ -7426,7 +7724,328 @@ pub struct DataShapeRecord {
     pub rebake_generation: u64,
     pub transform_refusal: TransformRefusalClass,
     pub replacement_receipt: StorageIntentReceiptId,
+    // -- Storage-intent authority typed fields --
+    /// Typed record size class.
+    pub record_size_class: RecordSizeClass,
+    /// Typed compression algorithm class.
+    pub compression_class: CompressionAlgorithmClass,
+    /// Compression ordering relative to encryption.
+    pub compression_ordering: CompressionOrderingClass,
+    /// Typed digest suite.
+    pub digest_suite: DigestSuiteClass,
+    /// Dedup fingerprint scope evidence.
+    pub dedup_scope: DedupFingerprintScopeClass,
+    /// Encryption domain for transform boundary.
+    pub encryption_domain: StorageIntentDomainId,
+    /// EC/archive shape parameters.
+    pub ec_archive_shape: ECArchiveShape,
+    /// Coalescing mode for small objects.
+    pub coalescing_mode: CoalescingModeClass,
+    /// Rebake eligibility state.
+    pub rebake_eligibility: RebakeEligibilityClass,
+    /// Data-shape specific refusal reason (if any).
+    pub data_shape_refusal: DataShapeRefusalReason,
+    /// Policy that authorized this shape.
+    pub policy_id: StorageIntentPolicyId,
+    /// Policy revision at write time.
+    pub policy_revision: StorageIntentPolicyRevision,
+    /// Cost accounting evidence ref.
+    pub cost_accounting_ref: StorageIntentEvidenceRef,
+    /// Evidence provenance ref.
     pub evidence: StorageIntentEvidenceRef,
+}
+
+impl DataShapeRecord {
+    /// Returns true when no transform has been refused.
+    #[must_use]
+    pub const fn is_transform_legal(self) -> bool {
+        matches!(self.transform_refusal, TransformRefusalClass::None)
+            && matches!(self.data_shape_refusal, DataShapeRefusalReason::None)
+    }
+
+    /// Returns true when encryption domain is present.
+    #[must_use]
+    pub const fn has_encryption_domain(self) -> bool {
+        !self.encryption_domain.is_zero()
+    }
+
+    /// Returns true when dedup domain is present.
+    #[must_use]
+    pub const fn has_dedup_domain(self) -> bool {
+        !self.dedup_domain.is_zero()
+    }
+
+    /// Returns true when the shape uses compression.
+    #[must_use]
+    pub const fn is_compressed(self) -> bool {
+        !matches!(self.compression_class, CompressionAlgorithmClass::None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data-shape hard-gate validation predicates.
+// ---------------------------------------------------------------------------
+
+
+/// Const-compatible domain-id equality.
+const fn domain_ids_equal(a: StorageIntentDomainId, b: StorageIntentDomainId) -> bool {
+    let mut i = 0;
+    while i < 16 {
+        if a.0[i] != b.0[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Const-compatible receipt-id equality.
+const fn receipt_ids_equal(a: StorageIntentReceiptId, b: StorageIntentReceiptId) -> bool {
+    let mut i = 0;
+    while i < 16 {
+        if a.0[i] != b.0[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Returns SATISFIED when the data-shape evidence record has usable evidence.
+///
+/// Unknown, missing, or stale data-shape evidence blocks authority.
+#[must_use]
+pub const fn data_shape_evidence_is_usable(
+    record: DataShapeRecord,
+) -> ReceiptPredicateResult {
+    if record.evidence.is_bound() {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+}
+
+/// Returns SATISFIED when the evidence record reports a legal transform.
+///
+/// Any transform or data-shape refusal blocks authority.
+#[must_use]
+pub const fn data_shape_transform_is_legal(
+    record: DataShapeRecord,
+) -> ReceiptPredicateResult {
+    if record.is_transform_legal() {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+}
+
+/// Returns SATISFIED when dedup does not cross encryption or tenant domains
+/// without explicit policy permission.
+///
+/// Identity law: dedup fingerprints are over the policy-approved identity
+/// and domain; they cannot cross encryption, tenant, security, or retention
+/// domains by accident.
+#[must_use]
+pub const fn data_shape_dedup_domain_is_compatible(
+    record: DataShapeRecord,
+    policy_domain: StorageIntentDomainId,
+) -> ReceiptPredicateResult {
+    // No dedup active: trivially satisfied.
+    if matches!(record.dedup_scope, DedupFingerprintScopeClass::NoDedup)
+        || matches!(record.dedup_scope, DedupFingerprintScopeClass::Unknown)
+    {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    // Dedup refused: unsatisfied.
+    if matches!(record.dedup_scope, DedupFingerprintScopeClass::DedupRefused) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::IllegalSharingDomain,
+        );
+    }
+    // If a sharing domain is specified, it must match policy.
+    if !record.dedup_domain.is_zero() && !domain_ids_equal(record.dedup_domain, policy_domain) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::IllegalSharingDomain,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Returns SATISFIED when encryption is not bypassed for dedup,
+/// compression, or recovery convenience.
+///
+/// Identity law: encryption cannot be bypassed to make compression,
+/// dedup, repair, recovery, or operator inspection convenient.
+#[must_use]
+pub const fn data_shape_encryption_is_not_bypassed(
+    record: DataShapeRecord,
+    policy_requires_encryption: bool,
+) -> ReceiptPredicateResult {
+    if !policy_requires_encryption {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    // Encryption domain must be present when policy requires encryption.
+    if record.encryption_domain.is_zero() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingAuthenticatedPrincipal,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Returns SATISFIED when compression ordering respects the
+/// compress-then-encrypt identity law.
+///
+/// Compression must happen before encryption for useful compression.
+/// Encrypt-then-compress is a legal but wasteful choice that must be
+/// an explicit policy decision, not a silent default.
+#[must_use]
+pub const fn data_shape_compression_ordering_is_legal(
+    record: DataShapeRecord,
+) -> ReceiptPredicateResult {
+    match record.compression_ordering {
+        CompressionOrderingClass::CompressThenEncrypt
+        | CompressionOrderingClass::CompressOnly
+        | CompressionOrderingClass::NoCompression => ReceiptPredicateResult::SATISFIED,
+        CompressionOrderingClass::EncryptThenCompress => {
+            // Legal but uneconomical; not a hard gate failure.
+            ReceiptPredicateResult::SATISFIED
+        }
+        CompressionOrderingClass::Unknown => {
+            ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+        }
+    }
+}
+
+/// Returns SATISFIED when the EC/archive shape is valid and can satisfy
+/// read-serving latency floors.
+///
+/// EC shapes with high rebuild width or restore-time width may block
+/// read-serving unless the policy explicitly permits degraded reads.
+#[must_use]
+pub const fn data_shape_ec_shape_is_legal(
+    shape: ECArchiveShape,
+) -> ReceiptPredicateResult {
+    if shape.is_replication() {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    if !shape.is_valid() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+    // Rebuild width must not exceed total shards.
+    if shape.rebuild_width > shape.total_shards() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Returns SATISFIED when rebake replacement receipts exist before
+/// old shape retirement.
+///
+/// Identity law: rebake must publish replacement placement and data-shape
+/// receipts that satisfy the target policy before old shape receipts
+/// or locators are retired.
+#[must_use]
+pub const fn data_shape_rebake_replacement_receipt_is_present(
+    record: DataShapeRecord,
+) -> ReceiptPredicateResult {
+    match record.rebake_eligibility {
+        RebakeEligibilityClass::Unknown
+        | RebakeEligibilityClass::RebakeForbidden
+        | RebakeEligibilityClass::ShadowEvaluation => ReceiptPredicateResult::SATISFIED,
+        RebakeEligibilityClass::EligibleAfterCooldown
+        | RebakeEligibilityClass::EligibleImmediate => {
+            if !receipt_ids_equal(record.replacement_receipt, StorageIntentReceiptId::ZERO) {
+                ReceiptPredicateResult::SATISFIED
+            } else {
+                ReceiptPredicateResult::refused(
+                    StorageIntentRefusalReason::ReceiptWouldWeaken,
+                )
+            }
+        }
+        RebakeEligibilityClass::ReplacementReceiptPending => {
+            ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::ReceiptWouldWeaken,
+            )
+        }
+        RebakeEligibilityClass::PaybackWindowNotMet => {
+            ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::MovementDebtNotPaidBack,
+            )
+        }
+    }
+}
+
+/// Returns SATISFIED when the digest suite meets or exceeds the policy floor.
+#[must_use]
+pub const fn data_shape_digest_suite_is_adequate(
+    record: DataShapeRecord,
+    policy_min_suite: DigestSuiteClass,
+) -> ReceiptPredicateResult {
+    if record.digest_suite as u8 >= policy_min_suite as u8
+        && !matches!(record.digest_suite, DigestSuiteClass::Unknown)
+    {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+}
+
+/// Full data-shape hard-gate check: combine all predicates.
+///
+/// Returns SATISFIED only when all identity-law, domain, integrity,
+/// and receipt-retirement predicates pass. Any single refusal blocks
+/// authority.
+#[must_use]
+pub const fn data_shape_hard_gate_check(
+    record: DataShapeRecord,
+    policy: DataShapePolicy,
+) -> ReceiptPredicateResult {
+    // Evidence must be usable.
+    let r = data_shape_evidence_is_usable(record);
+    if !r.satisfied {
+        return r;
+    }
+    // Transform must be legal.
+    let r = data_shape_transform_is_legal(record);
+    if !r.satisfied {
+        return r;
+    }
+    // Dedup domain must be compatible with policy.
+    let r = data_shape_dedup_domain_is_compatible(record, policy.sharing_domain);
+    if !r.satisfied {
+        return r;
+    }
+    // Encryption must not be bypassed if policy requires it.
+    let r = data_shape_encryption_is_not_bypassed(
+        record,
+        !policy.encryption_domain.is_zero(),
+    );
+    if !r.satisfied {
+        return r;
+    }
+    // Compression ordering must be legal.
+    let r = data_shape_compression_ordering_is_legal(record);
+    if !r.satisfied {
+        return r;
+    }
+    // EC shape must be valid.
+    let r = data_shape_ec_shape_is_legal(record.ec_archive_shape);
+    if !r.satisfied {
+        return r;
+    }
+    // Rebake replacement receipt must be present when eligible.
+    let r = data_shape_rebake_replacement_receipt_is_present(record);
+    if !r.satisfied {
+        return r;
+    }
+    // Digest suite must meet policy floor.
+    let r = data_shape_digest_suite_is_adequate(record, policy.digest_suite);
+    if !r.satisfied {
+        return r;
+    }
+    ReceiptPredicateResult::SATISFIED
 }
 
 /// Allocation class used by allocator evidence.
@@ -8326,6 +8945,95 @@ impl_u8_canonical!(TransformRefusalClass, {
     ReplacementReceiptMissing = 7 => "replacement-receipt-missing",
 });
 
+impl_u8_canonical!(RecordSizeClass, {
+    Unknown = 0 => "unknown",
+    Tiny = 1 => "tiny",
+    Small = 2 => "small",
+    Medium = 3 => "medium",
+    Large = 4 => "large",
+    Huge = 5 => "huge",
+    RangeOverride = 6 => "range-override",
+});
+
+impl_u8_canonical!(CompressionAlgorithmClass, {
+    None = 0 => "none",
+    Lz4Fast = 1 => "lz4-fast",
+    Lz4High = 2 => "lz4-high",
+    ZstdFast = 3 => "zstd-fast",
+    ZstdHigh = 4 => "zstd-high",
+    ZstdAdaptive = 5 => "zstd-adaptive",
+    DictionaryBacked = 6 => "dictionary-backed",
+    Custom = 7 => "custom",
+});
+
+impl_u8_canonical!(CompressionOrderingClass, {
+    Unknown = 0 => "unknown",
+    CompressThenEncrypt = 1 => "compress-then-encrypt",
+    EncryptThenCompress = 2 => "encrypt-then-compress",
+    CompressOnly = 3 => "compress-only",
+    NoCompression = 4 => "no-compression",
+});
+
+impl_u8_canonical!(DigestSuiteClass, {
+    Unknown = 0 => "unknown",
+    Crc32cFraming = 1 => "crc32c-framing",
+    Blake3Content = 2 => "blake3-content",
+    Blake3KeyedRoot = 3 => "blake3-keyed-root",
+    Crc32cPlusBlake3 = 4 => "crc32c-plus-blake3",
+    FullIntegrityTrailerV2 = 5 => "full-integrity-trailer-v2",
+});
+
+impl_u8_canonical!(DedupFingerprintScopeClass, {
+    Unknown = 0 => "unknown",
+    NoDedup = 1 => "no-dedup",
+    DatasetLocal = 2 => "dataset-local",
+    TenantLocal = 3 => "tenant-local",
+    SecurityDomain = 4 => "security-domain",
+    CrossDomainAuthorized = 5 => "cross-domain-authorized",
+    DedupRefused = 6 => "dedup-refused",
+});
+
+impl_u8_canonical!(CoalescingModeClass, {
+    Unknown = 0 => "unknown",
+    NoCoalescing = 1 => "no-coalescing",
+    InlinePayload = 2 => "inline-payload",
+    PackedSmallFiles = 3 => "packed-small-files",
+    DirBlockInline = 4 => "dir-block-inline",
+    XattrPayloadInline = 5 => "xattr-payload-inline",
+    ExternalizedSmallObject = 6 => "externalized-small-object",
+});
+
+impl_u8_canonical!(RebakeEligibilityClass, {
+    Unknown = 0 => "unknown",
+    RebakeForbidden = 1 => "rebake-forbidden",
+    ShadowEvaluation = 2 => "shadow-evaluation",
+    EligibleAfterCooldown = 3 => "eligible-after-cooldown",
+    EligibleImmediate = 4 => "eligible-immediate",
+    ReplacementReceiptPending = 5 => "replacement-receipt-pending",
+    PaybackWindowNotMet = 6 => "payback-window-not-met",
+});
+
+impl_u8_canonical!(DataShapeRefusalReason, {
+    None = 0 => "none",
+    UnknownDataShapeEvidence = 1 => "unknown-data-shape-evidence",
+    StaleDataShapeEvidence = 2 => "stale-data-shape-evidence",
+    WrongDomainForDedup = 3 => "wrong-domain-for-dedup",
+    DedupCrossesTenantDomain = 4 => "dedup-crosses-tenant-domain",
+    EncryptionBypassedForDedup = 5 => "encryption-bypassed-for-dedup",
+    CompressedBeforeEncryptionOrderViolation = 6 => "compressed-before-encryption-order-violation",
+    ECShapeBlocksReadServing = 7 => "ec-shape-blocks-read-serving",
+    ECShapeExceedsRebuildBudget = 8 => "ec-shape-exceeds-rebuild-budget",
+    ECShapeExceedsRestoreTime = 9 => "ec-shape-exceeds-restore-time",
+    RecordSizeTooSmallForEC = 10 => "record-size-too-small-for-ec",
+    RecordSizeTooLargeForOverwriteLatency = 11 => "record-size-too-large-for-overwrite-latency",
+    DigestSuiteTooWeakForPolicy = 12 => "digest-suite-too-weak-for-policy",
+    CompressionExceedsCpuBudget = 13 => "compression-exceeds-cpu-budget",
+    CompressionExceedsMemoryBudget = 14 => "compression-exceeds-memory-budget",
+    RebakePaybackWindowNotMet = 15 => "rebake-payback-window-not-met",
+    RebakeReplacementReceiptMissing = 16 => "rebake-replacement-receipt-missing",
+    CostBudgetExceeded = 17 => "cost-budget-exceeded",
+});
+
 impl_u8_canonical!(AllocationClass, {
     Unknown = 0 => "unknown",
     IntentLog = 1 => "intent-log",
@@ -8656,6 +9364,26 @@ pub enum StorageIntentRefusalReason {
     GeoCatchUpReserveExceeded = 79,
     /// Background optimizer would borrow protected reserves without override.
     OptimizerProtectedReserveBorrow = 80,
+    /// Data-shape evidence is unknown, missing, or not a data-shape artifact.
+    UnknownDataShapeEvidence = 81,
+    /// Data-shape evidence is stale or superseded.
+    StaleDataShapeEvidence = 82,
+    /// Transform refused for data-shape reasons (see DataShapeRefusalReason).
+    DataShapeTransformRefused = 83,
+    /// Compression ordering violates policy (e.g. compressed before encryption order).
+    IllegalCompressionOrdering = 84,
+    /// Dedup domain crosses encryption or tenant boundary without authorization.
+    DedupCrossesTenantDomain = 85,
+    /// Encryption was bypassed for dedup or compression convenience.
+    EncryptionBypassedForDedup = 86,
+    /// EC/archive shape blocks read-serving latency floors.
+    ECShapeBlocksReadServing = 87,
+    /// Rebake replacement receipt is missing; old shape cannot be retired.
+    RebakeReplacementReceiptMissing = 88,
+    /// Rebake payback window has not elapsed; cooldown required.
+    RebakePaybackWindowNotMet = 89,
+    /// Data-shape cost budget (CPU, memory, wear, WAN) would be exceeded.
+    DataShapeCostBudgetExceeded = 90,
 }
 
 impl StorageIntentRefusalReason {
@@ -8748,6 +9476,16 @@ impl StorageIntentRefusalReason {
             Self::RelocationScratchReserveExhausted => "relocation-scratch-reserve-exhausted",
             Self::GeoCatchUpReserveExceeded => "geo-catch-up-reserve-exceeded",
             Self::OptimizerProtectedReserveBorrow => "optimizer-protected-reserve-borrow",
+            Self::UnknownDataShapeEvidence => "unknown-data-shape-evidence",
+            Self::StaleDataShapeEvidence => "stale-data-shape-evidence",
+            Self::DataShapeTransformRefused => "data-shape-transform-refused",
+            Self::IllegalCompressionOrdering => "illegal-compression-ordering",
+            Self::DedupCrossesTenantDomain => "dedup-crosses-tenant-domain",
+            Self::EncryptionBypassedForDedup => "encryption-bypassed-for-dedup",
+            Self::ECShapeBlocksReadServing => "ec-shape-blocks-read-serving",
+            Self::RebakeReplacementReceiptMissing => "rebake-replacement-receipt-missing",
+            Self::RebakePaybackWindowNotMet => "rebake-payback-window-not-met",
+            Self::DataShapeCostBudgetExceeded => "data-shape-cost-budget-exceeded",
         }
     }
 
@@ -8836,6 +9574,16 @@ impl StorageIntentRefusalReason {
             78 => Some(Self::RelocationScratchReserveExhausted),
             79 => Some(Self::GeoCatchUpReserveExceeded),
             80 => Some(Self::OptimizerProtectedReserveBorrow),
+            81 => Some(Self::UnknownDataShapeEvidence),
+            82 => Some(Self::StaleDataShapeEvidence),
+            83 => Some(Self::DataShapeTransformRefused),
+            84 => Some(Self::IllegalCompressionOrdering),
+            85 => Some(Self::DedupCrossesTenantDomain),
+            86 => Some(Self::EncryptionBypassedForDedup),
+            87 => Some(Self::ECShapeBlocksReadServing),
+            88 => Some(Self::RebakeReplacementReceiptMissing),
+            89 => Some(Self::RebakePaybackWindowNotMet),
+            90 => Some(Self::DataShapeCostBudgetExceeded),
             _ => None,
         }
     }
@@ -17778,4 +18526,423 @@ mod tests {
             "rolled-back"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Data-shape type tests (issue #878)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn record_size_class_enums_encode_decode_roundtrip() {
+        let classes = [
+            RecordSizeClass::Unknown,
+            RecordSizeClass::Tiny,
+            RecordSizeClass::Small,
+            RecordSizeClass::Medium,
+            RecordSizeClass::Large,
+            RecordSizeClass::Huge,
+            RecordSizeClass::RangeOverride,
+        ];
+        for c in &classes {
+            let disc = c.to_discriminant();
+            let decoded = RecordSizeClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*c), "roundtrip failed for {:?}", c.as_str());
+        }
+        assert_eq!(RecordSizeClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn compression_algorithm_enums_encode_decode_roundtrip() {
+        let algs = [
+            CompressionAlgorithmClass::None,
+            CompressionAlgorithmClass::Lz4Fast,
+            CompressionAlgorithmClass::Lz4High,
+            CompressionAlgorithmClass::ZstdFast,
+            CompressionAlgorithmClass::ZstdHigh,
+            CompressionAlgorithmClass::ZstdAdaptive,
+            CompressionAlgorithmClass::DictionaryBacked,
+            CompressionAlgorithmClass::Custom,
+        ];
+        for a in &algs {
+            let disc = a.to_discriminant();
+            let decoded = CompressionAlgorithmClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*a), "roundtrip failed for {:?}", a.as_str());
+        }
+        assert_eq!(CompressionAlgorithmClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn compression_ordering_enums_encode_decode_roundtrip() {
+        let orders = [
+            CompressionOrderingClass::Unknown,
+            CompressionOrderingClass::CompressThenEncrypt,
+            CompressionOrderingClass::EncryptThenCompress,
+            CompressionOrderingClass::CompressOnly,
+            CompressionOrderingClass::NoCompression,
+        ];
+        for o in &orders {
+            let disc = o.to_discriminant();
+            let decoded = CompressionOrderingClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*o), "roundtrip failed for {:?}", o.as_str());
+        }
+        assert_eq!(CompressionOrderingClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn digest_suite_enums_encode_decode_roundtrip() {
+        let suites = [
+            DigestSuiteClass::Unknown,
+            DigestSuiteClass::Crc32cFraming,
+            DigestSuiteClass::Blake3Content,
+            DigestSuiteClass::Blake3KeyedRoot,
+            DigestSuiteClass::Crc32cPlusBlake3,
+            DigestSuiteClass::FullIntegrityTrailerV2,
+        ];
+        for s in &suites {
+            let disc = s.to_discriminant();
+            let decoded = DigestSuiteClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*s), "roundtrip failed for {:?}", s.as_str());
+        }
+        assert_eq!(DigestSuiteClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn dedup_fingerprint_scope_enums_encode_decode_roundtrip() {
+        let scopes = [
+            DedupFingerprintScopeClass::Unknown,
+            DedupFingerprintScopeClass::NoDedup,
+            DedupFingerprintScopeClass::DatasetLocal,
+            DedupFingerprintScopeClass::TenantLocal,
+            DedupFingerprintScopeClass::SecurityDomain,
+            DedupFingerprintScopeClass::CrossDomainAuthorized,
+            DedupFingerprintScopeClass::DedupRefused,
+        ];
+        for s in &scopes {
+            let disc = s.to_discriminant();
+            let decoded = DedupFingerprintScopeClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*s), "roundtrip failed for {:?}", s.as_str());
+        }
+        assert_eq!(DedupFingerprintScopeClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn ec_archive_shape_replication_is_detected() {
+        let repl = ECArchiveShape::REPLICATION;
+        assert!(repl.is_replication());
+        assert!(!repl.is_erasure_coded());
+        assert!(repl.is_valid());
+        assert_eq!(repl.total_shards(), 1);
+    }
+
+    #[test]
+    fn ec_archive_shape_erasure_coding_is_detected() {
+        let ec = ECArchiveShape {
+            ec_data_shards: 6,
+            ec_parity_shards: 2,
+            stripe_unit_bytes: 65536,
+            locality_group_size: 3,
+            rebuild_width: 8,
+            restore_read_width: 6,
+        };
+        assert!(!ec.is_replication());
+        assert!(ec.is_erasure_coded());
+        assert!(ec.is_valid());
+        assert_eq!(ec.total_shards(), 8);
+    }
+
+    #[test]
+    fn ec_archive_shape_invalid_zero_k_is_rejected() {
+        let bad = ECArchiveShape {
+            ec_data_shards: 0,
+            ec_parity_shards: 2,
+            ..ECArchiveShape::default()
+        };
+        assert!(!bad.is_valid());
+    }
+
+    #[test]
+    fn coalescing_mode_enums_encode_decode_roundtrip() {
+        let modes = [
+            CoalescingModeClass::Unknown,
+            CoalescingModeClass::NoCoalescing,
+            CoalescingModeClass::InlinePayload,
+            CoalescingModeClass::PackedSmallFiles,
+            CoalescingModeClass::DirBlockInline,
+            CoalescingModeClass::XattrPayloadInline,
+            CoalescingModeClass::ExternalizedSmallObject,
+        ];
+        for m in &modes {
+            let disc = m.to_discriminant();
+            let decoded = CoalescingModeClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*m), "roundtrip failed for {:?}", m.as_str());
+        }
+        assert_eq!(CoalescingModeClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn rebake_eligibility_enums_encode_decode_roundtrip() {
+        let eligs = [
+            RebakeEligibilityClass::Unknown,
+            RebakeEligibilityClass::RebakeForbidden,
+            RebakeEligibilityClass::ShadowEvaluation,
+            RebakeEligibilityClass::EligibleAfterCooldown,
+            RebakeEligibilityClass::EligibleImmediate,
+            RebakeEligibilityClass::ReplacementReceiptPending,
+            RebakeEligibilityClass::PaybackWindowNotMet,
+        ];
+        for e in &eligs {
+            let disc = e.to_discriminant();
+            let decoded = RebakeEligibilityClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*e), "roundtrip failed for {:?}", e.as_str());
+        }
+        assert_eq!(RebakeEligibilityClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn data_shape_refusal_enums_encode_decode_roundtrip() {
+        let refusals = [
+            DataShapeRefusalReason::None,
+            DataShapeRefusalReason::UnknownDataShapeEvidence,
+            DataShapeRefusalReason::StaleDataShapeEvidence,
+            DataShapeRefusalReason::WrongDomainForDedup,
+            DataShapeRefusalReason::DedupCrossesTenantDomain,
+            DataShapeRefusalReason::CompressedBeforeEncryptionOrderViolation,
+            DataShapeRefusalReason::ECShapeBlocksReadServing,
+            DataShapeRefusalReason::RecordSizeTooSmallForEC,
+            DataShapeRefusalReason::DigestSuiteTooWeakForPolicy,
+            DataShapeRefusalReason::CompressionExceedsCpuBudget,
+            DataShapeRefusalReason::RebakePaybackWindowNotMet,
+            DataShapeRefusalReason::RebakeReplacementReceiptMissing,
+            DataShapeRefusalReason::CostBudgetExceeded,
+        ];
+        for r in &refusals {
+            let disc = r.to_discriminant();
+            let decoded = DataShapeRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+        assert_eq!(DataShapeRefusalReason::from_discriminant(255), None);
+    }
+
+    fn data_shape_evidence_ref(kind: StorageIntentEvidenceKind, id_byte: u8) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = id_byte;
+        StorageIntentEvidenceRef {
+            kind,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    fn healthy_data_shape_record() -> DataShapeRecord {
+        DataShapeRecord {
+            record_size_class: RecordSizeClass::Medium,
+            compression_class: CompressionAlgorithmClass::ZstdFast,
+            compression_ordering: CompressionOrderingClass::CompressThenEncrypt,
+            digest_suite: DigestSuiteClass::Crc32cPlusBlake3,
+            dedup_scope: DedupFingerprintScopeClass::DatasetLocal,
+            encryption_domain: StorageIntentDomainId([1_u8; 16]),
+            encryption_key_epoch: 5,
+            ec_archive_shape: ECArchiveShape::REPLICATION,
+            coalescing_mode: CoalescingModeClass::NoCoalescing,
+            rebake_eligibility: RebakeEligibilityClass::RebakeForbidden,
+            transform_refusal: TransformRefusalClass::None,
+            data_shape_refusal: DataShapeRefusalReason::None,
+            evidence: data_shape_evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 1),
+            ..DataShapeRecord::default()
+        }
+    }
+
+    fn restrictive_data_shape_policy() -> DataShapePolicy {
+        DataShapePolicy {
+            policy_id: StorageIntentPolicyId([1_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(1),
+            record_size_class: RecordSizeClass::Medium,
+            compression_algorithm: CompressionAlgorithmClass::ZstdFast,
+            compression_ordering: CompressionOrderingClass::CompressThenEncrypt,
+            digest_suite: DigestSuiteClass::Crc32cPlusBlake3,
+            dedup_scope: DedupFingerprintScopeClass::DatasetLocal,
+            encryption_domain: StorageIntentDomainId([1_u8; 16]),
+            encryption_key_epoch_min: 1,
+            ec_archive_shape: ECArchiveShape::REPLICATION,
+            coalescing_mode: CoalescingModeClass::NoCoalescing,
+            rebake_eligibility: RebakeEligibilityClass::RebakeForbidden,
+            sharing_domain: StorageIntentDomainId::ZERO,
+            ..DataShapePolicy::default()
+        }
+    }
+
+    #[test]
+    fn healthy_data_shape_record_passes_hard_gate_check() {
+        let record = healthy_data_shape_record();
+        let policy = restrictive_data_shape_policy();
+        assert!(data_shape_evidence_is_usable(record).satisfied);
+        assert!(data_shape_transform_is_legal(record).satisfied);
+        assert!(data_shape_hard_gate_check(record, policy).satisfied);
+    }
+
+    #[test]
+    fn missing_evidence_blocks_hard_gate() {
+        let mut record = healthy_data_shape_record();
+        record.evidence = StorageIntentEvidenceRef::default(); // no evidence bound
+        let result = data_shape_evidence_is_usable(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+
+    #[test]
+    fn transform_refusal_blocks_hard_gate() {
+        let mut record = healthy_data_shape_record();
+        record.transform_refusal = TransformRefusalClass::UnsupportedCompression;
+        let result = data_shape_transform_is_legal(record);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn data_shape_refusal_blocks_hard_gate() {
+        let mut record = healthy_data_shape_record();
+        record.data_shape_refusal = DataShapeRefusalReason::DigestSuiteTooWeakForPolicy;
+        let result = data_shape_transform_is_legal(record);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn dedup_domain_mismatch_is_blocked() {
+        let mut record = healthy_data_shape_record();
+        record.dedup_scope = DedupFingerprintScopeClass::TenantLocal;
+        record.dedup_domain = StorageIntentDomainId([2_u8; 16]);
+        // Policy has a non-zero domain that doesn't match the record domain
+        let policy_domain = StorageIntentDomainId([1_u8; 16]);
+        let result = data_shape_dedup_domain_is_compatible(record, policy_domain);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::IllegalSharingDomain);
+    }
+
+    #[test]
+    fn dedup_refused_state_is_blocked() {
+        let mut record = healthy_data_shape_record();
+        record.dedup_scope = DedupFingerprintScopeClass::DedupRefused;
+        let policy = restrictive_data_shape_policy();
+        let result = data_shape_dedup_domain_is_compatible(record, policy.sharing_domain);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn no_dedup_is_always_compatible() {
+        let mut record = healthy_data_shape_record();
+        record.dedup_scope = DedupFingerprintScopeClass::NoDedup;
+        let policy = restrictive_data_shape_policy();
+        let result = data_shape_dedup_domain_is_compatible(record, policy.sharing_domain);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn encryption_not_bypassed_when_policy_requires_it() {
+        let record = healthy_data_shape_record();
+        let result = data_shape_encryption_is_not_bypassed(record, true);
+        assert!(result.satisfied); // record has encryption domain
+    }
+
+    #[test]
+    fn encryption_bypass_is_blocked_when_policy_requires_it() {
+        let mut record = healthy_data_shape_record();
+        record.encryption_domain = StorageIntentDomainId::ZERO;
+        let result = data_shape_encryption_is_not_bypassed(record, true);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn compression_ordering_unknown_is_blocked() {
+        let mut record = healthy_data_shape_record();
+        record.compression_ordering = CompressionOrderingClass::Unknown;
+        let result = data_shape_compression_ordering_is_legal(record);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn ec_replication_always_legal() {
+        let shape = ECArchiveShape::REPLICATION;
+        let result = data_shape_ec_shape_is_legal(shape);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn ec_invalid_shape_is_blocked() {
+        let shape = ECArchiveShape {
+            ec_data_shards: 0,
+            ec_parity_shards: 2,
+            ..ECArchiveShape::default()
+        };
+        let result = data_shape_ec_shape_is_legal(shape);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn rebake_replacement_receipt_missing_is_blocked() {
+        let mut record = healthy_data_shape_record();
+        record.rebake_eligibility = RebakeEligibilityClass::EligibleImmediate;
+        record.replacement_receipt = StorageIntentReceiptId::ZERO;
+        let result = data_shape_rebake_replacement_receipt_is_present(record);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn rebake_payback_window_not_met_is_blocked() {
+        let mut record = healthy_data_shape_record();
+        record.rebake_eligibility = RebakeEligibilityClass::PaybackWindowNotMet;
+        let result = data_shape_rebake_replacement_receipt_is_present(record);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn digest_suite_below_policy_floor_is_blocked() {
+        let mut record = healthy_data_shape_record();
+        record.digest_suite = DigestSuiteClass::Crc32cFraming;
+        let policy = restrictive_data_shape_policy(); // requires Crc32cPlusBlake3
+        let result = data_shape_digest_suite_is_adequate(record, policy.digest_suite);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn digest_suite_at_or_above_floor_passes() {
+        let record = healthy_data_shape_record(); // Crc32cPlusBlake3
+        let policy = restrictive_data_shape_policy(); // requires Crc32cPlusBlake3
+        let result = data_shape_digest_suite_is_adequate(record, policy.digest_suite);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn data_shape_record_is_compressed_detection() {
+        let mut record = DataShapeRecord::default();
+        assert!(!record.is_compressed());
+        record.compression_class = CompressionAlgorithmClass::ZstdFast;
+        assert!(record.is_compressed());
+    }
+
+    #[test]
+    fn storage_intent_refusal_reason_enums_encode_decode_data_shape() {
+        let refusals = [
+            StorageIntentRefusalReason::UnknownDataShapeEvidence,
+            StorageIntentRefusalReason::StaleDataShapeEvidence,
+            StorageIntentRefusalReason::DataShapeTransformRefused,
+            StorageIntentRefusalReason::IllegalCompressionOrdering,
+            StorageIntentRefusalReason::DedupCrossesTenantDomain,
+            StorageIntentRefusalReason::EncryptionBypassedForDedup,
+            StorageIntentRefusalReason::ECShapeBlocksReadServing,
+            StorageIntentRefusalReason::RebakeReplacementReceiptMissing,
+            StorageIntentRefusalReason::RebakePaybackWindowNotMet,
+            StorageIntentRefusalReason::DataShapeCostBudgetExceeded,
+        ];
+        for r in &refusals {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+    }
+
+    #[test]
+    fn data_shape_policy_default_has_zero_policy_id() {
+        let policy = DataShapePolicy::default();
+        assert!(policy.policy_id.is_zero());
+    }
+
 }
