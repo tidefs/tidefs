@@ -59,6 +59,7 @@ members = [
   "crates/tidefs-reserve-ledger",
   "crates/tidefs-anti-entropy-auditor",
   "crates/tidefs-relocation-planner",
+  "crates/tidefs-relocation-governor",
   "crates/tidefs-placement-planner",
   "crates/tidefs-placement-runtime",
   "crates/tidefs-verification-engine",
@@ -284,6 +285,7 @@ tidefs-reclaim = { path = "crates/tidefs-reclaim" }
 tidefs-reclaim-queue-core = { path = "crates/tidefs-reclaim-queue-core" }
 tidefs-recovery-loop = { path = "crates/tidefs-recovery-loop" }
 tidefs-relocation-planner = { path = "crates/tidefs-relocation-planner" }
+tidefs-relocation-governor = { path = "crates/tidefs-relocation-governor" }
 tidefs-replica-health = { path = "crates/tidefs-replica-health" }
 tidefs-replicated-object-store = { path = "crates/tidefs-replicated-object-store" }
 tidefs-replication = { path = "crates/tidefs-replication" }

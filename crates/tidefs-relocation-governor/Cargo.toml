@@ -1,0 +1,31 @@
+[package]
+name = "tidefs-relocation-governor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+
+description = """
+Relocation governor: unified admission, lifecycle, anti-thrash, and
+scheduling model for defrag, compaction, rebake, rebuild, evacuation,
+promotion, demotion, geo catch-up, and wear rebalance. Consumes
+storage-intent records and authority rules; does not execute data
+movers.
+"""
+
+[dependencies]
+tidefs-storage-intent-core = { workspace = true }
+tidefs-background-scheduler = { workspace = true }
+tidefs-incremental-job-core = { workspace = true }
+tidefs-types-incremental-job-core = { workspace = true }
+serde = { version = "1", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+
+[lib]
+path = "src/lib.rs"
