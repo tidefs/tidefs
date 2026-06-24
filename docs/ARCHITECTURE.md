@@ -415,6 +415,17 @@ prefix (`control-plane-*`, `policy-authority-*`, `observe-*`, `response-registry
 authority update in `docs/workspace-package-classification.md`. Historical
 review notes in this document do not authorize scaffold recovery.
 
+## Incumbent Comparison Boundary
+
+The ZFS and CephFS comparison sections below are imported historical design
+input, not current TideFS capability, performance, reliability, maturity,
+feature-completeness, or successor claims. The "Where TideFS is ahead" rows
+describe intended architectural differences, not validated product advantages.
+The "gaps to close" rows describe work that remains deferred or unvalidated.
+No statement in these comparison sections may be cited as current TideFS
+product capability. Any future product-facing comparison must name a #875
+claim id and carry the comparator evidence required by #928/#930.
+
 ## Comparison With ZFS
 
 ### Where TideFS is ahead
@@ -506,6 +517,5 @@ TideFS has basic tooling.
 
 **No external object service**: TideFS does not expose an S3-compatible,
 RADOS, or RGW-style object API. The supported product surfaces are filesystem
-(POSIX/FUSE and kernel VFS) and block-volume (ublk/kernel block). CephFS
-successor claims are therefore limited to filesystem, block-volume, and
-distributed-durability parity, not object-service compatibility.
+(POSIX/FUSE and kernel VFS) and block-volume (ublk/kernel block).
+Any future product comparison would be limited to the filesystem (POSIX/FUSE and kernel VFS) and block-volume (ublk/kernel block) surfaces, not object-service compatibility. No successor or parity wording is current until a #875 claim id and #928/#930 comparator evidence exist for those surfaces.
