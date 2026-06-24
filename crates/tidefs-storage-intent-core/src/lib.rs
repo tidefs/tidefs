@@ -5826,6 +5826,855 @@ pub enum StorageIntentActionClass {
     ArchiveMigration = 12,
 }
 
+/// Execution step for an authority-changing storage-intent action.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentActionExecutionStepState {
+    #[default]
+    Unknown = 0,
+    Planned = 1,
+    Admitted = 2,
+    Prepared = 3,
+    Copying = 4,
+    Verifying = 5,
+    Publishing = 6,
+    Cutover = 7,
+    RetiringSource = 8,
+    Complete = 9,
+    Aborted = 10,
+    RolledBack = 11,
+    Refused = 12,
+}
+
+impl StorageIntentActionExecutionStepState {
+    /// Returns true when the step can still be retried after a crash.
+    #[must_use]
+    pub const fn requires_idempotent_replay(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    /// Returns true after target bytes may have been written.
+    #[must_use]
+    pub const fn requires_source_protection(self) -> bool {
+        matches!(
+            self,
+            Self::Admitted
+                | Self::Prepared
+                | Self::Copying
+                | Self::Verifying
+                | Self::Publishing
+                | Self::Cutover
+                | Self::RetiringSource
+                | Self::Complete
+                | Self::Aborted
+                | Self::RolledBack
+        )
+    }
+
+    /// Returns true when target-write evidence must be verified.
+    #[must_use]
+    pub const fn requires_target_verification(self) -> bool {
+        matches!(
+            self,
+            Self::Verifying
+                | Self::Publishing
+                | Self::Cutover
+                | Self::RetiringSource
+                | Self::Complete
+        )
+    }
+
+    /// Returns true when publication/cutover evidence must exist.
+    #[must_use]
+    pub const fn requires_publication_boundary(self) -> bool {
+        matches!(
+            self,
+            Self::Publishing | Self::Cutover | Self::RetiringSource | Self::Complete
+        )
+    }
+
+    /// Returns true when abort or rollback proof must remain visible.
+    #[must_use]
+    pub const fn requires_abort_or_rollback_proof(self) -> bool {
+        matches!(self, Self::Aborted | Self::RolledBack | Self::Refused)
+    }
+
+    /// Returns true when this step can be final action-completion evidence.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// Replay state recorded for crash recovery and duplicate delivery.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentActionReplayState {
+    #[default]
+    Unknown = 0,
+    FirstAttempt = 1,
+    RetryInProgress = 2,
+    CrashRecovery = 3,
+    DuplicateSuppressed = 4,
+    ReplayRefused = 5,
+}
+
+/// Staleness or invalidation class for execution evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentActionEvidenceState {
+    #[default]
+    Unknown = 0,
+    Fresh = 1,
+    DecisionFrontierStale = 2,
+    PolicyRevisionChanged = 3,
+    MediaCapabilityChanged = 4,
+    CapacityReserveChanged = 5,
+    MembershipChanged = 6,
+    TrustChanged = 7,
+    TemporalExpired = 8,
+    EvidenceRetentionCompacted = 9,
+}
+
+impl StorageIntentActionEvidenceState {
+    /// Returns true when the action may continue without revalidation.
+    #[must_use]
+    pub const fn is_fresh_for_execution(self) -> bool {
+        matches!(self, Self::Fresh)
+    }
+}
+
+/// Source-retirement state guarded by action-execution evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentSourceRetirementState {
+    #[default]
+    Unknown = 0,
+    Forbidden = 1,
+    RetainedForRollback = 2,
+    PendingCompletion = 3,
+    Ready = 4,
+    Retired = 5,
+}
+
+impl StorageIntentSourceRetirementState {
+    /// Returns true when source receipts are still protected from retirement.
+    #[must_use]
+    pub const fn forbids_retirement(self) -> bool {
+        matches!(
+            self,
+            Self::Unknown | Self::Forbidden | Self::RetainedForRollback | Self::PendingCompletion
+        )
+    }
+}
+
+/// Target-copy verification state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentActionTargetVerificationState {
+    #[default]
+    Unknown = 0,
+    NotStarted = 1,
+    PartialWrite = 2,
+    DigestMismatch = 3,
+    DegradedPartial = 4,
+    Verified = 5,
+    Refused = 6,
+}
+
+impl StorageIntentActionTargetVerificationState {
+    /// Returns true when target bytes are verified as complete authority input.
+    #[must_use]
+    pub const fn is_verified(self) -> bool {
+        matches!(self, Self::Verified)
+    }
+}
+
+/// Publication and cutover state for replacement receipts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentActionPublicationState {
+    #[default]
+    Unknown = 0,
+    NotPublished = 1,
+    ReplacementPublished = 2,
+    CutoverVisible = 3,
+    SourceRetirementPublished = 4,
+    NoCutover = 5,
+}
+
+impl StorageIntentActionPublicationState {
+    /// Returns true when a replacement publication boundary exists.
+    #[must_use]
+    pub const fn has_replacement_publication(self) -> bool {
+        matches!(
+            self,
+            Self::ReplacementPublished | Self::CutoverVisible | Self::SourceRetirementPublished
+        )
+    }
+}
+
+/// Action-execution refusal detail.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentActionExecutionRefusalReason {
+    #[default]
+    None = 0,
+    MissingActionIdentity = 1,
+    PlannerDecisionIsNotExecution = 2,
+    MissingDecisionAdmissionEvidence = 3,
+    StaleExecutionEvidence = 4,
+    NonIdempotentReplay = 5,
+    DuplicateActionDelivery = 6,
+    MissingSourceProtection = 7,
+    TargetWriteIsNotCompletion = 8,
+    MissingTargetVerification = 9,
+    PartialTargetWrite = 10,
+    MissingMediaFlushOrBarrierProof = 11,
+    MissingPublicationEvidence = 12,
+    MissingOrderingEvidence = 13,
+    MissingRecoveryDegradationEvidence = 14,
+    MissingRetentionEvidence = 15,
+    MissingActionCompletionEvidence = 16,
+    SourceRetirementForbidden = 17,
+    ReserveExhausted = 18,
+    ReserveDoubleSpent = 19,
+    AbortRollbackIncomplete = 20,
+    NoCutoverProofMissing = 21,
+    ContradictoryReceiptPublication = 22,
+    RefusedByActionEvidence = 23,
+}
+
+impl StorageIntentActionExecutionRefusalReason {
+    /// Map action-specific refusal to the shared policy/refusal vocabulary.
+    #[must_use]
+    pub const fn to_storage_intent_refusal(self) -> StorageIntentRefusalReason {
+        match self {
+            Self::None => StorageIntentRefusalReason::None,
+            Self::NonIdempotentReplay => StorageIntentRefusalReason::NonIdempotentReplay,
+            Self::MissingOrderingEvidence => StorageIntentRefusalReason::MissingOrderingEvidence,
+            Self::MissingMediaFlushOrBarrierProof => {
+                StorageIntentRefusalReason::UnsupportedFlushFuaSemantics
+            }
+            Self::ReserveExhausted | Self::ReserveDoubleSpent => {
+                StorageIntentRefusalReason::MovementDebtNotPaidBack
+            }
+            Self::SourceRetirementForbidden | Self::ContradictoryReceiptPublication => {
+                StorageIntentRefusalReason::ReceiptWouldWeaken
+            }
+            _ => StorageIntentRefusalReason::EvidenceNotUsable,
+        }
+    }
+}
+
+/// Action-execution proof dimensions present in one evidence record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentActionExecutionFlags(pub u64);
+
+impl StorageIntentActionExecutionFlags {
+    pub const EMPTY: Self = Self(0);
+    pub const ACTION_IDENTITY: Self = Self(1_u64 << 0);
+    pub const DECISION_FRONTIER_REF: Self = Self(1_u64 << 1);
+    pub const HARD_GATE_REF: Self = Self(1_u64 << 2);
+    pub const SELECTED_CANDIDATE_REF: Self = Self(1_u64 << 3);
+    pub const COUNTERFACTUAL_PAYBACK_REF: Self = Self(1_u64 << 4);
+    pub const RESERVE_ADMISSION_REF: Self = Self(1_u64 << 5);
+    pub const ISOLATION_REF: Self = Self(1_u64 << 6);
+    pub const MEDIA_CAPABILITY_REF: Self = Self(1_u64 << 7);
+    pub const RETENTION_REF: Self = Self(1_u64 << 8);
+    pub const IDEMPOTENCY_KEY: Self = Self(1_u64 << 9);
+    pub const STEP_SEQUENCE: Self = Self(1_u64 << 10);
+    pub const CRASH_RECOVERY_MARKER: Self = Self(1_u64 << 11);
+    pub const DUPLICATE_SUPPRESSION: Self = Self(1_u64 << 12);
+    pub const SOURCE_RECEIPTS: Self = Self(1_u64 << 13);
+    pub const ROLLBACK_SOURCES_RETAINED: Self = Self(1_u64 << 14);
+    pub const READ_SERVING_ELIGIBILITY: Self = Self(1_u64 << 15);
+    pub const FORBID_SOURCE_RETIREMENT_UNTIL_COMPLETE: Self = Self(1_u64 << 16);
+    pub const TARGET_RECEIPT_CANDIDATE: Self = Self(1_u64 << 17);
+    pub const TARGET_DIGEST_INTEGRITY: Self = Self(1_u64 << 18);
+    pub const MEDIA_FLUSH_BARRIER: Self = Self(1_u64 << 19);
+    pub const RECONSTRUCTION_WIDTH: Self = Self(1_u64 << 20);
+    pub const REPLACEMENT_PUBLICATION: Self = Self(1_u64 << 21);
+    pub const PUBLICATION_ORDERING: Self = Self(1_u64 << 22);
+    pub const RECOVERY_DEGRADATION_REF: Self = Self(1_u64 << 23);
+    pub const POLICY_ROLLOUT_REF: Self = Self(1_u64 << 24);
+    pub const VISIBLE_CONVERGING_STATE: Self = Self(1_u64 << 25);
+    pub const OPERATOR_EXPLANATION_REF: Self = Self(1_u64 << 26);
+    pub const ABORT_REASON: Self = Self(1_u64 << 27);
+    pub const PARTIAL_TARGET_CLEANUP: Self = Self(1_u64 << 28);
+    pub const ROLLBACK_COMPLETION: Self = Self(1_u64 << 29);
+    pub const NO_CUTOVER_PROOF: Self = Self(1_u64 << 30);
+    pub const BUDGET_ACCOUNTING: Self = Self(1_u64 << 31);
+    pub const PAYBACK_ATTACHMENT: Self = Self(1_u64 << 32);
+    pub const COOLDOWN_DEPENDENCY: Self = Self(1_u64 << 33);
+    pub const ACTION_COMPLETION_PROOF: Self = Self(1_u64 << 34);
+
+    /// Add flags.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns true when all required flags are present.
+    #[must_use]
+    pub const fn contains_all(self, required: Self) -> bool {
+        (self.0 & required.0) == required.0
+    }
+}
+
+/// Decision, admission, and peer-authority refs consumed by an action executor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentActionExecutionAdmissionRefs {
+    pub decision_frontier_ref: StorageIntentEvidenceRef,
+    pub hard_gate_result_ref: StorageIntentEvidenceRef,
+    pub selected_candidate_ref: StorageIntentEvidenceRef,
+    pub counterfactual_payback_ref: StorageIntentEvidenceRef,
+    pub reserve_admission_ref: StorageIntentEvidenceRef,
+    pub scheduler_admission_ref: StorageIntentEvidenceRef,
+    pub tenant_isolation_ref: StorageIntentEvidenceRef,
+    pub media_capability_ref: StorageIntentEvidenceRef,
+    pub evidence_retention_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentActionExecutionAdmissionRefs {
+    /// Returns true when the selected decision/admission basis is evidence-backed.
+    #[must_use]
+    pub const fn has_required_refs(self) -> bool {
+        evidence_ref_is_kind(
+            self.decision_frontier_ref,
+            StorageIntentEvidenceKind::DecisionFrontierEvidence,
+        ) && evidence_ref_has_id(self.hard_gate_result_ref)
+            && evidence_ref_has_id(self.selected_candidate_ref)
+            && evidence_ref_has_id(self.counterfactual_payback_ref)
+            && evidence_ref_has_id(self.reserve_admission_ref)
+            && evidence_ref_has_id(self.scheduler_admission_ref)
+            && evidence_ref_is_kind(
+                self.tenant_isolation_ref,
+                StorageIntentEvidenceKind::TenantIsolationEvidence,
+            )
+            && evidence_ref_is_kind(
+                self.media_capability_ref,
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            )
+            && evidence_ref_is_kind(
+                self.evidence_retention_ref,
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+            )
+    }
+}
+
+/// Idempotency, step sequence, crash-recovery, and duplicate-suppression proof.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentActionExecutionReplayRecord {
+    pub idempotency_key: StorageIntentReplayIdempotencyKey,
+    pub step_sequence: u64,
+    pub retry_generation: u32,
+    pub state: StorageIntentActionReplayState,
+    pub crash_recovery_marker_ref: StorageIntentEvidenceRef,
+    pub duplicate_suppression_ref: StorageIntentEvidenceRef,
+    pub replay_refusal_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentActionExecutionReplayRecord {
+    /// Returns true when replay cannot duplicate reserves, receipts, or retirements.
+    #[must_use]
+    pub const fn is_idempotent_for_step(self, step: StorageIntentActionExecutionStepState) -> bool {
+        if !step.requires_idempotent_replay() {
+            return false;
+        }
+        if self.idempotency_key.is_zero() || self.step_sequence == 0 {
+            return false;
+        }
+        if !evidence_ref_has_id(self.crash_recovery_marker_ref)
+            || !evidence_ref_has_id(self.duplicate_suppression_ref)
+        {
+            return false;
+        }
+        !matches!(self.state, StorageIntentActionReplayState::Unknown)
+    }
+
+    /// Returns true when a duplicate delivery has been suppressed visibly.
+    #[must_use]
+    pub const fn duplicate_delivery_is_suppressed(self) -> bool {
+        matches!(
+            self.state,
+            StorageIntentActionReplayState::DuplicateSuppressed
+        ) && evidence_ref_has_id(self.duplicate_suppression_ref)
+            && evidence_ref_has_id(self.replay_refusal_ref)
+    }
+}
+
+/// Source receipts, rollback protection, and read-serving legality.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentActionSourceProtectionRecord {
+    pub source_receipts_ref: StorageIntentEvidenceRef,
+    pub old_placement_ref: StorageIntentEvidenceRef,
+    pub old_placement_generation: u64,
+    pub retained_rollback_sources_ref: StorageIntentEvidenceRef,
+    pub retained_rollback_source_count: u8,
+    pub read_serving_eligibility_ref: StorageIntentEvidenceRef,
+    pub read_serving_eligible: bool,
+    pub retirement_state: StorageIntentSourceRetirementState,
+}
+
+impl StorageIntentActionSourceProtectionRecord {
+    /// Returns true while source receipts remain safe for reads or rollback.
+    #[must_use]
+    pub const fn protects_source_before_retirement(self) -> bool {
+        evidence_ref_has_id(self.source_receipts_ref)
+            && evidence_ref_has_id(self.old_placement_ref)
+            && self.old_placement_generation > 0
+            && evidence_ref_has_id(self.retained_rollback_sources_ref)
+            && self.retained_rollback_source_count > 0
+            && evidence_ref_has_id(self.read_serving_eligibility_ref)
+            && self.read_serving_eligible
+            && !matches!(
+                self.retirement_state,
+                StorageIntentSourceRetirementState::Retired
+            )
+    }
+}
+
+/// Target receipt candidate, integrity, flush/barrier, and width proof.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentActionTargetVerificationRecord {
+    pub state: StorageIntentActionTargetVerificationState,
+    pub target_receipt_candidate_ref: StorageIntentEvidenceRef,
+    pub digest_integrity_ref: StorageIntentEvidenceRef,
+    pub media_flush_barrier_ref: StorageIntentEvidenceRef,
+    pub reconstruction_width: u8,
+    pub required_reconstruction_width: u8,
+    pub target_bytes: u64,
+    pub verified_bytes: u64,
+}
+
+impl StorageIntentActionTargetVerificationRecord {
+    /// Returns true when a target write has become verified target evidence.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        self.state.is_verified()
+            && evidence_ref_has_id(self.target_receipt_candidate_ref)
+            && evidence_ref_has_id(self.digest_integrity_ref)
+            && evidence_ref_has_id(self.media_flush_barrier_ref)
+            && self.required_reconstruction_width > 0
+            && self.reconstruction_width >= self.required_reconstruction_width
+            && self.target_bytes > 0
+            && self.target_bytes == self.verified_bytes
+    }
+}
+
+/// Replacement publication, ordering, recovery, rollout, and explanation proof.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentActionPublicationBoundaryRecord {
+    pub state: StorageIntentActionPublicationState,
+    pub replacement_receipt_ref: StorageIntentEvidenceRef,
+    pub ordering_evidence_ref: StorageIntentEvidenceRef,
+    pub recovery_degradation_ref: StorageIntentEvidenceRef,
+    pub policy_rollout_ref: StorageIntentEvidenceRef,
+    pub visible_state_ref: StorageIntentEvidenceRef,
+    pub operator_explanation_ref: StorageIntentEvidenceRef,
+    pub publication_sequence: u64,
+}
+
+impl StorageIntentActionPublicationBoundaryRecord {
+    /// Returns true when cutover has durable, ordered, visible publication proof.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        self.state.has_replacement_publication()
+            && evidence_ref_has_id(self.replacement_receipt_ref)
+            && evidence_ref_is_kind(
+                self.ordering_evidence_ref,
+                StorageIntentEvidenceKind::OrderingEvidence,
+            )
+            && evidence_ref_is_kind(
+                self.recovery_degradation_ref,
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            )
+            && evidence_ref_is_kind(
+                self.policy_rollout_ref,
+                StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            )
+            && evidence_ref_has_id(self.visible_state_ref)
+            && evidence_ref_has_id(self.operator_explanation_ref)
+            && self.publication_sequence > 0
+    }
+}
+
+/// Abort, rollback, partial-target cleanup, and no-cutover proof.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentActionAbortRollbackRecord {
+    pub abort_reason: StorageIntentActionExecutionRefusalReason,
+    pub partial_target_cleanup_ref: StorageIntentEvidenceRef,
+    pub retained_proof_ref: StorageIntentEvidenceRef,
+    pub rollback_completion_ref: StorageIntentEvidenceRef,
+    pub no_cutover_proof_ref: StorageIntentEvidenceRef,
+    pub cutover_published: bool,
+}
+
+impl StorageIntentActionAbortRollbackRecord {
+    /// Returns true when aborted or rolled-back work remains auditable.
+    #[must_use]
+    pub const fn is_visible_no_cutover(self) -> bool {
+        !self.cutover_published
+            && !matches!(
+                self.abort_reason,
+                StorageIntentActionExecutionRefusalReason::None
+            )
+            && evidence_ref_has_id(self.partial_target_cleanup_ref)
+            && evidence_ref_has_id(self.retained_proof_ref)
+            && evidence_ref_has_id(self.rollback_completion_ref)
+            && evidence_ref_has_id(self.no_cutover_proof_ref)
+    }
+}
+
+/// Work, disruption, reserve, egress, write, outcome, and cooldown accounting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentActionBudgetOutcomeRecord {
+    pub work_bytes: u64,
+    pub foreground_disruption_us: u64,
+    pub media_write_bytes: u64,
+    pub network_egress_bytes: u64,
+    pub reserve_consumed_bytes: u64,
+    pub reserve_budget_bytes: u64,
+    pub reserve_generation: u64,
+    pub outcome_attachment_ref: StorageIntentEvidenceRef,
+    pub payback_ref: StorageIntentEvidenceRef,
+    pub cooldown_dependency_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentActionBudgetOutcomeRecord {
+    /// Returns true when accounting is present and cannot spend outside admission.
+    #[must_use]
+    pub const fn is_within_admitted_budget(self) -> bool {
+        self.work_bytes > 0
+            && self.reserve_budget_bytes > 0
+            && self.reserve_consumed_bytes <= self.reserve_budget_bytes
+            && self.reserve_generation > 0
+            && evidence_ref_has_id(self.outcome_attachment_ref)
+            && evidence_ref_has_id(self.payback_ref)
+            && evidence_ref_has_id(self.cooldown_dependency_ref)
+    }
+}
+
+/// Complete #911 action-execution evidence record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentActionExecutionEvidence {
+    pub evidence_ref: StorageIntentEvidenceRef,
+    pub action_id: StorageIntentEvidenceId,
+    pub subject_scope: StorageIntentObjectScope,
+    pub action_class: StorageIntentActionClass,
+    pub producer_component_ref: StorageIntentEvidenceRef,
+    pub producer_version: u64,
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub execution_epoch: u64,
+    pub temporal_ref: StorageIntentEvidenceRef,
+    pub integrity_ref: StorageIntentEvidenceRef,
+    pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
+    pub admission_refs: StorageIntentActionExecutionAdmissionRefs,
+    pub step_state: StorageIntentActionExecutionStepState,
+    pub replay: StorageIntentActionExecutionReplayRecord,
+    pub source_protection: StorageIntentActionSourceProtectionRecord,
+    pub target_verification: StorageIntentActionTargetVerificationRecord,
+    pub publication: StorageIntentActionPublicationBoundaryRecord,
+    pub abort_rollback: StorageIntentActionAbortRollbackRecord,
+    pub budget: StorageIntentActionBudgetOutcomeRecord,
+    pub action_completion_ref: StorageIntentEvidenceRef,
+    pub evidence_state: StorageIntentActionEvidenceState,
+    pub flags: StorageIntentActionExecutionFlags,
+    pub refusal: StorageIntentActionExecutionRefusalReason,
+}
+
+impl StorageIntentActionExecutionEvidence {
+    /// Returns true when this record is bound as action-execution evidence.
+    #[must_use]
+    pub const fn has_action_identity(self) -> bool {
+        evidence_ref_is_kind(
+            self.evidence_ref,
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+        ) && !bytes32_are_zero(self.action_id.0)
+            && !bytes16_are_zero(self.subject_scope.dataset_id.0)
+            && self.execution_epoch > 0
+            && self.producer_version > 0
+            && self.policy_revision.0 > 0
+            && evidence_ref_has_id(self.producer_component_ref)
+            && evidence_ref_is_kind(
+                self.temporal_ref,
+                StorageIntentEvidenceKind::TemporalEvidence,
+            )
+            && evidence_ref_has_id(self.integrity_ref)
+            && evidence_ref_is_kind(
+                self.evidence_query_snapshot_ref,
+                StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+            )
+    }
+
+    /// Returns true when a planner decision is paired with actual admission refs.
+    #[must_use]
+    pub const fn has_execution_admission(self) -> bool {
+        self.admission_refs.has_required_refs()
+            && self
+                .flags
+                .contains_all(StorageIntentActionExecutionFlags::DECISION_FRONTIER_REF)
+            && self
+                .flags
+                .contains_all(StorageIntentActionExecutionFlags::RESERVE_ADMISSION_REF)
+    }
+
+    /// Returns true when every retry of this step has a stable replay key.
+    #[must_use]
+    pub const fn has_idempotent_replay(self) -> bool {
+        self.replay.is_idempotent_for_step(self.step_state)
+            && self
+                .flags
+                .contains_all(StorageIntentActionExecutionFlags::IDEMPOTENCY_KEY)
+            && self
+                .flags
+                .contains_all(StorageIntentActionExecutionFlags::STEP_SEQUENCE)
+            && self
+                .flags
+                .contains_all(StorageIntentActionExecutionFlags::CRASH_RECOVERY_MARKER)
+            && self
+                .flags
+                .contains_all(StorageIntentActionExecutionFlags::DUPLICATE_SUPPRESSION)
+    }
+
+    /// Returns true when source receipts are retained until authority is safe.
+    #[must_use]
+    pub const fn has_source_protection(self) -> bool {
+        if !self.step_state.requires_source_protection() {
+            return true;
+        }
+        self.source_protection.protects_source_before_retirement()
+            && self
+                .flags
+                .contains_all(StorageIntentActionExecutionFlags::SOURCE_RECEIPTS)
+            && self.flags.contains_all(
+                StorageIntentActionExecutionFlags::FORBID_SOURCE_RETIREMENT_UNTIL_COMPLETE,
+            )
+    }
+
+    /// Returns true when target evidence is more than a target write.
+    #[must_use]
+    pub const fn has_target_verification(self) -> bool {
+        if !self.step_state.requires_target_verification() {
+            return true;
+        }
+        self.target_verification.is_complete()
+            && self.flags.contains_all(
+                StorageIntentActionExecutionFlags::TARGET_RECEIPT_CANDIDATE
+                    .union(StorageIntentActionExecutionFlags::TARGET_DIGEST_INTEGRITY)
+                    .union(StorageIntentActionExecutionFlags::MEDIA_FLUSH_BARRIER)
+                    .union(StorageIntentActionExecutionFlags::RECONSTRUCTION_WIDTH),
+            )
+    }
+
+    /// Returns true when publication/cutover is ordered and visible.
+    #[must_use]
+    pub const fn has_publication_boundary(self) -> bool {
+        if !self.step_state.requires_publication_boundary() {
+            return true;
+        }
+        self.publication.is_complete()
+            && self.flags.contains_all(
+                StorageIntentActionExecutionFlags::REPLACEMENT_PUBLICATION
+                    .union(StorageIntentActionExecutionFlags::PUBLICATION_ORDERING)
+                    .union(StorageIntentActionExecutionFlags::RECOVERY_DEGRADATION_REF)
+                    .union(StorageIntentActionExecutionFlags::POLICY_ROLLOUT_REF)
+                    .union(StorageIntentActionExecutionFlags::VISIBLE_CONVERGING_STATE),
+            )
+    }
+
+    /// Returns true when abort or rollback remains visible until retention permits compaction.
+    #[must_use]
+    pub const fn has_visible_abort_or_rollback(self) -> bool {
+        if !self.step_state.requires_abort_or_rollback_proof() {
+            return true;
+        }
+        self.abort_rollback.is_visible_no_cutover()
+            && self.flags.contains_all(
+                StorageIntentActionExecutionFlags::ABORT_REASON
+                    .union(StorageIntentActionExecutionFlags::PARTIAL_TARGET_CLEANUP)
+                    .union(StorageIntentActionExecutionFlags::ROLLBACK_COMPLETION)
+                    .union(StorageIntentActionExecutionFlags::NO_CUTOVER_PROOF),
+            )
+    }
+
+    /// Returns true when completion proof exists.
+    #[must_use]
+    pub const fn has_action_completion_proof(self) -> bool {
+        self.step_state.is_complete()
+            && evidence_ref_is_kind(
+                self.action_completion_ref,
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+            )
+            && self
+                .flags
+                .contains_all(StorageIntentActionExecutionFlags::ACTION_COMPLETION_PROOF)
+    }
+
+    /// Return the first fail-closed action-execution refusal.
+    #[must_use]
+    pub const fn action_refusal(self) -> StorageIntentActionExecutionRefusalReason {
+        if !matches!(
+            self.refusal,
+            StorageIntentActionExecutionRefusalReason::None
+        ) {
+            return self.refusal;
+        }
+        if !self.has_action_identity()
+            || !self
+                .flags
+                .contains_all(StorageIntentActionExecutionFlags::ACTION_IDENTITY)
+        {
+            return StorageIntentActionExecutionRefusalReason::MissingActionIdentity;
+        }
+        if !self.evidence_state.is_fresh_for_execution() {
+            return StorageIntentActionExecutionRefusalReason::StaleExecutionEvidence;
+        }
+        if !self.has_execution_admission() {
+            return StorageIntentActionExecutionRefusalReason::MissingDecisionAdmissionEvidence;
+        }
+        if !self.has_idempotent_replay() {
+            return StorageIntentActionExecutionRefusalReason::NonIdempotentReplay;
+        }
+        if self.replay.duplicate_delivery_is_suppressed() {
+            return StorageIntentActionExecutionRefusalReason::DuplicateActionDelivery;
+        }
+        if !self.budget.is_within_admitted_budget()
+            || !self
+                .flags
+                .contains_all(StorageIntentActionExecutionFlags::BUDGET_ACCOUNTING)
+        {
+            return StorageIntentActionExecutionRefusalReason::ReserveExhausted;
+        }
+        if !self.has_source_protection() {
+            return StorageIntentActionExecutionRefusalReason::MissingSourceProtection;
+        }
+        if self.step_state.requires_target_verification()
+            && !self.target_verification.state.is_verified()
+        {
+            return if matches!(
+                self.target_verification.state,
+                StorageIntentActionTargetVerificationState::PartialWrite
+                    | StorageIntentActionTargetVerificationState::DegradedPartial
+            ) || self.target_verification.verified_bytes < self.target_verification.target_bytes
+            {
+                StorageIntentActionExecutionRefusalReason::PartialTargetWrite
+            } else {
+                StorageIntentActionExecutionRefusalReason::MissingTargetVerification
+            };
+        }
+        if !self.has_target_verification() {
+            return StorageIntentActionExecutionRefusalReason::TargetWriteIsNotCompletion;
+        }
+        if !self.has_publication_boundary() {
+            if !evidence_ref_is_kind(
+                self.publication.ordering_evidence_ref,
+                StorageIntentEvidenceKind::OrderingEvidence,
+            ) {
+                return StorageIntentActionExecutionRefusalReason::MissingOrderingEvidence;
+            }
+            if !evidence_ref_is_kind(
+                self.publication.recovery_degradation_ref,
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            ) {
+                return StorageIntentActionExecutionRefusalReason::MissingRecoveryDegradationEvidence;
+            }
+            return StorageIntentActionExecutionRefusalReason::MissingPublicationEvidence;
+        }
+        if !self.has_visible_abort_or_rollback() {
+            return StorageIntentActionExecutionRefusalReason::AbortRollbackIncomplete;
+        }
+        if self.step_state.is_complete() && !self.has_action_completion_proof() {
+            return StorageIntentActionExecutionRefusalReason::MissingActionCompletionEvidence;
+        }
+        StorageIntentActionExecutionRefusalReason::None
+    }
+
+    /// Return the fail-closed reason that blocks source receipt retirement.
+    #[must_use]
+    pub const fn source_retirement_refusal(self) -> StorageIntentActionExecutionRefusalReason {
+        let action_refusal = self.action_refusal();
+        if !matches!(
+            action_refusal,
+            StorageIntentActionExecutionRefusalReason::None
+                | StorageIntentActionExecutionRefusalReason::DuplicateActionDelivery
+        ) {
+            return action_refusal;
+        }
+        if !self.has_action_completion_proof() {
+            return StorageIntentActionExecutionRefusalReason::MissingActionCompletionEvidence;
+        }
+        if self.source_protection.retirement_state.forbids_retirement() {
+            return StorageIntentActionExecutionRefusalReason::SourceRetirementForbidden;
+        }
+        if !evidence_ref_is_kind(
+            self.admission_refs.evidence_retention_ref,
+            StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+        ) {
+            return StorageIntentActionExecutionRefusalReason::MissingRetentionEvidence;
+        }
+        StorageIntentActionExecutionRefusalReason::None
+    }
+}
+
+/// Returns true when `evidence_ref` is a bound artifact of `kind`.
+#[must_use]
+pub const fn evidence_ref_is_kind(
+    evidence_ref: StorageIntentEvidenceRef,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    evidence_ref.kind as u16 == kind as u16 && !bytes32_are_zero(evidence_ref.id.0)
+}
+
+/// Evaluate whether action execution can count as completed authority.
+#[must_use]
+pub const fn action_execution_satisfies_completion(
+    evidence: StorageIntentActionExecutionEvidence,
+) -> ReceiptPredicateResult {
+    let refusal = evidence.action_refusal();
+    if matches!(refusal, StorageIntentActionExecutionRefusalReason::None)
+        && evidence.has_action_completion_proof()
+    {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    let completion_refusal = if matches!(refusal, StorageIntentActionExecutionRefusalReason::None) {
+        StorageIntentActionExecutionRefusalReason::MissingActionCompletionEvidence
+    } else {
+        refusal
+    };
+    ReceiptPredicateResult::refused(completion_refusal.to_storage_intent_refusal())
+}
+
+/// Evaluate whether old source receipts may be retired.
+#[must_use]
+pub const fn action_execution_allows_source_retirement(
+    evidence: StorageIntentActionExecutionEvidence,
+) -> ReceiptPredicateResult {
+    let refusal = evidence.source_retirement_refusal();
+    if matches!(refusal, StorageIntentActionExecutionRefusalReason::None) {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    ReceiptPredicateResult::refused(refusal.to_storage_intent_refusal())
+}
+
 /// Source used to serve a read, with freshness evidence elsewhere.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -6466,6 +7315,99 @@ impl_u8_canonical!(StorageIntentActionClass, {
     ReclaimRelocation = 10 => "reclaim-relocation",
     GeoCatchup = 11 => "geo-catchup",
     ArchiveMigration = 12 => "archive-migration",
+});
+
+impl_u8_canonical!(StorageIntentActionExecutionStepState, {
+    Unknown = 0 => "unknown",
+    Planned = 1 => "planned",
+    Admitted = 2 => "admitted",
+    Prepared = 3 => "prepared",
+    Copying = 4 => "copying",
+    Verifying = 5 => "verifying",
+    Publishing = 6 => "publishing",
+    Cutover = 7 => "cutover",
+    RetiringSource = 8 => "retiring-source",
+    Complete = 9 => "complete",
+    Aborted = 10 => "aborted",
+    RolledBack = 11 => "rolled-back",
+    Refused = 12 => "refused",
+});
+
+impl_u8_canonical!(StorageIntentActionReplayState, {
+    Unknown = 0 => "unknown",
+    FirstAttempt = 1 => "first-attempt",
+    RetryInProgress = 2 => "retry-in-progress",
+    CrashRecovery = 3 => "crash-recovery",
+    DuplicateSuppressed = 4 => "duplicate-suppressed",
+    ReplayRefused = 5 => "replay-refused",
+});
+
+impl_u8_canonical!(StorageIntentActionEvidenceState, {
+    Unknown = 0 => "unknown",
+    Fresh = 1 => "fresh",
+    DecisionFrontierStale = 2 => "decision-frontier-stale",
+    PolicyRevisionChanged = 3 => "policy-revision-changed",
+    MediaCapabilityChanged = 4 => "media-capability-changed",
+    CapacityReserveChanged = 5 => "capacity-reserve-changed",
+    MembershipChanged = 6 => "membership-changed",
+    TrustChanged = 7 => "trust-changed",
+    TemporalExpired = 8 => "temporal-expired",
+    EvidenceRetentionCompacted = 9 => "evidence-retention-compacted",
+});
+
+impl_u8_canonical!(StorageIntentSourceRetirementState, {
+    Unknown = 0 => "unknown",
+    Forbidden = 1 => "forbidden",
+    RetainedForRollback = 2 => "retained-for-rollback",
+    PendingCompletion = 3 => "pending-completion",
+    Ready = 4 => "ready",
+    Retired = 5 => "retired",
+});
+
+impl_u8_canonical!(StorageIntentActionTargetVerificationState, {
+    Unknown = 0 => "unknown",
+    NotStarted = 1 => "not-started",
+    PartialWrite = 2 => "partial-write",
+    DigestMismatch = 3 => "digest-mismatch",
+    DegradedPartial = 4 => "degraded-partial",
+    Verified = 5 => "verified",
+    Refused = 6 => "refused",
+});
+
+impl_u8_canonical!(StorageIntentActionPublicationState, {
+    Unknown = 0 => "unknown",
+    NotPublished = 1 => "not-published",
+    ReplacementPublished = 2 => "replacement-published",
+    CutoverVisible = 3 => "cutover-visible",
+    SourceRetirementPublished = 4 => "source-retirement-published",
+    NoCutover = 5 => "no-cutover",
+});
+
+impl_u8_canonical!(StorageIntentActionExecutionRefusalReason, {
+    None = 0 => "none",
+    MissingActionIdentity = 1 => "missing-action-identity",
+    PlannerDecisionIsNotExecution = 2 => "planner-decision-is-not-execution",
+    MissingDecisionAdmissionEvidence = 3 => "missing-decision-admission-evidence",
+    StaleExecutionEvidence = 4 => "stale-execution-evidence",
+    NonIdempotentReplay = 5 => "non-idempotent-replay",
+    DuplicateActionDelivery = 6 => "duplicate-action-delivery",
+    MissingSourceProtection = 7 => "missing-source-protection",
+    TargetWriteIsNotCompletion = 8 => "target-write-is-not-completion",
+    MissingTargetVerification = 9 => "missing-target-verification",
+    PartialTargetWrite = 10 => "partial-target-write",
+    MissingMediaFlushOrBarrierProof = 11 => "missing-media-flush-or-barrier-proof",
+    MissingPublicationEvidence = 12 => "missing-publication-evidence",
+    MissingOrderingEvidence = 13 => "missing-ordering-evidence",
+    MissingRecoveryDegradationEvidence = 14 => "missing-recovery-degradation-evidence",
+    MissingRetentionEvidence = 15 => "missing-retention-evidence",
+    MissingActionCompletionEvidence = 16 => "missing-action-completion-evidence",
+    SourceRetirementForbidden = 17 => "source-retirement-forbidden",
+    ReserveExhausted = 18 => "reserve-exhausted",
+    ReserveDoubleSpent = 19 => "reserve-double-spent",
+    AbortRollbackIncomplete = 20 => "abort-rollback-incomplete",
+    NoCutoverProofMissing = 21 => "no-cutover-proof-missing",
+    ContradictoryReceiptPublication = 22 => "contradictory-receipt-publication",
+    RefusedByActionEvidence = 23 => "refused-by-action-evidence",
 });
 
 impl_u8_canonical!(StorageIntentDecisionAuthorityMode, {
@@ -9627,6 +10569,227 @@ mod tests {
         }
     }
 
+    fn action_execution_flags() -> StorageIntentActionExecutionFlags {
+        StorageIntentActionExecutionFlags::ACTION_IDENTITY
+            .union(StorageIntentActionExecutionFlags::DECISION_FRONTIER_REF)
+            .union(StorageIntentActionExecutionFlags::HARD_GATE_REF)
+            .union(StorageIntentActionExecutionFlags::SELECTED_CANDIDATE_REF)
+            .union(StorageIntentActionExecutionFlags::COUNTERFACTUAL_PAYBACK_REF)
+            .union(StorageIntentActionExecutionFlags::RESERVE_ADMISSION_REF)
+            .union(StorageIntentActionExecutionFlags::ISOLATION_REF)
+            .union(StorageIntentActionExecutionFlags::MEDIA_CAPABILITY_REF)
+            .union(StorageIntentActionExecutionFlags::RETENTION_REF)
+            .union(StorageIntentActionExecutionFlags::IDEMPOTENCY_KEY)
+            .union(StorageIntentActionExecutionFlags::STEP_SEQUENCE)
+            .union(StorageIntentActionExecutionFlags::CRASH_RECOVERY_MARKER)
+            .union(StorageIntentActionExecutionFlags::DUPLICATE_SUPPRESSION)
+            .union(StorageIntentActionExecutionFlags::SOURCE_RECEIPTS)
+            .union(StorageIntentActionExecutionFlags::ROLLBACK_SOURCES_RETAINED)
+            .union(StorageIntentActionExecutionFlags::READ_SERVING_ELIGIBILITY)
+            .union(StorageIntentActionExecutionFlags::FORBID_SOURCE_RETIREMENT_UNTIL_COMPLETE)
+            .union(StorageIntentActionExecutionFlags::TARGET_RECEIPT_CANDIDATE)
+            .union(StorageIntentActionExecutionFlags::TARGET_DIGEST_INTEGRITY)
+            .union(StorageIntentActionExecutionFlags::MEDIA_FLUSH_BARRIER)
+            .union(StorageIntentActionExecutionFlags::RECONSTRUCTION_WIDTH)
+            .union(StorageIntentActionExecutionFlags::REPLACEMENT_PUBLICATION)
+            .union(StorageIntentActionExecutionFlags::PUBLICATION_ORDERING)
+            .union(StorageIntentActionExecutionFlags::RECOVERY_DEGRADATION_REF)
+            .union(StorageIntentActionExecutionFlags::POLICY_ROLLOUT_REF)
+            .union(StorageIntentActionExecutionFlags::VISIBLE_CONVERGING_STATE)
+            .union(StorageIntentActionExecutionFlags::OPERATOR_EXPLANATION_REF)
+            .union(StorageIntentActionExecutionFlags::ABORT_REASON)
+            .union(StorageIntentActionExecutionFlags::PARTIAL_TARGET_CLEANUP)
+            .union(StorageIntentActionExecutionFlags::ROLLBACK_COMPLETION)
+            .union(StorageIntentActionExecutionFlags::NO_CUTOVER_PROOF)
+            .union(StorageIntentActionExecutionFlags::BUDGET_ACCOUNTING)
+            .union(StorageIntentActionExecutionFlags::PAYBACK_ATTACHMENT)
+            .union(StorageIntentActionExecutionFlags::COOLDOWN_DEPENDENCY)
+            .union(StorageIntentActionExecutionFlags::ACTION_COMPLETION_PROOF)
+    }
+
+    fn action_execution_evidence(
+        step_state: StorageIntentActionExecutionStepState,
+    ) -> StorageIntentActionExecutionEvidence {
+        let decision = decision_frontier();
+
+        StorageIntentActionExecutionEvidence {
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::ActionExecutionEvidence, 220),
+            action_id: StorageIntentEvidenceId([221_u8; 32]),
+            subject_scope: decision.subject_scope,
+            action_class: decision.action_class,
+            producer_component_ref: evidence_ref(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                222,
+            ),
+            producer_version: 1,
+            policy_id: decision.policy_id,
+            policy_revision: decision.policy_revision,
+            execution_epoch: 44,
+            temporal_ref: evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 223),
+            integrity_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 224),
+            evidence_query_snapshot_ref: evidence_ref(
+                StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+                225,
+            ),
+            admission_refs: StorageIntentActionExecutionAdmissionRefs {
+                decision_frontier_ref: decision.evidence_ref,
+                hard_gate_result_ref: evidence_ref(
+                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    226,
+                ),
+                selected_candidate_ref: evidence_ref(
+                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    227,
+                ),
+                counterfactual_payback_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                    228,
+                ),
+                reserve_admission_ref: evidence_ref(
+                    StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                    229,
+                ),
+                scheduler_admission_ref: evidence_ref(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    230,
+                ),
+                tenant_isolation_ref: evidence_ref(
+                    StorageIntentEvidenceKind::TenantIsolationEvidence,
+                    231,
+                ),
+                media_capability_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    232,
+                ),
+                evidence_retention_ref: evidence_ref(
+                    StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                    233,
+                ),
+            },
+            step_state,
+            replay: StorageIntentActionExecutionReplayRecord {
+                idempotency_key: StorageIntentReplayIdempotencyKey([234_u8; 16]),
+                step_sequence: 1,
+                retry_generation: 0,
+                state: StorageIntentActionReplayState::FirstAttempt,
+                crash_recovery_marker_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    235,
+                ),
+                duplicate_suppression_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    236,
+                ),
+                replay_refusal_ref: StorageIntentEvidenceRef::default(),
+            },
+            source_protection: StorageIntentActionSourceProtectionRecord {
+                source_receipts_ref: evidence_ref(StorageIntentEvidenceKind::PlacementReceipt, 237),
+                old_placement_ref: evidence_ref(StorageIntentEvidenceKind::PlacementReceipt, 238),
+                old_placement_generation: 7,
+                retained_rollback_sources_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    239,
+                ),
+                retained_rollback_source_count: 1,
+                read_serving_eligibility_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                    240,
+                ),
+                read_serving_eligible: true,
+                retirement_state: StorageIntentSourceRetirementState::Ready,
+            },
+            target_verification: StorageIntentActionTargetVerificationRecord {
+                state: StorageIntentActionTargetVerificationState::Verified,
+                target_receipt_candidate_ref: evidence_ref(
+                    StorageIntentEvidenceKind::PlacementReceipt,
+                    241,
+                ),
+                digest_integrity_ref: evidence_ref(
+                    StorageIntentEvidenceKind::DataShapeEvidence,
+                    242,
+                ),
+                media_flush_barrier_ref: evidence_ref(
+                    StorageIntentEvidenceKind::OrderingEvidence,
+                    243,
+                ),
+                reconstruction_width: 3,
+                required_reconstruction_width: 2,
+                target_bytes: 4096,
+                verified_bytes: 4096,
+            },
+            publication: StorageIntentActionPublicationBoundaryRecord {
+                state: StorageIntentActionPublicationState::ReplacementPublished,
+                replacement_receipt_ref: evidence_ref(
+                    StorageIntentEvidenceKind::PlacementReceipt,
+                    244,
+                ),
+                ordering_evidence_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 245),
+                recovery_degradation_ref: evidence_ref(
+                    StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                    246,
+                ),
+                policy_rollout_ref: evidence_ref(
+                    StorageIntentEvidenceKind::PolicyRolloutEvidence,
+                    247,
+                ),
+                visible_state_ref: evidence_ref(StorageIntentEvidenceKind::ResultRefusalEvidence, 248),
+                operator_explanation_ref: evidence_ref(
+                    StorageIntentEvidenceKind::OperatorExplanationProjection,
+                    249,
+                ),
+                publication_sequence: 1,
+            },
+            abort_rollback: StorageIntentActionAbortRollbackRecord {
+                abort_reason: StorageIntentActionExecutionRefusalReason::RefusedByActionEvidence,
+                partial_target_cleanup_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    250,
+                ),
+                retained_proof_ref: evidence_ref(
+                    StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                    251,
+                ),
+                rollback_completion_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    252,
+                ),
+                no_cutover_proof_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    253,
+                ),
+                cutover_published: false,
+            },
+            budget: StorageIntentActionBudgetOutcomeRecord {
+                work_bytes: 4096,
+                foreground_disruption_us: 10,
+                media_write_bytes: 8192,
+                network_egress_bytes: 0,
+                reserve_consumed_bytes: 4096,
+                reserve_budget_bytes: 8192,
+                reserve_generation: 1,
+                outcome_attachment_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                    254,
+                ),
+                payback_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                    255,
+                ),
+                cooldown_dependency_ref: evidence_ref(
+                    StorageIntentEvidenceKind::TemporalEvidence,
+                    219,
+                ),
+            },
+            action_completion_ref: evidence_ref(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                218,
+            ),
+            evidence_state: StorageIntentActionEvidenceState::Fresh,
+            flags: action_execution_flags(),
+            refusal: StorageIntentActionExecutionRefusalReason::None,
+        }
+    }
+
     fn media_evidence(byte: u8) -> StorageIntentEvidenceRef {
         evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, byte)
     }
@@ -9965,6 +11128,185 @@ mod tests {
             ordering_evidence_satisfies_requirement(ordering_requirement(), prediction_reordered)
                 .refusal,
             StorageIntentRefusalReason::OrderingAggregationWouldWeaken
+        );
+    }
+
+    #[test]
+    fn action_execution_requires_idempotent_replay_for_each_crash_step() {
+        let steps = [
+            StorageIntentActionExecutionStepState::Planned,
+            StorageIntentActionExecutionStepState::Admitted,
+            StorageIntentActionExecutionStepState::Prepared,
+            StorageIntentActionExecutionStepState::Copying,
+            StorageIntentActionExecutionStepState::Verifying,
+            StorageIntentActionExecutionStepState::Publishing,
+            StorageIntentActionExecutionStepState::Cutover,
+            StorageIntentActionExecutionStepState::RetiringSource,
+            StorageIntentActionExecutionStepState::Complete,
+            StorageIntentActionExecutionStepState::Aborted,
+            StorageIntentActionExecutionStepState::RolledBack,
+            StorageIntentActionExecutionStepState::Refused,
+        ];
+
+        for step in steps {
+            let mut evidence = action_execution_evidence(step);
+            evidence.replay.crash_recovery_marker_ref = StorageIntentEvidenceRef::default();
+
+            assert_eq!(
+                evidence.action_refusal(),
+                StorageIntentActionExecutionRefusalReason::NonIdempotentReplay,
+                "step {} did not fail closed on missing crash marker",
+                step.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_action_delivery_is_suppressed_not_reexecuted() {
+        let mut evidence = action_execution_evidence(StorageIntentActionExecutionStepState::Copying);
+        evidence.replay.state = StorageIntentActionReplayState::DuplicateSuppressed;
+        evidence.replay.replay_refusal_ref = evidence_ref(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            217,
+        );
+
+        assert!(evidence.replay.duplicate_delivery_is_suppressed());
+        assert_eq!(
+            evidence.action_refusal(),
+            StorageIntentActionExecutionRefusalReason::DuplicateActionDelivery
+        );
+        assert_eq!(
+            action_execution_satisfies_completion(evidence).refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn target_write_is_not_completion_without_verification_and_barrier() {
+        let mut partial =
+            action_execution_evidence(StorageIntentActionExecutionStepState::Verifying);
+        partial.target_verification.state = StorageIntentActionTargetVerificationState::PartialWrite;
+        partial.target_verification.verified_bytes = 2048;
+
+        assert_eq!(
+            partial.action_refusal(),
+            StorageIntentActionExecutionRefusalReason::PartialTargetWrite
+        );
+
+        let mut missing_barrier =
+            action_execution_evidence(StorageIntentActionExecutionStepState::Complete);
+        missing_barrier.target_verification.media_flush_barrier_ref =
+            StorageIntentEvidenceRef::default();
+
+        assert_eq!(
+            missing_barrier.action_refusal(),
+            StorageIntentActionExecutionRefusalReason::TargetWriteIsNotCompletion
+        );
+        assert_eq!(
+            action_execution_satisfies_completion(missing_barrier).refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn stale_action_evidence_blocks_or_requires_revalidation() {
+        let stale_states = [
+            StorageIntentActionEvidenceState::DecisionFrontierStale,
+            StorageIntentActionEvidenceState::PolicyRevisionChanged,
+            StorageIntentActionEvidenceState::MediaCapabilityChanged,
+            StorageIntentActionEvidenceState::CapacityReserveChanged,
+            StorageIntentActionEvidenceState::MembershipChanged,
+            StorageIntentActionEvidenceState::TrustChanged,
+            StorageIntentActionEvidenceState::TemporalExpired,
+            StorageIntentActionEvidenceState::EvidenceRetentionCompacted,
+        ];
+
+        for state in stale_states {
+            let mut evidence =
+                action_execution_evidence(StorageIntentActionExecutionStepState::Copying);
+            evidence.evidence_state = state;
+
+            assert_eq!(
+                evidence.action_refusal(),
+                StorageIntentActionExecutionRefusalReason::StaleExecutionEvidence,
+                "state {} did not block stale execution",
+                state.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn reserve_exhaustion_mid_action_refuses_progress() {
+        let mut evidence =
+            action_execution_evidence(StorageIntentActionExecutionStepState::Copying);
+        evidence.budget.reserve_consumed_bytes = evidence.budget.reserve_budget_bytes + 1;
+
+        assert_eq!(
+            evidence.action_refusal(),
+            StorageIntentActionExecutionRefusalReason::ReserveExhausted
+        );
+        assert_eq!(
+            action_execution_satisfies_completion(evidence).refusal,
+            StorageIntentRefusalReason::MovementDebtNotPaidBack
+        );
+    }
+
+    #[test]
+    fn rollback_before_publication_stays_visible_but_is_not_completion() {
+        let mut evidence =
+            action_execution_evidence(StorageIntentActionExecutionStepState::RolledBack);
+        evidence.source_protection.retirement_state =
+            StorageIntentSourceRetirementState::RetainedForRollback;
+        evidence.publication = StorageIntentActionPublicationBoundaryRecord::default();
+
+        assert!(evidence.abort_rollback.is_visible_no_cutover());
+        assert_eq!(
+            evidence.action_refusal(),
+            StorageIntentActionExecutionRefusalReason::None
+        );
+        assert_eq!(
+            action_execution_satisfies_completion(evidence).refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_eq!(
+            evidence.source_retirement_refusal(),
+            StorageIntentActionExecutionRefusalReason::MissingActionCompletionEvidence
+        );
+    }
+
+    #[test]
+    fn crash_after_publication_can_resume_before_source_retirement() {
+        let mut evidence =
+            action_execution_evidence(StorageIntentActionExecutionStepState::Complete);
+        evidence.replay.state = StorageIntentActionReplayState::CrashRecovery;
+        evidence.replay.retry_generation = 1;
+        evidence.publication.state = StorageIntentActionPublicationState::ReplacementPublished;
+        evidence.source_protection.retirement_state = StorageIntentSourceRetirementState::Ready;
+
+        assert_eq!(
+            evidence.action_refusal(),
+            StorageIntentActionExecutionRefusalReason::None
+        );
+        assert!(action_execution_satisfies_completion(evidence).satisfied);
+        assert!(action_execution_allows_source_retirement(evidence).satisfied);
+    }
+
+    #[test]
+    fn source_retirement_refuses_without_action_completion_proof() {
+        let mut evidence =
+            action_execution_evidence(StorageIntentActionExecutionStepState::Complete);
+        evidence.action_completion_ref = StorageIntentEvidenceRef::default();
+        evidence.flags = StorageIntentActionExecutionFlags(
+            evidence.flags.0 & !StorageIntentActionExecutionFlags::ACTION_COMPLETION_PROOF.0,
+        );
+
+        assert_eq!(
+            evidence.source_retirement_refusal(),
+            StorageIntentActionExecutionRefusalReason::MissingActionCompletionEvidence
+        );
+        assert_eq!(
+            action_execution_allows_source_retirement(evidence).refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
 
@@ -11221,6 +12563,38 @@ mod tests {
         assert_eq!(
             StorageIntentActionClass::DurablePlacementMovement.as_str(),
             "durable-placement-movement"
+        );
+        assert_eq!(
+            StorageIntentActionExecutionStepState::from_discriminant(8),
+            Some(StorageIntentActionExecutionStepState::RetiringSource)
+        );
+        assert_eq!(
+            StorageIntentActionExecutionStepState::RolledBack.as_str(),
+            "rolled-back"
+        );
+        assert_eq!(
+            StorageIntentActionReplayState::CrashRecovery.as_str(),
+            "crash-recovery"
+        );
+        assert_eq!(
+            StorageIntentActionEvidenceState::PolicyRevisionChanged.as_str(),
+            "policy-revision-changed"
+        );
+        assert_eq!(
+            StorageIntentSourceRetirementState::from_discriminant(4),
+            Some(StorageIntentSourceRetirementState::Ready)
+        );
+        assert_eq!(
+            StorageIntentActionTargetVerificationState::PartialWrite.as_str(),
+            "partial-write"
+        );
+        assert_eq!(
+            StorageIntentActionPublicationState::ReplacementPublished.as_str(),
+            "replacement-published"
+        );
+        assert_eq!(
+            StorageIntentActionExecutionRefusalReason::from_discriminant(16),
+            Some(StorageIntentActionExecutionRefusalReason::MissingActionCompletionEvidence)
         );
         assert_eq!(StorageMediaClass::NvmeFlash.to_discriminant(), 3);
         assert_eq!(
