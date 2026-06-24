@@ -3537,6 +3537,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-storage-intent-scheduler"
+version = "0.421.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tidefs-storage-intent-core",
+ "tidefs-types-transport-session",
+]
+
+[[package]]
 name = "tidefs-storage-intent-workload-signals"
 version = "0.421.0"
 dependencies = [
