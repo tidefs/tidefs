@@ -7691,6 +7691,47 @@ pub enum DataShapeRefusalReason {
     CostBudgetExceeded = 17,
 }
 
+impl DataShapeRefusalReason {
+    /// Project data-shape specific refusals into the shared storage-intent
+    /// refusal namespace.
+    #[must_use]
+    pub const fn to_storage_intent_refusal(self) -> StorageIntentRefusalReason {
+        match self {
+            Self::None => StorageIntentRefusalReason::None,
+            Self::UnknownDataShapeEvidence => {
+                StorageIntentRefusalReason::UnknownDataShapeEvidence
+            }
+            Self::StaleDataShapeEvidence => StorageIntentRefusalReason::StaleDataShapeEvidence,
+            Self::WrongDomainForDedup | Self::DedupCrossesTenantDomain => {
+                StorageIntentRefusalReason::DedupCrossesTenantDomain
+            }
+            Self::EncryptionBypassedForDedup => {
+                StorageIntentRefusalReason::EncryptionBypassedForDedup
+            }
+            Self::CompressedBeforeEncryptionOrderViolation => {
+                StorageIntentRefusalReason::IllegalCompressionOrdering
+            }
+            Self::ECShapeBlocksReadServing
+            | Self::ECShapeExceedsRebuildBudget
+            | Self::ECShapeExceedsRestoreTime
+            | Self::RecordSizeTooSmallForEC => StorageIntentRefusalReason::ECShapeBlocksReadServing,
+            Self::RecordSizeTooLargeForOverwriteLatency
+            | Self::CompressionExceedsCpuBudget
+            | Self::CompressionExceedsMemoryBudget
+            | Self::CostBudgetExceeded => StorageIntentRefusalReason::DataShapeCostBudgetExceeded,
+            Self::DigestSuiteTooWeakForPolicy => {
+                StorageIntentRefusalReason::DataShapeTransformRefused
+            }
+            Self::RebakePaybackWindowNotMet => {
+                StorageIntentRefusalReason::RebakePaybackWindowNotMet
+            }
+            Self::RebakeReplacementReceiptMissing => {
+                StorageIntentRefusalReason::RebakeReplacementReceiptMissing
+            }
+        }
+    }
+}
+
 
 /// Data-shape evidence: proven encoded shape for a range or generation.
 ///
@@ -7756,11 +7797,36 @@ pub struct DataShapeRecord {
 }
 
 impl DataShapeRecord {
+    /// Returns the shared refusal implied by the data-shape record.
+    #[must_use]
+    pub const fn shape_refusal(self) -> StorageIntentRefusalReason {
+        if !matches!(self.data_shape_refusal, DataShapeRefusalReason::None) {
+            return self.data_shape_refusal.to_storage_intent_refusal();
+        }
+        match self.transform_refusal {
+            TransformRefusalClass::None => StorageIntentRefusalReason::None,
+            TransformRefusalClass::UnsupportedCompression
+            | TransformRefusalClass::UnsupportedChecksum
+            | TransformRefusalClass::ErasureShapeIllegal => {
+                StorageIntentRefusalReason::DataShapeTransformRefused
+            }
+            TransformRefusalClass::DedupDomainMismatch => {
+                StorageIntentRefusalReason::DedupCrossesTenantDomain
+            }
+            TransformRefusalClass::EncryptionKeyEpochStale => {
+                StorageIntentRefusalReason::StaleKeyEpoch
+            }
+            TransformRefusalClass::RebakeWouldWeakenReceipt
+            | TransformRefusalClass::ReplacementReceiptMissing => {
+                StorageIntentRefusalReason::RebakeReplacementReceiptMissing
+            }
+        }
+    }
+
     /// Returns true when no transform has been refused.
     #[must_use]
     pub const fn is_transform_legal(self) -> bool {
-        matches!(self.transform_refusal, TransformRefusalClass::None)
-            && matches!(self.data_shape_refusal, DataShapeRefusalReason::None)
+        matches!(self.shape_refusal(), StorageIntentRefusalReason::None)
     }
 
     /// Returns true when encryption domain is present.
@@ -7811,6 +7877,11 @@ const fn receipt_ids_equal(a: StorageIntentReceiptId, b: StorageIntentReceiptId)
     true
 }
 
+/// Const-compatible policy-id equality.
+const fn policy_ids_equal(a: StorageIntentPolicyId, b: StorageIntentPolicyId) -> bool {
+    bytes16_equal(a.0, b.0)
+}
+
 /// Returns SATISFIED when the data-shape evidence record has usable evidence.
 ///
 /// Unknown, missing, or stale data-shape evidence blocks authority.
@@ -7818,10 +7889,17 @@ const fn receipt_ids_equal(a: StorageIntentReceiptId, b: StorageIntentReceiptId)
 pub const fn data_shape_evidence_is_usable(
     record: DataShapeRecord,
 ) -> ReceiptPredicateResult {
-    if record.evidence.is_bound() {
-        return ReceiptPredicateResult::SATISFIED;
+    if !evidence_ref_is_kind(record.evidence, StorageIntentEvidenceKind::DataShapeEvidence) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnknownDataShapeEvidence,
+        );
     }
-    ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+    if record.evidence.generation == 0 || record.evidence.version == 0 {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::StaleDataShapeEvidence,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
 }
 
 /// Returns SATISFIED when the evidence record reports a legal transform.
@@ -7831,10 +7909,33 @@ pub const fn data_shape_evidence_is_usable(
 pub const fn data_shape_transform_is_legal(
     record: DataShapeRecord,
 ) -> ReceiptPredicateResult {
-    if record.is_transform_legal() {
+    let refusal = record.shape_refusal();
+    if matches!(refusal, StorageIntentRefusalReason::None) {
         return ReceiptPredicateResult::SATISFIED;
     }
-    ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+    ReceiptPredicateResult::refused(refusal)
+}
+
+/// Returns SATISFIED when the shape record was proven under the policy
+/// identity and revision being checked.
+#[must_use]
+pub const fn data_shape_policy_identity_is_current(
+    record: DataShapeRecord,
+    policy: DataShapePolicy,
+) -> ReceiptPredicateResult {
+    if !policy.policy_id.is_zero()
+        && (record.policy_id.is_zero() || !policy_ids_equal(record.policy_id, policy.policy_id))
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::StaleDataShapeEvidence,
+        );
+    }
+    if policy.policy_revision.0 > 0 && record.policy_revision.0 < policy.policy_revision.0 {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::StaleDataShapeEvidence,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
 }
 
 /// Returns SATISFIED when dedup does not cross encryption or tenant domains
@@ -7849,21 +7950,24 @@ pub const fn data_shape_dedup_domain_is_compatible(
     policy_domain: StorageIntentDomainId,
 ) -> ReceiptPredicateResult {
     // No dedup active: trivially satisfied.
-    if matches!(record.dedup_scope, DedupFingerprintScopeClass::NoDedup)
-        || matches!(record.dedup_scope, DedupFingerprintScopeClass::Unknown)
-    {
+    if matches!(record.dedup_scope, DedupFingerprintScopeClass::NoDedup) {
         return ReceiptPredicateResult::SATISFIED;
+    }
+    if matches!(record.dedup_scope, DedupFingerprintScopeClass::Unknown) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnknownDataShapeEvidence,
+        );
     }
     // Dedup refused: unsatisfied.
     if matches!(record.dedup_scope, DedupFingerprintScopeClass::DedupRefused) {
         return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::IllegalSharingDomain,
+            StorageIntentRefusalReason::DedupCrossesTenantDomain,
         );
     }
     // If a sharing domain is specified, it must match policy.
     if !record.dedup_domain.is_zero() && !domain_ids_equal(record.dedup_domain, policy_domain) {
         return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::IllegalSharingDomain,
+            StorageIntentRefusalReason::DedupCrossesTenantDomain,
         );
     }
     ReceiptPredicateResult::SATISFIED
@@ -7885,7 +7989,7 @@ pub const fn data_shape_encryption_is_not_bypassed(
     // Encryption domain must be present when policy requires encryption.
     if record.encryption_domain.is_zero() {
         return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::MissingAuthenticatedPrincipal,
+            StorageIntentRefusalReason::EncryptionBypassedForDedup,
         );
     }
     ReceiptPredicateResult::SATISFIED
@@ -7910,7 +8014,9 @@ pub const fn data_shape_compression_ordering_is_legal(
             ReceiptPredicateResult::SATISFIED
         }
         CompressionOrderingClass::Unknown => {
-            ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+            ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::IllegalCompressionOrdering,
+            )
         }
     }
 }
@@ -7929,13 +8035,14 @@ pub const fn data_shape_ec_shape_is_legal(
     }
     if !shape.is_valid() {
         return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::EvidenceNotUsable,
+            StorageIntentRefusalReason::ECShapeBlocksReadServing,
         );
     }
     // Rebuild width must not exceed total shards.
-    if shape.rebuild_width > shape.total_shards() {
+    if shape.rebuild_width > shape.total_shards() || shape.restore_read_width > shape.total_shards()
+    {
         return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::EvidenceNotUsable,
+            StorageIntentRefusalReason::ECShapeBlocksReadServing,
         );
     }
     ReceiptPredicateResult::SATISFIED
@@ -7961,18 +8068,18 @@ pub const fn data_shape_rebake_replacement_receipt_is_present(
                 ReceiptPredicateResult::SATISFIED
             } else {
                 ReceiptPredicateResult::refused(
-                    StorageIntentRefusalReason::ReceiptWouldWeaken,
+                    StorageIntentRefusalReason::RebakeReplacementReceiptMissing,
                 )
             }
         }
         RebakeEligibilityClass::ReplacementReceiptPending => {
             ReceiptPredicateResult::refused(
-                StorageIntentRefusalReason::ReceiptWouldWeaken,
+                StorageIntentRefusalReason::RebakeReplacementReceiptMissing,
             )
         }
         RebakeEligibilityClass::PaybackWindowNotMet => {
             ReceiptPredicateResult::refused(
-                StorageIntentRefusalReason::MovementDebtNotPaidBack,
+                StorageIntentRefusalReason::RebakePaybackWindowNotMet,
             )
         }
     }
@@ -7989,7 +8096,7 @@ pub const fn data_shape_digest_suite_is_adequate(
     {
         return ReceiptPredicateResult::SATISFIED;
     }
-    ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+    ReceiptPredicateResult::refused(StorageIntentRefusalReason::DataShapeTransformRefused)
 }
 
 /// Full data-shape hard-gate check: combine all predicates.
@@ -8009,6 +8116,11 @@ pub const fn data_shape_hard_gate_check(
     }
     // Transform must be legal.
     let r = data_shape_transform_is_legal(record);
+    if !r.satisfied {
+        return r;
+    }
+    // Policy identity and revision must match the evaluated policy.
+    let r = data_shape_policy_identity_is_current(record, policy);
     if !r.satisfied {
         return r;
     }
@@ -18747,6 +18859,8 @@ mod tests {
             rebake_eligibility: RebakeEligibilityClass::RebakeForbidden,
             transform_refusal: TransformRefusalClass::None,
             data_shape_refusal: DataShapeRefusalReason::None,
+            policy_id: StorageIntentPolicyId([1_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(1),
             evidence: data_shape_evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 1),
             ..DataShapeRecord::default()
         }
@@ -18786,7 +18900,22 @@ mod tests {
         record.evidence = StorageIntentEvidenceRef::default(); // no evidence bound
         let result = data_shape_evidence_is_usable(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceNotUsable);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnknownDataShapeEvidence
+        );
+    }
+
+    #[test]
+    fn stale_evidence_blocks_hard_gate() {
+        let mut record = healthy_data_shape_record();
+        record.evidence.generation = 0;
+        let result = data_shape_evidence_is_usable(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::StaleDataShapeEvidence
+        );
     }
 
     #[test]
@@ -18795,6 +18924,10 @@ mod tests {
         record.transform_refusal = TransformRefusalClass::UnsupportedCompression;
         let result = data_shape_transform_is_legal(record);
         assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::DataShapeTransformRefused
+        );
     }
 
     #[test]
@@ -18803,6 +18936,26 @@ mod tests {
         record.data_shape_refusal = DataShapeRefusalReason::DigestSuiteTooWeakForPolicy;
         let result = data_shape_transform_is_legal(record);
         assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::DataShapeTransformRefused
+        );
+    }
+
+    #[test]
+    fn stale_policy_revision_blocks_hard_gate() {
+        let mut record = healthy_data_shape_record();
+        let policy = DataShapePolicy {
+            policy_revision: StorageIntentPolicyRevision(2),
+            ..restrictive_data_shape_policy()
+        };
+        record.policy_revision = StorageIntentPolicyRevision(1);
+        let result = data_shape_policy_identity_is_current(record, policy);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::StaleDataShapeEvidence
+        );
     }
 
     #[test]
@@ -18814,7 +18967,10 @@ mod tests {
         let policy_domain = StorageIntentDomainId([1_u8; 16]);
         let result = data_shape_dedup_domain_is_compatible(record, policy_domain);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::IllegalSharingDomain);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::DedupCrossesTenantDomain
+        );
     }
 
     #[test]
@@ -18824,6 +18980,10 @@ mod tests {
         let policy = restrictive_data_shape_policy();
         let result = data_shape_dedup_domain_is_compatible(record, policy.sharing_domain);
         assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::DedupCrossesTenantDomain
+        );
     }
 
     #[test]
@@ -18848,6 +19008,10 @@ mod tests {
         record.encryption_domain = StorageIntentDomainId::ZERO;
         let result = data_shape_encryption_is_not_bypassed(record, true);
         assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EncryptionBypassedForDedup
+        );
     }
 
     #[test]
@@ -18856,6 +19020,10 @@ mod tests {
         record.compression_ordering = CompressionOrderingClass::Unknown;
         let result = data_shape_compression_ordering_is_legal(record);
         assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::IllegalCompressionOrdering
+        );
     }
 
     #[test]
@@ -18874,6 +19042,10 @@ mod tests {
         };
         let result = data_shape_ec_shape_is_legal(shape);
         assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::ECShapeBlocksReadServing
+        );
     }
 
     #[test]
@@ -18883,6 +19055,10 @@ mod tests {
         record.replacement_receipt = StorageIntentReceiptId::ZERO;
         let result = data_shape_rebake_replacement_receipt_is_present(record);
         assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::RebakeReplacementReceiptMissing
+        );
     }
 
     #[test]
@@ -18891,6 +19067,10 @@ mod tests {
         record.rebake_eligibility = RebakeEligibilityClass::PaybackWindowNotMet;
         let result = data_shape_rebake_replacement_receipt_is_present(record);
         assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::RebakePaybackWindowNotMet
+        );
     }
 
     #[test]
@@ -18900,6 +19080,10 @@ mod tests {
         let policy = restrictive_data_shape_policy(); // requires Crc32cPlusBlake3
         let result = data_shape_digest_suite_is_adequate(record, policy.digest_suite);
         assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::DataShapeTransformRefused
+        );
     }
 
     #[test]
