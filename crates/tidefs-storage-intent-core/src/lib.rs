@@ -11599,6 +11599,988 @@ const fn div_ceil_u64(numerator: u64, denominator: u64) -> u64 {
     }
 }
 
+// ===== Policy Rollout Evidence (Issue #901) =====
+
+/// Classification of a policy revision change.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentPolicyChangeClass {
+    /// No change class assigned.
+    #[default]
+    Unknown = 0,
+    /// Strengthens durability, RPO, trust, recovery, capacity, or visibility floors.
+    Strengthen = 1,
+    /// Weakens durability, RPO, trust, recovery, capacity, or visibility floors.
+    Weaken = 2,
+    /// Lateral change: different shape, same floor level.
+    Lateral = 3,
+    /// The old and new policy languages are not compatible.
+    Incompatible = 4,
+    /// Privileged emergency override that bypasses normal stage gates.
+    EmergencyOverride = 5,
+    /// Restoring a previous or superseding revision.
+    Rollback = 6,
+    /// Re-entering a previously rolled-back or superseded revision.
+    ReEntry = 7,
+    /// The old revision is being fully retired.
+    Retirement = 8,
+}
+
+impl StorageIntentPolicyChangeClass {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Strengthen => "strengthen",
+            Self::Weaken => "weaken",
+            Self::Lateral => "lateral",
+            Self::Incompatible => "incompatible",
+            Self::EmergencyOverride => "emergency-override",
+            Self::Rollback => "rollback",
+            Self::ReEntry => "re-entry",
+            Self::Retirement => "retirement",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Strengthen),
+            2 => Some(Self::Weaken),
+            3 => Some(Self::Lateral),
+            4 => Some(Self::Incompatible),
+            5 => Some(Self::EmergencyOverride),
+            6 => Some(Self::Rollback),
+            7 => Some(Self::ReEntry),
+            8 => Some(Self::Retirement),
+            _ => None,
+        }
+    }
+
+    /// Returns true when the change class weakens any policy floor.
+    #[must_use]
+    pub const fn is_weakening(self) -> bool {
+        matches!(
+            self,
+            Self::Weaken | Self::Incompatible | Self::EmergencyOverride
+        )
+    }
+
+    /// Returns true when the change class requires downgrade authorization.
+    #[must_use]
+    pub const fn requires_downgrade_authorization(self) -> bool {
+        matches!(
+            self,
+            Self::Weaken | Self::Incompatible | Self::EmergencyOverride
+        )
+    }
+}
+
+impl fmt::Display for StorageIntentPolicyChangeClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Policy rollout stage state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentPolicyStageState {
+    /// No stage recorded.
+    #[default]
+    Unknown = 0,
+    /// Source policy exists but is not a storage-intent language for admission.
+    Draft = 1,
+    /// Compiler/planner can explain effects, but no receipt may cite this revision.
+    DryRun = 2,
+    /// Capacity, trust, membership, recovery, validation, and runbook refs permit staging.
+    PreflightAdmitted = 3,
+    /// Published for a bounded scope or cohort with in-flight fence and rollback anchor.
+    Staged = 4,
+    /// New operations in scope cite the new revision; old receipts keep historical revision.
+    ActiveForNewWrites = 5,
+    /// Existing ranges/generations owe replacement receipts or convergence.
+    ConvergingExisting = 6,
+    /// Missing prerequisites; revision is not yet active but not rolled back.
+    Blocked = 7,
+    /// Stage cannot safely continue; must fence new work or re-enter restored revision.
+    RollbackRequired = 8,
+    /// Future admission uses restored revision; rollback receipts and obligations visible.
+    RolledBack = 9,
+    /// A later revision replaced this one; new work cannot cite it except for cleanup/re-entry.
+    Superseded = 10,
+    /// No live receipt, convergence, rollback, or explanation dependency remains.
+    Retired = 11,
+    /// The change cannot become active for the selected scope.
+    Refused = 12,
+}
+
+impl StorageIntentPolicyStageState {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Draft => "draft",
+            Self::DryRun => "dry-run",
+            Self::PreflightAdmitted => "preflight-admitted",
+            Self::Staged => "staged",
+            Self::ActiveForNewWrites => "active-for-new-writes",
+            Self::ConvergingExisting => "converging-existing",
+            Self::Blocked => "blocked",
+            Self::RollbackRequired => "rollback-required",
+            Self::RolledBack => "rolled-back",
+            Self::Superseded => "superseded",
+            Self::Retired => "retired",
+            Self::Refused => "refused",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Draft),
+            2 => Some(Self::DryRun),
+            3 => Some(Self::PreflightAdmitted),
+            4 => Some(Self::Staged),
+            5 => Some(Self::ActiveForNewWrites),
+            6 => Some(Self::ConvergingExisting),
+            7 => Some(Self::Blocked),
+            8 => Some(Self::RollbackRequired),
+            9 => Some(Self::RolledBack),
+            10 => Some(Self::Superseded),
+            11 => Some(Self::Retired),
+            12 => Some(Self::Refused),
+            _ => None,
+        }
+    }
+
+    /// Returns true when the stage represents an active or transitioning state.
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveForNewWrites | Self::ConvergingExisting
+        )
+    }
+
+    /// Returns true when the stage is a terminal state.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Superseded | Self::Retired | Self::Refused
+        )
+    }
+
+    /// Returns true when the stage permits new writes.
+    #[must_use]
+    pub const fn admits_new_writes(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveForNewWrites | Self::ConvergingExisting
+        )
+    }
+
+    /// Returns true when the rollout is blocked but not yet rolled back.
+    #[must_use]
+    pub const fn requires_intervention(self) -> bool {
+        matches!(
+            self,
+            Self::Blocked | Self::RollbackRequired
+        )
+    }
+}
+
+impl fmt::Display for StorageIntentPolicyStageState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Old-receipt treatment under a new policy revision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentOldReceiptTreatment {
+    /// No treatment recorded.
+    #[default]
+    Unknown = 0,
+    /// Old receipts remain valid under the original revision.
+    Grandfathered = 1,
+    /// Old receipts must be replaced or re-proved before satisfying the new revision.
+    RequireConvergence = 2,
+    /// Old receipts are valid for their original claim but not for new claims.
+    UnusableForNewClaims = 3,
+    /// Receipts from the old revision must be refused for any purpose.
+    Refuse = 4,
+}
+
+impl StorageIntentOldReceiptTreatment {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Grandfathered => "grandfathered",
+            Self::RequireConvergence => "require-convergence",
+            Self::UnusableForNewClaims => "unusable-for-new-claims",
+            Self::Refuse => "refuse",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Grandfathered),
+            2 => Some(Self::RequireConvergence),
+            3 => Some(Self::UnusableForNewClaims),
+            4 => Some(Self::Refuse),
+            _ => None,
+        }
+    }
+
+    /// Returns true when old receipts remain valid without convergence.
+    #[must_use]
+    pub const fn preserves_old_receipts(self) -> bool {
+        matches!(
+            self,
+            Self::Grandfathered | Self::UnusableForNewClaims
+        )
+    }
+
+    /// Returns true when old receipts must be replaced before satisfying the new revision.
+    #[must_use]
+    pub const fn requires_convergence(self) -> bool {
+        matches!(self, Self::RequireConvergence)
+    }
+}
+
+impl fmt::Display for StorageIntentOldReceiptTreatment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// In-flight operation types that must be fenced during rollout.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentInFlightOperationFlags(pub u32);
+
+impl StorageIntentInFlightOperationFlags {
+    pub const EMPTY: Self = Self(0);
+
+    pub const WRITES: Self = Self(1 << 0);
+    pub const FSYNC_FUA: Self = Self(1 << 1);
+    pub const READ_REPAIR: Self = Self(1 << 2);
+    pub const REBUILD: Self = Self(1 << 3);
+    pub const RELOCATION: Self = Self(1 << 4);
+    pub const REBAKE: Self = Self(1 << 5);
+    pub const GEO_CATCHUP: Self = Self(1 << 6);
+    pub const ARCHIVE_RESTORE: Self = Self(1 << 7);
+    pub const RECEIPT_RETIREMENT: Self = Self(1 << 8);
+
+    pub const ALL_NEW_WRITE: Self = Self(
+        Self::WRITES.0
+            | Self::FSYNC_FUA.0,
+    );
+
+    pub const ALL_BACKGROUND: Self = Self(
+        Self::READ_REPAIR.0
+            | Self::REBUILD.0
+            | Self::RELOCATION.0
+            | Self::REBAKE.0
+            | Self::GEO_CATCHUP.0
+            | Self::ARCHIVE_RESTORE.0
+            | Self::RECEIPT_RETIREMENT.0,
+    );
+
+    pub const ALL: Self = Self(Self::ALL_NEW_WRITE.0 | Self::ALL_BACKGROUND.0);
+
+    /// Returns true when a flag is set.
+    #[must_use]
+    pub const fn has(self, flags: Self) -> bool {
+        (self.0 & flags.0) == flags.0
+    }
+
+    /// Set additional flags.
+    #[must_use]
+    pub const fn with(self, flags: Self) -> Self {
+        Self(self.0 | flags.0)
+    }
+
+    /// Returns true when new-write operations are fenced.
+    #[must_use]
+    pub const fn fenced_new_writes(self) -> bool {
+        (self.0 & Self::WRITES.0) != 0
+            && (self.0 & Self::FSYNC_FUA.0) != 0
+    }
+
+    /// Returns true when at least one background operation is fenced.
+    #[must_use]
+    pub const fn has_any_background_fence(self) -> bool {
+        (self.0 & Self::ALL_BACKGROUND.0) != 0
+    }
+}
+
+/// Typed refusal reason for policy rollout.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentRolloutRefusalReason {
+    /// No refusal.
+    #[default]
+    None = 0,
+    /// Stale policy source: last-known source generation is newer than compiled.
+    StalePolicySource = 1,
+    /// Conflicting overrides cannot be merged.
+    ConflictingOverrides = 2,
+    /// Downgrade authorization is missing.
+    MissingDowngradeAuthorization = 3,
+    /// Unsafe downgrade detected (durability, RPO, trust, recovery, capacity, or visibility floor).
+    UnsafeDowngrade = 4,
+    /// In-flight fence operation failed.
+    InFlightFenceFailure = 5,
+    /// Convergence debt exceeds policy tolerance.
+    ConvergenceDebt = 6,
+    /// Validation gate failure.
+    ValidationGateFailure = 7,
+    /// Unsupported combination of policy sources or revision classes.
+    UnsupportedCombination = 8,
+    /// Missing preflight simulation evidence.
+    MissingPreflightEvidence = 9,
+    /// Stale preflight simulation evidence.
+    StalePreflightEvidence = 10,
+    /// Missing evidence query snapshot.
+    MissingEvidenceQuerySnapshot = 11,
+    /// Missing temporal evidence for stage deadlines.
+    MissingTemporalEvidence = 12,
+    /// Stage deadline has been crossed.
+    StageDeadlineCrossed = 13,
+    /// Missing runbook step or operator acknowledgment.
+    MissingRunbookStep = 14,
+}
+
+impl StorageIntentRolloutRefusalReason {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::StalePolicySource => "stale-policy-source",
+            Self::ConflictingOverrides => "conflicting-overrides",
+            Self::MissingDowngradeAuthorization => "missing-downgrade-authorization",
+            Self::UnsafeDowngrade => "unsafe-downgrade",
+            Self::InFlightFenceFailure => "in-flight-fence-failure",
+            Self::ConvergenceDebt => "convergence-debt",
+            Self::ValidationGateFailure => "validation-gate-failure",
+            Self::UnsupportedCombination => "unsupported-combination",
+            Self::MissingPreflightEvidence => "missing-preflight-evidence",
+            Self::StalePreflightEvidence => "stale-preflight-evidence",
+            Self::MissingEvidenceQuerySnapshot => "missing-evidence-query-snapshot",
+            Self::MissingTemporalEvidence => "missing-temporal-evidence",
+            Self::StageDeadlineCrossed => "stage-deadline-crossed",
+            Self::MissingRunbookStep => "missing-runbook-step",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::None),
+            1 => Some(Self::StalePolicySource),
+            2 => Some(Self::ConflictingOverrides),
+            3 => Some(Self::MissingDowngradeAuthorization),
+            4 => Some(Self::UnsafeDowngrade),
+            5 => Some(Self::InFlightFenceFailure),
+            6 => Some(Self::ConvergenceDebt),
+            7 => Some(Self::ValidationGateFailure),
+            8 => Some(Self::UnsupportedCombination),
+            9 => Some(Self::MissingPreflightEvidence),
+            10 => Some(Self::StalePreflightEvidence),
+            11 => Some(Self::MissingEvidenceQuerySnapshot),
+            12 => Some(Self::MissingTemporalEvidence),
+            13 => Some(Self::StageDeadlineCrossed),
+            14 => Some(Self::MissingRunbookStep),
+            _ => None,
+        }
+    }
+
+    /// Returns true when a refusal reason is present.
+    #[must_use]
+    pub const fn is_refused(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl fmt::Display for StorageIntentRolloutRefusalReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Policy rollout, downgrade, rollback, and convergence-frontier evidence.
+///
+/// This record is the concrete projection for evidence kind
+/// `PolicyRolloutEvidence = 14` as prescribed by the
+/// `docs/STORAGE_INTENT_POLICY_AUTHORITY.md` field inventory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentPolicyRolloutEvidence {
+    /// Self-referencing identity for this evidence artifact.
+    pub evidence_ref: StorageIntentEvidenceRef,
+    /// Compiled policy identity targeted by this rollout.
+    pub compiled_policy_id: StorageIntentPolicyId,
+    /// Compiled policy revision targeted by this rollout.
+    pub compiled_policy_revision: StorageIntentPolicyRevision,
+    /// Previously active revision, if any.
+    pub previous_policy_id: StorageIntentPolicyId,
+    /// Previously active revision number.
+    pub previous_policy_revision: StorageIntentPolicyRevision,
+    /// Revision being restored (set during rollback or re-entry).
+    pub target_policy_id: StorageIntentPolicyId,
+    /// Target revision number for rollback or supersession.
+    pub target_policy_revision: StorageIntentPolicyRevision,
+    /// Monotonic policy publication epoch.
+    pub policy_epoch: u64,
+    /// Names the pool, dataset, mount, caller, inherited-default, override,
+    /// or internal-maintenance source set from #855.
+    pub source_policy_ref: StorageIntentEvidenceRef,
+    /// Records which policy sources participated and which conflicts or
+    /// inheritance rules were applied.
+    pub source_provenance_mask: u32,
+    /// Full provenance trace including per-source stamps.
+    pub source_provenance_refs: StorageIntentEvidenceRefs,
+    /// Proves the compiled revision was durably published.
+    pub publication_transaction_ref: StorageIntentEvidenceRef,
+    /// Classifies the nature of the change.
+    pub change_class: StorageIntentPolicyChangeClass,
+    /// Authz/audit evidence required when a change lowers durability, RPO,
+    /// trust, recovery, capacity, or visibility floors.
+    pub downgrade_authorization_ref: StorageIntentEvidenceRef,
+    /// Current stage state.
+    pub stage_state: StorageIntentPolicyStageState,
+    /// Names the pool, dataset, mount, file, range, generation, cohort,
+    /// or internal-maintenance scope affected by the revision.
+    pub scope_selector: StorageIntentObjectScope,
+    /// Says whether old receipts are grandfathered, require convergence,
+    /// are unusable for new claims, or must be refused.
+    pub old_receipt_treatment: StorageIntentOldReceiptTreatment,
+    /// Which operations continue under old or new revision.
+    pub in_flight_fence_flags: StorageIntentInFlightOperationFlags,
+    /// Evidence ref for the in-flight fence record.
+    pub in_flight_fence_ref: StorageIntentEvidenceRef,
+    /// Per-range, per-generation, per-receipt, or per-cohort convergence frontier.
+    pub convergence_frontier_ref: StorageIntentEvidenceRef,
+    /// Proves stronger placement, shape, trust, recovery, or capacity
+    /// requirements were earned before old-revision satisfaction is claimed.
+    pub replacement_receipt_set_ref: StorageIntentEvidenceRef,
+    /// Remaining convergence, rollback repair, receipt-retirement,
+    /// validation, or operator-review work.
+    pub outstanding_obligation_ref: StorageIntentEvidenceRef,
+    /// Old-revision proof-retention evidence for safe explanation and purge.
+    pub old_revision_retention_ref: StorageIntentEvidenceRef,
+    /// Evidence that no live receipt, generation, repair, receive-base, or
+    /// operator claim still depends on this revision before retirement.
+    pub safe_retirement_evidence_ref: StorageIntentEvidenceRef,
+    /// Rollback anchor snapshot, dry-run/preflight result, failed-stage reason,
+    /// restored revision, rollback receipt, and post-rollback verification.
+    pub rollback_reentry_ref: StorageIntentEvidenceRef,
+    /// Later revision that replaced this one.
+    pub supersession_ref: StorageIntentEvidenceRef,
+    /// Typed refusal reason when the rollout cannot proceed.
+    pub refusal_reason: StorageIntentRolloutRefusalReason,
+    /// Preflight simulation evidence ref for dry-run/preflight-admitted states.
+    pub preflight_evidence_ref: StorageIntentEvidenceRef,
+    /// Temporal evidence ref for stage deadlines and convergence age.
+    pub temporal_evidence_ref: StorageIntentEvidenceRef,
+    /// Evidence query snapshot ref for the decision basis.
+    pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
+    /// Action-execution evidence ref for rollout cutover, rollback, or
+    /// source-retirement work.
+    pub action_execution_evidence_ref: StorageIntentEvidenceRef,
+    /// Caller-visible result/refusal evidence ref for rollout outcomes.
+    pub result_refusal_evidence_ref: StorageIntentEvidenceRef,
+    /// Measurement-attribution evidence ref when measured deltas shaped the
+    /// rollout, feedback, or validation decision.
+    pub measurement_attribution_evidence_ref: StorageIntentEvidenceRef,
+    /// Policy-revision-scoped feedback window or predictor state ref.
+    pub feedback_window_ref: StorageIntentEvidenceRef,
+    /// Tenant isolation evidence ref for budget/tenant-aware rollout.
+    pub tenant_isolation_evidence_ref: StorageIntentEvidenceRef,
+    /// Capacity admission evidence ref for reserve-aware rollout.
+    pub capacity_admission_evidence_ref: StorageIntentEvidenceRef,
+    /// Decision frontier evidence ref for the selection basis.
+    pub decision_frontier_evidence_ref: StorageIntentEvidenceRef,
+    /// Membership evidence ref for epoch/quorum-aware rollout.
+    pub membership_evidence_ref: StorageIntentEvidenceRef,
+    /// Trust domain evidence ref for security/domain-aware rollout.
+    pub trust_domain_evidence_ref: StorageIntentEvidenceRef,
+    /// Recovery/degradation evidence ref for repair-aware rollout.
+    pub recovery_evidence_ref: StorageIntentEvidenceRef,
+    /// Media capability evidence ref for role-aware rollout.
+    pub media_capability_evidence_ref: StorageIntentEvidenceRef,
+    /// Metadata/namespace evidence ref for namespace-aware rollout.
+    pub metadata_namespace_evidence_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentPolicyRolloutEvidence {
+    /// Returns true when the rollout has a compiled policy identity.
+    #[must_use]
+    pub const fn has_compiled_policy(self) -> bool {
+        matches!(
+            self.evidence_ref.kind,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence
+        )
+            && evidence_ref_has_id(self.evidence_ref)
+            && !self.compiled_policy_id.is_zero()
+            && self.compiled_policy_revision.0 > 0
+    }
+
+    /// Returns true when the rollout has a previous revision to compare against.
+    #[must_use]
+    pub const fn has_previous_revision(self) -> bool {
+        !self.previous_policy_id.is_zero()
+            && self.previous_policy_revision.0 > 0
+    }
+
+    /// Returns true when the rollout has a target revision (rollback or supersession).
+    #[must_use]
+    pub const fn has_target_revision(self) -> bool {
+        !self.target_policy_id.is_zero()
+            && self.target_policy_revision.0 > 0
+    }
+
+    /// Returns true when the change class is set to a known value.
+    #[must_use]
+    pub const fn has_change_class(self) -> bool {
+        !matches!(self.change_class, StorageIntentPolicyChangeClass::Unknown)
+    }
+
+    /// Returns true when the scope selector is bound.
+    #[must_use]
+    pub const fn has_scope(self) -> bool {
+        !self.scope_selector.dataset_id.is_zero()
+            || !bytes32_are_zero(self.scope_selector.object_id.0)
+            || self.scope_selector.range_len > 0
+    }
+
+    /// Returns true when the stage state is known.
+    #[must_use]
+    pub const fn has_stage_state(self) -> bool {
+        !matches!(self.stage_state, StorageIntentPolicyStageState::Unknown)
+    }
+
+    /// Returns true when the rollout is refused.
+    #[must_use]
+    pub const fn is_refused(self) -> bool {
+        matches!(self.stage_state, StorageIntentPolicyStageState::Refused)
+            || self.refusal_reason.is_refused()
+    }
+
+    /// Returns true when a publication transaction ref is present.
+    #[must_use]
+    pub const fn has_publication_transaction(self) -> bool {
+        evidence_ref_has_id(self.publication_transaction_ref)
+    }
+
+    /// Returns true when the change class requires downgrade authorization
+    /// and the authorization ref is present.
+    #[must_use]
+    pub const fn has_downgrade_authorization_if_required(self) -> bool {
+        if !self.change_class.requires_downgrade_authorization() {
+            return true;
+        }
+        evidence_ref_has_id(self.downgrade_authorization_ref)
+    }
+
+    /// Returns true when the old-receipt treatment is defined.
+    #[must_use]
+    pub const fn has_old_receipt_treatment(self) -> bool {
+        !matches!(
+            self.old_receipt_treatment,
+            StorageIntentOldReceiptTreatment::Unknown
+        )
+    }
+
+    /// Returns true when the in-flight fence is defined for the current stage.
+    #[must_use]
+    pub const fn has_in_flight_fence(self) -> bool {
+        evidence_ref_has_id(self.in_flight_fence_ref)
+            && self.in_flight_fence_flags.0 != 0
+    }
+
+    /// Returns true when retirement is backed by retention and cleanup proof.
+    #[must_use]
+    pub const fn has_safe_retirement_evidence(self) -> bool {
+        evidence_ref_has_id(self.old_revision_retention_ref)
+            && evidence_ref_has_id(self.safe_retirement_evidence_ref)
+    }
+}
+
+// ===== Rollout hard law predicates =====
+
+/// Hard rollout law: publication is not activation.
+///
+/// A compiled revision can exist for dry-run, comparison, and operator
+/// explanation without admitting new writes.
+#[must_use]
+pub const fn rollout_publication_is_not_activation(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    // A rollout can have a compiled policy without being active.
+    evidence.has_compiled_policy()
+}
+
+/// Hard rollout law: activation for new writes requires publication transaction,
+/// scope selector, stage state, and in-flight fence.
+///
+/// Missing one of those is `unknown-evidence`, `blocked`, or `refused`.
+#[must_use]
+pub const fn rollout_activation_requires_publication_scope_stage_fence(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    evidence.has_compiled_policy()
+        && evidence.has_publication_transaction()
+        && evidence.has_scope()
+        && evidence.has_stage_state()
+        && evidence.has_in_flight_fence()
+        && !evidence.is_refused()
+}
+
+/// Hard rollout law: strengthening may gate new operations immediately,
+/// but old generations reach stronger satisfaction only after replacement
+/// receipts, convergence frontiers, and old-receipt retirement law say so.
+#[must_use]
+pub const fn rollout_strengthen_new_writes_only(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    if matches!(
+        evidence.change_class,
+        StorageIntentPolicyChangeClass::Strengthen
+    ) {
+        // Strengthening: old receipts must be grandfathered or require convergence.
+        matches!(
+            evidence.old_receipt_treatment,
+            StorageIntentOldReceiptTreatment::Grandfathered
+                | StorageIntentOldReceiptTreatment::RequireConvergence
+        )
+    } else {
+        true
+    }
+}
+
+/// Hard rollout law: weakening requires downgrade authorization and audit refs,
+/// and it must not turn prior durable, geo, recovery, trust, or capacity
+/// promises into weaker product claims.
+#[must_use]
+pub const fn rollout_weaken_requires_authorization_and_audit(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    if !evidence.change_class.is_weakening() {
+        return true;
+    }
+    evidence.has_downgrade_authorization_if_required()
+        && evidence_ref_has_id(evidence.downgrade_authorization_ref)
+}
+
+/// Hard rollout law: reads, repair, rebuild, relocation, rebake, geo catch-up,
+/// RAM authority, block-volume flush/FUA, and receipt retirement must choose
+/// the policy revision by receipt identity and rollout fence, not by a
+/// mutable global property lookup.
+#[must_use]
+pub const fn rollout_operation_chooses_revision_by_receipt_and_fence(
+    evidence: StorageIntentPolicyRolloutEvidence,
+    receipt_policy_revision: StorageIntentPolicyRevision,
+    in_flight_operation: StorageIntentInFlightOperationFlags,
+) -> bool {
+    if in_flight_operation.0 == 0 {
+        return false;
+    }
+    if evidence.in_flight_fence_flags.has(in_flight_operation) {
+        return evidence.has_in_flight_fence();
+    }
+    // Unfenced operations must carry a concrete historical receipt revision.
+    receipt_policy_revision.0 > 0
+}
+
+/// Hard rollout law: relocation across a revision boundary must publish
+/// target receipts for the target revision before claiming convergence,
+/// and it must preserve source receipts until rollback and old-receipt
+/// retirement law allow retirement.
+#[must_use]
+pub const fn rollout_relocation_crosses_revision_boundary(
+    evidence: StorageIntentPolicyRolloutEvidence,
+    source_receipt_revision: StorageIntentPolicyRevision,
+) -> bool {
+    // Relocation crosses revision boundary when source receipt revision
+    // differs from compiled revision.
+    if source_receipt_revision.0 == evidence.compiled_policy_revision.0 {
+        return false;
+    }
+    // Must have replacement receipt set and outstanding obligation refs.
+    evidence_ref_has_id(evidence.replacement_receipt_set_ref)
+        && evidence_ref_has_id(evidence.outstanding_obligation_ref)
+}
+
+/// Hard rollout law: rollback is a receipt-producing operation.
+/// It restores future admission to a previous or superseding revision,
+/// but it does not erase receipts earned while the failed revision was staged.
+#[must_use]
+pub const fn rollout_rollback_is_receipt_producing(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(
+        evidence.stage_state,
+        StorageIntentPolicyStageState::RolledBack
+    )
+        && evidence.has_target_revision()
+        && evidence_ref_has_id(evidence.rollback_reentry_ref)
+}
+
+/// Hard rollout law: superseded revisions remain visible until no live
+/// receipt, retained generation, receive base, geo backlog, repair
+/// obligation, or operator claim still depends on their explanation.
+#[must_use]
+pub const fn rollout_superseded_remains_visible_until_clean(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(
+        evidence.stage_state,
+        StorageIntentPolicyStageState::Superseded
+    )
+        && evidence_ref_has_id(evidence.supersession_ref)
+}
+
+// ===== Stage transition predicates =====
+
+/// Stage transition: draft → dry-run.
+///
+/// A draft can become a dry-run when the compiled policy has an identity
+/// and a publication transaction is bound.
+#[must_use]
+pub const fn rollout_can_transition_draft_to_dry_run(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(evidence.stage_state, StorageIntentPolicyStageState::Draft)
+        && evidence.has_compiled_policy()
+        && evidence_ref_has_id(evidence.publication_transaction_ref)
+}
+
+/// Stage transition: dry-run → preflight-admitted.
+///
+/// A dry-run can be preflight-admitted when preflight simulation evidence
+/// is present and not stale, and the evidence query snapshot is bound.
+#[must_use]
+pub const fn rollout_can_transition_dry_run_to_preflight_admitted(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(evidence.stage_state, StorageIntentPolicyStageState::DryRun)
+        && evidence_ref_has_id(evidence.preflight_evidence_ref)
+        && evidence_ref_has_id(evidence.evidence_query_snapshot_ref)
+}
+
+/// Stage transition: preflight-admitted → staged.
+///
+/// Preflight-admitted can be staged when scope is bound, downgrade
+/// authorization is present if required, and in-flight fence is recorded.
+#[must_use]
+pub const fn rollout_can_transition_preflight_admitted_to_staged(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(
+        evidence.stage_state,
+        StorageIntentPolicyStageState::PreflightAdmitted
+    )
+        && evidence.has_scope()
+        && evidence.has_downgrade_authorization_if_required()
+        && evidence.has_in_flight_fence()
+}
+
+/// Stage transition: staged → active-for-new-writes.
+///
+/// Staged becomes active when publication transaction is bound, scope
+/// is set, old-receipt treatment is defined, and the change class is known.
+#[must_use]
+pub const fn rollout_can_transition_staged_to_active(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(evidence.stage_state, StorageIntentPolicyStageState::Staged)
+        && evidence.has_compiled_policy()
+        && evidence.has_publication_transaction()
+        && evidence.has_scope()
+        && evidence.has_old_receipt_treatment()
+        && evidence.has_change_class()
+}
+
+/// Stage transition: active-for-new-writes → converging-existing.
+///
+/// Active becomes converging when new writes are being admitted and
+/// convergence frontier and replacement receipt set are bound.
+#[must_use]
+pub const fn rollout_can_transition_active_to_converging(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(
+        evidence.stage_state,
+        StorageIntentPolicyStageState::ActiveForNewWrites
+    )
+        && evidence_ref_has_id(evidence.convergence_frontier_ref)
+        && evidence_ref_has_id(evidence.replacement_receipt_set_ref)
+}
+
+/// Stage transition: converging-existing → superseded.
+///
+/// Converging becomes superseded when a later revision has replaced it.
+#[must_use]
+pub const fn rollout_can_transition_converging_to_superseded(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(
+        evidence.stage_state,
+        StorageIntentPolicyStageState::ConvergingExisting
+    )
+        && evidence_ref_has_id(evidence.supersession_ref)
+}
+
+/// Stage transition: any active state → rollback-required.
+///
+/// Rollback is required when the stage cannot safely continue.
+#[must_use]
+pub const fn rollout_can_transition_to_rollback_required(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    evidence.stage_state.admits_new_writes()
+        || matches!(
+            evidence.stage_state,
+            StorageIntentPolicyStageState::Staged
+                | StorageIntentPolicyStageState::Blocked
+        )
+}
+
+/// Stage transition: rollback-required → rolled-back.
+///
+/// Rollback is complete when the rollback/re-entry ref is present.
+#[must_use]
+pub const fn rollout_can_transition_rollback_required_to_rolled_back(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(
+        evidence.stage_state,
+        StorageIntentPolicyStageState::RollbackRequired
+    )
+        && evidence_ref_has_id(evidence.rollback_reentry_ref)
+}
+
+/// Stage transition: any active or staged state → blocked.
+///
+/// The rollout becomes blocked when prerequisites are missing.
+#[must_use]
+pub const fn rollout_can_become_blocked(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(
+        evidence.stage_state,
+        StorageIntentPolicyStageState::Staged
+            | StorageIntentPolicyStageState::ActiveForNewWrites
+            | StorageIntentPolicyStageState::ConvergingExisting
+    )
+}
+
+/// Stage transition: blocked → rollback-required.
+///
+/// Blocked can move to rollback-required when intervention is needed.
+#[must_use]
+pub const fn rollout_can_transition_blocked_to_rollback_required(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(evidence.stage_state, StorageIntentPolicyStageState::Blocked)
+}
+
+/// Stage transition: superseded → retired.
+///
+/// Superseded becomes retired when no obligations remain and retention/safe
+/// retirement evidence says the old revision is no longer needed.
+#[must_use]
+pub const fn rollout_can_transition_superseded_to_retired(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(
+        evidence.stage_state,
+        StorageIntentPolicyStageState::Superseded
+    )
+        && !evidence_ref_has_id(evidence.outstanding_obligation_ref)
+        && evidence.has_safe_retirement_evidence()
+}
+
+/// Returns true when the in-flight fence requires new writes to use the
+/// new revision.
+#[must_use]
+pub const fn rollout_fence_splits_new_and_old_writes(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    evidence.stage_state.admits_new_writes()
+        && evidence.in_flight_fence_flags.fenced_new_writes()
+}
+
+/// Returns true when old-receipt treatment permits reading old receipts.
+#[must_use]
+pub const fn rollout_permits_reading_old_receipts(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    !matches!(
+        evidence.old_receipt_treatment,
+        StorageIntentOldReceiptTreatment::Refuse
+            | StorageIntentOldReceiptTreatment::Unknown
+    )
+}
+
+/// Returns true when replacement receipt evidence is required before
+/// claiming convergence for old-revision receipts.
+#[must_use]
+pub const fn rollout_requires_replacement_receipts_for_old_generations(
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> bool {
+    matches!(
+        evidence.old_receipt_treatment,
+        StorageIntentOldReceiptTreatment::RequireConvergence
+    )
+        && evidence_ref_has_id(evidence.replacement_receipt_set_ref)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16220,6 +17202,580 @@ mod tests {
         assert_eq!(
             temporal_evidence_age_ms(evidence, 20000, 10000),
             Some(10000)
+        );
+    }
+
+    // ===== Policy Rollout Evidence tests (Issue #901) =====
+
+    fn rollout_evidence_ref(byte: u8) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = byte;
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    fn publication_ref(byte: u8) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = byte;
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::LocalIntentRecord,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    fn preflight_ref(byte: u8) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = byte;
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::PreflightSimulationEvidence,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    fn query_snapshot_ref(byte: u8) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = byte;
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    fn authz_ref(byte: u8) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = byte;
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::TrustDomainEvidence,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    fn build_rollout_base() -> StorageIntentPolicyRolloutEvidence {
+        let mut compiled_id = [0_u8; 16];
+        compiled_id[0] = 1;
+        StorageIntentPolicyRolloutEvidence {
+            evidence_ref: rollout_evidence_ref(1),
+            compiled_policy_id: StorageIntentPolicyId(compiled_id),
+            compiled_policy_revision: StorageIntentPolicyRevision(1),
+            previous_policy_id: StorageIntentPolicyId::ZERO,
+            previous_policy_revision: StorageIntentPolicyRevision(0),
+            target_policy_id: StorageIntentPolicyId::ZERO,
+            target_policy_revision: StorageIntentPolicyRevision(0),
+            policy_epoch: 1,
+            source_policy_ref: StorageIntentEvidenceRef::default(),
+            source_provenance_mask: 0,
+            source_provenance_refs: StorageIntentEvidenceRefs::default(),
+            publication_transaction_ref: publication_ref(1),
+            change_class: StorageIntentPolicyChangeClass::Strengthen,
+            downgrade_authorization_ref: StorageIntentEvidenceRef::default(),
+            stage_state: StorageIntentPolicyStageState::Draft,
+            scope_selector: StorageIntentObjectScope::default(),
+            old_receipt_treatment: StorageIntentOldReceiptTreatment::Grandfathered,
+            in_flight_fence_flags: StorageIntentInFlightOperationFlags::EMPTY,
+            in_flight_fence_ref: StorageIntentEvidenceRef::default(),
+            convergence_frontier_ref: StorageIntentEvidenceRef::default(),
+            replacement_receipt_set_ref: StorageIntentEvidenceRef::default(),
+            outstanding_obligation_ref: StorageIntentEvidenceRef::default(),
+            old_revision_retention_ref: StorageIntentEvidenceRef::default(),
+            safe_retirement_evidence_ref: StorageIntentEvidenceRef::default(),
+            rollback_reentry_ref: StorageIntentEvidenceRef::default(),
+            supersession_ref: StorageIntentEvidenceRef::default(),
+            refusal_reason: StorageIntentRolloutRefusalReason::None,
+            preflight_evidence_ref: StorageIntentEvidenceRef::default(),
+            temporal_evidence_ref: StorageIntentEvidenceRef::default(),
+            evidence_query_snapshot_ref: StorageIntentEvidenceRef::default(),
+            action_execution_evidence_ref: StorageIntentEvidenceRef::default(),
+            result_refusal_evidence_ref: StorageIntentEvidenceRef::default(),
+            measurement_attribution_evidence_ref: StorageIntentEvidenceRef::default(),
+            feedback_window_ref: StorageIntentEvidenceRef::default(),
+            tenant_isolation_evidence_ref: StorageIntentEvidenceRef::default(),
+            capacity_admission_evidence_ref: StorageIntentEvidenceRef::default(),
+            decision_frontier_evidence_ref: StorageIntentEvidenceRef::default(),
+            membership_evidence_ref: StorageIntentEvidenceRef::default(),
+            trust_domain_evidence_ref: StorageIntentEvidenceRef::default(),
+            recovery_evidence_ref: StorageIntentEvidenceRef::default(),
+            media_capability_evidence_ref: StorageIntentEvidenceRef::default(),
+            metadata_namespace_evidence_ref: StorageIntentEvidenceRef::default(),
+        }
+    }
+
+    #[test]
+    fn rollout_change_class_enums_encode_decode_roundtrip() {
+        let classes = [
+            StorageIntentPolicyChangeClass::Unknown,
+            StorageIntentPolicyChangeClass::Strengthen,
+            StorageIntentPolicyChangeClass::Weaken,
+            StorageIntentPolicyChangeClass::Lateral,
+            StorageIntentPolicyChangeClass::Incompatible,
+            StorageIntentPolicyChangeClass::EmergencyOverride,
+            StorageIntentPolicyChangeClass::Rollback,
+            StorageIntentPolicyChangeClass::ReEntry,
+            StorageIntentPolicyChangeClass::Retirement,
+        ];
+        for c in &classes {
+            let disc = c.to_discriminant();
+            let decoded = StorageIntentPolicyChangeClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*c), "roundtrip failed for {:?}", c.as_str());
+        }
+        assert_eq!(StorageIntentPolicyChangeClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn rollout_weakening_classes_require_authorization() {
+        assert!(StorageIntentPolicyChangeClass::Weaken.is_weakening());
+        assert!(StorageIntentPolicyChangeClass::Incompatible.is_weakening());
+        assert!(StorageIntentPolicyChangeClass::EmergencyOverride.is_weakening());
+        assert!(!StorageIntentPolicyChangeClass::Strengthen.is_weakening());
+        assert!(!StorageIntentPolicyChangeClass::Lateral.is_weakening());
+        assert!(!StorageIntentPolicyChangeClass::Rollback.is_weakening());
+    }
+
+    #[test]
+    fn rollout_weakening_classes_require_downgrade_authz() {
+        assert!(StorageIntentPolicyChangeClass::Weaken.requires_downgrade_authorization());
+        assert!(StorageIntentPolicyChangeClass::Incompatible.requires_downgrade_authorization());
+        assert!(StorageIntentPolicyChangeClass::EmergencyOverride.requires_downgrade_authorization());
+        assert!(!StorageIntentPolicyChangeClass::Strengthen.requires_downgrade_authorization());
+    }
+
+    #[test]
+    fn rollout_stage_state_enums_encode_decode_roundtrip() {
+        let states = [
+            StorageIntentPolicyStageState::Unknown,
+            StorageIntentPolicyStageState::Draft,
+            StorageIntentPolicyStageState::DryRun,
+            StorageIntentPolicyStageState::PreflightAdmitted,
+            StorageIntentPolicyStageState::Staged,
+            StorageIntentPolicyStageState::ActiveForNewWrites,
+            StorageIntentPolicyStageState::ConvergingExisting,
+            StorageIntentPolicyStageState::Blocked,
+            StorageIntentPolicyStageState::RollbackRequired,
+            StorageIntentPolicyStageState::RolledBack,
+            StorageIntentPolicyStageState::Superseded,
+            StorageIntentPolicyStageState::Retired,
+            StorageIntentPolicyStageState::Refused,
+        ];
+        for s in &states {
+            let disc = s.to_discriminant();
+            let decoded = StorageIntentPolicyStageState::from_discriminant(disc);
+            assert_eq!(decoded, Some(*s), "roundtrip failed for {:?}", s.as_str());
+        }
+        assert_eq!(StorageIntentPolicyStageState::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn rollout_active_states_admit_new_writes() {
+        assert!(StorageIntentPolicyStageState::ActiveForNewWrites.admits_new_writes());
+        assert!(StorageIntentPolicyStageState::ConvergingExisting.admits_new_writes());
+        assert!(!StorageIntentPolicyStageState::Draft.admits_new_writes());
+        assert!(!StorageIntentPolicyStageState::DryRun.admits_new_writes());
+        assert!(!StorageIntentPolicyStageState::Staged.admits_new_writes());
+        assert!(!StorageIntentPolicyStageState::Refused.admits_new_writes());
+    }
+
+    #[test]
+    fn rollout_terminal_states_are_terminal() {
+        assert!(StorageIntentPolicyStageState::Superseded.is_terminal());
+        assert!(StorageIntentPolicyStageState::Retired.is_terminal());
+        assert!(StorageIntentPolicyStageState::Refused.is_terminal());
+        assert!(!StorageIntentPolicyStageState::ActiveForNewWrites.is_terminal());
+    }
+
+    #[test]
+    fn old_receipt_treatment_enums_encode_decode_roundtrip() {
+        let treatments = [
+            StorageIntentOldReceiptTreatment::Unknown,
+            StorageIntentOldReceiptTreatment::Grandfathered,
+            StorageIntentOldReceiptTreatment::RequireConvergence,
+            StorageIntentOldReceiptTreatment::UnusableForNewClaims,
+            StorageIntentOldReceiptTreatment::Refuse,
+        ];
+        for t in &treatments {
+            let disc = t.to_discriminant();
+            let decoded = StorageIntentOldReceiptTreatment::from_discriminant(disc);
+            assert_eq!(decoded, Some(*t), "roundtrip failed for {:?}", t.as_str());
+        }
+        assert_eq!(StorageIntentOldReceiptTreatment::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn rollout_refusal_reason_enums_encode_decode_roundtrip() {
+        let reasons = [
+            StorageIntentRolloutRefusalReason::None,
+            StorageIntentRolloutRefusalReason::StalePolicySource,
+            StorageIntentRolloutRefusalReason::ConflictingOverrides,
+            StorageIntentRolloutRefusalReason::MissingDowngradeAuthorization,
+            StorageIntentRolloutRefusalReason::UnsafeDowngrade,
+            StorageIntentRolloutRefusalReason::InFlightFenceFailure,
+            StorageIntentRolloutRefusalReason::ConvergenceDebt,
+            StorageIntentRolloutRefusalReason::ValidationGateFailure,
+            StorageIntentRolloutRefusalReason::UnsupportedCombination,
+            StorageIntentRolloutRefusalReason::MissingPreflightEvidence,
+            StorageIntentRolloutRefusalReason::StalePreflightEvidence,
+            StorageIntentRolloutRefusalReason::MissingEvidenceQuerySnapshot,
+            StorageIntentRolloutRefusalReason::MissingTemporalEvidence,
+            StorageIntentRolloutRefusalReason::StageDeadlineCrossed,
+            StorageIntentRolloutRefusalReason::MissingRunbookStep,
+        ];
+        for r in &reasons {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentRolloutRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+        assert_eq!(StorageIntentRolloutRefusalReason::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn in_flight_flags_combine_and_test() {
+        let fenced = StorageIntentInFlightOperationFlags::WRITES
+            .with(StorageIntentInFlightOperationFlags::FSYNC_FUA);
+        assert!(fenced.has(StorageIntentInFlightOperationFlags::WRITES));
+        assert!(fenced.has(StorageIntentInFlightOperationFlags::FSYNC_FUA));
+        assert!(!fenced.has(StorageIntentInFlightOperationFlags::RELOCATION));
+        assert!(fenced.fenced_new_writes());
+        assert!(!fenced.has_any_background_fence());
+    }
+
+    #[test]
+    fn rollout_has_compiled_policy_when_bound() {
+        let evidence = build_rollout_base();
+        assert!(evidence.has_compiled_policy());
+        assert!(evidence.has_publication_transaction());
+    }
+
+    #[test]
+    fn rollout_default_is_not_compiled() {
+        let evidence = StorageIntentPolicyRolloutEvidence::default();
+        assert!(!evidence.has_compiled_policy());
+        assert!(!evidence.has_publication_transaction());
+    }
+
+    #[test]
+    fn rollout_publication_is_not_activation_law() {
+        let evidence = build_rollout_base();
+        // Published but not yet active.
+        assert!(rollout_publication_is_not_activation(evidence));
+        assert!(!evidence.stage_state.admits_new_writes());
+    }
+
+    #[test]
+    fn test_activation_requires_publication_scope_stage_fence() {
+        let mut evidence = build_rollout_base();
+        // Missing scope, stage, fence.
+        assert!(!rollout_activation_requires_publication_scope_stage_fence(evidence));
+
+        // Add publication, scope, stage, and mark not refused.
+        evidence.publication_transaction_ref = publication_ref(2);
+        evidence.scope_selector.dataset_id = StorageIntentDomainId([1_u8; 16]);
+        evidence.stage_state = StorageIntentPolicyStageState::ActiveForNewWrites;
+        assert!(!rollout_activation_requires_publication_scope_stage_fence(evidence));
+
+        evidence.in_flight_fence_flags = StorageIntentInFlightOperationFlags::ALL_NEW_WRITE;
+        evidence.in_flight_fence_ref = rollout_evidence_ref(3);
+        assert!(rollout_activation_requires_publication_scope_stage_fence(evidence));
+    }
+
+    #[test]
+    fn rollout_strengthen_new_writes_only_law() {
+        let mut evidence = build_rollout_base();
+        evidence.change_class = StorageIntentPolicyChangeClass::Strengthen;
+        evidence.old_receipt_treatment = StorageIntentOldReceiptTreatment::Grandfathered;
+        assert!(rollout_strengthen_new_writes_only(evidence));
+
+        // Grandfathered is valid for strengthen.
+        evidence.old_receipt_treatment = StorageIntentOldReceiptTreatment::RequireConvergence;
+        assert!(rollout_strengthen_new_writes_only(evidence));
+
+        // Refuse is not valid for strengthen.
+        evidence.old_receipt_treatment = StorageIntentOldReceiptTreatment::Refuse;
+        assert!(!rollout_strengthen_new_writes_only(evidence));
+    }
+
+    #[test]
+    fn rollout_weaken_requires_authorization_law() {
+        let mut evidence = build_rollout_base();
+        evidence.change_class = StorageIntentPolicyChangeClass::Strengthen;
+        // Strengthen does not require downgrade authorization.
+        assert!(rollout_weaken_requires_authorization_and_audit(evidence));
+
+        evidence.change_class = StorageIntentPolicyChangeClass::Weaken;
+        // Weaken with missing authorization ref should fail.
+        assert!(!rollout_weaken_requires_authorization_and_audit(evidence));
+
+        evidence.downgrade_authorization_ref = authz_ref(1);
+        assert!(rollout_weaken_requires_authorization_and_audit(evidence));
+    }
+
+    #[test]
+    fn test_operation_chooses_revision_by_receipt_and_fence() {
+        let mut evidence = build_rollout_base();
+        evidence.in_flight_fence_flags = StorageIntentInFlightOperationFlags::WRITES;
+        let old_revision = StorageIntentPolicyRevision(0);
+
+        // Fenced write without a fence record cannot select the new revision.
+        assert!(!rollout_operation_chooses_revision_by_receipt_and_fence(
+            evidence,
+            old_revision,
+            StorageIntentInFlightOperationFlags::WRITES,
+        ));
+
+        evidence.in_flight_fence_ref = rollout_evidence_ref(11);
+        // Fenced write under new revision — operation is fenced, so true.
+        assert!(rollout_operation_chooses_revision_by_receipt_and_fence(
+            evidence,
+            old_revision,
+            StorageIntentInFlightOperationFlags::WRITES,
+        ));
+
+        // Non-fenced operation with old receipt revision — uses receipt identity.
+        assert!(rollout_operation_chooses_revision_by_receipt_and_fence(
+            evidence,
+            StorageIntentPolicyRevision(7),
+            StorageIntentInFlightOperationFlags::RELOCATION,
+        ));
+        assert!(!rollout_operation_chooses_revision_by_receipt_and_fence(
+            evidence,
+            StorageIntentPolicyRevision(0),
+            StorageIntentInFlightOperationFlags::RELOCATION,
+        ));
+        assert!(!rollout_operation_chooses_revision_by_receipt_and_fence(
+            evidence,
+            StorageIntentPolicyRevision(7),
+            StorageIntentInFlightOperationFlags::EMPTY,
+        ));
+    }
+
+    #[test]
+    fn test_relocation_crosses_revision_boundary() {
+        let mut evidence = build_rollout_base();
+        let old_revision = StorageIntentPolicyRevision(0);
+
+        // Same revision — no boundary crossing.
+        assert!(!rollout_relocation_crosses_revision_boundary(evidence, StorageIntentPolicyRevision(1)));
+
+        // Different revision without replacement receipt set — fails.
+        assert!(!rollout_relocation_crosses_revision_boundary(evidence, old_revision));
+
+        // Add replacement receipt set and outstanding obligation refs.
+        evidence.replacement_receipt_set_ref = rollout_evidence_ref(2);
+        evidence.outstanding_obligation_ref = rollout_evidence_ref(3);
+        assert!(rollout_relocation_crosses_revision_boundary(evidence, old_revision));
+    }
+
+    #[test]
+    fn test_rollback_is_receipt_producing() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::RolledBack;
+        let mut target_id = [0_u8; 16];
+        target_id[0] = 2;
+        evidence.target_policy_id = StorageIntentPolicyId(target_id);
+        evidence.target_policy_revision = StorageIntentPolicyRevision(2);
+        evidence.rollback_reentry_ref = rollout_evidence_ref(10);
+        assert!(rollout_rollback_is_receipt_producing(evidence));
+    }
+
+    #[test]
+    fn test_superseded_remains_visible() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::Superseded;
+        evidence.supersession_ref = rollout_evidence_ref(11);
+        assert!(rollout_superseded_remains_visible_until_clean(evidence));
+    }
+
+    #[test]
+    fn rollout_stage_transition_draft_to_dry_run() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::Draft;
+        assert!(rollout_can_transition_draft_to_dry_run(evidence));
+
+        // Missing publication ref blocks transition.
+        evidence.publication_transaction_ref = StorageIntentEvidenceRef::default();
+        assert!(!rollout_can_transition_draft_to_dry_run(evidence));
+    }
+
+    #[test]
+    fn rollout_stage_transition_dry_run_to_preflight_admitted() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::DryRun;
+        evidence.preflight_evidence_ref = preflight_ref(1);
+        evidence.evidence_query_snapshot_ref = query_snapshot_ref(1);
+        assert!(rollout_can_transition_dry_run_to_preflight_admitted(evidence));
+    }
+
+    #[test]
+    fn rollout_stage_transition_preflight_admitted_to_staged() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::PreflightAdmitted;
+        evidence.scope_selector.dataset_id = StorageIntentDomainId([1_u8; 16]);
+        evidence.change_class = StorageIntentPolicyChangeClass::Strengthen;
+        evidence.in_flight_fence_ref = rollout_evidence_ref(1);
+        evidence.in_flight_fence_flags = StorageIntentInFlightOperationFlags::WRITES;
+        assert!(rollout_can_transition_preflight_admitted_to_staged(evidence));
+
+        // Weaken without authorization blocks.
+        evidence.change_class = StorageIntentPolicyChangeClass::Weaken;
+        assert!(!rollout_can_transition_preflight_admitted_to_staged(evidence));
+
+        // Weaken with authorization passes.
+        evidence.downgrade_authorization_ref = authz_ref(1);
+        assert!(rollout_can_transition_preflight_admitted_to_staged(evidence));
+    }
+
+    #[test]
+    fn rollout_stage_transition_staged_to_active() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::Staged;
+        evidence.scope_selector.dataset_id = StorageIntentDomainId([1_u8; 16]);
+        evidence.old_receipt_treatment = StorageIntentOldReceiptTreatment::Grandfathered;
+        assert!(rollout_can_transition_staged_to_active(evidence));
+    }
+
+    #[test]
+    fn rollout_can_become_blocked_from_staged_or_active() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::Staged;
+        assert!(rollout_can_become_blocked(evidence));
+
+        evidence.stage_state = StorageIntentPolicyStageState::ActiveForNewWrites;
+        assert!(rollout_can_become_blocked(evidence));
+
+        evidence.stage_state = StorageIntentPolicyStageState::ConvergingExisting;
+        assert!(rollout_can_become_blocked(evidence));
+
+        evidence.stage_state = StorageIntentPolicyStageState::Draft;
+        assert!(!rollout_can_become_blocked(evidence));
+    }
+
+    #[test]
+    fn rollout_blocked_to_rollback_required() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::Blocked;
+        assert!(rollout_can_transition_blocked_to_rollback_required(evidence));
+    }
+
+    #[test]
+    fn rollout_rollback_required_to_rolled_back() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::RollbackRequired;
+        // Missing rollback reentry ref — cannot complete rollback.
+        assert!(!rollout_can_transition_rollback_required_to_rolled_back(evidence));
+
+        evidence.rollback_reentry_ref = rollout_evidence_ref(20);
+        assert!(rollout_can_transition_rollback_required_to_rolled_back(evidence));
+    }
+
+    #[test]
+    fn rollout_superseded_to_retired() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::Superseded;
+        // Missing retention/retirement proof — cannot retire.
+        assert!(!rollout_can_transition_superseded_to_retired(evidence));
+
+        evidence.old_revision_retention_ref =
+            evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 31);
+        evidence.safe_retirement_evidence_ref =
+            evidence_ref(StorageIntentEvidenceKind::LifecycleGenerationEvidence, 32);
+        // No outstanding obligations and retention/retirement proof — can retire.
+        assert!(rollout_can_transition_superseded_to_retired(evidence));
+
+        // With outstanding obligations — cannot retire.
+        evidence.outstanding_obligation_ref = rollout_evidence_ref(30);
+        assert!(!rollout_can_transition_superseded_to_retired(evidence));
+    }
+
+    #[test]
+    fn test_fence_splits_new_and_old_writes() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::ActiveForNewWrites;
+        evidence.in_flight_fence_flags = StorageIntentInFlightOperationFlags::WRITES
+            .with(StorageIntentInFlightOperationFlags::FSYNC_FUA);
+        assert!(rollout_fence_splits_new_and_old_writes(evidence));
+    }
+
+    #[test]
+    fn test_permits_reading_old_receipts() {
+        let mut evidence = build_rollout_base();
+        evidence.old_receipt_treatment = StorageIntentOldReceiptTreatment::Grandfathered;
+        assert!(rollout_permits_reading_old_receipts(evidence));
+
+        evidence.old_receipt_treatment = StorageIntentOldReceiptTreatment::Refuse;
+        assert!(!rollout_permits_reading_old_receipts(evidence));
+    }
+
+    #[test]
+    fn test_requires_replacement_receipts_for_old_generations() {
+        let mut evidence = build_rollout_base();
+        evidence.old_receipt_treatment = StorageIntentOldReceiptTreatment::RequireConvergence;
+        evidence.replacement_receipt_set_ref = rollout_evidence_ref(40);
+        assert!(rollout_requires_replacement_receipts_for_old_generations(evidence));
+
+        evidence.replacement_receipt_set_ref = StorageIntentEvidenceRef::default();
+        assert!(!rollout_requires_replacement_receipts_for_old_generations(evidence));
+    }
+
+    #[test]
+    fn rollout_is_refused_when_stage_state_is_refused() {
+        let mut evidence = build_rollout_base();
+        evidence.stage_state = StorageIntentPolicyStageState::Refused;
+        assert!(evidence.is_refused());
+    }
+
+    #[test]
+    fn rollout_is_refused_when_refusal_reason_is_present() {
+        let mut evidence = build_rollout_base();
+        evidence.refusal_reason = StorageIntentRolloutRefusalReason::UnsafeDowngrade;
+        assert!(evidence.is_refused());
+    }
+
+    #[test]
+    fn rollout_has_downgrade_authorization_if_required() {
+        let mut evidence = build_rollout_base();
+        // Strengthen does not require authorization.
+        evidence.change_class = StorageIntentPolicyChangeClass::Strengthen;
+        assert!(evidence.has_downgrade_authorization_if_required());
+
+        // Weaken without authorization fails.
+        evidence.change_class = StorageIntentPolicyChangeClass::Weaken;
+        assert!(!evidence.has_downgrade_authorization_if_required());
+
+        // Weaken with authorization passes.
+        evidence.downgrade_authorization_ref = authz_ref(1);
+        assert!(evidence.has_downgrade_authorization_if_required());
+    }
+
+    #[test]
+    fn rollout_change_class_display_outputs_stable_spelling() {
+        assert_eq!(
+            StorageIntentPolicyChangeClass::Strengthen.as_str(),
+            "strengthen"
+        );
+        assert_eq!(
+            StorageIntentPolicyChangeClass::Weaken.as_str(),
+            "weaken"
+        );
+    }
+
+    #[test]
+    fn rollout_stage_display_outputs_stable_spelling() {
+        assert_eq!(
+            StorageIntentPolicyStageState::ActiveForNewWrites.as_str(),
+            "active-for-new-writes"
+        );
+        assert_eq!(
+            StorageIntentPolicyStageState::RolledBack.as_str(),
+            "rolled-back"
         );
     }
 }
