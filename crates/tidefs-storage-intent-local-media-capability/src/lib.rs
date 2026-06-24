@@ -1307,7 +1307,7 @@ mod tests {
                 .facts(),
             )
             .with_block_io(ublk.block_io_facts(evidence(5)))
-            .with_atomicity(ublk.atomicity_facts(0, true, evidence(6)))
+            .with_atomicity(ublk.atomicity_facts(4096, true, evidence(6)))
             .with_geometry(ublk.geometry_facts(evidence(7)))
             .with_health(identity.health_facts(evidence(8)))
             .with_freshness(identity.freshness_facts(evidence(9)));
@@ -1318,6 +1318,7 @@ mod tests {
         assert_eq!(record.media_class, StorageMediaClass::NvmeFlash);
         assert_eq!(record.flush_ordering, MediaFlushOrderingClass::FlushAndFua);
         assert_eq!(record.physical_block_bytes, 4096);
+        assert_eq!(record.atomic_write_unit_bytes, 4096);
         assert_eq!(record.optimal_io_bytes, 131_072);
     }
 
