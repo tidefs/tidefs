@@ -650,10 +650,11 @@ pub fn plan_storage_intent_placement(
         .filter(|report| report.legal)
         .map(|report| report.failure_domain_key)
         .collect();
-    if legal_domains.len() < request.min_distinct_failure_domains {
+    let selectable_failure_domains = legal_domains.len().min(request.required_target_count);
+    if selectable_failure_domains < request.min_distinct_failure_domains {
         reasons.push(StorageIntentPlacementReason::NotEnoughFailureDomains {
             required: request.min_distinct_failure_domains,
-            available: legal_domains.len(),
+            available: selectable_failure_domains,
         });
     }
 
@@ -662,6 +663,10 @@ pub fn plan_storage_intent_placement(
         request.required_target_count,
         request.min_distinct_failure_domains,
     );
+    let selected_failure_domains: BTreeSet<u64> = selected_indices
+        .iter()
+        .map(|index| candidate_reports[*index].failure_domain_key)
+        .collect();
     let selected_index_set: BTreeSet<usize> = selected_indices.iter().copied().collect();
     for (index, report) in candidate_reports.iter_mut().enumerate() {
         report.selected = selected_index_set.contains(&index);
@@ -673,6 +678,7 @@ pub fn plan_storage_intent_placement(
         .collect::<Vec<_>>();
 
     let admitted = selected_targets.len() == request.required_target_count
+        && selected_failure_domains.len() >= request.min_distinct_failure_domains
         && !has_blocking_request_reason(&reasons);
 
     StorageIntentPlacementPlan {
@@ -2011,6 +2017,80 @@ mod tests {
             .candidate_reports
             .iter()
             .any(|report| report.target_id == 2 && report.legal && !report.selected));
+    }
+
+    #[test]
+    fn plan_rejects_failure_domain_floor_wider_than_selected_set() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let first = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        let second = candidate(
+            2,
+            20,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                2,
+            ),
+            &[first, second],
+        );
+
+        assert!(!plan.admitted);
+        assert_eq!(plan.selected_targets.len(), 1);
+        assert_eq!(plan.legal_targets(), vec![1, 2]);
+        assert!(matches!(
+            plan.reasons.last(),
+            Some(StorageIntentPlacementReason::NotEnoughFailureDomains {
+                required: 2,
+                available: 1
+            })
+        ));
+
+        let legacy = evaluate_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                2,
+            ),
+            &[
+                candidate(
+                    1,
+                    10,
+                    StorageMediaRole::PlacementAuthority,
+                    StorageIntentGuaranteeClass::FullPlacement,
+                    FailureDomainMask::NODE,
+                    StorageMediaClass::NvmeFlash,
+                ),
+                candidate(
+                    2,
+                    20,
+                    StorageMediaRole::PlacementAuthority,
+                    StorageIntentGuaranteeClass::FullPlacement,
+                    FailureDomainMask::NODE,
+                    StorageMediaClass::NvmeFlash,
+                ),
+            ],
+        );
+        assert!(!legacy.admitted);
+        assert!(legacy.has_refusal(StorageIntentRefusalReason::FailureDomainNotMet));
     }
 
     #[test]
