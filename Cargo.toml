@@ -304,6 +304,7 @@ tidefs-shard-group = { path = "crates/tidefs-shard-group" }
 tidefs-space-accounting = { path = "crates/tidefs-space-accounting" }
 tidefs-spacemap-allocator = { path = "crates/tidefs-spacemap-allocator" }
 tidefs-storage-intent-core = { path = "crates/tidefs-storage-intent-core" }
+tidefs-storage-intent-local-media-capability = { path = "crates/tidefs-storage-intent-local-media-capability" }
 tidefs-storage-intent-read-serving = { path = "crates/tidefs-storage-intent-read-serving" }
 tidefs-storage-intent-remote-media-capability = { path = "crates/tidefs-storage-intent-remote-media-capability" }
 tidefs-storage-intent-workload-signals = { path = "crates/tidefs-storage-intent-workload-signals" }

@@ -18,6 +18,8 @@ evidence is stale, contradicted, compacted, or superseded.
 """
 
 [dependencies]
+tidefs-storage-intent-local-media-capability = { workspace = true }
+tidefs-storage-intent-remote-media-capability = { workspace = true }
 tidefs-storage-intent-core = { workspace = true }
 
 [lib]
