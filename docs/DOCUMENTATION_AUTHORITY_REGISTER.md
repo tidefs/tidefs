@@ -409,6 +409,36 @@ comparator evidence required by #928/#930:
 - `docs/WHOLE_REPO_REVIEW.md`: incumbent references are fail-closed review
   blockers only.
 
+Non-overlapping child slices completed the cluster-by-cluster audit and added
+Incumbent Comparison Boundary sections to the following file groups. Each
+grouped file is classified as historical/design input only for its comparison
+text; no product-facing successor, superiority, or parity wording exists in
+any of these files without a #875 claim id and #928/#930 comparator evidence.
+
+Child slices (all merged):
+- #933 / PR #955: background jobs, deferred cleanup, reclaim, orphan-index,
+  and universal-cursor comparison wording.
+- #934 / PR #956: dataset lifecycle, snapshot, send/receive, pool import/export,
+  device topology, rename, reflink/copy-offload, and operator lifecycle
+  comparison wording.
+- #935 / PR #946: cache, mmap, RAM authority, sync intent, latency/throughput,
+  QoS, and access-pattern comparison wording.
+- #936 / PR #937: integrity, checksum, transform, scrub/repair, erasure-coding,
+  SOTA, and coverage-matrix comparison wording.
+- #965: online defrag BPR subordinate to storage-intent relocation gates.
+
+Consolidation closure (this commit):
+- `docs/ARCHITECTURE.md`: ZFS and CephFS "Where TideFS is ahead" / "gaps to
+  close" comparison sections are historical design input, not current capability
+  or successor claims. A Incumbent Comparison Boundary section now gates both
+  comparison blocks, and the former "CephFS successor claims" product-surface
+  line is rewritten as a non-claim scope note citing #875/#928/#930.
+
+This consolidation closes the #931 audit. No live doc contains un-gated
+incumbent-comparison, successor, or product-superiority wording. Any future
+product-facing comparison must route through #875 claim ids and #928/#930
+comparator evidence.
+
 ## Initial Open Queue Resolution (#689)
 
 Classified for TFR-019 / GitHub issue #689 on 2026-06-21 after reviewing the
