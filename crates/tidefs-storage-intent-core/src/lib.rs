@@ -1192,6 +1192,11 @@ pub const STORAGE_INTENT_DECISION_HARD_GATES: usize = 20;
 /// Bounded score entries retained by one decision frontier.
 pub const STORAGE_INTENT_DECISION_SCORE_ENTRIES: usize = StorageIntentDecisionScoreDimension::COUNT;
 
+#[allow(clippy::cast_lossless)]
+const fn decision_frontier_len(len: u8) -> usize {
+    len as usize
+}
+
 /// Authority mode for one decision frontier.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -1352,7 +1357,7 @@ impl StorageIntentDecisionHardGateResultSet {
     /// Number of retained hard-gate records.
     #[must_use]
     pub const fn len(self) -> usize {
-        self.len as usize
+        decision_frontier_len(self.len)
     }
 
     /// Append a hard-gate record if capacity remains.
@@ -1360,10 +1365,10 @@ impl StorageIntentDecisionHardGateResultSet {
         &mut self,
         gate: StorageIntentDecisionHardGateResult,
     ) -> Result<(), EvidenceRefsError> {
-        if self.len as usize >= STORAGE_INTENT_DECISION_HARD_GATES {
+        if decision_frontier_len(self.len) >= STORAGE_INTENT_DECISION_HARD_GATES {
             return Err(EvidenceRefsError::Full);
         }
-        self.gates[self.len as usize] = gate;
+        self.gates[decision_frontier_len(self.len)] = gate;
         self.len += 1;
         Ok(())
     }
@@ -1372,7 +1377,7 @@ impl StorageIntentDecisionHardGateResultSet {
     #[must_use]
     pub const fn has_non_passing_gate(self) -> bool {
         let mut index = 0;
-        while index < self.len as usize {
+        while index < decision_frontier_len(self.len) {
             if !self.gates[index].verdict.admits_scoring() {
                 return true;
             }
@@ -1416,6 +1421,13 @@ pub enum StorageIntentDecisionScoreDimension {
 
 impl StorageIntentDecisionScoreDimension {
     pub const COUNT: usize = 18;
+    pub const COUNT_U8: u8 = 18;
+
+    /// Return this score dimension's requirement-mask bit.
+    #[must_use]
+    pub const fn bit(self) -> u64 {
+        1_u64 << self.to_discriminant()
+    }
 }
 
 /// Unit attached to a known score dimension.
@@ -1500,7 +1512,7 @@ impl StorageIntentDecisionScoreVector {
     /// Number of retained score entries.
     #[must_use]
     pub const fn len(self) -> usize {
-        self.len as usize
+        decision_frontier_len(self.len)
     }
 
     /// Append a score entry if capacity remains.
@@ -1508,10 +1520,10 @@ impl StorageIntentDecisionScoreVector {
         &mut self,
         entry: StorageIntentDecisionScoreEntry,
     ) -> Result<(), EvidenceRefsError> {
-        if self.len as usize >= STORAGE_INTENT_DECISION_SCORE_ENTRIES {
+        if decision_frontier_len(self.len) >= STORAGE_INTENT_DECISION_SCORE_ENTRIES {
             return Err(EvidenceRefsError::Full);
         }
-        self.entries[self.len as usize] = entry;
+        self.entries[decision_frontier_len(self.len)] = entry;
         self.len += 1;
         Ok(())
     }
@@ -1523,8 +1535,10 @@ impl StorageIntentDecisionScoreVector {
         dimension: StorageIntentDecisionScoreDimension,
     ) -> StorageIntentDecisionScoreState {
         let mut index = 0;
-        while index < self.len as usize {
-            if self.entries[index].dimension as u8 == dimension as u8 {
+        while index < decision_frontier_len(self.len) {
+            if self.entries[index].dimension.to_discriminant()
+                == dimension.to_discriminant()
+            {
                 return self.entries[index].state;
             }
             index += 1;
@@ -1539,7 +1553,7 @@ impl StorageIntentDecisionScoreVector {
         required: StorageIntentDecisionScoreRequirementMask,
     ) -> bool {
         let mut raw = 0_u8;
-        while raw < StorageIntentDecisionScoreDimension::COUNT as u8 {
+        while raw < StorageIntentDecisionScoreDimension::COUNT_U8 {
             let bit = 1_u64 << raw;
             if (required.0 & bit) != 0 {
                 let dimension = match StorageIntentDecisionScoreDimension::from_discriminant(raw) {
@@ -1570,25 +1584,25 @@ pub struct StorageIntentDecisionScoreRequirementMask(pub u64);
 impl StorageIntentDecisionScoreRequirementMask {
     pub const EMPTY: Self = Self(0);
     pub const AUTHORITY_MINIMUM: Self = Self(
-        (1_u64 << StorageIntentDecisionScoreDimension::Latency as u8)
-            | (1_u64 << StorageIntentDecisionScoreDimension::Tail as u8)
-            | (1_u64 << StorageIntentDecisionScoreDimension::Throughput as u8)
-            | (1_u64 << StorageIntentDecisionScoreDimension::MediaWriteCost as u8)
-            | (1_u64 << StorageIntentDecisionScoreDimension::CapacityCost as u8)
-            | (1_u64 << StorageIntentDecisionScoreDimension::RecoveryRpoRisk as u8)
-            | (1_u64 << StorageIntentDecisionScoreDimension::PaybackRisk as u8),
+        StorageIntentDecisionScoreDimension::Latency.bit()
+            | StorageIntentDecisionScoreDimension::Tail.bit()
+            | StorageIntentDecisionScoreDimension::Throughput.bit()
+            | StorageIntentDecisionScoreDimension::MediaWriteCost.bit()
+            | StorageIntentDecisionScoreDimension::CapacityCost.bit()
+            | StorageIntentDecisionScoreDimension::RecoveryRpoRisk.bit()
+            | StorageIntentDecisionScoreDimension::PaybackRisk.bit(),
     );
 
     /// Construct a one-dimension requirement.
     #[must_use]
     pub const fn from_dimension(dimension: StorageIntentDecisionScoreDimension) -> Self {
-        Self(1_u64 << dimension as u8)
+        Self(dimension.bit())
     }
 
     /// Add one required dimension.
     #[must_use]
     pub const fn with(self, dimension: StorageIntentDecisionScoreDimension) -> Self {
-        Self(self.0 | (1_u64 << dimension as u8))
+        Self(self.0 | dimension.bit())
     }
 }
 
@@ -1665,7 +1679,7 @@ impl StorageIntentDecisionCandidateSet {
     /// Number of retained candidates.
     #[must_use]
     pub const fn len(self) -> usize {
-        self.len as usize
+        decision_frontier_len(self.len)
     }
 
     /// Append a candidate if capacity remains.
@@ -1673,10 +1687,10 @@ impl StorageIntentDecisionCandidateSet {
         &mut self,
         candidate: StorageIntentDecisionCandidateRecord,
     ) -> Result<(), EvidenceRefsError> {
-        if self.len as usize >= STORAGE_INTENT_DECISION_FRONTIER_CANDIDATES {
+        if decision_frontier_len(self.len) >= STORAGE_INTENT_DECISION_FRONTIER_CANDIDATES {
             return Err(EvidenceRefsError::Full);
         }
-        self.candidates[self.len as usize] = candidate;
+        self.candidates[decision_frontier_len(self.len)] = candidate;
         self.len += 1;
         Ok(())
     }
@@ -1685,10 +1699,11 @@ impl StorageIntentDecisionCandidateSet {
     #[must_use]
     pub const fn has_non_legal_candidate(self) -> bool {
         let mut index = 0;
-        while index < self.len as usize {
-            if self.candidates[index].status as u8
-                != StorageIntentDecisionCandidateStatus::Legal as u8
-            {
+        while index < decision_frontier_len(self.len) {
+            if !matches!(
+                self.candidates[index].status,
+                StorageIntentDecisionCandidateStatus::Legal
+            ) {
                 return true;
             }
             index += 1;
@@ -1700,7 +1715,7 @@ impl StorageIntentDecisionCandidateSet {
     #[must_use]
     pub const fn illegal_candidates_are_unscored(self) -> bool {
         let mut index = 0;
-        while index < self.len as usize {
+        while index < decision_frontier_len(self.len) {
             let candidate = self.candidates[index];
             if !candidate.status.may_reach_scoring() && candidate.has_score() {
                 return false;
@@ -1717,7 +1732,7 @@ impl StorageIntentDecisionCandidateSet {
             return false;
         }
         let mut index = 0;
-        while index < self.len as usize {
+        while index < decision_frontier_len(self.len) {
             if bytes32_equal(self.candidates[index].candidate_id.0, candidate_id.0) {
                 return true;
             }
@@ -1809,7 +1824,7 @@ impl StorageIntentDecisionSelectionRecord {
     /// Returns true when a tie-break selection is deterministic and evidence-backed.
     #[must_use]
     pub const fn tie_breaker_is_deterministic(self) -> bool {
-        if self.reason as u8 != StorageIntentDecisionSelectionReason::TieBreak as u8 {
+        if !matches!(self.reason, StorageIntentDecisionSelectionReason::TieBreak) {
             return true;
         }
         self.tie_breaker.is_deterministic()
@@ -1820,8 +1835,8 @@ impl StorageIntentDecisionSelectionRecord {
     /// Returns true when the selected state admits authority-changing work.
     #[must_use]
     pub const fn is_admitted(self) -> bool {
-        self.state as u8 == StorageIntentDecisionSelectedState::Admitted as u8
-            && self.refusal as u16 == StorageIntentRefusalReason::None as u16
+        matches!(self.state, StorageIntentDecisionSelectedState::Admitted)
+            && matches!(self.refusal, StorageIntentRefusalReason::None)
             && !bytes32_are_zero(self.selected_plan_id.0)
     }
 }
@@ -1914,7 +1929,10 @@ impl StorageIntentDecisionEvidence {
     /// Returns true when the decision identity and shared evidence cut are bound.
     #[must_use]
     pub const fn has_decision_identity(self) -> bool {
-        self.evidence_ref.kind as u16 == StorageIntentEvidenceKind::DecisionFrontierEvidence as u16
+        matches!(
+            self.evidence_ref.kind,
+            StorageIntentEvidenceKind::DecisionFrontierEvidence
+        )
             && evidence_ref_has_id(self.evidence_ref)
             && !bytes32_are_zero(self.decision_id.0)
             && !self.policy_id.is_zero()
@@ -1922,11 +1940,15 @@ impl StorageIntentDecisionEvidence {
             && self.actor_version > 0
             && self.decision_epoch > 0
             && evidence_ref_has_id(self.actor_component_ref)
-            && self.temporal_evidence_ref.kind as u16
-                == StorageIntentEvidenceKind::TemporalEvidence as u16
+            && matches!(
+                self.temporal_evidence_ref.kind,
+                StorageIntentEvidenceKind::TemporalEvidence
+            )
             && evidence_ref_has_id(self.temporal_evidence_ref)
-            && self.evidence_query_snapshot_ref.kind as u16
-                == StorageIntentEvidenceKind::EvidenceQuerySnapshot as u16
+            && matches!(
+                self.evidence_query_snapshot_ref.kind,
+                StorageIntentEvidenceKind::EvidenceQuerySnapshot
+            )
             && evidence_ref_has_id(self.evidence_query_snapshot_ref)
     }
 
@@ -1977,7 +1999,7 @@ pub const fn decision_frontier_satisfies_audit_policy(
     evidence: StorageIntentDecisionEvidence,
     required_scores: StorageIntentDecisionScoreRequirementMask,
 ) -> ReceiptPredicateResult {
-    if evidence.refusal as u16 != StorageIntentRefusalReason::None as u16 {
+    if !matches!(evidence.refusal, StorageIntentRefusalReason::None) {
         return ReceiptPredicateResult::refused(evidence.refusal);
     }
     if !evidence.has_decision_identity()
@@ -9339,19 +9361,22 @@ mod tests {
     fn decision_score_vector(unknown_media_cost: bool) -> StorageIntentDecisionScoreVector {
         let mut vector = StorageIntentDecisionScoreVector::EMPTY;
         let dimensions = [
-            StorageIntentDecisionScoreDimension::Latency,
-            StorageIntentDecisionScoreDimension::Tail,
-            StorageIntentDecisionScoreDimension::Throughput,
-            StorageIntentDecisionScoreDimension::MediaWriteCost,
-            StorageIntentDecisionScoreDimension::CapacityCost,
-            StorageIntentDecisionScoreDimension::RecoveryRpoRisk,
-            StorageIntentDecisionScoreDimension::PaybackRisk,
+            (StorageIntentDecisionScoreDimension::Latency, 180),
+            (StorageIntentDecisionScoreDimension::Tail, 181),
+            (StorageIntentDecisionScoreDimension::Throughput, 182),
+            (StorageIntentDecisionScoreDimension::MediaWriteCost, 183),
+            (StorageIntentDecisionScoreDimension::CapacityCost, 184),
+            (StorageIntentDecisionScoreDimension::RecoveryRpoRisk, 185),
+            (StorageIntentDecisionScoreDimension::PaybackRisk, 186),
         ];
 
-        for (offset, dimension) in dimensions.into_iter().enumerate() {
-            let mut entry = known_decision_score(dimension, 180 + offset as u8);
+        for (dimension, byte) in dimensions {
+            let mut entry = known_decision_score(dimension, byte);
             if unknown_media_cost
-                && dimension as u8 == StorageIntentDecisionScoreDimension::MediaWriteCost as u8
+                && matches!(
+                    dimension,
+                    StorageIntentDecisionScoreDimension::MediaWriteCost
+                )
             {
                 entry.state = StorageIntentDecisionScoreState::UnknownCost;
             }
