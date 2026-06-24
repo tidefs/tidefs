@@ -115,6 +115,7 @@ members = [
   "crates/tidefs-storage-intent-local-media-capability",
   "crates/tidefs-storage-intent-remote-media-capability",
   "crates/tidefs-storage-intent-media-capability-refresh",
+  "crates/tidefs-storage-intent-cost",
   "crates/tidefs-namespace",
   "crates/tidefs-inode-table",
   "crates/tidefs-xattr-storage",
@@ -301,6 +302,7 @@ tidefs-space-accounting = { path = "crates/tidefs-space-accounting" }
 tidefs-spacemap-allocator = { path = "crates/tidefs-spacemap-allocator" }
 tidefs-storage-intent-core = { path = "crates/tidefs-storage-intent-core" }
 tidefs-storage-intent-workload-signals = { path = "crates/tidefs-storage-intent-workload-signals" }
+tidefs-storage-intent-cost = { path = "crates/tidefs-storage-intent-cost" }
 tidefs-tdma-scheduler = { path = "crates/tidefs-tdma-scheduler" }
 tidefs-trace-oracle = { path = "crates/tidefs-trace-oracle" }
 tidefs-transport = { path = "crates/tidefs-transport" }

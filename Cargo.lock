@@ -3482,6 +3482,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-storage-intent-cost"
+version = "0.421.0"
+dependencies = [
+ "serde",
+ "tidefs-storage-intent-core",
+]
+
+[[package]]
 name = "tidefs-storage-intent-local-media-capability"
 version = "0.421.0"
 dependencies = [
