@@ -620,6 +620,7 @@ Important 2026-06-01 findings:
   command-registry enforcement, live-owner routing audit, preview-UAPI
   cross-references, cluster diagnostic/prototype separation, runtime validation,
   and any future production UAPI or ABI freeze.
+Issue #1267 records the current runtime-fed operator product-surface decision: no runtime-fed operator product surface exists, the P10-04 truth-surface law is missing from the repository, and no product carrier class is selectable until TFR-011 and TFR-017 close. The decision maps follow-ups for P10-04 disposition, TFR-011/TFR-017 closeout, and documentation cleanup.
 - `TFR-012`: Device lifecycle and media privacy remain incomplete. Pool-member
   backing must be one byte-addressable media model: block devices for
   production and regular files for hidden development mode. Directory
