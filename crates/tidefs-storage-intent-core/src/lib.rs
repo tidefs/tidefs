@@ -22214,6 +22214,9 @@ mod tests {
             retry_cooldown_ms: 0,
             refusal: StorageIntentRecoveryRefusalReason::None,
             refusal_ref: StorageIntentEvidenceRef::default(),
+        }
+    }
+
     // ---- Layout/allocator evidence tests ----
 
     fn layout_evidence_ref(byte: u8) -> StorageIntentEvidenceRef {
@@ -23570,6 +23573,9 @@ mod tests {
         evidence.repair_ticket_ref = ordering_ref(121);
         let result = recovery_evidence_supports_scrub_repair(evidence);
         assert!(result.satisfied);
+    }
+
+    #[test]
     fn authoritative_layout_is_authoritative() {
         let rec = authoritative_layout_record();
         assert!(rec.has_evidence());
