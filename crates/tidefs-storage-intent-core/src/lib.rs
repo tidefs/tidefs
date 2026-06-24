@@ -19944,7 +19944,11 @@ mod tests {
         assert!(!result.satisfied);
         assert_eq!(
             result.refusal,
-            StorageIntentRefusalReason::UnknownDataShapeEvidence    #[test]
+            StorageIntentRefusalReason::UnknownDataShapeEvidence
+        );
+    }
+
+    #[test]
     fn no_quorum_refuses_authority() {
         let mut evidence = healthy_recovery_evidence();
         evidence.degradation = StorageIntentDegradationClass::NoQuorum;
@@ -20275,7 +20279,12 @@ mod tests {
         let mut record = healthy_data_shape_record();
         record.dedup_scope = DedupFingerprintScopeClass::NoDedup;
         let policy = restrictive_data_shape_policy();
-        let result = data_shape_dedup_domain_is_compatible(record, policy.sharing_domain);    fn healthy_recovery_evidence_passes_all_basic_predicates() {
+        let result = data_shape_dedup_domain_is_compatible(record, policy.sharing_domain);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn healthy_recovery_evidence_passes_all_basic_predicates() {
         let evidence = healthy_recovery_evidence();
         assert!(evidence.has_recovery_evidence());
         assert!(evidence.has_degradation_policy());
@@ -20453,7 +20462,10 @@ mod tests {
     fn data_shape_policy_default_has_zero_policy_id() {
         let policy = DataShapePolicy::default();
         assert!(policy.policy_id.is_zero());
-    }    fn degraded_write_refused_when_policy_refuses_all_degraded() {
+    }
+
+    #[test]
+    fn degraded_write_refused_when_policy_refuses_all_degraded() {
         let mut evidence = healthy_recovery_evidence();
         evidence.degradation = StorageIntentDegradationClass::DegradedVisible;
         evidence.degradation_policy.refusal_law =
