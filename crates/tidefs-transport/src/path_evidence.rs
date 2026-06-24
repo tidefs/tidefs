@@ -33,6 +33,12 @@
 //! congestion/backpressure window, public/non-dedicated carrier class,
 //! and cost/egress refs. Consumers must not mistake WAN paths for local
 //! low-latency domains.
+//!
+//! ## Evidence cuts
+//!
+//! Records carry an optional source-index/catalog reference so #913
+//! evidence-query snapshots can replay, audit, or invalidate the exact
+//! transport evidence basis used by downstream consumers.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -771,6 +777,7 @@ impl Default for WanInternetEvidence {
 /// | Field | Meaning |
 /// |---|---|
 /// | `generation` | Monotonic counter for staleness detection |
+/// | `source_index_ref` | Opaque source index/catalog ref for replayable evidence cuts |
 /// | `local_peer` | Local node identity (opaque ref) |
 /// | `remote_peer` | Remote node identity (opaque ref) |
 /// | `proximity_domain` | Local/rack/DC/WAN/internet classification |
@@ -787,6 +794,8 @@ impl Default for WanInternetEvidence {
 pub struct TransportPathEvidence {
     /// Monotonic evidence generation counter.
     pub generation: PathEvidenceGeneration,
+    /// Opaque source index/catalog ref for replayable evidence-query cuts.
+    pub source_index_ref: Option<String>,
     /// Local node identity (opaque string ref).
     pub local_peer: String,
     /// Remote node identity (opaque string ref).
@@ -836,6 +845,7 @@ impl TransportPathEvidence {
     ) -> Self {
         Self {
             generation,
+            source_index_ref: None,
             local_peer: local_peer.into(),
             remote_peer: remote_peer.into(),
             proximity_domain,
@@ -861,6 +871,7 @@ impl TransportPathEvidence {
     ) -> Self {
         Self {
             generation,
+            source_index_ref: None,
             local_peer: local_peer.into(),
             remote_peer: remote_peer.into(),
             proximity_domain: PathProximityDomain::Unknown,
@@ -891,6 +902,7 @@ impl TransportPathEvidence {
     ) -> Self {
         Self {
             generation,
+            source_index_ref: None,
             local_peer: local_peer.into(),
             remote_peer: remote_peer.into(),
             proximity_domain,
@@ -935,6 +947,13 @@ impl TransportPathEvidence {
     #[must_use]
     pub fn with_queue_state(mut self, qs: PathQueueState) -> Self {
         self.queue_state = qs;
+        self
+    }
+
+    /// Attach an opaque source index/catalog reference for replayable cuts.
+    #[must_use]
+    pub fn with_source_index_ref(mut self, source_index_ref: impl Into<String>) -> Self {
+        self.source_index_ref = Some(source_index_ref.into());
         self
     }
 
@@ -1296,6 +1315,31 @@ mod tests {
         assert!(!evidence.is_fresh());
         assert!(evidence.is_unsafe_for_planning());
         assert_eq!(evidence.proximity_domain, PathProximityDomain::Unknown);
+    }
+
+    #[test]
+    fn evidence_source_index_ref_preserved() {
+        let now = SystemTime::now();
+        let window = Duration::from_secs(30);
+        let evidence = TransportPathEvidence::fresh_measured(
+            PathEvidenceGeneration::new(7),
+            "node-a",
+            "node-h",
+            PathProximityDomain::Rack,
+            PathLatency::measured(Duration::from_micros(75), None),
+            PathBandwidth::measured(10_000_000_000),
+            PathLossClass::None,
+            PathQueueState::absent(),
+            PathCarrierFamily::Tcp,
+            now,
+            window,
+        )
+        .with_source_index_ref("transport-path-source-index:frontier-42");
+
+        assert_eq!(
+            evidence.source_index_ref.as_deref(),
+            Some("transport-path-source-index:frontier-42")
+        );
     }
 
     #[test]
