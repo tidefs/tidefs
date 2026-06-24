@@ -162,13 +162,13 @@ impl StorageIntentBudgetCaps {
     /// Returns the primary backpressure reason, or None.
     #[must_use]
     pub fn backpressure_reason(&self) -> Option<StorageIntentRefusalReason> {
-        if self.dirty_bytes > self.max_dirty_bytes {
+        if self.dirty_bytes > self.max_dirty_bytes
+            || self.inflight_bytes > self.max_inflight_bytes
+        {
             Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
-        } else if self.inflight_bytes > self.max_inflight_bytes {
-            Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
-        } else if self.device_queue_depth > self.max_device_queue_depth {
-            Some(StorageIntentRefusalReason::EvidenceNotUsable)
-        } else if self.allocator_pressure_pct > 90 {
+        } else if self.device_queue_depth > self.max_device_queue_depth
+            || self.allocator_pressure_pct > 90
+        {
             Some(StorageIntentRefusalReason::EvidenceNotUsable)
         } else if self.background_optimizer_budget_bytes == 0 {
             Some(StorageIntentRefusalReason::MovementDebtNotPaidBack)
@@ -847,11 +847,11 @@ impl StorageIntentScheduler {
         }
 
         // ── 5. Check serving-trial expiry ──
-        if request.work_class == AdmissionWorkClass::CacheOnlyTrial {
-            if self.caps.foreground_latency_budget_us > 0
-                && self.caps.inflight_bytes > self.caps.max_inflight_bytes / 2
-            {
-                let decision = AdmissionDecision::expired(
+        if request.work_class == AdmissionWorkClass::CacheOnlyTrial
+            && self.caps.foreground_latency_budget_us > 0
+            && self.caps.inflight_bytes > self.caps.max_inflight_bytes / 2
+        {
+            let decision = AdmissionDecision::expired(
                     lane,
                     StorageIntentRefusalReason::MovementDebtNotPaidBack,
                     request.budget_owner,
@@ -940,9 +940,9 @@ impl StorageIntentScheduler {
         }
 
         if caps.device_queue_depth > caps.max_device_queue_depth && caps.max_device_queue_depth > 0
+            && lane != LaneClass::Control
         {
-            if lane != LaneClass::Control {
-                return Some((
+            return Some((
                     StorageIntentRefusalReason::EvidenceNotUsable,
                     BudgetConstraintClass::DeviceQueueDepth,
                 ));
