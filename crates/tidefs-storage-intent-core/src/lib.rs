@@ -6429,12 +6429,16 @@ impl StorageIntentActionExecutionEvidence {
     #[must_use]
     pub const fn has_execution_admission(self) -> bool {
         self.admission_refs.has_required_refs()
-            && self
-                .flags
-                .contains_all(StorageIntentActionExecutionFlags::DECISION_FRONTIER_REF)
-            && self
-                .flags
-                .contains_all(StorageIntentActionExecutionFlags::RESERVE_ADMISSION_REF)
+            && self.flags.contains_all(
+                StorageIntentActionExecutionFlags::DECISION_FRONTIER_REF
+                    .union(StorageIntentActionExecutionFlags::HARD_GATE_REF)
+                    .union(StorageIntentActionExecutionFlags::SELECTED_CANDIDATE_REF)
+                    .union(StorageIntentActionExecutionFlags::COUNTERFACTUAL_PAYBACK_REF)
+                    .union(StorageIntentActionExecutionFlags::RESERVE_ADMISSION_REF)
+                    .union(StorageIntentActionExecutionFlags::ISOLATION_REF)
+                    .union(StorageIntentActionExecutionFlags::MEDIA_CAPABILITY_REF)
+                    .union(StorageIntentActionExecutionFlags::RETENTION_REF),
+            )
     }
 
     /// Returns true when every retry of this step has a stable replay key.
@@ -11159,6 +11163,21 @@ mod tests {
                 step.as_str()
             );
         }
+    }
+
+    #[test]
+    fn action_execution_admission_flags_must_match_admission_refs() {
+        let mut evidence =
+            action_execution_evidence(StorageIntentActionExecutionStepState::Admitted);
+        evidence.flags = StorageIntentActionExecutionFlags(
+            evidence.flags.0 & !StorageIntentActionExecutionFlags::HARD_GATE_REF.0,
+        );
+
+        assert!(evidence.admission_refs.has_required_refs());
+        assert_eq!(
+            evidence.action_refusal(),
+            StorageIntentActionExecutionRefusalReason::MissingDecisionAdmissionEvidence
+        );
     }
 
     #[test]
