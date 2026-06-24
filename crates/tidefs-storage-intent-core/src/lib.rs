@@ -1888,6 +1888,111 @@ pub enum QuarantineState {
     Quarantined = 2,
 }
 
+/// Storage-intent role whose trust/domain evidence is being evaluated.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentTrustRole {
+    #[default]
+    SyncIntent = 0,
+    QuorumIntent = 1,
+    GeoIntent = 2,
+    DurablePlacement = 3,
+    ReadServing = 4,
+    DegradedReconstruction = 5,
+    AuthoritativeRam = 6,
+    RepairSource = 7,
+    RelocationTarget = 8,
+    DedupRebakeSharing = 9,
+    ArchiveRestore = 10,
+}
+
+/// Freshness/refusal state of the trust-domain evidence cut.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum TrustEvidenceFreshnessState {
+    #[default]
+    Unknown = 0,
+    Fresh = 1,
+    Missing = 2,
+    Stale = 3,
+    Contradictory = 4,
+    Refused = 5,
+}
+
+/// Encryption/key lifecycle state projected from the key authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum TrustKeyLifecycleState {
+    #[default]
+    Unknown = 0,
+    Active = 1,
+    RotatingDualValid = 2,
+    Revoked = 3,
+    Quarantined = 4,
+    Retired = 5,
+}
+
+/// Revocation state of the peer, domain, principal, or trust epoch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum TrustRevocationState {
+    #[default]
+    Clear = 0,
+    Revoked = 1,
+}
+
+/// Dedup/reflink/rebake sharing compatibility projected from shape evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum DedupSharingCompatibilityState {
+    #[default]
+    Unknown = 0,
+    Compatible = 1,
+    SameTenantOnly = 2,
+    CrossTenantForbidden = 3,
+    Refused = 4,
+}
+
+/// Allowed-domain classes proven by regulatory or operator policy evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct TrustAllowedDomainMask(pub u32);
+
+impl TrustAllowedDomainMask {
+    pub const EMPTY: Self = Self(0);
+    pub const SAME_ADMIN: Self = Self(1 << 0);
+    pub const SAME_SECURITY: Self = Self(1 << 1);
+    pub const SAME_TENANT: Self = Self(1 << 2);
+    pub const SAME_POLICY: Self = Self(1 << 3);
+    pub const SAME_JURISDICTION: Self = Self(1 << 4);
+    pub const GEO_ALLOWED: Self = Self(1 << 5);
+    pub const INTERNET_ALLOWED: Self = Self(1 << 6);
+    pub const OPERATOR_DEFINED: Self = Self(1 << 7);
+
+    /// Add classes.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns true when no class is required or proved.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns true when all required classes are present.
+    #[must_use]
+    pub const fn contains_all(self, required: Self) -> bool {
+        (self.0 & required.0) == required.0
+    }
+}
+
 /// Trust evidence dimensions required or proved by a receipt.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -1907,6 +2012,19 @@ impl TrustEvidenceFlags {
     pub const SHARING_DOMAIN: Self = Self(1 << 9);
     pub const NOT_COMPROMISED: Self = Self(1 << 10);
     pub const NOT_QUARANTINED: Self = Self(1 << 11);
+    pub const PEER_IDENTITY: Self = Self(1 << 12);
+    pub const DATASET_DOMAIN: Self = Self(1 << 13);
+    pub const POLICY_DOMAIN: Self = Self(1 << 14);
+    pub const BUDGET_OWNER_DOMAIN: Self = Self(1 << 15);
+    pub const ENCRYPTION_DOMAIN: Self = Self(1 << 16);
+    pub const KEY_LIFECYCLE: Self = Self(1 << 17);
+    pub const KEY_LEASE: Self = Self(1 << 18);
+    pub const DEDUP_SHARING_COMPATIBLE: Self = Self(1 << 19);
+    pub const REGULATORY_DOMAIN: Self = Self(1 << 20);
+    pub const OPERATOR_ALLOWED_DOMAIN: Self = Self(1 << 21);
+    pub const TRUST_EPOCH: Self = Self(1 << 22);
+    pub const FRESH_TRUST_EVIDENCE: Self = Self(1 << 23);
+    pub const NOT_REVOKED: Self = Self(1 << 24);
 
     /// Add flags.
     #[must_use]
@@ -1950,6 +2068,40 @@ impl TrustRequirement {
 }
 
 impl Default for TrustRequirement {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+/// Extended trust/domain requirement used by role-specific #897 predicates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct TrustDomainRequirement {
+    pub base: TrustRequirement,
+    pub dataset_domain: StorageIntentDomainId,
+    pub policy_domain: StorageIntentDomainId,
+    pub budget_owner_domain: StorageIntentDomainId,
+    pub encryption_domain: StorageIntentDomainId,
+    pub allowed_domain_classes: TrustAllowedDomainMask,
+    pub min_trust_epoch: u64,
+    pub max_evidence_age_ms: u64,
+}
+
+impl TrustDomainRequirement {
+    /// No extended trust/domain floor.
+    pub const NONE: Self = Self {
+        base: TrustRequirement::NONE,
+        dataset_domain: StorageIntentDomainId::ZERO,
+        policy_domain: StorageIntentDomainId::ZERO,
+        budget_owner_domain: StorageIntentDomainId::ZERO,
+        encryption_domain: StorageIntentDomainId::ZERO,
+        allowed_domain_classes: TrustAllowedDomainMask::EMPTY,
+        min_trust_epoch: 0,
+        max_evidence_age_ms: 0,
+    };
+}
+
+impl Default for TrustDomainRequirement {
     fn default() -> Self {
         Self::NONE
     }
@@ -1999,12 +2151,42 @@ impl Default for TrustEvidenceState {
 pub struct TrustEvidenceRecord {
     pub state: TrustEvidenceState,
     pub principal_ref: StorageIntentEvidenceRef,
+    pub peer_identity_ref: StorageIntentEvidenceRef,
+    pub admin_domain_ref: StorageIntentEvidenceRef,
+    pub security_domain_ref: StorageIntentEvidenceRef,
+    pub tenant_domain_ref: StorageIntentEvidenceRef,
+    pub dataset_domain: StorageIntentDomainId,
+    pub dataset_domain_ref: StorageIntentEvidenceRef,
+    pub policy_domain: StorageIntentDomainId,
+    pub policy_domain_ref: StorageIntentEvidenceRef,
+    pub budget_owner_domain: StorageIntentDomainId,
+    pub budget_owner_domain_ref: StorageIntentEvidenceRef,
+    pub encryption_domain: StorageIntentDomainId,
+    pub encryption_domain_ref: StorageIntentEvidenceRef,
     pub session_security_ref: StorageIntentEvidenceRef,
     pub key_epoch_ref: StorageIntentEvidenceRef,
+    pub key_lifecycle: TrustKeyLifecycleState,
+    pub key_lifecycle_ref: StorageIntentEvidenceRef,
+    pub key_lease_ref: StorageIntentEvidenceRef,
     pub authorization_ref: StorageIntentEvidenceRef,
     pub audit_ref: StorageIntentEvidenceRef,
     pub residency_ref: StorageIntentEvidenceRef,
     pub sharing_domain_ref: StorageIntentEvidenceRef,
+    pub sharing_compatibility: DedupSharingCompatibilityState,
+    pub sharing_compatibility_ref: StorageIntentEvidenceRef,
+    pub allowed_domain_classes: TrustAllowedDomainMask,
+    pub regulatory_domain_ref: StorageIntentEvidenceRef,
+    pub operator_allowed_domain_ref: StorageIntentEvidenceRef,
+    pub trust_epoch: u64,
+    pub trust_epoch_ref: StorageIntentEvidenceRef,
+    pub evidence_age_ms: u64,
+    pub freshness_state: TrustEvidenceFreshnessState,
+    pub freshness_ref: StorageIntentEvidenceRef,
+    pub revocation_state: TrustRevocationState,
+    pub revocation_ref: StorageIntentEvidenceRef,
+    pub compromise_ref: StorageIntentEvidenceRef,
+    pub quarantine_ref: StorageIntentEvidenceRef,
+    pub refusal_ref: StorageIntentEvidenceRef,
 }
 
 /// Storage media classes known to the policy layer.
@@ -4597,6 +4779,51 @@ impl_u8_canonical!(QuarantineState, {
     Quarantined = 2 => "quarantined",
 });
 
+impl_u8_canonical!(StorageIntentTrustRole, {
+    SyncIntent = 0 => "sync-intent",
+    QuorumIntent = 1 => "quorum-intent",
+    GeoIntent = 2 => "geo-intent",
+    DurablePlacement = 3 => "durable-placement",
+    ReadServing = 4 => "read-serving",
+    DegradedReconstruction = 5 => "degraded-reconstruction",
+    AuthoritativeRam = 6 => "authoritative-ram",
+    RepairSource = 7 => "repair-source",
+    RelocationTarget = 8 => "relocation-target",
+    DedupRebakeSharing = 9 => "dedup-rebake-sharing",
+    ArchiveRestore = 10 => "archive-restore",
+});
+
+impl_u8_canonical!(TrustEvidenceFreshnessState, {
+    Unknown = 0 => "unknown",
+    Fresh = 1 => "fresh",
+    Missing = 2 => "missing",
+    Stale = 3 => "stale",
+    Contradictory = 4 => "contradictory",
+    Refused = 5 => "refused",
+});
+
+impl_u8_canonical!(TrustKeyLifecycleState, {
+    Unknown = 0 => "unknown",
+    Active = 1 => "active",
+    RotatingDualValid = 2 => "rotating-dual-valid",
+    Revoked = 3 => "revoked",
+    Quarantined = 4 => "quarantined",
+    Retired = 5 => "retired",
+});
+
+impl_u8_canonical!(TrustRevocationState, {
+    Clear = 0 => "clear",
+    Revoked = 1 => "revoked",
+});
+
+impl_u8_canonical!(DedupSharingCompatibilityState, {
+    Unknown = 0 => "unknown",
+    Compatible = 1 => "compatible",
+    SameTenantOnly = 2 => "same-tenant-only",
+    CrossTenantForbidden = 3 => "cross-tenant-forbidden",
+    Refused = 4 => "refused",
+});
+
 impl_u8_canonical!(StorageMediaClass, {
     SystemRam = 0 => "system-ram",
     RemoteRam = 1 => "remote-ram",
@@ -5142,6 +5369,12 @@ pub enum StorageIntentRefusalReason {
     UnknownArchiveRestoreRetention = 36,
     /// Correctness depends on RDMA being present for a remote target.
     RdmaRequiredForCorrectness = 37,
+    /// Peer, principal, domain, trust epoch, or key lifecycle was revoked.
+    RevokedTrustDomain = 38,
+    /// Trust-domain evidence is missing, stale, contradictory, or refused.
+    StaleTrustEvidence = 39,
+    /// Required key-lease evidence is absent.
+    MissingKeyLeaseEvidence = 40,
 }
 
 impl StorageIntentRefusalReason {
@@ -5189,6 +5422,9 @@ impl StorageIntentRefusalReason {
             Self::PmemFlushFenceMissing => "pmem-flush-fence-missing",
             Self::UnknownArchiveRestoreRetention => "unknown-archive-restore-retention",
             Self::RdmaRequiredForCorrectness => "rdma-required-for-correctness",
+            Self::RevokedTrustDomain => "revoked-trust-domain",
+            Self::StaleTrustEvidence => "stale-trust-evidence",
+            Self::MissingKeyLeaseEvidence => "missing-key-lease-evidence",
         }
     }
 
@@ -5234,6 +5470,9 @@ impl StorageIntentRefusalReason {
             35 => Some(Self::PmemFlushFenceMissing),
             36 => Some(Self::UnknownArchiveRestoreRetention),
             37 => Some(Self::RdmaRequiredForCorrectness),
+            38 => Some(Self::RevokedTrustDomain),
+            39 => Some(Self::StaleTrustEvidence),
+            40 => Some(Self::MissingKeyLeaseEvidence),
             _ => None,
         }
     }
@@ -5330,7 +5569,8 @@ pub const fn trust_security_satisfies(
         && (!observed
             .flags
             .contains_all(TrustEvidenceFlags::ADMIN_DOMAIN)
-            || !bytes16_equal(observed.admin_domain.0, required.admin_domain.0))
+            || (!required.admin_domain.is_zero()
+                && !bytes16_equal(observed.admin_domain.0, required.admin_domain.0)))
     {
         return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
     }
@@ -5340,7 +5580,8 @@ pub const fn trust_security_satisfies(
         && (!observed
             .flags
             .contains_all(TrustEvidenceFlags::SECURITY_DOMAIN)
-            || !bytes16_equal(observed.security_domain.0, required.security_domain.0))
+            || (!required.security_domain.is_zero()
+                && !bytes16_equal(observed.security_domain.0, required.security_domain.0)))
     {
         return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
     }
@@ -5350,7 +5591,8 @@ pub const fn trust_security_satisfies(
         && (!observed
             .flags
             .contains_all(TrustEvidenceFlags::TENANT_DOMAIN)
-            || !bytes16_equal(observed.tenant_domain.0, required.tenant_domain.0))
+            || (!required.tenant_domain.is_zero()
+                && !bytes16_equal(observed.tenant_domain.0, required.tenant_domain.0)))
     {
         return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
     }
@@ -5433,6 +5675,490 @@ pub const fn trust_security_satisfies(
     {
         return ReceiptPredicateResult::refused(StorageIntentRefusalReason::QuarantinedSource);
     }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Role-specific default trust/domain requirement.
+#[must_use]
+pub const fn trust_domain_role_requirement(role: StorageIntentTrustRole) -> TrustDomainRequirement {
+    TrustDomainRequirement {
+        base: TrustRequirement {
+            required_flags: trust_domain_role_required_flags(role),
+            min_session_security: trust_domain_role_min_session_security(role),
+            min_key_epoch: 0,
+            admin_domain: StorageIntentDomainId::ZERO,
+            security_domain: StorageIntentDomainId::ZERO,
+            tenant_domain: StorageIntentDomainId::ZERO,
+            residency: ResidencyScope::Unspecified,
+            sharing_domain: SharingDomainClass::PrivateDataset,
+        },
+        dataset_domain: StorageIntentDomainId::ZERO,
+        policy_domain: StorageIntentDomainId::ZERO,
+        budget_owner_domain: StorageIntentDomainId::ZERO,
+        encryption_domain: StorageIntentDomainId::ZERO,
+        allowed_domain_classes: trust_domain_role_allowed_domain_floor(role),
+        min_trust_epoch: 0,
+        max_evidence_age_ms: 0,
+    }
+}
+
+/// Predicate: can trust/domain evidence satisfy one storage-intent role?
+#[must_use]
+pub const fn trust_domain_role_satisfies(
+    role: StorageIntentTrustRole,
+    required: TrustDomainRequirement,
+    observed: TrustEvidenceRecord,
+) -> ReceiptPredicateResult {
+    let role_flags = trust_domain_role_required_flags(role);
+    let effective_flags = required.base.required_flags.union(role_flags);
+    let effective = TrustRequirement {
+        required_flags: effective_flags,
+        min_session_security: trust_domain_session_floor(
+            required.base.min_session_security,
+            trust_domain_role_min_session_security(role),
+        ),
+        min_key_epoch: required.base.min_key_epoch,
+        admin_domain: required.base.admin_domain,
+        security_domain: required.base.security_domain,
+        tenant_domain: required.base.tenant_domain,
+        residency: required.base.residency,
+        sharing_domain: required.base.sharing_domain,
+    };
+
+    let base = trust_security_satisfies(effective, observed.state);
+    if !base.satisfied {
+        return base;
+    }
+
+    trust_domain_record_refs_satisfy(role, required, effective_flags, observed)
+}
+
+#[must_use]
+pub const fn trust_domain_role_required_flags(role: StorageIntentTrustRole) -> TrustEvidenceFlags {
+    let common = TrustEvidenceFlags::AUTHENTICATED_PRINCIPAL
+        .union(TrustEvidenceFlags::PEER_IDENTITY)
+        .union(TrustEvidenceFlags::ADMIN_DOMAIN)
+        .union(TrustEvidenceFlags::SECURITY_DOMAIN)
+        .union(TrustEvidenceFlags::SESSION_SECURITY)
+        .union(TrustEvidenceFlags::TRUST_EPOCH)
+        .union(TrustEvidenceFlags::FRESH_TRUST_EVIDENCE)
+        .union(TrustEvidenceFlags::NOT_REVOKED)
+        .union(TrustEvidenceFlags::NOT_QUARANTINED);
+
+    match role {
+        StorageIntentTrustRole::SyncIntent => common,
+        StorageIntentTrustRole::QuorumIntent => common
+            .union(TrustEvidenceFlags::AUTHORIZATION)
+            .union(TrustEvidenceFlags::AUDIT),
+        StorageIntentTrustRole::GeoIntent => common
+            .union(TrustEvidenceFlags::TENANT_DOMAIN)
+            .union(TrustEvidenceFlags::RESIDENCY)
+            .union(TrustEvidenceFlags::AUTHORIZATION)
+            .union(TrustEvidenceFlags::AUDIT)
+            .union(TrustEvidenceFlags::REGULATORY_DOMAIN)
+            .union(TrustEvidenceFlags::OPERATOR_ALLOWED_DOMAIN),
+        StorageIntentTrustRole::DurablePlacement => common
+            .union(TrustEvidenceFlags::TENANT_DOMAIN)
+            .union(TrustEvidenceFlags::DATASET_DOMAIN)
+            .union(TrustEvidenceFlags::POLICY_DOMAIN)
+            .union(TrustEvidenceFlags::BUDGET_OWNER_DOMAIN)
+            .union(TrustEvidenceFlags::ENCRYPTION_DOMAIN)
+            .union(TrustEvidenceFlags::KEY_EPOCH)
+            .union(TrustEvidenceFlags::KEY_LIFECYCLE)
+            .union(TrustEvidenceFlags::KEY_LEASE)
+            .union(TrustEvidenceFlags::AUTHORIZATION)
+            .union(TrustEvidenceFlags::AUDIT)
+            .union(TrustEvidenceFlags::RESIDENCY),
+        StorageIntentTrustRole::ReadServing => common
+            .union(TrustEvidenceFlags::TENANT_DOMAIN)
+            .union(TrustEvidenceFlags::DATASET_DOMAIN)
+            .union(TrustEvidenceFlags::KEY_EPOCH)
+            .union(TrustEvidenceFlags::KEY_LIFECYCLE)
+            .union(TrustEvidenceFlags::AUTHORIZATION)
+            .union(TrustEvidenceFlags::AUDIT),
+        StorageIntentTrustRole::DegradedReconstruction => common
+            .union(TrustEvidenceFlags::TENANT_DOMAIN)
+            .union(TrustEvidenceFlags::DATASET_DOMAIN)
+            .union(TrustEvidenceFlags::KEY_EPOCH)
+            .union(TrustEvidenceFlags::KEY_LIFECYCLE)
+            .union(TrustEvidenceFlags::AUTHORIZATION)
+            .union(TrustEvidenceFlags::AUDIT)
+            .union(TrustEvidenceFlags::RESIDENCY)
+            .union(TrustEvidenceFlags::NOT_COMPROMISED),
+        StorageIntentTrustRole::AuthoritativeRam => common
+            .union(TrustEvidenceFlags::TENANT_DOMAIN)
+            .union(TrustEvidenceFlags::DATASET_DOMAIN)
+            .union(TrustEvidenceFlags::KEY_EPOCH)
+            .union(TrustEvidenceFlags::KEY_LIFECYCLE)
+            .union(TrustEvidenceFlags::KEY_LEASE)
+            .union(TrustEvidenceFlags::AUTHORIZATION)
+            .union(TrustEvidenceFlags::AUDIT),
+        StorageIntentTrustRole::RepairSource => common
+            .union(TrustEvidenceFlags::TENANT_DOMAIN)
+            .union(TrustEvidenceFlags::DATASET_DOMAIN)
+            .union(TrustEvidenceFlags::KEY_EPOCH)
+            .union(TrustEvidenceFlags::KEY_LIFECYCLE)
+            .union(TrustEvidenceFlags::AUTHORIZATION)
+            .union(TrustEvidenceFlags::AUDIT)
+            .union(TrustEvidenceFlags::RESIDENCY)
+            .union(TrustEvidenceFlags::NOT_COMPROMISED),
+        StorageIntentTrustRole::RelocationTarget => common
+            .union(TrustEvidenceFlags::TENANT_DOMAIN)
+            .union(TrustEvidenceFlags::DATASET_DOMAIN)
+            .union(TrustEvidenceFlags::POLICY_DOMAIN)
+            .union(TrustEvidenceFlags::BUDGET_OWNER_DOMAIN)
+            .union(TrustEvidenceFlags::ENCRYPTION_DOMAIN)
+            .union(TrustEvidenceFlags::KEY_EPOCH)
+            .union(TrustEvidenceFlags::KEY_LIFECYCLE)
+            .union(TrustEvidenceFlags::KEY_LEASE)
+            .union(TrustEvidenceFlags::AUTHORIZATION)
+            .union(TrustEvidenceFlags::AUDIT)
+            .union(TrustEvidenceFlags::RESIDENCY)
+            .union(TrustEvidenceFlags::OPERATOR_ALLOWED_DOMAIN),
+        StorageIntentTrustRole::DedupRebakeSharing => common
+            .union(TrustEvidenceFlags::TENANT_DOMAIN)
+            .union(TrustEvidenceFlags::DATASET_DOMAIN)
+            .union(TrustEvidenceFlags::POLICY_DOMAIN)
+            .union(TrustEvidenceFlags::KEY_EPOCH)
+            .union(TrustEvidenceFlags::KEY_LIFECYCLE)
+            .union(TrustEvidenceFlags::AUTHORIZATION)
+            .union(TrustEvidenceFlags::AUDIT)
+            .union(TrustEvidenceFlags::SHARING_DOMAIN)
+            .union(TrustEvidenceFlags::DEDUP_SHARING_COMPATIBLE),
+        StorageIntentTrustRole::ArchiveRestore => common
+            .union(TrustEvidenceFlags::TENANT_DOMAIN)
+            .union(TrustEvidenceFlags::DATASET_DOMAIN)
+            .union(TrustEvidenceFlags::POLICY_DOMAIN)
+            .union(TrustEvidenceFlags::ENCRYPTION_DOMAIN)
+            .union(TrustEvidenceFlags::KEY_EPOCH)
+            .union(TrustEvidenceFlags::KEY_LIFECYCLE)
+            .union(TrustEvidenceFlags::KEY_LEASE)
+            .union(TrustEvidenceFlags::AUTHORIZATION)
+            .union(TrustEvidenceFlags::AUDIT)
+            .union(TrustEvidenceFlags::RESIDENCY)
+            .union(TrustEvidenceFlags::REGULATORY_DOMAIN)
+            .union(TrustEvidenceFlags::OPERATOR_ALLOWED_DOMAIN),
+    }
+}
+
+#[must_use]
+pub const fn trust_domain_role_min_session_security(
+    role: StorageIntentTrustRole,
+) -> SessionSecurityClass {
+    match role {
+        StorageIntentTrustRole::SyncIntent
+        | StorageIntentTrustRole::DurablePlacement
+        | StorageIntentTrustRole::ReadServing => SessionSecurityClass::Authenticated,
+        StorageIntentTrustRole::QuorumIntent | StorageIntentTrustRole::AuthoritativeRam => {
+            SessionSecurityClass::MutualAuthenticated
+        }
+        StorageIntentTrustRole::GeoIntent
+        | StorageIntentTrustRole::DegradedReconstruction
+        | StorageIntentTrustRole::RepairSource
+        | StorageIntentTrustRole::RelocationTarget
+        | StorageIntentTrustRole::DedupRebakeSharing
+        | StorageIntentTrustRole::ArchiveRestore => SessionSecurityClass::Encrypted,
+    }
+}
+
+#[must_use]
+pub const fn trust_domain_role_allowed_domain_floor(
+    role: StorageIntentTrustRole,
+) -> TrustAllowedDomainMask {
+    match role {
+        StorageIntentTrustRole::GeoIntent => TrustAllowedDomainMask::GEO_ALLOWED,
+        StorageIntentTrustRole::ArchiveRestore => TrustAllowedDomainMask::SAME_JURISDICTION
+            .union(TrustAllowedDomainMask::OPERATOR_DEFINED),
+        StorageIntentTrustRole::DedupRebakeSharing => TrustAllowedDomainMask::SAME_TENANT,
+        StorageIntentTrustRole::RelocationTarget => TrustAllowedDomainMask::OPERATOR_DEFINED,
+        _ => TrustAllowedDomainMask::EMPTY,
+    }
+}
+
+const fn trust_domain_session_floor(
+    requested: SessionSecurityClass,
+    role_floor: SessionSecurityClass,
+) -> SessionSecurityClass {
+    match (requested, role_floor) {
+        (SessionSecurityClass::Attested, _) | (_, SessionSecurityClass::Attested) => {
+            SessionSecurityClass::Attested
+        }
+        (SessionSecurityClass::MutualAuthenticated, _)
+        | (_, SessionSecurityClass::MutualAuthenticated) => {
+            SessionSecurityClass::MutualAuthenticated
+        }
+        (SessionSecurityClass::Encrypted, _) | (_, SessionSecurityClass::Encrypted) => {
+            SessionSecurityClass::Encrypted
+        }
+        (SessionSecurityClass::Authenticated, _) | (_, SessionSecurityClass::Authenticated) => {
+            SessionSecurityClass::Authenticated
+        }
+        _ => SessionSecurityClass::None,
+    }
+}
+
+const fn trust_domain_effective_allowed_mask(
+    role: StorageIntentTrustRole,
+    required: TrustAllowedDomainMask,
+) -> TrustAllowedDomainMask {
+    if required.is_empty() {
+        trust_domain_role_allowed_domain_floor(role)
+    } else {
+        required
+    }
+}
+
+const fn trust_domain_id_satisfies(
+    required: StorageIntentDomainId,
+    observed: StorageIntentDomainId,
+) -> bool {
+    !observed.is_zero() && (required.is_zero() || bytes16_equal(required.0, observed.0))
+}
+
+const fn trust_key_lifecycle_is_active(lifecycle: TrustKeyLifecycleState) -> bool {
+    matches!(
+        lifecycle,
+        TrustKeyLifecycleState::Active | TrustKeyLifecycleState::RotatingDualValid
+    )
+}
+
+const fn trust_domain_record_refs_satisfy(
+    role: StorageIntentTrustRole,
+    required: TrustDomainRequirement,
+    flags: TrustEvidenceFlags,
+    observed: TrustEvidenceRecord,
+) -> ReceiptPredicateResult {
+    if flags.contains_all(TrustEvidenceFlags::AUTHENTICATED_PRINCIPAL)
+        && !evidence_ref_has_id(observed.principal_ref)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingAuthenticatedPrincipal,
+        );
+    }
+    if flags.contains_all(TrustEvidenceFlags::PEER_IDENTITY)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::PEER_IDENTITY)
+            || !evidence_ref_has_id(observed.peer_identity_ref))
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingAuthenticatedPrincipal,
+        );
+    }
+    if flags.contains_all(TrustEvidenceFlags::ADMIN_DOMAIN)
+        && (!trust_domain_id_satisfies(required.base.admin_domain, observed.state.admin_domain)
+            || !evidence_ref_has_id(observed.admin_domain_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
+    }
+    if flags.contains_all(TrustEvidenceFlags::SECURITY_DOMAIN)
+        && (!trust_domain_id_satisfies(
+            required.base.security_domain,
+            observed.state.security_domain,
+        ) || !evidence_ref_has_id(observed.security_domain_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
+    }
+    if flags.contains_all(TrustEvidenceFlags::TENANT_DOMAIN)
+        && (!trust_domain_id_satisfies(required.base.tenant_domain, observed.state.tenant_domain)
+            || !evidence_ref_has_id(observed.tenant_domain_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
+    }
+    if flags.contains_all(TrustEvidenceFlags::DATASET_DOMAIN)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::DATASET_DOMAIN)
+            || !trust_domain_id_satisfies(required.dataset_domain, observed.dataset_domain)
+            || !evidence_ref_has_id(observed.dataset_domain_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
+    }
+    if flags.contains_all(TrustEvidenceFlags::POLICY_DOMAIN)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::POLICY_DOMAIN)
+            || !trust_domain_id_satisfies(required.policy_domain, observed.policy_domain)
+            || !evidence_ref_has_id(observed.policy_domain_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
+    }
+    if flags.contains_all(TrustEvidenceFlags::BUDGET_OWNER_DOMAIN)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::BUDGET_OWNER_DOMAIN)
+            || !trust_domain_id_satisfies(
+                required.budget_owner_domain,
+                observed.budget_owner_domain,
+            )
+            || !evidence_ref_has_id(observed.budget_owner_domain_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
+    }
+    if flags.contains_all(TrustEvidenceFlags::ENCRYPTION_DOMAIN)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::ENCRYPTION_DOMAIN)
+            || !trust_domain_id_satisfies(required.encryption_domain, observed.encryption_domain)
+            || !evidence_ref_has_id(observed.encryption_domain_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
+    }
+    if flags.contains_all(TrustEvidenceFlags::SESSION_SECURITY)
+        && !evidence_ref_has_id(observed.session_security_ref)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingRequiredSessionSecurity,
+        );
+    }
+    if flags.contains_all(TrustEvidenceFlags::KEY_EPOCH)
+        && !evidence_ref_has_id(observed.key_epoch_ref)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleKeyEpoch);
+    }
+    if flags.contains_all(TrustEvidenceFlags::KEY_LIFECYCLE) {
+        if !observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::KEY_LIFECYCLE)
+            || !evidence_ref_has_id(observed.key_lifecycle_ref)
+        {
+            return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleKeyEpoch);
+        }
+        if matches!(
+            observed.key_lifecycle,
+            TrustKeyLifecycleState::Revoked | TrustKeyLifecycleState::Retired
+        ) {
+            return ReceiptPredicateResult::refused(StorageIntentRefusalReason::RevokedTrustDomain);
+        }
+        if matches!(observed.key_lifecycle, TrustKeyLifecycleState::Quarantined) {
+            return ReceiptPredicateResult::refused(StorageIntentRefusalReason::QuarantinedSource);
+        }
+        if !trust_key_lifecycle_is_active(observed.key_lifecycle) {
+            return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleKeyEpoch);
+        }
+    }
+    if flags.contains_all(TrustEvidenceFlags::KEY_LEASE)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::KEY_LEASE)
+            || !evidence_ref_has_id(observed.key_lease_ref))
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingKeyLeaseEvidence,
+        );
+    }
+    if flags.contains_all(TrustEvidenceFlags::AUTHORIZATION)
+        && !evidence_ref_has_id(observed.authorization_ref)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::MissingAuthorization);
+    }
+    if flags.contains_all(TrustEvidenceFlags::AUDIT) && !evidence_ref_has_id(observed.audit_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::MissingAudit);
+    }
+    if flags.contains_all(TrustEvidenceFlags::RESIDENCY)
+        && !evidence_ref_has_id(observed.residency_ref)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::ResidencyViolation);
+    }
+    if flags.contains_all(TrustEvidenceFlags::SHARING_DOMAIN)
+        && !evidence_ref_has_id(observed.sharing_domain_ref)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::IllegalSharingDomain);
+    }
+    if flags.contains_all(TrustEvidenceFlags::DEDUP_SHARING_COMPATIBLE)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::DEDUP_SHARING_COMPATIBLE)
+            || !evidence_ref_has_id(observed.sharing_compatibility_ref)
+            || !matches!(
+                observed.sharing_compatibility,
+                DedupSharingCompatibilityState::Compatible
+            ))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::IllegalSharingDomain);
+    }
+
+    let required_allowed_domain =
+        trust_domain_effective_allowed_mask(role, required.allowed_domain_classes);
+    if flags.contains_all(TrustEvidenceFlags::REGULATORY_DOMAIN)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::REGULATORY_DOMAIN)
+            || required_allowed_domain.is_empty()
+            || !observed
+                .allowed_domain_classes
+                .contains_all(required_allowed_domain)
+            || !evidence_ref_has_id(observed.regulatory_domain_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::ResidencyViolation);
+    }
+    if flags.contains_all(TrustEvidenceFlags::OPERATOR_ALLOWED_DOMAIN)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::OPERATOR_ALLOWED_DOMAIN)
+            || required_allowed_domain.is_empty()
+            || !observed
+                .allowed_domain_classes
+                .contains_all(required_allowed_domain)
+            || !evidence_ref_has_id(observed.operator_allowed_domain_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::ResidencyViolation);
+    }
+    if flags.contains_all(TrustEvidenceFlags::TRUST_EPOCH)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::TRUST_EPOCH)
+            || observed.trust_epoch < required.min_trust_epoch
+            || !evidence_ref_has_id(observed.trust_epoch_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleTrustEvidence);
+    }
+    if flags.contains_all(TrustEvidenceFlags::FRESH_TRUST_EVIDENCE)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::FRESH_TRUST_EVIDENCE)
+            || !matches!(observed.freshness_state, TrustEvidenceFreshnessState::Fresh)
+            || (required.max_evidence_age_ms != 0
+                && observed.evidence_age_ms > required.max_evidence_age_ms)
+            || !evidence_ref_has_id(observed.freshness_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleTrustEvidence);
+    }
+    if flags.contains_all(TrustEvidenceFlags::NOT_REVOKED)
+        && (!observed
+            .state
+            .flags
+            .contains_all(TrustEvidenceFlags::NOT_REVOKED)
+            || matches!(observed.revocation_state, TrustRevocationState::Revoked)
+            || !evidence_ref_has_id(observed.revocation_ref))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::RevokedTrustDomain);
+    }
+    if flags.contains_all(TrustEvidenceFlags::NOT_COMPROMISED)
+        && !evidence_ref_has_id(observed.compromise_ref)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::CompromisedRepairSource,
+        );
+    }
+    if flags.contains_all(TrustEvidenceFlags::NOT_QUARANTINED)
+        && !evidence_ref_has_id(observed.quarantine_ref)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::QuarantinedSource);
+    }
+
     ReceiptPredicateResult::SATISFIED
 }
 
@@ -6001,6 +6727,110 @@ mod tests {
             u64::from(byte),
             1,
         )
+    }
+
+    fn trust_ref(byte: u8) -> StorageIntentEvidenceRef {
+        evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, byte)
+    }
+
+    fn trust_role_residency(role: StorageIntentTrustRole) -> ResidencyScope {
+        match role {
+            StorageIntentTrustRole::GeoIntent => ResidencyScope::GeoReplicaAllowed,
+            StorageIntentTrustRole::ArchiveRestore => ResidencyScope::Jurisdiction,
+            StorageIntentTrustRole::DurablePlacement
+            | StorageIntentTrustRole::DegradedReconstruction
+            | StorageIntentTrustRole::RepairSource
+            | StorageIntentTrustRole::RelocationTarget => ResidencyScope::Region,
+            _ => ResidencyScope::Unspecified,
+        }
+    }
+
+    fn trust_role_requirement_for_test(role: StorageIntentTrustRole) -> TrustDomainRequirement {
+        TrustDomainRequirement {
+            base: TrustRequirement {
+                required_flags: trust_domain_role_required_flags(role),
+                min_session_security: trust_domain_role_min_session_security(role),
+                min_key_epoch: 9,
+                admin_domain: DOMAIN_A,
+                security_domain: DOMAIN_A,
+                tenant_domain: DOMAIN_A,
+                residency: trust_role_residency(role),
+                sharing_domain: SharingDomainClass::SameTenant,
+            },
+            dataset_domain: DOMAIN_A,
+            policy_domain: DOMAIN_A,
+            budget_owner_domain: DOMAIN_A,
+            encryption_domain: DOMAIN_A,
+            allowed_domain_classes: trust_domain_role_allowed_domain_floor(role),
+            min_trust_epoch: 7,
+            max_evidence_age_ms: 100,
+        }
+    }
+
+    fn all_allowed_domain_classes() -> TrustAllowedDomainMask {
+        TrustAllowedDomainMask::SAME_ADMIN
+            .union(TrustAllowedDomainMask::SAME_SECURITY)
+            .union(TrustAllowedDomainMask::SAME_TENANT)
+            .union(TrustAllowedDomainMask::SAME_POLICY)
+            .union(TrustAllowedDomainMask::SAME_JURISDICTION)
+            .union(TrustAllowedDomainMask::GEO_ALLOWED)
+            .union(TrustAllowedDomainMask::INTERNET_ALLOWED)
+            .union(TrustAllowedDomainMask::OPERATOR_DEFINED)
+    }
+
+    fn full_trust_record_for_role(role: StorageIntentTrustRole) -> TrustEvidenceRecord {
+        let reference = trust_ref(170_u8 + role.to_discriminant());
+        TrustEvidenceRecord {
+            state: TrustEvidenceState {
+                flags: trust_domain_role_required_flags(role),
+                session_security: trust_domain_role_min_session_security(role),
+                key_epoch: 9,
+                admin_domain: DOMAIN_A,
+                security_domain: DOMAIN_A,
+                tenant_domain: DOMAIN_A,
+                residency: trust_role_residency(role),
+                sharing_domain: SharingDomainClass::PrivateDataset,
+                compromise_state: CompromiseState::Clear,
+                quarantine_state: QuarantineState::Clear,
+            },
+            principal_ref: reference,
+            peer_identity_ref: reference,
+            admin_domain_ref: reference,
+            security_domain_ref: reference,
+            tenant_domain_ref: reference,
+            dataset_domain: DOMAIN_A,
+            dataset_domain_ref: reference,
+            policy_domain: DOMAIN_A,
+            policy_domain_ref: reference,
+            budget_owner_domain: DOMAIN_A,
+            budget_owner_domain_ref: reference,
+            encryption_domain: DOMAIN_A,
+            encryption_domain_ref: reference,
+            session_security_ref: reference,
+            key_epoch_ref: reference,
+            key_lifecycle: TrustKeyLifecycleState::Active,
+            key_lifecycle_ref: reference,
+            key_lease_ref: reference,
+            authorization_ref: reference,
+            audit_ref: reference,
+            residency_ref: reference,
+            sharing_domain_ref: reference,
+            sharing_compatibility: DedupSharingCompatibilityState::Compatible,
+            sharing_compatibility_ref: reference,
+            allowed_domain_classes: all_allowed_domain_classes(),
+            regulatory_domain_ref: reference,
+            operator_allowed_domain_ref: reference,
+            trust_epoch: 7,
+            trust_epoch_ref: reference,
+            evidence_age_ms: 10,
+            freshness_state: TrustEvidenceFreshnessState::Fresh,
+            freshness_ref: reference,
+            revocation_state: TrustRevocationState::Clear,
+            revocation_ref: reference,
+            compromise_ref: reference,
+            quarantine_ref: reference,
+            refusal_ref: reference,
+        }
     }
 
     fn freshness_row(
@@ -6998,6 +7828,154 @@ mod tests {
         assert_eq!(
             trust_security_satisfies(required, observed).refusal,
             StorageIntentRefusalReason::MissingAuthorization
+        );
+    }
+
+    #[test]
+    fn trust_role_predicates_cover_named_roles() {
+        let roles = [
+            StorageIntentTrustRole::SyncIntent,
+            StorageIntentTrustRole::QuorumIntent,
+            StorageIntentTrustRole::GeoIntent,
+            StorageIntentTrustRole::DurablePlacement,
+            StorageIntentTrustRole::ReadServing,
+            StorageIntentTrustRole::DegradedReconstruction,
+            StorageIntentTrustRole::AuthoritativeRam,
+            StorageIntentTrustRole::RepairSource,
+            StorageIntentTrustRole::RelocationTarget,
+            StorageIntentTrustRole::DedupRebakeSharing,
+            StorageIntentTrustRole::ArchiveRestore,
+        ];
+
+        for role in roles {
+            assert_eq!(
+                trust_domain_role_satisfies(
+                    role,
+                    trust_role_requirement_for_test(role),
+                    full_trust_record_for_role(role),
+                ),
+                ReceiptPredicateResult::SATISFIED,
+                "role {} should have a satisfiable trust/domain evidence envelope",
+                role
+            );
+        }
+    }
+
+    #[test]
+    fn stale_key_epoch_blocks_durable_placement() {
+        let role = StorageIntentTrustRole::DurablePlacement;
+        let mut observed = full_trust_record_for_role(role);
+        observed.state.key_epoch = 8;
+
+        assert_eq!(
+            trust_domain_role_satisfies(role, trust_role_requirement_for_test(role), observed)
+                .refusal,
+            StorageIntentRefusalReason::StaleKeyEpoch
+        );
+    }
+
+    #[test]
+    fn revoked_or_quarantined_trust_domain_is_refused() {
+        let role = StorageIntentTrustRole::ReadServing;
+        let mut observed = full_trust_record_for_role(role);
+        observed.revocation_state = TrustRevocationState::Revoked;
+
+        assert_eq!(
+            trust_domain_role_satisfies(role, trust_role_requirement_for_test(role), observed)
+                .refusal,
+            StorageIntentRefusalReason::RevokedTrustDomain
+        );
+
+        let mut observed = full_trust_record_for_role(role);
+        observed.state.quarantine_state = QuarantineState::Quarantined;
+        assert_eq!(
+            trust_domain_role_satisfies(role, trust_role_requirement_for_test(role), observed)
+                .refusal,
+            StorageIntentRefusalReason::QuarantinedSource
+        );
+    }
+
+    #[test]
+    fn internet_path_needs_session_security_not_rdma() {
+        let role = StorageIntentTrustRole::GeoIntent;
+        let required = TrustDomainRequirement {
+            base: TrustRequirement {
+                residency: ResidencyScope::InternetAllowed,
+                ..trust_role_requirement_for_test(role).base
+            },
+            allowed_domain_classes: TrustAllowedDomainMask::INTERNET_ALLOWED,
+            ..trust_role_requirement_for_test(role)
+        };
+        let mut observed = full_trust_record_for_role(role);
+        observed.state.residency = ResidencyScope::InternetAllowed;
+        observed.allowed_domain_classes = TrustAllowedDomainMask::INTERNET_ALLOWED;
+        observed.state.session_security = SessionSecurityClass::Authenticated;
+
+        assert_eq!(
+            trust_domain_role_satisfies(role, required, observed).refusal,
+            StorageIntentRefusalReason::MissingRequiredSessionSecurity
+        );
+    }
+
+    #[test]
+    fn cross_tenant_dedup_rebake_is_illegal_without_sharing_authority() {
+        let role = StorageIntentTrustRole::DedupRebakeSharing;
+        let mut observed = full_trust_record_for_role(role);
+        observed.state.sharing_domain = SharingDomainClass::CrossTenantAllowed;
+        observed.sharing_compatibility = DedupSharingCompatibilityState::CrossTenantForbidden;
+
+        assert_eq!(
+            trust_domain_role_satisfies(role, trust_role_requirement_for_test(role), observed)
+                .refusal,
+            StorageIntentRefusalReason::IllegalSharingDomain
+        );
+    }
+
+    #[test]
+    fn cross_admin_geo_placement_requires_authorization_ref() {
+        let role = StorageIntentTrustRole::GeoIntent;
+        let required = TrustDomainRequirement {
+            base: TrustRequirement {
+                admin_domain: StorageIntentDomainId::ZERO,
+                security_domain: StorageIntentDomainId::ZERO,
+                ..trust_role_requirement_for_test(role).base
+            },
+            ..trust_role_requirement_for_test(role)
+        };
+        let mut observed = full_trust_record_for_role(role);
+        observed.state.admin_domain = DOMAIN_B;
+        observed.state.security_domain = DOMAIN_B;
+        observed.authorization_ref = StorageIntentEvidenceRef::default();
+
+        assert_eq!(
+            trust_domain_role_satisfies(role, required, observed).refusal,
+            StorageIntentRefusalReason::MissingAuthorization
+        );
+    }
+
+    #[test]
+    fn regulatory_residency_refusal_is_visible() {
+        let role = StorageIntentTrustRole::ArchiveRestore;
+        let mut observed = full_trust_record_for_role(role);
+        observed.state.residency = ResidencyScope::InternetAllowed;
+
+        assert_eq!(
+            trust_domain_role_satisfies(role, trust_role_requirement_for_test(role), observed)
+                .refusal,
+            StorageIntentRefusalReason::ResidencyViolation
+        );
+    }
+
+    #[test]
+    fn compromised_repair_source_is_rejected() {
+        let role = StorageIntentTrustRole::RepairSource;
+        let mut observed = full_trust_record_for_role(role);
+        observed.state.compromise_state = CompromiseState::Compromised;
+
+        assert_eq!(
+            trust_domain_role_satisfies(role, trust_role_requirement_for_test(role), observed)
+                .refusal,
+            StorageIntentRefusalReason::CompromisedRepairSource
         );
     }
 
