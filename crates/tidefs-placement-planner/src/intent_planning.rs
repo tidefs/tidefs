@@ -13,14 +13,15 @@ use std::collections::BTreeSet;
 use tidefs_storage_intent_core::{
     ack_receipt_satisfies_requested_floor, evaluate_receipt_against_policy,
     media_capability_satisfies_role, prefetch_residency_decision_is_cache_only,
-    prefetch_residency_decision_may_request_authority_change, AllocationClass, CostWearRecord,
-    DataShapeRecord, EvidenceFamilyFreshnessState, LayoutAllocatorRecord, MediaRoleMask,
-    MediaRoleRequirement, PredictionConfidence, PrefetchResidencyDecisionOutcome,
-    PrefetchResidencyDecisionRecord, ReceiptPredicateResult, SkippedMoveReason,
-    StorageIntentActionClass, StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot,
-    StorageIntentEvidenceRef, StorageIntentGuaranteeClass, StorageIntentPolicy,
-    StorageIntentReceipt, StorageIntentReceiptId, StorageIntentRefusalReason, StorageMediaRole,
-    TransformRefusalClass,
+    prefetch_residency_decision_may_request_authority_change, trust_domain_role_requirement,
+    trust_domain_role_satisfies, AllocationClass, CostWearRecord, DataShapeRecord,
+    EvidenceFamilyFreshnessState, LayoutAllocatorRecord, MediaRoleMask, MediaRoleRequirement,
+    PredictionConfidence, PrefetchResidencyDecisionOutcome, PrefetchResidencyDecisionRecord,
+    ReceiptPredicateResult, SkippedMoveReason, StorageIntentActionClass, StorageIntentEvidenceKind,
+    StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef, StorageIntentGuaranteeClass,
+    StorageIntentPolicy, StorageIntentReceipt, StorageIntentReceiptId, StorageIntentRefusalReason,
+    StorageIntentTrustRole, StorageMediaRole, TransformRefusalClass, TrustDomainRequirement,
+    TrustEvidenceRecord,
 };
 
 use crate::TierGoal;
@@ -101,6 +102,21 @@ impl StorageIntentPlacementRole {
             Self::ColdArchivePlacement => StorageIntentActionClass::ArchiveMigration,
             Self::GeoDeltaRemoteIntent => StorageIntentActionClass::GeoCatchup,
             Self::RepairRelocationTemporary => StorageIntentActionClass::ReadTriggeredRepair,
+        }
+    }
+
+    /// Trust/domain role required for this placement role.
+    #[must_use]
+    pub const fn trust_role(self) -> StorageIntentTrustRole {
+        match self {
+            Self::SyncIntentTarget => StorageIntentTrustRole::SyncIntent,
+            Self::CacheOnlyHotServingTrial | Self::AuthoritativeHotServingReplica => {
+                StorageIntentTrustRole::ReadServing
+            }
+            Self::DurableFullPlacement => StorageIntentTrustRole::DurablePlacement,
+            Self::ColdArchivePlacement => StorageIntentTrustRole::ArchiveRestore,
+            Self::GeoDeltaRemoteIntent => StorageIntentTrustRole::GeoIntent,
+            Self::RepairRelocationTemporary => StorageIntentTrustRole::RelocationTarget,
         }
     }
 
@@ -279,6 +295,8 @@ pub struct StorageIntentPlacementCandidate {
     pub cost_wear: Option<CostWearRecord>,
     /// Optional #967 prefetch/residency decision input.
     pub prefetch_residency: Option<PrefetchResidencyDecisionRecord>,
+    /// #897 authenticated peer/domain evidence for the candidate.
+    pub trust_domain_evidence: Option<TrustEvidenceRecord>,
     /// Predictor confidence for authority-changing movement.
     pub prediction_confidence: PredictionConfidence,
     /// Capacity/admission gate.
@@ -313,6 +331,7 @@ impl StorageIntentPlacementCandidate {
             layout_allocator: None,
             cost_wear: None,
             prefetch_residency: None,
+            trust_domain_evidence: None,
             prediction_confidence: PredictionConfidence::Unknown,
             capacity_admission: PlacementEvidenceState::Unknown,
             transport_path: PlacementEvidenceState::Unknown,
@@ -397,6 +416,12 @@ pub enum StorageIntentPlacementReason {
     CandidateCacheOnlyCannotSatisfyAuthority { target_id: u64 },
     /// Geo or remote role lacked geo/remote evidence.
     CandidateGeoRemoteEvidenceMissing { target_id: u64 },
+    /// Trust/domain evidence rejected the role before scoring.
+    CandidateTrustDomainRefused {
+        target_id: u64,
+        role: StorageIntentTrustRole,
+        refusal: StorageIntentRefusalReason,
+    },
     /// Authority movement lacked predictor confidence.
     CandidateLowPredictionConfidence {
         target_id: u64,
@@ -422,6 +447,7 @@ impl StorageIntentPlacementReason {
             | Self::CandidateReceiptRefused { refusal, .. }
             | Self::CandidateMediaCapabilityRefused { refusal, .. }
             | Self::CandidateEvidenceGateRefused { refusal, .. }
+            | Self::CandidateTrustDomainRefused { refusal, .. }
             | Self::CandidateMovementDebtRefused { refusal, .. } => Some(*refusal),
             Self::PreflightSimulationNotAuthoritative => {
                 Some(StorageIntentRefusalReason::EvidenceNotUsable)
@@ -1320,6 +1346,7 @@ fn evaluate_candidate(
         candidate.trust_domain,
         StorageIntentRefusalReason::EvidenceNotUsable,
     );
+    evaluate_trust_domain(request, candidate, reasons);
     require_candidate_gate(
         reasons,
         candidate.target_id,
@@ -1363,6 +1390,54 @@ fn require_candidate_gate(
             refusal,
         });
     }
+}
+
+fn evaluate_trust_domain(
+    request: &StorageIntentPlacementRequest,
+    candidate: &StorageIntentPlacementCandidate,
+    reasons: &mut Vec<StorageIntentPlacementReason>,
+) {
+    let role = request.role.trust_role();
+    let Some(observed) = candidate.trust_domain_evidence else {
+        reasons.push(StorageIntentPlacementReason::CandidateTrustDomainRefused {
+            target_id: candidate.target_id,
+            role,
+            refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+        });
+        return;
+    };
+
+    let result =
+        trust_domain_role_satisfies(role, trust_domain_requirement(request, role), observed);
+    push_predicate_refusal(
+        reasons,
+        candidate.target_id,
+        result,
+        |target_id, refusal| StorageIntentPlacementReason::CandidateTrustDomainRefused {
+            target_id,
+            role,
+            refusal,
+        },
+    );
+}
+
+fn trust_domain_requirement(
+    request: &StorageIntentPlacementRequest,
+    role: StorageIntentTrustRole,
+) -> TrustDomainRequirement {
+    let mut requirement = trust_domain_role_requirement(role);
+    requirement.base.required_flags = requirement
+        .base
+        .required_flags
+        .union(request.policy.trust.required_flags);
+    requirement.base.min_session_security = request.policy.trust.min_session_security;
+    requirement.base.min_key_epoch = request.policy.trust.min_key_epoch;
+    requirement.base.admin_domain = request.policy.trust.admin_domain;
+    requirement.base.security_domain = request.policy.trust.security_domain;
+    requirement.base.tenant_domain = request.policy.trust.tenant_domain;
+    requirement.base.residency = request.policy.trust.residency;
+    requirement.base.sharing_domain = request.policy.trust.sharing_domain;
+    requirement
 }
 
 fn role_requires_data_shape(role: StorageIntentPlacementRole) -> bool {
@@ -1587,20 +1662,22 @@ fn skipped_move_refusal(reason: SkippedMoveReason) -> StorageIntentRefusalReason
 mod tests {
     use super::*;
     use tidefs_storage_intent_core::{
-        CompromiseState, DurabilityReceiptState, DurabilityRequirement, DurabilityState,
-        EvidenceCompletenessVerdict, EvidenceConsumerClass, EvidenceFamilyFreshness,
-        EvidenceFamilyFreshnessSet, EvidenceQueryContextClass, EvidenceQuerySubjectScope,
-        EvidenceQuerySubjectScopeClass, FailureDomainMask, MediaArchiveRestoreSemantics,
-        MediaAtomicityClass, MediaCapabilityFlags, MediaCapabilityFreshnessState,
-        MediaFlushOrderingClass, MediaHealthState, MediaPersistenceDomain,
-        MediaProtocolGeometryClass, MediaRemoteCommitSemantics, PrefetchResidencyCandidateClass,
-        PrefetchResidencyDecisionEvidenceRefs, PrefetchResidencyDecisionOutcome,
-        PrefetchResidencyStateClass, ProximityClass, ReadServingSourceClass, ResidencyScope,
-        SegmentRegionClass, SessionSecurityClass, SharingDomainClass, StorageIntentActionClass,
-        StorageIntentDomainId, StorageIntentEvidenceId, StorageIntentEvidenceRef,
-        StorageIntentEvidenceRefs, StorageIntentMediaCapabilityRecord, StorageIntentObjectScope,
-        StorageIntentPolicyId, StorageIntentPolicyRevision, StorageIntentReceiptId,
-        StorageMediaClass, TrustEvidenceFlags, TrustEvidenceState, TrustRequirement,
+        CompromiseState, DedupSharingCompatibilityState, DurabilityReceiptState,
+        DurabilityRequirement, DurabilityState, EvidenceCompletenessVerdict, EvidenceConsumerClass,
+        EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet, EvidenceQueryContextClass,
+        EvidenceQuerySubjectScope, EvidenceQuerySubjectScopeClass, FailureDomainMask,
+        MediaArchiveRestoreSemantics, MediaAtomicityClass, MediaCapabilityFlags,
+        MediaCapabilityFreshnessState, MediaFlushOrderingClass, MediaHealthState,
+        MediaPersistenceDomain, MediaProtocolGeometryClass, MediaRemoteCommitSemantics,
+        PrefetchResidencyCandidateClass, PrefetchResidencyDecisionEvidenceRefs,
+        PrefetchResidencyDecisionOutcome, PrefetchResidencyStateClass, ProximityClass,
+        QuarantineState, ReadServingSourceClass, ResidencyScope, SegmentRegionClass,
+        SessionSecurityClass, SharingDomainClass, StorageIntentActionClass, StorageIntentDomainId,
+        StorageIntentEvidenceId, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
+        StorageIntentMediaCapabilityRecord, StorageIntentObjectScope, StorageIntentPolicyId,
+        StorageIntentPolicyRevision, StorageIntentReceiptId, StorageMediaClass, TrustEvidenceFlags,
+        TrustEvidenceFreshnessState, TrustEvidenceState, TrustKeyLifecycleState, TrustRequirement,
+        TrustRevocationState,
     };
 
     const POLICY_ID: StorageIntentPolicyId = StorageIntentPolicyId([7_u8; 16]);
@@ -1790,7 +1867,77 @@ mod tests {
             residency: ResidencyScope::GeoReplicaAllowed,
             sharing_domain: SharingDomainClass::PrivateDataset,
             compromise_state: CompromiseState::Clear,
-            quarantine_state: tidefs_storage_intent_core::QuarantineState::Clear,
+            quarantine_state: QuarantineState::Clear,
+        }
+    }
+
+    fn trust_role_for_media(role: StorageMediaRole) -> StorageIntentTrustRole {
+        match role {
+            StorageMediaRole::SyncIntent => StorageIntentTrustRole::SyncIntent,
+            StorageMediaRole::ReadCache | StorageMediaRole::ServingDataHot => {
+                StorageIntentTrustRole::ReadServing
+            }
+            StorageMediaRole::GeoAsyncReplica => StorageIntentTrustRole::GeoIntent,
+            StorageMediaRole::ArchiveEc => StorageIntentTrustRole::ArchiveRestore,
+            StorageMediaRole::RepairTemp => StorageIntentTrustRole::RelocationTarget,
+            _ => StorageIntentTrustRole::DurablePlacement,
+        }
+    }
+
+    fn trust_record(role: StorageIntentTrustRole) -> TrustEvidenceRecord {
+        let requirement = trust_domain_role_requirement(role);
+        let trust_ref = evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, 53);
+
+        TrustEvidenceRecord {
+            state: TrustEvidenceState {
+                flags: requirement.base.required_flags,
+                session_security: requirement.base.min_session_security,
+                key_epoch: 1,
+                admin_domain: DOMAIN_A,
+                security_domain: DOMAIN_A,
+                tenant_domain: DOMAIN_A,
+                residency: ResidencyScope::GeoReplicaAllowed,
+                sharing_domain: SharingDomainClass::PrivateDataset,
+                compromise_state: CompromiseState::Clear,
+                quarantine_state: QuarantineState::Clear,
+            },
+            principal_ref: trust_ref,
+            peer_identity_ref: trust_ref,
+            admin_domain_ref: trust_ref,
+            security_domain_ref: trust_ref,
+            tenant_domain_ref: trust_ref,
+            dataset_domain: DOMAIN_A,
+            dataset_domain_ref: trust_ref,
+            policy_domain: DOMAIN_A,
+            policy_domain_ref: trust_ref,
+            budget_owner_domain: DOMAIN_A,
+            budget_owner_domain_ref: trust_ref,
+            encryption_domain: DOMAIN_A,
+            encryption_domain_ref: trust_ref,
+            session_security_ref: trust_ref,
+            key_epoch_ref: trust_ref,
+            key_lifecycle: TrustKeyLifecycleState::Active,
+            key_lifecycle_ref: trust_ref,
+            key_lease_ref: trust_ref,
+            authorization_ref: trust_ref,
+            audit_ref: trust_ref,
+            residency_ref: trust_ref,
+            sharing_domain_ref: trust_ref,
+            sharing_compatibility: DedupSharingCompatibilityState::Compatible,
+            sharing_compatibility_ref: trust_ref,
+            allowed_domain_classes: requirement.allowed_domain_classes,
+            regulatory_domain_ref: trust_ref,
+            operator_allowed_domain_ref: trust_ref,
+            trust_epoch: 1,
+            trust_epoch_ref: trust_ref,
+            evidence_age_ms: 1,
+            freshness_state: TrustEvidenceFreshnessState::Fresh,
+            freshness_ref: trust_ref,
+            revocation_state: TrustRevocationState::Clear,
+            revocation_ref: trust_ref,
+            compromise_ref: trust_ref,
+            quarantine_ref: trust_ref,
+            refusal_ref: trust_ref,
         }
     }
 
@@ -1943,6 +2090,8 @@ mod tests {
             self.data_shape = Some(data_shape());
             self.layout_allocator = Some(layout());
             self.cost_wear = Some(cost_wear());
+            self.trust_domain_evidence =
+                Some(trust_record(trust_role_for_media(self.receipt.media_role)));
             self.prediction_confidence = PredictionConfidence::High;
             self
         }
@@ -2224,6 +2373,75 @@ mod tests {
 
         assert!(!result.admitted);
         assert!(result.has_refusal(StorageIntentRefusalReason::WrongDomain));
+    }
+
+    #[test]
+    fn trust_domain_record_refuses_quarantined_or_unauthorized_candidate() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::GeoAsync,
+            FailureDomainMask::GEO,
+        );
+        let mut quarantined = candidate(
+            1,
+            10,
+            StorageMediaRole::GeoAsyncReplica,
+            StorageIntentGuaranteeClass::GeoAsync,
+            FailureDomainMask::GEO,
+            StorageMediaClass::NvmeFlash,
+        );
+        let trust = quarantined
+            .trust_domain_evidence
+            .as_mut()
+            .expect("candidate fixture carries trust/domain evidence");
+        trust.state.quarantine_state = QuarantineState::Quarantined;
+
+        let result = evaluate_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::GeoDeltaRemoteIntent,
+                1,
+                1,
+            ),
+            &[quarantined],
+        );
+
+        assert!(!result.admitted);
+        assert!(result.has_refusal(StorageIntentRefusalReason::QuarantinedSource));
+        assert!(result.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::CandidateTrustDomainRefused {
+                role: StorageIntentTrustRole::GeoIntent,
+                refusal: StorageIntentRefusalReason::QuarantinedSource,
+                ..
+            }
+        )));
+
+        let mut unauthorized = candidate(
+            2,
+            20,
+            StorageMediaRole::GeoAsyncReplica,
+            StorageIntentGuaranteeClass::GeoAsync,
+            FailureDomainMask::GEO,
+            StorageMediaClass::NvmeFlash,
+        );
+        unauthorized
+            .trust_domain_evidence
+            .as_mut()
+            .expect("candidate fixture carries trust/domain evidence")
+            .authorization_ref = StorageIntentEvidenceRef::default();
+
+        let result = evaluate_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::GeoDeltaRemoteIntent,
+                1,
+                1,
+            ),
+            &[unauthorized],
+        );
+
+        assert!(!result.admitted);
+        assert!(result.has_refusal(StorageIntentRefusalReason::MissingAuthorization));
     }
 
     #[test]
