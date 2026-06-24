@@ -9,6 +9,8 @@ include::chapters/00-preface.adoc[]
 
 include::chapters/05-book-plan.adoc[]
 
+include::chapters/15-documentation-authority.adoc[]
+
 = Operator Guide
 
 include::chapters/10-tidefsctl.adoc[]

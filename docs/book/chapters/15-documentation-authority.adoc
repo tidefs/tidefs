@@ -1,0 +1,72 @@
+== Documentation Authority
+
+This chapter is for readers who need to know where the book stops and which
+repo surfaces own the current answer. TideFS remains pre-alpha. The book should
+help operators and contributors orient themselves, but it does not turn a
+design note, historical status snapshot, CI artifact, evidence input, or
+gate-local receipt into product truth.
+
+=== Current Entry Points
+
+Start with the current reader path before treating any detailed document as
+authority:
+
+* `README.md` states the project maturity, target, and claim boundary.
+* `AGENTS.md` records the development and claim-hygiene rules for
+  Codex-authored changes.
+* `docs/INDEX.md` is the reader entry point for current policy, review,
+  evidence, and design/reference material.
+* `docs/book/README.adoc` is the book authoring authority.
+* `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` classifies imported documents and
+  names the states that decide whether a document can be cited as current.
+
+A path listed in `docs/INDEX.md` or linked from a book chapter is not
+automatically current behavior. Follow the authority register and the owning
+document's stated scope.
+
+=== Review And Debt Registers
+
+The review surfaces explain what blocks honest product claims:
+
+* `docs/REVIEW_TODO_POLICY.md` says durable debt belongs in the review
+  register, not anonymous inline markers.
+* `docs/REVIEW_TODO_REGISTER.md` records broad unresolved areas, including
+  documentation-authority drift under `TFR-019`.
+* `docs/WHOLE_REPO_REVIEW.md` gives the wider review narrative and explains
+  why old imported material cannot be treated as current status.
+
+These files are direction and blocker evidence. They do not close a capability
+claim by themselves.
+
+=== Authority Register States
+
+When the book points to another document, read that document through the
+classification state in `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`:
+
+* `Current policy` is a binding rule that matches current source and repo
+  policy.
+* `Current spec` is a design or implementation contract that matches current
+  source behavior and recorded evidence.
+* `Historical input` is useful background, not current status.
+* `Delete candidate` is stale duplicate, obsolete closeout, or scaffold text
+  whose useful content has already moved elsewhere.
+
+Book chapters may summarize historical input only when the surrounding text
+labels it as background. Historical input must not be used to describe current
+commands, supported behavior, release posture, or product maturity unless a
+subsequent authority-register classification promotes that exact scope.
+
+=== Evidence And Verdict Boundaries
+
+Validation and evidence documents help reviewers interpret work, but they are
+not whole-product verdicts. `docs/GITHUB_CI.md` describes CI behavior.
+`docs/CLAIMS_GATE_POLICY.md` guards publishing-facing claim wording.
+`docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md` and
+`docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` describe evidence
+inputs and gate-local receipts. `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`
+owns the whole-product verdict boundary.
+
+Until that verdict boundary records a decision, book text must keep the
+pre-alpha maturity boundary visible and treat CI artifacts, evidence indexes,
+claims-gate results, and gate-local receipts as inputs for review rather than
+as release-readiness or product-admission decisions.
