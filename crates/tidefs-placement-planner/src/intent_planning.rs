@@ -1514,13 +1514,13 @@ fn evaluate_layout(
             refusal: LayoutRefusal::UnknownAllocationClass,
         });
     }
-    if layout.pending_free_bytes > 0 && !layout.pending_free_safe {
+    if layout.pending_free_bytes > 0 && !layout.pending_free_is_safe() {
         reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
             target_id: candidate.target_id,
             refusal: LayoutRefusal::PendingFreeUnsafe,
         });
     }
-    if layout.stale_mirror_refusal {
+    if layout.stale_pointer_refusal {
         reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
             target_id: candidate.target_id,
             refusal: LayoutRefusal::StaleMirror,
@@ -1661,6 +1661,7 @@ fn skipped_move_refusal(reason: SkippedMoveReason) -> StorageIntentRefusalReason
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_storage_intent_core::PendingFreeSafetyClass;
     use tidefs_storage_intent_core::{
         CompromiseState, DedupSharingCompatibilityState, DurabilityReceiptState,
         DurabilityRequirement, DurabilityState, EvidenceCompletenessVerdict, EvidenceConsumerClass,
@@ -2044,7 +2045,7 @@ mod tests {
         LayoutAllocatorRecord {
             allocation_class: AllocationClass::LargeSequential,
             region_class: SegmentRegionClass::Warm,
-            pending_free_safe: true,
+            pending_free_safety: PendingFreeSafetyClass::Safe,
             evidence: evidence_ref(StorageIntentEvidenceKind::LayoutAllocatorEvidence, 61),
             ..LayoutAllocatorRecord::default()
         }
