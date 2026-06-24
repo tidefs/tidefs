@@ -8,7 +8,8 @@
 //! `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`. It gives write admission,
 //! placement, transport, relocation, validation, and explanation code one
 //! shared vocabulary for requested policy, earned receipts, evidence refs,
-//! media roles, trust state, durability/RPO, cost/wear, and refusal shape.
+//! media roles, trust state, durability/RPO, capacity/admission, cost/wear,
+//! and refusal shape.
 //!
 //! It does not activate runtime placement behavior or define a durable wire or
 //! on-disk format. Callers that persist these records must define their own
@@ -7876,6 +7877,40 @@ pub enum StorageIntentRefusalReason {
     MissingRemoteApplyFrontier = 62,
     /// Evidence is sequence-only; wall-clock RPO or freshness cannot be proved.
     SequenceOnlyCannotSatisfyWallClockRpo = 63,
+    /// Capacity/admission evidence is missing or not a capacity artifact.
+    MissingCapacityAdmissionEvidence = 64,
+    /// Capacity evidence is older than the legal admission frontier.
+    StaleCapacityEvidence = 65,
+    /// Capacity admission was not active when the role needed it.
+    CapacityAdmissionNotActive = 66,
+    /// Logical or requested headroom is exhausted.
+    CapacityHeadroomExhausted = 67,
+    /// Physical, allocation-class, or segment-class headroom is exhausted.
+    PhysicalHeadroomExhausted = 68,
+    /// Dataset quota, slop, or protected logical floor would be violated.
+    QuotaOrSlopFloorExceeded = 69,
+    /// Allocation ticket evidence is missing, stale, or expired.
+    StaleAllocationTicket = 70,
+    /// Reserve escrow or reserve receipt evidence has expired.
+    ExpiredReserveEscrow = 71,
+    /// Pending-free bytes were counted before publication and fences were safe.
+    PendingFreeNotSafe = 72,
+    /// Reclaimable bytes or reclaim debt were counted before retirement was safe.
+    ReclaimDebtNotSafe = 73,
+    /// Amplification estimate omitted required old-plus-new or transform overlap.
+    CapacityAmplificationUnderestimated = 74,
+    /// Claim or reserve ledgers report overcommitment.
+    ReserveOvercommitted = 75,
+    /// Admission would breach a protected sync, repair, evacuation, or retirement floor.
+    ProtectedReserveWouldBeBreached = 76,
+    /// Repair, rebuild, evacuation, or receipt-retirement reserve is exhausted.
+    RecoveryReserveExhausted = 77,
+    /// Relocation scratch reserve is exhausted.
+    RelocationScratchReserveExhausted = 78,
+    /// Geo catch-up backlog exceeds admitted reserve.
+    GeoCatchUpReserveExceeded = 79,
+    /// Background optimizer would borrow protected reserves without override.
+    OptimizerProtectedReserveBorrow = 80,
 }
 
 impl StorageIntentRefusalReason {
@@ -7949,6 +7984,23 @@ impl StorageIntentRefusalReason {
             Self::CrossedPolicyStageDeadline => "crossed-policy-stage-deadline",
             Self::MissingRemoteApplyFrontier => "missing-remote-apply-frontier",
             Self::SequenceOnlyCannotSatisfyWallClockRpo => "sequence-only-cannot-satisfy-wall-clock-rpo",
+            Self::MissingCapacityAdmissionEvidence => "missing-capacity-admission-evidence",
+            Self::StaleCapacityEvidence => "stale-capacity-evidence",
+            Self::CapacityAdmissionNotActive => "capacity-admission-not-active",
+            Self::CapacityHeadroomExhausted => "capacity-headroom-exhausted",
+            Self::PhysicalHeadroomExhausted => "physical-headroom-exhausted",
+            Self::QuotaOrSlopFloorExceeded => "quota-or-slop-floor-exceeded",
+            Self::StaleAllocationTicket => "stale-allocation-ticket",
+            Self::ExpiredReserveEscrow => "expired-reserve-escrow",
+            Self::PendingFreeNotSafe => "pending-free-not-safe",
+            Self::ReclaimDebtNotSafe => "reclaim-debt-not-safe",
+            Self::CapacityAmplificationUnderestimated => "capacity-amplification-underestimated",
+            Self::ReserveOvercommitted => "reserve-overcommitted",
+            Self::ProtectedReserveWouldBeBreached => "protected-reserve-would-be-breached",
+            Self::RecoveryReserveExhausted => "recovery-reserve-exhausted",
+            Self::RelocationScratchReserveExhausted => "relocation-scratch-reserve-exhausted",
+            Self::GeoCatchUpReserveExceeded => "geo-catch-up-reserve-exceeded",
+            Self::OptimizerProtectedReserveBorrow => "optimizer-protected-reserve-borrow",
         }
     }
 
@@ -8020,6 +8072,23 @@ impl StorageIntentRefusalReason {
             61 => Some(Self::CrossedPolicyStageDeadline),
             62 => Some(Self::MissingRemoteApplyFrontier),
             63 => Some(Self::SequenceOnlyCannotSatisfyWallClockRpo),
+            64 => Some(Self::MissingCapacityAdmissionEvidence),
+            65 => Some(Self::StaleCapacityEvidence),
+            66 => Some(Self::CapacityAdmissionNotActive),
+            67 => Some(Self::CapacityHeadroomExhausted),
+            68 => Some(Self::PhysicalHeadroomExhausted),
+            69 => Some(Self::QuotaOrSlopFloorExceeded),
+            70 => Some(Self::StaleAllocationTicket),
+            71 => Some(Self::ExpiredReserveEscrow),
+            72 => Some(Self::PendingFreeNotSafe),
+            73 => Some(Self::ReclaimDebtNotSafe),
+            74 => Some(Self::CapacityAmplificationUnderestimated),
+            75 => Some(Self::ReserveOvercommitted),
+            76 => Some(Self::ProtectedReserveWouldBeBreached),
+            77 => Some(Self::RecoveryReserveExhausted),
+            78 => Some(Self::RelocationScratchReserveExhausted),
+            79 => Some(Self::GeoCatchUpReserveExceeded),
+            80 => Some(Self::OptimizerProtectedReserveBorrow),
             _ => None,
         }
     }
@@ -9974,6 +10043,815 @@ pub const fn temporal_evidence_age_ms(
     }
     Some(now_ms - event_timestamp_ms)
 }
+
+/// Storage-intent capacity role being admitted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentCapacityAdmissionRole {
+    #[default]
+    Unknown = 0,
+    LocalIntent = 1,
+    QuorumIntent = 2,
+    FullPlacement = 3,
+    GeoCatchUp = 4,
+    ArchiveEc = 5,
+    ReadRepair = 6,
+    Relocation = 7,
+    Rebake = 8,
+    AuthorityPromotion = 9,
+    RamIntentBacking = 10,
+    BlockFlushFua = 11,
+    FallocateReservation = 12,
+    ReceiptRetirement = 13,
+    BackgroundOptimizer = 14,
+}
+
+impl_u8_canonical!(StorageIntentCapacityAdmissionRole, {
+    Unknown = 0 => "unknown",
+    LocalIntent = 1 => "local-intent",
+    QuorumIntent = 2 => "quorum-intent",
+    FullPlacement = 3 => "full-placement",
+    GeoCatchUp = 4 => "geo-catch-up",
+    ArchiveEc = 5 => "archive-ec",
+    ReadRepair = 6 => "read-repair",
+    Relocation = 7 => "relocation",
+    Rebake = 8 => "rebake",
+    AuthorityPromotion = 9 => "authority-promotion",
+    RamIntentBacking = 10 => "ram-intent-backing",
+    BlockFlushFua = 11 => "block-flush-fua",
+    FallocateReservation = 12 => "fallocate-reservation",
+    ReceiptRetirement = 13 => "receipt-retirement",
+    BackgroundOptimizer = 14 => "background-optimizer",
+});
+
+impl StorageIntentCapacityAdmissionRole {
+    /// Returns true when the role is background optimizer work.
+    #[must_use]
+    pub const fn is_background_optimizer(self) -> bool {
+        matches!(
+            self,
+            Self::Relocation | Self::Rebake | Self::BackgroundOptimizer
+        )
+    }
+}
+
+/// Lifecycle state of one admission or reserve escrow.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentCapacityAdmissionState {
+    #[default]
+    Unknown = 0,
+    Admitted = 1,
+    DegradedVisible = 2,
+    Blocked = 3,
+    Refused = 4,
+    Expired = 5,
+    Released = 6,
+    Aborted = 7,
+    Committed = 8,
+}
+
+impl_u8_canonical!(StorageIntentCapacityAdmissionState, {
+    Unknown = 0 => "unknown",
+    Admitted = 1 => "admitted",
+    DegradedVisible = 2 => "degraded-visible",
+    Blocked = 3 => "blocked",
+    Refused = 4 => "refused",
+    Expired = 5 => "expired",
+    Released = 6 => "released",
+    Aborted = 7 => "aborted",
+    Committed = 8 => "committed",
+});
+
+impl StorageIntentCapacityAdmissionState {
+    /// Returns true when the admission can still satisfy capacity authority.
+    #[must_use]
+    pub const fn is_active_for_authority(self) -> bool {
+        matches!(self, Self::Admitted | Self::Committed)
+    }
+}
+
+/// Pressure state reported by reserve and claim ledgers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentReservePressureState {
+    #[default]
+    Unknown = 0,
+    Normal = 1,
+    Elevated = 2,
+    Critical = 3,
+    Overcommitted = 4,
+    ProtectedFloorWouldBeBreached = 5,
+}
+
+impl_u8_canonical!(StorageIntentReservePressureState, {
+    Unknown = 0 => "unknown",
+    Normal = 1 => "normal",
+    Elevated = 2 => "elevated",
+    Critical = 3 => "critical",
+    Overcommitted = 4 => "overcommitted",
+    ProtectedFloorWouldBeBreached = 5 => "protected-floor-would-be-breached",
+});
+
+/// Protected reserve floors that capacity admission may not trespass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentProtectedReserveMask(pub u32);
+
+impl StorageIntentProtectedReserveMask {
+    pub const EMPTY: Self = Self(0);
+    pub const SYNC: Self = Self(1_u32 << 0);
+    pub const REPAIR: Self = Self(1_u32 << 1);
+    pub const EVACUATION: Self = Self(1_u32 << 2);
+    pub const RECEIPT_RETIREMENT: Self = Self(1_u32 << 3);
+
+    /// Add protected floors.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns true when no protected floor is named.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Capacity/admission facts proven by a record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentCapacityAdmissionFlags(pub u64);
+
+impl StorageIntentCapacityAdmissionFlags {
+    pub const EMPTY: Self = Self(0);
+    pub const LOGICAL_HEADROOM_PROVED: Self = Self(1_u64 << 0);
+    pub const QUOTA_HEADROOM_PROVED: Self = Self(1_u64 << 1);
+    pub const PHYSICAL_HEADROOM_PROVED: Self = Self(1_u64 << 2);
+    pub const ALLOCATION_CLASS_HEADROOM_PROVED: Self = Self(1_u64 << 3);
+    pub const SEGMENT_CLASS_HEADROOM_PROVED: Self = Self(1_u64 << 4);
+    pub const ALLOCATION_TICKET_FRESH: Self = Self(1_u64 << 5);
+    pub const CLAIM_LEDGER_FRESH: Self = Self(1_u64 << 6);
+    pub const RESERVE_LEDGER_FRESH: Self = Self(1_u64 << 7);
+    pub const RESERVE_RECEIPT_FRESH: Self = Self(1_u64 << 8);
+    pub const RESERVE_ESCROW_ACTIVE: Self = Self(1_u64 << 9);
+    pub const DIRTY_WINDOW_RESERVED: Self = Self(1_u64 << 10);
+    pub const WRITEBACK_BUDGET_RESERVED: Self = Self(1_u64 << 11);
+    pub const SYNC_INTENT_RESERVED: Self = Self(1_u64 << 12);
+    pub const REPAIR_RESERVE_AVAILABLE: Self = Self(1_u64 << 13);
+    pub const EVACUATION_RESERVE_AVAILABLE: Self = Self(1_u64 << 14);
+    pub const REBUILD_RESERVE_AVAILABLE: Self = Self(1_u64 << 15);
+    pub const GEO_CATCHUP_RESERVE_AVAILABLE: Self = Self(1_u64 << 16);
+    pub const RELOCATION_RESERVE_AVAILABLE: Self = Self(1_u64 << 17);
+    pub const PENDING_FREE_PUBLISHED: Self = Self(1_u64 << 18);
+    pub const PENDING_FREE_FENCED: Self = Self(1_u64 << 19);
+    pub const PENDING_FREE_SNAPSHOT_SAFE: Self = Self(1_u64 << 20);
+    pub const PENDING_FREE_GENERATION_SAFE: Self = Self(1_u64 << 21);
+    pub const RECEIPT_RETIREMENT_SAFE: Self = Self(1_u64 << 22);
+    pub const RECLAIM_DEBT_ACCOUNTED: Self = Self(1_u64 << 23);
+    pub const AMPLIFICATION_ESTIMATE_PROVED: Self = Self(1_u64 << 24);
+    pub const SLOP_FLOOR_PRESERVED: Self = Self(1_u64 << 25);
+    pub const PROTECTED_FLOORS_PRESERVED: Self = Self(1_u64 << 26);
+    pub const EVIDENCE_FRESH: Self = Self(1_u64 << 27);
+    pub const QUERY_SNAPSHOT_FRESH: Self = Self(1_u64 << 28);
+    pub const TENANT_BUDGET_PROVED: Self = Self(1_u64 << 29);
+    pub const TEMPORAL_DEADLINES_VALID: Self = Self(1_u64 << 30);
+    pub const POLICY_ROLLOUT_SAFE: Self = Self(1_u64 << 31);
+    pub const AUTHORITY_PROMOTION_SAFE: Self = Self(1_u64 << 32);
+    pub const EXPLICIT_OPTIMIZER_OVERRIDE: Self = Self(1_u64 << 33);
+
+    /// Combine capacity facts.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns true when every required fact is present.
+    #[must_use]
+    pub const fn contains_all(self, required: Self) -> bool {
+        (self.0 & required.0) == required.0
+    }
+}
+
+/// Evidence references consumed by capacity/admission predicates.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentCapacityAdmissionRefs {
+    pub dataset_ref: StorageIntentEvidenceRef,
+    pub space_domain_ref: StorageIntentEvidenceRef,
+    pub quota_ref: StorageIntentEvidenceRef,
+    pub logical_headroom_ref: StorageIntentEvidenceRef,
+    pub physical_headroom_ref: StorageIntentEvidenceRef,
+    pub allocation_class_ref: StorageIntentEvidenceRef,
+    pub segment_class_ref: StorageIntentEvidenceRef,
+    pub allocation_ticket_ref: StorageIntentEvidenceRef,
+    pub claim_ledger_ref: StorageIntentEvidenceRef,
+    pub reserve_ledger_ref: StorageIntentEvidenceRef,
+    pub reserve_receipt_ref: StorageIntentEvidenceRef,
+    pub dirty_window_ref: StorageIntentEvidenceRef,
+    pub writeback_budget_ref: StorageIntentEvidenceRef,
+    pub sync_intent_reserve_ref: StorageIntentEvidenceRef,
+    pub repair_reserve_ref: StorageIntentEvidenceRef,
+    pub evacuation_reserve_ref: StorageIntentEvidenceRef,
+    pub rebuild_reserve_ref: StorageIntentEvidenceRef,
+    pub geo_catchup_reserve_ref: StorageIntentEvidenceRef,
+    pub relocation_scratch_ref: StorageIntentEvidenceRef,
+    pub pending_free_frontier_ref: StorageIntentEvidenceRef,
+    pub reclaim_debt_ref: StorageIntentEvidenceRef,
+    pub amplification_estimate_ref: StorageIntentEvidenceRef,
+    pub capacity_authority_ref: StorageIntentEvidenceRef,
+    pub policy_rollout_ref: StorageIntentEvidenceRef,
+    pub tenant_isolation_ref: StorageIntentEvidenceRef,
+    pub temporal_ref: StorageIntentEvidenceRef,
+    pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentCapacityAdmissionRefs {
+    /// Returns true when core dataset, quota, logical, physical, and cut refs exist.
+    #[must_use]
+    pub const fn has_core_refs(self) -> bool {
+        self.dataset_ref.is_bound()
+            && self.space_domain_ref.is_bound()
+            && self.quota_ref.is_bound()
+            && self.logical_headroom_ref.is_bound()
+            && self.physical_headroom_ref.is_bound()
+            && self.amplification_estimate_ref.is_bound()
+            && self.capacity_authority_ref.is_bound()
+            && self.policy_rollout_ref.is_bound()
+            && self.tenant_isolation_ref.is_bound()
+            && self.temporal_ref.is_bound()
+            && self.evidence_query_snapshot_ref.is_bound()
+    }
+}
+
+/// Capacity amplification estimate for one admission decision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentCapacityAmplificationEstimate {
+    pub logical_bytes: u64,
+    pub replica_count: u16,
+    pub ec_data_shards: u16,
+    pub ec_parity_shards: u16,
+    pub cow_old_plus_new_bytes: u64,
+    pub snapshot_pinned_bytes: u64,
+    pub clone_pinned_bytes: u64,
+    pub receive_base_pinned_bytes: u64,
+    pub compression_expansion_bytes: u64,
+    pub rebake_overlap_bytes: u64,
+    pub receipt_overlap_bytes: u64,
+    pub projected_required_bytes: u64,
+    pub estimate_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentCapacityAmplificationEstimate {
+    /// Returns the minimum byte floor implied by every explicit amplification term.
+    #[must_use]
+    pub const fn component_floor_bytes(self) -> u64 {
+        let replicated = if self.replica_count > 1 {
+            saturating_mul_u64(self.logical_bytes, self.replica_count as u64)
+        } else {
+            self.logical_bytes
+        };
+        let ec_total_shards = self.ec_data_shards as u64 + self.ec_parity_shards as u64;
+        let ec_floor = if self.ec_data_shards > 0 && self.ec_parity_shards > 0 {
+            div_ceil_u64(
+                saturating_mul_u64(self.logical_bytes, ec_total_shards),
+                self.ec_data_shards as u64,
+            )
+        } else {
+            replicated
+        };
+        let mut total = max_u64(replicated, ec_floor);
+        total = saturating_add_u64(total, self.cow_old_plus_new_bytes);
+        total = saturating_add_u64(total, self.snapshot_pinned_bytes);
+        total = saturating_add_u64(total, self.clone_pinned_bytes);
+        total = saturating_add_u64(total, self.receive_base_pinned_bytes);
+        total = saturating_add_u64(total, self.compression_expansion_bytes);
+        total = saturating_add_u64(total, self.rebake_overlap_bytes);
+        saturating_add_u64(total, self.receipt_overlap_bytes)
+    }
+
+    /// Returns true when the projection cites evidence and covers every term.
+    #[must_use]
+    pub const fn proves_required_overlap(self) -> bool {
+        self.estimate_ref.is_bound()
+            && self.projected_required_bytes >= self.component_floor_bytes()
+            && self.projected_required_bytes > 0
+    }
+}
+
+/// Capacity/admission evidence projected into storage-intent authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentCapacityAdmissionEvidence {
+    pub evidence_ref: StorageIntentEvidenceRef,
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub scope: StorageIntentObjectScope,
+    pub dataset_id: StorageIntentDomainId,
+    pub space_domain_id: StorageIntentDomainId,
+    pub quota_domain_id: StorageIntentDomainId,
+    pub budget_owner_id: StorageIntentDomainId,
+    pub state: StorageIntentCapacityAdmissionState,
+    pub reserve_pressure: StorageIntentReservePressureState,
+    pub protected_floor_breaches: StorageIntentProtectedReserveMask,
+    pub flags: StorageIntentCapacityAdmissionFlags,
+    pub refs: StorageIntentCapacityAdmissionRefs,
+    pub amplification: StorageIntentCapacityAmplificationEstimate,
+    pub logical_required_bytes: u64,
+    pub logical_available_bytes: u64,
+    pub quota_available_bytes: u64,
+    pub physical_required_bytes: u64,
+    pub physical_available_bytes: u64,
+    pub dirty_window_required_bytes: u64,
+    pub dirty_window_available_bytes: u64,
+    pub writeback_required_bytes: u64,
+    pub writeback_available_bytes: u64,
+    pub sync_intent_required_bytes: u64,
+    pub sync_intent_available_bytes: u64,
+    pub recovery_required_bytes: u64,
+    pub repair_scratch_available_bytes: u64,
+    pub evacuation_scratch_available_bytes: u64,
+    pub rebuild_scratch_available_bytes: u64,
+    pub geo_catchup_required_bytes: u64,
+    pub geo_catchup_available_bytes: u64,
+    pub relocation_scratch_required_bytes: u64,
+    pub relocation_scratch_available_bytes: u64,
+    pub pending_free_counted_bytes: u64,
+    pub reclaimable_counted_bytes: u64,
+    pub reclaim_debt_bytes: u64,
+    pub slop_floor_required_bytes: u64,
+    pub protected_floor_required_bytes: u64,
+    pub protected_floor_available_bytes: u64,
+    pub evidence_observed_at_ms: u64,
+    pub evidence_valid_until_ms: u64,
+    pub allocation_ticket_expires_at_ms: u64,
+    pub reserve_escrow_expires_at_ms: u64,
+    pub refusal: StorageIntentRefusalReason,
+}
+
+impl Default for StorageIntentCapacityAdmissionEvidence {
+    fn default() -> Self {
+        Self {
+            evidence_ref: StorageIntentEvidenceRef::default(),
+            policy_id: StorageIntentPolicyId::ZERO,
+            policy_revision: StorageIntentPolicyRevision(0),
+            scope: StorageIntentObjectScope::default(),
+            dataset_id: StorageIntentDomainId::ZERO,
+            space_domain_id: StorageIntentDomainId::ZERO,
+            quota_domain_id: StorageIntentDomainId::ZERO,
+            budget_owner_id: StorageIntentDomainId::ZERO,
+            state: StorageIntentCapacityAdmissionState::Unknown,
+            reserve_pressure: StorageIntentReservePressureState::Unknown,
+            protected_floor_breaches: StorageIntentProtectedReserveMask::EMPTY,
+            flags: StorageIntentCapacityAdmissionFlags::EMPTY,
+            refs: StorageIntentCapacityAdmissionRefs::default(),
+            amplification: StorageIntentCapacityAmplificationEstimate::default(),
+            logical_required_bytes: 0,
+            logical_available_bytes: 0,
+            quota_available_bytes: 0,
+            physical_required_bytes: 0,
+            physical_available_bytes: 0,
+            dirty_window_required_bytes: 0,
+            dirty_window_available_bytes: 0,
+            writeback_required_bytes: 0,
+            writeback_available_bytes: 0,
+            sync_intent_required_bytes: 0,
+            sync_intent_available_bytes: 0,
+            recovery_required_bytes: 0,
+            repair_scratch_available_bytes: 0,
+            evacuation_scratch_available_bytes: 0,
+            rebuild_scratch_available_bytes: 0,
+            geo_catchup_required_bytes: 0,
+            geo_catchup_available_bytes: 0,
+            relocation_scratch_required_bytes: 0,
+            relocation_scratch_available_bytes: 0,
+            pending_free_counted_bytes: 0,
+            reclaimable_counted_bytes: 0,
+            reclaim_debt_bytes: 0,
+            slop_floor_required_bytes: 0,
+            protected_floor_required_bytes: 0,
+            protected_floor_available_bytes: 0,
+            evidence_observed_at_ms: 0,
+            evidence_valid_until_ms: 0,
+            allocation_ticket_expires_at_ms: 0,
+            reserve_escrow_expires_at_ms: 0,
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+}
+
+impl StorageIntentCapacityAdmissionEvidence {
+    /// Returns true when the record is a bound capacity/admission artifact.
+    #[must_use]
+    pub const fn has_capacity_identity(self) -> bool {
+        self.evidence_ref.is_bound()
+            && self.evidence_ref.kind as u16
+                == StorageIntentEvidenceKind::CapacityAdmissionEvidence as u16
+    }
+
+    /// Returns true when the evidence timestamp is usable for authority.
+    #[must_use]
+    pub const fn is_fresh_for_authority(self, now_ms: u64, max_age_ms: u64) -> bool {
+        if self.evidence_observed_at_ms == 0 || now_ms < self.evidence_observed_at_ms {
+            return false;
+        }
+        if self.evidence_valid_until_ms == 0 || now_ms > self.evidence_valid_until_ms {
+            return false;
+        }
+        if max_age_ms > 0 && now_ms - self.evidence_observed_at_ms > max_age_ms {
+            return false;
+        }
+        self.flags
+            .contains_all(StorageIntentCapacityAdmissionFlags::EVIDENCE_FRESH)
+    }
+
+    /// Returns true when a counted pending-free byte contribution is safe.
+    #[must_use]
+    pub const fn pending_free_is_admissible(self) -> bool {
+        self.pending_free_counted_bytes == 0
+            || (self.refs.pending_free_frontier_ref.is_bound()
+                && self
+                    .flags
+                    .contains_all(capacity_pending_free_safety_flags()))
+    }
+
+    /// Returns true when counted reclaimable bytes are fenced by retirement law.
+    #[must_use]
+    pub const fn reclaim_debt_is_admissible(self) -> bool {
+        self.reclaimable_counted_bytes == 0
+            || (self.refs.reclaim_debt_ref.is_bound()
+                && self.flags.contains_all(
+                    StorageIntentCapacityAdmissionFlags::RECLAIM_DEBT_ACCOUNTED
+                        .union(StorageIntentCapacityAdmissionFlags::RECEIPT_RETIREMENT_SAFE),
+                ))
+    }
+}
+
+/// Capacity/admission requirement for one storage-intent role.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentCapacityAdmissionRequirement {
+    pub role: StorageIntentCapacityAdmissionRole,
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub scope: StorageIntentObjectScope,
+    pub min_logical_bytes: u64,
+    pub min_physical_bytes: u64,
+    pub max_evidence_age_ms: u64,
+    pub now_ms: u64,
+}
+
+/// Predicate: can capacity/admission evidence satisfy the requested role?
+#[must_use]
+pub const fn capacity_evidence_satisfies_role(
+    requirement: StorageIntentCapacityAdmissionRequirement,
+    evidence: StorageIntentCapacityAdmissionEvidence,
+) -> ReceiptPredicateResult {
+    if !evidence.has_capacity_identity() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingCapacityAdmissionEvidence,
+        );
+    }
+    if evidence.refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return ReceiptPredicateResult::refused(evidence.refusal);
+    }
+    if !evidence.refs.has_core_refs() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !capacity_requirement_scope_matches(requirement, evidence) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.state.is_active_for_authority() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::CapacityAdmissionNotActive,
+        );
+    }
+    if !evidence.is_fresh_for_authority(requirement.now_ms, requirement.max_evidence_age_ms) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleCapacityEvidence);
+    }
+    if !evidence
+        .flags
+        .contains_all(capacity_role_required_flags(requirement.role))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !capacity_allocation_ticket_is_usable(requirement, evidence) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleAllocationTicket);
+    }
+    if !capacity_reserve_escrow_is_usable(requirement, evidence) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::ExpiredReserveEscrow);
+    }
+    if !evidence.pending_free_is_admissible() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::PendingFreeNotSafe);
+    }
+    if !evidence.reclaim_debt_is_admissible() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::ReclaimDebtNotSafe);
+    }
+    let protected_refusal = capacity_protected_floor_refusal(requirement.role, evidence);
+    if protected_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return ReceiptPredicateResult::refused(protected_refusal);
+    }
+    if !evidence.amplification.proves_required_overlap()
+        || evidence.amplification.component_floor_bytes()
+            < max_u64(
+                requirement.min_physical_bytes,
+                evidence.physical_required_bytes,
+            )
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::CapacityAmplificationUnderestimated,
+        );
+    }
+    let logical_required = max_u64(
+        requirement.min_logical_bytes,
+        evidence.logical_required_bytes,
+    );
+    if evidence.logical_available_bytes < logical_required {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::CapacityHeadroomExhausted,
+        );
+    }
+    let quota_required = saturating_add_u64(logical_required, evidence.slop_floor_required_bytes);
+    if evidence.quota_available_bytes < quota_required
+        || !evidence
+            .flags
+            .contains_all(StorageIntentCapacityAdmissionFlags::SLOP_FLOOR_PRESERVED)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::QuotaOrSlopFloorExceeded,
+        );
+    }
+    let physical_required = max_u64(
+        max_u64(
+            requirement.min_physical_bytes,
+            evidence.physical_required_bytes,
+        ),
+        evidence.amplification.projected_required_bytes,
+    );
+    if evidence.physical_available_bytes < physical_required {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::PhysicalHeadroomExhausted,
+        );
+    }
+    if evidence.dirty_window_available_bytes < evidence.dirty_window_required_bytes
+        || evidence.writeback_available_bytes < evidence.writeback_required_bytes
+        || evidence.sync_intent_available_bytes < evidence.sync_intent_required_bytes
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::CapacityHeadroomExhausted,
+        );
+    }
+    let scratch_refusal = capacity_role_scratch_refusal(requirement.role, evidence);
+    if scratch_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return ReceiptPredicateResult::refused(scratch_refusal);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: are pending-free publication/fence/snapshot/generation frontiers safe?
+#[must_use]
+pub const fn capacity_pending_free_is_safe(
+    evidence: StorageIntentCapacityAdmissionEvidence,
+) -> bool {
+    evidence.pending_free_is_admissible()
+}
+
+const fn capacity_pending_free_safety_flags() -> StorageIntentCapacityAdmissionFlags {
+    StorageIntentCapacityAdmissionFlags::PENDING_FREE_PUBLISHED
+        .union(StorageIntentCapacityAdmissionFlags::PENDING_FREE_FENCED)
+        .union(StorageIntentCapacityAdmissionFlags::PENDING_FREE_SNAPSHOT_SAFE)
+        .union(StorageIntentCapacityAdmissionFlags::PENDING_FREE_GENERATION_SAFE)
+        .union(StorageIntentCapacityAdmissionFlags::RECEIPT_RETIREMENT_SAFE)
+}
+
+const fn capacity_base_required_flags() -> StorageIntentCapacityAdmissionFlags {
+    StorageIntentCapacityAdmissionFlags::LOGICAL_HEADROOM_PROVED
+        .union(StorageIntentCapacityAdmissionFlags::QUOTA_HEADROOM_PROVED)
+        .union(StorageIntentCapacityAdmissionFlags::PHYSICAL_HEADROOM_PROVED)
+        .union(StorageIntentCapacityAdmissionFlags::ALLOCATION_CLASS_HEADROOM_PROVED)
+        .union(StorageIntentCapacityAdmissionFlags::SEGMENT_CLASS_HEADROOM_PROVED)
+        .union(StorageIntentCapacityAdmissionFlags::ALLOCATION_TICKET_FRESH)
+        .union(StorageIntentCapacityAdmissionFlags::CLAIM_LEDGER_FRESH)
+        .union(StorageIntentCapacityAdmissionFlags::RESERVE_LEDGER_FRESH)
+        .union(StorageIntentCapacityAdmissionFlags::RESERVE_RECEIPT_FRESH)
+        .union(StorageIntentCapacityAdmissionFlags::RESERVE_ESCROW_ACTIVE)
+        .union(StorageIntentCapacityAdmissionFlags::AMPLIFICATION_ESTIMATE_PROVED)
+        .union(StorageIntentCapacityAdmissionFlags::SLOP_FLOOR_PRESERVED)
+        .union(StorageIntentCapacityAdmissionFlags::PROTECTED_FLOORS_PRESERVED)
+        .union(StorageIntentCapacityAdmissionFlags::EVIDENCE_FRESH)
+        .union(StorageIntentCapacityAdmissionFlags::QUERY_SNAPSHOT_FRESH)
+        .union(StorageIntentCapacityAdmissionFlags::TENANT_BUDGET_PROVED)
+        .union(StorageIntentCapacityAdmissionFlags::TEMPORAL_DEADLINES_VALID)
+        .union(StorageIntentCapacityAdmissionFlags::POLICY_ROLLOUT_SAFE)
+}
+
+const fn capacity_role_required_flags(
+    role: StorageIntentCapacityAdmissionRole,
+) -> StorageIntentCapacityAdmissionFlags {
+    let base = capacity_base_required_flags();
+    match role {
+        StorageIntentCapacityAdmissionRole::Unknown => StorageIntentCapacityAdmissionFlags::EMPTY,
+        StorageIntentCapacityAdmissionRole::LocalIntent
+        | StorageIntentCapacityAdmissionRole::QuorumIntent
+        | StorageIntentCapacityAdmissionRole::BlockFlushFua => base
+            .union(StorageIntentCapacityAdmissionFlags::DIRTY_WINDOW_RESERVED)
+            .union(StorageIntentCapacityAdmissionFlags::WRITEBACK_BUDGET_RESERVED)
+            .union(StorageIntentCapacityAdmissionFlags::SYNC_INTENT_RESERVED),
+        StorageIntentCapacityAdmissionRole::FullPlacement
+        | StorageIntentCapacityAdmissionRole::ArchiveEc
+        | StorageIntentCapacityAdmissionRole::FallocateReservation => base,
+        StorageIntentCapacityAdmissionRole::GeoCatchUp => {
+            base.union(StorageIntentCapacityAdmissionFlags::GEO_CATCHUP_RESERVE_AVAILABLE)
+        }
+        StorageIntentCapacityAdmissionRole::ReadRepair => base
+            .union(StorageIntentCapacityAdmissionFlags::REPAIR_RESERVE_AVAILABLE)
+            .union(StorageIntentCapacityAdmissionFlags::REBUILD_RESERVE_AVAILABLE),
+        StorageIntentCapacityAdmissionRole::Relocation => {
+            base.union(StorageIntentCapacityAdmissionFlags::RELOCATION_RESERVE_AVAILABLE)
+        }
+        StorageIntentCapacityAdmissionRole::Rebake
+        | StorageIntentCapacityAdmissionRole::BackgroundOptimizer => base,
+        StorageIntentCapacityAdmissionRole::AuthorityPromotion => {
+            base.union(StorageIntentCapacityAdmissionFlags::AUTHORITY_PROMOTION_SAFE)
+        }
+        StorageIntentCapacityAdmissionRole::RamIntentBacking => base
+            .union(StorageIntentCapacityAdmissionFlags::DIRTY_WINDOW_RESERVED)
+            .union(StorageIntentCapacityAdmissionFlags::WRITEBACK_BUDGET_RESERVED)
+            .union(StorageIntentCapacityAdmissionFlags::SYNC_INTENT_RESERVED)
+            .union(StorageIntentCapacityAdmissionFlags::TENANT_BUDGET_PROVED),
+        StorageIntentCapacityAdmissionRole::ReceiptRetirement => {
+            base.union(StorageIntentCapacityAdmissionFlags::RECEIPT_RETIREMENT_SAFE)
+        }
+    }
+}
+
+const fn capacity_requirement_scope_matches(
+    requirement: StorageIntentCapacityAdmissionRequirement,
+    evidence: StorageIntentCapacityAdmissionEvidence,
+) -> bool {
+    if !requirement.policy_id.is_zero()
+        && !bytes16_equal(requirement.policy_id.0, evidence.policy_id.0)
+    {
+        return false;
+    }
+    if requirement.policy_revision.0 > 0
+        && requirement.policy_revision.0 != evidence.policy_revision.0
+    {
+        return false;
+    }
+    if !requirement.scope.dataset_id.is_zero()
+        && !bytes16_equal(requirement.scope.dataset_id.0, evidence.dataset_id.0)
+    {
+        return false;
+    }
+    if !bytes32_are_zero(requirement.scope.object_id.0)
+        && !bytes32_equal(requirement.scope.object_id.0, evidence.scope.object_id.0)
+    {
+        return false;
+    }
+    true
+}
+
+const fn capacity_allocation_ticket_is_usable(
+    requirement: StorageIntentCapacityAdmissionRequirement,
+    evidence: StorageIntentCapacityAdmissionEvidence,
+) -> bool {
+    if !capacity_role_required_flags(requirement.role)
+        .contains_all(StorageIntentCapacityAdmissionFlags::ALLOCATION_TICKET_FRESH)
+    {
+        return true;
+    }
+    evidence.refs.allocation_ticket_ref.is_bound()
+        && evidence.allocation_ticket_expires_at_ms > 0
+        && requirement.now_ms <= evidence.allocation_ticket_expires_at_ms
+}
+
+const fn capacity_reserve_escrow_is_usable(
+    requirement: StorageIntentCapacityAdmissionRequirement,
+    evidence: StorageIntentCapacityAdmissionEvidence,
+) -> bool {
+    if !capacity_role_required_flags(requirement.role)
+        .contains_all(StorageIntentCapacityAdmissionFlags::RESERVE_ESCROW_ACTIVE)
+    {
+        return true;
+    }
+    evidence.refs.reserve_receipt_ref.is_bound()
+        && evidence.reserve_escrow_expires_at_ms > 0
+        && requirement.now_ms <= evidence.reserve_escrow_expires_at_ms
+}
+
+const fn capacity_protected_floor_refusal(
+    role: StorageIntentCapacityAdmissionRole,
+    evidence: StorageIntentCapacityAdmissionEvidence,
+) -> StorageIntentRefusalReason {
+    if matches!(
+        evidence.reserve_pressure,
+        StorageIntentReservePressureState::Overcommitted
+    ) {
+        return StorageIntentRefusalReason::ReserveOvercommitted;
+    }
+    if evidence.protected_floor_available_bytes < evidence.protected_floor_required_bytes {
+        return StorageIntentRefusalReason::ProtectedReserveWouldBeBreached;
+    }
+    if matches!(
+        evidence.reserve_pressure,
+        StorageIntentReservePressureState::ProtectedFloorWouldBeBreached
+    ) || !evidence.protected_floor_breaches.is_empty()
+    {
+        if role.is_background_optimizer()
+            && !evidence
+                .flags
+                .contains_all(StorageIntentCapacityAdmissionFlags::EXPLICIT_OPTIMIZER_OVERRIDE)
+        {
+            return StorageIntentRefusalReason::OptimizerProtectedReserveBorrow;
+        }
+        return StorageIntentRefusalReason::ProtectedReserveWouldBeBreached;
+    }
+    StorageIntentRefusalReason::None
+}
+
+const fn capacity_role_scratch_refusal(
+    role: StorageIntentCapacityAdmissionRole,
+    evidence: StorageIntentCapacityAdmissionEvidence,
+) -> StorageIntentRefusalReason {
+    match role {
+        StorageIntentCapacityAdmissionRole::ReadRepair => {
+            if evidence.repair_scratch_available_bytes < evidence.recovery_required_bytes
+                || evidence.rebuild_scratch_available_bytes < evidence.recovery_required_bytes
+            {
+                StorageIntentRefusalReason::RecoveryReserveExhausted
+            } else {
+                StorageIntentRefusalReason::None
+            }
+        }
+        StorageIntentCapacityAdmissionRole::GeoCatchUp => {
+            if evidence.geo_catchup_available_bytes < evidence.geo_catchup_required_bytes {
+                StorageIntentRefusalReason::GeoCatchUpReserveExceeded
+            } else {
+                StorageIntentRefusalReason::None
+            }
+        }
+        StorageIntentCapacityAdmissionRole::Relocation => {
+            if evidence.relocation_scratch_available_bytes
+                < evidence.relocation_scratch_required_bytes
+            {
+                StorageIntentRefusalReason::RelocationScratchReserveExhausted
+            } else {
+                StorageIntentRefusalReason::None
+            }
+        }
+        StorageIntentCapacityAdmissionRole::ReceiptRetirement => {
+            if evidence.evacuation_scratch_available_bytes < evidence.recovery_required_bytes {
+                StorageIntentRefusalReason::RecoveryReserveExhausted
+            } else {
+                StorageIntentRefusalReason::None
+            }
+        }
+        _ => StorageIntentRefusalReason::None,
+    }
+}
+
+const fn max_u64(left: u64, right: u64) -> u64 {
+    if left >= right {
+        left
+    } else {
+        right
+    }
+}
+
+const fn saturating_add_u64(left: u64, right: u64) -> u64 {
+    if u64::MAX - left < right {
+        u64::MAX
+    } else {
+        left + right
+    }
+}
+
+const fn saturating_mul_u64(left: u64, right: u64) -> u64 {
+    if right != 0 && left > u64::MAX / right {
+        u64::MAX
+    } else {
+        left * right
+    }
+}
+
+const fn div_ceil_u64(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        0
+    } else {
+        let quotient = numerator / denominator;
+        if numerator % denominator == 0 {
+            quotient
+        } else {
+            saturating_add_u64(quotient, 1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9992,6 +10870,393 @@ mod tests {
 
     fn trust_ref(byte: u8) -> StorageIntentEvidenceRef {
         evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, byte)
+    }
+
+    fn capacity_scope() -> StorageIntentObjectScope {
+        StorageIntentObjectScope {
+            dataset_id: DOMAIN_A,
+            object_id: StorageIntentEvidenceId([201_u8; 32]),
+            range_start: 0,
+            range_len: 4096,
+            generation: 11,
+        }
+    }
+
+    fn capacity_refs() -> StorageIntentCapacityAdmissionRefs {
+        StorageIntentCapacityAdmissionRefs {
+            dataset_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 130),
+            space_domain_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                131,
+            ),
+            quota_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 132),
+            logical_headroom_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                133,
+            ),
+            physical_headroom_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                134,
+            ),
+            allocation_class_ref: evidence_ref(
+                StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+                135,
+            ),
+            segment_class_ref: evidence_ref(
+                StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+                136,
+            ),
+            allocation_ticket_ref: evidence_ref(
+                StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+                137,
+            ),
+            claim_ledger_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                138,
+            ),
+            reserve_ledger_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                139,
+            ),
+            reserve_receipt_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                140,
+            ),
+            dirty_window_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 141),
+            writeback_budget_ref: evidence_ref(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                142,
+            ),
+            sync_intent_reserve_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                143,
+            ),
+            repair_reserve_ref: evidence_ref(
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                144,
+            ),
+            evacuation_reserve_ref: evidence_ref(
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                145,
+            ),
+            rebuild_reserve_ref: evidence_ref(
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                146,
+            ),
+            geo_catchup_reserve_ref: evidence_ref(
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                147,
+            ),
+            relocation_scratch_ref: evidence_ref(
+                StorageIntentEvidenceKind::RelocationReceipt,
+                148,
+            ),
+            pending_free_frontier_ref: evidence_ref(
+                StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+                149,
+            ),
+            reclaim_debt_ref: evidence_ref(
+                StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+                150,
+            ),
+            amplification_estimate_ref: evidence_ref(
+                StorageIntentEvidenceKind::DataShapeEvidence,
+                151,
+            ),
+            capacity_authority_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                152,
+            ),
+            policy_rollout_ref: evidence_ref(
+                StorageIntentEvidenceKind::PolicyRolloutEvidence,
+                153,
+            ),
+            tenant_isolation_ref: evidence_ref(
+                StorageIntentEvidenceKind::TenantIsolationEvidence,
+                154,
+            ),
+            temporal_ref: evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 155),
+            evidence_query_snapshot_ref: evidence_ref(
+                StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+                156,
+            ),
+        }
+    }
+
+    fn full_capacity_flags() -> StorageIntentCapacityAdmissionFlags {
+        capacity_base_required_flags()
+            .union(StorageIntentCapacityAdmissionFlags::DIRTY_WINDOW_RESERVED)
+            .union(StorageIntentCapacityAdmissionFlags::WRITEBACK_BUDGET_RESERVED)
+            .union(StorageIntentCapacityAdmissionFlags::SYNC_INTENT_RESERVED)
+            .union(StorageIntentCapacityAdmissionFlags::REPAIR_RESERVE_AVAILABLE)
+            .union(StorageIntentCapacityAdmissionFlags::EVACUATION_RESERVE_AVAILABLE)
+            .union(StorageIntentCapacityAdmissionFlags::REBUILD_RESERVE_AVAILABLE)
+            .union(StorageIntentCapacityAdmissionFlags::GEO_CATCHUP_RESERVE_AVAILABLE)
+            .union(StorageIntentCapacityAdmissionFlags::RELOCATION_RESERVE_AVAILABLE)
+            .union(StorageIntentCapacityAdmissionFlags::AUTHORITY_PROMOTION_SAFE)
+    }
+
+    fn capacity_requirement(
+        role: StorageIntentCapacityAdmissionRole,
+    ) -> StorageIntentCapacityAdmissionRequirement {
+        StorageIntentCapacityAdmissionRequirement {
+            role,
+            policy_id: StorageIntentPolicyId([157_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(12),
+            scope: capacity_scope(),
+            min_logical_bytes: 100,
+            min_physical_bytes: 300,
+            max_evidence_age_ms: 2000,
+            now_ms: 2000,
+        }
+    }
+
+    fn capacity_evidence() -> StorageIntentCapacityAdmissionEvidence {
+        let scope = capacity_scope();
+        StorageIntentCapacityAdmissionEvidence {
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 158),
+            policy_id: StorageIntentPolicyId([157_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(12),
+            scope,
+            dataset_id: scope.dataset_id,
+            space_domain_id: DOMAIN_A,
+            quota_domain_id: DOMAIN_A,
+            budget_owner_id: DOMAIN_A,
+            state: StorageIntentCapacityAdmissionState::Admitted,
+            reserve_pressure: StorageIntentReservePressureState::Normal,
+            protected_floor_breaches: StorageIntentProtectedReserveMask::EMPTY,
+            flags: full_capacity_flags(),
+            refs: capacity_refs(),
+            amplification: StorageIntentCapacityAmplificationEstimate {
+                logical_bytes: 100,
+                replica_count: 2,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+                cow_old_plus_new_bytes: 0,
+                snapshot_pinned_bytes: 0,
+                clone_pinned_bytes: 0,
+                receive_base_pinned_bytes: 0,
+                compression_expansion_bytes: 0,
+                rebake_overlap_bytes: 0,
+                receipt_overlap_bytes: 0,
+                projected_required_bytes: 400,
+                estimate_ref: evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 159),
+            },
+            logical_required_bytes: 100,
+            logical_available_bytes: 10_000,
+            quota_available_bytes: 10_000,
+            physical_required_bytes: 300,
+            physical_available_bytes: 10_000,
+            dirty_window_required_bytes: 100,
+            dirty_window_available_bytes: 1000,
+            writeback_required_bytes: 100,
+            writeback_available_bytes: 1000,
+            sync_intent_required_bytes: 100,
+            sync_intent_available_bytes: 1000,
+            recovery_required_bytes: 100,
+            repair_scratch_available_bytes: 1000,
+            evacuation_scratch_available_bytes: 1000,
+            rebuild_scratch_available_bytes: 1000,
+            geo_catchup_required_bytes: 100,
+            geo_catchup_available_bytes: 1000,
+            relocation_scratch_required_bytes: 100,
+            relocation_scratch_available_bytes: 1000,
+            pending_free_counted_bytes: 0,
+            reclaimable_counted_bytes: 0,
+            reclaim_debt_bytes: 0,
+            slop_floor_required_bytes: 50,
+            protected_floor_required_bytes: 100,
+            protected_floor_available_bytes: 1000,
+            evidence_observed_at_ms: 1000,
+            evidence_valid_until_ms: 5000,
+            allocation_ticket_expires_at_ms: 5000,
+            reserve_escrow_expires_at_ms: 5000,
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
+    #[test]
+    fn capacity_evidence_satisfies_all_named_roles() {
+        let roles = [
+            StorageIntentCapacityAdmissionRole::LocalIntent,
+            StorageIntentCapacityAdmissionRole::QuorumIntent,
+            StorageIntentCapacityAdmissionRole::FullPlacement,
+            StorageIntentCapacityAdmissionRole::GeoCatchUp,
+            StorageIntentCapacityAdmissionRole::ArchiveEc,
+            StorageIntentCapacityAdmissionRole::ReadRepair,
+            StorageIntentCapacityAdmissionRole::Relocation,
+            StorageIntentCapacityAdmissionRole::Rebake,
+            StorageIntentCapacityAdmissionRole::AuthorityPromotion,
+            StorageIntentCapacityAdmissionRole::RamIntentBacking,
+            StorageIntentCapacityAdmissionRole::BlockFlushFua,
+            StorageIntentCapacityAdmissionRole::FallocateReservation,
+            StorageIntentCapacityAdmissionRole::ReceiptRetirement,
+            StorageIntentCapacityAdmissionRole::BackgroundOptimizer,
+        ];
+
+        for role in roles {
+            assert_eq!(
+                capacity_evidence_satisfies_role(capacity_requirement(role), capacity_evidence()),
+                ReceiptPredicateResult::SATISFIED,
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_enospc_refuses_without_logical_headroom() {
+        let evidence = StorageIntentCapacityAdmissionEvidence {
+            logical_available_bytes: 99,
+            ..capacity_evidence()
+        };
+
+        assert_eq!(
+            capacity_evidence_satisfies_role(
+                capacity_requirement(StorageIntentCapacityAdmissionRole::LocalIntent),
+                evidence,
+            )
+            .refusal,
+            StorageIntentRefusalReason::CapacityHeadroomExhausted
+        );
+    }
+
+    #[test]
+    fn capacity_quota_and_slop_floor_refuse() {
+        let evidence = StorageIntentCapacityAdmissionEvidence {
+            quota_available_bytes: 149,
+            ..capacity_evidence()
+        };
+
+        assert_eq!(
+            capacity_evidence_satisfies_role(
+                capacity_requirement(StorageIntentCapacityAdmissionRole::FallocateReservation),
+                evidence,
+            )
+            .refusal,
+            StorageIntentRefusalReason::QuotaOrSlopFloorExceeded
+        );
+    }
+
+    #[test]
+    fn capacity_stale_allocation_ticket_refuses() {
+        let evidence = StorageIntentCapacityAdmissionEvidence {
+            allocation_ticket_expires_at_ms: 1999,
+            ..capacity_evidence()
+        };
+
+        assert_eq!(
+            capacity_evidence_satisfies_role(
+                capacity_requirement(StorageIntentCapacityAdmissionRole::FullPlacement),
+                evidence,
+            )
+            .refusal,
+            StorageIntentRefusalReason::StaleAllocationTicket
+        );
+    }
+
+    #[test]
+    fn capacity_expired_reserve_escrow_refuses() {
+        let evidence = StorageIntentCapacityAdmissionEvidence {
+            reserve_escrow_expires_at_ms: 1999,
+            ..capacity_evidence()
+        };
+
+        assert_eq!(
+            capacity_evidence_satisfies_role(
+                capacity_requirement(StorageIntentCapacityAdmissionRole::QuorumIntent),
+                evidence,
+            )
+            .refusal,
+            StorageIntentRefusalReason::ExpiredReserveEscrow
+        );
+    }
+
+    #[test]
+    fn capacity_pending_free_counted_too_early_refuses() {
+        let evidence = StorageIntentCapacityAdmissionEvidence {
+            pending_free_counted_bytes: 4096,
+            ..capacity_evidence()
+        };
+
+        assert!(!capacity_pending_free_is_safe(evidence));
+        assert_eq!(
+            capacity_evidence_satisfies_role(
+                capacity_requirement(StorageIntentCapacityAdmissionRole::FullPlacement),
+                evidence,
+            )
+            .refusal,
+            StorageIntentRefusalReason::PendingFreeNotSafe
+        );
+    }
+
+    #[test]
+    fn capacity_cow_old_plus_new_under_snapshot_pressure_refuses() {
+        let mut evidence = capacity_evidence();
+        evidence.amplification.cow_old_plus_new_bytes = 1000;
+        evidence.amplification.snapshot_pinned_bytes = 500;
+        evidence.amplification.projected_required_bytes = 300;
+
+        assert!(!evidence.amplification.proves_required_overlap());
+        assert_eq!(
+            capacity_evidence_satisfies_role(
+                capacity_requirement(StorageIntentCapacityAdmissionRole::FullPlacement),
+                evidence,
+            )
+            .refusal,
+            StorageIntentRefusalReason::CapacityAmplificationUnderestimated
+        );
+    }
+
+    #[test]
+    fn capacity_relocation_scratch_reserve_exhaustion_refuses() {
+        let evidence = StorageIntentCapacityAdmissionEvidence {
+            relocation_scratch_available_bytes: 99,
+            ..capacity_evidence()
+        };
+
+        assert_eq!(
+            capacity_evidence_satisfies_role(
+                capacity_requirement(StorageIntentCapacityAdmissionRole::Relocation),
+                evidence,
+            )
+            .refusal,
+            StorageIntentRefusalReason::RelocationScratchReserveExhausted
+        );
+    }
+
+    #[test]
+    fn capacity_geo_catch_up_backlog_exceeding_reserve_refuses() {
+        let evidence = StorageIntentCapacityAdmissionEvidence {
+            geo_catchup_available_bytes: 99,
+            ..capacity_evidence()
+        };
+
+        assert_eq!(
+            capacity_evidence_satisfies_role(
+                capacity_requirement(StorageIntentCapacityAdmissionRole::GeoCatchUp),
+                evidence,
+            )
+            .refusal,
+            StorageIntentRefusalReason::GeoCatchUpReserveExceeded
+        );
+    }
+
+    #[test]
+    fn capacity_optimizer_refuses_protected_reserve_borrow() {
+        let evidence = StorageIntentCapacityAdmissionEvidence {
+            protected_floor_breaches: StorageIntentProtectedReserveMask::SYNC,
+            reserve_pressure: StorageIntentReservePressureState::ProtectedFloorWouldBeBreached,
+            ..capacity_evidence()
+        };
+
+        assert_eq!(
+            capacity_evidence_satisfies_role(
+                capacity_requirement(StorageIntentCapacityAdmissionRole::BackgroundOptimizer),
+                evidence,
+            )
+            .refusal,
+            StorageIntentRefusalReason::OptimizerProtectedReserveBorrow
+        );
     }
 
     fn trust_role_residency(role: StorageIntentTrustRole) -> ResidencyScope {
