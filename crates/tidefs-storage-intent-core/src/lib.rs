@@ -4799,24 +4799,13 @@ pub enum PrefetchResidencyStateClass {
 /// Input snapshot for a prefetch/residency decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Default)]
 pub struct PrefetchResidencyDecisionContext {
     pub policy: PrefetchResidencyPolicyEnvelope,
     pub signal: WorkloadSignalRecord,
     pub source_media: StorageIntentMediaCapabilityRecord,
     pub target_media: StorageIntentMediaCapabilityRecord,
     pub cost_wear: CostWearRecord,
-}
-
-impl Default for PrefetchResidencyDecisionContext {
-    fn default() -> Self {
-        Self {
-            policy: PrefetchResidencyPolicyEnvelope::default(),
-            signal: WorkloadSignalRecord::default(),
-            source_media: StorageIntentMediaCapabilityRecord::default(),
-            target_media: StorageIntentMediaCapabilityRecord::default(),
-            cost_wear: CostWearRecord::default(),
-        }
-    }
 }
 
 /// Result record emitted by the prefetch/residency decision authority.
