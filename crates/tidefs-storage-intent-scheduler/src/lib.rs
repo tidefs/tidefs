@@ -21,9 +21,11 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use tidefs_storage_intent_core::{
+    EvidenceFamilyFreshnessState, PrefetchResidencyActionMask, PrefetchResidencyCandidateClass,
+    PrefetchResidencyPolicyEnvelope, PrefetchResidencyPolicyFlags, PrefetchResidencyPolicyScope,
     StorageIntentActionClass, StorageIntentEvidenceId, StorageIntentEvidenceKind,
-    StorageIntentEvidenceRef, StorageIntentGuaranteeClass, StorageIntentPolicyId,
-    StorageIntentPolicyRevision, StorageIntentRefusalReason,
+    StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef, StorageIntentGuaranteeClass,
+    StorageIntentPolicyId, StorageIntentPolicyRevision, StorageIntentRefusalReason,
 };
 use tidefs_types_transport_session::{LaneClass, LaneConfig};
 
@@ -33,6 +35,17 @@ use tidefs_types_transport_session::{LaneClass, LaneConfig};
 
 /// Canonical identifier for this scheduler/admission surface.
 pub const STORAGE_INTENT_SCHEDULER_SPEC: &str = "tidefs-storage-intent-scheduler-v1-issue-862";
+
+/// Maximum evidence refs carried directly on one admission request.
+pub const MAX_ADMISSION_EVIDENCE_REFS: usize = 8;
+
+/// Maximum distinct evidence families tracked for one admission decision.
+///
+/// Compiled prefetch/residency policies can require more evidence families
+/// than request-local evidence refs carry, because the active policy envelope
+/// also supplies refs. Keep this large enough for the policy flag surface plus
+/// request-local requirements, and fail closed if a caller still overflows it.
+pub const MAX_REQUIRED_EVIDENCE_KINDS: usize = 24;
 
 // ---------------------------------------------------------------------------
 // Lane mapping: storage-intent action → LaneClass
@@ -103,6 +116,41 @@ pub const fn action_class_is_repair_escalation(action: StorageIntentActionClass)
     )
 }
 
+/// Return the stricter lane when two classifiers disagree.
+///
+/// `LaneClass` uses lower discriminants for higher priority. Resolving to the
+/// stricter lane lets an externally classified authority or durability action
+/// prevent a broad work-class label from accidentally demoting it to a
+/// droppable lane.
+#[must_use]
+pub const fn stricter_lane(left: LaneClass, right: LaneClass) -> LaneClass {
+    if lane_priority(left) <= lane_priority(right) {
+        left
+    } else {
+        right
+    }
+}
+
+/// Resolve the effective dispatch lane from both scheduler work class and
+/// storage-intent action class.
+#[must_use]
+pub const fn resolve_admission_lane(
+    work_class: AdmissionWorkClass,
+    action_class: StorageIntentActionClass,
+) -> LaneClass {
+    stricter_lane(work_class.lane_class(), action_class_to_lane(action_class))
+}
+
+const fn lane_priority(lane: LaneClass) -> u8 {
+    match lane {
+        LaneClass::Control => 0,
+        LaneClass::Metadata => 1,
+        LaneClass::Demand => 2,
+        LaneClass::Speculative => 3,
+        LaneClass::Background => 4,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Budget cap types — hard enforcement dimensions
 // ---------------------------------------------------------------------------
@@ -162,8 +210,7 @@ impl StorageIntentBudgetCaps {
     /// Returns the primary backpressure reason, or None.
     #[must_use]
     pub fn backpressure_reason(&self) -> Option<StorageIntentRefusalReason> {
-        if self.dirty_bytes > self.max_dirty_bytes
-            || self.inflight_bytes > self.max_inflight_bytes
+        if self.dirty_bytes > self.max_dirty_bytes || self.inflight_bytes > self.max_inflight_bytes
         {
             Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
         } else if self.device_queue_depth > self.max_device_queue_depth
@@ -259,12 +306,12 @@ impl AdmissionWorkClass {
     pub const fn lane_class(self) -> LaneClass {
         match self {
             Self::SyncBarrier | Self::MetadataStorm => LaneClass::Metadata,
-            Self::ForegroundIo | Self::ReadServing | Self::VmRandomIo | Self::BulkIngest => {
-                LaneClass::Demand
-            }
-            Self::SpeculativePrefetch | Self::CacheOnlyTrial | Self::AuthorityPromotion => {
-                LaneClass::Speculative
-            }
+            Self::ForegroundIo
+            | Self::ReadServing
+            | Self::VmRandomIo
+            | Self::BulkIngest
+            | Self::AuthorityPromotion => LaneClass::Demand,
+            Self::SpeculativePrefetch | Self::CacheOnlyTrial => LaneClass::Speculative,
             Self::BackgroundOptimizer => LaneClass::Background,
             Self::RepairEscalation => LaneClass::Control,
         }
@@ -314,7 +361,18 @@ pub struct AdmissionRequest {
     pub guarantee: StorageIntentGuaranteeClass,
 
     /// Evidence refs carried by the request.
-    pub evidence_refs: [StorageIntentEvidenceRef; 8],
+    pub evidence_refs: [StorageIntentEvidenceRef; MAX_ADMISSION_EVIDENCE_REFS],
+
+    /// Evidence families that must be present and fresh enough for this
+    /// request. The scheduler also augments this list from compiled policy
+    /// flags when a policy snapshot is active.
+    pub required_evidence_kinds: [StorageIntentEvidenceKind; MAX_REQUIRED_EVIDENCE_KINDS],
+
+    /// Number of populated entries in `required_evidence_kinds`.
+    pub required_evidence_count: u8,
+
+    /// True when required evidence did not fit in `required_evidence_kinds`.
+    pub required_evidence_overflow: bool,
 }
 
 /// An empty evidence ref sentinel for array initialization.
@@ -324,6 +382,51 @@ pub const EMPTY_EVIDENCE_REF: StorageIntentEvidenceRef = StorageIntentEvidenceRe
     generation: 0,
     version: 0,
 };
+
+fn push_required_evidence_kind(
+    kinds: &mut [StorageIntentEvidenceKind],
+    count: &mut u8,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    if kind as u16 == StorageIntentEvidenceKind::Unknown as u16 {
+        return true;
+    }
+
+    let mut index = 0;
+    while index < *count as usize {
+        if kinds[index] as u16 == kind as u16 {
+            return true;
+        }
+        index += 1;
+    }
+
+    if (*count as usize) < kinds.len() {
+        kinds[*count as usize] = kind;
+        *count = (*count).saturating_add(1);
+        true
+    } else {
+        false
+    }
+}
+
+fn evidence_ref_matches_kind(
+    evidence: StorageIntentEvidenceRef,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    evidence.is_bound() && evidence.kind as u16 == kind as u16
+}
+
+fn action_mask_contains_any_prefetch_candidate(mask: PrefetchResidencyActionMask) -> bool {
+    mask.contains_candidate(PrefetchResidencyCandidateClass::BoundedReadahead)
+        || mask.contains_candidate(PrefetchResidencyCandidateClass::StridedVectorPrefetch)
+        || mask.contains_candidate(PrefetchResidencyCandidateClass::MetadataNamespacePrefetch)
+        || mask.contains_candidate(PrefetchResidencyCandidateClass::SmallRandomHotsetTrial)
+        || mask.contains_candidate(PrefetchResidencyCandidateClass::ManifestIndexPrefetch)
+        || mask.contains_candidate(PrefetchResidencyCandidateClass::SnapshotClonePrefetch)
+        || mask.contains_candidate(PrefetchResidencyCandidateClass::DegradedReadPrefetch)
+        || mask.contains_candidate(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch)
+        || mask.contains_candidate(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage)
+}
 
 impl AdmissionRequest {
     /// Construct a request with no evidence.
@@ -348,7 +451,11 @@ impl AdmissionRequest {
             policy_id,
             policy_revision,
             guarantee,
-            evidence_refs: [EMPTY_EVIDENCE_REF; 8],
+            evidence_refs: [EMPTY_EVIDENCE_REF; MAX_ADMISSION_EVIDENCE_REFS],
+            required_evidence_kinds: [StorageIntentEvidenceKind::Unknown;
+                MAX_REQUIRED_EVIDENCE_KINDS],
+            required_evidence_count: 0,
+            required_evidence_overflow: false,
         }
     }
 
@@ -362,6 +469,31 @@ impl AdmissionRequest {
             }
         }
         self
+    }
+
+    /// Require one evidence family for this request.
+    #[must_use]
+    pub fn with_required_evidence_kind(mut self, kind: StorageIntentEvidenceKind) -> Self {
+        if !push_required_evidence_kind(
+            &mut self.required_evidence_kinds,
+            &mut self.required_evidence_count,
+            kind,
+        ) {
+            self.required_evidence_overflow = true;
+        }
+        self
+    }
+
+    /// Resolve the effective dispatch lane from work and action class.
+    #[must_use]
+    pub const fn resolved_lane(&self) -> LaneClass {
+        resolve_admission_lane(self.work_class, self.action_class)
+    }
+
+    /// Returns true only when both the work and action class are droppable.
+    #[must_use]
+    pub const fn can_be_dropped(&self) -> bool {
+        self.work_class.can_be_dropped() && action_class_can_be_dropped(self.action_class)
     }
 }
 
@@ -617,11 +749,14 @@ pub struct SchedulingEvidence {
     pub policy_revision: StorageIntentPolicyRevision,
 
     /// Evidence refs that were available for this decision.
-    pub available_evidence: [StorageIntentEvidenceRef; 8],
+    pub available_evidence: [StorageIntentEvidenceRef; MAX_ADMISSION_EVIDENCE_REFS],
 
     /// Evidence refs that were missing or stale.
-    pub missing_evidence_kinds: [StorageIntentEvidenceKind; 8],
+    pub missing_evidence_kinds: [StorageIntentEvidenceKind; MAX_REQUIRED_EVIDENCE_KINDS],
     pub missing_evidence_count: u8,
+
+    /// True when required evidence overflowed the scheduler evidence buffer.
+    pub missing_evidence_overflow: bool,
 }
 
 /// Which budget cap constrained the decision (or None).
@@ -665,6 +800,52 @@ pub struct LaneAdmissionCounters {
     pub last_service_tick: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EvidenceAssessment {
+    confidence: SchedulingConfidenceClass,
+    refusal: StorageIntentRefusalReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequiredEvidenceKinds {
+    kinds: [StorageIntentEvidenceKind; MAX_REQUIRED_EVIDENCE_KINDS],
+    count: u8,
+    overflow: bool,
+}
+
+impl RequiredEvidenceKinds {
+    const fn empty() -> Self {
+        Self {
+            kinds: [StorageIntentEvidenceKind::Unknown; MAX_REQUIRED_EVIDENCE_KINDS],
+            count: 0,
+            overflow: false,
+        }
+    }
+
+    fn push(&mut self, kind: StorageIntentEvidenceKind) {
+        if !push_required_evidence_kind(&mut self.kinds, &mut self.count, kind) {
+            self.overflow = true;
+        }
+    }
+}
+
+impl EvidenceAssessment {
+    const HIGH: Self = Self {
+        confidence: SchedulingConfidenceClass::High,
+        refusal: StorageIntentRefusalReason::None,
+    };
+
+    const fn refused(
+        confidence: SchedulingConfidenceClass,
+        refusal: StorageIntentRefusalReason,
+    ) -> Self {
+        Self {
+            confidence,
+            refusal,
+        }
+    }
+}
+
 /// The storage-intent scheduler.
 ///
 /// One instance governs admission for a single resource domain (e.g., one
@@ -693,6 +874,12 @@ pub struct StorageIntentScheduler {
 
     /// Current policy revision.
     pub active_policy_revision: StorageIntentPolicyRevision,
+
+    /// Active compiled prefetch/residency policy snapshot from #855.
+    pub active_prefetch_policy: PrefetchResidencyPolicyEnvelope,
+
+    /// Evidence-query cut that supports the active compiled policy.
+    pub active_evidence_snapshot: StorageIntentEvidenceQuerySnapshot,
 
     /// Recently emitted evidence (bounded ring).
     pub evidence_log: Vec<SchedulingEvidence>,
@@ -743,6 +930,8 @@ impl StorageIntentScheduler {
             current_tick: 0,
             active_policy_id: StorageIntentPolicyId::ZERO,
             active_policy_revision: StorageIntentPolicyRevision(0),
+            active_prefetch_policy: PrefetchResidencyPolicyEnvelope::default(),
+            active_evidence_snapshot: StorageIntentEvidenceQuerySnapshot::default(),
             evidence_log: Vec::with_capacity(Self::MAX_EVIDENCE_LOG),
         }
     }
@@ -755,6 +944,28 @@ impl StorageIntentScheduler {
     ) {
         self.active_policy_id = policy_id;
         self.active_policy_revision = revision;
+    }
+
+    /// Consume a compiled prefetch/residency policy envelope from #855.
+    ///
+    /// The scheduler records the policy identity, stores the policy envelope
+    /// for later action-mask and evidence checks, and only tightens lane caps
+    /// from compiled policy limits. A zero compiled limit means "no compiled
+    /// limit", not "zero-byte lane".
+    pub fn apply_prefetch_residency_policy(
+        &mut self,
+        policy: &PrefetchResidencyPolicyEnvelope,
+        evidence_snapshot: Option<&StorageIntentEvidenceQuerySnapshot>,
+    ) {
+        self.active_prefetch_policy = *policy;
+        self.active_evidence_snapshot = match evidence_snapshot {
+            Some(snapshot) => *snapshot,
+            None => StorageIntentEvidenceQuerySnapshot::default(),
+        };
+        self.set_active_policy(policy.policy_id, policy.policy_revision);
+
+        self.tighten_lane_inflight_bytes(LaneClass::Speculative, policy.max_prefetch_window_bytes);
+        self.tighten_lane_inflight_bytes(LaneClass::Background, policy.max_staging_bytes);
     }
 
     /// Advance the monotonic tick.
@@ -774,16 +985,34 @@ impl StorageIntentScheduler {
     pub fn admit(&mut self, request: &AdmissionRequest) -> AdmissionDecision {
         self.advance_tick();
 
-        let lane = request.work_class.lane_class();
+        let lane = request.resolved_lane();
         let config = self
             .lane_configs
             .get(&lane)
             .cloned()
             .unwrap_or_else(|| LaneConfig::background(u64::MAX, u64::MAX));
+        let evidence_assessment = self.assess_evidence(request);
+
+        if evidence_assessment.refusal as u16 != StorageIntentRefusalReason::None as u16 {
+            let decision =
+                self.conservative_refusal_decision(lane, request, evidence_assessment.refusal);
+            self.record_decision(lane, &decision);
+            self.emit_evidence(
+                request,
+                &decision,
+                evidence_assessment.confidence,
+                if decision.outcome == AdmissionOutcome::Dropped {
+                    Some(evidence_assessment.refusal)
+                } else {
+                    None
+                },
+            );
+            return decision;
+        }
 
         // ── 1. Check budget caps in priority order ──
         if let Some((reason, budget_class)) = self.check_hard_caps(request, lane) {
-            let mut decision = if request.work_class.can_be_dropped() {
+            let mut decision = if request.can_be_dropped() {
                 AdmissionDecision::dropped(lane, reason, request.budget_owner)
             } else if lane == LaneClass::Background {
                 AdmissionDecision::refused(lane, reason, request.budget_owner)
@@ -794,28 +1023,28 @@ impl StorageIntentScheduler {
             };
             decision = decision.with_budget_class(budget_class);
             self.record_decision(lane, &decision);
-            self.emit_evidence(request, &decision, SchedulingConfidenceClass::High, None);
+            self.emit_evidence(request, &decision, evidence_assessment.confidence, None);
             return decision;
         }
 
         // ── 2. Check tenant isolation ──
         if !request.budget_owner.is_zero() {
             if let Some((reason, budget_class)) = self.check_tenant_isolation(request) {
-                let decision = if request.work_class.can_be_dropped() {
+                let decision = if request.can_be_dropped() {
                     AdmissionDecision::dropped(lane, reason, request.budget_owner)
                 } else {
                     AdmissionDecision::backpressured(lane, reason, request.budget_owner)
                 }
                 .with_budget_class(budget_class);
                 self.record_decision(lane, &decision);
-                self.emit_evidence(request, &decision, SchedulingConfidenceClass::High, None);
+                self.emit_evidence(request, &decision, evidence_assessment.confidence, None);
                 return decision;
             }
         }
 
         // ── 3. Check per-lane inflight caps ──
         if let Some((reason, budget_class)) = self.check_lane_inflight(lane, request, &config) {
-            let mut decision = if request.work_class.can_be_dropped() {
+            let mut decision = if request.can_be_dropped() {
                 AdmissionDecision::dropped(lane, reason, request.budget_owner)
             } else if lane == LaneClass::Background {
                 AdmissionDecision::refused(lane, reason, request.budget_owner)
@@ -826,12 +1055,12 @@ impl StorageIntentScheduler {
             };
             decision = decision.with_budget_class(budget_class);
             self.record_decision(lane, &decision);
-            self.emit_evidence(request, &decision, SchedulingConfidenceClass::High, None);
+            self.emit_evidence(request, &decision, evidence_assessment.confidence, None);
             return decision;
         }
 
         // ── 4. Check speculative drop/expiry ──
-        if request.work_class.can_be_dropped() {
+        if request.can_be_dropped() {
             if let Some((reason, budget_class)) = self.check_speculative_pressure() {
                 let decision = AdmissionDecision::dropped(lane, reason, request.budget_owner)
                     .with_budget_class(budget_class);
@@ -839,7 +1068,7 @@ impl StorageIntentScheduler {
                 self.emit_evidence(
                     request,
                     &decision,
-                    SchedulingConfidenceClass::High,
+                    evidence_assessment.confidence,
                     Some(reason),
                 );
                 return decision;
@@ -861,7 +1090,7 @@ impl StorageIntentScheduler {
             self.emit_evidence(
                 request,
                 &decision,
-                SchedulingConfidenceClass::High,
+                evidence_assessment.confidence,
                 Some(StorageIntentRefusalReason::MovementDebtNotPaidBack),
             );
             return decision;
@@ -883,13 +1112,347 @@ impl StorageIntentScheduler {
         }
 
         self.record_decision(lane, &decision);
-        self.emit_evidence(request, &decision, SchedulingConfidenceClass::High, None);
+        self.emit_evidence(request, &decision, evidence_assessment.confidence, None);
         decision
     }
 
     // ------------------------------------------------------------------
     // Internal checks
     // ------------------------------------------------------------------
+
+    fn tighten_lane_inflight_bytes(&mut self, lane: LaneClass, compiled_limit: u64) {
+        if compiled_limit == 0 {
+            return;
+        }
+
+        let fallback = match lane {
+            LaneClass::Control => LaneConfig::control(compiled_limit, u64::MAX),
+            LaneClass::Metadata => LaneConfig::metadata(compiled_limit, u64::MAX),
+            LaneClass::Demand => LaneConfig::demand(compiled_limit, u64::MAX),
+            LaneClass::Speculative => LaneConfig::speculative(compiled_limit, u64::MAX),
+            LaneClass::Background => LaneConfig::background(compiled_limit, u64::MAX),
+        };
+
+        let config = self.lane_configs.entry(lane).or_insert(fallback);
+        if config.max_inflight_bytes == 0 {
+            config.max_inflight_bytes = compiled_limit;
+        } else {
+            config.max_inflight_bytes = config.max_inflight_bytes.min(compiled_limit);
+        }
+    }
+
+    fn conservative_refusal_decision(
+        &self,
+        lane: LaneClass,
+        request: &AdmissionRequest,
+        reason: StorageIntentRefusalReason,
+    ) -> AdmissionDecision {
+        if request.can_be_dropped()
+            && reason as u16 != StorageIntentRefusalReason::NoLegalReceiptSet as u16
+        {
+            AdmissionDecision::dropped(lane, reason, request.budget_owner)
+        } else {
+            AdmissionDecision::refused(lane, reason, request.budget_owner)
+        }
+    }
+
+    fn assess_evidence(&self, request: &AdmissionRequest) -> EvidenceAssessment {
+        if let Some(refusal) = self.check_policy_identity(request) {
+            return EvidenceAssessment::refused(SchedulingConfidenceClass::Contradicted, refusal);
+        }
+
+        if self.active_policy_loaded()
+            && self.action_is_prefetch_residency_scoped(request.action_class)
+        {
+            if !self.policy_scope_usable() {
+                return EvidenceAssessment::refused(
+                    SchedulingConfidenceClass::Unknown,
+                    StorageIntentRefusalReason::EvidenceNotUsable,
+                );
+            }
+
+            if !self.policy_allows_action(request.action_class) {
+                return EvidenceAssessment::refused(
+                    SchedulingConfidenceClass::DegradedVisible,
+                    StorageIntentRefusalReason::NoLegalReceiptSet,
+                );
+            }
+        }
+
+        let required_evidence = self.collect_required_evidence_kinds(request);
+        if required_evidence.overflow {
+            return EvidenceAssessment::refused(
+                SchedulingConfidenceClass::Unknown,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            );
+        }
+
+        let mut confidence = EvidenceAssessment::HIGH.confidence;
+        let mut index = 0;
+        while index < required_evidence.count as usize {
+            let kind = required_evidence.kinds[index];
+            if !self.has_bound_evidence_kind(request, kind) {
+                return EvidenceAssessment::refused(
+                    SchedulingConfidenceClass::Unknown,
+                    StorageIntentRefusalReason::EvidenceNotUsable,
+                );
+            }
+
+            match self.blocking_freshness_for_kind(kind) {
+                Some(blocking_confidence) => {
+                    return EvidenceAssessment::refused(
+                        blocking_confidence,
+                        StorageIntentRefusalReason::EvidenceNotUsable,
+                    );
+                }
+                None => {
+                    if required_evidence.count > 0
+                        && !self.active_evidence_snapshot.has_query_identity()
+                    {
+                        confidence = SchedulingConfidenceClass::DegradedVisible;
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        EvidenceAssessment {
+            confidence,
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
+    fn check_policy_identity(
+        &self,
+        request: &AdmissionRequest,
+    ) -> Option<StorageIntentRefusalReason> {
+        if request.policy_id.is_zero() {
+            return None;
+        }
+
+        if !self.active_policy_loaded() {
+            return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+        }
+
+        if request.policy_id != self.active_policy_id
+            || request.policy_revision != self.active_policy_revision
+        {
+            return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+        }
+
+        None
+    }
+
+    fn active_policy_loaded(&self) -> bool {
+        !self.active_policy_id.is_zero() && self.active_policy_revision.0 > 0
+    }
+
+    fn policy_scope_usable(&self) -> bool {
+        if self
+            .active_prefetch_policy
+            .flags
+            .contains_all(PrefetchResidencyPolicyFlags::REQUIRE_DATASET_SCOPE)
+        {
+            matches!(
+                self.active_prefetch_policy.policy_scope,
+                PrefetchResidencyPolicyScope::Dataset | PrefetchResidencyPolicyScope::SubjectRange
+            )
+        } else {
+            true
+        }
+    }
+
+    fn action_is_prefetch_residency_scoped(&self, action: StorageIntentActionClass) -> bool {
+        matches!(
+            action,
+            StorageIntentActionClass::QueuePrefetchTuning
+                | StorageIntentActionClass::CacheOnlyServingTrial
+                | StorageIntentActionClass::FlashServingPromotion
+                | StorageIntentActionClass::AuthorityPromotion
+        )
+    }
+
+    fn policy_allows_action(&self, action: StorageIntentActionClass) -> bool {
+        let mask = self.active_prefetch_policy.allowed_actions;
+        match action {
+            StorageIntentActionClass::QueuePrefetchTuning => {
+                action_mask_contains_any_prefetch_candidate(mask)
+            }
+            StorageIntentActionClass::CacheOnlyServingTrial => {
+                mask.contains_candidate(PrefetchResidencyCandidateClass::CacheOnlyTrial)
+                    || mask.contains_candidate(PrefetchResidencyCandidateClass::VolatileRamTrial)
+            }
+            StorageIntentActionClass::FlashServingPromotion => {
+                mask.contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing)
+                    || mask.contains_candidate(PrefetchResidencyCandidateClass::IntentBackedRam)
+                    || mask.contains_candidate(PrefetchResidencyCandidateClass::PmemDurable)
+            }
+            StorageIntentActionClass::AuthorityPromotion => {
+                mask.contains_candidate(
+                    PrefetchResidencyCandidateClass::AuthorityPromotionCandidate,
+                ) || mask.contains_candidate(PrefetchResidencyCandidateClass::IntentBackedRam)
+                    || mask.contains_candidate(PrefetchResidencyCandidateClass::PmemDurable)
+            }
+            _ => true,
+        }
+    }
+
+    fn collect_required_evidence_kinds(&self, request: &AdmissionRequest) -> RequiredEvidenceKinds {
+        let mut required = RequiredEvidenceKinds::empty();
+        if request.required_evidence_overflow
+            || request.required_evidence_count as usize > request.required_evidence_kinds.len()
+        {
+            required.overflow = true;
+        }
+
+        let mut index = 0;
+        let request_required_count =
+            (request.required_evidence_count as usize).min(request.required_evidence_kinds.len());
+        while index < request_required_count {
+            required.push(request.required_evidence_kinds[index]);
+            index += 1;
+        }
+
+        if self.active_policy_loaded()
+            && self.action_is_prefetch_residency_scoped(request.action_class)
+        {
+            self.push_policy_required_evidence(&mut required);
+        }
+
+        required
+    }
+
+    fn push_policy_required_evidence(&self, required: &mut RequiredEvidenceKinds) {
+        let flags = self.active_prefetch_policy.flags;
+
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_SERVICE_OBJECTIVE) {
+            required.push(StorageIntentEvidenceKind::ServiceObjectiveEvidence);
+        }
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_EVIDENCE_QUERY) {
+            required.push(StorageIntentEvidenceKind::EvidenceQuerySnapshot);
+        }
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_FRESH_MEDIA_CAPABILITY) {
+            required.push(StorageIntentEvidenceKind::MediaCapabilityEvidence);
+        }
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_COST_WEAR_EVIDENCE)
+            || flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_EGRESS_RESTORE_EVIDENCE)
+        {
+            required.push(StorageIntentEvidenceKind::MediaCostWearLedger);
+        }
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_PAYBACK_FOR_MOVEMENT) {
+            required.push(StorageIntentEvidenceKind::DecisionFrontierEvidence);
+        }
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_CAPACITY_RESERVE) {
+            required.push(StorageIntentEvidenceKind::CapacityAdmissionEvidence);
+        }
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_TENANT_ISOLATION) {
+            required.push(StorageIntentEvidenceKind::TenantIsolationEvidence);
+        }
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_READ_SERVING_BOUNDARY) {
+            required.push(StorageIntentEvidenceKind::ReadFreshnessEvidence);
+        }
+        if flags
+            .contains_all(PrefetchResidencyPolicyFlags::REQUIRE_RELOCATION_BOUNDARY_FOR_AUTHORITY)
+        {
+            required.push(StorageIntentEvidenceKind::RelocationReceipt);
+        }
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_TRUST_DOMAIN) {
+            required.push(StorageIntentEvidenceKind::TrustDomainEvidence);
+        }
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_TRANSPORT_BUDGET) {
+            required.push(StorageIntentEvidenceKind::TransportPathEvidence);
+        }
+        if flags.contains_all(PrefetchResidencyPolicyFlags::REQUIRE_SCHEDULER_ADMISSION) {
+            required.push(StorageIntentEvidenceKind::SchedulerAdmissionRecord);
+        }
+    }
+
+    fn has_bound_evidence_kind(
+        &self,
+        request: &AdmissionRequest,
+        kind: StorageIntentEvidenceKind,
+    ) -> bool {
+        request
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence_ref_matches_kind(*evidence, kind))
+            || self.active_policy_has_bound_evidence_kind(kind)
+    }
+
+    fn active_policy_has_bound_evidence_kind(&self, kind: StorageIntentEvidenceKind) -> bool {
+        let refs = self.active_prefetch_policy.evidence_refs;
+        match kind {
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence => {
+                evidence_ref_matches_kind(refs.service_objective_ref, kind)
+            }
+            StorageIntentEvidenceKind::EvidenceQuerySnapshot => {
+                evidence_ref_matches_kind(refs.evidence_query_ref, kind)
+            }
+            StorageIntentEvidenceKind::DecisionFrontierEvidence => {
+                evidence_ref_matches_kind(refs.decision_frontier_ref, kind)
+            }
+            StorageIntentEvidenceKind::MediaCapabilityEvidence => {
+                evidence_ref_matches_kind(refs.media_capability_ref, kind)
+            }
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord => {
+                evidence_ref_matches_kind(refs.scheduler_admission_ref, kind)
+            }
+            StorageIntentEvidenceKind::CapacityAdmissionEvidence => {
+                evidence_ref_matches_kind(refs.capacity_reserve_ref, kind)
+            }
+            StorageIntentEvidenceKind::TenantIsolationEvidence => {
+                evidence_ref_matches_kind(refs.tenant_isolation_ref, kind)
+            }
+            StorageIntentEvidenceKind::MediaCostWearLedger => {
+                evidence_ref_matches_kind(refs.cost_wear_ref, kind)
+                    || evidence_ref_matches_kind(refs.egress_restore_cost_ref, kind)
+            }
+            StorageIntentEvidenceKind::TransportPathEvidence => {
+                evidence_ref_matches_kind(refs.transport_budget_ref, kind)
+            }
+            StorageIntentEvidenceKind::TrustDomainEvidence => {
+                evidence_ref_matches_kind(refs.trust_domain_ref, kind)
+            }
+            StorageIntentEvidenceKind::ReadFreshnessEvidence => {
+                evidence_ref_matches_kind(refs.read_serving_boundary_ref, kind)
+            }
+            StorageIntentEvidenceKind::RelocationReceipt => {
+                evidence_ref_matches_kind(refs.relocation_boundary_ref, kind)
+            }
+            StorageIntentEvidenceKind::ResultRefusalEvidence => {
+                evidence_ref_matches_kind(refs.result_refusal_ref, kind)
+            }
+            _ => false,
+        }
+    }
+
+    fn blocking_freshness_for_kind(
+        &self,
+        kind: StorageIntentEvidenceKind,
+    ) -> Option<SchedulingConfidenceClass> {
+        if !self.active_evidence_snapshot.has_query_identity() {
+            return None;
+        }
+
+        match self
+            .active_evidence_snapshot
+            .family_freshness
+            .state_for_kind(kind)
+        {
+            EvidenceFamilyFreshnessState::Fresh => None,
+            EvidenceFamilyFreshnessState::Contradictory => {
+                Some(SchedulingConfidenceClass::Contradicted)
+            }
+            EvidenceFamilyFreshnessState::Stale
+            | EvidenceFamilyFreshnessState::Superseded
+            | EvidenceFamilyFreshnessState::Redacted
+            | EvidenceFamilyFreshnessState::Compacted => Some(SchedulingConfidenceClass::Stale),
+            EvidenceFamilyFreshnessState::Unknown
+            | EvidenceFamilyFreshnessState::Missing
+            | EvidenceFamilyFreshnessState::Unavailable
+            | EvidenceFamilyFreshnessState::Refused => Some(SchedulingConfidenceClass::Unknown),
+        }
+    }
 
     fn check_hard_caps(
         &self,
@@ -938,7 +1501,8 @@ impl StorageIntentScheduler {
             }
         }
 
-        if caps.device_queue_depth > caps.max_device_queue_depth && caps.max_device_queue_depth > 0
+        if caps.device_queue_depth > caps.max_device_queue_depth
+            && caps.max_device_queue_depth > 0
             && lane != LaneClass::Control
         {
             return Some((
@@ -1144,15 +1708,21 @@ impl StorageIntentScheduler {
             self.evidence_log.remove(0);
         }
 
-        let mut missing_kinds = [StorageIntentEvidenceKind::Unknown; 8];
+        let required_evidence = self.collect_required_evidence_kinds(request);
+        let mut missing_kinds = [StorageIntentEvidenceKind::Unknown; MAX_REQUIRED_EVIDENCE_KINDS];
         let mut missing_count: u8 = 0;
-
-        // Detect missing/stale evidence by checking for unbound refs.
-        for ev in &request.evidence_refs {
-            if !ev.is_bound() && (missing_count as usize) < 8 {
-                missing_kinds[missing_count as usize] = ev.kind;
-                missing_count = missing_count.saturating_add(1);
+        let mut missing_evidence_overflow = required_evidence.overflow;
+        let mut index = 0;
+        while index < required_evidence.count as usize {
+            let kind = required_evidence.kinds[index];
+            if !self.has_bound_evidence_kind(request, kind)
+                || self.blocking_freshness_for_kind(kind).is_some()
+            {
+                if !push_required_evidence_kind(&mut missing_kinds, &mut missing_count, kind) {
+                    missing_evidence_overflow = true;
+                }
             }
+            index += 1;
         }
 
         let evidence = SchedulingEvidence {
@@ -1176,6 +1746,7 @@ impl StorageIntentScheduler {
             available_evidence: request.evidence_refs,
             missing_evidence_kinds: missing_kinds,
             missing_evidence_count: missing_count,
+            missing_evidence_overflow,
         };
 
         self.evidence_log.push(evidence);
@@ -1290,6 +1861,33 @@ mod tests {
         )
     }
 
+    fn policy_id(byte: u8) -> StorageIntentPolicyId {
+        StorageIntentPolicyId([byte; 16])
+    }
+
+    fn evidence_id(byte: u8) -> StorageIntentEvidenceId {
+        StorageIntentEvidenceId([byte; 32])
+    }
+
+    fn evidence_ref(kind: StorageIntentEvidenceKind, byte: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(kind, evidence_id(byte), 1, 1)
+    }
+
+    fn compiled_prefetch_policy() -> PrefetchResidencyPolicyEnvelope {
+        PrefetchResidencyPolicyEnvelope {
+            policy_id: policy_id(7),
+            policy_revision: StorageIntentPolicyRevision(3),
+            policy_scope: PrefetchResidencyPolicyScope::Dataset,
+            allowed_actions: PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::BoundedReadahead,
+            )
+            .with(PrefetchResidencyCandidateClass::CacheOnlyTrial),
+            max_prefetch_window_bytes: 4096,
+            max_staging_bytes: 8192,
+            ..PrefetchResidencyPolicyEnvelope::default()
+        }
+    }
+
     // ── Lane mapping tests ──
 
     #[test]
@@ -1323,6 +1921,45 @@ mod tests {
     }
 
     #[test]
+    fn authority_promotion_maps_to_demand_lane() {
+        let req = AdmissionRequest::new(
+            AdmissionWorkClass::AuthorityPromotion,
+            StorageIntentActionClass::AuthorityPromotion,
+            StorageIntentBudgetOwnerId::ZERO,
+            4096,
+            1,
+            StorageIntentPolicyId::ZERO,
+            StorageIntentPolicyRevision(0),
+            StorageIntentGuaranteeClass::FullPlacement,
+        );
+        assert_eq!(req.work_class.lane_class(), LaneClass::Demand);
+        assert_eq!(req.resolved_lane(), LaneClass::Demand);
+    }
+
+    #[test]
+    fn action_lane_prevents_authority_demoting_to_speculative() {
+        let mut s = test_scheduler();
+        s.caps.max_inflight_bytes = 100;
+        s.caps.inflight_bytes = 90;
+        s.caps.foreground_latency_budget_us = 1;
+
+        let req = AdmissionRequest::new(
+            AdmissionWorkClass::SpeculativePrefetch,
+            StorageIntentActionClass::AuthorityPromotion,
+            StorageIntentBudgetOwnerId::ZERO,
+            4096,
+            1,
+            StorageIntentPolicyId::ZERO,
+            StorageIntentPolicyRevision(0),
+            StorageIntentGuaranteeClass::FullPlacement,
+        );
+
+        let decision = s.admit(&req);
+        assert_eq!(decision.lane, LaneClass::Demand);
+        assert_ne!(decision.outcome, AdmissionOutcome::Dropped);
+    }
+
+    #[test]
     fn lane_mapping_covers_all_action_classes() {
         let all_actions = [
             StorageIntentActionClass::QueuePrefetchTuning,
@@ -1350,6 +1987,185 @@ mod tests {
                     || lane == LaneClass::Background
             );
         }
+    }
+
+    // ── Compiled policy tests ──
+
+    #[test]
+    fn compiled_prefetch_policy_updates_identity_and_caps() {
+        let mut s = test_scheduler();
+        let policy = compiled_prefetch_policy();
+
+        s.apply_prefetch_residency_policy(&policy, None);
+
+        assert_eq!(s.active_policy_id, policy.policy_id);
+        assert_eq!(s.active_policy_revision, policy.policy_revision);
+        assert_eq!(
+            s.lane_configs
+                .get(&LaneClass::Speculative)
+                .unwrap()
+                .max_inflight_bytes,
+            policy.max_prefetch_window_bytes
+        );
+        assert_eq!(
+            s.lane_configs
+                .get(&LaneClass::Background)
+                .unwrap()
+                .max_inflight_bytes,
+            policy.max_staging_bytes
+        );
+    }
+
+    #[test]
+    fn compiled_policy_refuses_disallowed_prefetch_actions() {
+        let mut s = test_scheduler();
+        let mut policy = compiled_prefetch_policy();
+        policy.allowed_actions = PrefetchResidencyActionMask::from_candidate(
+            PrefetchResidencyCandidateClass::NoPrefetch,
+        );
+        s.apply_prefetch_residency_policy(&policy, None);
+
+        let decision = s.admit(&speculative_prefetch_request());
+
+        assert_eq!(decision.outcome, AdmissionOutcome::Refused);
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::NoLegalReceiptSet
+        );
+    }
+
+    #[test]
+    fn compiled_policy_flags_add_named_required_evidence() {
+        let mut s = test_scheduler();
+        let mut policy = compiled_prefetch_policy();
+        policy.flags = PrefetchResidencyPolicyFlags::REQUIRE_SERVICE_OBJECTIVE
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_CAPACITY_RESERVE);
+        s.apply_prefetch_residency_policy(&policy, None);
+
+        let decision = s.admit(&speculative_prefetch_request());
+        let evidence = s.drain_evidence();
+
+        assert_eq!(decision.outcome, AdmissionOutcome::Dropped);
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_eq!(evidence[0].missing_evidence_count, 2);
+        assert_eq!(
+            evidence[0].missing_evidence_kinds[0],
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence
+        );
+        assert_eq!(
+            evidence[0].missing_evidence_kinds[1],
+            StorageIntentEvidenceKind::CapacityAdmissionEvidence
+        );
+    }
+
+    #[test]
+    fn compiled_policy_late_required_evidence_is_not_truncated() {
+        let mut s = test_scheduler();
+        let mut policy = compiled_prefetch_policy();
+        policy.max_prefetch_window_bytes = 1024 * 1024;
+        policy.flags = PrefetchResidencyPolicyFlags::REQUIRE_SERVICE_OBJECTIVE
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_EVIDENCE_QUERY)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_FRESH_MEDIA_CAPABILITY)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_COST_WEAR_EVIDENCE)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_EGRESS_RESTORE_EVIDENCE)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_PAYBACK_FOR_MOVEMENT)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_CAPACITY_RESERVE)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_TENANT_ISOLATION)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_READ_SERVING_BOUNDARY)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_RELOCATION_BOUNDARY_FOR_AUTHORITY)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_TRUST_DOMAIN)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_TRANSPORT_BUDGET)
+            .union(PrefetchResidencyPolicyFlags::REQUIRE_SCHEDULER_ADMISSION);
+        policy.evidence_refs = tidefs_storage_intent_core::PrefetchResidencyDecisionEvidenceRefs {
+            service_objective_ref: evidence_ref(
+                StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                21,
+            ),
+            evidence_query_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 22),
+            decision_frontier_ref: evidence_ref(
+                StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                23,
+            ),
+            media_capability_ref: evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                24,
+            ),
+            capacity_reserve_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                25,
+            ),
+            tenant_isolation_ref: evidence_ref(
+                StorageIntentEvidenceKind::TenantIsolationEvidence,
+                26,
+            ),
+            cost_wear_ref: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 27),
+            transport_budget_ref: evidence_ref(
+                StorageIntentEvidenceKind::TransportPathEvidence,
+                28,
+            ),
+            trust_domain_ref: evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, 29),
+            read_serving_boundary_ref: evidence_ref(
+                StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                30,
+            ),
+            relocation_boundary_ref: evidence_ref(StorageIntentEvidenceKind::RelocationReceipt, 31),
+            ..Default::default()
+        };
+        s.apply_prefetch_residency_policy(&policy, None);
+
+        let decision = s.admit(&speculative_prefetch_request());
+        let evidence = s.drain_evidence();
+        let missing =
+            &evidence[0].missing_evidence_kinds[..evidence[0].missing_evidence_count as usize];
+
+        assert_eq!(decision.outcome, AdmissionOutcome::Dropped);
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(!evidence[0].missing_evidence_overflow);
+        assert!(missing.contains(&StorageIntentEvidenceKind::SchedulerAdmissionRecord));
+    }
+
+    #[test]
+    fn required_evidence_overflow_refuses_closed() {
+        let mut s = test_scheduler();
+        let mut req = foreground_read_request();
+        req.required_evidence_count = MAX_REQUIRED_EVIDENCE_KINDS as u8 + 1;
+
+        let decision = s.admit(&req);
+        let evidence = s.drain_evidence();
+
+        assert_eq!(decision.outcome, AdmissionOutcome::Refused);
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(evidence[0].missing_evidence_overflow);
+    }
+
+    #[test]
+    fn bound_required_evidence_degrades_without_query_snapshot() {
+        let mut s = test_scheduler();
+        let req = foreground_read_request()
+            .with_required_evidence_kind(StorageIntentEvidenceKind::OrderingEvidence)
+            .with_evidence(evidence_ref(
+                StorageIntentEvidenceKind::OrderingEvidence,
+                11,
+            ));
+
+        let decision = s.admit(&req);
+        let evidence = s.drain_evidence();
+
+        assert_eq!(decision.outcome, AdmissionOutcome::Admitted);
+        assert_eq!(evidence[0].missing_evidence_count, 0);
+        assert_eq!(
+            evidence[0].confidence,
+            SchedulingConfidenceClass::DegradedVisible
+        );
     }
 
     // ── Admission priority tests ──
@@ -1659,10 +2475,26 @@ mod tests {
     #[test]
     fn evidence_captures_missing_evidence_kinds() {
         let mut s = test_scheduler();
-        let req = foreground_read_request(); // has empty evidence refs
+        let req = foreground_read_request()
+            .with_required_evidence_kind(StorageIntentEvidenceKind::OrderingEvidence);
+        let decision = s.admit(&req);
+        let evidence = s.drain_evidence();
+        assert_eq!(decision.outcome, AdmissionOutcome::Refused);
+        assert_eq!(evidence[0].confidence, SchedulingConfidenceClass::Unknown);
+        assert_eq!(evidence[0].missing_evidence_count, 1);
+        assert_eq!(
+            evidence[0].missing_evidence_kinds[0],
+            StorageIntentEvidenceKind::OrderingEvidence
+        );
+    }
+
+    #[test]
+    fn evidence_does_not_report_unused_slots_as_missing() {
+        let mut s = test_scheduler();
+        let req = foreground_read_request();
         s.admit(&req);
         let evidence = s.drain_evidence();
-        assert_eq!(evidence[0].missing_evidence_count, 8); // all 8 slots are unbound
+        assert_eq!(evidence[0].missing_evidence_count, 0);
     }
 
     #[test]
