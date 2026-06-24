@@ -9496,6 +9496,36 @@ pub enum StorageIntentRefusalReason {
     RebakePaybackWindowNotMet = 89,
     /// Data-shape cost budget (CPU, memory, wear, WAN) would be exceeded.
     DataShapeCostBudgetExceeded = 90,
+    /// Lifecycle evidence is missing, unknown, or not a lifecycle artifact.
+    UnknownLifecycleEvidence = 91,
+    /// Lifecycle evidence is stale or superseded.
+    StaleLifecycleEvidence = 92,
+    /// Lifecycle class is unknown, blocked, refused, or degraded-visible.
+    LifecycleClassBlocked = 93,
+    /// Generation is held by data-retaining snapshot; reclaim illegal.
+    GenerationHeldBySnapshot = 94,
+    /// Generation is held by data-retaining clone; reclaim illegal.
+    GenerationHeldByClone = 95,
+    /// Generation is held by receive-base dependency; reclaim illegal.
+    GenerationHeldByReceiveBase = 96,
+    /// Generation is held by orphan (open/unlinked) state; reclaim illegal.
+    GenerationHeldByOrphan = 97,
+    /// Dead-pending-reclaim bytes are not free capacity yet.
+    DeadPendingReclaimNotYetFree = 98,
+    /// Young short-lived bytes blocked from flash promotion without dwell.
+    YoungByteFlashPromotionBlocked = 99,
+    /// Snapshot-pinned or cold generation blocked from flash reshaping.
+    SnapshotPinnedFlashPlacementBlocked = 100,
+    /// Receive base-root content dependency unprotected for geo catch-up.
+    ReceiveBaseUnprotectedForGeoCatchUp = 101,
+    /// Bookmark-only anchor cannot retain bytes; reclaim is legal.
+    BookmarkOnlyCannotRetainBytes = 102,
+    /// Destroy/tombstone state conflicts with admission or placement.
+    DestroyTombstoneAdmissionConflict = 103,
+    /// Contradictory lifecycle evidence from multiple authorities.
+    ContradictoryLifecycleEvidence = 104,
+    /// Required omitted-content dependency evidence is missing.
+    MissingOmittedContentDependency = 105,
 }
 
 impl StorageIntentRefusalReason {
@@ -9598,6 +9628,21 @@ impl StorageIntentRefusalReason {
             Self::RebakeReplacementReceiptMissing => "rebake-replacement-receipt-missing",
             Self::RebakePaybackWindowNotMet => "rebake-payback-window-not-met",
             Self::DataShapeCostBudgetExceeded => "data-shape-cost-budget-exceeded",
+            Self::UnknownLifecycleEvidence => "unknown-lifecycle-evidence",
+            Self::StaleLifecycleEvidence => "stale-lifecycle-evidence",
+            Self::LifecycleClassBlocked => "lifecycle-class-blocked",
+            Self::GenerationHeldBySnapshot => "generation-held-by-snapshot",
+            Self::GenerationHeldByClone => "generation-held-by-clone",
+            Self::GenerationHeldByReceiveBase => "generation-held-by-receive-base",
+            Self::GenerationHeldByOrphan => "generation-held-by-orphan",
+            Self::DeadPendingReclaimNotYetFree => "dead-pending-reclaim-not-yet-free",
+            Self::YoungByteFlashPromotionBlocked => "young-byte-flash-promotion-blocked",
+            Self::SnapshotPinnedFlashPlacementBlocked => "snapshot-pinned-flash-placement-blocked",
+            Self::ReceiveBaseUnprotectedForGeoCatchUp => "receive-base-unprotected-for-geo-catch-up",
+            Self::BookmarkOnlyCannotRetainBytes => "bookmark-only-cannot-retain-bytes",
+            Self::DestroyTombstoneAdmissionConflict => "destroy-tombstone-admission-conflict",
+            Self::ContradictoryLifecycleEvidence => "contradictory-lifecycle-evidence",
+            Self::MissingOmittedContentDependency => "missing-omitted-content-dependency",
         }
     }
 
@@ -9696,6 +9741,21 @@ impl StorageIntentRefusalReason {
             88 => Some(Self::RebakeReplacementReceiptMissing),
             89 => Some(Self::RebakePaybackWindowNotMet),
             90 => Some(Self::DataShapeCostBudgetExceeded),
+            91 => Some(Self::UnknownLifecycleEvidence),
+            92 => Some(Self::StaleLifecycleEvidence),
+            93 => Some(Self::LifecycleClassBlocked),
+            94 => Some(Self::GenerationHeldBySnapshot),
+            95 => Some(Self::GenerationHeldByClone),
+            96 => Some(Self::GenerationHeldByReceiveBase),
+            97 => Some(Self::GenerationHeldByOrphan),
+            98 => Some(Self::DeadPendingReclaimNotYetFree),
+            99 => Some(Self::YoungByteFlashPromotionBlocked),
+            100 => Some(Self::SnapshotPinnedFlashPlacementBlocked),
+            101 => Some(Self::ReceiveBaseUnprotectedForGeoCatchUp),
+            102 => Some(Self::BookmarkOnlyCannotRetainBytes),
+            103 => Some(Self::DestroyTombstoneAdmissionConflict),
+            104 => Some(Self::ContradictoryLifecycleEvidence),
+            105 => Some(Self::MissingOmittedContentDependency),
             _ => None,
         }
     }
@@ -14396,6 +14456,817 @@ impl_u8_canonical!(StorageIntentRecoveryRefusalReason, {
     ResidencyViolationInRecovery = 19 => "residency-violation-in-recovery",
     RecoveryDeadlineCrossed = 20 => "recovery-deadline-crossed",
 });
+
+// ===== Storage-intent lifecycle generation evidence =====
+
+/// Lifecycle class assigned to one subject/range/generation.
+///
+/// These are the authoritative lifecycle state spellings that
+/// placement, relocation, reclaim, read serving, send/receive,
+/// and operator explanation must consume.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentLifecycleClass {
+    /// Unknown or unclassified lifecycle state.
+    #[default]
+    Unknown = 0,
+    /// Young bytes actively receiving writes; high overwrite/delete risk.
+    YoungDirty = 1,
+    /// Young bytes acknowledged; dwell clock running.
+    YoungAcknowledged = 2,
+    /// Stable hot range; serving-promotion eligible.
+    StableHot = 3,
+    /// Stable warm range; candidate for balanced tiering.
+    StableWarm = 4,
+    /// Stable cold range; archive candidate, low reshuffle benefit.
+    StableCold = 5,
+    /// Pinned by data-retaining snapshot; reclaim illegal.
+    SnapshotPinned = 6,
+    /// Held by data-retaining clone root; reclaim illegal.
+    CloneHeld = 7,
+    /// Held as receive-base dependency; reclaim illegal.
+    ReceiveBaseHeld = 8,
+    /// Bookmark-only anchor; non-retaining, reclaim legal.
+    BookmarkOnlyNonretaining = 9,
+    /// Held by orphan (open/unlinked) state; reclaim illegal.
+    OrphanHeld = 10,
+    /// Dead pending reclaim; not free capacity yet.
+    DeadPendingReclaim = 11,
+    /// Actively destroying; admission conflict.
+    Destroying = 12,
+    /// Tombstone; visible for explanation, not reusable.
+    Tombstone = 13,
+}
+
+impl_u8_canonical!(StorageIntentLifecycleClass, {
+    Unknown = 0 => "unknown",
+    YoungDirty = 1 => "young-dirty",
+    YoungAcknowledged = 2 => "young-acknowledged",
+    StableHot = 3 => "stable-hot",
+    StableWarm = 4 => "stable-warm",
+    StableCold = 5 => "stable-cold",
+    SnapshotPinned = 6 => "snapshot-pinned",
+    CloneHeld = 7 => "clone-held",
+    ReceiveBaseHeld = 8 => "receive-base-held",
+    BookmarkOnlyNonretaining = 9 => "bookmark-only-nonretaining",
+    OrphanHeld = 10 => "orphan-held",
+    DeadPendingReclaim = 11 => "dead-pending-reclaim",
+    Destroying = 12 => "destroying",
+    Tombstone = 13 => "tombstone",
+});
+
+impl StorageIntentLifecycleClass {
+    /// Returns true when the lifecycle class blocks reclaim or retirement.
+    #[must_use]
+    pub const fn blocks_reclaim(self) -> bool {
+        matches!(
+            self,
+            Self::SnapshotPinned
+                | Self::CloneHeld
+                | Self::ReceiveBaseHeld
+                | Self::OrphanHeld
+        )
+    }
+
+    /// Returns true when the lifecycle class is a retaining state.
+    #[must_use]
+    pub const fn is_retaining(self) -> bool {
+        matches!(
+            self,
+            Self::YoungDirty
+                | Self::YoungAcknowledged
+                | Self::StableHot
+                | Self::StableWarm
+                | Self::StableCold
+                | Self::SnapshotPinned
+                | Self::CloneHeld
+                | Self::ReceiveBaseHeld
+                | Self::OrphanHeld
+        )
+    }
+
+    /// Returns true when the lifecycle class is a terminal or posthumous state.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Destroying | Self::Tombstone)
+    }
+
+    /// Returns true when bytes in this class are young (not yet stable).
+    #[must_use]
+    pub const fn is_young(self) -> bool {
+        matches!(self, Self::YoungDirty | Self::YoungAcknowledged)
+    }
+
+    /// Returns true when bytes in this class may be considered for flash promotion.
+    #[must_use]
+    pub const fn may_promote_to_flash(self) -> bool {
+        matches!(self, Self::StableHot | Self::StableWarm)
+    }
+}
+
+/// Anchor kind that may retain or not-retain generations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentAnchorKind {
+    /// No anchor or unknown.
+    #[default]
+    Unknown = 0,
+    /// Data-retaining snapshot anchor.
+    Snapshot = 1,
+    /// Data-retaining clone anchor.
+    Clone = 2,
+    /// Bookmark anchor (non-retaining by default).
+    Bookmark = 3,
+    /// Receive-base anchor (retaining while dependency exists).
+    ReceiveBase = 4,
+    /// Orphan (open/unlinked) anchor (retaining until reclaim).
+    Orphan = 5,
+}
+
+impl_u8_canonical!(StorageIntentAnchorKind, {
+    Unknown = 0 => "unknown",
+    Snapshot = 1 => "snapshot",
+    Clone = 2 => "clone",
+    Bookmark = 3 => "bookmark",
+    ReceiveBase = 4 => "receive-base",
+    Orphan = 5 => "orphan",
+});
+
+impl StorageIntentAnchorKind {
+    /// Returns true when this anchor kind is data-retaining by default.
+    #[must_use]
+    pub const fn is_data_retaining(self) -> bool {
+        matches!(self, Self::Snapshot | Self::Clone | Self::ReceiveBase | Self::Orphan)
+    }
+
+    /// Returns true when this anchor is non-retaining by default (bookmarks).
+    #[must_use]
+    pub const fn is_non_retaining(self) -> bool {
+        matches!(self, Self::Bookmark)
+    }
+}
+
+/// Lifecycle provenance: distinguishes authoritative evidence from predictive hints.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentLifecycleProvenanceClass {
+    /// Unknown provenance.
+    #[default]
+    Unknown = 0,
+    /// Authoritative catalog, pin, receipt, root, or fence evidence.
+    Authoritative = 1,
+    /// Predictive workload, heat, or time-since-write signal only.
+    Predictive = 2,
+    /// Degraded or stale confidence; previous authority stale.
+    Degraded = 3,
+}
+
+impl_u8_canonical!(StorageIntentLifecycleProvenanceClass, {
+    Unknown = 0 => "unknown",
+    Authoritative = 1 => "authoritative",
+    Predictive = 2 => "predictive",
+    Degraded = 3 => "degraded",
+});
+
+/// Lifecycle evidence flags.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentLifecycleFlags(pub u64);
+
+impl StorageIntentLifecycleFlags {
+    /// Empty flag set.
+    pub const EMPTY: Self = Self(0);
+
+    /// Evidence is present and bound.
+    pub const EVIDENCE_PRESENT: u64 = 1 << 0;
+    /// Evidence is fresh (within legal staleness frontier).
+    pub const FRESH: u64 = 1 << 1;
+    /// Lifecycle class is authoritatively proven.
+    pub const AUTHORITATIVE_PROVENANCE: u64 = 1 << 2;
+    /// Retaining anchor is catalog-consistent.
+    pub const CATALOG_CONSISTENT: u64 = 1 << 3;
+    /// Snapshot/clone/receive-base pin is catalog-proven.
+    pub const PIN_CATALOG_PROVEN: u64 = 1 << 4;
+    /// Receive-base dependencies are satisfied.
+    pub const RECEIVE_BASE_DEPENDENCIES_SATISFIED: u64 = 1 << 5;
+    /// Omitted-content dependency evidence is bound.
+    pub const OMITTED_CONTENT_DEPENDENCIES_BOUND: u64 = 1 << 6;
+    /// Reclaim frontier is published and fenced.
+    pub const RECLAIM_FRONTIER_PUBLISHED: u64 = 1 << 7;
+    /// Reclaim receipt is earned and durable.
+    pub const RECLAIM_RECEIPT_EARNED: u64 = 1 << 8;
+    /// Tombstone is visible for operator explanation.
+    pub const TOMBSTONE_VISIBLE: u64 = 1 << 9;
+    /// Destroy state is admitted and in-progress.
+    pub const DESTROY_ADMITTED: u64 = 1 << 10;
+    /// Young-byte dwell/payback window has been met.
+    pub const DWELL_PAYBACK_MET: u64 = 1 << 11;
+    /// Snapshot-pinned cold policy allows flash promotion with payback.
+    pub const SNAPSHOT_PINNED_POLICY_ALLOWS: u64 = 1 << 12;
+    /// Dependencies are not contradictory.
+    pub const NOT_CONTRADICTORY: u64 = 1 << 13;
+    /// Bookmark confirmed non-retaining (no later authority override).
+    pub const BOOKMARK_NON_RETAINING_CONFIRMED: u64 = 1 << 14;
+    /// Evidence is refused at the record level.
+    pub const REFUSED: u64 = 1 << 15;
+
+    /// Returns true when all bits in `mask` are set.
+    #[must_use]
+    pub const fn contains_all(self, mask: u64) -> bool {
+        self.0 & mask == mask
+    }
+
+    /// Returns true when any bit in `mask` is set.
+    #[must_use]
+    pub const fn intersects(self, mask: u64) -> bool {
+        self.0 & mask != 0
+    }
+
+    /// Returns true when the flag set is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Combine two flag sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// Lifecycle refusal reason scoped to lifecycle evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentLifecycleRefusalReason {
+    /// No refusal.
+    #[default]
+    None = 0,
+    /// Lifecycle evidence is missing or not a lifecycle artifact.
+    MissingLifecycleEvidence = 1,
+    /// Lifecycle evidence is stale or superseded.
+    StaleLifecycleEvidence = 2,
+    /// Lifecycle class is unknown or unclassified.
+    UnknownLifecycleClass = 3,
+    /// Snapshot pin evidence is missing or contradictory.
+    MissingSnapshotPinEvidence = 4,
+    /// Clone hold evidence is missing or contradictory.
+    MissingCloneHoldEvidence = 5,
+    /// Receive-base dependency evidence is missing.
+    MissingReceiveBaseDependency = 6,
+    /// Orphan hold evidence is missing.
+    MissingOrphanHoldEvidence = 7,
+    /// Reclaim frontier is unpublished or unfenced.
+    ReclaimFrontierNotPublished = 8,
+    /// Omitted-content dependency for geo catch-up is missing.
+    MissingOmittedContentDependency = 9,
+    /// Bookmark non-retaining status is ambiguous.
+    AmbiguousBookmarkRetention = 10,
+    /// Destroy/tombstone admission evidence is missing.
+    MissingDestroyAdmission = 11,
+    /// Contradictory lifecycle evidence from multiple authorities.
+    ContradictoryLifecycleEvidence = 12,
+}
+
+impl_u8_canonical!(StorageIntentLifecycleRefusalReason, {
+    None = 0 => "none",
+    MissingLifecycleEvidence = 1 => "missing-lifecycle-evidence",
+    StaleLifecycleEvidence = 2 => "stale-lifecycle-evidence",
+    UnknownLifecycleClass = 3 => "unknown-lifecycle-class",
+    MissingSnapshotPinEvidence = 4 => "missing-snapshot-pin-evidence",
+    MissingCloneHoldEvidence = 5 => "missing-clone-hold-evidence",
+    MissingReceiveBaseDependency = 6 => "missing-receive-base-dependency",
+    MissingOrphanHoldEvidence = 7 => "missing-orphan-hold-evidence",
+    ReclaimFrontierNotPublished = 8 => "reclaim-frontier-not-published",
+    MissingOmittedContentDependency = 9 => "missing-omitted-content-dependency",
+    AmbiguousBookmarkRetention = 10 => "ambiguous-bookmark-retention",
+    MissingDestroyAdmission = 11 => "missing-destroy-admission",
+    ContradictoryLifecycleEvidence = 12 => "contradictory-lifecycle-evidence",
+});
+
+impl StorageIntentLifecycleRefusalReason {
+    /// Returns true when a refusal reason is present.
+    #[must_use]
+    pub const fn is_refused(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Storage-intent lifecycle generation evidence record.
+///
+/// This is the concrete projection for evidence kind
+/// `LifecycleGenerationEvidence = 35` as prescribed by
+/// `docs/STORAGE_INTENT_POLICY_AUTHORITY.md`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentLifecycleGenerationEvidence {
+    /// Self-referential evidence identity.
+    pub evidence_ref: StorageIntentEvidenceRef,
+    /// Owning policy identity.
+    pub policy_id: StorageIntentPolicyId,
+    /// Owning policy revision.
+    pub policy_revision: StorageIntentPolicyRevision,
+    /// Subject identity (dataset, object, range, generation).
+    pub subject_scope: StorageIntentObjectScope,
+    /// Dataset identity for lineage/branch scoping.
+    pub dataset_id: StorageIntentDomainId,
+    /// Lineage or branch identity.
+    pub branch_id: StorageIntentDomainId,
+    /// Committed-root identity for this generation.
+    pub committed_root_id: StorageIntentEvidenceId,
+    /// Committed-root generation.
+    pub committed_root_generation: u64,
+    /// Authoritative lifecycle class.
+    pub lifecycle_class: StorageIntentLifecycleClass,
+    /// Lifecycle provenance (authoritative vs predictive).
+    pub provenance: StorageIntentLifecycleProvenanceClass,
+    /// Anchor kind that retains or observes this generation.
+    pub anchor_kind: StorageIntentAnchorKind,
+    /// Birth generation or fence reference.
+    pub birth_generation: u64,
+    /// Last-write generation or fence reference.
+    pub last_write_generation: u64,
+    /// Last-overwrite generation or fence reference (zero if never overwritten).
+    pub last_overwrite_generation: u64,
+    /// Delete/unlink generation or fence reference (zero if never deleted).
+    pub delete_generation: u64,
+    /// Snapshot-pin generation or fence reference (if pinned).
+    pub snapshot_generation: u64,
+    /// Clone-hold generation or fence reference (if held).
+    pub clone_generation: u64,
+    /// Receive-base generation or fence reference (if base dependency exists).
+    pub receive_base_generation: u64,
+    /// Replacement generation or fence reference after relocation/rebake.
+    pub replacement_generation: u64,
+    /// Reclaim-frontier generation or fence reference.
+    pub reclaim_frontier_generation: u64,
+    /// Evidence flags.
+    pub flags: StorageIntentLifecycleFlags,
+    /// Evidence refs for authority sources.
+    pub refs: StorageIntentLifecycleRefs,
+    /// Lifecycle refusal at the record level.
+    pub refusal: StorageIntentLifecycleRefusalReason,
+}
+
+/// Inline evidence references for lifecycle evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentLifecycleRefs {
+    /// Snapshot catalog ref.
+    pub snapshot_catalog_ref: StorageIntentEvidenceRef,
+    /// Clone catalog ref.
+    pub clone_catalog_ref: StorageIntentEvidenceRef,
+    /// Receive-base dependency ref.
+    pub receive_base_ref: StorageIntentEvidenceRef,
+    /// Orphan hold ref.
+    pub orphan_hold_ref: StorageIntentEvidenceRef,
+    /// Bookmark catalog ref.
+    pub bookmark_ref: StorageIntentEvidenceRef,
+    /// Reclaim receipt ref.
+    pub reclaim_receipt_ref: StorageIntentEvidenceRef,
+    /// Reclaim frontier publication ref.
+    pub reclaim_frontier_ref: StorageIntentEvidenceRef,
+    /// Omitted-content dependency ref (for geo catch-up).
+    pub omitted_content_dependency_ref: StorageIntentEvidenceRef,
+    /// Replacement evidence ref (post relocation/rebake).
+    pub replacement_evidence_ref: StorageIntentEvidenceRef,
+    /// Destroy/tombstone admission ref.
+    pub destroy_admission_ref: StorageIntentEvidenceRef,
+    /// Layout evidence ref for capacity agreement.
+    pub layout_evidence_ref: StorageIntentEvidenceRef,
+    /// Ordering evidence ref for barrier/sequence consistency.
+    pub ordering_evidence_ref: StorageIntentEvidenceRef,
+    /// Placement receipt ref.
+    pub placement_receipt_ref: StorageIntentEvidenceRef,
+    /// Lifecycle pin/catalog authority ref.
+    pub lifecycle_pin_ref: StorageIntentEvidenceRef,
+    /// Dwell/payback evidence ref.
+    pub dwell_payback_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentLifecycleGenerationEvidence {
+    /// Returns true when the record cites a bound lifecycle-generation artifact.
+    #[must_use]
+    pub const fn has_lifecycle_identity(self) -> bool {
+        self.evidence_ref.kind as u16
+            == StorageIntentEvidenceKind::LifecycleGenerationEvidence as u16
+            && evidence_ref_has_id(self.evidence_ref)
+            && !self.policy_id.is_zero()
+            && self.policy_revision.0 > 0
+    }
+
+    /// Returns true when the lifecycle class is authoritative.
+    #[must_use]
+    pub const fn has_authoritative_provenance(self) -> bool {
+        matches!(
+            self.provenance,
+            StorageIntentLifecycleProvenanceClass::Authoritative
+        ) && self
+            .flags
+            .contains_all(StorageIntentLifecycleFlags::AUTHORITATIVE_PROVENANCE)
+    }
+
+    /// Returns true when the record is refused or degraded.
+    #[must_use]
+    pub const fn is_refused(self) -> bool {
+        self.refusal.is_refused()
+            || matches!(
+                self.provenance,
+                StorageIntentLifecycleProvenanceClass::Degraded
+            )
+            || self
+                .flags
+                .contains_all(StorageIntentLifecycleFlags::REFUSED)
+    }
+
+    /// Returns true when snapshot pin evidence is catalog-proven.
+    #[must_use]
+    pub const fn has_snapshot_pin_proven(self) -> bool {
+        self.lifecycle_class as u8 == StorageIntentLifecycleClass::SnapshotPinned as u8
+            && self
+                .flags
+                .contains_all(StorageIntentLifecycleFlags::PIN_CATALOG_PROVEN)
+            && evidence_ref_has_id(self.refs.snapshot_catalog_ref)
+    }
+
+    /// Returns true when clone hold evidence is catalog-proven.
+    #[must_use]
+    pub const fn has_clone_hold_proven(self) -> bool {
+        self.lifecycle_class as u8 == StorageIntentLifecycleClass::CloneHeld as u8
+            && self
+                .flags
+                .contains_all(StorageIntentLifecycleFlags::PIN_CATALOG_PROVEN)
+            && evidence_ref_has_id(self.refs.clone_catalog_ref)
+    }
+
+    /// Returns true when receive-base dependency evidence is bound.
+    #[must_use]
+    pub const fn has_receive_base_dependency(self) -> bool {
+        self.lifecycle_class as u8 == StorageIntentLifecycleClass::ReceiveBaseHeld as u8
+            && self
+                .flags
+                .contains_all(StorageIntentLifecycleFlags::RECEIVE_BASE_DEPENDENCIES_SATISFIED)
+            && evidence_ref_has_id(self.refs.receive_base_ref)
+    }
+
+    /// Returns true when omitted-content dependency evidence is bound for geo catch-up.
+    #[must_use]
+    pub const fn has_omitted_content_dependency(self) -> bool {
+        self.flags
+            .contains_all(StorageIntentLifecycleFlags::OMITTED_CONTENT_DEPENDENCIES_BOUND)
+            && evidence_ref_has_id(self.refs.omitted_content_dependency_ref)
+    }
+
+    /// Returns true when the reclaim frontier is published and fenced.
+    #[must_use]
+    pub const fn has_reclaim_frontier_published(self) -> bool {
+        self.flags
+            .contains_all(StorageIntentLifecycleFlags::RECLAIM_FRONTIER_PUBLISHED)
+            && evidence_ref_has_id(self.refs.reclaim_frontier_ref)
+    }
+
+    /// Returns true when a reclaim receipt is earned and durable.
+    #[must_use]
+    pub const fn has_reclaim_receipt(self) -> bool {
+        self.flags
+            .contains_all(StorageIntentLifecycleFlags::RECLAIM_RECEIPT_EARNED)
+            && evidence_ref_has_id(self.refs.reclaim_receipt_ref)
+    }
+
+    /// Returns true when bookmark is confirmed non-retaining.
+    #[must_use]
+    pub const fn has_bookmark_non_retaining_confirmed(self) -> bool {
+        self.anchor_kind as u8 == StorageIntentAnchorKind::Bookmark as u8
+            && self.flags
+                .contains_all(StorageIntentLifecycleFlags::BOOKMARK_NON_RETAINING_CONFIRMED)
+    }
+
+    /// Returns true when young bytes have met dwell/payback.
+    #[must_use]
+    pub const fn has_dwell_payback_met(self) -> bool {
+        self.flags
+            .contains_all(StorageIntentLifecycleFlags::DWELL_PAYBACK_MET)
+            && evidence_ref_has_id(self.refs.dwell_payback_ref)
+    }
+}
+
+// ===== Lifecycle hard-gate predicates =====
+
+/// Hard gate: lifecycle evidence must be present and bound.
+///
+/// Rejects unknown, missing, or wrong-kind evidence before any lifecycle
+/// state interpretation.
+#[must_use]
+pub const fn lifecycle_evidence_is_present(
+    evidence: StorageIntentLifecycleGenerationEvidence,
+) -> ReceiptPredicateResult {
+    if !evidence.has_lifecycle_identity() || !evidence
+        .flags
+        .contains_all(StorageIntentLifecycleFlags::EVIDENCE_PRESENT)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnknownLifecycleEvidence,
+        );
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentLifecycleFlags::FRESH)
+        || evidence.evidence_ref.generation == 0
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::StaleLifecycleEvidence,
+        );
+    }
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::LifecycleClassBlocked,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: reclaim cannot retire a generation still held by a
+/// data-retaining snapshot, clone, receive-base, or orphan.
+#[must_use]
+pub const fn lifecycle_reclaim_is_safe(
+    evidence: StorageIntentLifecycleGenerationEvidence,
+) -> ReceiptPredicateResult {
+    // Evidence must be present first.
+    let present = lifecycle_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    // Lifecycle class must not be unknown.
+    if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::Unknown as u8 {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::LifecycleClassBlocked,
+        );
+    }
+    // Snapshot-pinned: reclaim illegal.
+    if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::SnapshotPinned as u8 {
+        if !evidence.has_snapshot_pin_proven() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::GenerationHeldBySnapshot,
+            );
+        }
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::GenerationHeldBySnapshot,
+        );
+    }
+    // Clone-held: reclaim illegal.
+    if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::CloneHeld as u8 {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::GenerationHeldByClone,
+        );
+    }
+    // Receive-base-held: reclaim illegal.
+    if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::ReceiveBaseHeld as u8 {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::GenerationHeldByReceiveBase,
+        );
+    }
+    // Orphan-held: reclaim illegal.
+    if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::OrphanHeld as u8 {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::GenerationHeldByOrphan,
+        );
+    }
+    // Dead-pending-reclaim: not free yet; need frontier + receipt.
+    if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::DeadPendingReclaim as u8 {
+        if !evidence.has_reclaim_frontier_published() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::DeadPendingReclaimNotYetFree,
+            );
+        }
+        if !evidence.has_reclaim_receipt() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::DeadPendingReclaimNotYetFree,
+            );
+        }
+    }
+    // Destroying/tombstone: admission conflict.
+    if evidence.lifecycle_class.is_terminal() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::DestroyTombstoneAdmissionConflict,
+        );
+    }
+    // Bookmark: reclaim is legal (bookmarks do not retain bytes).
+    // Young/stable classes: reclaim is legal if not otherwise retained.
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: young short-lived bytes must not be promoted to durable flash
+/// serving roles without dwell/payback evidence or explicit policy.
+#[must_use]
+pub const fn lifecycle_flash_promotion_is_legal(
+    evidence: StorageIntentLifecycleGenerationEvidence,
+    policy_allows_young_promotion: bool,
+) -> ReceiptPredicateResult {
+    let present = lifecycle_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    // Young bytes: blocked unless dwell/payback met or policy allows.
+    if evidence.lifecycle_class.is_young() {
+        if policy_allows_young_promotion {
+            return ReceiptPredicateResult::SATISFIED;
+        }
+        if evidence.has_dwell_payback_met() {
+            return ReceiptPredicateResult::SATISFIED;
+        }
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::YoungByteFlashPromotionBlocked,
+        );
+    }
+    // Snapshot-pinned or cold: blocked unless policy and payback allow.
+    if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::SnapshotPinned as u8
+        || evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::StableCold as u8
+    {
+        if !evidence
+            .flags
+            .contains_all(StorageIntentLifecycleFlags::SNAPSHOT_PINNED_POLICY_ALLOWS)
+        {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::SnapshotPinnedFlashPlacementBlocked,
+            );
+        }
+        if !evidence.has_dwell_payback_met() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::SnapshotPinnedFlashPlacementBlocked,
+            );
+        }
+    }
+    // Stable hot/warm: promotion is legal.
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: dead-pending-reclaim bytes are not available capacity until
+/// layout evidence and reclaim receipt/fence agree.
+#[must_use]
+pub const fn lifecycle_dead_pending_is_not_free(
+    evidence: StorageIntentLifecycleGenerationEvidence,
+) -> ReceiptPredicateResult {
+    let present = lifecycle_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::DeadPendingReclaim as u8 {
+        // Must have reclaim frontier published and reclaim receipt earned.
+        if !evidence.has_reclaim_frontier_published() || !evidence.has_reclaim_receipt() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::DeadPendingReclaimNotYetFree,
+            );
+        }
+        // Layout evidence must agree.
+        if !evidence_ref_has_id(evidence.refs.layout_evidence_ref) {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::DeadPendingReclaimNotYetFree,
+            );
+        }
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: receive/geo catch-up must not publish a state that depends on
+/// missing or unprotected base-root or omitted-content dependency content.
+#[must_use]
+pub const fn lifecycle_receive_base_is_protected(
+    evidence: StorageIntentLifecycleGenerationEvidence,
+    requires_omitted_content_protection: bool,
+) -> ReceiptPredicateResult {
+    let present = lifecycle_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::ReceiveBaseHeld as u8 {
+        if !evidence.has_receive_base_dependency() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::ReceiveBaseUnprotectedForGeoCatchUp,
+            );
+        }
+        if requires_omitted_content_protection && !evidence.has_omitted_content_dependency() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::MissingOmittedContentDependency,
+            );
+        }
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: bookmarks are non-retaining anchors unless a later
+/// current authority explicitly changes that rule.
+#[must_use]
+pub const fn lifecycle_bookmark_does_not_retain(
+    evidence: StorageIntentLifecycleGenerationEvidence,
+) -> ReceiptPredicateResult {
+    let present = lifecycle_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    if evidence.anchor_kind as u8 == StorageIntentAnchorKind::Bookmark as u8 {
+        // Bookmark must be confirmed non-retaining.
+        if !evidence.has_bookmark_non_retaining_confirmed() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::BookmarkOnlyCannotRetainBytes,
+            );
+        }
+        // A bookmark that IS retaining would be a policy error; refuse.
+        if evidence.lifecycle_class.blocks_reclaim() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::BookmarkOnlyCannotRetainBytes,
+            );
+        }
+        // Non-retaining bookmarks pass - reclaim is legal for these bytes.
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: contradictory or stale lifecycle evidence must become
+/// typed unknown/blocked/refused/degraded, not silent satisfaction.
+#[must_use]
+pub const fn lifecycle_evidence_is_not_contradictory(
+    evidence: StorageIntentLifecycleGenerationEvidence,
+) -> ReceiptPredicateResult {
+    let present = lifecycle_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentLifecycleFlags::NOT_CONTRADICTORY)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::ContradictoryLifecycleEvidence,
+        );
+    }
+    if evidence.refusal as u8
+        == StorageIntentLifecycleRefusalReason::ContradictoryLifecycleEvidence as u8
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::ContradictoryLifecycleEvidence,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: authority boundaries are strict.
+/// Workload hints and timestamps are predictions, not authority.
+/// Lifecycle provenance must cite authoritative catalog/pin/receipt/root
+/// evidence for retaining or reclaim decisions.
+#[must_use]
+pub const fn lifecycle_provenance_is_authoritative_when_required(
+    evidence: StorageIntentLifecycleGenerationEvidence,
+    requires_authoritative_provenance: bool,
+) -> ReceiptPredicateResult {
+    let present = lifecycle_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    if !requires_authoritative_provenance {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    if !evidence.has_authoritative_provenance() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::LifecycleClassBlocked,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Returns true when lifecycle evidence is usable for admission, placement,
+/// relocation, reclaim, and explanation decisions.
+///
+/// This combines the minimum set of hard gates that every consumer must pass
+/// before acting on lifecycle state.
+#[must_use]
+pub const fn lifecycle_evidence_is_usable(
+    evidence: StorageIntentLifecycleGenerationEvidence,
+) -> ReceiptPredicateResult {
+    // 1. Evidence must be present.
+    let present = lifecycle_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    // 2. Evidence must not be contradictory.
+    let not_contradictory = lifecycle_evidence_is_not_contradictory(evidence);
+    if !not_contradictory.satisfied {
+        return not_contradictory;
+    }
+    // 3. Provenance must be authoritative for authority consumers.
+    if !evidence.has_authoritative_provenance()
+        && evidence.provenance as u8
+            != StorageIntentLifecycleProvenanceClass::Predictive as u8
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::LifecycleClassBlocked,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
 
 #[cfg(test)]
 mod tests {
@@ -20514,6 +21385,527 @@ mod tests {
         evidence.scrub_finding_ref = evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 120);
         evidence.repair_ticket_ref = ordering_ref(121);
         let result = recovery_evidence_supports_scrub_repair(evidence);
+        assert!(result.satisfied);
+    }
+
+    // ===== Lifecycle evidence tests =====
+
+    fn lifecycle_evidence_ref(byte: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            StorageIntentEvidenceKind::LifecycleGenerationEvidence,
+            StorageIntentEvidenceId([byte; 32]),
+            u64::from(byte),
+            1,
+        )
+    }
+
+    fn healthy_lifecycle_record() -> StorageIntentLifecycleGenerationEvidence {
+        StorageIntentLifecycleGenerationEvidence {
+            evidence_ref: lifecycle_evidence_ref(201),
+            policy_id: StorageIntentPolicyId([201_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(5),
+            subject_scope: StorageIntentObjectScope {
+                dataset_id: DOMAIN_A,
+                object_id: StorageIntentEvidenceId([202_u8; 32]),
+                range_start: 0,
+                range_len: 65536,
+                generation: 10,
+            },
+            dataset_id: DOMAIN_A,
+            branch_id: StorageIntentDomainId([203_u8; 16]),
+            committed_root_id: StorageIntentEvidenceId([204_u8; 32]),
+            committed_root_generation: 10,
+            lifecycle_class: StorageIntentLifecycleClass::StableHot,
+            provenance: StorageIntentLifecycleProvenanceClass::Authoritative,
+            anchor_kind: StorageIntentAnchorKind::Unknown,
+            birth_generation: 1,
+            last_write_generation: 9,
+            last_overwrite_generation: 3,
+            delete_generation: 0,
+            snapshot_generation: 0,
+            clone_generation: 0,
+            receive_base_generation: 0,
+            replacement_generation: 0,
+            reclaim_frontier_generation: 0,
+            flags: StorageIntentLifecycleFlags(
+                StorageIntentLifecycleFlags::EVIDENCE_PRESENT
+                    | StorageIntentLifecycleFlags::FRESH
+                    | StorageIntentLifecycleFlags::AUTHORITATIVE_PROVENANCE
+                    | StorageIntentLifecycleFlags::NOT_CONTRADICTORY,
+            ),
+            refs: StorageIntentLifecycleRefs::default(),
+            refusal: StorageIntentLifecycleRefusalReason::None,
+        }
+    }
+
+    #[test]
+    fn missing_lifecycle_evidence_is_refused() {
+        let mut record = healthy_lifecycle_record();
+        record.evidence_ref = StorageIntentEvidenceRef::default();
+        let result = lifecycle_evidence_is_present(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnknownLifecycleEvidence
+        );
+    }
+
+    #[test]
+    fn stale_lifecycle_evidence_is_refused() {
+        let mut record = healthy_lifecycle_record();
+        record.evidence_ref.generation = 0;
+        let result = lifecycle_evidence_is_present(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::StaleLifecycleEvidence
+        );
+    }
+
+    #[test]
+    fn refused_lifecycle_record_is_blocked() {
+        let mut record = healthy_lifecycle_record();
+        record.refusal = StorageIntentLifecycleRefusalReason::StaleLifecycleEvidence;
+        record.flags = StorageIntentLifecycleFlags(
+            StorageIntentLifecycleFlags::EVIDENCE_PRESENT
+                | StorageIntentLifecycleFlags::FRESH
+                | StorageIntentLifecycleFlags::REFUSED,
+        );
+        let result = lifecycle_evidence_is_present(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::LifecycleClassBlocked
+        );
+    }
+
+    #[test]
+    fn snapshot_pinned_blocks_reclaim() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::SnapshotPinned;
+        record.anchor_kind = StorageIntentAnchorKind::Snapshot;
+        record.snapshot_generation = 2;
+        record.refs.snapshot_catalog_ref = lifecycle_evidence_ref(210);
+        record.flags = StorageIntentLifecycleFlags(
+            record.flags.0 | StorageIntentLifecycleFlags::PIN_CATALOG_PROVEN,
+        );
+        let result = lifecycle_reclaim_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::GenerationHeldBySnapshot
+        );
+    }
+
+    #[test]
+    fn clone_held_blocks_reclaim() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::CloneHeld;
+        record.anchor_kind = StorageIntentAnchorKind::Clone;
+        record.clone_generation = 2;
+        let result = lifecycle_reclaim_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::GenerationHeldByClone
+        );
+    }
+
+    #[test]
+    fn receive_base_held_blocks_reclaim() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::ReceiveBaseHeld;
+        record.anchor_kind = StorageIntentAnchorKind::ReceiveBase;
+        record.receive_base_generation = 2;
+        let result = lifecycle_reclaim_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::GenerationHeldByReceiveBase
+        );
+    }
+
+    #[test]
+    fn orphan_held_blocks_reclaim() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::OrphanHeld;
+        record.anchor_kind = StorageIntentAnchorKind::Orphan;
+        let result = lifecycle_reclaim_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::GenerationHeldByOrphan
+        );
+    }
+
+    #[test]
+    fn dead_pending_reclaim_needs_frontier_and_receipt() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::DeadPendingReclaim;
+        // No reclaim frontier or receipt set.
+        let result = lifecycle_reclaim_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::DeadPendingReclaimNotYetFree
+        );
+    }
+
+    #[test]
+    fn dead_pending_with_frontier_and_receipt_passes() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::DeadPendingReclaim;
+        record.reclaim_frontier_generation = 5;
+        record.refs.reclaim_frontier_ref = lifecycle_evidence_ref(211);
+        record.refs.reclaim_receipt_ref = lifecycle_evidence_ref(212);
+        record.flags = StorageIntentLifecycleFlags(
+            record.flags.0
+                | StorageIntentLifecycleFlags::RECLAIM_FRONTIER_PUBLISHED
+                | StorageIntentLifecycleFlags::RECLAIM_RECEIPT_EARNED,
+        );
+        let result = lifecycle_reclaim_is_safe(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn young_bytes_without_dwell_block_flash_promotion() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::YoungDirty;
+        let result = lifecycle_flash_promotion_is_legal(record, false);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::YoungByteFlashPromotionBlocked
+        );
+    }
+
+    #[test]
+    fn young_bytes_with_dwell_payback_allow_flash_promotion() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::YoungAcknowledged;
+        record.refs.dwell_payback_ref = lifecycle_evidence_ref(213);
+        record.flags = StorageIntentLifecycleFlags(
+            record.flags.0 | StorageIntentLifecycleFlags::DWELL_PAYBACK_MET,
+        );
+        let result = lifecycle_flash_promotion_is_legal(record, false);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn young_bytes_with_explicit_policy_allow_flash_promotion() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::YoungDirty;
+        let result = lifecycle_flash_promotion_is_legal(record, true);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn snapshot_pinned_blocks_flash_placement_without_policy() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::SnapshotPinned;
+        let result = lifecycle_flash_promotion_is_legal(record, false);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::SnapshotPinnedFlashPlacementBlocked
+        );
+    }
+
+    #[test]
+    fn bookmark_non_retaining_is_safe_for_reclaim() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::BookmarkOnlyNonretaining;
+        record.anchor_kind = StorageIntentAnchorKind::Bookmark;
+        record.flags = StorageIntentLifecycleFlags(
+            record.flags.0
+                | StorageIntentLifecycleFlags::BOOKMARK_NON_RETAINING_CONFIRMED,
+        );
+        let result = lifecycle_bookmark_does_not_retain(record);
+        assert!(result.satisfied);
+        // Bookmark-only bytes are safe to reclaim.
+        let reclaim = lifecycle_reclaim_is_safe(record);
+        assert!(reclaim.satisfied);
+    }
+
+    #[test]
+    fn bookmark_without_confirmation_is_refused() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::BookmarkOnlyNonretaining;
+        record.anchor_kind = StorageIntentAnchorKind::Bookmark;
+        // No BOOKMARK_NON_RETAINING_CONFIRMED flag.
+        let result = lifecycle_bookmark_does_not_retain(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::BookmarkOnlyCannotRetainBytes
+        );
+    }
+
+    #[test]
+    fn receive_base_without_dependency_is_unprotected() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::ReceiveBaseHeld;
+        record.anchor_kind = StorageIntentAnchorKind::ReceiveBase;
+        // No RECEIVE_BASE_DEPENDENCIES_SATISFIED.
+        let result = lifecycle_receive_base_is_protected(record, false);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::ReceiveBaseUnprotectedForGeoCatchUp
+        );
+    }
+
+    #[test]
+    fn receive_base_with_dependency_is_protected() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::ReceiveBaseHeld;
+        record.anchor_kind = StorageIntentAnchorKind::ReceiveBase;
+        record.receive_base_generation = 2;
+        record.refs.receive_base_ref = lifecycle_evidence_ref(214);
+        record.flags = StorageIntentLifecycleFlags(
+            record.flags.0
+                | StorageIntentLifecycleFlags::RECEIVE_BASE_DEPENDENCIES_SATISFIED,
+        );
+        let result = lifecycle_receive_base_is_protected(record, false);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn receive_base_missing_omitted_content_is_refused() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::ReceiveBaseHeld;
+        record.anchor_kind = StorageIntentAnchorKind::ReceiveBase;
+        record.receive_base_generation = 2;
+        record.refs.receive_base_ref = lifecycle_evidence_ref(215);
+        record.flags = StorageIntentLifecycleFlags(
+            record.flags.0
+                | StorageIntentLifecycleFlags::RECEIVE_BASE_DEPENDENCIES_SATISFIED,
+        );
+        // Requires omitted content but none bound.
+        let result = lifecycle_receive_base_is_protected(record, true);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MissingOmittedContentDependency
+        );
+    }
+
+    #[test]
+    fn contradictory_lifecycle_evidence_is_refused() {
+        let mut record = healthy_lifecycle_record();
+        // Clear NOT_CONTRADICTORY flag.
+        record.flags = StorageIntentLifecycleFlags(
+            StorageIntentLifecycleFlags::EVIDENCE_PRESENT
+                | StorageIntentLifecycleFlags::FRESH
+                | StorageIntentLifecycleFlags::AUTHORITATIVE_PROVENANCE,
+        );
+        let result = lifecycle_evidence_is_not_contradictory(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::ContradictoryLifecycleEvidence
+        );
+    }
+
+    #[test]
+    fn destroying_blocked_for_reclaim_and_admission() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::Destroying;
+        let result = lifecycle_reclaim_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::DestroyTombstoneAdmissionConflict
+        );
+    }
+
+    #[test]
+    fn predictive_provenance_degraded_on_authoritative_requirement() {
+        let mut record = healthy_lifecycle_record();
+        record.provenance = StorageIntentLifecycleProvenanceClass::Predictive;
+        let result = lifecycle_provenance_is_authoritative_when_required(record, true);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::LifecycleClassBlocked
+        );
+    }
+
+    #[test]
+    fn lifecycle_class_stable_hot_passes_reclaim() {
+        let record = healthy_lifecycle_record();
+        // StableHot with authoritative provenance should be reclaimable.
+        let result = lifecycle_reclaim_is_safe(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn lifecycle_class_young_dirty_passes_reclaim() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::YoungDirty;
+        let result = lifecycle_reclaim_is_safe(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn lifecycle_evidence_is_usable_combines_gates() {
+        let record = healthy_lifecycle_record();
+        let result = lifecycle_evidence_is_usable(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn lifecycle_evidence_is_usable_blocks_stale() {
+        let mut record = healthy_lifecycle_record();
+        record.evidence_ref.generation = 0;
+        let result = lifecycle_evidence_is_usable(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::StaleLifecycleEvidence
+        );
+    }
+
+    #[test]
+    fn lifecycle_anchor_kind_is_data_retaining() {
+        assert!(StorageIntentAnchorKind::Snapshot.is_data_retaining());
+        assert!(StorageIntentAnchorKind::Clone.is_data_retaining());
+        assert!(StorageIntentAnchorKind::ReceiveBase.is_data_retaining());
+        assert!(StorageIntentAnchorKind::Orphan.is_data_retaining());
+        assert!(!StorageIntentAnchorKind::Bookmark.is_data_retaining());
+        assert!(StorageIntentAnchorKind::Bookmark.is_non_retaining());
+    }
+
+    #[test]
+    fn lifecycle_class_blocks_reclaim_detection() {
+        assert!(StorageIntentLifecycleClass::SnapshotPinned.blocks_reclaim());
+        assert!(StorageIntentLifecycleClass::CloneHeld.blocks_reclaim());
+        assert!(StorageIntentLifecycleClass::ReceiveBaseHeld.blocks_reclaim());
+        assert!(StorageIntentLifecycleClass::OrphanHeld.blocks_reclaim());
+        assert!(!StorageIntentLifecycleClass::StableHot.blocks_reclaim());
+        assert!(!StorageIntentLifecycleClass::YoungDirty.blocks_reclaim());
+        assert!(!StorageIntentLifecycleClass::BookmarkOnlyNonretaining.blocks_reclaim());
+        assert!(!StorageIntentLifecycleClass::DeadPendingReclaim.blocks_reclaim());
+    }
+
+    #[test]
+    fn lifecycle_class_is_terminal_detection() {
+        assert!(StorageIntentLifecycleClass::Destroying.is_terminal());
+        assert!(StorageIntentLifecycleClass::Tombstone.is_terminal());
+        assert!(!StorageIntentLifecycleClass::StableHot.is_terminal());
+        assert!(!StorageIntentLifecycleClass::SnapshotPinned.is_terminal());
+    }
+
+    #[test]
+    fn lifecycle_class_is_young_detection() {
+        assert!(StorageIntentLifecycleClass::YoungDirty.is_young());
+        assert!(StorageIntentLifecycleClass::YoungAcknowledged.is_young());
+        assert!(!StorageIntentLifecycleClass::StableHot.is_young());
+        assert!(!StorageIntentLifecycleClass::SnapshotPinned.is_young());
+    }
+
+    #[test]
+    fn lifecycle_flags_contains_all_and_intersects() {
+        let flags = StorageIntentLifecycleFlags(
+            StorageIntentLifecycleFlags::EVIDENCE_PRESENT
+                | StorageIntentLifecycleFlags::FRESH
+                | StorageIntentLifecycleFlags::AUTHORITATIVE_PROVENANCE,
+        );
+        assert!(flags.contains_all(
+            StorageIntentLifecycleFlags::EVIDENCE_PRESENT
+                | StorageIntentLifecycleFlags::FRESH
+        ));
+        assert!(!flags.contains_all(StorageIntentLifecycleFlags::RECLAIM_RECEIPT_EARNED));
+        assert!(flags.intersects(StorageIntentLifecycleFlags::FRESH));
+        assert!(!flags.intersects(StorageIntentLifecycleFlags::DESTROY_ADMITTED));
+        assert!(!flags.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_refusal_reason_roundtrip() {
+        let refusals = [
+            StorageIntentLifecycleRefusalReason::None,
+            StorageIntentLifecycleRefusalReason::MissingLifecycleEvidence,
+            StorageIntentLifecycleRefusalReason::StaleLifecycleEvidence,
+            StorageIntentLifecycleRefusalReason::UnknownLifecycleClass,
+            StorageIntentLifecycleRefusalReason::MissingSnapshotPinEvidence,
+            StorageIntentLifecycleRefusalReason::MissingCloneHoldEvidence,
+            StorageIntentLifecycleRefusalReason::MissingReceiveBaseDependency,
+            StorageIntentLifecycleRefusalReason::MissingOrphanHoldEvidence,
+            StorageIntentLifecycleRefusalReason::ReclaimFrontierNotPublished,
+            StorageIntentLifecycleRefusalReason::MissingOmittedContentDependency,
+            StorageIntentLifecycleRefusalReason::AmbiguousBookmarkRetention,
+            StorageIntentLifecycleRefusalReason::MissingDestroyAdmission,
+            StorageIntentLifecycleRefusalReason::ContradictoryLifecycleEvidence,
+        ];
+        for r in &refusals {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentLifecycleRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+    }
+
+    #[test]
+    fn lifecycle_refusal_reason_storage_intent_refusal_roundtrip() {
+        let refusals = [
+            StorageIntentRefusalReason::UnknownLifecycleEvidence,
+            StorageIntentRefusalReason::StaleLifecycleEvidence,
+            StorageIntentRefusalReason::LifecycleClassBlocked,
+            StorageIntentRefusalReason::GenerationHeldBySnapshot,
+            StorageIntentRefusalReason::GenerationHeldByClone,
+            StorageIntentRefusalReason::GenerationHeldByReceiveBase,
+            StorageIntentRefusalReason::GenerationHeldByOrphan,
+            StorageIntentRefusalReason::DeadPendingReclaimNotYetFree,
+            StorageIntentRefusalReason::YoungByteFlashPromotionBlocked,
+            StorageIntentRefusalReason::SnapshotPinnedFlashPlacementBlocked,
+            StorageIntentRefusalReason::ReceiveBaseUnprotectedForGeoCatchUp,
+            StorageIntentRefusalReason::BookmarkOnlyCannotRetainBytes,
+            StorageIntentRefusalReason::DestroyTombstoneAdmissionConflict,
+            StorageIntentRefusalReason::ContradictoryLifecycleEvidence,
+            StorageIntentRefusalReason::MissingOmittedContentDependency,
+        ];
+        for r in &refusals {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+    }
+
+    #[test]
+    fn dead_pending_is_not_free_without_layout_evidence() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::DeadPendingReclaim;
+        record.reclaim_frontier_generation = 5;
+        record.refs.reclaim_frontier_ref = lifecycle_evidence_ref(216);
+        record.refs.reclaim_receipt_ref = lifecycle_evidence_ref(217);
+        record.flags = StorageIntentLifecycleFlags(
+            record.flags.0
+                | StorageIntentLifecycleFlags::RECLAIM_FRONTIER_PUBLISHED
+                | StorageIntentLifecycleFlags::RECLAIM_RECEIPT_EARNED,
+        );
+        // No layout evidence ref - should still be refused.
+        let result = lifecycle_dead_pending_is_not_free(record);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::DeadPendingReclaimNotYetFree
+        );
+    }
+
+    #[test]
+    fn dead_pending_is_not_free_passes_with_all_evidence() {
+        let mut record = healthy_lifecycle_record();
+        record.lifecycle_class = StorageIntentLifecycleClass::DeadPendingReclaim;
+        record.reclaim_frontier_generation = 5;
+        record.refs.reclaim_frontier_ref = lifecycle_evidence_ref(218);
+        record.refs.reclaim_receipt_ref = lifecycle_evidence_ref(219);
+        record.refs.layout_evidence_ref = lifecycle_evidence_ref(220);
+        record.flags = StorageIntentLifecycleFlags(
+            record.flags.0
+                | StorageIntentLifecycleFlags::RECLAIM_FRONTIER_PUBLISHED
+                | StorageIntentLifecycleFlags::RECLAIM_RECEIPT_EARNED,
+        );
+        let result = lifecycle_dead_pending_is_not_free(record);
         assert!(result.satisfied);
     }
 
