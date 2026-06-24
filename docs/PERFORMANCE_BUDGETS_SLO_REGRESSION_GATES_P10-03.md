@@ -133,6 +133,155 @@ The production design now requires these minimum `performance_budget_0` suite fa
 10. **`suite.performance_budget_0.migration_cutover_0.cutover_pause.test_profile_9`**
     - shadow cutover, rollback/re-entry, and stage-pause windows for `migration_cutover_0` / `userspace`
 
+The design now also requires these storage-intent `performance_budget_0` suite families.
+Every storage-intent row must bind its ack class, workload envelope, prediction
+confidence class, action class, media/topology/proximity profile, trust/domain
+evidence, data-shape evidence, allocator/layout evidence, and comparator set.
+
+Required evidence refs per row:
+  * `service_objective_ref` from #915 (blocking for caller-visible outcome rows, schema/readiness-only otherwise)
+  * `evidence_query_snapshot_ref` from #913
+  * `measurement_attribution_ref` from #912
+  * `result_refusal_ref` from #920 (blocking for caller-visible outcome rows, schema/readiness-only otherwise)
+  * `comparator_evidence_ref` from #928 and `claim_id_ref` from #875 (blocking for comparator/superiority rows, schema/readiness-only otherwise)
+
+Rows missing those refs are schema/readiness artifacts only, not performance,
+durability, WAN, wear, cost, RPO, comparator, or successor proof.
+
+11. **`suite.performance_budget_0.storage_intent.small_sync_local_intent.r10`**
+    - small-sync write acknowledgment latency for local intent (single-node, single-media-class)
+    - KPI families: latency.core, tail_amplification, success.rate
+    - evidence refs: #915, #913, #912, #920, #898 (capacity admission), #750 (membership/epoch), #894 (ordering/replay)
+
+12. **`suite.performance_budget_0.storage_intent.small_sync_quorum_intent.r11`**
+    - small-sync write acknowledgment latency for quorum/geo intent (multi-node, multi-failure-domain)
+    - KPI families: latency.core, tail_amplification, success.rate, freshness.propagation
+    - evidence refs: #915, #913, #912, #920, #750, #894, #846 (transport path), #897 (trust/domain)
+
+13. **`suite.performance_budget_0.storage_intent.full_placement_fsync.r12`**
+    - durability-barrier latency for full-placement fsync/FUA
+    - KPI families: latency.core, tail_amplification, throughput.floor, success.rate
+    - evidence refs: #915, #913, #912, #920, #898, #750, #894
+
+14. **`suite.performance_budget_0.storage_intent.vm_fua_barrier_tail.r13`**
+    - VM FUA/barrier tail latency under concurrent foreground I/O
+    - KPI families: latency.core, tail_amplification, disruption.window
+    - evidence refs: #915, #913, #912, #920, #898
+
+15. **`suite.performance_budget_0.storage_intent.metadata_storm_fsyncdir.r14`**
+    - metadata-storm p99 latency and fsyncdir behavior under high create/unlink/rename pressure
+    - KPI families: latency.core, tail_amplification, throughput.floor, pressure.efficiency
+    - evidence refs: #915, #913, #912, #920, #922 (metadata/namespace)
+
+16. **`suite.performance_budget_0.storage_intent.read_serving_source.r15`**
+    - read-serving latency per source class (cache, trial, RAM, local/remote receipt, degraded, snapshot, geo, archive)
+    - includes stale/refresh/refusal rate per source class
+    - KPI families: latency.core, tail_amplification, freshness.propagation, success.rate
+    - evidence refs: #915, #913, #912, #920, #844 (read serving), #856 (source classes), #900 (recovery/degradation)
+
+17. **`suite.performance_budget_0.storage_intent.degraded_read_reconstruction.r16`**
+    - degraded-read reconstruction latency and repair-on-read foreground/wear/cost budget
+    - KPI families: latency.core, tail_amplification, throughput.floor, pressure.efficiency
+    - evidence refs: #915, #913, #912, #920, #900, #904 (media capability)
+
+18. **`suite.performance_budget_0.storage_intent.streaming_ingest_throughput.r17`**
+    - streaming ingest throughput with measured flash wear per TiB logical writes
+    - must prove no flash wear explosion under sustained streaming writes
+    - KPI families: throughput.floor, pressure.efficiency, success.rate
+    - evidence refs: #915, #913, #912, #920, #845 (media wear ledger/wear), #904
+
+19. **`suite.performance_budget_0.storage_intent.data_shape_selection.r18`**
+    - data-shape selection behavior under latency, throughput, CPU, WAN, capacity, and wear budgets
+    - covers record sizing, compression, checksum/digest, dedup, encryption, EC, archive conversion
+    - KPI families: latency.core, throughput.floor, pressure.efficiency, success.rate
+    - evidence refs: #915, #913, #912, #920, #878 (data-shape selection), #842 (rebake payback)
+
+20. **`suite.performance_budget_0.storage_intent.allocator_layout_behavior.r19`**
+    - allocator/layout behavior under fragmentation, free-run scarcity, zone/alignment, block-volume, ENOSPC, and reclaim-debt pressure
+    - KPI families: latency.core, tail_amplification, throughput.floor, pressure.efficiency, success.rate
+    - evidence refs: #915, #913, #912, #920, #843 (placement planning), #898
+
+21. **`suite.performance_budget_0.storage_intent.one_pass_scan_no_promotion.r20`**
+    - one-pass scan behavior proving no persistent flash promotion without explicit policy and payback
+    - KPI families: pressure.efficiency, success.rate
+    - evidence refs: #915, #913, #912, #920, #967 (prefetch/residency), #972 (executor outcomes)
+
+22. **`suite.performance_budget_0.storage_intent.hot_read_cache_trial.r21`**
+    - hot read cache-only serving trial benefit/cost measurement
+    - cache hit rate, trial benefit, foreground disruption, capacity cost
+    - KPI families: latency.core, throughput.floor, pressure.efficiency
+    - evidence refs: #915, #913, #912, #920, #967, #972, #844
+
+23. **`suite.performance_budget_0.storage_intent.persistent_hot_promotion.r22`**
+    - persistent hot serving promotion benefit/cost including dwell, wear reservation, and payback
+    - must track: promotion dwell, wear reservation consumed, payback verdict, cooldown state
+    - KPI families: latency.core, throughput.floor, pressure.efficiency
+    - evidence refs: #915, #913, #912, #920, #967, #972, #848 (relocation), #845 (wear)
+
+24. **`suite.performance_budget_0.storage_intent.phase_change_anti_thrash.r23`**
+    - phase-changing sparse workload anti-thrash behavior
+    - must prove that sparse-to-dense or dense-to-sparse phase changes do not trigger unbounded promotion/demotion cycles
+    - KPI families: latency.core, tail_amplification, throughput.floor, pressure.efficiency
+    - evidence refs: #915, #913, #912, #920, #967, #848
+
+25. **`suite.performance_budget_0.storage_intent.noisy_tenant_isolation.r24`**
+    - noisy/adversarial multi-tenant prediction suppression and budget isolation
+    - must prove that one tenant's bulk/scan/relocation work does not destroy another tenant's p99 sync latency
+    - KPI families: latency.core, tail_amplification, throughput.floor, success.rate
+    - evidence refs: #915, #913, #912, #920, #902 (tenant/isolation), #901 (policy rollout)
+
+26. **`suite.performance_budget_0.storage_intent.hdd_defrag_benefit.r25`**
+    - HDD defrag benefit under seek-heavy and scan-heavy workloads
+    - KPI families: latency.core, throughput.floor, pressure.efficiency
+    - evidence refs: #915, #913, #912, #920, #848, #904
+
+27. **`suite.performance_budget_0.storage_intent.ssd_relocation_waf.r26`**
+    - SSD relocation WAF benefit/cost and failed-payback cooldown behavior
+    - must track: WAF delta, wear reservation, payback verdict, cooldown, skipped-move reasons
+    - KPI families: throughput.floor, pressure.efficiency
+    - evidence refs: #915, #913, #912, #920, #848, #845, #904
+
+28. **`suite.performance_budget_0.storage_intent.rebake_payback.r27`**
+    - rebake payback for compression, dedup, record sizing, checksum/digest, EC, and archive conversion
+    - must track: CPU cost, read amplification, degraded-read cost, rebake throughput
+    - KPI families: latency.core, throughput.floor, pressure.efficiency, success.rate
+    - evidence refs: #915, #913, #912, #920, #842, #878, #900
+
+29. **`suite.performance_budget_0.storage_intent.rebuild_repair_foreground.r28`**
+    - rebuild/repair foreground protection
+    - must prove rebuild does not destroy foreground p99 latency or exhaust recovery reserves
+    - KPI families: latency.core, tail_amplification, throughput.floor, recovery.window
+    - evidence refs: #915, #913, #912, #920, #900, #898
+
+30. **`suite.performance_budget_0.storage_intent.geo_async_rpo_lag.r29`**
+    - geo-async RPO lag under WAN and internet envelopes
+    - must track: timebase/skew/frontier evidence, catch-up rate, RPO ceiling
+    - KPI families: freshness.propagation, recovery.window, throughput.floor
+    - evidence refs: #915, #913, #912, #920, #846, #750, #894
+
+31. **`suite.performance_budget_0.storage_intent.trust_domain_changes.r30`**
+    - trust-domain and key-epoch changes under remote, repair, geo, cross-domain sharing, and internet envelopes
+    - must include wrong-domain, stale-key, missing-authorization, residency, and quarantine cases
+    - KPI families: latency.core, success.rate, freshness.propagation
+    - evidence refs: #915, #913, #912, #920, #897, #750
+
+32. **`suite.performance_budget_0.storage_intent.geo_intent_latency.r31`**
+    - geo-intent acknowledgment latency under the same WAN/internet path envelopes as r29
+    - KPI families: latency.core, tail_amplification, success.rate
+    - evidence refs: #915, #913, #912, #920, #846, #750, #897
+
+33. **`suite.performance_budget_0.storage_intent.ram_volatile_intent_latency.r32`**
+    - RAM volatile and RAM intent-backed acknowledgment latency
+    - must distinguish volatile RAM (no durability) from intent-backed RAM (receipt-persisted)
+    - KPI families: latency.core, tail_amplification, success.rate, freshness.propagation
+    - evidence refs: #915, #913, #912, #920, #847 (RAM authority), #904
+
+34. **`suite.performance_budget_0.storage_intent.media_wear_per_tib.r33`**
+    - media wear per TiB logical writes across all media classes (NVMe, SSD, HDD)
+    - must track: logical bytes, estimated media bytes, WAF, flash wear per TiB logical writes
+    - KPI families: pressure.efficiency, success.rate
+    - evidence refs: #915, #913, #912, #920, #845, #904, #957 (media-native convergence)
+
 ### 3.3 Workload-envelope classes
 
 Every `performance_budget_0` row must bind to one named workload envelope.
@@ -147,6 +296,30 @@ The minimum workload-envelope families are:
 - `envelope.performance_budget_0.query_render.e7`
 - `envelope.performance_budget_0.failover_resume.e8`
 - `envelope.performance_budget_0.cutover_pause_resume.e9`
+
+Storage-intent workload envelope extensions:
+  * `envelope.performance_budget_0.storage_intent.small_sync_local.e10`
+    small sync workload, single media class, local topology
+  * `envelope.performance_budget_0.storage_intent.small_sync_quorum.e11`
+    small sync workload, quorum topology, WAN/internet paths
+  * `envelope.performance_budget_0.storage_intent.full_placement_fsync.e12`
+    full-placement fsync/FUA workload with concurrent foreground I/O
+  * `envelope.performance_budget_0.storage_intent.metadata_storm.e13`
+    high-rate create/unlink/rename/fsyncdir workload
+  * `envelope.performance_budget_0.storage_intent.read_multi_source.e14`
+    read workload spanning cache, trial, RAM, local/remote receipt, degraded, snapshot, geo, archive sources
+  * `envelope.performance_budget_0.storage_intent.degraded_reconstruction.e15`
+    degraded/repair workload with missing or corrupt storage targets
+  * `envelope.performance_budget_0.storage_intent.streaming_ingest.e16`
+    sustained streaming write ingest measuring flash wear
+  * `envelope.performance_budget_0.storage_intent.data_shape_selection.e17`
+    workload exercising data-shape selection under latency/throughput/CPU/WAN/capacity/wear budgets
+  * `envelope.performance_budget_0.storage_intent.allocator_pressure.e18`
+    allocator/layout workload under fragmentation, free-run scarcity, zone/alignment, ENOSPC pressure
+  * `envelope.performance_budget_0.storage_intent.one_pass_scan.e19`
+    one-pass scan workload with flash promotion measurement
+  * `envelope.performance_budget_0.storage_intent.hotset_promotion.e20`
+    hot-set promotion/demotion workload measuring dwell, wear reservation, and payback
 
 No budget may be expressed only against a tool default profile or an undocumented benchmark script.
 
@@ -186,6 +359,21 @@ The production design now fixes these KPI families:
 10. **`kpi.performance_budget_0.success.rate`**
     - bounded refusal/error rate under the declared envelope, excluding intentionally degraded or policy-refused outcomes
 
+Storage-intent KPI family extensions:
+
+11. **`kpi.performance_budget_0.storage_intent.wear_per_tib`**
+    - flash wear per TiB logical writes, WAF, media bytes consumed per logical byte
+
+12. **`kpi.performance_budget_0.storage_intent.cost.per_byte`**
+    - network egress, CPU cost, memory growth, evidence-storage cost per unit work
+
+13. **`kpi.performance_budget_0.storage_intent.movement.debt`**
+    - movement debt delta, payback window, cooldown state, skipped-move reasons
+
+14. **`kpi.performance_budget_0.storage_intent.prediction.confidence`**
+    - prediction confidence class, action class, missing-outcome evidence, failed-payback counts,
+      wrong-domain or stale-key refusal counts
+
 A row may use only the subset that applies, but the subset must be declared.
 
 ### 4.2 Mandatory environment profiles
@@ -206,6 +394,12 @@ Gate law depends on profile:
 - `e2` and `e3` are mandatory for release-required userspace rows,
 - `e4` is mandatory once mixed userspace/kernel rows exist,
 - and `e5` is mandatory for declared soak/disaster rows.
+Storage-intent environment profile extensions:
+  * `env.performance_budget_0.storage_intent.wan_internet.e6`
+    WAN and internet path environment for geo/RPO/trust-domain rows
+  * `env.performance_budget_0.storage_intent.multitenant_adversarial.e7`
+    multi-tenant noisy-neighbor environment for isolation rows
+
 
 ### 4.3 Noise-policy law
 
@@ -240,6 +434,40 @@ A later policy revision may tighten them, but may not silently loosen them.
 | `budget.performance_budget_0.explanation_query.query_render.r7` | `explanation_query` answer/render rows | warm answer p95 <= 50 ms, p99 <= 200 ms; deep-lineage answer p95 <= 300 ms, p99 <= 1.2 s |
 | `budget.performance_budget_0.runtime_recovery_0.failover_resume.r8` | failover/fence/recovery rows | degraded/refusal state visible <= 1 s after fence trigger; resumed legal service p95 <= 15 s, p99 <= 60 s |
 | `budget.performance_budget_0.migration_cutover_0.cutover_pause.r9` | cutover/rollback/re-entry rows | cutover pause p95 <= 3 s, p99 <= 15 s; rollback re-entry p95 <= 30 s, p99 <= 120 s |
+
+Storage-intent numeric budget classes (schema/readiness floors -- runtime measurement evidence belongs to later implementation/validation issues):
+
+| Budget class | Applies to | Required floor / ceiling |
+|---|---|---|
+| `budget.performance_budget_0.storage_intent.small_sync_local.r10` | small sync local intent rows | p50 <= 0.5 ms, p95 <= 2 ms, p99 <= 10 ms (NVMe); p50 <= 2 ms, p95 <= 10 ms, p99 <= 50 ms (SSD); tail amplification <= 10x steady-state |
+| `budget.performance_budget_0.storage_intent.small_sync_quorum.r11` | small sync quorum intent rows | p95 <= 5 ms under quorum ack; p99 <= 25 ms; tail amplification <= 10x steady-state |
+| `budget.performance_budget_0.storage_intent.full_placement_fsync.r12` | full-placement fsync rows | p95 <= 35 ms, p99 <= 125 ms (local); p95 <= 150 ms, p99 <= 500 ms (quorum/geo) |
+| `budget.performance_budget_0.storage_intent.vm_fua_barrier_tail.r13` | VM FUA/barrier tail rows | p99 <= 10 ms under concurrent foreground I/O; no p99 stall > 100 ms |
+| `budget.performance_budget_0.storage_intent.metadata_storm_fsyncdir.r14` | metadata storm rows | p95 <= 4 ms, p99 <= 15 ms (hot path); p99 fsyncdir <= 50 ms; relative throughput >= 85% of previous admitted variant |
+| `budget.performance_budget_0.storage_intent.read_serving_source.r15` | read serving source rows | p95 <= 2 ms (cache hit); p95 <= 10 ms (local receipt); p95 <= 50 ms (degraded); stale/refresh rate <= 5% under declared envelope |
+| `budget.performance_budget_0.storage_intent.degraded_read_reconstruction.r16` | degraded read reconstruction rows | p95 <= 25 ms (single-missing); p99 <= 100 ms; repair-on-read foreground impact <= 15% p99 regression |
+| `budget.performance_budget_0.storage_intent.streaming_ingest_throughput.r17` | streaming ingest throughput rows | throughput >= 80% of raw device baseline; WAF <= 1.5; flash wear per TiB logical writes <= 1.2 TiB media bytes |
+| `budget.performance_budget_0.storage_intent.data_shape_selection.r18` | data-shape selection rows | latency impact <= 10% p95 regression vs baseline shape; CPU cost <= 2x baseline per unit work |
+| `budget.performance_budget_0.storage_intent.allocator_layout_behavior.r19` | allocator/layout rows | p99 <= 2x baseline under 80% capacity utilization; ENOSPC refusal rate <= 1% under declared envelope |
+| `budget.performance_budget_0.storage_intent.one_pass_scan_no_promotion.r20` | one-pass scan rows | flash promotion bytes = 0 without explicit policy; scan throughput >= 80% of raw device baseline |
+| `budget.performance_budget_0.storage_intent.hot_read_cache_trial.r21` | hot read cache trial rows | cache hit rate improvement >= 20% vs baseline; foreground p99 impact <= 5% |
+| `budget.performance_budget_0.storage_intent.persistent_hot_promotion.r22` | persistent hot promotion rows | promotion dwell >= 60 s; wear reservation consumed <= declared budget; payback within declared window |
+| `budget.performance_budget_0.storage_intent.phase_change_anti_thrash.r23` | phase-change anti-thrash rows | promotion/demotion cycle count <= 3 per phase change; p99 impact <= 2x steady-state |
+| `budget.performance_budget_0.storage_intent.noisy_tenant_isolation.r24` | noisy tenant isolation rows | protected tenant p99 sync latency <= 2x baseline under noisy neighbor; noisy tenant throughput capped per isolation budget |
+| `budget.performance_budget_0.storage_intent.hdd_defrag_benefit.r25` | HDD defrag rows | seek-heavy p95 improvement >= 30% post-defrag; scan throughput improvement >= 20% |
+| `budget.performance_budget_0.storage_intent.ssd_relocation_waf.r26` | SSD relocation WAF rows | WAF delta <= 0.5 per relocated TiB; payback within declared window; failed-payback cooldown enforced |
+| `budget.performance_budget_0.storage_intent.rebake_payback.r27` | rebake payback rows | compression ratio improvement >= declared target; CPU cost within declared budget; read amplification <= 2x |
+| `budget.performance_budget_0.storage_intent.rebuild_repair_foreground.r28` | rebuild/repair rows | foreground p99 <= 1.5x baseline during rebuild; recovery window <= declared RTO |
+| `budget.performance_budget_0.storage_intent.geo_async_rpo_lag.r29` | geo-async RPO rows | RPO lag <= 60 s under declared WAN envelope; catch-up rate >= 80% of WAN throughput |
+| `budget.performance_budget_0.storage_intent.trust_domain_changes.r30` | trust-domain change rows | key-epoch change p99 stall <= 5 s; wrong-domain refusal latency <= 1 ms; residency violation refusal rate = 100% |
+| `budget.performance_budget_0.storage_intent.geo_intent_latency.r31` | geo-intent latency rows | p95 <= 50 ms (WAN); p99 <= 200 ms; tail amplification <= 10x |
+| `budget.performance_budget_0.storage_intent.ram_volatile_intent_latency.r32` | RAM intent latency rows | volatile RAM p50 <= 10 us, p99 <= 50 us; intent-backed RAM p50 <= 50 us, p99 <= 200 us |
+| `budget.performance_budget_0.storage_intent.media_wear_per_tib.r33` | media wear rows | WAF <= 1.5 for NVMe ingest; WAF <= 2.0 for SSD; logical to media byte ratio reported per media class |
+
+The budgets above are **gate-floor schema/readiness values only**.
+Runtime measurement evidence belongs to later implementation/validation issues.
+No row closes because average throughput improved; required tail, disruption,
+recovery/RPO, and wear/cost budgets must pass under the declared envelope.
 
 ### 4.5 Relative regression-lock law
 
@@ -314,6 +542,46 @@ A release-relevant row passes only when all of these are true:
 - and all required artifacts exist.
 
 This forbids the common failure mode where a row passes because one comparator improved while tail latency, pause windows, or failover recovery quietly regressed.
+
+### 5.4.1 Storage-intent artifact requirement classes
+
+For storage-intent rows, these additional artifact classes are mandatory:
+
+  * `artifact.performance_budget_0.storage_intent.ack_class_receipt`
+    per-row ack-class receipt: requested class, earned class, refusal state, downgrade reason
+
+  * `artifact.performance_budget_0.storage_intent.media_topology_profile`
+    media/topology/proximity profile snapshot: RAM, NVMe, SSD, HDD, rack, DC, WAN, internet, RDMA-absent baseline
+
+  * `artifact.performance_budget_0.storage_intent.trust_domain_evidence`
+    trust/domain evidence snapshot: key epoch, authorization/audit refs, residency, sharing-domain, quarantine/refusal state
+
+  * `artifact.performance_budget_0.storage_intent.data_shape_evidence`
+    data-shape evidence: record size, compression, checksum/digest, dedup, encryption, EC, archive shape,
+    CPU cost, read amplification, transform refusal state
+
+  * `artifact.performance_budget_0.storage_intent.allocator_layout_evidence`
+    allocator/layout evidence: fragmentation score, free-run pressure, seek/locality, alignment,
+    zone/write-pointer constraints, pending-free safety, reclaim debt
+
+  * `artifact.performance_budget_0.storage_intent.movement_debt_evidence`
+    movement-debt evidence: debt delta, payback window, cooldown state, skipped-move reasons
+
+  * `artifact.performance_budget_0.storage_intent.wear_cost_evidence`
+    wear/cost evidence: logical bytes, estimated media bytes, WAF, flash wear per TiB logical writes,
+    network egress cost, CPU cost, evidence-storage cost
+
+  * `artifact.performance_budget_0.storage_intent.prediction_confidence_evidence`
+    prediction confidence evidence: confidence class, action class, missing-outcome counts,
+    failed-payback verdicts, wrong-domain/stale-key refusal counts
+
+  * `artifact.performance_budget_0.storage_intent.comparator_evidence`
+    comparator evidence snapshot: comparator set identity, environment profile, claim id from #875,
+    comparator configuration from #928, measurement equivalence proof or refusal
+
+Rows that must cite comparator evidence (#928) or claim ids (#875) to make
+product-superiority claims: r15, r16, r17, r22, r26, r27, r28, r29, r31, r32, r33.
+All other rows are schema/readiness artifacts only until linked evidence is live.
 
 ## 6. Regression bucket grammar
 
@@ -566,6 +834,30 @@ the remaining gaps are tracked in the tables below.
 | 8 | `suite.performance_budget_0.explanation_query.query_render.test_profile_7` | **not-implemented** | — |
 | 9 | `suite.performance_budget_0.runtime_recovery_0.failover_resume.test_profile_8` | **not-implemented** | — |
 | 10 | `suite.performance_budget_0.migration_cutover_0.cutover_pause.test_profile_9` | **not-implemented** | — |
+| 11 | `suite.performance_budget_0.storage_intent.small_sync_local_intent.r10` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 12 | `suite.performance_budget_0.storage_intent.small_sync_quorum_intent.r11` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 13 | `suite.performance_budget_0.storage_intent.full_placement_fsync.r12` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 14 | `suite.performance_budget_0.storage_intent.vm_fua_barrier_tail.r13` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 15 | `suite.performance_budget_0.storage_intent.metadata_storm_fsyncdir.r14` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 16 | `suite.performance_budget_0.storage_intent.read_serving_source.r15` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
+| 17 | `suite.performance_budget_0.storage_intent.degraded_read_reconstruction.r16` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
+| 18 | `suite.performance_budget_0.storage_intent.streaming_ingest_throughput.r17` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
+| 19 | `suite.performance_budget_0.storage_intent.data_shape_selection.r18` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 20 | `suite.performance_budget_0.storage_intent.allocator_layout_behavior.r19` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 21 | `suite.performance_budget_0.storage_intent.one_pass_scan_no_promotion.r20` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 22 | `suite.performance_budget_0.storage_intent.hot_read_cache_trial.r21` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 23 | `suite.performance_budget_0.storage_intent.persistent_hot_promotion.r22` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
+| 24 | `suite.performance_budget_0.storage_intent.phase_change_anti_thrash.r23` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 25 | `suite.performance_budget_0.storage_intent.noisy_tenant_isolation.r24` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 26 | `suite.performance_budget_0.storage_intent.hdd_defrag_benefit.r25` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 27 | `suite.performance_budget_0.storage_intent.ssd_relocation_waf.r26` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
+| 28 | `suite.performance_budget_0.storage_intent.rebake_payback.r27` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
+| 29 | `suite.performance_budget_0.storage_intent.rebuild_repair_foreground.r28` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
+| 30 | `suite.performance_budget_0.storage_intent.geo_async_rpo_lag.r29` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
+| 31 | `suite.performance_budget_0.storage_intent.trust_domain_changes.r30` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass |
+| 32 | `suite.performance_budget_0.storage_intent.geo_intent_latency.r31` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
+| 33 | `suite.performance_budget_0.storage_intent.ram_volatile_intent_latency.r32` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
+| 34 | `suite.performance_budget_0.storage_intent.media_wear_per_tib.r33` | **defined-schema-only** | #850: #915 #913 #912 #920 required for runtime pass; #875 #928 required for comparator claims |
 
 ### 12.2 KPI families — 2 of 10 tracked
 
@@ -580,7 +872,13 @@ the remaining gaps are tracked in the tables below.
 | 8 | `kpi.performance_budget_0.query_render.latency` | **not-tracked** | — |
 | 9 | `kpi.performance_budget_0.pressure.efficiency` | **not-tracked** | — |
 | 10 | `kpi.performance_budget_0.success.rate` | **not-tracked** | — |
+| 11 | `kpi.performance_budget_0.storage_intent.wear_per_tib` | **defined-schema-only** | #850 |
+| 12 | `kpi.performance_budget_0.storage_intent.cost.per_byte` | **defined-schema-only** | #850 |
+| 13 | `kpi.performance_budget_0.storage_intent.movement.debt` | **defined-schema-only** | #850 |
+| 14 | `kpi.performance_budget_0.storage_intent.prediction.confidence` | **defined-schema-only** | #850 |
 
+
+Storage-intent KPI families 11-14 (wear_per_tib, cost.per_byte, movement.debt, prediction.confidence) added by #850 as defined-schema-only.
 ### 12.3 Numeric budget classes — 0 of 10 enforced
 
 |---|---|---|---|
@@ -594,7 +892,33 @@ the remaining gaps are tracked in the tables below.
 | 8 | `budget.performance_budget_0.explanation_query.query_render.r7` | **not-enforced** | — |
 | 9 | `budget.performance_budget_0.runtime_recovery_0.failover_resume.r8` | **not-enforced** | — |
 | 10 | `budget.performance_budget_0.migration_cutover_0.cutover_pause.r9` | **not-enforced** | — |
+| 11 | `budget.performance_budget_0.storage_intent.small_sync_local.r10` | **defined-schema-only** | #850 |
+| 12 | `budget.performance_budget_0.storage_intent.small_sync_quorum.r11` | **defined-schema-only** | #850 |
+| 13 | `budget.performance_budget_0.storage_intent.full_placement_fsync.r12` | **defined-schema-only** | #850 |
+| 14 | `budget.performance_budget_0.storage_intent.vm_fua_barrier_tail.r13` | **defined-schema-only** | #850 |
+| 15 | `budget.performance_budget_0.storage_intent.metadata_storm_fsyncdir.r14` | **defined-schema-only** | #850 |
+| 16 | `budget.performance_budget_0.storage_intent.read_serving_source.r15` | **defined-schema-only** | #850 |
+| 17 | `budget.performance_budget_0.storage_intent.degraded_read_reconstruction.r16` | **defined-schema-only** | #850 |
+| 18 | `budget.performance_budget_0.storage_intent.streaming_ingest_throughput.r17` | **defined-schema-only** | #850 |
+| 19 | `budget.performance_budget_0.storage_intent.data_shape_selection.r18` | **defined-schema-only** | #850 |
+| 20 | `budget.performance_budget_0.storage_intent.allocator_layout_behavior.r19` | **defined-schema-only** | #850 |
+| 21 | `budget.performance_budget_0.storage_intent.one_pass_scan_no_promotion.r20` | **defined-schema-only** | #850 |
+| 22 | `budget.performance_budget_0.storage_intent.hot_read_cache_trial.r21` | **defined-schema-only** | #850 |
+| 23 | `budget.performance_budget_0.storage_intent.persistent_hot_promotion.r22` | **defined-schema-only** | #850 |
+| 24 | `budget.performance_budget_0.storage_intent.phase_change_anti_thrash.r23` | **defined-schema-only** | #850 |
+| 25 | `budget.performance_budget_0.storage_intent.noisy_tenant_isolation.r24` | **defined-schema-only** | #850 |
+| 26 | `budget.performance_budget_0.storage_intent.hdd_defrag_benefit.r25` | **defined-schema-only** | #850 |
+| 27 | `budget.performance_budget_0.storage_intent.ssd_relocation_waf.r26` | **defined-schema-only** | #850 |
+| 28 | `budget.performance_budget_0.storage_intent.rebake_payback.r27` | **defined-schema-only** | #850 |
+| 29 | `budget.performance_budget_0.storage_intent.rebuild_repair_foreground.r28` | **defined-schema-only** | #850 |
+| 30 | `budget.performance_budget_0.storage_intent.geo_async_rpo_lag.r29` | **defined-schema-only** | #850 |
+| 31 | `budget.performance_budget_0.storage_intent.trust_domain_changes.r30` | **defined-schema-only** | #850 |
+| 32 | `budget.performance_budget_0.storage_intent.geo_intent_latency.r31` | **defined-schema-only** | #850 |
+| 33 | `budget.performance_budget_0.storage_intent.ram_volatile_intent_latency.r32` | **defined-schema-only** | #850 |
+| 34 | `budget.performance_budget_0.storage_intent.media_wear_per_tib.r33` | **defined-schema-only** | #850 |
 
+
+Storage-intent numeric budget classes r10-r33 added by #850 as defined-schema-only. Budgets are gate-floor schema/readiness values; runtime measurement evidence belongs to later implementation/validation issues.
 ### 12.4 Workload-envelope classes -- 10 defined, 1 executed at runtime
 
 All 10 workload-envelope families (`e0` through `e9`) exist as design
@@ -602,10 +926,14 @@ contracts only. No workload-envelope manifest, parameter binding, or
 row-linked execution exists at runtime.
 
 
+Storage-intent workload envelope extensions `e10` through `e20` are added by #850 as defined-schema-only. No workload-envelope manifest, parameter binding, or row-linked execution exists at runtime.
+
 All 6 environment profiles (`e0` through `e5`) are design contracts only.
 No environment snapshot, hardware/runtime/kernel/variant capture, or
 noise-policy binding exists at runtime.
 
+
+Storage-intent environment profile extensions `e6` (WAN/internet) and `e7` (multitenant-adversarial) are added by #850 as defined-schema-only. No environment snapshot or noise-policy binding exists at runtime.
 ### 12.6 Noise policies — 4 defined, 0 enforced
 
 All 4 noise policy families (`n0` through `n3`) exist as design contracts.
@@ -808,15 +1136,17 @@ This means performance work items remain open while measured gates are
 missing: the receipt explicitly shows which artifacts, comparators, and
 budgets are still outstanding.
 
+
+
 ### 12.13 Summary
 
 | Category | Defined | Implemented |
 |---|---|---|
-| Suite families | 10 | 2 (#6132: metadata_hotset, stream_mix) |
-| KPI families | 10 | 2 (#6132: latency.core, throughput.floor) |
-| Numeric budget classes | 10 | 3 (posix_stream_mix, block_random_queue, general_purpose; enforced via NumericBudget/RegressionLock) |
-| Workload-envelope classes | 10 | 0 |
-| Environment profiles | 6 | 0 |
+| Suite families | 10 (base) + 24 (storage intent) | 2 (#6132: metadata_hotset, stream_mix) + 0 (storage intent schema-only) |
+| KPI families | 10 (base) + 4 (storage intent) | 2 (#6132: latency.core, throughput.floor) + 0 (storage intent schema-only) |
+| Numeric budget classes | 10 (base) + 24 (storage intent) | 3 (posix_stream_mix, block_random_queue, general_purpose; enforced via NumericBudget/RegressionLock) + 0 (storage intent schema-only) |
+| Workload-envelope classes | 10 (base) + 11 (storage intent) | 0 |
+| Environment profiles | 6 (base) + 2 (storage intent) | 0 |
 | Noise policies | 4 | 0 |
 | Baseline policy families | 5 | 0 |
 | Regression bucket classes | 10 | 1 (BudgetBucket enum: 10 variants) |
