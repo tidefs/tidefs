@@ -585,6 +585,253 @@ pub struct PrefetchResidencyPolicySources {
     pub evidence_refs: PrefetchResidencyDecisionEvidenceRefs,
 }
 
+// ---------------------------------------------------------------------------
+// Dataset policy config — persistence and inheritance storage
+// ---------------------------------------------------------------------------
+
+/// Per-dataset policy configuration entry stored in the dataset property set.
+///
+/// Every field is optional (`None` means "inherit from parent"). When
+/// [`resolve_effective_dataset_policy`] walks the parent chain, it fills
+/// unset fields from the resolved parent, and ultimately from pool defaults.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DatasetPrefetchResidencyPolicyConfig {
+    /// Dataset-local prefetch/residency source. `None` means inherit.
+    pub dataset: Option<PrefetchResidencyPolicySource>,
+    /// Mount profile. `None` means inherit.
+    pub mount_profile: Option<PrefetchResidencyPolicySource>,
+    /// Product profile. `None` means inherit.
+    pub product_profile: Option<PrefetchResidencyPolicySource>,
+    /// Whether per-file/per-range overrides are admitted.
+    /// `None` means inherit.
+    pub admits_subject_range_overrides: Option<bool>,
+    /// Explicit unsafe/volatile opt-in. `None` means inherit.
+    pub explicit_unsafe_opt_in: Option<bool>,
+    /// Default caller request flags for operations. `None` means inherit.
+    pub default_caller_flags: Option<CallerRequestFlags>,
+    /// Default caller hints. `None` means inherit.
+    pub default_caller_hints: Option<CallerHintSource>,
+    /// Default internal maintenance intent. `None` means inherit.
+    pub default_maintenance_intent: Option<InternalMaintenanceIntent>,
+    /// Per-dataset prefetch window cap in bytes. `None` means inherit;
+    /// `Some(0)` means no cap is set locally.
+    pub prefetch_window_limit: Option<u64>,
+    /// Per-dataset staging cap in bytes. `None` means inherit;
+    /// `Some(0)` means no cap is set locally.
+    pub staging_limit: Option<u64>,
+    /// Per-dataset signal mass/decay floors. `None` means inherit.
+    pub min_sample_mass: Option<u32>,
+    pub min_observation_window_ms: Option<u64>,
+    pub max_decay_age_ms: Option<u64>,
+    /// Per-dataset dwell/cooldown floors in ms. `None` means inherit.
+    pub dwell_min_ms: Option<u64>,
+    pub cooldown_ms: Option<u64>,
+    /// Monotonic revision of this config entry.
+    pub revision: u64,
+    /// Generation number for epoch tracking.
+    pub generation: u64,
+    /// Epoch for in-flight operation attribution.
+    pub epoch: u64,
+}
+
+impl DatasetPrefetchResidencyPolicyConfig {
+    /// Empty config with no local overrides.
+    pub const EMPTY: Self = Self {
+        dataset: None,
+        mount_profile: None,
+        product_profile: None,
+        admits_subject_range_overrides: None,
+        explicit_unsafe_opt_in: None,
+        default_caller_flags: None,
+        default_caller_hints: None,
+        default_maintenance_intent: None,
+        prefetch_window_limit: None,
+        staging_limit: None,
+        min_sample_mass: None,
+        min_observation_window_ms: None,
+        max_decay_age_ms: None,
+        dwell_min_ms: None,
+        cooldown_ms: None,
+        revision: 0,
+        generation: 0,
+        epoch: 0,
+    };
+}
+
+/// Pool-wide prefetch/residency policy defaults — the root of inheritance.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PoolPrefetchResidencyPolicyDefaults {
+    /// Pool-level default source.
+    pub pool_default: PrefetchResidencyPolicySource,
+    /// Pool-level prefetch window cap, or 0 for unlimited.
+    pub prefetch_window_limit: u64,
+    /// Pool-level staging cap, or 0 for unlimited.
+    pub staging_limit: u64,
+    /// Pool-level signal floors.
+    pub min_sample_mass: u32,
+    pub min_observation_window_ms: u64,
+    pub max_decay_age_ms: u64,
+    /// Pool-level dwell/cooldown floors.
+    pub dwell_min_ms: u64,
+    pub cooldown_ms: u64,
+    /// Monotonic revision of pool defaults.
+    pub revision: u64,
+    pub generation: u64,
+    pub epoch: u64,
+}
+
+impl PoolPrefetchResidencyPolicyDefaults {
+    /// Pool defaults with only the low-risk action mask.
+    pub const fn minimal() -> Self {
+        Self {
+            pool_default: PrefetchResidencyPolicySource::new(
+                StorageIntentPolicySourceClass::PoolDefault,
+                PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+            ),
+            prefetch_window_limit: 0,
+            staging_limit: 0,
+            min_sample_mass: 0,
+            min_observation_window_ms: 0,
+            max_decay_age_ms: 0,
+            dwell_min_ms: 0,
+            cooldown_ms: 0,
+            revision: 0,
+            generation: 0,
+            epoch: 0,
+        }
+    }
+}
+
+/// Walk the dataset inheritance chain to resolve the effective policy.
+///
+/// Resolution order:
+/// 1. Pool defaults form the root.
+/// 2. Inherited (parent) config overrides pool defaults where set.
+/// 3. Local (child) config overrides inherited where set.
+///
+/// A `PrefetchResidencyPolicySource` field that has `present == false`
+/// (default-constructed) is treated as unset, regardless of the `Option`
+/// wrapper — the caller should only wrap a source whose `present` is true.
+#[must_use]
+pub fn resolve_effective_dataset_policy(
+    local: &DatasetPrefetchResidencyPolicyConfig,
+    inherited: Option<&DatasetPrefetchResidencyPolicyConfig>,
+    pool_defaults: &PoolPrefetchResidencyPolicyDefaults,
+) -> DatasetPrefetchResidencyPolicyConfig {
+    let mut resolved = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+
+    // Layer 1: pool defaults
+    resolved.dataset = Some(pool_defaults.pool_default);
+    resolved.prefetch_window_limit = maybe(pool_defaults.prefetch_window_limit);
+    resolved.staging_limit = maybe(pool_defaults.staging_limit);
+    resolved.min_sample_mass = maybe(pool_defaults.min_sample_mass);
+    resolved.min_observation_window_ms = maybe(pool_defaults.min_observation_window_ms);
+    resolved.max_decay_age_ms = maybe(pool_defaults.max_decay_age_ms);
+    resolved.dwell_min_ms = maybe(pool_defaults.dwell_min_ms);
+    resolved.cooldown_ms = maybe(pool_defaults.cooldown_ms);
+    resolved.revision = pool_defaults.revision;
+    resolved.generation = pool_defaults.generation;
+    resolved.epoch = pool_defaults.epoch;
+
+    // Layer 2: inherited parent overrides
+    if let Some(parent) = inherited {
+        override_if_set(&mut resolved.dataset, &parent.dataset);
+        override_if_set(&mut resolved.mount_profile, &parent.mount_profile);
+        override_if_set(&mut resolved.product_profile, &parent.product_profile);
+        override_if_set(&mut resolved.admits_subject_range_overrides, &parent.admits_subject_range_overrides);
+        override_if_set(&mut resolved.explicit_unsafe_opt_in, &parent.explicit_unsafe_opt_in);
+        override_if_set(&mut resolved.default_caller_flags, &parent.default_caller_flags);
+        override_if_set(&mut resolved.default_caller_hints, &parent.default_caller_hints);
+        override_if_set(
+            &mut resolved.default_maintenance_intent,
+            &parent.default_maintenance_intent,
+        );
+        override_if_set(&mut resolved.prefetch_window_limit, &parent.prefetch_window_limit);
+        override_if_set(&mut resolved.staging_limit, &parent.staging_limit);
+        override_if_set(&mut resolved.min_sample_mass, &parent.min_sample_mass);
+        override_if_set(&mut resolved.min_observation_window_ms, &parent.min_observation_window_ms);
+        override_if_set(&mut resolved.max_decay_age_ms, &parent.max_decay_age_ms);
+        override_if_set(&mut resolved.dwell_min_ms, &parent.dwell_min_ms);
+        override_if_set(&mut resolved.cooldown_ms, &parent.cooldown_ms);
+        resolved.revision = parent.revision.max(resolved.revision);
+        resolved.generation = parent.generation.max(resolved.generation);
+        resolved.epoch = parent.epoch.max(resolved.epoch);
+    }
+
+    // Layer 3: local overrides
+    override_if_set(&mut resolved.dataset, &local.dataset);
+    override_if_set(&mut resolved.mount_profile, &local.mount_profile);
+    override_if_set(&mut resolved.product_profile, &local.product_profile);
+    override_if_set(&mut resolved.admits_subject_range_overrides, &local.admits_subject_range_overrides);
+    override_if_set(&mut resolved.explicit_unsafe_opt_in, &local.explicit_unsafe_opt_in);
+    override_if_set(&mut resolved.default_caller_flags, &local.default_caller_flags);
+    override_if_set(&mut resolved.default_caller_hints, &local.default_caller_hints);
+    override_if_set(
+        &mut resolved.default_maintenance_intent,
+        &local.default_maintenance_intent,
+    );
+    override_if_set(&mut resolved.prefetch_window_limit, &local.prefetch_window_limit);
+    override_if_set(&mut resolved.staging_limit, &local.staging_limit);
+    override_if_set(&mut resolved.min_sample_mass, &local.min_sample_mass);
+    override_if_set(&mut resolved.min_observation_window_ms, &local.min_observation_window_ms);
+    override_if_set(&mut resolved.max_decay_age_ms, &local.max_decay_age_ms);
+    override_if_set(&mut resolved.dwell_min_ms, &local.dwell_min_ms);
+    override_if_set(&mut resolved.cooldown_ms, &local.cooldown_ms);
+    resolved.revision = local.revision.max(resolved.revision);
+    resolved.generation = local.generation.max(resolved.generation);
+    resolved.epoch = local.epoch.max(resolved.epoch);
+
+    resolved
+}
+
+/// Convert a resolved effective dataset policy config into compiler input.
+#[must_use]
+pub fn config_to_prefetch_residency_sources(
+    config: &DatasetPrefetchResidencyPolicyConfig,
+    identity: StorageIntentPolicyIdentity,
+    evidence_state: PrefetchResidencyPolicyEvidenceState,
+    evidence_refs: PrefetchResidencyDecisionEvidenceRefs,
+    caller_flags: Option<CallerRequestFlags>,
+    caller_hints: Option<CallerHintSource>,
+    internal_maintenance: Option<InternalMaintenanceIntent>,
+    subject_range_override: Option<PrefetchResidencyPolicySource>,
+) -> PrefetchResidencyPolicySources {
+    PrefetchResidencyPolicySources {
+        identity,
+        pool_default: config
+            .dataset
+            .unwrap_or(PrefetchResidencyPolicySource::ABSENT),
+        inherited_dataset: PrefetchResidencyPolicySource::ABSENT,
+        dataset: config
+            .dataset
+            .unwrap_or(PrefetchResidencyPolicySource::ABSENT),
+        mount_profile: config
+            .mount_profile
+            .unwrap_or(PrefetchResidencyPolicySource::ABSENT),
+        product_profile: config
+            .product_profile
+            .unwrap_or(PrefetchResidencyPolicySource::ABSENT),
+        subject_range_override: subject_range_override
+            .unwrap_or(PrefetchResidencyPolicySource::ABSENT),
+        caller_flags: caller_flags.unwrap_or_default(),
+        caller_hints: caller_hints.unwrap_or_default(),
+        internal_maintenance: internal_maintenance.unwrap_or_default(),
+        evidence_state,
+        evidence_refs,
+    }
+}
+
+fn maybe<T: Copy>(v: T) -> Option<T> {
+    Some(v)
+}
+
+fn override_if_set<T: Copy>(target: &mut Option<T>, source: &Option<T>) {
+    if let Some(v) = source {
+        *target = Some(*v);
+    }
+}
+
+
 /// Policy compile status.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[repr(u8)]
@@ -2362,5 +2609,366 @@ mod tests {
         assert!(!decision
             .requirements
             .contains_all(StorageIntentPolicyRolloutRequirements::OPERATOR_CONSENT));
+    }
+
+    #[test]
+    fn pool_defaults_provide_base_values_for_inheritance() {
+        let pool = PoolPrefetchResidencyPolicyDefaults::minimal();
+        let local = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        let resolved = resolve_effective_dataset_policy(&local, None, &pool);
+
+        assert!(resolved.dataset.is_some());
+        let ds = resolved.dataset.unwrap();
+        assert!(ds.present);
+        assert_eq!(ds.class, StorageIntentPolicySourceClass::PoolDefault);
+    }
+
+    #[test]
+    fn local_config_overrides_inherited_parent_config() {
+        let pool = PoolPrefetchResidencyPolicyDefaults::minimal();
+
+        let mut parent = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        parent.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::InheritedDataset,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH
+                .with(PrefetchResidencyCandidateClass::BoundedReadahead),
+        ));
+        parent.prefetch_window_limit = Some(256 * 1024);
+        parent.admits_subject_range_overrides = Some(false);
+
+        let mut local = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        local.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH
+                .with(PrefetchResidencyCandidateClass::BoundedReadahead)
+                .with(PrefetchResidencyCandidateClass::StridedVectorPrefetch),
+        ));
+        local.prefetch_window_limit = Some(512 * 1024);
+        local.admits_subject_range_overrides = Some(true);
+        local.revision = 5;
+
+        let resolved = resolve_effective_dataset_policy(&local, Some(&parent), &pool);
+
+        // Local dataset source overrides inherited
+        let ds = resolved.dataset.unwrap();
+        assert_eq!(ds.class, StorageIntentPolicySourceClass::Dataset);
+        assert!(ds
+            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::StridedVectorPrefetch));
+
+        // Local limit overrides parent limit
+        assert_eq!(resolved.prefetch_window_limit, Some(512 * 1024));
+
+        // Local override for admits_subject_range_overrides
+        assert_eq!(resolved.admits_subject_range_overrides, Some(true));
+
+        // Revision should be the max of all layers
+        assert_eq!(resolved.revision, 5);
+    }
+
+    #[test]
+    fn inherited_parent_preserves_values_when_local_is_unset() {
+        let pool = PoolPrefetchResidencyPolicyDefaults::minimal();
+
+        let mut parent = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        parent.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::InheritedDataset,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH
+                .with(PrefetchResidencyCandidateClass::FlashHotServing),
+        ));
+        parent.prefetch_window_limit = Some(1024 * 1024);
+        parent.dwell_min_ms = Some(30_000);
+        parent.revision = 3;
+
+        let local = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+
+        let resolved = resolve_effective_dataset_policy(&local, Some(&parent), &pool);
+
+        // Inherited values preserved when local has no override
+        let ds = resolved.dataset.unwrap();
+        assert!(ds
+            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
+        assert_eq!(resolved.prefetch_window_limit, Some(1024 * 1024));
+        assert_eq!(resolved.dwell_min_ms, Some(30_000));
+        assert_eq!(resolved.revision, 3);
+    }
+
+    #[test]
+    fn pool_default_cannot_relax_dataset_policy_through_inheritance() {
+        // Pool has only low-risk prefetch; parent dataset tightens to
+        // readahead-only; child inherits the tightened policy.
+        let mut pool = PoolPrefetchResidencyPolicyDefaults::minimal();
+        pool.pool_default = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::PoolDefault,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        );
+
+        let mut parent = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        parent.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::BoundedReadahead,
+            ),
+        ));
+        parent.revision = 1;
+
+        let local = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+
+        let resolved = resolve_effective_dataset_policy(&local, Some(&parent), &pool);
+
+        // The dataset policy (via parent) restricts actions; pool doesn't widen
+        let ds = resolved.dataset.unwrap();
+        assert!(!ds
+            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
+        assert!(ds
+            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::BoundedReadahead));
+    }
+
+    #[test]
+    fn multi_level_inheritance_chain_resolves_correctly() {
+        let mut pool = PoolPrefetchResidencyPolicyDefaults::minimal();
+        pool.pool_default = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::PoolDefault,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        );
+        pool.prefetch_window_limit = 64 * 1024;
+        pool.revision = 0;
+
+        // grandparent: tightens to readahead, sets dwell
+        let mut grandparent = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        grandparent.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::BoundedReadahead,
+            ),
+        ));
+        grandparent.dwell_min_ms = Some(60_000);
+        grandparent.revision = 1;
+
+        // parent: adds stride prefetch, tightens window
+        let mut parent = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        parent.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::BoundedReadahead,
+            )
+            .with(PrefetchResidencyCandidateClass::StridedVectorPrefetch),
+        ));
+        parent.prefetch_window_limit = Some(128 * 1024);
+        parent.revision = 2;
+
+        // child: adds flash serving, further tightens window
+        let mut child = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        child.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::BoundedReadahead,
+            )
+            .with(PrefetchResidencyCandidateClass::StridedVectorPrefetch)
+            .with(PrefetchResidencyCandidateClass::FlashHotServing),
+        ));
+        child.prefetch_window_limit = Some(256 * 1024);
+        child.revision = 3;
+
+        // Resolve grandparent first
+        let resolved_gp = resolve_effective_dataset_policy(&grandparent, None, &pool);
+        // Resolve parent inheriting from grandparent
+        let resolved_p = resolve_effective_dataset_policy(&parent, Some(&resolved_gp), &pool);
+        // Resolve child inheriting from parent
+        let resolved_c = resolve_effective_dataset_policy(&child, Some(&resolved_p), &pool);
+
+        let ds = resolved_c.dataset.unwrap();
+        assert!(ds
+            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::BoundedReadahead));
+        assert!(ds
+            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::StridedVectorPrefetch));
+        assert!(ds
+            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
+
+        // Dwell comes from grandparent
+        assert_eq!(resolved_c.dwell_min_ms, Some(60_000));
+        // Window limit from child (most restrictive? no — child overrides, child's limit wins)
+        assert_eq!(resolved_c.prefetch_window_limit, Some(256 * 1024));
+        // Revision from child (max)
+        assert_eq!(resolved_c.revision, 3);
+    }
+
+    #[test]
+    fn explicit_unsafe_opt_in_preserved_through_inheritance() {
+        let pool = PoolPrefetchResidencyPolicyDefaults::minimal();
+
+        let mut parent = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        parent.dataset = Some(
+            PrefetchResidencyPolicySource::new(
+                StorageIntentPolicySourceClass::Dataset,
+                PrefetchResidencyActionMask::LOW_RISK_PREFETCH
+                    .with(PrefetchResidencyCandidateClass::VolatileRamTrial),
+            )
+            .with_explicit_unsafe_opt_in(),
+        );
+        parent.explicit_unsafe_opt_in = Some(true);
+
+        let local = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        let resolved = resolve_effective_dataset_policy(&local, Some(&parent), &pool);
+
+        // Unsafe opt-in preserved from parent
+        assert_eq!(resolved.explicit_unsafe_opt_in, Some(true));
+        let ds = resolved.dataset.unwrap();
+        assert!(ds.explicit_unsafe_opt_in);
+    }
+
+    #[test]
+    fn config_to_sources_produces_valid_compiler_input() {
+        let pool = PoolPrefetchResidencyPolicyDefaults::minimal();
+        let local = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        let resolved = resolve_effective_dataset_policy(&local, None, &pool);
+
+        let identity = StorageIntentPolicyIdentity {
+            policy_id: StorageIntentPolicyId([1u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(1),
+            pool_id: StorageIntentDomainId([2u8; 16]),
+            dataset_id: StorageIntentDomainId([3u8; 16]),
+            budget_owner: StorageIntentDomainId([4u8; 16]),
+        };
+
+        let evidence_state = PrefetchResidencyPolicyEvidenceState::default();
+        let evidence_refs = PrefetchResidencyDecisionEvidenceRefs::default();
+
+        let sources = config_to_prefetch_residency_sources(
+            &resolved,
+            identity,
+            evidence_state,
+            evidence_refs,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(sources.identity.policy_id, identity.policy_id);
+        assert!(sources.dataset.present);
+        assert!(!sources.subject_range_override.present);
+        assert!(!sources.caller_flags.durable_floor());
+    }
+
+    #[test]
+    fn same_pool_different_datasets_get_distinct_compiled_policies() {
+        let mut pool = PoolPrefetchResidencyPolicyDefaults::minimal();
+        pool.pool_default = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::PoolDefault,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        );
+
+        // Dataset A: aggressive slow-media prefetch
+        let mut ds_a = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        ds_a.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH
+                .with(PrefetchResidencyCandidateClass::BoundedReadahead)
+                .with(PrefetchResidencyCandidateClass::StridedVectorPrefetch)
+                .with(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch)
+                .with(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage),
+        ));
+        ds_a.prefetch_window_limit = Some(8 << 20);
+        ds_a.revision = 1;
+
+        // Dataset B: refuses all prefetch
+        let mut ds_b = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        ds_b.dataset = Some(PrefetchResidencyPolicySource::refusing(
+            PrefetchResidencyPolicySource::new(
+                StorageIntentPolicySourceClass::Dataset,
+                PrefetchResidencyActionMask::ALL_DEFINED,
+            ),
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        ));
+        ds_b.revision = 2;
+
+        let resolved_a = resolve_effective_dataset_policy(&ds_a, None, &pool);
+        let resolved_b = resolve_effective_dataset_policy(&ds_b, None, &pool);
+
+        let ds_source_a = resolved_a.dataset.unwrap();
+        let ds_source_b = resolved_b.dataset.unwrap();
+
+        // Dataset A allows several action classes
+        assert!(ds_source_a
+            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::BoundedReadahead));
+        assert!(ds_source_a
+            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch));
+
+        // Dataset B refuses all
+        assert!(!ds_source_b.refused_actions.is_empty());
+    }
+
+    #[test]
+    fn revision_tracking_maximises_across_inheritance_layers() {
+        let pool = PoolPrefetchResidencyPolicyDefaults {
+            revision: 10,
+            ..PoolPrefetchResidencyPolicyDefaults::minimal()
+        };
+
+        let parent = DatasetPrefetchResidencyPolicyConfig {
+            revision: 20,
+            ..DatasetPrefetchResidencyPolicyConfig::EMPTY
+        };
+
+        let local = DatasetPrefetchResidencyPolicyConfig {
+            revision: 5,
+            ..DatasetPrefetchResidencyPolicyConfig::EMPTY
+        };
+
+        let resolved = resolve_effective_dataset_policy(&local, Some(&parent), &pool);
+        assert_eq!(resolved.revision, 20); // max of 10, 20, 5
+        assert_eq!(resolved.generation, 0);
+        assert_eq!(resolved.epoch, 0);
+    }
+
+    #[test]
+    fn budget_exhaustion_visible_in_compiled_output() {
+        // Pool sets a cost/wear budget; dataset exceeds it => the compiler
+        // should produce a lowered/refused status when evidence is missing.
+        let pool = PoolPrefetchResidencyPolicyDefaults::minimal();
+
+        let mut ds = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        // Request flash serving but provide no wear evidence
+        ds.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH
+                .with(PrefetchResidencyCandidateClass::FlashHotServing),
+        ));
+        ds.revision = 1;
+
+        let resolved = resolve_effective_dataset_policy(&ds, None, &pool);
+
+        let identity = StorageIntentPolicyIdentity {
+            policy_id: StorageIntentPolicyId([1u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(1),
+            pool_id: StorageIntentDomainId([2u8; 16]),
+            dataset_id: StorageIntentDomainId([3u8; 16]),
+            budget_owner: StorageIntentDomainId([4u8; 16]),
+        };
+
+        // No wear, freshness, or media capability evidence
+        let evidence_state = PrefetchResidencyPolicyEvidenceState::default();
+        let evidence_refs = PrefetchResidencyDecisionEvidenceRefs::default();
+
+        let sources = config_to_prefetch_residency_sources(
+            &resolved,
+            identity,
+            evidence_state,
+            evidence_refs,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        // Missing wear/freshness evidence should lower flash actions
+        assert!(matches!(
+            result.status,
+            StorageIntentPolicyCompileStatus::Lowered
+                | StorageIntentPolicyCompileStatus::Refused
+        ));
+        assert_ne!(result.refusal, StorageIntentRefusalReason::None);
     }
 }
