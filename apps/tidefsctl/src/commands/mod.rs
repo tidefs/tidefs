@@ -14,6 +14,7 @@ pub mod mount;
 mod offline_pool;
 pub mod pool;
 pub mod snapshot;
+pub mod storage_intent;
 
 #[cfg(test)]
 pub(crate) use authz::command_surface_authority_table;

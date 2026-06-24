@@ -534,6 +534,13 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
         summary: "list dataset property definitions and effective values",
     },
     CommandSurface {
+        path: "storage-intent explain",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::PassiveDiagnostic,
+        summary:
+            "render supplied storage-intent policy, receipt, and evidence-query records read-only",
+    },
+    CommandSurface {
         path: "mount",
         class: CommandClass::UserspaceHarness,
         routing: RoutingSemantics::UserspaceHarness,

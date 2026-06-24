@@ -94,6 +94,12 @@ enum Command {
         cmd: commands::dataset::DatasetCommand,
     },
 
+    /// Explain supplied storage-intent policy, receipt, and evidence records
+    StorageIntent {
+        #[command(subcommand)]
+        cmd: commands::storage_intent::StorageIntentCommand,
+    },
+
     /// Trigger online extent map defragmentation
     Defrag {
         /// Path to file or directory to defrag
@@ -171,6 +177,7 @@ fn main() {
         Command::Device { cmd } => commands::device::handle_device(cmd),
         Command::Snapshot { cmd } => commands::snapshot::handle_snapshot(cmd),
         Command::Dataset { cmd } => commands::dataset::handle_dataset(cmd),
+        Command::StorageIntent { cmd } => commands::storage_intent::handle_storage_intent(cmd),
 
         Command::Diag {
             output_dir,
@@ -510,6 +517,27 @@ mod tests {
         use clap::Parser;
         let args = Cli::try_parse_from(["tidefsctl", "nonexistent"]);
         assert!(args.is_err(), "unknown command should fail");
+    }
+
+    #[test]
+    fn cli_parse_storage_intent_explain_read_only_surface() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "storage-intent",
+            "explain",
+            "--dataset",
+            "tank/fs",
+            "--file",
+            "/file",
+            "--range",
+            "0..4096",
+            "--json",
+        ]);
+        assert!(
+            args.is_ok(),
+            "storage-intent explain should parse as a read-only operator surface"
+        );
     }
 
     #[test]
