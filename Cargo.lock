@@ -3251,6 +3251,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-relocation-governor"
+version = "0.421.0"
+dependencies = [
+ "serde",
+ "tidefs-background-scheduler",
+ "tidefs-incremental-job-core",
+ "tidefs-storage-intent-core",
+ "tidefs-types-incremental-job-core",
+]
+
+[[package]]
 name = "tidefs-relocation-planner"
 version = "0.421.0"
 dependencies = [
