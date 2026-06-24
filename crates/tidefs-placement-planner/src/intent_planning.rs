@@ -352,6 +352,8 @@ pub enum StorageIntentPlacementReason {
         kind: StorageIntentEvidenceKind,
         state: PlacementEvidenceState,
     },
+    /// Fresh #926 preflight output cannot replace a live placement frontier.
+    PreflightSimulationNotAuthoritative,
     /// Candidate receipt failed the compiled policy predicate.
     CandidateReceiptRefused {
         target_id: u64,
@@ -421,6 +423,9 @@ impl StorageIntentPlacementReason {
             | Self::CandidateMediaCapabilityRefused { refusal, .. }
             | Self::CandidateEvidenceGateRefused { refusal, .. }
             | Self::CandidateMovementDebtRefused { refusal, .. } => Some(*refusal),
+            Self::PreflightSimulationNotAuthoritative => {
+                Some(StorageIntentRefusalReason::EvidenceNotUsable)
+            }
             Self::CandidateGuaranteeFloorNotMet { .. } => {
                 Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
             }
@@ -1233,6 +1238,14 @@ fn require_fresh_evidence_family(
         kind,
         state: PlacementEvidenceState::from_family_state(state),
     });
+    if kind == StorageIntentEvidenceKind::DecisionFrontierEvidence
+        && request
+            .evidence_query
+            .family_freshness
+            .family_is_fresh_for_authority(StorageIntentEvidenceKind::PreflightSimulationEvidence)
+    {
+        reasons.push(StorageIntentPlacementReason::PreflightSimulationNotAuthoritative);
+    }
 }
 
 fn evaluate_candidate(
@@ -1634,8 +1647,29 @@ mod tests {
         evidence_cut_filter(policy, |kind| kind != missing)
     }
 
+    fn evidence_cut_with_preflight_without_decision_frontier(
+        policy: StorageIntentPolicy,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        evidence_cut_filter_with(
+            policy,
+            &[StorageIntentEvidenceKind::PreflightSimulationEvidence],
+            |kind| kind != StorageIntentEvidenceKind::DecisionFrontierEvidence,
+        )
+    }
+
     fn evidence_cut_filter<F>(
         policy: StorageIntentPolicy,
+        keep: F,
+    ) -> StorageIntentEvidenceQuerySnapshot
+    where
+        F: Fn(StorageIntentEvidenceKind) -> bool,
+    {
+        evidence_cut_filter_with(policy, &[], keep)
+    }
+
+    fn evidence_cut_filter_with<F>(
+        policy: StorageIntentPolicy,
+        extra: &[StorageIntentEvidenceKind],
         keep: F,
     ) -> StorageIntentEvidenceQuerySnapshot
     where
@@ -1644,7 +1678,7 @@ mod tests {
         let mut included = StorageIntentEvidenceRefs::EMPTY;
         let mut freshness = EvidenceFamilyFreshnessSet::EMPTY;
         let mut byte = 10_u8;
-        for kind in all_test_evidence() {
+        for kind in all_test_evidence().chain(extra.iter().copied()) {
             if !keep(kind) {
                 byte = byte.wrapping_add(1);
                 continue;
@@ -2652,6 +2686,49 @@ mod tests {
             ]
         ));
     }
+
+    #[test]
+    fn preflight_simulation_cannot_replace_live_decision_frontier() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut request = request(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+        );
+        request.evidence_query = evidence_cut_with_preflight_without_decision_frontier(policy);
+        let candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!plan.admitted);
+        assert!(plan.candidate_reports.is_empty());
+        assert_eq!(
+            plan.first_refusal(),
+            Some(StorageIntentRefusalReason::EvidenceNotUsable)
+        );
+        assert!(matches!(
+            plan.reasons.as_slice(),
+            [
+                StorageIntentPlacementReason::EvidenceFamilyNotFresh {
+                    kind: StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    state: PlacementEvidenceState::Unknown
+                },
+                StorageIntentPlacementReason::PreflightSimulationNotAuthoritative
+            ]
+        ));
+    }
+
     #[test]
     fn tier_goal_compatibility_emits_non_blocking_warning() {
         let policy = policy(
