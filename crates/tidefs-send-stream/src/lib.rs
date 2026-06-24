@@ -20,8 +20,8 @@
 //! use this crate; its `Frame::Send` / `Frame::Receive` handlers currently
 //! encode and decode the older `ChangedRecordExport` format (VFSSEND1,
 //! defined in `tidefs-local-filesystem`). Wiring the storage-node daemon
-//! to VFSSEND2 is tracked by issue #5949, with the send-stream session
-//! adapter (issue #6087) as the canonical network delivery path.
+//! to VFSSEND2 is governed by the distributed snapshot shipping design (issue #1250). Follow-up implementation
+//! issues in the #1250 follow-up map own the per-component wiring (storage-node send path, receive path, session lifecycle). The send-stream session adapter remains the canonical network delivery path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

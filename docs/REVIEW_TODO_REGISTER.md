@@ -13,12 +13,12 @@ OpenZFS/Ceph-class claims.
 | TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Use `docs/TRANSFORM_PIPELINE_AUTHORITY.md` as the #1063 boundary decision and close its non-overlapping follow-up map before claiming runtime conformance. |
 | TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Use `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` as the boundary decision and close the linked follow-up issue map. |
 | TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` for the integrated recovery/fsync/writeback/mmap durability boundary and follow-up map, and `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` for the invalidation trigger, stale-generation, and FUSE/kernel/cluster lease model; then prove and test the end-to-end durability and cache-coherency contract. |
-| TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Authority doc created at `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` (issue #1246). Deadlist integration design owned by #1248; distributed snapshot shipping remains an open design item. |
+| TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Authority doc created at `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` (issue #1246). Deadlist integration design owned by #1248. Distributed snapshot shipping design decision recorded in `docs/design/distributed-snapshot-shipping.md` (issue #1250); VFSSEND2 selected as protocol foundation, follow-up implementation-issue map created. |
 | TFR-011 | Operator CLI/UAPI | CLI, FUSE, ublk, kernel UAPI, and docs can describe different truths. | Define one public operator/UAPI boundary and keep internal crates behind it. |
 | TFR-013 | Stub/placeholder stage | Several crates and docs still look like stage scaffolding rather than product behavior. | Classify placeholders explicitly and delete or implement them. |
 | TFR-014 | Licensing/provenance | Fresh TideFS import must preserve Linux-style GPLv2+syscall-note licensing and third-party provenance. | Audit all package metadata and file-local notices after rename. |
 | TFR-016 | Inline debt marker hygiene | Non-vendored source and active harness text still carried issue-era TODO/continuation wording. | Replace anonymous markers with register-addressed comments and treat old issue refs as historical context only. |
-| TFR-017 | Transport/cluster authority | Cluster CLI, storage-node, send-buffer, epoch-fence, and orchestrator paths still expose staged or placeholder distributed behavior. | Define the transport authority, cross-replica comparison, dispatch, and backpressure semantics before multi-node claims. |
+| TFR-017 | Transport/cluster authority | Cluster CLI, storage-node, send-buffer, epoch-fence, and orchestrator paths still expose staged or placeholder distributed behavior. | Define the transport authority, cross-replica comparison, dispatch, and backpressure semantics before multi-node claims. Distributed snapshot shipping design (#1250, `docs/design/distributed-snapshot-shipping.md`) selects VFSSEND2 as the send/receive protocol foundation and maps follow-up implementation issues; concrete transport binding (TCP, RDMA, etc.) remains deferred to this TFR-017 decision. |
 | TFR-019 | Documentation authority drift | Imported docs still mix design intent, issue closeout records, maturity labels, and current-status claims. | Reclassify every doc as current policy, current spec, historical input, or delete candidate before relying on it. |
 | TFR-020 | Test signal authority | Unit, integration, harness, policy, and marker tests are widespread enough that test count can outgrow product confidence. | Apply `docs/TEST_SIGNAL_POLICY.md`: keep product/invariant signal, demote marker/stale/scaffold signal, and make fixtures match the claim being proved. |
 | TFR-021 | Nextgen verification contract authority | The verification/performance/offload plan needs one evidence chain instead of separate request-contract, model, trace, crash, performance, adapter, and offload systems. | Issue #1066 surveyed 30+ verification surfaces, chose unified evidence manifest with typed claim anchors (Model A, rejecting per-system bundles), mapped 11 evidence producers and 7 consumers, and recorded the follow-up issue map in `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`. Keep high-value claim ids blocked until issue-scoped evidence and claims-gate support exist; the follow-up map names existing issues (#809-#835) and six new issue areas. |
@@ -599,7 +599,7 @@ Important 2026-06-01 findings:
 
   TFR-010 investigation outcome (issue #1246): `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md`
   records the live snapshot/clone/send-receive behavior and cross-subsystem contracts.
-  Deadlist integration design owned by #1248; distributed snapshot shipping remains an open design gap.
+  Deadlist integration design owned by #1248. Distributed snapshot shipping design decision recorded in `docs/design/distributed-snapshot-shipping.md` (issue #1250); VFSSEND2 selected as protocol foundation.
 - `TFR-011`: Operator/UAPI authority is not yet one boundary.
   Commit `7dbb0759` removes the fake `pool list` parser surface instead of
   accepting a command whose handler only said scaffolding had been removed, and
@@ -933,7 +933,7 @@ Important 2026-06-01 findings:
   `replication_factor`, and no longer falls back to the local store simply
   because startup came from a config file. Commit `d7d31643` separately restores
   storage-node test-build hygiene after the existing `carrier_policy` field.
-  TFR-017 remains open because the live store derives quorum from
+  Distributed snapshot shipping design (#1250) selects VFSSEND2 as the protocol foundation; concrete transport binding (TCP, RDMA) remains open. TFR-017 remains open because the live store derives quorum from
   `replication_factor` and opens remote replica sessions. The narrow
   carrier-policy/runtime-fallback slice now checks policy before runtime
   RDMA-to-TCP demotion: `prefer` keeps disclosed TCP recovery, while `enforce`
