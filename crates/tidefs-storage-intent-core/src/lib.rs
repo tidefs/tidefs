@@ -5980,6 +5980,22 @@ pub enum StorageIntentRefusalReason {
     PendingOrderingConvergence = 54,
     /// Required ordering dependency refs are absent from the same evidence cut.
     MissingOrderingDependency = 55,
+    /// Temporal evidence is missing or not a temporal-evidence artifact.
+    MissingTemporalEvidence = 56,
+    /// Clock skew is unknown; wall-time claims cannot be proved.
+    UnknownClockSkew = 57,
+    /// Clock-health sample is stale and cannot support freshness claims.
+    StaleClockHealthSample = 58,
+    /// Clock has stepped backwards; wall-time comparisons are unreliable.
+    BackwardsClockStep = 59,
+    /// Temporal lease or expiry deadline has passed.
+    ExpiredTemporalLease = 60,
+    /// Policy rollout stage deadline has been crossed.
+    CrossedPolicyStageDeadline = 61,
+    /// Remote apply frontier evidence is missing; RPO cannot be proved.
+    MissingRemoteApplyFrontier = 62,
+    /// Evidence is sequence-only; wall-clock RPO or freshness cannot be proved.
+    SequenceOnlyCannotSatisfyWallClockRpo = 63,
 }
 
 impl StorageIntentRefusalReason {
@@ -6045,6 +6061,14 @@ impl StorageIntentRefusalReason {
             Self::OrderingAggregationWouldWeaken => "ordering-aggregation-would-weaken",
             Self::PendingOrderingConvergence => "pending-ordering-convergence",
             Self::MissingOrderingDependency => "missing-ordering-dependency",
+            Self::MissingTemporalEvidence => "missing-temporal-evidence",
+            Self::UnknownClockSkew => "unknown-clock-skew",
+            Self::StaleClockHealthSample => "stale-clock-health-sample",
+            Self::BackwardsClockStep => "backwards-clock-step",
+            Self::ExpiredTemporalLease => "expired-temporal-lease",
+            Self::CrossedPolicyStageDeadline => "crossed-policy-stage-deadline",
+            Self::MissingRemoteApplyFrontier => "missing-remote-apply-frontier",
+            Self::SequenceOnlyCannotSatisfyWallClockRpo => "sequence-only-cannot-satisfy-wall-clock-rpo",
         }
     }
 
@@ -6108,6 +6132,14 @@ impl StorageIntentRefusalReason {
             53 => Some(Self::OrderingAggregationWouldWeaken),
             54 => Some(Self::PendingOrderingConvergence),
             55 => Some(Self::MissingOrderingDependency),
+            56 => Some(Self::MissingTemporalEvidence),
+            57 => Some(Self::UnknownClockSkew),
+            58 => Some(Self::StaleClockHealthSample),
+            59 => Some(Self::BackwardsClockStep),
+            60 => Some(Self::ExpiredTemporalLease),
+            61 => Some(Self::CrossedPolicyStageDeadline),
+            62 => Some(Self::MissingRemoteApplyFrontier),
+            63 => Some(Self::SequenceOnlyCannotSatisfyWallClockRpo),
             _ => None,
         }
     }
@@ -7348,6 +7380,720 @@ pub fn evaluate_receipt_set_against_policy(
     }
 }
 
+// ── Temporal evidence types (issue #903) ── //
+
+/// Timebase identity for storage-intent temporal evidence.
+///
+/// Distinguishes local monotonic, local wall-clock, cluster consensus,
+/// remote wall-clock, and sequence/log-frontier timebases so consumers
+/// know whether age, lag, expiry, and deadline facts are comparable
+/// and fresh enough for the requested role.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentTimebaseClass {
+    /// No timebase evidence available.
+    #[default]
+    Unknown = 0,
+    /// Local monotonic clock (e.g. CLOCK_MONOTONIC).
+    LocalMonotonic = 1,
+    /// Local wall clock (e.g. CLOCK_REALTIME).
+    LocalWallClock = 2,
+    /// Cluster or consensus time agreed across members.
+    ClusterConsensusTime = 3,
+    /// Remote peer-reported wall clock.
+    RemoteWallClock = 4,
+    /// Sequence or log frontier (LSN, raft index, etc.).
+    SequenceLogFrontier = 5,
+    /// Sequence-only evidence without time conversion.
+    SequenceOnly = 6,
+}
+
+impl_u8_canonical!(StorageIntentTimebaseClass, {
+    Unknown = 0 => "unknown",
+    LocalMonotonic = 1 => "local-monotonic",
+    LocalWallClock = 2 => "local-wall-clock",
+    ClusterConsensusTime = 3 => "cluster-consensus-time",
+    RemoteWallClock = 4 => "remote-wall-clock",
+    SequenceLogFrontier = 5 => "sequence-log-frontier",
+    SequenceOnly = 6 => "sequence-only",
+});
+
+/// Returns true when the timebase can support wall-clock age, lag, or expiry comparisons.
+#[must_use]
+pub const fn timebase_supports_wall_clock(timebase: StorageIntentTimebaseClass) -> bool {
+    matches!(
+        timebase,
+        StorageIntentTimebaseClass::LocalWallClock
+            | StorageIntentTimebaseClass::ClusterConsensusTime
+            | StorageIntentTimebaseClass::RemoteWallClock
+    )
+}
+
+/// Returns true when the timebase can only provide sequence or monotonic ordering.
+#[must_use]
+pub const fn timebase_is_sequence_only(timebase: StorageIntentTimebaseClass) -> bool {
+    matches!(
+        timebase,
+        StorageIntentTimebaseClass::SequenceLogFrontier | StorageIntentTimebaseClass::SequenceOnly
+    )
+}
+
+/// Clock source identity for temporal evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentClockSourceClass {
+    /// Clock source is unknown.
+    #[default]
+    Unknown = 0,
+    /// Local CMOS / RTC hardware clock.
+    LocalCmos = 1,
+    /// Local TSC or platform timer.
+    LocalTsc = 2,
+    /// NTP-synchronized clock.
+    NtpSynchronized = 3,
+    /// PTP / IEEE 1588 synchronized clock.
+    PtpSynchronized = 4,
+    /// Derived from cluster consensus protocol.
+    ClusterConsensusDerived = 5,
+    /// Reported by a remote peer.
+    RemotePeerReported = 6,
+    /// Derived from sequence or log frontier rate.
+    SequenceDerived = 7,
+}
+
+impl_u8_canonical!(StorageIntentClockSourceClass, {
+    Unknown = 0 => "unknown",
+    LocalCmos = 1 => "local-cmos",
+    LocalTsc = 2 => "local-tsc",
+    NtpSynchronized = 3 => "ntp-synchronized",
+    PtpSynchronized = 4 => "ptp-synchronized",
+    ClusterConsensusDerived = 5 => "cluster-consensus-derived",
+    RemotePeerReported = 6 => "remote-peer-reported",
+    SequenceDerived = 7 => "sequence-derived",
+});
+
+/// Bitmask of clock health properties.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct ClockHealthFlags(pub u8);
+
+impl ClockHealthFlags {
+    /// No health properties asserted.
+    pub const EMPTY: Self = Self(0);
+
+    /// Clock is known to be monotonic (no backwards steps observed).
+    pub const MONOTONIC: u8 = 1 << 0;
+
+    /// Skew bound is known and current.
+    pub const KNOWN_SKEW: u8 = 1 << 1;
+
+    /// No backwards clock step has been observed since the last health sample.
+    pub const NO_BACKWARDS_STEP: u8 = 1 << 2;
+
+    /// No leap second is pending or in progress.
+    pub const NO_LEAP_SECOND_PENDING: u8 = 1 << 3;
+
+    /// Clock has not been stepped (only slewed) since last health sample.
+    pub const NO_STEP_ADJUSTMENT: u8 = 1 << 4;
+
+    /// All defined health flags.
+    pub const ALL_DEFINED: u8 =
+        Self::MONOTONIC
+        | Self::KNOWN_SKEW
+        | Self::NO_BACKWARDS_STEP
+        | Self::NO_LEAP_SECOND_PENDING
+        | Self::NO_STEP_ADJUSTMENT;
+
+    /// Construct a mask with a single flag.
+    #[must_use]
+    pub const fn from_flag(flag: u8) -> Self {
+        Self(flag)
+    }
+
+    /// Combine with another flag set.
+    #[must_use]
+    pub const fn with(self, flag: u8) -> Self {
+        Self(self.0 | flag)
+    }
+
+    /// Returns true when all bits in `required` are set.
+    #[must_use]
+    pub const fn contains_all(self, required: u8) -> bool {
+        (self.0 & required) == required
+    }
+
+    /// Returns true when any bit in `mask` is set.
+    #[must_use]
+    pub const fn intersects(self, mask: u8) -> bool {
+        (self.0 & mask) != 0
+    }
+}
+
+/// Clock health evidence carried by temporal evidence records.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentClockHealth {
+    /// Clock source identity.
+    pub source: StorageIntentClockSourceClass,
+    /// Synchronization domain (zero when unknown or local-only).
+    pub sync_domain: StorageIntentDomainId,
+    /// Conservative skew bound in microseconds (0 = unknown skew).
+    pub skew_bound_us: u64,
+    /// Health flags.
+    pub flags: ClockHealthFlags,
+    /// Age of the clock-health sample in milliseconds.
+    pub sample_age_ms: u64,
+    /// Evidence ref for the clock-health sample artifact.
+    pub sample_ref: StorageIntentEvidenceRef,
+    /// Evidence ref for the clock-health authority source.
+    pub health_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentClockHealth {
+    /// Returns true when clock health cites a non-empty artifact.
+    #[must_use]
+    pub const fn has_evidence(self) -> bool {
+        self.sample_ref.is_bound() || self.health_ref.is_bound()
+    }
+
+    /// Returns true when skew is bounded and the bound is known.
+    #[must_use]
+    pub const fn has_known_skew(self) -> bool {
+        self.skew_bound_us > 0 && self.flags.contains_all(ClockHealthFlags::KNOWN_SKEW)
+    }
+
+    /// Returns true when the clock has not stepped backwards.
+    #[must_use]
+    pub const fn no_backwards_step(self) -> bool {
+        self.flags.contains_all(ClockHealthFlags::NO_BACKWARDS_STEP)
+    }
+}
+
+/// Event frontier class for temporal evidence.
+///
+/// Binds a specific event type to a comparable time or sequence frontier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentEventFrontierClass {
+    /// No event frontier bound.
+    #[default]
+    Unknown = 0,
+    /// Write receipt publication frontier.
+    WriteReceipt = 1,
+    /// Committed root frontier.
+    CommittedRoot = 2,
+    /// Policy publication frontier.
+    PolicyPublication = 3,
+    /// Membership epoch frontier.
+    MembershipEpoch = 4,
+    /// Trust or key epoch frontier.
+    TrustKeyEpoch = 5,
+    /// Receive source frontier.
+    ReceiveSource = 6,
+    /// Geo source frontier.
+    GeoSource = 7,
+    /// Remote apply frontier.
+    RemoteApply = 8,
+    /// Read source frontier.
+    ReadSource = 9,
+    /// Prediction decision frontier.
+    PredictionDecision = 10,
+    /// Relocation outcome frontier.
+    RelocationOutcome = 11,
+}
+
+impl_u8_canonical!(StorageIntentEventFrontierClass, {
+    Unknown = 0 => "unknown",
+    WriteReceipt = 1 => "write-receipt",
+    CommittedRoot = 2 => "committed-root",
+    PolicyPublication = 3 => "policy-publication",
+    MembershipEpoch = 4 => "membership-epoch",
+    TrustKeyEpoch = 5 => "trust-key-epoch",
+    ReceiveSource = 6 => "receive-source",
+    GeoSource = 7 => "geo-source",
+    RemoteApply = 8 => "remote-apply",
+    ReadSource = 9 => "read-source",
+    PredictionDecision = 10 => "prediction-decision",
+    RelocationOutcome = 11 => "relocation-outcome",
+});
+
+/// Lag or staleness class for temporal evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentStalenessClass {
+    /// No staleness class assigned.
+    #[default]
+    Unknown = 0,
+    /// Geo replica RPO lag.
+    GeoRpoLag = 1,
+    /// Stale-read age.
+    StaleReadAge = 2,
+    /// Read-serving freshness.
+    ReadServingFreshness = 3,
+    /// Archive or restore age.
+    ArchiveRestoreAge = 4,
+    /// Repair or rebuild lag.
+    RepairRebuildLag = 5,
+    /// Receive backlog age.
+    ReceiveBacklogAge = 6,
+    /// Remote catch-up age.
+    RemoteCatchUpAge = 7,
+}
+
+impl_u8_canonical!(StorageIntentStalenessClass, {
+    Unknown = 0 => "unknown",
+    GeoRpoLag = 1 => "geo-rpo-lag",
+    StaleReadAge = 2 => "stale-read-age",
+    ReadServingFreshness = 3 => "read-serving-freshness",
+    ArchiveRestoreAge = 4 => "archive-restore-age",
+    RepairRebuildLag = 5 => "repair-rebuild-lag",
+    ReceiveBacklogAge = 6 => "receive-backlog-age",
+    RemoteCatchUpAge = 7 => "remote-catch-up-age",
+});
+
+/// Expiry or deadline class for temporal evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentExpiryDeadlineClass {
+    /// No expiry or deadline class assigned.
+    #[default]
+    Unknown = 0,
+    /// Key lease expiry.
+    KeyLeaseExpiry = 1,
+    /// Authorization window deadline.
+    AuthorizationWindow = 2,
+    /// Policy rollout stage deadline.
+    PolicyRolloutStageDeadline = 3,
+    /// In-flight fence deadline.
+    InFlightFenceDeadline = 4,
+    /// Cooldown window.
+    CooldownWindow = 5,
+    /// Payback window.
+    PaybackWindow = 6,
+    /// TTL or lifecycle window.
+    TtlLifecycleWindow = 7,
+    /// Retry window.
+    RetryWindow = 8,
+    /// Refusal deadline.
+    RefusalDeadline = 9,
+}
+
+impl_u8_canonical!(StorageIntentExpiryDeadlineClass, {
+    Unknown = 0 => "unknown",
+    KeyLeaseExpiry = 1 => "key-lease-expiry",
+    AuthorizationWindow = 2 => "authorization-window",
+    PolicyRolloutStageDeadline = 3 => "policy-rollout-stage-deadline",
+    InFlightFenceDeadline = 4 => "in-flight-fence-deadline",
+    CooldownWindow = 5 => "cooldown-window",
+    PaybackWindow = 6 => "payback-window",
+    TtlLifecycleWindow = 7 => "ttl-lifecycle-window",
+    RetryWindow = 8 => "retry-window",
+    RefusalDeadline = 9 => "refusal-deadline",
+});
+
+/// Sequence-to-time conversion evidence.
+///
+/// Converts sequence/log/byte lag to wall-time only when the source rate,
+/// observation window, and uncertainty bound make the conversion conservative.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentSequenceTimeConversion {
+    /// Conservative source rate in bytes per second.
+    pub rate_bytes_per_sec: u64,
+    /// Observation window over which the rate was measured in milliseconds.
+    pub observation_window_ms: u64,
+    /// Uncertainty bound for the conversion in milliseconds.
+    pub uncertainty_bound_ms: u64,
+    /// Conservative wall-clock bound derived from the conversion.
+    pub conservative_bound_ms: u64,
+    /// Evidence ref for the conversion artifact.
+    pub conversion_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentSequenceTimeConversion {
+    /// Returns true when the conversion cites a non-empty artifact.
+    #[must_use]
+    pub const fn has_evidence(self) -> bool {
+        self.conversion_ref.is_bound()
+    }
+
+    /// Returns true when rate and uncertainty are explicit enough for conversion.
+    #[must_use]
+    pub const fn has_conservative_rate(self) -> bool {
+        self.rate_bytes_per_sec > 0
+            && self.observation_window_ms > 0
+            && self.conservative_bound_ms > 0
+    }
+}
+
+/// Temporal refusal reason at the evidence level.
+///
+/// These are typed refusal states that temporal evidence producers record
+/// when timebase, clock-health, or frontier evidence is not usable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentTemporalRefusalReason {
+    /// No refusal.
+    #[default]
+    None = 0,
+    /// Timebase evidence is missing.
+    MissingTimebase = 1,
+    /// Clock skew is unknown; wall-time claims cannot be proved.
+    UnknownSkew = 2,
+    /// Clock-health sample is stale.
+    StaleSample = 3,
+    /// Expiry or deadline has been crossed.
+    CrossedExpiry = 4,
+    /// Frontiers from different timebases are contradictory.
+    ContradictoryFrontier = 5,
+    /// Clock has stepped backwards.
+    BackwardsTime = 6,
+    /// Sequence frontier is insufficient for the requested conversion.
+    InsufficientSequenceFrontier = 7,
+    /// Cross-domain time comparison is not supported.
+    UnsupportedCrossDomainComparison = 8,
+}
+
+impl_u8_canonical!(StorageIntentTemporalRefusalReason, {
+    None = 0 => "none",
+    MissingTimebase = 1 => "missing-timebase",
+    UnknownSkew = 2 => "unknown-skew",
+    StaleSample = 3 => "stale-sample",
+    CrossedExpiry = 4 => "crossed-expiry",
+    ContradictoryFrontier = 5 => "contradictory-frontier",
+    BackwardsTime = 6 => "backwards-time",
+    InsufficientSequenceFrontier = 7 => "insufficient-sequence-frontier",
+    UnsupportedCrossDomainComparison = 8 => "unsupported-cross-domain-comparison",
+});
+
+/// Storage-intent temporal evidence record.
+///
+/// Carries timebase identity, clock health, event/frontier stamps,
+/// lag/staleness, expiry/deadline, sequence-to-time conversion, and
+/// typed refusal evidence so that consumers can make honest claims
+/// about age, lag, staleness, RPO/RTO, TTL, cooldown, payback,
+/// policy-stage deadlines, and evidence freshness.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentTemporalEvidence {
+    /// Self-referential evidence identity.
+    pub evidence: StorageIntentEvidenceRef,
+    /// Timebase identity.
+    pub timebase: StorageIntentTimebaseClass,
+    /// Evidence ref for the timebase artifact.
+    pub timebase_ref: StorageIntentEvidenceRef,
+    /// Clock health record.
+    pub clock_health: StorageIntentClockHealth,
+    /// Evidence ref for the clock-health artifact.
+    pub clock_health_ref: StorageIntentEvidenceRef,
+    /// Event frontier class.
+    pub event_frontier: StorageIntentEventFrontierClass,
+    /// Evidence ref for the event-frontier artifact.
+    pub event_frontier_ref: StorageIntentEvidenceRef,
+    /// Lag or staleness class.
+    pub staleness_class: StorageIntentStalenessClass,
+    /// Evidence ref for the lag/staleness artifact.
+    pub staleness_ref: StorageIntentEvidenceRef,
+    /// Expiry or deadline class.
+    pub expiry_deadline_class: StorageIntentExpiryDeadlineClass,
+    /// Evidence ref for the expiry/deadline artifact.
+    pub expiry_deadline_ref: StorageIntentEvidenceRef,
+    /// Sequence-to-time conversion evidence.
+    pub sequence_time_conversion: StorageIntentSequenceTimeConversion,
+    /// Temporal refusal reason at the evidence level.
+    pub refusal: StorageIntentTemporalRefusalReason,
+    /// Evidence ref for the refusal artifact.
+    pub refusal_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentTemporalEvidence {
+    /// Returns true when the record cites a non-empty temporal-evidence artifact.
+    #[must_use]
+    pub const fn has_temporal_evidence(self) -> bool {
+        self.evidence.kind as u16 == StorageIntentEvidenceKind::TemporalEvidence as u16
+            && !bytes32_are_zero(self.evidence.id.0)
+    }
+
+    /// Returns true when the timebase is explicit.
+    #[must_use]
+    pub const fn has_timebase(self) -> bool {
+        self.timebase as u8 != StorageIntentTimebaseClass::Unknown as u8
+            && self.timebase_ref.is_bound()
+    }
+
+    /// Returns true when clock health evidence is present.
+    #[must_use]
+    pub const fn has_clock_health(self) -> bool {
+        self.clock_health.has_evidence() && self.clock_health_ref.is_bound()
+    }
+
+    /// Returns true when an event frontier is bound.
+    #[must_use]
+    pub const fn has_event_frontier(self) -> bool {
+        self.event_frontier as u8 != StorageIntentEventFrontierClass::Unknown as u8
+            && self.event_frontier_ref.is_bound()
+    }
+
+    /// Returns true when lag/staleness evidence is present.
+    #[must_use]
+    pub const fn has_lag_staleness(self) -> bool {
+        self.staleness_class as u8 != StorageIntentStalenessClass::Unknown as u8
+            && self.staleness_ref.is_bound()
+    }
+
+    /// Returns true when expiry/deadline evidence is present.
+    #[must_use]
+    pub const fn has_expiry_deadline(self) -> bool {
+        self.expiry_deadline_class as u8 != StorageIntentExpiryDeadlineClass::Unknown as u8
+            && self.expiry_deadline_ref.is_bound()
+    }
+
+    /// Returns true when sequence-to-time conversion evidence is present.
+    #[must_use]
+    pub const fn has_sequence_conversion(self) -> bool {
+        self.sequence_time_conversion.has_evidence()
+    }
+
+    /// Returns true when the evidence has an active refusal.
+    #[must_use]
+    pub const fn is_refused(self) -> bool {
+        self.refusal as u8 != StorageIntentTemporalRefusalReason::None as u8
+    }
+}
+
+// ── Temporal evidence predicates ── //
+
+/// Returns true when the clock health sample is fresh enough for authority decisions.
+///
+/// A stale clock-health sample cannot support freshness, RPO, or expiry claims.
+#[must_use]
+pub const fn clock_health_is_fresh_for_authority(
+    health: StorageIntentClockHealth,
+    max_sample_age_ms: u64,
+) -> bool {
+    health.has_evidence() && health.sample_age_ms <= max_sample_age_ms
+}
+
+/// Returns true when wall-clock temporal evidence can prove the requested RPO bound.
+///
+/// Requires: wall-clock timebase, known clock skew, no backwards steps,
+/// fresh clock-health sample, remote-apply frontier evidence, and the
+/// observed lag does not exceed the RPO bound.
+#[must_use]
+pub const fn temporal_evidence_supports_wall_clock_rpo(
+    evidence: StorageIntentTemporalEvidence,
+    required_rpo_ms: u64,
+    observed_lag_ms: u64,
+    max_sample_age_ms: u64,
+) -> bool {
+    if !evidence.has_temporal_evidence() || evidence.is_refused() {
+        return false;
+    }
+    if !timebase_supports_wall_clock(evidence.timebase) {
+        return false;
+    }
+    if !clock_health_is_fresh_for_authority(evidence.clock_health, max_sample_age_ms) {
+        return false;
+    }
+    if !evidence.clock_health.has_known_skew() {
+        return false;
+    }
+    if !evidence.clock_health.no_backwards_step() {
+        return false;
+    }
+    if evidence.event_frontier as u8 != StorageIntentEventFrontierClass::RemoteApply as u8 {
+        return false;
+    }
+    // Observed lag plus skew bound must not exceed required RPO.
+    // When skew is known, add it to the conservative bound.
+    let conservative_lag_ms = observed_lag_ms.saturating_add(evidence.clock_health.skew_bound_us / 1000);
+    conservative_lag_ms <= required_rpo_ms
+}
+
+/// Returns true when temporal evidence can support a wall-clock freshness claim.
+///
+/// Requires: wall-clock timebase, known skew, no backwards steps,
+/// fresh clock-health sample, and a bound staleness ref.
+#[must_use]
+pub const fn temporal_evidence_supports_freshness_claim(
+    evidence: StorageIntentTemporalEvidence,
+    max_age_ms: u64,
+    max_sample_age_ms: u64,
+) -> bool {
+    if !evidence.has_temporal_evidence() || evidence.is_refused() {
+        return false;
+    }
+    if !timebase_supports_wall_clock(evidence.timebase) {
+        return false;
+    }
+    if !clock_health_is_fresh_for_authority(evidence.clock_health, max_sample_age_ms) {
+        return false;
+    }
+    if !evidence.clock_health.has_known_skew() {
+        return false;
+    }
+    if !evidence.clock_health.no_backwards_step() {
+        return false;
+    }
+    if !evidence.has_lag_staleness() {
+        return false;
+    }
+    // Freshness claim is valid when the evidence staleness ref is bound
+    // and the max age is within acceptable bounds.
+    max_age_ms > 0
+}
+
+/// Returns true when temporal evidence can support an expiry or deadline claim.
+///
+/// Requires: explicit expiry/deadline class, wall-clock timebase,
+/// known skew, no backwards steps, and fresh clock-health sample.
+#[must_use]
+pub const fn temporal_evidence_supports_expiry_claim(
+    evidence: StorageIntentTemporalEvidence,
+    deadline_ms: u64,
+    now_ms: u64,
+    max_sample_age_ms: u64,
+) -> bool {
+    if !evidence.has_temporal_evidence() || evidence.is_refused() {
+        return false;
+    }
+    if !timebase_supports_wall_clock(evidence.timebase) {
+        return false;
+    }
+    if !clock_health_is_fresh_for_authority(evidence.clock_health, max_sample_age_ms) {
+        return false;
+    }
+    if !evidence.clock_health.has_known_skew() {
+        return false;
+    }
+    if !evidence.clock_health.no_backwards_step() {
+        return false;
+    }
+    if !evidence.has_expiry_deadline() {
+        return false;
+    }
+    // Deadline has not passed, accounting for skew.
+    let conservative_now = now_ms.saturating_add(evidence.clock_health.skew_bound_us / 1000);
+    conservative_now < deadline_ms
+}
+
+/// Returns true when temporal evidence can support a cooldown or payback window claim.
+///
+/// Cooldown/payback windows can use local monotonic time when no cross-node
+/// comparison is required, but wall-clock claims need wall-clock timebase.
+#[must_use]
+pub const fn temporal_evidence_supports_cooldown_claim(
+    evidence: StorageIntentTemporalEvidence,
+    window_ms: u64,
+    elapsed_ms: u64,
+    requires_cross_node: bool,
+) -> bool {
+    if !evidence.has_temporal_evidence() || evidence.is_refused() {
+        return false;
+    }
+    if requires_cross_node && !timebase_supports_wall_clock(evidence.timebase) {
+        return false;
+    }
+    if !evidence.has_expiry_deadline() {
+        return false;
+    }
+    // Cooldown satisfied when elapsed time exceeds the window.
+    elapsed_ms >= window_ms
+}
+
+/// Map a temporal evidence refusal reason to the policy-level refusal reason.
+#[must_use]
+pub const fn temporal_refusal_to_policy_refusal(
+    reason: StorageIntentTemporalRefusalReason,
+) -> StorageIntentRefusalReason {
+    match reason {
+        StorageIntentTemporalRefusalReason::None => StorageIntentRefusalReason::None,
+        StorageIntentTemporalRefusalReason::MissingTimebase => {
+            StorageIntentRefusalReason::MissingTemporalEvidence
+        }
+        StorageIntentTemporalRefusalReason::UnknownSkew => {
+            StorageIntentRefusalReason::UnknownClockSkew
+        }
+        StorageIntentTemporalRefusalReason::StaleSample => {
+            StorageIntentRefusalReason::StaleClockHealthSample
+        }
+        StorageIntentTemporalRefusalReason::CrossedExpiry => {
+            StorageIntentRefusalReason::ExpiredTemporalLease
+        }
+        StorageIntentTemporalRefusalReason::ContradictoryFrontier => {
+            StorageIntentRefusalReason::EvidenceNotUsable
+        }
+        StorageIntentTemporalRefusalReason::BackwardsTime => {
+            StorageIntentRefusalReason::BackwardsClockStep
+        }
+        StorageIntentTemporalRefusalReason::InsufficientSequenceFrontier => {
+            StorageIntentRefusalReason::SequenceOnlyCannotSatisfyWallClockRpo
+        }
+        StorageIntentTemporalRefusalReason::UnsupportedCrossDomainComparison => {
+            StorageIntentRefusalReason::EvidenceNotUsable
+        }
+    }
+}
+
+/// Returns true when temporal evidence can satisfy a TTL/lifecycle window claim.
+///
+/// TTL claims need wall-clock timebase with known skew; sequence-only evidence
+/// is not sufficient to prove an absolute time window has elapsed.
+#[must_use]
+pub const fn temporal_evidence_supports_ttl_claim(
+    evidence: StorageIntentTemporalEvidence,
+    ttl_ms: u64,
+    age_ms: u64,
+    max_sample_age_ms: u64,
+) -> bool {
+    if !evidence.has_temporal_evidence() || evidence.is_refused() {
+        return false;
+    }
+    if !timebase_supports_wall_clock(evidence.timebase) {
+        return false;
+    }
+    if !clock_health_is_fresh_for_authority(evidence.clock_health, max_sample_age_ms) {
+        return false;
+    }
+    if !evidence.clock_health.has_known_skew() {
+        return false;
+    }
+    if !evidence.clock_health.no_backwards_step() {
+        return false;
+    }
+    age_ms >= ttl_ms
+}
+
+/// Returns the temporal evidence age in milliseconds, or None if not computable.
+///
+/// Evidence age is computable only when a wall-clock timebase with known skew
+/// and no backwards step is available.
+#[must_use]
+pub const fn temporal_evidence_age_ms(
+    evidence: StorageIntentTemporalEvidence,
+    now_ms: u64,
+    event_timestamp_ms: u64,
+) -> Option<u64> {
+    if !evidence.has_temporal_evidence() || evidence.is_refused() {
+        return None;
+    }
+    if !timebase_supports_wall_clock(evidence.timebase) {
+        return None;
+    }
+    if !evidence.clock_health.has_known_skew() || !evidence.clock_health.no_backwards_step() {
+        return None;
+    }
+    if now_ms < event_timestamp_ms {
+        return None;
+    }
+    Some(now_ms - event_timestamp_ms)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9910,5 +10656,373 @@ mod tests {
             .validate(),
             Err(StorageIntentRecordError::NonZeroReserved)
         );
+    }
+    // ── Temporal evidence tests (issue #903) ── //
+
+    fn temporal_evidence_ref(kind: StorageIntentEvidenceKind, byte: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            kind,
+            StorageIntentEvidenceId([byte; 32]),
+            u64::from(byte),
+            1,
+        )
+    }
+
+    fn healthy_wall_clock_timebase() -> StorageIntentTemporalEvidence {
+        StorageIntentTemporalEvidence {
+            evidence: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 1),
+            timebase: StorageIntentTimebaseClass::LocalWallClock,
+            timebase_ref: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 2),
+            clock_health: StorageIntentClockHealth {
+                source: StorageIntentClockSourceClass::NtpSynchronized,
+                sync_domain: StorageIntentDomainId::ZERO,
+                skew_bound_us: 100, // 100 us skew
+                flags: ClockHealthFlags::from_flag(
+                    ClockHealthFlags::MONOTONIC
+                        | ClockHealthFlags::KNOWN_SKEW
+                        | ClockHealthFlags::NO_BACKWARDS_STEP,
+                ),
+                sample_age_ms: 1000,
+                sample_ref: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 3),
+                health_ref: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 4),
+            },
+            clock_health_ref: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 5),
+            event_frontier: StorageIntentEventFrontierClass::RemoteApply,
+            event_frontier_ref: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 6),
+            staleness_class: StorageIntentStalenessClass::GeoRpoLag,
+            staleness_ref: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 7),
+            expiry_deadline_class: StorageIntentExpiryDeadlineClass::Unknown,
+            expiry_deadline_ref: StorageIntentEvidenceRef::default(),
+            sequence_time_conversion: StorageIntentSequenceTimeConversion::default(),
+            refusal: StorageIntentTemporalRefusalReason::None,
+            refusal_ref: StorageIntentEvidenceRef::default(),
+        }
+    }
+
+    #[test]
+    fn unknown_clock_skew_cannot_satisfy_wall_clock_rpo() {
+        let mut evidence = healthy_wall_clock_timebase();
+        // Set unknown skew: zero bound and missing KNOWN_SKEW flag.
+        evidence.clock_health.skew_bound_us = 0;
+        evidence.clock_health.flags = ClockHealthFlags::from_flag(
+            ClockHealthFlags::MONOTONIC | ClockHealthFlags::NO_BACKWARDS_STEP,
+        );
+
+        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
+        // But the evidence still has a wall-clock timebase.
+        assert!(timebase_supports_wall_clock(evidence.timebase));
+        // The refusal should map correctly.
+        assert_eq!(
+            temporal_refusal_to_policy_refusal(StorageIntentTemporalRefusalReason::UnknownSkew),
+            StorageIntentRefusalReason::UnknownClockSkew
+        );
+    }
+
+    #[test]
+    fn unknown_clock_skew_cannot_satisfy_freshness() {
+        let mut evidence = healthy_wall_clock_timebase();
+        evidence.clock_health.skew_bound_us = 0;
+        evidence.clock_health.flags = ClockHealthFlags::EMPTY;
+
+        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
+    }
+
+    #[test]
+    fn backwards_clock_step_cannot_satisfy_wall_clock_claims() {
+        let mut evidence = healthy_wall_clock_timebase();
+        // Remove NO_BACKWARDS_STEP flag — simulates a backwards clock step.
+        evidence.clock_health.flags = ClockHealthFlags::from_flag(
+            ClockHealthFlags::MONOTONIC | ClockHealthFlags::KNOWN_SKEW,
+        );
+
+        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
+        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+
+        // Map backwards time to the policy refusal.
+        assert_eq!(
+            temporal_refusal_to_policy_refusal(StorageIntentTemporalRefusalReason::BackwardsTime),
+            StorageIntentRefusalReason::BackwardsClockStep
+        );
+    }
+
+    #[test]
+    fn stale_clock_health_sample_cannot_satisfy_freshness() {
+        let evidence = healthy_wall_clock_timebase();
+        // Sample age is 1000 ms, max is 500 ms -> stale.
+        assert!(!clock_health_is_fresh_for_authority(evidence.clock_health, 500));
+        // But with generous max sample age, it's fresh.
+        assert!(clock_health_is_fresh_for_authority(evidence.clock_health, 2000));
+
+        // Stale sample makes all wall-clock claims fail.
+        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 500));
+    }
+
+    #[test]
+    fn expired_temporal_lease_cannot_satisfy_expiry_claim() {
+        let mut evidence = healthy_wall_clock_timebase();
+        evidence.expiry_deadline_class = StorageIntentExpiryDeadlineClass::KeyLeaseExpiry;
+        evidence.expiry_deadline_ref =
+            temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 10);
+
+        // Deadline is 10000 ms, now is 15000 ms — expired.
+        assert!(!temporal_evidence_supports_expiry_claim(evidence, 10000, 15000, 5000));
+
+        // Map crossed expiry to policy refusal.
+        assert_eq!(
+            temporal_refusal_to_policy_refusal(StorageIntentTemporalRefusalReason::CrossedExpiry),
+            StorageIntentRefusalReason::ExpiredTemporalLease
+        );
+    }
+
+    #[test]
+    fn crossed_policy_stage_deadline_cannot_satisfy_freshness() {
+        let mut evidence = healthy_wall_clock_timebase();
+        evidence.expiry_deadline_class =
+            StorageIntentExpiryDeadlineClass::PolicyRolloutStageDeadline;
+        evidence.expiry_deadline_ref =
+            temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 11);
+
+        // Deadline has passed.
+        assert!(!temporal_evidence_supports_expiry_claim(evidence, 10000, 15000, 5000));
+    }
+
+    #[test]
+    fn missing_remote_apply_frontier_cannot_satisfy_rpo() {
+        let mut evidence = healthy_wall_clock_timebase();
+        evidence.event_frontier = StorageIntentEventFrontierClass::CommittedRoot;
+
+        // RPO requires RemoteApply frontier.
+        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
+    }
+
+    #[test]
+    fn sequence_only_lag_cannot_satisfy_wall_clock_rpo() {
+        let mut evidence = healthy_wall_clock_timebase();
+        evidence.timebase = StorageIntentTimebaseClass::SequenceOnly;
+
+        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
+        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+
+        assert!(timebase_is_sequence_only(evidence.timebase));
+        assert!(!timebase_supports_wall_clock(evidence.timebase));
+
+        // Map insufficient sequence to policy refusal.
+        assert_eq!(
+            temporal_refusal_to_policy_refusal(
+                StorageIntentTemporalRefusalReason::InsufficientSequenceFrontier
+            ),
+            StorageIntentRefusalReason::SequenceOnlyCannotSatisfyWallClockRpo
+        );
+    }
+
+    #[test]
+    fn sequence_only_lag_cannot_satisfy_wall_clock_freshness() {
+        let mut evidence = healthy_wall_clock_timebase();
+        evidence.timebase = StorageIntentTimebaseClass::SequenceLogFrontier;
+
+        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
+        // But cooldown claims can work with local monotonic time.
+        assert!(timebase_is_sequence_only(evidence.timebase));
+    }
+
+    #[test]
+    fn local_monotonic_supports_cooldown_but_not_cross_node() {
+        let mut evidence = healthy_wall_clock_timebase();
+        evidence.timebase = StorageIntentTimebaseClass::LocalMonotonic;
+        evidence.expiry_deadline_class = StorageIntentExpiryDeadlineClass::CooldownWindow;
+        evidence.expiry_deadline_ref =
+            temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 12);
+
+        // Local cooldown with local monotonic time is valid.
+        assert!(temporal_evidence_supports_cooldown_claim(evidence, 5000, 10000, false));
+        // Cross-node cooldown needs wall-clock.
+        assert!(!temporal_evidence_supports_cooldown_claim(evidence, 5000, 10000, true));
+    }
+
+    #[test]
+    fn unbound_temporal_evidence_rejected() {
+        let evidence = StorageIntentTemporalEvidence::default();
+        assert!(!evidence.has_temporal_evidence());
+        assert!(!evidence.has_timebase());
+        assert!(!evidence.has_clock_health());
+        assert!(!evidence.has_event_frontier());
+        assert!(!evidence.has_lag_staleness());
+        assert!(!evidence.has_expiry_deadline());
+        assert!(!evidence.has_sequence_conversion());
+        assert!(!evidence.is_refused());
+
+        // All predicates must return false for unbound evidence.
+        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
+        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
+        assert!(!temporal_evidence_supports_expiry_claim(evidence, 10000, 5000, 5000));
+        assert!(!temporal_evidence_supports_cooldown_claim(evidence, 5000, 10000, false));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 3600_000, 5000));
+    }
+
+    #[test]
+    fn refused_temporal_evidence_blocks_all_claims() {
+        let mut evidence = healthy_wall_clock_timebase();
+        evidence.refusal = StorageIntentTemporalRefusalReason::MissingTimebase;
+
+        assert!(evidence.is_refused());
+        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
+        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
+        assert!(!temporal_evidence_supports_expiry_claim(evidence, 10000, 5000, 5000));
+    }
+
+    #[test]
+    fn temporal_evidence_age_requires_wall_clock_and_known_skew() {
+        let evidence = healthy_wall_clock_timebase();
+        assert_eq!(temporal_evidence_age_ms(evidence, 20000, 10000), Some(10000));
+
+        // Backwards time returns None.
+        assert_eq!(temporal_evidence_age_ms(evidence, 5000, 10000), None);
+
+        // Missing skew returns None.
+        let mut no_skew = evidence;
+        no_skew.clock_health.skew_bound_us = 0;
+        assert_eq!(temporal_evidence_age_ms(no_skew, 20000, 10000), None);
+
+        // Sequence-only returns None.
+        let mut seq = evidence;
+        seq.timebase = StorageIntentTimebaseClass::SequenceOnly;
+        assert_eq!(temporal_evidence_age_ms(seq, 20000, 10000), None);
+    }
+
+    #[test]
+    fn temporal_refusal_reasons_map_to_policy_refusals() {
+        assert_eq!(
+            temporal_refusal_to_policy_refusal(StorageIntentTemporalRefusalReason::None),
+            StorageIntentRefusalReason::None
+        );
+        assert_eq!(
+            temporal_refusal_to_policy_refusal(StorageIntentTemporalRefusalReason::MissingTimebase),
+            StorageIntentRefusalReason::MissingTemporalEvidence
+        );
+        assert_eq!(
+            temporal_refusal_to_policy_refusal(StorageIntentTemporalRefusalReason::StaleSample),
+            StorageIntentRefusalReason::StaleClockHealthSample
+        );
+        assert_eq!(
+            temporal_refusal_to_policy_refusal(
+                StorageIntentTemporalRefusalReason::ContradictoryFrontier
+            ),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_eq!(
+            temporal_refusal_to_policy_refusal(
+                StorageIntentTemporalRefusalReason::UnsupportedCrossDomainComparison
+            ),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn timebase_enums_encode_decode_roundtrip() {
+        let timebases = [
+            StorageIntentTimebaseClass::Unknown,
+            StorageIntentTimebaseClass::LocalMonotonic,
+            StorageIntentTimebaseClass::LocalWallClock,
+            StorageIntentTimebaseClass::ClusterConsensusTime,
+            StorageIntentTimebaseClass::RemoteWallClock,
+            StorageIntentTimebaseClass::SequenceLogFrontier,
+            StorageIntentTimebaseClass::SequenceOnly,
+        ];
+        for tb in &timebases {
+            let disc = tb.to_discriminant();
+            let decoded = StorageIntentTimebaseClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*tb), "roundtrip failed for {:?}", tb.as_str());
+        }
+        assert_eq!(StorageIntentTimebaseClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn temporal_refusal_enums_encode_decode_roundtrip() {
+        let refusals = [
+            StorageIntentTemporalRefusalReason::None,
+            StorageIntentTemporalRefusalReason::MissingTimebase,
+            StorageIntentTemporalRefusalReason::UnknownSkew,
+            StorageIntentTemporalRefusalReason::StaleSample,
+            StorageIntentTemporalRefusalReason::CrossedExpiry,
+            StorageIntentTemporalRefusalReason::ContradictoryFrontier,
+            StorageIntentTemporalRefusalReason::BackwardsTime,
+            StorageIntentTemporalRefusalReason::InsufficientSequenceFrontier,
+            StorageIntentTemporalRefusalReason::UnsupportedCrossDomainComparison,
+        ];
+        for r in &refusals {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentTemporalRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+        assert_eq!(
+            StorageIntentTemporalRefusalReason::from_discriminant(255),
+            None
+        );
+    }
+
+    #[test]
+    fn clock_health_flags_combine_and_test() {
+        let flags = ClockHealthFlags::from_flag(
+            ClockHealthFlags::MONOTONIC | ClockHealthFlags::KNOWN_SKEW,
+        );
+        assert!(flags.contains_all(ClockHealthFlags::MONOTONIC));
+        assert!(flags.contains_all(ClockHealthFlags::KNOWN_SKEW));
+        assert!(!flags.contains_all(ClockHealthFlags::NO_BACKWARDS_STEP));
+        assert!(flags.intersects(ClockHealthFlags::MONOTONIC));
+        assert!(!flags.intersects(ClockHealthFlags::NO_LEAP_SECOND_PENDING));
+
+        let all = ClockHealthFlags::from_flag(ClockHealthFlags::ALL_DEFINED);
+        assert!(all.contains_all(ClockHealthFlags::MONOTONIC));
+        assert!(all.contains_all(ClockHealthFlags::NO_STEP_ADJUSTMENT));
+    }
+
+    #[test]
+    fn sequence_time_conversion_validates_rate_and_bounds() {
+        let conv = StorageIntentSequenceTimeConversion {
+            rate_bytes_per_sec: 100_000_000,
+            observation_window_ms: 60_000,
+            uncertainty_bound_ms: 500,
+            conservative_bound_ms: 5000,
+            conversion_ref: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 20),
+        };
+        assert!(conv.has_evidence());
+        assert!(conv.has_conservative_rate());
+
+        let empty = StorageIntentSequenceTimeConversion::default();
+        assert!(!empty.has_evidence());
+        assert!(!empty.has_conservative_rate());
+    }
+
+    #[test]
+    fn ttl_claim_fails_on_sequence_only_timebase() {
+        let mut evidence = healthy_wall_clock_timebase();
+        evidence.timebase = StorageIntentTimebaseClass::SequenceOnly;
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+    }
+
+    #[test]
+    fn ttl_claim_fails_on_backwards_clock_step() {
+        let mut evidence = healthy_wall_clock_timebase();
+        evidence.clock_health.flags = ClockHealthFlags::from_flag(ClockHealthFlags::KNOWN_SKEW);
+        // Missing NO_BACKWARDS_STEP.
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+    }
+
+    #[test]
+    fn healthy_temporal_evidence_satisfies_all_wall_clock_claims() {
+        let evidence = healthy_wall_clock_timebase();
+        assert!(evidence.has_temporal_evidence());
+        assert!(evidence.has_timebase());
+        assert!(evidence.has_clock_health());
+        assert!(evidence.has_event_frontier());
+        assert!(evidence.has_lag_staleness());
+
+        // Known skew, no backwards step, wall-clock timebase, fresh sample.
+        assert!(temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
+        assert!(temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
+        assert!(temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert_eq!(temporal_evidence_age_ms(evidence, 20000, 10000), Some(10000));
     }
 }
