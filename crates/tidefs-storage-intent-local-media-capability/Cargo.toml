@@ -20,6 +20,8 @@ probing hardware or claiming durability from labels.
 [dependencies]
 tidefs-kernel-storage-io = { workspace = true }
 tidefs-storage-intent-core = { workspace = true }
+tidefs-types-pool-label-core = { workspace = true }
+tidefs-ublk-abi = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
