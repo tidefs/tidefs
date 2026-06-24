@@ -516,3 +516,21 @@ product source, Cargo manifests, the sealed types/trait design docs, other
 | Path | State | Classification note |
 |---|---|---|
 | `docs/design/incremental-job-core-wire-up-deferred-design.md` | Historical input | Imported Forgejo-era wire-up deferred design (old issue #2047, coordination seal #1930) with design-sealed status, design-spec maturity, storage-core lane, Forgejo-era URLs (`172.16.106.12/forgejo/forgeadmin`), and deferred wire-up claims for 14 background maintenance subsystems. The pre-existing "imported/historical design input" header annotation is consistent with this register's Historical input state: the annotation explicitly denies current policy, current spec, implementation-status evidence, release-readiness evidence, and worker scheduling authority. Live source has `tidefs-types-incremental-job-core` and `tidefs-incremental-job-core` crates implementing the sealed `IncrementalJob` trait contract, but the 14-subsystem wire-up deferral architecture, per-subsystem cursor schemas, schedule-priority table, observability contract, and subsystem-migration phases described in the document have no current live-source implementation evidence, no claim-registry coverage, and no current background-scheduler runtime authority in the active GitHub issue and PR coordination surface. The sibling sealed-types docs (`docs/design/incremental-job-core-types-crate-design.md`, `docs/design/incremental-job-core-types-crate-design-sealed.md`) remain under their own register rows. This file is preserved as lineage material for future incremental-job wire-up review and must not be cited as current TideFS implementation status, release-readiness evidence, or worker scheduling authority. |
+
+### Release Readiness Verdict Contract (#1279)
+
+Classified for GitHub issue #1279 on 2026-06-24 after reviewing this register's
+authority rule and review method, `docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md`,
+`docs/UNRELEASED_AUTHORITY_POLICY.md`, `docs/CLAIMS_GATE_POLICY.md`,
+`docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, `docs/GITHUB_CI.md`,
+`docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`, the current open PR and issue
+validation conventions, and bounded source inspection of
+`crates/tidefs-validation/src/performance_gate/runner.rs`. This slice classifies
+the verdict contract only; classification rows for the five evidence-input
+documents are deferred to a follow-up issue mapped in the contract's follow-up
+issue map. This slice does not edit the evidence-input documents beyond the
+cross-reference additions recorded in #1279.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/RELEASE_READINESS_VERDICT_CONTRACT.md` | Current policy | Design decision #1279 defining the release-readiness verdict boundary. Names the verdict owner, required evidence families, explicit non-claims, and the distinction between gate-local readiness receipts (such as P10-03 `GateReceipt.release_ready`, claims-gate claim status, and release-candidate evidence index) and whole-product admission. States that no release-readiness verdict exists as of 2026-06-24, that TideFS is not release-ready, and that no automated gate, CI workflow, or generated artifact may render an unqualified release-readiness claim without the verdict owner's recorded decision. Maps follow-up issues #1283 and #1284 for the remaining scoped P10-03 receipt rename/rendering work and release-facing documentation register classifications. The contract is a design/decision artifact; it does not implement a product surface, widen publishing claims, or change `validation/claims.toml`. |

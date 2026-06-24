@@ -361,6 +361,10 @@ standalone lane workflows.
 ### Gate role
 
 The release candidate evidence index is a **gate input**, not a gate verdict.
+The verdict boundary that consumes this evidence index and the other inputs
+listed below is defined in `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`. That
+contract records required evidence families, explicit non-claims, and the
+distinction between gate-local readiness receipts and whole-product admission.
 A product readiness decision must combine the index with:
 
 - Lane-local manifest review (issues 643-646).
