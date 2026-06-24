@@ -35,14 +35,27 @@ use tidefs_membership_epoch::{
 // Public types
 // ---------------------------------------------------------------------------
 
-/// The storage tier for which replica targets are being computed.
+/// Legacy storage-tier classification for replica-target computation.
+///
+/// `TierGoal` is preserved for existing callers and coarse tier selection,
+/// but it is not a complete storage-intent model.  Callers that need
+/// fine-grained placement roles, media constraints, trust/domain gates,
+/// transport eligibility, data-shape compatibility, or movement-payback
+/// evidence should use [`intent_planning::StorageIntentPlacementRole`]
+/// instead.  When a `StorageIntentPlacementRequest` carries a `TierGoal`,
+/// the planner emits a non-blocking `TierGoalIsNotStorageIntentModel` reason
+/// to make the legacy intent visible to explanation and performance consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TierGoal {
-    /// Primary replicas — full data set, strictest anti-affinity.
+    /// Primary replicas — full data set, strictest anti-affinity.  Prefer
+    /// [`StorageIntentPlacementRole::DurableFullPlacement`] for new code.
     Primary = 0,
-    /// Secondary replicas — may permit degraded placement.
+    /// Secondary replicas — may permit degraded placement.  Prefer
+    /// [`StorageIntentPlacementRole::AuthoritativeHotServingReplica`] for
+    /// authority-bearing secondary placement in new code.
     Secondary = 1,
-    /// Archive or cold replicas — relaxed anti-affinity.
+    /// Archive or cold replicas — relaxed anti-affinity.  Prefer
+    /// [`StorageIntentPlacementRole::ColdArchivePlacement`] for new code.
     Archive = 2,
 }
 
