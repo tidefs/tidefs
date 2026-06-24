@@ -21,10 +21,6 @@ use tidefs_storage_intent_core::{
 use tidefs_types_pool_label_core::{
     DeviceClass as LabelDeviceClass, PoolLabelV1, PoolState as LabelPoolState,
 };
-use tidefs_ublk_abi::{
-    UblkFeatureFlags, UblkParams, UBLK_ATTR_FUA, UBLK_ATTR_ROTATIONAL, UBLK_ATTR_VOLATILE_CACHE,
-    UBLK_PARAM_TYPE_BASIC, UBLK_PARAM_TYPE_DISCARD, UBLK_PARAM_TYPE_ZONED,
-};
 
 /// Version of the local media-capability producer record shape.
 pub const LOCAL_MEDIA_CAPABILITY_PRODUCER_VERSION: u16 = 1;
@@ -49,10 +45,6 @@ const fn bytes16_nonzero(bytes: [u8; 16]) -> bool {
         index += 1;
     }
     false
-}
-
-const fn ublk_param_type_present(params: UblkParams, ty: u32) -> bool {
-    (params.types & ty) == ty
 }
 
 const fn block_bytes_from_shift(shift: u8) -> u32 {
@@ -323,9 +315,118 @@ impl LocalPersistenceSnapshot {
 
 /// ublk queue and request-shape sample, not lower-media durability proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalUblkShapeParams {
+    pub basic_shape_present: bool,
+    pub discard_shape_present: bool,
+    pub zoned_shape_present: bool,
+    pub fua_advertised: bool,
+    pub rotational: bool,
+    pub volatile_write_cache: bool,
+    pub zoned_feature_advertised: bool,
+    pub logical_bs_shift: u8,
+    pub physical_bs_shift: u8,
+    pub io_opt_shift: u8,
+    pub dev_sectors: u64,
+    pub max_discard_sectors: u32,
+    pub max_write_zeroes_sectors: u32,
+    pub max_zone_append_sectors: u32,
+}
+
+impl Default for LocalUblkShapeParams {
+    fn default() -> Self {
+        Self {
+            basic_shape_present: false,
+            discard_shape_present: false,
+            zoned_shape_present: false,
+            fua_advertised: false,
+            rotational: false,
+            volatile_write_cache: false,
+            zoned_feature_advertised: false,
+            logical_bs_shift: 0,
+            physical_bs_shift: 0,
+            io_opt_shift: 0,
+            dev_sectors: 0,
+            max_discard_sectors: 0,
+            max_write_zeroes_sectors: 0,
+            max_zone_append_sectors: 0,
+        }
+    }
+}
+
+impl LocalUblkShapeParams {
+    #[must_use]
+    pub const fn block_device(
+        logical_bs_shift: u8,
+        physical_bs_shift: u8,
+        io_opt_shift: u8,
+        dev_sectors: u64,
+    ) -> Self {
+        Self {
+            basic_shape_present: true,
+            discard_shape_present: false,
+            zoned_shape_present: false,
+            fua_advertised: false,
+            rotational: false,
+            volatile_write_cache: false,
+            zoned_feature_advertised: false,
+            logical_bs_shift,
+            physical_bs_shift,
+            io_opt_shift,
+            dev_sectors,
+            max_discard_sectors: 0,
+            max_write_zeroes_sectors: 0,
+            max_zone_append_sectors: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_fua_advertised(mut self) -> Self {
+        self.fua_advertised = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_rotational(mut self) -> Self {
+        self.rotational = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_volatile_write_cache(mut self) -> Self {
+        self.volatile_write_cache = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_discard_shape(
+        mut self,
+        max_discard_sectors: u32,
+        max_write_zeroes_sectors: u32,
+    ) -> Self {
+        self.discard_shape_present = true;
+        self.max_discard_sectors = max_discard_sectors;
+        self.max_write_zeroes_sectors = max_write_zeroes_sectors;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_zoned_shape(mut self, max_zone_append_sectors: u32) -> Self {
+        self.zoned_shape_present = true;
+        self.max_zone_append_sectors = max_zone_append_sectors;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_zoned_feature_advertised(mut self) -> Self {
+        self.zoned_feature_advertised = true;
+        self
+    }
+}
+
+/// Normalized ublk queue and request-shape sample, not ublk ABI ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalUblkRequestShapeSnapshot {
-    pub params: UblkParams,
-    pub features: UblkFeatureFlags,
+    pub params: LocalUblkShapeParams,
     pub queue_depth: u16,
     pub observed_flush_request: bool,
     pub observed_fua_write: bool,
@@ -337,8 +438,7 @@ pub struct LocalUblkRequestShapeSnapshot {
 impl Default for LocalUblkRequestShapeSnapshot {
     fn default() -> Self {
         Self {
-            params: UblkParams::default(),
-            features: UblkFeatureFlags(0),
+            params: LocalUblkShapeParams::default(),
             queue_depth: 0,
             observed_flush_request: false,
             observed_fua_write: false,
@@ -351,10 +451,9 @@ impl Default for LocalUblkRequestShapeSnapshot {
 
 impl LocalUblkRequestShapeSnapshot {
     #[must_use]
-    pub const fn new(params: UblkParams, features: UblkFeatureFlags, queue_depth: u16) -> Self {
+    pub const fn new(params: LocalUblkShapeParams, queue_depth: u16) -> Self {
         Self {
             params,
-            features,
             queue_depth,
             observed_flush_request: false,
             observed_fua_write: false,
@@ -386,28 +485,27 @@ impl LocalUblkRequestShapeSnapshot {
 
     #[must_use]
     pub const fn block_io_facts(self, flush_ref: StorageIntentEvidenceRef) -> LocalBlockIoFacts {
-        let logical_block_bytes = if ublk_param_type_present(self.params, UBLK_PARAM_TYPE_BASIC) {
-            block_bytes_from_shift(self.params.basic.logical_bs_shift)
+        let logical_block_bytes = if self.params.basic_shape_present {
+            block_bytes_from_shift(self.params.logical_bs_shift)
         } else {
             0
         };
         let capabilities = KernelStorageIoCapabilities {
-            read: logical_block_bytes != 0 && self.params.basic.dev_sectors != 0,
-            write: logical_block_bytes != 0 && self.params.basic.dev_sectors != 0,
+            read: logical_block_bytes != 0 && self.params.dev_sectors != 0,
+            write: logical_block_bytes != 0 && self.params.dev_sectors != 0,
             flush: self.observed_flush_request || self.flush_passthrough_proven,
-            discard: ublk_param_type_present(self.params, UBLK_PARAM_TYPE_DISCARD)
-                && self.params.discard.max_discard_sectors != 0,
-            write_zeroes: ublk_param_type_present(self.params, UBLK_PARAM_TYPE_DISCARD)
-                && self.params.discard.max_write_zeroes_sectors != 0,
+            discard: self.params.discard_shape_present && self.params.max_discard_sectors != 0,
+            write_zeroes: self.params.discard_shape_present
+                && self.params.max_write_zeroes_sectors != 0,
             zero_range: false,
             teardown: false,
             sector_size: logical_block_bytes,
-            capacity_sectors: self.params.basic.dev_sectors,
+            capacity_sectors: self.params.dev_sectors,
         };
         let flush_ordering = if self.flush_passthrough_proven
             && self.fua_passthrough_proven
             && self.ordering_limitations_absent
-            && (self.params.basic.attrs & UBLK_ATTR_FUA) == UBLK_ATTR_FUA
+            && self.params.fua_advertised
         {
             MediaFlushOrderingClass::FlushAndFua
         } else if self.observed_flush_request || self.observed_fua_write {
@@ -432,8 +530,8 @@ impl LocalUblkRequestShapeSnapshot {
         logical_block_atomic_proven: bool,
         atomicity_ref: StorageIntentEvidenceRef,
     ) -> LocalAtomicityFacts {
-        let physical_block_bytes = if ublk_param_type_present(self.params, UBLK_PARAM_TYPE_BASIC) {
-            block_bytes_from_shift(self.params.basic.physical_bs_shift)
+        let physical_block_bytes = if self.params.basic_shape_present {
+            block_bytes_from_shift(self.params.physical_bs_shift)
         } else {
             0
         };
@@ -457,22 +555,20 @@ impl LocalUblkRequestShapeSnapshot {
         self,
         geometry_ref: StorageIntentEvidenceRef,
     ) -> LocalGeometryFacts {
-        let optimal_io_bytes = if ublk_param_type_present(self.params, UBLK_PARAM_TYPE_BASIC) {
-            block_bytes_from_shift(self.params.basic.io_opt_shift)
+        let optimal_io_bytes = if self.params.basic_shape_present {
+            block_bytes_from_shift(self.params.io_opt_shift)
         } else {
             0
         };
-        let geometry = if self.features.contains(UblkFeatureFlags::ZONED)
-            || ublk_param_type_present(self.params, UBLK_PARAM_TYPE_ZONED)
-        {
-            if self.params.zoned.max_zone_append_sectors != 0 {
+        let geometry = if self.params.zoned_feature_advertised || self.params.zoned_shape_present {
+            if self.params.max_zone_append_sectors != 0 {
                 MediaProtocolGeometryClass::ZonedAppend
             } else {
                 MediaProtocolGeometryClass::ZonedSequential
             }
-        } else if (self.params.basic.attrs & UBLK_ATTR_ROTATIONAL) == UBLK_ATTR_ROTATIONAL {
+        } else if self.params.rotational {
             MediaProtocolGeometryClass::RotationalSeek
-        } else if ublk_param_type_present(self.params, UBLK_PARAM_TYPE_BASIC) {
+        } else if self.params.basic_shape_present {
             MediaProtocolGeometryClass::RandomBlock
         } else {
             MediaProtocolGeometryClass::Unknown
@@ -483,7 +579,7 @@ impl LocalUblkRequestShapeSnapshot {
 
     #[must_use]
     pub const fn volatile_write_cache_visible(self) -> bool {
-        (self.params.basic.attrs & UBLK_ATTR_VOLATILE_CACHE) == UBLK_ATTR_VOLATILE_CACHE
+        self.params.volatile_write_cache
     }
 }
 
@@ -1061,19 +1157,10 @@ mod tests {
         label
     }
 
-    fn ublk_params() -> UblkParams {
-        let mut params = UblkParams {
-            types: UBLK_PARAM_TYPE_BASIC | UBLK_PARAM_TYPE_DISCARD,
-            ..UblkParams::default()
-        };
-        params.basic.attrs = UBLK_ATTR_FUA;
-        params.basic.logical_bs_shift = 12;
-        params.basic.physical_bs_shift = 12;
-        params.basic.io_opt_shift = 17;
-        params.basic.dev_sectors = 2048;
-        params.discard.max_discard_sectors = 128;
-        params.discard.max_write_zeroes_sectors = 64;
-        params
+    const fn ublk_params() -> LocalUblkShapeParams {
+        LocalUblkShapeParams::block_device(12, 12, 17, 2048)
+            .with_fua_advertised()
+            .with_discard_shape(128, 64)
     }
 
     #[test]
@@ -1260,7 +1347,7 @@ mod tests {
 
     #[test]
     fn ublk_fua_request_shape_without_passthrough_proof_is_flush_only() {
-        let ublk = LocalUblkRequestShapeSnapshot::new(ublk_params(), UblkFeatureFlags(0), 32)
+        let ublk = LocalUblkRequestShapeSnapshot::new(ublk_params(), 32)
             .with_observed_flush_request()
             .with_observed_fua_write();
         let facts = strong_nvme_facts().with_block_io(ublk.block_io_facts(evidence(5)));
@@ -1288,7 +1375,7 @@ mod tests {
             LocalPathIdentityClass::StableMultipath,
             5,
         );
-        let ublk = LocalUblkRequestShapeSnapshot::new(ublk_params(), UblkFeatureFlags(0), 64)
+        let ublk = LocalUblkRequestShapeSnapshot::new(ublk_params(), 64)
             .with_observed_flush_request()
             .with_observed_fua_write()
             .with_ordering_passthrough_proof();

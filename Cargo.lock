@@ -3498,7 +3498,6 @@ dependencies = [
  "tidefs-kernel-storage-io",
  "tidefs-storage-intent-core",
  "tidefs-types-pool-label-core",
- "tidefs-ublk-abi",
 ]
 
 [[package]]
