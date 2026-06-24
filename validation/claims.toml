@@ -257,11 +257,13 @@ id = "ublk.started_export.live_service_loop.v1"
 status = "validated"
 scope = "uBLK started export admission and daemon-owned live data-queue service loop"
 required_evidence_classes = [
+  "started-export-service-loop-model",
   "runtime-ublk-started-export-admission-artifact",
   "runtime-ublk-completion-artifact",
   "claims-gate-review",
 ]
 evidence_requirements = [
+  { class = "started-export-service-loop-model", path = "validation/artifacts/ublk/started-export-service-loop-model.json", validation_tier = "source-model", blocking_issues = [] },
   { class = "runtime-ublk-started-export-admission-artifact", path = "validation/artifacts/ublk/started-export-admission-runtime.json", validation_tier = "qemu-guest", blocking_issues = [] },
   { class = "runtime-ublk-completion-artifact", path = "validation/artifacts/ublk/qid-tag-completion-runtime.json", validation_tier = "qemu-guest", blocking_issues = [] },
   { class = "claims-gate-review", path = "validation/artifacts/ublk/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
@@ -341,3 +343,246 @@ generated_doc = "Blocked page-cache writeback authority claim. TideFS has the au
 evidence_artifacts = [
   { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", source = "claims-gate", scope = "model-runtime-boundary-review" },
 ]
+
+[[claims]]
+id = "storage.intent.ack_receipt_honesty.v1"
+status = "blocked"
+scope = "storage-intent acknowledgment receipts and hidden durable-to-volatile downgrade prevention"
+required_evidence_classes = [
+  "storage-intent-policy-receipt-authority",
+  "storage-intent-ack-receipt-runtime",
+  "storage-intent-ordering-membership-media-gates",
+  "storage-intent-ack-fault-matrix",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "storage-intent-policy-receipt-authority", path = "validation/artifacts/storage-intent/ack-receipt-policy-authority.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ack-receipt-policy-authority.manifest.json", blocking_issues = ["#841", "#855", "#913", "#920"] },
+  { class = "storage-intent-ack-receipt-runtime", path = "validation/artifacts/storage-intent/ack-receipt-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/storage-intent/ack-receipt-runtime.manifest.json", blocking_issues = ["#842", "#862", "#874", "#920"] },
+  { class = "storage-intent-ordering-membership-media-gates", path = "validation/artifacts/storage-intent/ack-receipt-authority-gates.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ack-receipt-authority-gates.manifest.json", blocking_issues = ["#750", "#894", "#904", "#913"] },
+  { class = "storage-intent-ack-fault-matrix", path = "validation/artifacts/storage-intent/ack-receipt-fault-matrix.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/ack-receipt-fault-matrix.manifest.json", blocking_issues = ["#863", "#900"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ack-receipt-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+]
+blockers = [
+  "Earned acknowledgment receipts from #842, policy source records from #855, consistent evidence cuts from #913, and caller-visible result/refusal evidence from #920 are not registered as validated runtime evidence for this claim.",
+  "Membership epoch #750, ordering/replay #894, and media capability #904 gates must prove the receipt participants before a volatile, local-intent, quorum-intent, full-placement, geo-async, or geo-intent acknowledgment can be called durable.",
+  "Fault rows from #863 and recovery/degradation evidence from #900 must reject kill-before-ack, crash-after-ack, stale media, and under-quorum cases without silently downgrading the promised receipt class.",
+  "Non-claim boundary: a receipt label, source-model row, simulation, or successful local write is not proof of durable acknowledgment honesty and must not support product-facing durability wording.",
+]
+generated_doc = "Blocked storage-intent acknowledgment receipt honesty claim. Future wording must show policy-source, earned-receipt, membership, ordering, media-capability, result/refusal, and fault evidence before TideFS may imply that acknowledgments avoid hidden durable-to-volatile downgrades."
+evidence_artifacts = []
+
+[[claims]]
+id = "storage.intent.sync_latency_envelope.v1"
+status = "blocked"
+scope = "fast local and quorum sync intent latency under declared workload, media, topology, and service-objective envelopes"
+required_evidence_classes = [
+  "storage-intent-service-objective-envelope",
+  "storage-intent-sync-performance-row",
+  "storage-intent-scheduler-admission-row",
+  "storage-intent-sync-fault-row",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "storage-intent-service-objective-envelope", path = "validation/artifacts/storage-intent/sync-latency-service-objective.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/sync-latency-service-objective.manifest.json", blocking_issues = ["#855", "#913", "#915"] },
+  { class = "storage-intent-sync-performance-row", path = "validation/artifacts/storage-intent/sync-latency-performance-row.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/sync-latency-performance-row.manifest.json", blocking_issues = ["#846", "#850", "#912", "#928"] },
+  { class = "storage-intent-scheduler-admission-row", path = "validation/artifacts/storage-intent/sync-latency-scheduler-admission.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/sync-latency-scheduler-admission.manifest.json", blocking_issues = ["#862", "#898", "#902", "#904"] },
+  { class = "storage-intent-sync-fault-row", path = "validation/artifacts/storage-intent/sync-latency-fault-row.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/sync-latency-fault-row.manifest.json", blocking_issues = ["#863", "#900", "#920"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/sync-latency-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/sync-latency-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+]
+blockers = [
+  "Performance rows from #850 must bind the exact ack class, p50/p95/p99/tail envelope, media/topology profile, transport path #846, service objective #915, and comparator evidence #928 before any fast-sync claim can strengthen.",
+  "Scheduler admission #862, capacity admission #898, tenant isolation #902, media capability #904, and result/refusal #920 evidence must show low latency was not bought by illegal reserve borrowing, hidden throttling, or weaker receipt semantics.",
+  "Measurement attribution #912 and fault validation #863 must prove row evidence is causal and durable under crash, partition, media, recovery, and degraded-state cases; row-only or average-only evidence is not claim proof.",
+  "Non-claim boundary: a benchmark row, simulator estimate, class label, or comparator name alone is diagnostic only and must not become OpenZFS/Ceph/DRBD or fast durable sync product wording.",
+]
+generated_doc = "Blocked storage-intent sync latency envelope claim. Future wording must cite service-objective, performance-row, scheduler/admission, media, attribution, comparator, result/refusal, and fault evidence for the declared envelope before TideFS may claim fast local or quorum sync intent latency."
+evidence_artifacts = []
+
+[[claims]]
+id = "storage.intent.placement_satisfaction.v1"
+status = "blocked"
+scope = "adaptive placement and relocation preserving policy satisfaction state, receipts, and source-retirement boundaries"
+required_evidence_classes = [
+  "storage-intent-placement-decision-frontier",
+  "storage-intent-satisfaction-reconciler",
+  "storage-intent-relocation-action-execution",
+  "storage-intent-placement-performance-fault-rows",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "storage-intent-placement-decision-frontier", path = "validation/artifacts/storage-intent/placement-decision-frontier.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/placement-decision-frontier.manifest.json", blocking_issues = ["#843", "#845", "#904", "#905", "#913", "#926"] },
+  { class = "storage-intent-satisfaction-reconciler", path = "validation/artifacts/storage-intent/placement-satisfaction-reconciler.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/placement-satisfaction-reconciler.manifest.json", blocking_issues = ["#841", "#874", "#901", "#920"] },
+  { class = "storage-intent-relocation-action-execution", path = "validation/artifacts/storage-intent/placement-relocation-action-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/placement-relocation-action-execution.manifest.json", blocking_issues = ["#848", "#911", "#912", "#920"] },
+  { class = "storage-intent-placement-performance-fault-rows", path = "validation/artifacts/storage-intent/placement-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/placement-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#898", "#900"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/placement-satisfaction-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/placement-satisfaction-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+]
+blockers = [
+  "Placement planning #843, predictor evidence #845, media capability #904, decision-frontier evidence #905, and preflight simulation #926 must distinguish candidate evaluation from authority-changing placement.",
+  "Satisfaction reconciliation #874, policy rollout #901, result/refusal #920, action execution #911, and relocation #848 must prove replacements are published and source receipts are retired only after satisfaction remains visible and earned.",
+  "Capacity #898, recovery/degradation #900, performance #850, fault #863, attribution #912, and evidence-query #913 rows must cover relocation, repair, rebuild, rebake, geo catch-up, and failure cases under the declared envelope.",
+  "Non-claim boundary: adaptive placement, decision score, preflight output, simulation-only satisfaction, or copied bytes cannot prove placement correctness or source-retirement safety.",
+]
+generated_doc = "Blocked storage-intent placement satisfaction claim. Future wording must prove decision frontiers, satisfaction reconciliation, action execution, relocation/source-retirement law, performance, attribution, capacity, recovery, and fault rows before TideFS may claim adaptive placement or relocation preserves satisfaction state and receipts."
+evidence_artifacts = []
+
+[[claims]]
+id = "storage.intent.flash_wear_budget.v1"
+status = "blocked"
+scope = "flash wear, write amplification, and movement-budget protection for promotion, defrag, rebake, rebuild, relocation, and prefetch/residency actions"
+required_evidence_classes = [
+  "storage-intent-media-cost-wear-ledger",
+  "storage-intent-wear-decision-attribution",
+  "storage-intent-wear-performance-fault-rows",
+  "storage-intent-prefetch-residency-execution",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "storage-intent-media-cost-wear-ledger", path = "validation/artifacts/storage-intent/flash-wear-cost-ledger.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/flash-wear-cost-ledger.manifest.json", blocking_issues = ["#844", "#856", "#898", "#904"] },
+  { class = "storage-intent-wear-decision-attribution", path = "validation/artifacts/storage-intent/flash-wear-decision-attribution.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/flash-wear-decision-attribution.manifest.json", blocking_issues = ["#845", "#905", "#912", "#913", "#915"] },
+  { class = "storage-intent-wear-performance-fault-rows", path = "validation/artifacts/storage-intent/flash-wear-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/flash-wear-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#900"] },
+  { class = "storage-intent-prefetch-residency-execution", path = "validation/artifacts/storage-intent/flash-wear-prefetch-residency-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/flash-wear-prefetch-residency-execution.manifest.json", blocking_issues = ["#848", "#862", "#967", "#972"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/flash-wear-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/flash-wear-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+]
+blockers = [
+  "Media cost and wear ledger evidence from #844/#856, capacity admission #898, and media capability #904 must prove unknown WAF, endurance reserve exhaustion, and stale device labels are fail-closed.",
+  "Decision #905, prediction #845, service-objective #915, attribution #912, and evidence-query #913 evidence must bind every movement, promotion, demotion, or cooldown to causal wear and payback data.",
+  "Scheduler #862, relocation #848, prefetch decision #967, prefetch executor #972, performance #850, fault #863, and recovery #900 evidence must show movement does not hide flash-wear harm behind cache warming, relocation, rebuild, or rebake wins.",
+  "Non-claim boundary: WAF estimates, device-class labels, simulator projections, or row-only media counters are not proof of flash-wear protection or smarter tiering.",
+]
+generated_doc = "Blocked storage-intent flash-wear budget claim. Future wording must prove media/cost ledgers, admission, decision and attribution evidence, prefetch/residency execution, performance rows, and fault rows before TideFS may claim flash-friendly placement, learned tiering, or write-amplification protection."
+evidence_artifacts = []
+
+[[claims]]
+id = "storage.intent.data_shape_honesty.v1"
+status = "blocked"
+scope = "data-shape and transform honesty for compression, checksum/digest, deduplication, encryption, erasure coding, archive shape, coalescing, and rebake claims"
+required_evidence_classes = [
+  "storage-intent-data-shape-policy-evidence",
+  "storage-intent-transform-execution-evidence",
+  "storage-intent-data-shape-performance-fault-rows",
+  "storage-intent-data-shape-result-boundary",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "storage-intent-data-shape-policy-evidence", path = "validation/artifacts/storage-intent/data-shape-policy-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-policy-evidence.manifest.json", blocking_issues = ["#855", "#878", "#904", "#913", "#915"] },
+  { class = "storage-intent-transform-execution-evidence", path = "validation/artifacts/storage-intent/data-shape-transform-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/data-shape-transform-execution.manifest.json", blocking_issues = ["#848", "#911", "#912", "#920"] },
+  { class = "storage-intent-data-shape-performance-fault-rows", path = "validation/artifacts/storage-intent/data-shape-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/data-shape-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#898", "#900"] },
+  { class = "storage-intent-data-shape-result-boundary", path = "validation/artifacts/storage-intent/data-shape-result-boundary.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-result-boundary.manifest.json", blocking_issues = ["#841", "#874", "#901", "#920"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/data-shape-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/data-shape-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+]
+blockers = [
+  "Data-shape policy evidence #878, dataset policy source #855, media capability #904, evidence-query cuts #913, and service objectives #915 must bind record size, compression, digest, dedup, encryption, EC, archive, coalescing, and refusal state.",
+  "Relocation/rebake #848, action execution #911, measurement attribution #912, result/refusal #920, satisfaction #874, and rollout #901 evidence must prove transformed bytes do not imply authority, source retirement, or degraded-read safety before receipts say so.",
+  "Performance #850, fault #863, capacity #898, and recovery #900 evidence must cover CPU cost, read amplification, degraded reconstruction, key epoch, illegal dedup domain, malformed transform frames, and EC/archive under-width cases.",
+  "Non-claim boundary: transform labels, class-only evidence, rebake intent, compression ratio, or simulation-only output cannot become data-shape correctness, capacity, performance, or successor wording.",
+]
+generated_doc = "Blocked storage-intent data-shape honesty claim. Future wording must prove policy evidence, transform execution, result/refusal and satisfaction boundaries, performance rows, and fault rows before TideFS may claim honest compression, digest, dedup, encryption, EC/archive, coalescing, or rebake behavior."
+evidence_artifacts = []
+
+[[claims]]
+id = "storage.intent.layout_allocator_honesty.v1"
+status = "blocked"
+scope = "allocator and layout honesty for defrag, compaction, zone/alignment, pending-free, reclaim, and fragmentation claims"
+required_evidence_classes = [
+  "storage-intent-layout-policy-evidence",
+  "storage-intent-lifecycle-capacity-evidence",
+  "storage-intent-layout-action-execution",
+  "storage-intent-layout-performance-fault-rows",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "storage-intent-layout-policy-evidence", path = "validation/artifacts/storage-intent/layout-policy-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/layout-policy-evidence.manifest.json", blocking_issues = ["#855", "#880", "#904", "#905", "#913"] },
+  { class = "storage-intent-lifecycle-capacity-evidence", path = "validation/artifacts/storage-intent/layout-lifecycle-capacity-evidence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/layout-lifecycle-capacity-evidence.manifest.json", blocking_issues = ["#881", "#898", "#900", "#903"] },
+  { class = "storage-intent-layout-action-execution", path = "validation/artifacts/storage-intent/layout-action-execution.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/layout-action-execution.manifest.json", blocking_issues = ["#848", "#911", "#912", "#920"] },
+  { class = "storage-intent-layout-performance-fault-rows", path = "validation/artifacts/storage-intent/layout-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/layout-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#862", "#902"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/layout-allocator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/layout-allocator-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+]
+blockers = [
+  "Layout evidence #880, dataset policy #855, media capability #904, decision frontier #905, and evidence-query #913 must bind fragmentation, free-run pressure, locality, zone/write-pointer, alignment, pending-free, and reclaim debt before allocator claims can strengthen.",
+  "Lifecycle #881, capacity/admission #898, recovery/degradation #900, and temporal #903 evidence must prove pending-free and reclaim frontiers are current and legal before reuse, defrag, compaction, or source retirement.",
+  "Relocation #848, action execution #911, attribution #912, scheduler #862, tenant isolation #902, performance #850, fault #863, and result/refusal #920 rows must cover crashes, ENOSPC, reserve erosion, wrong-generation layout evidence, and zone/alignment incompatibility.",
+  "Non-claim boundary: free-space mirrors, fragmentation scores, pending-free queues, simulator output, or defrag row labels are not allocator/layout correctness proof.",
+]
+generated_doc = "Blocked storage-intent allocator/layout honesty claim. Future wording must prove layout policy, lifecycle and capacity frontiers, action execution, result/refusal, performance rows, and fault rows before TideFS may claim safe defrag, compaction, zone alignment, pending-free reuse, reclaim, or fragmentation improvement."
+evidence_artifacts = []
+
+[[claims]]
+id = "storage.intent.geo_async_rpo.v1"
+status = "blocked"
+scope = "WAN and internet geo-async RPO, geo-intent, catch-up, and freshness honesty without RDMA as a correctness dependency"
+required_evidence_classes = [
+  "storage-intent-geo-policy-transport-evidence",
+  "storage-intent-geo-temporal-recovery-evidence",
+  "storage-intent-geo-performance-fault-rows",
+  "storage-intent-geo-result-boundary",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "storage-intent-geo-policy-transport-evidence", path = "validation/artifacts/storage-intent/geo-policy-transport-evidence.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/geo-policy-transport-evidence.manifest.json", blocking_issues = ["#750", "#846", "#855", "#904", "#913"] },
+  { class = "storage-intent-geo-temporal-recovery-evidence", path = "validation/artifacts/storage-intent/geo-temporal-recovery-evidence.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/geo-temporal-recovery-evidence.manifest.json", blocking_issues = ["#881", "#900", "#901", "#903", "#920"] },
+  { class = "storage-intent-geo-performance-fault-rows", path = "validation/artifacts/storage-intent/geo-performance-fault-rows.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/geo-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#912", "#915"] },
+  { class = "storage-intent-geo-result-boundary", path = "validation/artifacts/storage-intent/geo-result-boundary.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/geo-result-boundary.manifest.json", blocking_issues = ["#842", "#874", "#898", "#902", "#920"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/geo-async-rpo-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+]
+blockers = [
+  "Transport path #846, membership #750, policy source #855, media capability #904, evidence-query #913, and result/refusal #920 evidence must bind WAN/internet and RDMA-absent baselines before geo claims can strengthen.",
+  "Temporal #903, lifecycle #881, recovery/degradation #900, policy rollout #901, satisfaction #874, capacity #898, and tenant isolation #902 evidence must prove lag, catch-up, freshness, backlog, and degraded-visible boundaries.",
+  "Performance #850, fault #863, service objective #915, attribution #912, and earned ack receipts #842 must cover partitions, latency stretch, packet loss, bandwidth clamp, stale clocks, and remote-lag forbidden outcomes.",
+  "Non-claim boundary: RDMA availability, TCP connectivity, geo backlog counters, stale-read labels, or simulation-only preflight output do not prove RPO seconds, latest-read freshness, or geo-intent correctness.",
+]
+generated_doc = "Blocked storage-intent geo-async RPO claim. Future wording must prove WAN/internet transport, temporal lag, recovery/degradation, policy rollout, service-objective, performance, attribution, result/refusal, and fault evidence before TideFS may claim geo-async RPO or geo-intent behavior without RDMA as a correctness dependency."
+evidence_artifacts = []
+
+[[claims]]
+id = "storage.intent.ram_authority_loss_boundary.v1"
+status = "blocked"
+scope = "RAM, replicated-volatile, PMem-backed, and intent-backed authority loss-boundary honesty"
+required_evidence_classes = [
+  "storage-intent-ram-authority-policy",
+  "storage-intent-ram-media-receipt-gates",
+  "storage-intent-ram-performance-fault-rows",
+  "storage-intent-ram-result-boundary",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "storage-intent-ram-authority-policy", path = "validation/artifacts/storage-intent/ram-authority-policy.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ram-authority-policy.manifest.json", blocking_issues = ["#847", "#855", "#913", "#915"] },
+  { class = "storage-intent-ram-media-receipt-gates", path = "validation/artifacts/storage-intent/ram-media-receipt-gates.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/ram-media-receipt-gates.manifest.json", blocking_issues = ["#842", "#904", "#920", "#957"] },
+  { class = "storage-intent-ram-performance-fault-rows", path = "validation/artifacts/storage-intent/ram-performance-fault-rows.json", validation_tier = "qemu-guest", manifest_path = "validation/artifacts/storage-intent/ram-performance-fault-rows.manifest.json", blocking_issues = ["#850", "#863", "#900"] },
+  { class = "storage-intent-ram-result-boundary", path = "validation/artifacts/storage-intent/ram-result-boundary.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ram-result-boundary.manifest.json", blocking_issues = ["#750", "#874", "#894", "#901", "#902"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/ram-authority-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/ram-authority-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+]
+blockers = [
+  "RAM authority #847, dataset policy #855, evidence-query #913, service-objective #915, media capability #904, and media-native convergence #957 must distinguish volatile RAM, replicated volatile RAM, PMem persistence domains, and intent-backed authority.",
+  "Ack receipts #842, ordering #894, membership #750, satisfaction #874, rollout #901, isolation #902, and result/refusal #920 evidence must make loss boundaries caller-visible instead of silently treating volatile success as durable POSIX or block barriers.",
+  "Performance #850, fault #863, and recovery/degradation #900 rows must cover RAM loss, node loss, stale replicas, PMem flush/FUA/barrier gaps, and degradation without upgrading volatile evidence into durability proof.",
+  "Non-claim boundary: RAM-fast latency, replicated-copy counts, PMem labels, or source-model authority text do not prove durable RAM authority or loss-boundary safety.",
+]
+generated_doc = "Blocked storage-intent RAM authority loss-boundary claim. Future wording must prove RAM authority policy, media/receipt gates, membership and ordering, result/refusal visibility, performance rows, and fault rows before TideFS may claim RAM-fast, replicated, PMem-backed, or intent-backed authority durability."
+evidence_artifacts = []
+
+[[claims]]
+id = "storage.intent.successor_comparator.v1"
+status = "blocked"
+scope = "explicit OpenZFS, Ceph, DRBD, local-filesystem successor or comparator-performance wording for storage-intent behavior"
+required_evidence_classes = [
+  "storage-intent-comparator-equivalence-evidence",
+  "storage-intent-successor-performance-fault-set",
+  "storage-intent-successor-claim-boundary-review",
+  "storage-intent-operator-explanation-evidence",
+  "claims-gate-review",
+]
+evidence_requirements = [
+  { class = "storage-intent-comparator-equivalence-evidence", path = "validation/artifacts/storage-intent/successor-comparator-equivalence.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-comparator-equivalence.manifest.json", blocking_issues = ["#850", "#912", "#913", "#915", "#928"] },
+  { class = "storage-intent-successor-performance-fault-set", path = "validation/artifacts/storage-intent/successor-performance-fault-set.json", validation_tier = "multi-process-distributed", manifest_path = "validation/artifacts/storage-intent/successor-performance-fault-set.manifest.json", blocking_issues = ["#846", "#850", "#863", "#900", "#904"] },
+  { class = "storage-intent-successor-claim-boundary-review", path = "validation/artifacts/storage-intent/successor-claim-boundary-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-claim-boundary-review.manifest.json", blocking_issues = ["#841", "#843", "#844", "#845", "#848", "#855", "#856", "#862", "#874", "#878", "#880", "#905", "#920", "#926"] },
+  { class = "storage-intent-operator-explanation-evidence", path = "validation/artifacts/storage-intent/successor-operator-explanation.json", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-operator-explanation.manifest.json", blocking_issues = ["#849", "#901", "#902", "#903", "#913", "#920"] },
+  { class = "claims-gate-review", path = "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/storage-intent/successor-comparator-claims-gate-review.manifest.json", blocking_issues = ["#875"] },
+]
+blockers = [
+  "Comparator equivalence #928, performance #850, fault #863, attribution #912, evidence-query #913, service-objective #915, transport #846, media capability #904, and recovery/degradation #900 evidence must match the exact workload, media, topology, failure, and cost envelope.",
+  "Policy receipts #841, placement #843, media/wear #844, prediction #845, relocation #848, policy config #855, cost #856, scheduler #862, satisfaction #874, data-shape #878, layout #880, decision frontier #905, result/refusal #920, and preflight #926 boundaries must be claim-ready before successor wording can consume them.",
+  "Operator explanation #849, rollout #901, tenant isolation #902, temporal #903, evidence-query #913, and result/refusal #920 evidence must expose residual limitations, refusals, degraded-visible states, and non-comparable envelopes.",
+  "Non-claim boundary: naming OpenZFS, Ceph, DRBD, local filesystems, an average throughput win, a benchmark class, or a row label is not product-language permission without a validated claim for the exact scope.",
+]
+generated_doc = "Blocked storage-intent successor/comparator claim. Future wording must prove comparator equivalence, matched performance and fault evidence, attribution, operator explanation, and every consumed storage-intent claim boundary before TideFS may use explicit OpenZFS, Ceph, DRBD, local-filesystem successor, superiority, or comparator-performance wording."
+evidence_artifacts = []
