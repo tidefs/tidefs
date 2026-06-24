@@ -777,15 +777,12 @@ mod serde_families {
 
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<
-        [EvidenceFamilyFreshness; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES],
-        D::Error,
-    > {
+    ) -> Result<[EvidenceFamilyFreshness; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES], D::Error>
+    {
         struct ArrayVisitor;
 
         impl<'de> serde::de::Visitor<'de> for ArrayVisitor {
-            type Value =
-                [EvidenceFamilyFreshness; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES];
+            type Value = [EvidenceFamilyFreshness; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES];
 
             fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
                 f.write_str("a sequence of EvidenceFamilyFreshness")
@@ -795,8 +792,8 @@ mod serde_families {
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut arr = [EvidenceFamilyFreshness::EMPTY;
-                    STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES];
+                let mut arr =
+                    [EvidenceFamilyFreshness::EMPTY; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES];
                 let mut idx: usize = 0;
                 while let Some(elem) = seq.next_element::<EvidenceFamilyFreshness>()? {
                     if idx >= STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES {
@@ -2856,6 +2853,547 @@ pub struct StorageIntentObjectScope {
     pub generation: u64,
 }
 
+/// Stable idempotency key for crash replay and duplicate suppression.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentReplayIdempotencyKey(pub [u8; 16]);
+
+impl StorageIntentReplayIdempotencyKey {
+    /// All-zero sentinel for "no replay key".
+    pub const ZERO: Self = Self([0_u8; 16]);
+
+    /// Returns true when this is the sentinel value.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        bytes16_are_zero(self.0)
+    }
+}
+
+/// Caller-visible operation scope proven by ordering evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentOrderingOperationScope {
+    /// No caller-visible operation scope was recorded.
+    #[default]
+    Unknown = 0,
+    /// Range write intent or dirty writeback range.
+    RangeWrite = 1,
+    /// File `fsync` data and required metadata barrier.
+    FileFsync = 2,
+    /// File `fdatasync` data and retrieval metadata barrier.
+    FileFdatasync = 3,
+    /// Directory `fsync` namespace barrier.
+    DirectoryFsync = 4,
+    /// `O_DSYNC` range write barrier.
+    ODsyncDataWrite = 5,
+    /// Block-volume or media FUA write barrier.
+    FuaBlockWrite = 6,
+    /// Shared writable mmap `msync(MS_SYNC)` barrier.
+    MsyncSync = 7,
+    /// Filesystem or dataset `syncfs` barrier.
+    SyncfsDatasetBarrier = 8,
+    /// Local intent replay after recovery.
+    LocalIntentReplay = 9,
+    /// Durable quorum intent fanout.
+    QuorumIntentFanout = 10,
+    /// Relocation replacement-publication cutover.
+    RelocationCutover = 11,
+    /// Data-shape rebake publication boundary.
+    Rebake = 12,
+    /// Repair or rebuild replacement publication.
+    Repair = 13,
+    /// Old receipt retirement after replacement proof.
+    ReceiptRetirement = 14,
+}
+
+/// Evidence aggregation shape used by fast sync paths.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentOrderingAggregationClass {
+    /// Single operation, no aggregation.
+    #[default]
+    Single = 0,
+    /// Multiple barriers were batched behind a shared boundary.
+    Batched = 1,
+    /// Work was sharded while preserving caller-visible barriers.
+    Sharded = 2,
+    /// Adjacent or compatible ranges were coalesced.
+    Coalesced = 3,
+    /// Work was pipelined with explicit replay or convergence obligations.
+    Pipelined = 4,
+    /// Quorum fanout was grouped behind one replay frontier.
+    QuorumFanout = 5,
+}
+
+/// Completion state for the ordering/replay contract, not byte placement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentOrderingCompletionState {
+    /// Completion is unknown.
+    #[default]
+    Unknown = 0,
+    /// Replay is still owed before the contract can satisfy authority.
+    PendingReplay = 1,
+    /// Placement, quorum, or publication convergence is still owed.
+    PendingConvergence = 2,
+    /// The caller-visible ordering/replay contract is satisfied.
+    Satisfied = 3,
+    /// A weaker/degraded state is visible but cannot satisfy authority.
+    DegradedVisible = 4,
+    /// Evidence producer refused the contract.
+    Refused = 5,
+    /// Receipt retirement has completed under replacement proof.
+    Retired = 6,
+}
+
+impl StorageIntentOrderingCompletionState {
+    /// Returns true when the state can satisfy an authority-changing predicate.
+    #[must_use]
+    pub const fn is_authority_satisfied(self) -> bool {
+        matches!(self, Self::Satisfied | Self::Retired)
+    }
+
+    /// Returns true when completion is pending and must name an obligation.
+    #[must_use]
+    pub const fn requires_pending_obligation_ref(self) -> bool {
+        matches!(self, Self::PendingReplay | Self::PendingConvergence)
+    }
+}
+
+/// Bit-set of facts an ordering-evidence producer has proved.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentOrderingFlags(pub u64);
+
+impl StorageIntentOrderingFlags {
+    pub const EMPTY: Self = Self(0);
+    /// A bound `OrderingEvidence` artifact exists.
+    pub const EVIDENCE_PRESENT: Self = Self(1 << 0);
+    /// The evidence is fresh for the consumer's authority cut.
+    pub const FRESH: Self = Self(1 << 1);
+    /// Dirty epoch is sealed for the barrier being acknowledged.
+    pub const DIRTY_EPOCH_SEALED: Self = Self(1 << 2);
+    /// Committed root or publication boundary matches the requested root.
+    pub const ROOT_MATCHES: Self = Self(1 << 3);
+    /// Range/dataset scope covers the caller-visible barrier.
+    pub const RANGE_MATCHES: Self = Self(1 << 4);
+    /// Replay idempotency key and duplicate-suppression law are present.
+    pub const REPLAY_IDEMPOTENT: Self = Self(1 << 5);
+    /// Namespace dependencies are complete for directory or metadata barriers.
+    pub const NAMESPACE_COMPLETE: Self = Self(1 << 6);
+    /// Metadata deltas needed for replay are complete.
+    pub const METADATA_DELTA_COMPLETE: Self = Self(1 << 7);
+    /// Prior writeback errors are recorded and cannot be hidden by the receipt.
+    pub const WRITEBACK_ERRORS_RECORDED: Self = Self(1 << 8);
+    /// Required quorum count and membership/fence evidence are satisfied.
+    pub const QUORUM_SATISFIED: Self = Self(1 << 9);
+    /// Evidence is not contradicted by another fresh authority artifact.
+    pub const NOT_CONTRADICTORY: Self = Self(1 << 10);
+    /// Required dependency refs are complete in the same evidence cut.
+    pub const DEPENDENCIES_COMPLETE: Self = Self(1 << 11);
+    /// Aggregation preserves the caller-visible barrier order.
+    pub const BARRIER_PRESERVED: Self = Self(1 << 12);
+    /// Ordering evidence is not being substituted by placement evidence.
+    pub const PLACEMENT_INDEPENDENT: Self = Self(1 << 13);
+    /// Workload prediction did not weaken or reorder required barriers.
+    pub const PREDICTION_INDEPENDENT: Self = Self(1 << 14);
+
+    /// Minimum facts for an authority-changing ordering predicate.
+    pub const AUTHORITY_MINIMUM: Self = Self(
+        Self::EVIDENCE_PRESENT.0
+            | Self::FRESH.0
+            | Self::DIRTY_EPOCH_SEALED.0
+            | Self::ROOT_MATCHES.0
+            | Self::RANGE_MATCHES.0
+            | Self::REPLAY_IDEMPOTENT.0
+            | Self::WRITEBACK_ERRORS_RECORDED.0
+            | Self::NOT_CONTRADICTORY.0
+            | Self::DEPENDENCIES_COMPLETE.0
+            | Self::BARRIER_PRESERVED.0
+            | Self::PLACEMENT_INDEPENDENT.0
+            | Self::PREDICTION_INDEPENDENT.0,
+    );
+
+    /// Return the union of two flag sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns true if all `required` facts are present.
+    #[must_use]
+    pub const fn contains_all(self, required: Self) -> bool {
+        (self.0 & required.0) == required.0
+    }
+
+    /// Returns true if any fact in `other` is present.
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+}
+
+/// Predicate input describing the ordering contract a caller-visible receipt needs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentOrderingRequirement {
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub operation_scope: StorageIntentOrderingOperationScope,
+    pub object_scope: StorageIntentObjectScope,
+    pub committed_root_id: StorageIntentEvidenceId,
+    pub min_dirty_epoch: u64,
+    pub min_barrier_sequence: u64,
+    pub min_intent_log_sequence: u64,
+    pub required_quorum: u16,
+    pub required_flags: StorageIntentOrderingFlags,
+    pub dependency_refs: StorageIntentEvidenceRefs,
+}
+
+impl Default for StorageIntentOrderingRequirement {
+    fn default() -> Self {
+        Self {
+            policy_id: StorageIntentPolicyId::ZERO,
+            policy_revision: StorageIntentPolicyRevision(0),
+            operation_scope: StorageIntentOrderingOperationScope::Unknown,
+            object_scope: StorageIntentObjectScope::default(),
+            committed_root_id: StorageIntentEvidenceId::ZERO,
+            min_dirty_epoch: 0,
+            min_barrier_sequence: 0,
+            min_intent_log_sequence: 0,
+            required_quorum: 0,
+            required_flags: StorageIntentOrderingFlags::AUTHORITY_MINIMUM,
+            dependency_refs: StorageIntentEvidenceRefs::EMPTY,
+        }
+    }
+}
+
+/// Ordering/replay evidence projection for #894.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentOrderingEvidence {
+    pub evidence_ref: StorageIntentEvidenceRef,
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub operation_scope: StorageIntentOrderingOperationScope,
+    pub object_scope: StorageIntentObjectScope,
+    pub dirty_epoch: u64,
+    pub barrier_sequence: u64,
+    pub intent_log_sequence: u64,
+    pub replay_idempotency_key: StorageIntentReplayIdempotencyKey,
+    pub committed_root_id: StorageIntentEvidenceId,
+    pub committed_root_generation: u64,
+    pub publication_sequence: u64,
+    pub proved_quorum: u16,
+    pub required_quorum: u16,
+    pub aggregation: StorageIntentOrderingAggregationClass,
+    pub completion: StorageIntentOrderingCompletionState,
+    pub flags: StorageIntentOrderingFlags,
+    pub dependency_refs: StorageIntentEvidenceRefs,
+    pub local_intent_ref: StorageIntentEvidenceRef,
+    pub committed_root_ref: StorageIntentEvidenceRef,
+    pub publication_ref: StorageIntentEvidenceRef,
+    pub namespace_ref: StorageIntentEvidenceRef,
+    pub metadata_delta_ref: StorageIntentEvidenceRef,
+    pub writeback_error_ref: StorageIntentEvidenceRef,
+    pub quorum_ref: StorageIntentEvidenceRef,
+    pub placement_ref: StorageIntentEvidenceRef,
+    pub prediction_ref: StorageIntentEvidenceRef,
+    pub replay_obligation_ref: StorageIntentEvidenceRef,
+    pub convergence_ref: StorageIntentEvidenceRef,
+    pub refusal: StorageIntentRefusalReason,
+}
+
+impl Default for StorageIntentOrderingEvidence {
+    fn default() -> Self {
+        Self {
+            evidence_ref: StorageIntentEvidenceRef::default(),
+            policy_id: StorageIntentPolicyId::ZERO,
+            policy_revision: StorageIntentPolicyRevision(0),
+            operation_scope: StorageIntentOrderingOperationScope::Unknown,
+            object_scope: StorageIntentObjectScope::default(),
+            dirty_epoch: 0,
+            barrier_sequence: 0,
+            intent_log_sequence: 0,
+            replay_idempotency_key: StorageIntentReplayIdempotencyKey::ZERO,
+            committed_root_id: StorageIntentEvidenceId::ZERO,
+            committed_root_generation: 0,
+            publication_sequence: 0,
+            proved_quorum: 0,
+            required_quorum: 0,
+            aggregation: StorageIntentOrderingAggregationClass::Single,
+            completion: StorageIntentOrderingCompletionState::Unknown,
+            flags: StorageIntentOrderingFlags::EMPTY,
+            dependency_refs: StorageIntentEvidenceRefs::EMPTY,
+            local_intent_ref: StorageIntentEvidenceRef::default(),
+            committed_root_ref: StorageIntentEvidenceRef::default(),
+            publication_ref: StorageIntentEvidenceRef::default(),
+            namespace_ref: StorageIntentEvidenceRef::default(),
+            metadata_delta_ref: StorageIntentEvidenceRef::default(),
+            writeback_error_ref: StorageIntentEvidenceRef::default(),
+            quorum_ref: StorageIntentEvidenceRef::default(),
+            placement_ref: StorageIntentEvidenceRef::default(),
+            prediction_ref: StorageIntentEvidenceRef::default(),
+            replay_obligation_ref: StorageIntentEvidenceRef::default(),
+            convergence_ref: StorageIntentEvidenceRef::default(),
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+}
+
+/// Returns true when the ref is a bound ordering-evidence artifact.
+#[must_use]
+pub const fn ordering_evidence_ref_is_bound(evidence_ref: StorageIntentEvidenceRef) -> bool {
+    evidence_ref.kind as u16 == StorageIntentEvidenceKind::OrderingEvidence as u16
+        && !bytes32_are_zero(evidence_ref.id.0)
+}
+
+const fn ordering_range_end(start: u64, len: u64) -> u64 {
+    if len == 0 {
+        return u64::MAX;
+    }
+    if start > u64::MAX - len {
+        return u64::MAX;
+    }
+    start + len
+}
+
+/// Returns true when `evidence_scope` covers the requested object/range scope.
+#[must_use]
+pub const fn ordering_object_scope_covers(
+    evidence_scope: StorageIntentObjectScope,
+    required_scope: StorageIntentObjectScope,
+) -> bool {
+    if !bytes16_equal(evidence_scope.dataset_id.0, required_scope.dataset_id.0) {
+        return false;
+    }
+    if !bytes32_are_zero(required_scope.object_id.0)
+        && !bytes32_equal(evidence_scope.object_id.0, required_scope.object_id.0)
+    {
+        return false;
+    }
+    if required_scope.range_len == 0 {
+        return true;
+    }
+    if evidence_scope.range_len == 0 {
+        return true;
+    }
+    let evidence_end = ordering_range_end(evidence_scope.range_start, evidence_scope.range_len);
+    let required_end = ordering_range_end(required_scope.range_start, required_scope.range_len);
+    evidence_scope.range_start <= required_scope.range_start && evidence_end >= required_end
+}
+
+const fn ordering_dependencies_satisfied(
+    required: StorageIntentEvidenceRefs,
+    observed: StorageIntentEvidenceRefs,
+) -> bool {
+    let mut index = 0;
+    while index < required.len as usize {
+        let dependency = required.refs[index];
+        if dependency.is_bound() && !observed.contains_ref(dependency) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Returns true when non-single aggregation preserves barriers or records the debt.
+#[must_use]
+pub const fn ordering_evidence_records_pending_obligation(
+    evidence: StorageIntentOrderingEvidence,
+) -> bool {
+    match evidence.completion {
+        StorageIntentOrderingCompletionState::PendingReplay => {
+            evidence_ref_has_id(evidence.replay_obligation_ref)
+        }
+        StorageIntentOrderingCompletionState::PendingConvergence => {
+            evidence_ref_has_id(evidence.convergence_ref)
+        }
+        _ => false,
+    }
+}
+
+/// Returns true when batching/sharding/coalescing/pipelining did not weaken barriers.
+#[must_use]
+pub const fn ordering_evidence_aggregation_is_legal(
+    evidence: StorageIntentOrderingEvidence,
+) -> bool {
+    if matches!(
+        evidence.aggregation,
+        StorageIntentOrderingAggregationClass::Single
+    ) {
+        return true;
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::BARRIER_PRESERVED)
+        || !evidence
+            .flags
+            .contains_all(StorageIntentOrderingFlags::REPLAY_IDEMPOTENT)
+        || !evidence
+            .flags
+            .contains_all(StorageIntentOrderingFlags::NOT_CONTRADICTORY)
+    {
+        return false;
+    }
+    evidence.completion.is_authority_satisfied()
+        || ordering_evidence_records_pending_obligation(evidence)
+}
+
+/// Evaluate one ordering evidence record against a caller-visible requirement.
+#[must_use]
+pub const fn ordering_evidence_satisfies_requirement(
+    requirement: StorageIntentOrderingRequirement,
+    evidence: StorageIntentOrderingEvidence,
+) -> ReceiptPredicateResult {
+    if !ordering_evidence_ref_is_bound(evidence.evidence_ref)
+        || !evidence
+            .flags
+            .contains_all(StorageIntentOrderingFlags::EVIDENCE_PRESENT)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingOrderingEvidence,
+        );
+    }
+    if evidence.refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return ReceiptPredicateResult::refused(evidence.refusal);
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::FRESH)
+        || evidence.dirty_epoch < requirement.min_dirty_epoch
+        || evidence.barrier_sequence < requirement.min_barrier_sequence
+        || evidence.intent_log_sequence < requirement.min_intent_log_sequence
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleOrderingEvidence);
+    }
+    if requirement.operation_scope as u8 != StorageIntentOrderingOperationScope::Unknown as u8
+        && evidence.operation_scope as u8 != requirement.operation_scope as u8
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongOrderingScope);
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::DIRTY_EPOCH_SEALED)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::UnsealedDirtyEpoch);
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::ROOT_MATCHES)
+        || (!bytes32_are_zero(requirement.committed_root_id.0)
+            && !bytes32_equal(
+                requirement.committed_root_id.0,
+                evidence.committed_root_id.0,
+            ))
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongCommittedRoot);
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::RANGE_MATCHES)
+        || !ordering_object_scope_covers(evidence.object_scope, requirement.object_scope)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongOrderingRange);
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::REPLAY_IDEMPOTENT)
+        || evidence.replay_idempotency_key.is_zero()
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NonIdempotentReplay);
+    }
+    if requirement
+        .required_flags
+        .contains_all(StorageIntentOrderingFlags::NAMESPACE_COMPLETE)
+        && !evidence
+            .flags
+            .contains_all(StorageIntentOrderingFlags::NAMESPACE_COMPLETE)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::PartialNamespaceEvidence,
+        );
+    }
+    if requirement
+        .required_flags
+        .contains_all(StorageIntentOrderingFlags::METADATA_DELTA_COMPLETE)
+        && !evidence
+            .flags
+            .contains_all(StorageIntentOrderingFlags::METADATA_DELTA_COMPLETE)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::IncompleteMetadataDelta,
+        );
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::WRITEBACK_ERRORS_RECORDED)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::LostWritebackError);
+    }
+    let quorum_required = if requirement.required_quorum > 0 {
+        requirement.required_quorum
+    } else {
+        evidence.required_quorum
+    };
+    if quorum_required > 0
+        && (!evidence
+            .flags
+            .contains_all(StorageIntentOrderingFlags::QUORUM_SATISFIED)
+            || evidence.proved_quorum < quorum_required)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::UnderQuorum);
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::NOT_CONTRADICTORY)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::ContradictoryOrderingEvidence,
+        );
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::DEPENDENCIES_COMPLETE)
+        || !ordering_dependencies_satisfied(requirement.dependency_refs, evidence.dependency_refs)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingOrderingDependency,
+        );
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::PLACEMENT_INDEPENDENT)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingOrderingEvidence,
+        );
+    }
+    if !evidence
+        .flags
+        .contains_all(StorageIntentOrderingFlags::PREDICTION_INDEPENDENT)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::OrderingAggregationWouldWeaken,
+        );
+    }
+    if !ordering_evidence_aggregation_is_legal(evidence) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::OrderingAggregationWouldWeaken,
+        );
+    }
+    if !evidence.completion.is_authority_satisfied() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::PendingOrderingConvergence,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
 /// RAM/PMem authority record carried by #841 without runtime-local policy dialects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -4736,6 +5274,43 @@ impl_u8_canonical!(EvidenceRetentionClass, {
     Purgeable = 3 => "purgeable",
 });
 
+impl_u8_canonical!(StorageIntentOrderingOperationScope, {
+    Unknown = 0 => "unknown",
+    RangeWrite = 1 => "range-write",
+    FileFsync = 2 => "file-fsync",
+    FileFdatasync = 3 => "file-fdatasync",
+    DirectoryFsync = 4 => "directory-fsync",
+    ODsyncDataWrite = 5 => "odsync-data-write",
+    FuaBlockWrite = 6 => "fua-block-write",
+    MsyncSync = 7 => "msync-sync",
+    SyncfsDatasetBarrier = 8 => "syncfs-dataset-barrier",
+    LocalIntentReplay = 9 => "local-intent-replay",
+    QuorumIntentFanout = 10 => "quorum-intent-fanout",
+    RelocationCutover = 11 => "relocation-cutover",
+    Rebake = 12 => "rebake",
+    Repair = 13 => "repair",
+    ReceiptRetirement = 14 => "receipt-retirement",
+});
+
+impl_u8_canonical!(StorageIntentOrderingAggregationClass, {
+    Single = 0 => "single",
+    Batched = 1 => "batched",
+    Sharded = 2 => "sharded",
+    Coalesced = 3 => "coalesced",
+    Pipelined = 4 => "pipelined",
+    QuorumFanout = 5 => "quorum-fanout",
+});
+
+impl_u8_canonical!(StorageIntentOrderingCompletionState, {
+    Unknown = 0 => "unknown",
+    PendingReplay = 1 => "pending-replay",
+    PendingConvergence = 2 => "pending-convergence",
+    Satisfied = 3 => "satisfied",
+    DegradedVisible = 4 => "degraded-visible",
+    Refused = 5 => "refused",
+    Retired = 6 => "retired",
+});
+
 impl_u8_canonical!(DurabilityState, {
     Volatile = 0 => "volatile",
     DurableIntent = 1 => "durable-intent",
@@ -5375,6 +5950,36 @@ pub enum StorageIntentRefusalReason {
     StaleTrustEvidence = 39,
     /// Required key-lease evidence is absent.
     MissingKeyLeaseEvidence = 40,
+    /// Ordering evidence names a different caller-visible operation scope.
+    WrongOrderingScope = 41,
+    /// Required ordering evidence is absent or not an ordering artifact.
+    MissingOrderingEvidence = 42,
+    /// Ordering evidence is stale for the requested barrier or replay frontier.
+    StaleOrderingEvidence = 43,
+    /// Dirty epoch was not sealed for the acknowledged barrier.
+    UnsealedDirtyEpoch = 44,
+    /// Committed-root or publication boundary does not match the requirement.
+    WrongCommittedRoot = 45,
+    /// Ordering evidence does not cover the requested dataset/object/range.
+    WrongOrderingRange = 46,
+    /// Replay idempotency key or duplicate-suppression law is missing.
+    NonIdempotentReplay = 47,
+    /// Namespace dependency set is partial for a namespace barrier.
+    PartialNamespaceEvidence = 48,
+    /// Metadata delta set is incomplete for exact replay.
+    IncompleteMetadataDelta = 49,
+    /// Prior writeback error state was not preserved for the barrier.
+    LostWritebackError = 50,
+    /// Quorum fanout did not prove the required quorum count.
+    UnderQuorum = 51,
+    /// Ordering evidence contradicts another fresh authority artifact.
+    ContradictoryOrderingEvidence = 52,
+    /// Aggregation, batching, sharding, coalescing, or prediction would weaken order.
+    OrderingAggregationWouldWeaken = 53,
+    /// Ordering evidence records pending replay or convergence but not completion.
+    PendingOrderingConvergence = 54,
+    /// Required ordering dependency refs are absent from the same evidence cut.
+    MissingOrderingDependency = 55,
 }
 
 impl StorageIntentRefusalReason {
@@ -5425,6 +6030,21 @@ impl StorageIntentRefusalReason {
             Self::RevokedTrustDomain => "revoked-trust-domain",
             Self::StaleTrustEvidence => "stale-trust-evidence",
             Self::MissingKeyLeaseEvidence => "missing-key-lease-evidence",
+            Self::WrongOrderingScope => "wrong-ordering-scope",
+            Self::MissingOrderingEvidence => "missing-ordering-evidence",
+            Self::StaleOrderingEvidence => "stale-ordering-evidence",
+            Self::UnsealedDirtyEpoch => "unsealed-dirty-epoch",
+            Self::WrongCommittedRoot => "wrong-root",
+            Self::WrongOrderingRange => "wrong-range",
+            Self::NonIdempotentReplay => "non-idempotent-replay",
+            Self::PartialNamespaceEvidence => "partial-namespace-evidence",
+            Self::IncompleteMetadataDelta => "incomplete-metadata-delta",
+            Self::LostWritebackError => "lost-writeback-error",
+            Self::UnderQuorum => "under-quorum",
+            Self::ContradictoryOrderingEvidence => "contradictory-ordering-evidence",
+            Self::OrderingAggregationWouldWeaken => "ordering-aggregation-would-weaken",
+            Self::PendingOrderingConvergence => "pending-ordering-convergence",
+            Self::MissingOrderingDependency => "missing-ordering-dependency",
         }
     }
 
@@ -5473,6 +6093,21 @@ impl StorageIntentRefusalReason {
             38 => Some(Self::RevokedTrustDomain),
             39 => Some(Self::StaleTrustEvidence),
             40 => Some(Self::MissingKeyLeaseEvidence),
+            41 => Some(Self::WrongOrderingScope),
+            42 => Some(Self::MissingOrderingEvidence),
+            43 => Some(Self::StaleOrderingEvidence),
+            44 => Some(Self::UnsealedDirtyEpoch),
+            45 => Some(Self::WrongCommittedRoot),
+            46 => Some(Self::WrongOrderingRange),
+            47 => Some(Self::NonIdempotentReplay),
+            48 => Some(Self::PartialNamespaceEvidence),
+            49 => Some(Self::IncompleteMetadataDelta),
+            50 => Some(Self::LostWritebackError),
+            51 => Some(Self::UnderQuorum),
+            52 => Some(Self::ContradictoryOrderingEvidence),
+            53 => Some(Self::OrderingAggregationWouldWeaken),
+            54 => Some(Self::PendingOrderingConvergence),
+            55 => Some(Self::MissingOrderingDependency),
             _ => None,
         }
     }
@@ -7009,6 +7644,94 @@ mod tests {
         }
     }
 
+    fn ordering_flags() -> StorageIntentOrderingFlags {
+        StorageIntentOrderingFlags::AUTHORITY_MINIMUM
+            .union(StorageIntentOrderingFlags::NAMESPACE_COMPLETE)
+            .union(StorageIntentOrderingFlags::METADATA_DELTA_COMPLETE)
+            .union(StorageIntentOrderingFlags::QUORUM_SATISFIED)
+    }
+
+    fn ordering_flags_without(flag: StorageIntentOrderingFlags) -> StorageIntentOrderingFlags {
+        StorageIntentOrderingFlags(ordering_flags().0 & !flag.0)
+    }
+
+    fn ordering_scope() -> StorageIntentObjectScope {
+        StorageIntentObjectScope {
+            dataset_id: DOMAIN_A,
+            object_id: StorageIntentEvidenceId([31_u8; 32]),
+            range_start: 4096,
+            range_len: 8192,
+            generation: 4,
+        }
+    }
+
+    fn ordering_dependency() -> StorageIntentEvidenceRef {
+        evidence_ref(StorageIntentEvidenceKind::MetadataNamespaceEvidence, 116)
+    }
+
+    fn ordering_requirement() -> StorageIntentOrderingRequirement {
+        let mut dependency_refs = StorageIntentEvidenceRefs::EMPTY;
+        dependency_refs.push(ordering_dependency()).unwrap();
+
+        StorageIntentOrderingRequirement {
+            policy_id: StorageIntentPolicyId([111_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(12),
+            operation_scope: StorageIntentOrderingOperationScope::FileFsync,
+            object_scope: ordering_scope(),
+            committed_root_id: StorageIntentEvidenceId([112_u8; 32]),
+            min_dirty_epoch: 10,
+            min_barrier_sequence: 20,
+            min_intent_log_sequence: 30,
+            required_quorum: 2,
+            required_flags: ordering_flags(),
+            dependency_refs,
+        }
+    }
+
+    fn ordering_evidence() -> StorageIntentOrderingEvidence {
+        let mut dependency_refs = StorageIntentEvidenceRefs::EMPTY;
+        dependency_refs.push(ordering_dependency()).unwrap();
+
+        StorageIntentOrderingEvidence {
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 110),
+            policy_id: StorageIntentPolicyId([111_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(12),
+            operation_scope: StorageIntentOrderingOperationScope::FileFsync,
+            object_scope: ordering_scope(),
+            dirty_epoch: 10,
+            barrier_sequence: 20,
+            intent_log_sequence: 30,
+            replay_idempotency_key: StorageIntentReplayIdempotencyKey([117_u8; 16]),
+            committed_root_id: StorageIntentEvidenceId([112_u8; 32]),
+            committed_root_generation: 2,
+            publication_sequence: 40,
+            proved_quorum: 2,
+            required_quorum: 2,
+            aggregation: StorageIntentOrderingAggregationClass::Single,
+            completion: StorageIntentOrderingCompletionState::Satisfied,
+            flags: ordering_flags(),
+            dependency_refs,
+            local_intent_ref: evidence_ref(StorageIntentEvidenceKind::LocalIntentRecord, 113),
+            committed_root_ref: evidence_ref(StorageIntentEvidenceKind::LocalIntentRecord, 114),
+            publication_ref: evidence_ref(StorageIntentEvidenceKind::ActionExecutionEvidence, 115),
+            namespace_ref: ordering_dependency(),
+            metadata_delta_ref: evidence_ref(
+                StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+                118,
+            ),
+            writeback_error_ref: evidence_ref(
+                StorageIntentEvidenceKind::ResultRefusalEvidence,
+                119,
+            ),
+            quorum_ref: evidence_ref(StorageIntentEvidenceKind::MembershipEvidence, 120),
+            placement_ref: evidence_ref(StorageIntentEvidenceKind::PlacementReceipt, 121),
+            prediction_ref: evidence_ref(StorageIntentEvidenceKind::PredictionEvidence, 122),
+            replay_obligation_ref: StorageIntentEvidenceRef::default(),
+            convergence_ref: StorageIntentEvidenceRef::default(),
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
     fn media_evidence(byte: u8) -> StorageIntentEvidenceRef {
         evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, byte)
     }
@@ -7062,6 +7785,292 @@ mod tests {
             remote_commit_ref: evidence,
             archive_restore_ref: evidence,
         }
+    }
+
+    #[test]
+    fn ordering_evidence_satisfies_exact_barrier_requirement() {
+        let result =
+            ordering_evidence_satisfies_requirement(ordering_requirement(), ordering_evidence());
+
+        assert!(result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::None);
+        assert!(ordering_object_scope_covers(
+            StorageIntentObjectScope {
+                range_start: 0,
+                range_len: 32 * 1024,
+                ..ordering_scope()
+            },
+            ordering_scope(),
+        ));
+        assert_eq!(
+            StorageIntentOrderingOperationScope::FileFsync.as_str(),
+            "file-fsync"
+        );
+        assert_eq!(
+            StorageIntentOrderingCompletionState::Retired.as_str(),
+            "retired"
+        );
+    }
+
+    #[test]
+    fn ordering_evidence_covers_all_caller_visible_scopes() {
+        let scopes = [
+            (
+                1,
+                StorageIntentOrderingOperationScope::RangeWrite,
+                "range-write",
+            ),
+            (
+                2,
+                StorageIntentOrderingOperationScope::FileFsync,
+                "file-fsync",
+            ),
+            (
+                3,
+                StorageIntentOrderingOperationScope::FileFdatasync,
+                "file-fdatasync",
+            ),
+            (
+                4,
+                StorageIntentOrderingOperationScope::DirectoryFsync,
+                "directory-fsync",
+            ),
+            (
+                5,
+                StorageIntentOrderingOperationScope::ODsyncDataWrite,
+                "odsync-data-write",
+            ),
+            (
+                6,
+                StorageIntentOrderingOperationScope::FuaBlockWrite,
+                "fua-block-write",
+            ),
+            (
+                7,
+                StorageIntentOrderingOperationScope::MsyncSync,
+                "msync-sync",
+            ),
+            (
+                8,
+                StorageIntentOrderingOperationScope::SyncfsDatasetBarrier,
+                "syncfs-dataset-barrier",
+            ),
+            (
+                9,
+                StorageIntentOrderingOperationScope::LocalIntentReplay,
+                "local-intent-replay",
+            ),
+            (
+                10,
+                StorageIntentOrderingOperationScope::QuorumIntentFanout,
+                "quorum-intent-fanout",
+            ),
+            (
+                11,
+                StorageIntentOrderingOperationScope::RelocationCutover,
+                "relocation-cutover",
+            ),
+            (12, StorageIntentOrderingOperationScope::Rebake, "rebake"),
+            (13, StorageIntentOrderingOperationScope::Repair, "repair"),
+            (
+                14,
+                StorageIntentOrderingOperationScope::ReceiptRetirement,
+                "receipt-retirement",
+            ),
+        ];
+
+        for (discriminant, scope, spelling) in scopes {
+            assert_eq!(
+                StorageIntentOrderingOperationScope::from_discriminant(discriminant),
+                Some(scope)
+            );
+            assert_eq!(scope.as_str(), spelling);
+        }
+        assert_eq!(
+            StorageIntentOrderingOperationScope::from_discriminant(99),
+            None
+        );
+    }
+
+    #[test]
+    fn ordering_evidence_hard_gates_refuse_unsatisfied_contracts() {
+        let requirement = ordering_requirement();
+
+        assert_eq!(
+            ordering_evidence_satisfies_requirement(
+                requirement,
+                StorageIntentOrderingEvidence::default(),
+            )
+            .refusal,
+            StorageIntentRefusalReason::MissingOrderingEvidence
+        );
+
+        let cases = [
+            (
+                StorageIntentOrderingEvidence {
+                    flags: ordering_flags_without(StorageIntentOrderingFlags::FRESH),
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::StaleOrderingEvidence,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    dirty_epoch: 9,
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::StaleOrderingEvidence,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    operation_scope: StorageIntentOrderingOperationScope::DirectoryFsync,
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::WrongOrderingScope,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    flags: ordering_flags_without(StorageIntentOrderingFlags::DIRTY_EPOCH_SEALED),
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::UnsealedDirtyEpoch,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    committed_root_id: StorageIntentEvidenceId([99_u8; 32]),
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::WrongCommittedRoot,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    object_scope: StorageIntentObjectScope {
+                        range_start: 0,
+                        range_len: 4096,
+                        ..ordering_scope()
+                    },
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::WrongOrderingRange,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    replay_idempotency_key: StorageIntentReplayIdempotencyKey::ZERO,
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::NonIdempotentReplay,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    flags: ordering_flags_without(StorageIntentOrderingFlags::NAMESPACE_COMPLETE),
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::PartialNamespaceEvidence,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    flags: ordering_flags_without(
+                        StorageIntentOrderingFlags::METADATA_DELTA_COMPLETE,
+                    ),
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::IncompleteMetadataDelta,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    flags: ordering_flags_without(
+                        StorageIntentOrderingFlags::WRITEBACK_ERRORS_RECORDED,
+                    ),
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::LostWritebackError,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    proved_quorum: 1,
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::UnderQuorum,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    flags: ordering_flags_without(StorageIntentOrderingFlags::NOT_CONTRADICTORY),
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::ContradictoryOrderingEvidence,
+            ),
+            (
+                StorageIntentOrderingEvidence {
+                    dependency_refs: StorageIntentEvidenceRefs::EMPTY,
+                    ..ordering_evidence()
+                },
+                StorageIntentRefusalReason::MissingOrderingDependency,
+            ),
+        ];
+
+        for (evidence, refusal) in cases {
+            assert_eq!(
+                ordering_evidence_satisfies_requirement(requirement, evidence).refusal,
+                refusal
+            );
+        }
+    }
+
+    #[test]
+    fn ordering_aggregation_requires_preserved_barriers_or_obligation() {
+        let pending = StorageIntentOrderingEvidence {
+            aggregation: StorageIntentOrderingAggregationClass::Coalesced,
+            completion: StorageIntentOrderingCompletionState::PendingConvergence,
+            convergence_ref: evidence_ref(StorageIntentEvidenceKind::ActionExecutionEvidence, 123),
+            ..ordering_evidence()
+        };
+
+        assert!(ordering_evidence_aggregation_is_legal(pending));
+        assert!(ordering_evidence_records_pending_obligation(pending));
+        assert_eq!(
+            ordering_evidence_satisfies_requirement(ordering_requirement(), pending).refusal,
+            StorageIntentRefusalReason::PendingOrderingConvergence
+        );
+
+        let missing_obligation = StorageIntentOrderingEvidence {
+            convergence_ref: StorageIntentEvidenceRef::default(),
+            ..pending
+        };
+        assert!(!ordering_evidence_aggregation_is_legal(missing_obligation));
+
+        let weakened_barrier = StorageIntentOrderingEvidence {
+            aggregation: StorageIntentOrderingAggregationClass::Pipelined,
+            flags: ordering_flags_without(StorageIntentOrderingFlags::BARRIER_PRESERVED),
+            ..ordering_evidence()
+        };
+        assert_eq!(
+            ordering_evidence_satisfies_requirement(ordering_requirement(), weakened_barrier)
+                .refusal,
+            StorageIntentRefusalReason::OrderingAggregationWouldWeaken
+        );
+    }
+
+    #[test]
+    fn placement_and_prediction_refs_do_not_substitute_for_ordering() {
+        let placement_only = StorageIntentOrderingEvidence {
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::PlacementReceipt, 124),
+            placement_ref: evidence_ref(StorageIntentEvidenceKind::PlacementReceipt, 125),
+            ..ordering_evidence()
+        };
+        assert_eq!(
+            ordering_evidence_satisfies_requirement(ordering_requirement(), placement_only).refusal,
+            StorageIntentRefusalReason::MissingOrderingEvidence
+        );
+
+        let prediction_reordered = StorageIntentOrderingEvidence {
+            flags: ordering_flags_without(StorageIntentOrderingFlags::PREDICTION_INDEPENDENT),
+            prediction_ref: evidence_ref(StorageIntentEvidenceKind::PredictionEvidence, 126),
+            ..ordering_evidence()
+        };
+        assert_eq!(
+            ordering_evidence_satisfies_requirement(ordering_requirement(), prediction_reordered)
+                .refusal,
+            StorageIntentRefusalReason::OrderingAggregationWouldWeaken
+        );
     }
 
     #[test]
