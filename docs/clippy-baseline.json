@@ -496,7 +496,7 @@
       "exit_code": 0
     },
     "tidefs-storage-intent-satisfaction": {
-      "warnings": 7,
+      "warnings": 0,
       "exit_code": 0
     },
     "tidefs-storage-node": {
@@ -649,10 +649,6 @@
     },
     "tidefs-storage-intent-scheduler": {
       "warnings": 0,
-      "exit_code": 0
-    },
-    "tidefs-storage-intent-satisfaction": {
-      "warnings": 7,
       "exit_code": 0
     },
     "tidefs-storage-intent-workload-signals": {

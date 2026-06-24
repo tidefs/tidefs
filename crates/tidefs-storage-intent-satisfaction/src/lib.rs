@@ -98,6 +98,21 @@ pub const STORAGE_INTENT_SATISFACTION_VERSION: u16 = 1;
 pub const STORAGE_INTENT_SATISFACTION_SPEC: &str =
     "tidefs-storage-intent-satisfaction-v1-issue-874";
 
+/// Error returned when a bounded satisfaction buffer is full.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageIntentSatisfactionError {
+    /// The inline buffer has reached its capacity limit.
+    BufferFull,
+}
+
+impl fmt::Display for StorageIntentSatisfactionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BufferFull => f.write_str("satisfaction inline buffer full"),
+        }
+    }
+}
+
 /// Bounded number of reason/output rows carried inline by one satisfaction record.
 pub const STORAGE_INTENT_SATISFACTION_INLINE_REASONS: usize = 24;
 
@@ -482,9 +497,9 @@ impl StorageIntentSatisfactionReasonSet {
     }
 
     /// Append one row.
-    pub fn push(&mut self, row: StorageIntentSatisfactionReasonRecord) -> Result<(), ()> {
+    pub fn push(&mut self, row: StorageIntentSatisfactionReasonRecord) -> Result<(), StorageIntentSatisfactionError> {
         if self.len as usize >= STORAGE_INTENT_SATISFACTION_INLINE_REASONS {
-            return Err(());
+            return Err(StorageIntentSatisfactionError::BufferFull);
         }
         self.rows[self.len as usize] = row;
         self.len += 1;
@@ -549,9 +564,9 @@ impl StorageIntentSatisfactionReceiptSet {
     }
 
     /// Append one receipt id.
-    pub fn push(&mut self, receipt: StorageIntentReceiptId) -> Result<(), ()> {
+    pub fn push(&mut self, receipt: StorageIntentReceiptId) -> Result<(), StorageIntentSatisfactionError> {
         if self.len as usize >= STORAGE_INTENT_SATISFACTION_INLINE_RECEIPTS {
-            return Err(());
+            return Err(StorageIntentSatisfactionError::BufferFull);
         }
         self.receipts[self.len as usize] = receipt;
         self.len += 1;
@@ -605,12 +620,12 @@ impl StorageIntentSatisfactionEvidenceSet {
     }
 
     /// Append one evidence ref if bound and not already present.
-    pub fn push_unique(&mut self, evidence_ref: StorageIntentEvidenceRef) -> Result<(), ()> {
+    pub fn push_unique(&mut self, evidence_ref: StorageIntentEvidenceRef) -> Result<(), StorageIntentSatisfactionError> {
         if !evidence_ref.is_bound() || self.contains(evidence_ref) {
             return Ok(());
         }
         if self.len as usize >= STORAGE_INTENT_SATISFACTION_INLINE_EVIDENCE_REFS {
-            return Err(());
+            return Err(StorageIntentSatisfactionError::BufferFull);
         }
         self.refs[self.len as usize] = evidence_ref;
         self.len += 1;
