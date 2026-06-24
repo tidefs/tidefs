@@ -1184,6 +1184,692 @@ impl StorageIntentEvidenceQuerySnapshot {
     }
 }
 
+/// Bounded measurement metric entries carried inline by attribution evidence.
+pub const STORAGE_INTENT_MEASUREMENT_METRIC_ENTRIES: usize = 16;
+
+/// Causal verdict for a measured outcome.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentMeasurementAttributionVerdict {
+    #[default]
+    Unknown = 0,
+    Attributable = 1,
+    PartiallyAttributableWithBounds = 2,
+    Confounded = 3,
+    InsufficientSample = 4,
+    Stale = 5,
+    Contradicted = 6,
+    ShadowOnly = 7,
+    Refused = 8,
+}
+
+impl StorageIntentMeasurementAttributionVerdict {
+    /// Returns true when this verdict may support authority-changing uses.
+    #[must_use]
+    pub const fn may_support_authority(self) -> bool {
+        matches!(
+            self,
+            Self::Attributable | Self::PartiallyAttributableWithBounds
+        )
+    }
+
+    /// Returns true when this verdict is diagnostic only.
+    #[must_use]
+    pub const fn blocks_authority(self) -> bool {
+        matches!(
+            self,
+            Self::Unknown
+                | Self::Confounded
+                | Self::InsufficientSample
+                | Self::Stale
+                | Self::Contradicted
+                | Self::ShadowOnly
+                | Self::Refused
+        )
+    }
+}
+
+/// Baseline or counterfactual family for a measured outcome.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentMeasurementBaselineClass {
+    #[default]
+    Unknown = 0,
+    PriorAdmittedVariant = 1,
+    ShadowTarget = 2,
+    IncumbentPeerComparator = 3,
+    NoopCounterfactual = 4,
+    SamePolicyCohort = 5,
+    NoValidBaselineRefused = 6,
+}
+
+/// Measurement dimension retained by attribution evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentMeasurementMetricDimension {
+    #[default]
+    Latency = 0,
+    TailLatency = 1,
+    Throughput = 2,
+    Iops = 3,
+    CacheHitRatio = 4,
+    ReadAmplification = 5,
+    WriteAmplification = 6,
+    MediaWriteBytes = 7,
+    WearCost = 8,
+    NetworkEgressBytes = 9,
+    RestoreBytes = 10,
+    CostMicrounits = 11,
+    RpoLag = 12,
+    CpuTime = 13,
+    ForegroundHarm = 14,
+    PaybackWindow = 15,
+}
+
+/// Unit attached to a measured metric.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentMeasurementMetricUnit {
+    #[default]
+    UnitlessPpm = 0,
+    Microseconds = 1,
+    Milliseconds = 2,
+    Bytes = 3,
+    BytesPerSecond = 4,
+    Iops = 5,
+    CostMicrounits = 6,
+    Count = 7,
+}
+
+/// State of a measured metric entry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentMeasurementMetricState {
+    #[default]
+    Unknown = 0,
+    Known = 1,
+    Bounded = 2,
+    Censored = 3,
+    Dropped = 4,
+    Refused = 5,
+}
+
+impl StorageIntentMeasurementMetricState {
+    /// Returns true when this metric may support an attribution verdict.
+    #[must_use]
+    pub const fn is_usable_for_attribution(self) -> bool {
+        matches!(self, Self::Known | Self::Bounded)
+    }
+}
+
+/// One measured metric entry with unit, uncertainty, and source evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentMeasurementMetricEntry {
+    pub dimension: StorageIntentMeasurementMetricDimension,
+    pub state: StorageIntentMeasurementMetricState,
+    pub unit: StorageIntentMeasurementMetricUnit,
+    pub value: i64,
+    pub variance_ppm: u32,
+    pub evidence_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentMeasurementMetricEntry {
+    pub const EMPTY: Self = Self {
+        dimension: StorageIntentMeasurementMetricDimension::Latency,
+        state: StorageIntentMeasurementMetricState::Unknown,
+        unit: StorageIntentMeasurementMetricUnit::UnitlessPpm,
+        value: 0,
+        variance_ppm: 0,
+        evidence_ref: StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::Unknown,
+            id: StorageIntentEvidenceId::ZERO,
+            generation: 0,
+            version: 0,
+        },
+    };
+
+    /// Returns true when this metric is source-backed and usable.
+    #[must_use]
+    pub const fn is_usable_for_attribution(self) -> bool {
+        self.state.is_usable_for_attribution() && evidence_ref_has_id(self.evidence_ref)
+    }
+}
+
+/// Bounded vector of raw metrics, normalized KPIs, and deltas.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentMeasurementMetricSet {
+    len: u8,
+    entries: [StorageIntentMeasurementMetricEntry; STORAGE_INTENT_MEASUREMENT_METRIC_ENTRIES],
+}
+
+impl StorageIntentMeasurementMetricSet {
+    pub const EMPTY: Self = Self {
+        len: 0,
+        entries: [StorageIntentMeasurementMetricEntry::EMPTY;
+            STORAGE_INTENT_MEASUREMENT_METRIC_ENTRIES],
+    };
+
+    /// Number of retained metric entries.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.len as usize
+    }
+
+    /// Append a metric entry if capacity remains.
+    pub fn push(
+        &mut self,
+        entry: StorageIntentMeasurementMetricEntry,
+    ) -> Result<(), EvidenceRefsError> {
+        if self.len as usize >= STORAGE_INTENT_MEASUREMENT_METRIC_ENTRIES {
+            return Err(EvidenceRefsError::Full);
+        }
+        self.entries[self.len as usize] = entry;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Returns true when any usable metric is retained.
+    #[must_use]
+    pub const fn has_usable_metric(self) -> bool {
+        let mut index = 0;
+        while index < self.len as usize {
+            if self.entries[index].is_usable_for_attribution() {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// Returns true when a usable metric dimension is retained.
+    #[must_use]
+    pub const fn has_usable_dimension(
+        self,
+        dimension: StorageIntentMeasurementMetricDimension,
+    ) -> bool {
+        let mut index = 0;
+        while index < self.len as usize {
+            let entry = self.entries[index];
+            if entry.dimension as u8 == dimension as u8 && entry.is_usable_for_attribution() {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// Returns true when cost, wear, or network deltas are represented.
+    #[must_use]
+    pub const fn has_cost_wear_or_network_delta(self) -> bool {
+        self.has_usable_dimension(StorageIntentMeasurementMetricDimension::MediaWriteBytes)
+            || self.has_usable_dimension(StorageIntentMeasurementMetricDimension::WearCost)
+            || self
+                .has_usable_dimension(StorageIntentMeasurementMetricDimension::NetworkEgressBytes)
+            || self.has_usable_dimension(StorageIntentMeasurementMetricDimension::RestoreBytes)
+            || self.has_usable_dimension(StorageIntentMeasurementMetricDimension::CostMicrounits)
+    }
+
+    /// Returns true when foreground harm is explicitly bounded.
+    #[must_use]
+    pub const fn has_foreground_harm_delta(self) -> bool {
+        self.has_usable_dimension(StorageIntentMeasurementMetricDimension::ForegroundHarm)
+    }
+
+    /// Returns true when payback window evidence is explicitly represented.
+    #[must_use]
+    pub const fn has_payback_window(self) -> bool {
+        self.has_usable_dimension(StorageIntentMeasurementMetricDimension::PaybackWindow)
+    }
+}
+
+/// Allowed use mask for a measurement-attribution verdict.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentMeasurementAttributionUseMask(pub u64);
+
+impl StorageIntentMeasurementAttributionUseMask {
+    pub const EMPTY: Self = Self(0);
+    pub const DIAGNOSE: Self = Self(1 << 0);
+    pub const OPEN_INVESTIGATION: Self = Self(1 << 1);
+    pub const FORCE_CONSERVATIVE_COOLDOWN: Self = Self(1 << 2);
+    pub const LOWER_CONFIDENCE: Self = Self(1 << 3);
+    pub const TRAIN_CONFIDENCE_UPWARD: Self = Self(1 << 4);
+    pub const CLOSE_PAYBACK: Self = Self(1 << 5);
+    pub const ADMIT_AUTHORITY_MOVEMENT: Self = Self(1 << 6);
+    pub const RETIRE_SOURCE_RECEIPTS: Self = Self(1 << 7);
+    pub const SPEND_EXTRA_FLASH_MOVEMENT_BUDGET: Self = Self(1 << 8);
+    pub const SUPPORT_PERFORMANCE_EVIDENCE: Self = Self(1 << 9);
+    pub const SUPPORT_FAULT_EVIDENCE: Self = Self(1 << 10);
+    pub const SUPPORT_OPERATOR_EXPLANATION: Self = Self(1 << 11);
+    pub const SUPPORT_PUBLIC_OR_COMPARATOR_CLAIM: Self = Self(1 << 12);
+
+    pub const NON_AUTHORITY_SAFE: Self = Self(
+        Self::DIAGNOSE.0
+            | Self::OPEN_INVESTIGATION.0
+            | Self::FORCE_CONSERVATIVE_COOLDOWN.0
+            | Self::LOWER_CONFIDENCE.0
+            | Self::SUPPORT_OPERATOR_EXPLANATION.0,
+    );
+
+    pub const AUTHORITY_CHANGING: Self = Self(
+        Self::TRAIN_CONFIDENCE_UPWARD.0
+            | Self::CLOSE_PAYBACK.0
+            | Self::ADMIT_AUTHORITY_MOVEMENT.0
+            | Self::RETIRE_SOURCE_RECEIPTS.0
+            | Self::SPEND_EXTRA_FLASH_MOVEMENT_BUDGET.0
+            | Self::SUPPORT_PERFORMANCE_EVIDENCE.0
+            | Self::SUPPORT_FAULT_EVIDENCE.0
+            | Self::SUPPORT_PUBLIC_OR_COMPARATOR_CLAIM.0,
+    );
+
+    pub const PAYBACK_OR_MOVEMENT: Self = Self(
+        Self::CLOSE_PAYBACK.0
+            | Self::ADMIT_AUTHORITY_MOVEMENT.0
+            | Self::RETIRE_SOURCE_RECEIPTS.0
+            | Self::SPEND_EXTRA_FLASH_MOVEMENT_BUDGET.0,
+    );
+
+    /// Returns true when the mask is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Add another allowed-use mask.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns true when all bits from `other` are present.
+    #[must_use]
+    pub const fn contains_all(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Returns true when any bit from `other` is present.
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+
+    /// Strip all bits from `other`.
+    #[must_use]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
+/// Scope-transfer mask for attribution reuse beyond the exact measured scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentMeasurementTransferScopeMask(pub u64);
+
+impl StorageIntentMeasurementTransferScopeMask {
+    pub const EMPTY: Self = Self(0);
+    pub const SAME_POLICY_REVISION: Self = Self(1 << 0);
+    pub const SAME_TENANT: Self = Self(1 << 1);
+    pub const SAME_DATASET: Self = Self(1 << 2);
+    pub const SAME_WORKLOAD_ENVELOPE: Self = Self(1 << 3);
+    pub const SAME_ENVIRONMENT_PROFILE: Self = Self(1 << 4);
+    pub const SAME_MEDIA_CLASS: Self = Self(1 << 5);
+    pub const SAME_TRANSPORT_PATH: Self = Self(1 << 6);
+    pub const SAME_SERVICE_OBJECTIVE: Self = Self(1 << 7);
+    pub const SAME_COST_WEAR_BASIS: Self = Self(1 << 8);
+    pub const EXPLICIT_TRANSFER_RULE: Self = Self(1 << 9);
+    pub const ISOLATION_ELIGIBLE: Self = Self(1 << 10);
+    pub const TRUST_DOMAIN_ELIGIBLE: Self = Self(1 << 11);
+    pub const DOMAIN_ELIGIBLE: Self = Self(1 << 12);
+
+    pub const EXACT_AUTHORITY_SCOPE: Self = Self(
+        Self::SAME_POLICY_REVISION.0
+            | Self::SAME_TENANT.0
+            | Self::SAME_DATASET.0
+            | Self::SAME_WORKLOAD_ENVELOPE.0
+            | Self::SAME_ENVIRONMENT_PROFILE.0
+            | Self::SAME_MEDIA_CLASS.0
+            | Self::SAME_TRANSPORT_PATH.0
+            | Self::SAME_SERVICE_OBJECTIVE.0
+            | Self::SAME_COST_WEAR_BASIS.0,
+    );
+
+    pub const CROSS_SCOPE_ELIGIBILITY: Self = Self(
+        Self::EXPLICIT_TRANSFER_RULE.0
+            | Self::ISOLATION_ELIGIBLE.0
+            | Self::TRUST_DOMAIN_ELIGIBLE.0
+            | Self::DOMAIN_ELIGIBLE.0,
+    );
+
+    /// Add another scope mask.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns true when all bits from `other` are present.
+    #[must_use]
+    pub const fn contains_all(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+}
+
+/// Sample window, warmup, censor/drop, variance, and source-window evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentMeasurementSampleWindow {
+    pub temporal_window_ref: StorageIntentEvidenceRef,
+    pub warmup_ms: u64,
+    pub sample_window_ms: u64,
+    pub sample_mass: u64,
+    pub censored_sample_count: u64,
+    pub dropped_sample_count: u64,
+    pub variance_ppm: u32,
+    pub confidence_bound_ppm: u32,
+    pub censor_drop_policy_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentMeasurementSampleWindow {
+    /// Returns true when warmup, sample mass, duration, and censor policy are explicit.
+    #[must_use]
+    pub const fn has_sample_boundary(self) -> bool {
+        evidence_ref_has_id(self.temporal_window_ref)
+            && self.sample_window_ms > 0
+            && self.sample_mass > 0
+            && self.confidence_bound_ppm > 0
+            && evidence_ref_has_id(self.censor_drop_policy_ref)
+    }
+}
+
+/// Baseline, comparator, and counterfactual lineage for attribution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentMeasurementComparatorLineage {
+    pub baseline_class: StorageIntentMeasurementBaselineClass,
+    pub baseline_ref: StorageIntentEvidenceRef,
+    pub comparator_ref: StorageIntentEvidenceRef,
+    pub counterfactual_ref: StorageIntentEvidenceRef,
+    pub prior_admitted_variant_ref: StorageIntentEvidenceRef,
+    pub shadow_target_ref: StorageIntentEvidenceRef,
+    pub baseline_generation: u64,
+    pub no_valid_baseline_refusal: StorageIntentRefusalReason,
+}
+
+impl StorageIntentMeasurementComparatorLineage {
+    /// Returns true when the record explicitly refuses a usable baseline.
+    #[must_use]
+    pub const fn has_no_valid_baseline_refusal(self) -> bool {
+        matches!(
+            self.baseline_class,
+            StorageIntentMeasurementBaselineClass::NoValidBaselineRefused
+        ) && self.no_valid_baseline_refusal as u16 != StorageIntentRefusalReason::None as u16
+    }
+
+    /// Returns true when authority use has an inspectable baseline.
+    #[must_use]
+    pub const fn has_authority_baseline(self) -> bool {
+        if self.has_no_valid_baseline_refusal()
+            || matches!(
+                self.baseline_class,
+                StorageIntentMeasurementBaselineClass::Unknown
+            )
+            || self.no_valid_baseline_refusal as u16 != StorageIntentRefusalReason::None as u16
+            || self.baseline_generation == 0
+            || !evidence_ref_has_id(self.baseline_ref)
+        {
+            return false;
+        }
+        if matches!(
+            self.baseline_class,
+            StorageIntentMeasurementBaselineClass::IncumbentPeerComparator
+        ) && (self.comparator_ref.kind as u16
+            != StorageIntentEvidenceKind::ComparatorEvidence as u16
+            || !evidence_ref_has_id(self.comparator_ref))
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// Storage-intent measurement-attribution evidence projection owned by #912.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentMeasurementAttributionEvidence {
+    pub evidence_ref: StorageIntentEvidenceRef,
+    pub measurement_id: StorageIntentEvidenceId,
+    pub tenant_id: StorageIntentDomainId,
+    pub budget_owner_id: StorageIntentDomainId,
+    pub subject: EvidenceQuerySubjectScope,
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub observation_generation: u64,
+    pub producer_component_ref: StorageIntentEvidenceRef,
+    pub producer_version: u64,
+    pub workload_envelope_ref: StorageIntentEvidenceRef,
+    pub workload_scope_ref: StorageIntentEvidenceRef,
+    pub environment_profile_ref: StorageIntentEvidenceRef,
+    pub noise_policy_ref: StorageIntentEvidenceRef,
+    pub service_objective_ref: StorageIntentEvidenceRef,
+    pub sample_window: StorageIntentMeasurementSampleWindow,
+    pub measurement_source_refs: StorageIntentEvidenceRefs,
+    pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
+    pub decision_frontier_ref: StorageIntentEvidenceRef,
+    pub action_execution_ref: StorageIntentEvidenceRef,
+    pub admission_ref: StorageIntentEvidenceRef,
+    pub scheduler_ref: StorageIntentEvidenceRef,
+    pub isolation_ref: StorageIntentEvidenceRef,
+    pub capacity_ref: StorageIntentEvidenceRef,
+    pub source_media_ref: StorageIntentEvidenceRef,
+    pub target_media_ref: StorageIntentEvidenceRef,
+    pub trust_domain_ref: StorageIntentEvidenceRef,
+    pub transport_path_ref: StorageIntentEvidenceRef,
+    pub recovery_ref: StorageIntentEvidenceRef,
+    pub rollout_ref: StorageIntentEvidenceRef,
+    pub layout_ref: StorageIntentEvidenceRef,
+    pub lifecycle_ref: StorageIntentEvidenceRef,
+    pub shaping_refs: StorageIntentEvidenceRefs,
+    pub comparator: StorageIntentMeasurementComparatorLineage,
+    pub metrics: StorageIntentMeasurementMetricSet,
+    pub verdict: StorageIntentMeasurementAttributionVerdict,
+    pub bounded_uncertainty_ppm: u32,
+    pub allowed_uses: StorageIntentMeasurementAttributionUseMask,
+    pub allowed_use_ref: StorageIntentEvidenceRef,
+    pub transfer_scope: StorageIntentMeasurementTransferScopeMask,
+    pub transfer_scope_ref: StorageIntentEvidenceRef,
+    pub attribution_verdict_ref: StorageIntentEvidenceRef,
+    pub retention_ref: StorageIntentEvidenceRef,
+    pub refusal: StorageIntentRefusalReason,
+}
+
+impl StorageIntentMeasurementAttributionEvidence {
+    /// Returns true when identity, policy, subject, and producer are bound.
+    #[must_use]
+    pub const fn has_measurement_identity(self) -> bool {
+        self.evidence_ref.kind as u16
+            == StorageIntentEvidenceKind::MeasurementAttributionEvidence as u16
+            && evidence_ref_has_id(self.evidence_ref)
+            && !bytes32_are_zero(self.measurement_id.0)
+            && !self.policy_id.is_zero()
+            && self.policy_revision.0 > 0
+            && self.observation_generation > 0
+            && !self.tenant_id.is_zero()
+            && !self.budget_owner_id.is_zero()
+            && self.producer_version > 0
+            && evidence_ref_has_id(self.producer_component_ref)
+            && measurement_subject_scope_is_bound(self.subject)
+    }
+
+    /// Returns true when workload, environment, noise, sample, and sources are bound.
+    #[must_use]
+    pub const fn has_measurement_basis(self) -> bool {
+        evidence_ref_has_id(self.workload_envelope_ref)
+            && evidence_ref_has_id(self.workload_scope_ref)
+            && evidence_ref_has_id(self.environment_profile_ref)
+            && evidence_ref_has_id(self.noise_policy_ref)
+            && evidence_ref_has_id(self.service_objective_ref)
+            && self.sample_window.has_sample_boundary()
+            && !self.measurement_source_refs.is_empty()
+            && self.metrics.has_usable_metric()
+    }
+
+    /// Returns true when the decision, executed action, query cut, and retention are bound.
+    #[must_use]
+    pub const fn has_authority_lineage(self) -> bool {
+        self.evidence_query_snapshot_ref.kind as u16
+            == StorageIntentEvidenceKind::EvidenceQuerySnapshot as u16
+            && evidence_ref_has_id(self.evidence_query_snapshot_ref)
+            && self.decision_frontier_ref.kind as u16
+                == StorageIntentEvidenceKind::DecisionFrontierEvidence as u16
+            && evidence_ref_has_id(self.decision_frontier_ref)
+            && self.action_execution_ref.kind as u16
+                == StorageIntentEvidenceKind::ActionExecutionEvidence as u16
+            && evidence_ref_has_id(self.action_execution_ref)
+            && self.retention_ref.kind as u16
+                == StorageIntentEvidenceKind::EvidenceRetentionEvidence as u16
+            && evidence_ref_has_id(self.retention_ref)
+    }
+
+    /// Returns true when non-decision shaping evidence is explicit.
+    #[must_use]
+    pub const fn has_shaping_evidence(self) -> bool {
+        evidence_ref_has_id(self.admission_ref)
+            && evidence_ref_has_id(self.scheduler_ref)
+            && evidence_ref_has_id(self.isolation_ref)
+            && evidence_ref_has_id(self.capacity_ref)
+            && evidence_ref_has_id(self.source_media_ref)
+            && evidence_ref_has_id(self.target_media_ref)
+            && evidence_ref_has_id(self.trust_domain_ref)
+            && evidence_ref_has_id(self.transport_path_ref)
+            && evidence_ref_has_id(self.recovery_ref)
+            && evidence_ref_has_id(self.rollout_ref)
+            && evidence_ref_has_id(self.layout_ref)
+            && evidence_ref_has_id(self.lifecycle_ref)
+    }
+
+    /// Returns true when the verdict and allowed-use artifact are explicit.
+    #[must_use]
+    pub const fn has_verdict_boundary(self) -> bool {
+        evidence_ref_has_id(self.allowed_use_ref)
+            && evidence_ref_has_id(self.attribution_verdict_ref)
+            && self.refusal as u16 == StorageIntentRefusalReason::None as u16
+            && (!matches!(
+                self.verdict,
+                StorageIntentMeasurementAttributionVerdict::PartiallyAttributableWithBounds
+            ) || self.bounded_uncertainty_ppm > 0)
+    }
+
+    /// Returns true when any authority-changing use is requested or allowed.
+    #[must_use]
+    pub const fn carries_authority_changing_use(self) -> bool {
+        self.allowed_uses
+            .intersects(StorageIntentMeasurementAttributionUseMask::AUTHORITY_CHANGING)
+    }
+
+    /// Returns true when diagnostic-only verdicts do not carry authority permissions.
+    #[must_use]
+    pub const fn hard_law_is_respected(self) -> bool {
+        !self.verdict.blocks_authority() || !self.carries_authority_changing_use()
+    }
+
+    /// Returns true when the attribution can transfer to the requested authority scope.
+    #[must_use]
+    pub const fn authority_transfer_is_allowed(self) -> bool {
+        self.transfer_scope
+            .contains_all(StorageIntentMeasurementTransferScopeMask::EXACT_AUTHORITY_SCOPE)
+            || (self
+                .transfer_scope
+                .contains_all(StorageIntentMeasurementTransferScopeMask::CROSS_SCOPE_ELIGIBILITY)
+                && evidence_ref_has_id(self.transfer_scope_ref))
+    }
+
+    /// Returns true when metrics include the deltas needed for payback and movement.
+    #[must_use]
+    pub const fn metrics_support_payback_or_movement(self) -> bool {
+        self.metrics.has_payback_window()
+            && self.metrics.has_cost_wear_or_network_delta()
+            && self.metrics.has_foreground_harm_delta()
+    }
+
+    /// Returns true when this record can support the requested use mask.
+    #[must_use]
+    pub const fn authorizes_use(
+        self,
+        requested: StorageIntentMeasurementAttributionUseMask,
+    ) -> bool {
+        if requested.is_empty()
+            || !self.allowed_uses.contains_all(requested)
+            || !self.has_measurement_identity()
+            || !self.has_measurement_basis()
+            || !self.has_verdict_boundary()
+            || !self.hard_law_is_respected()
+        {
+            return false;
+        }
+        if !requested.intersects(StorageIntentMeasurementAttributionUseMask::AUTHORITY_CHANGING) {
+            return true;
+        }
+        if !self.verdict.may_support_authority()
+            || !self.has_authority_lineage()
+            || !self.has_shaping_evidence()
+            || !self.comparator.has_authority_baseline()
+            || !self.authority_transfer_is_allowed()
+        {
+            return false;
+        }
+        if requested.intersects(StorageIntentMeasurementAttributionUseMask::PAYBACK_OR_MOVEMENT)
+            && !self.metrics_support_payback_or_movement()
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// Predicate wrapper for callers that want a typed refusal result.
+#[must_use]
+pub const fn measurement_attribution_authorizes_use(
+    evidence: StorageIntentMeasurementAttributionEvidence,
+    requested: StorageIntentMeasurementAttributionUseMask,
+) -> ReceiptPredicateResult {
+    if evidence.authorizes_use(requested) {
+        ReceiptPredicateResult::SATISFIED
+    } else if evidence.refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        ReceiptPredicateResult::refused(evidence.refusal)
+    } else {
+        ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable)
+    }
+}
+
+const fn measurement_subject_scope_is_bound(subject: EvidenceQuerySubjectScope) -> bool {
+    match subject.scope_class {
+        EvidenceQuerySubjectScopeClass::Unknown => false,
+        EvidenceQuerySubjectScopeClass::Request => evidence_ref_has_id(subject.request_ref),
+        EvidenceQuerySubjectScopeClass::Action => evidence_ref_has_id(subject.action_ref),
+        EvidenceQuerySubjectScopeClass::ObjectRange => {
+            !subject.object_scope.dataset_id.is_zero()
+                && !bytes32_are_zero(subject.object_scope.object_id.0)
+                && subject.object_scope.range_len > 0
+        }
+        EvidenceQuerySubjectScopeClass::Dataset => !subject.object_scope.dataset_id.is_zero(),
+        EvidenceQuerySubjectScopeClass::Pool => !subject.pool_id.is_zero(),
+        EvidenceQuerySubjectScopeClass::Domain => !subject.domain_id.is_zero(),
+        EvidenceQuerySubjectScopeClass::Cluster => false,
+        EvidenceQuerySubjectScopeClass::ValidationArtifact => {
+            evidence_ref_has_id(subject.validation_ref)
+        }
+        EvidenceQuerySubjectScopeClass::Claim => {
+            evidence_ref_has_id(subject.request_ref) || evidence_ref_has_id(subject.validation_ref)
+        }
+    }
+}
+
 /// Bounded candidate records retained by one decision frontier.
 pub const STORAGE_INTENT_DECISION_FRONTIER_CANDIDATES: usize = 16;
 
@@ -1543,9 +2229,7 @@ impl StorageIntentDecisionScoreVector {
     ) -> StorageIntentDecisionScoreState {
         let mut index = 0;
         while index < decision_frontier_len(self.len) {
-            if self.entries[index].dimension.to_discriminant()
-                == dimension.to_discriminant()
-            {
+            if self.entries[index].dimension.to_discriminant() == dimension.to_discriminant() {
                 return self.entries[index].state;
             }
             index += 1;
@@ -1901,8 +2585,7 @@ impl StorageIntentDecisionEvidence {
         matches!(
             self.evidence_ref.kind,
             StorageIntentEvidenceKind::DecisionFrontierEvidence
-        )
-            && evidence_ref_has_id(self.evidence_ref)
+        ) && evidence_ref_has_id(self.evidence_ref)
             && !bytes32_are_zero(self.decision_id.0)
             && !self.policy_id.is_zero()
             && self.policy_revision.0 > 0
@@ -6579,7 +7262,8 @@ impl StorageIntentActionExecutionEvidence {
                 self.target_verification.state,
                 StorageIntentActionTargetVerificationState::PartialWrite
                     | StorageIntentActionTargetVerificationState::DegradedPartial
-            ) || self.target_verification.verified_bytes < self.target_verification.target_bytes
+            ) || self.target_verification.verified_bytes
+                < self.target_verification.target_bytes
             {
                 StorageIntentActionExecutionRefusalReason::PartialTargetWrite
             } else {
@@ -6917,6 +7601,67 @@ impl_u8_canonical!(EvidenceRetentionClass, {
     Summarizable = 1 => "summarizable",
     Redactable = 2 => "redactable",
     Purgeable = 3 => "purgeable",
+});
+
+impl_u8_canonical!(StorageIntentMeasurementAttributionVerdict, {
+    Unknown = 0 => "unknown",
+    Attributable = 1 => "attributable",
+    PartiallyAttributableWithBounds = 2 => "partially-attributable-with-bounds",
+    Confounded = 3 => "confounded",
+    InsufficientSample = 4 => "insufficient-sample",
+    Stale = 5 => "stale",
+    Contradicted = 6 => "contradicted",
+    ShadowOnly = 7 => "shadow-only",
+    Refused = 8 => "refused",
+});
+
+impl_u8_canonical!(StorageIntentMeasurementBaselineClass, {
+    Unknown = 0 => "unknown",
+    PriorAdmittedVariant = 1 => "prior-admitted-variant",
+    ShadowTarget = 2 => "shadow-target",
+    IncumbentPeerComparator = 3 => "incumbent-peer-comparator",
+    NoopCounterfactual = 4 => "noop-counterfactual",
+    SamePolicyCohort = 5 => "same-policy-cohort",
+    NoValidBaselineRefused = 6 => "no-valid-baseline-refused",
+});
+
+impl_u8_canonical!(StorageIntentMeasurementMetricDimension, {
+    Latency = 0 => "latency",
+    TailLatency = 1 => "tail-latency",
+    Throughput = 2 => "throughput",
+    Iops = 3 => "iops",
+    CacheHitRatio = 4 => "cache-hit-ratio",
+    ReadAmplification = 5 => "read-amplification",
+    WriteAmplification = 6 => "write-amplification",
+    MediaWriteBytes = 7 => "media-write-bytes",
+    WearCost = 8 => "wear-cost",
+    NetworkEgressBytes = 9 => "network-egress-bytes",
+    RestoreBytes = 10 => "restore-bytes",
+    CostMicrounits = 11 => "cost-microunits",
+    RpoLag = 12 => "rpo-lag",
+    CpuTime = 13 => "cpu-time",
+    ForegroundHarm = 14 => "foreground-harm",
+    PaybackWindow = 15 => "payback-window",
+});
+
+impl_u8_canonical!(StorageIntentMeasurementMetricUnit, {
+    UnitlessPpm = 0 => "unitless-ppm",
+    Microseconds = 1 => "microseconds",
+    Milliseconds = 2 => "milliseconds",
+    Bytes = 3 => "bytes",
+    BytesPerSecond = 4 => "bytes-per-second",
+    Iops = 5 => "iops",
+    CostMicrounits = 6 => "cost-microunits",
+    Count = 7 => "count",
+});
+
+impl_u8_canonical!(StorageIntentMeasurementMetricState, {
+    Unknown = 0 => "unknown",
+    Known = 1 => "known",
+    Bounded = 2 => "bounded",
+    Censored = 3 => "censored",
+    Dropped = 4 => "dropped",
+    Refused = 5 => "refused",
 });
 
 impl_u8_canonical!(StorageIntentOrderingOperationScope, {
@@ -7983,7 +8728,9 @@ impl StorageIntentRefusalReason {
             Self::ExpiredTemporalLease => "expired-temporal-lease",
             Self::CrossedPolicyStageDeadline => "crossed-policy-stage-deadline",
             Self::MissingRemoteApplyFrontier => "missing-remote-apply-frontier",
-            Self::SequenceOnlyCannotSatisfyWallClockRpo => "sequence-only-cannot-satisfy-wall-clock-rpo",
+            Self::SequenceOnlyCannotSatisfyWallClockRpo => {
+                "sequence-only-cannot-satisfy-wall-clock-rpo"
+            }
             Self::MissingCapacityAdmissionEvidence => "missing-capacity-admission-evidence",
             Self::StaleCapacityEvidence => "stale-capacity-evidence",
             Self::CapacityAdmissionNotActive => "capacity-admission-not-active",
@@ -9448,8 +10195,7 @@ impl ClockHealthFlags {
     pub const NO_STEP_ADJUSTMENT: u8 = 1 << 4;
 
     /// All defined health flags.
-    pub const ALL_DEFINED: u8 =
-        Self::MONOTONIC
+    pub const ALL_DEFINED: u8 = Self::MONOTONIC
         | Self::KNOWN_SKEW
         | Self::NO_BACKWARDS_STEP
         | Self::NO_LEAP_SECOND_PENDING
@@ -9861,7 +10607,8 @@ pub const fn temporal_evidence_supports_wall_clock_rpo(
     }
     // Observed lag plus skew bound must not exceed required RPO.
     // When skew is known, add it to the conservative bound.
-    let conservative_lag_ms = observed_lag_ms.saturating_add(evidence.clock_health.skew_bound_us / 1000);
+    let conservative_lag_ms =
+        observed_lag_ms.saturating_add(evidence.clock_health.skew_bound_us / 1000);
     conservative_lag_ms <= required_rpo_ms
 }
 
@@ -10947,18 +11694,12 @@ mod tests {
                 StorageIntentEvidenceKind::RecoveryDegradationEvidence,
                 147,
             ),
-            relocation_scratch_ref: evidence_ref(
-                StorageIntentEvidenceKind::RelocationReceipt,
-                148,
-            ),
+            relocation_scratch_ref: evidence_ref(StorageIntentEvidenceKind::RelocationReceipt, 148),
             pending_free_frontier_ref: evidence_ref(
                 StorageIntentEvidenceKind::LayoutAllocatorEvidence,
                 149,
             ),
-            reclaim_debt_ref: evidence_ref(
-                StorageIntentEvidenceKind::LayoutAllocatorEvidence,
-                150,
-            ),
+            reclaim_debt_ref: evidence_ref(StorageIntentEvidenceKind::LayoutAllocatorEvidence, 150),
             amplification_estimate_ref: evidence_ref(
                 StorageIntentEvidenceKind::DataShapeEvidence,
                 151,
@@ -10967,10 +11708,7 @@ mod tests {
                 StorageIntentEvidenceKind::CapacityAdmissionEvidence,
                 152,
             ),
-            policy_rollout_ref: evidence_ref(
-                StorageIntentEvidenceKind::PolicyRolloutEvidence,
-                153,
-            ),
+            policy_rollout_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 153),
             tenant_isolation_ref: evidence_ref(
                 StorageIntentEvidenceKind::TenantIsolationEvidence,
                 154,
@@ -11510,6 +12248,233 @@ mod tests {
         snapshot
     }
 
+    fn measurement_metric(
+        dimension: StorageIntentMeasurementMetricDimension,
+        unit: StorageIntentMeasurementMetricUnit,
+        byte: u8,
+    ) -> StorageIntentMeasurementMetricEntry {
+        StorageIntentMeasurementMetricEntry {
+            dimension,
+            state: StorageIntentMeasurementMetricState::Known,
+            unit,
+            value: i64::from(byte) * 100,
+            variance_ppm: u32::from(byte),
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, byte),
+        }
+    }
+
+    fn measurement_metrics(include_payback_deltas: bool) -> StorageIntentMeasurementMetricSet {
+        let mut metrics = StorageIntentMeasurementMetricSet::EMPTY;
+        metrics
+            .push(measurement_metric(
+                StorageIntentMeasurementMetricDimension::Latency,
+                StorageIntentMeasurementMetricUnit::Microseconds,
+                101,
+            ))
+            .unwrap();
+        metrics
+            .push(measurement_metric(
+                StorageIntentMeasurementMetricDimension::Throughput,
+                StorageIntentMeasurementMetricUnit::BytesPerSecond,
+                102,
+            ))
+            .unwrap();
+
+        if include_payback_deltas {
+            metrics
+                .push(measurement_metric(
+                    StorageIntentMeasurementMetricDimension::PaybackWindow,
+                    StorageIntentMeasurementMetricUnit::Milliseconds,
+                    103,
+                ))
+                .unwrap();
+            metrics
+                .push(measurement_metric(
+                    StorageIntentMeasurementMetricDimension::MediaWriteBytes,
+                    StorageIntentMeasurementMetricUnit::Bytes,
+                    104,
+                ))
+                .unwrap();
+            metrics
+                .push(measurement_metric(
+                    StorageIntentMeasurementMetricDimension::ForegroundHarm,
+                    StorageIntentMeasurementMetricUnit::UnitlessPpm,
+                    105,
+                ))
+                .unwrap();
+        }
+        metrics
+    }
+
+    fn all_authority_measurement_uses() -> StorageIntentMeasurementAttributionUseMask {
+        StorageIntentMeasurementAttributionUseMask::NON_AUTHORITY_SAFE
+            .union(StorageIntentMeasurementAttributionUseMask::TRAIN_CONFIDENCE_UPWARD)
+            .union(StorageIntentMeasurementAttributionUseMask::CLOSE_PAYBACK)
+            .union(StorageIntentMeasurementAttributionUseMask::ADMIT_AUTHORITY_MOVEMENT)
+            .union(StorageIntentMeasurementAttributionUseMask::RETIRE_SOURCE_RECEIPTS)
+            .union(StorageIntentMeasurementAttributionUseMask::SPEND_EXTRA_FLASH_MOVEMENT_BUDGET)
+            .union(StorageIntentMeasurementAttributionUseMask::SUPPORT_PERFORMANCE_EVIDENCE)
+            .union(StorageIntentMeasurementAttributionUseMask::SUPPORT_FAULT_EVIDENCE)
+            .union(StorageIntentMeasurementAttributionUseMask::SUPPORT_PUBLIC_OR_COMPARATOR_CLAIM)
+    }
+
+    fn measurement_source_refs() -> StorageIntentEvidenceRefs {
+        let mut refs = StorageIntentEvidenceRefs::EMPTY;
+        refs.push(evidence_ref(
+            StorageIntentEvidenceKind::ValidationArtifact,
+            106,
+        ))
+        .unwrap();
+        refs.push(evidence_ref(
+            StorageIntentEvidenceKind::TemporalEvidence,
+            107,
+        ))
+        .unwrap();
+        refs
+    }
+
+    fn shaping_refs() -> StorageIntentEvidenceRefs {
+        let mut refs = StorageIntentEvidenceRefs::EMPTY;
+        refs.push(evidence_ref(
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            108,
+        ))
+        .unwrap();
+        refs.push(evidence_ref(
+            StorageIntentEvidenceKind::TenantIsolationEvidence,
+            109,
+        ))
+        .unwrap();
+        refs
+    }
+
+    fn measurement_attribution() -> StorageIntentMeasurementAttributionEvidence {
+        StorageIntentMeasurementAttributionEvidence {
+            evidence_ref: evidence_ref(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                110,
+            ),
+            measurement_id: StorageIntentEvidenceId([111_u8; 32]),
+            tenant_id: DOMAIN_A,
+            budget_owner_id: DOMAIN_A,
+            subject: EvidenceQuerySubjectScope {
+                scope_class: EvidenceQuerySubjectScopeClass::ObjectRange,
+                object_scope: StorageIntentObjectScope {
+                    dataset_id: DOMAIN_A,
+                    object_id: StorageIntentEvidenceId([112_u8; 32]),
+                    range_start: 4096,
+                    range_len: 131_072,
+                    generation: 3,
+                },
+                pool_id: StorageIntentDomainId([113_u8; 16]),
+                domain_id: DOMAIN_A,
+                request_ref: evidence_ref(StorageIntentEvidenceKind::LocalIntentRecord, 114),
+                action_ref: evidence_ref(StorageIntentEvidenceKind::ActionExecutionEvidence, 115),
+                validation_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 116),
+            },
+            policy_id: StorageIntentPolicyId([117_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(12),
+            observation_generation: 13,
+            producer_component_ref: evidence_ref(
+                StorageIntentEvidenceKind::ValidationArtifact,
+                118,
+            ),
+            producer_version: 14,
+            workload_envelope_ref: evidence_ref(StorageIntentEvidenceKind::WorkloadEvidence, 119),
+            workload_scope_ref: evidence_ref(StorageIntentEvidenceKind::WorkloadEvidence, 120),
+            environment_profile_ref: evidence_ref(
+                StorageIntentEvidenceKind::TransportPathEvidence,
+                121,
+            ),
+            noise_policy_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 122),
+            service_objective_ref: evidence_ref(
+                StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                123,
+            ),
+            sample_window: StorageIntentMeasurementSampleWindow {
+                temporal_window_ref: evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 124),
+                warmup_ms: 5_000,
+                sample_window_ms: 60_000,
+                sample_mass: 512,
+                censored_sample_count: 2,
+                dropped_sample_count: 1,
+                variance_ppm: 5_000,
+                confidence_bound_ppm: 20_000,
+                censor_drop_policy_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                    125,
+                ),
+            },
+            measurement_source_refs: measurement_source_refs(),
+            evidence_query_snapshot_ref: evidence_ref(
+                StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+                126,
+            ),
+            decision_frontier_ref: evidence_ref(
+                StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                127,
+            ),
+            action_execution_ref: evidence_ref(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                128,
+            ),
+            admission_ref: evidence_ref(StorageIntentEvidenceKind::SchedulerAdmissionRecord, 129),
+            scheduler_ref: evidence_ref(StorageIntentEvidenceKind::SchedulerAdmissionRecord, 130),
+            isolation_ref: evidence_ref(StorageIntentEvidenceKind::TenantIsolationEvidence, 131),
+            capacity_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 132),
+            source_media_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 133),
+            target_media_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 134),
+            trust_domain_ref: evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, 135),
+            transport_path_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 136),
+            recovery_ref: evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 137),
+            rollout_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 138),
+            layout_ref: evidence_ref(StorageIntentEvidenceKind::LayoutAllocatorEvidence, 139),
+            lifecycle_ref: evidence_ref(
+                StorageIntentEvidenceKind::LifecycleGenerationEvidence,
+                140,
+            ),
+            shaping_refs: shaping_refs(),
+            comparator: StorageIntentMeasurementComparatorLineage {
+                baseline_class: StorageIntentMeasurementBaselineClass::PriorAdmittedVariant,
+                baseline_ref: evidence_ref(StorageIntentEvidenceKind::PlacementReceipt, 141),
+                comparator_ref: evidence_ref(StorageIntentEvidenceKind::ComparatorEvidence, 142),
+                counterfactual_ref: evidence_ref(
+                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    143,
+                ),
+                prior_admitted_variant_ref: evidence_ref(
+                    StorageIntentEvidenceKind::PlacementReceipt,
+                    144,
+                ),
+                shadow_target_ref: evidence_ref(
+                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    145,
+                ),
+                baseline_generation: 15,
+                no_valid_baseline_refusal: StorageIntentRefusalReason::None,
+            },
+            metrics: measurement_metrics(true),
+            verdict: StorageIntentMeasurementAttributionVerdict::Attributable,
+            bounded_uncertainty_ppm: 0,
+            allowed_uses: all_authority_measurement_uses(),
+            allowed_use_ref: evidence_ref(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                146,
+            ),
+            transfer_scope: StorageIntentMeasurementTransferScopeMask::EXACT_AUTHORITY_SCOPE,
+            transfer_scope_ref: evidence_ref(
+                StorageIntentEvidenceKind::TenantIsolationEvidence,
+                147,
+            ),
+            attribution_verdict_ref: evidence_ref(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                148,
+            ),
+            retention_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 149),
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
     fn decision_candidate_id(byte: u8) -> StorageIntentEvidenceId {
         StorageIntentEvidenceId([byte; 32])
     }
@@ -11993,7 +12958,10 @@ mod tests {
                     StorageIntentEvidenceKind::PlacementReceipt,
                     244,
                 ),
-                ordering_evidence_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 245),
+                ordering_evidence_ref: evidence_ref(
+                    StorageIntentEvidenceKind::OrderingEvidence,
+                    245,
+                ),
                 recovery_degradation_ref: evidence_ref(
                     StorageIntentEvidenceKind::RecoveryDegradationEvidence,
                     246,
@@ -12002,7 +12970,10 @@ mod tests {
                     StorageIntentEvidenceKind::PolicyRolloutEvidence,
                     247,
                 ),
-                visible_state_ref: evidence_ref(StorageIntentEvidenceKind::ResultRefusalEvidence, 248),
+                visible_state_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ResultRefusalEvidence,
+                    248,
+                ),
                 operator_explanation_ref: evidence_ref(
                     StorageIntentEvidenceKind::OperatorExplanationProjection,
                     249,
@@ -12448,12 +13419,11 @@ mod tests {
 
     #[test]
     fn duplicate_action_delivery_is_suppressed_not_reexecuted() {
-        let mut evidence = action_execution_evidence(StorageIntentActionExecutionStepState::Copying);
+        let mut evidence =
+            action_execution_evidence(StorageIntentActionExecutionStepState::Copying);
         evidence.replay.state = StorageIntentActionReplayState::DuplicateSuppressed;
-        evidence.replay.replay_refusal_ref = evidence_ref(
-            StorageIntentEvidenceKind::ActionExecutionEvidence,
-            217,
-        );
+        evidence.replay.replay_refusal_ref =
+            evidence_ref(StorageIntentEvidenceKind::ActionExecutionEvidence, 217);
 
         assert!(evidence.replay.duplicate_delivery_is_suppressed());
         assert_eq!(
@@ -12470,7 +13440,8 @@ mod tests {
     fn target_write_is_not_completion_without_verification_and_barrier() {
         let mut partial =
             action_execution_evidence(StorageIntentActionExecutionStepState::Verifying);
-        partial.target_verification.state = StorageIntentActionTargetVerificationState::PartialWrite;
+        partial.target_verification.state =
+            StorageIntentActionTargetVerificationState::PartialWrite;
         partial.target_verification.verified_bytes = 2048;
 
         assert_eq!(
@@ -12953,6 +13924,121 @@ mod tests {
         );
         assert!(!stale_objective.has_fresh_prefetch_residency_basis());
         assert!(!stale_objective.authorizes_prefetch_residency_feedback());
+    }
+
+    #[test]
+    fn measurement_attribution_with_full_lineage_can_close_payback() {
+        let evidence = measurement_attribution();
+        let requested = StorageIntentMeasurementAttributionUseMask::TRAIN_CONFIDENCE_UPWARD
+            .union(StorageIntentMeasurementAttributionUseMask::CLOSE_PAYBACK)
+            .union(StorageIntentMeasurementAttributionUseMask::ADMIT_AUTHORITY_MOVEMENT);
+
+        assert!(evidence.has_measurement_identity());
+        assert!(evidence.has_measurement_basis());
+        assert!(evidence.has_authority_lineage());
+        assert!(evidence.has_shaping_evidence());
+        assert!(evidence.metrics_support_payback_or_movement());
+        assert!(evidence.authorizes_use(requested));
+        assert_eq!(
+            measurement_attribution_authorizes_use(evidence, requested),
+            ReceiptPredicateResult::SATISFIED
+        );
+    }
+
+    #[test]
+    fn confounded_measurements_are_diagnostic_only() {
+        let mut evidence = measurement_attribution();
+        evidence.verdict = StorageIntentMeasurementAttributionVerdict::Confounded;
+        evidence.allowed_uses = StorageIntentMeasurementAttributionUseMask::NON_AUTHORITY_SAFE;
+
+        assert!(evidence.verdict.blocks_authority());
+        assert!(evidence.hard_law_is_respected());
+        assert!(evidence.authorizes_use(StorageIntentMeasurementAttributionUseMask::DIAGNOSE));
+        assert!(evidence.authorizes_use(
+            StorageIntentMeasurementAttributionUseMask::FORCE_CONSERVATIVE_COOLDOWN
+        ));
+        assert!(!evidence
+            .authorizes_use(StorageIntentMeasurementAttributionUseMask::TRAIN_CONFIDENCE_UPWARD));
+        assert!(!evidence.authorizes_use(StorageIntentMeasurementAttributionUseMask::CLOSE_PAYBACK));
+
+        evidence.allowed_uses = evidence
+            .allowed_uses
+            .union(StorageIntentMeasurementAttributionUseMask::CLOSE_PAYBACK);
+        assert!(!evidence.hard_law_is_respected());
+        assert!(!evidence.authorizes_use(StorageIntentMeasurementAttributionUseMask::DIAGNOSE));
+    }
+
+    #[test]
+    fn missing_or_refused_baseline_blocks_payback_and_claims() {
+        let mut evidence = measurement_attribution();
+        evidence.comparator = StorageIntentMeasurementComparatorLineage {
+            baseline_class: StorageIntentMeasurementBaselineClass::NoValidBaselineRefused,
+            no_valid_baseline_refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+            ..evidence.comparator
+        };
+
+        assert!(evidence.comparator.has_no_valid_baseline_refusal());
+        assert!(!evidence.comparator.has_authority_baseline());
+        assert!(evidence.authorizes_use(StorageIntentMeasurementAttributionUseMask::DIAGNOSE));
+        assert!(!evidence.authorizes_use(StorageIntentMeasurementAttributionUseMask::CLOSE_PAYBACK));
+        assert!(!evidence.authorizes_use(
+            StorageIntentMeasurementAttributionUseMask::SUPPORT_PUBLIC_OR_COMPARATOR_CLAIM
+        ));
+    }
+
+    #[test]
+    fn cross_scope_training_requires_explicit_transfer_evidence() {
+        let mut evidence = measurement_attribution();
+
+        evidence.transfer_scope = StorageIntentMeasurementTransferScopeMask::EXPLICIT_TRANSFER_RULE
+            .union(StorageIntentMeasurementTransferScopeMask::ISOLATION_ELIGIBLE)
+            .union(StorageIntentMeasurementTransferScopeMask::TRUST_DOMAIN_ELIGIBLE);
+        evidence.transfer_scope_ref = StorageIntentEvidenceRef::default();
+        assert!(!evidence.authority_transfer_is_allowed());
+        assert!(!evidence
+            .authorizes_use(StorageIntentMeasurementAttributionUseMask::TRAIN_CONFIDENCE_UPWARD));
+
+        evidence.transfer_scope = evidence
+            .transfer_scope
+            .union(StorageIntentMeasurementTransferScopeMask::DOMAIN_ELIGIBLE);
+        assert!(!evidence.authority_transfer_is_allowed());
+
+        evidence.transfer_scope_ref =
+            evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, 150);
+        assert!(evidence.authority_transfer_is_allowed());
+        assert!(evidence
+            .authorizes_use(StorageIntentMeasurementAttributionUseMask::TRAIN_CONFIDENCE_UPWARD));
+    }
+
+    #[test]
+    fn partial_attribution_requires_bounds_before_authority_use() {
+        let mut evidence = measurement_attribution();
+        evidence.verdict =
+            StorageIntentMeasurementAttributionVerdict::PartiallyAttributableWithBounds;
+        evidence.bounded_uncertainty_ppm = 0;
+
+        assert!(!evidence.has_verdict_boundary());
+        assert!(!evidence.authorizes_use(
+            StorageIntentMeasurementAttributionUseMask::SUPPORT_PERFORMANCE_EVIDENCE
+        ));
+
+        evidence.bounded_uncertainty_ppm = 25_000;
+        assert!(evidence.has_verdict_boundary());
+        assert!(evidence.authorizes_use(
+            StorageIntentMeasurementAttributionUseMask::SUPPORT_PERFORMANCE_EVIDENCE
+        ));
+    }
+
+    #[test]
+    fn payback_uses_require_payback_cost_and_harm_metrics() {
+        let mut evidence = measurement_attribution();
+        evidence.metrics = measurement_metrics(false);
+
+        assert!(evidence.metrics.has_usable_metric());
+        assert!(!evidence.metrics_support_payback_or_movement());
+        assert!(evidence
+            .authorizes_use(StorageIntentMeasurementAttributionUseMask::TRAIN_CONFIDENCE_UPWARD));
+        assert!(!evidence.authorizes_use(StorageIntentMeasurementAttributionUseMask::CLOSE_PAYBACK));
     }
 
     #[test]
@@ -14698,7 +15784,10 @@ mod tests {
     }
     // ── Temporal evidence tests (issue #903) ── //
 
-    fn temporal_evidence_ref(kind: StorageIntentEvidenceKind, byte: u8) -> StorageIntentEvidenceRef {
+    fn temporal_evidence_ref(
+        kind: StorageIntentEvidenceKind,
+        byte: u8,
+    ) -> StorageIntentEvidenceRef {
         StorageIntentEvidenceRef::new(
             kind,
             StorageIntentEvidenceId([byte; 32]),
@@ -14727,7 +15816,10 @@ mod tests {
             },
             clock_health_ref: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 5),
             event_frontier: StorageIntentEventFrontierClass::RemoteApply,
-            event_frontier_ref: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 6),
+            event_frontier_ref: temporal_evidence_ref(
+                StorageIntentEvidenceKind::TemporalEvidence,
+                6,
+            ),
             staleness_class: StorageIntentStalenessClass::GeoRpoLag,
             staleness_ref: temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 7),
             expiry_deadline_class: StorageIntentExpiryDeadlineClass::Unknown,
@@ -14747,7 +15839,9 @@ mod tests {
             ClockHealthFlags::MONOTONIC | ClockHealthFlags::NO_BACKWARDS_STEP,
         );
 
-        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
+        assert!(!temporal_evidence_supports_wall_clock_rpo(
+            evidence, 5000, 1000, 5000
+        ));
         // But the evidence still has a wall-clock timebase.
         assert!(timebase_supports_wall_clock(evidence.timebase));
         // The refusal should map correctly.
@@ -14763,20 +15857,27 @@ mod tests {
         evidence.clock_health.skew_bound_us = 0;
         evidence.clock_health.flags = ClockHealthFlags::EMPTY;
 
-        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
+        assert!(!temporal_evidence_supports_freshness_claim(
+            evidence, 30000, 5000
+        ));
     }
 
     #[test]
     fn backwards_clock_step_cannot_satisfy_wall_clock_claims() {
         let mut evidence = healthy_wall_clock_timebase();
         // Remove NO_BACKWARDS_STEP flag — simulates a backwards clock step.
-        evidence.clock_health.flags = ClockHealthFlags::from_flag(
-            ClockHealthFlags::MONOTONIC | ClockHealthFlags::KNOWN_SKEW,
-        );
+        evidence.clock_health.flags =
+            ClockHealthFlags::from_flag(ClockHealthFlags::MONOTONIC | ClockHealthFlags::KNOWN_SKEW);
 
-        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
-        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
+        assert!(!temporal_evidence_supports_wall_clock_rpo(
+            evidence, 5000, 1000, 5000
+        ));
+        assert!(!temporal_evidence_supports_freshness_claim(
+            evidence, 30000, 5000
+        ));
+        assert!(!temporal_evidence_supports_ttl_claim(
+            evidence, 3_600_000, 7_200_000, 5000
+        ));
 
         // Map backwards time to the policy refusal.
         assert_eq!(
@@ -14789,12 +15890,20 @@ mod tests {
     fn stale_clock_health_sample_cannot_satisfy_freshness() {
         let evidence = healthy_wall_clock_timebase();
         // Sample age is 1000 ms, max is 500 ms -> stale.
-        assert!(!clock_health_is_fresh_for_authority(evidence.clock_health, 500));
+        assert!(!clock_health_is_fresh_for_authority(
+            evidence.clock_health,
+            500
+        ));
         // But with generous max sample age, it's fresh.
-        assert!(clock_health_is_fresh_for_authority(evidence.clock_health, 2000));
+        assert!(clock_health_is_fresh_for_authority(
+            evidence.clock_health,
+            2000
+        ));
 
         // Stale sample makes all wall-clock claims fail.
-        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 500));
+        assert!(!temporal_evidence_supports_wall_clock_rpo(
+            evidence, 5000, 1000, 500
+        ));
     }
 
     #[test]
@@ -14805,7 +15914,9 @@ mod tests {
             temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 10);
 
         // Deadline is 10000 ms, now is 15000 ms — expired.
-        assert!(!temporal_evidence_supports_expiry_claim(evidence, 10000, 15000, 5000));
+        assert!(!temporal_evidence_supports_expiry_claim(
+            evidence, 10000, 15000, 5000
+        ));
 
         // Map crossed expiry to policy refusal.
         assert_eq!(
@@ -14823,7 +15934,9 @@ mod tests {
             temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 11);
 
         // Deadline has passed.
-        assert!(!temporal_evidence_supports_expiry_claim(evidence, 10000, 15000, 5000));
+        assert!(!temporal_evidence_supports_expiry_claim(
+            evidence, 10000, 15000, 5000
+        ));
     }
 
     #[test]
@@ -14832,7 +15945,9 @@ mod tests {
         evidence.event_frontier = StorageIntentEventFrontierClass::CommittedRoot;
 
         // RPO requires RemoteApply frontier.
-        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
+        assert!(!temporal_evidence_supports_wall_clock_rpo(
+            evidence, 5000, 1000, 5000
+        ));
     }
 
     #[test]
@@ -14840,9 +15955,15 @@ mod tests {
         let mut evidence = healthy_wall_clock_timebase();
         evidence.timebase = StorageIntentTimebaseClass::SequenceOnly;
 
-        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
-        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
+        assert!(!temporal_evidence_supports_wall_clock_rpo(
+            evidence, 5000, 1000, 5000
+        ));
+        assert!(!temporal_evidence_supports_freshness_claim(
+            evidence, 30000, 5000
+        ));
+        assert!(!temporal_evidence_supports_ttl_claim(
+            evidence, 3_600_000, 7_200_000, 5000
+        ));
 
         assert!(timebase_is_sequence_only(evidence.timebase));
         assert!(!timebase_supports_wall_clock(evidence.timebase));
@@ -14861,7 +15982,9 @@ mod tests {
         let mut evidence = healthy_wall_clock_timebase();
         evidence.timebase = StorageIntentTimebaseClass::SequenceLogFrontier;
 
-        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
+        assert!(!temporal_evidence_supports_freshness_claim(
+            evidence, 30000, 5000
+        ));
         // But cooldown claims can work with local monotonic time.
         assert!(timebase_is_sequence_only(evidence.timebase));
     }
@@ -14875,9 +15998,13 @@ mod tests {
             temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 12);
 
         // Local cooldown with local monotonic time is valid.
-        assert!(temporal_evidence_supports_cooldown_claim(evidence, 5000, 10000, false));
+        assert!(temporal_evidence_supports_cooldown_claim(
+            evidence, 5000, 10000, false
+        ));
         // Cross-node cooldown needs wall-clock.
-        assert!(!temporal_evidence_supports_cooldown_claim(evidence, 5000, 10000, true));
+        assert!(!temporal_evidence_supports_cooldown_claim(
+            evidence, 5000, 10000, true
+        ));
     }
 
     #[test]
@@ -14893,11 +16020,21 @@ mod tests {
         assert!(!evidence.is_refused());
 
         // All predicates must return false for unbound evidence.
-        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
-        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(!temporal_evidence_supports_expiry_claim(evidence, 10000, 5000, 5000));
-        assert!(!temporal_evidence_supports_cooldown_claim(evidence, 5000, 10000, false));
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 3_600_000, 5000));
+        assert!(!temporal_evidence_supports_wall_clock_rpo(
+            evidence, 5000, 1000, 5000
+        ));
+        assert!(!temporal_evidence_supports_freshness_claim(
+            evidence, 30000, 5000
+        ));
+        assert!(!temporal_evidence_supports_expiry_claim(
+            evidence, 10000, 5000, 5000
+        ));
+        assert!(!temporal_evidence_supports_cooldown_claim(
+            evidence, 5000, 10000, false
+        ));
+        assert!(!temporal_evidence_supports_ttl_claim(
+            evidence, 3_600_000, 3_600_000, 5000
+        ));
     }
 
     #[test]
@@ -14906,15 +16043,24 @@ mod tests {
         evidence.refusal = StorageIntentTemporalRefusalReason::MissingTimebase;
 
         assert!(evidence.is_refused());
-        assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
-        assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(!temporal_evidence_supports_expiry_claim(evidence, 10000, 5000, 5000));
+        assert!(!temporal_evidence_supports_wall_clock_rpo(
+            evidence, 5000, 1000, 5000
+        ));
+        assert!(!temporal_evidence_supports_freshness_claim(
+            evidence, 30000, 5000
+        ));
+        assert!(!temporal_evidence_supports_expiry_claim(
+            evidence, 10000, 5000, 5000
+        ));
     }
 
     #[test]
     fn temporal_evidence_age_requires_wall_clock_and_known_skew() {
         let evidence = healthy_wall_clock_timebase();
-        assert_eq!(temporal_evidence_age_ms(evidence, 20000, 10000), Some(10000));
+        assert_eq!(
+            temporal_evidence_age_ms(evidence, 20000, 10000),
+            Some(10000)
+        );
 
         // Backwards time returns None.
         assert_eq!(temporal_evidence_age_ms(evidence, 5000, 10000), None);
@@ -15003,9 +16149,8 @@ mod tests {
 
     #[test]
     fn clock_health_flags_combine_and_test() {
-        let flags = ClockHealthFlags::from_flag(
-            ClockHealthFlags::MONOTONIC | ClockHealthFlags::KNOWN_SKEW,
-        );
+        let flags =
+            ClockHealthFlags::from_flag(ClockHealthFlags::MONOTONIC | ClockHealthFlags::KNOWN_SKEW);
         assert!(flags.contains_all(ClockHealthFlags::MONOTONIC));
         assert!(flags.contains_all(ClockHealthFlags::KNOWN_SKEW));
         assert!(!flags.contains_all(ClockHealthFlags::NO_BACKWARDS_STEP));
@@ -15038,7 +16183,9 @@ mod tests {
     fn ttl_claim_fails_on_sequence_only_timebase() {
         let mut evidence = healthy_wall_clock_timebase();
         evidence.timebase = StorageIntentTimebaseClass::SequenceOnly;
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(
+            evidence, 3_600_000, 7_200_000, 5000
+        ));
     }
 
     #[test]
@@ -15046,7 +16193,9 @@ mod tests {
         let mut evidence = healthy_wall_clock_timebase();
         evidence.clock_health.flags = ClockHealthFlags::from_flag(ClockHealthFlags::KNOWN_SKEW);
         // Missing NO_BACKWARDS_STEP.
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(
+            evidence, 3_600_000, 7_200_000, 5000
+        ));
     }
 
     #[test]
@@ -15059,9 +16208,18 @@ mod tests {
         assert!(evidence.has_lag_staleness());
 
         // Known skew, no backwards step, wall-clock timebase, fresh sample.
-        assert!(temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
-        assert!(temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
-        assert_eq!(temporal_evidence_age_ms(evidence, 20000, 10000), Some(10000));
+        assert!(temporal_evidence_supports_wall_clock_rpo(
+            evidence, 5000, 1000, 5000
+        ));
+        assert!(temporal_evidence_supports_freshness_claim(
+            evidence, 30000, 5000
+        ));
+        assert!(temporal_evidence_supports_ttl_claim(
+            evidence, 3_600_000, 7_200_000, 5000
+        ));
+        assert_eq!(
+            temporal_evidence_age_ms(evidence, 20000, 10000),
+            Some(10000)
+        );
     }
 }
