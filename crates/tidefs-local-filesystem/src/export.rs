@@ -393,8 +393,11 @@ mod tests {
         fs.create_snapshot("snap0").expect("create snapshot");
 
         fs.set_auto_commit(false);
+        fs.set_max_uncommitted_mutations(1_000_000);
         fs.write_file("/lost.txt", 0, b"live payloaddata")
             .expect("mutate live file");
+        fs.create_dir("/live-only", 0o755)
+            .expect("create live-only dir");
         let before = fs.uncommitted_mutation_count();
         assert!(before > 0, "setup should leave deferred live mutations");
 
@@ -408,6 +411,7 @@ mod tests {
                 .expect("read live file after extract"),
             b"live payloaddata"
         );
+        assert!(fs.lookup("/live-only").is_ok());
     }
 
     #[test]
