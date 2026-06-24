@@ -1925,7 +1925,7 @@ impl StorageIntentDecisionEvidence {
     pub const fn retains_decision_frontier(self) -> bool {
         self.candidates.len() > 1
             && !bytes32_are_zero(self.candidates.candidate_set_digest.0)
-            && self.hard_gates.len() > 0
+            && !self.hard_gates.is_empty()
             && (!self.candidates.has_non_legal_candidate()
                 || self.hard_gates.has_non_passing_gate())
     }
@@ -12128,7 +12128,7 @@ mod tests {
 
         assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
         assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
 
         // Map backwards time to the policy refusal.
         assert_eq!(
@@ -12194,7 +12194,7 @@ mod tests {
 
         assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
         assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
 
         assert!(timebase_is_sequence_only(evidence.timebase));
         assert!(!timebase_supports_wall_clock(evidence.timebase));
@@ -12249,7 +12249,7 @@ mod tests {
         assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
         assert!(!temporal_evidence_supports_expiry_claim(evidence, 10000, 5000, 5000));
         assert!(!temporal_evidence_supports_cooldown_claim(evidence, 5000, 10000, false));
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 3600_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 3_600_000, 5000));
     }
 
     #[test]
@@ -12390,7 +12390,7 @@ mod tests {
     fn ttl_claim_fails_on_sequence_only_timebase() {
         let mut evidence = healthy_wall_clock_timebase();
         evidence.timebase = StorageIntentTimebaseClass::SequenceOnly;
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
     }
 
     #[test]
@@ -12398,7 +12398,7 @@ mod tests {
         let mut evidence = healthy_wall_clock_timebase();
         evidence.clock_health.flags = ClockHealthFlags::from_flag(ClockHealthFlags::KNOWN_SKEW);
         // Missing NO_BACKWARDS_STEP.
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
     }
 
     #[test]
@@ -12413,7 +12413,7 @@ mod tests {
         // Known skew, no backwards step, wall-clock timebase, fresh sample.
         assert!(temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
         assert!(temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert!(temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
         assert_eq!(temporal_evidence_age_ms(evidence, 20000, 10000), Some(10000));
     }
 }
