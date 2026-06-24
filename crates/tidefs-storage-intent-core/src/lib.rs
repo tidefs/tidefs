@@ -8495,10 +8495,11 @@ impl LayoutAllocatorRecord {
         if self.largest_free_run_bytes < requested_bytes {
             return false;
         }
-        if required_alignment > 0 && self.extent_alignment_bytes > 0 {
-            if required_alignment > self.extent_alignment_bytes {
-                return false;
-            }
+        if required_alignment > 0
+            && self.extent_alignment_bytes > 0
+            && required_alignment > self.extent_alignment_bytes
+        {
+            return false;
         }
         true
     }
