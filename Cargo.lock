@@ -2686,6 +2686,7 @@ dependencies = [
  "tidefs-scrub-core",
  "tidefs-send-stream",
  "tidefs-space-accounting",
+ "tidefs-storage-intent-core",
  "tidefs-types-cache-lattice-core",
  "tidefs-types-claim-ledger-core",
  "tidefs-types-dataset-feature-flags-core",
