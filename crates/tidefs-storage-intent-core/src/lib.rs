@@ -13441,6 +13441,962 @@ pub const fn rollout_requires_replacement_receipts_for_old_generations(
     )
         && evidence_ref_has_id(evidence.replacement_receipt_set_ref)
 }
+
+// ── Recovery/degradation evidence types (#900) ── //
+
+/// Current degraded state for a receipt set, read path, or repair obligation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDegradationClass {
+    /// No degradation; receipt set is exact and authority-capable.
+    #[default]
+    Exact = 0,
+    /// A weaker or healing state is visible but must not be hidden as exact.
+    DegradedVisible = 1,
+    /// Active reconstruction in progress; receipts are not yet authority.
+    Reconstructing = 2,
+    /// A read repair or scrub-triggered repair is required before next authority use.
+    RepairRequired = 3,
+    /// A full rebuild or resilver must complete before authority can be restored.
+    RebuildRequired = 4,
+    /// Quorum is not reachable for the receipt set.
+    NoQuorum = 5,
+    /// Network partition prevents authority-capable operation.
+    Partitioned = 6,
+    /// Geo-replication lag exceeds the policy RPO bound.
+    GeoLagged = 7,
+    /// Operation is temporarily blocked by a recovery cooldown, fence, or gate.
+    Blocked = 8,
+    /// Operation is permanently refused by evidence or policy.
+    Refused = 9,
+    /// Evidence is missing and the degradation class cannot be determined.
+    UnknownEvidence = 10,
+}
+
+impl StorageIntentDegradationClass {
+    /// Returns true when the state may legally satisfy authority.
+    #[must_use]
+    pub const fn is_authority_capable(self) -> bool {
+        matches!(self, Self::Exact)
+    }
+
+    /// Returns true when the state is visible but must not change authority.
+    #[must_use]
+    pub const fn is_visible_non_authority(self) -> bool {
+        matches!(
+            self,
+            Self::DegradedVisible
+                | Self::Reconstructing
+                | Self::RepairRequired
+                | Self::RebuildRequired
+                | Self::NoQuorum
+                | Self::Partitioned
+                | Self::GeoLagged
+        )
+    }
+
+    /// Returns true when the state blocks all authority-changing use.
+    #[must_use]
+    pub const fn blocks_authority(self) -> bool {
+        matches!(
+            self,
+            Self::Blocked
+                | Self::Refused
+                | Self::UnknownEvidence
+                | Self::NoQuorum
+                | Self::Partitioned
+        )
+    }
+}
+
+/// Visibility law for degraded state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDegradationVisibility {
+    /// No explicit degradation visibility law.
+    #[default]
+    Unknown = 0,
+    /// Degraded state must be surfaced to callers or operators.
+    Visible = 1,
+    /// Degraded state may be hidden only when the guarantee class permits it.
+    ConditionalHide = 2,
+    /// Degraded state must not be hidden under any circumstances.
+    ForbidHide = 3,
+}
+
+/// Refusal law for degraded reads, writes, or repairs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDegradationRefusalLaw {
+    /// No explicit refusal law.
+    #[default]
+    Unknown = 0,
+    /// Refuse when any target is missing or under-width.
+    RefuseWhenUnderWidth = 1,
+    /// Refuse when quorum is not reachable.
+    RefuseWhenNoQuorum = 2,
+    /// Refuse when partition or split-brain hazard exists.
+    RefuseWhenPartitioned = 3,
+    /// Refuse when geo lag exceeds policy.
+    RefuseWhenGeoLagged = 4,
+    /// Refuse when trust, key, or domain evidence is stale.
+    RefuseWhenTrustEvidenceStale = 5,
+    /// Refuse when capacity reserve cannot cover the repair.
+    RefuseWhenNoRepairReserve = 6,
+    /// Serve degraded-visible reads but refuse authority-changing operations.
+    ServeDegradedReadsOnly = 7,
+    /// Refuse all operations while degraded.
+    RefuseAllDegraded = 8,
+}
+
+/// Requested degradation policy bound to a compiled storage-intent policy revision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDegradationPolicy {
+    /// Visibility law for degraded state.
+    pub visibility: StorageIntentDegradationVisibility,
+    /// Refusal law for degraded operations.
+    pub refusal_law: StorageIntentDegradationRefusalLaw,
+    /// The compiled policy that set this degradation law.
+    pub policy_ref: StorageIntentEvidenceRef,
+    /// Policy revision that defined these bounds.
+    pub policy_revision: StorageIntentPolicyRevision,
+}
+
+impl StorageIntentDegradationPolicy {
+    /// Returns true when the policy explicitly forbids hiding degradation.
+    #[must_use]
+    pub const fn forbids_hiding_degradation(self) -> bool {
+        matches!(self.visibility, StorageIntentDegradationVisibility::ForbidHide)
+    }
+
+    /// Returns true when the policy permits degraded-visible reads.
+    #[must_use]
+    pub const fn permits_degraded_reads(self) -> bool {
+        matches!(
+            self.refusal_law,
+            StorageIntentDegradationRefusalLaw::ServeDegradedReadsOnly
+        )
+    }
+
+    /// Returns true when the policy refuses all operations while degraded.
+    #[must_use]
+    pub const fn refuses_all_degraded(self) -> bool {
+        matches!(
+            self.refusal_law,
+            StorageIntentDegradationRefusalLaw::RefuseAllDegraded
+        )
+    }
+
+    /// Returns true when the policy has a bound policy reference.
+    #[must_use]
+    pub const fn has_policy_ref(self) -> bool {
+        evidence_ref_has_id(self.policy_ref) && self.policy_revision.0 > 0
+    }
+}
+
+/// Recovery priority class for repair, rebuild, and catch-up scheduling.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentRecoveryPriorityClass {
+    /// Priority is unknown or not yet determined.
+    #[default]
+    Unknown = 0,
+    /// Immediate critical: data loss or corruption risk is active.
+    ImmediateCritical = 1,
+    /// High foreground: read path is blocked or will degrade without repair.
+    HighForeground = 2,
+    /// Normal priority: scheduled recovery within the RTO window.
+    Normal = 3,
+    /// Background opportunistic: recovery may use idle resources.
+    BackgroundOpportunistic = 4,
+    /// Deferred or hibernating: recovery is held behind a cooldown or gate.
+    DeferredHibernating = 5,
+    /// Archived: recovery is not needed for live authority.
+    Archived = 6,
+}
+
+/// Individual target degradation class within a receipt set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentTargetDegradationClass {
+    /// Target is present and accounted for.
+    #[default]
+    Present = 0,
+    /// Target is missing entirely (device lost, unplugged, or decommissioned).
+    Missing = 1,
+    /// Target data is corrupt or digest-mismatched.
+    Corrupt = 2,
+    /// Target data is stale (outdated generation or epoch).
+    Stale = 3,
+    /// Target is quarantined by trust or health evidence.
+    Quarantined = 4,
+    /// Target has been fenced out of the membership.
+    Fenced = 5,
+    /// Target is draining and must not satisfy fresh reads.
+    Drained = 6,
+    /// Target belongs to a wrong administrative or trust domain.
+    WrongDomain = 7,
+    /// Target count is below the redundancy width.
+    UnderWidth = 8,
+    /// Target is unreachable due to transport or network failure.
+    Unreachable = 9,
+}
+
+/// Split-brain hazard state from membership evidence (#750).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentSplitBrainHazard {
+    /// No split-brain hazard is detected.
+    #[default]
+    None = 0,
+    /// Partition is possible; hazard assessment is incomplete.
+    Possible = 1,
+    /// A confirmed split-brain hazard exists.
+    Confirmed = 2,
+    /// Hazard was detected and the minority side is fenced.
+    FencedMinority = 3,
+    /// Hazard was detected and is being healed.
+    Healing = 4,
+    /// Evidence is missing and the hazard cannot be determined.
+    UnknownEvidence = 5,
+}
+
+/// Typed refusal reason for recovery/degradation evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentRecoveryRefusalReason {
+    /// No refusal.
+    #[default]
+    None = 0,
+    /// No legal receipt set exists for this recovery role.
+    NoLegalReceiptSet = 1,
+    /// Source receipt is stale or missing.
+    StaleSourceReceipt = 2,
+    /// Reconstruction width is below policy minimum.
+    UnderWidthReconstruction = 3,
+    /// A corrupt repair source was included in the reconstruction set.
+    CorruptRepairSource = 4,
+    /// Partition healing attempted with an old membership epoch.
+    OldEpochPartitionHealing = 5,
+    /// A fenced or draining peer was counted as a data source.
+    FencedPeerCountedAsData = 6,
+    /// A quarantined source was used for repair or reconstruction.
+    QuarantinedRepairSource = 7,
+    /// A wrong-domain source was included in the reconstruction set.
+    WrongDomainRepairSource = 8,
+    /// Read repair was attempted without capacity reserve evidence.
+    ReadRepairWithoutReserve = 9,
+    /// Replacement receipt is missing at old-receipt retirement time.
+    MissingReplacementReceipt = 10,
+    /// Geo lag exceeds the policy RPO bound.
+    GeoLagExceedsPolicy = 11,
+    /// Trust evidence is stale for repair or geo participants.
+    StaleTrustEvidenceForRecovery = 12,
+    /// Ordering evidence is missing for repair publication.
+    MissingOrderingForRepairPublication = 13,
+    /// Capacity reserve cannot cover the rebuild scratch space.
+    InsufficientRebuildScratchCapacity = 14,
+    /// Recovery is blocked by a retry cooldown.
+    RecoveryCooldownBlocked = 15,
+    /// Evidence is missing for the recovery obligation.
+    MissingRecoveryObligationEvidence = 16,
+    /// Split-brain hazard prevents safe recovery.
+    SplitBrainHazardUnsafe = 17,
+    /// Key epoch is stale for cross-domain repair sources.
+    StaleKeyEpochForRecovery = 18,
+    /// Residency constraint is violated by a repair participant.
+    ResidencyViolationInRecovery = 19,
+    /// Recovery RPO/RTO deadline has been crossed.
+    RecoveryDeadlineCrossed = 20,
+}
+
+/// Full recovery/degradation evidence record (#900).
+///
+/// This record is the storage-intent authority projection for degraded reads,
+/// read repair, scrub-triggered repair, rebuild/resilver, evacuation,
+/// relocation overlap, geo catch-up, archive restore, degraded write admission,
+/// receipt retirement, and satisfaction reconciliation.
+///
+/// It cites placement receipt sets, membership evidence, trust evidence,
+/// ordering evidence, capacity evidence, and media-capability evidence
+/// without implementing their producer or consumer runtime behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentRecoveryDegradationEvidence {
+    /// Self-referential evidence identity.
+    pub evidence_ref: StorageIntentEvidenceRef,
+    /// Requested degradation policy from the compiled storage-intent policy.
+    pub degradation_policy: StorageIntentDegradationPolicy,
+    /// Current degraded state.
+    pub degradation: StorageIntentDegradationClass,
+    /// Evidence ref for the source placement receipt set.
+    pub source_receipt_set_ref: StorageIntentEvidenceRef,
+    /// Receipt generation for the source set.
+    pub receipt_generation: u64,
+    /// Redundancy width (total targets including parity) for the receipt set.
+    pub redundancy_width: u8,
+    /// Reconstruction width (minimum targets needed to reconstruct).
+    pub reconstruction_width: u8,
+    /// Evidence ref for the payload digest or shard-digest set.
+    pub payload_digest_ref: StorageIntentEvidenceRef,
+    /// Wall-clock freshness of the source evidence in milliseconds (0 if unknown).
+    pub source_freshness_ms: u64,
+    /// True when source freshness is backed by temporal evidence.
+    pub source_freshness_known: bool,
+    /// Population counts for each target degradation class.
+    pub target_present: u8,
+    pub target_missing: u8,
+    pub target_corrupt: u8,
+    pub target_stale: u8,
+    pub target_quarantined: u8,
+    pub target_fenced: u8,
+    pub target_drained: u8,
+    pub target_wrong_domain: u8,
+    pub target_under_width: u8,
+    pub target_unreachable: u8,
+    /// Repair and rebuild evidence refs.
+    pub read_repair_ref: StorageIntentEvidenceRef,
+    pub scrub_finding_ref: StorageIntentEvidenceRef,
+    pub repair_ticket_ref: StorageIntentEvidenceRef,
+    pub rebuild_ticket_ref: StorageIntentEvidenceRef,
+    pub relocation_overlap_ref: StorageIntentEvidenceRef,
+    pub replacement_receipt_ref: StorageIntentEvidenceRef,
+    pub flow_commit_ref: StorageIntentEvidenceRef,
+    pub old_receipt_retirement_ref: StorageIntentEvidenceRef,
+    /// Partition and healing evidence refs (#750).
+    pub partition_evidence_ref: StorageIntentEvidenceRef,
+    pub membership_epoch_ref: StorageIntentEvidenceRef,
+    pub fence_ref: StorageIntentEvidenceRef,
+    pub quorum_set_ref: StorageIntentEvidenceRef,
+    pub witness_role_ref: StorageIntentEvidenceRef,
+    pub data_role_ref: StorageIntentEvidenceRef,
+    pub split_brain_hazard: StorageIntentSplitBrainHazard,
+    /// Trust and domain evidence refs (#897).
+    pub trust_domain_ref: StorageIntentEvidenceRef,
+    pub key_epoch_ref: StorageIntentEvidenceRef,
+    pub authorization_ref: StorageIntentEvidenceRef,
+    pub audit_ref: StorageIntentEvidenceRef,
+    pub residency_ref: StorageIntentEvidenceRef,
+    pub quarantine_ref: StorageIntentEvidenceRef,
+    /// Ordering and replay evidence refs (#894).
+    pub repair_publication_ref: StorageIntentEvidenceRef,
+    pub rebuild_completion_ref: StorageIntentEvidenceRef,
+    pub replacement_publication_ref: StorageIntentEvidenceRef,
+    pub receipt_retirement_ordering_ref: StorageIntentEvidenceRef,
+    /// Capacity and admission evidence refs (#898).
+    pub read_repair_capacity_ref: StorageIntentEvidenceRef,
+    pub rebuild_scratch_capacity_ref: StorageIntentEvidenceRef,
+    pub evacuation_capacity_ref: StorageIntentEvidenceRef,
+    pub geo_backlog_capacity_ref: StorageIntentEvidenceRef,
+    pub receipt_retirement_capacity_ref: StorageIntentEvidenceRef,
+    /// Recovery scheduling and debt state.
+    pub recovery_priority: StorageIntentRecoveryPriorityClass,
+    pub rpo_lag_ms: u64,
+    pub rto_lag_ms: u64,
+    pub repair_debt_bytes: u64,
+    pub degraded_read_foreground_cost_us: u32,
+    pub retry_cooldown_ms: u64,
+    /// Recovery-level typed refusal.
+    pub refusal: StorageIntentRecoveryRefusalReason,
+    pub refusal_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentRecoveryDegradationEvidence {
+    /// Returns true when the record cites a non-empty recovery/degradation artifact.
+    #[must_use]
+    pub const fn has_recovery_evidence(self) -> bool {
+        self.evidence_ref.kind as u16
+            == StorageIntentEvidenceKind::RecoveryDegradationEvidence as u16
+            && !bytes32_are_zero(self.evidence_ref.id.0)
+    }
+
+    /// Returns true when the degradation policy is bound.
+    #[must_use]
+    pub const fn has_degradation_policy(self) -> bool {
+        self.degradation_policy.has_policy_ref()
+    }
+
+    /// Returns true when the source receipt set is bound.
+    #[must_use]
+    pub const fn has_source_receipt_set(self) -> bool {
+        evidence_ref_has_id(self.source_receipt_set_ref) && self.receipt_generation > 0
+    }
+
+    /// Returns true when the receipt set has enough targets present for authority.
+    #[must_use]
+    pub const fn has_authority_width(self) -> bool {
+        self.redundancy_width > 0
+            && self.target_present >= self.redundancy_width
+            && self.target_missing == 0
+            && self.target_corrupt == 0
+            && self.target_unreachable == 0
+    }
+
+    /// Returns true when enough targets are reachable for degraded reconstruction.
+    #[must_use]
+    pub const fn has_reconstruction_width(self) -> bool {
+        self.reconstruction_width > 0
+            && self.target_present >= self.reconstruction_width
+    }
+
+    /// Returns true when no target is quarantined, fenced, or wrong-domain.
+    #[must_use]
+    pub const fn targets_are_clean(self) -> bool {
+        self.target_corrupt == 0
+            && self.target_stale == 0
+            && self.target_quarantined == 0
+            && self.target_fenced == 0
+            && self.target_wrong_domain == 0
+            && self.target_drained == 0
+    }
+
+    /// Returns true when the recovery evidence has an active refusal.
+    #[must_use]
+    pub const fn is_refused(self) -> bool {
+        self.refusal as u8 != StorageIntentRecoveryRefusalReason::None as u8
+    }
+
+    /// Returns true when the degradation class is authority-capable (exact).
+    #[must_use]
+    pub const fn is_exact(self) -> bool {
+        self.degradation.is_authority_capable()
+    }
+
+    /// Returns true when the degradation is visible but non-authority.
+    #[must_use]
+    pub const fn is_degraded_visible(self) -> bool {
+        self.degradation.is_visible_non_authority()
+    }
+
+    /// Returns true when source freshness is known and within a bound.
+    #[must_use]
+    pub const fn source_freshness_within(self, max_age_ms: u64) -> bool {
+        self.source_freshness_known && self.source_freshness_ms <= max_age_ms
+    }
+}
+
+// ── Recovery/degradation evidence predicates (#900) ── //
+
+/// Predicate: can this receipt set serve a degraded read?
+///
+/// A degraded read is legal only when the policy permits degraded-visible reads,
+/// the receipt set has reconstruction width, no quarantined or fenced target
+/// is counted as a data source, trust and domain evidence is present, and
+/// the source freshness is within the tolerable bound.
+#[must_use]
+pub const fn recovery_evidence_supports_degraded_read(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+    max_source_age_ms: u64,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.degradation_policy.permits_degraded_reads() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NoLegalReceiptSet);
+    }
+    if !evidence.has_source_receipt_set() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_reconstruction_width() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.targets_are_clean() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::QuarantinedSource);
+    }
+    if !evidence.source_freshness_within(max_source_age_ms) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleOrderingEvidence);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can a read repair proceed?
+///
+/// A read repair is legal only when a source receipt set is present,
+/// the repair target is identified, the read repair capacity ref is bound,
+/// and the source data is not from a fenced, quarantined, or wrong-domain peer.
+#[must_use]
+pub const fn recovery_evidence_supports_read_repair(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_source_receipt_set() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NoLegalReceiptSet);
+    }
+    if evidence.target_corrupt == 0 && evidence.target_stale == 0 && evidence.target_missing == 0 {
+        // Nothing to repair; this is not a predicate failure but a no-op.
+        // Still satisfiable: repair is not needed.
+    }
+    if evidence.target_quarantined > 0 {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::QuarantinedSource);
+    }
+    if evidence.target_fenced > 0 {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if evidence.target_wrong_domain > 0 {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
+    }
+    if !evidence_ref_has_id(evidence.read_repair_capacity_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can a scrub-triggered repair proceed?
+///
+/// A scrub-triggered repair is legal only when a scrub finding ref is bound,
+/// the repair ticket ref is bound, and the targets are clean of quarantined,
+/// fenced, or wrong-domain peers.
+#[must_use]
+pub const fn recovery_evidence_supports_scrub_repair(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.scrub_finding_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.repair_ticket_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.targets_are_clean() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::QuarantinedSource);
+    }
+    if !evidence.has_reconstruction_width() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can a rebuild or resilver proceed?
+///
+/// A rebuild is legal only when the rebuild ticket ref is bound,
+/// the rebuild completion ordering ref is bound, the capacity reserve
+/// for rebuild scratch is bound, and the source receipt set has reconstruction width.
+#[must_use]
+pub const fn recovery_evidence_supports_rebuild(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.rebuild_ticket_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.rebuild_completion_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.rebuild_scratch_capacity_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_source_receipt_set() || !evidence.has_reconstruction_width() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NoLegalReceiptSet);
+    }
+    if !evidence.targets_are_clean() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::QuarantinedSource);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can an evacuation proceed?
+///
+/// Evacuation is legal only when the evacuation capacity ref is bound,
+/// a source receipt set exists, and no target is fenced or drained
+/// in a way that would hide data loss.
+#[must_use]
+pub const fn recovery_evidence_supports_evacuation(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.evacuation_capacity_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_source_receipt_set() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NoLegalReceiptSet);
+    }
+    // Drained targets are expected during evacuation, but fenced targets
+    // must not be counted as safe to drain.
+    if evidence.target_fenced > 0 {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can a relocation overlap proceed?
+///
+/// Relocation overlap (source and destination both holding authority temporarily)
+/// is legal only when the relocation overlap ref is bound, the replacement
+/// receipt ref is bound, and the source receipt set is present.
+#[must_use]
+pub const fn recovery_evidence_supports_relocation_overlap(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.relocation_overlap_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.replacement_receipt_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_source_receipt_set() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NoLegalReceiptSet);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can a geo catch-up proceed?
+///
+/// Geo catch-up is legal only when the geo backlog capacity ref is bound,
+/// the trust domain ref is bound, the partition evidence ref is present,
+/// and the split-brain hazard is not confirmed or healing.
+#[must_use]
+pub const fn recovery_evidence_supports_geo_catchup(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+    max_geo_lag_ms: u64,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.geo_backlog_capacity_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.trust_domain_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::WrongDomain);
+    }
+    if evidence.split_brain_hazard as u8 == StorageIntentSplitBrainHazard::Confirmed as u8
+        || evidence.split_brain_hazard as u8 == StorageIntentSplitBrainHazard::Healing as u8
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if evidence.rpo_lag_ms > max_geo_lag_ms {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::DurabilityOrRpoNotMet);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can an archive restore proceed?
+///
+/// Archive restore is legal only when the archive restore evidence refs
+/// are present, the residency ref is bound (if required), and the
+/// receipt set has at least reconstruction width.
+#[must_use]
+pub const fn recovery_evidence_supports_archive_restore(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_source_receipt_set() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NoLegalReceiptSet);
+    }
+    if !evidence.has_reconstruction_width() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can a degraded write be admitted when policy permits it?
+///
+/// A degraded write is legal only when the policy does not refuse all degraded
+/// operations, the receipt set has reconstruction width, and the source
+/// receipt evidence is present. Hidden downgrade (claiming durable success
+/// from under-width or stale evidence) is forbidden.
+#[must_use]
+pub const fn recovery_evidence_supports_degraded_write(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if evidence.degradation_policy.refuses_all_degraded() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_source_receipt_set() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NoLegalReceiptSet);
+    }
+    if !evidence.has_reconstruction_width() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if evidence.degradation.blocks_authority() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    // Hidden downgrade gate: if degradation is not exact, the write must
+    // not be claimed as durable success.
+    if evidence.is_exact() {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    // Degraded-visible write: policy must permit degraded reads at minimum.
+    if !evidence.degradation_policy.permits_degraded_reads() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can an old receipt be retired?
+///
+/// Receipt retirement is legal only when the replacement receipt ref is bound,
+/// the old receipt retirement ref is bound (ordering evidence for retirement),
+/// the receipt retirement ordering ref is bound, and the receipt retirement
+/// capacity ref is bound.
+#[must_use]
+pub const fn recovery_evidence_supports_receipt_retirement(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.replacement_receipt_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.old_receipt_retirement_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence_ref_has_id(evidence.receipt_retirement_ordering_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::MissingOrderingEvidence);
+    }
+    if !evidence_ref_has_id(evidence.receipt_retirement_capacity_ref) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: can satisfaction reconciliation proceed?
+///
+/// Satisfaction reconciliation (#874) is legal only when the receipt set
+/// is present, the degradation class is not blocked or refused, and
+/// the recovery obligation evidence is present.
+#[must_use]
+pub const fn recovery_evidence_supports_satisfaction_reconciliation(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.is_refused() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_recovery_evidence() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if evidence.degradation.blocks_authority() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !evidence.has_source_receipt_set() {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NoLegalReceiptSet);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: does the degradation policy forbid hiding the degraded state?
+///
+/// When true, callers and operators must surface the degradation class and
+/// refusal reason; an "OK" or "success" result is illegal.
+#[must_use]
+pub const fn degradation_forbids_hiding(
+    policy: StorageIntentDegradationPolicy,
+    degradation: StorageIntentDegradationClass,
+) -> bool {
+    if policy.forbids_hiding_degradation() {
+        return true;
+    }
+    // Even without explicit forbid-hide, a non-exact degradation must not be hidden
+    // when the policy has conditional-hide but the degradation is not exact.
+    if policy.visibility as u8 == StorageIntentDegradationVisibility::ConditionalHide as u8
+        && !degradation.is_authority_capable()
+    {
+        return true;
+    }
+    false
+}
+
+/// Predicate: verify that a recovery/degradation record does not commit any
+/// of the hidden-downgrade violations enumerated in #900.
+///
+/// Returns true when the record would be illegal to surface as authority.
+/// Durable success, fresh read, geo intent, full placement, or receipt
+/// retirement must not be claimed from stale, under-width, partition-ambiguous,
+/// wrong-domain, under-reserved, or unverified reconstruction evidence.
+#[must_use]
+pub const fn recovery_evidence_commits_hidden_downgrade(
+    evidence: StorageIntentRecoveryDegradationEvidence,
+) -> bool {
+    // If the record itself is refused, a hidden-downgrade claim would be outright fraud.
+    if evidence.is_refused() {
+        return true;
+    }
+    if !evidence.has_recovery_evidence() {
+        return true;
+    }
+    // Claiming exact/authority from under-width targets.
+    if evidence.is_exact() && !evidence.has_authority_width() {
+        return true;
+    }
+    // Claiming fresh read from stale source.
+    if evidence.is_exact() && !evidence.source_freshness_known {
+        return true;
+    }
+    // Claiming geo intent while geo-lagged.
+    if evidence.degradation as u8 == StorageIntentDegradationClass::Exact as u8
+        && evidence.rpo_lag_ms > 0
+        && !evidence.source_freshness_known
+    {
+        return true;
+    }
+    // Claiming full placement from under-width reconstruction.
+    if evidence.is_exact() && evidence.target_under_width > 0 {
+        return true;
+    }
+    // Claiming exact authority during partition ambiguity.
+    if evidence.is_exact()
+        && evidence.split_brain_hazard as u8 != StorageIntentSplitBrainHazard::None as u8
+    {
+        return true;
+    }
+    // Claiming receipt retirement without replacement receipt.
+    if evidence_ref_has_id(evidence.old_receipt_retirement_ref)
+        && !evidence_ref_has_id(evidence.replacement_receipt_ref)
+    {
+        return true;
+    }
+    // Claiming authority with wrong-domain targets mixed in.
+    if evidence.is_exact() && evidence.target_wrong_domain > 0 {
+        return true;
+    }
+    false
+}
+
+// ── Canonical encodings for new enums ── //
+
+impl_u8_canonical!(StorageIntentDegradationClass, {
+    Exact = 0 => "exact",
+    DegradedVisible = 1 => "degraded-visible",
+    Reconstructing = 2 => "reconstructing",
+    RepairRequired = 3 => "repair-required",
+    RebuildRequired = 4 => "rebuild-required",
+    NoQuorum = 5 => "no-quorum",
+    Partitioned = 6 => "partitioned",
+    GeoLagged = 7 => "geo-lagged",
+    Blocked = 8 => "blocked",
+    Refused = 9 => "refused",
+    UnknownEvidence = 10 => "unknown-evidence",
+});
+
+impl_u8_canonical!(StorageIntentDegradationVisibility, {
+    Unknown = 0 => "unknown",
+    Visible = 1 => "visible",
+    ConditionalHide = 2 => "conditional-hide",
+    ForbidHide = 3 => "forbid-hide",
+});
+
+impl_u8_canonical!(StorageIntentDegradationRefusalLaw, {
+    Unknown = 0 => "unknown",
+    RefuseWhenUnderWidth = 1 => "refuse-when-under-width",
+    RefuseWhenNoQuorum = 2 => "refuse-when-no-quorum",
+    RefuseWhenPartitioned = 3 => "refuse-when-partitioned",
+    RefuseWhenGeoLagged = 4 => "refuse-when-geo-lagged",
+    RefuseWhenTrustEvidenceStale = 5 => "refuse-when-trust-evidence-stale",
+    RefuseWhenNoRepairReserve = 6 => "refuse-when-no-repair-reserve",
+    ServeDegradedReadsOnly = 7 => "serve-degraded-reads-only",
+    RefuseAllDegraded = 8 => "refuse-all-degraded",
+});
+
+impl_u8_canonical!(StorageIntentRecoveryPriorityClass, {
+    Unknown = 0 => "unknown",
+    ImmediateCritical = 1 => "immediate-critical",
+    HighForeground = 2 => "high-foreground",
+    Normal = 3 => "normal",
+    BackgroundOpportunistic = 4 => "background-opportunistic",
+    DeferredHibernating = 5 => "deferred-hibernating",
+    Archived = 6 => "archived",
+});
+
+impl_u8_canonical!(StorageIntentTargetDegradationClass, {
+    Present = 0 => "present",
+    Missing = 1 => "missing",
+    Corrupt = 2 => "corrupt",
+    Stale = 3 => "stale",
+    Quarantined = 4 => "quarantined",
+    Fenced = 5 => "fenced",
+    Drained = 6 => "drained",
+    WrongDomain = 7 => "wrong-domain",
+    UnderWidth = 8 => "under-width",
+    Unreachable = 9 => "unreachable",
+});
+
+impl_u8_canonical!(StorageIntentSplitBrainHazard, {
+    None = 0 => "none",
+    Possible = 1 => "possible",
+    Confirmed = 2 => "confirmed",
+    FencedMinority = 3 => "fenced-minority",
+    Healing = 4 => "healing",
+    UnknownEvidence = 5 => "unknown-evidence",
+});
+
+impl_u8_canonical!(StorageIntentRecoveryRefusalReason, {
+    None = 0 => "none",
+    NoLegalReceiptSet = 1 => "no-legal-receipt-set",
+    StaleSourceReceipt = 2 => "stale-source-receipt",
+    UnderWidthReconstruction = 3 => "under-width-reconstruction",
+    CorruptRepairSource = 4 => "corrupt-repair-source",
+    OldEpochPartitionHealing = 5 => "old-epoch-partition-healing",
+    FencedPeerCountedAsData = 6 => "fenced-peer-counted-as-data",
+    QuarantinedRepairSource = 7 => "quarantined-repair-source",
+    WrongDomainRepairSource = 8 => "wrong-domain-repair-source",
+    ReadRepairWithoutReserve = 9 => "read-repair-without-reserve",
+    MissingReplacementReceipt = 10 => "missing-replacement-receipt",
+    GeoLagExceedsPolicy = 11 => "geo-lag-exceeds-policy",
+    StaleTrustEvidenceForRecovery = 12 => "stale-trust-evidence-for-recovery",
+    MissingOrderingForRepairPublication = 13 => "missing-ordering-for-repair-publication",
+    InsufficientRebuildScratchCapacity = 14 => "insufficient-rebuild-scratch-capacity",
+    RecoveryCooldownBlocked = 15 => "recovery-cooldown-blocked",
+    MissingRecoveryObligationEvidence = 16 => "missing-recovery-obligation-evidence",
+    SplitBrainHazardUnsafe = 17 => "split-brain-hazard-unsafe",
+    StaleKeyEpochForRecovery = 18 => "stale-key-epoch-for-recovery",
+    ResidencyViolationInRecovery = 19 => "residency-violation-in-recovery",
+    RecoveryDeadlineCrossed = 20 => "recovery-deadline-crossed",
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18171,6 +19127,92 @@ mod tests {
         }
     }
 
+    // ── Recovery/degradation evidence model tests (#900) ── //
+
+    fn recovery_evidence_ref(byte: u8) -> StorageIntentEvidenceRef {
+        evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, byte)
+    }
+
+    fn placement_receipt_ref(byte: u8) -> StorageIntentEvidenceRef {
+        evidence_ref(StorageIntentEvidenceKind::PlacementReceipt, byte)
+    }
+
+    fn capacity_ref(byte: u8) -> StorageIntentEvidenceRef {
+        evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, byte)
+    }
+
+    fn ordering_ref(byte: u8) -> StorageIntentEvidenceRef {
+        evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, byte)
+    }
+
+    fn healthy_recovery_evidence() -> StorageIntentRecoveryDegradationEvidence {
+        StorageIntentRecoveryDegradationEvidence {
+            evidence_ref: recovery_evidence_ref(1),
+            degradation_policy: StorageIntentDegradationPolicy {
+                visibility: StorageIntentDegradationVisibility::Visible,
+                refusal_law: StorageIntentDegradationRefusalLaw::ServeDegradedReadsOnly,
+                policy_ref: placement_receipt_ref(10),
+                policy_revision: StorageIntentPolicyRevision(1),
+            },
+            degradation: StorageIntentDegradationClass::Exact,
+            source_receipt_set_ref: placement_receipt_ref(20),
+            receipt_generation: 3,
+            redundancy_width: 3,
+            reconstruction_width: 2,
+            payload_digest_ref: evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 30),
+            source_freshness_ms: 5000,
+            source_freshness_known: true,
+            target_present: 3,
+            target_missing: 0,
+            target_corrupt: 0,
+            target_stale: 0,
+            target_quarantined: 0,
+            target_fenced: 0,
+            target_drained: 0,
+            target_wrong_domain: 0,
+            target_under_width: 0,
+            target_unreachable: 0,
+            read_repair_ref: StorageIntentEvidenceRef::default(),
+            scrub_finding_ref: StorageIntentEvidenceRef::default(),
+            repair_ticket_ref: StorageIntentEvidenceRef::default(),
+            rebuild_ticket_ref: StorageIntentEvidenceRef::default(),
+            relocation_overlap_ref: StorageIntentEvidenceRef::default(),
+            replacement_receipt_ref: StorageIntentEvidenceRef::default(),
+            flow_commit_ref: StorageIntentEvidenceRef::default(),
+            old_receipt_retirement_ref: StorageIntentEvidenceRef::default(),
+            partition_evidence_ref: StorageIntentEvidenceRef::default(),
+            membership_epoch_ref: StorageIntentEvidenceRef::default(),
+            fence_ref: StorageIntentEvidenceRef::default(),
+            quorum_set_ref: StorageIntentEvidenceRef::default(),
+            witness_role_ref: StorageIntentEvidenceRef::default(),
+            data_role_ref: StorageIntentEvidenceRef::default(),
+            split_brain_hazard: StorageIntentSplitBrainHazard::None,
+            trust_domain_ref: StorageIntentEvidenceRef::default(),
+            key_epoch_ref: StorageIntentEvidenceRef::default(),
+            authorization_ref: StorageIntentEvidenceRef::default(),
+            audit_ref: StorageIntentEvidenceRef::default(),
+            residency_ref: StorageIntentEvidenceRef::default(),
+            quarantine_ref: StorageIntentEvidenceRef::default(),
+            repair_publication_ref: StorageIntentEvidenceRef::default(),
+            rebuild_completion_ref: StorageIntentEvidenceRef::default(),
+            replacement_publication_ref: StorageIntentEvidenceRef::default(),
+            receipt_retirement_ordering_ref: StorageIntentEvidenceRef::default(),
+            read_repair_capacity_ref: capacity_ref(40),
+            rebuild_scratch_capacity_ref: StorageIntentEvidenceRef::default(),
+            evacuation_capacity_ref: StorageIntentEvidenceRef::default(),
+            geo_backlog_capacity_ref: StorageIntentEvidenceRef::default(),
+            receipt_retirement_capacity_ref: StorageIntentEvidenceRef::default(),
+            recovery_priority: StorageIntentRecoveryPriorityClass::Normal,
+            rpo_lag_ms: 0,
+            rto_lag_ms: 10000,
+            repair_debt_bytes: 0,
+            degraded_read_foreground_cost_us: 0,
+            retry_cooldown_ms: 0,
+            refusal: StorageIntentRecoveryRefusalReason::None,
+            refusal_ref: StorageIntentEvidenceRef::default(),
+        }
+    }
+
     #[test]
     fn rollout_change_class_enums_encode_decode_roundtrip() {
         let classes = [
@@ -18907,6 +19949,260 @@ mod tests {
     }
 
     #[test]
+    fn no_quorum_refuses_authority() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.degradation = StorageIntentDegradationClass::NoQuorum;
+        // No-quorum must refuse authority-changing operations.
+        let result = recovery_evidence_supports_degraded_write(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn stale_receipt_source_refuses_degraded_read() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.source_freshness_ms = 120_000;
+        // Request max freshness of 60_000ms; the 120_000ms source is stale.
+        let result = recovery_evidence_supports_degraded_read(evidence, 60_000);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn under_width_ec_reconstruction_blocks_authority() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.target_present = 1;
+        evidence.redundancy_width = 6;
+        evidence.reconstruction_width = 3;
+        assert!(!evidence.has_authority_width());
+        assert!(!evidence.has_reconstruction_width());
+        let result = recovery_evidence_supports_degraded_read(evidence, 30_000);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn corrupt_repair_source_blocks_rebuild() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.target_corrupt = 1;
+        evidence.target_present = 2;
+        evidence.redundancy_width = 3;
+        evidence.reconstruction_width = 2;
+        evidence.rebuild_ticket_ref = ordering_ref(50);
+        evidence.rebuild_completion_ref = ordering_ref(51);
+        evidence.rebuild_scratch_capacity_ref = capacity_ref(52);
+        // Has reconstruction width but source is corrupt.
+        assert!(evidence.has_reconstruction_width());
+        // Rebuild predicate: targets must be clean.
+        let result = recovery_evidence_supports_rebuild(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn partition_healing_with_old_epoch_refuses_geo_catchup() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.degradation = StorageIntentDegradationClass::Partitioned;
+        evidence.split_brain_hazard = StorageIntentSplitBrainHazard::Confirmed;
+        evidence.geo_backlog_capacity_ref = capacity_ref(60);
+        evidence.trust_domain_ref = trust_ref(61);
+        let result = recovery_evidence_supports_geo_catchup(evidence, 30_000);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn fenced_peer_counted_as_data_blocks_degraded_read() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.target_fenced = 1;
+        evidence.target_present = 2;
+        evidence.redundancy_width = 3;
+        evidence.reconstruction_width = 2;
+        // Has reconstruction width but a fenced peer is in the set.
+        assert!(evidence.has_reconstruction_width());
+        let result = recovery_evidence_supports_degraded_read(evidence, 30_000);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn quarantined_repair_source_blocks_read_repair() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.target_quarantined = 1;
+        evidence.target_present = 2;
+        evidence.redundancy_width = 3;
+        evidence.reconstruction_width = 2;
+        let result = recovery_evidence_supports_read_repair(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn wrong_domain_repair_source_blocks_read_repair() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.target_wrong_domain = 1;
+        evidence.target_present = 2;
+        evidence.redundancy_width = 3;
+        evidence.reconstruction_width = 2;
+        let result = recovery_evidence_supports_read_repair(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn read_repair_without_capacity_reserve_is_refused() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.read_repair_capacity_ref = StorageIntentEvidenceRef::default();
+        evidence.target_stale = 1;
+        evidence.target_present = 2;
+        evidence.redundancy_width = 3;
+        evidence.reconstruction_width = 2;
+        let result = recovery_evidence_supports_read_repair(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn replacement_receipt_missing_at_receipt_retirement() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.replacement_receipt_ref = StorageIntentEvidenceRef::default();
+        evidence.old_receipt_retirement_ref = ordering_ref(70);
+        evidence.receipt_retirement_ordering_ref = ordering_ref(71);
+        evidence.receipt_retirement_capacity_ref = capacity_ref(72);
+        let result = recovery_evidence_supports_receipt_retirement(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn geo_lag_exceeding_policy_refuses_catchup() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.geo_backlog_capacity_ref = capacity_ref(80);
+        evidence.trust_domain_ref = trust_ref(81);
+        evidence.rpo_lag_ms = 60_000;
+        // Policy max lag is 30_000ms.
+        let result = recovery_evidence_supports_geo_catchup(evidence, 30_000);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn policy_permitted_degraded_visible_reads_succeed() {
+        let evidence = healthy_recovery_evidence();
+        // Exact + ServeDegradedReadsOnly policy = degraded read allowed.
+        let result = recovery_evidence_supports_degraded_read(evidence, 30_000);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn hidden_downgrade_detected_when_exact_claimed_under_width() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.degradation = StorageIntentDegradationClass::Exact;
+        evidence.target_under_width = 1;
+        assert!(recovery_evidence_commits_hidden_downgrade(evidence));
+    }
+
+    #[test]
+    fn hidden_downgrade_detected_when_exact_claimed_with_partition_ambiguity() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.degradation = StorageIntentDegradationClass::Exact;
+        evidence.split_brain_hazard = StorageIntentSplitBrainHazard::Possible;
+        assert!(recovery_evidence_commits_hidden_downgrade(evidence));
+    }
+
+    #[test]
+    fn hidden_downgrade_detected_when_exact_claimed_with_wrong_domain_targets() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.degradation = StorageIntentDegradationClass::Exact;
+        evidence.target_wrong_domain = 1;
+        assert!(recovery_evidence_commits_hidden_downgrade(evidence));
+    }
+
+    #[test]
+    fn hidden_downgrade_detected_when_retirement_lacks_replacement_receipt() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.old_receipt_retirement_ref = ordering_ref(92);
+        evidence.replacement_receipt_ref = StorageIntentEvidenceRef::default();
+        assert!(recovery_evidence_commits_hidden_downgrade(evidence));
+    }
+
+    #[test]
+    fn degradation_forbids_hiding_when_policy_says_forbid() {
+        let policy = StorageIntentDegradationPolicy {
+            visibility: StorageIntentDegradationVisibility::ForbidHide,
+            refusal_law: StorageIntentDegradationRefusalLaw::ServeDegradedReadsOnly,
+            policy_ref: placement_receipt_ref(90),
+            policy_revision: StorageIntentPolicyRevision(2),
+        };
+        assert!(degradation_forbids_hiding(
+            policy,
+            StorageIntentDegradationClass::DegradedVisible
+        ));
+    }
+
+    #[test]
+    fn degradation_allows_hiding_when_exact_and_conditional() {
+        let policy = StorageIntentDegradationPolicy {
+            visibility: StorageIntentDegradationVisibility::ConditionalHide,
+            refusal_law: StorageIntentDegradationRefusalLaw::ServeDegradedReadsOnly,
+            policy_ref: placement_receipt_ref(91),
+            policy_revision: StorageIntentPolicyRevision(2),
+        };
+        assert!(!degradation_forbids_hiding(
+            policy,
+            StorageIntentDegradationClass::Exact
+        ));
+    }
+
+    #[test]
+    fn degradation_enums_encode_decode_roundtrip() {
+        let classes = [
+            StorageIntentDegradationClass::Exact,
+            StorageIntentDegradationClass::DegradedVisible,
+            StorageIntentDegradationClass::Reconstructing,
+            StorageIntentDegradationClass::RepairRequired,
+            StorageIntentDegradationClass::RebuildRequired,
+            StorageIntentDegradationClass::NoQuorum,
+            StorageIntentDegradationClass::Partitioned,
+            StorageIntentDegradationClass::GeoLagged,
+            StorageIntentDegradationClass::Blocked,
+            StorageIntentDegradationClass::Refused,
+            StorageIntentDegradationClass::UnknownEvidence,
+        ];
+        for c in &classes {
+            let disc = c.to_discriminant();
+            let decoded = StorageIntentDegradationClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*c), "roundtrip failed for {:?}", c.as_str());
+        }
+        assert_eq!(StorageIntentDegradationClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn recovery_refusal_enums_encode_decode_roundtrip() {
+        let refusals = [
+            StorageIntentRecoveryRefusalReason::None,
+            StorageIntentRecoveryRefusalReason::NoLegalReceiptSet,
+            StorageIntentRecoveryRefusalReason::StaleSourceReceipt,
+            StorageIntentRecoveryRefusalReason::UnderWidthReconstruction,
+            StorageIntentRecoveryRefusalReason::CorruptRepairSource,
+            StorageIntentRecoveryRefusalReason::OldEpochPartitionHealing,
+            StorageIntentRecoveryRefusalReason::FencedPeerCountedAsData,
+            StorageIntentRecoveryRefusalReason::QuarantinedRepairSource,
+            StorageIntentRecoveryRefusalReason::WrongDomainRepairSource,
+            StorageIntentRecoveryRefusalReason::ReadRepairWithoutReserve,
+            StorageIntentRecoveryRefusalReason::MissingReplacementReceipt,
+            StorageIntentRecoveryRefusalReason::GeoLagExceedsPolicy,
+            StorageIntentRecoveryRefusalReason::StaleTrustEvidenceForRecovery,
+            StorageIntentRecoveryRefusalReason::MissingOrderingForRepairPublication,
+            StorageIntentRecoveryRefusalReason::InsufficientRebuildScratchCapacity,
+            StorageIntentRecoveryRefusalReason::RecoveryCooldownBlocked,
+            StorageIntentRecoveryRefusalReason::MissingRecoveryObligationEvidence,
+            StorageIntentRecoveryRefusalReason::SplitBrainHazardUnsafe,
+            StorageIntentRecoveryRefusalReason::StaleKeyEpochForRecovery,
+            StorageIntentRecoveryRefusalReason::ResidencyViolationInRecovery,
+            StorageIntentRecoveryRefusalReason::RecoveryDeadlineCrossed,
+        ];
+        for r in &refusals {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentRecoveryRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+        assert_eq!(
+            StorageIntentRecoveryRefusalReason::from_discriminant(255),
+            None
+        );
+    }
+
+    #[test]
     fn stale_evidence_blocks_hard_gate() {
         let mut record = healthy_data_shape_record();
         record.evidence.generation = 0;
@@ -18992,6 +20288,53 @@ mod tests {
         record.dedup_scope = DedupFingerprintScopeClass::NoDedup;
         let policy = restrictive_data_shape_policy();
         let result = data_shape_dedup_domain_is_compatible(record, policy.sharing_domain);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn healthy_recovery_evidence_passes_all_basic_predicates() {
+        let evidence = healthy_recovery_evidence();
+        assert!(evidence.has_recovery_evidence());
+        assert!(evidence.has_degradation_policy());
+        assert!(evidence.has_source_receipt_set());
+        assert!(evidence.has_authority_width());
+        assert!(evidence.has_reconstruction_width());
+        assert!(evidence.targets_are_clean());
+        assert!(evidence.is_exact());
+        assert!(!evidence.is_refused());
+        assert!(evidence.source_freshness_within(30_000));
+        assert!(!recovery_evidence_commits_hidden_downgrade(evidence));
+    }
+
+    #[test]
+    fn refused_recovery_evidence_blocks_all_predicates() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.refusal = StorageIntentRecoveryRefusalReason::RecoveryCooldownBlocked;
+        assert!(evidence.is_refused());
+
+        assert!(!recovery_evidence_supports_degraded_read(evidence, 30_000).satisfied);
+        assert!(!recovery_evidence_supports_read_repair(evidence).satisfied);
+        assert!(!recovery_evidence_supports_rebuild(evidence).satisfied);
+        assert!(!recovery_evidence_supports_geo_catchup(evidence, 30_000).satisfied);
+        assert!(!recovery_evidence_supports_receipt_retirement(evidence).satisfied);
+        assert!(recovery_evidence_commits_hidden_downgrade(evidence));
+    }
+
+    #[test]
+    fn unrecognized_evidence_ref_does_not_satisfy() {
+        let mut evidence = healthy_recovery_evidence();
+        // Corrupt the evidence_ref so it no longer points to RecoveryDegradation.
+        evidence.evidence_ref = placement_receipt_ref(99);
+        assert!(!evidence.has_recovery_evidence());
+        let result = recovery_evidence_supports_degraded_read(evidence, 30_000);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn exact_write_admission_when_not_degraded() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.degradation = StorageIntentDegradationClass::Exact;
+        let result = recovery_evidence_supports_degraded_write(evidence);
         assert!(result.satisfied);
     }
 
@@ -19127,6 +20470,51 @@ mod tests {
     fn data_shape_policy_default_has_zero_policy_id() {
         let policy = DataShapePolicy::default();
         assert!(policy.policy_id.is_zero());
+    }
+
+    #[test]
+    fn degraded_write_refused_when_policy_refuses_all_degraded() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.degradation = StorageIntentDegradationClass::DegradedVisible;
+        evidence.degradation_policy.refusal_law =
+            StorageIntentDegradationRefusalLaw::RefuseAllDegraded;
+        let result = recovery_evidence_supports_degraded_write(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn satisfaction_reconciliation_blocked_when_degradation_blocks_authority() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.degradation = StorageIntentDegradationClass::Blocked;
+        let result = recovery_evidence_supports_satisfaction_reconciliation(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn evacuation_refused_when_fenced_targets_present() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.evacuation_capacity_ref = capacity_ref(100);
+        evidence.target_fenced = 1;
+        let result = recovery_evidence_supports_evacuation(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn relocation_overlap_requires_replacement_receipt() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.relocation_overlap_ref = ordering_ref(110);
+        evidence.replacement_receipt_ref = StorageIntentEvidenceRef::default();
+        let result = recovery_evidence_supports_relocation_overlap(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn scrub_repair_requires_scrub_finding_and_repair_ticket() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.scrub_finding_ref = evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 120);
+        evidence.repair_ticket_ref = ordering_ref(121);
+        let result = recovery_evidence_supports_scrub_repair(evidence);
+        assert!(result.satisfied);
     }
 
 }
