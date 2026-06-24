@@ -2523,4 +2523,55 @@ mod tests {
             ]
         ));
     }
+    #[test]
+    fn tier_goal_compatibility_emits_non_blocking_warning() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let cand = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+
+        // Request with a TierGoal set alongside a storage-intent role; the
+        // planner should still admit the candidate but emit a non-blocking
+        // TierGoalIsNotStorageIntentModel warning so that explanation and
+        // performance consumers can see the legacy intent.
+        let mut request = request(
+            policy.clone(),
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+        );
+        request.tier_goal = Some(TierGoal::Primary);
+
+        let plan = plan_storage_intent_placement(&request, &[cand]);
+        assert!(plan.admitted);
+        assert_eq!(plan.selected_targets, vec![1]);
+        assert!(plan.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::TierGoalIsNotStorageIntentModel(TierGoal::Primary)
+        )));
+
+        // The evaluation wrapper must also succeed and carry the same reason.
+        let eval = evaluate_storage_intent_placement(&request, &[candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        )]);
+        assert!(eval.admitted);
+        assert!(eval.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::TierGoalIsNotStorageIntentModel(TierGoal::Primary)
+        )));
+    }
+
 }
