@@ -481,71 +481,33 @@ projection slice:
 
 ## 9. Remaining TFR-005 Runtime Sites
 
-These runtime projection sites still need owned issues, implementation and
-validation where source behavior must change, or an explicit decision record
-where the current behavior is already the intended authority contract, before
-TFR-005 can close:
+These rows are the closeout map for the original section 9 sites. Each row is
+classified as resolved by closed evidence, delegated to a live non-overlapping
+issue family, conditional/future-only, or still-needs-prepared-issue. A
+delegated or conditional row does not close TFR-005; closure still requires the
+runtime owners to land and any claim evidence to support closure.
 
-1. **`metadata_version` to `subtree_rev` / `dir_rev` coupling (RESOLVED, issue #688).**
-   `InodeRecord::to_inode_attr()` now projects both counters from their own
-   stored fields instead of `metadata_version`. `subtree_rev` and `dir_rev`
-   are persisted via a backward-compatible encode/decode tail extension and
-   advanced independently: `advance_subtree_revision` for attribute/content
-   changes and directory entry mutation paths for `dir_rev`. Non-directory
-   inodes keep `dir_rev == 0`. The three sub-items above are satisfied:
-   increment rules are independent, `dir_rev` persists per-directory across
-   round trips, and the projection no longer uses `metadata_version`.
+| Site | Classification | Closeout / owner |
+| --- | --- | --- |
+| `metadata_version` to `subtree_rev` / `dir_rev` coupling | Resolved by closed source/docs | Issues #688 and #994 split namespace revision counters from `metadata_version`. `InodeRecord::to_inode_attr()` projects from stored `subtree_rev` and `dir_rev` fields, the counters persist across encode/decode round trips, content and metadata mutation paths advance `subtree_rev` independently, directory mutation paths advance `dir_rev`, and non-directory inodes keep `dir_rev == 0`. |
+| Intent-log replay and commit-group recovery | Resolved by closed decision; conditional/future-only coverage | Issue #694 recorded the recovery-generation drift contract in section 3.2. Recovery paths may initialize `generation`, `data_version`, and `metadata_version` from one accepted recovery tick, and later mounted writes intentionally let those identities diverge. No recovery source change is required merely to preserve or restore equality. A future focused issue is needed only if executable recovery/write/scrub coverage or runtime guards are added for this contract. |
+| Scrub and repair identity | Delegated to live non-overlapping issue family | Issue #742 records the local scrub identity boundary: `ScrubBlockId` identifies content by `(inode_id, data_version)` and must not treat POSIX time, `metadata_version`, storage-generation ticks, or intent-log epochs as identity substitutes. Issue #650 closed the mounted content scrub-read authority slice. Live issues #651 and #652 own transform-aware scrub routing and repair dispatch gating; they must preserve this identity boundary. |
+| Send/receive export/import | Resolved by closed docs/source issues | Issue #695 records that changed-record stream versions own only envelope shape, while each local record payload's local filesystem format version owns POSIX timestamp, `data_version`, and `metadata_version` layout. Issue #1002 added the focused VFSSEND1 guard coverage; related sender-authority and receive-merge follow-ups #777 and #703 are closed. Future send-stream work must preserve this rule instead of adding a timestamp/version reconciliation pass. |
+| Content object reclaim and orphan cleanup | Delegated to live non-overlapping issue family | Issue #746 records `data_version` as the `(inode_id, data_version)` content identity token and names the separate reclaim liveness guard: commit-group death/stability, placement receipt epoch/generation evidence, and orphan replay watermarks. Live issues #675 and #676 own receipt-driven consumer policy and rebake/reclaim trims; they must not treat `data_version` as the reclaim clock. |
+| Format-golden and codec surfaces | Conditional/future-only; gate resolved by closed issue | Issue #696 made VFS codec/vector manifest drift fail in focused tooling. No source, serialized ABI, or golden-vector update is due for this document-only reconciliation. If a later slice intentionally changes serialized ABI, such as a `FILESYSTEM_FORMAT_VERSION` bump from 6 to 7, that slice must update the golden-format corpus and codec surfaces atomically with the format version change. |
 
-2. **Intent-log replay and commit-group recovery**.
-   Section 3.2 now specifies the recovery-generation drift contract: recovery
-   paths (`crash_recovery.rs`, `txg_replay.rs`) may initialize `generation`,
-   `data_version`, and `metadata_version` from one accepted recovery tick, and
-   later mounted writes intentionally let those identities diverge. No recovery
-   source change is required merely to preserve or restore equality among those
-   fields. A future implementation issue is needed only if executable coverage
-   or runtime guards are added for this contract; its expected write set should
-   be limited to focused local-filesystem recovery/write/scrub tests and any
-   minimal helper adjustments they require, and it must not edit
-   `crash_recovery.rs` while issue #692 or another live recovery/runtime owner
-   holds that path.
-
-3. **Scrub and repair identity**.
-   `ScrubBlockId` uses `(inode_id, data_version)` as block identity. Scrub
-   must not confuse wall-clock time, content version, checksum scope, and
-   repair row identity. The scrub path already treats `data_version` as a
-   content-identity token; `docs/SCRUB_IDENTITY_AUTHORITY.md` now records that
-   scrub-identity boundary. Remaining implementation work belongs to the
-   transform-aware scrub read, scrub routing, and repair dispatch slices rather
-   than to this timestamp/generation authority document.
-
-4. **Send/receive export/import**.
-   Send/receive serializes timestamp and storage version fields. The
-   export/import paths must project through one current authority — the
-   encoding format version in the changed-record export header — and must not
-   introduce a separate timestamp/version reconciliation pass.
-
-5. **Content object reclaim and orphan cleanup**.
-   `data_version` is used as both a content identity token (for object key
-   generation) and a storage-ordering hint (for reclaim liveness). These two
-   uses are now named separately in
-   `docs/CONTENT_OBJECT_VERSION_AUTHORITY.md`: `data_version` is the content
-   identity token for `(inode_id, data_version)` keys, while reclaim must
-   consume a separate liveness guard built from commit-group death/stability,
-   placement receipt epoch/generation evidence, and orphan replay watermarks.
-   Runtime reclaim and rebake policy remain owned by issues #675 and #676.
-
-6. **Format-golden and codec surfaces**.
-   If a later slice intentionally changes the serialized ABI (e.g.,
-   `FILESYSTEM_FORMAT_VERSION` bump from 6 to 7), the golden-format test
-   corpus and `tidefs-schema-codec-vfs` codec surfaces must be updated
-   atomically with the format version change.
+Current still-needs-prepared-issue classification: none discovered by this
+reconciliation. If a future audit finds implementation work outside the
+delegated live families or conditional rows above, record a focused prepared
+issue before editing runtime source.
 
 ## 10. Non-Claim
 
 This document is a planning and design authority document. It does not:
 
 - Change on-disk format or runtime behavior.
-- Close TFR-005. The remaining blockers in section 9 must be resolved through
-  owned implementation issues.
+- Close TFR-005. The delegated live issue families and conditional/future-only
+  rows in section 9 must be satisfied, and claims evidence must support
+  closure, before TFR-005 can close.
 - Claim production readiness. Production claims are gated on closing TFR-005
   and its descendant issues.
