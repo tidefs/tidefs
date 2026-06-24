@@ -1288,6 +1288,172 @@ fn write_sparse_size_change<S: ContentWriteStore>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_sparse_size_changing_overlay<S: ContentWriteStore>(
+    dedup_enabled: bool,
+    store: &mut S,
+    old_layout: &ContentLayout,
+    old_manifest: &ContentManifestObject,
+    old_record: &InodeRecord,
+    new_record: &InodeRecord,
+    overlay_offset: u64,
+    overlay_bytes: &[u8],
+    dedup_index: &mut DedupIndex,
+    mut quorum_store: Option<&mut tidefs_quorum_write_runtime::QuorumObjectStore>,
+    compression_policy: &ContentCompressionPolicy,
+) -> Result<()> {
+    let new_chunk_count = content_chunk_count(new_record.size)?;
+    let mut chunks_by_index = BTreeMap::new();
+
+    for old_ref in &old_manifest.chunks {
+        if old_ref.chunk_index >= new_chunk_count {
+            continue;
+        }
+        let new_len = content_chunk_len(new_record.size, old_ref.chunk_index)?;
+        let chunk_start = content_chunk_start(old_ref.chunk_index)?;
+        let chunk_end =
+            chunk_start
+                .checked_add(u64::from(new_len))
+                .ok_or(FileSystemError::SizeOverflow {
+                    requested: u64::MAX,
+                })?;
+        if range_intersects_overlay(chunk_start, chunk_end, overlay_offset, overlay_bytes)? {
+            continue;
+        }
+        if old_ref.len == new_len {
+            chunks_by_index.insert(old_ref.chunk_index, old_ref.clone());
+            continue;
+        }
+        if old_ref.is_hole() {
+            chunks_by_index.insert(
+                old_ref.chunk_index,
+                ContentChunkRef::hole(old_ref.chunk_index, new_len),
+            );
+            continue;
+        }
+
+        let mut chunk_bytes = vec![0_u8; new_len as usize];
+        copy_old_content_into_chunk(
+            store.raw_store(),
+            old_layout,
+            old_record.size,
+            old_ref.chunk_index,
+            &mut chunk_bytes,
+        )?;
+        let per_inode_key = content_chunk_object_key_for_version(
+            new_record.inode_id,
+            new_record.data_version,
+            old_ref.chunk_index,
+        );
+        let encoded = encode_chunk_with_dedup(
+            dedup_enabled,
+            store,
+            new_record,
+            old_ref.chunk_index,
+            &chunk_bytes,
+            dedup_index,
+            &mut quorum_store,
+            compression_policy,
+        )?;
+        dedup_index.record_chunk_written();
+        let checksum = checksum64(&encoded);
+        let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?.1;
+        if let Some(ref mut qs) = quorum_store {
+            let _ = qs.quorum_put(per_inode_key, &encoded);
+        }
+        chunks_by_index.insert(
+            old_ref.chunk_index,
+            ContentChunkRef {
+                chunk_index: old_ref.chunk_index,
+                data_version: new_record.data_version,
+                len: chunk_bytes.len() as u32,
+                checksum,
+                placement_receipt_generation: chunk_receipt.generation,
+            },
+        );
+    }
+
+    if let Some((first_overlay_chunk, last_overlay_chunk)) =
+        overlay_chunk_index_bounds(new_record.size, overlay_offset, overlay_bytes.len())?
+    {
+        for chunk_index in first_overlay_chunk..=last_overlay_chunk {
+            let chunk_len = content_chunk_len(new_record.size, chunk_index)? as usize;
+            let old_chunk_is_sparse_zero = find_chunk_in_manifest(old_manifest, chunk_index)
+                .is_none_or(ContentChunkRef::is_hole);
+            if old_chunk_is_sparse_zero
+                && overlay_chunk_writes_only_zeros(
+                    chunk_index,
+                    chunk_len as u32,
+                    overlay_offset,
+                    overlay_bytes,
+                )?
+            {
+                continue;
+            }
+
+            let mut chunk_bytes = vec![0_u8; chunk_len];
+            copy_old_content_into_chunk(
+                store.raw_store(),
+                old_layout,
+                old_record.size,
+                chunk_index,
+                &mut chunk_bytes,
+            )?;
+            overlay_chunk_bytes(chunk_index, overlay_offset, overlay_bytes, &mut chunk_bytes)?;
+            if old_chunk_is_sparse_zero && chunk_bytes.iter().all(|byte| *byte == 0) {
+                continue;
+            }
+
+            let per_inode_key = content_chunk_object_key_for_version(
+                new_record.inode_id,
+                new_record.data_version,
+                chunk_index,
+            );
+            let encoded = encode_chunk_with_dedup(
+                dedup_enabled,
+                store,
+                new_record,
+                chunk_index,
+                &chunk_bytes,
+                dedup_index,
+                &mut quorum_store,
+                compression_policy,
+            )?;
+            dedup_index.record_chunk_written();
+            let checksum = checksum64(&encoded);
+            let chunk_receipt = store.put_with_receipt(per_inode_key, &encoded)?.1;
+            if let Some(ref mut qs) = quorum_store {
+                let _ = qs.quorum_put(per_inode_key, &encoded);
+            }
+            chunks_by_index.insert(
+                chunk_index,
+                ContentChunkRef {
+                    chunk_index,
+                    data_version: new_record.data_version,
+                    len: chunk_bytes.len() as u32,
+                    checksum,
+                    placement_receipt_generation: chunk_receipt.generation,
+                },
+            );
+        }
+    }
+
+    let manifest = ContentManifestObject {
+        inode_id: new_record.inode_id,
+        data_version: new_record.data_version,
+        file_size: new_record.size,
+        chunk_size: content_chunk_size(),
+        chunks: chunks_by_index.into_values().collect(),
+    };
+    let manifest_key = content_object_key_for_version(new_record.inode_id, new_record.data_version);
+    let manifest_encoded = encode_content_manifest_sparse(&manifest);
+    let _ = store.put_with_receipt(manifest_key, &manifest_encoded)?;
+    if let Some(ref mut qs) = quorum_store {
+        let _ = qs.quorum_put(manifest_key, &manifest_encoded);
+    }
+    Ok(())
+}
+
 pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
     request: WriteChunkedContentOverlay<'_, S>,
 ) -> Result<()> {
@@ -1321,6 +1487,23 @@ pub(crate) fn write_chunked_content_with_overlay<S: ContentWriteStore>(
     if allow_holes && old_record.size == new_record.size && !overlay_bytes.is_empty() {
         if let ContentLayout::Chunked(ref old_manifest) = old_layout {
             return write_same_size_sparse_overlay(
+                dedup_enabled,
+                store,
+                &old_layout,
+                old_manifest,
+                old_record,
+                new_record,
+                overlay_offset,
+                overlay_bytes,
+                dedup_index,
+                quorum_store,
+                compression_policy,
+            );
+        }
+    }
+    if allow_holes && old_record.size != new_record.size && !overlay_bytes.is_empty() {
+        if let ContentLayout::Chunked(ref old_manifest) = old_layout {
+            return write_sparse_size_changing_overlay(
                 dedup_enabled,
                 store,
                 &old_layout,
@@ -2516,6 +2699,60 @@ mod tests {
             .expect("read tail byte from implicit sparse chunk");
 
         assert_eq!(bytes, vec![0]);
+    }
+
+    #[test]
+    fn sparse_size_changing_overlay_materializes_only_touched_far_chunk() {
+        let mut store = temp_store("far-sparse-overlay");
+        let old_record = test_record(42, 1, 0);
+        let far_chunk_index = 1_000_000_u64;
+        let chunk_size = u64::from(content_chunk_size());
+        let offset_in_chunk = 123_u64;
+        let overlay_offset = far_chunk_index * chunk_size + offset_in_chunk;
+        let payload = b"generic-013-fsstress-write".to_vec();
+        let new_record = test_record(42, 2, overlay_offset + payload.len() as u64);
+        let mut dedup_index = DedupIndex::new();
+        let compression_policy = ContentCompressionPolicy::off();
+
+        write_chunked_content_with_overlay(WriteChunkedContentOverlay {
+            dedup_enabled: false,
+            store: &mut store,
+            inode_id: old_record.inode_id,
+            old_record: &old_record,
+            new_record: &new_record,
+            overlay_offset,
+            overlay_bytes: &payload,
+            allow_holes: true,
+            dedup_index: &mut dedup_index,
+            quorum_store: None,
+            compression_policy: &compression_policy,
+        })
+        .expect("write far sparse overlay");
+
+        let layout = read_content_layout_from_store(&store, new_record.inode_id, &new_record, true)
+            .expect("read new sparse layout");
+        let ContentLayout::Chunked(manifest) = &layout else {
+            panic!("far sparse overlay must write chunked content");
+        };
+
+        assert_eq!(manifest.file_size, new_record.size);
+        assert_eq!(manifest.chunks.len(), 1);
+        let chunk_ref = &manifest.chunks[0];
+        assert_eq!(chunk_ref.chunk_index, far_chunk_index);
+        assert_eq!(
+            chunk_ref.len,
+            (offset_in_chunk + payload.len() as u64) as u32
+        );
+        assert!(!chunk_ref.is_hole());
+
+        let prefix =
+            read_content_range_from_layout(&store, &layout, far_chunk_index * chunk_size, 8, None)
+                .expect("read sparse prefix in touched chunk");
+        assert_eq!(prefix, vec![0_u8; 8]);
+        let read_back =
+            read_content_range_from_layout(&store, &layout, overlay_offset, payload.len(), None)
+                .expect("read far sparse overlay bytes");
+        assert_eq!(read_back, payload);
     }
 
     /// `read_chunk_bytes_with_receipt` falls back to the raw store when
