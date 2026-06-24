@@ -681,7 +681,7 @@ fn push_layout_section(report: &mut ExplainReport, layout: Option<&LayoutAllocat
             "layout-allocator",
             "#880 supplied LayoutAllocatorRecord",
             vec![format!(
-                "allocation={} region={} fragmentation={}ppm locality={}ppm free-run-pressure={}ppm alignment={} zone-write-pointer={} pending-free={} pending-free-safe={} reclaim-debt={} stale-mirror-refusal={} evidence={}",
+                "allocation={} region={} fragmentation={}ppm locality={}ppm free-run-pressure={}ppm alignment={} zone-write-pointer={} pending-free={} pending-free-safety={} reclaim-debt={} stale-pointer-refusal={} evidence={}",
                 layout.allocation_class.as_str(),
                 layout.region_class.as_str(),
                 layout.fragmentation_ppm,
@@ -690,9 +690,9 @@ fn push_layout_section(report: &mut ExplainReport, layout: Option<&LayoutAllocat
                 layout.alignment_bytes,
                 layout.zone_write_pointer,
                 layout.pending_free_bytes,
-                layout.pending_free_safe,
+                layout.pending_free_safety.as_str(),
                 layout.reclaim_debt_bytes,
-                layout.stale_mirror_refusal,
+                layout.stale_pointer_refusal,
                 evidence_ref(layout.evidence)
             )],
         )),
