@@ -32,8 +32,7 @@ use tidefs_types_transport_session::{LaneClass, LaneConfig};
 // ---------------------------------------------------------------------------
 
 /// Canonical identifier for this scheduler/admission surface.
-pub const STORAGE_INTENT_SCHEDULER_SPEC: &str =
-    "tidefs-storage-intent-scheduler-v1-issue-862";
+pub const STORAGE_INTENT_SCHEDULER_SPEC: &str = "tidefs-storage-intent-scheduler-v1-issue-862";
 
 // ---------------------------------------------------------------------------
 // Lane mapping: storage-intent action → LaneClass
@@ -260,13 +259,12 @@ impl AdmissionWorkClass {
     pub const fn lane_class(self) -> LaneClass {
         match self {
             Self::SyncBarrier | Self::MetadataStorm => LaneClass::Metadata,
-            Self::ForegroundIo
-            | Self::ReadServing
-            | Self::VmRandomIo
-            | Self::BulkIngest => LaneClass::Demand,
-            Self::SpeculativePrefetch
-            | Self::CacheOnlyTrial
-            | Self::AuthorityPromotion => LaneClass::Speculative,
+            Self::ForegroundIo | Self::ReadServing | Self::VmRandomIo | Self::BulkIngest => {
+                LaneClass::Demand
+            }
+            Self::SpeculativePrefetch | Self::CacheOnlyTrial | Self::AuthorityPromotion => {
+                LaneClass::Speculative
+            }
             Self::BackgroundOptimizer => LaneClass::Background,
             Self::RepairEscalation => LaneClass::Control,
         }
@@ -277,9 +275,7 @@ impl AdmissionWorkClass {
     pub const fn can_be_dropped(self) -> bool {
         matches!(
             self,
-            Self::SpeculativePrefetch
-                | Self::CacheOnlyTrial
-                | Self::BackgroundOptimizer
+            Self::SpeculativePrefetch | Self::CacheOnlyTrial | Self::BackgroundOptimizer
         )
     }
 
@@ -332,6 +328,7 @@ pub const EMPTY_EVIDENCE_REF: StorageIntentEvidenceRef = StorageIntentEvidenceRe
 impl AdmissionRequest {
     /// Construct a request with no evidence.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         work_class: AdmissionWorkClass,
         action_class: StorageIntentActionClass,
@@ -401,6 +398,9 @@ pub struct AdmissionDecision {
     /// Reason for non-admitted outcomes.
     pub refusal: StorageIntentRefusalReason,
 
+    /// Budget dimension that constrained this decision.
+    pub budget_class: BudgetConstraintClass,
+
     /// Queue time before this decision, in microseconds.
     pub queue_time_us: u64,
 
@@ -422,6 +422,7 @@ impl AdmissionDecision {
             outcome: AdmissionOutcome::Admitted,
             lane,
             refusal: StorageIntentRefusalReason::None,
+            budget_class: BudgetConstraintClass::None,
             queue_time_us: 0,
             starvation_override: false,
             reserve_protected: false,
@@ -440,6 +441,7 @@ impl AdmissionDecision {
             outcome: AdmissionOutcome::Backpressured,
             lane,
             refusal: reason,
+            budget_class: BudgetConstraintClass::None,
             queue_time_us: 0,
             starvation_override: false,
             reserve_protected: false,
@@ -458,6 +460,7 @@ impl AdmissionDecision {
             outcome: AdmissionOutcome::Refused,
             lane,
             refusal: reason,
+            budget_class: BudgetConstraintClass::None,
             queue_time_us: 0,
             starvation_override: false,
             reserve_protected: false,
@@ -476,6 +479,7 @@ impl AdmissionDecision {
             outcome: AdmissionOutcome::Dropped,
             lane,
             refusal: reason,
+            budget_class: BudgetConstraintClass::None,
             queue_time_us: 0,
             starvation_override: false,
             reserve_protected: false,
@@ -494,11 +498,38 @@ impl AdmissionDecision {
             outcome: AdmissionOutcome::Throttled,
             lane,
             refusal: reason,
+            budget_class: BudgetConstraintClass::None,
             queue_time_us: 0,
             starvation_override: false,
             reserve_protected: false,
             budget_owner,
         }
+    }
+
+    /// Create an expired decision for cache-only serving trials.
+    #[must_use]
+    pub const fn expired(
+        lane: LaneClass,
+        reason: StorageIntentRefusalReason,
+        budget_owner: StorageIntentBudgetOwnerId,
+    ) -> Self {
+        Self {
+            outcome: AdmissionOutcome::Expired,
+            lane,
+            refusal: reason,
+            budget_class: BudgetConstraintClass::None,
+            queue_time_us: 0,
+            starvation_override: false,
+            reserve_protected: false,
+            budget_owner,
+        }
+    }
+
+    /// Record the budget dimension that constrained this decision.
+    #[must_use]
+    pub const fn with_budget_class(mut self, budget_class: BudgetConstraintClass) -> Self {
+        self.budget_class = budget_class;
+        self
     }
 
     /// Record queue time.
@@ -676,8 +707,14 @@ impl StorageIntentScheduler {
     pub fn new() -> Self {
         let mut lane_configs = BTreeMap::new();
         lane_configs.insert(LaneClass::Control, LaneConfig::control(u64::MAX, u64::MAX));
-        lane_configs.insert(LaneClass::Metadata, LaneConfig::metadata(16 * 1024 * 1024, 1024));
-        lane_configs.insert(LaneClass::Demand, LaneConfig::demand(256 * 1024 * 1024, 4096));
+        lane_configs.insert(
+            LaneClass::Metadata,
+            LaneConfig::metadata(16 * 1024 * 1024, 1024),
+        );
+        lane_configs.insert(
+            LaneClass::Demand,
+            LaneConfig::demand(256 * 1024 * 1024, 4096),
+        );
         lane_configs.insert(
             LaneClass::Speculative,
             LaneConfig::speculative(64 * 1024 * 1024, 2048),
@@ -745,16 +782,17 @@ impl StorageIntentScheduler {
             .unwrap_or_else(|| LaneConfig::background(u64::MAX, u64::MAX));
 
         // ── 1. Check budget caps in priority order ──
-        if let Some(reason) = self.check_hard_caps(request, lane) {
-            let decision = if request.work_class.can_be_dropped() {
+        if let Some((reason, budget_class)) = self.check_hard_caps(request, lane) {
+            let mut decision = if request.work_class.can_be_dropped() {
                 AdmissionDecision::dropped(lane, reason, request.budget_owner)
             } else if lane == LaneClass::Background {
                 AdmissionDecision::refused(lane, reason, request.budget_owner)
             } else if lane == LaneClass::Control || lane == LaneClass::Metadata {
-                AdmissionDecision::admitted(lane, request.budget_owner)
+                AdmissionDecision::admitted(lane, request.budget_owner).with_reserve_protection()
             } else {
                 AdmissionDecision::throttled(lane, reason, request.budget_owner)
             };
+            decision = decision.with_budget_class(budget_class);
             self.record_decision(lane, &decision);
             self.emit_evidence(request, &decision, SchedulingConfidenceClass::High, None);
             return decision;
@@ -762,12 +800,13 @@ impl StorageIntentScheduler {
 
         // ── 2. Check tenant isolation ──
         if !request.budget_owner.is_zero() {
-            if let Some(reason) = self.check_tenant_isolation(request) {
+            if let Some((reason, budget_class)) = self.check_tenant_isolation(request) {
                 let decision = if request.work_class.can_be_dropped() {
                     AdmissionDecision::dropped(lane, reason, request.budget_owner)
                 } else {
                     AdmissionDecision::backpressured(lane, reason, request.budget_owner)
-                };
+                }
+                .with_budget_class(budget_class);
                 self.record_decision(lane, &decision);
                 self.emit_evidence(request, &decision, SchedulingConfidenceClass::High, None);
                 return decision;
@@ -775,16 +814,17 @@ impl StorageIntentScheduler {
         }
 
         // ── 3. Check per-lane inflight caps ──
-        if let Some(reason) = self.check_lane_inflight(lane, request, &config) {
-            let decision = if request.work_class.can_be_dropped() {
+        if let Some((reason, budget_class)) = self.check_lane_inflight(lane, request, &config) {
+            let mut decision = if request.work_class.can_be_dropped() {
                 AdmissionDecision::dropped(lane, reason, request.budget_owner)
             } else if lane == LaneClass::Background {
                 AdmissionDecision::refused(lane, reason, request.budget_owner)
             } else if lane == LaneClass::Control || lane == LaneClass::Metadata {
-                AdmissionDecision::admitted(lane, request.budget_owner)
+                AdmissionDecision::admitted(lane, request.budget_owner).with_reserve_protection()
             } else {
                 AdmissionDecision::throttled(lane, reason, request.budget_owner)
             };
+            decision = decision.with_budget_class(budget_class);
             self.record_decision(lane, &decision);
             self.emit_evidence(request, &decision, SchedulingConfidenceClass::High, None);
             return decision;
@@ -792,8 +832,9 @@ impl StorageIntentScheduler {
 
         // ── 4. Check speculative drop/expiry ──
         if request.work_class.can_be_dropped() {
-            if let Some(reason) = self.check_speculative_pressure() {
-                let decision = AdmissionDecision::dropped(lane, reason, request.budget_owner);
+            if let Some((reason, budget_class)) = self.check_speculative_pressure() {
+                let decision = AdmissionDecision::dropped(lane, reason, request.budget_owner)
+                    .with_budget_class(budget_class);
                 self.record_decision(lane, &decision);
                 self.emit_evidence(
                     request,
@@ -810,11 +851,12 @@ impl StorageIntentScheduler {
             if self.caps.foreground_latency_budget_us > 0
                 && self.caps.inflight_bytes > self.caps.max_inflight_bytes / 2
             {
-                let decision = AdmissionDecision::dropped(
+                let decision = AdmissionDecision::expired(
                     lane,
                     StorageIntentRefusalReason::MovementDebtNotPaidBack,
                     request.budget_owner,
-                );
+                )
+                .with_budget_class(BudgetConstraintClass::ForegroundLatency);
                 self.record_decision(lane, &decision);
                 self.emit_evidence(
                     request,
@@ -854,7 +896,7 @@ impl StorageIntentScheduler {
         &self,
         request: &AdmissionRequest,
         lane: LaneClass,
-    ) -> Option<StorageIntentRefusalReason> {
+    ) -> Option<(StorageIntentRefusalReason, BudgetConstraintClass)> {
         let caps = &self.caps;
 
         // Repair escalation bypasses dirty/inflight caps.
@@ -867,29 +909,43 @@ impl StorageIntentScheduler {
 
         if !is_barrier {
             if caps.allocator_pressure_pct > 90 {
-                return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+                return Some((
+                    StorageIntentRefusalReason::EvidenceNotUsable,
+                    BudgetConstraintClass::AllocatorPressure,
+                ));
             }
             if caps.background_optimizer_budget_bytes == 0 && lane == LaneClass::Background {
-                return Some(StorageIntentRefusalReason::MovementDebtNotPaidBack);
+                return Some((
+                    StorageIntentRefusalReason::MovementDebtNotPaidBack,
+                    BudgetConstraintClass::BackgroundOptimizer,
+                ));
             }
         }
 
         if caps.dirty_bytes > caps.max_dirty_bytes && caps.max_dirty_bytes > 0 {
-            return Some(StorageIntentRefusalReason::GuaranteeFloorNotMet);
+            return Some((
+                StorageIntentRefusalReason::GuaranteeFloorNotMet,
+                BudgetConstraintClass::DirtyBytes,
+            ));
         }
 
         if caps.inflight_bytes > caps.max_inflight_bytes && caps.max_inflight_bytes > 0 {
             // Still admit Metadata and Control; throttle everything else.
             if lane != LaneClass::Metadata && lane != LaneClass::Control {
-                return Some(StorageIntentRefusalReason::GuaranteeFloorNotMet);
+                return Some((
+                    StorageIntentRefusalReason::GuaranteeFloorNotMet,
+                    BudgetConstraintClass::InflightBytes,
+                ));
             }
         }
 
-        if caps.device_queue_depth > caps.max_device_queue_depth
-            && caps.max_device_queue_depth > 0
+        if caps.device_queue_depth > caps.max_device_queue_depth && caps.max_device_queue_depth > 0
         {
             if lane != LaneClass::Control {
-                return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+                return Some((
+                    StorageIntentRefusalReason::EvidenceNotUsable,
+                    BudgetConstraintClass::DeviceQueueDepth,
+                ));
             }
         }
 
@@ -899,13 +955,19 @@ impl StorageIntentScheduler {
     fn check_tenant_isolation(
         &self,
         request: &AdmissionRequest,
-    ) -> Option<StorageIntentRefusalReason> {
+    ) -> Option<(StorageIntentRefusalReason, BudgetConstraintClass)> {
         let owner = self.owner_isolation.get(&request.budget_owner)?;
         if owner.throttle {
-            return Some(owner.throttle_reason);
+            return Some((
+                owner.throttle_reason,
+                BudgetConstraintClass::TenantIsolation,
+            ));
         }
         if owner.max_dirty_bytes > 0 && owner.dirty_bytes > owner.max_dirty_bytes {
-            return Some(StorageIntentRefusalReason::GuaranteeFloorNotMet);
+            return Some((
+                StorageIntentRefusalReason::GuaranteeFloorNotMet,
+                BudgetConstraintClass::TenantIsolation,
+            ));
         }
         None
     }
@@ -915,35 +977,49 @@ impl StorageIntentScheduler {
         lane: LaneClass,
         request: &AdmissionRequest,
         config: &LaneConfig,
-    ) -> Option<StorageIntentRefusalReason> {
+    ) -> Option<(StorageIntentRefusalReason, BudgetConstraintClass)> {
         let counter = self.counters.get(&lane)?;
 
         if config.max_inflight_bytes > 0
             && counter.inflight_bytes + request.requested_bytes > config.max_inflight_bytes
         {
-            return Some(StorageIntentRefusalReason::GuaranteeFloorNotMet);
+            return Some((
+                StorageIntentRefusalReason::GuaranteeFloorNotMet,
+                BudgetConstraintClass::InflightBytes,
+            ));
         }
 
         if config.max_inflight_ops > 0
             && counter.inflight_ops + request.requested_ops > config.max_inflight_ops
         {
-            return Some(StorageIntentRefusalReason::GuaranteeFloorNotMet);
+            return Some((
+                StorageIntentRefusalReason::GuaranteeFloorNotMet,
+                BudgetConstraintClass::InflightBytes,
+            ));
         }
 
         None
     }
 
-    fn check_speculative_pressure(&self) -> Option<StorageIntentRefusalReason> {
+    fn check_speculative_pressure(
+        &self,
+    ) -> Option<(StorageIntentRefusalReason, BudgetConstraintClass)> {
         // Drop speculative work when foreground latency budget is at risk.
         if self.caps.foreground_latency_budget_us > 0
             && self.caps.inflight_bytes > self.caps.max_inflight_bytes.saturating_mul(7) / 10
         {
-            return Some(StorageIntentRefusalReason::MovementDebtNotPaidBack);
+            return Some((
+                StorageIntentRefusalReason::MovementDebtNotPaidBack,
+                BudgetConstraintClass::ForegroundLatency,
+            ));
         }
 
         // Drop speculative work when allocator pressure is high.
         if self.caps.allocator_pressure_pct > 70 {
-            return Some(StorageIntentRefusalReason::EvidenceNotUsable);
+            return Some((
+                StorageIntentRefusalReason::EvidenceNotUsable,
+                BudgetConstraintClass::AllocatorPressure,
+            ));
         }
 
         None
@@ -1070,22 +1146,6 @@ impl StorageIntentScheduler {
             self.evidence_log.remove(0);
         }
 
-        let budget_class = if decision.outcome == AdmissionOutcome::Admitted
-            || decision.outcome == AdmissionOutcome::Throttled
-        {
-            BudgetConstraintClass::None
-        } else if decision.refusal == StorageIntentRefusalReason::GuaranteeFloorNotMet {
-            BudgetConstraintClass::DirtyBytes
-        } else if decision.refusal == StorageIntentRefusalReason::GuaranteeFloorNotMet {
-            BudgetConstraintClass::InflightBytes
-        } else if decision.refusal == StorageIntentRefusalReason::EvidenceNotUsable {
-            BudgetConstraintClass::AllocatorPressure
-        } else if decision.refusal == StorageIntentRefusalReason::MovementDebtNotPaidBack {
-            BudgetConstraintClass::BackgroundOptimizer
-        } else {
-            BudgetConstraintClass::None
-        };
-
         let mut missing_kinds = [StorageIntentEvidenceKind::Unknown; 8];
         let mut missing_count: u8 = 0;
 
@@ -1112,7 +1172,7 @@ impl StorageIntentScheduler {
             speculative_drop_reason,
             starvation_override: decision.starvation_override,
             reserve_protected: decision.reserve_protected,
-            budget_class,
+            budget_class: decision.budget_class,
             policy_id: self.active_policy_id,
             policy_revision: self.active_policy_revision,
             available_evidence: request.evidence_refs,
@@ -1355,7 +1415,10 @@ mod tests {
         let req = speculative_prefetch_request();
         let decision = s.admit(&req);
         assert_eq!(decision.outcome, AdmissionOutcome::Dropped);
-        assert_eq!(decision.refusal, StorageIntentRefusalReason::EvidenceNotUsable);
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
     }
 
     #[test]
@@ -1393,7 +1456,10 @@ mod tests {
         let req = background_defrag_request();
         let decision = s.admit(&req);
         assert_eq!(decision.outcome, AdmissionOutcome::Dropped);
-        assert_eq!(decision.refusal, StorageIntentRefusalReason::EvidenceNotUsable);
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
     }
 
     #[test]
@@ -1418,6 +1484,7 @@ mod tests {
         let req = foreground_read_request();
         let decision = s.admit(&req);
         assert_eq!(decision.outcome, AdmissionOutcome::Throttled);
+        assert_eq!(decision.budget_class, BudgetConstraintClass::InflightBytes);
     }
 
     // ── Tenant isolation tests ──
@@ -1441,6 +1508,10 @@ mod tests {
 
         let decision = s.admit(&req);
         assert_eq!(decision.outcome, AdmissionOutcome::Backpressured);
+        assert_eq!(
+            decision.budget_class,
+            BudgetConstraintClass::TenantIsolation
+        );
         assert_eq!(
             decision.refusal,
             StorageIntentRefusalReason::GuaranteeFloorNotMet
@@ -1480,7 +1551,11 @@ mod tests {
         );
 
         let decision = s.admit(&req);
-        assert_eq!(decision.outcome, AdmissionOutcome::Dropped);
+        assert_eq!(decision.outcome, AdmissionOutcome::Expired);
+        assert_eq!(
+            decision.budget_class,
+            BudgetConstraintClass::ForegroundLatency
+        );
     }
 
     // ── Per-lane inflight cap tests ──
@@ -1603,6 +1678,32 @@ mod tests {
         assert_eq!(
             evidence[0].budget_class,
             BudgetConstraintClass::BackgroundOptimizer
+        );
+    }
+
+    #[test]
+    fn evidence_distinguishes_allocator_and_inflight_pressure() {
+        let mut s = test_scheduler();
+        s.caps.allocator_pressure_pct = 95;
+
+        let req = background_defrag_request();
+        s.admit(&req);
+        let evidence = s.drain_evidence();
+        assert_eq!(
+            evidence[0].budget_class,
+            BudgetConstraintClass::AllocatorPressure
+        );
+
+        s.caps.allocator_pressure_pct = 0;
+        s.caps.max_inflight_bytes = 1024;
+        s.caps.inflight_bytes = 2048;
+
+        let req = foreground_read_request();
+        s.admit(&req);
+        let evidence = s.drain_evidence();
+        assert_eq!(
+            evidence[0].budget_class,
+            BudgetConstraintClass::InflightBytes
         );
     }
 
