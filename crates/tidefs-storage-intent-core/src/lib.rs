@@ -14294,7 +14294,7 @@ pub const fn recovery_evidence_commits_hidden_downgrade(
         return true;
     }
     // Claiming receipt retirement without replacement receipt.
-    if evidence.replacement_receipt_ref.is_bound()
+    if evidence_ref_has_id(evidence.old_receipt_retirement_ref)
         && !evidence_ref_has_id(evidence.replacement_receipt_ref)
     {
         return true;
@@ -20104,6 +20104,14 @@ mod tests {
         let mut evidence = healthy_recovery_evidence();
         evidence.degradation = StorageIntentDegradationClass::Exact;
         evidence.target_wrong_domain = 1;
+        assert!(recovery_evidence_commits_hidden_downgrade(evidence));
+    }
+
+    #[test]
+    fn hidden_downgrade_detected_when_retirement_lacks_replacement_receipt() {
+        let mut evidence = healthy_recovery_evidence();
+        evidence.old_receipt_retirement_ref = ordering_ref(92);
+        evidence.replacement_receipt_ref = StorageIntentEvidenceRef::default();
         assert!(recovery_evidence_commits_hidden_downgrade(evidence));
     }
 
