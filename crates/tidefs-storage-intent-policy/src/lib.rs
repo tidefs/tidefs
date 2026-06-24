@@ -23,6 +23,9 @@ pub const STORAGE_INTENT_POLICY_SOURCE_VERSION: u16 = 1;
 /// Stable compiler identifier for evidence and fixture tests.
 pub const STORAGE_INTENT_POLICY_SOURCE_SPEC: &str = "tidefs-storage-intent-policy-v1-issue-855";
 
+/// Bounded source provenance fan-in for one compiled policy snapshot.
+pub const STORAGE_INTENT_POLICY_SOURCE_TRACE_REFS: usize = 10;
+
 const LOW_RISK_DEFAULT_FLAGS: PrefetchResidencyPolicyFlags =
     PrefetchResidencyPolicyFlags::REQUIRE_DATASET_SCOPE
         .union(PrefetchResidencyPolicyFlags::REQUIRE_READ_SERVING_BOUNDARY)
@@ -117,12 +120,160 @@ impl StorageIntentPolicySourceMask {
     }
 }
 
+/// Persisted source revision evidence preserved in a compiled snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageIntentPolicySourceStamp {
+    pub class: StorageIntentPolicySourceClass,
+    pub revision: u64,
+    pub generation: u64,
+    pub epoch: u64,
+    pub evidence_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentPolicySourceStamp {
+    /// Empty provenance stamp.
+    pub const EMPTY: Self = Self {
+        class: StorageIntentPolicySourceClass::Absent,
+        revision: 0,
+        generation: 0,
+        epoch: 0,
+        evidence_ref: StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::Unknown,
+            id: tidefs_storage_intent_core::StorageIntentEvidenceId::ZERO,
+            generation: 0,
+            version: 0,
+        },
+    };
+
+    /// Returns true when the stamp names a real source class.
+    #[must_use]
+    pub const fn is_present(self) -> bool {
+        !matches!(self.class, StorageIntentPolicySourceClass::Absent)
+    }
+}
+
+/// Errors while constructing a bounded source trace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum StorageIntentPolicySourceTraceError {
+    /// The trace is full.
+    Full,
+    /// The stamp does not name a source class.
+    AbsentClass,
+}
+
+/// Bounded provenance list for sources that participated in compilation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageIntentPolicySourceTrace {
+    len: u8,
+    stamps: [StorageIntentPolicySourceStamp; STORAGE_INTENT_POLICY_SOURCE_TRACE_REFS],
+}
+
+impl StorageIntentPolicySourceTrace {
+    /// Empty source trace.
+    pub const EMPTY: Self = Self {
+        len: 0,
+        stamps: [StorageIntentPolicySourceStamp::EMPTY; STORAGE_INTENT_POLICY_SOURCE_TRACE_REFS],
+    };
+
+    /// Number of source stamps present.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.len as usize
+    }
+
+    /// Returns true when the trace is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Return the backing array and valid length.
+    #[must_use]
+    pub const fn as_parts(
+        &self,
+    ) -> (
+        &[StorageIntentPolicySourceStamp; STORAGE_INTENT_POLICY_SOURCE_TRACE_REFS],
+        u8,
+    ) {
+        (&self.stamps, self.len)
+    }
+
+    /// Append one source stamp.
+    pub fn push(
+        &mut self,
+        stamp: StorageIntentPolicySourceStamp,
+    ) -> Result<(), StorageIntentPolicySourceTraceError> {
+        if !stamp.is_present() {
+            return Err(StorageIntentPolicySourceTraceError::AbsentClass);
+        }
+        if self.len as usize >= STORAGE_INTENT_POLICY_SOURCE_TRACE_REFS {
+            return Err(StorageIntentPolicySourceTraceError::Full);
+        }
+
+        self.stamps[self.len as usize] = stamp;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Returns true when a source class is present in the trace.
+    #[must_use]
+    pub const fn contains_class(self, class: StorageIntentPolicySourceClass) -> bool {
+        let mut index = 0;
+        while index < self.len as usize {
+            if self.stamps[index].class as u8 == class as u8 {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// Return the stamp for a source class, if present.
+    #[must_use]
+    pub fn stamp_for_class(
+        self,
+        class: StorageIntentPolicySourceClass,
+    ) -> Option<StorageIntentPolicySourceStamp> {
+        let mut index = 0;
+        while index < self.len as usize {
+            if self.stamps[index].class as u8 == class as u8 {
+                return Some(self.stamps[index]);
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// Highest source epoch carried by the trace.
+    #[must_use]
+    pub const fn max_epoch(self) -> u64 {
+        let mut max_epoch = 0_u64;
+        let mut index = 0;
+        while index < self.len as usize {
+            if self.stamps[index].epoch > max_epoch {
+                max_epoch = self.stamps[index].epoch;
+            }
+            index += 1;
+        }
+        max_epoch
+    }
+}
+
+impl Default for StorageIntentPolicySourceTrace {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// One typed prefetch/residency policy source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrefetchResidencyPolicySource {
     pub class: StorageIntentPolicySourceClass,
     pub present: bool,
     pub source_revision: u64,
+    pub source_generation: u64,
+    pub source_epoch: u64,
+    pub source_ref: StorageIntentEvidenceRef,
     pub allowed_actions: PrefetchResidencyActionMask,
     pub refused_actions: PrefetchResidencyActionMask,
     pub required_flags: PrefetchResidencyPolicyFlags,
@@ -145,6 +296,14 @@ impl PrefetchResidencyPolicySource {
         class: StorageIntentPolicySourceClass::Absent,
         present: false,
         source_revision: 0,
+        source_generation: 0,
+        source_epoch: 0,
+        source_ref: StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::Unknown,
+            id: tidefs_storage_intent_core::StorageIntentEvidenceId::ZERO,
+            generation: 0,
+            version: 0,
+        },
         allowed_actions: PrefetchResidencyActionMask::EMPTY,
         refused_actions: PrefetchResidencyActionMask::EMPTY,
         required_flags: PrefetchResidencyPolicyFlags::EMPTY,
@@ -171,6 +330,14 @@ impl PrefetchResidencyPolicySource {
             class,
             present: true,
             source_revision: 0,
+            source_generation: 0,
+            source_epoch: 0,
+            source_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::Unknown,
+                id: tidefs_storage_intent_core::StorageIntentEvidenceId::ZERO,
+                generation: 0,
+                version: 0,
+            },
             allowed_actions,
             refused_actions: PrefetchResidencyActionMask::EMPTY,
             required_flags: PrefetchResidencyPolicyFlags::EMPTY,
@@ -185,6 +352,34 @@ impl PrefetchResidencyPolicySource {
             cooldown_ms: 0,
             admits_subject_range_overrides: false,
             explicit_unsafe_opt_in: false,
+        }
+    }
+
+    /// Attach persisted source revision, generation, epoch, and evidence ref.
+    #[must_use]
+    pub const fn with_source_stamp(
+        mut self,
+        revision: u64,
+        generation: u64,
+        epoch: u64,
+        evidence_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        self.source_revision = revision;
+        self.source_generation = generation;
+        self.source_epoch = epoch;
+        self.source_ref = evidence_ref;
+        self
+    }
+
+    /// Convert this source into a trace stamp.
+    #[must_use]
+    pub const fn source_stamp(self) -> StorageIntentPolicySourceStamp {
+        StorageIntentPolicySourceStamp {
+            class: self.class,
+            revision: self.source_revision,
+            generation: self.source_generation,
+            epoch: self.source_epoch,
+            evidence_ref: self.source_ref,
         }
     }
 
@@ -414,6 +609,7 @@ pub struct StorageIntentPolicyCompileResult {
     pub status: StorageIntentPolicyCompileStatus,
     pub envelope: PrefetchResidencyPolicyEnvelope,
     pub source_mask: StorageIntentPolicySourceMask,
+    pub source_trace: StorageIntentPolicySourceTrace,
     pub refusal: StorageIntentRefusalReason,
     pub explicit_unsafe_opt_in: bool,
     pub subject_range_override_admitted: bool,
@@ -425,11 +621,220 @@ impl Default for StorageIntentPolicyCompileResult {
             status: StorageIntentPolicyCompileStatus::Refused,
             envelope: PrefetchResidencyPolicyEnvelope::default(),
             source_mask: StorageIntentPolicySourceMask::EMPTY,
+            source_trace: StorageIntentPolicySourceTrace::EMPTY,
             refusal: StorageIntentRefusalReason::EvidenceNotUsable,
             explicit_unsafe_opt_in: false,
             subject_range_override_admitted: false,
         }
     }
+}
+
+/// Rollout class for replacing one compiled policy snapshot with another.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[repr(u8)]
+pub enum StorageIntentPolicyChangeClass {
+    /// The snapshots are byte-for-byte equal.
+    #[default]
+    Unchanged = 0,
+    /// Only the compiled revision changed.
+    EquivalentRevision = 1,
+    /// The new snapshot is stricter or removes optional actions.
+    Tightening = 2,
+    /// The new snapshot relaxes caps, floors, flags, or action admission.
+    Relaxing = 3,
+    /// The new snapshot admits authority/remote movement that must converge.
+    ConvergenceRequired = 4,
+    /// The new snapshot enables weaker volatile/unsafe behavior.
+    UnsafeDowngrade = 5,
+    /// Budget ownership changes and must be operator-visible.
+    BudgetOwnerChange = 6,
+    /// Snapshots do not describe the same dataset policy lineage.
+    Incompatible = 7,
+}
+
+/// Rollout requirements produced by policy change classification.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct StorageIntentPolicyRolloutRequirements(pub u32);
+
+impl StorageIntentPolicyRolloutRequirements {
+    /// No special rollout requirement.
+    pub const EMPTY: Self = Self(0);
+    /// Named operator consent is required.
+    pub const OPERATOR_CONSENT: Self = Self(1_u32 << 0);
+    /// Apply to new writes only until other evidence says otherwise.
+    pub const NEW_WRITES_ONLY: Self = Self(1_u32 << 1);
+    /// Relocation/convergence evidence is required before satisfaction.
+    pub const CONVERGENCE_REQUIRED: Self = Self(1_u32 << 2);
+    /// Policy rollout evidence is required for the revision transition.
+    pub const ROLLOUT_EVIDENCE: Self = Self(1_u32 << 3);
+    /// Any weaker result must stay receipt-visible.
+    pub const RECEIPT_VISIBLE_DEGRADATION: Self = Self(1_u32 << 4);
+
+    /// Merge two requirement sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns true when all requested flags are present.
+    #[must_use]
+    pub const fn contains_all(self, required: Self) -> bool {
+        (self.0 & required.0) == required.0
+    }
+}
+
+/// Evidence available when classifying a policy rollout.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageIntentPolicyRolloutEvidence {
+    pub operator_consent: bool,
+    pub rollout_evidence: bool,
+    pub convergence_evidence: bool,
+    pub operator_consent_ref: StorageIntentEvidenceRef,
+    pub rollout_ref: StorageIntentEvidenceRef,
+    pub convergence_ref: StorageIntentEvidenceRef,
+}
+
+/// Result of classifying a policy revision transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageIntentPolicyChangeDecision {
+    pub change_class: StorageIntentPolicyChangeClass,
+    pub requirements: StorageIntentPolicyRolloutRequirements,
+    pub refused: bool,
+    pub refusal: StorageIntentRefusalReason,
+}
+
+impl StorageIntentPolicyChangeDecision {
+    /// Build an accepted rollout classification.
+    #[must_use]
+    pub const fn accepted(
+        change_class: StorageIntentPolicyChangeClass,
+        requirements: StorageIntentPolicyRolloutRequirements,
+    ) -> Self {
+        Self {
+            change_class,
+            requirements,
+            refused: false,
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
+    /// Build a refused rollout classification.
+    #[must_use]
+    pub const fn refused(
+        change_class: StorageIntentPolicyChangeClass,
+        requirements: StorageIntentPolicyRolloutRequirements,
+        refusal: StorageIntentRefusalReason,
+    ) -> Self {
+        Self {
+            change_class,
+            requirements,
+            refused: true,
+            refusal,
+        }
+    }
+}
+
+impl Default for StorageIntentPolicyChangeDecision {
+    fn default() -> Self {
+        Self::refused(
+            StorageIntentPolicyChangeClass::Incompatible,
+            StorageIntentPolicyRolloutRequirements::EMPTY,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        )
+    }
+}
+
+/// Classify how a compiled prefetch/residency policy revision may roll out.
+#[must_use]
+pub fn classify_prefetch_residency_policy_change(
+    old: PrefetchResidencyPolicyEnvelope,
+    new: PrefetchResidencyPolicyEnvelope,
+    evidence: StorageIntentPolicyRolloutEvidence,
+) -> StorageIntentPolicyChangeDecision {
+    if old == new {
+        return StorageIntentPolicyChangeDecision::accepted(
+            StorageIntentPolicyChangeClass::Unchanged,
+            StorageIntentPolicyRolloutRequirements::EMPTY,
+        );
+    }
+
+    if !same_policy_lineage(old, new) {
+        return StorageIntentPolicyChangeDecision::refused(
+            StorageIntentPolicyChangeClass::Incompatible,
+            StorageIntentPolicyRolloutRequirements::EMPTY,
+            StorageIntentRefusalReason::WrongDomain,
+        );
+    }
+
+    if new.policy_revision.0 <= old.policy_revision.0 {
+        return StorageIntentPolicyChangeDecision::refused(
+            StorageIntentPolicyChangeClass::Incompatible,
+            StorageIntentPolicyRolloutRequirements::ROLLOUT_EVIDENCE,
+            StorageIntentRefusalReason::ReceiptWouldWeaken,
+        );
+    }
+
+    let mut change_class = if prefetch_envelopes_equivalent_except_revision(old, new) {
+        StorageIntentPolicyChangeClass::EquivalentRevision
+    } else {
+        StorageIntentPolicyChangeClass::Tightening
+    };
+    let mut requirements = StorageIntentPolicyRolloutRequirements::ROLLOUT_EVIDENCE;
+
+    if old.budget_owner != new.budget_owner {
+        change_class = StorageIntentPolicyChangeClass::BudgetOwnerChange;
+        requirements = requirements
+            .union(StorageIntentPolicyRolloutRequirements::OPERATOR_CONSENT)
+            .union(StorageIntentPolicyRolloutRequirements::NEW_WRITES_ONLY);
+    } else if unsafe_or_volatile_added(old.allowed_actions, new.allowed_actions) {
+        change_class = StorageIntentPolicyChangeClass::UnsafeDowngrade;
+        requirements = requirements
+            .union(StorageIntentPolicyRolloutRequirements::OPERATOR_CONSENT)
+            .union(StorageIntentPolicyRolloutRequirements::NEW_WRITES_ONLY)
+            .union(StorageIntentPolicyRolloutRequirements::RECEIPT_VISIBLE_DEGRADATION);
+    } else if authority_or_remote_action_added(old.allowed_actions, new.allowed_actions) {
+        change_class = StorageIntentPolicyChangeClass::ConvergenceRequired;
+        requirements = requirements
+            .union(StorageIntentPolicyRolloutRequirements::NEW_WRITES_ONLY)
+            .union(StorageIntentPolicyRolloutRequirements::CONVERGENCE_REQUIRED);
+    } else if prefetch_policy_relaxes(old, new) {
+        change_class = StorageIntentPolicyChangeClass::Relaxing;
+        requirements = requirements
+            .union(StorageIntentPolicyRolloutRequirements::OPERATOR_CONSENT)
+            .union(StorageIntentPolicyRolloutRequirements::NEW_WRITES_ONLY);
+    } else if !prefetch_envelopes_equivalent_except_revision(old, new) {
+        requirements = requirements.union(StorageIntentPolicyRolloutRequirements::NEW_WRITES_ONLY);
+    }
+
+    if requirements.contains_all(StorageIntentPolicyRolloutRequirements::OPERATOR_CONSENT)
+        && (!evidence.operator_consent || !evidence_ref_has_id(evidence.operator_consent_ref))
+    {
+        return StorageIntentPolicyChangeDecision::refused(
+            change_class,
+            requirements,
+            StorageIntentRefusalReason::MissingAuthorization,
+        );
+    }
+    if requirements.contains_all(StorageIntentPolicyRolloutRequirements::ROLLOUT_EVIDENCE)
+        && (!evidence.rollout_evidence || !evidence_ref_has_id(evidence.rollout_ref))
+    {
+        return StorageIntentPolicyChangeDecision::refused(
+            change_class,
+            requirements,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+    if requirements.contains_all(StorageIntentPolicyRolloutRequirements::CONVERGENCE_REQUIRED)
+        && (!evidence.convergence_evidence || !evidence_ref_has_id(evidence.convergence_ref))
+    {
+        return StorageIntentPolicyChangeDecision::refused(
+            change_class,
+            requirements,
+            StorageIntentRefusalReason::MovementDebtNotPaidBack,
+        );
+    }
+
+    StorageIntentPolicyChangeDecision::accepted(change_class, requirements)
 }
 
 /// Compile pool, dataset, mount, caller, and maintenance sources into the #967
@@ -453,6 +858,7 @@ pub fn compile_prefetch_residency_policy(
     result.refusal = StorageIntentRefusalReason::None;
 
     let mut source_mask = StorageIntentPolicySourceMask::EMPTY;
+    let mut source_trace = StorageIntentPolicySourceTrace::EMPTY;
     let mut actions = PrefetchResidencyActionMask::ALL_DEFINED;
     let mut has_dataset_policy = false;
     let mut flags = LOW_RISK_DEFAULT_FLAGS;
@@ -473,6 +879,7 @@ pub fn compile_prefetch_residency_policy(
     has_dataset_policy |= apply_source(
         sources.inherited_dataset,
         &mut source_mask,
+        &mut source_trace,
         &mut actions,
         &mut flags,
         &mut max_prefetch_window_bytes,
@@ -489,6 +896,7 @@ pub fn compile_prefetch_residency_policy(
     has_dataset_policy |= apply_source(
         sources.dataset,
         &mut source_mask,
+        &mut source_trace,
         &mut actions,
         &mut flags,
         &mut max_prefetch_window_bytes,
@@ -505,6 +913,7 @@ pub fn compile_prefetch_residency_policy(
     apply_source(
         sources.mount_profile,
         &mut source_mask,
+        &mut source_trace,
         &mut actions,
         &mut flags,
         &mut max_prefetch_window_bytes,
@@ -520,6 +929,7 @@ pub fn compile_prefetch_residency_policy(
     apply_source(
         sources.product_profile,
         &mut source_mask,
+        &mut source_trace,
         &mut actions,
         &mut flags,
         &mut max_prefetch_window_bytes,
@@ -538,6 +948,7 @@ pub fn compile_prefetch_residency_policy(
             apply_source(
                 sources.subject_range_override,
                 &mut source_mask,
+                &mut source_trace,
                 &mut actions,
                 &mut flags,
                 &mut max_prefetch_window_bytes,
@@ -550,6 +961,7 @@ pub fn compile_prefetch_residency_policy(
                 &mut explicit_unsafe_opt_in,
             );
         } else {
+            push_source_trace(&mut source_trace, sources.subject_range_override);
             actions = mask_intersection(actions, PrefetchResidencyActionMask::LOW_RISK_PREFETCH);
             result.status = StorageIntentPolicyCompileStatus::Lowered;
             result.refusal = StorageIntentRefusalReason::MissingAuthorization;
@@ -558,6 +970,7 @@ pub fn compile_prefetch_residency_policy(
 
     if !has_dataset_policy {
         result.source_mask = source_mask;
+        result.source_trace = source_trace;
         result.refusal = StorageIntentRefusalReason::EvidenceNotUsable;
         return result;
     }
@@ -641,6 +1054,7 @@ pub fn compile_prefetch_residency_policy(
 
     if actions.is_empty() {
         result.source_mask = source_mask;
+        result.source_trace = source_trace;
         result.status = StorageIntentPolicyCompileStatus::Refused;
         if result.refusal == StorageIntentRefusalReason::None {
             result.refusal = StorageIntentRefusalReason::NoLegalReceiptSet;
@@ -683,6 +1097,7 @@ pub fn compile_prefetch_residency_policy(
 
     result.envelope = envelope;
     result.source_mask = source_mask;
+    result.source_trace = source_trace;
     result.explicit_unsafe_opt_in = explicit_unsafe_opt_in;
     result.subject_range_override_admitted = subject_range_override_admitted;
     if result.refusal == StorageIntentRefusalReason::None {
@@ -702,6 +1117,7 @@ pub fn compile_prefetch_residency_policy(
 fn apply_source(
     source: PrefetchResidencyPolicySource,
     source_mask: &mut StorageIntentPolicySourceMask,
+    source_trace: &mut StorageIntentPolicySourceTrace,
     actions: &mut PrefetchResidencyActionMask,
     flags: &mut PrefetchResidencyPolicyFlags,
     max_prefetch_window_bytes: &mut u64,
@@ -718,6 +1134,7 @@ fn apply_source(
     }
 
     *source_mask = source_mask.with(source.class);
+    push_source_trace(source_trace, source);
     *actions = mask_intersection(*actions, source.allowed_actions);
     *actions = mask_without(*actions, source.refused_actions);
     *flags = flags.union(source.required_flags);
@@ -742,6 +1159,86 @@ fn apply_source(
         source.class,
         StorageIntentPolicySourceClass::InheritedDataset | StorageIntentPolicySourceClass::Dataset
     )
+}
+
+fn push_source_trace(
+    source_trace: &mut StorageIntentPolicySourceTrace,
+    source: PrefetchResidencyPolicySource,
+) {
+    let _ = source_trace.push(source.source_stamp());
+}
+
+fn same_policy_lineage(
+    old: PrefetchResidencyPolicyEnvelope,
+    new: PrefetchResidencyPolicyEnvelope,
+) -> bool {
+    !policy_id_is_zero(old.policy_id)
+        && old.policy_id == new.policy_id
+        && !domain_id_is_zero(old.pool_id)
+        && old.pool_id == new.pool_id
+        && !domain_id_is_zero(old.dataset_id)
+        && old.dataset_id == new.dataset_id
+}
+
+fn prefetch_envelopes_equivalent_except_revision(
+    old: PrefetchResidencyPolicyEnvelope,
+    new: PrefetchResidencyPolicyEnvelope,
+) -> bool {
+    old.policy_id == new.policy_id
+        && old.policy_scope == new.policy_scope
+        && old.pool_id == new.pool_id
+        && old.dataset_id == new.dataset_id
+        && old.budget_owner == new.budget_owner
+        && old.allowed_actions == new.allowed_actions
+        && old.flags == new.flags
+        && old.max_prefetch_window_bytes == new.max_prefetch_window_bytes
+        && old.max_staging_bytes == new.max_staging_bytes
+        && old.min_sample_mass == new.min_sample_mass
+        && old.min_observation_window_ms == new.min_observation_window_ms
+        && old.max_decay_age_ms == new.max_decay_age_ms
+        && old.dwell_min_ms == new.dwell_min_ms
+        && old.cooldown_ms == new.cooldown_ms
+        && old.evidence_refs == new.evidence_refs
+}
+
+fn unsafe_or_volatile_added(
+    old_actions: PrefetchResidencyActionMask,
+    new_actions: PrefetchResidencyActionMask,
+) -> bool {
+    let added = mask_without(new_actions, old_actions);
+    added.contains_candidate(PrefetchResidencyCandidateClass::VolatileRamTrial)
+}
+
+fn authority_or_remote_action_added(
+    old_actions: PrefetchResidencyActionMask,
+    new_actions: PrefetchResidencyActionMask,
+) -> bool {
+    let added = mask_without(new_actions, old_actions);
+    mask_overlaps(added, AUTHORITY_MOVEMENT_ACTIONS)
+        || mask_overlaps(added, REMOTE_OR_ARCHIVE_ACTIONS)
+}
+
+fn prefetch_policy_relaxes(
+    old: PrefetchResidencyPolicyEnvelope,
+    new: PrefetchResidencyPolicyEnvelope,
+) -> bool {
+    (new.allowed_actions.0 & !old.allowed_actions.0) != 0
+        || (old.flags.0 & !new.flags.0) != 0
+        || max_ceiling_relaxed(old.max_prefetch_window_bytes, new.max_prefetch_window_bytes)
+        || max_ceiling_relaxed(old.max_staging_bytes, new.max_staging_bytes)
+        || max_ceiling_relaxed(old.max_decay_age_ms, new.max_decay_age_ms)
+        || min_floor_relaxed(old.min_sample_mass, new.min_sample_mass)
+        || min_floor_relaxed(old.min_observation_window_ms, new.min_observation_window_ms)
+        || min_floor_relaxed(old.dwell_min_ms, new.dwell_min_ms)
+        || min_floor_relaxed(old.cooldown_ms, new.cooldown_ms)
+}
+
+fn max_ceiling_relaxed(old: u64, new: u64) -> bool {
+    old != 0 && (new == 0 || new > old)
+}
+
+fn min_floor_relaxed<T: Ord>(old: T, new: T) -> bool {
+    new < old
 }
 
 fn apply_evidence_state(
@@ -1084,6 +1581,33 @@ mod tests {
             scheduler_admission: true,
             trust_domain: true,
             transport_budget: true,
+        }
+    }
+
+    fn rollout_evidence(
+        operator_consent: bool,
+        rollout: bool,
+        convergence: bool,
+    ) -> StorageIntentPolicyRolloutEvidence {
+        StorageIntentPolicyRolloutEvidence {
+            operator_consent,
+            rollout_evidence: rollout,
+            convergence_evidence: convergence,
+            operator_consent_ref: if operator_consent {
+                evidence(StorageIntentEvidenceKind::PolicyRolloutEvidence, 70)
+            } else {
+                StorageIntentEvidenceRef::default()
+            },
+            rollout_ref: if rollout {
+                evidence(StorageIntentEvidenceKind::PolicyRolloutEvidence, 71)
+            } else {
+                StorageIntentEvidenceRef::default()
+            },
+            convergence_ref: if convergence {
+                evidence(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 72)
+            } else {
+                StorageIntentEvidenceRef::default()
+            },
         }
     }
 
@@ -1650,5 +2174,186 @@ mod tests {
         assert_eq!(new.envelope.policy_revision, StorageIntentPolicyRevision(2));
         assert_eq!(old.envelope.max_prefetch_window_bytes, 1 << 20);
         assert_eq!(new.envelope.max_prefetch_window_bytes, 128 * 1024);
+    }
+
+    #[test]
+    fn source_trace_preserves_revision_generation_epoch_and_ref() {
+        let mut sources = baseline_sources(DATASET_A);
+        sources.pool_default = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::PoolDefault,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        )
+        .with_source_stamp(
+            10,
+            20,
+            30,
+            evidence(StorageIntentEvidenceKind::PolicyRolloutEvidence, 73),
+        );
+        sources.dataset = sources.dataset.with_source_stamp(
+            11,
+            21,
+            31,
+            evidence(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 74),
+        );
+        sources.mount_profile = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::MountProfile,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        )
+        .with_source_stamp(
+            12,
+            22,
+            32,
+            evidence(StorageIntentEvidenceKind::ServiceObjectiveEvidence, 75),
+        );
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        assert_eq!(result.status, StorageIntentPolicyCompileStatus::Compiled);
+        assert_eq!(result.source_trace.len(), 3);
+        assert!(result
+            .source_trace
+            .contains_class(StorageIntentPolicySourceClass::PoolDefault));
+        assert!(result
+            .source_trace
+            .contains_class(StorageIntentPolicySourceClass::MountProfile));
+        assert_eq!(result.source_trace.max_epoch(), 32);
+
+        let dataset_stamp = result
+            .source_trace
+            .stamp_for_class(StorageIntentPolicySourceClass::Dataset)
+            .unwrap();
+        assert_eq!(dataset_stamp.revision, 11);
+        assert_eq!(dataset_stamp.generation, 21);
+        assert_eq!(dataset_stamp.epoch, 31);
+        assert_eq!(
+            dataset_stamp.evidence_ref,
+            evidence(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 74)
+        );
+    }
+
+    #[test]
+    fn unsafe_rollout_requires_named_operator_consent() {
+        let old = compile_prefetch_residency_policy(baseline_sources(DATASET_A)).envelope;
+        let mut new_sources = baseline_sources(DATASET_A);
+        new_sources.identity = identity(DATASET_A, 2);
+        new_sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH
+                .with(PrefetchResidencyCandidateClass::VolatileRamTrial),
+        )
+        .with_explicit_unsafe_opt_in();
+        let new = compile_prefetch_residency_policy(new_sources).envelope;
+
+        let refused = classify_prefetch_residency_policy_change(
+            old,
+            new,
+            rollout_evidence(false, true, false),
+        );
+
+        assert_eq!(
+            refused.change_class,
+            StorageIntentPolicyChangeClass::UnsafeDowngrade
+        );
+        assert!(refused.refused);
+        assert_eq!(
+            refused.refusal,
+            StorageIntentRefusalReason::MissingAuthorization
+        );
+        assert!(refused
+            .requirements
+            .contains_all(StorageIntentPolicyRolloutRequirements::OPERATOR_CONSENT));
+        assert!(refused
+            .requirements
+            .contains_all(StorageIntentPolicyRolloutRequirements::RECEIPT_VISIBLE_DEGRADATION));
+
+        let accepted = classify_prefetch_residency_policy_change(
+            old,
+            new,
+            rollout_evidence(true, true, false),
+        );
+        assert!(!accepted.refused);
+        assert_eq!(
+            accepted.change_class,
+            StorageIntentPolicyChangeClass::UnsafeDowngrade
+        );
+    }
+
+    #[test]
+    fn authority_expansion_requires_convergence_before_satisfied() {
+        let old = compile_prefetch_residency_policy(baseline_sources(DATASET_A)).envelope;
+        let mut new_sources = baseline_sources(DATASET_A);
+        new_sources.identity = identity(DATASET_A, 2);
+        new_sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH
+                .with(PrefetchResidencyCandidateClass::AuthorityPromotionCandidate),
+        );
+        let new = compile_prefetch_residency_policy(new_sources).envelope;
+
+        let refused = classify_prefetch_residency_policy_change(
+            old,
+            new,
+            rollout_evidence(false, true, false),
+        );
+
+        assert_eq!(
+            refused.change_class,
+            StorageIntentPolicyChangeClass::ConvergenceRequired
+        );
+        assert!(refused.refused);
+        assert_eq!(
+            refused.refusal,
+            StorageIntentRefusalReason::MovementDebtNotPaidBack
+        );
+        assert!(refused
+            .requirements
+            .contains_all(StorageIntentPolicyRolloutRequirements::CONVERGENCE_REQUIRED));
+
+        let accepted = classify_prefetch_residency_policy_change(
+            old,
+            new,
+            rollout_evidence(false, true, true),
+        );
+        assert!(!accepted.refused);
+        assert_eq!(
+            accepted.change_class,
+            StorageIntentPolicyChangeClass::ConvergenceRequired
+        );
+    }
+
+    #[test]
+    fn tightening_rollout_applies_to_new_writes_without_operator_consent() {
+        let old = compile_prefetch_residency_policy(baseline_sources(DATASET_A)).envelope;
+        let mut new_sources = baseline_sources(DATASET_A);
+        new_sources.identity = identity(DATASET_A, 2);
+        new_sources.dataset = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::from_candidate(
+                PrefetchResidencyCandidateClass::BoundedReadahead,
+            ),
+        )
+        .requiring(PrefetchResidencyPolicyFlags::REQUIRE_READ_SERVING_BOUNDARY)
+        .with_prefetch_window_limit(128 * 1024)
+        .with_staging_limit(4 << 20)
+        .with_signal_floor(64, 10_000, 30_000);
+        let new = compile_prefetch_residency_policy(new_sources).envelope;
+
+        let decision = classify_prefetch_residency_policy_change(
+            old,
+            new,
+            rollout_evidence(false, true, false),
+        );
+
+        assert_eq!(
+            decision.change_class,
+            StorageIntentPolicyChangeClass::Tightening
+        );
+        assert!(!decision.refused);
+        assert!(decision
+            .requirements
+            .contains_all(StorageIntentPolicyRolloutRequirements::NEW_WRITES_ONLY));
+        assert!(!decision
+            .requirements
+            .contains_all(StorageIntentPolicyRolloutRequirements::OPERATOR_CONSENT));
     }
 }
