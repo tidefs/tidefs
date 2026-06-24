@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 pub mod constraint;
+pub mod intent_planning;
 pub mod node_placement;
 pub mod placement_plan;
 use tidefs_durability_layout::{

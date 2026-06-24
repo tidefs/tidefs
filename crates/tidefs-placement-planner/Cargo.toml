@@ -18,4 +18,5 @@ thiserror = "1"
 tidefs-durability-layout = { workspace = true }
 tidefs-membership-epoch = { workspace = true }
 tidefs-replication-model = { workspace = true }
+tidefs-storage-intent-core = { workspace = true }
 blake3 = "1"
