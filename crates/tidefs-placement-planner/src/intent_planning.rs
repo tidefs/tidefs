@@ -18,8 +18,7 @@ use tidefs_storage_intent_core::{
     MediaRoleRequirement, PredictionConfidence, PrefetchResidencyDecisionRecord,
     ReceiptPredicateResult, SkippedMoveReason, StorageIntentEvidenceKind,
     StorageIntentEvidenceQuerySnapshot, StorageIntentGuaranteeClass, StorageIntentPolicy,
-    StorageIntentReceipt, StorageIntentRefusalReason, StorageIntentRefusalReason::*,
-    StorageMediaRole, TransformRefusalClass,
+    StorageIntentReceipt, StorageIntentRefusalReason, StorageMediaRole, TransformRefusalClass,
 };
 
 use crate::TierGoal;
@@ -406,11 +405,21 @@ impl StorageIntentPlacementReason {
             | Self::CandidateMediaCapabilityRefused { refusal, .. }
             | Self::CandidateEvidenceGateRefused { refusal, .. }
             | Self::CandidateMovementDebtRefused { refusal, .. } => Some(*refusal),
-            Self::CandidateGuaranteeFloorNotMet { .. } => Some(GuaranteeFloorNotMet),
-            Self::CandidateCacheOnlyCannotSatisfyAuthority { .. } => Some(CacheCannotBeAuthority),
-            Self::CandidateGeoRemoteEvidenceMissing { .. } => Some(FailureDomainNotMet),
-            Self::NotEnoughLegalCandidates { .. } => Some(NoLegalReceiptSet),
-            Self::NotEnoughFailureDomains { .. } => Some(FailureDomainNotMet),
+            Self::CandidateGuaranteeFloorNotMet { .. } => {
+                Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
+            }
+            Self::CandidateCacheOnlyCannotSatisfyAuthority { .. } => {
+                Some(StorageIntentRefusalReason::CacheCannotBeAuthority)
+            }
+            Self::CandidateGeoRemoteEvidenceMissing { .. } => {
+                Some(StorageIntentRefusalReason::FailureDomainNotMet)
+            }
+            Self::NotEnoughLegalCandidates { .. } => {
+                Some(StorageIntentRefusalReason::NoLegalReceiptSet)
+            }
+            Self::NotEnoughFailureDomains { .. } => {
+                Some(StorageIntentRefusalReason::FailureDomainNotMet)
+            }
             _ => None,
         }
     }
@@ -576,7 +585,7 @@ fn evidence_cut_refusal(
     {
         None
     } else {
-        Some(EvidenceNotUsable)
+        Some(StorageIntentRefusalReason::EvidenceNotUsable)
     }
 }
 
@@ -652,28 +661,28 @@ fn evaluate_candidate(
         candidate.target_id,
         CandidateGate::CapacityAdmission,
         candidate.capacity_admission,
-        NoLegalReceiptSet,
+        StorageIntentRefusalReason::NoLegalReceiptSet,
     );
     require_candidate_gate(
         reasons,
         candidate.target_id,
         CandidateGate::TransportPath,
         candidate.transport_path,
-        EvidenceNotUsable,
+        StorageIntentRefusalReason::EvidenceNotUsable,
     );
     require_candidate_gate(
         reasons,
         candidate.target_id,
         CandidateGate::TrustDomain,
         candidate.trust_domain,
-        EvidenceNotUsable,
+        StorageIntentRefusalReason::EvidenceNotUsable,
     );
     require_candidate_gate(
         reasons,
         candidate.target_id,
         CandidateGate::DecisionFrontier,
         candidate.decision_frontier,
-        EvidenceNotUsable,
+        StorageIntentRefusalReason::EvidenceNotUsable,
     );
 
     evaluate_data_shape(role_requires_data_shape(role), candidate, reasons);
@@ -731,7 +740,7 @@ fn evaluate_data_shape(
         candidate.target_id,
         CandidateGate::DataShape,
         candidate.data_shape_state,
-        EvidenceNotUsable,
+        StorageIntentRefusalReason::EvidenceNotUsable,
     );
 
     let Some(data_shape) = candidate.data_shape else {
@@ -739,7 +748,7 @@ fn evaluate_data_shape(
             target_id: candidate.target_id,
             gate: CandidateGate::DataShape,
             state: PlacementEvidenceState::Missing,
-            refusal: EvidenceNotUsable,
+            refusal: StorageIntentRefusalReason::EvidenceNotUsable,
         });
         return;
     };
@@ -761,7 +770,7 @@ fn evaluate_layout(
         candidate.target_id,
         CandidateGate::LayoutAllocator,
         candidate.layout_allocator_state,
-        EvidenceNotUsable,
+        StorageIntentRefusalReason::EvidenceNotUsable,
     );
 
     let Some(layout) = candidate.layout_allocator else {
@@ -871,7 +880,7 @@ fn evaluate_movement_debt(
     let Some(cost_wear) = candidate.cost_wear else {
         reasons.push(StorageIntentPlacementReason::CandidateMovementDebtRefused {
             target_id: candidate.target_id,
-            refusal: EvidenceNotUsable,
+            refusal: StorageIntentRefusalReason::EvidenceNotUsable,
         });
         return;
     };
@@ -882,21 +891,21 @@ fn evaluate_movement_debt(
     {
         reasons.push(StorageIntentPlacementReason::CandidateMovementDebtRefused {
             target_id: candidate.target_id,
-            refusal: MovementDebtNotPaidBack,
+            refusal: StorageIntentRefusalReason::MovementDebtNotPaidBack,
         });
     }
 
     if cost_wear.expected_write_bytes > 0 && cost_wear.write_amplification_ppm == 0 {
         reasons.push(StorageIntentPlacementReason::CandidateMovementDebtRefused {
             target_id: candidate.target_id,
-            refusal: EvidenceNotUsable,
+            refusal: StorageIntentRefusalReason::EvidenceNotUsable,
         });
     }
 
     if cost_wear.flash_wear_cost_ppm == u32::MAX {
         reasons.push(StorageIntentPlacementReason::CandidateMovementDebtRefused {
             target_id: candidate.target_id,
-            refusal: FlashWearBudgetExceeded,
+            refusal: StorageIntentRefusalReason::FlashWearBudgetExceeded,
         });
     }
 
@@ -910,13 +919,15 @@ fn evaluate_movement_debt(
 
 fn skipped_move_refusal(reason: SkippedMoveReason) -> StorageIntentRefusalReason {
     match reason {
-        SkippedMoveReason::FlashWearBudgetExceeded => FlashWearBudgetExceeded,
-        SkippedMoveReason::ReceiptWouldWeaken => ReceiptWouldWeaken,
-        SkippedMoveReason::SourceQuarantined => QuarantinedSource,
-        SkippedMoveReason::NoLegalTarget => NoLegalReceiptSet,
-        SkippedMoveReason::StaleEvidence => EvidenceNotUsable,
+        SkippedMoveReason::FlashWearBudgetExceeded => {
+            StorageIntentRefusalReason::FlashWearBudgetExceeded
+        }
+        SkippedMoveReason::ReceiptWouldWeaken => StorageIntentRefusalReason::ReceiptWouldWeaken,
+        SkippedMoveReason::SourceQuarantined => StorageIntentRefusalReason::QuarantinedSource,
+        SkippedMoveReason::NoLegalTarget => StorageIntentRefusalReason::NoLegalReceiptSet,
+        SkippedMoveReason::StaleEvidence => StorageIntentRefusalReason::EvidenceNotUsable,
         SkippedMoveReason::None => StorageIntentRefusalReason::None,
-        _ => MovementDebtNotPaidBack,
+        _ => StorageIntentRefusalReason::MovementDebtNotPaidBack,
     }
 }
 
@@ -1264,7 +1275,7 @@ mod tests {
         );
 
         assert!(!result.admitted);
-        assert!(result.has_refusal(PersistentMediaRequired));
+        assert!(result.has_refusal(StorageIntentRefusalReason::PersistentMediaRequired));
     }
 
     #[test]
@@ -1293,7 +1304,7 @@ mod tests {
         );
 
         assert!(!result.admitted);
-        assert!(result.has_refusal(FailureDomainNotMet));
+        assert!(result.has_refusal(StorageIntentRefusalReason::FailureDomainNotMet));
     }
 
     #[test]
@@ -1367,7 +1378,7 @@ mod tests {
         );
 
         assert!(!result.admitted);
-        assert!(result.has_refusal(CacheCannotBeAuthority));
+        assert!(result.has_refusal(StorageIntentRefusalReason::CacheCannotBeAuthority));
     }
 
     #[test]
@@ -1397,7 +1408,7 @@ mod tests {
         );
 
         assert!(!result.admitted);
-        assert!(result.has_refusal(WrongDomain));
+        assert!(result.has_refusal(StorageIntentRefusalReason::WrongDomain));
     }
 
     #[test]
@@ -1459,6 +1470,6 @@ mod tests {
             reason,
             StorageIntentPlacementReason::CandidateLowPredictionConfidence { .. }
         )));
-        assert!(result.has_refusal(MovementDebtNotPaidBack));
+        assert!(result.has_refusal(StorageIntentRefusalReason::MovementDebtNotPaidBack));
     }
 }
