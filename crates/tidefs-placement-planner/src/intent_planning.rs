@@ -1316,7 +1316,7 @@ fn evaluate_candidate(
     );
 
     evaluate_data_shape(role_requires_data_shape(role), candidate, reasons);
-    evaluate_layout(candidate, reasons);
+    evaluate_layout(role_requires_layout_allocator(role), candidate, reasons);
     evaluate_cache_authority_boundary(role, candidate, reasons);
     evaluate_geo_remote_boundary(role, candidate, reasons);
     evaluate_movement_debt(role, candidate, reasons);
@@ -1356,6 +1356,10 @@ fn role_requires_data_shape(role: StorageIntentPlacementRole) -> bool {
     !role.is_cache_only()
 }
 
+fn role_requires_layout_allocator(role: StorageIntentPlacementRole) -> bool {
+    !role.is_cache_only()
+}
+
 fn evaluate_data_shape(
     required: bool,
     candidate: &StorageIntentPlacementCandidate,
@@ -1392,9 +1396,14 @@ fn evaluate_data_shape(
 }
 
 fn evaluate_layout(
+    required: bool,
     candidate: &StorageIntentPlacementCandidate,
     reasons: &mut Vec<StorageIntentPlacementReason>,
 ) {
+    if !required {
+        return;
+    }
+
     require_candidate_gate(
         reasons,
         candidate.target_id,
@@ -1719,6 +1728,20 @@ mod tests {
         }
     }
 
+    fn cache_only_policy() -> StorageIntentPolicy {
+        StorageIntentPolicy {
+            policy_id: POLICY_ID,
+            revision: StorageIntentPolicyRevision(1),
+            requested_guarantee: StorageIntentGuaranteeClass::VolatileLocal,
+            max_proximity: ProximityClass::Geo,
+            media: MediaRoleRequirement {
+                allowed_roles: MediaRoleMask::from_role(StorageMediaRole::ReadCache),
+                require_authority_role: false,
+            },
+            ..StorageIntentPolicy::default()
+        }
+    }
+
     fn trust(domain: StorageIntentDomainId) -> TrustEvidenceState {
         TrustEvidenceState {
             flags: TrustEvidenceFlags::AUTHENTICATED_PRINCIPAL
@@ -2031,6 +2054,112 @@ mod tests {
 
         assert!(!result.admitted);
         assert!(result.has_refusal(StorageIntentRefusalReason::CacheCannotBeAuthority));
+    }
+
+    #[test]
+    fn cache_only_trial_does_not_require_layout_or_data_shape_records() {
+        let policy = cache_only_policy();
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::ReadCache,
+            StorageIntentGuaranteeClass::VolatileLocal,
+            FailureDomainMask::EMPTY,
+            StorageMediaClass::SystemRam,
+        );
+        candidate.media_capability = volatile_media();
+        candidate.data_shape = None;
+        candidate.data_shape_state = PlacementEvidenceState::Unknown;
+        candidate.layout_allocator = None;
+        candidate.layout_allocator_state = PlacementEvidenceState::Unknown;
+
+        let request = StorageIntentPlacementRequest::new(
+            policy,
+            StorageIntentPlacementRole::CacheOnlyHotServingTrial,
+            1,
+            1,
+            evidence_cut_filter(policy, |kind| {
+                !matches!(
+                    kind,
+                    StorageIntentEvidenceKind::DataShapeEvidence
+                        | StorageIntentEvidenceKind::LayoutAllocatorEvidence
+                )
+            }),
+        );
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(plan.admitted, "{plan:?}");
+        assert_eq!(plan.selected_targets, vec![1]);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("selected candidate report exists");
+        assert!(report.legal);
+        assert!(!report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                    gate: CandidateGate::DataShape | CandidateGate::LayoutAllocator,
+                    ..
+                } | StorageIntentPlacementReason::CandidateDataShapeRefused { .. }
+                    | StorageIntentPlacementReason::CandidateLayoutRefused { .. }
+            )
+        )));
+    }
+
+    #[test]
+    fn durable_placement_still_requires_layout_allocator_record() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.layout_allocator = None;
+        candidate.layout_allocator_state = PlacementEvidenceState::Unknown;
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(!report.legal);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                    gate: CandidateGate::LayoutAllocator,
+                    state: PlacementEvidenceState::Unknown,
+                    ..
+                }
+            )
+        )));
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateLayoutRefused {
+                    refusal: LayoutRefusal::MissingEvidence,
+                    ..
+                }
+            )
+        )));
     }
 
     #[test]
@@ -2559,19 +2688,21 @@ mod tests {
         )));
 
         // The evaluation wrapper must also succeed and carry the same reason.
-        let eval = evaluate_storage_intent_placement(&request, &[candidate(
-            1,
-            10,
-            StorageMediaRole::PlacementAuthority,
-            StorageIntentGuaranteeClass::FullPlacement,
-            FailureDomainMask::NODE,
-            StorageMediaClass::NvmeFlash,
-        )]);
+        let eval = evaluate_storage_intent_placement(
+            &request,
+            &[candidate(
+                1,
+                10,
+                StorageMediaRole::PlacementAuthority,
+                StorageIntentGuaranteeClass::FullPlacement,
+                FailureDomainMask::NODE,
+                StorageMediaClass::NvmeFlash,
+            )],
+        );
         assert!(eval.admitted);
         assert!(eval.reasons.iter().any(|reason| matches!(
             reason,
             StorageIntentPlacementReason::TierGoalIsNotStorageIntentModel(TierGoal::Primary)
         )));
     }
-
 }
