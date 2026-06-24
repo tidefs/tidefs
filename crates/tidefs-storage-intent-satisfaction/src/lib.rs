@@ -197,6 +197,13 @@ pub enum StorageIntentSatisfactionAxis {
     OperatorExplanation = 28,
     PerformanceRow = 29,
     FaultValidation = 30,
+    ActionExecution = 31,
+    ResultRefusal = 32,
+    EvidenceRetention = 33,
+    MetadataNamespace = 34,
+    PreflightSimulation = 35,
+    Comparator = 36,
+    ClaimGate = 37,
 }
 
 impl_u8_canonical!(StorageIntentSatisfactionAxis, {
@@ -231,6 +238,13 @@ impl_u8_canonical!(StorageIntentSatisfactionAxis, {
     OperatorExplanation = 28 => "operator-explanation",
     PerformanceRow = 29 => "performance-row",
     FaultValidation = 30 => "fault-validation",
+    ActionExecution = 31 => "action-execution",
+    ResultRefusal = 32 => "result-refusal",
+    EvidenceRetention = 33 => "evidence-retention",
+    MetadataNamespace = 34 => "metadata-namespace",
+    PreflightSimulation = 35 => "preflight-simulation",
+    Comparator = 36 => "comparator",
+    ClaimGate = 37 => "claim-gate",
 });
 
 /// Machine-readable reason emitted for a satisfaction row.
@@ -1078,14 +1092,24 @@ pub const fn axis_for_evidence_kind(
         StorageIntentEvidenceKind::ValidationArtifact => {
             StorageIntentSatisfactionAxis::FaultValidation
         }
-        StorageIntentEvidenceKind::PreflightSimulationEvidence
-        | StorageIntentEvidenceKind::ActionExecutionEvidence
-        | StorageIntentEvidenceKind::ResultRefusalEvidence
-        | StorageIntentEvidenceKind::EvidenceRetentionEvidence
-        | StorageIntentEvidenceKind::MetadataNamespaceEvidence
-        | StorageIntentEvidenceKind::ComparatorEvidence
-        | StorageIntentEvidenceKind::ClaimGateEvidence
-        | StorageIntentEvidenceKind::Unknown => StorageIntentSatisfactionAxis::Unknown,
+        StorageIntentEvidenceKind::PreflightSimulationEvidence => {
+            StorageIntentSatisfactionAxis::PreflightSimulation
+        }
+        StorageIntentEvidenceKind::ActionExecutionEvidence => {
+            StorageIntentSatisfactionAxis::ActionExecution
+        }
+        StorageIntentEvidenceKind::ResultRefusalEvidence => {
+            StorageIntentSatisfactionAxis::ResultRefusal
+        }
+        StorageIntentEvidenceKind::EvidenceRetentionEvidence => {
+            StorageIntentSatisfactionAxis::EvidenceRetention
+        }
+        StorageIntentEvidenceKind::MetadataNamespaceEvidence => {
+            StorageIntentSatisfactionAxis::MetadataNamespace
+        }
+        StorageIntentEvidenceKind::ComparatorEvidence => StorageIntentSatisfactionAxis::Comparator,
+        StorageIntentEvidenceKind::ClaimGateEvidence => StorageIntentSatisfactionAxis::ClaimGate,
+        StorageIntentEvidenceKind::Unknown => StorageIntentSatisfactionAxis::Unknown,
     }
 }
 
@@ -2213,5 +2237,64 @@ mod tests {
             .flags
             .contains_all(StorageIntentSatisfactionFlags::SNAPSHOT_GATED_BEFORE_RECEIPTS));
         assert!(record.satisfying_receipts.is_empty());
+    }
+
+    #[test]
+    fn new_evidence_kinds_map_to_correct_axes() {
+        assert_eq!(
+            axis_for_evidence_kind(StorageIntentEvidenceKind::PreflightSimulationEvidence),
+            StorageIntentSatisfactionAxis::PreflightSimulation
+        );
+        assert_eq!(
+            axis_for_evidence_kind(StorageIntentEvidenceKind::ActionExecutionEvidence),
+            StorageIntentSatisfactionAxis::ActionExecution
+        );
+        assert_eq!(
+            axis_for_evidence_kind(StorageIntentEvidenceKind::ResultRefusalEvidence),
+            StorageIntentSatisfactionAxis::ResultRefusal
+        );
+        assert_eq!(
+            axis_for_evidence_kind(StorageIntentEvidenceKind::EvidenceRetentionEvidence),
+            StorageIntentSatisfactionAxis::EvidenceRetention
+        );
+        assert_eq!(
+            axis_for_evidence_kind(StorageIntentEvidenceKind::MetadataNamespaceEvidence),
+            StorageIntentSatisfactionAxis::MetadataNamespace
+        );
+        assert_eq!(
+            axis_for_evidence_kind(StorageIntentEvidenceKind::ComparatorEvidence),
+            StorageIntentSatisfactionAxis::Comparator
+        );
+        assert_eq!(
+            axis_for_evidence_kind(StorageIntentEvidenceKind::ClaimGateEvidence),
+            StorageIntentSatisfactionAxis::ClaimGate
+        );
+
+        // Unknown must still map to Unknown.
+        assert_eq!(
+            axis_for_evidence_kind(StorageIntentEvidenceKind::Unknown),
+            StorageIntentSatisfactionAxis::Unknown
+        );
+
+        // Each new axis round-trips through discriminant encode/decode.
+        for (axis, discriminant) in [
+            (StorageIntentSatisfactionAxis::ActionExecution, 31u8),
+            (StorageIntentSatisfactionAxis::ResultRefusal, 32),
+            (StorageIntentSatisfactionAxis::EvidenceRetention, 33),
+            (StorageIntentSatisfactionAxis::MetadataNamespace, 34),
+            (StorageIntentSatisfactionAxis::PreflightSimulation, 35),
+            (StorageIntentSatisfactionAxis::Comparator, 36),
+            (StorageIntentSatisfactionAxis::ClaimGate, 37),
+        ] {
+            assert_eq!(axis.to_discriminant(), discriminant);
+            assert_eq!(
+                StorageIntentSatisfactionAxis::from_discriminant(discriminant),
+                Some(axis)
+            );
+        }
+
+        // Out-of-range discriminants fail closed.
+        assert_eq!(StorageIntentSatisfactionAxis::from_discriminant(38), None);
+        assert_eq!(StorageIntentSatisfactionAxis::from_discriminant(255), None);
     }
 }
