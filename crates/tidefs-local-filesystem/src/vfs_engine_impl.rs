@@ -6463,7 +6463,7 @@ mod tests {
         fs.write_file("/lost.txt", 0, b"snapshot bytes")
             .expect("write file");
         fs.create_snapshot("snap0").expect("create snapshot");
-        fs.write_file("/lost.txt", 0, b"live bytes")
+        fs.write_file("/lost.txt", 0, b"live bytesdata")
             .expect("mutate live file");
         let engine = VfsLocalFileSystem::new(fs);
 
@@ -6503,7 +6503,7 @@ mod tests {
                 .borrow()
                 .read_file("/lost.txt")
                 .expect("read live file"),
-            b"live bytes"
+            b"live bytesdata"
         );
     }
 
