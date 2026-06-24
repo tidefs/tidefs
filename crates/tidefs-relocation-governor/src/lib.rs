@@ -32,16 +32,12 @@
 //! - `geo-catchup` — WAN/internet replica RPO catch-up
 //! - `wear-rebalance` — flash/NVMe endurance-aware movement
 //!
-//! # Comparison to Ceph / ZFS
+//! # Non-claim boundary
 //!
-//! - Ceph: backfill is PG-scoped, triggered by OSD health changes;
-//!   no tiering-aware relocation, no policy-change triggers, no
-//!   wear-rebalance, no anti-thrash debt model.
-//! - ZFS: no native relocation — send/recv is manual, no automated
-//!   reclaim, tiering relocation, or geo catch-up.
-//! - TideFS: the relocation governor is one policy-to-evidence optimizer
-//!   family covering all movement reasons with explicit admission gates,
-//!   anti-thrash rules, and receipt-safe retirement law.
+//! This crate is a source-model surface. It does not claim runtime relocation,
+//! mounted-filesystem behavior, or product superiority over existing storage
+//! systems. Runtime activation remains gated on the evidence producers and
+//! action-execution surfaces named by issue #848.
 
 pub mod admission;
 pub mod anti_thrash;
