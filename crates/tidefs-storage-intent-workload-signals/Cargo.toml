@@ -1,0 +1,23 @@
+[package]
+name = "tidefs-storage-intent-workload-signals"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+
+description = """
+Bounded local workload-signal producers for storage intent. Collects fixed-size
+sketches, cost/materialization metadata, and conservative read-only snapshots
+without making placement, scheduling, relocation, or receipt decisions.
+"""
+
+[dependencies]
+tidefs-storage-intent-core = { workspace = true }
+
+[lib]
+path = "src/lib.rs"

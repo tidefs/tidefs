@@ -109,6 +109,7 @@ members = [
   "crates/tidefs-durability-layout",
   "crates/tidefs-intent-log",
   "crates/tidefs-storage-intent-core",
+  "crates/tidefs-storage-intent-workload-signals",
   "crates/tidefs-storage-intent-policy",
   "crates/tidefs-storage-intent-local-media-capability",
   "crates/tidefs-storage-intent-remote-media-capability",
@@ -297,6 +298,7 @@ tidefs-shard-group = { path = "crates/tidefs-shard-group" }
 tidefs-space-accounting = { path = "crates/tidefs-space-accounting" }
 tidefs-spacemap-allocator = { path = "crates/tidefs-spacemap-allocator" }
 tidefs-storage-intent-core = { path = "crates/tidefs-storage-intent-core" }
+tidefs-storage-intent-workload-signals = { path = "crates/tidefs-storage-intent-workload-signals" }
 tidefs-tdma-scheduler = { path = "crates/tidefs-tdma-scheduler" }
 tidefs-trace-oracle = { path = "crates/tidefs-trace-oracle" }
 tidefs-transport = { path = "crates/tidefs-transport" }

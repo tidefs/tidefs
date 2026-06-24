@@ -3500,6 +3500,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-storage-intent-workload-signals"
+version = "0.421.0"
+dependencies = [
+ "tidefs-storage-intent-core",
+]
+
+[[package]]
 name = "tidefs-storage-node"
 version = "0.421.0"
 dependencies = [
