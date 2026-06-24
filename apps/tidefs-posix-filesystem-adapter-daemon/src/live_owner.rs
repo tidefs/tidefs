@@ -184,6 +184,8 @@ struct LiveOwnerResponse {
     exit_code: i32,
     text: Option<String>,
     json: Option<serde_json::Value>,
+    bytes_hex: Option<String>,
+    bytes: Option<usize>,
     error: Option<String>,
 }
 
@@ -194,6 +196,8 @@ impl LiveOwnerResponse {
             exit_code: 0,
             text: Some(text),
             json: None,
+            bytes_hex: None,
+            bytes: None,
             error: None,
         }
     }
@@ -204,6 +208,8 @@ impl LiveOwnerResponse {
             exit_code: 0,
             text: None,
             json: Some(value),
+            bytes_hex: None,
+            bytes: None,
             error: None,
         }
     }
@@ -214,6 +220,8 @@ impl LiveOwnerResponse {
             exit_code,
             text: None,
             json: None,
+            bytes_hex: None,
+            bytes: None,
             error: Some(message.into()),
         }
     }
@@ -282,7 +290,7 @@ fn dispatch_request(
             "create" | "list" | "rename" | "destroy" | "set-strategy" | "upgrade" | "get" | "set"
             | "list-props" | "seal-key" | "rotate-key",
         )
-        | ("snapshot", "create" | "list" | "destroy" | "rollback" | "send")
+        | ("snapshot", "create" | "list" | "destroy" | "rollback" | "extract" | "send")
         | ("device", "remove") => delegate_admin_request(&request, engine),
         _ => LiveOwnerResponse::error(
             1,

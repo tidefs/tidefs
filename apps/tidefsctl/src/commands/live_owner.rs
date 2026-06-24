@@ -504,8 +504,7 @@ fn exit_unavailable(route: LivePoolRoute<'_>, lookup_error: &str) -> ! {
             hex_uuid(&pool_uuid)
         );
     }
-    if let Some(line) =
-        device_removal_authority_line(command, operation, route_device_path(&route))
+    if let Some(line) = device_removal_authority_line(command, operation, route_device_path(&route))
     {
         eprintln!("{line}");
     }
@@ -595,6 +594,40 @@ fn send_live_owner_request_at(
         .unwrap_or(false);
     if ok {
         validate_required_owner_evidence(route, &response)?;
+        if let Some(bytes_hex) = response
+            .get("bytes_hex")
+            .and_then(serde_json::Value::as_str)
+        {
+            let bytes = decode_live_owner_hex(bytes_hex)?;
+            if route.json {
+                let out = serde_json::json!({
+                    "ok": true,
+                    "bytes": response
+                        .get("bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(bytes.len() as u64),
+                    "bytes_hex": bytes_hex,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&out).map_err(|err| {
+                        LiveOwnerRequestError::Owner {
+                            exit_code: 2,
+                            message: format!("format live-owner bytes JSON: {err}"),
+                        }
+                    })?
+                );
+            } else {
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(&bytes)
+                    .map_err(|err| LiveOwnerRequestError::Owner {
+                        exit_code: 1,
+                        message: format!("write live-owner byte response to stdout: {err}"),
+                    })?;
+            }
+            return Ok(());
+        }
         if route.json {
             if let Some(value) = response.get("json") {
                 let mut value = value.clone();
@@ -698,9 +731,7 @@ fn is_device_removal_route(command: &str, operation: &str) -> bool {
     command == "device" && operation == "remove"
 }
 
-fn route_device_path<'route>(
-    route: &'route LivePoolRoute<'_>,
-) -> Option<&'route str> {
+fn route_device_path<'route>(route: &'route LivePoolRoute<'_>) -> Option<&'route str> {
     route
         .args
         .get("device_path")
@@ -787,6 +818,29 @@ fn live_owner_status_text_json(route: &LivePoolRoute<'_>, text: &str) -> serde_j
             "text": text,
         })
     }
+}
+
+fn decode_live_owner_hex(value: &str) -> Result<Vec<u8>, LiveOwnerRequestError> {
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    if hex.len() % 2 != 0 {
+        return Err(LiveOwnerRequestError::Owner {
+            exit_code: 2,
+            message: "decode live-owner byte response: odd-length hex".to_string(),
+        });
+    }
+    hex.as_bytes()
+        .chunks(2)
+        .map(|chunk| {
+            let part = std::str::from_utf8(chunk).map_err(|err| LiveOwnerRequestError::Owner {
+                exit_code: 2,
+                message: format!("decode live-owner byte response: invalid UTF-8: {err}"),
+            })?;
+            u8::from_str_radix(part, 16).map_err(|err| LiveOwnerRequestError::Owner {
+                exit_code: 2,
+                message: format!("decode live-owner byte response: invalid hex byte {part}: {err}"),
+            })
+        })
+        .collect()
 }
 
 fn print_live_owner_status_classification(route: &LivePoolRoute<'_>) {
@@ -1504,12 +1558,11 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(DEVICE_REMOVAL_AUTHORITY_KIND)
         );
-        assert!(
-            json.get("authority_error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap()
-                .contains("committed evacuation receipt authority")
-        );
+        assert!(json
+            .get("authority_error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .contains("committed evacuation receipt authority"));
 
         let lines = cached_without_owner_lines("device", "remove", "tank", None);
         assert!(lines
@@ -1530,8 +1583,7 @@ mod tests {
 
         assert!(line.contains("committed evacuation receipt authority"));
         assert!(line.contains("/dev/disk2"));
-        assert!(device_removal_authority_line("device", "status", Some("/dev/disk2"))
-            .is_none());
+        assert!(device_removal_authority_line("device", "status", Some("/dev/disk2")).is_none());
     }
 
     #[test]

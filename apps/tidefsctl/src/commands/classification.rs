@@ -22,7 +22,6 @@ pub(crate) enum CommandClass {
     RemovedOrUnsupported,
 }
 
-
 impl CommandClass {
     const HELP_ORDER: [Self; 5] = [
         Self::PublicOperator,
@@ -55,7 +54,6 @@ impl CommandClass {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RoutingSemantics {
     NoLivePoolState,
@@ -68,7 +66,6 @@ pub(crate) enum RoutingSemantics {
     DevelopmentExercise,
     Removed,
 }
-
 
 impl RoutingSemantics {
     pub(crate) const fn label(self) -> &'static str {
@@ -86,13 +83,11 @@ impl RoutingSemantics {
     }
 }
 
-
 impl fmt::Display for RoutingSemantics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.label())
     }
 }
-
 
 /// Authority source for a reported status fact.
 ///
@@ -131,7 +126,6 @@ pub(crate) enum StatusSource {
     UnsupportedOrOffline,
 }
 
-
 impl StatusSource {
     pub(crate) const fn label(self) -> &'static str {
         match self {
@@ -148,7 +142,6 @@ impl StatusSource {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CommandSurface {
     pub(crate) path: &'static str,
@@ -156,7 +149,6 @@ pub(crate) struct CommandSurface {
     pub(crate) routing: RoutingSemantics,
     pub(crate) summary: &'static str,
 }
-
 
 impl CommandSurface {
     pub(crate) const fn visible_in_root_help(self) -> bool {
@@ -206,9 +198,7 @@ pub(crate) fn compute_command_registry_digest() -> String {
     compute_command_registry_digest_for_surfaces(COMMAND_SURFACES)
 }
 
-pub(crate) fn compute_command_registry_digest_for_surfaces(
-    surfaces: &[CommandSurface],
-) -> String {
+pub(crate) fn compute_command_registry_digest_for_surfaces(surfaces: &[CommandSurface]) -> String {
     let entries = surfaces
         .iter()
         .map(CommandRegistryDigestEntry::from_surface)
@@ -244,11 +234,7 @@ fn compute_command_registry_digest_from_entries(
         "format",
         "tidefsctl-command-registry-digest-v1",
     );
-    update_registry_digest_field(
-        &mut hasher,
-        "entry-count",
-        &entries.len().to_string(),
-    );
+    update_registry_digest_field(&mut hasher, "entry-count", &entries.len().to_string());
 
     for entry in entries {
         update_registry_digest_field(&mut hasher, "path", entry.path);
@@ -412,8 +398,8 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
     CommandSurface {
         path: "snapshot extract",
         class: CommandClass::PublicOperator,
-        routing: RoutingSemantics::LiveOwnerOrOfflineInput,
-        summary: "register runtime-pending one-shot snapshot file extraction surface",
+        routing: RoutingSemantics::LiveOwner,
+        summary: "extract one regular file from a snapshot through the live owner",
     },
     CommandSurface {
         path: "snapshot rollback",
@@ -658,7 +644,6 @@ pub(crate) fn find_surface(path: &str) -> Option<&'static CommandSurface> {
     COMMAND_SURFACES.iter().find(|surface| surface.path == path)
 }
 
-
 pub(crate) fn removed_surface_error(path: &str) -> String {
     match find_surface(path) {
         Some(surface) if surface.class == CommandClass::RemovedOrUnsupported => format!(
@@ -672,7 +657,6 @@ pub(crate) fn removed_surface_error(path: &str) -> String {
         None => format!("tidefsctl {path}: unknown command surface"),
     }
 }
-
 
 pub(crate) fn root_long_about() -> String {
     let mut out = String::from(
@@ -697,7 +681,6 @@ pub(crate) fn root_long_about() -> String {
     out
 }
 
-
 fn push_help_section(out: &mut String, class: CommandClass) {
     out.push_str(class.heading());
     out.push_str(":\n");
@@ -715,7 +698,6 @@ fn push_help_section(out: &mut String, class: CommandClass) {
     }
     out.push('\n');
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -817,17 +799,25 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_export_and_extract_are_runtime_pending_surfaces() {
-        for path in ["snapshot export", "snapshot extract"] {
-            let surface = find_surface(path).expect("snapshot export/extract classified");
-            assert_eq!(surface.class, CommandClass::PublicOperator);
-            assert_eq!(surface.routing, RoutingSemantics::LiveOwnerOrOfflineInput);
-            assert!(
-                surface.summary.contains("runtime-pending"),
-                "{path} summary must not claim implemented runtime behavior: {}",
-                surface.summary
-            );
-        }
+    fn snapshot_export_classification_is_runtime_pending_surface() {
+        let surface = find_surface("snapshot export").expect("snapshot export classified");
+        assert_eq!(surface.class, CommandClass::PublicOperator);
+        assert_eq!(surface.routing, RoutingSemantics::LiveOwnerOrOfflineInput);
+        assert!(
+            surface.summary.contains("runtime-pending"),
+            "snapshot export summary must not claim implemented runtime behavior: {}",
+            surface.summary
+        );
+    }
+
+    #[test]
+    fn snapshot_extract_classification_is_live_owner_runtime() {
+        let surface = find_surface("snapshot extract").expect("snapshot extract classified");
+        assert_eq!(surface.class, CommandClass::PublicOperator);
+        assert_eq!(surface.routing, RoutingSemantics::LiveOwner);
+        assert!(surface.summary.contains("regular file"));
+        assert!(surface.summary.contains("live owner"));
+        assert!(!surface.summary.contains("runtime-pending"));
     }
 
     #[test]
@@ -993,17 +983,34 @@ mod tests {
             ),
             (StatusSource::KernelUapi, "source:kernel-uapi"),
             (StatusSource::UserspaceDaemon, "source:userspace-daemon"),
-            (StatusSource::CachedLocalMetadata, "source:cached-local-metadata"),
+            (
+                StatusSource::CachedLocalMetadata,
+                "source:cached-local-metadata",
+            ),
             (StatusSource::CommandLineParse, "source:command-line-parse"),
-            (StatusSource::StaticConfiguration, "source:static-configuration"),
-            (StatusSource::UnsupportedOrOffline, "source:unsupported-or-offline"),
+            (
+                StatusSource::StaticConfiguration,
+                "source:static-configuration",
+            ),
+            (
+                StatusSource::UnsupportedOrOffline,
+                "source:unsupported-or-offline",
+            ),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for (source, label) in &sources {
             assert_eq!(source.label(), *label, "StatusSource label mismatch");
-            assert!(seen.insert(*label), "duplicate StatusSource label: {}", label);
+            assert!(
+                seen.insert(*label),
+                "duplicate StatusSource label: {}",
+                label
+            );
         }
-        assert_eq!(seen.len(), sources.len(), "all StatusSource labels must be covered");
+        assert_eq!(
+            seen.len(),
+            sources.len(),
+            "all StatusSource labels must be covered"
+        );
     }
 
     #[test]
@@ -1051,10 +1058,11 @@ mod tests {
         }
         // Sanity: the help must mention at least the non-removed surfaces.
         assert!(
-            extracted.len() >= super::COMMAND_SURFACES
-                .iter()
-                .filter(|s| s.visible_in_root_help())
-                .count(),
+            extracted.len()
+                >= super::COMMAND_SURFACES
+                    .iter()
+                    .filter(|s| s.visible_in_root_help())
+                    .count(),
             "help extracted {} paths, expected at least {} visible surfaces",
             extracted.len(),
             super::COMMAND_SURFACES
@@ -1111,7 +1119,6 @@ mod tests {
         }
     }
 }
-
 
 /// Extract command paths from `root_long_about()` help text.
 /// Command lines match the pattern `  <path> [<routing>] - <summary>`.
