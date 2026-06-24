@@ -29,6 +29,24 @@ The remaining documents are design/reference material. Their authority state is
 scoped by `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`; a path appearing below is
 not automatically current status.
 
+Release readiness boundary and evidence inputs:
+
+- `docs/RELEASE_READINESS_VERDICT_CONTRACT.md` is the whole-product
+  release-readiness verdict boundary.
+- `docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md` describes the
+  release-candidate evidence index as a gate input.
+- `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` defines the
+  performance-budget gate and gate-local receipts.
+- `docs/GITHUB_CI.md` describes standing CI and release-candidate workflow
+  behavior.
+- `docs/CLAIMS_GATE_POLICY.md` defines publishing-facing claim guardrails and
+  individual claim validation.
+- `docs/UNRELEASED_AUTHORITY_POLICY.md` defines the unreleased-surface
+  authority and compatibility guardrail.
+
+The evidence inputs, gate-local receipts, CI artifacts, and claims-gate results
+listed here do not combine into a product-admission decision on their own.
+
 Key design, policy, and reference areas:
 
 - `docs/ARCHITECTURE.md`
@@ -49,8 +67,6 @@ Key design, policy, and reference areas:
 - `docs/TRANSPORT_CLUSTER_AUTHORITY.md`
 - `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`
 - `docs/FUSE_ADAPTER_CONTRACT_ASSUMPTIONS.md`
-- `docs/CLAIMS_GATE_POLICY.md`
-- `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`
 - `docs/OPERATOR_UAPI_AUTHORITY.md`
 - `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`
 - `docs/NEXTGEN_VERIFICATION_EVIDENCE_CHAIN_AUTHORITY.md`
