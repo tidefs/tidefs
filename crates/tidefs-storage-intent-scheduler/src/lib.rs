@@ -176,6 +176,11 @@ pub struct StorageIntentBudgetCaps {
     /// When exceeded, transport sends are backpressured.
     pub max_transport_window_bytes: u64,
 
+    /// Current transport window bytes in use across all sessions.
+    /// When exceeded, demand-class transport sends are backpressured
+    /// and speculative/background work is dropped first.
+    pub transport_window_bytes: u64,
+
     /// Hard cap on device queue depth (outstanding I/O ops).
     pub max_device_queue_depth: u64,
 
@@ -187,8 +192,9 @@ pub struct StorageIntentBudgetCaps {
     pub allocator_pressure_pct: u8,
 
     /// Foreground latency budget in microseconds.
-    /// Scheduler throttles Speculative and Background lanes when
-    /// observed p99 exceeds this bound.
+    /// Scheduler throttles Demand, Speculative, and Background lanes
+    /// when inflight pressure (>70% of cap) indicates the budget
+    /// is at risk. Control and Metadata are exempt.
     pub foreground_latency_budget_us: u64,
 
     /// Background optimizer budget bytes remaining in this window.
@@ -202,6 +208,8 @@ impl StorageIntentBudgetCaps {
     pub fn any_cap_exceeded(&self) -> bool {
         self.dirty_bytes > self.max_dirty_bytes
             || self.inflight_bytes > self.max_inflight_bytes
+            || (self.max_transport_window_bytes > 0
+                && self.transport_window_bytes > self.max_transport_window_bytes)
             || self.device_queue_depth > self.max_device_queue_depth
             || self.allocator_pressure_pct > 90
             || self.background_optimizer_budget_bytes == 0
@@ -211,6 +219,10 @@ impl StorageIntentBudgetCaps {
     #[must_use]
     pub fn backpressure_reason(&self) -> Option<StorageIntentRefusalReason> {
         if self.dirty_bytes > self.max_dirty_bytes || self.inflight_bytes > self.max_inflight_bytes
+        {
+            Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
+        } else if self.max_transport_window_bytes > 0
+            && self.transport_window_bytes > self.max_transport_window_bytes
         {
             Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
         } else if self.device_queue_depth > self.max_device_queue_depth
@@ -1511,6 +1523,35 @@ impl StorageIntentScheduler {
             ));
         }
 
+        // Transport window cap: backpressure demand-class and drop
+        // speculative/background work when the window is exceeded.
+        // Metadata and Control bypass this cap.
+        if caps.max_transport_window_bytes > 0
+            && caps.transport_window_bytes > caps.max_transport_window_bytes
+            && lane != LaneClass::Metadata
+            && lane != LaneClass::Control
+        {
+            return Some((
+                StorageIntentRefusalReason::GuaranteeFloorNotMet,
+                BudgetConstraintClass::TransportWindow,
+            ));
+        }
+
+        // Foreground latency budget: throttle demand-class work and
+        // drop speculative/background when budget would be exceeded.
+        // Control and Metadata bypass; repair escalation already
+        // returned None above.
+        if caps.foreground_latency_budget_us > 0
+            && caps.inflight_bytes > caps.max_inflight_bytes.saturating_mul(7) / 10
+            && lane != LaneClass::Control
+            && lane != LaneClass::Metadata
+        {
+            return Some((
+                StorageIntentRefusalReason::MovementDebtNotPaidBack,
+                BudgetConstraintClass::ForegroundLatency,
+            ));
+        }
+
         None
     }
 
@@ -2662,6 +2703,7 @@ mod tests {
             max_inflight_bytes: 1024 * 1024,
             inflight_bytes: 0,
             max_transport_window_bytes: 1024 * 1024,
+            transport_window_bytes: 0,
             max_device_queue_depth: 32,
             device_queue_depth: 0,
             allocator_pressure_pct: 10,
@@ -2756,5 +2798,155 @@ mod tests {
         );
         let lat_decision = s.admit(&lat_req);
         assert_eq!(lat_decision.outcome, AdmissionOutcome::Admitted);
+    }
+
+    // ── Transport window enforcement tests ──
+
+    #[test]
+    fn transport_window_exceeded_throttles_demand() {
+        let mut s = test_scheduler();
+        s.caps.max_transport_window_bytes = 1024;
+        s.caps.transport_window_bytes = 2048;
+
+        let req = foreground_read_request();
+        let decision = s.admit(&req);
+        // Demand lane is not droppable, not Background, not Control/Metadata
+        // → throttled under hard-cap pressure.
+        assert_eq!(decision.outcome, AdmissionOutcome::Throttled);
+        assert_eq!(
+            decision.budget_class,
+            BudgetConstraintClass::TransportWindow
+        );
+    }
+
+    #[test]
+    fn transport_window_exceeded_drops_speculative() {
+        let mut s = test_scheduler();
+        s.caps.max_transport_window_bytes = 1024;
+        s.caps.transport_window_bytes = 2048;
+
+        let req = speculative_prefetch_request();
+        let decision = s.admit(&req);
+        assert_eq!(decision.outcome, AdmissionOutcome::Dropped);
+        assert_eq!(
+            decision.budget_class,
+            BudgetConstraintClass::TransportWindow
+        );
+    }
+
+    #[test]
+    fn transport_window_exceeded_metadata_still_admitted() {
+        let mut s = test_scheduler();
+        s.caps.max_transport_window_bytes = 1024;
+        s.caps.transport_window_bytes = 2048;
+
+        let req = metadata_request();
+        let decision = s.admit(&req);
+        assert_eq!(decision.outcome, AdmissionOutcome::Admitted);
+    }
+
+    #[test]
+    fn transport_window_zero_means_unlimited() {
+        let mut s = test_scheduler();
+        s.caps.max_transport_window_bytes = 0;
+        s.caps.transport_window_bytes = 999_999_999;
+
+        let req = foreground_read_request();
+        let decision = s.admit(&req);
+        // Cap is zero → unlimited, so no backpressure.
+        assert_eq!(decision.outcome, AdmissionOutcome::Admitted);
+    }
+
+    // ── Foreground latency budget enforcement tests ──
+
+    #[test]
+    fn foreground_latency_budget_throttles_demand_under_inflight_pressure() {
+        let mut s = test_scheduler();
+        s.caps.max_inflight_bytes = 10000;
+        s.caps.inflight_bytes = 8000; // >70% of cap
+        s.caps.foreground_latency_budget_us = 100;
+
+        let req = foreground_read_request();
+        let decision = s.admit(&req);
+        // Demand lane throttled (not dropped, not backpressured) under
+        // hard-cap pressure.
+        assert_eq!(decision.outcome, AdmissionOutcome::Throttled);
+        assert_eq!(
+            decision.budget_class,
+            BudgetConstraintClass::ForegroundLatency
+        );
+    }
+
+    #[test]
+    fn foreground_latency_budget_drops_background_under_pressure() {
+        let mut s = test_scheduler();
+        s.caps.max_inflight_bytes = 10000;
+        s.caps.inflight_bytes = 8000;
+        s.caps.foreground_latency_budget_us = 100;
+        s.caps.background_optimizer_budget_bytes = 1024 * 1024;
+
+        let req = background_defrag_request();
+        let decision = s.admit(&req);
+        assert_eq!(decision.outcome, AdmissionOutcome::Dropped);
+    }
+
+    #[test]
+    fn foreground_latency_budget_not_enforced_below_threshold() {
+        let mut s = test_scheduler();
+        s.caps.max_inflight_bytes = 10000;
+        s.caps.inflight_bytes = 5000; // 50% of cap, below 70% threshold
+        s.caps.foreground_latency_budget_us = 100;
+
+        let req = foreground_read_request();
+        let decision = s.admit(&req);
+        // Below threshold, should be admitted normally.
+        assert_eq!(decision.outcome, AdmissionOutcome::Admitted);
+    }
+
+    #[test]
+    fn foreground_latency_zero_means_not_enforced() {
+        let mut s = test_scheduler();
+        s.caps.max_inflight_bytes = 10000;
+        s.caps.inflight_bytes = 9000;
+        s.caps.foreground_latency_budget_us = 0;
+
+        let req = foreground_read_request();
+        let decision = s.admit(&req);
+        assert_eq!(decision.outcome, AdmissionOutcome::Admitted);
+    }
+
+    // ── Updated budget caps tests ──
+
+    #[test]
+    fn budget_caps_normal_state_includes_transport_window() {
+        let caps = StorageIntentBudgetCaps {
+            max_dirty_bytes: 1024 * 1024,
+            dirty_bytes: 0,
+            max_inflight_bytes: 1024 * 1024,
+            inflight_bytes: 0,
+            max_transport_window_bytes: 1024 * 1024,
+            transport_window_bytes: 0,
+            max_device_queue_depth: 32,
+            device_queue_depth: 0,
+            allocator_pressure_pct: 10,
+            foreground_latency_budget_us: 1000,
+            background_optimizer_budget_bytes: 1024 * 1024,
+        };
+        assert!(!caps.any_cap_exceeded());
+        assert_eq!(caps.backpressure_reason(), None);
+    }
+
+    #[test]
+    fn budget_caps_detect_transport_window_exceeded() {
+        let caps = StorageIntentBudgetCaps {
+            max_transport_window_bytes: 100,
+            transport_window_bytes: 200,
+            ..Default::default()
+        };
+        assert!(caps.any_cap_exceeded());
+        assert_eq!(
+            caps.backpressure_reason(),
+            Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
+        );
     }
 }
