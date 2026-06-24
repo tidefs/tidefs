@@ -2749,7 +2749,7 @@ mod tests {
         // TierGoalIsNotStorageIntentModel warning so that explanation and
         // performance consumers can see the legacy intent.
         let mut request = request(
-            policy.clone(),
+            policy,
             StorageIntentPlacementRole::DurableFullPlacement,
             1,
             1,
