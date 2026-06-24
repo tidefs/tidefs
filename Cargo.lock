@@ -3507,6 +3507,8 @@ name = "tidefs-storage-intent-media-capability-refresh"
 version = "0.421.0"
 dependencies = [
  "tidefs-storage-intent-core",
+ "tidefs-storage-intent-local-media-capability",
+ "tidefs-storage-intent-remote-media-capability",
 ]
 
 [[package]]

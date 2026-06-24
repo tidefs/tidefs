@@ -17,6 +17,12 @@ use tidefs_storage_intent_core::{
     StorageIntentMediaCapabilityRecord, StorageIntentRefusalReason, StorageMediaClass,
     StorageMediaRole,
 };
+use tidefs_storage_intent_local_media_capability::{
+    produce_local_media_capability, LocalMediaCapabilityFacts,
+};
+use tidefs_storage_intent_remote_media_capability::{
+    produce_remote_media_capability, RemoteMediaCapabilityFacts,
+};
 
 /// Canonical identifier for this authority surface.
 pub const STORAGE_INTENT_MEDIA_CAPABILITY_REFRESH_SPEC: &str =
@@ -251,6 +257,76 @@ impl MediaCapabilityGenerationRecord {
             retention: MediaCapabilityRetentionState::Exact,
             invalidations: MediaCapabilityInvalidationMask::EMPTY,
         }
+    }
+
+    /// Build a generation record directly from the #960 local producer input.
+    ///
+    /// The landed local producer shape carries identity, namespace, firmware,
+    /// settings, pool-member, health, and freshness generations. It does not
+    /// yet expose separate path or multipath generation fields, so those remain
+    /// explicit refresh-layer inputs through [`Self::with_path_generations`].
+    #[must_use]
+    pub const fn from_local_producer_facts(facts: LocalMediaCapabilityFacts) -> Self {
+        Self::from_capability(produce_local_media_capability(facts))
+            .with_local_producer_facts(facts)
+    }
+
+    /// Overlay the #960 local producer generations onto an existing refresh
+    /// generation record.
+    #[must_use]
+    pub const fn with_local_producer_facts(mut self, facts: LocalMediaCapabilityFacts) -> Self {
+        self.capability_ref = facts.evidence;
+        self.target_identity_ref = facts.identity.stable_identity_ref;
+        self.freshness_ref = facts.freshness.freshness_ref;
+        self.media_class = facts.media_class;
+        self.freshness = facts.freshness.freshness;
+        self.health = facts.health.health;
+        self.identity_generation = facts.identity.identity_generation;
+        self.namespace_generation = facts.identity.namespace_generation;
+        self.firmware_generation = facts.identity.firmware_generation;
+        self.settings_generation = facts.identity.settings_generation;
+        self.pool_member_generation = facts.identity.pool_member_generation;
+        self
+    }
+
+    /// Build a generation record directly from the #961 remote/object/archive
+    /// producer input.
+    ///
+    /// The remote producer stores endpoint and key epochs in the shared
+    /// media-capability record for #904 role predicates. The refresh model also
+    /// projects them into remote-specific generation fields so endpoint failover
+    /// and key rotation cannot be mistaken for ordinary firmware/settings drift.
+    #[must_use]
+    pub const fn from_remote_producer_facts(facts: RemoteMediaCapabilityFacts) -> Self {
+        Self::from_capability(produce_remote_media_capability(facts))
+            .with_remote_producer_facts(facts)
+    }
+
+    /// Overlay the #961 remote producer generations onto an existing refresh
+    /// generation record.
+    #[must_use]
+    pub const fn with_remote_producer_facts(mut self, facts: RemoteMediaCapabilityFacts) -> Self {
+        self.capability_ref = facts.evidence;
+        self.target_identity_ref = facts.identity.stable_identity_ref;
+        self.freshness_ref = facts.freshness.freshness_ref;
+        self.media_class = facts.media_class;
+        self.freshness = facts.freshness.freshness;
+        self.health = facts.health.health;
+        self.identity_generation = facts.identity.identity_generation;
+        self.namespace_generation = facts.identity.namespace_generation;
+        self.firmware_generation = facts.identity.endpoint_generation;
+        self.settings_generation = facts.identity.credential_key_epoch;
+        self.pool_member_generation = facts.identity.pool_member_generation;
+        self.path_generation = facts.path.path_ref.generation;
+        self.remote_endpoint_generation = facts.identity.endpoint_generation;
+        self.credential_key_epoch = facts.identity.credential_key_epoch;
+        self.trust_generation = facts.trust.trust_ref.generation;
+        self.quarantine_generation = match facts.health.health {
+            MediaHealthState::Quarantined => facts.health.health_ref.generation,
+            _ => 0,
+        };
+        self.archive_retention_generation = facts.archive.archive_restore_ref.generation;
+        self
     }
 
     #[must_use]
@@ -601,6 +677,17 @@ pub fn media_capability_generation_record_drift(
     if observed.freshness == MediaCapabilityFreshnessState::Contradictory {
         mask = mask.union(MediaCapabilityInvalidationMask::CONTRADICTED);
     }
+    if baseline.health != observed.health
+        && matches!(
+            observed.health,
+            MediaHealthState::Degraded | MediaHealthState::Failed | MediaHealthState::Quarantined
+        )
+    {
+        mask = mask.union(MediaCapabilityInvalidationMask::HEALTH_DEGRADED);
+        if observed.health == MediaHealthState::Quarantined {
+            mask = mask.union(MediaCapabilityInvalidationMask::TRUST_OR_QUARANTINE_CHANGED);
+        }
+    }
 
     mask
 }
@@ -899,6 +986,13 @@ mod tests {
         MediaArchiveRestoreSemantics, MediaAtomicityClass, MediaFlushOrderingClass,
         MediaPersistenceDomain, MediaProtocolGeometryClass, MediaRemoteCommitSemantics,
     };
+    use tidefs_storage_intent_local_media_capability::{
+        LocalFreshnessFacts, LocalMediaIdentityFacts,
+    };
+    use tidefs_storage_intent_remote_media_capability::{
+        RemoteArchiveFacts, RemoteCommitFacts, RemoteCostRecoveryFacts, RemoteFreshnessFacts,
+        RemoteHealthFacts, RemotePathFacts, RemoteTargetIdentityFacts, RemoteTrustFacts,
+    };
 
     fn evidence_id(seed: u8) -> StorageIntentEvidenceId {
         StorageIntentEvidenceId([seed; 32])
@@ -909,6 +1003,19 @@ mod tests {
             kind,
             evidence_id(seed),
             u64::from(seed),
+            STORAGE_INTENT_MEDIA_CAPABILITY_REFRESH_VERSION,
+        )
+    }
+
+    fn evidence_with_generation(
+        kind: StorageIntentEvidenceKind,
+        seed: u8,
+        generation: u64,
+    ) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            kind,
+            evidence_id(seed),
+            generation,
             STORAGE_INTENT_MEDIA_CAPABILITY_REFRESH_VERSION,
         )
     }
@@ -1018,6 +1125,83 @@ mod tests {
         }
     }
 
+    fn local_producer_facts(seed: u8) -> LocalMediaCapabilityFacts {
+        LocalMediaCapabilityFacts::new(StorageMediaClass::NvmeFlash, capability_evidence(seed))
+            .with_identity(LocalMediaIdentityFacts::stable(
+                100 + u64::from(seed),
+                capability_evidence(seed.wrapping_add(1)),
+                capability_evidence(seed.wrapping_add(2)),
+            ))
+            .with_freshness(LocalFreshnessFacts::new(
+                MediaCapabilityFreshnessState::Fresh,
+                capability_evidence(seed.wrapping_add(3)),
+            ))
+    }
+
+    fn remote_archive_facts(seed: u8) -> RemoteMediaCapabilityFacts {
+        RemoteMediaCapabilityFacts::new(StorageMediaClass::TapeArchive, capability_evidence(seed))
+            .with_identity(RemoteTargetIdentityFacts::stable(
+                500 + u64::from(seed),
+                capability_evidence(seed.wrapping_add(1)),
+                capability_evidence(seed.wrapping_add(2)),
+            ))
+            .with_path(RemotePathFacts::tcp_or_internet_legal(
+                evidence_with_generation(
+                    StorageIntentEvidenceKind::TransportPathEvidence,
+                    seed.wrapping_add(3),
+                    1_000 + u64::from(seed),
+                ),
+            ))
+            .with_commit(
+                RemoteCommitFacts::new(
+                    MediaPersistenceDomain::ArchiveDurable,
+                    MediaFlushOrderingClass::ArchiveCommit,
+                    MediaAtomicityClass::AppendRecordAtomic,
+                    MediaProtocolGeometryClass::ArchiveSequential,
+                    MediaRemoteCommitSemantics::ArchiveRetained,
+                    capability_evidence(seed.wrapping_add(4)),
+                )
+                .with_units(4096, 4096, 262_144),
+            )
+            .with_archive(RemoteArchiveFacts::new(
+                MediaArchiveRestoreSemantics::RestoreAudited,
+                evidence_with_generation(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    seed.wrapping_add(5),
+                    2_000 + u64::from(seed),
+                ),
+            ))
+            .with_freshness(RemoteFreshnessFacts::fresh_zero_lag(evidence(
+                StorageIntentEvidenceKind::TemporalEvidence,
+                seed.wrapping_add(6),
+            )))
+            .with_trust(RemoteTrustFacts::trusted(evidence_with_generation(
+                StorageIntentEvidenceKind::TrustDomainEvidence,
+                seed.wrapping_add(7),
+                3_000 + u64::from(seed),
+            )))
+            .with_cost_recovery(RemoteCostRecoveryFacts::bounded(
+                evidence(
+                    StorageIntentEvidenceKind::MediaCostWearLedger,
+                    seed.wrapping_add(8),
+                ),
+                evidence(
+                    StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                    seed.wrapping_add(9),
+                ),
+            ))
+            .with_health(RemoteHealthFacts::new(
+                MediaHealthState::Healthy,
+                evidence_with_generation(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    seed.wrapping_add(10),
+                    4_000 + u64::from(seed),
+                ),
+            ))
+            .with_max_queue_depth(32)
+            .with_latency_class_us(5_000)
+    }
+
     fn generation(
         capability: StorageIntentMediaCapabilityRecord,
     ) -> MediaCapabilityGenerationRecord {
@@ -1043,6 +1227,160 @@ mod tests {
             generation,
             MediaCapabilityRefreshRequirement::for_role(role),
         ))
+    }
+
+    #[test]
+    fn local_producer_facts_feed_refresh_generations_and_fail_closed_on_drift() {
+        let baseline_facts = local_producer_facts(27);
+        let mut observed_facts = baseline_facts;
+        observed_facts.identity.namespace_generation += 1;
+        observed_facts.identity.settings_generation += 1;
+        observed_facts.freshness = LocalFreshnessFacts::new(
+            MediaCapabilityFreshnessState::Stale,
+            capability_evidence(31),
+        );
+
+        let baseline = MediaCapabilityGenerationRecord::from_local_producer_facts(baseline_facts)
+            .with_evidence_cut(evidence_cut(97));
+        let observed = MediaCapabilityGenerationRecord::from_local_producer_facts(observed_facts)
+            .with_evidence_cut(evidence_cut(97));
+
+        assert_eq!(
+            baseline.target_identity_ref,
+            baseline_facts.identity.stable_identity_ref
+        );
+        assert_eq!(
+            baseline.namespace_generation,
+            baseline_facts.identity.namespace_generation
+        );
+        assert_eq!(
+            baseline.settings_generation,
+            baseline_facts.identity.settings_generation
+        );
+        assert_eq!(
+            baseline.freshness_ref,
+            baseline_facts.freshness.freshness_ref
+        );
+
+        let drift = media_capability_generation_record_drift(baseline, observed);
+        assert!(drift.intersects(MediaCapabilityInvalidationMask::NAMESPACE_IDENTITY_CHANGED));
+        assert!(drift.intersects(MediaCapabilityInvalidationMask::FIRMWARE_OR_SETTINGS_CHANGED));
+        assert!(drift.intersects(MediaCapabilityInvalidationMask::STALE_PROBE_AGE));
+
+        let capability = produce_local_media_capability(observed_facts);
+        let verdict = evaluate(
+            capability,
+            observed.with_invalidations(drift),
+            MediaCapabilityUseRole::DurableSyncIntent,
+        );
+        assert_eq!(
+            verdict.outcome,
+            MediaCapabilityRefreshOutcome::RevalidationRequired
+        );
+        assert_eq!(
+            verdict.refusal,
+            StorageIntentRefusalReason::StaleMediaCapabilityEvidence
+        );
+        assert!(!verdict.authority_usable);
+    }
+
+    #[test]
+    fn remote_producer_facts_feed_endpoint_key_trust_and_archive_generations() {
+        let baseline_facts = remote_archive_facts(41);
+        let mut observed_facts = baseline_facts;
+        observed_facts.identity.endpoint_generation += 1;
+        observed_facts.identity.credential_key_epoch += 1;
+        observed_facts.path = RemotePathFacts::tcp_or_internet_legal(evidence_with_generation(
+            StorageIntentEvidenceKind::TransportPathEvidence,
+            44,
+            baseline_facts.path.path_ref.generation + 1,
+        ));
+        observed_facts.archive = RemoteArchiveFacts::new(
+            MediaArchiveRestoreSemantics::RestoreAudited,
+            evidence_with_generation(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                45,
+                baseline_facts.archive.archive_restore_ref.generation + 1,
+            ),
+        );
+        observed_facts.trust = RemoteTrustFacts::trusted(evidence_with_generation(
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            46,
+            baseline_facts.trust.trust_ref.generation + 1,
+        ));
+
+        let baseline = MediaCapabilityGenerationRecord::from_remote_producer_facts(baseline_facts)
+            .with_evidence_cut(evidence_cut(98));
+        let observed = MediaCapabilityGenerationRecord::from_remote_producer_facts(observed_facts)
+            .with_evidence_cut(evidence_cut(98));
+
+        assert_eq!(
+            baseline.remote_endpoint_generation,
+            baseline_facts.identity.endpoint_generation
+        );
+        assert_eq!(
+            baseline.credential_key_epoch,
+            baseline_facts.identity.credential_key_epoch
+        );
+        assert_eq!(
+            baseline.path_generation,
+            baseline_facts.path.path_ref.generation
+        );
+        assert_eq!(
+            baseline.trust_generation,
+            baseline_facts.trust.trust_ref.generation
+        );
+        assert_eq!(
+            baseline.archive_retention_generation,
+            baseline_facts.archive.archive_restore_ref.generation
+        );
+
+        let drift = media_capability_generation_record_drift(baseline, observed);
+        assert!(drift.intersects(MediaCapabilityInvalidationMask::PATH_OR_MULTIPATH_CHANGED));
+        assert!(drift.intersects(MediaCapabilityInvalidationMask::REMOTE_ENDPOINT_CHANGED));
+        assert!(drift.intersects(MediaCapabilityInvalidationMask::CREDENTIAL_KEY_EPOCH_CHANGED));
+        assert!(drift.intersects(MediaCapabilityInvalidationMask::TRUST_OR_QUARANTINE_CHANGED));
+        assert!(drift.intersects(MediaCapabilityInvalidationMask::ARCHIVE_RETENTION_CHANGED));
+
+        let capability = produce_remote_media_capability(observed_facts);
+        let verdict = evaluate(
+            capability,
+            observed.with_invalidations(drift),
+            MediaCapabilityUseRole::RemoteDurable,
+        );
+        assert_eq!(verdict.outcome, MediaCapabilityRefreshOutcome::Quarantined);
+        assert_eq!(
+            verdict.refusal,
+            StorageIntentRefusalReason::QuarantinedSource
+        );
+        assert!(!verdict.authority_usable);
+    }
+
+    #[test]
+    fn generation_record_health_degradation_is_an_invalidation_source() {
+        let baseline = generation(block_capability(47));
+        let observed = MediaCapabilityGenerationRecord {
+            health: MediaHealthState::Degraded,
+            ..baseline
+        };
+
+        let drift = media_capability_generation_record_drift(baseline, observed);
+        assert!(drift.intersects(MediaCapabilityInvalidationMask::HEALTH_DEGRADED));
+
+        let verdict = evaluate(
+            block_capability(47),
+            observed.with_invalidations(drift),
+            MediaCapabilityUseRole::FullPlacement,
+        );
+        assert_eq!(
+            verdict.outcome,
+            MediaCapabilityRefreshOutcome::RevalidationRequired
+        );
+        assert_eq!(
+            verdict.refusal,
+            StorageIntentRefusalReason::StaleMediaCapabilityEvidence
+        );
+        assert!(!verdict.authority_usable);
     }
 
     #[test]
