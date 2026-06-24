@@ -17,8 +17,9 @@ use tidefs_storage_intent_core::{
     DataShapeRecord, EvidenceFamilyFreshnessState, LayoutAllocatorRecord, MediaRoleMask,
     MediaRoleRequirement, PredictionConfidence, PrefetchResidencyDecisionOutcome,
     PrefetchResidencyDecisionRecord, ReceiptPredicateResult, SkippedMoveReason,
-    StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot, StorageIntentGuaranteeClass,
-    StorageIntentPolicy, StorageIntentReceipt, StorageIntentRefusalReason, StorageMediaRole,
+    StorageIntentActionClass, StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot,
+    StorageIntentEvidenceRef, StorageIntentGuaranteeClass, StorageIntentPolicy,
+    StorageIntentReceipt, StorageIntentReceiptId, StorageIntentRefusalReason, StorageMediaRole,
     TransformRefusalClass,
 };
 
@@ -86,6 +87,20 @@ impl StorageIntentPlacementRole {
             Self::ColdArchivePlacement => StorageMediaRole::ArchiveEc,
             Self::GeoDeltaRemoteIntent => StorageMediaRole::GeoAsyncReplica,
             Self::RepairRelocationTemporary => StorageMediaRole::RepairTemp,
+        }
+    }
+
+    /// Scheduler action class used when an admitted plan is handed to execution.
+    #[must_use]
+    pub const fn action_class(self) -> StorageIntentActionClass {
+        match self {
+            Self::SyncIntentTarget => StorageIntentActionClass::NewWriteShaping,
+            Self::CacheOnlyHotServingTrial => StorageIntentActionClass::CacheOnlyServingTrial,
+            Self::AuthoritativeHotServingReplica => StorageIntentActionClass::AuthorityPromotion,
+            Self::DurableFullPlacement => StorageIntentActionClass::DurablePlacementMovement,
+            Self::ColdArchivePlacement => StorageIntentActionClass::ArchiveMigration,
+            Self::GeoDeltaRemoteIntent => StorageIntentActionClass::GeoCatchup,
+            Self::RepairRelocationTemporary => StorageIntentActionClass::ReadTriggeredRepair,
         }
     }
 
@@ -591,6 +606,80 @@ impl StorageIntentPlacementPlan {
     }
 }
 
+/// Scheduler handoff for one selected storage-intent placement target.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StorageIntentPlacementDispatchRecord {
+    /// Selected target id from the placement plan.
+    pub target_id: u64,
+    /// Failure-domain key preserved from planner selection.
+    pub failure_domain_key: u64,
+    /// Storage-intent role being dispatched.
+    pub role: StorageIntentPlacementRole,
+    /// Coarse scheduler action class for the selected role.
+    pub action_class: StorageIntentActionClass,
+    /// Receipt id from the selected candidate input; this is not a new receipt.
+    pub receipt_id: StorageIntentReceiptId,
+    /// #905 decision-frontier artifact that made the selected set replayable.
+    pub decision_frontier_ref: StorageIntentEvidenceRef,
+    /// Scheduler admission artifact that authorizes queueing this action.
+    pub scheduler_admission_ref: StorageIntentEvidenceRef,
+    /// #911 action execution is still pending; the planner never fabricates it.
+    pub action_execution_ref: Option<StorageIntentEvidenceRef>,
+}
+
+/// Reason a placement plan could not be handed to an execution scheduler.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum StorageIntentPlacementDispatchReason {
+    /// The underlying placement plan did not satisfy hard gates.
+    PlacementPlanNotAdmitted { refusal: StorageIntentRefusalReason },
+    /// The #905 decision-frontier replay anchor is absent or not fresh.
+    DecisionFrontierEvidenceNotFresh { state: PlacementEvidenceState },
+    /// Scheduler admission evidence is absent or not fresh.
+    SchedulerAdmissionEvidenceNotFresh { state: PlacementEvidenceState },
+    /// A selected report no longer has a matching input candidate.
+    SelectedCandidateMissing { target_id: u64 },
+}
+
+impl StorageIntentPlacementDispatchReason {
+    /// Storage-intent refusal represented by this scheduler handoff reason.
+    #[must_use]
+    pub const fn refusal_reason(self) -> StorageIntentRefusalReason {
+        match self {
+            Self::PlacementPlanNotAdmitted { refusal } => refusal,
+            Self::DecisionFrontierEvidenceNotFresh { .. }
+            | Self::SchedulerAdmissionEvidenceNotFresh { .. } => {
+                StorageIntentRefusalReason::EvidenceNotUsable
+            }
+            Self::SelectedCandidateMissing { .. } => StorageIntentRefusalReason::NoLegalReceiptSet,
+        }
+    }
+}
+
+/// Pre-execution handoff from storage-intent placement into scheduler intents.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StorageIntentPlacementDispatchPlan {
+    /// Whether every selected target can be queued for execution.
+    pub dispatchable: bool,
+    /// Underlying placement decision and candidate reports.
+    pub placement_plan: StorageIntentPlacementPlan,
+    /// Scheduler intent records for selected targets.
+    pub records: Vec<StorageIntentPlacementDispatchRecord>,
+    /// Reasons execution dispatch was refused or deferred.
+    pub reasons: Vec<StorageIntentPlacementDispatchReason>,
+}
+
+impl StorageIntentPlacementDispatchPlan {
+    /// First storage-intent refusal reason, if any.
+    #[must_use]
+    pub fn first_refusal(&self) -> Option<StorageIntentRefusalReason> {
+        self.reasons
+            .iter()
+            .map(|reason| reason.refusal_reason())
+            .find(|refusal| *refusal != StorageIntentRefusalReason::None)
+            .or_else(|| self.placement_plan.first_refusal())
+    }
+}
+
 /// Evaluate hard constraints for one storage-intent placement request.
 #[must_use]
 pub fn evaluate_storage_intent_placement(
@@ -687,6 +776,134 @@ pub fn plan_storage_intent_placement(
         reasons,
         candidate_reports,
     }
+}
+
+/// Build scheduler handoff records for an admitted storage-intent placement plan.
+///
+/// This is a model-level dispatch surface only: it preserves the selected
+/// #905 decision frontier and scheduler-admission refs, but leaves #911 action
+/// execution unset so callers cannot treat a queued action as a receipt,
+/// cutover, or source-retirement proof.
+#[must_use]
+pub fn plan_storage_intent_dispatch(
+    request: &StorageIntentPlacementRequest,
+    candidates: &[StorageIntentPlacementCandidate],
+) -> StorageIntentPlacementDispatchPlan {
+    let placement_plan = plan_storage_intent_placement(request, candidates);
+    let mut reasons = Vec::new();
+
+    if !placement_plan.admitted {
+        reasons.push(
+            StorageIntentPlacementDispatchReason::PlacementPlanNotAdmitted {
+                refusal: placement_plan
+                    .first_refusal()
+                    .unwrap_or(StorageIntentRefusalReason::NoLegalReceiptSet),
+            },
+        );
+        return StorageIntentPlacementDispatchPlan {
+            dispatchable: false,
+            placement_plan,
+            records: Vec::new(),
+            reasons,
+        };
+    }
+
+    let decision_frontier_ref =
+        match fresh_family_ref(request, StorageIntentEvidenceKind::DecisionFrontierEvidence) {
+            Some(evidence_ref) => evidence_ref,
+            None => {
+                reasons.push(
+                    StorageIntentPlacementDispatchReason::DecisionFrontierEvidenceNotFresh {
+                        state: family_state(
+                            request,
+                            StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                        ),
+                    },
+                );
+                StorageIntentEvidenceRef::default()
+            }
+        };
+    let scheduler_admission_ref =
+        match fresh_family_ref(request, StorageIntentEvidenceKind::SchedulerAdmissionRecord) {
+            Some(evidence_ref) => evidence_ref,
+            None => {
+                reasons.push(
+                    StorageIntentPlacementDispatchReason::SchedulerAdmissionEvidenceNotFresh {
+                        state: family_state(
+                            request,
+                            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                        ),
+                    },
+                );
+                StorageIntentEvidenceRef::default()
+            }
+        };
+
+    if !reasons.is_empty() {
+        return StorageIntentPlacementDispatchPlan {
+            dispatchable: false,
+            placement_plan,
+            records: Vec::new(),
+            reasons,
+        };
+    }
+
+    let mut records = Vec::with_capacity(request.required_target_count);
+    for report in placement_plan
+        .candidate_reports
+        .iter()
+        .filter(|report| report.selected)
+    {
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.target_id == report.target_id)
+        else {
+            reasons.push(
+                StorageIntentPlacementDispatchReason::SelectedCandidateMissing {
+                    target_id: report.target_id,
+                },
+            );
+            continue;
+        };
+
+        records.push(StorageIntentPlacementDispatchRecord {
+            target_id: report.target_id,
+            failure_domain_key: report.failure_domain_key,
+            role: request.role,
+            action_class: request.role.action_class(),
+            receipt_id: candidate.receipt.receipt_id,
+            decision_frontier_ref,
+            scheduler_admission_ref,
+            action_execution_ref: None,
+        });
+    }
+
+    let dispatchable = reasons.is_empty() && records.len() == request.required_target_count;
+    StorageIntentPlacementDispatchPlan {
+        dispatchable,
+        placement_plan,
+        records,
+        reasons,
+    }
+}
+
+fn fresh_family_ref(
+    request: &StorageIntentPlacementRequest,
+    kind: StorageIntentEvidenceKind,
+) -> Option<StorageIntentEvidenceRef> {
+    request
+        .evidence_query
+        .family_freshness
+        .fresh_ref_for_kind(kind)
+}
+
+fn family_state(
+    request: &StorageIntentPlacementRequest,
+    kind: StorageIntentEvidenceKind,
+) -> PlacementEvidenceState {
+    PlacementEvidenceState::from_family_state(
+        request.evidence_query.family_freshness.state_for_kind(kind),
+    )
 }
 
 fn request_level_reasons(
@@ -1377,6 +1594,7 @@ mod tests {
         StorageIntentEvidenceKind::RecoveryDegradationEvidence,
         StorageIntentEvidenceKind::PolicyRolloutEvidence,
         StorageIntentEvidenceKind::TenantIsolationEvidence,
+        StorageIntentEvidenceKind::SchedulerAdmissionRecord,
         StorageIntentEvidenceKind::TemporalEvidence,
         StorageIntentEvidenceKind::DataShapeEvidence,
         StorageIntentEvidenceKind::LayoutAllocatorEvidence,
@@ -1397,10 +1615,31 @@ mod tests {
     }
 
     fn evidence_cut(policy: StorageIntentPolicy) -> StorageIntentEvidenceQuerySnapshot {
+        evidence_cut_filter(policy, |_| true)
+    }
+
+    fn evidence_cut_without(
+        policy: StorageIntentPolicy,
+        missing: StorageIntentEvidenceKind,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        evidence_cut_filter(policy, |kind| kind != missing)
+    }
+
+    fn evidence_cut_filter<F>(
+        policy: StorageIntentPolicy,
+        keep: F,
+    ) -> StorageIntentEvidenceQuerySnapshot
+    where
+        F: Fn(StorageIntentEvidenceKind) -> bool,
+    {
         let mut included = StorageIntentEvidenceRefs::EMPTY;
         let mut freshness = EvidenceFamilyFreshnessSet::EMPTY;
         let mut byte = 10_u8;
         for kind in all_test_evidence() {
+            if !keep(kind) {
+                byte = byte.wrapping_add(1);
+                continue;
+            }
             let evidence = evidence_ref(kind, byte);
             included.push(evidence).unwrap();
             freshness
@@ -2170,5 +2409,118 @@ mod tests {
                 skipped_reason: SkippedMoveReason::ReclaimReserveUnavailable
             }
         )));
+    }
+
+    #[test]
+    fn dispatch_records_preserve_scheduler_and_decision_refs_without_execution_receipts() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let request = request(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            2,
+            2,
+        );
+        let candidates = [
+            candidate(
+                1,
+                10,
+                StorageMediaRole::PlacementAuthority,
+                StorageIntentGuaranteeClass::FullPlacement,
+                FailureDomainMask::NODE,
+                StorageMediaClass::NvmeFlash,
+            ),
+            candidate(
+                2,
+                20,
+                StorageMediaRole::PlacementAuthority,
+                StorageIntentGuaranteeClass::FullPlacement,
+                FailureDomainMask::NODE,
+                StorageMediaClass::NvmeFlash,
+            ),
+        ];
+
+        let dispatch = plan_storage_intent_dispatch(&request, &candidates);
+
+        assert!(dispatch.dispatchable);
+        assert!(dispatch.placement_plan.admitted);
+        assert_eq!(dispatch.records.len(), 2);
+        assert_eq!(
+            dispatch
+                .records
+                .iter()
+                .map(|record| record.target_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        for record in &dispatch.records {
+            assert_eq!(
+                record.role,
+                StorageIntentPlacementRole::DurableFullPlacement
+            );
+            assert_eq!(
+                record.action_class,
+                StorageIntentActionClass::DurablePlacementMovement
+            );
+            assert_eq!(
+                record.decision_frontier_ref.kind,
+                StorageIntentEvidenceKind::DecisionFrontierEvidence
+            );
+            assert!(record.decision_frontier_ref.is_bound());
+            assert_eq!(
+                record.scheduler_admission_ref.kind,
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord
+            );
+            assert!(record.scheduler_admission_ref.is_bound());
+            assert!(record.action_execution_ref.is_none());
+        }
+        assert_eq!(dispatch.first_refusal(), None);
+    }
+
+    #[test]
+    fn dispatch_refuses_admitted_plan_without_scheduler_admission_evidence() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut request = request(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+        );
+        request.evidence_query =
+            evidence_cut_without(policy, StorageIntentEvidenceKind::SchedulerAdmissionRecord);
+        let candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+
+        let placement = plan_storage_intent_placement(&request, &[candidate.clone()]);
+        assert!(placement.admitted);
+
+        let dispatch = plan_storage_intent_dispatch(&request, &[candidate]);
+
+        assert!(!dispatch.dispatchable);
+        assert!(dispatch.placement_plan.admitted);
+        assert!(dispatch.records.is_empty());
+        assert_eq!(
+            dispatch.first_refusal(),
+            Some(StorageIntentRefusalReason::EvidenceNotUsable)
+        );
+        assert!(matches!(
+            dispatch.reasons.as_slice(),
+            [
+                StorageIntentPlacementDispatchReason::SchedulerAdmissionEvidenceNotFresh {
+                    state: PlacementEvidenceState::Unknown
+                }
+            ]
+        ));
     }
 }
