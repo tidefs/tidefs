@@ -5466,6 +5466,7 @@ impl LocalFileSystem {
                 name: String::from_utf8_lossy(&name).into_owned(),
             });
         }
+        self.sync_all()?;
         let source_root = self.selected_current_root_summary()?;
         self.begin_mutation(); // was: let previous_state = self.state.clone()
         let created_at_generation = self.bump_generation();
