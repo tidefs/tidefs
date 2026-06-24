@@ -59,7 +59,7 @@ pub const STORAGE_INTENT_CORE_SPEC: &str = "tidefs-storage-intent-core-v1-issue-
 pub const STORAGE_INTENT_RECORD_VERSION: u16 = 1;
 
 /// Bounded evidence fan-in carried inline by a policy or receipt.
-pub const STORAGE_INTENT_INLINE_EVIDENCE_REFS: usize = 16;
+pub const STORAGE_INTENT_INLINE_EVIDENCE_REFS: usize = 20;
 
 /// Bounded per-family freshness fan-in carried by an evidence query snapshot.
 pub const STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES: usize = StorageIntentEvidenceKind::COUNT;
