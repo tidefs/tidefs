@@ -1,0 +1,877 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+
+//! Local storage-intent acknowledgment receipts.
+//!
+//! This module is deliberately a shape and evidence surface. It binds local
+//! write and durability-barrier replies to the shared storage-intent core
+//! records without claiming transport, distributed quorum, operator UAPI, or
+//! broad crash-validation closure.
+
+use tidefs_storage_intent_core::{
+    DurabilityReceiptState, DurabilityRequirement, DurabilityState, FailureDomainMask,
+    ProximityClass, ReadServingSourceClass, StorageIntentActionClass, StorageIntentEvidenceId,
+    StorageIntentEvidenceKind, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
+    StorageIntentGuaranteeClass, StorageIntentPolicy, StorageIntentPolicyId,
+    StorageIntentPolicyRevision, StorageIntentReceipt, StorageIntentReceiptId,
+    StorageIntentRefusal, StorageIntentRefusalReason, StorageMediaClass, StorageMediaRole,
+    TrustEvidenceState,
+};
+
+/// Local filesystem receipt surface version for issue #842.
+pub const LOCAL_ACK_RECEIPT_SPEC: &str = "tidefs-local-ack-receipt-v1-issue-842";
+
+/// Record version carried by local evidence refs.
+pub const LOCAL_ACK_RECEIPT_RECORD_VERSION: u16 = 1;
+
+/// Synthetic policy id for the current source-local receipt-shape slice.
+pub const LOCAL_ACK_POLICY_ID: StorageIntentPolicyId = StorageIntentPolicyId(*b"tidefs-ack-842v1");
+
+/// Revision of the local source-shape policy used by this crate.
+pub const LOCAL_ACK_POLICY_REVISION: StorageIntentPolicyRevision = StorageIntentPolicyRevision(1);
+
+const LOCAL_ACK_RECEIPT_LEDGER_LIMIT: usize = 256;
+
+/// Local operation that emitted an earned-ack receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(u8)]
+pub enum LocalAckOperation {
+    /// A sync-style write was acknowledged through a durable local intent.
+    SyncWrite = 0,
+    /// A POSIX fsync-style barrier completed.
+    Fsync = 1,
+    /// A POSIX fdatasync-style barrier completed.
+    Fdatasync = 2,
+    /// O_DSYNC data-range intent completed.
+    Odsync = 3,
+    /// Shared writable mmap MS_SYNC intent completed.
+    SharedMmapMsync = 4,
+    /// Filesystem-wide sync/syncfs completed.
+    Syncfs = 5,
+    /// Directory fsync completed.
+    FsyncDirectory = 6,
+}
+
+impl LocalAckOperation {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SyncWrite => "sync-write",
+            Self::Fsync => "fsync",
+            Self::Fdatasync => "fdatasync",
+            Self::Odsync => "odsync",
+            Self::SharedMmapMsync => "shared-mmap-msync",
+            Self::Syncfs => "syncfs",
+            Self::FsyncDirectory => "fsync-directory",
+        }
+    }
+
+    /// Stable local discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Object and range that one local receipt covers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct LocalAckReceiptTarget {
+    pub inode_id: Option<u64>,
+    pub offset: u64,
+    pub length: u64,
+    pub has_range: bool,
+}
+
+impl LocalAckReceiptTarget {
+    /// Filesystem-wide target.
+    pub const FILESYSTEM: Self = Self {
+        inode_id: None,
+        offset: 0,
+        length: 0,
+        has_range: false,
+    };
+
+    /// Inode-wide target.
+    #[must_use]
+    pub const fn inode(inode_id: u64) -> Self {
+        Self {
+            inode_id: Some(inode_id),
+            offset: 0,
+            length: 0,
+            has_range: false,
+        }
+    }
+
+    /// Byte-range target.
+    #[must_use]
+    pub const fn range(inode_id: u64, offset: u64, length: u64) -> Self {
+        Self {
+            inode_id: Some(inode_id),
+            offset,
+            length,
+            has_range: true,
+        }
+    }
+}
+
+/// Synchronous receipt result, separate from asynchronous convergence debt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(u8)]
+pub enum LocalAckReceiptDisposition {
+    /// Durable POSIX receipt: local intent or placement evidence backs success.
+    DurablePosix = 0,
+    /// Explicitly weaker non-POSIX/unsafe receipt class.
+    WeakerUnsafeVolatile = 1,
+    /// Typed refusal returned instead of hidden weakening.
+    Refused = 2,
+    /// Missing or stale evidence leaves the receipt unknown.
+    Unknown = 3,
+    /// Policy/evidence gate blocked emission.
+    Blocked = 4,
+}
+
+/// Asynchronous convergence state carried alongside the synchronous ack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(u8)]
+pub enum LocalAckConvergenceState {
+    /// The synchronous ack also satisfied the modeled local convergence target.
+    Satisfied = 0,
+    /// Local durable intent was earned, but full local placement still has debt.
+    PendingFullPlacement = 1,
+    /// Later placement/convergence is actively expected.
+    Converging = 2,
+    /// Degraded state is caller-visible and not normalized into success.
+    DegradedVisible = 3,
+    /// Required evidence is missing, stale, or outside the current cut.
+    Unknown = 4,
+    /// A hard policy/evidence gate blocks the requested floor.
+    Blocked = 5,
+    /// The requested floor was refused.
+    Refused = 6,
+}
+
+impl LocalAckConvergenceState {
+    /// True when later full-placement work remains.
+    #[must_use]
+    pub const fn has_pending_full_placement(self) -> bool {
+        matches!(self, Self::PendingFullPlacement | Self::Converging)
+    }
+}
+
+/// Local receipt envelope that preserves issue #842 evidence refs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalAckReceipt {
+    pub receipt: StorageIntentReceipt,
+    pub operation: LocalAckOperation,
+    pub target: LocalAckReceiptTarget,
+    pub requested_ack_floor: StorageIntentGuaranteeClass,
+    pub payload_or_replay_digest: Option<u64>,
+    pub local_intent_record_ref: StorageIntentEvidenceRef,
+    pub ordering_ref: StorageIntentEvidenceRef,
+    pub flush_fence_ref: StorageIntentEvidenceRef,
+    pub media_capability_ref: StorageIntentEvidenceRef,
+    pub placement_ref: StorageIntentEvidenceRef,
+    pub reserve_ref: StorageIntentEvidenceRef,
+    pub dirty_window_ref: StorageIntentEvidenceRef,
+    pub rollout_ref: StorageIntentEvidenceRef,
+    pub tenant_isolation_ref: StorageIntentEvidenceRef,
+    pub convergence: LocalAckConvergenceState,
+    pub replacement_receipt: StorageIntentReceiptId,
+    pub retires_receipt: StorageIntentReceiptId,
+    pub old_receipt_retired: bool,
+    pub refusal: StorageIntentRefusal,
+    pub disposition: LocalAckReceiptDisposition,
+}
+
+impl LocalAckReceipt {
+    /// Build a local durable-intent success receipt with pending placement debt.
+    #[must_use]
+    pub fn durable_intent(
+        sequence: u64,
+        operation: LocalAckOperation,
+        target: LocalAckReceiptTarget,
+        payload_or_replay_digest: Option<u64>,
+    ) -> Self {
+        let local_intent_record_ref = evidence_ref(
+            StorageIntentEvidenceKind::LocalIntentRecord,
+            "local-intent",
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        let ordering_ref = evidence_ref(
+            StorageIntentEvidenceKind::OrderingEvidence,
+            "ordering",
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        let flush_fence_ref = evidence_ref(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            "flush-fence",
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        let media_capability_ref = evidence_ref(
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            "media-capability",
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        let reserve_ref = evidence_ref(
+            StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+            "reserve",
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        let dirty_window_ref = evidence_ref(
+            StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+            "dirty-window",
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        let rollout_ref = evidence_ref(
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            "rollout",
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        let tenant_isolation_ref = evidence_ref(
+            StorageIntentEvidenceKind::TenantIsolationEvidence,
+            "tenant-isolation",
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        let evidence_refs = evidence_refs(&[
+            local_intent_record_ref,
+            ordering_ref,
+            flush_fence_ref,
+            media_capability_ref,
+            reserve_ref,
+            dirty_window_ref,
+            rollout_ref,
+            tenant_isolation_ref,
+        ]);
+        let receipt = StorageIntentReceipt {
+            receipt_id: receipt_id(sequence, operation, target, payload_or_replay_digest),
+            policy_id: LOCAL_ACK_POLICY_ID,
+            policy_revision: LOCAL_ACK_POLICY_REVISION,
+            ack_class: StorageIntentGuaranteeClass::LocalIntent,
+            failure_domains: FailureDomainMask::LOCAL,
+            proximity: ProximityClass::LocalMedia,
+            durability: DurabilityReceiptState {
+                state: DurabilityState::DurableIntent,
+                observed_lag_ms: 0,
+                lag_known: true,
+            },
+            trust: TrustEvidenceState::EMPTY,
+            media_role: StorageMediaRole::SyncIntent,
+            media_class: StorageMediaClass::ObjectAppliance,
+            read_source: ReadServingSourceClass::PlacementReceipt,
+            action_class: StorageIntentActionClass::NewWriteShaping,
+            evidence_refs,
+        };
+        Self {
+            receipt,
+            operation,
+            target,
+            requested_ack_floor: StorageIntentGuaranteeClass::LocalIntent,
+            payload_or_replay_digest,
+            local_intent_record_ref,
+            ordering_ref,
+            flush_fence_ref,
+            media_capability_ref,
+            placement_ref: StorageIntentEvidenceRef::default(),
+            reserve_ref,
+            dirty_window_ref,
+            rollout_ref,
+            tenant_isolation_ref,
+            convergence: LocalAckConvergenceState::PendingFullPlacement,
+            replacement_receipt: StorageIntentReceiptId::ZERO,
+            retires_receipt: StorageIntentReceiptId::ZERO,
+            old_receipt_retired: false,
+            refusal: refusal(
+                sequence,
+                receipt.receipt_id,
+                StorageIntentRefusalReason::None,
+            ),
+            disposition: LocalAckReceiptDisposition::DurablePosix,
+        }
+    }
+
+    /// Build a full local commit/placement-shaped success receipt.
+    #[must_use]
+    pub fn full_local_placement(
+        sequence: u64,
+        operation: LocalAckOperation,
+        target: LocalAckReceiptTarget,
+        payload_or_replay_digest: Option<u64>,
+    ) -> Self {
+        let mut receipt =
+            Self::durable_intent(sequence, operation, target, payload_or_replay_digest);
+        let placement_ref = evidence_ref(
+            StorageIntentEvidenceKind::PlacementReceipt,
+            "placement",
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        let local_intent_record_ref = receipt.local_intent_record_ref;
+        let ordering_ref = receipt.ordering_ref;
+        let flush_fence_ref = receipt.flush_fence_ref;
+        let media_capability_ref = receipt.media_capability_ref;
+        let reserve_ref = receipt.reserve_ref;
+        let dirty_window_ref = receipt.dirty_window_ref;
+        let rollout_ref = receipt.rollout_ref;
+        let tenant_isolation_ref = receipt.tenant_isolation_ref;
+        receipt.receipt.ack_class = StorageIntentGuaranteeClass::FullPlacement;
+        receipt.receipt.durability = DurabilityReceiptState {
+            state: DurabilityState::FullPlacement,
+            observed_lag_ms: 0,
+            lag_known: true,
+        };
+        receipt.receipt.media_role = StorageMediaRole::PlacementAuthority;
+        receipt.receipt.action_class = StorageIntentActionClass::DurablePlacementMovement;
+        receipt.receipt.evidence_refs = evidence_refs(&[
+            local_intent_record_ref,
+            ordering_ref,
+            flush_fence_ref,
+            media_capability_ref,
+            placement_ref,
+            reserve_ref,
+            dirty_window_ref,
+            rollout_ref,
+            tenant_isolation_ref,
+        ]);
+        receipt.requested_ack_floor = StorageIntentGuaranteeClass::LocalIntent;
+        receipt.placement_ref = placement_ref;
+        receipt.convergence = LocalAckConvergenceState::Satisfied;
+        receipt
+    }
+
+    /// Build an explicit weaker/unsafe volatile receipt shape.
+    #[must_use]
+    pub fn unsafe_volatile(
+        sequence: u64,
+        operation: LocalAckOperation,
+        target: LocalAckReceiptTarget,
+        payload_or_replay_digest: Option<u64>,
+        reason: StorageIntentRefusalReason,
+    ) -> Self {
+        let flush_fence_ref = evidence_ref(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            "unsafe-volatile",
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        let mut evidence_refs = StorageIntentEvidenceRefs::EMPTY;
+        let _ = evidence_refs.push(flush_fence_ref);
+        let receipt_id = receipt_id(sequence, operation, target, payload_or_replay_digest);
+        let receipt = StorageIntentReceipt {
+            receipt_id,
+            policy_id: LOCAL_ACK_POLICY_ID,
+            policy_revision: LOCAL_ACK_POLICY_REVISION,
+            ack_class: StorageIntentGuaranteeClass::VolatileLocal,
+            failure_domains: FailureDomainMask::LOCAL,
+            proximity: ProximityClass::LocalRam,
+            durability: DurabilityReceiptState {
+                state: DurabilityState::Volatile,
+                observed_lag_ms: u64::MAX,
+                lag_known: false,
+            },
+            trust: TrustEvidenceState::EMPTY,
+            media_role: StorageMediaRole::RamVolatileAuthority,
+            media_class: StorageMediaClass::SystemRam,
+            read_source: ReadServingSourceClass::Cache,
+            action_class: StorageIntentActionClass::NewWriteShaping,
+            evidence_refs,
+        };
+        Self {
+            receipt,
+            operation,
+            target,
+            requested_ack_floor: StorageIntentGuaranteeClass::VolatileLocal,
+            payload_or_replay_digest,
+            local_intent_record_ref: StorageIntentEvidenceRef::default(),
+            ordering_ref: StorageIntentEvidenceRef::default(),
+            flush_fence_ref,
+            media_capability_ref: StorageIntentEvidenceRef::default(),
+            placement_ref: StorageIntentEvidenceRef::default(),
+            reserve_ref: StorageIntentEvidenceRef::default(),
+            dirty_window_ref: StorageIntentEvidenceRef::default(),
+            rollout_ref: StorageIntentEvidenceRef::default(),
+            tenant_isolation_ref: StorageIntentEvidenceRef::default(),
+            convergence: LocalAckConvergenceState::DegradedVisible,
+            replacement_receipt: StorageIntentReceiptId::ZERO,
+            retires_receipt: StorageIntentReceiptId::ZERO,
+            old_receipt_retired: false,
+            refusal: refusal(sequence, receipt_id, reason),
+            disposition: LocalAckReceiptDisposition::WeakerUnsafeVolatile,
+        }
+    }
+
+    /// Build a typed refusal for an unmet requested floor.
+    #[must_use]
+    pub fn refused_unmet_floor(
+        sequence: u64,
+        operation: LocalAckOperation,
+        target: LocalAckReceiptTarget,
+        requested_ack_floor: StorageIntentGuaranteeClass,
+        earned_ack_class: StorageIntentGuaranteeClass,
+        reason: StorageIntentRefusalReason,
+    ) -> Self {
+        let attempted = Self::durable_intent(sequence, operation, target, None);
+        let mut receipt = attempted.receipt;
+        receipt.ack_class = earned_ack_class;
+        if !matches!(
+            earned_ack_class,
+            StorageIntentGuaranteeClass::LocalIntent
+                | StorageIntentGuaranteeClass::FullPlacement
+                | StorageIntentGuaranteeClass::QuorumIntent
+                | StorageIntentGuaranteeClass::GeoIntent
+                | StorageIntentGuaranteeClass::GeoFullPlacement
+                | StorageIntentGuaranteeClass::ArchiveEc
+        ) {
+            receipt.durability = DurabilityReceiptState {
+                state: DurabilityState::Volatile,
+                observed_lag_ms: u64::MAX,
+                lag_known: false,
+            };
+        }
+        Self {
+            receipt,
+            operation,
+            target,
+            requested_ack_floor,
+            payload_or_replay_digest: None,
+            local_intent_record_ref: attempted.local_intent_record_ref,
+            ordering_ref: attempted.ordering_ref,
+            flush_fence_ref: attempted.flush_fence_ref,
+            media_capability_ref: attempted.media_capability_ref,
+            placement_ref: attempted.placement_ref,
+            reserve_ref: attempted.reserve_ref,
+            dirty_window_ref: attempted.dirty_window_ref,
+            rollout_ref: attempted.rollout_ref,
+            tenant_isolation_ref: attempted.tenant_isolation_ref,
+            convergence: LocalAckConvergenceState::Refused,
+            replacement_receipt: StorageIntentReceiptId::ZERO,
+            retires_receipt: StorageIntentReceiptId::ZERO,
+            old_receipt_retired: false,
+            refusal: refusal(sequence, receipt.receipt_id, reason),
+            disposition: LocalAckReceiptDisposition::Refused,
+        }
+    }
+
+    /// Returns true for durable POSIX success receipts.
+    #[must_use]
+    pub const fn is_posix_durable_success(self) -> bool {
+        matches!(self.disposition, LocalAckReceiptDisposition::DurablePosix)
+            && matches!(
+                self.receipt.durability.state,
+                DurabilityState::DurableIntent | DurabilityState::FullPlacement
+            )
+    }
+
+    /// Refusal reason carried by this envelope.
+    #[must_use]
+    pub const fn refusal_reason(self) -> StorageIntentRefusalReason {
+        self.refusal.reason
+    }
+}
+
+/// Bounded latest-receipt side-channel owned by `LocalFileSystem`.
+#[derive(Clone, Debug)]
+pub struct LocalAckReceiptLedger {
+    receipts: Vec<LocalAckReceipt>,
+    next_sequence: u64,
+}
+
+impl LocalAckReceiptLedger {
+    /// Create an empty ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            receipts: Vec::new(),
+            next_sequence: 1,
+        }
+    }
+
+    /// Reserve the next monotonic local sequence.
+    pub fn next_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1).max(1);
+        sequence
+    }
+
+    /// Append a receipt, keeping only the bounded latest window.
+    pub fn record(&mut self, receipt: LocalAckReceipt) {
+        self.receipts.push(receipt);
+        if self.receipts.len() > LOCAL_ACK_RECEIPT_LEDGER_LIMIT {
+            self.receipts.remove(0);
+        }
+    }
+
+    /// Latest recorded receipt.
+    #[must_use]
+    pub fn latest(&self) -> Option<LocalAckReceipt> {
+        self.receipts.last().copied()
+    }
+
+    /// Snapshot of the bounded receipt window.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<LocalAckReceipt> {
+        self.receipts.clone()
+    }
+
+    /// Number of receipts in the bounded window.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.receipts.len()
+    }
+
+    /// Whether no receipts are recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.receipts.is_empty()
+    }
+}
+
+impl Default for LocalAckReceiptLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Build the local policy shape used to evaluate a requested floor.
+#[must_use]
+pub fn local_ack_policy(requested_guarantee: StorageIntentGuaranteeClass) -> StorageIntentPolicy {
+    let durability = match requested_guarantee {
+        StorageIntentGuaranteeClass::VolatileLocal
+        | StorageIntentGuaranteeClass::VolatileReplicated
+        | StorageIntentGuaranteeClass::RemoteVolatilePlusLocal => DurabilityRequirement::VOLATILE,
+        StorageIntentGuaranteeClass::FullPlacement
+        | StorageIntentGuaranteeClass::GeoAsync
+        | StorageIntentGuaranteeClass::GeoFullPlacement
+        | StorageIntentGuaranteeClass::ArchiveEc => DurabilityRequirement {
+            min_state: DurabilityState::FullPlacement,
+            max_lag_ms: 0,
+            allow_unknown_lag: false,
+        },
+        StorageIntentGuaranteeClass::LocalIntent
+        | StorageIntentGuaranteeClass::QuorumIntent
+        | StorageIntentGuaranteeClass::GeoIntent => DurabilityRequirement::DURABLE_INTENT_ZERO_LAG,
+    };
+
+    StorageIntentPolicy {
+        policy_id: LOCAL_ACK_POLICY_ID,
+        revision: LOCAL_ACK_POLICY_REVISION,
+        requested_guarantee,
+        required_failure_domains: FailureDomainMask::LOCAL,
+        max_proximity: ProximityClass::LocalMedia,
+        durability,
+        ..StorageIntentPolicy::default()
+    }
+}
+
+fn evidence_refs(refs: &[StorageIntentEvidenceRef]) -> StorageIntentEvidenceRefs {
+    let mut evidence_refs = StorageIntentEvidenceRefs::EMPTY;
+    for evidence_ref in refs {
+        if evidence_ref.is_bound() {
+            let _ = evidence_refs.push(*evidence_ref);
+        }
+    }
+    evidence_refs
+}
+
+fn receipt_id(
+    sequence: u64,
+    operation: LocalAckOperation,
+    target: LocalAckReceiptTarget,
+    payload_or_replay_digest: Option<u64>,
+) -> StorageIntentReceiptId {
+    let mut out = [0_u8; 16];
+    let hash = hash_context(
+        "receipt",
+        sequence,
+        operation,
+        target,
+        payload_or_replay_digest,
+    );
+    out.copy_from_slice(&hash[..16]);
+    StorageIntentReceiptId(out)
+}
+
+fn evidence_ref(
+    kind: StorageIntentEvidenceKind,
+    label: &'static str,
+    sequence: u64,
+    operation: LocalAckOperation,
+    target: LocalAckReceiptTarget,
+    payload_or_replay_digest: Option<u64>,
+) -> StorageIntentEvidenceRef {
+    StorageIntentEvidenceRef::new(
+        kind,
+        StorageIntentEvidenceId(hash_context(
+            label,
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        )),
+        sequence,
+        LOCAL_ACK_RECEIPT_RECORD_VERSION,
+    )
+}
+
+fn refusal(
+    sequence: u64,
+    attempted_receipt: StorageIntentReceiptId,
+    reason: StorageIntentRefusalReason,
+) -> StorageIntentRefusal {
+    StorageIntentRefusal {
+        policy_id: LOCAL_ACK_POLICY_ID,
+        policy_revision: LOCAL_ACK_POLICY_REVISION,
+        attempted_receipt,
+        reason,
+        evidence: StorageIntentEvidenceRef::new(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            StorageIntentEvidenceId(hash_refusal_context(sequence, attempted_receipt, reason)),
+            sequence,
+            LOCAL_ACK_RECEIPT_RECORD_VERSION,
+        ),
+    }
+}
+
+fn hash_context(
+    label: &str,
+    sequence: u64,
+    operation: LocalAckOperation,
+    target: LocalAckReceiptTarget,
+    payload_or_replay_digest: Option<u64>,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(LOCAL_ACK_RECEIPT_SPEC.as_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update(&sequence.to_le_bytes());
+    hasher.update(&[operation.to_discriminant()]);
+    match target.inode_id {
+        Some(inode_id) => {
+            hasher.update(&[1]);
+            hasher.update(&inode_id.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+            hasher.update(&0_u64.to_le_bytes());
+        }
+    }
+    hasher.update(&target.offset.to_le_bytes());
+    hasher.update(&target.length.to_le_bytes());
+    hasher.update(&[u8::from(target.has_range)]);
+    match payload_or_replay_digest {
+        Some(digest) => {
+            hasher.update(&[1]);
+            hasher.update(&digest.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+            hasher.update(&0_u64.to_le_bytes());
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn hash_refusal_context(
+    sequence: u64,
+    attempted_receipt: StorageIntentReceiptId,
+    reason: StorageIntentRefusalReason,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(LOCAL_ACK_RECEIPT_SPEC.as_bytes());
+    hasher.update(b"refusal");
+    hasher.update(&sequence.to_le_bytes());
+    hasher.update(&attempted_receipt.0);
+    hasher.update(&reason.to_discriminant().to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tidefs_storage_intent_core::{
+        ack_receipt_satisfies_requested_floor, evaluate_receipt_against_policy,
+    };
+
+    #[test]
+    fn durable_intent_receipt_records_pending_full_placement() {
+        let receipt = LocalAckReceipt::durable_intent(
+            1,
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::range(42, 64, 4096),
+            Some(0xfeed_beef),
+        );
+
+        assert_eq!(
+            receipt.receipt.ack_class,
+            StorageIntentGuaranteeClass::LocalIntent
+        );
+        assert!(receipt.is_posix_durable_success());
+        assert!(receipt.local_intent_record_ref.is_bound());
+        assert!(receipt.flush_fence_ref.is_bound());
+        assert_eq!(
+            receipt.convergence,
+            LocalAckConvergenceState::PendingFullPlacement
+        );
+        assert!(receipt.convergence.has_pending_full_placement());
+        assert_eq!(receipt.refusal_reason(), StorageIntentRefusalReason::None);
+        assert!(ack_receipt_satisfies_requested_floor(
+            StorageIntentGuaranteeClass::LocalIntent,
+            receipt.receipt.ack_class
+        ));
+    }
+
+    #[test]
+    fn full_local_placement_receipt_satisfies_full_floor_when_evidence_is_bound() {
+        let receipt = LocalAckReceipt::full_local_placement(
+            2,
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(7),
+            None,
+        );
+
+        assert_eq!(
+            receipt.receipt.ack_class,
+            StorageIntentGuaranteeClass::FullPlacement
+        );
+        assert_eq!(receipt.convergence, LocalAckConvergenceState::Satisfied);
+        assert!(receipt.placement_ref.is_bound());
+        let result = evaluate_receipt_against_policy(
+            local_ack_policy(StorageIntentGuaranteeClass::FullPlacement),
+            receipt.receipt,
+        );
+        assert!(result.satisfied, "refusal was {:?}", result.refusal);
+    }
+
+    #[test]
+    fn pending_convergence_does_not_imply_full_placement() {
+        let receipt = LocalAckReceipt::durable_intent(
+            3,
+            LocalAckOperation::Fdatasync,
+            LocalAckReceiptTarget::inode(9),
+            None,
+        );
+
+        assert!(
+            evaluate_receipt_against_policy(
+                local_ack_policy(StorageIntentGuaranteeClass::LocalIntent),
+                receipt.receipt,
+            )
+            .satisfied
+        );
+        let result = evaluate_receipt_against_policy(
+            local_ack_policy(StorageIntentGuaranteeClass::FullPlacement),
+            receipt.receipt,
+        );
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::GuaranteeFloorNotMet
+        );
+    }
+
+    #[test]
+    fn unsafe_volatile_receipt_is_distinct_from_posix_durable_success() {
+        let receipt = LocalAckReceipt::unsafe_volatile(
+            4,
+            LocalAckOperation::Odsync,
+            LocalAckReceiptTarget::range(11, 0, 512),
+            Some(0x1234),
+            StorageIntentRefusalReason::UnsafeVolatileWriteCache,
+        );
+
+        assert_eq!(
+            receipt.disposition,
+            LocalAckReceiptDisposition::WeakerUnsafeVolatile
+        );
+        assert!(!receipt.is_posix_durable_success());
+        assert_eq!(
+            receipt.refusal_reason(),
+            StorageIntentRefusalReason::UnsafeVolatileWriteCache
+        );
+        assert_eq!(
+            receipt.receipt.ack_class,
+            StorageIntentGuaranteeClass::VolatileLocal
+        );
+        let result = evaluate_receipt_against_policy(
+            local_ack_policy(StorageIntentGuaranteeClass::LocalIntent),
+            receipt.receipt,
+        );
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn refusal_shape_preserves_requested_floor_and_reason() {
+        let receipt = LocalAckReceipt::refused_unmet_floor(
+            5,
+            LocalAckOperation::SharedMmapMsync,
+            LocalAckReceiptTarget::range(13, 4096, 4096),
+            StorageIntentGuaranteeClass::FullPlacement,
+            StorageIntentGuaranteeClass::LocalIntent,
+            StorageIntentRefusalReason::DurabilityOrRpoNotMet,
+        );
+
+        assert_eq!(receipt.disposition, LocalAckReceiptDisposition::Refused);
+        assert_eq!(receipt.convergence, LocalAckConvergenceState::Refused);
+        assert_eq!(
+            receipt.requested_ack_floor,
+            StorageIntentGuaranteeClass::FullPlacement
+        );
+        assert_eq!(
+            receipt.refusal_reason(),
+            StorageIntentRefusalReason::DurabilityOrRpoNotMet
+        );
+        assert_eq!(
+            receipt.refusal.attempted_receipt,
+            receipt.receipt.receipt_id
+        );
+    }
+
+    #[test]
+    fn ledger_keeps_latest_receipts_bounded() {
+        let mut ledger = LocalAckReceiptLedger::new();
+        let first = LocalAckReceipt::durable_intent(
+            ledger.next_sequence(),
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::inode(1),
+            None,
+        );
+        ledger.record(first);
+        let second = LocalAckReceipt::full_local_placement(
+            ledger.next_sequence(),
+            LocalAckOperation::Fsync,
+            LocalAckReceiptTarget::inode(1),
+            None,
+        );
+        ledger.record(second);
+
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger.latest(), Some(second));
+        assert_eq!(ledger.snapshot(), vec![first, second]);
+    }
+}

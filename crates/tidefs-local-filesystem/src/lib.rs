@@ -290,6 +290,7 @@
 //!   standalone local filesystem layer that can operate independently of
 //!   the distributed layer.
 
+pub mod ack_receipt;
 pub mod admission;
 mod allocation;
 mod background_cleaner;
@@ -373,6 +374,9 @@ use std::time::{Duration, Instant};
 
 static NEXT_LOCAL_DATASET_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 
+use crate::ack_receipt::{
+    LocalAckOperation, LocalAckReceipt, LocalAckReceiptLedger, LocalAckReceiptTarget,
+};
 use tidefs_intent_log::XattrNamespace;
 
 use tidefs_background_scheduler::{
@@ -404,6 +408,7 @@ use tidefs_reserve_ledger::{BudgetDomain, ReserveClass};
 use tidefs_space_accounting::{
     DatasetQuotaHierarchy, SpaceAccounting, SpaceDomainRegistry, StatfsResult,
 };
+use tidefs_storage_intent_core::{StorageIntentGuaranteeClass, StorageIntentRefusalReason};
 use tidefs_types_claim_ledger_core::StorageAuthorityToken;
 use tidefs_types_claim_ledger_core::{
     BudgetDomainId, ClaimEntry, ClaimId, ClaimReason, ObligationLedger,
@@ -1477,6 +1482,8 @@ pub struct LocalFileSystem {
     /// Per-mutation delta recording old values of modified objects.
     /// Used for O(dirty) rollback instead of O(all) state clone.
     intent_log: IntentLog,
+    /// Latest local write/barrier ack receipts emitted for sync-style callers.
+    ack_receipts: LocalAckReceiptLedger,
     /// Metadata-level intent-log buffer for crash-safe namespace operations
     /// (rename, link, unlink, create, etc.). Populated by mutation methods and
     /// drained by the TxgCoordinator during two-phase commit.
@@ -3350,6 +3357,7 @@ impl LocalFileSystem {
             pending_permits: Vec::new(),
             dirty_set: DirtySet::default(),
             intent_log,
+            ack_receipts: LocalAckReceiptLedger::new(),
             intent_log_buffer: None,
             commit_group: CommitGroupStateMachine::with_starting_commit_group(
                 CommitGroupConfig::default(),
@@ -10693,6 +10701,13 @@ impl LocalFileSystem {
         // Sync writes get high throughput allocation to avoid intent-log backpressure.
         self.store.set_scheduling_class(IoClass::SyncData);
         if !self.commit_group.record_write(length) {
+            self.record_unmet_floor_ack_refusal(
+                LocalAckOperation::SyncWrite,
+                LocalAckReceiptTarget::range(inode_id.get(), offset, length),
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageIntentGuaranteeClass::VolatileLocal,
+                StorageIntentRefusalReason::NoLegalReceiptSet,
+            );
             return Ok(IntentLogReplyState::Refused);
         }
         let root_anchor = IntentLogRootAnchor {
@@ -10727,6 +10742,13 @@ impl LocalFileSystem {
 
         if !accepted {
             // Pressure threshold exceeded — caller must fall back to full commit
+            self.record_unmet_floor_ack_refusal(
+                LocalAckOperation::SyncWrite,
+                LocalAckReceiptTarget::range(inode_id.get(), offset, length),
+                StorageIntentGuaranteeClass::LocalIntent,
+                StorageIntentGuaranteeClass::VolatileLocal,
+                StorageIntentRefusalReason::NoLegalReceiptSet,
+            );
             return Ok(IntentLogReplyState::Refused);
         }
 
@@ -10748,6 +10770,11 @@ impl LocalFileSystem {
         self.mark_inode_content_dirty(inode_id);
         self.invalidate_hot_read_cache_for_inode(inode_id);
 
+        self.record_durable_intent_ack_receipt(
+            LocalAckOperation::SyncWrite,
+            LocalAckReceiptTarget::range(inode_id.get(), offset, length),
+            Some(payload_digest.0),
+        );
         Ok(IntentLogReplyState::IntentDurable)
     }
 
@@ -10828,6 +10855,101 @@ impl LocalFileSystem {
         self.intent_log.is_empty()
     }
 
+    /// Latest local ack receipt emitted by a sync-style write or barrier path.
+    #[must_use]
+    pub fn latest_local_ack_receipt(&self) -> Option<LocalAckReceipt> {
+        self.ack_receipts.latest()
+    }
+
+    /// Snapshot the bounded local ack receipt window.
+    #[must_use]
+    pub fn local_ack_receipts_snapshot(&self) -> Vec<LocalAckReceipt> {
+        self.ack_receipts.snapshot()
+    }
+
+    /// Record an O_DSYNC data-range receipt after its durable local intent is synced.
+    #[must_use]
+    pub fn record_odsync_data_range_ack_receipt(
+        &mut self,
+        inode_id: InodeId,
+        offset: u64,
+        length: u64,
+        payload_digest: IntegrityDigest64,
+    ) -> LocalAckReceipt {
+        self.record_durable_intent_ack_receipt(
+            LocalAckOperation::Odsync,
+            LocalAckReceiptTarget::range(inode_id.get(), offset, length),
+            Some(payload_digest.0),
+        )
+    }
+
+    /// Record a shared writable mmap MS_SYNC receipt after local intent is durable.
+    #[must_use]
+    pub fn record_shared_mmap_msync_ack_receipt(
+        &mut self,
+        inode_id: InodeId,
+        offset: u64,
+        length: u64,
+        payload_digest: IntegrityDigest64,
+    ) -> LocalAckReceipt {
+        self.record_durable_intent_ack_receipt(
+            LocalAckOperation::SharedMmapMsync,
+            LocalAckReceiptTarget::range(inode_id.get(), offset, length),
+            Some(payload_digest.0),
+        )
+    }
+
+    fn record_durable_intent_ack_receipt(
+        &mut self,
+        operation: LocalAckOperation,
+        target: LocalAckReceiptTarget,
+        payload_or_replay_digest: Option<u64>,
+    ) -> LocalAckReceipt {
+        let sequence = self.ack_receipts.next_sequence();
+        let receipt =
+            LocalAckReceipt::durable_intent(sequence, operation, target, payload_or_replay_digest);
+        self.ack_receipts.record(receipt);
+        receipt
+    }
+
+    fn record_full_local_placement_ack_receipt(
+        &mut self,
+        operation: LocalAckOperation,
+        target: LocalAckReceiptTarget,
+        payload_or_replay_digest: Option<u64>,
+    ) -> LocalAckReceipt {
+        let sequence = self.ack_receipts.next_sequence();
+        let receipt = LocalAckReceipt::full_local_placement(
+            sequence,
+            operation,
+            target,
+            payload_or_replay_digest,
+        );
+        self.ack_receipts.record(receipt);
+        receipt
+    }
+
+    fn record_unmet_floor_ack_refusal(
+        &mut self,
+        operation: LocalAckOperation,
+        target: LocalAckReceiptTarget,
+        requested_ack_floor: StorageIntentGuaranteeClass,
+        earned_ack_class: StorageIntentGuaranteeClass,
+        reason: StorageIntentRefusalReason,
+    ) -> LocalAckReceipt {
+        let sequence = self.ack_receipts.next_sequence();
+        let receipt = LocalAckReceipt::refused_unmet_floor(
+            sequence,
+            operation,
+            target,
+            requested_ack_floor,
+            earned_ack_class,
+            reason,
+        );
+        self.ack_receipts.record(receipt);
+        receipt
+    }
+
     pub fn fsync_file(&mut self, path: impl AsRef<str>) -> Result<()> {
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
         let started = Instant::now();
@@ -10861,6 +10983,13 @@ impl LocalFileSystem {
         self.fsync_stats
             .fsync_total_ns
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if result.is_ok() {
+            self.record_full_local_placement_ack_receipt(
+                LocalAckOperation::Fsync,
+                LocalAckReceiptTarget::inode(attr.inode_id.get()),
+                None,
+            );
+        }
         result
     }
 
@@ -10888,6 +11017,11 @@ impl LocalFileSystem {
             self.fsync_stats
                 .fdatasync_total_ns
                 .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.record_durable_intent_ack_receipt(
+                LocalAckOperation::Fdatasync,
+                LocalAckReceiptTarget::inode(attr.inode_id.get()),
+                None,
+            );
             return Ok(());
         }
         if self.state.dirty_content.contains(&attr.inode_id) {
@@ -10905,6 +11039,11 @@ impl LocalFileSystem {
             )?;
             self.store.sync_all().map_err(FileSystemError::from)?;
             self.mark_content_clean(attr.inode_id);
+            self.record_full_local_placement_ack_receipt(
+                LocalAckOperation::Fdatasync,
+                LocalAckReceiptTarget::inode(attr.inode_id.get()),
+                None,
+            );
         }
         self.fsync_stats
             .fdatasync_count
@@ -10943,6 +11082,13 @@ impl LocalFileSystem {
         self.fsync_stats
             .fsync_total_ns
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if result.is_ok() {
+            self.record_full_local_placement_ack_receipt(
+                LocalAckOperation::Syncfs,
+                LocalAckReceiptTarget::FILESYSTEM,
+                None,
+            );
+        }
         result
     }
 
@@ -11026,6 +11172,11 @@ impl LocalFileSystem {
         if self.intent_log.pending_flush_count() > 0 {
             self.intent_log
                 .flush_and_sync(self.store.raw_primary_store_mut())?;
+            self.record_durable_intent_ack_receipt(
+                LocalAckOperation::Fdatasync,
+                LocalAckReceiptTarget::FILESYSTEM,
+                None,
+            );
             return Ok(());
         }
         let dirty_inodes: Vec<InodeId> = self.state.dirty_content.iter().copied().collect();
@@ -11046,6 +11197,13 @@ impl LocalFileSystem {
         self.store.sync_all().map_err(FileSystemError::from)?;
         for inode_id in &dirty_inodes {
             self.mark_content_clean(*inode_id);
+        }
+        if !dirty_inodes.is_empty() {
+            self.record_full_local_placement_ack_receipt(
+                LocalAckOperation::Fdatasync,
+                LocalAckReceiptTarget::FILESYSTEM,
+                None,
+            );
         }
         Ok(())
     }
@@ -11096,6 +11254,13 @@ impl LocalFileSystem {
         self.fsync_stats
             .fsync_total_ns
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if result.is_ok() {
+            self.record_full_local_placement_ack_receipt(
+                LocalAckOperation::Fsync,
+                LocalAckReceiptTarget::inode(inode_id.get()),
+                None,
+            );
+        }
         result
     }
 
@@ -11106,6 +11271,7 @@ impl LocalFileSystem {
     pub fn sync_inode_data_only(&mut self, inode_id: InodeId) -> Result<()> {
         check_crash_hook(CrashInjectionPoint::OpFsyncBeforeFlush);
         let started = Instant::now();
+        let had_pending_intent = self.intent_log.has_pending_data_for_inode(inode_id);
         if self.intent_log.has_pending_data_for_inode(inode_id) {
             self.intent_log
                 .flush_and_sync(self.store.raw_primary_store_mut())?;
@@ -11117,6 +11283,7 @@ impl LocalFileSystem {
             // pool import provides an additional safety net. Persist data
             // through the content-object path for immediate durability.
         }
+        let had_dirty_content = self.state.dirty_content.contains(&inode_id);
         if self.state.dirty_content.contains(&inode_id) {
             let record = self
                 .state
@@ -11132,6 +11299,19 @@ impl LocalFileSystem {
             )?;
             self.store.sync_all().map_err(FileSystemError::from)?;
             self.mark_content_clean(inode_id);
+        }
+        if had_dirty_content {
+            self.record_full_local_placement_ack_receipt(
+                LocalAckOperation::Fdatasync,
+                LocalAckReceiptTarget::inode(inode_id.get()),
+                None,
+            );
+        } else if had_pending_intent {
+            self.record_durable_intent_ack_receipt(
+                LocalAckOperation::Fdatasync,
+                LocalAckReceiptTarget::inode(inode_id.get()),
+                None,
+            );
         }
         self.fsync_stats
             .fdatasync_count
@@ -11167,6 +11347,13 @@ impl LocalFileSystem {
         self.store.sync_all().map_err(FileSystemError::from)?;
         for inode_id in &dirty_inodes {
             self.mark_content_clean(*inode_id);
+        }
+        if !dirty_inodes.is_empty() {
+            self.record_full_local_placement_ack_receipt(
+                LocalAckOperation::Fdatasync,
+                LocalAckReceiptTarget::FILESYSTEM,
+                None,
+            );
         }
         Ok(())
     }
@@ -11207,6 +11394,11 @@ impl LocalFileSystem {
         )?;
         self.store.sync_data().map_err(FileSystemError::from)?;
         self.mark_content_clean(inode_id);
+        self.record_full_local_placement_ack_receipt(
+            LocalAckOperation::Fdatasync,
+            LocalAckReceiptTarget::inode(inode_id.get()),
+            None,
+        );
         self.fsync_stats
             .fdatasync_count
             .fetch_add(1, Ordering::Relaxed);
@@ -11265,6 +11457,11 @@ impl LocalFileSystem {
         self.fsync_stats
             .fsync_total_ns
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.record_full_local_placement_ack_receipt(
+            LocalAckOperation::FsyncDirectory,
+            LocalAckReceiptTarget::inode(attr.inode_id.get()),
+            None,
+        );
         Ok(())
     }
     /// Sync the extent allocator's in-memory state into FileSystemState so
