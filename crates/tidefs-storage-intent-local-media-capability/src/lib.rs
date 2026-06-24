@@ -4,8 +4,8 @@
 
 //! Local media-capability producer records for storage intent.
 //!
-//! This crate is the first #960 source slice. It does not probe hardware,
-//! execute I/O, emit receipts, score placement, or account wear. It maps
+//! This crate owns the narrow #960 local producer surface. It does not probe
+//! hardware, execute I/O, emit receipts, score placement, or account wear. It maps
 //! already-collected local facts into
 //! [`StorageIntentMediaCapabilityRecord`] so downstream storage-intent
 //! consumers can use the #904 role predicate instead of device labels.
@@ -17,6 +17,13 @@ use tidefs_storage_intent_core::{
     MediaPersistenceDomain, MediaProtocolGeometryClass, MediaRemoteCommitSemantics,
     StorageIntentEvidenceId, StorageIntentEvidenceKind, StorageIntentEvidenceRef,
     StorageIntentMediaCapabilityRecord, StorageMediaClass,
+};
+use tidefs_types_pool_label_core::{
+    DeviceClass as LabelDeviceClass, PoolLabelV1, PoolState as LabelPoolState,
+};
+use tidefs_ublk_abi::{
+    UblkFeatureFlags, UblkParams, UBLK_ATTR_FUA, UBLK_ATTR_ROTATIONAL, UBLK_ATTR_VOLATILE_CACHE,
+    UBLK_PARAM_TYPE_BASIC, UBLK_PARAM_TYPE_DISCARD, UBLK_PARAM_TYPE_ZONED,
 };
 
 /// Version of the local media-capability producer record shape.
@@ -32,6 +39,453 @@ const EMPTY_EVIDENCE_REF: StorageIntentEvidenceRef = StorageIntentEvidenceRef {
     generation: 0,
     version: 0,
 };
+
+const fn bytes16_nonzero(bytes: [u8; 16]) -> bool {
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0 {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+const fn ublk_param_type_present(params: UblkParams, ty: u32) -> bool {
+    (params.types & ty) == ty
+}
+
+const fn block_bytes_from_shift(shift: u8) -> u32 {
+    if shift < 32 {
+        1_u32 << shift
+    } else {
+        0
+    }
+}
+
+const fn label_media_class(device_class: LabelDeviceClass) -> StorageMediaClass {
+    match device_class {
+        LabelDeviceClass::Hdd => StorageMediaClass::HddRotational,
+        LabelDeviceClass::Ssd => StorageMediaClass::SsdFlash,
+        LabelDeviceClass::Nvme | LabelDeviceClass::LogDevice => StorageMediaClass::NvmeFlash,
+        LabelDeviceClass::Cache => StorageMediaClass::SsdFlash,
+        LabelDeviceClass::Special => StorageMediaClass::SsdFlash,
+        LabelDeviceClass::Spare => StorageMediaClass::HddRotational,
+    }
+}
+
+const fn label_health(device_health: u8) -> MediaHealthState {
+    match device_health {
+        0 => MediaHealthState::Healthy,
+        1 => MediaHealthState::Degraded,
+        2 => MediaHealthState::Failed,
+        _ => MediaHealthState::Unknown,
+    }
+}
+
+/// How the local path or multipath view identifies a target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LocalPathIdentityClass {
+    /// No usable path identity sample was supplied.
+    #[default]
+    Unknown,
+    /// A path string exists, but no stable namespace or multipath binding does.
+    PathOnly,
+    /// One local path is bound to the sampled namespace for this generation.
+    StableSinglePath,
+    /// A multipath set is bound to the sampled namespace for this generation.
+    StableMultipath,
+}
+
+impl LocalPathIdentityClass {
+    #[must_use]
+    pub const fn proves_stable_attach(self) -> bool {
+        matches!(self, Self::StableSinglePath | Self::StableMultipath)
+    }
+}
+
+/// Explicit firmware/settings generation evidence for the sampled device.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LocalFirmwareSettingsSnapshot {
+    pub firmware_generation: u64,
+    pub settings_generation: u64,
+    pub generation_proven: bool,
+}
+
+impl LocalFirmwareSettingsSnapshot {
+    #[must_use]
+    pub const fn proven(firmware_generation: u64, settings_generation: u64) -> Self {
+        Self {
+            firmware_generation,
+            settings_generation,
+            generation_proven: true,
+        }
+    }
+}
+
+/// Pool-label and attach identity snapshot for one local pool member.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalPoolMemberIdentitySnapshot {
+    pub pool_guid: [u8; 16],
+    pub device_guid: [u8; 16],
+    pub pool_state: LabelPoolState,
+    pub label_commit_group: u64,
+    pub topology_generation: u64,
+    pub device_index: u32,
+    pub device_count: u32,
+    pub device_class: LabelDeviceClass,
+    pub device_capacity_bytes: u64,
+    pub device_health: u8,
+    pub checksum_verified: bool,
+    pub namespace_matches_current_attach: bool,
+    pub path_identity: LocalPathIdentityClass,
+    pub multipath_generation: u64,
+    pub stale_reattach: bool,
+}
+
+impl LocalPoolMemberIdentitySnapshot {
+    /// Capture the stable fields from a decoded pool label plus attach proof.
+    #[must_use]
+    pub const fn from_pool_label(
+        label: &PoolLabelV1,
+        checksum_verified: bool,
+        namespace_matches_current_attach: bool,
+        path_identity: LocalPathIdentityClass,
+        multipath_generation: u64,
+    ) -> Self {
+        Self {
+            pool_guid: label.pool_guid,
+            device_guid: label.device_guid,
+            pool_state: label.pool_state,
+            label_commit_group: label.label_commit_group,
+            topology_generation: label.topology_generation,
+            device_index: label.device_index,
+            device_count: label.device_count,
+            device_class: label.device_class,
+            device_capacity_bytes: label.device_capacity_bytes,
+            device_health: label.device_health,
+            checksum_verified,
+            namespace_matches_current_attach,
+            path_identity,
+            multipath_generation,
+            stale_reattach: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_stale_reattach(mut self) -> Self {
+        self.stale_reattach = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn media_class(self) -> StorageMediaClass {
+        label_media_class(self.device_class)
+    }
+
+    #[must_use]
+    pub const fn health_facts(self, health_ref: StorageIntentEvidenceRef) -> LocalHealthFacts {
+        LocalHealthFacts::new(label_health(self.device_health_code()), health_ref)
+    }
+
+    #[must_use]
+    pub const fn freshness_facts(
+        self,
+        freshness_ref: StorageIntentEvidenceRef,
+    ) -> LocalFreshnessFacts {
+        if self.stale_reattach {
+            return LocalFreshnessFacts::new(MediaCapabilityFreshnessState::Stale, freshness_ref);
+        }
+        if self.checksum_verified && self.namespace_matches_current_attach {
+            LocalFreshnessFacts::new(MediaCapabilityFreshnessState::Fresh, freshness_ref)
+        } else if self.checksum_verified {
+            LocalFreshnessFacts::new(MediaCapabilityFreshnessState::Contradictory, freshness_ref)
+        } else {
+            LocalFreshnessFacts::new(MediaCapabilityFreshnessState::Missing, freshness_ref)
+        }
+    }
+
+    #[must_use]
+    pub const fn identity_facts(
+        self,
+        firmware_settings: LocalFirmwareSettingsSnapshot,
+        stable_identity_ref: StorageIntentEvidenceRef,
+        namespace_identity_ref: StorageIntentEvidenceRef,
+    ) -> LocalMediaIdentityFacts {
+        let stable_label_identity = self.checksum_verified
+            && bytes16_nonzero(self.pool_guid)
+            && bytes16_nonzero(self.device_guid)
+            && self.pool_state.is_importable()
+            && self.namespace_matches_current_attach
+            && self.path_identity.proves_stable_attach()
+            && !self.stale_reattach;
+
+        LocalMediaIdentityFacts {
+            stable_device_identity: stable_label_identity,
+            stable_namespace_identity: stable_label_identity,
+            pool_member_binding: stable_label_identity && self.device_count > 0,
+            firmware_capability_generation: stable_label_identity
+                && firmware_settings.generation_proven,
+            identity_generation: self.label_commit_group,
+            namespace_generation: self.topology_generation,
+            firmware_generation: firmware_settings.firmware_generation,
+            settings_generation: firmware_settings.settings_generation,
+            pool_member_generation: self
+                .topology_generation
+                .saturating_add(self.multipath_generation),
+            stable_identity_ref,
+            namespace_identity_ref,
+        }
+    }
+
+    const fn device_health_code(self) -> u8 {
+        if self.device_class as u8 == LabelDeviceClass::Spare as u8 {
+            return 3;
+        }
+        if self.device_count == 0 {
+            return 3;
+        }
+        self.device_health
+    }
+}
+
+/// Explicit proof source for persistence-domain classification.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LocalPersistenceProofKind {
+    #[default]
+    Missing,
+    DeviceClassLabelOnly,
+    OperatorHintOnly,
+    ExplicitProbe,
+}
+
+/// Persistence-domain sample that refuses to treat labels as proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalPersistenceSnapshot {
+    pub domain: MediaPersistenceDomain,
+    pub proof_kind: LocalPersistenceProofKind,
+    pub write_cache_safe: bool,
+    pub persistence_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for LocalPersistenceSnapshot {
+    fn default() -> Self {
+        Self {
+            domain: MediaPersistenceDomain::Unknown,
+            proof_kind: LocalPersistenceProofKind::Missing,
+            write_cache_safe: false,
+            persistence_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+impl LocalPersistenceSnapshot {
+    #[must_use]
+    pub const fn label_only(persistence_ref: StorageIntentEvidenceRef) -> Self {
+        Self {
+            domain: MediaPersistenceDomain::Unknown,
+            proof_kind: LocalPersistenceProofKind::DeviceClassLabelOnly,
+            write_cache_safe: false,
+            persistence_ref,
+        }
+    }
+
+    #[must_use]
+    pub const fn explicit(
+        domain: MediaPersistenceDomain,
+        write_cache_safe: bool,
+        persistence_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        Self {
+            domain,
+            proof_kind: LocalPersistenceProofKind::ExplicitProbe,
+            write_cache_safe,
+            persistence_ref,
+        }
+    }
+
+    #[must_use]
+    pub const fn facts(self) -> LocalPersistenceFacts {
+        if !matches!(self.proof_kind, LocalPersistenceProofKind::ExplicitProbe) {
+            return LocalPersistenceFacts {
+                domain: MediaPersistenceDomain::Unknown,
+                write_cache_safe: false,
+                persistence_ref: self.persistence_ref,
+            };
+        }
+        LocalPersistenceFacts {
+            domain: self.domain,
+            write_cache_safe: self.write_cache_safe,
+            persistence_ref: self.persistence_ref,
+        }
+    }
+}
+
+/// ublk queue and request-shape sample, not lower-media durability proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalUblkRequestShapeSnapshot {
+    pub params: UblkParams,
+    pub features: UblkFeatureFlags,
+    pub queue_depth: u16,
+    pub observed_flush_request: bool,
+    pub observed_fua_write: bool,
+    pub flush_passthrough_proven: bool,
+    pub fua_passthrough_proven: bool,
+    pub ordering_limitations_absent: bool,
+}
+
+impl Default for LocalUblkRequestShapeSnapshot {
+    fn default() -> Self {
+        Self {
+            params: UblkParams::default(),
+            features: UblkFeatureFlags(0),
+            queue_depth: 0,
+            observed_flush_request: false,
+            observed_fua_write: false,
+            flush_passthrough_proven: false,
+            fua_passthrough_proven: false,
+            ordering_limitations_absent: false,
+        }
+    }
+}
+
+impl LocalUblkRequestShapeSnapshot {
+    #[must_use]
+    pub const fn new(params: UblkParams, features: UblkFeatureFlags, queue_depth: u16) -> Self {
+        Self {
+            params,
+            features,
+            queue_depth,
+            observed_flush_request: false,
+            observed_fua_write: false,
+            flush_passthrough_proven: false,
+            fua_passthrough_proven: false,
+            ordering_limitations_absent: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_observed_flush_request(mut self) -> Self {
+        self.observed_flush_request = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_observed_fua_write(mut self) -> Self {
+        self.observed_fua_write = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_ordering_passthrough_proof(mut self) -> Self {
+        self.flush_passthrough_proven = true;
+        self.fua_passthrough_proven = true;
+        self.ordering_limitations_absent = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn block_io_facts(self, flush_ref: StorageIntentEvidenceRef) -> LocalBlockIoFacts {
+        let logical_block_bytes = if ublk_param_type_present(self.params, UBLK_PARAM_TYPE_BASIC) {
+            block_bytes_from_shift(self.params.basic.logical_bs_shift)
+        } else {
+            0
+        };
+        let capabilities = KernelStorageIoCapabilities {
+            read: logical_block_bytes != 0 && self.params.basic.dev_sectors != 0,
+            write: logical_block_bytes != 0 && self.params.basic.dev_sectors != 0,
+            flush: self.observed_flush_request || self.flush_passthrough_proven,
+            discard: ublk_param_type_present(self.params, UBLK_PARAM_TYPE_DISCARD)
+                && self.params.discard.max_discard_sectors != 0,
+            write_zeroes: ublk_param_type_present(self.params, UBLK_PARAM_TYPE_DISCARD)
+                && self.params.discard.max_write_zeroes_sectors != 0,
+            zero_range: false,
+            teardown: false,
+            sector_size: logical_block_bytes,
+            capacity_sectors: self.params.basic.dev_sectors,
+        };
+        let flush_ordering = if self.flush_passthrough_proven
+            && self.fua_passthrough_proven
+            && self.ordering_limitations_absent
+            && (self.params.basic.attrs & UBLK_ATTR_FUA) == UBLK_ATTR_FUA
+        {
+            MediaFlushOrderingClass::FlushAndFua
+        } else if self.observed_flush_request || self.observed_fua_write {
+            MediaFlushOrderingClass::FlushOnly
+        } else {
+            MediaFlushOrderingClass::Unknown
+        };
+
+        LocalBlockIoFacts {
+            capabilities,
+            flush_ordering,
+            discard_zeroes_shape_proven: capabilities.discard || capabilities.write_zeroes,
+            max_queue_depth: self.queue_depth as u32,
+            flush_ref,
+        }
+    }
+
+    #[must_use]
+    pub const fn atomicity_facts(
+        self,
+        atomic_write_unit_bytes: u32,
+        logical_block_atomic_proven: bool,
+        atomicity_ref: StorageIntentEvidenceRef,
+    ) -> LocalAtomicityFacts {
+        let physical_block_bytes = if ublk_param_type_present(self.params, UBLK_PARAM_TYPE_BASIC) {
+            block_bytes_from_shift(self.params.basic.physical_bs_shift)
+        } else {
+            0
+        };
+        let atomicity = if atomic_write_unit_bytes != 0 {
+            MediaAtomicityClass::AtomicWriteUnit
+        } else if logical_block_atomic_proven {
+            MediaAtomicityClass::LogicalBlockAtomic
+        } else {
+            MediaAtomicityClass::Unknown
+        };
+        LocalAtomicityFacts::block_atomic(
+            atomicity,
+            physical_block_bytes,
+            atomic_write_unit_bytes,
+            atomicity_ref,
+        )
+    }
+
+    #[must_use]
+    pub const fn geometry_facts(
+        self,
+        geometry_ref: StorageIntentEvidenceRef,
+    ) -> LocalGeometryFacts {
+        let optimal_io_bytes = if ublk_param_type_present(self.params, UBLK_PARAM_TYPE_BASIC) {
+            block_bytes_from_shift(self.params.basic.io_opt_shift)
+        } else {
+            0
+        };
+        let geometry = if self.features.contains(UblkFeatureFlags::ZONED)
+            || ublk_param_type_present(self.params, UBLK_PARAM_TYPE_ZONED)
+        {
+            if self.params.zoned.max_zone_append_sectors != 0 {
+                MediaProtocolGeometryClass::ZonedAppend
+            } else {
+                MediaProtocolGeometryClass::ZonedSequential
+            }
+        } else if (self.params.basic.attrs & UBLK_ATTR_ROTATIONAL) == UBLK_ATTR_ROTATIONAL {
+            MediaProtocolGeometryClass::RotationalSeek
+        } else if ublk_param_type_present(self.params, UBLK_PARAM_TYPE_BASIC) {
+            MediaProtocolGeometryClass::RandomBlock
+        } else {
+            MediaProtocolGeometryClass::Unknown
+        };
+
+        LocalGeometryFacts::new(geometry, optimal_io_bytes, geometry_ref)
+    }
+
+    #[must_use]
+    pub const fn volatile_write_cache_visible(self) -> bool {
+        (self.params.basic.attrs & UBLK_ATTR_VOLATILE_CACHE) == UBLK_ATTR_VOLATILE_CACHE
+    }
+}
 
 /// Stable identity and generation facts for a local target.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -595,6 +1049,33 @@ mod tests {
         )
     }
 
+    fn pool_label() -> PoolLabelV1 {
+        let mut label = PoolLabelV1::new([0xAA; 16], [0xBB; 16], "pool");
+        label.label_commit_group = 42;
+        label.topology_generation = 7;
+        label.device_count = 2;
+        label.device_index = 1;
+        label.device_class = LabelDeviceClass::Nvme;
+        label.device_capacity_bytes = 4 * 1024 * 1024;
+        label.device_health = 0;
+        label
+    }
+
+    fn ublk_params() -> UblkParams {
+        let mut params = UblkParams {
+            types: UBLK_PARAM_TYPE_BASIC | UBLK_PARAM_TYPE_DISCARD,
+            ..UblkParams::default()
+        };
+        params.basic.attrs = UBLK_ATTR_FUA;
+        params.basic.logical_bs_shift = 12;
+        params.basic.physical_bs_shift = 12;
+        params.basic.io_opt_shift = 17;
+        params.basic.dev_sectors = 2048;
+        params.discard.max_discard_sectors = 128;
+        params.discard.max_write_zeroes_sectors = 64;
+        params
+    }
+
     #[test]
     fn strong_local_block_facts_satisfy_sync_intent_role() {
         let record = produce_local_media_capability(strong_nvme_facts());
@@ -651,6 +1132,193 @@ mod tests {
             result.refusal,
             StorageIntentRefusalReason::MissingMediaCapabilityEvidence
         );
+    }
+
+    #[test]
+    fn pool_label_identity_without_firmware_generation_refuses_authority() {
+        let identity = LocalPoolMemberIdentitySnapshot::from_pool_label(
+            &pool_label(),
+            true,
+            true,
+            LocalPathIdentityClass::StableMultipath,
+            3,
+        );
+        let facts = strong_nvme_facts()
+            .with_identity(identity.identity_facts(
+                LocalFirmwareSettingsSnapshot::default(),
+                evidence(2),
+                evidence(3),
+            ))
+            .with_health(identity.health_facts(evidence(8)))
+            .with_freshness(identity.freshness_facts(evidence(9)));
+        let record = produce_local_media_capability(facts);
+        let result = durable_sync_result(record);
+
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::FIRMWARE_CAPABILITY_GENERATION));
+        assert_eq!(record.identity_generation, 42);
+        assert_eq!(record.namespace_generation, 7);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnstableNamespaceIdentity
+        );
+    }
+
+    #[test]
+    fn stale_reattach_turns_pool_identity_into_stale_evidence() {
+        let identity = LocalPoolMemberIdentitySnapshot::from_pool_label(
+            &pool_label(),
+            true,
+            true,
+            LocalPathIdentityClass::StableSinglePath,
+            0,
+        )
+        .with_stale_reattach();
+        let facts = strong_nvme_facts()
+            .with_identity(identity.identity_facts(
+                LocalFirmwareSettingsSnapshot::proven(8, 9),
+                evidence(2),
+                evidence(3),
+            ))
+            .with_freshness(identity.freshness_facts(evidence(9)));
+        let record = produce_local_media_capability(facts);
+        let result = durable_sync_result(record);
+
+        assert_eq!(record.freshness, MediaCapabilityFreshnessState::Stale);
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::STABLE_NAMESPACE_IDENTITY));
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::StaleMediaCapabilityEvidence
+        );
+    }
+
+    #[test]
+    fn path_only_pool_label_identity_refuses_authority() {
+        let identity = LocalPoolMemberIdentitySnapshot::from_pool_label(
+            &pool_label(),
+            true,
+            true,
+            LocalPathIdentityClass::PathOnly,
+            0,
+        );
+        let facts = strong_nvme_facts().with_identity(identity.identity_facts(
+            LocalFirmwareSettingsSnapshot::proven(8, 9),
+            evidence(2),
+            evidence(3),
+        ));
+        let record = produce_local_media_capability(facts);
+        let result = durable_sync_result(record);
+
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::STABLE_DEVICE_IDENTITY));
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnstableNamespaceIdentity
+        );
+    }
+
+    #[test]
+    fn label_only_persistence_does_not_prove_persistent_domain() {
+        let record = produce_local_media_capability(
+            strong_nvme_facts()
+                .with_persistence(LocalPersistenceSnapshot::label_only(evidence(4)).facts()),
+        );
+        let result = durable_sync_result(record);
+
+        assert_eq!(record.persistence, MediaPersistenceDomain::Unknown);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnknownPersistenceDomain
+        );
+    }
+
+    #[test]
+    fn pool_label_degraded_health_refuses_durable_role() {
+        let mut label = pool_label();
+        label.device_health = 1;
+        let identity = LocalPoolMemberIdentitySnapshot::from_pool_label(
+            &label,
+            true,
+            true,
+            LocalPathIdentityClass::StableMultipath,
+            0,
+        );
+        let facts = strong_nvme_facts().with_health(identity.health_facts(evidence(8)));
+        let record = produce_local_media_capability(facts);
+        let result = durable_sync_result(record);
+
+        assert_eq!(record.health, MediaHealthState::Degraded);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::DegradedMediaHealth
+        );
+    }
+
+    #[test]
+    fn ublk_fua_request_shape_without_passthrough_proof_is_flush_only() {
+        let ublk = LocalUblkRequestShapeSnapshot::new(ublk_params(), UblkFeatureFlags(0), 32)
+            .with_observed_flush_request()
+            .with_observed_fua_write();
+        let facts = strong_nvme_facts().with_block_io(ublk.block_io_facts(evidence(5)));
+        let record = produce_local_media_capability(facts);
+        let result = durable_sync_result(record);
+
+        assert_eq!(record.logical_block_bytes, 4096);
+        assert_eq!(record.max_queue_depth, 32);
+        assert_eq!(record.flush_ordering, MediaFlushOrderingClass::FlushOnly);
+        assert!(record
+            .flags
+            .contains_all(MediaCapabilityFlags::DISCARD_ZEROES_SHAPE));
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnsupportedFlushFuaSemantics
+        );
+    }
+
+    #[test]
+    fn ublk_and_pool_snapshots_can_produce_durable_local_capability() {
+        let identity = LocalPoolMemberIdentitySnapshot::from_pool_label(
+            &pool_label(),
+            true,
+            true,
+            LocalPathIdentityClass::StableMultipath,
+            5,
+        );
+        let ublk = LocalUblkRequestShapeSnapshot::new(ublk_params(), UblkFeatureFlags(0), 64)
+            .with_observed_flush_request()
+            .with_observed_fua_write()
+            .with_ordering_passthrough_proof();
+        let facts = LocalMediaCapabilityFacts::new(identity.media_class(), evidence(1))
+            .with_identity(identity.identity_facts(
+                LocalFirmwareSettingsSnapshot::proven(99, 100),
+                evidence(2),
+                evidence(3),
+            ))
+            .with_persistence(
+                LocalPersistenceSnapshot::explicit(
+                    MediaPersistenceDomain::OrdinaryPersistent,
+                    false,
+                    evidence(4),
+                )
+                .facts(),
+            )
+            .with_block_io(ublk.block_io_facts(evidence(5)))
+            .with_atomicity(ublk.atomicity_facts(0, true, evidence(6)))
+            .with_geometry(ublk.geometry_facts(evidence(7)))
+            .with_health(identity.health_facts(evidence(8)))
+            .with_freshness(identity.freshness_facts(evidence(9)));
+        let record = produce_local_media_capability(facts);
+        let result = durable_sync_result(record);
+
+        assert!(result.satisfied);
+        assert_eq!(record.media_class, StorageMediaClass::NvmeFlash);
+        assert_eq!(record.flush_ordering, MediaFlushOrderingClass::FlushAndFua);
+        assert_eq!(record.physical_block_bytes, 4096);
+        assert_eq!(record.optimal_io_bytes, 131_072);
     }
 
     #[test]
