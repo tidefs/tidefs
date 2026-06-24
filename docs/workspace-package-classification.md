@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 158 |
+| Workspace packages | 162 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 163 |
-| Classified package roots | 163 |
+| Discovered package manifests | 167 |
+| Classified package roots | 167 |
 
 ## TFR-002 Category Mapping
 
@@ -25,7 +25,7 @@ root.
 
 | TFR-002 category | Current roles | Count | Boundary |
 | --- | --- | ---: | --- |
-| `product` | `product-code`, `adapter-operator` | 137 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
+| `product` | `product-code`, `adapter-operator` | 141 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
 | `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 25 | Repo policy tooling, CI/developer support, demos, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
 | `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
 | `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
@@ -52,7 +52,7 @@ holding area.
 
 | Role | Count |
 | --- | ---: |
-| `product-code` | 123 |
+| `product-code` | 127 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
 | `proof-harness` | 12 |
@@ -176,6 +176,7 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-reclaim` | `tidefs-reclaim` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-reclaim-queue-core` | `tidefs-reclaim-queue-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-recovery-loop` | `tidefs-recovery-loop` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
+| `crates/tidefs-relocation-governor` | `tidefs-relocation-governor` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-relocation-planner` | `tidefs-relocation-planner` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-replica-health` | `tidefs-replica-health` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-replicated-object-store` | `tidefs-replicated-object-store` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -193,11 +194,13 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-space-accounting` | `tidefs-space-accounting` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-spacemap-allocator` | `tidefs-spacemap-allocator` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-storage-intent-core` | `tidefs-storage-intent-core` | `workspace-member` | `product-code` | planned authority surface for #841 storage-intent records and predicates; downstream wiring required before release claims. |
+| `crates/tidefs-storage-intent-cost` | `tidefs-storage-intent-cost` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-storage-intent-local-media-capability` | `tidefs-storage-intent-local-media-capability` | `workspace-member` | `product-code` | planned authority surface for #960 local media-capability producer records; model/fixture slice only and downstream freshness/runtime wiring required before release claims. |
 | `crates/tidefs-storage-intent-media-capability-refresh` | `tidefs-storage-intent-media-capability-refresh` | `workspace-member` | `product-code` | planned authority surface for #962 media-capability freshness and invalidation records; model/fixture slice only and downstream #913 consumer wiring required before release claims. |
 | `crates/tidefs-storage-intent-policy` | `tidefs-storage-intent-policy` | `workspace-member` | `product-code` | planned authority surface for #855 dataset-scoped storage-intent policy source compilation; downstream persistence, UAPI, runtime execution, and claim evidence required before release claims. |
-| `crates/tidefs-storage-intent-read-serving` | `tidefs-storage-intent-read-serving` | `workspace-member` | `product-code` | planned authority surface for #877 receipt-aware read-serving decisions; model/predicate slice only and runtime read-path, transport, repair, and operator wiring remain separately gated. |
 | `crates/tidefs-storage-intent-remote-media-capability` | `tidefs-storage-intent-remote-media-capability` | `workspace-member` | `product-code` | planned authority surface for #961 remote/object/archive media-capability producer records; model/fixture slice only, RDMA is not a correctness dependency, and downstream freshness/runtime wiring is required before release claims. |
+| `crates/tidefs-storage-intent-satisfaction` | `tidefs-storage-intent-satisfaction` | `workspace-member` | `product-code` | planned authority surface for #874 storage-intent satisfaction reconciliation; model-only slice with read-only satisfaction records, no placement/movement/retirement execution; downstream runtime and consumer wiring required before release claims. |
+| `crates/tidefs-storage-intent-workload-signals` | `tidefs-storage-intent-workload-signals` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-tdma-scheduler` | `tidefs-tdma-scheduler` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-trace-oracle` | `tidefs-trace-oracle` | `workspace-member` | `proof-harness` | current proof harness; test signal only and not a product capability claim. |
 | `crates/tidefs-transport` | `tidefs-transport` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
@@ -266,10 +269,12 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `crates/tidefs-secret-key-policy-runtime` | `tidefs-secret-key-policy-runtime` | `policy-tooling` | current policy-tooling authority for secret-key-policy runtime; 65 unit tests validate all 10 P9-04 algorithms (classify, seal-mint, lease, manifest-assemble, publish, activate, rotate, rewrap, revoke, recover) plus transport-TLS, node-join-bootstrap, envelope-wrapping, and disclosure gating surfaces; runtime is abstracted behind SealProvider/LeaseClock traits with mock providers for deterministic testing; forbid(unsafe_code); zero reverse dependencies reflect policy gate/tooling status; live KMS/HSM binding and runtime integration claims remain separately gated. |
 | `crates/tidefs-snapshot-pruner` | `tidefs-snapshot-pruner` | `product-code` | current product-code authority for snapshot retention, integrity-gated prune, clone/origin dependency protection, and deadlist-extent evidence management; 71 unit tests and 9 integration tests validate the full retention-policy engine (count, time-bucketed, age-based, and cap constraints), BLAKE3 integrity gating with domain-separated checksums, fail-closed pin-evidence planning with clone-index and origin-index lookup, explicit snapshot destroy with permission validation, deadlist drain consistency, and capacity-accounted extent release; zero reverse dependencies reflect service-boundary wiring, not placeholder status; follow-up issue required for live daemon integration and dataset-level automated prune scheduling. |
 | `crates/tidefs-storage-intent-core` | `tidefs-storage-intent-core` | `product-code` | planned authority surface for #841 storage-intent records and predicates; downstream wiring required before release claims. |
+| `crates/tidefs-storage-intent-cost` | `tidefs-storage-intent-cost` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-storage-intent-media-capability-refresh` | `tidefs-storage-intent-media-capability-refresh` | `product-code` | planned authority surface for #962 media-capability freshness and invalidation records; concrete #913 evidence-cut consumers and runtime wiring required before release claims. |
 | `crates/tidefs-storage-intent-policy` | `tidefs-storage-intent-policy` | `product-code` | planned authority surface for #855 dataset-scoped storage-intent policy source compilation; downstream persistence, UAPI, runtime execution, and claim evidence required before release claims. |
-| `crates/tidefs-storage-intent-read-serving` | `tidefs-storage-intent-read-serving` | `product-code` | planned authority surface for #877 receipt-aware read-serving decisions; model/predicate slice only and runtime read-path, transport, repair, and operator wiring remain separately gated. |
 | `crates/tidefs-storage-intent-remote-media-capability` | `tidefs-storage-intent-remote-media-capability` | `product-code` | planned authority surface for #961 remote/object/archive media-capability producer records; concrete adapters and #913 evidence-cut wiring required before release claims. |
+| `crates/tidefs-storage-intent-satisfaction` | `tidefs-storage-intent-satisfaction` | `product-code` | planned authority surface for #874 storage-intent satisfaction reconciliation; model-only slice with read-only satisfaction records, no placement/movement/retirement execution; downstream runtime and consumer wiring required before release claims. |
+| `crates/tidefs-storage-intent-workload-signals` | `tidefs-storage-intent-workload-signals` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-two-node-harness` | `tidefs-two-node-harness` | `proof-harness` | Authority established for deterministic two-node transport harness: 156 tests cover BLAKE3-authenticated session establishment, chunk-level digest verification, VFSSEND2 send-stream state transfer, placement-routed transfers, peer-join handshake, rebuild admission/completion recovery, receive-stream chunk decode/verify/reassemble, membership lease lifecycle, partition injection/healing/convergence, receipt-addressed degraded reads, and single-writer fencing; follow-up issue required for QEMU carrier validation (#1220). |
 | `crates/tidefs-vfs-rpc` | `tidefs-vfs-rpc` | `product-code` | Authority established for VFS_RPC wire protocol: 14 unit tests validate all 36 method definitions, request/response encoding/decoding roundtrips for all payload variants, per-peer dedup window replay/mutation/eviction, flagged bypass paths (NO_DEDUP, BULK_PENDING, UPTODATE_OK), transferable handle encoding, client-side operation multiplexing with in-flight bounds, and error mapping; forbid(unsafe_code); zero reverse dependencies reflect service-surface boundaries, not placeholder; follow-up issue required for live transport/RDMA/cluster integration with VFS Engine forwarding. |
 | `xtask/tidefs-xtask` | `tidefs-xtask` | `policy-tooling` | policy gate and developer tooling entrypoint; validates this classification authority. |
