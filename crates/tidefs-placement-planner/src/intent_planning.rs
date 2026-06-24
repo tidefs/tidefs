@@ -15,10 +15,11 @@ use tidefs_storage_intent_core::{
     media_capability_satisfies_role, prefetch_residency_decision_is_cache_only,
     prefetch_residency_decision_may_request_authority_change, AllocationClass, CostWearRecord,
     DataShapeRecord, EvidenceFamilyFreshnessState, LayoutAllocatorRecord, MediaRoleMask,
-    MediaRoleRequirement, PredictionConfidence, PrefetchResidencyDecisionRecord,
-    ReceiptPredicateResult, SkippedMoveReason, StorageIntentEvidenceKind,
-    StorageIntentEvidenceQuerySnapshot, StorageIntentGuaranteeClass, StorageIntentPolicy,
-    StorageIntentReceipt, StorageIntentRefusalReason, StorageMediaRole, TransformRefusalClass,
+    MediaRoleRequirement, PredictionConfidence, PrefetchResidencyDecisionOutcome,
+    PrefetchResidencyDecisionRecord, ReceiptPredicateResult, SkippedMoveReason,
+    StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot, StorageIntentGuaranteeClass,
+    StorageIntentPolicy, StorageIntentReceipt, StorageIntentRefusalReason, StorageMediaRole,
+    TransformRefusalClass,
 };
 
 use crate::TierGoal;
@@ -474,12 +475,217 @@ impl StorageIntentPlacementEvaluation {
     }
 }
 
+/// Per-candidate scoring or rejection detail preserved for explanation rows.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum StorageIntentPlacementCandidateReason {
+    /// Candidate failed one of the hard gates.
+    HardGate(StorageIntentPlacementReason),
+    /// Predictor confidence is not enough to treat a candidate as ordinary.
+    LowPredictionConfidence { confidence: PredictionConfidence },
+    /// A one-pass scan signal must not train placement upward.
+    OnePassScan,
+    /// Workload evidence contradicts the requested placement phase.
+    PhaseChangeContradiction {
+        contradiction: tidefs_storage_intent_core::ContradictionState,
+    },
+    /// Movement debt remains visible to scoring/explanation consumers.
+    MovementDebt { bytes: u64 },
+    /// Failed payback or anti-thrash cooldown remains visible.
+    FailedPaybackCooldown { cooldown_until_ms: u64 },
+    /// Cost evidence was absent or unpriced, so it cannot be scored as free.
+    UnknownCost,
+    /// Critical reserve or wear protection blocked or penalized the target.
+    CriticalReserveProtection { skipped_reason: SkippedMoveReason },
+}
+
+impl StorageIntentPlacementCandidateReason {
+    /// Return the storage-intent refusal carried by this reason, if any.
+    #[must_use]
+    pub fn refusal_reason(&self) -> Option<StorageIntentRefusalReason> {
+        match self {
+            Self::HardGate(reason) => reason.refusal_reason(),
+            Self::LowPredictionConfidence { .. }
+            | Self::OnePassScan
+            | Self::PhaseChangeContradiction { .. }
+            | Self::UnknownCost => Some(StorageIntentRefusalReason::EvidenceNotUsable),
+            Self::MovementDebt { .. } | Self::FailedPaybackCooldown { .. } => {
+                Some(StorageIntentRefusalReason::MovementDebtNotPaidBack)
+            }
+            Self::CriticalReserveProtection { skipped_reason } => {
+                Some(skipped_move_refusal(*skipped_reason))
+            }
+        }
+    }
+}
+
+/// Planner decision row for one candidate.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StorageIntentPlacementCandidateReport {
+    /// Candidate target id.
+    pub target_id: u64,
+    /// Failure-domain key at the request's selected level.
+    pub failure_domain_key: u64,
+    /// Whether candidate-level hard gates passed.
+    pub legal: bool,
+    /// Whether this candidate was selected into the returned plan.
+    pub selected: bool,
+    /// Conservative score used only after hard gates pass.
+    pub score: i64,
+    /// Hard-gate and scoring reasons for #849/#850 consumers.
+    pub reasons: Vec<StorageIntentPlacementCandidateReason>,
+}
+
+impl StorageIntentPlacementCandidateReport {
+    /// First storage-intent refusal reason, if any.
+    #[must_use]
+    pub fn first_refusal(&self) -> Option<StorageIntentRefusalReason> {
+        self.reasons
+            .iter()
+            .find_map(StorageIntentPlacementCandidateReason::refusal_reason)
+    }
+
+    /// Returns true when any report reason carries `refusal`.
+    #[must_use]
+    pub fn has_refusal(&self, refusal: StorageIntentRefusalReason) -> bool {
+        self.reasons
+            .iter()
+            .any(|reason| reason.refusal_reason() == Some(refusal))
+    }
+}
+
+/// Storage-intent-aware placement plan with preserved candidate reports.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StorageIntentPlacementPlan {
+    /// Whether request-level gates passed and enough legal targets were selected.
+    pub admitted: bool,
+    /// Deterministically selected target ids.
+    pub selected_targets: Vec<u64>,
+    /// Request-level reasons such as missing evidence families or short width.
+    pub reasons: Vec<StorageIntentPlacementReason>,
+    /// Candidate-level hard-gate and scoring rows.
+    pub candidate_reports: Vec<StorageIntentPlacementCandidateReport>,
+}
+
+impl StorageIntentPlacementPlan {
+    /// Target ids that survived all candidate-level hard gates.
+    #[must_use]
+    pub fn legal_targets(&self) -> Vec<u64> {
+        self.candidate_reports
+            .iter()
+            .filter(|report| report.legal)
+            .map(|report| report.target_id)
+            .collect()
+    }
+
+    /// First storage-intent refusal reason, if any.
+    #[must_use]
+    pub fn first_refusal(&self) -> Option<StorageIntentRefusalReason> {
+        self.reasons
+            .iter()
+            .find_map(StorageIntentPlacementReason::refusal_reason)
+            .or_else(|| {
+                self.candidate_reports
+                    .iter()
+                    .find_map(StorageIntentPlacementCandidateReport::first_refusal)
+            })
+    }
+}
+
 /// Evaluate hard constraints for one storage-intent placement request.
 #[must_use]
 pub fn evaluate_storage_intent_placement(
     request: &StorageIntentPlacementRequest,
     candidates: &[StorageIntentPlacementCandidate],
 ) -> StorageIntentPlacementEvaluation {
+    let plan = plan_storage_intent_placement(request, candidates);
+    let mut reasons = plan.reasons.clone();
+    for report in &plan.candidate_reports {
+        reasons.extend(report.reasons.iter().filter_map(|reason| match reason {
+            StorageIntentPlacementCandidateReason::HardGate(reason) => Some(reason.clone()),
+            _ => None,
+        }));
+    }
+
+    StorageIntentPlacementEvaluation {
+        admitted: plan.admitted,
+        legal_targets: plan.legal_targets(),
+        reasons,
+    }
+}
+
+/// Build a deterministic storage-intent placement plan after hard gates.
+#[must_use]
+pub fn plan_storage_intent_placement(
+    request: &StorageIntentPlacementRequest,
+    candidates: &[StorageIntentPlacementCandidate],
+) -> StorageIntentPlacementPlan {
+    let mut reasons = request_level_reasons(request);
+    if has_blocking_request_reason(&reasons) {
+        return StorageIntentPlacementPlan {
+            admitted: false,
+            selected_targets: Vec::new(),
+            reasons,
+            candidate_reports: Vec::new(),
+        };
+    }
+
+    let mut candidate_reports: Vec<StorageIntentPlacementCandidateReport> = candidates
+        .iter()
+        .map(|candidate| candidate_report(request, candidate))
+        .collect();
+
+    let legal_targets = candidate_reports
+        .iter()
+        .filter(|report| report.legal)
+        .count();
+    if legal_targets < request.required_target_count {
+        reasons.push(StorageIntentPlacementReason::NotEnoughLegalCandidates {
+            required: request.required_target_count,
+            available: legal_targets,
+        });
+    }
+
+    let legal_domains: BTreeSet<u64> = candidate_reports
+        .iter()
+        .filter(|report| report.legal)
+        .map(|report| report.failure_domain_key)
+        .collect();
+    if legal_domains.len() < request.min_distinct_failure_domains {
+        reasons.push(StorageIntentPlacementReason::NotEnoughFailureDomains {
+            required: request.min_distinct_failure_domains,
+            available: legal_domains.len(),
+        });
+    }
+
+    let selected_indices = select_candidate_reports(
+        &candidate_reports,
+        request.required_target_count,
+        request.min_distinct_failure_domains,
+    );
+    let selected_index_set: BTreeSet<usize> = selected_indices.iter().copied().collect();
+    for (index, report) in candidate_reports.iter_mut().enumerate() {
+        report.selected = selected_index_set.contains(&index);
+    }
+
+    let selected_targets = selected_indices
+        .iter()
+        .map(|index| candidate_reports[*index].target_id)
+        .collect::<Vec<_>>();
+
+    let admitted = selected_targets.len() == request.required_target_count
+        && !has_blocking_request_reason(&reasons);
+
+    StorageIntentPlacementPlan {
+        admitted,
+        selected_targets,
+        reasons,
+        candidate_reports,
+    }
+}
+
+fn request_level_reasons(
+    request: &StorageIntentPlacementRequest,
+) -> Vec<StorageIntentPlacementReason> {
     let mut reasons = Vec::new();
 
     if let Some(tier_goal) = request.tier_goal {
@@ -493,21 +699,13 @@ pub fn evaluate_storage_intent_placement(
         }
         state => {
             reasons.push(StorageIntentPlacementReason::CompiledPolicyEvidence { state });
-            return StorageIntentPlacementEvaluation {
-                admitted: false,
-                legal_targets: Vec::new(),
-                reasons,
-            };
+            return reasons;
         }
     }
 
     if let Some(refusal) = evidence_cut_refusal(request) {
         reasons.push(StorageIntentPlacementReason::EvidenceCutRefused { refusal });
-        return StorageIntentPlacementEvaluation {
-            admitted: false,
-            legal_targets: Vec::new(),
-            reasons,
-        };
+        return reasons;
     }
 
     for kind in request.role.hard_gate_evidence() {
@@ -524,52 +722,261 @@ pub fn evaluate_storage_intent_placement(
             StorageIntentPlacementReason::EvidenceFamilyNotFresh { .. }
         )
     }) {
-        return StorageIntentPlacementEvaluation {
-            admitted: false,
-            legal_targets: Vec::new(),
-            reasons,
-        };
+        return reasons;
     }
 
-    let mut legal_targets = Vec::new();
-    let mut legal_domains = BTreeSet::new();
+    reasons
+}
 
-    for candidate in candidates {
-        let before = reasons.len();
-        evaluate_candidate(request, candidate, &mut reasons);
-        if reasons.len() == before {
-            legal_targets.push(candidate.target_id);
-            legal_domains.insert(candidate.failure_domain_key);
+fn request_reason_is_non_blocking(reason: &StorageIntentPlacementReason) -> bool {
+    matches!(
+        reason,
+        StorageIntentPlacementReason::TierGoalIsNotStorageIntentModel(_)
+            | StorageIntentPlacementReason::CompiledPolicyConservativeDefault
+    )
+}
+
+fn has_blocking_request_reason(reasons: &[StorageIntentPlacementReason]) -> bool {
+    reasons
+        .iter()
+        .any(|reason| !request_reason_is_non_blocking(reason))
+}
+
+fn candidate_report(
+    request: &StorageIntentPlacementRequest,
+    candidate: &StorageIntentPlacementCandidate,
+) -> StorageIntentPlacementCandidateReport {
+    let mut hard_reasons = Vec::new();
+    evaluate_candidate(request, candidate, &mut hard_reasons);
+
+    let legal = hard_reasons.is_empty();
+    let mut reasons = hard_reasons
+        .into_iter()
+        .map(StorageIntentPlacementCandidateReason::HardGate)
+        .collect::<Vec<_>>();
+    let score = score_candidate(request, candidate, &mut reasons);
+
+    StorageIntentPlacementCandidateReport {
+        target_id: candidate.target_id,
+        failure_domain_key: candidate.failure_domain_key,
+        legal,
+        selected: false,
+        score: if legal { score } else { 0 },
+        reasons,
+    }
+}
+
+fn select_candidate_reports(
+    reports: &[StorageIntentPlacementCandidateReport],
+    required: usize,
+    min_distinct_domains: usize,
+) -> Vec<usize> {
+    let mut sorted = reports
+        .iter()
+        .enumerate()
+        .filter_map(|(index, report)| report.legal.then_some(index))
+        .collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        reports[*right]
+            .score
+            .cmp(&reports[*left].score)
+            .then_with(|| reports[*left].target_id.cmp(&reports[*right].target_id))
+    });
+
+    let mut selected = Vec::with_capacity(required);
+    let mut selected_set = BTreeSet::new();
+    let mut selected_domains = BTreeSet::new();
+
+    for index in sorted.iter().copied() {
+        if selected.len() >= required || selected_domains.len() >= min_distinct_domains {
+            break;
+        }
+        if selected_domains.insert(reports[index].failure_domain_key) {
+            selected.push(index);
+            selected_set.insert(index);
         }
     }
 
-    if legal_targets.len() < request.required_target_count {
-        reasons.push(StorageIntentPlacementReason::NotEnoughLegalCandidates {
-            required: request.required_target_count,
-            available: legal_targets.len(),
+    for index in sorted {
+        if selected.len() >= required {
+            break;
+        }
+        if selected_set.insert(index) {
+            selected.push(index);
+        }
+    }
+
+    selected
+}
+
+fn score_candidate(
+    request: &StorageIntentPlacementRequest,
+    candidate: &StorageIntentPlacementCandidate,
+    reasons: &mut Vec<StorageIntentPlacementCandidateReason>,
+) -> i64 {
+    let mut score = confidence_score(candidate.prediction_confidence, reasons);
+
+    if request.policy.workload.shape
+        == tidefs_storage_intent_core::WorkloadShape::SequentialReadScan
+        || candidate.prefetch_residency.is_some_and(|decision| {
+            decision.access_pattern == tidefs_storage_intent_core::AccessPatternClass::OnePassScan
+        })
+    {
+        reasons.push(StorageIntentPlacementCandidateReason::OnePassScan);
+        score -= 1_000;
+    }
+
+    if request.policy.workload.contradiction != tidefs_storage_intent_core::ContradictionState::None
+    {
+        reasons.push(
+            StorageIntentPlacementCandidateReason::PhaseChangeContradiction {
+                contradiction: request.policy.workload.contradiction,
+            },
+        );
+        score -= 1_000;
+    }
+
+    if let Some(layout) = candidate.layout_allocator {
+        score += i64::from(layout.locality_score_ppm.min(1_000_000) / 10_000);
+        score -= i64::from(layout.free_run_pressure_ppm.min(1_000_000) / 10_000);
+        score -= i64::from(layout.fragmentation_ppm.min(1_000_000) / 20_000);
+        if layout.reclaim_debt_bytes > 0 {
+            reasons.push(StorageIntentPlacementCandidateReason::MovementDebt {
+                bytes: layout.reclaim_debt_bytes,
+            });
+            score -= bounded_byte_penalty(layout.reclaim_debt_bytes);
+        }
+    }
+
+    score_cost_wear(candidate.cost_wear, reasons, &mut score);
+
+    if let Some(decision) = candidate.prefetch_residency {
+        score_prefetch_decision(decision, reasons, &mut score);
+    }
+
+    score
+}
+
+fn confidence_score(
+    confidence: PredictionConfidence,
+    reasons: &mut Vec<StorageIntentPlacementCandidateReason>,
+) -> i64 {
+    match confidence {
+        PredictionConfidence::High => 300,
+        PredictionConfidence::Medium => 100,
+        PredictionConfidence::Low | PredictionConfidence::Unknown => {
+            reasons.push(
+                StorageIntentPlacementCandidateReason::LowPredictionConfidence { confidence },
+            );
+            -500
+        }
+    }
+}
+
+fn score_cost_wear(
+    cost_wear: Option<CostWearRecord>,
+    reasons: &mut Vec<StorageIntentPlacementCandidateReason>,
+    score: &mut i64,
+) {
+    let Some(cost_wear) = cost_wear else {
+        reasons.push(StorageIntentPlacementCandidateReason::UnknownCost);
+        *score -= 1_000;
+        return;
+    };
+
+    if !cost_wear.evidence.is_bound()
+        || (cost_wear.expected_write_bytes > 0 && cost_wear.write_amplification_ppm == 0)
+    {
+        reasons.push(StorageIntentPlacementCandidateReason::UnknownCost);
+        *score -= 1_000;
+    } else {
+        *score -= i64::from(cost_wear.write_amplification_ppm / 100_000);
+    }
+
+    if cost_wear.movement_debt_bytes > 0 {
+        reasons.push(StorageIntentPlacementCandidateReason::MovementDebt {
+            bytes: cost_wear.movement_debt_bytes,
         });
+        *score -= bounded_byte_penalty(cost_wear.movement_debt_bytes);
     }
 
-    if legal_domains.len() < request.min_distinct_failure_domains {
-        reasons.push(StorageIntentPlacementReason::NotEnoughFailureDomains {
-            required: request.min_distinct_failure_domains,
-            available: legal_domains.len(),
-        });
+    if cost_wear.cooldown_until_ms > 0 || !cost_wear.payback_evidence.is_bound() {
+        reasons.push(
+            StorageIntentPlacementCandidateReason::FailedPaybackCooldown {
+                cooldown_until_ms: cost_wear.cooldown_until_ms,
+            },
+        );
+        *score -= 1_000;
     }
 
-    let admitted = reasons.iter().all(|reason| {
-        matches!(
-            reason,
-            StorageIntentPlacementReason::TierGoalIsNotStorageIntentModel(_)
-                | StorageIntentPlacementReason::CompiledPolicyConservativeDefault
-        )
-    });
-
-    StorageIntentPlacementEvaluation {
-        admitted,
-        legal_targets,
-        reasons,
+    match cost_wear.skipped_reason {
+        SkippedMoveReason::None => {}
+        SkippedMoveReason::MovementDebtTooHigh | SkippedMoveReason::PaybackWindowTooLong => {
+            reasons.push(StorageIntentPlacementCandidateReason::MovementDebt {
+                bytes: cost_wear.movement_debt_bytes,
+            });
+            *score -= 1_000;
+        }
+        SkippedMoveReason::CooldownActive => {
+            reasons.push(
+                StorageIntentPlacementCandidateReason::FailedPaybackCooldown {
+                    cooldown_until_ms: cost_wear.cooldown_until_ms,
+                },
+            );
+            *score -= 1_000;
+        }
+        SkippedMoveReason::FlashWearBudgetExceeded
+        | SkippedMoveReason::ReclaimReserveUnavailable
+        | SkippedMoveReason::CostBudgetExceeded => {
+            reasons.push(
+                StorageIntentPlacementCandidateReason::CriticalReserveProtection {
+                    skipped_reason: cost_wear.skipped_reason,
+                },
+            );
+            *score -= 10_000;
+        }
+        _ => {
+            reasons.push(StorageIntentPlacementCandidateReason::UnknownCost);
+            *score -= 1_000;
+        }
     }
+}
+
+fn score_prefetch_decision(
+    decision: PrefetchResidencyDecisionRecord,
+    reasons: &mut Vec<StorageIntentPlacementCandidateReason>,
+    score: &mut i64,
+) {
+    if decision.confidence < PredictionConfidence::Medium {
+        reasons.push(
+            StorageIntentPlacementCandidateReason::LowPredictionConfidence {
+                confidence: decision.confidence,
+            },
+        );
+        *score -= 500;
+    }
+
+    if decision.access_pattern == tidefs_storage_intent_core::AccessPatternClass::OnePassScan {
+        reasons.push(StorageIntentPlacementCandidateReason::OnePassScan);
+        *score -= 1_000;
+    }
+
+    if matches!(
+        decision.outcome,
+        PrefetchResidencyDecisionOutcome::Cooldown
+            | PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+    ) {
+        reasons.push(
+            StorageIntentPlacementCandidateReason::FailedPaybackCooldown {
+                cooldown_until_ms: 0,
+            },
+        );
+        *score -= 1_000;
+    }
+}
+
+fn bounded_byte_penalty(bytes: u64) -> i64 {
+    i64::try_from((bytes / 4096).min(10_000)).expect("bounded byte penalty fits i64")
 }
 
 fn evidence_cut_refusal(
@@ -1471,5 +1878,217 @@ mod tests {
             StorageIntentPlacementReason::CandidateLowPredictionConfidence { .. }
         )));
         assert!(result.has_refusal(StorageIntentRefusalReason::MovementDebtNotPaidBack));
+    }
+
+    #[test]
+    fn plan_admits_enough_legal_targets_while_reporting_rejected_candidates() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let legal = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        let mut rejected = candidate(
+            2,
+            20,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::SystemRam,
+        );
+        rejected.media_capability = volatile_media();
+
+        let request = request(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+        );
+        let plan = plan_storage_intent_placement(&request, &[legal, rejected]);
+
+        assert!(plan.admitted);
+        assert_eq!(plan.selected_targets, vec![1]);
+        assert_eq!(plan.legal_targets(), vec![1]);
+        let rejected_report = plan
+            .candidate_reports
+            .iter()
+            .find(|report| report.target_id == 2)
+            .expect("rejected candidate report exists");
+        assert!(!rejected_report.legal);
+        assert!(rejected_report.has_refusal(StorageIntentRefusalReason::PersistentMediaRequired));
+
+        let legacy = evaluate_storage_intent_placement(
+            &request,
+            &[
+                candidate(
+                    1,
+                    10,
+                    StorageMediaRole::PlacementAuthority,
+                    StorageIntentGuaranteeClass::FullPlacement,
+                    FailureDomainMask::NODE,
+                    StorageMediaClass::NvmeFlash,
+                ),
+                {
+                    let mut candidate = candidate(
+                        2,
+                        20,
+                        StorageMediaRole::PlacementAuthority,
+                        StorageIntentGuaranteeClass::FullPlacement,
+                        FailureDomainMask::NODE,
+                        StorageMediaClass::SystemRam,
+                    );
+                    candidate.media_capability = volatile_media();
+                    candidate
+                },
+            ],
+        );
+        assert!(legacy.admitted);
+        assert_eq!(legacy.legal_targets, vec![1]);
+        assert!(legacy.has_refusal(StorageIntentRefusalReason::PersistentMediaRequired));
+    }
+
+    #[test]
+    fn plan_selects_distinct_failure_domains_before_same_domain_score() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut first = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        first.layout_allocator.as_mut().unwrap().locality_score_ppm = 900_000;
+        let mut same_domain = candidate(
+            2,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        same_domain
+            .layout_allocator
+            .as_mut()
+            .unwrap()
+            .locality_score_ppm = 800_000;
+        let mut other_domain = candidate(
+            3,
+            20,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        other_domain
+            .layout_allocator
+            .as_mut()
+            .unwrap()
+            .locality_score_ppm = 100_000;
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                2,
+                2,
+            ),
+            &[first, same_domain, other_domain],
+        );
+
+        assert!(plan.admitted);
+        assert_eq!(plan.selected_targets, vec![1, 3]);
+        assert!(plan
+            .candidate_reports
+            .iter()
+            .any(|report| report.target_id == 2 && report.legal && !report.selected));
+    }
+
+    #[test]
+    fn candidate_reports_preserve_degraded_scoring_reasons() {
+        let mut policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        policy.workload.shape = tidefs_storage_intent_core::WorkloadShape::SequentialReadScan;
+        policy.workload.contradiction =
+            tidefs_storage_intent_core::ContradictionState::StrongContradiction;
+
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.prediction_confidence = PredictionConfidence::Low;
+        candidate.cost_wear = Some(CostWearRecord {
+            movement_debt_bytes: 8192,
+            expected_write_bytes: 4096,
+            write_amplification_ppm: 0,
+            cooldown_until_ms: 123,
+            skipped_reason: SkippedMoveReason::ReclaimReserveUnavailable,
+            payback_evidence: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 90),
+            evidence: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 91),
+            ..CostWearRecord::default()
+        });
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(plan.admitted);
+        let report = &plan.candidate_reports[0];
+        assert!(report.legal);
+        assert!(report.selected);
+        assert!(report.score < 0);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::LowPredictionConfidence { .. }
+        )));
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| matches!(reason, StorageIntentPlacementCandidateReason::OnePassScan)));
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::PhaseChangeContradiction { .. }
+        )));
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::MovementDebt { bytes: 8192 }
+        )));
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::FailedPaybackCooldown {
+                cooldown_until_ms: 123
+            }
+        )));
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| matches!(reason, StorageIntentPlacementCandidateReason::UnknownCost)));
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::CriticalReserveProtection {
+                skipped_reason: SkippedMoveReason::ReclaimReserveUnavailable
+            }
+        )));
     }
 }
