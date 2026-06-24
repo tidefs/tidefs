@@ -11029,7 +11029,7 @@ mod tests {
             refs: capacity_refs(),
             amplification: StorageIntentCapacityAmplificationEstimate {
                 logical_bytes: 100,
-                replica_count: 2,
+                replica_count: 3,
                 ec_data_shards: 0,
                 ec_parity_shards: 0,
                 cow_old_plus_new_bytes: 0,
