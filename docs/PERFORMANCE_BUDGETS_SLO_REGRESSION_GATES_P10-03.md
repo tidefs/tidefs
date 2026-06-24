@@ -796,6 +796,11 @@ be inspected through `render_markdown()`:
   4. Zero budget gap (no budget violations on any row)
   A receipt with open artifact or budget gaps is `NOT READY` regardless of
   pass counts.
+  **Scope note**: This `release_ready` field is a performance-gate-local receipt
+  scoped to the `performance_budget_0` matrix rows only. It is not a whole-product
+  release-readiness verdict. The release-readiness boundary, including the
+  evidence families a verdict must consume and explicit non-claims, is defined in
+  `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`.
 - `build_current_head_receipt` and `build_current_head_with_benches` both
   produce full-featured receipts with render_markdown available.
 

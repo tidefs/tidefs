@@ -117,6 +117,9 @@ may use non-secret repository variables for scheduling gates, such as
   profile, source SHA, lane job results, expected lane artifact names and path
   patterns, and absent lane-local manifests without making a product-readiness
   claim. Newer dispatches for the same branch and profile cancel older queued
+  The evidence index is consumed by the release-readiness verdict contract
+  (`docs/RELEASE_READINESS_VERDICT_CONTRACT.md`), which defines the boundary
+  between gate-local readiness receipts and whole-product admission.
   or running copies so superseded release-candidate runs do not leave stale
   self-hosted index jobs in the runner queue.
 
