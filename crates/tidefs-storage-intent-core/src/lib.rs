@@ -15845,7 +15845,7 @@ impl StorageIntentTenantIsolationEvidence {
     pub const fn has_legal_donation(self) -> bool {
         self.borrowing.is_donating
             && self.borrowing.may_donate
-            && !self.borrowing.donor_scope_id.0.iter().all(|&b| b == 0)
+            && self.borrowing.donor_scope_id.0 != [0_u8; 32]
     }
 }
 
@@ -16082,7 +16082,6 @@ pub const fn isolation_starvation_is_resolved(
         StorageIntentStarvationState::Constrained | StorageIntentStarvationState::Starving => {
             ReceiptPredicateResult::refused(StorageIntentRefusalReason::Starvation)
         }
-        _ => ReceiptPredicateResult::refused(StorageIntentRefusalReason::Starvation),
     }
 }
 
