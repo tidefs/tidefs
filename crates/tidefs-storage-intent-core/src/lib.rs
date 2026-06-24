@@ -1183,6 +1183,808 @@ impl StorageIntentEvidenceQuerySnapshot {
     }
 }
 
+/// Bounded candidate records retained by one decision frontier.
+pub const STORAGE_INTENT_DECISION_FRONTIER_CANDIDATES: usize = 16;
+
+/// Bounded hard-gate records retained by one decision frontier.
+pub const STORAGE_INTENT_DECISION_HARD_GATES: usize = 20;
+
+/// Bounded score entries retained by one decision frontier.
+pub const STORAGE_INTENT_DECISION_SCORE_ENTRIES: usize = StorageIntentDecisionScoreDimension::COUNT;
+
+#[allow(clippy::cast_lossless)]
+const fn decision_frontier_len(len: u8) -> usize {
+    len as usize
+}
+
+/// Authority mode for one decision frontier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionAuthorityMode {
+    #[default]
+    Unknown = 0,
+    Live = 1,
+    Shadow = 2,
+    Trial = 3,
+    Preflight = 4,
+    Simulated = 5,
+    Replay = 6,
+    Refused = 7,
+}
+
+impl StorageIntentDecisionAuthorityMode {
+    /// Returns true when this frontier may admit authority-changing work.
+    #[must_use]
+    pub const fn may_admit_authority_change(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+/// Candidate class captured before scoring.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionCandidateClass {
+    #[default]
+    Unknown = 0,
+    AcknowledgmentPlan = 1,
+    PlacementPlan = 2,
+    ReadServingPlan = 3,
+    SchedulingPlan = 4,
+    RebakePlan = 5,
+    RelocationPlan = 6,
+    RepairPlan = 7,
+    GeoPlan = 8,
+    ReceiptRetirementPlan = 9,
+    PrefetchResidencyPlan = 10,
+    NoActionPlan = 11,
+}
+
+/// Candidate status after hard gates and before score ranking.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionCandidateStatus {
+    #[default]
+    Unknown = 0,
+    Legal = 1,
+    Illegal = 2,
+    DegradedVisible = 3,
+    Deferred = 4,
+    Blocked = 5,
+    Refused = 6,
+}
+
+impl StorageIntentDecisionCandidateStatus {
+    /// Returns true when hard gates allow this candidate to reach scoring.
+    #[must_use]
+    pub const fn may_reach_scoring(self) -> bool {
+        matches!(self, Self::Legal)
+    }
+}
+
+/// Hard-gate dimension evaluated before score ranking.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionHardGateKind {
+    #[default]
+    Unknown = 0,
+    Guarantee = 1,
+    ServiceObjective = 2,
+    OrderingReplay = 3,
+    MembershipFence = 4,
+    TrustDomain = 5,
+    Temporal = 6,
+    MediaCapability = 7,
+    DataShape = 8,
+    Layout = 9,
+    Lifecycle = 10,
+    CapacityReserve = 11,
+    RecoveryDegradation = 12,
+    PolicyRollout = 13,
+    TenantIsolation = 14,
+    PredictionActionClass = 15,
+    Transport = 16,
+    Wear = 17,
+    OperatorPolicy = 18,
+}
+
+/// Hard-gate verdict retained for operator explanation and validation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionHardGateVerdict {
+    #[default]
+    Unknown = 0,
+    Passed = 1,
+    Failed = 2,
+    DegradedVisible = 3,
+    Blocked = 4,
+    Deferred = 5,
+    Refused = 6,
+}
+
+impl StorageIntentDecisionHardGateVerdict {
+    /// Returns true when this hard gate admits scoring.
+    #[must_use]
+    pub const fn admits_scoring(self) -> bool {
+        matches!(self, Self::Passed)
+    }
+}
+
+/// One retained hard-gate result.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDecisionHardGateResult {
+    pub candidate_id: StorageIntentEvidenceId,
+    pub gate: StorageIntentDecisionHardGateKind,
+    pub verdict: StorageIntentDecisionHardGateVerdict,
+    pub refusal: StorageIntentRefusalReason,
+    pub evidence_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentDecisionHardGateResult {
+    pub const EMPTY: Self = Self {
+        candidate_id: StorageIntentEvidenceId::ZERO,
+        gate: StorageIntentDecisionHardGateKind::Unknown,
+        verdict: StorageIntentDecisionHardGateVerdict::Unknown,
+        refusal: StorageIntentRefusalReason::None,
+        evidence_ref: StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::Unknown,
+            id: StorageIntentEvidenceId::ZERO,
+            generation: 0,
+            version: 0,
+        },
+    };
+}
+
+/// Bounded hard-gate result set for a decision frontier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDecisionHardGateResultSet {
+    len: u8,
+    gates: [StorageIntentDecisionHardGateResult; STORAGE_INTENT_DECISION_HARD_GATES],
+}
+
+impl StorageIntentDecisionHardGateResultSet {
+    pub const EMPTY: Self = Self {
+        len: 0,
+        gates: [StorageIntentDecisionHardGateResult::EMPTY; STORAGE_INTENT_DECISION_HARD_GATES],
+    };
+
+    /// Number of retained hard-gate records.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        decision_frontier_len(self.len)
+    }
+
+    /// Returns true when no hard-gate records are retained.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Append a hard-gate record if capacity remains.
+    pub fn push(
+        &mut self,
+        gate: StorageIntentDecisionHardGateResult,
+    ) -> Result<(), EvidenceRefsError> {
+        if decision_frontier_len(self.len) >= STORAGE_INTENT_DECISION_HARD_GATES {
+            return Err(EvidenceRefsError::Full);
+        }
+        self.gates[decision_frontier_len(self.len)] = gate;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Returns true when any retained hard gate did not pass.
+    #[must_use]
+    pub const fn has_non_passing_gate(self) -> bool {
+        let mut index = 0;
+        while index < decision_frontier_len(self.len) {
+            if !self.gates[index].verdict.admits_scoring() {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+}
+
+/// Score-vector dimension retained for one auditable decision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionScoreDimension {
+    #[default]
+    Latency = 0,
+    Tail = 1,
+    Throughput = 2,
+    ServiceObjectiveHeadroom = 3,
+    OrderingReplayCost = 4,
+    MediaWriteCost = 5,
+    CpuReadAmplification = 6,
+    LayoutReclaimCost = 7,
+    LifecycleChurnRisk = 8,
+    MembershipDrainRisk = 9,
+    CapacityCost = 10,
+    EgressCongestionCost = 11,
+    RecoveryRpoRisk = 12,
+    ForegroundDisruption = 13,
+    ConfidenceMispredictionRisk = 14,
+    MovementDebt = 15,
+    PaybackRisk = 16,
+    OperationalComplexity = 17,
+}
+
+impl StorageIntentDecisionScoreDimension {
+    pub const COUNT: usize = 18;
+    pub const COUNT_U8: u8 = 18;
+
+    /// Return this score dimension's requirement-mask bit.
+    #[must_use]
+    pub const fn bit(self) -> u64 {
+        1_u64 << self.to_discriminant()
+    }
+}
+
+/// Unit attached to a known score dimension.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionScoreUnit {
+    #[default]
+    UnitlessPpm = 0,
+    Microseconds = 1,
+    Bytes = 2,
+    BytesPerSecond = 3,
+    Iops = 4,
+    CostMicrounits = 5,
+    RiskPpm = 6,
+    Count = 7,
+}
+
+/// Typed score state. Unknowns are explicit and never score as zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionScoreState {
+    #[default]
+    UnknownCost = 0,
+    UnknownBenefit = 1,
+    Known = 2,
+    Blocked = 3,
+    DegradedVisible = 4,
+    Refused = 5,
+    NotApplicable = 6,
+}
+
+impl StorageIntentDecisionScoreState {
+    /// Returns true only for score states that can be ranked.
+    #[must_use]
+    pub const fn is_known_for_ranking(self) -> bool {
+        matches!(self, Self::Known | Self::NotApplicable)
+    }
+}
+
+/// One score-vector entry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDecisionScoreEntry {
+    pub dimension: StorageIntentDecisionScoreDimension,
+    pub state: StorageIntentDecisionScoreState,
+    pub unit: StorageIntentDecisionScoreUnit,
+    pub value: i64,
+    pub evidence_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentDecisionScoreEntry {
+    pub const EMPTY: Self = Self {
+        dimension: StorageIntentDecisionScoreDimension::Latency,
+        state: StorageIntentDecisionScoreState::UnknownCost,
+        unit: StorageIntentDecisionScoreUnit::UnitlessPpm,
+        value: 0,
+        evidence_ref: StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::Unknown,
+            id: StorageIntentEvidenceId::ZERO,
+            generation: 0,
+            version: 0,
+        },
+    };
+}
+
+/// Bounded score vector for one selected or scored candidate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDecisionScoreVector {
+    len: u8,
+    entries: [StorageIntentDecisionScoreEntry; STORAGE_INTENT_DECISION_SCORE_ENTRIES],
+}
+
+impl StorageIntentDecisionScoreVector {
+    pub const EMPTY: Self = Self {
+        len: 0,
+        entries: [StorageIntentDecisionScoreEntry::EMPTY; STORAGE_INTENT_DECISION_SCORE_ENTRIES],
+    };
+
+    /// Number of retained score entries.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        decision_frontier_len(self.len)
+    }
+
+    /// Returns true when no score entries are retained.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Append a score entry if capacity remains.
+    pub fn push(
+        &mut self,
+        entry: StorageIntentDecisionScoreEntry,
+    ) -> Result<(), EvidenceRefsError> {
+        if decision_frontier_len(self.len) >= STORAGE_INTENT_DECISION_SCORE_ENTRIES {
+            return Err(EvidenceRefsError::Full);
+        }
+        self.entries[decision_frontier_len(self.len)] = entry;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Return the recorded state for a dimension, or unknown-cost when absent.
+    #[must_use]
+    pub const fn state_for_dimension(
+        self,
+        dimension: StorageIntentDecisionScoreDimension,
+    ) -> StorageIntentDecisionScoreState {
+        let mut index = 0;
+        while index < decision_frontier_len(self.len) {
+            if self.entries[index].dimension.to_discriminant()
+                == dimension.to_discriminant()
+            {
+                return self.entries[index].state;
+            }
+            index += 1;
+        }
+        StorageIntentDecisionScoreState::UnknownCost
+    }
+
+    /// Returns true when all required score dimensions are known for ranking.
+    #[must_use]
+    pub const fn satisfies_required_dimensions(
+        self,
+        required: StorageIntentDecisionScoreRequirementMask,
+    ) -> bool {
+        let mut raw = 0_u8;
+        while raw < StorageIntentDecisionScoreDimension::COUNT_U8 {
+            let bit = 1_u64 << raw;
+            if (required.0 & bit) != 0 {
+                let dimension = match StorageIntentDecisionScoreDimension::from_discriminant(raw) {
+                    Some(dimension) => dimension,
+                    None => return false,
+                };
+                if !self.state_for_dimension(dimension).is_known_for_ranking() {
+                    return false;
+                }
+            }
+            raw += 1;
+        }
+        true
+    }
+}
+
+/// Required score dimensions for a policy or audit gate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDecisionScoreRequirementMask(pub u64);
+
+impl StorageIntentDecisionScoreRequirementMask {
+    pub const EMPTY: Self = Self(0);
+    pub const AUTHORITY_MINIMUM: Self = Self(
+        StorageIntentDecisionScoreDimension::Latency.bit()
+            | StorageIntentDecisionScoreDimension::Tail.bit()
+            | StorageIntentDecisionScoreDimension::Throughput.bit()
+            | StorageIntentDecisionScoreDimension::MediaWriteCost.bit()
+            | StorageIntentDecisionScoreDimension::CapacityCost.bit()
+            | StorageIntentDecisionScoreDimension::RecoveryRpoRisk.bit()
+            | StorageIntentDecisionScoreDimension::PaybackRisk.bit(),
+    );
+
+    /// Construct a one-dimension requirement.
+    #[must_use]
+    pub const fn from_dimension(dimension: StorageIntentDecisionScoreDimension) -> Self {
+        Self(dimension.bit())
+    }
+
+    /// Add one required dimension.
+    #[must_use]
+    pub const fn with(self, dimension: StorageIntentDecisionScoreDimension) -> Self {
+        Self(self.0 | dimension.bit())
+    }
+}
+
+/// One candidate retained by a decision frontier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDecisionCandidateRecord {
+    pub candidate_id: StorageIntentEvidenceId,
+    pub candidate_class: StorageIntentDecisionCandidateClass,
+    pub action_class: StorageIntentActionClass,
+    pub status: StorageIntentDecisionCandidateStatus,
+    pub deterministic_order_key: u64,
+    pub tie_breaker_input: u64,
+    pub input_evidence_refs: StorageIntentEvidenceRefs,
+    pub hard_gate_ref: StorageIntentEvidenceRef,
+    pub score_vector_ref: StorageIntentEvidenceRef,
+    pub rejection_refusal: StorageIntentRefusalReason,
+}
+
+impl StorageIntentDecisionCandidateRecord {
+    pub const EMPTY: Self = Self {
+        candidate_id: StorageIntentEvidenceId::ZERO,
+        candidate_class: StorageIntentDecisionCandidateClass::Unknown,
+        action_class: StorageIntentActionClass::QueuePrefetchTuning,
+        status: StorageIntentDecisionCandidateStatus::Unknown,
+        deterministic_order_key: 0,
+        tie_breaker_input: 0,
+        input_evidence_refs: StorageIntentEvidenceRefs::EMPTY,
+        hard_gate_ref: StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::Unknown,
+            id: StorageIntentEvidenceId::ZERO,
+            generation: 0,
+            version: 0,
+        },
+        score_vector_ref: StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::Unknown,
+            id: StorageIntentEvidenceId::ZERO,
+            generation: 0,
+            version: 0,
+        },
+        rejection_refusal: StorageIntentRefusalReason::None,
+    };
+
+    /// Returns true when this candidate carries score evidence.
+    #[must_use]
+    pub const fn has_score(self) -> bool {
+        evidence_ref_has_id(self.score_vector_ref)
+    }
+}
+
+/// Bounded candidate frontier with stable digest and deterministic ordering.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDecisionCandidateSet {
+    len: u8,
+    pub candidate_set_digest: StorageIntentEvidenceId,
+    candidates: [StorageIntentDecisionCandidateRecord; STORAGE_INTENT_DECISION_FRONTIER_CANDIDATES],
+}
+
+impl StorageIntentDecisionCandidateSet {
+    pub const EMPTY: Self = Self {
+        len: 0,
+        candidate_set_digest: StorageIntentEvidenceId::ZERO,
+        candidates: [StorageIntentDecisionCandidateRecord::EMPTY;
+            STORAGE_INTENT_DECISION_FRONTIER_CANDIDATES],
+    };
+
+    /// Number of retained candidates.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        decision_frontier_len(self.len)
+    }
+
+    /// Returns true when no candidates are retained.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Append a candidate if capacity remains.
+    pub fn push(
+        &mut self,
+        candidate: StorageIntentDecisionCandidateRecord,
+    ) -> Result<(), EvidenceRefsError> {
+        if decision_frontier_len(self.len) >= STORAGE_INTENT_DECISION_FRONTIER_CANDIDATES {
+            return Err(EvidenceRefsError::Full);
+        }
+        self.candidates[decision_frontier_len(self.len)] = candidate;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Returns true when any retained candidate is not legal.
+    #[must_use]
+    pub const fn has_non_legal_candidate(self) -> bool {
+        let mut index = 0;
+        while index < decision_frontier_len(self.len) {
+            if !matches!(
+                self.candidates[index].status,
+                StorageIntentDecisionCandidateStatus::Legal
+            ) {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// Returns true when every scored candidate first passed hard gates.
+    #[must_use]
+    pub const fn illegal_candidates_are_unscored(self) -> bool {
+        let mut index = 0;
+        while index < decision_frontier_len(self.len) {
+            let candidate = self.candidates[index];
+            if !candidate.status.may_reach_scoring() && candidate.has_score() {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    /// Returns true when a candidate id appears in the frontier.
+    #[must_use]
+    pub const fn contains_candidate_id(self, candidate_id: StorageIntentEvidenceId) -> bool {
+        if bytes32_are_zero(candidate_id.0) {
+            return false;
+        }
+        let mut index = 0;
+        while index < decision_frontier_len(self.len) {
+            if bytes32_equal(self.candidates[index].candidate_id.0, candidate_id.0) {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+}
+
+/// Reason the selected candidate won or no candidate may run.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionSelectionReason {
+    #[default]
+    Unknown = 0,
+    OnlyLegalCandidate = 1,
+    HighestScore = 2,
+    RequiredRepair = 3,
+    RequiredPolicy = 4,
+    TieBreak = 5,
+    NoCandidateLegal = 6,
+    Deferred = 7,
+    Refused = 8,
+}
+
+/// Deterministic tie-breaker used after score equality.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionTieBreakerClass {
+    #[default]
+    None = 0,
+    DeterministicOrderKey = 1,
+    PolicyPriority = 2,
+    StableExistingPlacement = 3,
+    LowerMovementDebt = 4,
+    LowerCapacityCost = 5,
+    HigherConfidence = 6,
+    LexicographicCandidateId = 7,
+}
+
+impl StorageIntentDecisionTieBreakerClass {
+    /// Returns true when the tie-breaker has deterministic inputs.
+    #[must_use]
+    pub const fn is_deterministic(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// State of the selected candidate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentDecisionSelectedState {
+    #[default]
+    Unknown = 0,
+    Shadow = 1,
+    Trial = 2,
+    Admitted = 3,
+    RollbackOnly = 4,
+    Deferred = 5,
+    Refused = 6,
+}
+
+/// Selected candidate, admission refs, tie-breaker, and refusal/defer state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDecisionSelectionRecord {
+    pub selected_plan_id: StorageIntentEvidenceId,
+    pub reason: StorageIntentDecisionSelectionReason,
+    pub tie_breaker: StorageIntentDecisionTieBreakerClass,
+    pub tie_breaker_input: u64,
+    pub state: StorageIntentDecisionSelectedState,
+    pub reserve_ref: StorageIntentEvidenceRef,
+    pub admission_ref: StorageIntentEvidenceRef,
+    pub rollback_proof_ref: StorageIntentEvidenceRef,
+    pub no_cutover_proof_ref: StorageIntentEvidenceRef,
+    pub refusal: StorageIntentRefusalReason,
+}
+
+impl StorageIntentDecisionSelectionRecord {
+    /// Returns true when a tie-break selection is deterministic and evidence-backed.
+    #[must_use]
+    pub const fn tie_breaker_is_deterministic(self) -> bool {
+        if !matches!(self.reason, StorageIntentDecisionSelectionReason::TieBreak) {
+            return true;
+        }
+        self.tie_breaker.is_deterministic()
+            && self.tie_breaker_input != 0
+            && evidence_ref_has_id(self.no_cutover_proof_ref)
+    }
+
+    /// Returns true when the selected state admits authority-changing work.
+    #[must_use]
+    pub const fn is_admitted(self) -> bool {
+        matches!(self.state, StorageIntentDecisionSelectedState::Admitted)
+            && matches!(self.refusal, StorageIntentRefusalReason::None)
+            && !bytes32_are_zero(self.selected_plan_id.0)
+    }
+}
+
+/// Counterfactual baseline, payback, harm, outcome, and retention anchors.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDecisionCounterfactualPaybackRecord {
+    pub decision_frontier_ref: StorageIntentEvidenceRef,
+    pub baseline_candidate_id: StorageIntentEvidenceId,
+    pub expected_payback_window_ms: u64,
+    pub expected_harm_ceiling_ppm: u32,
+    pub outcome_attachment_ref: StorageIntentEvidenceRef,
+    pub failed_payback_ref: StorageIntentEvidenceRef,
+    pub harm_attachment_ref: StorageIntentEvidenceRef,
+    pub cooldown_ref: StorageIntentEvidenceRef,
+    pub retention_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentDecisionCounterfactualPaybackRecord {
+    /// Returns true when failed payback or harm can attach to this frontier.
+    #[must_use]
+    pub const fn attaches_outcome_to_frontier(
+        self,
+        decision_frontier_ref: StorageIntentEvidenceRef,
+    ) -> bool {
+        evidence_ref_equal(self.decision_frontier_ref, decision_frontier_ref)
+            && !bytes32_are_zero(self.baseline_candidate_id.0)
+            && self.expected_payback_window_ms > 0
+            && self.expected_harm_ceiling_ppm > 0
+            && evidence_ref_has_id(self.outcome_attachment_ref)
+            && (evidence_ref_has_id(self.failed_payback_ref)
+                || evidence_ref_has_id(self.harm_attachment_ref))
+            && evidence_ref_has_id(self.retention_ref)
+    }
+}
+
+/// Complete #905 decision-frontier evidence record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDecisionEvidence {
+    pub evidence_ref: StorageIntentEvidenceRef,
+    pub decision_id: StorageIntentEvidenceId,
+    pub action_class: StorageIntentActionClass,
+    pub subject_scope: StorageIntentObjectScope,
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub actor_component_ref: StorageIntentEvidenceRef,
+    pub actor_version: u64,
+    pub decision_epoch: u64,
+    pub temporal_evidence_ref: StorageIntentEvidenceRef,
+    pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
+    pub authority_mode: StorageIntentDecisionAuthorityMode,
+    pub candidates: StorageIntentDecisionCandidateSet,
+    pub hard_gates: StorageIntentDecisionHardGateResultSet,
+    pub score_vector: StorageIntentDecisionScoreVector,
+    pub selected_candidate: StorageIntentDecisionSelectionRecord,
+    pub counterfactual_payback: StorageIntentDecisionCounterfactualPaybackRecord,
+    pub retention_ref: StorageIntentEvidenceRef,
+    pub refusal: StorageIntentRefusalReason,
+}
+
+impl StorageIntentDecisionEvidence {
+    /// Returns true when the decision identity and shared evidence cut are bound.
+    #[must_use]
+    pub const fn has_decision_identity(self) -> bool {
+        matches!(
+            self.evidence_ref.kind,
+            StorageIntentEvidenceKind::DecisionFrontierEvidence
+        )
+            && evidence_ref_has_id(self.evidence_ref)
+            && !bytes32_are_zero(self.decision_id.0)
+            && !self.policy_id.is_zero()
+            && self.policy_revision.0 > 0
+            && self.actor_version > 0
+            && self.decision_epoch > 0
+            && evidence_ref_has_id(self.actor_component_ref)
+            && matches!(
+                self.temporal_evidence_ref.kind,
+                StorageIntentEvidenceKind::TemporalEvidence
+            )
+            && evidence_ref_has_id(self.temporal_evidence_ref)
+            && matches!(
+                self.evidence_query_snapshot_ref.kind,
+                StorageIntentEvidenceKind::EvidenceQuerySnapshot
+            )
+            && evidence_ref_has_id(self.evidence_query_snapshot_ref)
+    }
+
+    /// Returns true when this record is not only the winning candidate.
+    #[must_use]
+    pub const fn retains_decision_frontier(self) -> bool {
+        self.candidates.len() > 1
+            && !bytes32_are_zero(self.candidates.candidate_set_digest.0)
+            && !self.hard_gates.is_empty()
+            && (!self.candidates.has_non_legal_candidate()
+                || self.hard_gates.has_non_passing_gate())
+    }
+
+    /// Returns true when no illegal, unknown, blocked, or refused candidate was scored.
+    #[must_use]
+    pub const fn illegal_candidates_are_unscored(self) -> bool {
+        self.candidates.illegal_candidates_are_unscored()
+    }
+
+    /// Returns true when required score dimensions are known for ranking.
+    #[must_use]
+    pub const fn required_scores_are_known(
+        self,
+        required: StorageIntentDecisionScoreRequirementMask,
+    ) -> bool {
+        self.score_vector.satisfies_required_dimensions(required)
+    }
+
+    /// Returns true when the selected candidate and any tie-breaker are deterministic.
+    #[must_use]
+    pub const fn selection_is_deterministic(self) -> bool {
+        self.candidates
+            .contains_candidate_id(self.selected_candidate.selected_plan_id)
+            && self.selected_candidate.tie_breaker_is_deterministic()
+    }
+
+    /// Returns true when failed payback or harm can attach to this exact frontier.
+    #[must_use]
+    pub const fn has_outcome_payback_anchor(self) -> bool {
+        self.counterfactual_payback
+            .attaches_outcome_to_frontier(self.evidence_ref)
+    }
+}
+
+/// Evaluate the #905 audit policy for an authority-capable frontier.
+#[must_use]
+pub const fn decision_frontier_satisfies_audit_policy(
+    evidence: StorageIntentDecisionEvidence,
+    required_scores: StorageIntentDecisionScoreRequirementMask,
+) -> ReceiptPredicateResult {
+    if !matches!(evidence.refusal, StorageIntentRefusalReason::None) {
+        return ReceiptPredicateResult::refused(evidence.refusal);
+    }
+    if !evidence.has_decision_identity()
+        || !evidence.retains_decision_frontier()
+        || !evidence.illegal_candidates_are_unscored()
+        || !evidence.required_scores_are_known(required_scores)
+        || !evidence.selection_is_deterministic()
+        || !evidence.has_outcome_payback_anchor()
+        || !evidence.selected_candidate.is_admitted()
+        || !evidence.authority_mode.may_admit_authority_change()
+        || !evidence_ref_has_id(evidence.retention_ref)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
 /// Bounded evidence set mutation error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -5677,6 +6479,149 @@ impl_u8_canonical!(StorageIntentActionClass, {
     ArchiveMigration = 12 => "archive-migration",
 });
 
+impl_u8_canonical!(StorageIntentDecisionAuthorityMode, {
+    Unknown = 0 => "unknown",
+    Live = 1 => "live",
+    Shadow = 2 => "shadow",
+    Trial = 3 => "trial",
+    Preflight = 4 => "preflight",
+    Simulated = 5 => "simulated",
+    Replay = 6 => "replay",
+    Refused = 7 => "refused",
+});
+
+impl_u8_canonical!(StorageIntentDecisionCandidateClass, {
+    Unknown = 0 => "unknown",
+    AcknowledgmentPlan = 1 => "acknowledgment-plan",
+    PlacementPlan = 2 => "placement-plan",
+    ReadServingPlan = 3 => "read-serving-plan",
+    SchedulingPlan = 4 => "scheduling-plan",
+    RebakePlan = 5 => "rebake-plan",
+    RelocationPlan = 6 => "relocation-plan",
+    RepairPlan = 7 => "repair-plan",
+    GeoPlan = 8 => "geo-plan",
+    ReceiptRetirementPlan = 9 => "receipt-retirement-plan",
+    PrefetchResidencyPlan = 10 => "prefetch-residency-plan",
+    NoActionPlan = 11 => "no-action-plan",
+});
+
+impl_u8_canonical!(StorageIntentDecisionCandidateStatus, {
+    Unknown = 0 => "unknown",
+    Legal = 1 => "legal",
+    Illegal = 2 => "illegal",
+    DegradedVisible = 3 => "degraded-visible",
+    Deferred = 4 => "deferred",
+    Blocked = 5 => "blocked",
+    Refused = 6 => "refused",
+});
+
+impl_u8_canonical!(StorageIntentDecisionHardGateKind, {
+    Unknown = 0 => "unknown",
+    Guarantee = 1 => "guarantee",
+    ServiceObjective = 2 => "service-objective",
+    OrderingReplay = 3 => "ordering-replay",
+    MembershipFence = 4 => "membership-fence",
+    TrustDomain = 5 => "trust-domain",
+    Temporal = 6 => "temporal",
+    MediaCapability = 7 => "media-capability",
+    DataShape = 8 => "data-shape",
+    Layout = 9 => "layout",
+    Lifecycle = 10 => "lifecycle",
+    CapacityReserve = 11 => "capacity-reserve",
+    RecoveryDegradation = 12 => "recovery-degradation",
+    PolicyRollout = 13 => "policy-rollout",
+    TenantIsolation = 14 => "tenant-isolation",
+    PredictionActionClass = 15 => "prediction-action-class",
+    Transport = 16 => "transport",
+    Wear = 17 => "wear",
+    OperatorPolicy = 18 => "operator-policy",
+});
+
+impl_u8_canonical!(StorageIntentDecisionHardGateVerdict, {
+    Unknown = 0 => "unknown",
+    Passed = 1 => "passed",
+    Failed = 2 => "failed",
+    DegradedVisible = 3 => "degraded-visible",
+    Blocked = 4 => "blocked",
+    Deferred = 5 => "deferred",
+    Refused = 6 => "refused",
+});
+
+impl_u8_canonical!(StorageIntentDecisionScoreDimension, {
+    Latency = 0 => "latency",
+    Tail = 1 => "tail",
+    Throughput = 2 => "throughput",
+    ServiceObjectiveHeadroom = 3 => "service-objective-headroom",
+    OrderingReplayCost = 4 => "ordering-replay-cost",
+    MediaWriteCost = 5 => "media-write-cost",
+    CpuReadAmplification = 6 => "cpu-read-amplification",
+    LayoutReclaimCost = 7 => "layout-reclaim-cost",
+    LifecycleChurnRisk = 8 => "lifecycle-churn-risk",
+    MembershipDrainRisk = 9 => "membership-drain-risk",
+    CapacityCost = 10 => "capacity-cost",
+    EgressCongestionCost = 11 => "egress-congestion-cost",
+    RecoveryRpoRisk = 12 => "recovery-rpo-risk",
+    ForegroundDisruption = 13 => "foreground-disruption",
+    ConfidenceMispredictionRisk = 14 => "confidence-misprediction-risk",
+    MovementDebt = 15 => "movement-debt",
+    PaybackRisk = 16 => "payback-risk",
+    OperationalComplexity = 17 => "operational-complexity",
+});
+
+impl_u8_canonical!(StorageIntentDecisionScoreUnit, {
+    UnitlessPpm = 0 => "unitless-ppm",
+    Microseconds = 1 => "microseconds",
+    Bytes = 2 => "bytes",
+    BytesPerSecond = 3 => "bytes-per-second",
+    Iops = 4 => "iops",
+    CostMicrounits = 5 => "cost-microunits",
+    RiskPpm = 6 => "risk-ppm",
+    Count = 7 => "count",
+});
+
+impl_u8_canonical!(StorageIntentDecisionScoreState, {
+    UnknownCost = 0 => "unknown-cost",
+    UnknownBenefit = 1 => "unknown-benefit",
+    Known = 2 => "known",
+    Blocked = 3 => "blocked",
+    DegradedVisible = 4 => "degraded-visible",
+    Refused = 5 => "refused",
+    NotApplicable = 6 => "not-applicable",
+});
+
+impl_u8_canonical!(StorageIntentDecisionSelectionReason, {
+    Unknown = 0 => "unknown",
+    OnlyLegalCandidate = 1 => "only-legal-candidate",
+    HighestScore = 2 => "highest-score",
+    RequiredRepair = 3 => "required-repair",
+    RequiredPolicy = 4 => "required-policy",
+    TieBreak = 5 => "tie-break",
+    NoCandidateLegal = 6 => "no-candidate-legal",
+    Deferred = 7 => "deferred",
+    Refused = 8 => "refused",
+});
+
+impl_u8_canonical!(StorageIntentDecisionTieBreakerClass, {
+    None = 0 => "none",
+    DeterministicOrderKey = 1 => "deterministic-order-key",
+    PolicyPriority = 2 => "policy-priority",
+    StableExistingPlacement = 3 => "stable-existing-placement",
+    LowerMovementDebt = 4 => "lower-movement-debt",
+    LowerCapacityCost = 5 => "lower-capacity-cost",
+    HigherConfidence = 6 => "higher-confidence",
+    LexicographicCandidateId = 7 => "lexicographic-candidate-id",
+});
+
+impl_u8_canonical!(StorageIntentDecisionSelectedState, {
+    Unknown = 0 => "unknown",
+    Shadow = 1 => "shadow",
+    Trial = 2 => "trial",
+    Admitted = 3 => "admitted",
+    RollbackOnly = 4 => "rollback-only",
+    Deferred = 5 => "deferred",
+    Refused = 6 => "refused",
+});
+
 impl_u8_canonical!(ReadServingSourceClass, {
     Cache = 0 => "cache",
     ServingTrial = 1 => "serving-trial",
@@ -8364,6 +9309,221 @@ mod tests {
         snapshot
     }
 
+    fn decision_candidate_id(byte: u8) -> StorageIntentEvidenceId {
+        StorageIntentEvidenceId([byte; 32])
+    }
+
+    fn known_decision_score(
+        dimension: StorageIntentDecisionScoreDimension,
+        byte: u8,
+    ) -> StorageIntentDecisionScoreEntry {
+        StorageIntentDecisionScoreEntry {
+            dimension,
+            state: StorageIntentDecisionScoreState::Known,
+            unit: StorageIntentDecisionScoreUnit::UnitlessPpm,
+            value: i64::from(byte) * 100,
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::DecisionFrontierEvidence, byte),
+        }
+    }
+
+    fn decision_score_vector(unknown_media_cost: bool) -> StorageIntentDecisionScoreVector {
+        let mut vector = StorageIntentDecisionScoreVector::EMPTY;
+        let dimensions = [
+            (StorageIntentDecisionScoreDimension::Latency, 180),
+            (StorageIntentDecisionScoreDimension::Tail, 181),
+            (StorageIntentDecisionScoreDimension::Throughput, 182),
+            (StorageIntentDecisionScoreDimension::MediaWriteCost, 183),
+            (StorageIntentDecisionScoreDimension::CapacityCost, 184),
+            (StorageIntentDecisionScoreDimension::RecoveryRpoRisk, 185),
+            (StorageIntentDecisionScoreDimension::PaybackRisk, 186),
+        ];
+
+        for (dimension, byte) in dimensions {
+            let mut entry = known_decision_score(dimension, byte);
+            if unknown_media_cost
+                && matches!(
+                    dimension,
+                    StorageIntentDecisionScoreDimension::MediaWriteCost
+                )
+            {
+                entry.state = StorageIntentDecisionScoreState::UnknownCost;
+            }
+            vector.push(entry).unwrap();
+        }
+        vector
+    }
+
+    fn decision_candidate(
+        byte: u8,
+        status: StorageIntentDecisionCandidateStatus,
+        scored: bool,
+    ) -> StorageIntentDecisionCandidateRecord {
+        StorageIntentDecisionCandidateRecord {
+            candidate_id: decision_candidate_id(byte),
+            candidate_class: StorageIntentDecisionCandidateClass::PlacementPlan,
+            action_class: StorageIntentActionClass::DurablePlacementMovement,
+            status,
+            deterministic_order_key: u64::from(byte),
+            tie_breaker_input: u64::from(byte) * 10,
+            input_evidence_refs: {
+                let mut refs = StorageIntentEvidenceRefs::EMPTY;
+                refs.push(evidence_ref(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    byte,
+                ))
+                .unwrap();
+                refs
+            },
+            hard_gate_ref: evidence_ref(StorageIntentEvidenceKind::DecisionFrontierEvidence, byte),
+            score_vector_ref: if scored {
+                evidence_ref(
+                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    120 + byte,
+                )
+            } else {
+                StorageIntentEvidenceRef::default()
+            },
+            rejection_refusal: if status.may_reach_scoring() {
+                StorageIntentRefusalReason::None
+            } else {
+                StorageIntentRefusalReason::EvidenceNotUsable
+            },
+        }
+    }
+
+    fn decision_candidate_set() -> StorageIntentDecisionCandidateSet {
+        let mut candidates = StorageIntentDecisionCandidateSet {
+            candidate_set_digest: decision_candidate_id(199),
+            ..StorageIntentDecisionCandidateSet::EMPTY
+        };
+        candidates
+            .push(decision_candidate(
+                1,
+                StorageIntentDecisionCandidateStatus::Legal,
+                true,
+            ))
+            .unwrap();
+        candidates
+            .push(decision_candidate(
+                2,
+                StorageIntentDecisionCandidateStatus::Illegal,
+                false,
+            ))
+            .unwrap();
+        candidates
+    }
+
+    fn decision_hard_gates() -> StorageIntentDecisionHardGateResultSet {
+        let mut gates = StorageIntentDecisionHardGateResultSet::EMPTY;
+        gates
+            .push(StorageIntentDecisionHardGateResult {
+                candidate_id: decision_candidate_id(1),
+                gate: StorageIntentDecisionHardGateKind::Guarantee,
+                verdict: StorageIntentDecisionHardGateVerdict::Passed,
+                refusal: StorageIntentRefusalReason::None,
+                evidence_ref: evidence_ref(
+                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    131,
+                ),
+            })
+            .unwrap();
+        gates
+            .push(StorageIntentDecisionHardGateResult {
+                candidate_id: decision_candidate_id(2),
+                gate: StorageIntentDecisionHardGateKind::MediaCapability,
+                verdict: StorageIntentDecisionHardGateVerdict::Failed,
+                refusal: StorageIntentRefusalReason::MissingMediaCapabilityEvidence,
+                evidence_ref: evidence_ref(
+                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    132,
+                ),
+            })
+            .unwrap();
+        gates
+    }
+
+    fn decision_payback_anchor(
+        frontier_ref: StorageIntentEvidenceRef,
+    ) -> StorageIntentDecisionCounterfactualPaybackRecord {
+        StorageIntentDecisionCounterfactualPaybackRecord {
+            decision_frontier_ref: frontier_ref,
+            baseline_candidate_id: decision_candidate_id(2),
+            expected_payback_window_ms: 60_000,
+            expected_harm_ceiling_ppm: 10_000,
+            outcome_attachment_ref: evidence_ref(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                140,
+            ),
+            failed_payback_ref: evidence_ref(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                141,
+            ),
+            harm_attachment_ref: StorageIntentEvidenceRef::default(),
+            cooldown_ref: evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 142),
+            retention_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 143),
+        }
+    }
+
+    fn decision_frontier() -> StorageIntentDecisionEvidence {
+        let frontier_ref = evidence_ref(StorageIntentEvidenceKind::DecisionFrontierEvidence, 200);
+        StorageIntentDecisionEvidence {
+            evidence_ref: frontier_ref,
+            decision_id: decision_candidate_id(201),
+            action_class: StorageIntentActionClass::DurablePlacementMovement,
+            subject_scope: StorageIntentObjectScope {
+                dataset_id: DOMAIN_A,
+                object_id: decision_candidate_id(202),
+                range_start: 0,
+                range_len: 4096,
+                generation: 1,
+            },
+            policy_id: StorageIntentPolicyId([203_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(9),
+            actor_component_ref: evidence_ref(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                204,
+            ),
+            actor_version: 1,
+            decision_epoch: 44,
+            temporal_evidence_ref: evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 205),
+            evidence_query_snapshot_ref: evidence_ref(
+                StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+                206,
+            ),
+            authority_mode: StorageIntentDecisionAuthorityMode::Live,
+            candidates: decision_candidate_set(),
+            hard_gates: decision_hard_gates(),
+            score_vector: decision_score_vector(false),
+            selected_candidate: StorageIntentDecisionSelectionRecord {
+                selected_plan_id: decision_candidate_id(1),
+                reason: StorageIntentDecisionSelectionReason::HighestScore,
+                tie_breaker: StorageIntentDecisionTieBreakerClass::None,
+                tie_breaker_input: 0,
+                state: StorageIntentDecisionSelectedState::Admitted,
+                reserve_ref: evidence_ref(
+                    StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                    207,
+                ),
+                admission_ref: evidence_ref(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    208,
+                ),
+                rollback_proof_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    209,
+                ),
+                no_cutover_proof_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    210,
+                ),
+                refusal: StorageIntentRefusalReason::None,
+            },
+            counterfactual_payback: decision_payback_anchor(frontier_ref),
+            retention_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 211),
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
     fn durable_policy() -> StorageIntentPolicy {
         StorageIntentPolicy {
             requested_guarantee: StorageIntentGuaranteeClass::LocalIntent,
@@ -10638,6 +11798,237 @@ mod tests {
     }
 
     #[test]
+    fn decision_frontier_discriminants_fail_closed() {
+        assert_eq!(
+            StorageIntentDecisionAuthorityMode::from_discriminant(4),
+            Some(StorageIntentDecisionAuthorityMode::Preflight)
+        );
+        assert!(!StorageIntentDecisionAuthorityMode::Preflight.may_admit_authority_change());
+        assert!(StorageIntentDecisionAuthorityMode::Live.may_admit_authority_change());
+        assert_eq!(
+            StorageIntentDecisionScoreState::UnknownCost.as_str(),
+            "unknown-cost"
+        );
+        assert_eq!(
+            StorageIntentDecisionScoreDimension::from_discriminant(17),
+            Some(StorageIntentDecisionScoreDimension::OperationalComplexity)
+        );
+        assert_eq!(
+            StorageIntentDecisionScoreDimension::from_discriminant(99),
+            None
+        );
+    }
+
+    #[test]
+    fn complete_decision_frontier_satisfies_audit_policy() {
+        let frontier = decision_frontier();
+
+        assert!(frontier.has_decision_identity());
+        assert!(frontier.retains_decision_frontier());
+        assert!(frontier.illegal_candidates_are_unscored());
+        assert!(frontier.required_scores_are_known(
+            StorageIntentDecisionScoreRequirementMask::AUTHORITY_MINIMUM
+        ));
+        assert!(frontier.selection_is_deterministic());
+        assert!(frontier.has_outcome_payback_anchor());
+        assert_eq!(
+            decision_frontier_satisfies_audit_policy(
+                frontier,
+                StorageIntentDecisionScoreRequirementMask::AUTHORITY_MINIMUM,
+            ),
+            ReceiptPredicateResult::SATISFIED
+        );
+    }
+
+    #[test]
+    fn illegal_decision_candidates_never_reach_scoring() {
+        let mut frontier = decision_frontier();
+        let mut candidates = StorageIntentDecisionCandidateSet {
+            candidate_set_digest: decision_candidate_id(199),
+            ..StorageIntentDecisionCandidateSet::EMPTY
+        };
+        candidates
+            .push(decision_candidate(
+                1,
+                StorageIntentDecisionCandidateStatus::Legal,
+                true,
+            ))
+            .unwrap();
+        candidates
+            .push(decision_candidate(
+                2,
+                StorageIntentDecisionCandidateStatus::Illegal,
+                true,
+            ))
+            .unwrap();
+        frontier.candidates = candidates;
+
+        assert!(!frontier.illegal_candidates_are_unscored());
+        assert_eq!(
+            decision_frontier_satisfies_audit_policy(
+                frontier,
+                StorageIntentDecisionScoreRequirementMask::AUTHORITY_MINIMUM,
+            )
+            .refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn all_legal_decision_frontiers_remain_auditable() {
+        let mut frontier = decision_frontier();
+        let mut candidates = StorageIntentDecisionCandidateSet {
+            candidate_set_digest: decision_candidate_id(199),
+            ..StorageIntentDecisionCandidateSet::EMPTY
+        };
+        candidates
+            .push(decision_candidate(
+                1,
+                StorageIntentDecisionCandidateStatus::Legal,
+                true,
+            ))
+            .unwrap();
+        candidates
+            .push(decision_candidate(
+                2,
+                StorageIntentDecisionCandidateStatus::Legal,
+                true,
+            ))
+            .unwrap();
+        frontier.candidates = candidates;
+
+        let mut hard_gates = StorageIntentDecisionHardGateResultSet::EMPTY;
+        for byte in [1_u8, 2_u8] {
+            hard_gates
+                .push(StorageIntentDecisionHardGateResult {
+                    candidate_id: decision_candidate_id(byte),
+                    gate: StorageIntentDecisionHardGateKind::Guarantee,
+                    verdict: StorageIntentDecisionHardGateVerdict::Passed,
+                    refusal: StorageIntentRefusalReason::None,
+                    evidence_ref: evidence_ref(
+                        StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                        140 + byte,
+                    ),
+                })
+                .unwrap();
+        }
+        frontier.hard_gates = hard_gates;
+
+        assert!(frontier.retains_decision_frontier());
+        assert_eq!(
+            decision_frontier_satisfies_audit_policy(
+                frontier,
+                StorageIntentDecisionScoreRequirementMask::AUTHORITY_MINIMUM,
+            ),
+            ReceiptPredicateResult::SATISFIED
+        );
+    }
+
+    #[test]
+    fn winner_only_decision_records_are_not_auditable() {
+        let mut frontier = decision_frontier();
+        let mut candidates = StorageIntentDecisionCandidateSet {
+            candidate_set_digest: decision_candidate_id(199),
+            ..StorageIntentDecisionCandidateSet::EMPTY
+        };
+        candidates
+            .push(decision_candidate(
+                1,
+                StorageIntentDecisionCandidateStatus::Legal,
+                true,
+            ))
+            .unwrap();
+        frontier.candidates = candidates;
+        frontier.hard_gates = StorageIntentDecisionHardGateResultSet::EMPTY;
+
+        assert!(!frontier.retains_decision_frontier());
+        assert_eq!(
+            decision_frontier_satisfies_audit_policy(
+                frontier,
+                StorageIntentDecisionScoreRequirementMask::AUTHORITY_MINIMUM,
+            )
+            .refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn unknown_required_score_dimensions_fail_closed() {
+        let mut frontier = decision_frontier();
+        frontier.score_vector = decision_score_vector(true);
+
+        assert_eq!(
+            frontier
+                .score_vector
+                .state_for_dimension(StorageIntentDecisionScoreDimension::MediaWriteCost),
+            StorageIntentDecisionScoreState::UnknownCost
+        );
+        assert!(!frontier.required_scores_are_known(
+            StorageIntentDecisionScoreRequirementMask::AUTHORITY_MINIMUM
+        ));
+        assert_eq!(
+            decision_frontier_satisfies_audit_policy(
+                frontier,
+                StorageIntentDecisionScoreRequirementMask::AUTHORITY_MINIMUM,
+            )
+            .refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn tie_breakers_are_deterministic_and_evidence_backed() {
+        let mut frontier = decision_frontier();
+        frontier.selected_candidate.reason = StorageIntentDecisionSelectionReason::TieBreak;
+        frontier.selected_candidate.tie_breaker = StorageIntentDecisionTieBreakerClass::None;
+        frontier.selected_candidate.tie_breaker_input = 0;
+        frontier.selected_candidate.no_cutover_proof_ref = StorageIntentEvidenceRef::default();
+
+        assert!(!frontier.selection_is_deterministic());
+        assert_eq!(
+            decision_frontier_satisfies_audit_policy(
+                frontier,
+                StorageIntentDecisionScoreRequirementMask::AUTHORITY_MINIMUM,
+            )
+            .refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        frontier.selected_candidate.tie_breaker =
+            StorageIntentDecisionTieBreakerClass::DeterministicOrderKey;
+        frontier.selected_candidate.tie_breaker_input = 99;
+        frontier.selected_candidate.no_cutover_proof_ref =
+            evidence_ref(StorageIntentEvidenceKind::ActionExecutionEvidence, 212);
+
+        assert!(frontier.selection_is_deterministic());
+        assert_eq!(
+            decision_frontier_satisfies_audit_policy(
+                frontier,
+                StorageIntentDecisionScoreRequirementMask::AUTHORITY_MINIMUM,
+            ),
+            ReceiptPredicateResult::SATISFIED
+        );
+    }
+
+    #[test]
+    fn failed_payback_and_harm_attach_to_original_frontier() {
+        let mut frontier = decision_frontier();
+        assert!(frontier.has_outcome_payback_anchor());
+
+        frontier.counterfactual_payback.decision_frontier_ref =
+            evidence_ref(StorageIntentEvidenceKind::DecisionFrontierEvidence, 213);
+        assert!(!frontier.has_outcome_payback_anchor());
+        assert_eq!(
+            decision_frontier_satisfies_audit_policy(
+                frontier,
+                StorageIntentDecisionScoreRequirementMask::AUTHORITY_MINIMUM,
+            )
+            .refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
     fn record_header_fails_closed() {
         assert_eq!(StorageIntentRecordHeader::CURRENT.validate(), Ok(()));
         assert_eq!(
@@ -10737,7 +12128,7 @@ mod tests {
 
         assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
         assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
 
         // Map backwards time to the policy refusal.
         assert_eq!(
@@ -10803,7 +12194,7 @@ mod tests {
 
         assert!(!temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
         assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
 
         assert!(timebase_is_sequence_only(evidence.timebase));
         assert!(!timebase_supports_wall_clock(evidence.timebase));
@@ -10858,7 +12249,7 @@ mod tests {
         assert!(!temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
         assert!(!temporal_evidence_supports_expiry_claim(evidence, 10000, 5000, 5000));
         assert!(!temporal_evidence_supports_cooldown_claim(evidence, 5000, 10000, false));
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 3600_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 3_600_000, 5000));
     }
 
     #[test]
@@ -10999,7 +12390,7 @@ mod tests {
     fn ttl_claim_fails_on_sequence_only_timebase() {
         let mut evidence = healthy_wall_clock_timebase();
         evidence.timebase = StorageIntentTimebaseClass::SequenceOnly;
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
     }
 
     #[test]
@@ -11007,7 +12398,7 @@ mod tests {
         let mut evidence = healthy_wall_clock_timebase();
         evidence.clock_health.flags = ClockHealthFlags::from_flag(ClockHealthFlags::KNOWN_SKEW);
         // Missing NO_BACKWARDS_STEP.
-        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert!(!temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
     }
 
     #[test]
@@ -11022,7 +12413,7 @@ mod tests {
         // Known skew, no backwards step, wall-clock timebase, fresh sample.
         assert!(temporal_evidence_supports_wall_clock_rpo(evidence, 5000, 1000, 5000));
         assert!(temporal_evidence_supports_freshness_claim(evidence, 30000, 5000));
-        assert!(temporal_evidence_supports_ttl_claim(evidence, 3600_000, 7200_000, 5000));
+        assert!(temporal_evidence_supports_ttl_claim(evidence, 3_600_000, 7_200_000, 5000));
         assert_eq!(temporal_evidence_age_ms(evidence, 20000, 10000), Some(10000));
     }
 }
