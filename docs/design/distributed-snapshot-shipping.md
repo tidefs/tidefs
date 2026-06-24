@@ -333,6 +333,11 @@ On partial receive (transport failure mid-stream):
 Each follow-up issue has a single responsibility, a non-overlapping expected
 write set, and a validation tier.
 
+Current GitHub mapping: #1252 owns send-path wiring, #1254 owns receive-path
+wiring, #1255 owns sender lifecycle, #1256 owns receiver lifecycle, #1257 owns
+clone delta propagation, #1259 owns the received-deletion deadlist trigger, and
+#1258 owns barrier integration.
+
 | Issue | Responsibility | Expected write set | Validation tier |
 |-------|---------------|-------------------|-----------------|
 | Wire storage-node daemon to VFSSEND2 send path | Replace VFSSEND1 `ChangedRecordExport` encoding in `tidefs-storage-node` `Frame::Send` handler with VFSSEND2 `SendBuilder` + `SendTransportBridge`. Storage-node daemon only; local-filesystem unchanged. | `apps/tidefs-storage-node/src/`, `Cargo.toml` (add send-stream dep) | Two-node harness + QEMU smoke |
@@ -343,21 +348,245 @@ write set, and a validation tier.
 | Deadlist derivation trigger on received deletion | Add a trigger point in the receive path that, after processing a snapshot-deletion delta, calls deadlist derivation for the affected root. Depends on #1248 for the derivation function. | `crates/tidefs-local-filesystem/src/send_receive.rs`, integration with deadlist module (TBD by #1248) | Unit tests, two-node harness |
 | Snapshot barrier integration with send | Wire the existing `SnapshotBarrier` protocol (in `tidefs-storage-node`) as the pre-send quiesce step: before a distributed snapshot send, the coordinator runs the barrier, then initiates the VFSSEND2 transfer. | `apps/tidefs-storage-node/src/snapshot_barrier.rs`, send-path integration | QEMU carrier (#1220) |
 
-### 7.2 Deferred decisions
+### 7.2 Decision: policy/admission driven event shipping
 
-The following are deferred to follow-up design or implementation issues:
+Distributed snapshot shipping is scheduled by a source-side admission policy,
+not by the transport layer and not by a timer that blindly starts sends. The
+policy consumes committed snapshot lifecycle events, explicit operator requests,
+and recovery/storage-intent signals, then admits a VFSSEND2
+`SessionClass::TransferBulk` / `MessageFamily::StateTransfer` shipment only
+when dataset, pool, peer, node, lane, membership, and receiver-state gates all
+allow it.
+
+This is a pre-alpha safety boundary. The scheduler does not cut snapshots,
+does not define retention, does not select a concrete carrier, and does not
+prove product replication. It chooses whether a committed snapshot or snapshot
+metadata mutation that already exists should be shipped now, resumed, retried,
+or refused/deferred with an operator-visible reason.
+
+#### Models considered
+
+1. **Source-coordinator periodic shipping.** A coordinator would scan every
+   dataset on a fixed interval and ship any unshipped snapshot.
+
+   This is rejected as the primary model. It is simple, but it hides why work is
+   admitted, creates bursty full-send storms after partitions, has no natural
+   place to consume storage-intent policy, and would couple snapshot shipping to
+   a retention policy this design does not own. Periodic scans remain useful
+   only as reconciliation: they may discover missed events and enqueue
+   candidates, but each candidate still goes through the admission gates below.
+
+2. **Transport/backpressure driven shipping.** Any source that can open a
+   `TransferBulk` session would enqueue stream chunks until transport
+   backpressure stops it.
+
+   This is rejected as the policy boundary. Transport owns session-local
+   mechanics and evidence, as recorded in `docs/TRANSPORT_CLUSTER_AUTHORITY.md`;
+   it does not know dataset lineage, incremental-base availability, retention
+   risk, recovery priority, tenant/budget ownership, or operator intent.
+
+3. **Policy/admission driven event shipping.** Snapshot lifecycle events and
+   operator or recovery requests create shipment candidates. A source-side
+   admission controller chooses full, incremental, resume, retry, or defer
+   using lineage state, receiver checkpoints, concurrency slots,
+   `SessionClass::TransferBulk` lane state, transport path evidence, and
+   storage-intent policy evidence when those surfaces exist.
+
+   This is selected. It preserves VFSSEND2's sender-driven session model, keeps
+   policy above transport, and is safe for pre-alpha TideFS because the default
+   behavior is conservative: background/bulk shipping yields to foreground
+   durability, metadata, control, and read pressure, and unknown evidence
+   produces a visible defer/refusal rather than a silent weaker guarantee.
+
+#### Trigger conditions
+
+Only committed, locally visible snapshot state can trigger shipment. A pending
+snapshot barrier, uncommitted txg, or partially applied received stream is not a
+valid source snapshot for outbound shipping.
+
+Initial full-send triggers are:
+
+- the receiver has no applied snapshot for the `(source pool, dataset, peer)`
+  relationship;
+- the receiver's advertised base root is missing, corrupt, or not lineage-
+  compatible, and policy/operator input allows a re-seed instead of refusing;
+- an operator requests a full resynchronization for a dataset/peer pair;
+- an incremental send cannot be formed because the base snapshot expired or was
+  deleted, but the source still has the target snapshot and the policy permits
+  replacing the receiver lineage with a full seed.
+
+Initial incremental-send triggers are:
+
+- a committed snapshot is newer than the receiver's last applied snapshot and
+  the receiver holds the declared base root;
+- a clone promotion, clone deletion, or snapshot deletion delta follows a
+  receiver-visible base snapshot;
+- a receiver requests resume or catch-up from a persisted checkpoint whose
+  cursor and stream digest still match the source's VFSSEND2 stream.
+
+Periodic reconciliation is allowed only to re-discover candidates that should
+already have been enqueued by the event path, such as a source restart, peer
+restart, or missed operator request. It must not create snapshots, change
+retention, or bypass admission.
+
+#### Admission order and concurrency limits
+
+The admission controller evaluates candidates in this order:
+
+1. Required control, membership, barrier, and foreground durability/read work
+   always wins over snapshot shipping.
+2. A valid resume attempt for an existing partial receive is admitted before a
+   new shipment for the same dataset/peer, because it usually consumes less
+   network and receiver staging space.
+3. Incremental sends are preferred over full sends when the receiver has a
+   verified base root.
+4. Full sends are admitted only when no incremental path is valid or an
+   operator/policy decision explicitly requests a re-seed.
+
+The initial hard limits are deliberately small:
+
+| Scope | Initial limit | Notes |
+|---|---:|---|
+| Dataset | 1 outbound shipment and 1 inbound shipment | A resume attempt consumes the same slot as its original shipment. Applying the final receive state is exclusive per dataset. |
+| Pool | 2 outbound shipments and 2 inbound shipments | Full sends and incremental sends both count as one pool slot; deployments may lower this under pressure. |
+| Peer pair | 1 outbound shipment and 1 inbound shipment | Prevents one slow peer from consuming all `TransferBulk` capacity. |
+| Node | 4 active snapshot-shipping sessions total | Includes send, receive, and resume sessions across all pools. |
+
+These are scheduler admission limits, not transport-QoS byte guarantees. Concrete
+bandwidth caps, dynamic token shrinkage, and governor-fed window limits remain
+owned by #862 and #891. Until those issues provide stronger policy evidence,
+snapshot shipping uses these static limits and the existing transport
+backpressure/lane state as conservative gates.
+
+#### Retry and backoff
+
+Every failed shipment records a typed retry state keyed by
+`(source pool, dataset, peer, target snapshot, stream id)`.
+
+| Failure class | Initial policy |
+|---|---|
+| Transport failure or timeout | Preserve receiver checkpoint evidence, mark the peer/dataset pair in exponential backoff with jitter, and retry only when membership still admits the peer and the `TransferBulk` lane is not sealed or hard-backpressured. |
+| Peer restart or membership epoch advance | Do not reuse stale sender-authority evidence. Refresh membership generation and sender authority, then prefer checkpoint resume if the receiver reports a matching checkpoint. |
+| Receiver busy or receiver concurrency limit | Defer using the receiver's hinted retry-after when available; otherwise use the normal backoff floor. This is not a full-send trigger by itself. |
+| Receiver rejection for unsupported feature, sender authority mismatch, trust/policy refusal, or cross-pool mismatch | Do not retry until the rejected evidence changes. Surface the refusal to operators with the receiver reason. |
+| Missing incremental base | Prefer a full seed only if policy/operator input allows re-seed and the source still has the target snapshot. Otherwise defer/refuse with a base-missing reason and require an operator or policy decision. |
+| Transport path evidence stale or contradictory | Defer unless policy explicitly allows conservative background shipping on unknown path evidence. This consumes #846 when available. |
+| Governor hard pressure | Refuse or keep deferred while #891 reports hard pressure for cluster queues or bulk transfer tokens. |
+
+The first retry delay is implementation-defined but must be nonzero; each
+subsequent retry backs off per failure key and resets only after a successful
+stream completion or a materially different failure class. Backoff state is
+separate from VFSSEND2 checkpoints: checkpoints identify how to resume data,
+while retry state identifies when a resume or replacement send may be admitted.
+
+#### Checkpoint and resume admission
+
+VFSSEND2 checkpoints are the only resume authority. A resume attempt is admitted
+only when all of these hold:
+
+- the receiver checkpoint carries a send cursor whose digest matches the source
+  stream prefix;
+- the source still has the target snapshot and any required base-root objects;
+- the sender authority can be refreshed for the current membership epoch;
+- no active session already owns the same `(dataset, peer, stream id)` resume;
+- the receiver staging state has not been discarded or superseded by a full
+  re-seed.
+
+If these checks fail, the scheduler either admits a full seed under the policy
+above or refuses/defer with a typed reason. A resume attempt must not silently
+fall back to a full send, because doing so can hide retention and operator-cost
+decisions.
+
+#### Lane and foreground-pressure treatment
+
+Snapshot shipping uses `SessionClass::TransferBulk` and
+`MessageFamily::StateTransfer`. The VFSSEND2 adapter maps that session class to
+transport `SendPriority::Bulk`, and `MessageFamily::StateTransfer` may run on
+the `Background` lane as its secondary lane. The initial scheduling policy
+therefore treats ordinary snapshot shipping as background/bulk work:
+
+- it is resumable and preemptible at VFSSEND2 chunk/checkpoint boundaries;
+- it yields to control, membership, metadata, intent-log durability barriers,
+  foreground reads/writes, and policy-protected repair/evacuation work;
+- memory pressure throttles or drains snapshot shipping before demand work;
+- a foreground/demand escalation is allowed only when a storage-intent or
+  recovery/degradation issue records the evidence that the shipment is required
+  for durability, RPO/RTO, or repair safety. #862 owns that policy enforcement
+  vocabulary and source implementation.
+
+#### Operator-visible defer/refusal reasons
+
+Implementations must expose stable refusal/defer classes before shipping becomes
+operator-facing behavior. Initial classes are:
+
+| Reason | Meaning |
+|---|---|
+| `snapshot_not_committed` | The source snapshot or delta is not durably visible. |
+| `snapshot_barrier_pending` | The #1258 pre-send barrier has not completed. |
+| `dataset_slot_in_use` | The dataset already has an active shipment in that direction. |
+| `pool_limit_reached` | The pool's snapshot-shipping slot limit is exhausted. |
+| `peer_limit_reached` | The peer pair already has an active shipment in that direction. |
+| `node_limit_reached` | The node-level snapshot-shipping session limit is exhausted. |
+| `membership_peer_unavailable` | Membership/roster evidence does not admit the peer. |
+| `sender_authority_stale` | Sender authority does not match the current membership epoch. |
+| `receiver_missing_base` | Incremental base-root validation failed on the receiver. |
+| `receiver_rejected_policy` | Receiver policy, trust, or feature negotiation rejected the stream. |
+| `transport_backoff` | The failure key is still in retry backoff. |
+| `transport_path_evidence_stale` | #846-style path evidence is missing, stale, or contradictory for the requested policy. |
+| `transport_backpressured` | Transport lane/backpressure state currently prevents admission. |
+| `governor_pressure` | #891-style resource governor pressure prevents bulk transfer admission. |
+| `storage_intent_budget_exhausted` | #862-style policy/QoS budget would be exceeded. |
+| `cross_pool_untrusted` | Cross-pool trust/policy evidence is absent or rejected. |
+| `resume_checkpoint_invalid` | The receiver checkpoint cannot be matched to the source stream. |
+| `resume_staging_missing` | Receiver staging state was discarded or superseded. |
+
+#### Implementation map
+
+This design reveals source work but does not assign it to this docs slice:
+
+- Update #1255 or create a same-scope sender scheduler issue before source
+  edits to add source-side shipment candidate state, retry/backoff state, and
+  resume admission around the VFSSEND2 sender session. Expected write set:
+  `crates/tidefs-send-stream/` session/scheduler module only, plus focused
+  tests.
+- Update #1256 before receiver-side lifecycle work to return typed receiver
+  refusal/defer reasons for missing base roots, invalid checkpoints, busy
+  staging, stale sender authority, and unsupported features. Expected write set:
+  `crates/tidefs-receive-stream/` and the receive integration already named by
+  #1256.
+- Keep #1258 as the barrier trigger owner. The scheduler consumes a
+  barrier-complete or barrier-refused result; it does not redesign
+  `SnapshotBarrier`.
+- Keep #846, #862, and #891 as non-blocking adjacent owners. Snapshot shipping
+  consumes their transport path evidence, intent/QoS budget results, and
+  governor pressure state when available, but this design does not move their
+  source write sets.
+- If implementation requires a standalone scheduler crate instead of extending
+  the #1255/#1256 session lifecycle surfaces, create a new GitHub issue before
+  source edits with a non-overlapping write set such as a new
+  `crates/tidefs-snapshot-shipping-scheduler/` crate and only narrow adapter
+  hooks in the sender/receiver lifecycle issues.
+
+#### Non-claims
+
+This scheduling decision does not claim product-ready replication, a WAN or
+RDMA performance guarantee, cross-pool trust policy, automatic snapshot
+retention policy, or successful QEMU carrier validation. #1220 remains the
+carrier-validation surface for runtime follow-up work.
+
+### 7.3 Remaining deferred decisions
+
+The following remain deferred to follow-up design or implementation issues:
 
 - **Concrete transport binding** (TCP, RDMA, etc.): deferred to TFR-017
   cluster authority decision.
-- **QoS budgets and bandwidth caps** for snapshot shipping sessions: deferred
-  to a transport-QoS design issue.
+- **Concrete QoS byte budgets and bandwidth caps** beyond the initial
+  concurrency limits above: deferred to #862 and #891 implementation evidence.
 - **Multi-hop routing** (sender → intermediate → receiver): not addressed;
   initial scope is point-to-point.
 - **Cross-pool snapshot shipping** (different pool UUIDs): VFSSEND2
   `SenderAuthority` carries pool UUID; cross-pool shipping requires
   pool-trust configuration beyond this design.
-- **Snapshot shipping scheduling** (when to ship, retry policy, concurrent
-  send limits): deferred to a snapshot-scheduling design issue.
 - **Deadlist derivation algorithm**: owned by #1248.
 
 ## 8. Evidence Reviewed
@@ -365,6 +594,12 @@ The following are deferred to follow-up design or implementation issues:
 - `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` (closed #1246) — snapshot,
   clone, deadlist, send/receive storage model authority.
 - `docs/REVIEW_TODO_REGISTER.md` TFR-010 and TFR-017 notes.
+- `docs/design/unified-scheduling-classes-lane-priority-model.md` — canonical
+  lane classes, background bulk-transfer treatment, starvation, preemption, and
+  memory-pressure rules.
+- `docs/TRANSPORT_CLUSTER_AUTHORITY.md` — split authority between
+  transport-local admission/backpressure mechanics and membership/runtime
+  roster, epoch, and fencing decisions.
 - `crates/tidefs-send-stream/src/lib.rs` — VFSSEND2 protocol framing,
   transport feature, current integration status, stale issue references.
 - `crates/tidefs-send-stream/src/send_stream_adapter.rs` — transport adapter
@@ -381,9 +616,16 @@ The following are deferred to follow-up design or implementation issues:
   barrier protocol.
 - `crates/tidefs-two-node-harness/src/receive_stream.rs` — VFSSEND2
   end-to-end validation through deterministic loopback transport.
+- `crates/tidefs-types-transport-session/src/lib.rs`,
+  `crates/tidefs-transport/src/outbound_send.rs`,
+  `crates/tidefs-transport/src/send_scheduler.rs`, and
+  `crates/tidefs-transport/src/send_backpressure.rs` — `TransferBulk`,
+  `StateTransfer`, lane class, send-priority, and backpressure source evidence.
 - `crates/tidefs-replication/src/write_path.rs` — replication write fan-out
   with quorum semantics.
 - `crates/tidefs-replicated-object-store/src/lib.rs` — N-replica store with
   quorum write, degraded read, replica repair.
 - Open issue #1248 (deadlist integration design).
 - Open issue #1220 (two-node QEMU carrier).
+- Live follow-up and adjacent issue bodies: #1252, #1254, #1255, #1256, #1257,
+  #1258, #1259, #846, #862, #891, and #1261.
