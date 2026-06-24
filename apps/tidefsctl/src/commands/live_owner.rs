@@ -822,7 +822,7 @@ fn live_owner_status_text_json(route: &LivePoolRoute<'_>, text: &str) -> serde_j
 
 fn decode_live_owner_hex(value: &str) -> Result<Vec<u8>, LiveOwnerRequestError> {
     let hex = value.strip_prefix("0x").unwrap_or(value);
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(LiveOwnerRequestError::Owner {
             exit_code: 2,
             message: "decode live-owner byte response: odd-length hex".to_string(),
