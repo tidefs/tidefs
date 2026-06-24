@@ -8864,8 +8864,7 @@ mod tests {
                     full_trust_record_for_role(role),
                 ),
                 ReceiptPredicateResult::SATISFIED,
-                "role {} should have a satisfiable trust/domain evidence envelope",
-                role
+                "role {role} should have a satisfiable trust/domain evidence envelope"
             );
         }
     }
