@@ -763,11 +763,65 @@ impl Default for EvidenceFamilyFreshness {
     }
 }
 
+#[cfg(feature = "serde")]
+mod serde_families {
+    use super::{EvidenceFamilyFreshness, STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES};
+
+    pub fn serialize<S: serde::Serializer>(
+        families: &[EvidenceFamilyFreshness; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::Serialize;
+        families[..].serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<
+        [EvidenceFamilyFreshness; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES],
+        D::Error,
+    > {
+        struct ArrayVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ArrayVisitor {
+            type Value =
+                [EvidenceFamilyFreshness; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES];
+
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("a sequence of EvidenceFamilyFreshness")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut arr = [EvidenceFamilyFreshness::EMPTY;
+                    STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES];
+                let mut idx: usize = 0;
+                while let Some(elem) = seq.next_element::<EvidenceFamilyFreshness>()? {
+                    if idx >= STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES {
+                        return Err(serde::de::Error::invalid_length(
+                            idx + 1,
+                            &"at most 36 EvidenceFamilyFreshness elements",
+                        ));
+                    }
+                    arr[idx] = elem;
+                    idx += 1;
+                }
+                Ok(arr)
+            }
+        }
+
+        deserializer.deserialize_seq(ArrayVisitor)
+    }
+}
+
 /// Bounded freshness table for families used by one evidence query snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct EvidenceFamilyFreshnessSet {
     len: u8,
+    #[cfg_attr(feature = "serde", serde(with = "serde_families"))]
     families: [EvidenceFamilyFreshness; STORAGE_INTENT_EVIDENCE_QUERY_FAMILY_STATES],
 }
 
