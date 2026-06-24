@@ -1,23 +1,41 @@
 # 11-Layer Architecture Dependency Matrix
 
-**Issue**: [#1284](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1284)
-**Status**: design-spec
-**Priority**: P1
-**Lane**: docs
-**Kind**: tracking
-**Milestone**: DESIGN-M1: Storage Foundation (Layers 0-2)
+**Issue**: Historical Forgejo issue
+[#1284](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1284)
+**Status**: historical-input
+**Priority**: Historical P1
+**Lane**: historical docs
+**Kind**: historical tracking
+**Milestone**: Historical DESIGN-M1: Storage Foundation (Layers 0-2)
 **Last updated**: 2026-05-03
+
+> **HISTORICAL DESIGN INPUT — NOT CURRENT AUTHORITY**
+>
+> This file is imported Forgejo-era coordination material for the May 2026
+> DESIGN issue set. Its Forgejo issue numbers, DESIGN milestone rows,
+> `claimed`/`ready`/`open`/`done` labels, critical-path and parallelization
+> tables, sequencing notes, and recent-change records are historical input
+> only.
+>
+> Do not use this matrix as live GitHub scheduling authority, implementation
+> status, release-readiness evidence, or current product architecture policy.
+> Current TideFS work-selection and status authority comes from live GitHub
+> issues and pull requests plus repo docs classified as current policy or
+> current spec by
+> [`docs/DOCUMENTATION_AUTHORITY_REGISTER.md`](../DOCUMENTATION_AUTHORITY_REGISTER.md).
 
 ## Abstract
 
-tidefs architecture is organized into 11 layers grouped into 4 milestone blocks.
-This document maps every DESIGN issue to its layer, exhaustively records
-cross-issue dependencies, identifies parallelization-safe groups, and traces
-the critical path from L0 (format contracts) through L11 (cluster orchestration).
+The imported Forgejo design model organized TideFS architecture into 11 layers
+grouped into 4 milestone blocks. This document mapped each historical DESIGN
+issue to its layer, recorded cross-issue dependencies, identified
+parallelization-safe groups, and traced a critical path from L0 (format
+contracts) through L11 (cluster orchestration).
 
-The matrix serves as the single source of truth for work sequencing. It is
-updated whenever an issue is created, split, merged, closed, or when a
-dependency is discovered.
+The matrix is preserved as historical design input for later source and
+documentation review. It is not maintained as the single source of truth for
+work sequencing, current implementation status, release readiness, or product
+architecture direction.
 
 ---
 
@@ -39,9 +57,10 @@ dependency is discovered.
 
 ### 1.1 Bedrock Issues
 
-Five issues form architectural bedrock. Their design decisions cascade into
-multiple dependents. Changes to these issues require coordinating all downstream
-consumers:
+In the historical design model, five Forgejo issues formed architectural
+bedrock. Their design decisions cascaded into multiple dependents. Treat these
+rows as imported dependency context, not as current GitHub issue status or a
+current downstream coordination rule:
 
 | Bedrock | Layer | Issue | Description |
 |---------|-------|-------|------------|
@@ -288,9 +307,10 @@ L11: #1241 ◄──────────────────────
 
 ## 4. Parallelization Groups
 
-Issues within a group can be claimed and worked on simultaneously.
-Groups are ordered by dependency: groups later in the list depend on
-groups earlier in the list (or are independent).
+In the historical Forgejo claim model, issues within a group could be claimed
+and worked on simultaneously. Groups were ordered by dependency: groups later
+in the list depended on groups earlier in the list (or were independent). These
+tables are not live GitHub scheduling authority.
 
 ### P0 — No-dependency, always safe
 
@@ -427,21 +447,26 @@ Bedrock issues #1220, #1213, #1179, #1209, #1285 have explicit dependency-block 
 
 ## 8. Serial Write Surfaces
 
-Per the parallel safety rules in AGENTS.md:
+The historical snapshot recorded these serial write surfaces:
 
 | Surface | Path | Rule |
 |---------|------|------|
 | Local filesystem | `crates/tidefs-local-filesystem/src/lib.rs` | One active issue at a time |
 | Local object store | `crates/tidefs-local-object-store/src/lib.rs` | One active issue at a time |
 
-Non-code DESIGN issues do not touch these surfaces.
-Implementation issues must check claim status before editing.
+Non-code DESIGN issues in that snapshot did not touch these surfaces.
+Historical implementation issues were expected to check Forgejo claim status
+before editing; current TideFS work must use live GitHub issue/PR coordination
+and repo docs classified as current policy or current spec.
 
 ---
 
-## 9. Issue State Reference
+## 9. Historical Issue State Reference
 
-For the authoritative state of any issue, query the Forgejo API:
+The Forgejo query below was the authority path for this imported snapshot only.
+It is not current TideFS work-selection, scheduling, implementation-status, or
+release-readiness authority. For current work, use live GitHub issues and pull
+requests plus repo docs classified as current policy or current spec.
 
 ```
 curl -u forgeadmin:TOKEN \
@@ -449,8 +474,8 @@ curl -u forgeadmin:TOKEN \
 ```
 
 Labels `codex:ready`, `codex:claimed`, `codex:needs-review`, `codex:blocked`, and
-`codex:done` are the only live coordination state. Do not trust local branch names
-or stale tracking files.
+`codex:done` are historical Forgejo-era labels in this context. Do not treat
+them as live coordination state.
 
-See `~/ai/bin/tidefs-claim status` for the current claim landscape before
-starting work.
+Do not use `~/ai/bin/tidefs-claim status` or this matrix to preselect current
+TideFS product direction.
