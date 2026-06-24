@@ -874,6 +874,7 @@ pub fn compile_prefetch_residency_policy(
 
     if sources.pool_default.present {
         source_mask = source_mask.with(StorageIntentPolicySourceClass::PoolDefault);
+        push_source_trace(&mut source_trace, sources.pool_default);
     }
 
     has_dataset_policy |= apply_source(
@@ -1222,8 +1223,14 @@ fn prefetch_policy_relaxes(
     old: PrefetchResidencyPolicyEnvelope,
     new: PrefetchResidencyPolicyEnvelope,
 ) -> bool {
-    (new.allowed_actions.0 & !old.allowed_actions.0) != 0
-        || (old.flags.0 & !new.flags.0) != 0
+    let actions_added = (new.allowed_actions.0 & !old.allowed_actions.0) != 0;
+    let actions_removed = (old.allowed_actions.0 & !new.allowed_actions.0) != 0;
+    let flags_relaxed = (old.flags.0 & !new.flags.0) != 0;
+    // Flag relaxation only overrides when actions are not also tightened.
+    let net_flag_relax = !actions_removed && flags_relaxed;
+
+    actions_added
+        || net_flag_relax
         || max_ceiling_relaxed(old.max_prefetch_window_bytes, new.max_prefetch_window_bytes)
         || max_ceiling_relaxed(old.max_staging_bytes, new.max_staging_bytes)
         || max_ceiling_relaxed(old.max_decay_age_ms, new.max_decay_age_ms)
