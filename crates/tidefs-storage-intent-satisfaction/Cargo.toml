@@ -1,0 +1,29 @@
+[package]
+name = "tidefs-storage-intent-satisfaction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+
+description = """
+Read-only storage-intent satisfaction reconciliation over supplied policy,
+receipt, and evidence-query records. Emits typed satisfied, converging,
+degraded-visible, unknown-evidence, blocked, refused, and unsafe/volatile state
+without choosing placement, executing movement, or retiring receipts.
+"""
+
+[features]
+default = []
+serde = ["dep:serde", "tidefs-storage-intent-core/serde"]
+
+[dependencies]
+tidefs-storage-intent-core = { workspace = true }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+
+[lib]
+path = "src/lib.rs"
