@@ -295,92 +295,69 @@ Important 2026-06-01 findings:
   local inode/directory maps remain filesystem-global, and FUSE lookup
   references, inode-table projection policy, and generic special-node `rdev`
   replay stay in the non-overlapping follow-up slices.
-- `TFR-005`: POSIX timestamp paths write through `metadata_version` and
-  `data_version`, and `InodeRecord::to_inode_attr()` projects those same
-  persisted fields back as POSIX atime/mtime/ctime/btime. `data_version` is
-  also content object key material, content-manifest identity, scrub block
-  identity, and an on-disk inode/content-manifest field. Intent-log replay
-  reconstructs content under a fresh generation tick and stores that tick back
-  as `data_version`/`metadata_version`, while namespace rename paths stamp
-  parent metadata with the moved entry generation. The main projection,
-  setattr, timestamp-update, and content-key hotspots now carry
-  register-backed markers, but the item remains open until POSIX time,
-  storage generation, replay, scrub, and format compatibility are designed as
-  one contract.
-- `TFR-005`: issue #330 removes `PosixTimeRecord::from_generation` and
-  `PosixTimeRecord::legacy_from_versions` from the local-filesystem runtime
-  projection.  `PosixTimeRecord::synthetic(now_ns)` provides the named
-  authority boundary for synthetic inodes.  The encoding format version < 5
-  legacy path now returns a clean decode error instead of reconstructing
-  POSIX timestamps from storage fields.  The VFS engine
-  `update_anonymous_size` no longer derives a version counter from `mtime_ns`.
-  Remaining TFR-005 local-filesystem sites include `subtree_rev`/`dir_rev`
-  coupling through `metadata_version`, intent-log replay version projection,
-  scrub/repair identity, and send/receive serialization.  See
-  `docs/TIMESTAMP_GENERATION_AUTHORITY.md` for the updated remaining-sites
-  list.
-- `TFR-005`: issue #325 adds `docs/TIMESTAMP_GENERATION_AUTHORITY.md` and
-  shared VFS/inode-attribute helper boundaries for POSIX nanosecond timestamps
-  versus VFS inode `Generation`. This narrows the shared API contract and
-  proves setattr timestamp operations preserve `generation`, `subtree_rev`, and
-  `dir_rev`, but it does not close TFR-005. Local-filesystem inode record
-  projection, intent-log replay, scrub/repair identity, reclaim/content-key
-  identity, and send/receive runtime projections remain unresolved.
+- `TFR-005`: the original local-filesystem audit found POSIX timestamp fields,
+  `metadata_version`, `data_version`, content object keys, scrub identity,
+  intent-log replay ticks, rename metadata stamps, and serialized format fields
+  coupled through the same runtime records. The main projection, setattr,
+  timestamp-update, and content-key hotspots carry register-backed markers.
+  The current closeout map is
+  `docs/TIMESTAMP_GENERATION_AUTHORITY.md` section 9. TFR-005 remains open
+  until the delegated live runtime families, any conditional future-only
+  coverage or ABI rows, and product-claim evidence support closure; stale
+  source/documentation slices that are now closed are not remaining blockers.
+- `TFR-005`: issues #325, #330, and #331 plus PR #348 separated POSIX
+  wall-clock timestamp authority from storage generation and content-version
+  identity. `PosixTimeRecord::from_generation` and
+  `PosixTimeRecord::legacy_from_versions` are gone,
+  `PosixTimeRecord::synthetic(now_ns)` is the named synthetic-inode boundary,
+  format version < 5 inode records fail closed instead of reconstructing POSIX
+  timestamps from storage fields, and `update_anonymous_size` no longer
+  derives a version counter from `mtime_ns`. These closed slices are not
+  remaining TFR-005 blockers.
 - `TFR-005`: issue #499 produces the comprehensive
   `docs/TIMESTAMP_GENERATION_AUTHORITY.md` design authority document,
-  replacing the guardrail version from issue #325. The design doc specifies:
+  replacing the guardrail version from issue #325. The design doc specifies
   crate-per-concept ownership, monotonicity/wraparound/epoch rules,
-  cross-authority relationship map (POSIX time, txg, data_version,
-  metadata_version, subtree_rev/dir_rev, format version, scrub identity),
-  and on-disk format compatibility rules for version field changes. This is a
-  planning document; it does not change runtime behavior or close TFR-005.
-  Remaining implementation blockers are listed in section 9 of the design doc:
-  `metadata_version` to `subtree_rev`/`dir_rev` coupling, intent-log replay
-  version projection, scrub/repair identity, send/receive serialization,
-  content-object reclaim identity, and format-golden/codec surfaces.
+  cross-authority relationships, and on-disk format compatibility rules for
+  version field changes. Section 9 now records the reconciled closeout map
+  instead of a stale unresolved-site list.
+- `TFR-005`: issue #694 resolves the intent-log replay and commit-group
+  recovery decision. Recovery may initialize `generation`, `data_version`, and
+  `metadata_version` from one accepted recovery tick, and later mounted writes
+  intentionally let those identities diverge. Future executable coverage or
+  runtime guards for that contract are conditional/future-only work, not a
+  currently discovered unprepared blocker.
+- `TFR-005`: issues #688 and #994 resolve the namespace-revision coupling.
+  `InodeRecord` stores `subtree_rev` and `dir_rev`, encode/decode persist both
+  counters through a backward-compatible tail extension, projections read the
+  stored counters instead of `metadata_version`, and metadata/content mutation
+  paths advance `subtree_rev` independently of `metadata_version`.
 - `TFR-005`: issue #742 adds `docs/SCRUB_IDENTITY_AUTHORITY.md` as the local
   scrub identity boundary. It records that the content identity carried by
-  `ScrubBlockId` is `(inode_id, data_version)`, where `data_version` is the
-  content-identity token defined by
-  `docs/TIMESTAMP_GENERATION_AUTHORITY.md`, and explicitly excludes POSIX
-  timestamps, wall-clock time, `metadata_version`, storage-generation ticks,
-  and intent-log epochs from scrub identity authority. This documentation
-  slice does not change runtime behavior or close TFR-005; transform-aware
-  scrub read authority, scrub routing, and repair dispatch remain owned by
-  issues #650, #651, and #652.
+  `ScrubBlockId` is `(inode_id, data_version)` and excludes POSIX timestamps,
+  wall-clock time, `metadata_version`, storage-generation ticks, and intent-log
+  epochs from scrub identity authority. Issue #650 closed the mounted
+  content-scrub read authority slice; live issues #651 and #652 own scrub
+  routing and repair dispatch gating.
+- `TFR-005`: issue #695 adds `docs/SEND_RECEIVE_VERSION_AUTHORITY.md`, issue
+  #1002 adds the focused VFSSEND1 authority guards, and related sender/receive
+  follow-ups #777 and #703 are closed. Send/receive stream versions own only
+  envelope shape; local payload format versions own POSIX timestamp,
+  `data_version`, and `metadata_version` layout. No separate
+  timestamp/version reconciliation pass remains to prepare from this register.
 - `TFR-005`: issue #746 adds `docs/CONTENT_OBJECT_VERSION_AUTHORITY.md` as the
   content-object version boundary. It records that `data_version` is the
   content identity token for `(inode_id, data_version)` content keys, not a
   reclaim clock, and names the separate reclaim liveness guard:
   `death_commit_group`, `stable_committed_txg`, replacement/base placement
   receipt epoch and generation evidence, and `OrphanReplayWatermark` when
-  orphan recovery participates. This documentation slice resolves the section 9
-  item 5 naming blocker without changing reclaim dispatch, rebake policy,
-  orphan cleanup, storage format, or runtime behavior; issues #675 and #676
-  still own implementation policy.
-
-- `TFR-005`: issue #688 splits VFS namespace revision counters `subtree_rev`
-  and `dir_rev` from `metadata_version` in the local-filesystem path.
-  `InodeRecord` gains a `subtree_rev` field, encode/decode persist both
-  counters via a backward-compatible tail extension, and
-  `InodeRecord::to_inode_attr()` projects from the stored counters instead of
-  `metadata_version`.  `apply_metadata_setattr_to_inode` advances
-  `subtree_rev` on metadata changes independently of `metadata_version`.
-  This resolves section 9 item 1 of
-  `docs/TIMESTAMP_GENERATION_AUTHORITY.md`.  Remaining TFR-005 blockers:
-  intent-log replay version projection, scrub/repair identity, send/receive
-  serialization, content-object reclaim identity, and format-golden/codec
-  surfaces.
-- `TFR-005`: issue #994 advances the content-write follow-up from issue
-  #688. Local write, truncate, fallocate, reflink, and VFS whole-file
-  copy-file-range paths now advance `subtree_rev` from the stored namespace
-  revision counter, and deferred write/truncate/metadata timestamp updates do
-  the same independently of `metadata_version`. Focused local-filesystem tests
-  cover deferred timestamp updates, direct write persistence across reopen,
-  truncate/fallocate advancement, and VFS whole-file copy projection. This
-  leaves the other TFR-005 blockers open: intent-log replay version
-  projection, scrub/repair identity, send/receive serialization,
-  content-object reclaim identity, and format-golden/codec surfaces.
+  orphan recovery participates. Live issues #675 and #676 still own receipt
+  consumer policy and rebake/reclaim trim implementation.
+- `TFR-005`: issue #696 resolves the section 9 format-golden/codec gate for
+  the current ABI by making VFS codec/vector manifest drift fail in focused
+  tooling. Future serialized ABI changes, such as a local filesystem format
+  version bump, remain conditional/future-only rows that must update golden
+  vectors and codec surfaces atomically with the ABI change.
 - `TFR-006`: Transform authority is still split across mounted-content
   compression, object-store device compression/encryption, helper compression
   and encryption crates, and inline content-addressed dedup. The
