@@ -33,7 +33,9 @@ use tidefs_binary_schema_checksum::crc32c;
 /// a `DeviceClass::Metadata` device backed by `DeviceMediaClass::Nvme`
 /// flash, or a `DeviceClass::Data` device backed by `DeviceMediaClass::Hdd`
 /// spinning rust.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum DeviceMediaClass {
     /// NVMe flash (PCIe-attached, very low latency).
     Nvme,
@@ -87,6 +89,11 @@ impl DeviceMediaClass {
     }
 
     /// Weight multiplier used by [`WriteAllocator`] scoring.
+    ///
+    /// This is only a local allocator hint. Storage-intent decisions that
+    /// spend flash lifetime or write-amplification budget must use the media
+    /// cost ledger instead of treating this weight as complete policy
+    /// authority.
     #[must_use]
     pub fn class_weight(self) -> f64 {
         match self {
