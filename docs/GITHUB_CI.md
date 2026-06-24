@@ -1,7 +1,18 @@
 # GitHub CI
 
-TideFS uses GitHub as the primary private remote. The repository remains
-private until the operator gives an explicit public-release go-ahead.
+TideFS uses GitHub as the primary remote for the main `tidefs/tidefs`
+repository. The operator approved making that main repository public on
+2026-06-21. This public repository status is a read-visibility boundary only:
+TideFS remains pre-alpha, and the visibility change is not a product release,
+release-readiness claim, or compatibility promise.
+
+GitHub outsider interaction remains restricted by the documented public-read
+controls: organization interaction limits stay at `collaborators_only`, pull
+request (PR) creation remains collaborator-only, `tidefs-ci` self-hosted runner
+access remains selected-repository access for the TideFS repositories, and
+workflow-token permissions remain read-only. The secret boundary below still
+keeps runner credentials, deployment keys, API tokens, TLS keys, and other
+TideFS secrets outside GitHub and outside this repository.
 
 ## Secret Boundary
 
