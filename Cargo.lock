@@ -2376,7 +2376,6 @@ dependencies = [
  "serde_json",
  "tidefs-membership-epoch",
  "tidefs-replication-model",
- "tidefs-storage-intent-core",
 ]
 
 [[package]]
@@ -2958,6 +2957,7 @@ dependencies = [
  "tidefs-durability-layout",
  "tidefs-membership-epoch",
  "tidefs-replication-model",
+ "tidefs-storage-intent-core",
 ]
 
 [[package]]
