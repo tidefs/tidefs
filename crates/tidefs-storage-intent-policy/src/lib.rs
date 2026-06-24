@@ -796,15 +796,13 @@ pub fn config_to_prefetch_residency_sources(
     internal_maintenance: Option<InternalMaintenanceIntent>,
     subject_range_override: Option<PrefetchResidencyPolicySource>,
 ) -> PrefetchResidencyPolicySources {
+    let dataset = materialize_dataset_source(config);
+
     PrefetchResidencyPolicySources {
         identity,
-        pool_default: config
-            .dataset
-            .unwrap_or(PrefetchResidencyPolicySource::ABSENT),
+        pool_default: dataset,
         inherited_dataset: PrefetchResidencyPolicySource::ABSENT,
-        dataset: config
-            .dataset
-            .unwrap_or(PrefetchResidencyPolicySource::ABSENT),
+        dataset,
         mount_profile: config
             .mount_profile
             .unwrap_or(PrefetchResidencyPolicySource::ABSENT),
@@ -813,12 +811,62 @@ pub fn config_to_prefetch_residency_sources(
             .unwrap_or(PrefetchResidencyPolicySource::ABSENT),
         subject_range_override: subject_range_override
             .unwrap_or(PrefetchResidencyPolicySource::ABSENT),
-        caller_flags: caller_flags.unwrap_or_default(),
-        caller_hints: caller_hints.unwrap_or_default(),
-        internal_maintenance: internal_maintenance.unwrap_or_default(),
+        caller_flags: caller_flags
+            .or(config.default_caller_flags)
+            .unwrap_or_default(),
+        caller_hints: caller_hints
+            .or(config.default_caller_hints)
+            .unwrap_or_default(),
+        internal_maintenance: internal_maintenance
+            .or(config.default_maintenance_intent)
+            .unwrap_or_default(),
         evidence_state,
         evidence_refs,
     }
+}
+
+fn materialize_dataset_source(
+    config: &DatasetPrefetchResidencyPolicyConfig,
+) -> PrefetchResidencyPolicySource {
+    let mut source = config
+        .dataset
+        .unwrap_or(PrefetchResidencyPolicySource::ABSENT);
+
+    if !source.present {
+        return source;
+    }
+
+    if let Some(admit) = config.admits_subject_range_overrides {
+        source.admits_subject_range_overrides = admit;
+    }
+    if let Some(opt_in) = config.explicit_unsafe_opt_in {
+        source.explicit_unsafe_opt_in = opt_in;
+    }
+    if let Some(bytes) = config.prefetch_window_limit {
+        source.has_prefetch_window_limit = bytes != 0;
+        source.max_prefetch_window_bytes = bytes;
+    }
+    if let Some(bytes) = config.staging_limit {
+        source.has_staging_limit = bytes != 0;
+        source.max_staging_bytes = bytes;
+    }
+    if let Some(sample_mass) = config.min_sample_mass {
+        source.min_sample_mass = sample_mass;
+    }
+    if let Some(window_ms) = config.min_observation_window_ms {
+        source.min_observation_window_ms = window_ms;
+    }
+    if let Some(decay_ms) = config.max_decay_age_ms {
+        source.max_decay_age_ms = decay_ms;
+    }
+    if let Some(dwell_ms) = config.dwell_min_ms {
+        source.dwell_min_ms = dwell_ms;
+    }
+    if let Some(cooldown_ms) = config.cooldown_ms {
+        source.cooldown_ms = cooldown_ms;
+    }
+
+    source
 }
 
 fn maybe<T: Copy>(v: T) -> Option<T> {
@@ -2848,6 +2896,140 @@ mod tests {
         assert!(sources.dataset.present);
         assert!(!sources.subject_range_override.present);
         assert!(!sources.caller_flags.durable_floor());
+    }
+
+    #[test]
+    fn config_to_sources_preserves_caps_defaults_and_override_admission() {
+        let mut config = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        config.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        ));
+        config.admits_subject_range_overrides = Some(true);
+        config.explicit_unsafe_opt_in = Some(true);
+        config.default_caller_flags = Some(CallerRequestFlags {
+            barrier: true,
+            ..CallerRequestFlags::default()
+        });
+        config.default_caller_hints = Some(CallerHintSource {
+            present: true,
+            hotness_hint: true,
+            lifetime_hint: false,
+            cache_bypass_hint: false,
+            requested_candidate: PrefetchResidencyCandidateClass::NoPrefetch,
+        });
+        config.default_maintenance_intent = Some(InternalMaintenanceIntent {
+            present: true,
+            protected_reserves_available: true,
+            ..InternalMaintenanceIntent::default()
+        });
+        config.prefetch_window_limit = Some(64 * 1024);
+        config.staging_limit = Some(2 << 20);
+        config.min_sample_mass = Some(48);
+        config.min_observation_window_ms = Some(10_000);
+        config.max_decay_age_ms = Some(120_000);
+        config.dwell_min_ms = Some(30_000);
+        config.cooldown_ms = Some(90_000);
+
+        let subject_range_override = PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::SubjectRangeOverride,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        )
+        .with_prefetch_window_limit(32 * 1024);
+        let sources = config_to_prefetch_residency_sources(
+            &config,
+            identity(DATASET_A, 1),
+            all_evidence(),
+            evidence_refs(),
+            None,
+            None,
+            None,
+            Some(subject_range_override),
+        );
+
+        assert!(sources.dataset.admits_subject_range_overrides);
+        assert!(sources.dataset.explicit_unsafe_opt_in);
+        assert!(sources.caller_flags.barrier);
+        assert!(sources.caller_hints.present);
+        assert!(sources.internal_maintenance.present);
+
+        let result = compile_prefetch_residency_policy(sources);
+
+        assert_eq!(
+            result.status,
+            StorageIntentPolicyCompileStatus::UnsafeVisible
+        );
+        assert!(result.subject_range_override_admitted);
+        assert_eq!(
+            result.envelope.policy_scope,
+            PrefetchResidencyPolicyScope::SubjectRange
+        );
+        assert_eq!(result.envelope.max_prefetch_window_bytes, 32 * 1024);
+        assert_eq!(result.envelope.max_staging_bytes, 2 << 20);
+        assert_eq!(result.envelope.min_sample_mass, 48);
+        assert_eq!(result.envelope.min_observation_window_ms, 10_000);
+        assert_eq!(result.envelope.max_decay_age_ms, 120_000);
+        assert_eq!(result.envelope.dwell_min_ms, 30_000);
+        assert_eq!(result.envelope.cooldown_ms, 90_000);
+        assert!(result
+            .source_mask
+            .contains(StorageIntentPolicySourceClass::CallerFlags));
+        assert!(result
+            .source_mask
+            .contains(StorageIntentPolicySourceClass::CallerHints));
+        assert!(result
+            .source_mask
+            .contains(StorageIntentPolicySourceClass::InternalMaintenance));
+    }
+
+    #[test]
+    fn config_default_hints_and_maintenance_cannot_authorize_movement() {
+        let mut config = DatasetPrefetchResidencyPolicyConfig::EMPTY;
+        config.dataset = Some(PrefetchResidencyPolicySource::new(
+            StorageIntentPolicySourceClass::Dataset,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH
+                .with(PrefetchResidencyCandidateClass::AuthorityPromotionCandidate),
+        ));
+        config.default_caller_hints = Some(CallerHintSource {
+            present: true,
+            hotness_hint: true,
+            lifetime_hint: true,
+            cache_bypass_hint: false,
+            requested_candidate: PrefetchResidencyCandidateClass::AuthorityPromotionCandidate,
+        });
+        config.default_maintenance_intent = Some(InternalMaintenanceIntent {
+            present: true,
+            relocation: true,
+            protected_reserves_available: false,
+            ..InternalMaintenanceIntent::default()
+        });
+
+        let result = compile_prefetch_residency_policy(config_to_prefetch_residency_sources(
+            &config,
+            identity(DATASET_A, 1),
+            all_evidence(),
+            evidence_refs(),
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        assert_eq!(result.status, StorageIntentPolicyCompileStatus::Lowered);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MovementDebtNotPaidBack
+        );
+        assert!(result
+            .source_mask
+            .contains(StorageIntentPolicySourceClass::CallerHints));
+        assert!(result
+            .source_mask
+            .contains(StorageIntentPolicySourceClass::InternalMaintenance));
+        assert!(!result
+            .envelope
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::AuthorityPromotionCandidate));
     }
 
     #[test]
