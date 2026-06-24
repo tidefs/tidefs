@@ -1661,7 +1661,6 @@ fn skipped_move_refusal(reason: SkippedMoveReason) -> StorageIntentRefusalReason
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_storage_intent_core::PendingFreeSafetyClass;
     use tidefs_storage_intent_core::{
         CompromiseState, DedupSharingCompatibilityState, DurabilityReceiptState,
         DurabilityRequirement, DurabilityState, EvidenceCompletenessVerdict, EvidenceConsumerClass,
@@ -1670,13 +1669,14 @@ mod tests {
         MediaArchiveRestoreSemantics, MediaAtomicityClass, MediaCapabilityFlags,
         MediaCapabilityFreshnessState, MediaFlushOrderingClass, MediaHealthState,
         MediaPersistenceDomain, MediaProtocolGeometryClass, MediaRemoteCommitSemantics,
-        PrefetchResidencyCandidateClass, PrefetchResidencyDecisionEvidenceRefs,
-        PrefetchResidencyDecisionOutcome, PrefetchResidencyStateClass, ProximityClass,
-        QuarantineState, ReadServingSourceClass, ResidencyScope, SegmentRegionClass,
-        SessionSecurityClass, SharingDomainClass, StorageIntentActionClass, StorageIntentDomainId,
-        StorageIntentEvidenceId, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
-        StorageIntentMediaCapabilityRecord, StorageIntentObjectScope, StorageIntentPolicyId,
-        StorageIntentPolicyRevision, StorageIntentReceiptId, StorageMediaClass, TrustEvidenceFlags,
+        PendingFreeSafetyClass, PrefetchResidencyCandidateClass,
+        PrefetchResidencyDecisionEvidenceRefs, PrefetchResidencyDecisionOutcome,
+        PrefetchResidencyStateClass, ProximityClass, QuarantineState, ReadServingSourceClass,
+        ResidencyScope, SegmentRegionClass, SessionSecurityClass, SharingDomainClass,
+        StorageIntentActionClass, StorageIntentDomainId, StorageIntentEvidenceId,
+        StorageIntentEvidenceRef, StorageIntentEvidenceRefs, StorageIntentMediaCapabilityRecord,
+        StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
+        StorageIntentReceiptId, StorageMediaClass, TrustEvidenceFlags,
         TrustEvidenceFreshnessState, TrustEvidenceState, TrustKeyLifecycleState, TrustRequirement,
         TrustRevocationState,
     };
