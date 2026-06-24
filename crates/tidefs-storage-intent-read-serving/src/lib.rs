@@ -282,6 +282,14 @@ impl ReadServingRejectionMask {
     pub const REMOTE_TRUST_OR_TRANSPORT_MISSING: Self = Self(1_u64 << 11);
     pub const REPAIR_REPLACEMENT_RECEIPT_MISSING: Self = Self(1_u64 << 12);
     pub const MISSING_FRESH_EVIDENCE_FAMILY: Self = Self(1_u64 << 13);
+    pub const MISSING_ORDERING_EVIDENCE: Self = Self(1_u64 << 14);
+    pub const MISSING_POLICY_ROLLOUT_EVIDENCE: Self = Self(1_u64 << 15);
+    pub const MISSING_TENANT_ISOLATION_EVIDENCE: Self = Self(1_u64 << 16);
+    pub const MISSING_SERVICE_OBJECTIVE_EVIDENCE: Self = Self(1_u64 << 17);
+    pub const MISSING_CAPACITY_ADMISSION_EVIDENCE: Self = Self(1_u64 << 18);
+    pub const TRUST_DOMAIN_MISMATCH: Self = Self(1_u64 << 19);
+    pub const MISSING_TEMPORAL_EVIDENCE: Self = Self(1_u64 << 20);
+    pub const PMEM_MISSING_MEDIA_CAPABILITY: Self = Self(1_u64 << 21);
 
     /// Merge two masks.
     #[must_use]
@@ -365,6 +373,11 @@ pub struct ReadServingEvidenceRefs {
     pub replacement_receipt_ref: StorageIntentEvidenceRef,
     pub prefetch_decision_ref: StorageIntentEvidenceRef,
     pub result_refusal_ref: StorageIntentEvidenceRef,
+    pub ordering_evidence_ref: StorageIntentEvidenceRef,
+    pub policy_rollout_ref: StorageIntentEvidenceRef,
+    pub tenant_isolation_ref: StorageIntentEvidenceRef,
+    pub service_objective_ref: StorageIntentEvidenceRef,
+    pub capacity_admission_ref: StorageIntentEvidenceRef,
 }
 
 impl ReadServingEvidenceRefs {
@@ -394,6 +407,11 @@ impl ReadServingEvidenceRefs {
         replacement_receipt_ref: EMPTY_EVIDENCE_REF,
         prefetch_decision_ref: EMPTY_EVIDENCE_REF,
         result_refusal_ref: EMPTY_EVIDENCE_REF,
+        ordering_evidence_ref: EMPTY_EVIDENCE_REF,
+        policy_rollout_ref: EMPTY_EVIDENCE_REF,
+        tenant_isolation_ref: EMPTY_EVIDENCE_REF,
+        service_objective_ref: EMPTY_EVIDENCE_REF,
+        capacity_admission_ref: EMPTY_EVIDENCE_REF,
     };
 
     /// Returns true when the decision cites a #913-compatible evidence cut.
@@ -1120,7 +1138,7 @@ const fn ram_refusal(
     ) {
         return Some((
             StorageIntentRefusalReason::MissingMediaCapabilityEvidence,
-            ReadServingRejectionMask::MISSING_EVIDENCE_REF,
+            ReadServingRejectionMask::PMEM_MISSING_MEDIA_CAPABILITY,
         ));
     }
     None
@@ -1339,6 +1357,111 @@ pub const fn read_serving_decision_is_cache_only(decision: ReadServingDecisionRe
         && (decision.cache_only || decision.serving_trial)
 }
 
+/// Summary of how one read was served, for explanation, performance, fault,
+/// and satisfaction consumers (#849, #850, #863, #874).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct ReadServingExplanation {
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub scope: StorageIntentObjectScope,
+    pub freshness_profile: ReadFreshnessProfile,
+    pub requested_source: StorageIntentReadSourceClass,
+    pub chosen_source: StorageIntentReadSourceClass,
+    pub core_source: CoreReadServingSourceClass,
+    pub decision_state: ReadServingDecisionState,
+    pub refusal: StorageIntentRefusalReason,
+    pub source_receipt: StorageIntentReceiptId,
+    pub freshness: ReadSourceFreshnessRecord,
+    pub object_generation: u64,
+    pub namespace_generation: u64,
+    pub layout_generation: u64,
+    pub cache_only: bool,
+    pub serving_trial: bool,
+    pub degraded_visible: bool,
+    pub read_repair: ReadRepairDisposition,
+    pub rejected_reasons: ReadServingRejectionMask,
+    pub prefetch_candidate: PrefetchResidencyCandidateClass,
+    pub prefetch_outcome: PrefetchResidencyDecisionOutcome,
+    pub prefetch_residency: PrefetchResidencyStateClass,
+    pub action_class: StorageIntentActionClass,
+    pub evidence_cut_state: ReadServingEvidenceCutState,
+}
+
+impl From<ReadServingDecisionRecord> for ReadServingExplanation {
+    fn from(decision: ReadServingDecisionRecord) -> Self {
+        Self {
+            policy_id: decision.policy_id,
+            policy_revision: decision.policy_revision,
+            scope: decision.scope,
+            freshness_profile: decision.freshness_profile,
+            requested_source: decision.requested_source,
+            chosen_source: decision.chosen_source,
+            core_source: decision.core_source,
+            decision_state: decision.decision_state,
+            refusal: decision.refusal,
+            source_receipt: decision.source_receipt,
+            freshness: decision.freshness,
+            object_generation: decision.object_generation,
+            namespace_generation: decision.namespace_generation,
+            layout_generation: decision.layout_generation,
+            cache_only: decision.cache_only,
+            serving_trial: decision.serving_trial,
+            degraded_visible: decision.degraded_visible,
+            read_repair: decision.read_repair,
+            rejected_reasons: decision.rejected_reasons,
+            prefetch_candidate: decision.prefetch_candidate,
+            prefetch_outcome: decision.prefetch_outcome,
+            prefetch_residency: decision.prefetch_residency,
+            action_class: decision.action_class,
+            evidence_cut_state: decision.evidence_cut_state,
+        }
+    }
+}
+
+impl Default for ReadServingExplanation {
+    fn default() -> Self {
+        Self::from(ReadServingDecisionRecord::default())
+    }
+}
+
+/// Returns true when policy rollout evidence is required for this source.
+#[must_use]
+pub const fn read_serving_requires_policy_rollout(source: StorageIntentReadSourceClass) -> bool {
+    matches!(
+        source,
+        StorageIntentReadSourceClass::RemotePlacementReceipt
+            | StorageIntentReadSourceClass::DegradedReconstruction
+            | StorageIntentReadSourceClass::GeoAsyncRemote
+            | StorageIntentReadSourceClass::ArchiveRestore
+    )
+}
+
+/// Returns true when tenant isolation evidence is required for this source.
+#[must_use]
+pub const fn read_serving_requires_tenant_isolation(source: StorageIntentReadSourceClass) -> bool {
+    read_source_requires_receipt(source)
+}
+
+/// Returns true when service objective evidence is required for this source.
+#[must_use]
+pub const fn read_serving_requires_service_objective(source: StorageIntentReadSourceClass) -> bool {
+    matches!(
+        source,
+        StorageIntentReadSourceClass::AuthoritativeRam
+            | StorageIntentReadSourceClass::AuthoritativePmem
+    )
+}
+
+/// Returns true when capacity admission evidence is required for read repair.
+#[must_use]
+pub const fn read_serving_requires_capacity_admission(
+    read_repair_requested: bool,
+    allow_read_repair: bool,
+) -> bool {
+    read_repair_requested && allow_read_repair
+}
+
 impl_u8_canonical!(StorageIntentReadSourceClass, {
     Unknown = 0 => "unknown",
     DirtyPageCacheVisible = 1 => "dirty-page-cache-visible",
@@ -1502,6 +1625,11 @@ mod tests {
                 22,
             ),
             result_refusal_ref: evidence_ref(StorageIntentEvidenceKind::ResultRefusalEvidence, 23),
+            ordering_evidence_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 24),
+            policy_rollout_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 25),
+            tenant_isolation_ref: evidence_ref(StorageIntentEvidenceKind::TenantIsolationEvidence, 26),
+            service_objective_ref: evidence_ref(StorageIntentEvidenceKind::ServiceObjectiveEvidence, 27),
+            capacity_admission_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 28),
         }
     }
 
@@ -1523,8 +1651,11 @@ mod tests {
             StorageIntentEvidenceKind::RamAuthorityEvidence => refs.ram_authority_ref,
             StorageIntentEvidenceKind::RecoveryDegradationEvidence => refs.recovery_degradation_ref,
             StorageIntentEvidenceKind::SchedulerAdmissionRecord => refs.scheduler_admission_ref,
-            StorageIntentEvidenceKind::CapacityAdmissionEvidence => refs.repair_budget_ref,
+            StorageIntentEvidenceKind::CapacityAdmissionEvidence => refs.capacity_admission_ref,
             StorageIntentEvidenceKind::DecisionFrontierEvidence => refs.prefetch_decision_ref,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence => refs.policy_rollout_ref,
+            StorageIntentEvidenceKind::TenantIsolationEvidence => refs.tenant_isolation_ref,
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence => refs.service_objective_ref,
             _ => evidence_ref(kind, 90),
         }
     }
@@ -1976,5 +2107,121 @@ mod tests {
             ReadRepairDisposition::ReplacementReceiptPublished
         );
         assert!(read_repair_may_retire_old_receipt(published));
+    }
+
+    #[test]
+    fn read_serving_explanation_round_trips_from_decision() {
+        let candidate = candidate(StorageIntentReadSourceClass::LocalPlacementReceipt);
+        let decision = decide(policy(ReadFreshnessProfile::LatestLocal), candidate);
+        let explanation = ReadServingExplanation::from(decision);
+        assert_eq!(explanation.decision_state, decision.decision_state);
+        assert_eq!(explanation.chosen_source, decision.chosen_source);
+        assert_eq!(explanation.rejected_reasons, decision.rejected_reasons);
+    }
+
+    #[test]
+    fn policy_rollout_required_for_remote_and_degraded_sources() {
+        assert!(read_serving_requires_policy_rollout(
+            StorageIntentReadSourceClass::RemotePlacementReceipt
+        ));
+        assert!(read_serving_requires_policy_rollout(
+            StorageIntentReadSourceClass::DegradedReconstruction
+        ));
+        assert!(read_serving_requires_policy_rollout(
+            StorageIntentReadSourceClass::GeoAsyncRemote
+        ));
+        assert!(read_serving_requires_policy_rollout(
+            StorageIntentReadSourceClass::ArchiveRestore
+        ));
+        assert!(!read_serving_requires_policy_rollout(
+            StorageIntentReadSourceClass::LocalPlacementReceipt
+        ));
+        assert!(!read_serving_requires_policy_rollout(
+            StorageIntentReadSourceClass::AuthoritativeRam
+        ));
+    }
+
+    #[test]
+    fn tenant_isolation_required_for_receipt_backed_sources() {
+        assert!(read_serving_requires_tenant_isolation(
+            StorageIntentReadSourceClass::LocalPlacementReceipt
+        ));
+        assert!(read_serving_requires_tenant_isolation(
+            StorageIntentReadSourceClass::RemotePlacementReceipt
+        ));
+        assert!(!read_serving_requires_tenant_isolation(
+            StorageIntentReadSourceClass::AuthoritativeRam
+        ));
+    }
+
+    #[test]
+    fn service_objective_required_for_ram_and_pmem_authority() {
+        assert!(read_serving_requires_service_objective(
+            StorageIntentReadSourceClass::AuthoritativeRam
+        ));
+        assert!(read_serving_requires_service_objective(
+            StorageIntentReadSourceClass::AuthoritativePmem
+        ));
+        assert!(!read_serving_requires_service_objective(
+            StorageIntentReadSourceClass::LocalPlacementReceipt
+        ));
+    }
+
+    #[test]
+    fn capacity_admission_required_when_read_repair_requested_and_allowed() {
+        assert!(read_serving_requires_capacity_admission(true, true));
+        assert!(!read_serving_requires_capacity_admission(false, true));
+        assert!(!read_serving_requires_capacity_admission(true, false));
+        assert!(!read_serving_requires_capacity_admission(false, false));
+    }
+
+    #[test]
+    fn pmem_requires_media_capability_evidence() {
+        let candidate = candidate(StorageIntentReadSourceClass::AuthoritativePmem);
+        let decision = decide(policy(ReadFreshnessProfile::LatestLocal), candidate);
+        assert_eq!(decision.decision_state, ReadServingDecisionState::Available);
+        assert_eq!(decision.refusal, StorageIntentRefusalReason::None);
+
+        let mut missing = candidate;
+        missing.evidence_refs.media_capability_ref = EMPTY_EVIDENCE_REF;
+        let refused = decide(policy(ReadFreshnessProfile::LatestLocal), missing);
+        assert_eq!(refused.decision_state, ReadServingDecisionState::Refused);
+        assert_eq!(
+            refused.refusal,
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        );
+        assert!(refused
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::PMEM_MISSING_MEDIA_CAPABILITY));
+    }
+
+    #[test]
+    fn remote_read_refuses_without_trust_domain_evidence() {
+        let mut candidate = candidate(StorageIntentReadSourceClass::RemotePlacementReceipt);
+        candidate.evidence_refs.trust_domain_ref = EMPTY_EVIDENCE_REF;
+        let decision = decide(policy(ReadFreshnessProfile::LatestLocal), candidate);
+        assert_eq!(decision.decision_state, ReadServingDecisionState::Refused);
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::REMOTE_TRUST_OR_TRANSPORT_MISSING));
+    }
+
+    #[test]
+    fn archive_restore_requires_archive_or_dr_profile() {
+        let candidate = candidate(StorageIntentReadSourceClass::ArchiveRestore);
+        let latest = decide(policy(ReadFreshnessProfile::LatestLocal), candidate);
+        assert_eq!(latest.decision_state, ReadServingDecisionState::Refused);
+        assert_eq!(
+            latest.refusal,
+            StorageIntentRefusalReason::DurabilityOrRpoNotMet
+        );
+        assert!(latest
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::GEO_PROFILE_MISMATCH));
+
+        let archive_policy = policy(ReadFreshnessProfile::ArchiveRestore);
+        let archive = decide(archive_policy, candidate);
+        assert_eq!(archive.decision_state, ReadServingDecisionState::Available);
+        assert_eq!(archive.refusal, StorageIntentRefusalReason::None);
     }
 }
