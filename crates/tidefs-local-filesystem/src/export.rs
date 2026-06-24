@@ -158,12 +158,22 @@ impl LocalFileSystem {
         let (_summary, exported_state) = self.load_snapshot_export_state(snapshot_name)?;
 
         self.hold_snapshot_tagged(snapshot_name, Some("export"))?;
+        self.stop_background_scheduler();
         let live_state = mem::replace(&mut self.state, exported_state);
         let live_write_buffers = mem::take(&mut self.write_buffers);
+        let live_auto_commit = mem::replace(&mut self.auto_commit, false);
+        let live_recovery_policy = mem::replace(&mut self.recovery_policy, RecoveryPolicy::ReadOnly);
+        let live_pending_permits = mem::take(&mut self.pending_permits);
+        let live_dirty_set = mem::replace(&mut self.dirty_set, Default::default());
+        self.uncommitted_mutation_count = 0;
         self.clear_snapshot_extract_caches();
 
         let read_result = self.read_file(&file_path);
 
+        self.auto_commit = live_auto_commit;
+        self.recovery_policy = live_recovery_policy;
+        self.pending_permits = live_pending_permits;
+        self.dirty_set = live_dirty_set;
         self.state = live_state;
         self.write_buffers = live_write_buffers;
         self.clear_snapshot_extract_caches();
@@ -317,7 +327,7 @@ mod tests {
             fs.write_file("/dir/lost.txt", 0, b"snapshot payload")
                 .expect("write file");
             fs.create_snapshot("snap0").expect("create snapshot");
-            fs.write_file("/dir/lost.txt", 0, b"live payload")
+            fs.write_file("/dir/lost.txt", 0, b"live payloaddata")
                 .expect("mutate live file");
         }
 
@@ -349,12 +359,12 @@ mod tests {
         fs.write_file("/lost.txt", 0, b"snapshot payload")
             .expect("write snapshot file");
         fs.create_snapshot("snap0").expect("create snapshot");
-        fs.write_file("/lost.txt", 0, b"live payload")
+        fs.write_file("/lost.txt", 0, b"live payloaddata")
             .expect("mutate live file");
 
         assert_eq!(
             fs.read_file("/lost.txt").expect("prime live inode cache"),
-            b"live payload"
+            b"live payloaddata"
         );
 
         let extracted = fs
@@ -364,7 +374,7 @@ mod tests {
         assert_eq!(
             fs.read_file("/lost.txt")
                 .expect("read live file after extract"),
-            b"live payload"
+            b"live payloaddata"
         );
     }
 
