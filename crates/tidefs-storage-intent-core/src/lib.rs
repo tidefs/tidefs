@@ -10993,6 +10993,7 @@ mod tests {
             .union(StorageIntentCapacityAdmissionFlags::REBUILD_RESERVE_AVAILABLE)
             .union(StorageIntentCapacityAdmissionFlags::GEO_CATCHUP_RESERVE_AVAILABLE)
             .union(StorageIntentCapacityAdmissionFlags::RELOCATION_RESERVE_AVAILABLE)
+            .union(StorageIntentCapacityAdmissionFlags::RECEIPT_RETIREMENT_SAFE)
             .union(StorageIntentCapacityAdmissionFlags::AUTHORITY_PROMOTION_SAFE)
     }
 
