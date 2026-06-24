@@ -50,4 +50,4 @@ deterministic refusal behavior before any Linux export surface is admitted.
 
 ## Non-Claims
 
-This is not a ublk daemon, not a Linux block device, not a `/dev/ublk-control`
+This is not a ublk daemon, not a Linux block device, not a `/dev/ublk-control` runtime, not `/dev/ublkcN` command execution, not io_uring queue execution.

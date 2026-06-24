@@ -53,7 +53,7 @@ admission, dispatch, and completion rendering against the existing in-memory
 source image; OW-301N adds a durable userspace backing-file image surface that
 future live ublk work can use without changing the request semantics.
 
-This remains below OW-301 and PC-012. It is not
+This remains below OW-301 and PC-012. It is not a kernel ublk runtime and does not claim block-device readiness.
 
 ## Non-Claims
 
