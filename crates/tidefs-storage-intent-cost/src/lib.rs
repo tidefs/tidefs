@@ -580,6 +580,7 @@ impl StorageIntentCostCharge {
         self.cost_class as u16 != StorageIntentCostClass::Unknown as u16
             && self.byte_count == 0
             && self.cost_microunits == 0
+            && !self.has_missing_evidence()
     }
 
     /// Returns true when evidence is missing (not even a stale ref).
@@ -944,6 +945,9 @@ impl StorageIntentCostSnapshot {
     /// `u64::MAX` when evidence for that class is missing/stale.
     #[must_use]
     pub const fn class_cost_or_missing(self, class: StorageIntentCostClass) -> u64 {
+        if class as u16 == StorageIntentCostClass::Unknown as u16 {
+            return u64::MAX;
+        }
         if self.evidence_state.class_is_missing(class)
             || self.evidence_state.class_is_stale(class)
             || self.evidence_state.class_is_refused(class)
@@ -951,19 +955,31 @@ impl StorageIntentCostSnapshot {
             return u64::MAX;
         }
         let mut total: u64 = 0;
+        let mut saw_known_class = false;
         let mut i: usize = 0;
         while i < self.charge_count as usize && i < MAX_COST_CHARGES {
             if self.charges[i].cost_class as u16 == class as u16 {
+                if self.charges[i].has_missing_evidence() {
+                    return u64::MAX;
+                }
+                saw_known_class = true;
                 total = saturating_add_u64(total, self.charges[i].cost_microunits);
             }
             i += 1;
         }
-        total
+        if saw_known_class {
+            total
+        } else {
+            u64::MAX
+        }
     }
 
     /// Sum byte count for a given cost class.
     #[must_use]
     pub const fn class_byte_count_or_missing(self, class: StorageIntentCostClass) -> u64 {
+        if class as u16 == StorageIntentCostClass::Unknown as u16 {
+            return u64::MAX;
+        }
         if self.evidence_state.class_is_missing(class)
             || self.evidence_state.class_is_stale(class)
             || self.evidence_state.class_is_refused(class)
@@ -971,14 +987,23 @@ impl StorageIntentCostSnapshot {
             return u64::MAX;
         }
         let mut total: u64 = 0;
+        let mut saw_known_class = false;
         let mut i: usize = 0;
         while i < self.charge_count as usize && i < MAX_COST_CHARGES {
             if self.charges[i].cost_class as u16 == class as u16 {
+                if self.charges[i].has_missing_evidence() {
+                    return u64::MAX;
+                }
+                saw_known_class = true;
                 total = saturating_add_u64(total, self.charges[i].byte_count);
             }
             i += 1;
         }
-        total
+        if saw_known_class {
+            total
+        } else {
+            u64::MAX
+        }
     }
 
     /// Total accumulated movement debt in bytes.
@@ -1444,6 +1469,18 @@ mod tests {
         assert!(!charge.is_nonzero());
     }
 
+    #[test]
+    fn zero_cost_requires_present_evidence() {
+        let charge = StorageIntentCostCharge {
+            cost_class: StorageIntentCostClass::CapacityPool,
+            byte_count: 0,
+            cost_microunits: 0,
+            ..StorageIntentCostCharge::ZERO
+        };
+        assert!(!charge.is_zero_cost_class_known());
+        assert!(charge.has_missing_evidence());
+    }
+
     // ------------------------------------------------------------------
     // Movement debt
     // ------------------------------------------------------------------
@@ -1564,6 +1601,69 @@ mod tests {
         assert_eq!(
             snapshot.class_cost_or_missing(StorageIntentCostClass::NetworkEgress),
             u64::MAX
+        );
+    }
+
+    #[test]
+    fn snapshot_absent_class_cost_is_unknown() {
+        let snapshot = StorageIntentCostSnapshot::default();
+        assert_eq!(
+            snapshot.class_cost_or_missing(StorageIntentCostClass::NetworkEgress),
+            u64::MAX
+        );
+        assert_eq!(
+            snapshot.class_byte_count_or_missing(StorageIntentCostClass::NetworkEgress),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn snapshot_missing_charge_evidence_is_unknown() {
+        let mut charges = [StorageIntentCostCharge::ZERO; MAX_COST_CHARGES];
+        charges[0] = StorageIntentCostCharge {
+            cost_class: StorageIntentCostClass::NetworkEgress,
+            reason_code: 1,
+            byte_count: 0,
+            cost_microunits: 0,
+            ..StorageIntentCostCharge::ZERO
+        };
+        let snapshot = StorageIntentCostSnapshot {
+            charges,
+            charge_count: 1,
+            ..StorageIntentCostSnapshot::default()
+        };
+        assert_eq!(
+            snapshot.class_cost_or_missing(StorageIntentCostClass::NetworkEgress),
+            u64::MAX
+        );
+        assert_eq!(
+            snapshot.class_byte_count_or_missing(StorageIntentCostClass::NetworkEgress),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn snapshot_known_zero_cost_stays_zero() {
+        let mut charges = [StorageIntentCostCharge::ZERO; MAX_COST_CHARGES];
+        charges[0] = StorageIntentCostCharge {
+            cost_class: StorageIntentCostClass::NetworkEgress,
+            reason_code: 1,
+            byte_count: 0,
+            cost_microunits: 0,
+            evidence: evidence_ref_1(),
+        };
+        let snapshot = StorageIntentCostSnapshot {
+            charges,
+            charge_count: 1,
+            ..StorageIntentCostSnapshot::default()
+        };
+        assert_eq!(
+            snapshot.class_cost_or_missing(StorageIntentCostClass::NetworkEgress),
+            0
+        );
+        assert_eq!(
+            snapshot.class_byte_count_or_missing(StorageIntentCostClass::NetworkEgress),
+            0
         );
     }
 
@@ -1891,6 +1991,7 @@ mod tests {
             cost_class: StorageIntentCostClass::CapacityMediaClass,
             byte_count: 0,
             cost_microunits: 0,
+            evidence: evidence_ref_1(),
             ..StorageIntentCostCharge::ZERO
         };
         assert!(!charge.is_nonzero());
