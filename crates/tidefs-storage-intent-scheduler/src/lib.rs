@@ -852,20 +852,19 @@ impl StorageIntentScheduler {
             && self.caps.inflight_bytes > self.caps.max_inflight_bytes / 2
         {
             let decision = AdmissionDecision::expired(
-                    lane,
-                    StorageIntentRefusalReason::MovementDebtNotPaidBack,
-                    request.budget_owner,
-                )
-                .with_budget_class(BudgetConstraintClass::ForegroundLatency);
-                self.record_decision(lane, &decision);
-                self.emit_evidence(
-                    request,
-                    &decision,
-                    SchedulingConfidenceClass::High,
-                    Some(StorageIntentRefusalReason::MovementDebtNotPaidBack),
-                );
-                return decision;
-            }
+                lane,
+                StorageIntentRefusalReason::MovementDebtNotPaidBack,
+                request.budget_owner,
+            )
+            .with_budget_class(BudgetConstraintClass::ForegroundLatency);
+            self.record_decision(lane, &decision);
+            self.emit_evidence(
+                request,
+                &decision,
+                SchedulingConfidenceClass::High,
+                Some(StorageIntentRefusalReason::MovementDebtNotPaidBack),
+            );
+            return decision;
         }
 
         // ── 6. Admitted ──
@@ -943,10 +942,9 @@ impl StorageIntentScheduler {
             && lane != LaneClass::Control
         {
             return Some((
-                    StorageIntentRefusalReason::EvidenceNotUsable,
-                    BudgetConstraintClass::DeviceQueueDepth,
-                ));
-            }
+                StorageIntentRefusalReason::EvidenceNotUsable,
+                BudgetConstraintClass::DeviceQueueDepth,
+            ));
         }
 
         None
