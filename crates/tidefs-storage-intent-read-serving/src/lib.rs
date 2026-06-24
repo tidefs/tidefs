@@ -281,6 +281,7 @@ impl ReadServingRejectionMask {
     pub const SNAPSHOT_GENERATION_MISMATCH: Self = Self(1_u64 << 10);
     pub const REMOTE_TRUST_OR_TRANSPORT_MISSING: Self = Self(1_u64 << 11);
     pub const REPAIR_REPLACEMENT_RECEIPT_MISSING: Self = Self(1_u64 << 12);
+    pub const MISSING_FRESH_EVIDENCE_FAMILY: Self = Self(1_u64 << 13);
 
     /// Merge two masks.
     #[must_use]
@@ -638,6 +639,143 @@ pub const fn read_source_requires_receipt(source: StorageIntentReadSourceClass) 
             | StorageIntentReadSourceClass::GeoAsyncRemote
             | StorageIntentReadSourceClass::ArchiveRestore
     )
+}
+
+const fn evidence_cut_has_fresh_family(
+    input: ReadServingDecisionInput,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    input
+        .evidence_query_snapshot
+        .contains_fresh_authority_family(kind)
+}
+
+const fn source_uses_remote_path(source: StorageIntentReadSourceClass) -> bool {
+    matches!(
+        source,
+        StorageIntentReadSourceClass::RemotePlacementReceipt
+            | StorageIntentReadSourceClass::GeoAsyncRemote
+            | StorageIntentReadSourceClass::ArchiveRestore
+    )
+}
+
+const fn source_uses_volatile_or_pmem_authority(source: StorageIntentReadSourceClass) -> bool {
+    matches!(
+        source,
+        StorageIntentReadSourceClass::AuthoritativeRam
+            | StorageIntentReadSourceClass::AuthoritativePmem
+    )
+}
+
+const fn source_uses_degradation_or_recovery(source: StorageIntentReadSourceClass) -> bool {
+    matches!(
+        source,
+        StorageIntentReadSourceClass::DegradedReconstruction
+            | StorageIntentReadSourceClass::GeoAsyncRemote
+            | StorageIntentReadSourceClass::ArchiveRestore
+    )
+}
+
+const fn read_serving_evidence_cut_missing_required_family(
+    input: ReadServingDecisionInput,
+) -> bool {
+    let source = input.candidate.source_class;
+    if !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::LocalIntentRecord)
+        || !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::ReadFreshnessEvidence)
+        || !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::TemporalEvidence)
+    {
+        return true;
+    }
+    if (input.policy.required_namespace_generation > 0
+        || matches!(source, StorageIntentReadSourceClass::SnapshotGeneration))
+        && !evidence_cut_has_fresh_family(
+            input,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+        )
+    {
+        return true;
+    }
+    if input.policy.required_layout_generation > 0
+        && !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::LayoutAllocatorEvidence)
+    {
+        return true;
+    }
+    if read_source_requires_receipt(source)
+        && !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::PlacementReceipt)
+    {
+        return true;
+    }
+    if read_source_is_cache_or_trial(source)
+        && !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::OrderingEvidence)
+    {
+        return true;
+    }
+    if input.policy.require_digest_verification
+        && !matches!(source, StorageIntentReadSourceClass::DirtyPageCacheVisible)
+        && !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::DataShapeEvidence)
+    {
+        return true;
+    }
+    if source_uses_volatile_or_pmem_authority(source)
+        && (!evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::RamAuthorityEvidence)
+            || !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::MembershipEvidence))
+    {
+        return true;
+    }
+    if matches!(
+        source,
+        StorageIntentReadSourceClass::AuthoritativePmem
+            | StorageIntentReadSourceClass::ArchiveRestore
+    ) && !evidence_cut_has_fresh_family(
+        input,
+        StorageIntentEvidenceKind::MediaCapabilityEvidence,
+    ) {
+        return true;
+    }
+    if source_uses_remote_path(source)
+        && (!evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::MembershipEvidence)
+            || !evidence_cut_has_fresh_family(
+                input,
+                StorageIntentEvidenceKind::TransportPathEvidence,
+            )
+            || !evidence_cut_has_fresh_family(
+                input,
+                StorageIntentEvidenceKind::TrustDomainEvidence,
+            ))
+    {
+        return true;
+    }
+    if source_uses_degradation_or_recovery(source)
+        && !evidence_cut_has_fresh_family(
+            input,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+        )
+    {
+        return true;
+    }
+    if matches!(source, StorageIntentReadSourceClass::DegradedReconstruction)
+        && !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::TrustDomainEvidence)
+    {
+        return true;
+    }
+    if matches!(source, StorageIntentReadSourceClass::CacheOnlyServingTrial)
+        && !evidence_cut_has_fresh_family(
+            input,
+            StorageIntentEvidenceKind::DecisionFrontierEvidence,
+        )
+    {
+        return true;
+    }
+    false
+}
+
+/// Returns true when the #913-compatible cut carries every fresh family this
+/// policy/source combination needs for read-serving authority.
+#[must_use]
+pub const fn read_serving_evidence_cut_has_required_families(
+    input: ReadServingDecisionInput,
+) -> bool {
+    !read_serving_evidence_cut_missing_required_family(input)
 }
 
 /// Classify an evidence-query snapshot for #877 callers.
@@ -1151,6 +1289,14 @@ pub const fn read_serving_decide(input: ReadServingDecisionInput) -> ReadServing
     if let Some((state, refusal, rejected)) = evidence_cut_refusal_state(input) {
         return decision_from_parts(input, state, refusal, rejected);
     }
+    if !read_serving_evidence_cut_has_required_families(input) {
+        return decision_from_parts(
+            input,
+            ReadServingDecisionState::Unavailable,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+            ReadServingRejectionMask::MISSING_FRESH_EVIDENCE_FAMILY,
+        );
+    }
     if let Some((refusal, rejected)) = common_refusal(input) {
         return decision_from_parts(input, ReadServingDecisionState::Refused, refusal, rejected);
     }
@@ -1259,8 +1405,9 @@ impl_u8_canonical!(ReadRepairDisposition, {
 mod tests {
     use super::*;
     use tidefs_storage_intent_core::{
-        EvidenceConsumerClass, EvidenceQuerySubjectScope, EvidenceQuerySubjectScopeClass,
-        EvidenceRetentionClass, StorageIntentEvidenceRefs,
+        EvidenceConsumerClass, EvidenceFamilyFreshness, EvidenceFamilyFreshnessState,
+        EvidenceQuerySubjectScope, EvidenceQuerySubjectScopeClass, EvidenceRetentionClass,
+        StorageIntentEvidenceRefs,
     };
 
     const POLICY_ID: StorageIntentPolicyId = StorageIntentPolicyId([7_u8; 16]);
@@ -1358,7 +1505,52 @@ mod tests {
         }
     }
 
-    fn snapshot() -> StorageIntentEvidenceQuerySnapshot {
+    fn family_ref(kind: StorageIntentEvidenceKind) -> StorageIntentEvidenceRef {
+        let refs = refs();
+        match kind {
+            StorageIntentEvidenceKind::LocalIntentRecord => refs.compiled_policy_ref,
+            StorageIntentEvidenceKind::ReadFreshnessEvidence => refs.freshness_ref,
+            StorageIntentEvidenceKind::TemporalEvidence => refs.temporal_ref,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence => refs.namespace_generation_ref,
+            StorageIntentEvidenceKind::LayoutAllocatorEvidence => refs.layout_allocator_ref,
+            StorageIntentEvidenceKind::DataShapeEvidence => refs.data_shape_ref,
+            StorageIntentEvidenceKind::PlacementReceipt => refs.placement_receipt_ref,
+            StorageIntentEvidenceKind::OrderingEvidence => refs.cache_fence_ref,
+            StorageIntentEvidenceKind::MembershipEvidence => refs.membership_epoch_ref,
+            StorageIntentEvidenceKind::TransportPathEvidence => refs.transport_path_ref,
+            StorageIntentEvidenceKind::TrustDomainEvidence => refs.trust_domain_ref,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence => refs.media_capability_ref,
+            StorageIntentEvidenceKind::RamAuthorityEvidence => refs.ram_authority_ref,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence => refs.recovery_degradation_ref,
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord => refs.scheduler_admission_ref,
+            StorageIntentEvidenceKind::CapacityAdmissionEvidence => refs.repair_budget_ref,
+            StorageIntentEvidenceKind::DecisionFrontierEvidence => refs.prefetch_decision_ref,
+            _ => evidence_ref(kind, 90),
+        }
+    }
+
+    fn push_family(
+        snapshot: &mut StorageIntentEvidenceQuerySnapshot,
+        kind: StorageIntentEvidenceKind,
+        state: EvidenceFamilyFreshnessState,
+    ) {
+        let evidence_ref = family_ref(kind);
+        snapshot.included_refs.push(evidence_ref).unwrap();
+        snapshot
+            .family_freshness
+            .push(EvidenceFamilyFreshness {
+                kind,
+                state,
+                source_index_generation: 1,
+                producer_generation: 1,
+                freshness_frontier_ms: 1000,
+                allowed_staleness_ms: 0,
+                evidence_ref,
+            })
+            .unwrap();
+    }
+
+    fn snapshot_base() -> StorageIntentEvidenceQuerySnapshot {
         let mut included_refs = StorageIntentEvidenceRefs::EMPTY;
         included_refs
             .push(evidence_ref(
@@ -1401,6 +1593,65 @@ mod tests {
         }
     }
 
+    const DEFAULT_FRESH_FAMILIES: [StorageIntentEvidenceKind; 17] = [
+        StorageIntentEvidenceKind::LocalIntentRecord,
+        StorageIntentEvidenceKind::ReadFreshnessEvidence,
+        StorageIntentEvidenceKind::TemporalEvidence,
+        StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+        StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+        StorageIntentEvidenceKind::DataShapeEvidence,
+        StorageIntentEvidenceKind::PlacementReceipt,
+        StorageIntentEvidenceKind::OrderingEvidence,
+        StorageIntentEvidenceKind::MembershipEvidence,
+        StorageIntentEvidenceKind::TransportPathEvidence,
+        StorageIntentEvidenceKind::TrustDomainEvidence,
+        StorageIntentEvidenceKind::MediaCapabilityEvidence,
+        StorageIntentEvidenceKind::RamAuthorityEvidence,
+        StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+        StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+        StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+        StorageIntentEvidenceKind::DecisionFrontierEvidence,
+    ];
+
+    fn snapshot_with_families(
+        families: &[StorageIntentEvidenceKind],
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        let mut snapshot = snapshot_base();
+        let mut index = 0;
+        while index < families.len() {
+            push_family(
+                &mut snapshot,
+                families[index],
+                EvidenceFamilyFreshnessState::Fresh,
+            );
+            index += 1;
+        }
+        snapshot
+    }
+
+    fn snapshot_with_family_override(
+        override_kind: StorageIntentEvidenceKind,
+        override_state: EvidenceFamilyFreshnessState,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        let mut snapshot = snapshot_base();
+        let mut index = 0;
+        while index < DEFAULT_FRESH_FAMILIES.len() {
+            let kind = DEFAULT_FRESH_FAMILIES[index];
+            let state = if kind as u16 == override_kind as u16 {
+                override_state
+            } else {
+                EvidenceFamilyFreshnessState::Fresh
+            };
+            push_family(&mut snapshot, kind, state);
+            index += 1;
+        }
+        snapshot
+    }
+
+    fn snapshot() -> StorageIntentEvidenceQuerySnapshot {
+        snapshot_with_families(&DEFAULT_FRESH_FAMILIES)
+    }
+
     fn candidate(source_class: StorageIntentReadSourceClass) -> ReadServingCandidateRecord {
         ReadServingCandidateRecord {
             policy_id: POLICY_ID,
@@ -1435,12 +1686,133 @@ mod tests {
         policy: ReadServingPolicy,
         candidate: ReadServingCandidateRecord,
     ) -> ReadServingDecisionRecord {
+        decide_with_snapshot(policy, candidate, snapshot())
+    }
+
+    fn decide_with_snapshot(
+        policy: ReadServingPolicy,
+        candidate: ReadServingCandidateRecord,
+        evidence_query_snapshot: StorageIntentEvidenceQuerySnapshot,
+    ) -> ReadServingDecisionRecord {
         read_serving_decide(ReadServingDecisionInput {
             policy,
             candidate,
             evidence_cut_state: ReadServingEvidenceCutState::Bound,
-            evidence_query_snapshot: snapshot(),
+            evidence_query_snapshot,
         })
+    }
+
+    #[test]
+    fn evidence_cut_requires_fresh_families_for_receipt_authority() {
+        let families = [
+            StorageIntentEvidenceKind::LocalIntentRecord,
+            StorageIntentEvidenceKind::ReadFreshnessEvidence,
+            StorageIntentEvidenceKind::TemporalEvidence,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+            StorageIntentEvidenceKind::PlacementReceipt,
+        ];
+        let input = ReadServingDecisionInput {
+            policy: policy(ReadFreshnessProfile::LatestLocal),
+            candidate: candidate(StorageIntentReadSourceClass::LocalPlacementReceipt),
+            evidence_cut_state: ReadServingEvidenceCutState::Bound,
+            evidence_query_snapshot: snapshot_with_families(&families),
+        };
+
+        assert!(!read_serving_evidence_cut_has_required_families(input));
+        let decision = read_serving_decide(input);
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_FRESH_EVIDENCE_FAMILY));
+    }
+
+    #[test]
+    fn stale_family_row_cannot_authorize_digest_backed_source() {
+        let input = ReadServingDecisionInput {
+            policy: policy(ReadFreshnessProfile::LatestLocal),
+            candidate: candidate(StorageIntentReadSourceClass::LocalPlacementReceipt),
+            evidence_cut_state: ReadServingEvidenceCutState::Bound,
+            evidence_query_snapshot: snapshot_with_family_override(
+                StorageIntentEvidenceKind::DataShapeEvidence,
+                EvidenceFamilyFreshnessState::Stale,
+            ),
+        };
+
+        assert!(!read_serving_evidence_cut_has_required_families(input));
+        let decision = read_serving_decide(input);
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_FRESH_EVIDENCE_FAMILY));
+    }
+
+    #[test]
+    fn remote_receipt_requires_transport_and_trust_families_in_cut() {
+        let families = [
+            StorageIntentEvidenceKind::LocalIntentRecord,
+            StorageIntentEvidenceKind::ReadFreshnessEvidence,
+            StorageIntentEvidenceKind::TemporalEvidence,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+            StorageIntentEvidenceKind::DataShapeEvidence,
+            StorageIntentEvidenceKind::PlacementReceipt,
+            StorageIntentEvidenceKind::MembershipEvidence,
+        ];
+        let decision = decide_with_snapshot(
+            policy(ReadFreshnessProfile::LatestLocal),
+            candidate(StorageIntentReadSourceClass::RemotePlacementReceipt),
+            snapshot_with_families(&families),
+        );
+
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_FRESH_EVIDENCE_FAMILY));
+    }
+
+    #[test]
+    fn serving_trial_requires_decision_frontier_family_in_cut() {
+        let families = [
+            StorageIntentEvidenceKind::LocalIntentRecord,
+            StorageIntentEvidenceKind::ReadFreshnessEvidence,
+            StorageIntentEvidenceKind::TemporalEvidence,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+            StorageIntentEvidenceKind::DataShapeEvidence,
+            StorageIntentEvidenceKind::OrderingEvidence,
+        ];
+        let mut candidate = candidate(StorageIntentReadSourceClass::CacheOnlyServingTrial);
+        candidate.prefetch_candidate = PrefetchResidencyCandidateClass::CacheOnlyTrial;
+        candidate.prefetch_outcome = PrefetchResidencyDecisionOutcome::ServingTrial;
+        candidate.prefetch_residency = PrefetchResidencyStateClass::VolatileRamServingTrial;
+
+        let decision = decide_with_snapshot(
+            policy(ReadFreshnessProfile::CacheOnlyAcceleration),
+            candidate,
+            snapshot_with_families(&families),
+        );
+
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_FRESH_EVIDENCE_FAMILY));
     }
 
     #[test]
