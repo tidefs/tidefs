@@ -6889,12 +6889,31 @@ const fn prefetch_residency_record(
     }
 }
 
+/// Returns true when a compiled #967 policy scope may consume a workload signal.
+#[must_use]
+pub const fn prefetch_residency_policy_scope_admits_signal(
+    policy_scope: PrefetchResidencyPolicyScope,
+    signal_scope: WorkloadSignalScopeClass,
+) -> bool {
+    match policy_scope {
+        PrefetchResidencyPolicyScope::Dataset => !matches!(
+            signal_scope,
+            WorkloadSignalScopeClass::Unknown | WorkloadSignalScopeClass::Pool
+        ),
+        PrefetchResidencyPolicyScope::SubjectRange => matches!(
+            signal_scope,
+            WorkloadSignalScopeClass::Request | WorkloadSignalScopeClass::SubjectRange
+        ),
+        PrefetchResidencyPolicyScope::Unknown | PrefetchResidencyPolicyScope::PoolDefault => false,
+    }
+}
+
 const fn prefetch_residency_policy_is_dataset_scoped(
     context: PrefetchResidencyDecisionContext,
 ) -> bool {
-    matches!(
+    prefetch_residency_policy_scope_admits_signal(
         context.policy.policy_scope,
-        PrefetchResidencyPolicyScope::Dataset | PrefetchResidencyPolicyScope::SubjectRange
+        context.signal.signal_scope,
     ) && !context.policy.dataset_id.is_zero()
         && bytes16_equal(context.policy.policy_id.0, context.signal.policy_id.0)
         && context.policy.policy_revision.0 == context.signal.policy_revision.0
@@ -6911,6 +6930,19 @@ const fn prefetch_residency_policy_has_source_refs(
 ) -> bool {
     evidence_ref_has_id(policy.evidence_refs.compiled_policy_ref)
         && evidence_ref_has_id(policy.evidence_refs.operator_policy_ref)
+}
+
+/// Returns true when a per-subject/range override is admitted by dataset policy.
+#[must_use]
+pub const fn prefetch_residency_policy_admits_subject_override(
+    context: PrefetchResidencyDecisionContext,
+    candidate: PrefetchResidencyCandidateClass,
+) -> bool {
+    matches!(
+        context.policy.policy_scope,
+        PrefetchResidencyPolicyScope::SubjectRange
+    ) && prefetch_residency_policy_is_dataset_scoped(context)
+        && context.policy.allowed_actions.contains_candidate(candidate)
 }
 
 const fn prefetch_residency_fallback_candidate(
@@ -24145,6 +24177,53 @@ mod tests {
         assert_eq!(decision.outcome, PrefetchResidencyDecisionOutcome::Refused);
         assert_eq!(
             decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn subject_range_override_must_match_scope_and_allowed_actions() {
+        let mut context = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::FlashHotServing,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        );
+        context.policy.policy_scope = PrefetchResidencyPolicyScope::SubjectRange;
+        context.signal.signal_scope = WorkloadSignalScopeClass::SubjectRange;
+        context.signal.scope.object_id = StorageIntentEvidenceId([88_u8; 32]);
+        context.signal.scope.range_start = 4096;
+        context.signal.scope.range_len = 8192;
+
+        assert!(!prefetch_residency_policy_admits_subject_override(
+            context,
+            PrefetchResidencyCandidateClass::FlashHotServing
+        ));
+        assert!(prefetch_residency_policy_admits_subject_override(
+            context,
+            PrefetchResidencyCandidateClass::BoundedReadahead
+        ));
+
+        let decision = prefetch_residency_decide(context);
+        assert_eq!(
+            decision.selected_candidate,
+            PrefetchResidencyCandidateClass::BoundedReadahead
+        );
+        assert_eq!(decision.outcome, PrefetchResidencyDecisionOutcome::Lowered);
+        assert!(prefetch_residency_decision_is_cache_only(decision));
+
+        let mut dataset_signal = context;
+        dataset_signal.signal.signal_scope = WorkloadSignalScopeClass::Dataset;
+
+        assert!(!prefetch_residency_policy_admits_subject_override(
+            dataset_signal,
+            PrefetchResidencyCandidateClass::BoundedReadahead
+        ));
+        let refused = prefetch_residency_decide(dataset_signal);
+        assert_eq!(refused.outcome, PrefetchResidencyDecisionOutcome::Refused);
+        assert_eq!(
+            refused.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
