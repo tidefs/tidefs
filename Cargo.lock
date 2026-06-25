@@ -3308,6 +3308,8 @@ dependencies = [
  "tidefs-replica-health",
  "tidefs-replication",
  "tidefs-replication-model",
+ "tidefs-storage-intent-core",
+ "tidefs-storage-intent-remote-media-capability",
  "tidefs-transport",
  "tidefs-types-transport-session",
  "tidefs-verification-engine",
