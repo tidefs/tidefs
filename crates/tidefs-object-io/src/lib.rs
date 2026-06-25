@@ -11,6 +11,8 @@
 use std::fmt;
 
 use tidefs_frame::{CompressedExtentPayload, decompress_extent_verified, TransformVerification};
+use tidefs_storage_intent_core::StorageIntentEvidenceRef;
+use tidefs_storage_intent_remote_media_capability::RemoteObjectIoVisibilitySample;
 
 pub use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreError};
 pub use tidefs_types_extent_map_core::{
@@ -102,6 +104,87 @@ impl ObjectStore for LocalObjectStore {
 
     fn get(&self, key: &ObjectKey) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
         LocalObjectStore::get(self, *key)
+    }
+}
+
+/// Payload-shape evidence observed by object I/O before projecting #961 facts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ObjectIoTransformVisibility {
+    /// No transform token was available or checked.
+    #[default]
+    Unknown = 0,
+    /// The object was stored without a transform, so no transform check applies.
+    NotRequired = 1,
+    /// A transform token was checked and matched the decoded object payload.
+    Verified = 2,
+    /// A transform token was present but failed or was contradicted.
+    Failed = 3,
+}
+
+impl ObjectIoTransformVisibility {
+    #[must_use]
+    pub const fn proves_visible_payload(self) -> bool {
+        matches!(self, Self::NotRequired | Self::Verified)
+    }
+}
+
+/// Bounded object-I/O observations that feed the #961 remote visibility sample.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObjectIoRemoteVisibilityFacts {
+    pub put_observed: bool,
+    pub get_observed: bool,
+    pub transform_visibility: ObjectIoTransformVisibility,
+    pub finalize_or_commit_proven: bool,
+}
+
+impl ObjectIoRemoteVisibilityFacts {
+    #[must_use]
+    pub const fn new(
+        put_observed: bool,
+        get_observed: bool,
+        transform_visibility: ObjectIoTransformVisibility,
+        finalize_or_commit_proven: bool,
+    ) -> Self {
+        Self {
+            put_observed,
+            get_observed,
+            transform_visibility,
+            finalize_or_commit_proven,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_write_read_lengths(
+        written_bytes: usize,
+        read_bytes: usize,
+        expected_bytes: usize,
+        transform_visibility: ObjectIoTransformVisibility,
+        finalize_or_commit_proven: bool,
+    ) -> Self {
+        let complete_nonempty = expected_bytes > 0;
+        Self {
+            put_observed: complete_nonempty && written_bytes == expected_bytes,
+            get_observed: complete_nonempty && read_bytes == expected_bytes,
+            transform_visibility,
+            finalize_or_commit_proven,
+        }
+    }
+
+    #[must_use]
+    pub const fn to_remote_media_visibility_sample(
+        self,
+        visibility_ref: StorageIntentEvidenceRef,
+    ) -> RemoteObjectIoVisibilitySample {
+        let round_trip_observed = self.put_observed && self.get_observed;
+        RemoteObjectIoVisibilitySample {
+            put_observed: self.put_observed,
+            get_observed: self.get_observed,
+            transform_verified: round_trip_observed
+                && self.transform_visibility.proves_visible_payload(),
+            finalize_or_commit_proven: self.finalize_or_commit_proven,
+            visibility_ref,
+        }
     }
 }
 
@@ -602,6 +685,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::error::Error;
+    use tidefs_storage_intent_core::{
+        MediaPersistenceDomain, MediaRemoteCommitSemantics, StorageIntentEvidenceId,
+        StorageIntentEvidenceKind,
+    };
     use tidefs_extent_map::InlineExtentMap;
 
     #[derive(Debug, Default)]
@@ -654,6 +741,15 @@ mod tests {
         );
         map.insert_extent(&[entry]).unwrap();
         (map, key)
+    }
+
+    fn visibility_evidence(seed: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            StorageIntentEvidenceId([seed; 32]),
+            u64::from(seed),
+            1,
+        )
     }
 
     #[derive(Clone, Debug, Default)]
@@ -1225,6 +1321,85 @@ mod tests {
         let read = io.read(&map, &store, 0, &mut buf).unwrap();
         assert_eq!(read, 11);
         assert_eq!(&buf, b"local-store");
+    }
+
+    #[test]
+    fn remote_visibility_adapter_projects_complete_roundtrip() {
+        let facts = ObjectIoRemoteVisibilityFacts::from_write_read_lengths(
+            11,
+            11,
+            11,
+            ObjectIoTransformVisibility::NotRequired,
+            true,
+        );
+        let sample = facts.to_remote_media_visibility_sample(visibility_evidence(31));
+        let commit = sample.to_commit_facts();
+
+        assert!(sample.put_observed);
+        assert!(sample.get_observed);
+        assert!(sample.transform_verified);
+        assert!(sample.finalize_or_commit_proven);
+        assert_eq!(
+            commit.remote_commit,
+            MediaRemoteCommitSemantics::ObjectConditionalDurable
+        );
+    }
+
+    #[test]
+    fn remote_visibility_adapter_requires_finalize_proof() {
+        let facts = ObjectIoRemoteVisibilityFacts::from_write_read_lengths(
+            11,
+            11,
+            11,
+            ObjectIoTransformVisibility::Verified,
+            false,
+        );
+        let sample = facts.to_remote_media_visibility_sample(visibility_evidence(32));
+        let commit = sample.to_commit_facts();
+
+        assert!(sample.transform_verified);
+        assert_eq!(
+            commit.remote_commit,
+            MediaRemoteCommitSemantics::VolatileAckOnly
+        );
+    }
+
+    #[test]
+    fn remote_visibility_adapter_unknown_transform_fails_closed() {
+        let facts = ObjectIoRemoteVisibilityFacts::from_write_read_lengths(
+            11,
+            11,
+            11,
+            ObjectIoTransformVisibility::Unknown,
+            true,
+        );
+        let sample = facts.to_remote_media_visibility_sample(visibility_evidence(33));
+        let commit = sample.to_commit_facts();
+
+        assert!(!sample.transform_verified);
+        assert_eq!(
+            commit.remote_commit,
+            MediaRemoteCommitSemantics::VolatileAckOnly
+        );
+    }
+
+    #[test]
+    fn remote_visibility_adapter_zero_length_noop_is_not_evidence() {
+        let facts = ObjectIoRemoteVisibilityFacts::from_write_read_lengths(
+            0,
+            0,
+            0,
+            ObjectIoTransformVisibility::NotRequired,
+            true,
+        );
+        let sample = facts.to_remote_media_visibility_sample(visibility_evidence(34));
+        let commit = sample.to_commit_facts();
+
+        assert!(!sample.put_observed);
+        assert!(!sample.get_observed);
+        assert!(!sample.transform_verified);
+        assert_eq!(commit.persistence, MediaPersistenceDomain::Unknown);
+        assert_eq!(commit.remote_commit, MediaRemoteCommitSemantics::Unknown);
     }
 
     // ── ObjectIoError unit tests ──────────────────────────────────────

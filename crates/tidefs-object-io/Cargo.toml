@@ -16,6 +16,8 @@ description = "Offset-based read/write primitives bridging extent-map and object
 tidefs-types-extent-map-core = { workspace = true }
 tidefs-local-object-store = { workspace = true }
 tidefs-frame = { workspace = true }
+tidefs-storage-intent-core = { workspace = true }
+tidefs-storage-intent-remote-media-capability = { workspace = true }
 blake3 = "=1.5.5"
 
 [dev-dependencies]
