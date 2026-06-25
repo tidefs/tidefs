@@ -1,6 +1,8 @@
 # TideFS Request Contract
 
-Maturity: current contract seed for issue #282.
+Documentation authority: Current spec under
+`docs/DOCUMENTATION_AUTHORITY_REGISTER.md` for the bounded
+request/completion contract shape only.
 
 This document describes the adapter boundary law for the first TideFS-owned
 request and completion contract. The implementation is a type and codec slice

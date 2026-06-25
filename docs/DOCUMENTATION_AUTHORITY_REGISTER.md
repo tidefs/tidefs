@@ -194,6 +194,27 @@ scheduling policy.
 |---|---|---|
 | `docs/design/coordination-review-roadmap-priorities-update.md` | Historical input | Imported Forgejo-era #1914 (superseding #1753) coordination pipeline health review from June 2026. It records lane-health machinery, active-lane status statements, coordinator-proliferation audit data, priority-ordering data structures and scheduling algorithms, deferred-wire-up claims, Forgejo issue references (#1914, #1753, #1738, #1903, #1644, #1923), design-spec metadata, and `STATUS.md`/`FEATURE_MATRIX.md` references that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current policy, automation behavior, implementation status, release-readiness evidence, worker scheduling authority, or product authority. |
 
+### Request Contract Authority (TFR-019 / #1136)
+
+Classified for TFR-019 / GitHub issue #1136 on 2026-06-25 after reviewing this
+register's authority rule and review method, `docs/REQUEST_CONTRACT.md`,
+`docs/INDEX.md`, the verification/model references in
+`docs/NEXTGEN_VERIFICATION_EVIDENCE_CHAIN_AUTHORITY.md`,
+`docs/NEXTGEN_VERIFICATION_CONTRACT_ROADMAP.md`,
+`docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`, and
+`docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`, the claim registry and scanned
+claims-gate document list, the source anchors in `crates/tidefs-types-vfs-core/`
+and `crates/tidefs-schema-codec-vfs/`, the model references in
+`crates/tidefs-env-fuse-model/`, `crates/tidefs-env-ublk-model/`,
+`crates/tidefs-model-core/`, and `crates/tidefs-trace-oracle/`, and closed
+GitHub issues #282, #528, #751, and #1066 as historical lineage evidence. This
+slice is documentation/source inspection only; it does not change source,
+claims-gate requirements, runtime behavior, or validation promises.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/REQUEST_CONTRACT.md` | Current spec | Binding only for the TideFS-owned request/completion contract shape: `ContractVersion(1)`, `RequestMetadata`, `RequestEnvelope`, `TideRequest`, `TideCompletion`, fixed-width little-endian v1 request envelopes at 128 bytes, fixed-width little-endian v1 completions at 96 bytes, decoder rejection of unsupported versions, wrong byte lengths, encoded-length drift, unknown metadata/status tags, and non-zero reserved fields, and explicit unsupported request payloads. The checked source anchors are `tidefs-types-vfs-core` for the portable records and `tidefs-schema-codec-vfs` for the v1 codecs and golden-vector self-checks; the checked verification/model docs and FUSE, uBLK, model-core, and trace-oracle references consume that boundary as contract-shape or model/harness evidence. This is not authority for FUSE, ublk, kernel VFS, RPC, storage, placement, rebuild, reclaim, or offload runtime rewiring; it is not runtime adapter validation, mounted behavior proof, production ABI freeze, release-readiness evidence, or claims-gate claim closure. |
+
 ### Checksum and BLAKE3 Authority
 
 Classified for TFR-019 / GitHub issue #332 on 2026-06-16 after checking live
