@@ -656,7 +656,7 @@
       "exit_code": 0
     },
     "tidefsctl": {
-      "warnings": 90,
+      "warnings": 91,
       "exit_code": 1
     }
   }
