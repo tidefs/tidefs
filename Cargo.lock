@@ -3652,6 +3652,7 @@ dependencies = [
  "tidefs-binary_schema-checksum",
  "tidefs-binary_schema-core",
  "tidefs-binary_schema-framing",
+ "tidefs-cache-core",
  "tidefs-clock-timing",
  "tidefs-cluster",
  "tidefs-durability-layout",
