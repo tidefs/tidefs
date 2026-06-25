@@ -65,6 +65,139 @@ pub enum PlacementMapRefusalReason {
     Stale { available_version: u64 },
 }
 
+/// Wire-stable scrub subject identity carried by comparison probes.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScrubComparisonSubject {
+    pub inode_id: u64,
+    pub data_version: u64,
+    pub kind: ScrubComparisonSubjectKind,
+}
+
+/// Wire-stable scrub subject kind.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScrubComparisonSubjectKind {
+    InlineContent,
+    ContentManifest,
+    ContentChunk { chunk_index: u64 },
+}
+
+/// Checksum-layer namespace for transport-carried comparison evidence.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScrubComparisonChecksumLayer {
+    InlineContentBody,
+    EncodedContentChunk,
+    SparseHole,
+}
+
+/// Request correlation identity echoed by comparison responses.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScrubComparisonCorrelationId {
+    pub origin_node_id: u64,
+    pub sequence: u64,
+}
+
+/// Receipt-bound scrub comparison probe sent to one authorized peer.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct ScrubComparisonProbe {
+    pub correlation_id: ScrubComparisonCorrelationId,
+    pub target_peer_id: u64,
+    pub subject: ScrubComparisonSubject,
+    pub object_key: [u8; 32],
+    pub checksum_layer: ScrubComparisonChecksumLayer,
+    pub expected_checksum: Option<[u8; 32]>,
+    pub placement_receipt_ref: PlacementReceiptRef,
+    pub membership_epoch: u64,
+}
+
+/// Peer-local result for a receipt-bound scrub comparison probe.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
+pub enum ScrubComparisonPeerOutcome {
+    Clean {
+        checksum: [u8; 32],
+    },
+    Mismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    Missing,
+    Unreadable,
+    NoChecksum,
+    ReceiptStale,
+}
+
+/// Receipt-bound response that echoes the probe identity.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct ScrubComparisonResponse {
+    pub correlation_id: ScrubComparisonCorrelationId,
+    pub responder_peer_id: u64,
+    pub subject: ScrubComparisonSubject,
+    pub object_key: [u8; 32],
+    pub checksum_layer: ScrubComparisonChecksumLayer,
+    pub placement_receipt_ref: PlacementReceiptRef,
+    pub membership_epoch: u64,
+    pub source_epoch: u64,
+    pub outcome: ScrubComparisonPeerOutcome,
+}
+
+impl ScrubComparisonResponse {
+    #[must_use]
+    pub fn echoes_probe_identity(&self, probe: &ScrubComparisonProbe) -> bool {
+        self.correlation_id == probe.correlation_id
+            && self.subject == probe.subject
+            && self.object_key == probe.object_key
+            && self.checksum_layer == probe.checksum_layer
+            && self.placement_receipt_ref == probe.placement_receipt_ref
+            && self.membership_epoch == probe.membership_epoch
+    }
+}
+
+/// Typed transport/session evidence for a probe without a peer response.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct ScrubComparisonTransportEvidence {
+    pub correlation_id: ScrubComparisonCorrelationId,
+    pub peer_id: u64,
+    pub session_id: SessionId,
+    pub subject: ScrubComparisonSubject,
+    pub object_key: [u8; 32],
+    pub checksum_layer: ScrubComparisonChecksumLayer,
+    pub placement_receipt_ref: PlacementReceiptRef,
+    pub membership_epoch: u64,
+    pub reason: ScrubComparisonTransportFailureReason,
+    pub detail: Option<String>,
+}
+
+impl ScrubComparisonTransportEvidence {
+    #[must_use]
+    pub fn from_probe_error(
+        probe: &ScrubComparisonProbe,
+        session_id: SessionId,
+        error: &TransportError,
+    ) -> Self {
+        Self {
+            correlation_id: probe.correlation_id,
+            peer_id: probe.target_peer_id,
+            session_id,
+            subject: probe.subject,
+            object_key: probe.object_key,
+            checksum_layer: probe.checksum_layer,
+            placement_receipt_ref: probe.placement_receipt_ref,
+            membership_epoch: probe.membership_epoch,
+            reason: scrub_comparison_transport_reason(error),
+            detail: Some(error.to_string()),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScrubComparisonTransportFailureReason {
+    SendFailed,
+    SessionFailed,
+    EpochRejected,
+    PeerDeparted,
+    Backpressured,
+    Timeout,
+}
+
 /// Wire message types for distributed object replication.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub enum ReplicationMessage {
@@ -184,6 +317,14 @@ pub enum ReplicationMessage {
         /// Fresh durable placement receipt recorded by a pool-backed repair.
         repaired_placement_receipt_ref: Option<PlacementReceiptRef>,
     },
+    /// Receipt-bound comparison probe for cross-replica scrub evidence.
+    ScrubComparisonProbe { probe: ScrubComparisonProbe },
+    /// Receipt-bound comparison response that echoes the probe identity.
+    ScrubComparisonResponse { response: ScrubComparisonResponse },
+    /// Local typed evidence for a comparison probe that could not be sent.
+    ScrubComparisonTransportEvidence {
+        evidence: ScrubComparisonTransportEvidence,
+    },
 }
 
 /// Send a structured replication message over a transport session.
@@ -205,6 +346,52 @@ pub fn recv_replication_msg(
     let payload = transport.recv_message(session_id)?;
     bincode::deserialize(&payload)
         .map_err(|e| TransportError::Generic(format!("replication deserialize: {e}")))
+}
+
+/// Send a receipt-bound scrub comparison probe and return typed evidence on failure.
+pub fn send_scrub_comparison_probe(
+    transport: &mut Transport,
+    session_id: SessionId,
+    probe: &ScrubComparisonProbe,
+) -> Result<(), ScrubComparisonTransportEvidence> {
+    let msg = ReplicationMessage::ScrubComparisonProbe {
+        probe: probe.clone(),
+    };
+    send_replication_msg(transport, session_id, &msg)
+        .map_err(|err| ScrubComparisonTransportEvidence::from_probe_error(probe, session_id, &err))
+}
+
+fn scrub_comparison_transport_reason(
+    error: &TransportError,
+) -> ScrubComparisonTransportFailureReason {
+    match error {
+        TransportError::SendBufferFull { .. }
+        | TransportError::SendConcurrencyLimitExceeded { .. }
+        | TransportError::WouldBlock(_)
+        | TransportError::TdmaWindowClosed { .. }
+        | TransportError::SessionConcurrencyLimit { .. }
+        | TransportError::MaxSessionsReached { .. } => {
+            ScrubComparisonTransportFailureReason::Backpressured
+        }
+        TransportError::PeerNotInRoster { .. }
+        | TransportError::PeerNotFound { .. }
+        | TransportError::SendBufferShutdown { .. } => {
+            ScrubComparisonTransportFailureReason::PeerDeparted
+        }
+        TransportError::SessionNotFound { .. }
+        | TransportError::SessionInWrongState { .. }
+        | TransportError::HandshakeFailed { .. }
+        | TransportError::AdmissionRejected { .. } => {
+            ScrubComparisonTransportFailureReason::SessionFailed
+        }
+        TransportError::Generic(message) if message.contains("epoch mismatch") => {
+            ScrubComparisonTransportFailureReason::EpochRejected
+        }
+        TransportError::Generic(message) if message.contains("timeout") => {
+            ScrubComparisonTransportFailureReason::Timeout
+        }
+        _ => ScrubComparisonTransportFailureReason::SendFailed,
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +421,29 @@ mod tests {
             blake3::hash(payload).into(),
             2,
         )
+    }
+
+    fn scrub_comparison_probe() -> ScrubComparisonProbe {
+        let payload = b"scrub-comparison";
+        let object_key =
+            tidefs_local_object_store::ObjectKey::from_name("scrub-comparison").as_bytes32();
+        ScrubComparisonProbe {
+            correlation_id: ScrubComparisonCorrelationId {
+                origin_node_id: 1,
+                sequence: 99,
+            },
+            target_peer_id: 20,
+            subject: ScrubComparisonSubject {
+                inode_id: 7,
+                data_version: 44,
+                kind: ScrubComparisonSubjectKind::ContentChunk { chunk_index: 3 },
+            },
+            object_key,
+            checksum_layer: ScrubComparisonChecksumLayer::EncodedContentChunk,
+            expected_checksum: Some(blake3::hash(payload).into()),
+            placement_receipt_ref: receipt_ref("scrub-comparison", payload, 31),
+            membership_epoch: 88,
+        }
     }
 
     // ── ScrubRequest round-trip ──
@@ -275,6 +485,108 @@ mod tests {
         };
         let rt = bincode_roundtrip(&msg);
         assert_eq!(rt, msg);
+    }
+
+    #[test]
+    fn scrub_comparison_probe_response_and_transport_evidence_roundtrip() {
+        let probe = scrub_comparison_probe();
+        let probe_msg = ReplicationMessage::ScrubComparisonProbe {
+            probe: probe.clone(),
+        };
+        assert_eq!(bincode_roundtrip(&probe_msg), probe_msg);
+
+        let response = ScrubComparisonResponse {
+            correlation_id: probe.correlation_id,
+            responder_peer_id: probe.target_peer_id,
+            subject: probe.subject,
+            object_key: probe.object_key,
+            checksum_layer: probe.checksum_layer,
+            placement_receipt_ref: probe.placement_receipt_ref,
+            membership_epoch: probe.membership_epoch,
+            source_epoch: probe.membership_epoch,
+            outcome: ScrubComparisonPeerOutcome::Clean {
+                checksum: probe.expected_checksum.unwrap(),
+            },
+        };
+        assert!(response.echoes_probe_identity(&probe));
+        let response_msg = ReplicationMessage::ScrubComparisonResponse {
+            response: response.clone(),
+        };
+        assert_eq!(bincode_roundtrip(&response_msg), response_msg);
+
+        let evidence = ScrubComparisonTransportEvidence {
+            correlation_id: probe.correlation_id,
+            peer_id: probe.target_peer_id,
+            session_id: SessionId::new(5),
+            subject: probe.subject,
+            object_key: probe.object_key,
+            checksum_layer: probe.checksum_layer,
+            placement_receipt_ref: probe.placement_receipt_ref,
+            membership_epoch: probe.membership_epoch,
+            reason: ScrubComparisonTransportFailureReason::Backpressured,
+            detail: Some("send queue full".to_string()),
+        };
+        let evidence_msg = ReplicationMessage::ScrubComparisonTransportEvidence { evidence };
+        assert_eq!(bincode_roundtrip(&evidence_msg), evidence_msg);
+    }
+
+    #[test]
+    fn scrub_comparison_response_identity_echo_rejects_cross_subject() {
+        let probe = scrub_comparison_probe();
+        let mut response = ScrubComparisonResponse {
+            correlation_id: probe.correlation_id,
+            responder_peer_id: probe.target_peer_id,
+            subject: probe.subject,
+            object_key: probe.object_key,
+            checksum_layer: probe.checksum_layer,
+            placement_receipt_ref: probe.placement_receipt_ref,
+            membership_epoch: probe.membership_epoch,
+            source_epoch: probe.membership_epoch,
+            outcome: ScrubComparisonPeerOutcome::NoChecksum,
+        };
+        assert!(response.echoes_probe_identity(&probe));
+        response.placement_receipt_ref.receipt_generation += 1;
+        assert!(!response.echoes_probe_identity(&probe));
+    }
+
+    #[test]
+    fn scrub_comparison_transport_errors_map_to_typed_evidence() {
+        let probe = scrub_comparison_probe();
+        let session_id = SessionId::new(42);
+
+        let backpressure = TransportError::SendBufferFull {
+            session_id,
+            capacity: 1024,
+            needed: 2048,
+        };
+        let evidence =
+            ScrubComparisonTransportEvidence::from_probe_error(&probe, session_id, &backpressure);
+        assert_eq!(
+            evidence.reason,
+            ScrubComparisonTransportFailureReason::Backpressured
+        );
+        assert_eq!(evidence.correlation_id, probe.correlation_id);
+
+        let departed = TransportError::PeerNotInRoster {
+            peer_id: probe.target_peer_id,
+            session_id,
+        };
+        let evidence =
+            ScrubComparisonTransportEvidence::from_probe_error(&probe, session_id, &departed);
+        assert_eq!(
+            evidence.reason,
+            ScrubComparisonTransportFailureReason::PeerDeparted
+        );
+
+        let epoch = TransportError::Generic(
+            "session s42 epoch mismatch: session bound to 7 but expected 8".to_string(),
+        );
+        let evidence =
+            ScrubComparisonTransportEvidence::from_probe_error(&probe, session_id, &epoch);
+        assert_eq!(
+            evidence.reason,
+            ScrubComparisonTransportFailureReason::EpochRejected
+        );
     }
 
     // ── RepairObject round-trip ──
