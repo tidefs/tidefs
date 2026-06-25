@@ -246,23 +246,24 @@ impl FencingWatchdog {
     /// The barrier is released only if the active forced-fence transition
     /// matches both the fenced node and target epoch, leaving unrelated
     /// membership transitions and other active fences untouched.
+    #[must_use]
     pub fn release_epoch_barrier_for_transition(
         &mut self,
         node_id: MemberId,
         to_epoch: EpochId,
     ) -> bool {
-        if self
+        let release_barrier = self
             .fencing
             .active_epoch_transition()
             .is_some_and(|transition| {
                 transition.node_id() == node_id && transition.to_epoch() == to_epoch
-            })
-        {
+            });
+
+        if release_barrier {
             self.fencing.release_epoch_barrier();
-            return true;
         }
 
-        false
+        release_barrier
     }
 
     /// Manual fence by operator command.
