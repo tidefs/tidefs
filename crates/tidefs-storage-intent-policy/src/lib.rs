@@ -1845,6 +1845,7 @@ mod tests {
     fn evidence_refs() -> PrefetchResidencyDecisionEvidenceRefs {
         PrefetchResidencyDecisionEvidenceRefs {
             compiled_policy_ref: evidence(StorageIntentEvidenceKind::PolicyRolloutEvidence, 1),
+            operator_policy_ref: evidence(StorageIntentEvidenceKind::PolicyRolloutEvidence, 16),
             service_objective_ref: evidence(StorageIntentEvidenceKind::ServiceObjectiveEvidence, 2),
             evidence_query_ref: evidence(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 3),
             decision_frontier_ref: evidence(StorageIntentEvidenceKind::DecisionFrontierEvidence, 4),

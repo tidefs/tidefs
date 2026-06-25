@@ -6289,6 +6289,7 @@ impl PrefetchResidencyPolicyFlags {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct PrefetchResidencyDecisionEvidenceRefs {
     pub compiled_policy_ref: StorageIntentEvidenceRef,
+    pub operator_policy_ref: StorageIntentEvidenceRef,
     pub service_objective_ref: StorageIntentEvidenceRef,
     pub evidence_query_ref: StorageIntentEvidenceRef,
     pub decision_frontier_ref: StorageIntentEvidenceRef,
@@ -6905,6 +6906,13 @@ const fn prefetch_residency_policy_is_dataset_scoped(
         && bytes16_equal(context.policy.budget_owner.0, context.signal.budget_owner.0)
 }
 
+const fn prefetch_residency_policy_has_source_refs(
+    policy: PrefetchResidencyPolicyEnvelope,
+) -> bool {
+    evidence_ref_has_id(policy.evidence_refs.compiled_policy_ref)
+        && evidence_ref_has_id(policy.evidence_refs.operator_policy_ref)
+}
+
 const fn prefetch_residency_fallback_candidate(
     policy: PrefetchResidencyPolicyEnvelope,
     signal: WorkloadSignalRecord,
@@ -7320,6 +7328,14 @@ pub const fn prefetch_residency_decide(
             context,
             PrefetchResidencyCandidateClass::Refused,
             PrefetchResidencyDecisionOutcome::Refused,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+    if !prefetch_residency_policy_has_source_refs(context.policy) {
+        return prefetch_residency_record(
+            context,
+            PrefetchResidencyCandidateClass::NeedMoreEvidence,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence,
             StorageIntentRefusalReason::EvidenceNotUsable,
         );
     }
@@ -23104,6 +23120,7 @@ mod tests {
     fn decision_refs() -> PrefetchResidencyDecisionEvidenceRefs {
         PrefetchResidencyDecisionEvidenceRefs {
             compiled_policy_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 40),
+            operator_policy_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 55),
             service_objective_ref: evidence_ref(
                 StorageIntentEvidenceKind::ServiceObjectiveEvidence,
                 41,
@@ -24128,6 +24145,80 @@ mod tests {
         assert_eq!(decision.outcome, PrefetchResidencyDecisionOutcome::Refused);
         assert_eq!(
             decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn prefetch_residency_decision_preserves_policy_source_refs() {
+        let context = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        );
+        let source_refs = context.policy.evidence_refs;
+
+        let decision = prefetch_residency_decide(context);
+
+        assert_eq!(
+            decision.outcome,
+            PrefetchResidencyDecisionOutcome::CacheOnly
+        );
+        assert_eq!(
+            decision.evidence_refs.compiled_policy_ref,
+            source_refs.compiled_policy_ref
+        );
+        assert_eq!(
+            decision.evidence_refs.operator_policy_ref,
+            source_refs.operator_policy_ref
+        );
+    }
+
+    #[test]
+    fn prefetch_residency_decision_requires_policy_source_refs() {
+        let mut missing_compiled_policy = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        );
+        missing_compiled_policy
+            .policy
+            .evidence_refs
+            .compiled_policy_ref = StorageIntentEvidenceRef::default();
+
+        let compiled_ref_decision = prefetch_residency_decide(missing_compiled_policy);
+        assert_eq!(
+            compiled_ref_decision.outcome,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+        );
+        assert_eq!(
+            compiled_ref_decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut missing_operator_policy = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::NoPrefetch,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        );
+        missing_operator_policy
+            .policy
+            .evidence_refs
+            .operator_policy_ref = StorageIntentEvidenceRef::default();
+
+        let operator_ref_decision = prefetch_residency_decide(missing_operator_policy);
+        assert_eq!(
+            operator_ref_decision.outcome,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+        );
+        assert_eq!(
+            operator_ref_decision.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
