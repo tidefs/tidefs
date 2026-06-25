@@ -92,7 +92,9 @@ pub use weighted_arc::{ArcList, ArcWeightStats, WeightedArc, WeightedArcEntry};
 pub use governor::{
     budget_category_for_cache_class, budget_category_for_cache_level, budget_category_for_entry,
     AdmissionTicket, BackpressureSignal, BudgetCategory, BudgetError, CacheBudgetLevel, Governor,
-    GovernorConfig,
+    GovernorAutoTuneDecision, GovernorAutoTuneError, GovernorAutoTuneEvidence,
+    GovernorAutoTuneOwner, GovernorAutoTuneSafety, GovernorAutoTuneSafetyEffect,
+    GovernorAutoTuneUnit, GovernorConfig, AUTO_TUNE_MAX_FRACTION_SHIFT, AUTO_TUNE_MAX_FRESHNESS_MS,
 };
 
 // ---------------------------------------------------------------------------
@@ -1247,6 +1249,7 @@ mod tests {
             inode_state_fraction: fraction(BudgetCategory::InodeState),
             cluster_queues_fraction: fraction(BudgetCategory::ClusterQueues),
             misc_fraction: fraction(BudgetCategory::Misc),
+            auto_tune: false,
         })
         .unwrap()
     }

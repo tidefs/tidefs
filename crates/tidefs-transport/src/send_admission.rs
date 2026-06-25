@@ -668,6 +668,7 @@ mod tests {
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 1.0,
             misc_fraction: 0.0,
+            auto_tune: false,
         })
         .unwrap()
     }
