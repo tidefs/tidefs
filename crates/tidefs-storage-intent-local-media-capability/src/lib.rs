@@ -921,6 +921,190 @@ impl LocalFreshnessFacts {
     }
 }
 
+/// Runtime health sample normalized before building local capability facts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LocalRuntimeHealthSnapshot {
+    pub sample_present: bool,
+    pub degraded: bool,
+    pub failed: bool,
+    pub quarantined: bool,
+    pub thermal_warning: bool,
+    pub error_window_open: bool,
+}
+
+impl LocalRuntimeHealthSnapshot {
+    #[must_use]
+    pub const fn healthy() -> Self {
+        Self {
+            sample_present: true,
+            degraded: false,
+            failed: false,
+            quarantined: false,
+            thermal_warning: false,
+            error_window_open: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_degraded(mut self) -> Self {
+        self.degraded = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_failed(mut self) -> Self {
+        self.failed = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_quarantined(mut self) -> Self {
+        self.quarantined = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_thermal_warning(mut self) -> Self {
+        self.thermal_warning = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_error_window_open(mut self) -> Self {
+        self.error_window_open = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn health_facts(self, health_ref: StorageIntentEvidenceRef) -> LocalHealthFacts {
+        let health = if !self.sample_present {
+            MediaHealthState::Unknown
+        } else if self.quarantined {
+            MediaHealthState::Quarantined
+        } else if self.failed {
+            MediaHealthState::Failed
+        } else if self.degraded || self.thermal_warning || self.error_window_open {
+            MediaHealthState::Degraded
+        } else {
+            MediaHealthState::Healthy
+        };
+
+        LocalHealthFacts::new(health, health_ref)
+    }
+}
+
+/// Runtime freshness sample normalized before building local capability facts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LocalRuntimeFreshnessSnapshot {
+    pub sample_present: bool,
+    pub sample_age_ms: u64,
+    pub max_sample_age_ms: u64,
+    pub identity_generation: u64,
+    pub namespace_generation: u64,
+    pub settings_generation: u64,
+    pub pool_member_generation: u64,
+    pub validated_reset_generation: u64,
+    pub observed_reset_generation: u64,
+    pub contradictory_sample: bool,
+}
+
+impl LocalRuntimeFreshnessSnapshot {
+    #[must_use]
+    pub const fn fresh_for_identity(
+        identity: LocalMediaIdentityFacts,
+        sample_age_ms: u64,
+        max_sample_age_ms: u64,
+        reset_generation: u64,
+    ) -> Self {
+        Self {
+            sample_present: true,
+            sample_age_ms,
+            max_sample_age_ms,
+            identity_generation: identity.identity_generation,
+            namespace_generation: identity.namespace_generation,
+            settings_generation: identity.settings_generation,
+            pool_member_generation: identity.pool_member_generation,
+            validated_reset_generation: reset_generation,
+            observed_reset_generation: reset_generation,
+            contradictory_sample: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_sample_age_ms(mut self, sample_age_ms: u64) -> Self {
+        self.sample_age_ms = sample_age_ms;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_sample_age_ms(mut self, max_sample_age_ms: u64) -> Self {
+        self.max_sample_age_ms = max_sample_age_ms;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_identity_generation(mut self, identity_generation: u64) -> Self {
+        self.identity_generation = identity_generation;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_namespace_generation(mut self, namespace_generation: u64) -> Self {
+        self.namespace_generation = namespace_generation;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_settings_generation(mut self, settings_generation: u64) -> Self {
+        self.settings_generation = settings_generation;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_pool_member_generation(mut self, pool_member_generation: u64) -> Self {
+        self.pool_member_generation = pool_member_generation;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_observed_reset_generation(mut self, reset_generation: u64) -> Self {
+        self.observed_reset_generation = reset_generation;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_contradictory_sample(mut self) -> Self {
+        self.contradictory_sample = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn freshness_facts(
+        self,
+        expected_identity: LocalMediaIdentityFacts,
+        freshness_ref: StorageIntentEvidenceRef,
+    ) -> LocalFreshnessFacts {
+        let freshness = if !self.sample_present {
+            MediaCapabilityFreshnessState::Missing
+        } else if self.sample_age_ms > self.max_sample_age_ms
+            || self.observed_reset_generation != self.validated_reset_generation
+        {
+            MediaCapabilityFreshnessState::Stale
+        } else if self.contradictory_sample
+            || self.identity_generation != expected_identity.identity_generation
+            || self.namespace_generation != expected_identity.namespace_generation
+            || self.settings_generation != expected_identity.settings_generation
+            || self.pool_member_generation != expected_identity.pool_member_generation
+        {
+            MediaCapabilityFreshnessState::Contradictory
+        } else {
+            MediaCapabilityFreshnessState::Fresh
+        };
+
+        LocalFreshnessFacts::new(freshness, freshness_ref)
+    }
+}
+
 /// Complete local producer input for one target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalMediaCapabilityFacts {
@@ -1037,8 +1221,28 @@ impl LocalMediaCapabilityFacts {
     }
 
     #[must_use]
+    pub const fn with_runtime_health(
+        mut self,
+        health: LocalRuntimeHealthSnapshot,
+        health_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        self.health = health.health_facts(health_ref);
+        self
+    }
+
+    #[must_use]
     pub const fn with_freshness(mut self, freshness: LocalFreshnessFacts) -> Self {
         self.freshness = freshness;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_runtime_freshness(
+        mut self,
+        freshness: LocalRuntimeFreshnessSnapshot,
+        freshness_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        self.freshness = freshness.freshness_facts(self.identity, freshness_ref);
         self
     }
 
@@ -1575,6 +1779,99 @@ mod tests {
         assert_eq!(
             result.refusal,
             StorageIntentRefusalReason::StaleMediaCapabilityEvidence
+        );
+    }
+
+    #[test]
+    fn runtime_sample_age_refuses_as_stale_evidence() {
+        let facts = strong_nvme_facts();
+        let freshness =
+            LocalRuntimeFreshnessSnapshot::fresh_for_identity(facts.identity, 30_001, 30_000, 4);
+        let record =
+            produce_local_media_capability(facts.with_runtime_freshness(freshness, evidence(9)));
+        let result = durable_sync_result(record);
+
+        assert_eq!(record.freshness, MediaCapabilityFreshnessState::Stale);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::StaleMediaCapabilityEvidence
+        );
+    }
+
+    #[test]
+    fn runtime_reset_generation_change_refuses_as_stale_evidence() {
+        let facts = strong_nvme_facts();
+        let freshness =
+            LocalRuntimeFreshnessSnapshot::fresh_for_identity(facts.identity, 4, 30_000, 7)
+                .with_observed_reset_generation(8);
+        let record =
+            produce_local_media_capability(facts.with_runtime_freshness(freshness, evidence(9)));
+        let result = durable_sync_result(record);
+
+        assert_eq!(record.freshness, MediaCapabilityFreshnessState::Stale);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::StaleMediaCapabilityEvidence
+        );
+    }
+
+    #[test]
+    fn runtime_generation_drift_refuses_as_contradictory_evidence() {
+        let facts = strong_nvme_facts();
+        let settings_change =
+            LocalRuntimeFreshnessSnapshot::fresh_for_identity(facts.identity, 4, 30_000, 7)
+                .with_settings_generation(facts.identity.settings_generation + 1);
+        let multipath_failover =
+            LocalRuntimeFreshnessSnapshot::fresh_for_identity(facts.identity, 4, 30_000, 7)
+                .with_pool_member_generation(facts.identity.pool_member_generation + 1);
+
+        let settings_record = produce_local_media_capability(
+            facts.with_runtime_freshness(settings_change, evidence(9)),
+        );
+        let failover_record = produce_local_media_capability(
+            facts.with_runtime_freshness(multipath_failover, evidence(9)),
+        );
+
+        assert_eq!(
+            settings_record.freshness,
+            MediaCapabilityFreshnessState::Contradictory
+        );
+        assert_eq!(
+            failover_record.freshness,
+            MediaCapabilityFreshnessState::Contradictory
+        );
+        assert_eq!(
+            durable_sync_result(settings_record).refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_eq!(
+            durable_sync_result(failover_record).refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn runtime_thermal_or_error_health_refuses_durable_role() {
+        let thermal = produce_local_media_capability(strong_nvme_facts().with_runtime_health(
+            LocalRuntimeHealthSnapshot::healthy().with_thermal_warning(),
+            evidence(8),
+        ));
+        let error_window = produce_local_media_capability(strong_nvme_facts().with_runtime_health(
+            LocalRuntimeHealthSnapshot::healthy().with_error_window_open(),
+            evidence(8),
+        ));
+
+        assert_eq!(thermal.health, MediaHealthState::Degraded);
+        assert_eq!(error_window.health, MediaHealthState::Degraded);
+        assert_eq!(
+            durable_sync_result(thermal).refusal,
+            StorageIntentRefusalReason::DegradedMediaHealth
+        );
+        assert_eq!(
+            durable_sync_result(error_window).refusal,
+            StorageIntentRefusalReason::DegradedMediaHealth
         );
     }
 
