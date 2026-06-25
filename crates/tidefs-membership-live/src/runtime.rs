@@ -1546,22 +1546,19 @@ impl MembershipRuntime {
     }
 
     fn clear_terminal_pending_transition(&mut self) -> bool {
-        if let Some(pending) = self.pending_transition.take() {
-            return self.release_pending_forced_fence_epoch_barrier(&pending.proposal);
+        match self.pending_transition.take() {
+            Some(pending) => self.release_pending_forced_fence_epoch_barrier(&pending.proposal),
+            None => false,
         }
-
-        false
     }
 
     fn release_pending_forced_fence_epoch_barrier(
         &mut self,
         proposal: &EpochTransitionProposal,
     ) -> bool {
-        if proposal.fence_token.is_none() {
-            return false;
-        }
-
-        self.release_forced_fence_epoch_barrier(&proposal.members_removed, proposal.to_epoch)
+        proposal.fence_token.is_some()
+            && self
+                .release_forced_fence_epoch_barrier(&proposal.members_removed, proposal.to_epoch)
     }
 
     fn release_forced_fence_epoch_barrier(
@@ -1569,16 +1566,10 @@ impl MembershipRuntime {
         members_removed: &[MemberId],
         to_epoch: EpochId,
     ) -> bool {
-        for &member_id in members_removed {
-            if self
-                .fencing
+        members_removed.iter().copied().any(|member_id| {
+            self.fencing
                 .release_epoch_barrier_for_transition(member_id, to_epoch)
-            {
-                return true;
-            }
-        }
-
-        false
+        })
     }
 
     /// Receive a commit and apply the epoch transition.
