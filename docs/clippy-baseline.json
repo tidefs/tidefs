@@ -1,7 +1,7 @@
 {
   "command": "cargo clippy -p <crate> --locked --all-targets --message-format=json",
   "workspace_root": ".",
-  "generated_at": "2026-06-24T20:16:22Z",
+  "generated_at": "2026-06-25T01:30:00Z",
   "crates": {
     "fuser": {
       "warnings": 52,
@@ -320,7 +320,7 @@
       "exit_code": 0
     },
     "tidefs-placement-planner": {
-      "warnings": 5,
+      "warnings": 7,
       "exit_code": 0
     },
     "tidefs-placement-runtime": {
@@ -472,7 +472,7 @@
       "exit_code": 0
     },
     "tidefs-storage-intent-core": {
-      "warnings": 12,
+      "warnings": 6,
       "exit_code": 0
     },
     "tidefs-storage-intent-local-media-capability": {
@@ -636,7 +636,7 @@
       "exit_code": 0
     },
     "tidefsctl": {
-      "warnings": 88,
+      "warnings": 90,
       "exit_code": 1
     },
     "tidefs-relocation-governor": {
