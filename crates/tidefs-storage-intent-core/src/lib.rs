@@ -8196,23 +8196,391 @@ pub enum SegmentRegionClass {
     EraseBlockAligned = 5,
     Fragmented = 6,
 }
+/// Authority provenance for allocator/layout evidence records.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum AllocatorEvidenceAuthority {
+    #[default]
+    Unknown = 0,
+    /// Evidence from durable allocator, placement, receipt, or publication/fence records.
+    DurableRecords = 1,
+    /// Evidence from rebuildable runtime mirrors (largest-run heaps, victim queues, heat maps).
+    RuntimeMirror = 2,
+    /// Evidence from topology scans, current free-space snapshots, or layout guesses only.
+    TopologyScan = 3,
+    /// Evidence is missing, stale, or outside its freshness window.
+    MissingStale = 4,
+}
+
+/// Zone device class for ZNS, SMR, or append-only media.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum ZoneDeviceClass {
+    #[default]
+    Unknown = 0,
+    /// Conventional random-write media with no zone constraints.
+    Conventional = 1,
+    /// ZNS / zoned-namespace SSD with sequential-write-required zones.
+    ZoneNamespace = 2,
+    /// SMR / shingled-magnetic-recording HDD with sequential-write bands.
+    ShingledMagnetic = 3,
+    /// Append-only sequential-write media (log-structured, WORM, or stream-oriented).
+    AppendOnly = 4,
+}
+
+/// Free-space pressure classification for admission and refusal decisions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum FreeSpacePressureClass {
+    #[default]
+    Unknown = 0,
+    /// Plenty of free space; no pressure.
+    None = 1,
+    /// Moderate fragmentation or free-run shortage; placement may be suboptimal.
+    Moderate = 2,
+    /// Free space is tight; admission may need critical-reserve escrow.
+    High = 3,
+    /// Critical reserve floor reached; new allocations refused without evacuation reserve.
+    Critical = 4,
+    /// ENOSPC: no free space available or all free space is below critical reserve.
+    Enospc = 5,
+}
+
+/// Why an allocation or placement was refused by allocator/layout evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum AllocationRefusalReason {
+    #[default]
+    None = 0,
+    /// No free run large enough for the requested allocation.
+    NoFreeRun = 1,
+    /// Free space exists but is too fragmented for the required alignment or extent.
+    Fragmented = 2,
+    /// Zone write pointer prevents the allocation without a zone reset first.
+    ZoneWritePointerBlocked = 3,
+    /// Allocation would consume the critical reserve floor (protected for sync/repair/evacuation).
+    CriticalReserveExhausted = 4,
+    /// Pending frees have not yet been published/fenced; reuse is unsafe.
+    PendingFreeUnsafe = 5,
+    /// Reclaim debt is too high; allocation would worsen the debt.
+    ReclaimDebtTooHigh = 6,
+    /// Allocator generation is stale; evidence may describe bytes already retired.
+    StaleAllocatorGeneration = 7,
+    /// Alignment requirements cannot be satisfied by any free extent.
+    AlignmentImpossible = 8,
+    /// The requested region/segment class is exhausted or unavailable.
+    RegionClassExhausted = 9,
+    /// Block-volume alignment requirement cannot be met.
+    BlockVolumeAlignmentViolation = 10,
+    /// Erase-block alignment requirement cannot be met.
+    EraseBlockAlignmentViolation = 11,
+    /// Evidence authority is insufficient (topology scan or stale mirror, not durable record).
+    EvidenceAuthorityInsufficient = 12,
+}
+
+/// Pending-free safety classification.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PendingFreeSafetyClass {
+    #[default]
+    Unknown = 0,
+    /// Pending frees are published and fenced; reuse is safe.
+    Safe = 1,
+    /// Pending frees are not yet published; reuse would violate receipt law.
+    Unpublished = 2,
+    /// Publication is in progress but not yet durable on all required replicas.
+    PublicationInProgress = 3,
+    /// Fence frontier has not advanced past the pending-free records; reuse unsafe.
+    FenceNotReached = 4,
+    /// Pending-free records are stale, contradictory, or outside freshness window.
+    EvidenceStale = 5,
+}
+
+/// Scan-contiguity classification for read-serving and defrag planning.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum ScanContiguityClass {
+    #[default]
+    Unknown = 0,
+    /// Allocation is fully contiguous; scan needs one I/O.
+    Contiguous = 1,
+    /// Moderate gaps; scan needs few I/Os with acceptable seek cost.
+    LowFragmentation = 2,
+    /// Many gaps or seeks; scan cost is significant.
+    HighFragmentation = 3,
+    /// Allocation is scattered; sequential scan is not practical.
+    Scattered = 4,
+}
 
 /// Layout/allocator evidence ref projection.
+///
+/// This record exposes allocator geometry, fragmentation, free-run availability,
+/// zone/erase-block constraints, pending-free safety, reclaim debt, and allocator
+/// generation evidence so placement, relocation, read-serving, and explanation
+/// consumers can reason about legality without recomputing allocator internals.
+///
+/// Authority boundaries:
+/// - Durable allocator, placement, receipt, and publication/fence records are
+///   authoritative evidence sources.
+/// - Runtime mirrors (largest-run heaps, victim queues, heat maps) are rebuildable
+///   guides that may score candidates but cannot satisfy policy alone.
+/// - Topology scans and current free-space snapshots are not authority; they cannot
+///   retire receipts, admit relocation, or satisfy read-serving by themselves.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct LayoutAllocatorRecord {
+    /// Allocation class for space-class differentiation (intent-log, metadata, data, etc.).
     pub allocation_class: AllocationClass,
+    /// Segment/region class for temperature or write-pattern alignment.
     pub region_class: SegmentRegionClass,
+    /// Failure-domain identity for the device, pool, or namespace owning this layout.
+    pub device_failure_domain_id: StorageIntentDomainId,
+    /// Segment or region identity for cross-referencing durable allocator records.
+    pub segment_id: StorageIntentEvidenceId,
+
+    // ---- Alignment requirements ----
+    /// Minimum allocation grain / block size (bytes).
+    pub grain_bytes: u32,
+    /// Required extent or run alignment for this allocation class (bytes).
+    pub extent_alignment_bytes: u32,
+    /// Stripe-width alignment for erasure-coded or RAID placement (bytes).
+    pub stripe_alignment_bytes: u32,
+    /// Block-volume (ublk/NBD/iSCSI) alignment requirement (bytes, 512 or 4096 typically).
+    pub block_volume_alignment_bytes: u32,
+    /// Device-reported optimal I/O size (bytes, 0 if unknown).
+    pub device_optimal_io_bytes: u32,
+
+    // ---- Free-run and fragmentation evidence ----
+    /// Largest single contiguous free run available (bytes, 0 if no free space).
+    pub largest_free_run_bytes: u64,
+    /// Number of distinct free runs (0 if no free space).
+    pub free_run_count: u32,
+    /// Free-run pressure in parts-per-million: how close is the largest run to exhaustion.
+    /// 0 = plenty, 1_000_000 = ENOSPC.
     pub free_run_pressure_ppm: u32,
+    /// Fragmentation score in ppm: ratio of free-run count to total free bytes normalized.
+    /// 0 = perfectly contiguous, 1_000_000 = maximally fragmented.
     pub fragmentation_ppm: u32,
+    /// Scan-contiguity classification for sequential-read cost estimation.
+    pub scan_contiguity: ScanContiguityClass,
+
+    // ---- Locality and seek evidence ----
+    /// Locality score in ppm: how tightly packed are related allocations.
+    /// 0 = no locality evidence, 1_000_000 = perfect locality.
     pub locality_score_ppm: u32,
-    pub alignment_bytes: u32,
+    /// Estimated seek cost in ppm relative to sequential baseline (0 = no extra seek cost).
+    pub seek_cost_estimate_ppm: u32,
+
+    // ---- Zone and erase-block evidence ----
+    /// Zone device class (conventional, ZNS, SMR, append-only).
+    pub zone_class: ZoneDeviceClass,
+    /// Erase-block or zone size (bytes, 0 if not applicable).
+    pub erase_block_bytes: u32,
+    /// Current zone write pointer (bytes from zone start, 0 if not applicable).
     pub zone_write_pointer: u64,
+    /// Zone reset is needed before the next write can proceed.
+    pub zone_reset_needed: bool,
+
+    // ---- Open-segment/cursor posture ----
+    /// Current write cursor within the open segment (bytes from segment start).
+    pub open_segment_cursor: u64,
+    /// Remaining writable bytes in the current open segment (0 if no open segment).
+    pub open_segment_remaining_bytes: u64,
+
+    // ---- Allocation ticket and reserve state ----
+    /// Reference to an allocation ticket or reservation if one is held.
+    pub allocation_ticket_ref: StorageIntentEvidenceRef,
+    /// Critical reserve floor: bytes that must be preserved for sync, repair, or evacuation.
+    pub critical_reserve_floor_bytes: u64,
+    /// Free-space pressure classification.
+    pub free_space_pressure: FreeSpacePressureClass,
+    /// Reason this allocation/placement was refused, or None if legal.
+    pub allocation_refusal: AllocationRefusalReason,
+
+    // ---- Pending-free evidence ----
+    /// Total bytes freed but not yet safe to reuse.
     pub pending_free_bytes: u64,
-    pub pending_free_safe: bool,
+    /// Safety classification for pending-free reuse.
+    pub pending_free_safety: PendingFreeSafetyClass,
+    /// Publication/fence frontier: sequence or epoch up to which pending frees are durable.
+    pub publication_fence_frontier: u64,
+
+    // ---- Reclaim debt ----
+    /// Bytes that must be reclaimed (defrag, compaction, segment drain) before capacity is usable.
     pub reclaim_debt_bytes: u64,
-    pub stale_mirror_refusal: bool,
+    /// A segment drain is currently in progress.
+    pub segment_drain_active: bool,
+    /// Bytes that are safe to reuse (published, fenced, and not held by snapshots or clones).
+    pub safe_to_reuse_bytes: u64,
+
+    // ---- Allocator generation / stale-pointer evidence ----
+    /// Monotonic allocator generation; stale if a read-serving or relocation consumer sees a lower value.
+    pub allocator_generation: u64,
+    /// Stale-pointer refusal: the allocator mirror is behind the durable allocator state.
+    pub stale_pointer_refusal: bool,
+
+    // ---- Confidence and authority ----
+    /// Provenance of this evidence record.
+    pub evidence_authority: AllocatorEvidenceAuthority,
+    /// Confidence in this evidence in ppm (1_000_000 = certain, 0 = unknown).
+    pub confidence_ppm: u32,
+    /// Age of this evidence snapshot in milliseconds relative to the evidence query timebase.
+    pub staleness_age_ms: u64,
+
+    /// Backing evidence reference for the evidence query that produced this record.
     pub evidence: StorageIntentEvidenceRef,
+}
+
+/// Hard-gate predicates for layout/allocator evidence legality.
+impl LayoutAllocatorRecord {
+    /// Returns true when this record has a bound evidence reference.
+    #[must_use]
+    pub const fn has_evidence(self) -> bool {
+        self.evidence.is_bound()
+    }
+
+    /// Returns true when the evidence authority is from durable allocator or placement records.
+    #[must_use]
+    pub const fn is_authoritative(self) -> bool {
+        matches!(
+            self.evidence_authority,
+            AllocatorEvidenceAuthority::DurableRecords
+        )
+    }
+
+    /// Returns true when the evidence is authoritative or a rebuildable runtime mirror.
+    /// Topology scans and missing/stale evidence do not satisfy this gate.
+    #[must_use]
+    pub const fn has_usable_authority(self) -> bool {
+        matches!(
+            self.evidence_authority,
+            AllocatorEvidenceAuthority::DurableRecords
+                | AllocatorEvidenceAuthority::RuntimeMirror
+        )
+    }
+
+    /// Returns true when free space is known to be available (not Unknown and not ENOSPC).
+    #[must_use]
+    pub const fn has_free_space(self) -> bool {
+        !matches!(
+            self.free_space_pressure,
+            FreeSpacePressureClass::Unknown | FreeSpacePressureClass::Enospc
+        )
+    }
+
+    /// Returns true when the critical reserve floor would not be consumed.
+    #[must_use]
+    pub const fn critical_reserve_is_protected(self, requested_bytes: u64) -> bool {
+        let available = self.largest_free_run_bytes;
+        if available <= self.critical_reserve_floor_bytes {
+            return false;
+        }
+        let usable = available - self.critical_reserve_floor_bytes;
+        requested_bytes <= usable
+    }
+
+    /// Returns true when a free run of at least `requested_bytes` with `required_alignment`
+    /// would be legal given the largest free run and alignment constraints.
+    #[must_use]
+    pub const fn free_run_is_available(self, requested_bytes: u64, required_alignment: u32) -> bool {
+        if requested_bytes == 0 {
+            return true;
+        }
+        if self.largest_free_run_bytes < requested_bytes {
+            return false;
+        }
+        if required_alignment > 0
+            && self.extent_alignment_bytes > 0
+            && required_alignment > self.extent_alignment_bytes
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Returns true when pending frees are safe to reuse (published and fenced).
+    #[must_use]
+    pub const fn pending_free_is_safe(self) -> bool {
+        matches!(self.pending_free_safety, PendingFreeSafetyClass::Safe)
+    }
+
+    /// Returns true when the zone write pointer is compatible with a write of `requested_bytes`.
+    /// For conventional media, always returns true.
+    #[must_use]
+    pub const fn zone_is_compatible(self, requested_bytes: u64) -> bool {
+        if matches!(self.zone_class, ZoneDeviceClass::Conventional | ZoneDeviceClass::Unknown) {
+            return true;
+        }
+        if self.zone_reset_needed {
+            return false;
+        }
+        if self.open_segment_remaining_bytes >= requested_bytes {
+            return true;
+        }
+        false
+    }
+
+    /// Returns true when the allocator generation is not stale for read-serving or relocation.
+    #[must_use]
+    pub const fn allocator_generation_is_current(self, required_generation: u64) -> bool {
+        if required_generation == 0 {
+            return true;
+        }
+        !self.stale_pointer_refusal && self.allocator_generation >= required_generation
+    }
+
+    /// Returns true when block-volume alignment is satisfied.
+    #[must_use]
+    pub const fn block_volume_alignment_is_satisfied(self, requested_block_volume_alignment: u32) -> bool {
+        if requested_block_volume_alignment == 0 {
+            return true;
+        }
+        self.block_volume_alignment_bytes > 0
+            && self.block_volume_alignment_bytes >= requested_block_volume_alignment
+    }
+
+    /// Returns true when the evidence is sufficient for placement planning.
+    /// Requires authoritative or mirror evidence, free space, no stale-pointer refusal,
+    /// and no pending-free unsafety.
+    #[must_use]
+    pub const fn is_ready_for_placement(self) -> bool {
+        self.has_usable_authority()
+            && self.has_free_space()
+            && !self.stale_pointer_refusal
+            && self.pending_free_is_safe()
+    }
+
+    /// Returns true when the evidence supports relocation/defrag decisions.
+    /// Requires authoritative evidence, a current allocator generation, and safe pending frees
+    /// (relocation must not consume bytes that are still publication-pending).
+    #[must_use]
+    pub const fn is_ready_for_relocation(self, required_allocator_generation: u64) -> bool {
+        self.is_authoritative()
+            && self.allocator_generation_is_current(required_allocator_generation)
+            && self.pending_free_is_safe()
+    }
+
+    /// Returns true when the evidence supports reclaim (segment drain, compaction).
+    /// Requires reclaim debt to be non-zero, evidence to be authoritative, and safe-to-reuse
+    /// bytes to be non-zero.
+    #[must_use]
+    pub const fn is_ready_for_reclaim(self) -> bool {
+        self.reclaim_debt_bytes > 0
+            && self.is_authoritative()
+            && self.safe_to_reuse_bytes > 0
+    }
+
+    /// Returns the typed allocation refusal reason from this record.
+    #[must_use]
+    pub const fn refusal_reason(self) -> AllocationRefusalReason {
+        self.allocation_refusal
+    }
 }
 
 /// Relocation or optimizer reason.
@@ -9171,6 +9539,64 @@ impl_u8_canonical!(SegmentRegionClass, {
     ZoneAppend = 4 => "zone-append",
     EraseBlockAligned = 5 => "erase-block-aligned",
     Fragmented = 6 => "fragmented",
+});
+
+impl_u8_canonical!(AllocatorEvidenceAuthority, {
+    Unknown = 0 => "unknown",
+    DurableRecords = 1 => "durable-records",
+    RuntimeMirror = 2 => "runtime-mirror",
+    TopologyScan = 3 => "topology-scan",
+    MissingStale = 4 => "missing-stale",
+});
+
+impl_u8_canonical!(ZoneDeviceClass, {
+    Unknown = 0 => "unknown",
+    Conventional = 1 => "conventional",
+    ZoneNamespace = 2 => "zone-namespace",
+    ShingledMagnetic = 3 => "shingled-magnetic",
+    AppendOnly = 4 => "append-only",
+});
+
+impl_u8_canonical!(FreeSpacePressureClass, {
+    Unknown = 0 => "unknown",
+    None = 1 => "none",
+    Moderate = 2 => "moderate",
+    High = 3 => "high",
+    Critical = 4 => "critical",
+    Enospc = 5 => "enospc",
+});
+
+impl_u8_canonical!(AllocationRefusalReason, {
+    None = 0 => "none",
+    NoFreeRun = 1 => "no-free-run",
+    Fragmented = 2 => "fragmented",
+    ZoneWritePointerBlocked = 3 => "zone-write-pointer-blocked",
+    CriticalReserveExhausted = 4 => "critical-reserve-exhausted",
+    PendingFreeUnsafe = 5 => "pending-free-unsafe",
+    ReclaimDebtTooHigh = 6 => "reclaim-debt-too-high",
+    StaleAllocatorGeneration = 7 => "stale-allocator-generation",
+    AlignmentImpossible = 8 => "alignment-impossible",
+    RegionClassExhausted = 9 => "region-class-exhausted",
+    BlockVolumeAlignmentViolation = 10 => "block-volume-alignment-violation",
+    EraseBlockAlignmentViolation = 11 => "erase-block-alignment-violation",
+    EvidenceAuthorityInsufficient = 12 => "evidence-authority-insufficient",
+});
+
+impl_u8_canonical!(PendingFreeSafetyClass, {
+    Unknown = 0 => "unknown",
+    Safe = 1 => "safe",
+    Unpublished = 2 => "unpublished",
+    PublicationInProgress = 3 => "publication-in-progress",
+    FenceNotReached = 4 => "fence-not-reached",
+    EvidenceStale = 5 => "evidence-stale",
+});
+
+impl_u8_canonical!(ScanContiguityClass, {
+    Unknown = 0 => "unknown",
+    Contiguous = 1 => "contiguous",
+    LowFragmentation = 2 => "low-fragmentation",
+    HighFragmentation = 3 => "high-fragmentation",
+    Scattered = 4 => "scattered",
 });
 
 impl_u8_canonical!(RelocationReasonClass, {
@@ -15989,10 +16415,10 @@ pub const fn isolation_trust_evidence_is_usable(
         return present;
     }
     // Trust evidence must be present when tenant or domain scope is required.
-    if (evidence.isolation_scope as u8 == StorageIntentIsolationScope::Tenant as u8
-        || evidence.isolation_scope as u8 == StorageIntentIsolationScope::Dataset as u8)
-        && !evidence.has_trust_evidence()
-    {
+    let scope_requires_trust =
+        evidence.isolation_scope as u8 == StorageIntentIsolationScope::Tenant as u8
+            || evidence.isolation_scope as u8 == StorageIntentIsolationScope::Dataset as u8;
+    if scope_requires_trust && !evidence.has_trust_evidence() {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::MissingTenantDomainEvidence,
         );
@@ -16011,11 +16437,10 @@ pub const fn isolation_temporal_evidence_is_usable(
     }
     // Temporal evidence is required when fair-share, borrowing, or noisy-neighbor
     // decisions depend on wall-time freshness.
-    if (evidence.fair_share.starvation_age_us > 0
+    let temporal_evidence_required = evidence.fair_share.starvation_age_us > 0
         || evidence.borrowing.outstanding_debt_bytes > 0
-        || evidence.noisy_neighbor.pressure_age_us > 0)
-        && !evidence.has_temporal_evidence()
-    {
+        || evidence.noisy_neighbor.pressure_age_us > 0;
+    if temporal_evidence_required && !evidence.has_temporal_evidence() {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::StaleIsolationEvidence,
         );
@@ -21792,6 +22217,60 @@ mod tests {
         }
     }
 
+    // ---- Layout/allocator evidence tests ----
+
+    fn layout_evidence_ref(byte: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+            StorageIntentEvidenceId([byte; 32]),
+            u64::from(byte),
+            1,
+        )
+    }
+
+    fn authoritative_layout_record() -> LayoutAllocatorRecord {
+        LayoutAllocatorRecord {
+            allocation_class: AllocationClass::SmallData,
+            region_class: SegmentRegionClass::Hot,
+            device_failure_domain_id: DOMAIN_A,
+            segment_id: StorageIntentEvidenceId([10_u8; 32]),
+            grain_bytes: 4096,
+            extent_alignment_bytes: 4096,
+            stripe_alignment_bytes: 0,
+            block_volume_alignment_bytes: 0,
+            device_optimal_io_bytes: 4096,
+            largest_free_run_bytes: 1_000_000_000,
+            free_run_count: 5,
+            free_run_pressure_ppm: 100_000,
+            fragmentation_ppm: 50_000,
+            scan_contiguity: ScanContiguityClass::LowFragmentation,
+            locality_score_ppm: 800_000,
+            seek_cost_estimate_ppm: 50_000,
+            zone_class: ZoneDeviceClass::Conventional,
+            erase_block_bytes: 0,
+            zone_write_pointer: 0,
+            zone_reset_needed: false,
+            open_segment_cursor: 100_000_000,
+            open_segment_remaining_bytes: 900_000_000,
+            allocation_ticket_ref: StorageIntentEvidenceRef::default(),
+            critical_reserve_floor_bytes: 100_000_000,
+            free_space_pressure: FreeSpacePressureClass::None,
+            allocation_refusal: AllocationRefusalReason::None,
+            pending_free_bytes: 50_000_000,
+            pending_free_safety: PendingFreeSafetyClass::Safe,
+            publication_fence_frontier: 1000,
+            reclaim_debt_bytes: 0,
+            segment_drain_active: false,
+            safe_to_reuse_bytes: 50_000_000,
+            allocator_generation: 42,
+            stale_pointer_refusal: false,
+            evidence_authority: AllocatorEvidenceAuthority::DurableRecords,
+            confidence_ppm: 1_000_000,
+            staleness_age_ms: 100,
+            evidence: layout_evidence_ref(1),
+        }
+    }
+
     #[test]
     fn rollout_change_class_enums_encode_decode_roundtrip() {
         let classes = [
@@ -23094,6 +23573,436 @@ mod tests {
         evidence.repair_ticket_ref = ordering_ref(121);
         let result = recovery_evidence_supports_scrub_repair(evidence);
         assert!(result.satisfied);
+    }
+
+    #[test]
+    fn authoritative_layout_is_authoritative() {
+        let rec = authoritative_layout_record();
+        assert!(rec.has_evidence());
+        assert!(rec.is_authoritative());
+        assert!(rec.has_usable_authority());
+        assert!(rec.has_free_space());
+    }
+
+    #[test]
+    fn runtime_mirror_is_usable_but_not_authoritative() {
+        let mut rec = authoritative_layout_record();
+        rec.evidence_authority = AllocatorEvidenceAuthority::RuntimeMirror;
+        assert!(!rec.is_authoritative());
+        assert!(rec.has_usable_authority());
+    }
+
+    #[test]
+    fn topology_scan_is_neither_authoritative_nor_usable() {
+        let mut rec = authoritative_layout_record();
+        rec.evidence_authority = AllocatorEvidenceAuthority::TopologyScan;
+        assert!(!rec.is_authoritative());
+        assert!(!rec.has_usable_authority());
+    }
+
+    #[test]
+    fn missing_stale_evidence_refused() {
+        let mut rec = authoritative_layout_record();
+        rec.evidence_authority = AllocatorEvidenceAuthority::MissingStale;
+        assert!(!rec.is_authoritative());
+        assert!(!rec.has_usable_authority());
+    }
+
+    #[test]
+    fn enospc_has_no_free_space() {
+        let mut rec = authoritative_layout_record();
+        rec.free_space_pressure = FreeSpacePressureClass::Enospc;
+        assert!(!rec.has_free_space());
+    }
+
+    #[test]
+    fn critical_reserve_is_protected_when_enough_headroom() {
+        let rec = authoritative_layout_record();
+        // 1 GB largest free run, 100 MB critical reserve, requesting 500 MB
+        assert!(rec.critical_reserve_is_protected(500_000_000));
+    }
+
+    #[test]
+    fn critical_reserve_refuses_when_request_exceeds_usable() {
+        let rec = authoritative_layout_record();
+        // 1 GB largest free run, 100 MB critical reserve, requesting 950 MB > 900 MB usable
+        assert!(!rec.critical_reserve_is_protected(950_000_000));
+    }
+
+    #[test]
+    fn critical_reserve_refuses_when_no_headroom() {
+        let mut rec = authoritative_layout_record();
+        rec.largest_free_run_bytes = 50_000_000; // less than 100 MB critical reserve
+        assert!(!rec.critical_reserve_is_protected(1));
+    }
+
+    #[test]
+    fn free_run_available_with_sufficient_space() {
+        let rec = authoritative_layout_record();
+        assert!(rec.free_run_is_available(100_000_000, 4096));
+    }
+
+    #[test]
+    fn free_run_refuses_when_too_large() {
+        let rec = authoritative_layout_record();
+        assert!(!rec.free_run_is_available(2_000_000_000, 4096));
+    }
+
+    #[test]
+    fn free_run_refuses_when_alignment_too_strict() {
+        let rec = authoritative_layout_record();
+        // extent_alignment_bytes is 4096, requesting 8192 alignment
+        assert!(!rec.free_run_is_available(4096, 8192));
+    }
+
+    #[test]
+    fn free_run_zero_request_always_ok() {
+        let rec = authoritative_layout_record();
+        assert!(rec.free_run_is_available(0, 0));
+    }
+
+    #[test]
+    fn pending_free_safe_when_published() {
+        let rec = authoritative_layout_record();
+        assert!(rec.pending_free_is_safe());
+    }
+
+    #[test]
+    fn pending_free_unsafe_when_unpublished() {
+        let mut rec = authoritative_layout_record();
+        rec.pending_free_safety = PendingFreeSafetyClass::Unpublished;
+        assert!(!rec.pending_free_is_safe());
+    }
+
+    #[test]
+    fn pending_free_unsafe_when_fence_not_reached() {
+        let mut rec = authoritative_layout_record();
+        rec.pending_free_safety = PendingFreeSafetyClass::FenceNotReached;
+        assert!(!rec.pending_free_is_safe());
+    }
+
+    #[test]
+    fn pending_free_unsafe_when_evidence_stale() {
+        let mut rec = authoritative_layout_record();
+        rec.pending_free_safety = PendingFreeSafetyClass::EvidenceStale;
+        assert!(!rec.pending_free_is_safe());
+    }
+
+    #[test]
+    fn zone_conventional_always_compatible() {
+        let rec = authoritative_layout_record();
+        assert!(rec.zone_is_compatible(1_000_000_000));
+    }
+
+    #[test]
+    fn zone_unknown_always_compatible() {
+        let mut rec = authoritative_layout_record();
+        rec.zone_class = ZoneDeviceClass::Unknown;
+        assert!(rec.zone_is_compatible(1_000_000_000));
+    }
+
+    #[test]
+    fn zone_namespace_refuses_when_reset_needed() {
+        let mut rec = authoritative_layout_record();
+        rec.zone_class = ZoneDeviceClass::ZoneNamespace;
+        rec.zone_reset_needed = true;
+        assert!(!rec.zone_is_compatible(4096));
+    }
+
+    #[test]
+    fn zone_namespace_refuses_when_request_exceeds_remaining() {
+        let mut rec = authoritative_layout_record();
+        rec.zone_class = ZoneDeviceClass::ZoneNamespace;
+        rec.open_segment_remaining_bytes = 4096;
+        assert!(!rec.zone_is_compatible(8192));
+    }
+
+    #[test]
+    fn zone_namespace_accepts_when_space_available() {
+        let mut rec = authoritative_layout_record();
+        rec.zone_class = ZoneDeviceClass::ZoneNamespace;
+        rec.open_segment_remaining_bytes = 100_000_000;
+        assert!(rec.zone_is_compatible(50_000_000));
+    }
+
+    #[test]
+    fn smr_behaves_like_zone_namespace() {
+        let mut rec = authoritative_layout_record();
+        rec.zone_class = ZoneDeviceClass::ShingledMagnetic;
+        rec.zone_reset_needed = true;
+        assert!(!rec.zone_is_compatible(4096));
+        rec.zone_reset_needed = false;
+        rec.open_segment_remaining_bytes = 1_000_000;
+        assert!(rec.zone_is_compatible(500_000));
+        assert!(!rec.zone_is_compatible(2_000_000));
+    }
+
+    #[test]
+    fn allocator_generation_current_when_equal() {
+        let rec = authoritative_layout_record();
+        assert!(rec.allocator_generation_is_current(42));
+    }
+
+    #[test]
+    fn allocator_generation_current_when_newer() {
+        let rec = authoritative_layout_record();
+        assert!(rec.allocator_generation_is_current(10));
+    }
+
+    #[test]
+    fn allocator_generation_refuses_when_stale() {
+        let rec = authoritative_layout_record();
+        assert!(!rec.allocator_generation_is_current(100));
+    }
+
+    #[test]
+    fn allocator_generation_refuses_on_stale_pointer_flag() {
+        let mut rec = authoritative_layout_record();
+        rec.stale_pointer_refusal = true;
+        assert!(!rec.allocator_generation_is_current(10));
+    }
+
+    #[test]
+    fn allocator_generation_zero_required_always_ok() {
+        let mut rec = authoritative_layout_record();
+        rec.stale_pointer_refusal = true;
+        assert!(rec.allocator_generation_is_current(0));
+    }
+
+    #[test]
+    fn block_volume_alignment_satisfied() {
+        let mut rec = authoritative_layout_record();
+        rec.block_volume_alignment_bytes = 4096;
+        assert!(rec.block_volume_alignment_is_satisfied(512));
+        assert!(rec.block_volume_alignment_is_satisfied(4096));
+    }
+
+    #[test]
+    fn block_volume_alignment_refuses_when_unset() {
+        let rec = authoritative_layout_record();
+        // block_volume_alignment_bytes is 0
+        assert!(!rec.block_volume_alignment_is_satisfied(512));
+    }
+
+    #[test]
+    fn block_volume_alignment_refuses_when_insufficient() {
+        let mut rec = authoritative_layout_record();
+        rec.block_volume_alignment_bytes = 512;
+        assert!(!rec.block_volume_alignment_is_satisfied(4096));
+    }
+
+    #[test]
+    fn block_volume_zero_alignment_always_ok() {
+        let rec = authoritative_layout_record();
+        assert!(rec.block_volume_alignment_is_satisfied(0));
+    }
+
+    #[test]
+    fn is_ready_for_placement_authoritative() {
+        let rec = authoritative_layout_record();
+        assert!(rec.is_ready_for_placement());
+    }
+
+    #[test]
+    fn is_ready_for_placement_refuses_on_topology_scan() {
+        let mut rec = authoritative_layout_record();
+        rec.evidence_authority = AllocatorEvidenceAuthority::TopologyScan;
+        assert!(!rec.is_ready_for_placement());
+    }
+
+    #[test]
+    fn is_ready_for_placement_refuses_on_enospc() {
+        let mut rec = authoritative_layout_record();
+        rec.free_space_pressure = FreeSpacePressureClass::Enospc;
+        assert!(!rec.is_ready_for_placement());
+    }
+
+    #[test]
+    fn is_ready_for_placement_refuses_on_stale_pointer() {
+        let mut rec = authoritative_layout_record();
+        rec.stale_pointer_refusal = true;
+        assert!(!rec.is_ready_for_placement());
+    }
+
+    #[test]
+    fn is_ready_for_placement_refuses_unsafe_pending_free() {
+        let mut rec = authoritative_layout_record();
+        rec.pending_free_safety = PendingFreeSafetyClass::Unpublished;
+        assert!(!rec.is_ready_for_placement());
+    }
+
+    #[test]
+    fn is_ready_for_relocation_requires_authoritative() {
+        let mut rec = authoritative_layout_record();
+        assert!(rec.is_ready_for_relocation(10));
+        rec.evidence_authority = AllocatorEvidenceAuthority::RuntimeMirror;
+        assert!(!rec.is_ready_for_relocation(10));
+    }
+
+    #[test]
+    fn is_ready_for_relocation_requires_current_generation() {
+        let rec = authoritative_layout_record();
+        assert!(!rec.is_ready_for_relocation(100)); // gen 42 < 100
+        assert!(rec.is_ready_for_relocation(42));
+    }
+
+    #[test]
+    fn is_ready_for_relocation_requires_safe_pending_free() {
+        let mut rec = authoritative_layout_record();
+        rec.pending_free_safety = PendingFreeSafetyClass::Unpublished;
+        assert!(!rec.is_ready_for_relocation(10));
+    }
+
+    #[test]
+    fn is_ready_for_reclaim_positive_debt_and_safe_reuse() {
+        let mut rec = authoritative_layout_record();
+        rec.reclaim_debt_bytes = 1_000_000;
+        rec.safe_to_reuse_bytes = 500_000;
+        assert!(rec.is_ready_for_reclaim());
+    }
+
+    #[test]
+    fn is_ready_for_reclaim_refuses_zero_debt() {
+        let rec = authoritative_layout_record();
+        assert!(!rec.is_ready_for_reclaim());
+    }
+
+    #[test]
+    fn is_ready_for_reclaim_refuses_zero_safe_reuse() {
+        let mut rec = authoritative_layout_record();
+        rec.reclaim_debt_bytes = 1_000_000;
+        rec.safe_to_reuse_bytes = 0;
+        assert!(!rec.is_ready_for_reclaim());
+    }
+
+    #[test]
+    fn is_ready_for_reclaim_refuses_non_authoritative() {
+        let mut rec = authoritative_layout_record();
+        rec.reclaim_debt_bytes = 1_000_000;
+        rec.safe_to_reuse_bytes = 500_000;
+        rec.evidence_authority = AllocatorEvidenceAuthority::TopologyScan;
+        assert!(!rec.is_ready_for_reclaim());
+    }
+
+    #[test]
+    fn refusal_reason_returns_typed_value() {
+        let mut rec = authoritative_layout_record();
+        assert_eq!(rec.refusal_reason(), AllocationRefusalReason::None);
+        rec.allocation_refusal = AllocationRefusalReason::NoFreeRun;
+        assert_eq!(rec.refusal_reason(), AllocationRefusalReason::NoFreeRun);
+    }
+
+    #[test]
+    fn default_layout_record_is_unknown_not_authoritative() {
+        let rec = LayoutAllocatorRecord::default();
+        assert!(!rec.is_authoritative());
+        assert!(!rec.has_usable_authority());
+        assert!(!rec.has_free_space()); // Unknown != None pressure
+        assert_eq!(rec.allocation_refusal, AllocationRefusalReason::None);
+        assert_eq!(rec.evidence_authority, AllocatorEvidenceAuthority::Unknown);
+    }
+
+    #[test]
+    fn layout_evidence_enums_encode_decode_roundtrip() {
+        // AllocatorEvidenceAuthority
+        let authorities = [
+            AllocatorEvidenceAuthority::Unknown,
+            AllocatorEvidenceAuthority::DurableRecords,
+            AllocatorEvidenceAuthority::RuntimeMirror,
+            AllocatorEvidenceAuthority::TopologyScan,
+            AllocatorEvidenceAuthority::MissingStale,
+        ];
+        for a in &authorities {
+            let disc = a.to_discriminant();
+            let decoded = AllocatorEvidenceAuthority::from_discriminant(disc);
+            assert_eq!(decoded, Some(*a), "roundtrip failed for {:?}", a.as_str());
+        }
+        assert_eq!(AllocatorEvidenceAuthority::from_discriminant(255), None);
+
+        // ZoneDeviceClass
+        let zones = [
+            ZoneDeviceClass::Unknown,
+            ZoneDeviceClass::Conventional,
+            ZoneDeviceClass::ZoneNamespace,
+            ZoneDeviceClass::ShingledMagnetic,
+            ZoneDeviceClass::AppendOnly,
+        ];
+        for z in &zones {
+            let disc = z.to_discriminant();
+            let decoded = ZoneDeviceClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*z), "roundtrip failed for {:?}", z.as_str());
+        }
+        assert_eq!(ZoneDeviceClass::from_discriminant(255), None);
+
+        // FreeSpacePressureClass
+        let pressures = [
+            FreeSpacePressureClass::Unknown,
+            FreeSpacePressureClass::None,
+            FreeSpacePressureClass::Moderate,
+            FreeSpacePressureClass::High,
+            FreeSpacePressureClass::Critical,
+            FreeSpacePressureClass::Enospc,
+        ];
+        for p in &pressures {
+            let disc = p.to_discriminant();
+            let decoded = FreeSpacePressureClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*p), "roundtrip failed for {:?}", p.as_str());
+        }
+        assert_eq!(FreeSpacePressureClass::from_discriminant(255), None);
+
+        // AllocationRefusalReason
+        let refusals = [
+            AllocationRefusalReason::None,
+            AllocationRefusalReason::NoFreeRun,
+            AllocationRefusalReason::Fragmented,
+            AllocationRefusalReason::ZoneWritePointerBlocked,
+            AllocationRefusalReason::CriticalReserveExhausted,
+            AllocationRefusalReason::PendingFreeUnsafe,
+            AllocationRefusalReason::ReclaimDebtTooHigh,
+            AllocationRefusalReason::StaleAllocatorGeneration,
+            AllocationRefusalReason::AlignmentImpossible,
+            AllocationRefusalReason::RegionClassExhausted,
+            AllocationRefusalReason::BlockVolumeAlignmentViolation,
+            AllocationRefusalReason::EraseBlockAlignmentViolation,
+            AllocationRefusalReason::EvidenceAuthorityInsufficient,
+        ];
+        for r in &refusals {
+            let disc = r.to_discriminant();
+            let decoded = AllocationRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+        assert_eq!(AllocationRefusalReason::from_discriminant(255), None);
+
+        // PendingFreeSafetyClass
+        let safeties = [
+            PendingFreeSafetyClass::Unknown,
+            PendingFreeSafetyClass::Safe,
+            PendingFreeSafetyClass::Unpublished,
+            PendingFreeSafetyClass::PublicationInProgress,
+            PendingFreeSafetyClass::FenceNotReached,
+            PendingFreeSafetyClass::EvidenceStale,
+        ];
+        for s in &safeties {
+            let disc = s.to_discriminant();
+            let decoded = PendingFreeSafetyClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*s), "roundtrip failed for {:?}", s.as_str());
+        }
+        assert_eq!(PendingFreeSafetyClass::from_discriminant(255), None);
+
+        // ScanContiguityClass
+        let scans = [
+            ScanContiguityClass::Unknown,
+            ScanContiguityClass::Contiguous,
+            ScanContiguityClass::LowFragmentation,
+            ScanContiguityClass::HighFragmentation,
+            ScanContiguityClass::Scattered,
+        ];
+        for sc in &scans {
+            let disc = sc.to_discriminant();
+            let decoded = ScanContiguityClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*sc), "roundtrip failed for {:?}", sc.as_str());
+        }
+        assert_eq!(ScanContiguityClass::from_discriminant(255), None);
     }
 
     // ===== Lifecycle evidence tests =====
