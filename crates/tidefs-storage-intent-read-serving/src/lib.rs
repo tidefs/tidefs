@@ -155,6 +155,10 @@ pub enum StorageIntentReadSourceClass {
     GeoAsyncRemote = 10,
     /// Archive or restore-stage source.
     ArchiveRestore = 11,
+    /// Metadata or namespace hot lookup source.
+    MetadataHotLookup = 12,
+    /// Directory index source backed by namespace evidence.
+    DirectoryIndex = 13,
 }
 
 /// Freshness profile requested by the caller or compiled policy.
@@ -290,6 +294,7 @@ impl ReadServingRejectionMask {
     pub const TRUST_DOMAIN_MISMATCH: Self = Self(1_u64 << 19);
     pub const MISSING_TEMPORAL_EVIDENCE: Self = Self(1_u64 << 20);
     pub const PMEM_MISSING_MEDIA_CAPABILITY: Self = Self(1_u64 << 21);
+    pub const MISSING_METADATA_NAMESPACE_EVIDENCE: Self = Self(1_u64 << 22);
 
     /// Merge two masks.
     #[must_use]
@@ -637,6 +642,8 @@ pub const fn read_source_core_class(
         }
         StorageIntentReadSourceClass::GeoAsyncRemote => CoreReadServingSourceClass::GeoAsyncLag,
         StorageIntentReadSourceClass::ArchiveRestore => CoreReadServingSourceClass::ArchiveRestore,
+        StorageIntentReadSourceClass::MetadataHotLookup
+        | StorageIntentReadSourceClass::DirectoryIndex => CoreReadServingSourceClass::Cache,
         StorageIntentReadSourceClass::Unknown => CoreReadServingSourceClass::Cache,
     }
 }
@@ -663,6 +670,29 @@ pub const fn read_source_requires_receipt(source: StorageIntentReadSourceClass) 
             | StorageIntentReadSourceClass::GeoAsyncRemote
             | StorageIntentReadSourceClass::ArchiveRestore
     )
+}
+
+/// Returns true when a source needs metadata/namespace evidence even if the
+/// caller did not request an explicit namespace generation floor.
+#[must_use]
+pub const fn read_source_requires_metadata_namespace(
+    source: StorageIntentReadSourceClass,
+) -> bool {
+    matches!(
+        source,
+        StorageIntentReadSourceClass::MetadataHotLookup
+            | StorageIntentReadSourceClass::DirectoryIndex
+            | StorageIntentReadSourceClass::SnapshotGeneration
+    )
+}
+
+const fn read_source_requires_ordering_fence(source: StorageIntentReadSourceClass) -> bool {
+    read_source_is_cache_or_trial(source)
+        || matches!(
+            source,
+            StorageIntentReadSourceClass::MetadataHotLookup
+                | StorageIntentReadSourceClass::DirectoryIndex
+        )
 }
 
 const fn evidence_cut_has_fresh_family(
@@ -711,7 +741,7 @@ const fn read_serving_evidence_cut_missing_required_family(
         return true;
     }
     if (input.policy.required_namespace_generation > 0
-        || matches!(source, StorageIntentReadSourceClass::SnapshotGeneration))
+        || read_source_requires_metadata_namespace(source))
         && !evidence_cut_has_fresh_family(
             input,
             StorageIntentEvidenceKind::MetadataNamespaceEvidence,
@@ -729,7 +759,7 @@ const fn read_serving_evidence_cut_missing_required_family(
     {
         return true;
     }
-    if read_source_is_cache_or_trial(source)
+    if read_source_requires_ordering_fence(source)
         && !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::OrderingEvidence)
     {
         return true;
@@ -861,13 +891,13 @@ pub const fn read_serving_candidate_missing_required_ref_reasons(
         missing = missing.union(ReadServingRejectionMask::MISSING_TEMPORAL_EVIDENCE);
     }
     if (input.policy.required_namespace_generation > 0
-        || matches!(source, StorageIntentReadSourceClass::SnapshotGeneration))
+        || read_source_requires_metadata_namespace(source))
         && !evidence_ref_has_kind(
             refs.namespace_generation_ref,
             StorageIntentEvidenceKind::MetadataNamespaceEvidence,
         )
     {
-        missing = missing.union(ReadServingRejectionMask::MISSING_EVIDENCE_REF);
+        missing = missing.union(ReadServingRejectionMask::MISSING_METADATA_NAMESPACE_EVIDENCE);
     }
     if input.policy.required_layout_generation > 0
         && !evidence_ref_has_kind(
@@ -898,6 +928,16 @@ pub const fn read_serving_candidate_missing_required_ref_reasons(
         ) {
             missing = missing.union(ReadServingRejectionMask::MISSING_ORDERING_EVIDENCE);
         }
+    }
+    if matches!(
+        source,
+        StorageIntentReadSourceClass::MetadataHotLookup
+            | StorageIntentReadSourceClass::DirectoryIndex
+    ) && !evidence_ref_has_kind(
+        refs.ordering_evidence_ref,
+        StorageIntentEvidenceKind::OrderingEvidence,
+    ) {
+        missing = missing.union(ReadServingRejectionMask::MISSING_ORDERING_EVIDENCE);
     }
     if input.policy.require_digest_verification
         && !matches!(source, StorageIntentReadSourceClass::DirtyPageCacheVisible)
@@ -1481,7 +1521,9 @@ const fn source_refusal(
         StorageIntentReadSourceClass::SnapshotGeneration => snapshot_refusal(input),
         StorageIntentReadSourceClass::GeoAsyncRemote => geo_refusal(input),
         StorageIntentReadSourceClass::ArchiveRestore => archive_refusal(input),
-        StorageIntentReadSourceClass::LocalPlacementReceipt => None,
+        StorageIntentReadSourceClass::LocalPlacementReceipt
+        | StorageIntentReadSourceClass::MetadataHotLookup
+        | StorageIntentReadSourceClass::DirectoryIndex => None,
         StorageIntentReadSourceClass::Unknown => Some((
             StorageIntentRefusalReason::NoLegalReceiptSet,
             ReadServingRejectionMask::MISSING_EVIDENCE_REF,
@@ -1498,7 +1540,9 @@ const fn success_state(input: ReadServingDecisionInput) -> ReadServingDecisionSt
         | StorageIntentReadSourceClass::RemotePlacementReceipt
         | StorageIntentReadSourceClass::SnapshotGeneration
         | StorageIntentReadSourceClass::GeoAsyncRemote
-        | StorageIntentReadSourceClass::ArchiveRestore => ReadServingDecisionState::Available,
+        | StorageIntentReadSourceClass::ArchiveRestore
+        | StorageIntentReadSourceClass::MetadataHotLookup
+        | StorageIntentReadSourceClass::DirectoryIndex => ReadServingDecisionState::Available,
         StorageIntentReadSourceClass::CleanCache => ReadServingDecisionState::CacheOnly,
         StorageIntentReadSourceClass::CacheOnlyServingTrial => {
             ReadServingDecisionState::ServingTrial
@@ -1683,6 +1727,8 @@ pub const fn read_serving_requires_service_objective(source: StorageIntentReadSo
         source,
         StorageIntentReadSourceClass::AuthoritativeRam
             | StorageIntentReadSourceClass::AuthoritativePmem
+            | StorageIntentReadSourceClass::MetadataHotLookup
+            | StorageIntentReadSourceClass::DirectoryIndex
     )
 }
 
@@ -1708,6 +1754,8 @@ impl_u8_canonical!(StorageIntentReadSourceClass, {
     SnapshotGeneration = 9 => "snapshot-generation",
     GeoAsyncRemote = 10 => "geo-async-remote",
     ArchiveRestore = 11 => "archive-restore",
+    MetadataHotLookup = 12 => "metadata-hot-lookup",
+    DirectoryIndex = 13 => "directory-index",
 });
 
 impl_u8_canonical!(ReadFreshnessProfile, {
@@ -2358,6 +2406,97 @@ mod tests {
     }
 
     #[test]
+    fn metadata_hot_lookup_requires_namespace_ref_without_policy_floor() {
+        let mut metadata_policy = policy(ReadFreshnessProfile::LatestLocal);
+        metadata_policy.required_namespace_generation = 0;
+        let mut candidate = candidate(StorageIntentReadSourceClass::MetadataHotLookup);
+        candidate.evidence_refs.namespace_generation_ref = EMPTY_EVIDENCE_REF;
+        let input = ReadServingDecisionInput {
+            policy: metadata_policy,
+            candidate,
+            evidence_cut_state: ReadServingEvidenceCutState::Bound,
+            evidence_query_snapshot: snapshot(),
+        };
+
+        assert!(read_source_requires_metadata_namespace(
+            StorageIntentReadSourceClass::MetadataHotLookup
+        ));
+        assert!(!read_serving_candidate_refs_have_required_families(input));
+        assert!(read_serving_candidate_missing_required_ref_reasons(input)
+            .intersects(ReadServingRejectionMask::MISSING_METADATA_NAMESPACE_EVIDENCE));
+        let decision = read_serving_decide(input);
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_METADATA_NAMESPACE_EVIDENCE));
+    }
+
+    #[test]
+    fn metadata_hot_lookup_requires_fresh_namespace_family_in_cut() {
+        let mut metadata_policy = policy(ReadFreshnessProfile::LatestLocal);
+        metadata_policy.required_namespace_generation = 0;
+        let candidate = candidate(StorageIntentReadSourceClass::MetadataHotLookup);
+        let decision = decide_with_snapshot(
+            metadata_policy,
+            candidate,
+            snapshot_with_family_override(
+                StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+                EvidenceFamilyFreshnessState::Stale,
+            ),
+        );
+
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_FRESH_EVIDENCE_FAMILY));
+    }
+
+    #[test]
+    fn directory_index_is_metadata_source_not_receipt_or_cache_authority() {
+        let mut candidate = candidate(StorageIntentReadSourceClass::DirectoryIndex);
+        candidate.source_receipt = StorageIntentReceiptId::ZERO;
+        candidate.evidence_refs.placement_receipt_ref = EMPTY_EVIDENCE_REF;
+
+        let decision = decide(policy(ReadFreshnessProfile::LatestLocal), candidate);
+
+        assert!(!read_source_requires_receipt(
+            StorageIntentReadSourceClass::DirectoryIndex
+        ));
+        assert!(!read_source_is_cache_or_trial(
+            StorageIntentReadSourceClass::DirectoryIndex
+        ));
+        assert!(read_source_requires_metadata_namespace(
+            StorageIntentReadSourceClass::DirectoryIndex
+        ));
+        assert_eq!(decision.decision_state, ReadServingDecisionState::Available);
+        assert_eq!(decision.source_receipt, StorageIntentReceiptId::ZERO);
+        assert!(!decision.cache_only);
+        assert_eq!(decision.refusal, StorageIntentRefusalReason::None);
+    }
+
+    #[test]
+    fn directory_index_requires_ordering_evidence_ref() {
+        let mut candidate = candidate(StorageIntentReadSourceClass::DirectoryIndex);
+        candidate.evidence_refs.ordering_evidence_ref = EMPTY_EVIDENCE_REF;
+
+        let decision = decide(policy(ReadFreshnessProfile::LatestLocal), candidate);
+
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_ORDERING_EVIDENCE));
+    }
+
+    #[test]
     fn local_receipt_requires_tenant_isolation_candidate_ref() {
         let mut candidate = candidate(StorageIntentReadSourceClass::LocalPlacementReceipt);
         candidate.evidence_refs.tenant_isolation_ref = EMPTY_EVIDENCE_REF;
@@ -2522,6 +2661,12 @@ mod tests {
         ));
         assert!(read_serving_requires_service_objective(
             StorageIntentReadSourceClass::AuthoritativePmem
+        ));
+        assert!(read_serving_requires_service_objective(
+            StorageIntentReadSourceClass::MetadataHotLookup
+        ));
+        assert!(read_serving_requires_service_objective(
+            StorageIntentReadSourceClass::DirectoryIndex
         ));
         assert!(!read_serving_requires_service_objective(
             StorageIntentReadSourceClass::LocalPlacementReceipt
