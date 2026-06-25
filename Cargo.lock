@@ -3497,7 +3497,6 @@ version = "0.421.0"
 dependencies = [
  "tidefs-kernel-storage-io",
  "tidefs-storage-intent-core",
- "tidefs-types-pool-label-core",
 ]
 
 [[package]]
