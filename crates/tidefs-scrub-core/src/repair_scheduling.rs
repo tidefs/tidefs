@@ -374,6 +374,58 @@ fn saturating_replica_count(len: usize) -> u16 {
 }
 
 // ---------------------------------------------------------------------------
+// RepairMountedScrubEvidence — mounted scrub identity required for writeback
+// ---------------------------------------------------------------------------
+
+/// Checksum evidence reported by the mounted scrub/read authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairMountedChecksumEvidence {
+    pub layer: ChecksumLayer,
+    pub expected: Option<[u8; 32]>,
+    pub actual: [u8; 32],
+    pub encoded_len: u64,
+}
+
+/// Mounted receipt/source evidence status observed during scrub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairMountedReceiptEvidenceStatus {
+    SparseHole,
+    ReceiptVerified {
+        generation: u64,
+    },
+    ReceiptObservedButUnbound {
+        generation: u64,
+    },
+    ReceiptMissing {
+        expected_generation: Option<u64>,
+    },
+    ReceiptStale {
+        expected_generation: u64,
+        observed_generation: u64,
+    },
+    ReceiptUnavailable {
+        expected_generation: Option<u64>,
+    },
+}
+
+impl RepairMountedReceiptEvidenceStatus {
+    #[must_use]
+    pub const fn allows_repair_dispatch(self) -> bool {
+        matches!(self, Self::ReceiptVerified { .. })
+    }
+}
+
+/// Transform-aware mounted scrub evidence carried into repair admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairMountedScrubEvidence {
+    pub subject: RepairCandidateIdentity,
+    pub expected_plaintext_len: u64,
+    pub observed_plaintext_len: Option<u64>,
+    pub checksum: RepairMountedChecksumEvidence,
+    pub receipt_status: RepairMountedReceiptEvidenceStatus,
+}
+
+// ---------------------------------------------------------------------------
 // RepairEvidence — placement authority required before scheduling repair
 // ---------------------------------------------------------------------------
 
@@ -400,6 +452,14 @@ impl RepairEvidenceClass {
 pub enum RepairEvidenceRejection {
     /// The typed scrub identity does not match the candidate entry.
     CandidateIdentityMismatch,
+    /// The candidate did not carry mounted scrub/read evidence.
+    MissingMountedScrubEvidence,
+    /// Mounted scrub evidence did not match the candidate identity or digest.
+    StaleMountedScrubEvidence,
+    /// Mounted scrub evidence did not carry checksum-layer proof.
+    MissingMountedChecksumEvidence,
+    /// Mounted scrub saw only missing, stale, unbound, or unavailable receipt evidence.
+    MountedScrubReceiptNotVerified,
     /// The finding has only a receiptless suspect record.
     MissingReceipt,
     /// The supplied receipt is synthetic, malformed, or for another object.
@@ -419,6 +479,10 @@ impl RepairEvidenceRejection {
     pub const fn label(self) -> &'static str {
         match self {
             Self::CandidateIdentityMismatch => "candidate-identity-mismatch",
+            Self::MissingMountedScrubEvidence => "missing-mounted-scrub-evidence",
+            Self::StaleMountedScrubEvidence => "stale-mounted-scrub-evidence",
+            Self::MissingMountedChecksumEvidence => "missing-mounted-checksum-evidence",
+            Self::MountedScrubReceiptNotVerified => "mounted-scrub-receipt-not-verified",
             Self::MissingReceipt => "missing-receipt",
             Self::StaleReceipt => "stale-receipt",
             Self::MissingComparisonRecord => "missing-comparison-record",
@@ -445,6 +509,7 @@ pub struct RepairEvidence {
     pub offset: u64,
     pub source_set: RepairSourceSet,
     pub placement_receipt_ref: PlacementReceiptRef,
+    pub mounted_scrub_evidence: RepairMountedScrubEvidence,
     pub comparison_evidence: Option<RepairComparisonEvidence>,
 }
 
@@ -453,6 +518,7 @@ impl RepairEvidence {
     pub fn from_placement_receipt(
         entry: &SuspectEntry,
         receipt: PlacementReceiptRef,
+        mounted_scrub_evidence: RepairMountedScrubEvidence,
     ) -> Result<Self, RepairEvidenceRejection> {
         if !receipt.is_committed_authority()
             || receipt.object_id != entry.locator_id
@@ -471,6 +537,7 @@ impl RepairEvidence {
                 target_count: receipt.target_count,
             },
             placement_receipt_ref: receipt,
+            mounted_scrub_evidence,
             comparison_evidence: None,
         })
     }
@@ -480,10 +547,13 @@ impl RepairEvidence {
     pub fn from_admission_input(
         input: &RepairAdmissionInput,
     ) -> Result<Self, RepairEvidenceRejection> {
+        let mounted_scrub_evidence = validate_mounted_scrub_for_writeback(input)?;
         let receipt = input
             .placement_receipt_ref
             .ok_or(RepairEvidenceRejection::MissingReceipt)?;
-        let mut evidence = Self::from_placement_receipt(&input.entry, receipt)?;
+        validate_mounted_receipt_binding(mounted_scrub_evidence, receipt)?;
+        let mut evidence =
+            Self::from_placement_receipt(&input.entry, receipt, mounted_scrub_evidence)?;
 
         if receipt.target_count > 1 {
             let comparison = input
@@ -495,6 +565,51 @@ impl RepairEvidence {
 
         Ok(evidence)
     }
+}
+
+fn validate_mounted_scrub_for_writeback(
+    input: &RepairAdmissionInput,
+) -> Result<RepairMountedScrubEvidence, RepairEvidenceRejection> {
+    let evidence = input
+        .mounted_scrub_evidence
+        .ok_or(RepairEvidenceRejection::MissingMountedScrubEvidence)?;
+
+    if evidence.subject != input.candidate_identity
+        || !evidence.subject.matches_suspect_entry(&input.entry)
+        || evidence.checksum.layer != checksum_layer_for_repair_kind(input.candidate_identity.kind)
+    {
+        return Err(RepairEvidenceRejection::StaleMountedScrubEvidence);
+    }
+
+    let Some(expected) = evidence.checksum.expected else {
+        return Err(RepairEvidenceRejection::MissingMountedChecksumEvidence);
+    };
+    if expected != input.entry.expected_hash || evidence.checksum.actual != input.entry.actual_hash
+    {
+        return Err(RepairEvidenceRejection::StaleMountedScrubEvidence);
+    }
+    if expected == evidence.checksum.actual {
+        return Err(RepairEvidenceRejection::StaleMountedScrubEvidence);
+    }
+    if !evidence.receipt_status.allows_repair_dispatch() {
+        return Err(RepairEvidenceRejection::MountedScrubReceiptNotVerified);
+    }
+
+    Ok(evidence)
+}
+
+fn validate_mounted_receipt_binding(
+    evidence: RepairMountedScrubEvidence,
+    receipt: PlacementReceiptRef,
+) -> Result<(), RepairEvidenceRejection> {
+    if let RepairMountedReceiptEvidenceStatus::ReceiptVerified { generation } =
+        evidence.receipt_status
+    {
+        if generation != receipt.receipt_generation {
+            return Err(RepairEvidenceRejection::StaleMountedScrubEvidence);
+        }
+    }
+    Ok(())
 }
 
 fn validate_comparison_for_writeback(
@@ -537,6 +652,7 @@ fn validate_comparison_for_writeback(
 pub struct RepairAdmissionInput {
     pub entry: SuspectEntry,
     pub candidate_identity: RepairCandidateIdentity,
+    pub mounted_scrub_evidence: Option<RepairMountedScrubEvidence>,
     pub placement_receipt_ref: Option<PlacementReceiptRef>,
     pub cross_replica_comparison: Option<RepairComparisonEvidence>,
     pub degraded_read_active: bool,
@@ -557,6 +673,7 @@ impl RepairAdmissionInput {
         Self {
             entry,
             candidate_identity,
+            mounted_scrub_evidence: None,
             placement_receipt_ref: None,
             cross_replica_comparison: None,
             degraded_read_active: false,
@@ -578,6 +695,7 @@ impl RepairAdmissionInput {
         Self {
             entry,
             candidate_identity,
+            mounted_scrub_evidence: None,
             placement_receipt_ref: Some(receipt),
             cross_replica_comparison: None,
             degraded_read_active: false,
@@ -587,6 +705,12 @@ impl RepairAdmissionInput {
     #[must_use]
     pub fn with_cross_replica_comparison(mut self, record: &CrossReplicaComparisonRecord) -> Self {
         self.cross_replica_comparison = Some(RepairComparisonEvidence::from_record(record));
+        self
+    }
+
+    #[must_use]
+    pub fn with_mounted_scrub_evidence(mut self, evidence: RepairMountedScrubEvidence) -> Self {
+        self.mounted_scrub_evidence = Some(evidence);
         self
     }
 
@@ -801,6 +925,14 @@ pub struct BridgeStats {
     pub entries_ingested: u64,
     /// Entries blocked because the carried scrub identity mismatched the entry.
     pub entries_blocked_identity_mismatch: u64,
+    /// Entries blocked because mounted scrub evidence was absent.
+    pub entries_blocked_missing_mounted_scrub_evidence: u64,
+    /// Entries blocked because mounted scrub evidence did not match the candidate.
+    pub entries_blocked_stale_mounted_scrub_evidence: u64,
+    /// Entries blocked because mounted scrub evidence had no checksum proof.
+    pub entries_blocked_missing_mounted_checksum: u64,
+    /// Entries blocked because mounted scrub receipt/source evidence was not verified.
+    pub entries_blocked_mounted_scrub_receipt_not_verified: u64,
     /// Entries admitted with receipt-backed evidence.
     pub entries_admitted_with_receipt: u64,
     /// Entries blocked because no placement receipt was supplied.
@@ -838,6 +970,10 @@ impl BridgeStats {
     #[must_use]
     pub const fn entries_blocked_by_evidence(&self) -> u64 {
         self.entries_blocked_identity_mismatch
+            + self.entries_blocked_missing_mounted_scrub_evidence
+            + self.entries_blocked_stale_mounted_scrub_evidence
+            + self.entries_blocked_missing_mounted_checksum
+            + self.entries_blocked_mounted_scrub_receipt_not_verified
             + self.entries_blocked_missing_receipt
             + self.entries_blocked_stale_receipt
             + self.entries_blocked_missing_comparison
@@ -994,6 +1130,19 @@ impl ScrubToRepairBridge {
         match reason {
             RepairEvidenceRejection::CandidateIdentityMismatch => {
                 self.stats.entries_blocked_identity_mismatch += 1;
+            }
+            RepairEvidenceRejection::MissingMountedScrubEvidence => {
+                self.stats.entries_blocked_missing_mounted_scrub_evidence += 1;
+            }
+            RepairEvidenceRejection::StaleMountedScrubEvidence => {
+                self.stats.entries_blocked_stale_mounted_scrub_evidence += 1;
+            }
+            RepairEvidenceRejection::MissingMountedChecksumEvidence => {
+                self.stats.entries_blocked_missing_mounted_checksum += 1;
+            }
+            RepairEvidenceRejection::MountedScrubReceiptNotVerified => {
+                self.stats
+                    .entries_blocked_mounted_scrub_receipt_not_verified += 1;
             }
             RepairEvidenceRejection::MissingReceipt => {
                 self.stats.entries_blocked_missing_receipt += 1;
@@ -1230,6 +1379,14 @@ pub struct RebakeSchedulingBridge {
     entries_generated: u64,
     /// Entries generated by evidence class.
     entries_by_evidence_class: [u64; RepairEvidenceClass::LEVEL_COUNT],
+    /// Entries blocked because mounted scrub evidence was absent.
+    entries_blocked_missing_mounted_scrub_evidence: u64,
+    /// Entries blocked because mounted scrub evidence did not match the candidate.
+    entries_blocked_stale_mounted_scrub_evidence: u64,
+    /// Entries blocked because mounted scrub evidence had no checksum proof.
+    entries_blocked_missing_mounted_checksum: u64,
+    /// Entries blocked because mounted scrub receipt/source evidence was not verified.
+    entries_blocked_mounted_scrub_receipt_not_verified: u64,
     /// Entries blocked because no placement receipt was supplied.
     entries_blocked_missing_receipt: u64,
     /// Entries blocked because the carried scrub identity mismatched the entry.
@@ -1258,6 +1415,10 @@ impl RebakeSchedulingBridge {
             pending_rebake: Vec::new(),
             entries_generated: 0,
             entries_by_evidence_class: [0; RepairEvidenceClass::LEVEL_COUNT],
+            entries_blocked_missing_mounted_scrub_evidence: 0,
+            entries_blocked_stale_mounted_scrub_evidence: 0,
+            entries_blocked_missing_mounted_checksum: 0,
+            entries_blocked_mounted_scrub_receipt_not_verified: 0,
             entries_blocked_missing_receipt: 0,
             entries_blocked_identity_mismatch: 0,
             entries_blocked_stale_receipt: 0,
@@ -1352,6 +1513,18 @@ impl RebakeSchedulingBridge {
 
     fn record_evidence_block(&mut self, reason: RepairEvidenceRejection) {
         match reason {
+            RepairEvidenceRejection::MissingMountedScrubEvidence => {
+                self.entries_blocked_missing_mounted_scrub_evidence += 1;
+            }
+            RepairEvidenceRejection::StaleMountedScrubEvidence => {
+                self.entries_blocked_stale_mounted_scrub_evidence += 1;
+            }
+            RepairEvidenceRejection::MissingMountedChecksumEvidence => {
+                self.entries_blocked_missing_mounted_checksum += 1;
+            }
+            RepairEvidenceRejection::MountedScrubReceiptNotVerified => {
+                self.entries_blocked_mounted_scrub_receipt_not_verified += 1;
+            }
             RepairEvidenceRejection::MissingReceipt => {
                 self.entries_blocked_missing_receipt += 1;
             }
@@ -1390,6 +1563,26 @@ impl RebakeSchedulingBridge {
     #[must_use]
     pub fn entries_generated_by_evidence_class(&self) -> &[u64; RepairEvidenceClass::LEVEL_COUNT] {
         &self.entries_by_evidence_class
+    }
+
+    #[must_use]
+    pub fn entries_blocked_missing_mounted_scrub_evidence(&self) -> u64 {
+        self.entries_blocked_missing_mounted_scrub_evidence
+    }
+
+    #[must_use]
+    pub fn entries_blocked_stale_mounted_scrub_evidence(&self) -> u64 {
+        self.entries_blocked_stale_mounted_scrub_evidence
+    }
+
+    #[must_use]
+    pub fn entries_blocked_missing_mounted_checksum(&self) -> u64 {
+        self.entries_blocked_missing_mounted_checksum
+    }
+
+    #[must_use]
+    pub fn entries_blocked_mounted_scrub_receipt_not_verified(&self) -> u64 {
+        self.entries_blocked_mounted_scrub_receipt_not_verified
     }
 
     #[must_use]
@@ -1534,8 +1727,7 @@ mod tests {
                 clean_sources: vec![2],
             },
         );
-        RepairAdmissionInput::with_receipt(entry, receipt)
-            .with_cross_replica_comparison(&comparison)
+        input_with_receipt_ref(entry, receipt).with_cross_replica_comparison(&comparison)
     }
 
     fn inputs_with_receipts(entries: &[SuspectEntry]) -> Vec<RepairAdmissionInput> {
@@ -1563,6 +1755,36 @@ mod tests {
         } else {
             ChecksumLayer::EncodedContentChunk
         }
+    }
+
+    fn mounted_scrub_evidence_for_entry(
+        entry: &SuspectEntry,
+        receipt_generation: u64,
+    ) -> RepairMountedScrubEvidence {
+        RepairMountedScrubEvidence {
+            subject: RepairCandidateIdentity::from_suspect_entry(entry),
+            expected_plaintext_len: 4096,
+            observed_plaintext_len: Some(4096),
+            checksum: RepairMountedChecksumEvidence {
+                layer: checksum_layer_for_entry(entry),
+                expected: Some(entry.expected_hash),
+                actual: entry.actual_hash,
+                encoded_len: 4096,
+            },
+            receipt_status: RepairMountedReceiptEvidenceStatus::ReceiptVerified {
+                generation: receipt_generation,
+            },
+        }
+    }
+
+    fn input_with_receipt_ref(
+        entry: SuspectEntry,
+        receipt: PlacementReceiptRef,
+    ) -> RepairAdmissionInput {
+        let receipt_generation = receipt.receipt_generation;
+        RepairAdmissionInput::with_receipt(entry, receipt).with_mounted_scrub_evidence(
+            mounted_scrub_evidence_for_entry(&entry, receipt_generation),
+        )
     }
 
     fn comparison_sets(classification: &ComparisonClassification) -> (Vec<u64>, Vec<u64>) {
@@ -1842,8 +2064,12 @@ mod tests {
     fn bridge_rejects_missing_receipt_evidence() {
         let mut bridge = ScrubToRepairBridge::new();
         let entry = make_entry(101, 1);
+        let mounted =
+            mounted_scrub_evidence_for_entry(&entry, receipt_for_entry(&entry).receipt_generation);
+        let input =
+            RepairAdmissionInput::missing_receipt(entry).with_mounted_scrub_evidence(mounted);
 
-        let admissions = bridge.ingest(&[entry], 3);
+        let admissions = bridge.ingest_with_evidence(&[input], 3);
 
         assert_eq!(
             admissions,
@@ -1859,10 +2085,89 @@ mod tests {
     }
 
     #[test]
+    fn bridge_rejects_missing_mounted_scrub_evidence() {
+        let mut bridge = ScrubToRepairBridge::new();
+        let entry = make_entry(109, 1);
+
+        let admissions = bridge.ingest(&[entry], 3);
+
+        assert_eq!(
+            admissions,
+            vec![RepairAdmission::Blocked {
+                locator_id: 109,
+                reason: RepairEvidenceRejection::MissingMountedScrubEvidence,
+            }]
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            bridge
+                .stats()
+                .entries_blocked_missing_mounted_scrub_evidence,
+            1
+        );
+        assert_eq!(bridge.stats().entries_blocked_by_evidence(), 1);
+    }
+
+    #[test]
+    fn bridge_rejects_missing_mounted_checksum_evidence() {
+        let mut bridge = ScrubToRepairBridge::new();
+        let entry = make_entry(110, 1);
+        let receipt = receipt_for_entry(&entry);
+        let mut mounted = mounted_scrub_evidence_for_entry(&entry, receipt.receipt_generation);
+        mounted.checksum.expected = None;
+        let input =
+            RepairAdmissionInput::with_receipt(entry, receipt).with_mounted_scrub_evidence(mounted);
+
+        let admissions = bridge.ingest_with_evidence(&[input], 3);
+
+        assert_eq!(
+            admissions,
+            vec![RepairAdmission::Blocked {
+                locator_id: 110,
+                reason: RepairEvidenceRejection::MissingMountedChecksumEvidence,
+            }]
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.stats().entries_blocked_missing_mounted_checksum, 1);
+        assert_eq!(bridge.stats().entries_blocked_by_evidence(), 1);
+    }
+
+    #[test]
+    fn bridge_rejects_unverified_mounted_scrub_receipt_evidence() {
+        let mut bridge = ScrubToRepairBridge::new();
+        let entry = make_entry(111, 1);
+        let receipt = receipt_for_entry(&entry);
+        let mut mounted = mounted_scrub_evidence_for_entry(&entry, receipt.receipt_generation);
+        mounted.receipt_status = RepairMountedReceiptEvidenceStatus::ReceiptMissing {
+            expected_generation: Some(receipt.receipt_generation),
+        };
+        let input =
+            RepairAdmissionInput::with_receipt(entry, receipt).with_mounted_scrub_evidence(mounted);
+
+        let admissions = bridge.ingest_with_evidence(&[input], 3);
+
+        assert_eq!(
+            admissions,
+            vec![RepairAdmission::Blocked {
+                locator_id: 111,
+                reason: RepairEvidenceRejection::MountedScrubReceiptNotVerified,
+            }]
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(
+            bridge
+                .stats()
+                .entries_blocked_mounted_scrub_receipt_not_verified,
+            1
+        );
+        assert_eq!(bridge.stats().entries_blocked_by_evidence(), 1);
+    }
+
+    #[test]
     fn bridge_rejects_missing_comparison_evidence() {
         let mut bridge = ScrubToRepairBridge::new();
         let entry = make_entry(107, 1);
-        let input = RepairAdmissionInput::with_receipt(entry, receipt_for_entry(&entry));
+        let input = input_with_receipt_ref(entry, receipt_for_entry(&entry));
 
         let admissions = bridge.ingest_with_evidence(&[input], 3);
 
@@ -1891,8 +2196,8 @@ mod tests {
             },
         );
         comparison.checksum_layer = ChecksumLayer::EncodedContentChunk;
-        let input = RepairAdmissionInput::with_receipt(entry, receipt)
-            .with_cross_replica_comparison(&comparison);
+        let input =
+            input_with_receipt_ref(entry, receipt).with_cross_replica_comparison(&comparison);
 
         let admissions = bridge.ingest_with_evidence(&[input], 3);
 
@@ -1912,7 +2217,7 @@ mod tests {
         let mut bridge = ScrubToRepairBridge::new();
         let entry = make_entry(102, 1);
         let stale = receipt_for_entry(&make_entry(999, 1));
-        let input = RepairAdmissionInput::with_receipt(entry, stale);
+        let input = input_with_receipt_ref(entry, stale);
 
         let admissions = bridge.ingest_with_evidence(&[input], 3);
 
@@ -1933,7 +2238,7 @@ mod tests {
             let mut bridge = ScrubToRepairBridge::new();
             let entry = make_entry(locator_id, 1);
             let stale = receipt_with_target_count(&entry, target_count);
-            let input = RepairAdmissionInput::with_receipt(entry, stale);
+            let input = input_with_receipt_ref(entry, stale);
 
             let admissions = bridge.ingest_with_evidence(&[input], 3);
 
@@ -2062,7 +2367,12 @@ mod tests {
     #[test]
     fn rebake_rejects_receiptless_payload_corruption() {
         let mut bridge = RebakeSchedulingBridge::new();
-        let generated = bridge.generate_rebake_entries(&[make_entry(301, 1)]);
+        let entry = make_entry(301, 1);
+        let mounted =
+            mounted_scrub_evidence_for_entry(&entry, receipt_for_entry(&entry).receipt_generation);
+        let input =
+            RepairAdmissionInput::missing_receipt(entry).with_mounted_scrub_evidence(mounted);
+        let generated = bridge.generate_rebake_entries_with_evidence(&[input]);
 
         assert!(generated.is_empty());
         assert_eq!(bridge.pending_count(), 0);
@@ -2075,7 +2385,7 @@ mod tests {
         let mut bridge = RebakeSchedulingBridge::new();
         let entry = make_entry(302, 1);
         let stale = receipt_with_target_count(&entry, 3);
-        let input = RepairAdmissionInput::with_receipt(entry, stale);
+        let input = input_with_receipt_ref(entry, stale);
 
         let generated = bridge.generate_rebake_entries_with_evidence(&[input]);
 

@@ -192,6 +192,14 @@ pub struct RepairSchedulerStats {
     pub unsurvivable: u64,
     /// Entries dispatched for repair.
     pub dispatched: u64,
+    /// Entries blocked because mounted scrub evidence was absent.
+    pub blocked_missing_mounted_scrub_evidence: u64,
+    /// Entries blocked because mounted scrub evidence did not match the candidate.
+    pub blocked_stale_mounted_scrub_evidence: u64,
+    /// Entries blocked because mounted scrub evidence had no checksum proof.
+    pub blocked_missing_mounted_checksum: u64,
+    /// Entries blocked because mounted scrub receipt/source evidence was not verified.
+    pub blocked_mounted_scrub_receipt_not_verified: u64,
     /// Entries blocked because no placement receipt was supplied.
     pub blocked_missing_receipt: u64,
     /// Entries blocked because the carried scrub identity mismatched the entry.
@@ -341,6 +349,30 @@ impl<D: DurabilityQuery> RepairScheduler<D> {
                     self.stats.blocked_identity_mismatch += 1;
                 }
                 RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::MissingMountedScrubEvidence,
+                    ..
+                } => {
+                    self.stats.blocked_missing_mounted_scrub_evidence += 1;
+                }
+                RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::StaleMountedScrubEvidence,
+                    ..
+                } => {
+                    self.stats.blocked_stale_mounted_scrub_evidence += 1;
+                }
+                RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::MissingMountedChecksumEvidence,
+                    ..
+                } => {
+                    self.stats.blocked_missing_mounted_checksum += 1;
+                }
+                RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::MountedScrubReceiptNotVerified,
+                    ..
+                } => {
+                    self.stats.blocked_mounted_scrub_receipt_not_verified += 1;
+                }
+                RepairAdmission::Blocked {
                     reason: RepairEvidenceRejection::MissingReceipt,
                     ..
                 } => {
@@ -444,7 +476,10 @@ mod tests {
         ChecksumLayer, ComparisonClassification, CrossReplicaComparisonRecord, ScrubSubject,
         ScrubSubjectKind,
     };
-    use crate::repair_scheduling::ScrubToRepairBridge;
+    use crate::repair_scheduling::{
+        RepairCandidateIdentity, RepairMountedChecksumEvidence, RepairMountedReceiptEvidenceStatus,
+        RepairMountedScrubEvidence, ScrubToRepairBridge,
+    };
     use tidefs_durability_layout::DurabilityLayoutV1;
     use tidefs_local_object_store::SuspectEntry;
     use tidefs_replication_model::PlacementReceiptRef;
@@ -483,12 +518,49 @@ mod tests {
     fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
         let receipt = receipt_for_entry(&entry);
         let comparison = comparison_record_for_entry(&entry);
-        RepairAdmissionInput::with_receipt(entry, receipt)
-            .with_cross_replica_comparison(&comparison)
+        input_with_receipt_ref(entry, receipt).with_cross_replica_comparison(&comparison)
     }
 
     fn inputs_with_receipts(entries: &[SuspectEntry]) -> Vec<RepairAdmissionInput> {
         entries.iter().copied().map(input_with_receipt).collect()
+    }
+
+    fn input_with_receipt_ref(
+        entry: SuspectEntry,
+        receipt: PlacementReceiptRef,
+    ) -> RepairAdmissionInput {
+        let receipt_generation = receipt.receipt_generation;
+        RepairAdmissionInput::with_receipt(entry, receipt).with_mounted_scrub_evidence(
+            mounted_scrub_evidence_for_entry(&entry, receipt_generation),
+        )
+    }
+
+    fn mounted_scrub_evidence_for_entry(
+        entry: &SuspectEntry,
+        receipt_generation: u64,
+    ) -> RepairMountedScrubEvidence {
+        RepairMountedScrubEvidence {
+            subject: RepairCandidateIdentity::from_suspect_entry(entry),
+            expected_plaintext_len: 4096,
+            observed_plaintext_len: Some(4096),
+            checksum: RepairMountedChecksumEvidence {
+                layer: checksum_layer_for_entry(entry),
+                expected: Some(entry.expected_hash),
+                actual: entry.actual_hash,
+                encoded_len: 4096,
+            },
+            receipt_status: RepairMountedReceiptEvidenceStatus::ReceiptVerified {
+                generation: receipt_generation,
+            },
+        }
+    }
+
+    fn checksum_layer_for_entry(entry: &SuspectEntry) -> ChecksumLayer {
+        if entry.offset == 0 {
+            ChecksumLayer::InlineContentBody
+        } else {
+            ChecksumLayer::EncodedContentChunk
+        }
     }
 
     fn comparison_record_for_entry(entry: &SuspectEntry) -> CrossReplicaComparisonRecord {
@@ -638,7 +710,7 @@ mod tests {
 
         assert_eq!(scheduler.stats().entries_ingested, 1);
         assert_eq!(scheduler.stats().dispatched, 0);
-        assert_eq!(scheduler.stats().blocked_missing_receipt, 1);
+        assert_eq!(scheduler.stats().blocked_missing_mounted_scrub_evidence, 1);
         assert_eq!(scheduler.bridge().pending_count(), 0);
     }
 
@@ -647,7 +719,7 @@ mod tests {
         let (_q, mut scheduler) = make_scheduler();
         let entry = make_entry(3, 0);
         let receipt = receipt_for_entry(&entry);
-        let input = RepairAdmissionInput::with_receipt(entry, receipt);
+        let input = input_with_receipt_ref(entry, receipt);
 
         scheduler.ingest_with_evidence(&[input]);
 
@@ -777,6 +849,10 @@ mod tests {
         assert_eq!(stats.unrecoverable, 0);
         assert_eq!(stats.unsurvivable, 0);
         assert_eq!(stats.dispatched, 0);
+        assert_eq!(stats.blocked_missing_mounted_scrub_evidence, 0);
+        assert_eq!(stats.blocked_stale_mounted_scrub_evidence, 0);
+        assert_eq!(stats.blocked_missing_mounted_checksum, 0);
+        assert_eq!(stats.blocked_mounted_scrub_receipt_not_verified, 0);
         assert_eq!(stats.blocked_missing_receipt, 0);
         assert_eq!(stats.blocked_identity_mismatch, 0);
         assert_eq!(stats.blocked_stale_receipt, 0);

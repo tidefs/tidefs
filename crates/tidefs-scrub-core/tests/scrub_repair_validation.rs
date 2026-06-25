@@ -14,7 +14,8 @@ use tidefs_local_object_store::SuspectEntry;
 use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 use tidefs_scrub::repair_scheduling::{
     RepairAdmission, RepairAdmissionInput, RepairBlockKind, RepairCandidateIdentity,
-    RepairEscalation, RepairEvidenceClass, RepairEvidenceRejection, ScrubToRepairBridge,
+    RepairEscalation, RepairEvidenceClass, RepairEvidenceRejection, RepairMountedChecksumEvidence,
+    RepairMountedReceiptEvidenceStatus, RepairMountedScrubEvidence, ScrubToRepairBridge,
 };
 use tidefs_scrub::scrub_repair::{
     BlockReconstructor, ScrubRepairEngine, ScrubRepairLedger, ScrubRepairOutcome,
@@ -146,7 +147,7 @@ fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
             clean_sources: vec![2],
         },
     );
-    RepairAdmissionInput::with_receipt_and_identity(entry, receipt, identity)
+    input_with_receipt_ref_and_identity(entry, receipt, identity)
         .with_cross_replica_comparison(&comparison)
 }
 
@@ -177,6 +178,43 @@ fn checksum_layer_for_entry(entry: &SuspectEntry) -> ChecksumLayer {
     } else {
         ChecksumLayer::EncodedContentChunk
     }
+}
+
+fn mounted_scrub_evidence_for_entry(
+    entry: &SuspectEntry,
+    receipt_generation: u64,
+) -> RepairMountedScrubEvidence {
+    RepairMountedScrubEvidence {
+        subject: identity_for_entry(entry),
+        expected_plaintext_len: 4096,
+        observed_plaintext_len: Some(4096),
+        checksum: RepairMountedChecksumEvidence {
+            layer: checksum_layer_for_entry(entry),
+            expected: Some(entry.expected_hash),
+            actual: entry.actual_hash,
+            encoded_len: 4096,
+        },
+        receipt_status: RepairMountedReceiptEvidenceStatus::ReceiptVerified {
+            generation: receipt_generation,
+        },
+    }
+}
+
+fn input_with_receipt_ref(
+    entry: SuspectEntry,
+    receipt: PlacementReceiptRef,
+) -> RepairAdmissionInput {
+    input_with_receipt_ref_and_identity(entry, receipt, identity_for_entry(&entry))
+}
+
+fn input_with_receipt_ref_and_identity(
+    entry: SuspectEntry,
+    receipt: PlacementReceiptRef,
+    identity: RepairCandidateIdentity,
+) -> RepairAdmissionInput {
+    let receipt_generation = receipt.receipt_generation;
+    RepairAdmissionInput::with_receipt_and_identity(entry, receipt, identity)
+        .with_mounted_scrub_evidence(mounted_scrub_evidence_for_entry(&entry, receipt_generation))
 }
 
 fn comparison_sets(classification: &ComparisonClassification) -> (Vec<u64>, Vec<u64>) {
@@ -540,7 +578,7 @@ fn missing_comparison_repair_admission_blocks_queueing() {
     let mut bridge = ScrubToRepairBridge::new();
     let entry = make_suspect_entry(709);
     let receipt = receipt_for_entry(&entry);
-    let input = RepairAdmissionInput::with_receipt(entry, receipt);
+    let input = input_with_receipt_ref(entry, receipt);
 
     let admissions = bridge.ingest_with_evidence(&[input], 2);
 
@@ -562,8 +600,7 @@ fn disagreement_comparison_repair_admission_blocks_queueing() {
     let receipt = receipt_for_entry(&entry);
     let comparison =
         comparison_record_for_entry(&entry, ComparisonClassification::CrossReplicaDisagreement);
-    let input = RepairAdmissionInput::with_receipt(entry, receipt)
-        .with_cross_replica_comparison(&comparison);
+    let input = input_with_receipt_ref(entry, receipt).with_cross_replica_comparison(&comparison);
 
     let admissions = bridge.ingest_with_evidence(&[input], 2);
 
@@ -590,8 +627,7 @@ fn remote_corruption_comparison_repair_admission_blocks_queueing() {
             clean_sources: vec![1],
         },
     );
-    let input = RepairAdmissionInput::with_receipt(entry, receipt)
-        .with_cross_replica_comparison(&comparison);
+    let input = input_with_receipt_ref(entry, receipt).with_cross_replica_comparison(&comparison);
 
     let admissions = bridge.ingest_with_evidence(&[input], 2);
 
@@ -615,8 +651,7 @@ fn checksum_authority_comparison_repair_admission_blocks_as_disagreement() {
         &entry,
         ComparisonClassification::ChecksumAuthorityDisagreement,
     );
-    let input = RepairAdmissionInput::with_receipt(entry, receipt)
-        .with_cross_replica_comparison(&comparison);
+    let input = input_with_receipt_ref(entry, receipt).with_cross_replica_comparison(&comparison);
 
     let admissions = bridge.ingest_with_evidence(&[input], 2);
 
@@ -645,8 +680,7 @@ fn stale_comparison_repair_admission_blocks_queueing() {
     );
     comparison.placement_receipt_generation =
         comparison.placement_receipt_generation.saturating_sub(1);
-    let input = RepairAdmissionInput::with_receipt(entry, receipt)
-        .with_cross_replica_comparison(&comparison);
+    let input = input_with_receipt_ref(entry, receipt).with_cross_replica_comparison(&comparison);
 
     let admissions = bridge.ingest_with_evidence(&[input], 2);
 
@@ -662,11 +696,37 @@ fn stale_comparison_repair_admission_blocks_queueing() {
 }
 
 #[test]
-fn missing_receipt_repair_admission_blocks_queueing() {
+fn missing_mounted_scrub_evidence_blocks_queueing() {
     let mut bridge = ScrubToRepairBridge::new();
     let entry = make_suspect_entry(701);
 
     let admissions = bridge.ingest(&[entry], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Blocked {
+            locator_id: 701,
+            reason: RepairEvidenceRejection::MissingMountedScrubEvidence,
+        }]
+    );
+    assert_eq!(bridge.pending_count(), 0);
+    assert_eq!(
+        bridge
+            .stats()
+            .entries_blocked_missing_mounted_scrub_evidence,
+        1
+    );
+}
+
+#[test]
+fn missing_receipt_repair_admission_blocks_queueing() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(701);
+    let mounted =
+        mounted_scrub_evidence_for_entry(&entry, receipt_for_entry(&entry).receipt_generation);
+    let input = RepairAdmissionInput::missing_receipt(entry).with_mounted_scrub_evidence(mounted);
+
+    let admissions = bridge.ingest_with_evidence(&[input], 2);
 
     assert_eq!(
         admissions,
@@ -691,8 +751,8 @@ fn stale_receipt_repair_admission_blocks_queueing() {
             clean_sources: vec![2],
         },
     );
-    let input = RepairAdmissionInput::with_receipt(entry, stale_receipt)
-        .with_cross_replica_comparison(&comparison);
+    let input =
+        input_with_receipt_ref(entry, stale_receipt).with_cross_replica_comparison(&comparison);
 
     let admissions = bridge.ingest_with_evidence(&[input], 2);
 
@@ -713,7 +773,7 @@ fn stale_receipt_payload_digest_blocks_queueing() {
     let entry = make_suspect_entry(705);
     let mut stale_receipt = receipt_for_entry(&entry);
     stale_receipt.payload_digest = [0xEE; 32];
-    let input = RepairAdmissionInput::with_receipt(entry, stale_receipt);
+    let input = input_with_receipt_ref(entry, stale_receipt);
 
     let admissions = bridge.ingest_with_evidence(&[input], 2);
 
@@ -734,7 +794,7 @@ fn policy_width_receipts_block_repair_admission() {
         let mut bridge = ScrubToRepairBridge::new();
         let entry = make_suspect_entry(locator_id);
         let receipt = receipt_with_target_count(&entry, target_count);
-        let input = RepairAdmissionInput::with_receipt(entry, receipt);
+        let input = input_with_receipt_ref(entry, receipt);
 
         let admissions = bridge.ingest_with_evidence(&[input], 2);
 
@@ -760,8 +820,7 @@ fn mismatched_candidate_identity_blocks_queueing() {
         RepairBlockKind::InlineContent,
     );
     let receipt = receipt_for_entry(&entry);
-    let input =
-        RepairAdmissionInput::with_receipt_and_identity(entry, receipt, mismatched_identity);
+    let input = input_with_receipt_ref_and_identity(entry, receipt, mismatched_identity);
 
     let admissions = bridge.ingest_with_evidence(&[input], 2);
 

@@ -21,11 +21,17 @@ use std::collections::BTreeMap;
 use tidefs_local_object_store::SuspectEntry;
 use tidefs_scrub::repair_scheduling::{
     RebakeSchedulingBridge, RepairAdmissionInput, RepairBlockKind, RepairCandidateIdentity,
+    RepairMountedChecksumEvidence, RepairMountedReceiptEvidenceStatus, RepairMountedScrubEvidence,
     ScrubToRepairBridge,
 };
+use tidefs_scrub::ChecksumLayer;
 
 use crate::repair::RepairAuthorityMismatch;
-use crate::scrub::{ScrubBlockId, ScrubBlockKind, ScrubBlockOutcome, ScrubReport, ScrubViolation};
+use crate::scrub::{
+    ScrubBlockEvidence, ScrubBlockId, ScrubBlockKind, ScrubBlockOutcome, ScrubReport,
+    ScrubViolation,
+};
+use crate::types::{MountedContentChecksumLayer, MountedContentPlacementEvidence};
 
 // ---------------------------------------------------------------------------
 // run_scrub_repair_pass
@@ -208,10 +214,18 @@ fn convert_violations_to_repair_inputs(report: &ScrubReport) -> Vec<RepairAdmiss
                 commit_group: 0,
                 timestamp_secs: timestamp,
             };
-            RepairAdmissionInput::missing_receipt_with_identity(
+            let mut input = RepairAdmissionInput::missing_receipt_with_identity(
                 entry,
                 repair_identity_from_scrub_block_id(&v.block_id),
-            )
+            );
+            if let Some(evidence) = report
+                .block_evidence
+                .get(&v.block_id)
+                .map(repair_mounted_scrub_evidence_from_scrub_evidence)
+            {
+                input = input.with_mounted_scrub_evidence(evidence);
+            }
+            input
         })
         .collect()
 }
@@ -232,6 +246,93 @@ fn repair_kind_from_scrub_kind(kind: ScrubBlockKind) -> RepairBlockKind {
             RepairBlockKind::ContentChunk { chunk_index }
         }
     }
+}
+
+fn repair_mounted_scrub_evidence_from_scrub_evidence(
+    evidence: &ScrubBlockEvidence,
+) -> RepairMountedScrubEvidence {
+    let checksum = evidence
+        .checksum_layer
+        .as_ref()
+        .map(|checksum| RepairMountedChecksumEvidence {
+            layer: repair_checksum_layer_from_mounted(checksum.layer),
+            expected: checksum.expected.map(repair_digest_from_integrity),
+            actual: repair_digest_from_integrity(checksum.actual),
+            encoded_len: checksum.encoded_len,
+        })
+        .unwrap_or_else(|| RepairMountedChecksumEvidence {
+            layer: repair_checksum_layer_from_scrub_kind(evidence.plaintext_identity.block_id.kind),
+            expected: None,
+            actual: [0u8; 32],
+            encoded_len: 0,
+        });
+    RepairMountedScrubEvidence {
+        subject: repair_identity_from_scrub_block_id(&evidence.plaintext_identity.block_id),
+        expected_plaintext_len: evidence.plaintext_identity.expected_plaintext_len,
+        observed_plaintext_len: evidence.plaintext_identity.observed_plaintext_len,
+        checksum,
+        receipt_status: repair_receipt_status_from_mounted(&evidence.placement_evidence),
+    }
+}
+
+fn repair_checksum_layer_from_mounted(layer: MountedContentChecksumLayer) -> ChecksumLayer {
+    match layer {
+        MountedContentChecksumLayer::InlineContentBody => ChecksumLayer::InlineContentBody,
+        MountedContentChecksumLayer::EncodedContentChunk => ChecksumLayer::EncodedContentChunk,
+        MountedContentChecksumLayer::SparseHole => ChecksumLayer::SparseHole,
+    }
+}
+
+fn repair_checksum_layer_from_scrub_kind(kind: ScrubBlockKind) -> ChecksumLayer {
+    match kind {
+        ScrubBlockKind::InlineContent | ScrubBlockKind::ContentManifest => {
+            ChecksumLayer::InlineContentBody
+        }
+        ScrubBlockKind::ContentChunk { .. } => ChecksumLayer::EncodedContentChunk,
+    }
+}
+
+fn repair_receipt_status_from_mounted(
+    evidence: &MountedContentPlacementEvidence,
+) -> RepairMountedReceiptEvidenceStatus {
+    match evidence {
+        MountedContentPlacementEvidence::SparseHole => {
+            RepairMountedReceiptEvidenceStatus::SparseHole
+        }
+        MountedContentPlacementEvidence::ReceiptVerified { generation } => {
+            RepairMountedReceiptEvidenceStatus::ReceiptVerified {
+                generation: *generation,
+            }
+        }
+        MountedContentPlacementEvidence::ReceiptObservedButUnbound { generation } => {
+            RepairMountedReceiptEvidenceStatus::ReceiptObservedButUnbound {
+                generation: *generation,
+            }
+        }
+        MountedContentPlacementEvidence::ReceiptMissing {
+            expected_generation,
+        } => RepairMountedReceiptEvidenceStatus::ReceiptMissing {
+            expected_generation: *expected_generation,
+        },
+        MountedContentPlacementEvidence::ReceiptStale {
+            expected_generation,
+            observed_generation,
+        } => RepairMountedReceiptEvidenceStatus::ReceiptStale {
+            expected_generation: *expected_generation,
+            observed_generation: *observed_generation,
+        },
+        MountedContentPlacementEvidence::ReceiptUnavailable {
+            expected_generation,
+        } => RepairMountedReceiptEvidenceStatus::ReceiptUnavailable {
+            expected_generation: *expected_generation,
+        },
+    }
+}
+
+fn repair_digest_from_integrity(digest: tidefs_local_object_store::IntegrityDigest64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&digest.0.to_le_bytes());
+    bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +382,17 @@ pub fn dispatch_repair_from_bridge(
         };
         let strategy = crate::repair::resolve_violation(&violation, ctx);
 
+        if let Err(reason) = verify_mounted_scrub_dispatch_evidence(&job) {
+            let outcome = crate::repair::RepairOutcome::AuthorityMismatch { reason };
+            applied_log.record(crate::repair::RepairEntry {
+                block_id: violation.block_id,
+                strategy,
+                outcome,
+            });
+            bridge.mark_authority_mismatch(locator_id);
+            continue;
+        }
+
         let entry = crate::repair::RepairEntry {
             block_id: violation.block_id.clone(),
             strategy,
@@ -327,6 +439,37 @@ pub fn dispatch_repair_from_bridge(
     }
 
     applied_log
+}
+
+fn verify_mounted_scrub_dispatch_evidence(
+    job: &tidefs_scrub::repair_scheduling::RepairJob,
+) -> Result<(), RepairAuthorityMismatch> {
+    let evidence = job.evidence.mounted_scrub_evidence;
+    if evidence.checksum.expected.is_none() {
+        return Err(RepairAuthorityMismatch::MountedScrubChecksumMissing);
+    }
+    if evidence.checksum.layer != checksum_layer_for_repair_kind(job.candidate_identity.kind) {
+        return Err(RepairAuthorityMismatch::MountedScrubEvidenceStale);
+    }
+    if evidence.subject != job.candidate_identity
+        || !evidence.subject.matches_suspect_entry(&job.entry)
+        || evidence.checksum.expected != Some(job.entry.expected_hash)
+        || evidence.checksum.actual != job.entry.actual_hash
+    {
+        return Err(RepairAuthorityMismatch::MountedScrubEvidenceStale);
+    }
+    if let RepairMountedReceiptEvidenceStatus::ReceiptVerified { generation } =
+        evidence.receipt_status
+    {
+        if generation != job.evidence.placement_receipt_ref.receipt_generation {
+            return Err(RepairAuthorityMismatch::MountedScrubEvidenceStale);
+        }
+    }
+    if !evidence.receipt_status.allows_repair_dispatch() {
+        return Err(RepairAuthorityMismatch::MountedScrubReceiptNotVerified);
+    }
+
+    Ok(())
 }
 
 /// Reconstruct a [`ScrubViolation`] from a [`RepairJob`] so the existing
@@ -479,7 +622,8 @@ fn current_content_layout(
 mod tests {
     use super::*;
     use crate::scrub::{
-        ScrubBlockId, ScrubBlockKind, ScrubBlockOutcome, ScrubReport, ScrubViolation,
+        ScrubBlockId, ScrubBlockKind, ScrubBlockOutcome, ScrubPlaintextIdentity,
+        ScrubRawMediaDiagnostic, ScrubReport, ScrubViolation,
     };
     use tidefs_local_object_store::IntegrityDigest64;
     use tidefs_replication_model::PlacementReceiptRef;
@@ -565,6 +709,27 @@ mod tests {
         )
     }
 
+    fn mounted_scrub_evidence_for_entry(
+        entry: &tidefs_local_object_store::SuspectEntry,
+        kind: RepairBlockKind,
+        receipt_generation: u64,
+    ) -> RepairMountedScrubEvidence {
+        RepairMountedScrubEvidence {
+            subject: RepairCandidateIdentity::new(entry.locator_id, entry.segment_id, kind),
+            expected_plaintext_len: 4096,
+            observed_plaintext_len: Some(4096),
+            checksum: RepairMountedChecksumEvidence {
+                layer: checksum_layer_for_repair_kind(kind),
+                expected: Some(entry.expected_hash),
+                actual: entry.actual_hash,
+                encoded_len: 4096,
+            },
+            receipt_status: RepairMountedReceiptEvidenceStatus::ReceiptVerified {
+                generation: receipt_generation,
+            },
+        }
+    }
+
     fn input_for_identity(
         inode_id: u64,
         data_version: u64,
@@ -577,12 +742,11 @@ mod tests {
         let entry = make_suspect_entry(inode_id, data_version, offset);
         let receipt = receipt_for_entry(&entry);
         let comparison = comparison_record_for_entry(&entry, kind);
-        RepairAdmissionInput::with_receipt_and_identity(
-            entry,
-            receipt,
-            RepairCandidateIdentity::new(inode_id, data_version, kind),
-        )
-        .with_cross_replica_comparison(&comparison)
+        let identity = RepairCandidateIdentity::new(inode_id, data_version, kind);
+        let mounted = mounted_scrub_evidence_for_entry(&entry, kind, receipt.receipt_generation);
+        RepairAdmissionInput::with_receipt_and_identity(entry, receipt, identity)
+            .with_mounted_scrub_evidence(mounted)
+            .with_cross_replica_comparison(&comparison)
     }
 
     fn comparison_record_for_entry(
@@ -759,7 +923,13 @@ mod tests {
         // Receiptless scrub findings are blocked rather than scheduled.
         assert!(!schedule.bridge.has_work());
         assert_eq!(schedule.bridge.pending_count(), 0);
-        assert_eq!(schedule.bridge.stats().entries_blocked_missing_receipt, 1);
+        assert_eq!(
+            schedule
+                .bridge
+                .stats()
+                .entries_blocked_missing_mounted_scrub_evidence,
+            1
+        );
 
         // Suspect entries are populated.
         assert_eq!(schedule.suspect_entries.len(), 1);
@@ -769,7 +939,12 @@ mod tests {
 
         // Single-copy mode: no rebake entries.
         assert_eq!(schedule.rebake.entries_generated(), 0);
-        assert_eq!(schedule.rebake.entries_blocked_missing_receipt(), 1);
+        assert_eq!(
+            schedule
+                .rebake
+                .entries_blocked_missing_mounted_scrub_evidence(),
+            1
+        );
     }
 
     #[test]
@@ -811,8 +986,19 @@ mod tests {
         let schedule = run_scrub_repair_scheduling(&report);
 
         assert_eq!(schedule.bridge.prioritized_jobs().len(), 0);
-        assert_eq!(schedule.bridge.stats().entries_blocked_missing_receipt, 2);
-        assert_eq!(schedule.rebake.entries_blocked_missing_receipt(), 2);
+        assert_eq!(
+            schedule
+                .bridge
+                .stats()
+                .entries_blocked_missing_mounted_scrub_evidence,
+            2
+        );
+        assert_eq!(
+            schedule
+                .rebake
+                .entries_blocked_missing_mounted_scrub_evidence(),
+            2
+        );
     }
 
     #[test]
@@ -909,6 +1095,46 @@ mod tests {
             .collect()
     }
 
+    fn digest64_bytes(digest: IntegrityDigest64) -> [u8; 32] {
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&digest.0.to_le_bytes());
+        hash
+    }
+
+    fn mounted_scrub_block_evidence(
+        block_id: ScrubBlockId,
+        expected: IntegrityDigest64,
+        actual: IntegrityDigest64,
+        receipt_generation: u64,
+    ) -> ScrubBlockEvidence {
+        let checksum_layer = match block_id.kind {
+            ScrubBlockKind::InlineContent | ScrubBlockKind::ContentManifest => {
+                MountedContentChecksumLayer::InlineContentBody
+            }
+            ScrubBlockKind::ContentChunk { .. } => MountedContentChecksumLayer::EncodedContentChunk,
+        };
+        ScrubBlockEvidence {
+            plaintext_identity: ScrubPlaintextIdentity {
+                block_id,
+                expected_plaintext_len: 4096,
+                observed_plaintext_len: None,
+            },
+            checksum_layer: Some(crate::types::MountedContentChecksumEvidence {
+                layer: checksum_layer,
+                expected: Some(expected),
+                actual,
+                encoded_len: 4096,
+            }),
+            placement_evidence: MountedContentPlacementEvidence::ReceiptVerified {
+                generation: receipt_generation,
+            },
+            raw_media_diagnostic: ScrubRawMediaDiagnostic {
+                object_key_hex: Some("test-object".to_string()),
+                reason: None,
+            },
+        }
+    }
+
     #[test]
     fn convert_corrupt_violation_to_suspect_entry() {
         let mut report = ScrubReport::empty();
@@ -935,6 +1161,44 @@ mod tests {
         assert_eq!(e.record_type, 1u8); // payload corruption
         assert!(!e.resolved);
         assert_eq!(e.repair_attempts, 0);
+    }
+
+    #[test]
+    fn convert_corrupt_violation_attaches_mounted_scrub_evidence() {
+        let mut report = ScrubReport::empty();
+        let block_id = ScrubBlockId {
+            inode_id: 101,
+            data_version: 4,
+            kind: ScrubBlockKind::ContentChunk { chunk_index: 6 },
+        };
+        let expected = IntegrityDigest64(0xABCD);
+        let actual = IntegrityDigest64(0x1234);
+        report.block_evidence.insert(
+            block_id.clone(),
+            mounted_scrub_block_evidence(block_id.clone(), expected, actual, 9),
+        );
+        report.violations.push(ScrubViolation {
+            block_id,
+            key_hex: "65".into(),
+            outcome: ScrubBlockOutcome::Corrupt { expected, actual },
+        });
+
+        let inputs = convert_violations_to_repair_inputs(&report);
+
+        assert_eq!(inputs.len(), 1);
+        let evidence = inputs[0]
+            .mounted_scrub_evidence
+            .expect("mounted scrub evidence");
+        assert_eq!(
+            evidence.subject,
+            RepairCandidateIdentity::new(101, 4, RepairBlockKind::ContentChunk { chunk_index: 6 })
+        );
+        assert_eq!(evidence.checksum.expected, Some(digest64_bytes(expected)));
+        assert_eq!(evidence.checksum.actual, digest64_bytes(actual));
+        assert_eq!(
+            evidence.receipt_status,
+            RepairMountedReceiptEvidenceStatus::ReceiptVerified { generation: 9 }
+        );
     }
 
     #[test]
@@ -999,7 +1263,14 @@ mod tests {
         use tidefs_scrub::repair_scheduling::{RepairEvidence, RepairJob};
 
         let receipt = receipt_for_entry(&suspect);
-        let evidence = RepairEvidence::from_placement_receipt(&suspect, receipt)
+        let mounted = mounted_scrub_evidence_for_entry(
+            &suspect,
+            RepairBlockKind::ContentChunk {
+                chunk_index: suspect.offset,
+            },
+            receipt.receipt_generation,
+        );
+        let evidence = RepairEvidence::from_placement_receipt(&suspect, receipt, mounted)
             .expect("test receipt should admit repair job");
         let identity = RepairCandidateIdentity::new(
             suspect.locator_id,
