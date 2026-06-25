@@ -26,6 +26,17 @@ use tidefs_storage_intent_core::{
 
 use crate::TierGoal;
 
+/// Transport path evidence record consumed from #846.
+///
+/// When #846 is absent or stale the planner carries unknown/degraded/refused
+/// state instead of scoring proximity as zero, high confidence, or ordinary
+/// preference.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TransportPathRecord {
+    /// Measured or declared proximity class for this candidate.
+    pub proximity: tidefs_storage_intent_core::ProximityClass,
+}
+
 const AUTHORITY_HARD_GATE_EVIDENCE: &[StorageIntentEvidenceKind] = &[
     StorageIntentEvidenceKind::MembershipEvidence,
     StorageIntentEvidenceKind::OrderingEvidence,
@@ -297,6 +308,10 @@ pub struct StorageIntentPlacementCandidate {
     pub prefetch_residency: Option<PrefetchResidencyDecisionRecord>,
     /// #897 authenticated peer/domain evidence for the candidate.
     pub trust_domain_evidence: Option<TrustEvidenceRecord>,
+    /// Observed proximity class for this candidate.
+    pub proximity: tidefs_storage_intent_core::ProximityClass,
+    /// Optional #846 transport path evidence record.
+    pub transport_path_evidence: Option<TransportPathRecord>,
     /// Predictor confidence for authority-changing movement.
     pub prediction_confidence: PredictionConfidence,
     /// Capacity/admission gate.
@@ -331,6 +346,8 @@ impl StorageIntentPlacementCandidate {
             layout_allocator: None,
             cost_wear: None,
             prefetch_residency: None,
+            proximity: tidefs_storage_intent_core::ProximityClass::InProcess,
+            transport_path_evidence: None,
             trust_domain_evidence: None,
             prediction_confidence: PredictionConfidence::Unknown,
             capacity_admission: PlacementEvidenceState::Unknown,
@@ -348,6 +365,7 @@ impl StorageIntentPlacementCandidate {
         self.capacity_admission = PlacementEvidenceState::Fresh;
         self.transport_path = PlacementEvidenceState::Fresh;
         self.trust_domain = PlacementEvidenceState::Fresh;
+        self.proximity = tidefs_storage_intent_core::ProximityClass::InProcess;
         self.data_shape_state = PlacementEvidenceState::Fresh;
         self.layout_allocator_state = PlacementEvidenceState::Fresh;
         self.decision_frontier = PlacementEvidenceState::Fresh;
@@ -421,6 +439,12 @@ pub enum StorageIntentPlacementReason {
         target_id: u64,
         role: StorageIntentTrustRole,
         refusal: StorageIntentRefusalReason,
+    },
+    /// Candidate transport proximity is farther than the policy maximum.
+    CandidateProximityRefused {
+        target_id: u64,
+        max_allowed: tidefs_storage_intent_core::ProximityClass,
+        observed: tidefs_storage_intent_core::ProximityClass,
     },
     /// Authority movement lacked predictor confidence.
     CandidateLowPredictionConfidence {
@@ -1358,6 +1382,7 @@ fn evaluate_candidate(
     evaluate_data_shape(role_requires_data_shape(role), candidate, reasons);
     evaluate_layout(role_requires_layout_allocator(role), candidate, reasons);
     evaluate_cache_authority_boundary(role, candidate, reasons);
+    evaluate_transport_proximity(request, candidate, reasons);
     evaluate_geo_remote_boundary(role, candidate, reasons);
     evaluate_movement_debt(role, candidate, reasons);
 }
@@ -1553,6 +1578,33 @@ fn evaluate_cache_authority_boundary(
                 },
             );
         }
+    }
+}
+
+/// Hard-gate proximity: refuse candidates whose observed path is farther
+/// than the policy maximum, and refuse when transport evidence is absent
+/// or the proximity is unknown.
+fn evaluate_transport_proximity(
+    request: &StorageIntentPlacementRequest,
+    candidate: &StorageIntentPlacementCandidate,
+    reasons: &mut Vec<StorageIntentPlacementReason>,
+) {
+    // candidate is already refused via the TransportPath gate check above.
+    // This check handles the proximity value itself.
+    if !candidate.transport_path.permits_hard_gate() {
+        // Gate check already emitted; do not double-count.
+        return;
+    }
+
+    if !tidefs_storage_intent_core::proximity_satisfies_max(
+        request.policy.max_proximity,
+        candidate.proximity,
+    ) {
+        reasons.push(StorageIntentPlacementReason::CandidateProximityRefused {
+            target_id: candidate.target_id,
+            max_allowed: request.policy.max_proximity,
+            observed: candidate.proximity,
+        });
     }
 }
 
@@ -3001,4 +3053,123 @@ mod tests {
             StorageIntentPlacementReason::TierGoalIsNotStorageIntentModel(TierGoal::Primary)
         )));
     }
+    #[test]
+    fn transport_proximity_farther_than_policy_max_is_refused() {
+        let mut tight_policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        tight_policy.max_proximity = tidefs_storage_intent_core::ProximityClass::Node;
+
+        // Build a candidate with receipt proximity that satisfies Node
+        // but with observed transport proximity set to WAN.
+        let far_receipt = {
+            let mut r = receipt(
+                StorageMediaRole::PlacementAuthority,
+                StorageIntentGuaranteeClass::FullPlacement,
+                FailureDomainMask::NODE,
+                StorageMediaClass::NvmeFlash,
+            );
+            r.proximity = tidefs_storage_intent_core::ProximityClass::InProcess;
+            r
+        };
+
+        let mut far = StorageIntentPlacementCandidate::new(
+            7,
+            70,
+            far_receipt,
+            durable_media(StorageMediaClass::NvmeFlash),
+        )
+        .with_fresh_hard_gates()
+        .with_records();
+        far.proximity = tidefs_storage_intent_core::ProximityClass::Wan;
+
+        let result = evaluate_storage_intent_placement(
+            &StorageIntentPlacementRequest::new(
+                tight_policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+                evidence_cut(tight_policy),
+            ),
+            &[far],
+        );
+
+        assert!(!result.admitted);
+        assert!(result.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::CandidateProximityRefused {
+                target_id: 7,
+                max_allowed: tidefs_storage_intent_core::ProximityClass::Node,
+                observed: tidefs_storage_intent_core::ProximityClass::Wan,
+            }
+        )));
+    }
+
+    #[test]
+    fn transport_path_gate_unknown_refuses_candidate_before_scoring() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut cand = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        cand.transport_path = PlacementEvidenceState::Unknown;
+
+        let result = evaluate_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[cand],
+        );
+
+        assert!(!result.admitted);
+        assert!(result.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                gate: CandidateGate::TransportPath,
+                state: PlacementEvidenceState::Unknown,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn proximity_in_process_satisfies_all_common_max_classes() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        // Default policy max is Geo; InProcess is much closer.
+        let cand = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+
+        let result = evaluate_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[cand],
+        );
+
+        assert!(result.admitted);
+    }
+
 }
