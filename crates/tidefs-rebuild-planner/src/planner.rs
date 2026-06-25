@@ -27,6 +27,7 @@ impl ReceiptBackedObjectPlacement {
         members: BTreeSet<MemberId>,
     ) -> Result<Self, ReconstructionTaskReceiptError> {
         ReconstructionTask::validate_receipt_ref(placement_receipt_ref)?;
+        validate_receipt_source_set(placement_receipt_ref, &members)?;
         Ok(Self {
             placement_receipt_ref,
             members,
@@ -112,8 +113,8 @@ pub fn plan_reconstruction(
 
     for (&object_id, placement) in &input.object_placement {
         let placement_receipt_ref = placement.placement_receipt_ref();
-        validate_receipt_for_object(object_id, placement_receipt_ref)?;
         let members = placement.members();
+        validate_receipt_for_object(object_id, placement_receipt_ref, members)?;
 
         // Skip objects already being rebuilt elsewhere
         if input.in_flight_objects.contains(&object_id) {
@@ -177,6 +178,7 @@ pub fn plan_reconstruction(
 fn validate_receipt_for_object(
     object_id: u64,
     placement_receipt_ref: PlacementReceiptRef,
+    members: &BTreeSet<MemberId>,
 ) -> Result<(), ReconstructionPlanningError> {
     if placement_receipt_ref.object_id != object_id {
         return Err(ReconstructionPlanningError::ReceiptObjectIdMismatch {
@@ -186,7 +188,24 @@ fn validate_receipt_for_object(
     }
     ReconstructionTask::validate_receipt_ref(placement_receipt_ref).map_err(|reason| {
         ReconstructionPlanningError::InvalidPlacementReceipt { object_id, reason }
+    })?;
+    validate_receipt_source_set(placement_receipt_ref, members).map_err(|reason| {
+        ReconstructionPlanningError::InvalidPlacementReceipt { object_id, reason }
     })
+}
+
+fn validate_receipt_source_set(
+    placement_receipt_ref: PlacementReceiptRef,
+    members: &BTreeSet<MemberId>,
+) -> Result<(), ReconstructionTaskReceiptError> {
+    let source_count = u16::try_from(members.len()).unwrap_or(u16::MAX);
+    if source_count != placement_receipt_ref.target_count {
+        return Err(ReconstructionTaskReceiptError::TopologyOnlySourceEvidence {
+            source_count,
+            receipt_target_count: placement_receipt_ref.target_count,
+        });
+    }
+    Ok(())
 }
 
 /// Select target nodes with failure-domain separation.
