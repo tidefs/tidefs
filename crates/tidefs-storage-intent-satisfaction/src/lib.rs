@@ -317,6 +317,8 @@ pub enum StorageIntentSatisfactionReason {
     NotAuthoritativeEnough = 47,
     ProducerFinding = 48,
     ReasonBufferFull = 49,
+    StaleTransportPathEvidence = 50,
+    RecoveryDegradationRefused = 51,
 }
 
 impl_u16_canonical!(StorageIntentSatisfactionReason, {
@@ -370,6 +372,8 @@ impl_u16_canonical!(StorageIntentSatisfactionReason, {
     NotAuthoritativeEnough = 47 => "not-authoritative-enough",
     ProducerFinding = 48 => "producer-finding",
     ReasonBufferFull = 49 => "reason-buffer-full",
+    StaleTransportPathEvidence = 50 => "stale-transport-path-evidence",
+    RecoveryDegradationRefused = 51 => "recovery-degradation-refused",
 });
 
 /// Output consumers represented by a satisfaction row.
@@ -1314,7 +1318,7 @@ fn reconcile_required_evidence(
     }
 
     let state = snapshot.family_freshness.state_for_kind(requirement.kind);
-    let mut reason = reason_for_family_state(state);
+    let mut reason = reason_for_family_state_kind(requirement.kind, state);
     if matches!(state, EvidenceFamilyFreshnessState::Fresh) {
         reason = StorageIntentSatisfactionReason::EvidenceRefOutOfCut;
     }
@@ -1553,6 +1557,67 @@ const fn reason_for_family_state(
         | EvidenceFamilyFreshnessState::Unavailable => {
             StorageIntentSatisfactionReason::EvidenceFamilyUnavailable
         }
+    }
+}
+
+/// Map evidence-kind and family-state to a specific satisfaction reason.
+/// Evidence-kind-specific staleness, wrong-domain, and degraded conditions
+/// produce precise reasons so that consumers can distinguish
+/// transport-path, read-serving, data-shape, layout, read-refusal, and
+/// recovery-degradation evidence problems without decoding generic
+/// family-state reasons.
+const fn reason_for_family_state_kind(
+    kind: StorageIntentEvidenceKind,
+    state: EvidenceFamilyFreshnessState,
+) -> StorageIntentSatisfactionReason {
+    match kind {
+        StorageIntentEvidenceKind::TransportPathEvidence => match state {
+            EvidenceFamilyFreshnessState::Stale
+            | EvidenceFamilyFreshnessState::Missing => {
+                StorageIntentSatisfactionReason::StaleTransportPathEvidence
+            }
+            _ => reason_for_family_state(state),
+        },
+        StorageIntentEvidenceKind::ReadFreshnessEvidence => match state {
+            EvidenceFamilyFreshnessState::Stale
+            | EvidenceFamilyFreshnessState::Missing => {
+                StorageIntentSatisfactionReason::StaleReadServingEvidence
+            }
+            EvidenceFamilyFreshnessState::Refused => {
+                StorageIntentSatisfactionReason::DegradedReadRefused
+            }
+            _ => reason_for_family_state(state),
+        },
+        StorageIntentEvidenceKind::DataShapeEvidence => match state {
+            EvidenceFamilyFreshnessState::Missing
+            | EvidenceFamilyFreshnessState::Stale
+            | EvidenceFamilyFreshnessState::Contradictory => {
+                StorageIntentSatisfactionReason::WrongDomainDataShapeEvidence
+            }
+            _ => reason_for_family_state(state),
+        },
+        StorageIntentEvidenceKind::LayoutAllocatorEvidence => match state {
+            EvidenceFamilyFreshnessState::Missing
+            | EvidenceFamilyFreshnessState::Stale => {
+                StorageIntentSatisfactionReason::StaleMirrorOnlyLayoutEvidence
+            }
+            _ => reason_for_family_state(state),
+        },
+        StorageIntentEvidenceKind::CapacityAdmissionEvidence => match state {
+            EvidenceFamilyFreshnessState::Stale
+            | EvidenceFamilyFreshnessState::Missing
+            | EvidenceFamilyFreshnessState::Contradictory => {
+                StorageIntentSatisfactionReason::CapacityReserveExhausted
+            }
+            _ => reason_for_family_state(state),
+        },
+        StorageIntentEvidenceKind::RecoveryDegradationEvidence => match state {
+            EvidenceFamilyFreshnessState::Refused => {
+                StorageIntentSatisfactionReason::RecoveryDegradationRefused
+            }
+            _ => reason_for_family_state(state),
+        },
+        _ => reason_for_family_state(state),
     }
 }
 
@@ -1959,7 +2024,7 @@ mod tests {
         );
         assert!(record
             .reasons
-            .contains_reason(StorageIntentSatisfactionReason::EvidenceFamilyStale));
+            .contains_reason(StorageIntentSatisfactionReason::StaleTransportPathEvidence));
     }
 
     #[test]
@@ -1998,7 +2063,7 @@ mod tests {
         );
         assert!(record
             .reasons
-            .contains_reason(StorageIntentSatisfactionReason::EvidenceFamilyMissing));
+            .contains_reason(StorageIntentSatisfactionReason::StaleMirrorOnlyLayoutEvidence));
     }
 
     #[test]
@@ -2155,7 +2220,7 @@ mod tests {
             StorageIntentSatisfactionReasonRecord {
                 axis: StorageIntentSatisfactionAxis::RecoveryDegradation,
                 state: StorageIntentSatisfactionClass::Refused,
-                reason: StorageIntentSatisfactionReason::DegradedReadRefused,
+                reason: StorageIntentSatisfactionReason::RecoveryDegradationRefused,
                 evidence_kind: StorageIntentEvidenceKind::RecoveryDegradationEvidence,
                 ..StorageIntentSatisfactionReasonRecord::EMPTY
             },
@@ -2177,7 +2242,7 @@ mod tests {
             .contains_reason(StorageIntentSatisfactionReason::StaleMirrorOnlyLayoutEvidence));
         assert!(record
             .reasons
-            .contains_reason(StorageIntentSatisfactionReason::DegradedReadRefused));
+            .contains_reason(StorageIntentSatisfactionReason::RecoveryDegradationRefused));
     }
 
     #[test]
@@ -2319,4 +2384,234 @@ mod tests {
         assert_eq!(StorageIntentSatisfactionAxis::from_discriminant(38), None);
         assert_eq!(StorageIntentSatisfactionAxis::from_discriminant(255), None);
     }
+
+    #[test]
+    fn topology_path_evidence_staleness_becomes_degraded_unknown() {
+        let snapshot = snapshot_with_families(
+            1,
+            &[(
+                StorageIntentEvidenceKind::TransportPathEvidence,
+                EvidenceFamilyFreshnessState::Stale,
+                1,
+            )],
+        );
+        let receipts = [receipt(20, 1, StorageIntentGuaranteeClass::LocalIntent)];
+        let required = [StorageIntentRequiredEvidence::required(
+            StorageIntentEvidenceKind::TransportPathEvidence,
+        )];
+        let record = reconcile_storage_intent_satisfaction(basic_input(
+            policy(1, StorageIntentGuaranteeClass::LocalIntent),
+            snapshot,
+            &receipts,
+            &required,
+        ));
+
+        assert_eq!(record.state, StorageIntentSatisfactionClass::UnknownEvidence);
+        assert!(record
+            .reasons
+            .contains_reason(StorageIntentSatisfactionReason::StaleTransportPathEvidence));
+    }
+
+    #[test]
+    fn under_width_failure_domain_placement_is_refused_by_receipt() {
+        // A receipt that fails evaluate_receipt_against_policy on
+        // failure-domain width should be refused. Use a LocalIntent
+        // receipt against a FullPlacement policy with required domains that
+        // the receipt cannot cover because of empty failure domains.
+        let snapshot = snapshot_with_families(
+            1,
+            &[(
+                StorageIntentEvidenceKind::PlacementReceipt,
+                EvidenceFamilyFreshnessState::Fresh,
+                1,
+            )],
+        );
+        let required = [StorageIntentRequiredEvidence::required(
+            StorageIntentEvidenceKind::PlacementReceipt,
+        )];
+        // receipt with ack=LocalIntent cannot satisfy policy=FullPlacement
+        let mut receipt = receipt(21, 1, StorageIntentGuaranteeClass::LocalIntent);
+        receipt.failure_domains = FailureDomainMask::EMPTY;
+        let receipts = [receipt];
+        let mut pol = policy(1, StorageIntentGuaranteeClass::FullPlacement);
+        pol.required_failure_domains = FailureDomainMask::LOCAL;
+        let input = basic_input(pol, snapshot, &receipts, &required);
+
+        let record = reconcile_storage_intent_satisfaction(input);
+        assert_ne!(record.state, StorageIntentSatisfactionClass::Satisfied);
+    }
+
+    #[test]
+    fn geo_async_lag_crossing_policy_rejects_receipt() {
+        let snapshot = snapshot_with_families(
+            1,
+            &[(
+                StorageIntentEvidenceKind::LocalIntentRecord,
+                EvidenceFamilyFreshnessState::Fresh,
+                1,
+            )],
+        );
+        let mut receipt = receipt(22, 1, StorageIntentGuaranteeClass::LocalIntent);
+        receipt.durability.observed_lag_ms = 60_000;
+        receipt.durability.lag_known = true;
+        let receipts = [receipt];
+        // Use a strong policy that demands low-lag placement.
+        let mut pol = policy(1, StorageIntentGuaranteeClass::FullPlacement);
+        pol.durability.max_lag_ms = 100;
+        let input = basic_input(pol, snapshot, &receipts, &[]);
+
+        let record = reconcile_storage_intent_satisfaction(input);
+        assert!(record.state != StorageIntentSatisfactionClass::Satisfied);
+    }
+
+    #[test]
+    fn exhausted_critical_reserves_becomes_degraded_or_blocked() {
+        let snapshot = snapshot_with_families(
+            1,
+            &[(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                EvidenceFamilyFreshnessState::Stale,
+                1,
+            )],
+        );
+        let required = [StorageIntentRequiredEvidence::required(
+            StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+        )];
+        let record = reconcile_storage_intent_satisfaction(basic_input(
+            policy(1, StorageIntentGuaranteeClass::LocalIntent),
+            snapshot,
+            &[receipt(23, 1, StorageIntentGuaranteeClass::LocalIntent)],
+            &required,
+        ));
+
+        assert!(record
+            .reasons
+            .contains_reason(StorageIntentSatisfactionReason::CapacityReserveExhausted));
+    }
+
+    #[test]
+    fn stale_read_serving_evidence_is_typed() {
+        let snapshot = snapshot_with_families(
+            1,
+            &[(
+                StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                EvidenceFamilyFreshnessState::Stale,
+                1,
+            )],
+        );
+        let required = [StorageIntentRequiredEvidence::required(
+            StorageIntentEvidenceKind::ReadFreshnessEvidence,
+        )];
+        let record = reconcile_storage_intent_satisfaction(basic_input(
+            policy(1, StorageIntentGuaranteeClass::LocalIntent),
+            snapshot,
+            &[receipt(24, 1, StorageIntentGuaranteeClass::LocalIntent)],
+            &required,
+        ));
+
+        assert!(record
+            .reasons
+            .contains_reason(StorageIntentSatisfactionReason::StaleReadServingEvidence));
+    }
+
+    #[test]
+    fn wrong_domain_data_shape_evidence_is_typed() {
+        let snapshot = snapshot_with_families(
+            1,
+            &[(
+                StorageIntentEvidenceKind::DataShapeEvidence,
+                EvidenceFamilyFreshnessState::Contradictory,
+                1,
+            )],
+        );
+        let required = [StorageIntentRequiredEvidence::required(
+            StorageIntentEvidenceKind::DataShapeEvidence,
+        )];
+        let record = reconcile_storage_intent_satisfaction(basic_input(
+            policy(1, StorageIntentGuaranteeClass::LocalIntent),
+            snapshot,
+            &[receipt(25, 1, StorageIntentGuaranteeClass::LocalIntent)],
+            &required,
+        ));
+
+        assert!(record
+            .reasons
+            .contains_reason(StorageIntentSatisfactionReason::WrongDomainDataShapeEvidence));
+    }
+
+    #[test]
+    fn stale_layout_allocator_evidence_is_typed() {
+        let snapshot = snapshot_with_families(
+            1,
+            &[(
+                StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+                EvidenceFamilyFreshnessState::Missing,
+                1,
+            )],
+        );
+        let required = [StorageIntentRequiredEvidence::required(
+            StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+        )];
+        let record = reconcile_storage_intent_satisfaction(basic_input(
+            policy(1, StorageIntentGuaranteeClass::LocalIntent),
+            snapshot,
+            &[receipt(26, 1, StorageIntentGuaranteeClass::LocalIntent)],
+            &required,
+        ));
+
+        assert!(record
+            .reasons
+            .contains_reason(StorageIntentSatisfactionReason::StaleMirrorOnlyLayoutEvidence));
+    }
+
+    #[test]
+    fn degraded_read_refusal_is_typed_for_read_serving_evidence_refusal() {
+        let snapshot = snapshot_with_families(
+            1,
+            &[(
+                StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                EvidenceFamilyFreshnessState::Refused,
+                1,
+            )],
+        );
+        let required = [StorageIntentRequiredEvidence::required(
+            StorageIntentEvidenceKind::ReadFreshnessEvidence,
+        )];
+        let record = reconcile_storage_intent_satisfaction(basic_input(
+            policy(1, StorageIntentGuaranteeClass::LocalIntent),
+            snapshot,
+            &[receipt(27, 1, StorageIntentGuaranteeClass::LocalIntent)],
+            &required,
+        ));
+
+        assert!(record
+            .reasons
+            .contains_reason(StorageIntentSatisfactionReason::DegradedReadRefused));
+    }
+
+    #[test]
+    fn recovery_degradation_refusal_is_typed() {
+        let snapshot = snapshot_with_families(
+            1,
+            &[(
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                EvidenceFamilyFreshnessState::Refused,
+                1,
+            )],
+        );
+        let required = [StorageIntentRequiredEvidence::required(
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+        )];
+        let record = reconcile_storage_intent_satisfaction(basic_input(
+            policy(1, StorageIntentGuaranteeClass::LocalIntent),
+            snapshot,
+            &[receipt(28, 1, StorageIntentGuaranteeClass::LocalIntent)],
+            &required,
+        ));
+
+        assert!(record
+            .reasons
+            .contains_reason(StorageIntentSatisfactionReason::RecoveryDegradationRefused));
+    }
+
 }
