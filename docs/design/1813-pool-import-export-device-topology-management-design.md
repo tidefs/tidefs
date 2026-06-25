@@ -1,5 +1,25 @@
 # Pool Import/Export and Online Device Topology Management — Design Specification
 
+**Documentation authority**: Historical input for TFR-019 / GitHub
+issue [#1137](https://github.com/tidefs/tidefs/issues/1137). This file is
+not current TideFS policy, current spec, implementation status,
+release-readiness evidence, or product authority.
+
+The design-sealed and "frozen" language below, the 7-phase implementation
+plan status claims, and the Forgejo issue references (#1813, #1267, #1283,
+#1248, #1243, #1239/#1229/#1241, #1237, #1189/#1694) are historical
+Forgejo-era design iteration inputs. The live source in
+`crates/tidefs-local-object-store/src/pool_importer.rs`,
+`crates/tidefs-local-object-store/src/pool_exporter.rs`, and
+`crates/tidefs-local-object-store/src/device_manager.rs` implements pool
+import/export and device topology management (Phases 2–5) referencing
+`docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` as its design
+authority. The PoolLabelV1 on-device label format remains authoritative
+through `crates/tidefs-types-pool-label-core/`. The ZFS/Ceph prior-art
+comparison table in §10 is incumbent-comparison context preserved as
+historical design input under the #931/#934 cluster boundary; it is not
+a current capability, availability, durability, or product claim.
+
 **Issue**: [#1813](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1813)
 **Status**: design-sealed
 **Maturity**: **design-spec** — comprehensive authoritative reference for pool import/export,
