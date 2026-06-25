@@ -14,7 +14,9 @@ use tidefs_storage_intent_core::{
     ack_receipt_satisfies_requested_floor, data_shape_hard_gate_check,
     evaluate_receipt_against_policy, media_capability_satisfies_role,
     prefetch_residency_decision_is_cache_only,
-    prefetch_residency_decision_may_request_authority_change, proximity_satisfies_max,
+    prefetch_residency_decision_may_request_authority_change,
+    preflight_simulation_evidence_is_usable, preflight_simulation_has_no_blockers,
+    preflight_simulation_is_preview_only, proximity_satisfies_max,
     service_objective_gate_candidate, trust_domain_role_requirement, trust_domain_role_satisfies,
     AllocationClass, AllocationRefusalReason, CostWearRecord, DataShapePolicy, DataShapeRecord,
     EvidenceFamilyFreshnessState, FreeSpacePressureClass, LayoutAllocatorRecord, MediaRoleMask,
@@ -22,9 +24,10 @@ use tidefs_storage_intent_core::{
     PrefetchResidencyDecisionRecord, ProximityClass, ReceiptPredicateResult, SkippedMoveReason,
     StorageIntentActionClass, StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot,
     StorageIntentEvidenceRef, StorageIntentGuaranteeClass, StorageIntentPolicy,
-    StorageIntentReceipt, StorageIntentReceiptId, StorageIntentRefusalReason,
-    StorageIntentServiceObjectiveEvidence, StorageIntentServiceObjectiveScope,
-    StorageIntentTrustRole, StorageMediaRole, TrustDomainRequirement, TrustEvidenceRecord,
+    StorageIntentPreflightSimulationEvidence, StorageIntentReceipt, StorageIntentReceiptId,
+    StorageIntentRefusalReason, StorageIntentServiceObjectiveEvidence,
+    StorageIntentServiceObjectiveScope, StorageIntentTrustRole, StorageMediaRole,
+    TrustDomainRequirement, TrustEvidenceRecord,
 };
 
 use crate::TierGoal;
@@ -331,6 +334,8 @@ pub struct StorageIntentPlacementCandidate {
     pub service_objective_scope: Option<StorageIntentServiceObjectiveScope>,
     /// Bounded #915 evidence query snapshot for the candidate objective.
     pub service_objective_query: Option<StorageIntentEvidenceQuerySnapshot>,
+    /// Optional #926 preflight simulation preview; never placement authority.
+    pub preflight_simulation: Option<StorageIntentPreflightSimulationEvidence>,
     /// #897 authenticated peer/domain evidence for the candidate.
     pub trust_domain_evidence: Option<TrustEvidenceRecord>,
     /// Observed proximity class for this candidate.
@@ -361,6 +366,8 @@ pub struct StorageIntentPlacementCandidate {
     pub service_objective_state: PlacementEvidenceState,
     /// Decision-frontier evidence gate.
     pub decision_frontier: PlacementEvidenceState,
+    /// Preflight simulation evidence gate (#926) when a preview is carried.
+    pub preflight_simulation_state: PlacementEvidenceState,
     /// Lifecycle/generation evidence gate (#881).
     pub lifecycle_generation: PlacementEvidenceState,
 }
@@ -387,6 +394,7 @@ impl StorageIntentPlacementCandidate {
             service_objective: None,
             service_objective_scope: None,
             service_objective_query: None,
+            preflight_simulation: None,
             proximity: ProximityClass::InProcess,
             transport_path_evidence: None,
             trust_domain_evidence: None,
@@ -402,6 +410,7 @@ impl StorageIntentPlacementCandidate {
             layout_allocator_state: PlacementEvidenceState::Unknown,
             service_objective_state: PlacementEvidenceState::Unknown,
             decision_frontier: PlacementEvidenceState::Unknown,
+            preflight_simulation_state: PlacementEvidenceState::Unknown,
             lifecycle_generation: PlacementEvidenceState::Unknown,
         }
     }
@@ -425,6 +434,7 @@ impl StorageIntentPlacementCandidate {
         self.service_objective_state = PlacementEvidenceState::Fresh;
         self.measurement_attribution = PlacementEvidenceState::Fresh;
         self.decision_frontier = PlacementEvidenceState::Fresh;
+        self.preflight_simulation_state = PlacementEvidenceState::Fresh;
         self.lifecycle_generation = PlacementEvidenceState::Fresh;
         self
     }
@@ -515,6 +525,11 @@ pub enum StorageIntentPlacementReason {
         outcome: PrefetchResidencyDecisionOutcome,
         refusal: StorageIntentRefusalReason,
     },
+    /// Candidate's #926 preflight preview cannot be used for activation.
+    CandidatePreflightSimulationRefused {
+        target_id: u64,
+        refusal: StorageIntentRefusalReason,
+    },
     /// Candidate transport proximity is farther than the policy maximum.
     CandidateProximityRefused {
         target_id: u64,
@@ -550,6 +565,7 @@ impl StorageIntentPlacementReason {
             | Self::CandidateServiceObjectiveRefused { refusal, .. }
             | Self::CandidateTrustDomainRefused { refusal, .. }
             | Self::CandidatePrefetchResidencyRefused { refusal, .. }
+            | Self::CandidatePreflightSimulationRefused { refusal, .. }
             | Self::CandidateMovementDebtRefused { refusal, .. } => Some(*refusal),
             Self::CandidateLayoutRefused { refusal, .. } => Some(layout_refusal_reason(*refusal)),
             Self::EvidenceFamilyNotFresh { .. } | Self::PreflightSimulationNotAuthoritative => {
@@ -590,6 +606,7 @@ pub enum CandidateGate {
     ServiceObjective,
     MeasurementAttribution,
     DecisionFrontier,
+    PreflightSimulation,
 }
 
 /// Layout/allocator refusal classes preserved for explanation.
@@ -1474,6 +1491,7 @@ fn evaluate_candidate(
     );
 
     evaluate_service_objective(role_requires_service_objective(role), candidate, reasons);
+    evaluate_preflight_simulation_boundary(request, candidate, reasons);
     evaluate_data_shape(request, role_requires_data_shape(role), candidate, reasons);
     evaluate_layout(role_requires_layout_allocator(role), candidate, reasons);
     evaluate_prefetch_residency_boundary(request, role, candidate, reasons);
@@ -1984,6 +2002,95 @@ fn prefetch_residency_hard_refusal(
     }
 }
 
+fn evaluate_preflight_simulation_boundary(
+    request: &StorageIntentPlacementRequest,
+    candidate: &StorageIntentPlacementCandidate,
+    reasons: &mut Vec<StorageIntentPlacementReason>,
+) {
+    let Some(preflight) = candidate.preflight_simulation else {
+        return;
+    };
+
+    if !candidate.preflight_simulation_state.permits_hard_gate() {
+        require_candidate_gate(
+            reasons,
+            candidate.target_id,
+            CandidateGate::PreflightSimulation,
+            candidate.preflight_simulation_state,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+        return;
+    }
+
+    if !request
+        .evidence_query
+        .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::PreflightSimulationEvidence)
+    {
+        reasons.push(StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+            target_id: candidate.target_id,
+            gate: CandidateGate::PreflightSimulation,
+            state: family_state(
+                request,
+                StorageIntentEvidenceKind::PreflightSimulationEvidence,
+            ),
+            refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+        });
+        return;
+    }
+
+    let usable = preflight_simulation_evidence_is_usable(preflight);
+    push_predicate_refusal(
+        reasons,
+        candidate.target_id,
+        usable,
+        |target_id, refusal| StorageIntentPlacementReason::CandidatePreflightSimulationRefused {
+            target_id,
+            refusal,
+        },
+    );
+    if !usable.satisfied {
+        return;
+    }
+
+    if !preflight_simulation_is_preview_only(preflight) {
+        reasons.push(
+            StorageIntentPlacementReason::CandidatePreflightSimulationRefused {
+                target_id: candidate.target_id,
+                refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+            },
+        );
+    }
+
+    if !preflight_simulation_has_no_blockers(preflight) {
+        reasons.push(
+            StorageIntentPlacementReason::CandidatePreflightSimulationRefused {
+                target_id: candidate.target_id,
+                refusal: preflight_activation_blocker_refusal(preflight),
+            },
+        );
+    }
+}
+
+fn preflight_activation_blocker_refusal(
+    preflight: StorageIntentPreflightSimulationEvidence,
+) -> StorageIntentRefusalReason {
+    for blocker in preflight
+        .blockers
+        .iter()
+        .take(usize::from(preflight.blocker_len))
+    {
+        if blocker.blocks_activation() {
+            return if blocker.refusal == StorageIntentRefusalReason::None {
+                StorageIntentRefusalReason::EvidenceNotUsable
+            } else {
+                blocker.refusal
+            };
+        }
+    }
+
+    StorageIntentRefusalReason::EvidenceNotUsable
+}
+
 /// Hard-gate proximity: refuse candidates whose observed path is farther
 /// than the policy maximum, and refuse when transport evidence is absent
 /// or the proximity is unknown.
@@ -2129,9 +2236,12 @@ mod tests {
         PrefetchResidencyDecisionOutcome, PrefetchResidencyStateClass, ProximityClass,
         QuarantineState, ReadServingSourceClass, RebakeEligibilityClass, RecordSizeClass,
         ResidencyScope, SegmentRegionClass, SessionSecurityClass, SharingDomainClass,
-        StorageIntentActionClass, StorageIntentDomainId, StorageIntentEvidenceId,
-        StorageIntentEvidenceRef, StorageIntentEvidenceRefs, StorageIntentMediaCapabilityRecord,
-        StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
+        StorageIntentActionClass, StorageIntentDecisionHardGateVerdict, StorageIntentDomainId,
+        StorageIntentEvidenceId, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
+        StorageIntentMediaCapabilityRecord, StorageIntentObjectScope, StorageIntentPolicyId,
+        StorageIntentPolicyRevision, StorageIntentPreflightActivationBlocker,
+        StorageIntentPreflightActivationBlockerKind, StorageIntentPreflightFidelityClass,
+        StorageIntentPreflightNonAuthorityMarker, StorageIntentPreflightSimulationEvidence,
         StorageIntentReceiptId, StorageIntentServiceObjectiveComparatorScope,
         StorageIntentServiceObjectiveEnvironmentProfile, StorageIntentServiceObjectiveEvidence,
         StorageIntentServiceObjectiveEvidenceRefs, StorageIntentServiceObjectiveFailureState,
@@ -2225,6 +2335,17 @@ mod tests {
             policy,
             &[StorageIntentEvidenceKind::PreflightSimulationEvidence],
             |kind| kind != StorageIntentEvidenceKind::DecisionFrontierEvidence,
+        )
+    }
+
+    fn evidence_cut_with_preflight(
+        policy: StorageIntentPolicy,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        evidence_cut_filter_with(
+            policy,
+            &[StorageIntentEvidenceKind::PreflightSimulationEvidence],
+            // #926 occupies the final inline ref slot for this durable-placement fixture.
+            |kind| kind != StorageIntentEvidenceKind::RelocationReceipt,
         )
     }
 
@@ -2624,6 +2745,32 @@ mod tests {
         }
     }
 
+    fn preflight_simulation() -> StorageIntentPreflightSimulationEvidence {
+        StorageIntentPreflightSimulationEvidence {
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::PreflightSimulationEvidence, 83),
+            simulation_id: evidence_id(84),
+            actor_component_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 85),
+            actor_version: 1,
+            temporal_ref: evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 86),
+            created_epoch: 1,
+            fidelity: StorageIntentPreflightFidelityClass::EvidenceSnapshotScoring,
+            non_authority: StorageIntentPreflightNonAuthorityMarker::ACTIVE,
+            ..StorageIntentPreflightSimulationEvidence::EMPTY
+        }
+    }
+
+    fn preflight_simulation_with_blocker() -> StorageIntentPreflightSimulationEvidence {
+        let mut evidence = preflight_simulation();
+        evidence.blockers[0] = StorageIntentPreflightActivationBlocker {
+            kind: StorageIntentPreflightActivationBlockerKind::Capacity,
+            verdict: StorageIntentDecisionHardGateVerdict::Failed,
+            refusal: StorageIntentRefusalReason::NoLegalReceiptSet,
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 87),
+        };
+        evidence.blocker_len = 1;
+        evidence
+    }
+
     fn service_objective_object_scope() -> StorageIntentObjectScope {
         StorageIntentObjectScope {
             dataset_id: DOMAIN_A,
@@ -2973,6 +3120,7 @@ mod tests {
             CandidateGate::ServiceObjective => candidate.service_objective_state = state,
             CandidateGate::MeasurementAttribution => candidate.measurement_attribution = state,
             CandidateGate::DecisionFrontier => candidate.decision_frontier = state,
+            CandidateGate::PreflightSimulation => candidate.preflight_simulation_state = state,
         }
     }
 
@@ -4520,6 +4668,169 @@ mod tests {
                 StorageIntentPlacementReason::PreflightSimulationNotAuthoritative
             ]
         ));
+    }
+
+    #[test]
+    fn preflight_simulation_candidate_state_refuses_before_scoring() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut request = request(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+        );
+        request.evidence_query = evidence_cut_with_preflight(policy);
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.preflight_simulation = Some(preflight_simulation());
+        candidate.preflight_simulation_state = PlacementEvidenceState::Stale;
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!plan.admitted);
+        let report = &plan.candidate_reports[0];
+        assert!(!report.legal);
+        assert_eq!(report.score, 0);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                    gate: CandidateGate::PreflightSimulation,
+                    state: PlacementEvidenceState::Stale,
+                    refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn preflight_simulation_candidate_requires_fresh_evidence_cut() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.preflight_simulation = Some(preflight_simulation());
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = &plan.candidate_reports[0];
+        assert!(!report.legal);
+        assert_eq!(report.score, 0);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                    gate: CandidateGate::PreflightSimulation,
+                    state: PlacementEvidenceState::Unknown,
+                    refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn preflight_simulation_activation_blocker_refuses_before_scoring() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut request = request(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+        );
+        request.evidence_query = evidence_cut_with_preflight(policy);
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.preflight_simulation = Some(preflight_simulation_with_blocker());
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!plan.admitted);
+        let report = &plan.candidate_reports[0];
+        assert!(!report.legal);
+        assert_eq!(report.score, 0);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidatePreflightSimulationRefused {
+                    refusal: StorageIntentRefusalReason::NoLegalReceiptSet,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn preflight_simulation_preview_does_not_create_authority_reason() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut request = request(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+        );
+        request.evidence_query = evidence_cut_with_preflight(policy);
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.preflight_simulation = Some(preflight_simulation());
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(plan.admitted, "{plan:?}");
+        let report = &plan.candidate_reports[0];
+        assert!(report.legal);
+        assert!(!report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidatePreflightSimulationRefused { .. }
+                    | StorageIntentPlacementReason::PreflightSimulationNotAuthoritative
+            )
+        )));
     }
 
     #[test]
