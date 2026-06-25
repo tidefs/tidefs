@@ -17,7 +17,7 @@
 //! their owning issues, not by this crate.
 
 extern crate alloc;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use tidefs_storage_intent_core::{
@@ -151,6 +151,14 @@ const fn lane_priority(lane: LaneClass) -> u8 {
     }
 }
 
+const LANE_CLASSES_BY_PRIORITY: [LaneClass; LaneClass::COUNT] = [
+    LaneClass::Control,
+    LaneClass::Metadata,
+    LaneClass::Demand,
+    LaneClass::Speculative,
+    LaneClass::Background,
+];
+
 // ---------------------------------------------------------------------------
 // Budget cap types — hard enforcement dimensions
 // ---------------------------------------------------------------------------
@@ -218,11 +226,10 @@ impl StorageIntentBudgetCaps {
     /// Returns the primary backpressure reason, or None.
     #[must_use]
     pub fn backpressure_reason(&self) -> Option<StorageIntentRefusalReason> {
-        if self.dirty_bytes > self.max_dirty_bytes || self.inflight_bytes > self.max_inflight_bytes
-        {
-            Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
-        } else if self.max_transport_window_bytes > 0
-            && self.transport_window_bytes > self.max_transport_window_bytes
+        if self.dirty_bytes > self.max_dirty_bytes
+            || self.inflight_bytes > self.max_inflight_bytes
+            || (self.max_transport_window_bytes > 0
+                && self.transport_window_bytes > self.max_transport_window_bytes)
         {
             Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
         } else if self.device_queue_depth > self.max_device_queue_depth
@@ -792,6 +799,262 @@ pub enum BudgetConstraintClass {
     BackgroundOptimizer,
     /// Tenant isolation budget constrained this decision.
     TenantIsolation,
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch queue: admitted work -> lane-ordered dispatch
+// ---------------------------------------------------------------------------
+
+/// Work admitted to a lane and waiting for dispatch.
+#[derive(Clone, Debug)]
+pub struct QueuedStorageIntentWork<T> {
+    /// Caller-owned work item.
+    pub item: T,
+
+    /// Admission request used to produce the decision.
+    pub request: AdmissionRequest,
+
+    /// Admission decision that made this work dispatchable.
+    pub admission: AdmissionDecision,
+
+    /// Monotonic enqueue time in microseconds, supplied by the caller.
+    pub enqueued_at_us: u64,
+
+    /// Evidence confidence carried from admission.
+    pub confidence: SchedulingConfidenceClass,
+}
+
+/// Work selected for dispatch from one lane.
+#[derive(Clone, Debug)]
+pub struct StorageIntentDispatch<T> {
+    /// Caller-owned work item.
+    pub item: T,
+
+    /// Original request.
+    pub request: AdmissionRequest,
+
+    /// Dispatch decision with queue time and starvation state applied.
+    pub decision: AdmissionDecision,
+
+    /// Lane selected for dispatch.
+    pub lane: LaneClass,
+
+    /// Time spent queued, in microseconds.
+    pub queue_time_us: u64,
+
+    /// True when this dispatch bypassed higher-priority queued work because
+    /// the selected lane exceeded its starvation timeout.
+    pub starvation_override: bool,
+}
+
+/// Reason an admission decision could not be queued for dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchQueueAdmissionError {
+    /// The decision was not dispatchable.
+    NotDispatchable {
+        /// Outcome that blocked dispatch.
+        outcome: AdmissionOutcome,
+        /// Refusal/drop/throttle reason carried by the decision.
+        refusal: StorageIntentRefusalReason,
+    },
+}
+
+/// Lane-ordered dispatch queue for already-admitted storage-intent work.
+///
+/// This queue is intentionally adapter-agnostic. FUSE, block, transport,
+/// device-IO, and background-service producers can enqueue their own work item
+/// type after `StorageIntentScheduler::admit` returns a dispatchable decision.
+/// The queue then selects the next lane using the unified `LaneClass` ordering
+/// and starvation timeouts without inventing a second scheduler vocabulary.
+#[derive(Clone, Debug)]
+pub struct StorageIntentDispatchQueue<T> {
+    queues: BTreeMap<LaneClass, VecDeque<QueuedStorageIntentWork<T>>>,
+    pending: usize,
+}
+
+impl<T> StorageIntentDispatchQueue<T> {
+    /// Create an empty dispatch queue with one FIFO per lane.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut queues = BTreeMap::new();
+        for lane in LANE_CLASSES_BY_PRIORITY {
+            queues.insert(lane, VecDeque::new());
+        }
+
+        Self { queues, pending: 0 }
+    }
+
+    /// Total queued work items.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.pending
+    }
+
+    /// Return true when no work is queued.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.pending == 0
+    }
+
+    /// Queued work items for one lane.
+    #[must_use]
+    pub fn lane_len(&self, lane: LaneClass) -> usize {
+        self.queues.get(&lane).map_or(0, VecDeque::len)
+    }
+
+    /// Queue work that has a dispatchable admission decision.
+    ///
+    /// `Admitted` and `Throttled` decisions may enter the dispatch queue.
+    /// `Backpressured`, `Dropped`, `Expired`, and `Refused` outcomes are
+    /// visible stop states and are not silently converted into runnable work.
+    pub fn enqueue_dispatchable(
+        &mut self,
+        request: AdmissionRequest,
+        admission: AdmissionDecision,
+        item: T,
+        enqueued_at_us: u64,
+        confidence: SchedulingConfidenceClass,
+    ) -> Result<(), DispatchQueueAdmissionError> {
+        if !matches!(
+            admission.outcome,
+            AdmissionOutcome::Admitted | AdmissionOutcome::Throttled
+        ) {
+            return Err(DispatchQueueAdmissionError::NotDispatchable {
+                outcome: admission.outcome,
+                refusal: admission.refusal,
+            });
+        }
+
+        let lane = admission.lane;
+        let queued = QueuedStorageIntentWork {
+            item,
+            request,
+            admission,
+            enqueued_at_us,
+            confidence,
+        };
+
+        self.queues.entry(lane).or_default().push_back(queued);
+        self.pending = self.pending.saturating_add(1);
+        Ok(())
+    }
+
+    /// Dispatch the next work item using `scheduler.current_tick + 1` as the
+    /// synthetic queue-time clock.
+    pub fn dispatch_next(
+        &mut self,
+        scheduler: &mut StorageIntentScheduler,
+    ) -> Option<StorageIntentDispatch<T>> {
+        let now_us = scheduler.current_tick.saturating_add(1);
+        self.dispatch_next_at(scheduler, now_us)
+    }
+
+    /// Dispatch the next work item at the caller-supplied monotonic time.
+    ///
+    /// Selection honors strict lane priority unless a lower-priority lane has
+    /// waited past its configured starvation timeout. Dispatch records
+    /// queue-time evidence and accounts the item as inflight.
+    pub fn dispatch_next_at(
+        &mut self,
+        scheduler: &mut StorageIntentScheduler,
+        now_us: u64,
+    ) -> Option<StorageIntentDispatch<T>> {
+        scheduler.advance_tick();
+
+        let (lane, starvation_override) = match self.select_starved_lane(scheduler, now_us) {
+            Some(lane) => (lane, true),
+            None => (self.select_priority_lane()?, false),
+        };
+
+        let queued = self.queues.get_mut(&lane)?.pop_front()?;
+        self.pending = self.pending.saturating_sub(1);
+
+        let queue_time_us = now_us.saturating_sub(queued.enqueued_at_us);
+        let mut decision = queued.admission.with_queue_time(queue_time_us);
+        if starvation_override {
+            decision = decision.with_starvation_override();
+        }
+
+        scheduler.account_inflight(
+            lane,
+            queued.request.requested_bytes,
+            queued.request.requested_ops,
+            queued.request.budget_owner,
+        );
+        if let Some(counter) = scheduler.counters.get_mut(&lane) {
+            counter.last_service_tick = scheduler.current_tick;
+        }
+        scheduler.emit_evidence(&queued.request, &decision, queued.confidence, None);
+
+        Some(StorageIntentDispatch {
+            item: queued.item,
+            request: queued.request,
+            decision,
+            lane,
+            queue_time_us,
+            starvation_override,
+        })
+    }
+
+    fn select_priority_lane(&self) -> Option<LaneClass> {
+        LANE_CLASSES_BY_PRIORITY
+            .into_iter()
+            .find(|&lane| self.lane_len(lane) > 0)
+    }
+
+    fn select_starved_lane(
+        &self,
+        scheduler: &StorageIntentScheduler,
+        now_us: u64,
+    ) -> Option<LaneClass> {
+        let mut selected: Option<(LaneClass, u64)> = None;
+
+        for lane in LANE_CLASSES_BY_PRIORITY {
+            let Some(wait_us) = self.starved_wait_us(lane, scheduler, now_us) else {
+                continue;
+            };
+
+            selected = match selected {
+                Some((best_lane, best_wait))
+                    if best_wait > wait_us
+                        || (best_wait == wait_us
+                            && lane_priority(best_lane) >= lane_priority(lane)) =>
+                {
+                    Some((best_lane, best_wait))
+                }
+                _ => Some((lane, wait_us)),
+            };
+        }
+
+        selected.map(|(lane, _)| lane)
+    }
+
+    fn starved_wait_us(
+        &self,
+        lane: LaneClass,
+        scheduler: &StorageIntentScheduler,
+        now_us: u64,
+    ) -> Option<u64> {
+        let config = scheduler.lane_configs.get(&lane)?;
+        if config.starvation_timeout_ms == 0 {
+            return None;
+        }
+
+        let queued = self.queues.get(&lane)?.front()?;
+        let wait_us = now_us.saturating_sub(queued.enqueued_at_us);
+        let timeout_us = config.starvation_timeout_ms.saturating_mul(1_000);
+        if wait_us > timeout_us {
+            Some(wait_us)
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> Default for StorageIntentDispatchQueue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1756,12 +2019,11 @@ impl StorageIntentScheduler {
         let mut index = 0;
         while index < required_evidence.count as usize {
             let kind = required_evidence.kinds[index];
-            if !self.has_bound_evidence_kind(request, kind)
-                || self.blocking_freshness_for_kind(kind).is_some()
+            if (!self.has_bound_evidence_kind(request, kind)
+                || self.blocking_freshness_for_kind(kind).is_some())
+                && !push_required_evidence_kind(&mut missing_kinds, &mut missing_count, kind)
             {
-                if !push_required_evidence_kind(&mut missing_kinds, &mut missing_count, kind) {
-                    missing_evidence_overflow = true;
-                }
+                missing_evidence_overflow = true;
             }
             index += 1;
         }
@@ -1822,6 +2084,10 @@ mod tests {
 
     fn test_scheduler() -> StorageIntentScheduler {
         StorageIntentScheduler::new()
+    }
+
+    fn enable_background_budget(scheduler: &mut StorageIntentScheduler) {
+        scheduler.caps.background_optimizer_budget_bytes = 1024 * 1024;
     }
 
     fn foreground_read_request() -> AdmissionRequest {
@@ -2584,7 +2850,7 @@ mod tests {
     fn starvation_timeout_triggers_override() {
         let mut s = test_scheduler();
         // Give enough background budget so hard caps don't block admission.
-        s.caps.background_optimizer_budget_bytes = 1024 * 1024;
+        enable_background_budget(&mut s);
         // Set background lane config with 1-tick starvation timeout.
         s.set_lane_config(LaneConfig {
             lane_class: LaneClass::Background,
@@ -2609,6 +2875,221 @@ mod tests {
         let req = background_defrag_request();
         let decision = s.admit(&req);
         assert!(decision.starvation_override);
+    }
+
+    // -- Dispatch queue tests --
+
+    #[test]
+    fn dispatch_queue_orders_by_unified_lane_priority() {
+        let mut s = test_scheduler();
+        enable_background_budget(&mut s);
+        let mut queue = StorageIntentDispatchQueue::new();
+
+        let background = background_defrag_request();
+        let background_decision = s.admit(&background);
+        assert_eq!(background_decision.outcome, AdmissionOutcome::Admitted);
+        queue
+            .enqueue_dispatchable(
+                background,
+                background_decision,
+                "background",
+                0,
+                SchedulingConfidenceClass::High,
+            )
+            .unwrap();
+
+        let demand = foreground_read_request();
+        let demand_decision = s.admit(&demand);
+        assert_eq!(demand_decision.outcome, AdmissionOutcome::Admitted);
+        queue
+            .enqueue_dispatchable(
+                demand,
+                demand_decision,
+                "demand",
+                0,
+                SchedulingConfidenceClass::High,
+            )
+            .unwrap();
+
+        let metadata = metadata_request();
+        let metadata_decision = s.admit(&metadata);
+        assert_eq!(metadata_decision.outcome, AdmissionOutcome::Admitted);
+        queue
+            .enqueue_dispatchable(
+                metadata,
+                metadata_decision,
+                "metadata",
+                0,
+                SchedulingConfidenceClass::High,
+            )
+            .unwrap();
+
+        let control = repair_escalation_request();
+        let control_decision = s.admit(&control);
+        assert_eq!(control_decision.outcome, AdmissionOutcome::Admitted);
+        queue
+            .enqueue_dispatchable(
+                control,
+                control_decision,
+                "control",
+                0,
+                SchedulingConfidenceClass::High,
+            )
+            .unwrap();
+
+        assert_eq!(queue.len(), 4);
+        let _ = s.drain_evidence();
+
+        let first = queue.dispatch_next_at(&mut s, 100).unwrap();
+        assert_eq!(first.item, "control");
+        assert_eq!(first.lane, LaneClass::Control);
+
+        let second = queue.dispatch_next_at(&mut s, 101).unwrap();
+        assert_eq!(second.item, "metadata");
+        assert_eq!(second.lane, LaneClass::Metadata);
+
+        let third = queue.dispatch_next_at(&mut s, 102).unwrap();
+        assert_eq!(third.item, "demand");
+        assert_eq!(third.lane, LaneClass::Demand);
+
+        let fourth = queue.dispatch_next_at(&mut s, 103).unwrap();
+        assert_eq!(fourth.item, "background");
+        assert_eq!(fourth.lane, LaneClass::Background);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn dispatch_queue_starvation_override_runs_starved_background_first() {
+        let mut s = test_scheduler();
+        enable_background_budget(&mut s);
+        s.set_lane_config(LaneConfig {
+            lane_class: LaneClass::Background,
+            max_inflight_bytes: u64::MAX,
+            max_inflight_ops: u64::MAX,
+            starvation_timeout_ms: 1,
+            preemptible: true,
+            droppable: true,
+            resumable: true,
+            pressure_throttle_order: 0,
+            latency_budget_ref: "latency.loose",
+            drop_or_reorder_policy_ref: "drop.oldest",
+        });
+
+        let mut queue = StorageIntentDispatchQueue::new();
+        let background = background_defrag_request();
+        let background_decision = s.admit(&background);
+        queue
+            .enqueue_dispatchable(
+                background,
+                background_decision,
+                "background",
+                0,
+                SchedulingConfidenceClass::High,
+            )
+            .unwrap();
+
+        let demand = foreground_read_request();
+        let demand_decision = s.admit(&demand);
+        queue
+            .enqueue_dispatchable(
+                demand,
+                demand_decision,
+                "demand",
+                2_000,
+                SchedulingConfidenceClass::High,
+            )
+            .unwrap();
+        let _ = s.drain_evidence();
+
+        let dispatch = queue.dispatch_next_at(&mut s, 2_500).unwrap();
+        assert_eq!(dispatch.item, "background");
+        assert_eq!(dispatch.lane, LaneClass::Background);
+        assert_eq!(dispatch.queue_time_us, 2_500);
+        assert!(dispatch.starvation_override);
+        assert!(dispatch.decision.starvation_override);
+
+        let evidence = s.drain_evidence();
+        assert_eq!(evidence[0].decision.queue_time_us, 2_500);
+        assert!(evidence[0].starvation_override);
+        assert_eq!(evidence[0].decision.lane, LaneClass::Background);
+    }
+
+    #[test]
+    fn dispatch_queue_rejects_visible_drop_state() {
+        let mut s = test_scheduler();
+        s.caps.max_inflight_bytes = 1024;
+        s.caps.inflight_bytes = 2048;
+        let mut queue = StorageIntentDispatchQueue::new();
+
+        let request = speculative_prefetch_request();
+        let decision = s.admit(&request);
+        assert_eq!(decision.outcome, AdmissionOutcome::Dropped);
+
+        let error = queue
+            .enqueue_dispatchable(
+                request,
+                decision,
+                "prefetch",
+                0,
+                SchedulingConfidenceClass::High,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            DispatchQueueAdmissionError::NotDispatchable {
+                outcome: AdmissionOutcome::Dropped,
+                refusal: StorageIntentRefusalReason::GuaranteeFloorNotMet,
+            }
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn dispatch_queue_accounts_inflight_by_budget_owner() {
+        let mut s = test_scheduler();
+        let owner = StorageIntentBudgetOwnerId([3; 16]);
+        let request = AdmissionRequest::new(
+            AdmissionWorkClass::ForegroundIo,
+            StorageIntentActionClass::ReadSourceRefresh,
+            owner,
+            4096,
+            2,
+            StorageIntentPolicyId::ZERO,
+            StorageIntentPolicyRevision(0),
+            StorageIntentGuaranteeClass::VolatileLocal,
+        );
+        let decision = s.admit(&request);
+        assert_eq!(decision.outcome, AdmissionOutcome::Admitted);
+
+        let mut queue = StorageIntentDispatchQueue::new();
+        queue
+            .enqueue_dispatchable(
+                request,
+                decision,
+                "foreground",
+                10,
+                SchedulingConfidenceClass::High,
+            )
+            .unwrap();
+        let _ = s.drain_evidence();
+
+        let dispatch = queue.dispatch_next_at(&mut s, 15).unwrap();
+        assert_eq!(dispatch.item, "foreground");
+        assert_eq!(dispatch.queue_time_us, 5);
+
+        let counter = s.counters.get(&LaneClass::Demand).unwrap();
+        assert_eq!(counter.inflight_bytes, 4096);
+        assert_eq!(counter.inflight_ops, 2);
+        assert_eq!(s.caps.inflight_bytes, 4096);
+
+        let owner_state = s.owner_isolation.get(&owner).unwrap();
+        assert_eq!(
+            *owner_state
+                .per_lane_inflight
+                .get(&LaneClass::Demand)
+                .unwrap(),
+            4096
+        );
     }
 
     // ── Drop/resume semantics tests ──
