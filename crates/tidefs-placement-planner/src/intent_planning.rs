@@ -14,15 +14,16 @@ use tidefs_storage_intent_core::{
     ack_receipt_satisfies_requested_floor, evaluate_receipt_against_policy,
     media_capability_satisfies_role, prefetch_residency_decision_is_cache_only,
     prefetch_residency_decision_may_request_authority_change, proximity_satisfies_max,
-    trust_domain_role_requirement, trust_domain_role_satisfies, AllocationClass, CostWearRecord,
-    DataShapeRecord,
-    EvidenceFamilyFreshnessState, LayoutAllocatorRecord, MediaRoleMask, MediaRoleRequirement,
-    PredictionConfidence, PrefetchResidencyDecisionOutcome, PrefetchResidencyDecisionRecord,
-    ProximityClass, ReceiptPredicateResult, SkippedMoveReason, StorageIntentActionClass,
-    StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef,
-    StorageIntentGuaranteeClass, StorageIntentPolicy, StorageIntentReceipt,
-    StorageIntentReceiptId, StorageIntentRefusalReason, StorageIntentTrustRole, StorageMediaRole,
-    TransformRefusalClass, TrustDomainRequirement, TrustEvidenceRecord,
+    service_objective_gate_candidate, trust_domain_role_requirement, trust_domain_role_satisfies,
+    AllocationClass, CostWearRecord, DataShapeRecord, EvidenceFamilyFreshnessState,
+    LayoutAllocatorRecord, MediaRoleMask, MediaRoleRequirement, PredictionConfidence,
+    PrefetchResidencyDecisionOutcome, PrefetchResidencyDecisionRecord, ProximityClass,
+    ReceiptPredicateResult, SkippedMoveReason, StorageIntentActionClass, StorageIntentEvidenceKind,
+    StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef, StorageIntentGuaranteeClass,
+    StorageIntentPolicy, StorageIntentReceipt, StorageIntentReceiptId, StorageIntentRefusalReason,
+    StorageIntentServiceObjectiveEvidence, StorageIntentServiceObjectiveScope,
+    StorageIntentTrustRole, StorageMediaRole, TransformRefusalClass, TrustDomainRequirement,
+    TrustEvidenceRecord,
 };
 
 use crate::TierGoal;
@@ -307,6 +308,12 @@ pub struct StorageIntentPlacementCandidate {
     pub cost_wear: Option<CostWearRecord>,
     /// Optional #967 prefetch/residency decision input.
     pub prefetch_residency: Option<PrefetchResidencyDecisionRecord>,
+    /// Optional #915 service-objective envelope for this candidate.
+    pub service_objective: Option<StorageIntentServiceObjectiveEvidence>,
+    /// Exact #915 scope this candidate is trying to satisfy.
+    pub service_objective_scope: Option<StorageIntentServiceObjectiveScope>,
+    /// Bounded #915 evidence query snapshot for the candidate objective.
+    pub service_objective_query: Option<StorageIntentEvidenceQuerySnapshot>,
     /// #897 authenticated peer/domain evidence for the candidate.
     pub trust_domain_evidence: Option<TrustEvidenceRecord>,
     /// Observed proximity class for this candidate.
@@ -325,6 +332,8 @@ pub struct StorageIntentPlacementCandidate {
     pub data_shape_state: PlacementEvidenceState,
     /// Layout/allocator evidence gate.
     pub layout_allocator_state: PlacementEvidenceState,
+    /// Service-objective evidence gate.
+    pub service_objective_state: PlacementEvidenceState,
     /// Decision-frontier evidence gate.
     pub decision_frontier: PlacementEvidenceState,
 }
@@ -347,6 +356,9 @@ impl StorageIntentPlacementCandidate {
             layout_allocator: None,
             cost_wear: None,
             prefetch_residency: None,
+            service_objective: None,
+            service_objective_scope: None,
+            service_objective_query: None,
             proximity: ProximityClass::InProcess,
             transport_path_evidence: None,
             trust_domain_evidence: None,
@@ -356,6 +368,7 @@ impl StorageIntentPlacementCandidate {
             trust_domain: PlacementEvidenceState::Unknown,
             data_shape_state: PlacementEvidenceState::Unknown,
             layout_allocator_state: PlacementEvidenceState::Unknown,
+            service_objective_state: PlacementEvidenceState::Unknown,
             decision_frontier: PlacementEvidenceState::Unknown,
         }
     }
@@ -372,6 +385,7 @@ impl StorageIntentPlacementCandidate {
         });
         self.data_shape_state = PlacementEvidenceState::Fresh;
         self.layout_allocator_state = PlacementEvidenceState::Fresh;
+        self.service_objective_state = PlacementEvidenceState::Fresh;
         self.decision_frontier = PlacementEvidenceState::Fresh;
         self
     }
@@ -441,6 +455,11 @@ pub enum StorageIntentPlacementReason {
         target_id: u64,
         refusal: LayoutRefusal,
     },
+    /// Service-objective evidence rejected the target.
+    CandidateServiceObjectiveRefused {
+        target_id: u64,
+        refusal: StorageIntentRefusalReason,
+    },
     /// Cache-only or trial state attempted to satisfy durable authority.
     CandidateCacheOnlyCannotSatisfyAuthority { target_id: u64 },
     /// Geo or remote role lacked geo/remote evidence.
@@ -482,6 +501,7 @@ impl StorageIntentPlacementReason {
             | Self::CandidateReceiptRefused { refusal, .. }
             | Self::CandidateMediaCapabilityRefused { refusal, .. }
             | Self::CandidateEvidenceGateRefused { refusal, .. }
+            | Self::CandidateServiceObjectiveRefused { refusal, .. }
             | Self::CandidateTrustDomainRefused { refusal, .. }
             | Self::CandidateMovementDebtRefused { refusal, .. } => Some(*refusal),
             Self::PreflightSimulationNotAuthoritative => {
@@ -515,6 +535,7 @@ pub enum CandidateGate {
     TrustDomain,
     DataShape,
     LayoutAllocator,
+    ServiceObjective,
     DecisionFrontier,
 }
 
@@ -1390,6 +1411,7 @@ fn evaluate_candidate(
         StorageIntentRefusalReason::EvidenceNotUsable,
     );
 
+    evaluate_service_objective(role_requires_service_objective(role), candidate, reasons);
     evaluate_data_shape(role_requires_data_shape(role), candidate, reasons);
     evaluate_layout(role_requires_layout_allocator(role), candidate, reasons);
     evaluate_cache_authority_boundary(role, candidate, reasons);
@@ -1482,6 +1504,67 @@ fn role_requires_data_shape(role: StorageIntentPlacementRole) -> bool {
 
 fn role_requires_layout_allocator(role: StorageIntentPlacementRole) -> bool {
     !role.is_cache_only()
+}
+
+fn role_requires_service_objective(role: StorageIntentPlacementRole) -> bool {
+    !role.is_cache_only()
+}
+
+fn evaluate_service_objective(
+    required: bool,
+    candidate: &StorageIntentPlacementCandidate,
+    reasons: &mut Vec<StorageIntentPlacementReason>,
+) {
+    if !required {
+        return;
+    }
+
+    require_candidate_gate(
+        reasons,
+        candidate.target_id,
+        CandidateGate::ServiceObjective,
+        candidate.service_objective_state,
+        StorageIntentRefusalReason::EvidenceNotUsable,
+    );
+
+    let Some(evidence) = candidate.service_objective else {
+        reasons.push(StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+            target_id: candidate.target_id,
+            gate: CandidateGate::ServiceObjective,
+            state: PlacementEvidenceState::Missing,
+            refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+        });
+        return;
+    };
+    let Some(scope) = candidate.service_objective_scope else {
+        reasons.push(StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+            target_id: candidate.target_id,
+            gate: CandidateGate::ServiceObjective,
+            state: PlacementEvidenceState::Missing,
+            refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+        });
+        return;
+    };
+    let Some(query) = candidate.service_objective_query else {
+        reasons.push(StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+            target_id: candidate.target_id,
+            gate: CandidateGate::ServiceObjective,
+            state: PlacementEvidenceState::Missing,
+            refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+        });
+        return;
+    };
+
+    let result = service_objective_gate_candidate(evidence, scope, query);
+    push_predicate_refusal(
+        reasons,
+        candidate.target_id,
+        result,
+        |target_id, refusal| StorageIntentPlacementReason::CandidateServiceObjectiveRefused {
+            target_id,
+            refusal,
+        },
+    );
 }
 
 fn evaluate_data_shape(
@@ -1723,21 +1806,29 @@ fn skipped_move_refusal(reason: SkippedMoveReason) -> StorageIntentRefusalReason
 mod tests {
     use super::*;
     use tidefs_storage_intent_core::{
-        CompromiseState, DedupSharingCompatibilityState, DurabilityReceiptState,
-        DurabilityRequirement, DurabilityState, EvidenceCompletenessVerdict, EvidenceConsumerClass,
-        EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet, EvidenceQueryContextClass,
-        EvidenceQuerySubjectScope, EvidenceQuerySubjectScopeClass, FailureDomainMask,
-        MediaArchiveRestoreSemantics, MediaAtomicityClass, MediaCapabilityFlags,
-        MediaCapabilityFreshnessState, MediaFlushOrderingClass, MediaHealthState,
-        MediaPersistenceDomain, MediaProtocolGeometryClass, MediaRemoteCommitSemantics,
-        PendingFreeSafetyClass, PrefetchResidencyCandidateClass,
-        PrefetchResidencyDecisionEvidenceRefs, PrefetchResidencyDecisionOutcome,
-        PrefetchResidencyStateClass, ProximityClass, QuarantineState, ReadServingSourceClass,
-        ResidencyScope, SegmentRegionClass, SessionSecurityClass, SharingDomainClass,
-        StorageIntentActionClass, StorageIntentDomainId, StorageIntentEvidenceId,
-        StorageIntentEvidenceRef, StorageIntentEvidenceRefs, StorageIntentMediaCapabilityRecord,
-        StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
-        StorageIntentReceiptId, StorageMediaClass, TrustEvidenceFlags,
+        AccessPatternClass, CompromiseState, DedupSharingCompatibilityState,
+        DurabilityReceiptState, DurabilityRequirement, DurabilityState,
+        EvidenceCompletenessVerdict, EvidenceConsumerClass, EvidenceFamilyFreshness,
+        EvidenceFamilyFreshnessSet, EvidenceQueryContextClass, EvidenceQuerySubjectScope,
+        EvidenceQuerySubjectScopeClass, FailureDomainMask, MediaArchiveRestoreSemantics,
+        MediaAtomicityClass, MediaCapabilityFlags, MediaCapabilityFreshnessState,
+        MediaFlushOrderingClass, MediaHealthState, MediaPersistenceDomain,
+        MediaProtocolGeometryClass, MediaRemoteCommitSemantics, PendingFreeSafetyClass,
+        PrefetchResidencyCandidateClass, PrefetchResidencyDecisionEvidenceRefs,
+        PrefetchResidencyDecisionOutcome, PrefetchResidencyStateClass, ProximityClass,
+        QuarantineState, ReadServingSourceClass, ResidencyScope, SegmentRegionClass,
+        SessionSecurityClass, SharingDomainClass, StorageIntentActionClass, StorageIntentDomainId,
+        StorageIntentEvidenceId, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
+        StorageIntentMediaCapabilityRecord, StorageIntentObjectScope, StorageIntentPolicyId,
+        StorageIntentPolicyRevision, StorageIntentReceiptId,
+        StorageIntentServiceObjectiveComparatorScope,
+        StorageIntentServiceObjectiveEnvironmentProfile, StorageIntentServiceObjectiveEvidence,
+        StorageIntentServiceObjectiveEvidenceRefs, StorageIntentServiceObjectiveFailureState,
+        StorageIntentServiceObjectiveLatencyEnvelope, StorageIntentServiceObjectiveOperation,
+        StorageIntentServiceObjectiveRecoveryFloor, StorageIntentServiceObjectiveScope,
+        StorageIntentServiceObjectiveState, StorageIntentServiceObjectiveThroughputEnvelope,
+        StorageIntentServiceObjectiveTopologyClass, StorageIntentServiceObjectiveTransportClass,
+        StorageIntentServiceObjectiveWorkloadPhase, StorageMediaClass, TrustEvidenceFlags,
         TrustEvidenceFreshnessState, TrustEvidenceState, TrustKeyLifecycleState, TrustRequirement,
         TrustRevocationState,
     };
@@ -2015,7 +2106,7 @@ mod tests {
             policy_revision: StorageIntentPolicyRevision(1),
             ack_class: guarantee,
             failure_domains: domains,
-            proximity: ProximityClass::Wan,
+            proximity: ProximityClass::InProcess,
             durability: DurabilityReceiptState {
                 state: DurabilityState::FullPlacement,
                 observed_lag_ms: 0,
@@ -2125,6 +2216,294 @@ mod tests {
         }
     }
 
+    fn service_objective_object_scope() -> StorageIntentObjectScope {
+        StorageIntentObjectScope {
+            dataset_id: DOMAIN_A,
+            object_id: evidence_id(200),
+            range_start: 0,
+            range_len: 4096,
+            generation: 1,
+        }
+    }
+
+    fn service_objective_scope(
+        role: StorageMediaRole,
+        guarantee: StorageIntentGuaranteeClass,
+        media_class: StorageMediaClass,
+    ) -> StorageIntentServiceObjectiveScope {
+        StorageIntentServiceObjectiveScope {
+            policy_id: POLICY_ID,
+            policy_revision: StorageIntentPolicyRevision(1),
+            subject_scope: service_objective_object_scope(),
+            tenant_id: DOMAIN_A,
+            budget_owner_id: DOMAIN_A,
+            workload_class: AccessPatternClass::DatabaseWalFsync,
+            workload_phase: StorageIntentServiceObjectiveWorkloadPhase::ForegroundSync,
+            operation: StorageIntentServiceObjectiveOperation::Fsync,
+            ack_class: guarantee,
+            media_class,
+            media_role: role,
+            topology_class: StorageIntentServiceObjectiveTopologyClass::SameHost,
+            transport_class: StorageIntentServiceObjectiveTransportClass::LocalOnly,
+            failure_state: StorageIntentServiceObjectiveFailureState::Nominal,
+            comparator_scope: StorageIntentServiceObjectiveComparatorScope::SameObjective,
+        }
+    }
+
+    fn service_objective_refs() -> StorageIntentServiceObjectiveEvidenceRefs {
+        StorageIntentServiceObjectiveEvidenceRefs {
+            workload_ref: evidence_ref(StorageIntentEvidenceKind::WorkloadEvidence, 101),
+            workload_scope_ref: evidence_ref(StorageIntentEvidenceKind::WorkloadEvidence, 102),
+            prediction_ref: evidence_ref(StorageIntentEvidenceKind::PredictionEvidence, 103),
+            evidence_query_snapshot_ref: evidence_ref(
+                StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+                210,
+            ),
+            scheduler_admission_ref: evidence_ref(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                104,
+            ),
+            queue_admission_ref: evidence_ref(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                105,
+            ),
+            degradation_ref: evidence_ref(
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                106,
+            ),
+            recovery_ref: evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 107),
+            rpo_rto_ref: evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 108),
+            topology_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 109),
+            media_capability_ref: evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                110,
+            ),
+            isolation_ref: evidence_ref(StorageIntentEvidenceKind::TenantIsolationEvidence, 111),
+            protected_p99_owner_ref: evidence_ref(
+                StorageIntentEvidenceKind::TenantIsolationEvidence,
+                112,
+            ),
+            capacity_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 113),
+            reserve_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 114),
+            cost_ref: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 115),
+            wear_ref: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 116),
+            waf_ref: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 117),
+            decision_frontier_ref: evidence_ref(
+                StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                118,
+            ),
+            hard_gate_ref: evidence_ref(StorageIntentEvidenceKind::DecisionFrontierEvidence, 119),
+            action_execution_ref: evidence_ref(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                120,
+            ),
+            result_refusal_ref: evidence_ref(StorageIntentEvidenceKind::ResultRefusalEvidence, 121),
+            measurement_attribution_ref: evidence_ref(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                122,
+            ),
+            performance_row_ref: evidence_ref(
+                StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                123,
+            ),
+            fault_row_ref: evidence_ref(StorageIntentEvidenceKind::ServiceObjectiveEvidence, 124),
+            comparator_ref: evidence_ref(StorageIntentEvidenceKind::ComparatorEvidence, 125),
+            claim_ref: evidence_ref(StorageIntentEvidenceKind::ClaimGateEvidence, 126),
+            retention_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 127),
+            ordering_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 128),
+            pmem_persistence_ref: evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                129,
+            ),
+            pmem_flush_fence_ref: evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                130,
+            ),
+            rdma_absent_correctness_ref: evidence_ref(
+                StorageIntentEvidenceKind::TransportPathEvidence,
+                131,
+            ),
+            remote_commit_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 132),
+            trust_ref: evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, 133),
+            seek_payback_ref: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 134),
+            foreground_p99_ref: evidence_ref(
+                StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                135,
+            ),
+        }
+    }
+
+    fn service_objective_evidence(
+        scope: StorageIntentServiceObjectiveScope,
+    ) -> StorageIntentServiceObjectiveEvidence {
+        StorageIntentServiceObjectiveEvidence {
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::ServiceObjectiveEvidence, 23),
+            objective_id: evidence_id(201),
+            producer_component_ref: evidence_ref(
+                StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                136,
+            ),
+            producer_version: 1,
+            objective_generation: 1,
+            rollout_stage_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 137),
+            temporal_ref: evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 138),
+            scope,
+            request_mix_ref: evidence_ref(StorageIntentEvidenceKind::WorkloadEvidence, 139),
+            confidence_ref: evidence_ref(StorageIntentEvidenceKind::PredictionEvidence, 140),
+            latency: StorageIntentServiceObjectiveLatencyEnvelope {
+                p50_ceiling_us: 100,
+                p95_ceiling_us: 500,
+                p99_ceiling_us: 1_000,
+                tail_ceiling_us: 2_000,
+                max_queue_us: 500,
+                max_admission_us: 500,
+                max_device_dwell_us: 500,
+                max_transport_dwell_us: 500,
+                jitter_ppm: 1,
+                tail_amplification_ppm: 1,
+                warmup_ref: evidence_ref(StorageIntentEvidenceKind::ServiceObjectiveEvidence, 141),
+                censoring_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                    142,
+                ),
+                breach_refusal: StorageIntentRefusalReason::DurabilityOrRpoNotMet,
+            },
+            throughput: StorageIntentServiceObjectiveThroughputEnvelope {
+                floor_bytes_per_sec: 4096,
+                ceiling_bytes_per_sec: 1_048_576,
+                burst_bytes: 65_536,
+                burst_window_ms: 1000,
+                dwell_window_ms: 1000,
+                max_concurrency: 4,
+                max_queue_depth: 16,
+                dirty_window_bytes: 131_072,
+                coalescing_ref: evidence_ref(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    143,
+                ),
+                batching_ref: evidence_ref(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    144,
+                ),
+                backpressure_ref: evidence_ref(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    145,
+                ),
+            },
+            recovery_floor: StorageIntentServiceObjectiveRecoveryFloor {
+                required_ack: scope.ack_class,
+                durability_floor: DurabilityState::FullPlacement,
+                stale_read_allowed: false,
+                degraded_visible_allowed: false,
+                explicit_volatile_allowed: false,
+                explicit_unsafe_visible_allowed: false,
+                rpo_lag_ceiling_ms: 1,
+                rto_ceiling_ms: 10_000,
+                partition_refusal: StorageIntentRefusalReason::DurabilityOrRpoNotMet,
+            },
+            environment: StorageIntentServiceObjectiveEnvironmentProfile {
+                source_media: scope.media_class,
+                target_media: scope.media_class,
+                media_role: scope.media_role,
+                topology_class: scope.topology_class,
+                transport_class: scope.transport_class,
+                thermal_health_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    146,
+                ),
+                namespace_identity_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    147,
+                ),
+                residency_ref: evidence_ref(StorageIntentEvidenceKind::ReadFreshnessEvidence, 148),
+                environment_ref: evidence_ref(
+                    StorageIntentEvidenceKind::TransportPathEvidence,
+                    149,
+                ),
+            },
+            refs: service_objective_refs(),
+            state: StorageIntentServiceObjectiveState::Satisfied,
+            state_reason_ref: evidence_ref(StorageIntentEvidenceKind::ResultRefusalEvidence, 150),
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
+    fn service_objective_query(
+        scope: StorageIntentServiceObjectiveScope,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        let mut included = StorageIntentEvidenceRefs::EMPTY;
+        let mut freshness = EvidenceFamilyFreshnessSet::EMPTY;
+        let families = [
+            (StorageIntentEvidenceKind::ServiceObjectiveEvidence, 23),
+            (StorageIntentEvidenceKind::WorkloadEvidence, 101),
+            (StorageIntentEvidenceKind::SchedulerAdmissionRecord, 104),
+            (StorageIntentEvidenceKind::CapacityAdmissionEvidence, 113),
+            (StorageIntentEvidenceKind::TenantIsolationEvidence, 111),
+            (StorageIntentEvidenceKind::MediaCapabilityEvidence, 110),
+            (StorageIntentEvidenceKind::RecoveryDegradationEvidence, 106),
+            (StorageIntentEvidenceKind::PolicyRolloutEvidence, 137),
+            (StorageIntentEvidenceKind::TransportPathEvidence, 109),
+            (StorageIntentEvidenceKind::TemporalEvidence, 138),
+            (StorageIntentEvidenceKind::MediaCostWearLedger, 115),
+            (StorageIntentEvidenceKind::DecisionFrontierEvidence, 118),
+            (StorageIntentEvidenceKind::ActionExecutionEvidence, 120),
+            (StorageIntentEvidenceKind::ResultRefusalEvidence, 121),
+            (
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                122,
+            ),
+            (StorageIntentEvidenceKind::ComparatorEvidence, 125),
+            (StorageIntentEvidenceKind::ClaimGateEvidence, 126),
+            (StorageIntentEvidenceKind::EvidenceRetentionEvidence, 127),
+        ];
+
+        for (kind, byte) in families {
+            let evidence = evidence_ref(kind, byte);
+            included.push(evidence).unwrap();
+            freshness
+                .push(EvidenceFamilyFreshness {
+                    kind,
+                    state: EvidenceFamilyFreshnessState::Fresh,
+                    source_index_generation: 1,
+                    producer_generation: 1,
+                    freshness_frontier_ms: 1,
+                    allowed_staleness_ms: 0,
+                    evidence_ref: evidence,
+                })
+                .unwrap();
+        }
+
+        StorageIntentEvidenceQuerySnapshot {
+            snapshot_id: evidence_id(210),
+            query_id: evidence_id(211),
+            consumer: EvidenceConsumerClass::Planner,
+            context: EvidenceQueryContextClass::ActionAdmission,
+            subject: EvidenceQuerySubjectScope {
+                scope_class: EvidenceQuerySubjectScopeClass::ObjectRange,
+                object_scope: scope.subject_scope,
+                ..EvidenceQuerySubjectScope::default()
+            },
+            policy_id: scope.policy_id,
+            policy_revision: scope.policy_revision,
+            temporal_frontier_ms: 1,
+            freshness_frontier_ms: 1,
+            allowed_staleness_ms: 0,
+            source_catalog_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 212),
+            source_index_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 213),
+            source_index_generation: 1,
+            producer_generation: 1,
+            producer_watermark_ms: 1,
+            compaction_generation: 0,
+            redaction_generation: 0,
+            included_refs: included,
+            family_freshness: freshness,
+            completeness: EvidenceCompletenessVerdict::CompleteForPurpose,
+            retention: tidefs_storage_intent_core::EvidenceRetentionClass::ExactRequired,
+            retention_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 214),
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
     fn candidate(
         target_id: u64,
         domain: u64,
@@ -2152,6 +2531,15 @@ mod tests {
             self.data_shape = Some(data_shape());
             self.layout_allocator = Some(layout());
             self.cost_wear = Some(cost_wear());
+            let service_objective_scope = service_objective_scope(
+                self.receipt.media_role,
+                self.receipt.ack_class,
+                self.receipt.media_class,
+            );
+            self.service_objective = Some(service_objective_evidence(service_objective_scope));
+            self.service_objective_scope = Some(service_objective_scope);
+            self.service_objective_query = Some(service_objective_query(service_objective_scope));
+            self.service_objective_state = PlacementEvidenceState::Fresh;
             self.trust_domain_evidence =
                 Some(trust_record(trust_role_for_media(self.receipt.media_role)));
             self.prediction_confidence = PredictionConfidence::High;
@@ -2405,6 +2793,153 @@ mod tests {
                 }
             )
         )));
+    }
+
+    #[test]
+    fn durable_placement_still_requires_service_objective_record() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.service_objective = None;
+        candidate.service_objective_scope = None;
+        candidate.service_objective_query = None;
+        candidate.service_objective_state = PlacementEvidenceState::Unknown;
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(!report.legal);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                    gate: CandidateGate::ServiceObjective,
+                    state: PlacementEvidenceState::Unknown,
+                    ..
+                }
+            )
+        )));
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                    gate: CandidateGate::ServiceObjective,
+                    state: PlacementEvidenceState::Missing,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn service_objective_refusal_blocks_candidate_before_scoring() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate
+            .service_objective
+            .as_mut()
+            .expect("candidate fixture carries service objective")
+            .state = StorageIntentServiceObjectiveState::CacheOnly;
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = &plan.candidate_reports[0];
+        assert!(!report.legal);
+        assert_eq!(report.score, 0);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateServiceObjectiveRefused {
+                    refusal: StorageIntentRefusalReason::CacheCannotBeAuthority,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn service_objective_scope_mismatch_refuses_candidate() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate
+            .service_objective_scope
+            .as_mut()
+            .expect("candidate fixture carries service objective scope")
+            .tenant_id = DOMAIN_B;
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        assert!(plan.candidate_reports[0]
+            .reasons
+            .iter()
+            .any(|reason| matches!(
+                reason,
+                StorageIntentPlacementCandidateReason::HardGate(
+                    StorageIntentPlacementReason::CandidateServiceObjectiveRefused {
+                        refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+                        ..
+                    }
+                )
+            )));
     }
 
     #[test]
@@ -3193,5 +3728,4 @@ mod tests {
             assert!(result.admitted, "max_proximity={max_proximity}");
         }
     }
-
 }
