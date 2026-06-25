@@ -22817,9 +22817,9 @@ mod tests {
     // Tenant isolation evidence model tests (issue #902)
     // -------------------------------------------------------------------
 
-    const DOMAIN_A: StorageIntentDomainId = StorageIntentDomainId([10_u8; 16]);
-    const DOMAIN_B: StorageIntentDomainId = StorageIntentDomainId([20_u8; 16]);
-    const DOMAIN_C: StorageIntentDomainId = StorageIntentDomainId([30_u8; 16]);
+    const ISOLATION_DOMAIN_A: StorageIntentDomainId = StorageIntentDomainId([10_u8; 16]);
+    const ISOLATION_DOMAIN_B: StorageIntentDomainId = StorageIntentDomainId([20_u8; 16]);
+    const ISOLATION_DOMAIN_C: StorageIntentDomainId = StorageIntentDomainId([30_u8; 16]);
 
     const fn isolation_evidence_ref(id_byte: u8) -> StorageIntentEvidenceRef {
         let mut id = [0_u8; 32];
@@ -22843,17 +22843,6 @@ mod tests {
         }
     }
 
-    const fn temporal_evidence_ref(id_byte: u8) -> StorageIntentEvidenceRef {
-        let mut id = [0_u8; 32];
-        id[0] = id_byte;
-        StorageIntentEvidenceRef {
-            kind: StorageIntentEvidenceKind::TemporalEvidence,
-            id: StorageIntentEvidenceId(id),
-            generation: 1,
-            version: 1,
-        }
-    }
-
     const fn exemption_evidence_ref(id_byte: u8) -> StorageIntentEvidenceRef {
         let mut id = [0_u8; 32];
         id[0] = id_byte;
@@ -22871,8 +22860,8 @@ mod tests {
             policy_id: StorageIntentPolicyId([1_u8; 16]),
             policy_revision: StorageIntentPolicyRevision(1),
             budget_owner: StorageIntentBudgetOwnerRef {
-                tenant_id: DOMAIN_A,
-                dataset_id: DOMAIN_B,
+                tenant_id: ISOLATION_DOMAIN_A,
+                dataset_id: ISOLATION_DOMAIN_B,
                 clone_family_id: StorageIntentDomainId::ZERO,
                 mount_id: StorageIntentDomainId::ZERO,
                 workload_class: StorageIntentIsolationScope::Tenant,
@@ -22925,7 +22914,10 @@ mod tests {
             throttle: StorageIntentIsolationThrottleReason::None,
             evidence_refs: StorageIntentEvidenceRefs::EMPTY,
             trust_evidence_ref: trust_evidence_ref(10),
-            temporal_evidence_ref: temporal_evidence_ref(20),
+            temporal_evidence_ref: temporal_evidence_ref(
+                StorageIntentEvidenceKind::TemporalEvidence,
+                20,
+            ),
             decision_evidence_ref: StorageIntentEvidenceRef::default(),
             service_objective_evidence_ref: StorageIntentEvidenceRef::default(),
             capacity_evidence_ref: StorageIntentEvidenceRef::default(),
@@ -23148,7 +23140,7 @@ mod tests {
     fn active_exemption_without_evidence_is_refused() {
         let mut record = healthy_isolation_record();
         record.exemption_override.operator_authorized_override = true;
-        record.exemption_override.authorizing_operator_id = DOMAIN_C;
+        record.exemption_override.authorizing_operator_id = ISOLATION_DOMAIN_C;
         // exemption_evidence_ref is default (no id).
         let result = isolation_reserve_is_protected(record, false, false);
         assert!(!result.satisfied);
@@ -23159,7 +23151,7 @@ mod tests {
     fn active_exemption_with_evidence_passes() {
         let mut record = healthy_isolation_record();
         record.exemption_override.operator_authorized_override = true;
-        record.exemption_override.authorizing_operator_id = DOMAIN_C;
+        record.exemption_override.authorizing_operator_id = ISOLATION_DOMAIN_C;
         record.exemption_override.exemption_evidence_ref = exemption_evidence_ref(50);
         let result = isolation_reserve_is_protected(record, false, false);
         assert!(result.satisfied);
@@ -23171,7 +23163,7 @@ mod tests {
         record.noisy_neighbor.mitigation_active = true;
         record.noisy_neighbor.pressure_age_us = 1000;
         record.noisy_neighbor.offender_owner = StorageIntentBudgetOwnerRef {
-            tenant_id: DOMAIN_B,
+            tenant_id: ISOLATION_DOMAIN_B,
             dataset_id: StorageIntentDomainId::ZERO,
             clone_family_id: StorageIntentDomainId::ZERO,
             mount_id: StorageIntentDomainId::ZERO,
@@ -23183,7 +23175,7 @@ mod tests {
             policy_revision: StorageIntentPolicyRevision(1),
         };
         record.noisy_neighbor.victim_owner = StorageIntentBudgetOwnerRef {
-            tenant_id: DOMAIN_A,
+            tenant_id: ISOLATION_DOMAIN_A,
             dataset_id: StorageIntentDomainId::ZERO,
             clone_family_id: StorageIntentDomainId::ZERO,
             mount_id: StorageIntentDomainId::ZERO,
@@ -23207,13 +23199,13 @@ mod tests {
         record.noisy_neighbor.mitigation_active = true;
         record.noisy_neighbor.pressure_age_us = 1000;
         record.noisy_neighbor.offender_owner = StorageIntentBudgetOwnerRef {
-            tenant_id: DOMAIN_B,
+            tenant_id: ISOLATION_DOMAIN_B,
             ..Default::default()
         };
         record.noisy_neighbor.offender_owner.policy_id = StorageIntentPolicyId([2_u8; 16]);
         record.noisy_neighbor.offender_owner.policy_revision = StorageIntentPolicyRevision(1);
         record.noisy_neighbor.victim_owner = StorageIntentBudgetOwnerRef {
-            tenant_id: DOMAIN_A,
+            tenant_id: ISOLATION_DOMAIN_A,
             ..Default::default()
         };
         record.noisy_neighbor.victim_owner.policy_id = StorageIntentPolicyId([1_u8; 16]);
@@ -23231,13 +23223,13 @@ mod tests {
         record.noisy_neighbor.mitigation_active = true;
         record.noisy_neighbor.pressure_age_us = 1000;
         record.noisy_neighbor.offender_owner = StorageIntentBudgetOwnerRef {
-            tenant_id: DOMAIN_B,
+            tenant_id: ISOLATION_DOMAIN_B,
             ..Default::default()
         };
         record.noisy_neighbor.offender_owner.policy_id = StorageIntentPolicyId([2_u8; 16]);
         record.noisy_neighbor.offender_owner.policy_revision = StorageIntentPolicyRevision(1);
         record.noisy_neighbor.victim_owner = StorageIntentBudgetOwnerRef {
-            tenant_id: DOMAIN_A,
+            tenant_id: ISOLATION_DOMAIN_A,
             ..Default::default()
         };
         record.noisy_neighbor.victim_owner.policy_id = StorageIntentPolicyId([1_u8; 16]);
@@ -23271,7 +23263,10 @@ mod tests {
     fn starvation_overridden_with_temporal_evidence_passes() {
         let mut record = healthy_isolation_record();
         record.fair_share.starvation_state = StorageIntentStarvationState::Overridden;
-        record.temporal_evidence_ref = temporal_evidence_ref(30);
+        record.temporal_evidence_ref = temporal_evidence_ref(
+            StorageIntentEvidenceKind::TemporalEvidence,
+            30,
+        );
         let result = isolation_starvation_is_resolved(record);
         assert!(result.satisfied);
     }
