@@ -2730,4 +2730,124 @@ mod tests {
         assert_eq!(archive.decision_state, ReadServingDecisionState::Available);
         assert_eq!(archive.refusal, StorageIntentRefusalReason::None);
     }
+
+    #[test]
+    fn explicit_stale_read_permits_geo_within_lag_envelope() {
+        let mut stale_policy = policy(ReadFreshnessProfile::ExplicitStaleRead);
+        stale_policy.max_remote_lag_ms = 5000;
+        let mut candidate = candidate(StorageIntentReadSourceClass::GeoAsyncRemote);
+        candidate.geo_lag_ms = 3000;
+        candidate.lag_known = true;
+
+        let decision = decide(stale_policy, candidate);
+        assert_eq!(decision.decision_state, ReadServingDecisionState::Available);
+        assert_eq!(decision.refusal, StorageIntentRefusalReason::None);
+        assert_eq!(decision.freshness.geo_lag_ms, 3000);
+        assert!(decision.freshness.lag_known);
+    }
+
+    #[test]
+    fn explicit_stale_read_refuses_geo_outside_lag_envelope() {
+        let mut stale_policy = policy(ReadFreshnessProfile::ExplicitStaleRead);
+        stale_policy.max_remote_lag_ms = 1000;
+        let mut candidate = candidate(StorageIntentReadSourceClass::GeoAsyncRemote);
+        candidate.geo_lag_ms = 3000;
+        candidate.lag_known = true;
+
+        let decision = decide(stale_policy, candidate);
+        assert_eq!(decision.decision_state, ReadServingDecisionState::Refused);
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::DurabilityOrRpoNotMet
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::GEO_LAG_OUTSIDE_RPO));
+    }
+
+    #[test]
+    fn explicit_stale_read_refuses_geo_without_lag_known() {
+        let mut stale_policy = policy(ReadFreshnessProfile::ExplicitStaleRead);
+        stale_policy.max_remote_lag_ms = 5000;
+        let mut candidate = candidate(StorageIntentReadSourceClass::GeoAsyncRemote);
+        candidate.geo_lag_ms = 0;
+        candidate.lag_known = false;
+
+        let decision = decide(stale_policy, candidate);
+        assert_eq!(decision.decision_state, ReadServingDecisionState::Refused);
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::DurabilityOrRpoNotMet
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::GEO_LAG_OUTSIDE_RPO));
+    }
+
+    #[test]
+    fn receipt_backed_degraded_reconstruction_requires_verified_evidence() {
+        let mut degraded_policy = policy(ReadFreshnessProfile::LatestLocal);
+        degraded_policy.degraded_read_policy = DegradedReadPolicy::ServeWhenVerified;
+        let mut candidate = candidate(StorageIntentReadSourceClass::DegradedReconstruction);
+        candidate.reconstruction_verified = true;
+        candidate.redundancy_width = 3;
+        candidate.missing_targets = 1;
+        candidate.digest_verified = true;
+        candidate.evidence_refs.recovery_degradation_ref =
+            evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 17);
+        candidate.evidence_refs.redundancy_ref =
+            evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 18);
+
+        let decision = decide(degraded_policy, candidate);
+        assert_eq!(decision.decision_state, ReadServingDecisionState::Available);
+        assert_eq!(decision.refusal, StorageIntentRefusalReason::None);
+        assert!(!decision.degraded_visible);
+    }
+
+    #[test]
+    fn receipt_backed_degraded_reconstruction_refuses_without_recovery_evidence() {
+        let mut degraded_policy = policy(ReadFreshnessProfile::LatestLocal);
+        degraded_policy.degraded_read_policy = DegradedReadPolicy::ServeWhenVerified;
+        let mut candidate = candidate(StorageIntentReadSourceClass::DegradedReconstruction);
+        candidate.reconstruction_verified = true;
+        candidate.redundancy_width = 3;
+        candidate.missing_targets = 1;
+        candidate.digest_verified = true;
+        candidate.evidence_refs.recovery_degradation_ref = EMPTY_EVIDENCE_REF;
+        candidate.evidence_refs.redundancy_ref =
+            evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 18);
+
+        let decision = decide(degraded_policy, candidate);
+        assert_eq!(decision.decision_state, ReadServingDecisionState::Refused);
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::DIGEST_OR_SHAPE_MISMATCH));
+    }
+
+    #[test]
+    fn degraded_reconstruction_exposes_visible_flag_when_policy_allows() {
+        let mut expose_policy = policy(ReadFreshnessProfile::LatestLocal);
+        expose_policy.degraded_read_policy = DegradedReadPolicy::ExposeDegradedVisible;
+        let mut candidate = candidate(StorageIntentReadSourceClass::DegradedReconstruction);
+        candidate.reconstruction_verified = true;
+        candidate.redundancy_width = 3;
+        candidate.missing_targets = 1;
+        candidate.digest_verified = true;
+        candidate.evidence_refs.recovery_degradation_ref =
+            evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 17);
+        candidate.evidence_refs.redundancy_ref =
+            evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 18);
+
+        let decision = decide(expose_policy, candidate);
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::DegradedVisible
+        );
+        assert_eq!(decision.refusal, StorageIntentRefusalReason::None);
+        assert!(decision.degraded_visible);
+    }
 }
