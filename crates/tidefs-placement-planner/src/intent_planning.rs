@@ -1164,14 +1164,18 @@ fn candidate_report(
         .into_iter()
         .map(StorageIntentPlacementCandidateReason::HardGate)
         .collect::<Vec<_>>();
-    let score = score_candidate(request, candidate, &mut reasons);
+    let score = if legal {
+        score_candidate(request, candidate, &mut reasons)
+    } else {
+        0
+    };
 
     StorageIntentPlacementCandidateReport {
         target_id: candidate.target_id,
         failure_domain_key: candidate.failure_domain_key,
         legal,
         selected: false,
-        score: if legal { score } else { 0 },
+        score,
         reasons,
     }
 }
@@ -3289,6 +3293,52 @@ mod tests {
 
         assert!(!result.admitted);
         assert!(result.has_refusal(StorageIntentRefusalReason::PersistentMediaRequired));
+    }
+
+    #[test]
+    fn hard_gate_rejected_candidate_is_not_scored() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::SystemRam,
+        );
+        candidate.media_capability = volatile_media();
+        candidate.prediction_confidence = PredictionConfidence::Unknown;
+        candidate.cost_wear = None;
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(!report.legal);
+        assert_eq!(report.score, 0);
+        assert!(report.has_refusal(StorageIntentRefusalReason::PersistentMediaRequired));
+        assert!(!report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::LowPredictionConfidence { .. }
+                | StorageIntentPlacementCandidateReason::UnknownCost
+                | StorageIntentPlacementCandidateReason::MovementDebt { .. }
+                | StorageIntentPlacementCandidateReason::FailedPaybackCooldown { .. }
+                | StorageIntentPlacementCandidateReason::CriticalReserveProtection { .. }
+        )));
     }
 
     #[test]
