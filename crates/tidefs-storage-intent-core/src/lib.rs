@@ -1362,6 +1362,12 @@ impl StorageIntentMeasurementMetricSet {
         self.len as usize
     }
 
+    /// Returns true when no metric entries are retained.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
     /// Append a metric entry if capacity remains.
     pub fn push(
         &mut self,
@@ -15983,14 +15989,13 @@ pub const fn isolation_trust_evidence_is_usable(
         return present;
     }
     // Trust evidence must be present when tenant or domain scope is required.
-    if evidence.isolation_scope as u8 == StorageIntentIsolationScope::Tenant as u8
-        || evidence.isolation_scope as u8 == StorageIntentIsolationScope::Dataset as u8
+    if (evidence.isolation_scope as u8 == StorageIntentIsolationScope::Tenant as u8
+        || evidence.isolation_scope as u8 == StorageIntentIsolationScope::Dataset as u8)
+        && !evidence.has_trust_evidence()
     {
-        if !evidence.has_trust_evidence() {
-            return ReceiptPredicateResult::refused(
-                StorageIntentRefusalReason::MissingTenantDomainEvidence,
-            );
-        }
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingTenantDomainEvidence,
+        );
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -16006,15 +16011,14 @@ pub const fn isolation_temporal_evidence_is_usable(
     }
     // Temporal evidence is required when fair-share, borrowing, or noisy-neighbor
     // decisions depend on wall-time freshness.
-    if evidence.fair_share.starvation_age_us > 0
+    if (evidence.fair_share.starvation_age_us > 0
         || evidence.borrowing.outstanding_debt_bytes > 0
-        || evidence.noisy_neighbor.pressure_age_us > 0
+        || evidence.noisy_neighbor.pressure_age_us > 0)
+        && !evidence.has_temporal_evidence()
     {
-        if !evidence.has_temporal_evidence() {
-            return ReceiptPredicateResult::refused(
-                StorageIntentRefusalReason::StaleIsolationEvidence,
-            );
-        }
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::StaleIsolationEvidence,
+        );
     }
     ReceiptPredicateResult::SATISFIED
 }

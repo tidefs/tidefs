@@ -226,11 +226,10 @@ impl StorageIntentBudgetCaps {
     /// Returns the primary backpressure reason, or None.
     #[must_use]
     pub fn backpressure_reason(&self) -> Option<StorageIntentRefusalReason> {
-        if self.dirty_bytes > self.max_dirty_bytes || self.inflight_bytes > self.max_inflight_bytes
-        {
-            Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
-        } else if self.max_transport_window_bytes > 0
-            && self.transport_window_bytes > self.max_transport_window_bytes
+        if self.dirty_bytes > self.max_dirty_bytes
+            || self.inflight_bytes > self.max_inflight_bytes
+            || (self.max_transport_window_bytes > 0
+                && self.transport_window_bytes > self.max_transport_window_bytes)
         {
             Some(StorageIntentRefusalReason::GuaranteeFloorNotMet)
         } else if self.device_queue_depth > self.max_device_queue_depth
@@ -998,12 +997,9 @@ impl<T> StorageIntentDispatchQueue<T> {
     }
 
     fn select_priority_lane(&self) -> Option<LaneClass> {
-        for lane in LANE_CLASSES_BY_PRIORITY {
-            if self.lane_len(lane) > 0 {
-                return Some(lane);
-            }
-        }
-        None
+        LANE_CLASSES_BY_PRIORITY
+            .into_iter()
+            .find(|&lane| self.lane_len(lane) > 0)
     }
 
     fn select_starved_lane(
@@ -2023,12 +2019,11 @@ impl StorageIntentScheduler {
         let mut index = 0;
         while index < required_evidence.count as usize {
             let kind = required_evidence.kinds[index];
-            if !self.has_bound_evidence_kind(request, kind)
-                || self.blocking_freshness_for_kind(kind).is_some()
+            if (!self.has_bound_evidence_kind(request, kind)
+                || self.blocking_freshness_for_kind(kind).is_some())
+                && !push_required_evidence_kind(&mut missing_kinds, &mut missing_count, kind)
             {
-                if !push_required_evidence_kind(&mut missing_kinds, &mut missing_count, kind) {
-                    missing_evidence_overflow = true;
-                }
+                missing_evidence_overflow = true;
             }
             index += 1;
         }
