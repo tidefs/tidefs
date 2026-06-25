@@ -326,6 +326,14 @@ pub struct StorageIntentPlacementCandidate {
     pub prediction_confidence: PredictionConfidence,
     /// Capacity/admission gate.
     pub capacity_admission: PlacementEvidenceState,
+    /// Recovery/degradation source gate.
+    pub recovery_degradation: PlacementEvidenceState,
+    /// Policy revision rollout gate.
+    pub policy_rollout: PlacementEvidenceState,
+    /// Tenant isolation and budget gate.
+    pub tenant_isolation: PlacementEvidenceState,
+    /// Temporal freshness/deadline gate.
+    pub temporal: PlacementEvidenceState,
     /// Transport/proximity gate.
     pub transport_path: PlacementEvidenceState,
     /// Trust/domain gate.
@@ -368,6 +376,10 @@ impl StorageIntentPlacementCandidate {
             trust_domain_evidence: None,
             prediction_confidence: PredictionConfidence::Unknown,
             capacity_admission: PlacementEvidenceState::Unknown,
+            recovery_degradation: PlacementEvidenceState::Unknown,
+            policy_rollout: PlacementEvidenceState::Unknown,
+            tenant_isolation: PlacementEvidenceState::Unknown,
+            temporal: PlacementEvidenceState::Unknown,
             transport_path: PlacementEvidenceState::Unknown,
             trust_domain: PlacementEvidenceState::Unknown,
             data_shape_state: PlacementEvidenceState::Unknown,
@@ -382,6 +394,10 @@ impl StorageIntentPlacementCandidate {
     #[must_use]
     pub fn with_fresh_hard_gates(mut self) -> Self {
         self.capacity_admission = PlacementEvidenceState::Fresh;
+        self.recovery_degradation = PlacementEvidenceState::Fresh;
+        self.policy_rollout = PlacementEvidenceState::Fresh;
+        self.tenant_isolation = PlacementEvidenceState::Fresh;
+        self.temporal = PlacementEvidenceState::Fresh;
         self.transport_path = PlacementEvidenceState::Fresh;
         self.trust_domain = PlacementEvidenceState::Fresh;
         self.proximity = ProximityClass::InProcess;
@@ -537,6 +553,10 @@ impl StorageIntentPlacementReason {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum CandidateGate {
     CapacityAdmission,
+    RecoveryDegradation,
+    PolicyRollout,
+    TenantIsolation,
+    Temporal,
     TransportPath,
     TrustDomain,
     DataShape,
@@ -1394,6 +1414,7 @@ fn evaluate_candidate(
         candidate.capacity_admission,
         StorageIntentRefusalReason::NoLegalReceiptSet,
     );
+    evaluate_authority_candidate_evidence_gates(role, candidate, reasons);
     require_candidate_gate(
         reasons,
         candidate.target_id,
@@ -1424,6 +1445,34 @@ fn evaluate_candidate(
     evaluate_transport_proximity(request, candidate, reasons);
     evaluate_geo_remote_boundary(role, candidate, reasons);
     evaluate_movement_debt(role, candidate, reasons);
+}
+
+fn evaluate_authority_candidate_evidence_gates(
+    role: StorageIntentPlacementRole,
+    candidate: &StorageIntentPlacementCandidate,
+    reasons: &mut Vec<StorageIntentPlacementReason>,
+) {
+    if role.is_cache_only() {
+        return;
+    }
+
+    for (gate, state) in [
+        (
+            CandidateGate::RecoveryDegradation,
+            candidate.recovery_degradation,
+        ),
+        (CandidateGate::PolicyRollout, candidate.policy_rollout),
+        (CandidateGate::TenantIsolation, candidate.tenant_isolation),
+        (CandidateGate::Temporal, candidate.temporal),
+    ] {
+        require_candidate_gate(
+            reasons,
+            candidate.target_id,
+            gate,
+            state,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
 }
 
 fn push_predicate_refusal<F>(
@@ -2551,6 +2600,26 @@ mod tests {
                 Some(trust_record(trust_role_for_media(self.receipt.media_role)));
             self.prediction_confidence = PredictionConfidence::High;
             self
+        }
+    }
+
+    fn set_candidate_gate_state(
+        candidate: &mut StorageIntentPlacementCandidate,
+        gate: CandidateGate,
+        state: PlacementEvidenceState,
+    ) {
+        match gate {
+            CandidateGate::CapacityAdmission => candidate.capacity_admission = state,
+            CandidateGate::RecoveryDegradation => candidate.recovery_degradation = state,
+            CandidateGate::PolicyRollout => candidate.policy_rollout = state,
+            CandidateGate::TenantIsolation => candidate.tenant_isolation = state,
+            CandidateGate::Temporal => candidate.temporal = state,
+            CandidateGate::TransportPath => candidate.transport_path = state,
+            CandidateGate::TrustDomain => candidate.trust_domain = state,
+            CandidateGate::DataShape => candidate.data_shape_state = state,
+            CandidateGate::LayoutAllocator => candidate.layout_allocator_state = state,
+            CandidateGate::ServiceObjective => candidate.service_objective_state = state,
+            CandidateGate::DecisionFrontier => candidate.decision_frontier = state,
         }
     }
 
@@ -3747,7 +3816,10 @@ mod tests {
             StorageIntentPlacementRole::DurableFullPlacement,
             1,
             1,
-            evidence_cut_without(policy, StorageIntentEvidenceKind::LifecycleGenerationEvidence),
+            evidence_cut_without(
+                policy,
+                StorageIntentEvidenceKind::LifecycleGenerationEvidence,
+            ),
         );
 
         let candidate = candidate(
@@ -3801,6 +3873,10 @@ mod tests {
         candidate.data_shape_state = PlacementEvidenceState::Unknown;
         candidate.layout_allocator = None;
         candidate.layout_allocator_state = PlacementEvidenceState::Unknown;
+        candidate.recovery_degradation = PlacementEvidenceState::Unknown;
+        candidate.policy_rollout = PlacementEvidenceState::Unknown;
+        candidate.tenant_isolation = PlacementEvidenceState::Unknown;
+        candidate.temporal = PlacementEvidenceState::Unknown;
 
         let plan = plan_storage_intent_placement(&request, &[candidate]);
 
@@ -3882,6 +3958,58 @@ mod tests {
     }
 
     #[test]
+    fn authority_candidate_remaining_evidence_gates_refuse_before_scoring() {
+        for gate in [
+            CandidateGate::RecoveryDegradation,
+            CandidateGate::PolicyRollout,
+            CandidateGate::TenantIsolation,
+            CandidateGate::Temporal,
+        ] {
+            let policy = policy(
+                StorageIntentGuaranteeClass::FullPlacement,
+                FailureDomainMask::NODE,
+            );
+            let mut candidate = candidate(
+                1,
+                10,
+                StorageMediaRole::PlacementAuthority,
+                StorageIntentGuaranteeClass::FullPlacement,
+                FailureDomainMask::NODE,
+                StorageMediaClass::NvmeFlash,
+            );
+            set_candidate_gate_state(&mut candidate, gate, PlacementEvidenceState::Missing);
+
+            let plan = plan_storage_intent_placement(
+                &request(
+                    policy,
+                    StorageIntentPlacementRole::DurableFullPlacement,
+                    1,
+                    1,
+                ),
+                &[candidate],
+            );
+
+            assert!(!plan.admitted, "{gate:?} should refuse: {plan:?}");
+            let report = plan
+                .candidate_reports
+                .first()
+                .expect("candidate report exists");
+            assert!(!report.legal);
+            assert_eq!(report.score, 0);
+            assert!(report.reasons.iter().any(|reason| matches!(
+                reason,
+                StorageIntentPlacementCandidateReason::HardGate(
+                    StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                        gate: observed_gate,
+                        state: PlacementEvidenceState::Missing,
+                        ..
+                    }
+                ) if *observed_gate == gate
+            )));
+        }
+    }
+
+    #[test]
     fn lifecycle_generation_candidate_state_starts_unknown() {
         let candidate = StorageIntentPlacementCandidate::new(
             1,
@@ -3899,6 +4027,13 @@ mod tests {
             candidate.lifecycle_generation,
             PlacementEvidenceState::Unknown
         );
+        assert_eq!(
+            candidate.recovery_degradation,
+            PlacementEvidenceState::Unknown
+        );
+        assert_eq!(candidate.policy_rollout, PlacementEvidenceState::Unknown);
+        assert_eq!(candidate.tenant_isolation, PlacementEvidenceState::Unknown);
+        assert_eq!(candidate.temporal, PlacementEvidenceState::Unknown);
     }
 
     #[test]
@@ -3920,6 +4055,12 @@ mod tests {
             candidate.lifecycle_generation,
             PlacementEvidenceState::Fresh
         );
+        assert_eq!(
+            candidate.recovery_degradation,
+            PlacementEvidenceState::Fresh
+        );
+        assert_eq!(candidate.policy_rollout, PlacementEvidenceState::Fresh);
+        assert_eq!(candidate.tenant_isolation, PlacementEvidenceState::Fresh);
+        assert_eq!(candidate.temporal, PlacementEvidenceState::Fresh);
     }
-
 }
