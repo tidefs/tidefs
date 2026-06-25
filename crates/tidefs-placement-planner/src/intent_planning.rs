@@ -534,7 +534,8 @@ impl StorageIntentPlacementReason {
             | Self::CandidateTrustDomainRefused { refusal, .. }
             | Self::CandidatePrefetchResidencyRefused { refusal, .. }
             | Self::CandidateMovementDebtRefused { refusal, .. } => Some(*refusal),
-            Self::PreflightSimulationNotAuthoritative => {
+            Self::EvidenceFamilyNotFresh { .. }
+            | Self::PreflightSimulationNotAuthoritative => {
                 Some(StorageIntentRefusalReason::EvidenceNotUsable)
             }
             Self::CandidateGuaranteeFloorNotMet { .. } => {
