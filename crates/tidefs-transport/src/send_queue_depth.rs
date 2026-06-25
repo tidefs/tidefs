@@ -65,6 +65,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::lane_demux::LaneClass;
+use crate::send_admission::ClusterQueuePressure;
 
 /// Stable queue-root name for transport send depth admission metadata.
 pub const SEND_QUEUE_DEPTH_QUEUE_ROOT: &str = "transport.send_queue_depth";
@@ -141,6 +142,22 @@ impl SendQueueDepthConfig {
         self.max_depth[lane.as_usize()]
     }
 
+    /// Return the effective max depth after applying governor
+    /// `cluster_queues` pressure.
+    ///
+    /// Ungoverned lanes remain ungoverned (`0`). Soft pressure halves the
+    /// queue-slot window; hard pressure reduces it to a minimal positive
+    /// window so required drain/receipt work can still be modeled explicitly
+    /// by callers that also carry a critical admission class.
+    #[must_use]
+    pub fn max_depth_under_cluster_pressure(
+        &self,
+        lane: LaneClass,
+        pressure: ClusterQueuePressure,
+    ) -> usize {
+        pressure_adjusted_depth(self.max_depth(lane), pressure)
+    }
+
     /// Return true if the given lane class is governed (max_depth > 0).
     #[must_use]
     pub fn is_governed(&self, lane: LaneClass) -> bool {
@@ -161,6 +178,17 @@ impl SendQueueDepthConfig {
                 }
             })
             .collect()
+    }
+}
+
+fn pressure_adjusted_depth(depth: usize, pressure: ClusterQueuePressure) -> usize {
+    if depth == 0 {
+        return 0;
+    }
+    match pressure {
+        ClusterQueuePressure::None => depth,
+        ClusterQueuePressure::SoftPressure => (depth / 2).max(1),
+        ClusterQueuePressure::HardPressure => (depth / 4).max(1),
     }
 }
 
@@ -331,6 +359,17 @@ impl SendQueueDepth {
     #[must_use]
     pub fn config(&self) -> &SendQueueDepthConfig {
         &self.config
+    }
+
+    /// Return this lane's effective queue-slot limit under observed
+    /// governor `cluster_queues` pressure.
+    #[must_use]
+    pub fn max_depth_under_cluster_pressure(
+        &self,
+        lane: LaneClass,
+        pressure: ClusterQueuePressure,
+    ) -> usize {
+        self.config.max_depth_under_cluster_pressure(lane, pressure)
     }
 
     /// Return compact source/adapter evidence for a bounded lane.
@@ -872,5 +911,49 @@ mod tests {
         assert!(s.contains("lane.transport_session_0.demand.l2"));
         assert!(s.contains("depth=512"));
         assert!(s.contains("max=512"));
+    }
+
+    #[test]
+    fn cluster_pressure_reduces_effective_depth_limits() {
+        let cfg = SendQueueDepthConfig::new([100; LaneClass::COUNT]).unwrap();
+        assert_eq!(
+            cfg.max_depth_under_cluster_pressure(LaneClass::Demand, ClusterQueuePressure::None),
+            100
+        );
+        assert_eq!(
+            cfg.max_depth_under_cluster_pressure(
+                LaneClass::Demand,
+                ClusterQueuePressure::SoftPressure
+            ),
+            50
+        );
+        assert_eq!(
+            cfg.max_depth_under_cluster_pressure(
+                LaneClass::Demand,
+                ClusterQueuePressure::HardPressure
+            ),
+            25
+        );
+    }
+
+    #[test]
+    fn cluster_pressure_keeps_ungoverned_lanes_unbounded() {
+        let cfg = SendQueueDepthConfig::with_lanes(&[(LaneClass::Control, 8)]).unwrap();
+        let gov = SendQueueDepth::new(cfg);
+
+        assert_eq!(
+            gov.max_depth_under_cluster_pressure(
+                LaneClass::Demand,
+                ClusterQueuePressure::HardPressure
+            ),
+            0
+        );
+        assert_eq!(
+            gov.max_depth_under_cluster_pressure(
+                LaneClass::Control,
+                ClusterQueuePressure::SoftPressure
+            ),
+            4
+        );
     }
 }

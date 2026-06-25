@@ -519,8 +519,10 @@ pub use request_response::{
 };
 pub use routing::{RouteEntry, RoutingTable};
 pub use send_admission::{
-    DroppedSendEvidence, SendAdmission, SendAdmissionEvidence, SendAdmissionOutcome,
-    SendAdmissionPolicy, SendCapacityClass, SendCapacityEvidence, SendWakeEvidence,
+    admit_cluster_queue_budget, ClusterQueueAdmissionClass, ClusterQueueAllocationKind,
+    ClusterQueueBudgetGuard, ClusterQueuePressure, DroppedSendEvidence, SendAdmission,
+    SendAdmissionEvidence, SendAdmissionOutcome, SendAdmissionPolicy, SendCapacityClass,
+    SendCapacityEvidence, SendPressureReason, SendWakeEvidence,
 };
 pub use send_backpressure::{
     data_lane_pressure_fn, SendCapacity, SendCapacitySet, SendCapacitySnapshot, SendWatermarkConfig,

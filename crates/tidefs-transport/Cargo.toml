@@ -36,6 +36,7 @@ ed25519-dalek = { workspace = true, features = ["serde"] }
 rand = "0.7"
 blake3 = "1"
 tidefs-auth = { workspace = true }
+tidefs-cache-core = { workspace = true }
 crc32c = "0.6"
 tidefs-binary_schema-checksum = { workspace = true }
 tidefs-binary_schema-core = { workspace = true }

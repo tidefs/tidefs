@@ -8,6 +8,13 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use tidefs_cache_core::Governor;
+
+use crate::send_admission::{
+    admit_cluster_queue_budget, ClusterQueueAdmissionClass, ClusterQueueAllocationKind,
+    ClusterQueueBudgetGuard, SendAdmission, SendAdmissionEvidence, SendAdmissionOutcome,
+    SendAdmissionPolicy, SendCapacityClass, SendCapacityEvidence,
+};
 
 /// Error returned when the request-concurrency limit is exceeded.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -30,6 +37,82 @@ pub struct RequestLimitExceeded {
 #[derive(Debug)]
 pub struct RequestConcurrencyGuard {
     counter: Arc<AtomicUsize>,
+}
+
+/// A request-concurrency slot paired with governor `cluster_queues` budget.
+#[derive(Debug)]
+pub struct BudgetedRequestConcurrencyGuard {
+    request_guard: RequestConcurrencyGuard,
+    cluster_budget: ClusterQueueBudgetGuard,
+}
+
+impl BudgetedRequestConcurrencyGuard {
+    /// Try to acquire one in-flight slot and charge the request's transport
+    /// bytes to `BudgetCategory::ClusterQueues`.
+    ///
+    /// Dropping the returned guard releases both the request slot and the
+    /// cluster-queue budget, covering completion, cancellation, timeout, and
+    /// peer-drain paths.
+    #[must_use]
+    pub fn acquire(
+        counter: &Arc<AtomicUsize>,
+        max: Option<usize>,
+        governor: &Governor,
+        bytes: u64,
+        admission_class: ClusterQueueAdmissionClass,
+    ) -> SendAdmission<Self> {
+        let budget = admit_cluster_queue_budget(
+            governor,
+            bytes,
+            ClusterQueueAllocationKind::RpcFrame,
+            admission_class,
+        );
+        let budget_pressure = budget.evidence.pressure_reason;
+        let Some(cluster_budget) = budget.value else {
+            return SendAdmission::without_value(budget.evidence);
+        };
+
+        match RequestConcurrencyGuard::acquire(counter, max) {
+            Ok(request_guard) => {
+                let evidence = match budget_pressure {
+                    Some(reason) => budget.evidence.with_pressure_reason(reason),
+                    None => budget.evidence,
+                };
+                SendAdmission::with_value(
+                    evidence,
+                    Self {
+                        request_guard,
+                        cluster_budget,
+                    },
+                )
+            }
+            Err(err) => {
+                drop(cluster_budget);
+                let evidence = SendAdmissionEvidence::new(SendAdmissionOutcome::Backpressured)
+                    .with_policy(SendAdmissionPolicy::Concurrency)
+                    .with_capacity(SendCapacityEvidence::new(
+                        SendCapacityClass::Concurrency,
+                        err.current,
+                        Some(1),
+                        Some(err.max),
+                    ));
+                SendAdmission::without_value(evidence)
+            }
+        }
+    }
+
+    /// Return the number of bytes still charged to cluster queues.
+    #[must_use]
+    pub fn budgeted_bytes(&self) -> u64 {
+        self.cluster_budget.bytes()
+    }
+
+    /// Return true while this guard owns a request slot.
+    #[must_use]
+    pub fn holds_request_slot(&self) -> bool {
+        let _ = &self.request_guard;
+        true
+    }
 }
 
 impl RequestConcurrencyGuard {
@@ -95,9 +178,23 @@ impl Drop for RequestConcurrencyGuard {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use tidefs_cache_core::{BudgetCategory, GovernorConfig};
 
     fn new_counter() -> Arc<AtomicUsize> {
         Arc::new(AtomicUsize::new(0))
+    }
+
+    fn cluster_only_governor() -> Governor {
+        Governor::new(GovernorConfig {
+            total_budget_bytes: 1_000,
+            data_cache_fraction: 0.0,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 1.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
     }
 
     /// Unlimited mode always succeeds and increments the counter.
@@ -219,5 +316,54 @@ mod tests {
         fn assert_sync<T: Sync>() {}
         assert_send::<RequestConcurrencyGuard>();
         assert_sync::<RequestConcurrencyGuard>();
+    }
+
+    #[test]
+    fn budgeted_guard_releases_request_and_cluster_budget_on_drop() {
+        let c = new_counter();
+        let governor = cluster_only_governor();
+
+        let admission = BudgetedRequestConcurrencyGuard::acquire(
+            &c,
+            Some(1),
+            &governor,
+            64,
+            ClusterQueueAdmissionClass::Normal,
+        );
+
+        assert!(admission.admitted());
+        let guard = admission.value.unwrap();
+        assert!(guard.holds_request_slot());
+        assert_eq!(guard.budgeted_bytes(), 64);
+        assert_eq!(RequestConcurrencyGuard::in_flight(&c), 1);
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 64);
+
+        drop(guard);
+
+        assert_eq!(RequestConcurrencyGuard::in_flight(&c), 0);
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 0);
+    }
+
+    #[test]
+    fn budgeted_guard_releases_budget_when_concurrency_is_full() {
+        let c = new_counter();
+        let governor = cluster_only_governor();
+        let _held = RequestConcurrencyGuard::acquire(&c, Some(1)).unwrap();
+
+        let admission = BudgetedRequestConcurrencyGuard::acquire(
+            &c,
+            Some(1),
+            &governor,
+            64,
+            ClusterQueueAdmissionClass::Normal,
+        );
+
+        assert!(!admission.admitted());
+        assert_eq!(
+            admission.evidence.outcome,
+            SendAdmissionOutcome::Backpressured
+        );
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 0);
+        assert_eq!(RequestConcurrencyGuard::in_flight(&c), 1);
     }
 }

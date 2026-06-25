@@ -42,10 +42,13 @@
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tidefs_cache_core::Governor;
 
 use crate::send_admission::{
-    DroppedSendEvidence, SendAdmissionEvidence, SendAdmissionOutcome, SendAdmissionPolicy,
-    SendCapacityClass, SendCapacityEvidence, SendWakeEvidence,
+    admit_cluster_queue_budget, ClusterQueueAdmissionClass, ClusterQueueAllocationKind,
+    ClusterQueueBudgetGuard, DroppedSendEvidence, SendAdmissionEvidence, SendAdmissionOutcome,
+    SendAdmissionPolicy, SendCapacityClass, SendCapacityEvidence, SendPressureReason,
+    SendWakeEvidence,
 };
 
 // ---------------------------------------------------------------------------
@@ -253,6 +256,42 @@ pub struct BufferStatsSnapshot {
 // PeerSendBuffer
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
+struct QueuedFrame {
+    bytes: Bytes,
+    cluster_budget: Option<ClusterQueueBudgetGuard>,
+}
+
+impl QueuedFrame {
+    fn new(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            cluster_budget: None,
+        }
+    }
+
+    fn with_cluster_budget(bytes: Bytes, cluster_budget: ClusterQueueBudgetGuard) -> Self {
+        Self {
+            bytes,
+            cluster_budget: Some(cluster_budget),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn into_bytes(self) -> Bytes {
+        self.bytes
+    }
+
+    fn cluster_budgeted_bytes(&self) -> u64 {
+        self.cluster_budget
+            .as_ref()
+            .map_or(0, |guard| guard.bytes())
+    }
+}
+
 /// Bounded per-peer send buffer holding serialized frames awaiting
 /// transmission.
 ///
@@ -270,7 +309,7 @@ pub struct BufferStatsSnapshot {
 #[derive(Debug)]
 pub struct PeerSendBuffer {
     /// Serialized frames queued for transmission.
-    queue: VecDeque<Bytes>,
+    queue: VecDeque<QueuedFrame>,
     /// Current sum of all `Bytes` lengths in `queue`.
     allocated: u64,
     /// Maximum total bytes allowed across all queued frames.
@@ -302,6 +341,42 @@ impl PeerSendBuffer {
     /// Returns typed evidence for accepted, drop-oldest, backpressured, and
     /// shutdown decisions.
     pub fn try_enqueue(&mut self, frame: Bytes) -> SendAdmissionEvidence {
+        self.try_enqueue_frame(QueuedFrame::new(frame), None)
+    }
+
+    /// Try to enqueue a frame after admitting its queued bytes against the
+    /// unified governor `cluster_queues` budget.
+    ///
+    /// The buffer owns the budget guard while the frame remains queued.
+    /// Dequeue, drop-oldest, drain, shutdown, and buffer drop release the
+    /// charged bytes by dropping the queued frame.
+    pub fn try_enqueue_with_cluster_budget(
+        &mut self,
+        frame: Bytes,
+        governor: &Governor,
+        admission_class: ClusterQueueAdmissionClass,
+    ) -> SendAdmissionEvidence {
+        let admission = admit_cluster_queue_budget(
+            governor,
+            frame.len() as u64,
+            ClusterQueueAllocationKind::SendBuffer,
+            admission_class,
+        );
+        let budget_pressure = admission.evidence.pressure_reason;
+        let Some(guard) = admission.value else {
+            return admission.evidence;
+        };
+        self.try_enqueue_frame(
+            QueuedFrame::with_cluster_budget(frame, guard),
+            budget_pressure,
+        )
+    }
+
+    fn try_enqueue_frame(
+        &mut self,
+        frame: QueuedFrame,
+        budget_pressure: Option<SendPressureReason>,
+    ) -> SendAdmissionEvidence {
         if self.shutdown.load(Ordering::Acquire) {
             self.stats.rejected_shutdown.fetch_add(1, Ordering::Relaxed);
             return self
@@ -359,18 +434,21 @@ impl PeerSendBuffer {
                     self.allocated += frame_len;
                     self.queue.push_back(frame);
                     self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
-                    return self
+                    let evidence = self
                         .evidence(SendAdmissionOutcome::DroppedOldest, frame_len as usize)
                         .with_policy(SendAdmissionPolicy::DropOldest)
                         .with_dropped(dropped);
+                    return attach_budget_pressure(evidence, budget_pressure);
                 }
             }
         }
         self.allocated += frame_len;
         self.queue.push_back(frame);
         self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
-        self.evidence(SendAdmissionOutcome::Accepted, frame_len as usize)
-            .with_policy(self.admission_policy())
+        let evidence = self
+            .evidence(SendAdmissionOutcome::Accepted, frame_len as usize)
+            .with_policy(self.admission_policy());
+        attach_budget_pressure(evidence, budget_pressure)
     }
 
     /// Remove and return the next frame from the front of the buffer.
@@ -379,7 +457,7 @@ impl PeerSendBuffer {
     pub fn dequeue(&mut self) -> Option<Bytes> {
         let frame = self.queue.pop_front()?;
         self.allocated = self.allocated.saturating_sub(frame.len() as u64);
-        Some(frame)
+        Some(frame.into_bytes())
     }
 
     /// Drop all queued frames and reset allocated memory to zero.
@@ -431,6 +509,15 @@ impl PeerSendBuffer {
         self.allocated
     }
 
+    /// Return bytes in this buffer that are currently charged to the
+    /// governor `cluster_queues` budget.
+    pub fn cluster_budgeted_bytes(&self) -> u64 {
+        self.queue
+            .iter()
+            .map(QueuedFrame::cluster_budgeted_bytes)
+            .sum()
+    }
+
     /// Return the configured maximum memory in bytes.
     pub fn max_memory(&self) -> u64 {
         self.max_memory
@@ -478,6 +565,16 @@ impl PeerSendBuffer {
     }
 }
 
+fn attach_budget_pressure(
+    evidence: SendAdmissionEvidence,
+    pressure: Option<SendPressureReason>,
+) -> SendAdmissionEvidence {
+    match pressure {
+        Some(reason) => evidence.with_pressure_reason(reason),
+        None => evidence,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -485,8 +582,22 @@ impl PeerSendBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_cache_core::{BudgetCategory, GovernorConfig};
 
     const KB: u64 = MIN_SEND_BUFFER_MEMORY;
+
+    fn cluster_only_governor(total_budget_bytes: u64) -> Governor {
+        Governor::new(GovernorConfig {
+            total_budget_bytes,
+            data_cache_fraction: 0.0,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 1.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
+    }
 
     // --- Enqueue / dequeue FIFO ordering ---
 
@@ -640,6 +751,82 @@ mod tests {
         buf.try_enqueue(Bytes::from_static(b"c"));
         buf.drain();
         assert_eq!(buf.stats.snapshot().dropped, 3);
+    }
+
+    #[test]
+    fn cluster_budget_released_on_dequeue() {
+        let governor = cluster_only_governor(10_000);
+        let mut buf = PeerSendBuffer::new(&SendBufferConfig::default());
+
+        let evidence = buf.try_enqueue_with_cluster_budget(
+            Bytes::from_static(b"frame"),
+            &governor,
+            ClusterQueueAdmissionClass::Normal,
+        );
+
+        assert_eq!(evidence.outcome, SendAdmissionOutcome::Accepted);
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 5);
+        assert_eq!(buf.cluster_budgeted_bytes(), 5);
+        assert_eq!(buf.dequeue().unwrap(), Bytes::from_static(b"frame"));
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 0);
+    }
+
+    #[test]
+    fn cluster_budget_released_on_drain() {
+        let governor = cluster_only_governor(10_000);
+        let mut buf = PeerSendBuffer::new(&SendBufferConfig::default());
+
+        assert_eq!(
+            buf.try_enqueue_with_cluster_budget(
+                Bytes::from_static(b"one"),
+                &governor,
+                ClusterQueueAdmissionClass::Normal
+            )
+            .outcome,
+            SendAdmissionOutcome::Accepted
+        );
+        assert_eq!(
+            buf.try_enqueue_with_cluster_budget(
+                Bytes::from_static(b"two"),
+                &governor,
+                ClusterQueueAdmissionClass::Normal
+            )
+            .outcome,
+            SendAdmissionOutcome::Accepted
+        );
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 6);
+
+        buf.drain();
+
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.allocated(), 0);
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 0);
+    }
+
+    #[test]
+    fn hard_cluster_pressure_refuses_non_critical_send_buffer() {
+        let governor = cluster_only_governor(1_000);
+        let _held = governor
+            .admit(BudgetCategory::ClusterQueues, 950)
+            .expect("seed hard pressure");
+        let mut buf = PeerSendBuffer::new(&SendBufferConfig::default());
+
+        let evidence = buf.try_enqueue_with_cluster_budget(
+            Bytes::from_static(b"x"),
+            &governor,
+            ClusterQueueAdmissionClass::Normal,
+        );
+
+        assert_eq!(evidence.outcome, SendAdmissionOutcome::Backpressured);
+        assert_eq!(buf.len(), 0);
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 950);
+        assert!(matches!(
+            evidence.pressure_reason,
+            Some(SendPressureReason::ClusterQueues {
+                pressure: crate::send_admission::ClusterQueuePressure::HardPressure,
+                ..
+            })
+        ));
     }
 
     #[test]
