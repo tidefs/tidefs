@@ -18,6 +18,7 @@ probing hardware or claiming durability from labels.
 """
 
 [dependencies]
+tidefs-kernel-storage-io = { workspace = true }
 tidefs-storage-intent-core = { workspace = true }
 
 [lib]
