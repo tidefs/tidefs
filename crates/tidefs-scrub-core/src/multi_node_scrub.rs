@@ -2,12 +2,14 @@
 //! Multi-node scrub fanout: coordinates scrub verification across peer nodes
 //! and records cross-node validation in a deterministic audit log.
 //!
-//! When a node's local scrub detects a checksum mismatch on an object, it
-//! fans out a verification request to one or more authoritative peers that
-//! hold replicas of the same object. Each peer independently verifies its
-//! local copy and returns the outcome plus optionally the verified data.
-//! The coordinator aggregates responses, selects the best authoritative
-//! source, and feeds the result into the repair pipeline.
+//! The receipt-bound comparison exchange in this module carries scrub subject,
+//! receipt, membership, checksum-layer, and correlation identity from the
+//! requester to each peer and back. It preserves negative transport/session
+//! outcomes as comparison evidence instead of treating missing peers as clean.
+//!
+//! The legacy fanout coordinator below still models older peer verification
+//! plumbing. The comparison exchange does not select repair sources or define
+//! repair outcomes.
 
 #![forbid(unsafe_code)]
 
@@ -15,9 +17,464 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cross_replica_comparison::{
+    ChecksumLayer, ComparisonCandidate, EvidenceReadOutcome, ReplicaEvidence, ScrubSubject,
+    ScrubSubjectKind, TransportFailureReason,
+};
 use tidefs_checksum_tree::Digest;
 use tidefs_local_object_store::{ObjectKey, SuspectEntry};
-use tidefs_replication_model::PlacementReceiptRef;
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
+
+// ---------------------------------------------------------------------------
+// Receipt-bound scrub comparison exchange
+// ---------------------------------------------------------------------------
+
+/// Wire-stable projection of the local scrub block identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScrubComparisonSubject {
+    pub inode_id: u64,
+    pub data_version: u64,
+    pub kind: ScrubComparisonSubjectKind,
+}
+
+impl ScrubComparisonSubject {
+    #[must_use]
+    pub const fn new(inode_id: u64, data_version: u64, kind: ScrubComparisonSubjectKind) -> Self {
+        Self {
+            inode_id,
+            data_version,
+            kind,
+        }
+    }
+
+    #[must_use]
+    pub const fn to_comparison_subject(self) -> ScrubSubject {
+        ScrubSubject {
+            inode_id: self.inode_id,
+            data_version: self.data_version,
+            kind: self.kind.to_comparison_kind(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ScrubComparisonSubjectKind {
+    InlineContent,
+    ContentManifest,
+    ContentChunk { chunk_index: u64 },
+}
+
+impl ScrubComparisonSubjectKind {
+    #[must_use]
+    pub const fn to_comparison_kind(self) -> ScrubSubjectKind {
+        match self {
+            Self::InlineContent => ScrubSubjectKind::InlineContent,
+            Self::ContentManifest => ScrubSubjectKind::ContentManifest,
+            Self::ContentChunk { chunk_index } => ScrubSubjectKind::ContentChunk { chunk_index },
+        }
+    }
+}
+
+/// Checksum layer carried by a scrub comparison exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ScrubComparisonChecksumLayer {
+    InlineContentBody,
+    EncodedContentChunk,
+    SparseHole,
+}
+
+impl ScrubComparisonChecksumLayer {
+    #[must_use]
+    pub const fn to_comparison_layer(self) -> ChecksumLayer {
+        match self {
+            Self::InlineContentBody => ChecksumLayer::InlineContentBody,
+            Self::EncodedContentChunk => ChecksumLayer::EncodedContentChunk,
+            Self::SparseHole => ChecksumLayer::SparseHole,
+        }
+    }
+}
+
+/// Request correlation identity for one peer probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScrubComparisonCorrelationId {
+    pub origin_node_id: u64,
+    pub sequence: u64,
+}
+
+impl ScrubComparisonCorrelationId {
+    #[must_use]
+    pub const fn new(origin_node_id: u64, sequence: u64) -> Self {
+        Self {
+            origin_node_id,
+            sequence,
+        }
+    }
+}
+
+/// A receipt-, epoch-, and checksum-layer-bound comparison probe.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrubComparisonProbe {
+    pub correlation_id: ScrubComparisonCorrelationId,
+    pub target_peer_id: u64,
+    pub subject: ScrubComparisonSubject,
+    pub object_key: [u8; 32],
+    pub checksum_layer: ScrubComparisonChecksumLayer,
+    pub expected_checksum: Option<Digest>,
+    pub placement_receipt_ref: PlacementReceiptRef,
+    pub membership_epoch: u64,
+    pub issued_at_secs: u64,
+}
+
+impl ScrubComparisonProbe {
+    #[must_use]
+    pub fn new(
+        correlation_id: ScrubComparisonCorrelationId,
+        target_peer_id: u64,
+        subject: ScrubComparisonSubject,
+        object_key: [u8; 32],
+        checksum_layer: ScrubComparisonChecksumLayer,
+        expected_checksum: Option<Digest>,
+        placement_receipt_ref: PlacementReceiptRef,
+        membership_epoch: u64,
+    ) -> Self {
+        Self {
+            correlation_id,
+            target_peer_id,
+            subject,
+            object_key,
+            checksum_layer,
+            expected_checksum,
+            placement_receipt_ref,
+            membership_epoch,
+            issued_at_secs: current_timestamp_secs(),
+        }
+    }
+
+    #[must_use]
+    pub fn candidate(&self) -> ComparisonCandidate {
+        ComparisonCandidate {
+            subject: self.subject.to_comparison_subject(),
+            object_key: self.object_key,
+            checksum_layer: self.checksum_layer.to_comparison_layer(),
+            expected_checksum: self.expected_checksum,
+            placement_receipt_epoch: self.placement_receipt_ref.receipt_epoch.0,
+            placement_receipt_generation: self.placement_receipt_ref.receipt_generation,
+            membership_epoch: self.membership_epoch,
+            redundancy_policy_id: receipt_redundancy_policy_id(
+                self.placement_receipt_ref.redundancy_policy,
+            ),
+            target_count: self.placement_receipt_ref.target_count,
+        }
+    }
+}
+
+/// Peer-local scrub evidence returned for one comparison probe.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrubComparisonPeerOutcome {
+    Clean { checksum: Digest },
+    Mismatch { expected: Digest, actual: Digest },
+    Missing,
+    Unreadable,
+    NoChecksum,
+    ReceiptStale,
+}
+
+impl ScrubComparisonPeerOutcome {
+    #[must_use]
+    pub fn to_read_outcome(&self) -> EvidenceReadOutcome {
+        match self {
+            Self::Clean { checksum } => EvidenceReadOutcome::Clean {
+                checksum: *checksum,
+            },
+            Self::Mismatch { expected, actual } => EvidenceReadOutcome::Mismatch {
+                expected: *expected,
+                actual: *actual,
+            },
+            Self::Missing => EvidenceReadOutcome::Missing,
+            Self::Unreadable => EvidenceReadOutcome::Unreadable,
+            Self::NoChecksum => EvidenceReadOutcome::NoChecksum,
+            Self::ReceiptStale => EvidenceReadOutcome::ReceiptStale,
+        }
+    }
+}
+
+/// Response from a peer. The identity fields intentionally echo the probe.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrubComparisonResponse {
+    pub correlation_id: ScrubComparisonCorrelationId,
+    pub responder_peer_id: u64,
+    pub subject: ScrubComparisonSubject,
+    pub object_key: [u8; 32],
+    pub checksum_layer: ScrubComparisonChecksumLayer,
+    pub placement_receipt_ref: PlacementReceiptRef,
+    pub membership_epoch: u64,
+    pub source_epoch: u64,
+    pub outcome: ScrubComparisonPeerOutcome,
+    pub timestamp_secs: u64,
+}
+
+impl ScrubComparisonResponse {
+    #[must_use]
+    pub fn new(
+        probe: &ScrubComparisonProbe,
+        responder_peer_id: u64,
+        source_epoch: u64,
+        outcome: ScrubComparisonPeerOutcome,
+    ) -> Self {
+        Self {
+            correlation_id: probe.correlation_id,
+            responder_peer_id,
+            subject: probe.subject,
+            object_key: probe.object_key,
+            checksum_layer: probe.checksum_layer,
+            placement_receipt_ref: probe.placement_receipt_ref,
+            membership_epoch: probe.membership_epoch,
+            source_epoch,
+            outcome,
+            timestamp_secs: current_timestamp_secs(),
+        }
+    }
+
+    #[must_use]
+    pub fn echoes_probe_identity(&self, probe: &ScrubComparisonProbe) -> bool {
+        self.correlation_id == probe.correlation_id
+            && self.subject == probe.subject
+            && self.object_key == probe.object_key
+            && self.checksum_layer == probe.checksum_layer
+            && self.placement_receipt_ref == probe.placement_receipt_ref
+            && self.membership_epoch == probe.membership_epoch
+    }
+
+    #[must_use]
+    pub fn to_replica_evidence(&self) -> ReplicaEvidence {
+        replica_evidence_from_identity(
+            self.responder_peer_id,
+            self.subject,
+            self.object_key,
+            self.checksum_layer,
+            self.placement_receipt_ref,
+            self.membership_epoch,
+            self.source_epoch,
+            self.outcome.to_read_outcome(),
+        )
+    }
+}
+
+/// Typed transport/session evidence for a probe that did not yield a response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrubComparisonTransportFailure {
+    pub correlation_id: ScrubComparisonCorrelationId,
+    pub peer_id: u64,
+    pub subject: ScrubComparisonSubject,
+    pub object_key: [u8; 32],
+    pub checksum_layer: ScrubComparisonChecksumLayer,
+    pub placement_receipt_ref: PlacementReceiptRef,
+    pub membership_epoch: u64,
+    pub reason: ScrubComparisonTransportFailureReason,
+    pub detail: Option<String>,
+    pub timestamp_secs: u64,
+}
+
+impl ScrubComparisonTransportFailure {
+    #[must_use]
+    pub fn from_probe(
+        probe: &ScrubComparisonProbe,
+        reason: ScrubComparisonTransportFailureReason,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            correlation_id: probe.correlation_id,
+            peer_id: probe.target_peer_id,
+            subject: probe.subject,
+            object_key: probe.object_key,
+            checksum_layer: probe.checksum_layer,
+            placement_receipt_ref: probe.placement_receipt_ref,
+            membership_epoch: probe.membership_epoch,
+            reason,
+            detail,
+            timestamp_secs: current_timestamp_secs(),
+        }
+    }
+
+    #[must_use]
+    pub fn to_replica_evidence(&self) -> ReplicaEvidence {
+        replica_evidence_from_identity(
+            self.peer_id,
+            self.subject,
+            self.object_key,
+            self.checksum_layer,
+            self.placement_receipt_ref,
+            self.membership_epoch,
+            self.membership_epoch,
+            EvidenceReadOutcome::TransportFailure {
+                reason: self.reason.to_comparison_reason(),
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrubComparisonTransportFailureReason {
+    SendFailed,
+    SessionFailed,
+    EpochRejected,
+    PeerDeparted,
+    Backpressured,
+    Timeout,
+}
+
+impl ScrubComparisonTransportFailureReason {
+    #[must_use]
+    pub const fn to_comparison_reason(self) -> TransportFailureReason {
+        match self {
+            Self::SendFailed => TransportFailureReason::Unreachable,
+            Self::SessionFailed | Self::PeerDeparted => TransportFailureReason::SessionClosed,
+            Self::EpochRejected => TransportFailureReason::EpochRejected,
+            Self::Backpressured => TransportFailureReason::Backpressured,
+            Self::Timeout => TransportFailureReason::Timeout,
+        }
+    }
+}
+
+/// Receipt target and committed roster snapshot used to build safe probes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrubComparisonTargetRoster {
+    placement_receipt_ref: PlacementReceiptRef,
+    membership_epoch: u64,
+    receipt_target_peer_ids: Vec<u64>,
+    committed_peer_ids: Vec<u64>,
+}
+
+impl ScrubComparisonTargetRoster {
+    pub fn new(
+        placement_receipt_ref: PlacementReceiptRef,
+        membership_epoch: u64,
+        receipt_target_peer_ids: Vec<u64>,
+        committed_peer_ids: Vec<u64>,
+    ) -> Result<Self, ScrubComparisonAdmissionError> {
+        if !placement_receipt_ref.is_committed_authority() {
+            return Err(ScrubComparisonAdmissionError::ReceiptNotCommitted);
+        }
+
+        let receipt_target_peer_ids = sorted_dedup(receipt_target_peer_ids);
+        if receipt_target_peer_ids.is_empty() {
+            return Err(ScrubComparisonAdmissionError::EmptyReceiptTargets);
+        }
+        if receipt_target_peer_ids.len() != placement_receipt_ref.target_count as usize {
+            return Err(ScrubComparisonAdmissionError::ReceiptTargetCountMismatch {
+                declared: placement_receipt_ref.target_count,
+                actual: receipt_target_peer_ids.len() as u16,
+            });
+        }
+
+        Ok(Self {
+            placement_receipt_ref,
+            membership_epoch,
+            receipt_target_peer_ids,
+            committed_peer_ids: sorted_dedup(committed_peer_ids),
+        })
+    }
+
+    #[must_use]
+    pub fn placement_receipt_ref(&self) -> PlacementReceiptRef {
+        self.placement_receipt_ref
+    }
+
+    #[must_use]
+    pub fn membership_epoch(&self) -> u64 {
+        self.membership_epoch
+    }
+
+    #[must_use]
+    pub fn receipt_target_peer_ids(&self) -> &[u64] {
+        &self.receipt_target_peer_ids
+    }
+
+    #[must_use]
+    pub fn committed_peer_ids(&self) -> &[u64] {
+        &self.committed_peer_ids
+    }
+
+    #[must_use]
+    pub fn authorizes_peer(&self, peer_id: u64) -> bool {
+        self.receipt_target_peer_ids.binary_search(&peer_id).is_ok()
+            && self.committed_peer_ids.binary_search(&peer_id).is_ok()
+    }
+
+    #[must_use]
+    pub fn authorized_peer_ids(&self) -> Vec<u64> {
+        self.receipt_target_peer_ids
+            .iter()
+            .copied()
+            .filter(|peer_id| self.committed_peer_ids.binary_search(peer_id).is_ok())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn build_probe_plan(
+        &self,
+        origin_node_id: u64,
+        first_sequence: u64,
+        subject: ScrubComparisonSubject,
+        object_key: [u8; 32],
+        checksum_layer: ScrubComparisonChecksumLayer,
+        expected_checksum: Option<Digest>,
+    ) -> ScrubComparisonDispatchPlan {
+        let mut probes = Vec::new();
+        let mut failures = Vec::new();
+
+        for (offset, peer_id) in self.receipt_target_peer_ids.iter().copied().enumerate() {
+            let correlation_id =
+                ScrubComparisonCorrelationId::new(origin_node_id, first_sequence + offset as u64);
+            let probe = ScrubComparisonProbe::new(
+                correlation_id,
+                peer_id,
+                subject,
+                object_key,
+                checksum_layer,
+                expected_checksum,
+                self.placement_receipt_ref,
+                self.membership_epoch,
+            );
+
+            if self.committed_peer_ids.binary_search(&peer_id).is_ok() {
+                probes.push(probe);
+            } else {
+                failures.push(ScrubComparisonTransportFailure::from_probe(
+                    &probe,
+                    ScrubComparisonTransportFailureReason::PeerDeparted,
+                    Some("receipt target absent from committed membership roster".to_string()),
+                ));
+            }
+        }
+
+        ScrubComparisonDispatchPlan { probes, failures }
+    }
+}
+
+/// Probe plan plus immediate typed evidence for receipt targets not sendable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrubComparisonDispatchPlan {
+    pub probes: Vec<ScrubComparisonProbe>,
+    pub failures: Vec<ScrubComparisonTransportFailure>,
+}
+
+impl ScrubComparisonDispatchPlan {
+    #[must_use]
+    pub fn immediate_failure_evidence(&self) -> Vec<ReplicaEvidence> {
+        self.failures
+            .iter()
+            .map(ScrubComparisonTransportFailure::to_replica_evidence)
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrubComparisonAdmissionError {
+    ReceiptNotCommitted,
+    EmptyReceiptTargets,
+    ReceiptTargetCountMismatch { declared: u16, actual: u16 },
+}
 
 // ---------------------------------------------------------------------------
 // ScrubFanoutRequest — sent to a peer for authoritative verification
@@ -654,6 +1111,45 @@ impl ScrubFanoutCoordinator {
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn receipt_redundancy_policy_id(policy: ReceiptRedundancyPolicy) -> u8 {
+    match policy {
+        ReceiptRedundancyPolicy::Replicated { .. } => 1,
+        ReceiptRedundancyPolicy::Erasure { .. } => 2,
+    }
+}
+
+fn replica_evidence_from_identity(
+    replica_id: u64,
+    subject: ScrubComparisonSubject,
+    object_key: [u8; 32],
+    checksum_layer: ScrubComparisonChecksumLayer,
+    placement_receipt_ref: PlacementReceiptRef,
+    membership_epoch: u64,
+    source_epoch: u64,
+    read_outcome: EvidenceReadOutcome,
+) -> ReplicaEvidence {
+    ReplicaEvidence {
+        replica_id,
+        subject: subject.to_comparison_subject(),
+        object_key,
+        checksum_layer: checksum_layer.to_comparison_layer(),
+        redundancy_policy_id: receipt_redundancy_policy_id(placement_receipt_ref.redundancy_policy),
+        target_count: placement_receipt_ref.target_count,
+        content_generation: subject.data_version,
+        placement_receipt_epoch: placement_receipt_ref.receipt_epoch.0,
+        placement_receipt_generation: placement_receipt_ref.receipt_generation,
+        membership_epoch,
+        source_epoch,
+        read_outcome,
+    }
+}
+
+fn sorted_dedup(mut ids: Vec<u64>) -> Vec<u64> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 fn current_timestamp_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -699,6 +1195,146 @@ mod tests {
             object_id: id.into(),
             verified_data: data,
         }
+    }
+
+    fn comparison_subject() -> ScrubComparisonSubject {
+        ScrubComparisonSubject::new(
+            7,
+            44,
+            ScrubComparisonSubjectKind::ContentChunk { chunk_index: 3 },
+        )
+    }
+
+    fn comparison_receipt(object_key: [u8; 32], generation: u64) -> PlacementReceiptRef {
+        PlacementReceiptRef::new(
+            9,
+            object_key,
+            Default::default(),
+            generation,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            4096,
+            [0x5A; 32],
+            2,
+        )
+    }
+
+    // -- Receipt-bound comparison exchange tests -----------------------
+
+    #[test]
+    fn comparison_roster_filters_departed_receipt_targets() {
+        let key = mk_key(b"receipt-bound").as_bytes32();
+        let receipt = comparison_receipt(key, 12);
+        let roster =
+            ScrubComparisonTargetRoster::new(receipt, 77, vec![20, 10], vec![30, 10]).unwrap();
+
+        assert_eq!(roster.authorized_peer_ids(), vec![10]);
+        assert!(roster.authorizes_peer(10));
+        assert!(!roster.authorizes_peer(20));
+
+        let plan = roster.build_probe_plan(
+            1,
+            900,
+            comparison_subject(),
+            key,
+            ScrubComparisonChecksumLayer::EncodedContentChunk,
+            Some([0x5A; 32]),
+        );
+
+        assert_eq!(plan.probes.len(), 1);
+        assert_eq!(plan.probes[0].target_peer_id, 10);
+        assert_eq!(
+            plan.probes[0].correlation_id,
+            ScrubComparisonCorrelationId::new(1, 900)
+        );
+        assert_eq!(plan.failures.len(), 1);
+        assert_eq!(plan.failures[0].peer_id, 20);
+        assert_eq!(
+            plan.failures[0].reason,
+            ScrubComparisonTransportFailureReason::PeerDeparted
+        );
+
+        let failure_evidence = plan.immediate_failure_evidence();
+        assert_eq!(failure_evidence.len(), 1);
+        assert_eq!(failure_evidence[0].replica_id, 20);
+        assert!(matches!(
+            failure_evidence[0].read_outcome,
+            EvidenceReadOutcome::TransportFailure {
+                reason: TransportFailureReason::SessionClosed
+            }
+        ));
+    }
+
+    #[test]
+    fn comparison_response_echoes_probe_identity_and_maps_to_evidence() {
+        let key = mk_key(b"probe-response").as_bytes32();
+        let receipt = comparison_receipt(key, 13);
+        let roster = ScrubComparisonTargetRoster::new(receipt, 88, vec![10, 20], vec![10, 20])
+            .expect("valid roster");
+        let plan = roster.build_probe_plan(
+            4,
+            12,
+            comparison_subject(),
+            key,
+            ScrubComparisonChecksumLayer::EncodedContentChunk,
+            Some([0x5A; 32]),
+        );
+        let probe = &plan.probes[0];
+        let candidate = probe.candidate();
+        assert_eq!(candidate.object_key, key);
+        assert_eq!(candidate.placement_receipt_generation, 13);
+        assert_eq!(candidate.membership_epoch, 88);
+
+        let response = ScrubComparisonResponse::new(
+            probe,
+            probe.target_peer_id,
+            88,
+            ScrubComparisonPeerOutcome::Clean {
+                checksum: [0x5A; 32],
+            },
+        );
+        assert!(response.echoes_probe_identity(probe));
+
+        let evidence = response.to_replica_evidence();
+        assert_eq!(evidence.replica_id, probe.target_peer_id);
+        assert_eq!(evidence.object_key, key);
+        assert_eq!(evidence.placement_receipt_generation, 13);
+        assert_eq!(evidence.membership_epoch, 88);
+        assert!(matches!(
+            evidence.read_outcome,
+            EvidenceReadOutcome::Clean { checksum } if checksum == [0x5A; 32]
+        ));
+
+        let mut stale_response = response.clone();
+        stale_response.object_key = mk_key(b"other-object").as_bytes32();
+        assert!(!stale_response.echoes_probe_identity(probe));
+    }
+
+    #[test]
+    fn comparison_roster_rejects_non_committed_receipts_and_width_mismatch() {
+        let key = mk_key(b"bad-receipt").as_bytes32();
+        let synthetic = PlacementReceiptRef::new(
+            9,
+            key,
+            Default::default(),
+            0,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            4096,
+            [0x5A; 32],
+            2,
+        );
+        assert_eq!(
+            ScrubComparisonTargetRoster::new(synthetic, 1, vec![10, 20], vec![10, 20]),
+            Err(ScrubComparisonAdmissionError::ReceiptNotCommitted)
+        );
+
+        let receipt = comparison_receipt(key, 14);
+        assert_eq!(
+            ScrubComparisonTargetRoster::new(receipt, 1, vec![10], vec![10]),
+            Err(ScrubComparisonAdmissionError::ReceiptTargetCountMismatch {
+                declared: 2,
+                actual: 1,
+            })
+        );
     }
 
     // ── Request/Response tests ────────────────────────────────────
