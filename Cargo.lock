@@ -3519,6 +3519,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-storage-intent-prefetch-executor"
+version = "0.421.0"
+dependencies = [
+ "serde",
+ "tidefs-storage-intent-core",
+ "tidefs-storage-intent-cost",
+]
+
+[[package]]
 name = "tidefs-storage-intent-read-serving"
 version = "0.421.0"
 dependencies = [

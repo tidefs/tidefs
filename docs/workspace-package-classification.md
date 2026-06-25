@@ -1,6 +1,6 @@
 # Workspace Package Classification
 
-Updated from current Cargo metadata and on-disk manifest discovery for issue #862 on 2026-06-24.
+Updated from current Cargo metadata and on-disk manifest discovery for issue #972 on 2026-06-25.
 This document is the package-role authority for TideFS workspace selection and TFR-002/TFR-019 reduction.
 It is enforced by `cargo run -p tidefs-xtask -- check-workspace-policy`.
 
@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 163 |
+| Workspace packages | 164 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 168 |
-| Classified package roots | 168 |
+| Discovered package manifests | 169 |
+| Classified package roots | 169 |
 
 ## TFR-002 Category Mapping
 
@@ -25,7 +25,7 @@ root.
 
 | TFR-002 category | Current roles | Count | Boundary |
 | --- | --- | ---: | --- |
-| `product` | `product-code`, `adapter-operator` | 142 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
+| `product` | `product-code`, `adapter-operator` | 143 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
 | `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 25 | Repo policy tooling, CI/developer support, demos, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
 | `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
 | `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
@@ -52,7 +52,7 @@ holding area.
 
 | Role | Count |
 | --- | ---: |
-| `product-code` | 128 |
+| `product-code` | 129 |
 | `adapter-operator` | 14 |
 | `policy-tooling` | 8 |
 | `proof-harness` | 12 |
@@ -198,6 +198,7 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-storage-intent-local-media-capability` | `tidefs-storage-intent-local-media-capability` | `workspace-member` | `product-code` | planned authority surface for #960 local media-capability producer records; model/fixture slice only and downstream freshness/runtime wiring required before release claims. |
 | `crates/tidefs-storage-intent-media-capability-refresh` | `tidefs-storage-intent-media-capability-refresh` | `workspace-member` | `product-code` | planned authority surface for #962 media-capability freshness and invalidation records; model/fixture slice only and downstream #913 consumer wiring required before release claims. |
 | `crates/tidefs-storage-intent-policy` | `tidefs-storage-intent-policy` | `workspace-member` | `product-code` | planned authority surface for #855 dataset-scoped storage-intent policy source compilation; downstream persistence, UAPI, runtime execution, and claim evidence required before release claims. |
+| `crates/tidefs-storage-intent-prefetch-executor` | `tidefs-storage-intent-prefetch-executor` | `workspace-member` | `product-code` | planned authority surface for #972 prefetch/staging executor records; model-only slice consumes #967/#913 decisions and evidence, preserves cache/trial/staged state, and leaves runtime I/O plus durable receipt authority separately gated. |
 | `crates/tidefs-storage-intent-read-serving` | `tidefs-storage-intent-read-serving` | `workspace-member` | `product-code` | planned authority surface for #877 storage-intent read-serving authority model; follow-up issue required for concrete dependency wiring and release claims. |
 | `crates/tidefs-storage-intent-remote-media-capability` | `tidefs-storage-intent-remote-media-capability` | `workspace-member` | `product-code` | planned authority surface for #961 remote/object/archive media-capability producer records; model/fixture slice only, RDMA is not a correctness dependency, and downstream freshness/runtime wiring is required before release claims. |
 | `crates/tidefs-storage-intent-satisfaction` | `tidefs-storage-intent-satisfaction` | `workspace-member` | `product-code` | planned authority surface for #874 storage-intent satisfaction reconciliation; model-only slice with read-only satisfaction records, no placement/movement/retirement execution; downstream runtime and consumer wiring required before release claims. |
@@ -275,6 +276,7 @@ Zero reverse dependencies do not imply deletion. They mean the package is an ent
 | `crates/tidefs-storage-intent-cost` | `tidefs-storage-intent-cost` | `product-code` | planned authority surface for non-wear storage-intent cost ledgers and budget snapshots; zero reverse dependencies reflect planner/consumer-boundary wiring, not placeholder status; downstream admission, placement, and performance consumers remain separately gated. |
 | `crates/tidefs-storage-intent-media-capability-refresh` | `tidefs-storage-intent-media-capability-refresh` | `product-code` | planned authority surface for #962 media-capability freshness and invalidation records; concrete #913 evidence-cut consumers and runtime wiring required before release claims. |
 | `crates/tidefs-storage-intent-policy` | `tidefs-storage-intent-policy` | `product-code` | planned authority surface for #855 dataset-scoped storage-intent policy source compilation; downstream persistence, UAPI, runtime execution, and claim evidence required before release claims. |
+| `crates/tidefs-storage-intent-prefetch-executor` | `tidefs-storage-intent-prefetch-executor` | `product-code` | planned authority surface for #972 prefetch/staging executor records; model-only slice consumes #967/#913 decisions and evidence, preserves cache/trial/staged state, and leaves runtime I/O plus durable receipt authority separately gated. |
 | `crates/tidefs-storage-intent-remote-media-capability` | `tidefs-storage-intent-remote-media-capability` | `product-code` | planned authority surface for #961 remote/object/archive media-capability producer records; concrete adapters and #913 evidence-cut wiring required before release claims. |
 | `crates/tidefs-storage-intent-satisfaction` | `tidefs-storage-intent-satisfaction` | `product-code` | planned authority surface for #874 storage-intent satisfaction reconciliation; model-only slice with read-only satisfaction records, no placement/movement/retirement execution; downstream runtime and consumer wiring required before release claims. |
 | `crates/tidefs-storage-intent-scheduler` | `tidefs-storage-intent-scheduler` | `product-code` | planned authority surface for #862 intent-aware admission lanes, QoS budgets, backpressure, speculative-drop behavior, and read-only scheduling evidence; zero reverse dependencies reflect adapter-integration boundaries, not placeholder status; FUSE, block, transport, and mounted runtime wiring remain separately gated. |

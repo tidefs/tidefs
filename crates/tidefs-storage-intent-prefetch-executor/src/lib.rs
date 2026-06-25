@@ -1,0 +1,2020 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+#![no_std]
+#![forbid(unsafe_code)]
+
+//! Storage-intent prefetch and staging executor boundary (#972).
+//!
+//! This crate records what a prefetch executor may attempt after #967 has
+//! already selected a legal prefetch/residency decision and #913 has supplied a
+//! lawful evidence cut. It does not move bytes, wire FUSE/block/transport
+//! adapters, publish replacement receipts, retire sources, satisfy durable sync,
+//! decide placement, or make performance/product claims.
+
+use core::fmt;
+
+use tidefs_storage_intent_core::{
+    AccessPatternClass, EvidenceCompletenessVerdict, EvidenceQuerySubjectScopeClass,
+    PredictionConfidence, PrefetchResidencyCandidateClass, PrefetchResidencyDecisionOutcome,
+    PrefetchResidencyDecisionRecord, PrefetchResidencyStateClass, StorageIntentActionClass,
+    StorageIntentDomainId, StorageIntentEvidenceId, StorageIntentEvidenceKind,
+    StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef, StorageIntentObjectScope,
+    StorageIntentPolicyId, StorageIntentPolicyRevision, StorageIntentRefusalReason,
+    StorageMediaClass,
+};
+use tidefs_storage_intent_cost::{
+    StorageIntentCostClass, StorageIntentCostEvidenceState, StorageIntentCostSnapshot,
+};
+
+macro_rules! impl_u8_canonical {
+    ($ty:ident, { $($variant:ident = $value:literal => $name:literal),+ $(,)? }) => {
+        impl $ty {
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)+
+                }
+            }
+
+            #[must_use]
+            pub const fn to_discriminant(self) -> u8 {
+                self as u8
+            }
+
+            #[must_use]
+            pub const fn from_discriminant(raw: u8) -> Option<Self> {
+                match raw {
+                    $($value => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+pub const STORAGE_INTENT_PREFETCH_EXECUTOR_VERSION: u16 = 1;
+pub const STORAGE_INTENT_PREFETCH_EXECUTOR_SPEC: &str =
+    "tidefs-storage-intent-prefetch-executor-v1-issue-972";
+
+const EMPTY_EVIDENCE_REF: StorageIntentEvidenceRef = StorageIntentEvidenceRef {
+    kind: StorageIntentEvidenceKind::Unknown,
+    id: StorageIntentEvidenceId::ZERO,
+    generation: 0,
+    version: 0,
+};
+
+const EMPTY_SCOPE: StorageIntentObjectScope = StorageIntentObjectScope {
+    dataset_id: StorageIntentDomainId::ZERO,
+    object_id: StorageIntentEvidenceId::ZERO,
+    range_start: 0,
+    range_len: 0,
+    generation: 0,
+};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchExecutorActionFamily {
+    #[default]
+    Unknown = 0,
+    BoundedSequentialReadahead = 1,
+    StridedVectorRangePrefetch = 2,
+    MetadataNamespaceWalkPrefetch = 3,
+    SmallRandomHotsetCacheTrial = 4,
+    ManifestIndexFanout = 5,
+    SnapshotCloneRepeatedRead = 6,
+    DegradedReadReconstruction = 7,
+    WanGeoDeltaPrefetch = 8,
+    ObjectArchiveRestoreStaging = 9,
+    ExplicitNoPrefetch = 10,
+    AuthorityChangingHandoff = 11,
+    Unsupported = 12,
+}
+
+impl_u8_canonical!(PrefetchExecutorActionFamily, {
+    Unknown = 0 => "unknown",
+    BoundedSequentialReadahead = 1 => "bounded-sequential-readahead",
+    StridedVectorRangePrefetch = 2 => "strided-vector-range-prefetch",
+    MetadataNamespaceWalkPrefetch = 3 => "metadata-namespace-walk-prefetch",
+    SmallRandomHotsetCacheTrial = 4 => "small-random-hotset-cache-trial",
+    ManifestIndexFanout = 5 => "manifest-index-fanout",
+    SnapshotCloneRepeatedRead = 6 => "snapshot-clone-repeated-read",
+    DegradedReadReconstruction = 7 => "degraded-read-reconstruction",
+    WanGeoDeltaPrefetch = 8 => "wan-geo-delta-prefetch",
+    ObjectArchiveRestoreStaging = 9 => "object-archive-restore-staging",
+    ExplicitNoPrefetch = 10 => "explicit-no-prefetch",
+    AuthorityChangingHandoff = 11 => "authority-changing-handoff",
+    Unsupported = 12 => "unsupported",
+});
+
+impl PrefetchExecutorActionFamily {
+    #[must_use]
+    pub const fn from_candidate(candidate: PrefetchResidencyCandidateClass) -> Self {
+        match candidate {
+            PrefetchResidencyCandidateClass::NoPrefetch => Self::ExplicitNoPrefetch,
+            PrefetchResidencyCandidateClass::BoundedReadahead => Self::BoundedSequentialReadahead,
+            PrefetchResidencyCandidateClass::StridedVectorPrefetch => {
+                Self::StridedVectorRangePrefetch
+            }
+            PrefetchResidencyCandidateClass::MetadataNamespacePrefetch => {
+                Self::MetadataNamespaceWalkPrefetch
+            }
+            PrefetchResidencyCandidateClass::SmallRandomHotsetTrial
+            | PrefetchResidencyCandidateClass::CacheOnlyTrial
+            | PrefetchResidencyCandidateClass::VolatileRamTrial => {
+                Self::SmallRandomHotsetCacheTrial
+            }
+            PrefetchResidencyCandidateClass::ManifestIndexPrefetch => Self::ManifestIndexFanout,
+            PrefetchResidencyCandidateClass::SnapshotClonePrefetch => {
+                Self::SnapshotCloneRepeatedRead
+            }
+            PrefetchResidencyCandidateClass::DegradedReadPrefetch => {
+                Self::DegradedReadReconstruction
+            }
+            PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch => Self::WanGeoDeltaPrefetch,
+            PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage => {
+                Self::ObjectArchiveRestoreStaging
+            }
+            PrefetchResidencyCandidateClass::AuthorityPromotionCandidate
+            | PrefetchResidencyCandidateClass::DemotionCandidate
+            | PrefetchResidencyCandidateClass::IntentBackedRam
+            | PrefetchResidencyCandidateClass::PmemDurable => Self::AuthorityChangingHandoff,
+            PrefetchResidencyCandidateClass::FlashHotServing
+            | PrefetchResidencyCandidateClass::HddLocalityOptimized => {
+                Self::BoundedSequentialReadahead
+            }
+            PrefetchResidencyCandidateClass::Cooldown
+            | PrefetchResidencyCandidateClass::NeedMoreEvidence
+            | PrefetchResidencyCandidateClass::Refused => Self::Unsupported,
+        }
+    }
+
+    #[must_use]
+    pub const fn action_class(self) -> StorageIntentActionClass {
+        match self {
+            Self::ExplicitNoPrefetch
+            | Self::BoundedSequentialReadahead
+            | Self::StridedVectorRangePrefetch
+            | Self::ManifestIndexFanout
+            | Self::SnapshotCloneRepeatedRead => StorageIntentActionClass::QueuePrefetchTuning,
+            Self::MetadataNamespaceWalkPrefetch => StorageIntentActionClass::ReadSourceRefresh,
+            Self::SmallRandomHotsetCacheTrial => StorageIntentActionClass::CacheOnlyServingTrial,
+            Self::DegradedReadReconstruction => {
+                StorageIntentActionClass::DegradedReadReconstruction
+            }
+            Self::WanGeoDeltaPrefetch => StorageIntentActionClass::GeoCatchup,
+            Self::ObjectArchiveRestoreStaging => StorageIntentActionClass::ArchiveMigration,
+            Self::AuthorityChangingHandoff => StorageIntentActionClass::AuthorityPromotion,
+            Self::Unknown | Self::Unsupported => StorageIntentActionClass::QueuePrefetchTuning,
+        }
+    }
+
+    #[must_use]
+    pub const fn needs_remote_path_evidence(self) -> bool {
+        matches!(
+            self,
+            Self::WanGeoDeltaPrefetch | Self::ObjectArchiveRestoreStaging
+        )
+    }
+
+    #[must_use]
+    pub const fn needs_metadata_namespace_evidence(self) -> bool {
+        matches!(
+            self,
+            Self::MetadataNamespaceWalkPrefetch
+                | Self::ManifestIndexFanout
+                | Self::SnapshotCloneRepeatedRead
+        )
+    }
+
+    #[must_use]
+    pub const fn is_negative_enforcement(self) -> bool {
+        matches!(self, Self::ExplicitNoPrefetch)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchExecutorByteState {
+    #[default]
+    Unknown = 0,
+    CacheOnly = 1,
+    CacheOnlyTrial = 2,
+    Staged = 3,
+    DegradedVisible = 4,
+    NoPrefetchEnforced = 5,
+    HandoffRequired = 6,
+    Blocked = 7,
+    Refused = 8,
+    Unavailable = 9,
+}
+
+impl_u8_canonical!(PrefetchExecutorByteState, {
+    Unknown = 0 => "unknown",
+    CacheOnly = 1 => "cache-only",
+    CacheOnlyTrial = 2 => "cache-only-trial",
+    Staged = 3 => "staged",
+    DegradedVisible = 4 => "degraded-visible",
+    NoPrefetchEnforced = 5 => "no-prefetch-enforced",
+    HandoffRequired = 6 => "handoff-required",
+    Blocked = 7 => "blocked",
+    Refused = 8 => "refused",
+    Unavailable = 9 => "unavailable",
+});
+
+impl PrefetchExecutorByteState {
+    #[must_use]
+    pub const fn is_non_authority(self) -> bool {
+        matches!(
+            self,
+            Self::CacheOnly
+                | Self::CacheOnlyTrial
+                | Self::Staged
+                | Self::DegradedVisible
+                | Self::NoPrefetchEnforced
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchExecutorOutcome {
+    #[default]
+    Unknown = 0,
+    Started = 1,
+    Dropped = 2,
+    Throttled = 3,
+    Completed = 4,
+    Stale = 5,
+    TimedOut = 6,
+    Refused = 7,
+    DegradedVisible = 8,
+    OverBudget = 9,
+    VerificationFailed = 10,
+    HandoffRequired = 11,
+    Blocked = 12,
+    Unavailable = 13,
+}
+
+impl_u8_canonical!(PrefetchExecutorOutcome, {
+    Unknown = 0 => "unknown",
+    Started = 1 => "started",
+    Dropped = 2 => "dropped",
+    Throttled = 3 => "throttled",
+    Completed = 4 => "completed",
+    Stale = 5 => "stale",
+    TimedOut = 6 => "timed-out",
+    Refused = 7 => "refused",
+    DegradedVisible = 8 => "degraded-visible",
+    OverBudget = 9 => "over-budget",
+    VerificationFailed = 10 => "verification-failed",
+    HandoffRequired = 11 => "handoff-required",
+    Blocked = 12 => "blocked",
+    Unavailable = 13 => "unavailable",
+});
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchExecutorSchedulerLane {
+    #[default]
+    Unknown = 0,
+    Control = 1,
+    Metadata = 2,
+    Demand = 3,
+    Speculative = 4,
+    Background = 5,
+}
+
+impl_u8_canonical!(PrefetchExecutorSchedulerLane, {
+    Unknown = 0 => "unknown",
+    Control = 1 => "control",
+    Metadata = 2 => "metadata",
+    Demand = 3 => "demand",
+    Speculative = 4 => "speculative",
+    Background = 5 => "background",
+});
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchExecutorAdmissionOutcome {
+    #[default]
+    Unknown = 0,
+    Admitted = 1,
+    Dropped = 2,
+    Throttled = 3,
+    Expired = 4,
+    Refused = 5,
+    Blocked = 6,
+    Unavailable = 7,
+}
+
+impl_u8_canonical!(PrefetchExecutorAdmissionOutcome, {
+    Unknown = 0 => "unknown",
+    Admitted = 1 => "admitted",
+    Dropped = 2 => "dropped",
+    Throttled = 3 => "throttled",
+    Expired = 4 => "expired",
+    Refused = 5 => "refused",
+    Blocked = 6 => "blocked",
+    Unavailable = 7 => "unavailable",
+});
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorPressureMask(pub u64);
+
+impl PrefetchExecutorPressureMask {
+    pub const EMPTY: Self = Self(0);
+    pub const FOREGROUND_POSIX_SYNC: Self = Self(1_u64 << 0);
+    pub const REPAIR: Self = Self(1_u64 << 1);
+    pub const EVACUATION: Self = Self(1_u64 << 2);
+    pub const RECEIPT_RETIREMENT: Self = Self(1_u64 << 3);
+    pub const MEMORY: Self = Self(1_u64 << 4);
+    pub const WEAR: Self = Self(1_u64 << 5);
+    pub const EGRESS: Self = Self(1_u64 << 6);
+    pub const RESTORE_COST: Self = Self(1_u64 << 7);
+    pub const P99_LATENCY: Self = Self(1_u64 << 8);
+    pub const PROTECTED_RESERVE: Self = Self(1_u64 << 9);
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorAntiWasteMask(pub u64);
+
+impl PrefetchExecutorAntiWasteMask {
+    pub const EMPTY: Self = Self(0);
+    pub const ONE_PASS_SCAN: Self = Self(1_u64 << 0);
+    pub const PHASE_CHANGE: Self = Self(1_u64 << 1);
+    pub const LOW_SAMPLE_MASS: Self = Self(1_u64 << 2);
+    pub const CONTRADICTED_HINTS: Self = Self(1_u64 << 3);
+    pub const MEMORY_ONLY_EVIDENCE: Self = Self(1_u64 << 4);
+    pub const SAMPLED_AWAY: Self = Self(1_u64 << 5);
+    pub const NOISY_NEIGHBOR_PRESSURE: Self = Self(1_u64 << 6);
+    pub const FAILED_PAYBACK: Self = Self(1_u64 << 7);
+    pub const LOW_DWELL: Self = Self(1_u64 << 8);
+    pub const COOLDOWN: Self = Self(1_u64 << 9);
+    pub const UNKNOWN_WAF: Self = Self(1_u64 << 10);
+    pub const UNKNOWN_EGRESS_OR_RESTORE_COST: Self = Self(1_u64 << 11);
+    pub const PROTECTED_RESERVE_PRESSURE: Self = Self(1_u64 << 12);
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+
+    #[must_use]
+    pub const fn cancellation_mask() -> Self {
+        Self(
+            Self::ONE_PASS_SCAN.0
+                | Self::PHASE_CHANGE.0
+                | Self::LOW_SAMPLE_MASS.0
+                | Self::CONTRADICTED_HINTS.0
+                | Self::MEMORY_ONLY_EVIDENCE.0
+                | Self::SAMPLED_AWAY.0
+                | Self::NOISY_NEIGHBOR_PRESSURE.0
+                | Self::FAILED_PAYBACK.0
+                | Self::LOW_DWELL.0
+                | Self::COOLDOWN.0
+                | Self::PROTECTED_RESERVE_PRESSURE.0,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorCostRequirementMask(pub u64);
+
+impl PrefetchExecutorCostRequirementMask {
+    pub const EMPTY: Self = Self(0);
+    pub const FLASH_WRITES: Self = Self(1_u64 << 0);
+    pub const CACHE_DEVICE_INDEXES: Self = Self(1_u64 << 1);
+    pub const PREDICTOR_CHECKPOINTS: Self = Self(1_u64 << 2);
+    pub const RETAINED_EVIDENCE: Self = Self(1_u64 << 3);
+    pub const RAM_PMEM_CAPACITY: Self = Self(1_u64 << 4);
+    pub const CPU: Self = Self(1_u64 << 5);
+    pub const MEMORY: Self = Self(1_u64 << 6);
+    pub const WAN_BANDWIDTH: Self = Self(1_u64 << 7);
+    pub const EGRESS: Self = Self(1_u64 << 8);
+    pub const OBJECT_ARCHIVE_RESTORE_CALLS: Self = Self(1_u64 << 9);
+    pub const STAGING_CAPACITY: Self = Self(1_u64 << 10);
+    pub const FOREGROUND_DISRUPTION: Self = Self(1_u64 << 11);
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorCostState {
+    pub snapshot: StorageIntentCostSnapshot,
+    pub required: PrefetchExecutorCostRequirementMask,
+    pub unknown_waf: bool,
+    pub unknown_egress_or_restore_cost: bool,
+    pub missing_isolation_evidence: bool,
+    pub over_budget: bool,
+    pub cost_ref: StorageIntentEvidenceRef,
+    pub isolation_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for PrefetchExecutorCostState {
+    fn default() -> Self {
+        Self {
+            snapshot: StorageIntentCostSnapshot::default(),
+            required: PrefetchExecutorCostRequirementMask::EMPTY,
+            unknown_waf: false,
+            unknown_egress_or_restore_cost: false,
+            missing_isolation_evidence: false,
+            over_budget: false,
+            cost_ref: EMPTY_EVIDENCE_REF,
+            isolation_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+impl PrefetchExecutorCostState {
+    #[must_use]
+    pub fn missing_required_cost(self) -> bool {
+        (self
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::EGRESS)
+            && class_missing_or_unknown(
+                self.snapshot.evidence_state,
+                StorageIntentCostClass::NetworkEgress,
+            ))
+            || (self
+                .required
+                .contains(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS)
+                && class_missing_or_unknown(
+                    self.snapshot.evidence_state,
+                    StorageIntentCostClass::RestoreTime,
+                ))
+            || (self
+                .required
+                .contains(PrefetchExecutorCostRequirementMask::CPU)
+                && class_missing_or_unknown(
+                    self.snapshot.evidence_state,
+                    StorageIntentCostClass::CpuProcessing,
+                ))
+            || (self
+                .required
+                .contains(PrefetchExecutorCostRequirementMask::MEMORY)
+                && class_missing_or_unknown(
+                    self.snapshot.evidence_state,
+                    StorageIntentCostClass::MemoryUsage,
+                ))
+            || (self
+                .required
+                .contains(PrefetchExecutorCostRequirementMask::STAGING_CAPACITY)
+                && class_missing_or_unknown(
+                    self.snapshot.evidence_state,
+                    StorageIntentCostClass::CapacityMediaClass,
+                ))
+            || (self
+                .required
+                .contains(PrefetchExecutorCostRequirementMask::FOREGROUND_DISRUPTION)
+                && class_missing_or_unknown(
+                    self.snapshot.evidence_state,
+                    StorageIntentCostClass::ForegroundDisruption,
+                ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorAdmissionRecord {
+    pub lane: PrefetchExecutorSchedulerLane,
+    pub outcome: PrefetchExecutorAdmissionOutcome,
+    pub pressure: PrefetchExecutorPressureMask,
+    pub droppable: bool,
+    pub throttleable: bool,
+    pub expirable: bool,
+    pub reserve_protected: bool,
+    pub budget_owner: StorageIntentDomainId,
+    pub requested_bytes: u64,
+    pub admitted_bytes: u64,
+    pub queue_time_us: u64,
+    pub refusal: StorageIntentRefusalReason,
+    pub scheduler_admission_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for PrefetchExecutorAdmissionRecord {
+    fn default() -> Self {
+        Self {
+            lane: PrefetchExecutorSchedulerLane::Unknown,
+            outcome: PrefetchExecutorAdmissionOutcome::Unknown,
+            pressure: PrefetchExecutorPressureMask::EMPTY,
+            droppable: false,
+            throttleable: false,
+            expirable: false,
+            reserve_protected: false,
+            budget_owner: StorageIntentDomainId::ZERO,
+            requested_bytes: 0,
+            admitted_bytes: 0,
+            queue_time_us: 0,
+            refusal: StorageIntentRefusalReason::None,
+            scheduler_admission_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+impl PrefetchExecutorAdmissionRecord {
+    #[must_use]
+    pub const fn admitted(
+        lane: PrefetchExecutorSchedulerLane,
+        budget_owner: StorageIntentDomainId,
+        evidence_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        Self {
+            lane,
+            outcome: PrefetchExecutorAdmissionOutcome::Admitted,
+            pressure: PrefetchExecutorPressureMask::EMPTY,
+            droppable: false,
+            throttleable: true,
+            expirable: false,
+            reserve_protected: false,
+            budget_owner,
+            requested_bytes: 0,
+            admitted_bytes: 0,
+            queue_time_us: 0,
+            refusal: StorageIntentRefusalReason::None,
+            scheduler_admission_ref: evidence_ref,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_outcome(
+        mut self,
+        outcome: PrefetchExecutorAdmissionOutcome,
+        refusal: StorageIntentRefusalReason,
+    ) -> Self {
+        self.outcome = outcome;
+        self.refusal = refusal;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_speculative_controls(
+        mut self,
+        droppable: bool,
+        throttleable: bool,
+        expirable: bool,
+    ) -> Self {
+        self.droppable = droppable;
+        self.throttleable = throttleable;
+        self.expirable = expirable;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchExecutorHandoffTarget {
+    #[default]
+    None = 0,
+    Promotion = 1,
+    Demotion = 2,
+    SourceRetirement = 3,
+    DurableResidencyChange = 4,
+    ReceiptPublication = 5,
+}
+
+impl_u8_canonical!(PrefetchExecutorHandoffTarget, {
+    None = 0 => "none",
+    Promotion = 1 => "promotion",
+    Demotion = 2 => "demotion",
+    SourceRetirement = 3 => "source-retirement",
+    DurableResidencyChange = 4 => "durable-residency-change",
+    ReceiptPublication = 5 => "receipt-publication",
+});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorMediaPath {
+    pub source_media: StorageMediaClass,
+    pub target_media: StorageMediaClass,
+    pub source_path_ref: StorageIntentEvidenceRef,
+    pub target_destination_ref: StorageIntentEvidenceRef,
+    pub media_capability_ref: StorageIntentEvidenceRef,
+    pub transport_path_ref: StorageIntentEvidenceRef,
+    pub trust_domain_ref: StorageIntentEvidenceRef,
+    pub rdma_available: bool,
+}
+
+impl Default for PrefetchExecutorMediaPath {
+    fn default() -> Self {
+        Self {
+            source_media: StorageMediaClass::SystemRam,
+            target_media: StorageMediaClass::SystemRam,
+            source_path_ref: EMPTY_EVIDENCE_REF,
+            target_destination_ref: EMPTY_EVIDENCE_REF,
+            media_capability_ref: EMPTY_EVIDENCE_REF,
+            transport_path_ref: EMPTY_EVIDENCE_REF,
+            trust_domain_ref: EMPTY_EVIDENCE_REF,
+            rdma_available: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorEvidenceRefs {
+    pub compiled_policy_ref: StorageIntentEvidenceRef,
+    pub prefetch_decision_ref: StorageIntentEvidenceRef,
+    pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
+    pub scheduler_admission_ref: StorageIntentEvidenceRef,
+    pub cost_wear_ref: StorageIntentEvidenceRef,
+    pub egress_restore_cost_ref: StorageIntentEvidenceRef,
+    pub media_capability_ref: StorageIntentEvidenceRef,
+    pub source_media_ref: StorageIntentEvidenceRef,
+    pub target_media_ref: StorageIntentEvidenceRef,
+    pub source_path_ref: StorageIntentEvidenceRef,
+    pub target_destination_ref: StorageIntentEvidenceRef,
+    pub read_serving_boundary_ref: StorageIntentEvidenceRef,
+    pub relocation_boundary_ref: StorageIntentEvidenceRef,
+    pub result_refusal_ref: StorageIntentEvidenceRef,
+    pub tenant_isolation_ref: StorageIntentEvidenceRef,
+    pub transport_budget_ref: StorageIntentEvidenceRef,
+    pub trust_domain_ref: StorageIntentEvidenceRef,
+    pub retention_ref: StorageIntentEvidenceRef,
+    pub attribution_ref: StorageIntentEvidenceRef,
+    pub validation_ref: StorageIntentEvidenceRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorResultDetail {
+    pub prefetched_bytes: u64,
+    pub used_bytes: u64,
+    pub unused_bytes: u64,
+    pub expired_bytes: u64,
+    pub latency_benefit_us: u64,
+    pub latency_harm_us: u64,
+    pub foreground_p50_disruption_us: u64,
+    pub foreground_p95_disruption_us: u64,
+    pub foreground_p99_disruption_us: u64,
+    pub queue_delay_us: u64,
+    pub flash_write_bytes: u64,
+    pub pmem_write_bytes: u64,
+    pub waf_micros: u64,
+    pub ram_pressure_bytes: u64,
+    pub cache_index_write_bytes: u64,
+    pub predictor_metadata_write_bytes: u64,
+    pub wan_bytes: u64,
+    pub egress_cost_microunits: u64,
+    pub restore_cost_microunits: u64,
+    pub staging_capacity_bytes: u64,
+    pub cpu_us: u64,
+    pub memory_bytes: u64,
+    pub protected_reserve_pressure: bool,
+    pub attribution_ref: StorageIntentEvidenceRef,
+    pub retention_ref: StorageIntentEvidenceRef,
+    pub validation_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for PrefetchExecutorResultDetail {
+    fn default() -> Self {
+        Self {
+            prefetched_bytes: 0,
+            used_bytes: 0,
+            unused_bytes: 0,
+            expired_bytes: 0,
+            latency_benefit_us: 0,
+            latency_harm_us: 0,
+            foreground_p50_disruption_us: 0,
+            foreground_p95_disruption_us: 0,
+            foreground_p99_disruption_us: 0,
+            queue_delay_us: 0,
+            flash_write_bytes: 0,
+            pmem_write_bytes: 0,
+            waf_micros: 0,
+            ram_pressure_bytes: 0,
+            cache_index_write_bytes: 0,
+            predictor_metadata_write_bytes: 0,
+            wan_bytes: 0,
+            egress_cost_microunits: 0,
+            restore_cost_microunits: 0,
+            staging_capacity_bytes: 0,
+            cpu_us: 0,
+            memory_bytes: 0,
+            protected_reserve_pressure: false,
+            attribution_ref: EMPTY_EVIDENCE_REF,
+            retention_ref: EMPTY_EVIDENCE_REF,
+            validation_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+impl PrefetchExecutorResultDetail {
+    #[must_use]
+    pub const fn has_usage_measurement(self) -> bool {
+        self.prefetched_bytes != 0
+            || self.used_bytes != 0
+            || self.unused_bytes != 0
+            || self.expired_bytes != 0
+    }
+
+    #[must_use]
+    pub const fn has_latency_measurement(self) -> bool {
+        self.latency_benefit_us != 0
+            || self.latency_harm_us != 0
+            || self.foreground_p50_disruption_us != 0
+            || self.foreground_p95_disruption_us != 0
+            || self.foreground_p99_disruption_us != 0
+            || self.queue_delay_us != 0
+    }
+
+    #[must_use]
+    pub const fn has_cost_or_pressure_measurement(self) -> bool {
+        self.flash_write_bytes != 0
+            || self.pmem_write_bytes != 0
+            || self.waf_micros != 0
+            || self.ram_pressure_bytes != 0
+            || self.cache_index_write_bytes != 0
+            || self.predictor_metadata_write_bytes != 0
+            || self.wan_bytes != 0
+            || self.egress_cost_microunits != 0
+            || self.restore_cost_microunits != 0
+            || self.staging_capacity_bytes != 0
+            || self.cpu_us != 0
+            || self.memory_bytes != 0
+            || self.protected_reserve_pressure
+    }
+
+    #[must_use]
+    pub const fn has_feedback_payback_inputs(self) -> bool {
+        self.has_usage_measurement()
+            || self.has_latency_measurement()
+            || self.has_cost_or_pressure_measurement()
+    }
+
+    #[must_use]
+    pub const fn has_feedback_evidence_root(self) -> bool {
+        self.attribution_ref.is_bound()
+            || self.retention_ref.is_bound()
+            || self.validation_ref.is_bound()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorInput {
+    pub decision: PrefetchResidencyDecisionRecord,
+    pub evidence_query_snapshot: StorageIntentEvidenceQuerySnapshot,
+    pub admission: PrefetchExecutorAdmissionRecord,
+    pub media_path: PrefetchExecutorMediaPath,
+    pub cost_state: PrefetchExecutorCostState,
+    pub result_detail: PrefetchExecutorResultDetail,
+    pub action_family: PrefetchExecutorActionFamily,
+    pub freshness_rpo_floor_ms: u64,
+    pub anti_waste: PrefetchExecutorAntiWasteMask,
+    pub require_known_waf: bool,
+    pub require_known_egress_restore_cost: bool,
+    pub require_budget_owner: bool,
+    pub require_isolation_evidence: bool,
+}
+
+impl Default for PrefetchExecutorInput {
+    fn default() -> Self {
+        Self {
+            decision: PrefetchResidencyDecisionRecord::default(),
+            evidence_query_snapshot: StorageIntentEvidenceQuerySnapshot::default(),
+            admission: PrefetchExecutorAdmissionRecord::default(),
+            media_path: PrefetchExecutorMediaPath::default(),
+            cost_state: PrefetchExecutorCostState::default(),
+            result_detail: PrefetchExecutorResultDetail::default(),
+            action_family: PrefetchExecutorActionFamily::Unknown,
+            freshness_rpo_floor_ms: 0,
+            anti_waste: PrefetchExecutorAntiWasteMask::EMPTY,
+            require_known_waf: false,
+            require_known_egress_restore_cost: false,
+            require_budget_owner: false,
+            require_isolation_evidence: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorRecord {
+    pub version: u16,
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub budget_owner: StorageIntentDomainId,
+    pub action_class: StorageIntentActionClass,
+    pub action_family: PrefetchExecutorActionFamily,
+    pub subject: StorageIntentObjectScope,
+    pub access_pattern: AccessPatternClass,
+    pub confidence: PredictionConfidence,
+    pub requested_candidate: PrefetchResidencyCandidateClass,
+    pub selected_candidate: PrefetchResidencyCandidateClass,
+    pub selected_residency: PrefetchResidencyStateClass,
+    pub decision_outcome: PrefetchResidencyDecisionOutcome,
+    pub executor_byte_state: PrefetchExecutorByteState,
+    pub source_media: StorageMediaClass,
+    pub target_media: StorageMediaClass,
+    pub source_path_ref: StorageIntentEvidenceRef,
+    pub target_destination_ref: StorageIntentEvidenceRef,
+    pub freshness_rpo_floor_ms: u64,
+    pub max_prefetch_window_bytes: u64,
+    pub max_staging_bytes: u64,
+    pub admission: PrefetchExecutorAdmissionRecord,
+    pub cost_state: PrefetchExecutorCostState,
+    pub result_detail: PrefetchExecutorResultDetail,
+    pub anti_waste: PrefetchExecutorAntiWasteMask,
+    pub outcome: PrefetchExecutorOutcome,
+    pub refusal: StorageIntentRefusalReason,
+    pub handoff_target: PrefetchExecutorHandoffTarget,
+    pub evidence_refs: PrefetchExecutorEvidenceRefs,
+}
+
+impl Default for PrefetchExecutorRecord {
+    fn default() -> Self {
+        Self {
+            version: STORAGE_INTENT_PREFETCH_EXECUTOR_VERSION,
+            policy_id: StorageIntentPolicyId::ZERO,
+            policy_revision: StorageIntentPolicyRevision(0),
+            budget_owner: StorageIntentDomainId::ZERO,
+            action_class: StorageIntentActionClass::QueuePrefetchTuning,
+            action_family: PrefetchExecutorActionFamily::Unknown,
+            subject: EMPTY_SCOPE,
+            access_pattern: AccessPatternClass::Unknown,
+            confidence: PredictionConfidence::Unknown,
+            requested_candidate: PrefetchResidencyCandidateClass::NoPrefetch,
+            selected_candidate: PrefetchResidencyCandidateClass::NoPrefetch,
+            selected_residency: PrefetchResidencyStateClass::Unknown,
+            decision_outcome: PrefetchResidencyDecisionOutcome::NoAction,
+            executor_byte_state: PrefetchExecutorByteState::Unknown,
+            source_media: StorageMediaClass::SystemRam,
+            target_media: StorageMediaClass::SystemRam,
+            source_path_ref: EMPTY_EVIDENCE_REF,
+            target_destination_ref: EMPTY_EVIDENCE_REF,
+            freshness_rpo_floor_ms: 0,
+            max_prefetch_window_bytes: 0,
+            max_staging_bytes: 0,
+            admission: PrefetchExecutorAdmissionRecord::default(),
+            cost_state: PrefetchExecutorCostState::default(),
+            result_detail: PrefetchExecutorResultDetail::default(),
+            anti_waste: PrefetchExecutorAntiWasteMask::EMPTY,
+            outcome: PrefetchExecutorOutcome::Unknown,
+            refusal: StorageIntentRefusalReason::None,
+            handoff_target: PrefetchExecutorHandoffTarget::None,
+            evidence_refs: PrefetchExecutorEvidenceRefs::default(),
+        }
+    }
+}
+
+impl PrefetchExecutorRecord {
+    #[must_use]
+    pub const fn can_publish_replacement_receipt(self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn can_retire_source_receipt(self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn can_satisfy_durable_sync(self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn implies_latest_read_authority(self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn is_non_authority_population(self) -> bool {
+        self.executor_byte_state.is_non_authority()
+    }
+
+    #[must_use]
+    pub const fn has_feedback_payback_inputs(self) -> bool {
+        self.result_detail.has_feedback_payback_inputs()
+    }
+
+    #[must_use]
+    pub const fn completed(mut self) -> Self {
+        self.outcome = PrefetchExecutorOutcome::Completed;
+        self
+    }
+
+    #[must_use]
+    pub const fn verification_failed(mut self) -> Self {
+        self.outcome = PrefetchExecutorOutcome::VerificationFailed;
+        self.refusal = StorageIntentRefusalReason::ValidationGateFailed;
+        self
+    }
+
+    #[must_use]
+    pub const fn timed_out(mut self) -> Self {
+        self.outcome = PrefetchExecutorOutcome::TimedOut;
+        self.refusal = StorageIntentRefusalReason::EvidenceNotUsable;
+        self
+    }
+}
+
+#[must_use]
+pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
+    let mut record = base_record(input);
+    let family = record.action_family;
+
+    if decision_identity_missing(input.decision) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+
+    if !snapshot_matches_decision(input.evidence_query_snapshot, input.decision) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Stale,
+            PrefetchExecutorByteState::Blocked,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+
+    if !evidence_ref_matches_snapshot(
+        input.decision.evidence_refs.evidence_query_ref,
+        input.evidence_query_snapshot,
+    ) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+
+    match input.evidence_query_snapshot.completeness {
+        EvidenceCompletenessVerdict::CompleteForPurpose => {}
+        EvidenceCompletenessVerdict::DegradedVisible => {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::DegradedVisible,
+                PrefetchExecutorByteState::DegradedVisible,
+                StorageIntentRefusalReason::None,
+            );
+        }
+        EvidenceCompletenessVerdict::Refused => {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::Refused,
+                PrefetchExecutorByteState::Refused,
+                snapshot_refusal(input.evidence_query_snapshot),
+            );
+        }
+        EvidenceCompletenessVerdict::Blocked
+        | EvidenceCompletenessVerdict::UnknownEvidence
+        | EvidenceCompletenessVerdict::PartialAdmissible
+        | EvidenceCompletenessVerdict::UnsafeVisible => {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::Blocked,
+                PrefetchExecutorByteState::Blocked,
+                snapshot_refusal(input.evidence_query_snapshot),
+            );
+        }
+    }
+
+    if !required_families_fresh(input.evidence_query_snapshot, family) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+
+    if family.is_negative_enforcement() || no_prefetch_decision(input.decision) {
+        record.executor_byte_state = PrefetchExecutorByteState::NoPrefetchEnforced;
+        record.outcome = PrefetchExecutorOutcome::Completed;
+        return record;
+    }
+
+    if decision_refused_or_needs_more_evidence(input.decision) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorByteState::Refused,
+            decision_refusal(input.decision),
+        );
+    }
+
+    if authority_handoff_required(input.decision, family) {
+        record.handoff_target = handoff_target(input.decision);
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::HandoffRequired,
+            PrefetchExecutorByteState::HandoffRequired,
+            StorageIntentRefusalReason::None,
+        );
+    }
+
+    if input.require_budget_owner && input.decision.budget_owner.is_zero() {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorByteState::Refused,
+            StorageIntentRefusalReason::UnownedWork,
+        );
+    }
+
+    if input.require_isolation_evidence
+        && (input.cost_state.missing_isolation_evidence
+            || !input.cost_state.isolation_ref.is_bound())
+    {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorByteState::Refused,
+            StorageIntentRefusalReason::MissingTenantDomainEvidence,
+        );
+    }
+
+    if input.require_known_waf
+        && (input.cost_state.unknown_waf
+            || input
+                .anti_waste
+                .intersects(PrefetchExecutorAntiWasteMask::UNKNOWN_WAF))
+    {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorByteState::Refused,
+            StorageIntentRefusalReason::FlashWearBudgetExceeded,
+        );
+    }
+
+    if input.require_known_egress_restore_cost
+        && (input.cost_state.unknown_egress_or_restore_cost
+            || input
+                .anti_waste
+                .intersects(PrefetchExecutorAntiWasteMask::UNKNOWN_EGRESS_OR_RESTORE_COST))
+    {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorByteState::Refused,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+
+    if input.cost_state.missing_required_cost() {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorByteState::Refused,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+
+    if input.cost_state.over_budget {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::OverBudget,
+            PrefetchExecutorByteState::Blocked,
+            StorageIntentRefusalReason::GuaranteeFloorNotMet,
+        );
+    }
+
+    if input
+        .anti_waste
+        .intersects(PrefetchExecutorAntiWasteMask::cancellation_mask())
+    {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Dropped,
+            PrefetchExecutorByteState::CacheOnly,
+            anti_waste_refusal(input.anti_waste),
+        );
+    }
+
+    match input.admission.outcome {
+        PrefetchExecutorAdmissionOutcome::Admitted => {
+            if !input.admission.scheduler_admission_ref.is_bound() {
+                terminal(
+                    record,
+                    PrefetchExecutorOutcome::Blocked,
+                    PrefetchExecutorByteState::Blocked,
+                    StorageIntentRefusalReason::EvidenceNotUsable,
+                )
+            } else {
+                record.executor_byte_state = byte_state_for_decision(input.decision, family);
+                record.outcome = PrefetchExecutorOutcome::Started;
+                record
+            }
+        }
+        PrefetchExecutorAdmissionOutcome::Dropped => terminal(
+            record,
+            PrefetchExecutorOutcome::Dropped,
+            PrefetchExecutorByteState::CacheOnly,
+            admission_refusal(input.admission),
+        ),
+        PrefetchExecutorAdmissionOutcome::Throttled => terminal(
+            record,
+            PrefetchExecutorOutcome::Throttled,
+            PrefetchExecutorByteState::CacheOnly,
+            admission_refusal(input.admission),
+        ),
+        PrefetchExecutorAdmissionOutcome::Expired => terminal(
+            record,
+            PrefetchExecutorOutcome::TimedOut,
+            PrefetchExecutorByteState::Unavailable,
+            admission_refusal(input.admission),
+        ),
+        PrefetchExecutorAdmissionOutcome::Refused => terminal(
+            record,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorByteState::Refused,
+            admission_refusal(input.admission),
+        ),
+        PrefetchExecutorAdmissionOutcome::Blocked => terminal(
+            record,
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            admission_refusal(input.admission),
+        ),
+        PrefetchExecutorAdmissionOutcome::Unavailable
+        | PrefetchExecutorAdmissionOutcome::Unknown => terminal(
+            record,
+            PrefetchExecutorOutcome::Unavailable,
+            PrefetchExecutorByteState::Unavailable,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        ),
+    }
+}
+
+fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
+    let family = if matches!(input.action_family, PrefetchExecutorActionFamily::Unknown) {
+        PrefetchExecutorActionFamily::from_candidate(input.decision.selected_candidate)
+    } else {
+        input.action_family
+    };
+
+    PrefetchExecutorRecord {
+        policy_id: input.decision.policy_id,
+        policy_revision: input.decision.policy_revision,
+        budget_owner: input.decision.budget_owner,
+        action_class: family.action_class(),
+        action_family: family,
+        subject: input.decision.scope,
+        access_pattern: input.decision.access_pattern,
+        confidence: input.decision.confidence,
+        requested_candidate: input.decision.requested_candidate,
+        selected_candidate: input.decision.selected_candidate,
+        selected_residency: input.decision.selected_residency,
+        decision_outcome: input.decision.outcome,
+        source_media: input.decision.source_media,
+        target_media: input.decision.target_media,
+        source_path_ref: input.media_path.source_path_ref,
+        target_destination_ref: input.media_path.target_destination_ref,
+        freshness_rpo_floor_ms: input.freshness_rpo_floor_ms,
+        max_prefetch_window_bytes: input.decision.max_prefetch_window_bytes,
+        max_staging_bytes: input.decision.max_staging_bytes,
+        admission: input.admission,
+        cost_state: input.cost_state,
+        result_detail: input.result_detail,
+        anti_waste: input.anti_waste,
+        evidence_refs: PrefetchExecutorEvidenceRefs {
+            compiled_policy_ref: input.decision.evidence_refs.compiled_policy_ref,
+            prefetch_decision_ref: input.decision.evidence_refs.decision_frontier_ref,
+            evidence_query_snapshot_ref: input.decision.evidence_refs.evidence_query_ref,
+            scheduler_admission_ref: input.admission.scheduler_admission_ref,
+            cost_wear_ref: input.decision.evidence_refs.cost_wear_ref,
+            egress_restore_cost_ref: input.decision.evidence_refs.egress_restore_cost_ref,
+            media_capability_ref: first_bound(
+                input.media_path.media_capability_ref,
+                input.decision.evidence_refs.media_capability_ref,
+            ),
+            source_media_ref: input.decision.source_media_ref,
+            target_media_ref: input.decision.target_media_ref,
+            source_path_ref: input.media_path.source_path_ref,
+            target_destination_ref: input.media_path.target_destination_ref,
+            read_serving_boundary_ref: input.decision.evidence_refs.read_serving_boundary_ref,
+            relocation_boundary_ref: input.decision.evidence_refs.relocation_boundary_ref,
+            result_refusal_ref: input.decision.evidence_refs.result_refusal_ref,
+            tenant_isolation_ref: first_bound(
+                input.cost_state.isolation_ref,
+                input.decision.evidence_refs.tenant_isolation_ref,
+            ),
+            transport_budget_ref: first_bound(
+                input.media_path.transport_path_ref,
+                input.decision.evidence_refs.transport_budget_ref,
+            ),
+            trust_domain_ref: first_bound(
+                input.media_path.trust_domain_ref,
+                input.decision.evidence_refs.trust_domain_ref,
+            ),
+            retention_ref: input.result_detail.retention_ref,
+            attribution_ref: input.result_detail.attribution_ref,
+            validation_ref: input.result_detail.validation_ref,
+        },
+        ..PrefetchExecutorRecord::default()
+    }
+}
+
+fn terminal(
+    mut record: PrefetchExecutorRecord,
+    outcome: PrefetchExecutorOutcome,
+    byte_state: PrefetchExecutorByteState,
+    refusal: StorageIntentRefusalReason,
+) -> PrefetchExecutorRecord {
+    record.outcome = outcome;
+    record.executor_byte_state = byte_state;
+    record.refusal = refusal;
+    record
+}
+
+fn decision_identity_missing(decision: PrefetchResidencyDecisionRecord) -> bool {
+    decision.policy_id.is_zero()
+        || decision.policy_revision.0 == 0
+        || decision.scope.dataset_id.is_zero()
+        || !decision.evidence_refs.decision_frontier_ref.is_bound()
+}
+
+fn snapshot_matches_decision(
+    snapshot: StorageIntentEvidenceQuerySnapshot,
+    decision: PrefetchResidencyDecisionRecord,
+) -> bool {
+    snapshot.has_query_identity()
+        && snapshot.has_policy_identity()
+        && snapshot.has_subject_scope()
+        && snapshot.subject.scope_class == EvidenceQuerySubjectScopeClass::ObjectRange
+        && snapshot.subject.object_scope == decision.scope
+        && snapshot.policy_id == decision.policy_id
+        && snapshot.policy_revision.0 >= decision.policy_revision.0
+}
+
+fn evidence_ref_matches_snapshot(
+    evidence_ref: StorageIntentEvidenceRef,
+    snapshot: StorageIntentEvidenceQuerySnapshot,
+) -> bool {
+    evidence_ref.kind == StorageIntentEvidenceKind::EvidenceQuerySnapshot
+        && evidence_ref.is_bound()
+        && evidence_ref.id == snapshot.snapshot_id
+        && evidence_ref.generation > 0
+        && evidence_ref.version > 0
+}
+
+fn required_families_fresh(
+    snapshot: StorageIntentEvidenceQuerySnapshot,
+    family: PrefetchExecutorActionFamily,
+) -> bool {
+    snapshot.contains_fresh_authority_family(StorageIntentEvidenceKind::EvidenceQuerySnapshot)
+        && snapshot
+            .contains_fresh_authority_family(StorageIntentEvidenceKind::DecisionFrontierEvidence)
+        && (family.is_negative_enforcement()
+            || snapshot.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            ))
+        && (!family.needs_metadata_namespace_evidence()
+            || snapshot.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            ))
+        && (!family.needs_remote_path_evidence()
+            || (snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::TransportPathEvidence)
+                && snapshot.contains_fresh_authority_family(
+                    StorageIntentEvidenceKind::TrustDomainEvidence,
+                )))
+        && (!matches!(
+            family,
+            PrefetchExecutorActionFamily::ObjectArchiveRestoreStaging
+                | PrefetchExecutorActionFamily::WanGeoDeltaPrefetch
+                | PrefetchExecutorActionFamily::BoundedSequentialReadahead
+                | PrefetchExecutorActionFamily::StridedVectorRangePrefetch
+                | PrefetchExecutorActionFamily::SmallRandomHotsetCacheTrial
+        ) || snapshot
+            .contains_fresh_authority_family(StorageIntentEvidenceKind::MediaCapabilityEvidence))
+        && snapshot
+            .contains_fresh_authority_family(StorageIntentEvidenceKind::ReadFreshnessEvidence)
+}
+
+fn no_prefetch_decision(decision: PrefetchResidencyDecisionRecord) -> bool {
+    matches!(
+        decision.selected_candidate,
+        PrefetchResidencyCandidateClass::NoPrefetch
+    ) || matches!(decision.outcome, PrefetchResidencyDecisionOutcome::NoAction)
+}
+
+fn decision_refused_or_needs_more_evidence(decision: PrefetchResidencyDecisionRecord) -> bool {
+    matches!(
+        decision.outcome,
+        PrefetchResidencyDecisionOutcome::Refused
+            | PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+    ) || matches!(
+        decision.selected_candidate,
+        PrefetchResidencyCandidateClass::NeedMoreEvidence
+            | PrefetchResidencyCandidateClass::Refused
+    ) || matches!(
+        decision.selected_residency,
+        PrefetchResidencyStateClass::Refused
+    )
+}
+
+fn authority_handoff_required(
+    decision: PrefetchResidencyDecisionRecord,
+    family: PrefetchExecutorActionFamily,
+) -> bool {
+    matches!(
+        family,
+        PrefetchExecutorActionFamily::AuthorityChangingHandoff
+    ) || matches!(
+        decision.selected_candidate,
+        PrefetchResidencyCandidateClass::AuthorityPromotionCandidate
+            | PrefetchResidencyCandidateClass::DemotionCandidate
+    ) || matches!(
+        decision.selected_residency,
+        PrefetchResidencyStateClass::IntentBackedRam
+            | PrefetchResidencyStateClass::PmemDurable
+            | PrefetchResidencyStateClass::RemoteDurable
+    ) || matches!(
+        decision.outcome,
+        PrefetchResidencyDecisionOutcome::PromotionCandidate
+            | PrefetchResidencyDecisionOutcome::DemotionCandidate
+    )
+}
+
+fn handoff_target(decision: PrefetchResidencyDecisionRecord) -> PrefetchExecutorHandoffTarget {
+    if matches!(
+        decision.selected_candidate,
+        PrefetchResidencyCandidateClass::DemotionCandidate
+    ) || matches!(
+        decision.outcome,
+        PrefetchResidencyDecisionOutcome::DemotionCandidate
+    ) {
+        PrefetchExecutorHandoffTarget::Demotion
+    } else if matches!(
+        decision.selected_residency,
+        PrefetchResidencyStateClass::IntentBackedRam
+            | PrefetchResidencyStateClass::PmemDurable
+            | PrefetchResidencyStateClass::RemoteDurable
+    ) {
+        PrefetchExecutorHandoffTarget::DurableResidencyChange
+    } else {
+        PrefetchExecutorHandoffTarget::Promotion
+    }
+}
+
+fn byte_state_for_decision(
+    decision: PrefetchResidencyDecisionRecord,
+    family: PrefetchExecutorActionFamily,
+) -> PrefetchExecutorByteState {
+    match family {
+        PrefetchExecutorActionFamily::ObjectArchiveRestoreStaging
+        | PrefetchExecutorActionFamily::WanGeoDeltaPrefetch => PrefetchExecutorByteState::Staged,
+        PrefetchExecutorActionFamily::DegradedReadReconstruction => {
+            PrefetchExecutorByteState::DegradedVisible
+        }
+        PrefetchExecutorActionFamily::SmallRandomHotsetCacheTrial => {
+            PrefetchExecutorByteState::CacheOnlyTrial
+        }
+        PrefetchExecutorActionFamily::ExplicitNoPrefetch => {
+            PrefetchExecutorByteState::NoPrefetchEnforced
+        }
+        _ if matches!(
+            decision.outcome,
+            PrefetchResidencyDecisionOutcome::ServingTrial
+                | PrefetchResidencyDecisionOutcome::CacheOnly
+        ) =>
+        {
+            PrefetchExecutorByteState::CacheOnlyTrial
+        }
+        _ => PrefetchExecutorByteState::CacheOnly,
+    }
+}
+
+fn decision_refusal(decision: PrefetchResidencyDecisionRecord) -> StorageIntentRefusalReason {
+    if matches!(decision.refusal, StorageIntentRefusalReason::None) {
+        StorageIntentRefusalReason::EvidenceNotUsable
+    } else {
+        decision.refusal
+    }
+}
+
+fn snapshot_refusal(snapshot: StorageIntentEvidenceQuerySnapshot) -> StorageIntentRefusalReason {
+    if matches!(snapshot.refusal, StorageIntentRefusalReason::None) {
+        StorageIntentRefusalReason::EvidenceNotUsable
+    } else {
+        snapshot.refusal
+    }
+}
+
+fn admission_refusal(admission: PrefetchExecutorAdmissionRecord) -> StorageIntentRefusalReason {
+    if matches!(admission.refusal, StorageIntentRefusalReason::None) {
+        StorageIntentRefusalReason::EvidenceNotUsable
+    } else {
+        admission.refusal
+    }
+}
+
+fn anti_waste_refusal(mask: PrefetchExecutorAntiWasteMask) -> StorageIntentRefusalReason {
+    if mask.intersects(PrefetchExecutorAntiWasteMask::NOISY_NEIGHBOR_PRESSURE) {
+        StorageIntentRefusalReason::NoisyNeighborPressure
+    } else if mask.intersects(PrefetchExecutorAntiWasteMask::FAILED_PAYBACK)
+        || mask.intersects(PrefetchExecutorAntiWasteMask::LOW_DWELL)
+        || mask.intersects(PrefetchExecutorAntiWasteMask::COOLDOWN)
+    {
+        StorageIntentRefusalReason::MovementDebtNotPaidBack
+    } else if mask.intersects(PrefetchExecutorAntiWasteMask::PROTECTED_RESERVE_PRESSURE) {
+        StorageIntentRefusalReason::ProtectedReserveWouldBeBreached
+    } else {
+        StorageIntentRefusalReason::EvidenceNotUsable
+    }
+}
+
+fn first_bound(
+    preferred: StorageIntentEvidenceRef,
+    fallback: StorageIntentEvidenceRef,
+) -> StorageIntentEvidenceRef {
+    if preferred.is_bound() {
+        preferred
+    } else {
+        fallback
+    }
+}
+
+fn class_missing_or_unknown(
+    state: StorageIntentCostEvidenceState,
+    class: StorageIntentCostClass,
+) -> bool {
+    state.class_is_missing(class) || state.class_is_stale(class) || state.class_is_refused(class)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tidefs_storage_intent_core::{
+        EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet, EvidenceQuerySubjectScope,
+        EvidenceQuerySubjectScopeClass, StorageIntentEvidenceRefs,
+    };
+
+    const POLICY: StorageIntentPolicyId = StorageIntentPolicyId([1; 16]);
+    const DATASET: StorageIntentDomainId = StorageIntentDomainId([2; 16]);
+    const BUDGET: StorageIntentDomainId = StorageIntentDomainId([3; 16]);
+    const OBJECT: StorageIntentEvidenceId = StorageIntentEvidenceId([4; 32]);
+    const SNAPSHOT: StorageIntentEvidenceId = StorageIntentEvidenceId([5; 32]);
+    const QUERY: StorageIntentEvidenceId = StorageIntentEvidenceId([6; 32]);
+    const DECISION: StorageIntentEvidenceId = StorageIntentEvidenceId([7; 32]);
+    const SCHED: StorageIntentEvidenceId = StorageIntentEvidenceId([8; 32]);
+    const MEDIA: StorageIntentEvidenceId = StorageIntentEvidenceId([9; 32]);
+    const READ: StorageIntentEvidenceId = StorageIntentEvidenceId([10; 32]);
+    const COST: StorageIntentEvidenceId = StorageIntentEvidenceId([11; 32]);
+    const ISO: StorageIntentEvidenceId = StorageIntentEvidenceId([12; 32]);
+    const TRANSPORT: StorageIntentEvidenceId = StorageIntentEvidenceId([13; 32]);
+    const TRUST: StorageIntentEvidenceId = StorageIntentEvidenceId([14; 32]);
+    const ATTRIBUTION: StorageIntentEvidenceId = StorageIntentEvidenceId([15; 32]);
+    const RETENTION: StorageIntentEvidenceId = StorageIntentEvidenceId([16; 32]);
+    const VALIDATION: StorageIntentEvidenceId = StorageIntentEvidenceId([17; 32]);
+
+    fn evidence(
+        kind: StorageIntentEvidenceKind,
+        id: StorageIntentEvidenceId,
+    ) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(kind, id, 1, 1)
+    }
+
+    fn scope() -> StorageIntentObjectScope {
+        StorageIntentObjectScope {
+            dataset_id: DATASET,
+            object_id: OBJECT,
+            range_start: 4096,
+            range_len: 8192,
+            generation: 9,
+        }
+    }
+
+    fn fresh(
+        kind: StorageIntentEvidenceKind,
+        id: StorageIntentEvidenceId,
+    ) -> EvidenceFamilyFreshness {
+        EvidenceFamilyFreshness {
+            kind,
+            state: tidefs_storage_intent_core::EvidenceFamilyFreshnessState::Fresh,
+            source_index_generation: 1,
+            producer_generation: 1,
+            freshness_frontier_ms: 10,
+            allowed_staleness_ms: 1,
+            evidence_ref: evidence(kind, id),
+        }
+    }
+
+    fn add_fresh(
+        snapshot: &mut StorageIntentEvidenceQuerySnapshot,
+        kind: StorageIntentEvidenceKind,
+        id: StorageIntentEvidenceId,
+    ) {
+        let family = fresh(kind, id);
+        snapshot.included_refs.push(family.evidence_ref).unwrap();
+        snapshot.family_freshness.push(family).unwrap();
+    }
+
+    fn snapshot(
+        extra_kind: Option<StorageIntentEvidenceKind>,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        let mut snapshot = StorageIntentEvidenceQuerySnapshot {
+            snapshot_id: SNAPSHOT,
+            query_id: QUERY,
+            subject: EvidenceQuerySubjectScope {
+                scope_class: EvidenceQuerySubjectScopeClass::ObjectRange,
+                object_scope: scope(),
+                ..EvidenceQuerySubjectScope::default()
+            },
+            policy_id: POLICY,
+            policy_revision: StorageIntentPolicyRevision(7),
+            temporal_frontier_ms: 10,
+            freshness_frontier_ms: 10,
+            source_index_generation: 1,
+            producer_generation: 1,
+            producer_watermark_ms: 10,
+            included_refs: StorageIntentEvidenceRefs::EMPTY,
+            family_freshness: EvidenceFamilyFreshnessSet::EMPTY,
+            completeness: EvidenceCompletenessVerdict::CompleteForPurpose,
+            ..StorageIntentEvidenceQuerySnapshot::default()
+        };
+
+        add_fresh(
+            &mut snapshot,
+            StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+            SNAPSHOT,
+        );
+        add_fresh(
+            &mut snapshot,
+            StorageIntentEvidenceKind::DecisionFrontierEvidence,
+            DECISION,
+        );
+        add_fresh(
+            &mut snapshot,
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            SCHED,
+        );
+        add_fresh(
+            &mut snapshot,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            MEDIA,
+        );
+        add_fresh(
+            &mut snapshot,
+            StorageIntentEvidenceKind::ReadFreshnessEvidence,
+            READ,
+        );
+        if let Some(kind) = extra_kind {
+            add_fresh(&mut snapshot, kind, TRANSPORT);
+        }
+        snapshot
+    }
+
+    fn decision(candidate: PrefetchResidencyCandidateClass) -> PrefetchResidencyDecisionRecord {
+        PrefetchResidencyDecisionRecord {
+            policy_id: POLICY,
+            policy_revision: StorageIntentPolicyRevision(7),
+            scope: scope(),
+            budget_owner: BUDGET,
+            requested_candidate: candidate,
+            selected_candidate: candidate,
+            selected_residency: PrefetchResidencyStateClass::CacheOnlyRam,
+            outcome: PrefetchResidencyDecisionOutcome::Admitted,
+            source_media: StorageMediaClass::HddRotational,
+            target_media: StorageMediaClass::SystemRam,
+            source_media_ref: evidence(StorageIntentEvidenceKind::MediaCapabilityEvidence, MEDIA),
+            target_media_ref: evidence(StorageIntentEvidenceKind::MediaCapabilityEvidence, MEDIA),
+            max_prefetch_window_bytes: 1 << 20,
+            max_staging_bytes: 1 << 21,
+            evidence_refs: tidefs_storage_intent_core::PrefetchResidencyDecisionEvidenceRefs {
+                evidence_query_ref: evidence(
+                    StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+                    SNAPSHOT,
+                ),
+                decision_frontier_ref: evidence(
+                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    DECISION,
+                ),
+                scheduler_admission_ref: evidence(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    SCHED,
+                ),
+                media_capability_ref: evidence(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    MEDIA,
+                ),
+                read_serving_boundary_ref: evidence(
+                    StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                    READ,
+                ),
+                cost_wear_ref: evidence(StorageIntentEvidenceKind::MediaCostWearLedger, COST),
+                egress_restore_cost_ref: evidence(
+                    StorageIntentEvidenceKind::MediaCostWearLedger,
+                    COST,
+                ),
+                tenant_isolation_ref: evidence(
+                    StorageIntentEvidenceKind::TenantIsolationEvidence,
+                    ISO,
+                ),
+                transport_budget_ref: evidence(
+                    StorageIntentEvidenceKind::TransportPathEvidence,
+                    TRANSPORT,
+                ),
+                trust_domain_ref: evidence(StorageIntentEvidenceKind::TrustDomainEvidence, TRUST),
+                ..tidefs_storage_intent_core::PrefetchResidencyDecisionEvidenceRefs::default()
+            },
+            ..PrefetchResidencyDecisionRecord::default()
+        }
+    }
+
+    fn admitted_input(candidate: PrefetchResidencyCandidateClass) -> PrefetchExecutorInput {
+        let decision = decision(candidate);
+        PrefetchExecutorInput {
+            evidence_query_snapshot: snapshot(None),
+            admission: PrefetchExecutorAdmissionRecord::admitted(
+                PrefetchExecutorSchedulerLane::Speculative,
+                BUDGET,
+                evidence(StorageIntentEvidenceKind::SchedulerAdmissionRecord, SCHED),
+            )
+            .with_speculative_controls(true, true, true),
+            media_path: PrefetchExecutorMediaPath {
+                source_media: decision.source_media,
+                target_media: decision.target_media,
+                media_capability_ref: evidence(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    MEDIA,
+                ),
+                ..PrefetchExecutorMediaPath::default()
+            },
+            cost_state: PrefetchExecutorCostState {
+                snapshot: StorageIntentCostSnapshot {
+                    evidence_id: COST,
+                    policy_id: POLICY,
+                    policy_revision: StorageIntentPolicyRevision(7),
+                    budget_owner: BUDGET,
+                    evidence_state: StorageIntentCostEvidenceState::FRESH,
+                    ..StorageIntentCostSnapshot::default()
+                },
+                cost_ref: evidence(StorageIntentEvidenceKind::MediaCostWearLedger, COST),
+                isolation_ref: evidence(StorageIntentEvidenceKind::TenantIsolationEvidence, ISO),
+                ..PrefetchExecutorCostState::default()
+            },
+            decision,
+            require_budget_owner: true,
+            require_isolation_evidence: true,
+            ..PrefetchExecutorInput::default()
+        }
+    }
+
+    #[test]
+    fn action_families_cover_required_candidates() {
+        assert_eq!(
+            PrefetchExecutorActionFamily::from_candidate(
+                PrefetchResidencyCandidateClass::BoundedReadahead
+            ),
+            PrefetchExecutorActionFamily::BoundedSequentialReadahead
+        );
+        assert_eq!(
+            PrefetchExecutorActionFamily::from_candidate(
+                PrefetchResidencyCandidateClass::StridedVectorPrefetch
+            ),
+            PrefetchExecutorActionFamily::StridedVectorRangePrefetch
+        );
+        assert_eq!(
+            PrefetchExecutorActionFamily::from_candidate(
+                PrefetchResidencyCandidateClass::MetadataNamespacePrefetch
+            ),
+            PrefetchExecutorActionFamily::MetadataNamespaceWalkPrefetch
+        );
+        assert_eq!(
+            PrefetchExecutorActionFamily::from_candidate(
+                PrefetchResidencyCandidateClass::SmallRandomHotsetTrial
+            ),
+            PrefetchExecutorActionFamily::SmallRandomHotsetCacheTrial
+        );
+        assert_eq!(
+            PrefetchExecutorActionFamily::from_candidate(
+                PrefetchResidencyCandidateClass::ManifestIndexPrefetch
+            ),
+            PrefetchExecutorActionFamily::ManifestIndexFanout
+        );
+        assert_eq!(
+            PrefetchExecutorActionFamily::from_candidate(
+                PrefetchResidencyCandidateClass::SnapshotClonePrefetch
+            ),
+            PrefetchExecutorActionFamily::SnapshotCloneRepeatedRead
+        );
+        assert_eq!(
+            PrefetchExecutorActionFamily::from_candidate(
+                PrefetchResidencyCandidateClass::DegradedReadPrefetch
+            ),
+            PrefetchExecutorActionFamily::DegradedReadReconstruction
+        );
+        assert_eq!(
+            PrefetchExecutorActionFamily::from_candidate(
+                PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch
+            ),
+            PrefetchExecutorActionFamily::WanGeoDeltaPrefetch
+        );
+        assert_eq!(
+            PrefetchExecutorActionFamily::from_candidate(
+                PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage
+            ),
+            PrefetchExecutorActionFamily::ObjectArchiveRestoreStaging
+        );
+        assert_eq!(
+            PrefetchExecutorActionFamily::from_candidate(
+                PrefetchResidencyCandidateClass::NoPrefetch
+            ),
+            PrefetchExecutorActionFamily::ExplicitNoPrefetch
+        );
+    }
+
+    #[test]
+    fn missing_decision_or_evidence_query_blocks_execution() {
+        let record = evaluate_prefetch_execution(PrefetchExecutorInput::default());
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_blocks_execution() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.evidence_query_snapshot.policy_revision = StorageIntentPolicyRevision(6);
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Stale);
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn mismatched_snapshot_subject_blocks_execution() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input
+            .evidence_query_snapshot
+            .subject
+            .object_scope
+            .range_start += 1;
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Stale);
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn cache_trial_record_is_cache_only_and_not_durable_authority() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::SmallRandomHotsetTrial);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::ServingTrial;
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::CacheOnlyTrial
+        );
+        assert!(record.is_non_authority_population());
+        assert!(!record.can_satisfy_durable_sync());
+        assert!(!record.can_publish_replacement_receipt());
+        assert!(!record.can_retire_source_receipt());
+        assert!(!record.implies_latest_read_authority());
+    }
+
+    #[test]
+    fn feedback_result_detail_is_preserved_for_975() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.admission.requested_bytes = 16 * 1024;
+        input.admission.admitted_bytes = 12 * 1024;
+        input.admission.queue_time_us = 17;
+        input.admission.reserve_protected = true;
+        input.admission.pressure = PrefetchExecutorPressureMask::P99_LATENCY
+            .union(PrefetchExecutorPressureMask::PROTECTED_RESERVE);
+        input.result_detail = PrefetchExecutorResultDetail {
+            prefetched_bytes: 12 * 1024,
+            used_bytes: 8 * 1024,
+            unused_bytes: 3 * 1024,
+            expired_bytes: 1024,
+            latency_benefit_us: 1_500,
+            latency_harm_us: 25,
+            foreground_p50_disruption_us: 4,
+            foreground_p95_disruption_us: 12,
+            foreground_p99_disruption_us: 31,
+            queue_delay_us: 17,
+            flash_write_bytes: 512,
+            pmem_write_bytes: 256,
+            waf_micros: 1_250_000,
+            ram_pressure_bytes: 64 * 1024,
+            cache_index_write_bytes: 128,
+            predictor_metadata_write_bytes: 64,
+            wan_bytes: 32,
+            egress_cost_microunits: 7,
+            restore_cost_microunits: 11,
+            staging_capacity_bytes: 12 * 1024,
+            cpu_us: 42,
+            memory_bytes: 64 * 1024,
+            protected_reserve_pressure: true,
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+        };
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(record.subject.dataset_id, DATASET);
+        assert_eq!(record.result_detail, input.result_detail);
+        assert!(record.has_feedback_payback_inputs());
+        assert!(record.result_detail.has_feedback_evidence_root());
+        assert_eq!(
+            record.evidence_refs.attribution_ref,
+            input.result_detail.attribution_ref
+        );
+        assert_eq!(
+            record.evidence_refs.retention_ref,
+            input.result_detail.retention_ref
+        );
+        assert_eq!(
+            record.evidence_refs.validation_ref,
+            input.result_detail.validation_ref
+        );
+        assert!(!record.can_satisfy_durable_sync());
+        assert!(!record.can_publish_replacement_receipt());
+    }
+
+    #[test]
+    fn completion_alone_is_not_feedback_payback_evidence() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
+        input.admission = PrefetchExecutorAdmissionRecord::default();
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Completed);
+        assert!(!record.has_feedback_payback_inputs());
+        assert!(!record.result_detail.has_feedback_evidence_root());
+    }
+
+    #[test]
+    fn scheduler_drop_is_preserved() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.admission = input.admission.with_outcome(
+            PrefetchExecutorAdmissionOutcome::Dropped,
+            StorageIntentRefusalReason::NoisyNeighborPressure,
+        );
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Dropped);
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::NoisyNeighborPressure
+        );
+    }
+
+    #[test]
+    fn unknown_waf_and_egress_refuse_when_policy_requires_proof() {
+        let mut waf = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        waf.require_known_waf = true;
+        waf.cost_state.unknown_waf = true;
+        let waf_record = evaluate_prefetch_execution(waf);
+        assert_eq!(waf_record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            waf_record.refusal,
+            StorageIntentRefusalReason::FlashWearBudgetExceeded
+        );
+
+        let mut egress = admitted_input(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage);
+        egress.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut egress.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        egress.require_known_egress_restore_cost = true;
+        egress.cost_state.unknown_egress_or_restore_cost = true;
+        let egress_record = evaluate_prefetch_execution(egress);
+        assert_eq!(egress_record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            egress_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn missing_required_cost_class_is_not_zero_cost() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage);
+        input.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        input.cost_state.required = PrefetchExecutorCostRequirementMask::EGRESS;
+        input.cost_state.snapshot.evidence_state = StorageIntentCostEvidenceState::FRESH
+            .with_missing(StorageIntentCostClass::NetworkEgress);
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn rdma_absence_is_not_a_correctness_failure() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        input.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        input.media_path.rdma_available = false;
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_ne!(
+            record.refusal,
+            StorageIntentRefusalReason::RdmaRequiredForCorrectness
+        );
+    }
+
+    #[test]
+    fn authority_changing_decision_hands_off_without_receipt_power() {
+        let mut input =
+            admitted_input(PrefetchResidencyCandidateClass::AuthorityPromotionCandidate);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::PromotionCandidate;
+        input.decision.selected_residency = PrefetchResidencyStateClass::PmemDurable;
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::HandoffRequired);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::HandoffRequired
+        );
+        assert_eq!(
+            record.handoff_target,
+            PrefetchExecutorHandoffTarget::DurableResidencyChange
+        );
+        assert!(!record.can_publish_replacement_receipt());
+        assert!(!record.can_retire_source_receipt());
+        assert!(!record.can_satisfy_durable_sync());
+    }
+
+    #[test]
+    fn explicit_no_prefetch_completes_without_dispatch_authority() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
+        input.admission = PrefetchExecutorAdmissionRecord::default();
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Completed);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::NoPrefetchEnforced
+        );
+        assert!(record.is_non_authority_population());
+        assert!(!record.can_satisfy_durable_sync());
+    }
+}
