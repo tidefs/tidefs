@@ -29,6 +29,8 @@
 //! ```
 
 use tidefs_auth::{SessionSecurity, SessionSecurityError, SessionSecurityStats};
+use tidefs_storage_intent_core::{StorageIntentEvidenceKind, StorageIntentEvidenceRef};
+use tidefs_storage_intent_remote_media_capability::RemoteTrustFacts;
 
 /// Wraps a post-HELLO transport session with HMAC per-frame authentication
 /// and optional ChaCha20-Poly1305 encryption.
@@ -155,6 +157,44 @@ impl SecureTransportStats {
             .total_failures()
             .saturating_add(self.inbound.total_failures())
     }
+
+    /// Project observed secure-frame evidence into the authentication portion
+    /// of #961 remote trust facts.
+    ///
+    /// This deliberately leaves domain compatibility, authorization, audit,
+    /// and residency unset; encrypted transport is evidence input, not a
+    /// complete #897 trust-domain authority decision.
+    #[must_use]
+    pub fn remote_media_authenticated_frame_facts(
+        &self,
+        encrypted: bool,
+        mutually_authenticated: bool,
+        trust_ref: StorageIntentEvidenceRef,
+    ) -> RemoteTrustFacts {
+        let trust_ref_is_bound = trust_ref.is_bound()
+            && trust_ref.kind as u16 == StorageIntentEvidenceKind::TrustDomainEvidence as u16;
+        let observed_authenticated_frames = self.total_frames_sent() > 0
+            && self.total_frames_received() > 0
+            && self.total_failures() == 0;
+
+        if !trust_ref_is_bound
+            || !encrypted
+            || !mutually_authenticated
+            || !observed_authenticated_frames
+        {
+            return RemoteTrustFacts::default();
+        }
+
+        RemoteTrustFacts {
+            authenticated_principal: true,
+            domain_compatible: false,
+            key_epoch_fresh: true,
+            authorization_present: false,
+            audit_present: false,
+            residency_compatible: false,
+            trust_ref,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,11 +204,21 @@ impl SecureTransportStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_storage_intent_core::StorageIntentEvidenceId;
 
     fn session_key() -> [u8; 32] {
         let mut k = [0u8; 32];
         k[0..16].copy_from_slice(b"test-session-key");
         k
+    }
+
+    fn trust_ref(seed: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            StorageIntentEvidenceId([seed; 32]),
+            u64::from(seed),
+            1,
+        )
     }
 
     // ── Plaintext round-trip ────────────────────────────────────────
@@ -366,6 +416,48 @@ mod tests {
         let s = open_t.stats();
         assert!(s.total_failures() > 0);
         assert_eq!(s.inbound.hmac_failures, 1);
+    }
+
+    #[test]
+    fn authenticated_frame_stats_project_partial_remote_trust() {
+        let stats = SecureTransportStats {
+            outbound: SessionSecurityStats {
+                frames_sent: 3,
+                ..SessionSecurityStats::default()
+            },
+            inbound: SessionSecurityStats {
+                frames_received: 2,
+                ..SessionSecurityStats::default()
+            },
+        };
+        let trust_ref = trust_ref(21);
+        let facts = stats.remote_media_authenticated_frame_facts(true, true, trust_ref);
+
+        assert!(facts.authenticated_principal);
+        assert!(facts.key_epoch_fresh);
+        assert!(!facts.domain_compatible);
+        assert!(!facts.authorization_present);
+        assert!(!facts.audit_present);
+        assert!(!facts.residency_compatible);
+        assert_eq!(facts.trust_ref, trust_ref);
+    }
+
+    #[test]
+    fn failed_secure_frame_stats_do_not_project_remote_trust() {
+        let stats = SecureTransportStats {
+            outbound: SessionSecurityStats {
+                frames_sent: 3,
+                ..SessionSecurityStats::default()
+            },
+            inbound: SessionSecurityStats {
+                frames_received: 2,
+                hmac_failures: 1,
+                ..SessionSecurityStats::default()
+            },
+        };
+        let facts = stats.remote_media_authenticated_frame_facts(true, true, trust_ref(22));
+
+        assert_eq!(facts, RemoteTrustFacts::default());
     }
 
     // ── Concurrent independent sessions ─────────────────────────────

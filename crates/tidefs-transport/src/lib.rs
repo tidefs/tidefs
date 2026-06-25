@@ -436,7 +436,7 @@ pub use tls::{generate_self_signed_cert, TlsTransport};
 pub use transport::{ConnectionPool, Transport};
 pub use types::{
     ChunkId, ChunkTransferId, CohortMembership, FamilyVersion, FenceVersion, Hash, HlcTimestamp,
-    NodeIdentityPublic, SessionId,
+    NodeIdentityPublic, RemoteMediaTransportIdentitySample, SessionId,
 };
 
 pub use boundedness::{
@@ -605,8 +605,8 @@ pub use idle_timeout::{
 pub use path_evidence::{
     PathBandwidth, PathCarrierClass, PathCarrierFamily, PathEncryptionContext,
     PathEvidenceConfidence, PathEvidenceGeneration, PathEvidenceStaleness,
-    PathFailureDomainRelation, PathLatency, PathLossClass, PathProximityDomain,
-    PathQueueState, TransportPathEvidence, TransportPathEvidenceRegistry,
+    PathFailureDomainRelation, PathLatency, PathLossClass, PathProximityDomain, PathQueueState,
+    RemoteMediaTransportPathPolicy, TransportPathEvidence, TransportPathEvidenceRegistry,
     WanInternetEvidence,
 };
 pub use peer_address_registry::PeerAddressRegistry;

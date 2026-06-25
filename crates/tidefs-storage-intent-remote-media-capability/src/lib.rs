@@ -880,6 +880,12 @@ pub const fn remote_authority_preflight_refusal(
     {
         return StorageIntentRefusalReason::UnstableNamespaceIdentity;
     }
+    if !evidence_ref_has_kind(
+        facts.path.path_ref,
+        StorageIntentEvidenceKind::TransportPathEvidence,
+    ) {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
     if matches!(facts.health.health, MediaHealthState::Unknown) {
         return StorageIntentRefusalReason::EvidenceNotUsable;
     }
@@ -1550,6 +1556,20 @@ mod tests {
             placement_result(record).refusal,
             StorageIntentRefusalReason::RdmaRequiredForCorrectness
         );
+    }
+
+    #[test]
+    fn missing_transport_path_ref_refuses_remote_authority() {
+        let facts = strong_object_facts().with_path(RemotePathFacts::default());
+        let record = produce_remote_media_capability(facts);
+
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
     }
 
     #[test]
