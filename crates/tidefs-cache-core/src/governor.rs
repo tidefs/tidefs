@@ -1431,8 +1431,15 @@ impl<W: CacheReclaimWorker> BackgroundService for GovernorCacheReclaimService<W>
         }
 
         let bounded = bounded_service_budget(*budget, Self::TICK_BUDGET);
-        let outcome = self.worker.reclaim_cache(request, bounded)?;
-        finish_reclaim_tick(Self::NAME, &self.governor, request, bounded, outcome)
+        match self.worker.reclaim_cache(request, bounded) {
+            Ok(outcome) => {
+                finish_reclaim_tick(Self::NAME, &self.governor, request, bounded, outcome)
+            }
+            Err(error) => {
+                self.governor.finish_reclaim_work(request);
+                Err(error)
+            }
+        }
     }
 
     fn has_work(&self) -> bool {
@@ -1490,8 +1497,15 @@ impl<W: DirtyReclaimWorker> BackgroundService for GovernorDirtyFlushService<W> {
         }
 
         let bounded = bounded_service_budget(*budget, Self::TICK_BUDGET);
-        let outcome = self.worker.flush_dirty(request, bounded)?;
-        finish_reclaim_tick(Self::NAME, &self.governor, request, bounded, outcome)
+        match self.worker.flush_dirty(request, bounded) {
+            Ok(outcome) => {
+                finish_reclaim_tick(Self::NAME, &self.governor, request, bounded, outcome)
+            }
+            Err(error) => {
+                self.governor.finish_reclaim_work(request);
+                Err(error)
+            }
+        }
     }
 
     fn has_work(&self) -> bool {
@@ -1548,8 +1562,15 @@ impl<W: CommitBoundaryWorker> BackgroundService for GovernorCommitBoundaryServic
         }
 
         let bounded = bounded_service_budget(*budget, Self::TICK_BUDGET);
-        let outcome = self.worker.force_commit_boundary(request, bounded)?;
-        finish_reclaim_tick(Self::NAME, &self.governor, request, bounded, outcome)
+        match self.worker.force_commit_boundary(request, bounded) {
+            Ok(outcome) => {
+                finish_reclaim_tick(Self::NAME, &self.governor, request, bounded, outcome)
+            }
+            Err(error) => {
+                self.governor.finish_reclaim_work(request);
+                Err(error)
+            }
+        }
     }
 
     fn has_work(&self) -> bool {
@@ -1756,6 +1777,21 @@ mod tests {
                 items_processed: 1,
                 bytes_processed: self.release_bytes,
                 bytes_released: self.release_bytes,
+            })
+        }
+    }
+
+    struct FailingCacheWorker;
+
+    impl CacheReclaimWorker for FailingCacheWorker {
+        fn reclaim_cache(
+            &mut self,
+            _request: ReclaimRequest,
+            _budget: ServiceBudget,
+        ) -> Result<ReclaimOutcome, ServiceError> {
+            Err(ServiceError::Internal {
+                service: "test-cache-reclaim",
+                message: "boom",
             })
         }
     }
@@ -2448,6 +2484,22 @@ mod tests {
 
         let idle = scheduler.run_cycle();
         assert_eq!(idle.services_ran, 0);
+    }
+
+    #[test]
+    fn failed_reclaim_tick_clears_inflight_request_for_retry() {
+        let g =
+            Governor::new(single_category_budget_config(BudgetCategory::DataCache, 1000)).unwrap();
+        g.admit(BudgetCategory::DataCache, 800).unwrap();
+        let mut service = GovernorCacheReclaimService::new(g.clone(), FailingCacheWorker);
+
+        let err = service.tick(&ServiceBudget::UNBOUNDED).unwrap_err();
+
+        assert!(matches!(err, ServiceError::Internal { .. }));
+        let state = pressure_state_for(&g, BudgetCategory::DataCache);
+        assert_eq!(state.stage, Some(ReclaimStage::EvictColdCache));
+        assert!(!state.reclaim_inflight);
+        assert!(g.has_reclaim_work(ReclaimWorkKind::CacheMaintenance));
     }
 
     #[test]
