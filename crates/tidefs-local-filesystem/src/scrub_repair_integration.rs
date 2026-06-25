@@ -248,6 +248,15 @@ fn repair_kind_from_scrub_kind(kind: ScrubBlockKind) -> RepairBlockKind {
     }
 }
 
+fn checksum_layer_for_repair_kind(kind: RepairBlockKind) -> ChecksumLayer {
+    match kind {
+        RepairBlockKind::InlineContent | RepairBlockKind::ContentManifest => {
+            ChecksumLayer::InlineContentBody
+        }
+        RepairBlockKind::ContentChunk { .. } => ChecksumLayer::EncodedContentChunk,
+    }
+}
+
 fn repair_mounted_scrub_evidence_from_scrub_evidence(
     evidence: &ScrubBlockEvidence,
 ) -> RepairMountedScrubEvidence {
