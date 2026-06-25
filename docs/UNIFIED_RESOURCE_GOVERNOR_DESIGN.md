@@ -137,10 +137,37 @@ pub struct ResourceGovernorConfig {
     pub cluster_queues_fraction: f64,   // default: 0.05
     pub misc_fraction: f64,             // default: 0.02
 
-    /// Whether to auto-tune fractions based on workload signals.
+    /// Whether to auto-tune soft watermarks from bounded workload signals.
     pub auto_tune: bool,                // default: false (operator opt-in)
 }
 ```
+
+### 3.5 Auto-Tune Input Contract
+
+`auto_tune` is an operator opt-in mode. When disabled, the governor ignores
+auto-tune evidence and keeps the static design-spec watermarks.
+
+The first implementation slice tunes category soft watermarks only. It does not
+raise hard category caps, does not reassign category fractions, and cannot
+exceed `total_budget_bytes`. Data-cache, metadata-cache, and inode-state
+pressure may raise their soft watermarks within the documented safety margin;
+dirty-byte, cluster-queue, and misc pressure lowers soft watermarks so unknown
+durability, dirty-debt, or queue effects stay conservative.
+
+Each auto-tune evidence record must name:
+
+- a `BudgetCategory`;
+- an evidence owner, such as governor utilization, cache admission,
+  hit/miss pressure, dirty-byte pressure, cache churn, or an explicit workload
+  signal record;
+- a unit;
+- freshness not older than `AUTO_TUNE_INTERVAL_MS`;
+- a bounded pressure score in `0..=100`;
+- safety effects for durability, dirty-byte, and cluster-queue limits.
+
+Missing owner/category/unit/freshness/safety metadata, stale evidence, out of
+range pressure, or any safety effect that would weaken a protected limit is
+rejected instead of weakening a watermark.
 
 ## 4. Admission Control
 
@@ -379,6 +406,7 @@ The governor exposes the following counter hierarchy:
 ```
 tidefs_governor_category_used_bytes{category="data_cache|meta_cache|..."}  gauge
 tidefs_governor_category_cap_bytes{category}                               gauge
+tidefs_governor_category_soft_watermark_bytes{category}                    gauge
 tidefs_governor_admits_total{category, priority, result}                   counter
 tidefs_governor_releases_total{category}                                   counter
 tidefs_governor_evictions_total{category, stage}                           counter
@@ -536,8 +564,11 @@ Implement `InodeState` eviction with LRU, reference-count tracking, and
 `FUSE_NOTIFY_PRUNE` integration. Tests for eviction safety.
 
 ### Phase 9: Auto-Tuning
-Implement workload signal capture and periodic fraction rebalancing. Bounded by
-safety margins (±20% of configured fractions).
+Implement workload signal capture and periodic tuning. The first source slice
+adjusts category soft watermarks only from explicit bounded local evidence.
+Future fraction rebalancing must preserve the same default-off, freshness, and
+protected-limit refusal contract. Both forms are bounded by the documented
+safety margin (±20% of the configured baseline).
 
 Full integration test: simulate multi-category memory pressure, verify ladder
 progression, backpressure activation, and recovery to idle state.

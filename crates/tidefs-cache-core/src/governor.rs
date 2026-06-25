@@ -214,6 +214,167 @@ pub struct AdmissionTicket {
     pub size: u64,
 }
 
+// ── Auto-tune evidence ─────────────────────────────────────────────────────
+
+/// Maximum per-category soft-watermark shift applied by auto-tune.
+pub const AUTO_TUNE_MAX_FRACTION_SHIFT: f64 = 0.20;
+
+/// Maximum evidence age accepted by [`Governor::apply_auto_tune`].
+pub const AUTO_TUNE_MAX_FRESHNESS_MS: u64 = 30_000;
+
+/// Owner of a bounded auto-tune evidence record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GovernorAutoTuneOwner {
+    /// Direct utilization and backpressure observed by the governor.
+    GovernorUtilization,
+    /// Admission/rejection pressure from cache-core callers.
+    CacheAdmission,
+    /// Cache hit/miss pressure.
+    HitMissPressure,
+    /// Dirty-byte pressure from local writeback accounting.
+    DirtyBytePressure,
+    /// Cache churn pressure from eviction/reinsertion behavior.
+    CacheChurn,
+    /// Explicit workload signal record with an external policy owner.
+    WorkloadSignalRecord,
+}
+
+/// Unit attached to a bounded auto-tune evidence record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GovernorAutoTuneUnit {
+    /// Pressure score in the inclusive range 0..=100.
+    Ratio0To100,
+    /// Byte count for the named category.
+    Bytes,
+    /// Event rate for churn, hit/miss, or admission pressure.
+    EventsPerSecond,
+}
+
+/// Effect of an auto-tune input on a protected safety limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GovernorAutoTuneSafetyEffect {
+    /// The input preserves the existing safety limit.
+    PreservesExistingLimit,
+    /// The input would weaken the existing safety limit.
+    WeakensLimit,
+}
+
+/// Safety-effect declaration required for every auto-tune input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GovernorAutoTuneSafety {
+    pub durability: GovernorAutoTuneSafetyEffect,
+    pub dirty_bytes: GovernorAutoTuneSafetyEffect,
+    pub cluster_queues: GovernorAutoTuneSafetyEffect,
+}
+
+impl GovernorAutoTuneSafety {
+    /// Declare that the input does not weaken protected safety limits.
+    #[must_use]
+    pub const fn preserves_existing_limits() -> Self {
+        Self {
+            durability: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+            dirty_bytes: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+            cluster_queues: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+        }
+    }
+
+    fn preserves_all_limits(self) -> bool {
+        self.durability == GovernorAutoTuneSafetyEffect::PreservesExistingLimit
+            && self.dirty_bytes == GovernorAutoTuneSafetyEffect::PreservesExistingLimit
+            && self.cluster_queues == GovernorAutoTuneSafetyEffect::PreservesExistingLimit
+    }
+}
+
+/// Explicit bounded pressure evidence for auto-tuning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GovernorAutoTuneEvidence {
+    /// Category to tune. Missing categories are rejected as ambiguous input.
+    pub category: Option<BudgetCategory>,
+    /// Owner/source of the evidence. Missing owners are rejected.
+    pub owner: Option<GovernorAutoTuneOwner>,
+    /// Unit for the evidence record. Missing units are rejected.
+    pub unit: Option<GovernorAutoTuneUnit>,
+    /// Age of the evidence in milliseconds. Missing or stale freshness is rejected.
+    pub freshness_ms: Option<u64>,
+    /// Bounded pressure score, interpreted as 0 = clear and 100 = maximum pressure.
+    pub pressure_score: u16,
+    /// Declared effect on protected safety limits.
+    pub safety: Option<GovernorAutoTuneSafety>,
+}
+
+impl GovernorAutoTuneEvidence {
+    /// Create a fully-specified local pressure record.
+    #[must_use]
+    pub const fn pressure(
+        category: BudgetCategory,
+        owner: GovernorAutoTuneOwner,
+        unit: GovernorAutoTuneUnit,
+        freshness_ms: u64,
+        pressure_score: u16,
+    ) -> Self {
+        Self {
+            category: Some(category),
+            owner: Some(owner),
+            unit: Some(unit),
+            freshness_ms: Some(freshness_ms),
+            pressure_score,
+            safety: Some(GovernorAutoTuneSafety::preserves_existing_limits()),
+        }
+    }
+}
+
+/// Result of an auto-tune application attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GovernorAutoTuneDecision {
+    /// Auto-tune is disabled, so inputs were ignored and no state changed.
+    Disabled,
+    /// Auto-tune updated the listed number of distinct category watermarks.
+    Applied { updated_categories: usize },
+}
+
+/// Error returned when an auto-tune input is unsafe or ambiguous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GovernorAutoTuneError {
+    /// Required explicit evidence metadata was missing.
+    AmbiguousInput(&'static str),
+    /// Evidence was older than the supported freshness window.
+    StaleInput {
+        freshness_ms: u64,
+        max_freshness_ms: u64,
+    },
+    /// Pressure score was outside 0..=100.
+    PressureOutOfRange { pressure_score: u16 },
+    /// The input would weaken a protected safety limit.
+    UnsafeInput {
+        category: BudgetCategory,
+        reason: &'static str,
+    },
+}
+
+impl fmt::Display for GovernorAutoTuneError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AmbiguousInput(reason) => write!(f, "ambiguous auto-tune input: {reason}"),
+            Self::StaleInput {
+                freshness_ms,
+                max_freshness_ms,
+            } => write!(
+                f,
+                "stale auto-tune input: age {freshness_ms}ms exceeds {max_freshness_ms}ms"
+            ),
+            Self::PressureOutOfRange { pressure_score } => {
+                write!(
+                    f,
+                    "auto-tune pressure score {pressure_score} out of range 0..=100"
+                )
+            }
+            Self::UnsafeInput { category, reason } => {
+                write!(f, "unsafe auto-tune input for {category}: {reason}")
+            }
+        }
+    }
+}
+
 // ── Per-category configuration ───────────────────────────────────────────
 
 /// Per-category budget configuration.
@@ -223,18 +384,32 @@ struct CategoryConfig {
     cap: u64,
     /// Soft watermark: above this, backpressure is [`SoftPressure`].
     soft_watermark: u64,
+    /// Default soft-watermark fraction from the static design spec.
+    base_soft_fraction: f64,
+    /// Current soft-watermark fraction after optional auto-tune.
+    soft_fraction: f64,
     /// Hard limit: equal to cap for simplicity in the first slice.
     hard_limit: u64,
 }
 
 impl CategoryConfig {
     fn new(cap: u64, soft_fraction: f64) -> Self {
-        let soft = (cap as f64 * soft_fraction) as u64;
         Self {
             cap,
-            soft_watermark: soft.min(cap),
+            soft_watermark: Self::soft_watermark(cap, soft_fraction),
+            base_soft_fraction: soft_fraction,
+            soft_fraction,
             hard_limit: cap,
         }
+    }
+
+    fn soft_watermark(cap: u64, soft_fraction: f64) -> u64 {
+        (cap as f64 * soft_fraction) as u64
+    }
+
+    fn set_soft_fraction(&mut self, soft_fraction: f64) {
+        self.soft_fraction = soft_fraction;
+        self.soft_watermark = Self::soft_watermark(self.cap, soft_fraction).min(self.cap);
     }
 }
 
@@ -276,6 +451,9 @@ pub struct GovernorConfig {
     pub inode_state_fraction: f64,      // default 0.08
     pub cluster_queues_fraction: f64,   // default 0.05
     pub misc_fraction: f64,             // default 0.02
+
+    /// Whether to auto-tune soft watermarks from explicit bounded evidence.
+    pub auto_tune: bool,                // default false
 }
 
 impl Default for GovernorConfig {
@@ -288,6 +466,7 @@ impl Default for GovernorConfig {
             inode_state_fraction: 0.08,
             cluster_queues_fraction: 0.05,
             misc_fraction: 0.02,
+            auto_tune: false,
         }
     }
 }
@@ -319,6 +498,17 @@ impl GovernorConfig {
             }
         }
         Ok(())
+    }
+
+    fn category_fractions(&self) -> [f64; 6] {
+        [
+            self.data_cache_fraction,
+            self.meta_cache_fraction,
+            self.dirty_bytes_fraction,
+            self.inode_state_fraction,
+            self.cluster_queues_fraction,
+            self.misc_fraction,
+        ]
     }
 }
 
@@ -357,26 +547,20 @@ impl Governor {
         BudgetCategory::Misc,
     ];
 
+    const DEFAULT_SOFT_FRACTIONS: [f64; 6] = [0.70, 0.70, 0.50, 0.70, 0.70, 0.70];
+
     /// Create a new governor from a validated configuration.
     ///
     /// Returns an error if the configuration fails validation.
     pub fn new(config: GovernorConfig) -> Result<Self, String> {
         config.validate()?;
         let total = config.total_budget_bytes;
-        let caps: [u64; 6] = [
-            (total as f64 * config.data_cache_fraction) as u64,
-            (total as f64 * config.meta_cache_fraction) as u64,
-            (total as f64 * config.dirty_bytes_fraction) as u64,
-            (total as f64 * config.inode_state_fraction) as u64,
-            (total as f64 * config.cluster_queues_fraction) as u64,
-            (total as f64 * config.misc_fraction) as u64,
-        ];
+        let caps = Self::caps_from_fractions(total, config.category_fractions());
         // Soft watermarks per the design spec.
-        let soft_fractions: [f64; 6] = [0.70, 0.70, 0.50, 0.70, 0.70, 0.70];
         let mut category_configs: [CategoryConfig; 6] =
             std::array::from_fn(|_| CategoryConfig::new(0, 0.0));
         for (i, &cap) in caps.iter().enumerate() {
-            category_configs[i] = CategoryConfig::new(cap, soft_fractions[i]);
+            category_configs[i] = CategoryConfig::new(cap, Self::DEFAULT_SOFT_FRACTIONS[i]);
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(GovernorInner {
@@ -512,6 +696,75 @@ impl Governor {
         Ok(())
     }
 
+    /// Apply explicit bounded local pressure evidence to soft watermarks.
+    ///
+    /// Auto-tune is disabled by default.  When enabled, this first governor-only
+    /// slice adjusts soft watermarks only; hard category caps and the global hard
+    /// budget remain unchanged.
+    pub fn apply_auto_tune(
+        &self,
+        evidence: &[GovernorAutoTuneEvidence],
+    ) -> Result<GovernorAutoTuneDecision, GovernorAutoTuneError> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.config.auto_tune {
+            return Ok(GovernorAutoTuneDecision::Disabled);
+        }
+
+        let mut updated = [false; 6];
+        for record in evidence {
+            let category = record
+                .category
+                .ok_or(GovernorAutoTuneError::AmbiguousInput("missing category"))?;
+            let owner = record
+                .owner
+                .ok_or(GovernorAutoTuneError::AmbiguousInput("missing owner"))?;
+            let _unit = record
+                .unit
+                .ok_or(GovernorAutoTuneError::AmbiguousInput("missing unit"))?;
+            let freshness_ms = record
+                .freshness_ms
+                .ok_or(GovernorAutoTuneError::AmbiguousInput("missing freshness"))?;
+            if freshness_ms > AUTO_TUNE_MAX_FRESHNESS_MS {
+                return Err(GovernorAutoTuneError::StaleInput {
+                    freshness_ms,
+                    max_freshness_ms: AUTO_TUNE_MAX_FRESHNESS_MS,
+                });
+            }
+            if record.pressure_score > 100 {
+                return Err(GovernorAutoTuneError::PressureOutOfRange {
+                    pressure_score: record.pressure_score,
+                });
+            }
+            let safety = record.safety.ok_or(GovernorAutoTuneError::AmbiguousInput(
+                "missing safety effect",
+            ))?;
+            if !safety.preserves_all_limits() {
+                return Err(GovernorAutoTuneError::UnsafeInput {
+                    category,
+                    reason: "input would weaken a protected safety limit",
+                });
+            }
+            if owner == GovernorAutoTuneOwner::DirtyBytePressure
+                && category != BudgetCategory::DirtyBytes
+            {
+                return Err(GovernorAutoTuneError::AmbiguousInput(
+                    "dirty-byte pressure must target dirty_bytes",
+                ));
+            }
+
+            let idx = Self::category_index(category);
+            let base = inner.category_configs[idx].base_soft_fraction;
+            let tuned = Self::tuned_soft_fraction(category, base, record.pressure_score);
+            inner.category_configs[idx].set_soft_fraction(tuned);
+            Self::refresh_pressure_locked(&mut inner, idx);
+            updated[idx] = true;
+        }
+
+        Ok(GovernorAutoTuneDecision::Applied {
+            updated_categories: updated.iter().filter(|&&was_updated| was_updated).count(),
+        })
+    }
+
     /// Return the backpressure signal for a specific category.
     #[must_use]
     pub fn backpressure(&self, category: BudgetCategory) -> BackpressureSignal {
@@ -560,6 +813,20 @@ impl Governor {
         inner.category_configs[idx].cap
     }
 
+    /// Return the current soft watermark for a category.
+    #[must_use]
+    pub fn category_soft_watermark(&self, category: BudgetCategory) -> u64 {
+        let inner = self.inner.lock().unwrap();
+        let idx = Self::category_index(category);
+        inner.category_configs[idx].soft_watermark
+    }
+
+    /// Return whether auto-tune is enabled.
+    #[must_use]
+    pub fn auto_tune_enabled(&self) -> bool {
+        self.inner.lock().unwrap().config.auto_tune
+    }
+
     /// Return total bytes used across all categories.
     #[must_use]
     pub fn total_used(&self) -> u64 {
@@ -583,6 +850,30 @@ impl Governor {
             BudgetCategory::ClusterQueues => 4,
             BudgetCategory::Misc => 5,
         }
+    }
+
+    fn caps_from_fractions(total: u64, fractions: [f64; 6]) -> [u64; 6] {
+        std::array::from_fn(|idx| (total as f64 * fractions[idx]) as u64)
+    }
+
+    fn tuned_soft_fraction(
+        category: BudgetCategory,
+        base_soft_fraction: f64,
+        pressure_score: u16,
+    ) -> f64 {
+        let pressure = f64::from(pressure_score) / 100.0;
+        let shift = base_soft_fraction * AUTO_TUNE_MAX_FRACTION_SHIFT * pressure;
+        let min = base_soft_fraction * (1.0 - AUTO_TUNE_MAX_FRACTION_SHIFT);
+        let max = base_soft_fraction * (1.0 + AUTO_TUNE_MAX_FRACTION_SHIFT);
+        let tuned = match category {
+            BudgetCategory::DataCache | BudgetCategory::MetaCache | BudgetCategory::InodeState => {
+                base_soft_fraction + shift
+            }
+            BudgetCategory::DirtyBytes | BudgetCategory::ClusterQueues | BudgetCategory::Misc => {
+                base_soft_fraction - shift
+            }
+        };
+        tuned.clamp(min, max)
     }
 
     fn pressure_flags(used: u64, cap: u64, soft_watermark: u64) -> (bool, bool) {
@@ -640,6 +931,46 @@ mod tests {
         GovernorConfig::default()
     }
 
+    fn single_category_config(category: BudgetCategory, auto_tune: bool) -> GovernorConfig {
+        let fraction = |candidate| {
+            if category == candidate {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        GovernorConfig {
+            total_budget_bytes: 1000,
+            data_cache_fraction: fraction(BudgetCategory::DataCache),
+            meta_cache_fraction: fraction(BudgetCategory::MetaCache),
+            dirty_bytes_fraction: fraction(BudgetCategory::DirtyBytes),
+            inode_state_fraction: fraction(BudgetCategory::InodeState),
+            cluster_queues_fraction: fraction(BudgetCategory::ClusterQueues),
+            misc_fraction: fraction(BudgetCategory::Misc),
+            auto_tune,
+        }
+    }
+
+    fn data_pressure(score: u16) -> GovernorAutoTuneEvidence {
+        GovernorAutoTuneEvidence::pressure(
+            BudgetCategory::DataCache,
+            GovernorAutoTuneOwner::HitMissPressure,
+            GovernorAutoTuneUnit::Ratio0To100,
+            1_000,
+            score,
+        )
+    }
+
+    fn dirty_pressure(score: u16) -> GovernorAutoTuneEvidence {
+        GovernorAutoTuneEvidence::pressure(
+            BudgetCategory::DirtyBytes,
+            GovernorAutoTuneOwner::DirtyBytePressure,
+            GovernorAutoTuneUnit::Ratio0To100,
+            1_000,
+            score,
+        )
+    }
+
     #[test]
     fn new_governor_starts_empty() {
         let g = Governor::new(test_config()).unwrap();
@@ -684,6 +1015,7 @@ mod tests {
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 0.0,
             misc_fraction: 0.0,
+            auto_tune: false,
         };
         let g = Governor::new(config).unwrap();
         // Fill data_cache to 500.
@@ -726,6 +1058,7 @@ mod tests {
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 0.0,
             misc_fraction: 0.0,
+            auto_tune: false,
         };
         let g = Governor::new(config).unwrap();
         // Cap is 1000, soft watermark at 70% = 700.
@@ -753,6 +1086,7 @@ mod tests {
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 0.0,
             misc_fraction: 0.0,
+            auto_tune: false,
         };
         let g = Governor::new(config).unwrap();
         // Cap is 1000, hard at 95% = 950.
@@ -778,6 +1112,7 @@ mod tests {
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 0.0,
             misc_fraction: 0.0,
+            auto_tune: false,
         };
         let g = Governor::new(config).unwrap();
         // Allocate to 750 (above 700 soft).
@@ -804,6 +1139,7 @@ mod tests {
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 0.0,
             misc_fraction: 0.0,
+            auto_tune: false,
         };
         let g = Governor::new(config).unwrap();
         // DataCache at 750 = soft.
@@ -867,6 +1203,7 @@ mod tests {
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 0.0,
             misc_fraction: 0.0,
+            auto_tune: false,
         };
         let g = Governor::new(config).unwrap();
 
@@ -894,6 +1231,127 @@ mod tests {
     #[test]
     fn config_validation_accepts_default() {
         assert!(GovernorConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn auto_tune_defaults_disabled_and_ignores_evidence() {
+        let g = Governor::new(single_category_config(BudgetCategory::DataCache, false)).unwrap();
+        let before = g.category_soft_watermark(BudgetCategory::DataCache);
+
+        let decision = g.apply_auto_tune(&[data_pressure(100)]).unwrap();
+
+        assert_eq!(decision, GovernorAutoTuneDecision::Disabled);
+        assert!(!g.auto_tune_enabled());
+        assert_eq!(g.category_soft_watermark(BudgetCategory::DataCache), before);
+    }
+
+    #[test]
+    fn auto_tune_uses_deterministic_hit_miss_pressure() {
+        let g = Governor::new(single_category_config(BudgetCategory::DataCache, true)).unwrap();
+
+        let decision = g.apply_auto_tune(&[data_pressure(50)]).unwrap();
+
+        assert_eq!(
+            decision,
+            GovernorAutoTuneDecision::Applied {
+                updated_categories: 1
+            }
+        );
+        assert_eq!(g.category_cap(BudgetCategory::DataCache), 1000);
+        assert_eq!(g.category_soft_watermark(BudgetCategory::DataCache), 770);
+    }
+
+    #[test]
+    fn auto_tune_enforces_watermark_bounds_without_raising_hard_caps() {
+        let data = Governor::new(single_category_config(BudgetCategory::DataCache, true)).unwrap();
+        data.apply_auto_tune(&[data_pressure(100)]).unwrap();
+
+        assert_eq!(data.category_soft_watermark(BudgetCategory::DataCache), 840);
+        assert_eq!(data.category_cap(BudgetCategory::DataCache), 1000);
+        assert!(matches!(
+            data.admit(BudgetCategory::DataCache, 1001),
+            Err(BudgetError::GlobalOverBudget { .. })
+        ));
+
+        let dirty =
+            Governor::new(single_category_config(BudgetCategory::DirtyBytes, true)).unwrap();
+        dirty.apply_auto_tune(&[dirty_pressure(100)]).unwrap();
+
+        assert_eq!(
+            dirty.category_soft_watermark(BudgetCategory::DirtyBytes),
+            400
+        );
+        assert_eq!(dirty.category_cap(BudgetCategory::DirtyBytes), 1000);
+    }
+
+    #[test]
+    fn auto_tune_clears_pressure_back_to_static_watermark() {
+        let g = Governor::new(single_category_config(BudgetCategory::DataCache, true)).unwrap();
+        g.admit(BudgetCategory::DataCache, 750).unwrap();
+        assert_eq!(
+            g.backpressure(BudgetCategory::DataCache),
+            BackpressureSignal::SoftPressure
+        );
+
+        g.apply_auto_tune(&[data_pressure(100)]).unwrap();
+        assert_eq!(g.category_soft_watermark(BudgetCategory::DataCache), 840);
+        assert_eq!(
+            g.backpressure(BudgetCategory::DataCache),
+            BackpressureSignal::None
+        );
+
+        g.apply_auto_tune(&[data_pressure(0)]).unwrap();
+        assert_eq!(g.category_soft_watermark(BudgetCategory::DataCache), 700);
+        assert_eq!(
+            g.backpressure(BudgetCategory::DataCache),
+            BackpressureSignal::SoftPressure
+        );
+    }
+
+    #[test]
+    fn auto_tune_refuses_ambiguous_stale_or_unsafe_input() {
+        let g = Governor::new(single_category_config(BudgetCategory::DataCache, true)).unwrap();
+
+        let mut missing_owner = data_pressure(10);
+        missing_owner.owner = None;
+        assert_eq!(
+            g.apply_auto_tune(&[missing_owner]),
+            Err(GovernorAutoTuneError::AmbiguousInput("missing owner"))
+        );
+
+        let mut stale = data_pressure(10);
+        stale.freshness_ms = Some(AUTO_TUNE_MAX_FRESHNESS_MS + 1);
+        assert_eq!(
+            g.apply_auto_tune(&[stale]),
+            Err(GovernorAutoTuneError::StaleInput {
+                freshness_ms: AUTO_TUNE_MAX_FRESHNESS_MS + 1,
+                max_freshness_ms: AUTO_TUNE_MAX_FRESHNESS_MS,
+            })
+        );
+
+        let out_of_range = data_pressure(101);
+        assert_eq!(
+            g.apply_auto_tune(&[out_of_range]),
+            Err(GovernorAutoTuneError::PressureOutOfRange {
+                pressure_score: 101
+            })
+        );
+
+        let mut unsafe_input = data_pressure(10);
+        unsafe_input.safety = Some(GovernorAutoTuneSafety {
+            durability: GovernorAutoTuneSafetyEffect::WeakensLimit,
+            dirty_bytes: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+            cluster_queues: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+        });
+        assert_eq!(
+            g.apply_auto_tune(&[unsafe_input]),
+            Err(GovernorAutoTuneError::UnsafeInput {
+                category: BudgetCategory::DataCache,
+                reason: "input would weaken a protected safety limit",
+            })
+        );
+
+        assert_eq!(g.category_soft_watermark(BudgetCategory::DataCache), 700);
     }
 
     #[test]
@@ -981,6 +1439,7 @@ mod tests {
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 0.0,
             misc_fraction: 0.0,
+            auto_tune: false,
         };
         let g = Governor::new(config).unwrap();
         g.admit(BudgetCategory::DataCache, 256).unwrap();
@@ -1003,6 +1462,7 @@ mod tests {
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 0.0,
             misc_fraction: 0.0,
+            auto_tune: false,
         };
         let g = Governor::new(config).unwrap();
         g.admit(BudgetCategory::DataCache, 128).unwrap();
