@@ -16415,10 +16415,10 @@ pub const fn isolation_trust_evidence_is_usable(
         return present;
     }
     // Trust evidence must be present when tenant or domain scope is required.
-    if (evidence.isolation_scope as u8 == StorageIntentIsolationScope::Tenant as u8
-        || evidence.isolation_scope as u8 == StorageIntentIsolationScope::Dataset as u8)
-        && !evidence.has_trust_evidence()
-    {
+    let scope_requires_trust =
+        evidence.isolation_scope as u8 == StorageIntentIsolationScope::Tenant as u8
+            || evidence.isolation_scope as u8 == StorageIntentIsolationScope::Dataset as u8;
+    if scope_requires_trust && !evidence.has_trust_evidence() {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::MissingTenantDomainEvidence,
         );
@@ -16437,11 +16437,10 @@ pub const fn isolation_temporal_evidence_is_usable(
     }
     // Temporal evidence is required when fair-share, borrowing, or noisy-neighbor
     // decisions depend on wall-time freshness.
-    if (evidence.fair_share.starvation_age_us > 0
+    let temporal_evidence_required = evidence.fair_share.starvation_age_us > 0
         || evidence.borrowing.outstanding_debt_bytes > 0
-        || evidence.noisy_neighbor.pressure_age_us > 0)
-        && !evidence.has_temporal_evidence()
-    {
+        || evidence.noisy_neighbor.pressure_age_us > 0;
+    if temporal_evidence_required && !evidence.has_temporal_evidence() {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::StaleIsolationEvidence,
         );
