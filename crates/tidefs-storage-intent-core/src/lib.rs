@@ -24491,6 +24491,35 @@ mod tests {
             StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
+    /// AC: flash promotion is refused when capacity reserve evidence is missing.
+    #[test]
+    fn flash_promotion_refused_when_capacity_reserve_evidence_is_missing() {
+        let mut no_capacity_reserve = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::FlashHotServing,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        );
+        no_capacity_reserve
+            .policy
+            .evidence_refs
+            .capacity_reserve_ref = StorageIntentEvidenceRef::default();
+
+        let refused = prefetch_residency_decide(no_capacity_reserve);
+        assert_eq!(
+            refused.outcome,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+        );
+        assert_eq!(
+            refused.refusal,
+            StorageIntentRefusalReason::NoLegalReceiptSet
+        );
+        assert_eq!(
+            refused.selected_candidate,
+            PrefetchResidencyCandidateClass::NeedMoreEvidence
+        );
+    }
 
     #[test]
     fn cache_only_decision_never_changes_authority() {
