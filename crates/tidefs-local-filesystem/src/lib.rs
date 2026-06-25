@@ -454,6 +454,16 @@ impl ReadServingRuntimeRead {
     pub fn served_bytes(&self) -> Option<&[u8]> {
         self.bytes.as_deref()
     }
+
+    #[allow(clippy::result_large_err)]
+    pub fn into_bytes(self) -> Result<Vec<u8>> {
+        match self.bytes {
+            Some(bytes) => Ok(bytes),
+            None => Err(crate::error::FileSystemError::ReadServingRefused {
+                decision: Box::new(self.decision),
+            }),
+        }
+    }
 }
 
 pub use crate::constants::*;
@@ -6545,6 +6555,16 @@ impl LocalFileSystem {
         })
     }
 
+    #[allow(clippy::result_large_err)]
+    pub fn read_file_with_required_read_serving(
+        &self,
+        path: impl AsRef<str>,
+        decision_input: ReadServingDecisionInput,
+    ) -> Result<Vec<u8>> {
+        self.read_file_with_read_serving(path, decision_input)?
+            .into_bytes()
+    }
+
     pub fn read_file_range_with_read_serving(
         &self,
         path: impl AsRef<str>,
@@ -6588,6 +6608,18 @@ impl LocalFileSystem {
             decision,
             bytes: Some(self.read_content_range(inode_id, &record, offset, length)?),
         })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn read_file_range_with_required_read_serving(
+        &self,
+        path: impl AsRef<str>,
+        offset: u64,
+        length: usize,
+        decision_input: ReadServingDecisionInput,
+    ) -> Result<Vec<u8>> {
+        self.read_file_range_with_read_serving(path, offset, length, decision_input)?
+            .into_bytes()
     }
 
     pub fn read_file(&self, path: impl AsRef<str>) -> Result<Vec<u8>> {

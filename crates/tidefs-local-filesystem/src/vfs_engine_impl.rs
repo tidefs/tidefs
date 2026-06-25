@@ -134,6 +134,7 @@ fn map_errno(err: &FileSystemError) -> Errno {
         FileSystemError::CorruptContent { .. } => Errno::EIO,
         FileSystemError::Unsupported { .. } => Errno::EOPNOTSUPP,
         FileSystemError::SizeOverflow { .. } => Errno::EFBIG,
+        FileSystemError::ReadServingRefused { .. } => Errno::EIO,
         FileSystemError::Store(StoreError::NoSpace) => Errno::ENOSPC,
         _ => Errno::EIO,
     }
