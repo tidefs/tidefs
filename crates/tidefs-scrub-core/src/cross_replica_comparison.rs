@@ -319,9 +319,10 @@ pub fn compare_cross_replica(
 
         if rejection.is_none() {
             accepted_evidence.push(ev);
-        } else if rejection == Some(EvidenceRejectionReason::StaleGeneration)
-            || rejection == Some(EvidenceRejectionReason::ReceiptStale)
-        {
+        } else if matches!(
+            rejection,
+            Some(EvidenceRejectionReason::StaleGeneration | EvidenceRejectionReason::ReceiptStale)
+        ) {
             stale_replicas.push(ev.replica_id);
         }
 
@@ -613,7 +614,8 @@ fn source_target_sets(classification: &ComparisonClassification) -> (Vec<u64>, V
         ComparisonClassification::SingleReplicaCorruption {
             corrupt_replica,
             clean_sources,
-        } => (clean_sources.clone(), vec![*corrupt_replica]),
+        }
+        |
         ComparisonClassification::RemoteReplicaCorruption {
             corrupt_replica,
             clean_sources,
