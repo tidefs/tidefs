@@ -51,6 +51,7 @@ tidefs-send-stream = { workspace = true }
 tidefs-receive-stream = { workspace = true }
 tidefs-storage-intent-core = { workspace = true }
 tidefs-storage-intent-read-serving = { workspace = true }
+tidefs-storage-intent-prefetch-executor = { workspace = true }
 
 tidefs-background-scheduler = { workspace = true }
 tidefs-compaction = { workspace = true }

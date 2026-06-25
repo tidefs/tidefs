@@ -225,6 +225,58 @@ pub(crate) fn issue_readahead(fs: &LocalFileSystem, path: &str, offset: u64, len
     );
 }
 
+#[allow(dead_code)]
+/// Outcome bundle returned by an executor-authorised readahead dispatch.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutorReadaheadOutcome {
+    /// The executor record produced by evaluate_prefetch_execution.
+    pub executor_record: tidefs_storage_intent_prefetch_executor::PrefetchExecutorRecord,
+    /// Bytes requested for dispatch when executor permitted the action;
+    /// None when the executor refused, blocked, or handed off the action.
+    pub bytes_issued: Option<u64>,
+}
+
+#[allow(dead_code)]
+/// Issue a readahead only after the storage-intent prefetch executor
+/// authorises the action family, evidence, budget, and scheduler admission.
+///
+/// This is the #972 adapter hook that consumes #967 decisions, #913 evidence
+/// snapshots, and the #862/#844/#856/#877/#893/#902 boundary refs carried
+/// inside `executor_input`.  When the executor returns
+/// `PrefetchExecutorOutcome::Started` the call dispatches the readahead
+/// through the existing read-serving gate; otherwise it records the refusal,
+/// block, or handoff outcome and does not touch cache or storage.
+pub(crate) fn issue_readahead_with_executor(
+    fs: &LocalFileSystem,
+    path: &str,
+    offset: u64,
+    length: u64,
+    executor_input: tidefs_storage_intent_prefetch_executor::PrefetchExecutorInput,
+) -> ExecutorReadaheadOutcome {
+    let record =
+        tidefs_storage_intent_prefetch_executor::evaluate_prefetch_execution(executor_input);
+
+    let bytes_issued = if record.outcome
+        == tidefs_storage_intent_prefetch_executor::PrefetchExecutorOutcome::Started
+    {
+        let len = usize::try_from(length).unwrap_or(usize::MAX);
+        let _ = fs.read_file_range_with_read_serving(
+            path,
+            offset,
+            len,
+            tidefs_storage_intent_read_serving::ReadServingDecisionInput::default(),
+        );
+        Some(length)
+    } else {
+        None
+    };
+
+    ExecutorReadaheadOutcome {
+        executor_record: record,
+        bytes_issued,
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -514,5 +566,69 @@ mod tests {
         let report = fs.hot_read_cache_report();
         assert_eq!(report.insertions, 0, "readahead has no authority evidence");
         assert_eq!(report.resident_entries, 0, "cache remains cold");
+    }
+
+    #[test]
+    fn executor_refused_readahead_does_not_dispatch() {
+        set_test_key();
+        let dir = temp_dir("executor-refused");
+        let payload = vec![0xEF; 128 * 1024];
+
+        let mut fs = LocalFileSystem::open(&dir).expect("open filesystem");
+        fs.create_file("/cold.bin", DEFAULT_FILE_PERMISSIONS)
+            .expect("create");
+        fs.write_file("/cold.bin", 0, &payload).expect("write");
+        fs.sync_all().expect("sync");
+
+        // Default executor input has no decision, evidence, or admission:
+        // the executor must refuse.
+        let executor_input = Default::default();
+
+        let outcome = issue_readahead_with_executor(
+            &fs,
+            "/cold.bin",
+            0,
+            payload.len() as u64,
+            executor_input,
+        );
+
+        assert_ne!(
+            outcome.executor_record.outcome,
+            tidefs_storage_intent_prefetch_executor::PrefetchExecutorOutcome::Started,
+            "executor must refuse when decision and evidence are absent"
+        );
+        assert!(
+            outcome.bytes_issued.is_none(),
+            "no bytes dispatched when executor refuses"
+        );
+    }
+
+    #[test]
+    fn executor_adapter_preserves_executor_record() {
+        set_test_key();
+        let dir = temp_dir("executor-record");
+        let payload = vec![0xAA; 64 * 1024];
+
+        let mut fs = LocalFileSystem::open(&dir).expect("open filesystem");
+        fs.create_file("/rec.bin", DEFAULT_FILE_PERMISSIONS)
+            .expect("create");
+        fs.write_file("/rec.bin", 0, &payload).expect("write");
+        fs.sync_all().expect("sync");
+
+        let executor_input = Default::default();
+
+        let outcome = issue_readahead_with_executor(
+            &fs,
+            "/rec.bin",
+            0,
+            payload.len() as u64,
+            executor_input,
+        );
+
+        // The outcome carries the full executor record for attribution (#912),
+        // retention (#910), and explanation (#849).
+        assert!(!outcome.executor_record.can_publish_replacement_receipt());
+        assert!(!outcome.executor_record.can_retire_source_receipt());
+        assert!(!outcome.executor_record.can_satisfy_durable_sync());
     }
 }
