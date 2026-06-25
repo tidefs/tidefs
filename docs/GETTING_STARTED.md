@@ -9,7 +9,11 @@ The repo provides a pinned Rust toolchain through Nix. No host-global Rust
 installation is needed.
 
 **Important**: The Nix build sandbox does not provide `/dev/kvm`, `/dev/fuse`,
-or the runtime device substrate. Nix builds artifacts only; autonomous runtime
+ublk, mounts, or the kernel device substrate. Nix builds produce artifacts
+only. QEMU, FUSE mounts, ublk block devices, xfstests, fsstress, fio, RDMA,
+and kernel module operations require execution outside the Nix build sandbox.
+The `nix run .#qemu-*` guest runners and the FUSE mount commands in this
+document expect `/dev/fuse` and `/dev/kvm` on the host.
 
 ## Quick Start
 
@@ -43,17 +47,14 @@ Smoke mount:
 
     cargo run -p tidefs-posix-filesystem-adapter-daemon -- smoke-mount
 
-
     nix run .#qemu-smoke            # FUSE smoke in QEMU guest (Linux 7.0)
     nix run .#posix-scoreboard      # FUSE POSIX scoreboard (requires /dev/fuse; use QEMU)
     nix run .#xfstests-runner       # diagnostic xfstests scoreboard wrapper
 
-kernel.** Nix builds artifacts only. QEMU and tests that touch `/dev/fuse`,
-ublk, mounts, RDMA, xfstests, fsstress, or fio filesystem semantics must launch
-outside the Nix build sandbox and run inside a guest.
-
-Legacy `qemu-smoke`, `qemu-ublk-*`, and `fuse-vm-test` app entrypoints are
-to outside-sandbox runners before relying on them.
+The legacy `qemu-smoke`, `qemu-ublk-*`, and `fuse-vm-test` app entrypoints are
+deprecated preview names retained for reference; prefer the `nix run .#qemu-*`
+flake runners or the `tidefs-posix-filesystem-adapter-daemon` entrypoints
+above.
 
 ## Where to Go Next
 
