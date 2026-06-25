@@ -19012,14 +19012,16 @@ pub const fn metadata_namespace_vfs_authority_is_bound(
     if !present.satisfied {
         return present;
     }
+    if evidence.vfs_authority.inode_number != 0
+        && evidence.vfs_authority.inode_generation == 0
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MetadataStaleInodeGeneration,
+        );
+    }
     if !evidence.has_vfs_authority() {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::EvidenceNotUsable,
-        );
-    }
-    if evidence.vfs_authority.inode_generation == 0 {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::MetadataStaleInodeGeneration,
         );
     }
     ReceiptPredicateResult::SATISFIED
@@ -28454,6 +28456,18 @@ mod tests {
         assert_eq!(
             result.refusal,
             StorageIntentRefusalReason::MetadataStaleInodeGeneration
+        );
+    }
+
+    #[test]
+    fn metadata_vfs_authority_bound_refused_when_inode_number_is_zero() {
+        let mut evidence = make_metadata_evidence();
+        evidence.vfs_authority.inode_number = 0;
+        let result = metadata_namespace_vfs_authority_is_bound(evidence);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
 
