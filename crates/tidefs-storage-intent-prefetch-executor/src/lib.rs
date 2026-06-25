@@ -674,12 +674,128 @@ pub struct PrefetchExecutorEvidenceRefs {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorResultDetail {
+    pub prefetched_bytes: u64,
+    pub used_bytes: u64,
+    pub unused_bytes: u64,
+    pub expired_bytes: u64,
+    pub latency_benefit_us: u64,
+    pub latency_harm_us: u64,
+    pub foreground_p50_disruption_us: u64,
+    pub foreground_p95_disruption_us: u64,
+    pub foreground_p99_disruption_us: u64,
+    pub queue_delay_us: u64,
+    pub flash_write_bytes: u64,
+    pub pmem_write_bytes: u64,
+    pub waf_micros: u64,
+    pub ram_pressure_bytes: u64,
+    pub cache_index_write_bytes: u64,
+    pub predictor_metadata_write_bytes: u64,
+    pub wan_bytes: u64,
+    pub egress_cost_microunits: u64,
+    pub restore_cost_microunits: u64,
+    pub staging_capacity_bytes: u64,
+    pub cpu_us: u64,
+    pub memory_bytes: u64,
+    pub protected_reserve_pressure: bool,
+    pub attribution_ref: StorageIntentEvidenceRef,
+    pub retention_ref: StorageIntentEvidenceRef,
+    pub validation_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for PrefetchExecutorResultDetail {
+    fn default() -> Self {
+        Self {
+            prefetched_bytes: 0,
+            used_bytes: 0,
+            unused_bytes: 0,
+            expired_bytes: 0,
+            latency_benefit_us: 0,
+            latency_harm_us: 0,
+            foreground_p50_disruption_us: 0,
+            foreground_p95_disruption_us: 0,
+            foreground_p99_disruption_us: 0,
+            queue_delay_us: 0,
+            flash_write_bytes: 0,
+            pmem_write_bytes: 0,
+            waf_micros: 0,
+            ram_pressure_bytes: 0,
+            cache_index_write_bytes: 0,
+            predictor_metadata_write_bytes: 0,
+            wan_bytes: 0,
+            egress_cost_microunits: 0,
+            restore_cost_microunits: 0,
+            staging_capacity_bytes: 0,
+            cpu_us: 0,
+            memory_bytes: 0,
+            protected_reserve_pressure: false,
+            attribution_ref: EMPTY_EVIDENCE_REF,
+            retention_ref: EMPTY_EVIDENCE_REF,
+            validation_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+impl PrefetchExecutorResultDetail {
+    #[must_use]
+    pub const fn has_usage_measurement(self) -> bool {
+        self.prefetched_bytes != 0
+            || self.used_bytes != 0
+            || self.unused_bytes != 0
+            || self.expired_bytes != 0
+    }
+
+    #[must_use]
+    pub const fn has_latency_measurement(self) -> bool {
+        self.latency_benefit_us != 0
+            || self.latency_harm_us != 0
+            || self.foreground_p50_disruption_us != 0
+            || self.foreground_p95_disruption_us != 0
+            || self.foreground_p99_disruption_us != 0
+            || self.queue_delay_us != 0
+    }
+
+    #[must_use]
+    pub const fn has_cost_or_pressure_measurement(self) -> bool {
+        self.flash_write_bytes != 0
+            || self.pmem_write_bytes != 0
+            || self.waf_micros != 0
+            || self.ram_pressure_bytes != 0
+            || self.cache_index_write_bytes != 0
+            || self.predictor_metadata_write_bytes != 0
+            || self.wan_bytes != 0
+            || self.egress_cost_microunits != 0
+            || self.restore_cost_microunits != 0
+            || self.staging_capacity_bytes != 0
+            || self.cpu_us != 0
+            || self.memory_bytes != 0
+            || self.protected_reserve_pressure
+    }
+
+    #[must_use]
+    pub const fn has_feedback_payback_inputs(self) -> bool {
+        self.has_usage_measurement()
+            || self.has_latency_measurement()
+            || self.has_cost_or_pressure_measurement()
+    }
+
+    #[must_use]
+    pub const fn has_feedback_evidence_root(self) -> bool {
+        self.attribution_ref.is_bound()
+            || self.retention_ref.is_bound()
+            || self.validation_ref.is_bound()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct PrefetchExecutorInput {
     pub decision: PrefetchResidencyDecisionRecord,
     pub evidence_query_snapshot: StorageIntentEvidenceQuerySnapshot,
     pub admission: PrefetchExecutorAdmissionRecord,
     pub media_path: PrefetchExecutorMediaPath,
     pub cost_state: PrefetchExecutorCostState,
+    pub result_detail: PrefetchExecutorResultDetail,
     pub action_family: PrefetchExecutorActionFamily,
     pub freshness_rpo_floor_ms: u64,
     pub anti_waste: PrefetchExecutorAntiWasteMask,
@@ -697,6 +813,7 @@ impl Default for PrefetchExecutorInput {
             admission: PrefetchExecutorAdmissionRecord::default(),
             media_path: PrefetchExecutorMediaPath::default(),
             cost_state: PrefetchExecutorCostState::default(),
+            result_detail: PrefetchExecutorResultDetail::default(),
             action_family: PrefetchExecutorActionFamily::Unknown,
             freshness_rpo_floor_ms: 0,
             anti_waste: PrefetchExecutorAntiWasteMask::EMPTY,
@@ -734,6 +851,7 @@ pub struct PrefetchExecutorRecord {
     pub max_staging_bytes: u64,
     pub admission: PrefetchExecutorAdmissionRecord,
     pub cost_state: PrefetchExecutorCostState,
+    pub result_detail: PrefetchExecutorResultDetail,
     pub anti_waste: PrefetchExecutorAntiWasteMask,
     pub outcome: PrefetchExecutorOutcome,
     pub refusal: StorageIntentRefusalReason,
@@ -767,6 +885,7 @@ impl Default for PrefetchExecutorRecord {
             max_staging_bytes: 0,
             admission: PrefetchExecutorAdmissionRecord::default(),
             cost_state: PrefetchExecutorCostState::default(),
+            result_detail: PrefetchExecutorResultDetail::default(),
             anti_waste: PrefetchExecutorAntiWasteMask::EMPTY,
             outcome: PrefetchExecutorOutcome::Unknown,
             refusal: StorageIntentRefusalReason::None,
@@ -800,6 +919,11 @@ impl PrefetchExecutorRecord {
     #[must_use]
     pub const fn is_non_authority_population(self) -> bool {
         self.executor_byte_state.is_non_authority()
+    }
+
+    #[must_use]
+    pub const fn has_feedback_payback_inputs(self) -> bool {
+        self.result_detail.has_feedback_payback_inputs()
     }
 
     #[must_use]
@@ -1086,6 +1210,7 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
         max_staging_bytes: input.decision.max_staging_bytes,
         admission: input.admission,
         cost_state: input.cost_state,
+        result_detail: input.result_detail,
         anti_waste: input.anti_waste,
         evidence_refs: PrefetchExecutorEvidenceRefs {
             compiled_policy_ref: input.decision.evidence_refs.compiled_policy_ref,
@@ -1117,9 +1242,9 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
                 input.media_path.trust_domain_ref,
                 input.decision.evidence_refs.trust_domain_ref,
             ),
-            retention_ref: EMPTY_EVIDENCE_REF,
-            attribution_ref: EMPTY_EVIDENCE_REF,
-            validation_ref: EMPTY_EVIDENCE_REF,
+            retention_ref: input.result_detail.retention_ref,
+            attribution_ref: input.result_detail.attribution_ref,
+            validation_ref: input.result_detail.validation_ref,
         },
         ..PrefetchExecutorRecord::default()
     }
@@ -1375,6 +1500,9 @@ mod tests {
     const ISO: StorageIntentEvidenceId = StorageIntentEvidenceId([12; 32]);
     const TRANSPORT: StorageIntentEvidenceId = StorageIntentEvidenceId([13; 32]);
     const TRUST: StorageIntentEvidenceId = StorageIntentEvidenceId([14; 32]);
+    const ATTRIBUTION: StorageIntentEvidenceId = StorageIntentEvidenceId([15; 32]);
+    const RETENTION: StorageIntentEvidenceId = StorageIntentEvidenceId([16; 32]);
+    const VALIDATION: StorageIntentEvidenceId = StorageIntentEvidenceId([17; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -1690,6 +1818,83 @@ mod tests {
         assert!(!record.can_publish_replacement_receipt());
         assert!(!record.can_retire_source_receipt());
         assert!(!record.implies_latest_read_authority());
+    }
+
+    #[test]
+    fn feedback_result_detail_is_preserved_for_975() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.admission.requested_bytes = 16 * 1024;
+        input.admission.admitted_bytes = 12 * 1024;
+        input.admission.queue_time_us = 17;
+        input.admission.reserve_protected = true;
+        input.admission.pressure = PrefetchExecutorPressureMask::P99_LATENCY
+            .union(PrefetchExecutorPressureMask::PROTECTED_RESERVE);
+        input.result_detail = PrefetchExecutorResultDetail {
+            prefetched_bytes: 12 * 1024,
+            used_bytes: 8 * 1024,
+            unused_bytes: 3 * 1024,
+            expired_bytes: 1024,
+            latency_benefit_us: 1_500,
+            latency_harm_us: 25,
+            foreground_p50_disruption_us: 4,
+            foreground_p95_disruption_us: 12,
+            foreground_p99_disruption_us: 31,
+            queue_delay_us: 17,
+            flash_write_bytes: 512,
+            pmem_write_bytes: 256,
+            waf_micros: 1_250_000,
+            ram_pressure_bytes: 64 * 1024,
+            cache_index_write_bytes: 128,
+            predictor_metadata_write_bytes: 64,
+            wan_bytes: 32,
+            egress_cost_microunits: 7,
+            restore_cost_microunits: 11,
+            staging_capacity_bytes: 12 * 1024,
+            cpu_us: 42,
+            memory_bytes: 64 * 1024,
+            protected_reserve_pressure: true,
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+        };
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(record.subject.dataset_id, DATASET);
+        assert_eq!(record.result_detail, input.result_detail);
+        assert!(record.has_feedback_payback_inputs());
+        assert!(record.result_detail.has_feedback_evidence_root());
+        assert_eq!(
+            record.evidence_refs.attribution_ref,
+            input.result_detail.attribution_ref
+        );
+        assert_eq!(
+            record.evidence_refs.retention_ref,
+            input.result_detail.retention_ref
+        );
+        assert_eq!(
+            record.evidence_refs.validation_ref,
+            input.result_detail.validation_ref
+        );
+        assert!(!record.can_satisfy_durable_sync());
+        assert!(!record.can_publish_replacement_receipt());
+    }
+
+    #[test]
+    fn completion_alone_is_not_feedback_payback_evidence() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
+        input.admission = PrefetchExecutorAdmissionRecord::default();
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Completed);
+        assert!(!record.has_feedback_payback_inputs());
+        assert!(!record.result_detail.has_feedback_evidence_root());
     }
 
     #[test]
