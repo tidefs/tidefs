@@ -1945,4 +1945,82 @@ mod tests {
         assert!(record.may_close_payback());
         assert!(!record.may_support_public_or_comparator_claim());
     }
+
+    #[test]
+    fn one_pass_scan_demotes_and_blocks_persistent_promotion() {
+        let mut input = admissible_input();
+        input.executor.anti_waste = PrefetchExecutorAntiWasteMask::ONE_PASS_SCAN;
+        input.executor.access_pattern = AccessPatternClass::OnePassScan;
+        input.executor.target_media = StorageMediaClass::NvmeFlash;
+
+        let record = evaluate_prefetch_feedback(input);
+
+        assert_eq!(record.verdict, PrefetchFeedbackVerdict::OnePassScan);
+        assert_eq!(
+            record.confidence_update,
+            PrefetchFeedbackConfidenceUpdate::LowerOneStep
+        );
+        assert!(record
+            .adjustments
+            .contains_all(PrefetchFeedbackAdjustmentMask::LOWER_ACTION_CLASS));
+        assert!(record
+            .adjustments
+            .contains_all(PrefetchFeedbackAdjustmentMask::EXPLICIT_NO_PREFETCH));
+        assert!(record
+            .adjustments
+            .contains_all(PrefetchFeedbackAdjustmentMask::DEMOTION_CANDIDATE));
+        assert!(record
+            .adjustments
+            .contains_all(PrefetchFeedbackAdjustmentMask::COOLDOWN));
+        assert_eq!(
+            record.next_candidate,
+            PrefetchResidencyCandidateClass::DemotionCandidate
+        );
+        assert_eq!(record.next_prefetch_window_bytes, 0);
+        assert!(record.cooldown_ms > 0);
+        assert!(!record.can_retire_source_receipt());
+    }
+
+    #[test]
+    fn phase_changed_workload_cools_down_and_demotes() {
+        let mut input = admissible_input();
+        input.executor.anti_waste = PrefetchExecutorAntiWasteMask::PHASE_CHANGE;
+        input.executor.access_pattern = AccessPatternClass::PhaseChangingSparse;
+        input.executor.target_media = StorageMediaClass::NvmeFlash;
+
+        let record = evaluate_prefetch_feedback(input);
+
+        assert_eq!(record.verdict, PrefetchFeedbackVerdict::PhaseChanged);
+        assert_eq!(
+            record.confidence_update,
+            PrefetchFeedbackConfidenceUpdate::LowerOneStep
+        );
+        assert!(record
+            .adjustments
+            .contains_all(PrefetchFeedbackAdjustmentMask::LOWER_ACTION_CLASS));
+        assert!(record
+            .adjustments
+            .contains_all(PrefetchFeedbackAdjustmentMask::DEMOTION_CANDIDATE));
+        assert!(record
+            .adjustments
+            .contains_all(PrefetchFeedbackAdjustmentMask::COOLDOWN));
+        assert!(record
+            .adjustments
+            .contains_all(PrefetchFeedbackAdjustmentMask::EXTEND_DWELL));
+        assert_eq!(
+            record.next_candidate,
+            PrefetchResidencyCandidateClass::DemotionCandidate
+        );
+        assert!(record.cooldown_ms > 0);
+        assert!(!record.can_retire_source_receipt());
+    }
+
+    #[test]
+    fn feedback_record_never_retires_or_spends_by_itself() {
+        let record = PrefetchFeedbackRecord::default();
+
+        assert!(!record.can_retire_source_receipt());
+        assert!(!record.can_publish_replacement_receipt());
+        assert!(!record.can_spend_extra_flash_movement_budget());
+    }
 }
