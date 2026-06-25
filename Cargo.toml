@@ -308,6 +308,7 @@ tidefs-storage-intent-core = { path = "crates/tidefs-storage-intent-core" }
 tidefs-storage-intent-local-media-capability = { path = "crates/tidefs-storage-intent-local-media-capability" }
 tidefs-storage-intent-read-serving = { path = "crates/tidefs-storage-intent-read-serving" }
 tidefs-storage-intent-remote-media-capability = { path = "crates/tidefs-storage-intent-remote-media-capability" }
+tidefs-storage-intent-policy = { path = "crates/tidefs-storage-intent-policy" }
 tidefs-storage-intent-workload-signals = { path = "crates/tidefs-storage-intent-workload-signals" }
 tidefs-storage-intent-cost = { path = "crates/tidefs-storage-intent-cost" }
 tidefs-storage-intent-prefetch-executor = { path = "crates/tidefs-storage-intent-prefetch-executor" }

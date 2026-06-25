@@ -128,7 +128,6 @@ enum Command {
         cmd: commands::kernel::KernelCommand,
     },
 
-
     /// Resolve merge conflicts for receive merge planner manual policy
     Merge {
         #[command(subcommand)]
@@ -537,6 +536,61 @@ mod tests {
         assert!(
             args.is_ok(),
             "storage-intent explain should parse as a read-only operator surface"
+        );
+    }
+
+    #[test]
+    fn cli_parse_storage_intent_policy_set_surface() {
+        use clap::Parser;
+        let args = Cli::try_parse_from([
+            "tidefsctl",
+            "storage-intent",
+            "policy",
+            "set",
+            "tank/fs",
+            "--allow",
+            "bounded-readahead,cache-only-trial",
+            "--refuse",
+            "flash-hot-serving",
+            "--max-prefetch-window-bytes",
+            "1048576",
+            "--budget-owner",
+            "dataset-a",
+            "--budget",
+            "ram=dataset-a",
+            "--feedback-mode",
+            "prefetch-windows",
+            "--json",
+        ]);
+        assert!(args.is_ok(), "storage-intent policy set should parse");
+    }
+
+    #[test]
+    fn cli_parse_storage_intent_policy_clear_and_dry_run_surfaces() {
+        use clap::Parser;
+        let clear = Cli::try_parse_from([
+            "tidefsctl",
+            "storage-intent",
+            "policy",
+            "clear",
+            "tank/fs",
+            "--all",
+            "--json",
+        ]);
+        assert!(clear.is_ok(), "storage-intent policy clear should parse");
+
+        let dry_run = Cli::try_parse_from([
+            "tidefsctl",
+            "storage-intent",
+            "policy",
+            "dry-run",
+            "--input",
+            "/tmp/source.json",
+            "--json",
+        ]);
+        assert!(
+            dry_run.is_ok(),
+            "storage-intent policy dry-run should parse"
         );
     }
 
@@ -1514,7 +1568,8 @@ mod tests {
     #[test]
     fn cli_parse_cluster_status_json() {
         use clap::Parser;
-        let args = super::Cli::try_parse_from(["tidefsctl", "cluster", "status", "mypool", "--json"]);
+        let args =
+            super::Cli::try_parse_from(["tidefsctl", "cluster", "status", "mypool", "--json"]);
         assert!(args.is_ok(), "cluster status --json should parse");
     }
 
@@ -1522,7 +1577,10 @@ mod tests {
     fn cli_parse_cluster_status_rejects_no_pool() {
         use clap::Parser;
         let args = super::Cli::try_parse_from(["tidefsctl", "cluster", "status"]);
-        assert!(args.is_err(), "cluster status without pool name should fail");
+        assert!(
+            args.is_err(),
+            "cluster status without pool name should fail"
+        );
     }
 
     #[test]
@@ -1535,7 +1593,8 @@ mod tests {
     #[test]
     fn cli_parse_device_status_json() {
         use clap::Parser;
-        let args = super::Cli::try_parse_from(["tidefsctl", "device", "status", "mypool", "--json"]);
+        let args =
+            super::Cli::try_parse_from(["tidefsctl", "device", "status", "mypool", "--json"]);
         assert!(args.is_ok(), "device status --json should parse");
     }
 
@@ -1545,5 +1604,4 @@ mod tests {
         let args = super::Cli::try_parse_from(["tidefsctl", "device", "status"]);
         assert!(args.is_err(), "device status without pool name should fail");
     }
-
 }

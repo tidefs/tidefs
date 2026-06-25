@@ -158,10 +158,7 @@ fn handle_resolve(
 
     if let Some(ref output_path) = output {
         if let Err(e) = fs::write(output_path, &output_json) {
-            eprintln!(
-                "error: failed to write {}: {e}",
-                output_path.display()
-            );
+            eprintln!("error: failed to write {}: {e}", output_path.display());
             process::exit(1);
         }
         eprintln!(

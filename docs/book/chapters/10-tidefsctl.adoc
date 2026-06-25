@@ -266,6 +266,45 @@ storage intent as a successor claim must be gated through #875 registered
 claim ids and fail closed until validated. The explain renderer never hides
 volatile or unsafe receipts from operator output or support bundles.
 
+=== Storage Intent Policy Source
+
+`tidefsctl storage-intent policy set|clear|show|dry-run` is the first
+dataset-scoped prefetch/residency UAPI slice. It builds and renders an
+explicit JSON policy source for adaptive prefetch, cache-only trials, RAM/PMem,
+flash/HDD, WAN/object/archive staging, promotion, demotion, dwell, cooldown,
+payback, feedback, and refusal controls. `set` and `clear` are local-only
+source publication helpers; `show` and `dry-run` are passive renderers.
+
+The policy source is not runtime authority. `dry-run` routes the staged source
+through the #855 policy compiler, renders #901 rollout state as staged or
+blocked when rollout/convergence evidence is absent, renders #926 preflight as
+required-unavailable or not-covered, and renders #972 executor support for each
+requested action as available, blocked, or refused. It does not execute
+prefetch, promotion, demotion, data movement, source retirement, or budget
+spend, and it does not reinterpret old receipts or already-running work.
+
+[source,sh]
+----
+tidefsctl storage-intent policy set tank/fs \
+  --allow bounded-readahead,cache-only-trial \
+  --refuse flash-hot-serving \
+  --max-prefetch-window-bytes 1048576 \
+  --budget-owner dataset-a \
+  --budget ram=dataset-a \
+  --feedback-mode prefetch-windows \
+  --output policy-source.json
+
+tidefsctl storage-intent policy dry-run --input policy-source.json
+tidefsctl storage-intent policy show --input policy-source.json --json
+tidefsctl storage-intent policy clear tank/fs --all --output policy-clear.json
+----
+
+Pool defaults, mount profiles, caller hints, workload detection, and learned
+feedback may seed or tighten the compiled source only through dataset
+inheritance and #855 merge rules. They must not relax a stricter dataset
+policy, authorize promotion by hotness hint alone, borrow another dataset's
+budget, or hide missing wear/cost/RPO/trust/preflight evidence.
+
 === Kernel Runtime Inventory
 
 `tidefsctl kernel status` reports the declared kernel control endpoint and the
@@ -353,6 +392,10 @@ byte-for-byte with source:
 | `dataset set` | `public-operator` | `live-owner-or-offline-input` | `local-only` | `visible` | set dataset properties through owner authority or explicit devices |
 | `dataset list-props` | `public-operator` | `live-owner-or-offline-input` | `unguarded` | `visible` | list dataset property definitions and effective values |
 | `storage-intent explain` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | render supplied storage-intent policy, receipt, and evidence-query records read-only |
+| `storage-intent policy set` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | stage dataset prefetch/residency policy source through #855 without activation |
+| `storage-intent policy clear` | `public-operator` | `no-live-pool-state` | `local-only` | `visible` | stage dataset prefetch/residency policy clears through #855 without activation |
+| `storage-intent policy show` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | render staged dataset prefetch/residency policy source documents |
+| `storage-intent policy dry-run` | `public-operator` | `passive-diagnostic` | `unguarded` | `visible` | compile staged dataset prefetch/residency policy source and render blocked support |
 | `mount` | `userspace-harness` | `userspace-harness` | `unguarded` | `visible` | launch the current direct FUSE development harness |
 | `pool mount` | `userspace-harness` | `userspace-harness` | `unguarded` | `visible` | import explicit devices and launch the current FUSE owner harness |
 | `pool integrity-check` | `operator-diagnostic` | `live-owner-or-offline-input` | `unguarded` | `visible` | run live-owner or explicit-device integrity diagnostics |
