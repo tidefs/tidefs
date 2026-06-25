@@ -911,8 +911,8 @@ pub const fn read_serving_candidate_missing_required_ref_reasons(
     {
         missing = missing.union(ReadServingRejectionMask::DIGEST_OR_SHAPE_MISMATCH);
     }
-    if source_uses_volatile_or_pmem_authority(source) {
-        if !evidence_ref_has_kind(
+    if source_uses_volatile_or_pmem_authority(source)
+        && (!evidence_ref_has_kind(
             refs.ram_authority_ref,
             StorageIntentEvidenceKind::RamAuthorityEvidence,
         ) || !evidence_ref_has_kind(
@@ -921,9 +921,9 @@ pub const fn read_serving_candidate_missing_required_ref_reasons(
         ) || !evidence_ref_has_kind(
             refs.lease_epoch_ref,
             StorageIntentEvidenceKind::MembershipEvidence,
-        ) {
-            missing = missing.union(ReadServingRejectionMask::MISSING_EVIDENCE_REF);
-        }
+        ))
+    {
+        missing = missing.union(ReadServingRejectionMask::MISSING_EVIDENCE_REF);
     }
     if matches!(source, StorageIntentReadSourceClass::AuthoritativePmem)
         && !evidence_ref_has_kind(
@@ -1318,20 +1318,18 @@ const fn cache_refusal(
     if matches!(
         input.candidate.source_class,
         StorageIntentReadSourceClass::CacheOnlyServingTrial
-    ) {
-        if !input.policy.allow_serving_trial
-            || !evidence_ref_has_id(input.candidate.evidence_refs.prefetch_decision_ref)
-            || !matches!(
-                input.candidate.prefetch_outcome,
-                PrefetchResidencyDecisionOutcome::CacheOnly
-                    | PrefetchResidencyDecisionOutcome::ServingTrial
-            )
-        {
-            return Some((
-                StorageIntentRefusalReason::CacheCannotBeAuthority,
-                ReadServingRejectionMask::CACHE_CANNOT_BE_AUTHORITY,
-            ));
-        }
+    ) && (!input.policy.allow_serving_trial
+        || !evidence_ref_has_id(input.candidate.evidence_refs.prefetch_decision_ref)
+        || !matches!(
+            input.candidate.prefetch_outcome,
+            PrefetchResidencyDecisionOutcome::CacheOnly
+                | PrefetchResidencyDecisionOutcome::ServingTrial
+        ))
+    {
+        return Some((
+            StorageIntentRefusalReason::CacheCannotBeAuthority,
+            ReadServingRejectionMask::CACHE_CANNOT_BE_AUTHORITY,
+        ));
     }
     None
 }
