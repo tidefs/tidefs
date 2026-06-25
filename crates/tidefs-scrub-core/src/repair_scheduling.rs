@@ -309,12 +309,9 @@ impl RepairEvidence {
         entry: &SuspectEntry,
         receipt: PlacementReceiptRef,
     ) -> Result<Self, RepairEvidenceRejection> {
-        if receipt.is_synthetic()
+        if !receipt.is_committed_authority()
             || receipt.object_id != entry.locator_id
             || (entry.expected_hash != [0; 32] && receipt.payload_digest != entry.expected_hash)
-            || !receipt.redundancy_policy.is_well_formed()
-            || receipt.target_count == 0
-            || receipt.target_count != receipt.redundancy_policy.target_width()
         {
             return Err(RepairEvidenceRejection::StaleReceipt);
         }
@@ -1246,6 +1243,20 @@ mod tests {
         )
     }
 
+    fn receipt_with_target_count(entry: &SuspectEntry, target_count: u16) -> PlacementReceiptRef {
+        let base = receipt_for_entry(entry);
+        PlacementReceiptRef::new(
+            base.object_id,
+            base.object_key,
+            base.receipt_epoch,
+            base.receipt_generation,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            base.payload_len,
+            base.payload_digest,
+            target_count,
+        )
+    }
+
     fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
         let receipt = receipt_for_entry(&entry);
         RepairAdmissionInput::with_receipt(entry, receipt)
@@ -1534,6 +1545,28 @@ mod tests {
     }
 
     #[test]
+    fn bridge_rejects_policy_width_receipt_evidence() {
+        for (locator_id, target_count) in [(105, 1u16), (106, 3u16)] {
+            let mut bridge = ScrubToRepairBridge::new();
+            let entry = make_entry(locator_id, 1);
+            let stale = receipt_with_target_count(&entry, target_count);
+            let input = RepairAdmissionInput::with_receipt(entry, stale);
+
+            let admissions = bridge.ingest_with_evidence(&[input], 3);
+
+            assert_eq!(
+                admissions,
+                vec![RepairAdmission::Blocked {
+                    locator_id,
+                    reason: RepairEvidenceRejection::StaleReceipt,
+                }]
+            );
+            assert_eq!(bridge.pending_count(), 0);
+            assert_eq!(bridge.stats().entries_blocked_stale_receipt, 1);
+        }
+    }
+
+    #[test]
     fn bridge_degraded_read_with_receipt_admits_immediate_job() {
         let mut bridge = ScrubToRepairBridge::new();
         let entry = make_entry(103, 1);
@@ -1652,6 +1685,21 @@ mod tests {
         assert_eq!(bridge.pending_count(), 0);
         assert_eq!(bridge.entries_generated(), 0);
         assert_eq!(bridge.entries_blocked_missing_receipt(), 1);
+    }
+
+    #[test]
+    fn rebake_rejects_policy_width_receipt_evidence() {
+        let mut bridge = RebakeSchedulingBridge::new();
+        let entry = make_entry(302, 1);
+        let stale = receipt_with_target_count(&entry, 3);
+        let input = RepairAdmissionInput::with_receipt(entry, stale);
+
+        let generated = bridge.generate_rebake_entries_with_evidence(&[input]);
+
+        assert!(generated.is_empty());
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.entries_generated(), 0);
+        assert_eq!(bridge.entries_blocked_stale_receipt(), 1);
     }
 
     #[test]

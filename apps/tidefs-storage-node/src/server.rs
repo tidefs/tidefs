@@ -1623,6 +1623,24 @@ fn placement_receipt_error_json(
             "required": required_count,
             "actual": target_count,
         }),
+        ReconstructionTaskReceiptError::OverWidthReceipt {
+            target_count,
+            required_count,
+        } => serde_json::json!({
+            "class": "over-width-receipt-targets",
+            "object_id": object_id,
+            "required": required_count,
+            "actual": target_count,
+        }),
+        ReconstructionTaskReceiptError::TopologyOnlySourceEvidence {
+            source_count,
+            receipt_target_count,
+        } => serde_json::json!({
+            "class": "topology-only-source-evidence",
+            "object_id": object_id,
+            "source_count": source_count,
+            "receipt_target_count": receipt_target_count,
+        }),
     }
 }
 
@@ -8263,6 +8281,33 @@ mod cluster_pool_handler_tests {
             planner["planner_error"]["class"],
             "malformed-receipt-policy"
         );
+
+        let mut over_width = receipt_ref_for_key(object_key, payload, 3);
+        over_width.target_count = 3;
+        let planner = receipt_backed_rebuild_planner_from_refs_json(
+            &config_with_rebuild_peer(),
+            vec![over_width],
+        );
+        assert_eq!(planner["available"], false);
+        assert_eq!(
+            planner["planner_error"]["class"],
+            "over-width-receipt-targets"
+        );
+        assert_eq!(planner["planner_error"]["required"], 2);
+        assert_eq!(planner["planner_error"]["actual"], 3);
+
+        let topology_only = receipt_ref_for_key(object_key, payload, 4);
+        let planner = receipt_backed_rebuild_planner_from_refs_json(
+            &config_with_rebuild_peer(),
+            vec![topology_only],
+        );
+        assert_eq!(planner["available"], false);
+        assert_eq!(
+            planner["planner_error"]["class"],
+            "topology-only-source-evidence"
+        );
+        assert_eq!(planner["planner_error"]["source_count"], 1);
+        assert_eq!(planner["planner_error"]["receipt_target_count"], 2);
 
         let synthetic = PlacementReceiptRef::synthetic_for_subject(
             tidefs_replication_model::ReplicatedSubjectId::new(99),

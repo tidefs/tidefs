@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 use super::*;
 use tidefs_membership_epoch::EpochId;
-use tidefs_replication_model::PlacementReceiptRef;
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 
 fn receipt_ref(object_id: u64) -> PlacementReceiptRef {
     let mut object_key = [0u8; 32];
@@ -16,6 +16,20 @@ fn receipt_ref(object_id: u64) -> PlacementReceiptRef {
         2,
         4096 + object_id,
         payload_digest,
+    )
+}
+
+fn receipt_ref_with_target_count(object_id: u64, target_count: u16) -> PlacementReceiptRef {
+    let base = receipt_ref(object_id);
+    PlacementReceiptRef::new(
+        base.object_id,
+        base.object_key,
+        base.receipt_epoch,
+        base.receipt_generation,
+        ReceiptRedundancyPolicy::Replicated { copies: 2 },
+        base.payload_len,
+        base.payload_digest,
+        target_count,
     )
 }
 
@@ -81,6 +95,25 @@ fn reconstruction_task_has_viable_sources() {
 fn reconstruction_task_target_count() {
     let task = full_task(1, vec![10], vec![20, 30], 0);
     assert_eq!(task.target_count(), 2);
+}
+
+#[test]
+fn reconstruction_task_rejects_over_width_receipt_ref() {
+    let err = ReconstructionTask::new_full_with_receipt(
+        receipt_ref_with_target_count(2, 3),
+        vec![10],
+        vec![20],
+        0,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err,
+        ReconstructionTaskReceiptError::OverWidthReceipt {
+            target_count: 3,
+            required_count: 2,
+        }
+    );
 }
 
 #[test]

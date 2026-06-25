@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tidefs_local_object_store::SuspectEntry;
-use tidefs_replication_model::PlacementReceiptRef;
+use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
 use tidefs_scrub::repair_scheduling::{
     RepairAdmission, RepairAdmissionInput, RepairBlockKind, RepairCandidateIdentity,
     RepairEscalation, RepairEvidenceClass, RepairEvidenceRejection, ScrubToRepairBridge,
@@ -113,6 +113,20 @@ fn receipt_for_entry(entry: &SuspectEntry) -> PlacementReceiptRef {
         2,
         4096,
         entry.expected_hash,
+    )
+}
+
+fn receipt_with_target_count(entry: &SuspectEntry, target_count: u16) -> PlacementReceiptRef {
+    let base = receipt_for_entry(entry);
+    PlacementReceiptRef::new(
+        base.object_id,
+        base.object_key,
+        base.receipt_epoch,
+        base.receipt_generation,
+        ReceiptRedundancyPolicy::Replicated { copies: 2 },
+        base.payload_len,
+        base.payload_digest,
+        target_count,
     )
 }
 
@@ -390,6 +404,28 @@ fn stale_receipt_payload_digest_blocks_queueing() {
     );
     assert_eq!(bridge.pending_count(), 0);
     assert_eq!(bridge.stats().entries_blocked_stale_receipt, 1);
+}
+
+#[test]
+fn policy_width_receipts_block_repair_admission() {
+    for (locator_id, target_count) in [(707, 1u16), (708, 3u16)] {
+        let mut bridge = ScrubToRepairBridge::new();
+        let entry = make_suspect_entry(locator_id);
+        let receipt = receipt_with_target_count(&entry, target_count);
+        let input = RepairAdmissionInput::with_receipt(entry, receipt);
+
+        let admissions = bridge.ingest_with_evidence(&[input], 2);
+
+        assert_eq!(
+            admissions,
+            vec![RepairAdmission::Blocked {
+                locator_id,
+                reason: RepairEvidenceRejection::StaleReceipt,
+            }]
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.stats().entries_blocked_stale_receipt, 1);
+    }
 }
 
 #[test]

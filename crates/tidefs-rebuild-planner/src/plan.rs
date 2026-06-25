@@ -18,6 +18,14 @@ pub enum ReconstructionTaskReceiptError {
         target_count: u16,
         required_count: u16,
     },
+    OverWidthReceipt {
+        target_count: u16,
+        required_count: u16,
+    },
+    TopologyOnlySourceEvidence {
+        source_count: u16,
+        receipt_target_count: u16,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,6 +87,12 @@ impl ReconstructionTask {
         let required_count = placement_receipt_ref.redundancy_policy.target_width();
         if placement_receipt_ref.target_count < required_count {
             return Err(ReconstructionTaskReceiptError::UnderWidthReceipt {
+                target_count: placement_receipt_ref.target_count,
+                required_count,
+            });
+        }
+        if placement_receipt_ref.target_count > required_count {
+            return Err(ReconstructionTaskReceiptError::OverWidthReceipt {
                 target_count: placement_receipt_ref.target_count,
                 required_count,
             });

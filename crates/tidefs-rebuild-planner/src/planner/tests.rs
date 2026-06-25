@@ -25,7 +25,7 @@ fn member_set(ids: &[u64]) -> BTreeSet<MemberId> {
     ids.iter().copied().map(MemberId).collect()
 }
 
-fn receipt_ref(object_id: u64) -> PlacementReceiptRef {
+fn receipt_ref_with_copies(object_id: u64, copies: u8) -> PlacementReceiptRef {
     let mut object_key = [0u8; 32];
     object_key[..8].copy_from_slice(&object_id.to_le_bytes());
     let mut payload_digest = [0u8; 32];
@@ -35,14 +35,23 @@ fn receipt_ref(object_id: u64) -> PlacementReceiptRef {
         object_key,
         EpochId::new(11),
         object_id + 1,
-        2,
+        copies,
         8192 + object_id,
         payload_digest,
     )
 }
 
+fn receipt_ref(object_id: u64) -> PlacementReceiptRef {
+    receipt_ref_with_copies(object_id, 2)
+}
+
 fn placement(object_id: u64, members: &[u64]) -> ReceiptBackedObjectPlacement {
-    ReceiptBackedObjectPlacement::new(receipt_ref(object_id), member_set(members)).unwrap()
+    let copies = u8::try_from(members.len()).expect("test source count fits in u8");
+    ReceiptBackedObjectPlacement::new(
+        receipt_ref_with_copies(object_id, copies),
+        member_set(members),
+    )
+    .unwrap()
 }
 
 fn insert_placement(input: &mut ReconstructionInput, object_id: u64, members: &[u64]) {
@@ -86,6 +95,20 @@ fn under_width_receipt_ref(object_id: u64) -> PlacementReceiptRef {
         base.payload_len,
         base.payload_digest,
         2,
+    )
+}
+
+fn over_width_receipt_ref(object_id: u64) -> PlacementReceiptRef {
+    let base = receipt_ref(object_id);
+    PlacementReceiptRef::new(
+        base.object_id,
+        base.object_key,
+        base.receipt_epoch,
+        base.receipt_generation,
+        ReceiptRedundancyPolicy::Replicated { copies: 2 },
+        base.payload_len,
+        base.payload_digest,
+        3,
     )
 }
 
@@ -389,6 +412,18 @@ fn receipt_backed_object_placement_constructor_rejects_synthetic_refs() {
 }
 
 #[test]
+fn receipt_backed_object_placement_constructor_rejects_topology_only_source_sets() {
+    let err = ReceiptBackedObjectPlacement::new(receipt_ref(10), member_set(&[1])).unwrap_err();
+    assert_eq!(
+        err,
+        ReconstructionTaskReceiptError::TopologyOnlySourceEvidence {
+            source_count: 1,
+            receipt_target_count: 2,
+        }
+    );
+}
+
+#[test]
 fn plan_reconstruction_refuses_unauthoritative_receipt_refs() {
     let cases = [
         (
@@ -423,6 +458,28 @@ fn plan_reconstruction_refuses_unauthoritative_receipt_refs() {
                 reason: ReconstructionTaskReceiptError::UnderWidthReceipt {
                     target_count: 2,
                     required_count: 3,
+                },
+            },
+        ),
+        (
+            10,
+            over_width_receipt_ref(10),
+            ReconstructionPlanningError::InvalidPlacementReceipt {
+                object_id: 10,
+                reason: ReconstructionTaskReceiptError::OverWidthReceipt {
+                    target_count: 3,
+                    required_count: 2,
+                },
+            },
+        ),
+        (
+            10,
+            receipt_ref(10),
+            ReconstructionPlanningError::InvalidPlacementReceipt {
+                object_id: 10,
+                reason: ReconstructionTaskReceiptError::TopologyOnlySourceEvidence {
+                    source_count: 1,
+                    receipt_target_count: 2,
                 },
             },
         ),
