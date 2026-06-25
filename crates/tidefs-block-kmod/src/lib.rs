@@ -389,6 +389,8 @@ impl BlockBio {
                 data: payload.clone(),
             });
         }
+        // SAFETY: cargo-side model bios use a null sentinel only as an opaque
+        // handle; no kernel bio pointer is dereferenced in this path.
         Self {
             opaque: unsafe { OpaqueBio::from_ptr(sentinel) },
             segments,
@@ -430,6 +432,8 @@ impl BlockBio {
         let sector_count = (data.len() as u32).div_ceil(sector_size);
         let payload = Vec::from(data);
         let sentinel = core::ptr::null();
+        // SAFETY: cargo-side model bios use a null sentinel only as an opaque
+        // handle; no kernel bio pointer is dereferenced in this path.
         Self {
             opaque: unsafe { OpaqueBio::from_ptr(sentinel) },
             segments,
@@ -466,6 +470,8 @@ impl BlockBio {
             zeroed_vec_u8(expected)
         };
         let sentinel: *const core::ffi::c_void = core::ptr::null();
+        // SAFETY: cargo-side model bios use a null sentinel only as an opaque
+        // handle; no kernel bio pointer is dereferenced in this path.
         Self {
             opaque: unsafe { OpaqueBio::from_ptr(sentinel) },
             segments,
@@ -502,6 +508,8 @@ impl BlockBio {
             zeroed_vec_u8(expected)
         };
         let sentinel = core::ptr::null();
+        // SAFETY: cargo-side model bios use a null sentinel only as an opaque
+        // handle; no kernel bio pointer is dereferenced in this path.
         Self {
             opaque: unsafe { OpaqueBio::from_ptr(sentinel) },
             segments,
@@ -955,6 +963,8 @@ impl BlockExport {
         let limits = BlockQueueLimits::fixed_capacity(capacity_sectors);
         let queue = BlockExportQueue::new(limits)?;
         let sentinel = core::ptr::null();
+        // SAFETY: cargo-side exports use a null request_queue sentinel only as
+        // an opaque handle; the pure-Rust queue owns the model behavior.
         Ok(Self {
             request_queue: unsafe { OpaqueRequestQueue::from_ptr(sentinel) },
             queue,
@@ -968,6 +978,8 @@ impl BlockExport {
     pub fn with_limits(limits: BlockQueueLimits) -> BridgeResult<Self> {
         let queue = BlockExportQueue::new(limits)?;
         let sentinel = core::ptr::null();
+        // SAFETY: cargo-side exports use a null request_queue sentinel only as
+        // an opaque handle; the pure-Rust queue owns the model behavior.
         Ok(Self {
             request_queue: unsafe { OpaqueRequestQueue::from_ptr(sentinel) },
             queue,

@@ -56,8 +56,12 @@ pub struct RawBlockFile {
 }
 
 #[cfg(CONFIG_RUST)]
+// SAFETY: RawBlockFile owns a single live struct file pointer; runtime I/O is
+// serialized by the block device mutex before reaching this adapter.
 unsafe impl Send for RawBlockFile {}
 #[cfg(CONFIG_RUST)]
+// SAFETY: shared references call kernel_read/kernel_write/vfs_fsync through the
+// serialized device path; Drop closes the owned filp exactly once.
 unsafe impl Sync for RawBlockFile {}
 
 impl RawBlockFile {
@@ -79,12 +83,19 @@ impl RawBlockFile {
     #[cfg(CONFIG_RUST)]
     pub fn open(path: &[u8], block_size: u32) -> Result<Self, Errno> {
         const O_FLAGS: i32 = 0x2 | 0x8000; // O_RDWR | O_LARGEFILE
+        // SAFETY: path is the NUL-terminated module parameter buffer supplied
+        // by the Kbuild entrypoint; filp_open returns either a live filp or an
+        // ERR_PTR/null sentinel checked below.
         let filp = unsafe { filp_open(path.as_ptr() as *const i8, O_FLAGS, 0u16) };
         if filp.is_null() || is_err_ptr(filp) {
             return Err(Errno::EIO);
         }
+        // SAFETY: filp was returned live by filp_open; vfs_llseek only updates
+        // kernel file position state for this owned file pointer.
         let sz = unsafe { vfs_llseek(filp, 0, 2) };
         if sz < 0 {
+            // SAFETY: filp is the owned file pointer from filp_open and has
+            // not been stored in RawBlockFile because open is failing.
             unsafe { filp_close(filp, core::ptr::null_mut()) };
             return Err(Errno::EIO);
         }
@@ -141,6 +152,8 @@ impl PoolCoreOps for RawBlockFile {
             return Err(Errno::EINVAL);
         }
         let mut pos: i64 = off as i64;
+        // SAFETY: self.filp is the live owned struct file; buf is a valid
+        // writable slice and the byte range was bounds checked above.
         let ret = unsafe {
             kernel_read(
                 self.filp,
@@ -174,6 +187,8 @@ impl PoolCoreOps for RawBlockFile {
             return Err(Errno::ENOSPC);
         }
         let mut pos: i64 = off as i64;
+        // SAFETY: self.filp is the live owned struct file; data is a valid
+        // initialized slice and the byte range was bounds checked above.
         let ret = unsafe {
             kernel_write(
                 self.filp,
@@ -196,6 +211,8 @@ impl PoolCoreOps for RawBlockFile {
         }
         #[cfg(CONFIG_RUST)]
         {
+            // SAFETY: self.filp is the live owned struct file; vfs_fsync does
+            // not access Rust memory and provides the kernel flush barrier.
             let ret = unsafe { vfs_fsync(self.filp, 0) };
             if ret < 0 {
                 Err(Errno((-ret) as u16))
@@ -275,6 +292,8 @@ impl crate::pool_core_backend::KernelStorageIoCompat for RawBlockFile {
             return Err(Errno::EINVAL);
         }
         let mut pos: i64 = off as i64;
+        // SAFETY: self.filp is the live owned struct file; buf is a valid
+        // writable slice and the sector range was bounds checked above.
         let ret = unsafe {
             kernel_read(
                 self.filp,
@@ -312,6 +331,8 @@ impl crate::pool_core_backend::KernelStorageIoCompat for RawBlockFile {
             return Err(Errno::ENOSPC);
         }
         let mut pos: i64 = off as i64;
+        // SAFETY: self.filp is the live owned struct file; data is a valid
+        // initialized slice and the sector range was bounds checked above.
         let ret = unsafe {
             kernel_write(
                 self.filp,
@@ -344,6 +365,8 @@ impl crate::pool_core_backend::KernelStorageIoCompat for RawBlockFile {
 impl Drop for RawBlockFile {
     fn drop(&mut self) {
         if !self.filp.is_null() && !is_err_ptr(self.filp) {
+            // SAFETY: self.filp is the owned file pointer from filp_open and
+            // Drop is the single close point for RawBlockFile.
             unsafe { filp_close(self.filp, core::ptr::null_mut()) };
         }
     }

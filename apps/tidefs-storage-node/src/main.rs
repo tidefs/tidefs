@@ -179,6 +179,8 @@ extern "C" fn signal_pipe_handler(_sig: i32) {
     let fd = SIGNAL_PIPE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         let buf = [1u8];
+        // SAFETY: write(2) is async-signal-safe; fd is the stored write end of
+        // the self-pipe and buf is a one-byte stack allocation valid here.
         unsafe {
             libc::write(fd, buf.as_ptr() as *const libc::c_void, 1);
         }
@@ -189,10 +191,13 @@ extern "C" fn signal_pipe_handler(_sig: i32) {
 fn os_pipe() -> Result<(std::fs::File, std::fs::File), std::io::Error> {
     use std::os::unix::io::FromRawFd;
     let mut fds = [-1i32; 2];
+    // SAFETY: pipe(2) writes exactly two file descriptors into fds on success.
     let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: after successful pipe(2), fds[0] and fds[1] are uniquely owned
+    // descriptors; from_raw_fd transfers each descriptor into a File.
     Ok(unsafe {
         (
             std::fs::File::from_raw_fd(fds[0]),
@@ -227,6 +232,8 @@ fn install_signal_handlers(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) 
     use std::os::unix::io::AsRawFd;
     SIGNAL_PIPE_FD.store(write_end.as_raw_fd(), Ordering::Relaxed);
 
+    // SAFETY: signal(2) installs an extern "C" handler with the required ABI;
+    // the handler only performs an async-signal-safe write to the self-pipe.
     unsafe {
         libc::signal(libc::SIGINT, signal_pipe_handler as libc::sighandler_t);
         libc::signal(libc::SIGTERM, signal_pipe_handler as libc::sighandler_t);

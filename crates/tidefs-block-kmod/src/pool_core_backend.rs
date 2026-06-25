@@ -1141,6 +1141,8 @@ mod tests {
         buffer: RefCell<Box<[u8]>>,
         block_size: u32,
     }
+    // SAFETY: tests access StubStorage through the single-threaded compatibility
+    // harness; RefCell enforces dynamic borrow rules inside that harness.
     unsafe impl Sync for StubStorage {}
 
     impl StubStorage {
