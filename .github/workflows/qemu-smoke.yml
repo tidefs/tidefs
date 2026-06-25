@@ -18,6 +18,7 @@ on:
           - kernel-no-daemon-teardown-validation
           - fuse-vm-test
           - qemu-ublk-smoke
+          - receipt-bound-reclaim-runtime
           - all
 
 permissions:
@@ -33,6 +34,11 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1' }}
     runs-on: [self-hosted, linux, x64, tidefs, nix, kvm]
     timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
+      CARGO_INCREMENTAL: 0
+      CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
     strategy:
       fail-fast: false
       matrix:
@@ -65,6 +71,10 @@ jobs:
             name: qemu-ublk-smoke
             command: nix run .#qemu-ublk-smoke -- --timeout 3600
             output_dir: /tmp/tidefs-validation/ublk
+          - id: receipt-bound-reclaim-runtime
+            name: receipt-bound-reclaim-runtime
+            command: nix develop .#ci --command cargo run --locked -p tidefs-validation --bin receipt-bound-reclaim-validation -- --row receipt-bound-obsolete-location-trim --output-dir /tmp/tidefs-validation/receipt-bound-reclaim-runtime
+            output_dir: /tmp/tidefs-validation/receipt-bound-reclaim-runtime
 
     steps:
       - name: Checkout
@@ -82,6 +92,7 @@ jobs:
         run: |
           rm -rf '${{ matrix.output_dir }}'
           mkdir -p '${{ matrix.output_dir }}'
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
       - name: Run smoke target
         if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
@@ -89,7 +100,9 @@ jobs:
           TIDEFS_FSYNC_SUMMARY_DIR: ${{ matrix.output_dir }}
           TIDEFS_TEARDOWN_OUTPUT_DIR: ${{ matrix.output_dir }}
           TIDEFS_NO_DAEMON_TEARDOWN_OUTPUT_DIR: ${{ matrix.output_dir }}
-        run: timeout --foreground 7200s bash -lc '${{ matrix.command }}'
+        run: |
+          export TIDEFS_GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          timeout --foreground 7200s bash -lc '${{ matrix.command }}'
 
       - name: Write kernel-fsync evidence manifest (smoke)
         if: ${{ always() && matrix.id == 'kernel-fsync-validation' && github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == 'kernel-fsync-validation') }}
@@ -154,3 +167,7 @@ jobs:
             ${{ matrix.output_dir }}/**
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Clean cargo target
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"

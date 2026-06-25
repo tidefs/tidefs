@@ -35,6 +35,7 @@ pub mod performance_gate;
 pub mod pool_rollback_import_validation;
 pub mod qemu;
 pub mod qemu_pin_manifest;
+pub mod receipt_bound_reclaim_runtime;
 pub mod runtime_artifact_source;
 pub mod smoke;
 pub mod support_bundle;

@@ -16,6 +16,10 @@ peer-crate operation recording/replay, and cargo-based smoke framework
 exercising peer crates as they land.
 """
 
+[[bin]]
+name = "receipt-bound-reclaim-validation"
+path = "src/bin/receipt_bound_reclaim_validation.rs"
+
 [features]
 default = []
 
@@ -113,6 +117,8 @@ tidefs-object-io = { workspace = true, optional = true }
 tidefs-local-filesystem = { workspace = true, optional = true }
 tidefs-intent-log = { workspace = true, optional = true }
 tidefs-reclaim = { workspace = true, optional = true }
+tidefs-reclaim-queue-core = { workspace = true }
+tidefs-types-reclaim-queue-core = { workspace = true }
 tidefs-namespace = { workspace = true, optional = true }
 tidefs-inode-attributes = { workspace = true, optional = true }
 tidefs-inode-table = { workspace = true, optional = true }
