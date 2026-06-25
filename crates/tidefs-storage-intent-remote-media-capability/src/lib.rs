@@ -15,8 +15,9 @@ use tidefs_storage_intent_core::{
     MediaArchiveRestoreSemantics, MediaAtomicityClass, MediaCapabilityFlags,
     MediaCapabilityFreshnessState, MediaFlushOrderingClass, MediaHealthState,
     MediaPersistenceDomain, MediaProtocolGeometryClass, MediaRemoteCommitSemantics,
-    StorageIntentEvidenceId, StorageIntentEvidenceKind, StorageIntentEvidenceRef,
-    StorageIntentMediaCapabilityRecord, StorageIntentRefusalReason, StorageMediaClass,
+    StorageIntentEvidenceId, StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot,
+    StorageIntentEvidenceRef, StorageIntentMediaCapabilityRecord, StorageIntentRefusalReason,
+    StorageMediaClass,
 };
 
 /// Version of the remote media-capability producer record shape.
@@ -144,6 +145,18 @@ impl Default for RemoteCommitFacts {
 }
 
 impl RemoteCommitFacts {
+    pub const UNKNOWN: Self = Self {
+        persistence: MediaPersistenceDomain::Unknown,
+        flush_ordering: MediaFlushOrderingClass::Unknown,
+        atomicity: MediaAtomicityClass::Unknown,
+        geometry: MediaProtocolGeometryClass::Unknown,
+        remote_commit: MediaRemoteCommitSemantics::Unknown,
+        logical_unit_bytes: 0,
+        atomic_unit_bytes: 0,
+        optimal_io_bytes: 0,
+        remote_commit_ref: EMPTY_EVIDENCE_REF,
+    };
+
     #[must_use]
     pub const fn new(
         persistence: MediaPersistenceDomain,
@@ -177,6 +190,50 @@ impl RemoteCommitFacts {
         self.atomic_unit_bytes = atomic_unit_bytes;
         self.optimal_io_bytes = optimal_io_bytes;
         self
+    }
+}
+
+/// Bounded object-I/O visibility sample from a remote object path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RemoteObjectIoVisibilitySample {
+    pub put_observed: bool,
+    pub get_observed: bool,
+    pub transform_verified: bool,
+    pub finalize_or_commit_proven: bool,
+    pub visibility_ref: StorageIntentEvidenceRef,
+}
+
+impl RemoteObjectIoVisibilitySample {
+    #[must_use]
+    pub const fn to_commit_facts(self) -> RemoteCommitFacts {
+        if self.put_observed
+            && self.get_observed
+            && self.transform_verified
+            && self.finalize_or_commit_proven
+            && self.visibility_ref.is_bound()
+        {
+            return RemoteCommitFacts::new(
+                MediaPersistenceDomain::ObjectDurable,
+                MediaFlushOrderingClass::ObjectCommit,
+                MediaAtomicityClass::IdempotentObjectPut,
+                MediaProtocolGeometryClass::RemoteObject,
+                MediaRemoteCommitSemantics::ObjectConditionalDurable,
+                self.visibility_ref,
+            );
+        }
+
+        if self.put_observed || self.get_observed || self.transform_verified {
+            return RemoteCommitFacts::new(
+                MediaPersistenceDomain::ObjectDurable,
+                MediaFlushOrderingClass::Unknown,
+                MediaAtomicityClass::IdempotentObjectPut,
+                MediaProtocolGeometryClass::RemoteObject,
+                MediaRemoteCommitSemantics::VolatileAckOnly,
+                self.visibility_ref,
+            );
+        }
+
+        RemoteCommitFacts::UNKNOWN
     }
 }
 
@@ -355,6 +412,124 @@ impl RemoteHealthFacts {
     #[must_use]
     pub const fn new(health: MediaHealthState, health_ref: StorageIntentEvidenceRef) -> Self {
         Self { health, health_ref }
+    }
+}
+
+/// Write class projected from a replicated object-store quorum write.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RemoteReplicatedObjectWriteClass {
+    #[default]
+    Unknown = 0,
+    Committed = 1,
+    DegradedCommitted = 2,
+    RefusedNoQuorum = 3,
+}
+
+impl RemoteReplicatedObjectWriteClass {
+    #[must_use]
+    pub const fn is_quorum_success(self) -> bool {
+        matches!(self, Self::Committed | Self::DegradedCommitted)
+    }
+}
+
+/// Read-only quorum-write sample used to produce remote commit and health facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteReplicatedObjectCommitSample {
+    pub write_class: RemoteReplicatedObjectWriteClass,
+    pub acks_count: u64,
+    pub target_count: u64,
+    pub quorum_size: u64,
+    pub needs_repair: bool,
+    pub digests_matched: bool,
+    pub placement_receipt_bound: bool,
+    pub skipped_unhealthy_count: u32,
+    pub commit_ref: StorageIntentEvidenceRef,
+    pub recovery_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for RemoteReplicatedObjectCommitSample {
+    fn default() -> Self {
+        Self {
+            write_class: RemoteReplicatedObjectWriteClass::Unknown,
+            acks_count: 0,
+            target_count: 0,
+            quorum_size: 0,
+            needs_repair: false,
+            digests_matched: false,
+            placement_receipt_bound: false,
+            skipped_unhealthy_count: 0,
+            commit_ref: EMPTY_EVIDENCE_REF,
+            recovery_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+impl RemoteReplicatedObjectCommitSample {
+    #[must_use]
+    pub const fn to_commit_facts(self) -> RemoteCommitFacts {
+        if self.write_class.is_quorum_success()
+            && self.acks_count >= self.quorum_size
+            && self.quorum_size > 0
+            && self.target_count > 0
+            && self.acks_count <= self.target_count
+            && self.digests_matched
+            && self.placement_receipt_bound
+            && self.commit_ref.is_bound()
+        {
+            return RemoteCommitFacts::new(
+                MediaPersistenceDomain::ObjectDurable,
+                MediaFlushOrderingClass::OrderedRemoteCommit,
+                MediaAtomicityClass::IdempotentObjectPut,
+                MediaProtocolGeometryClass::RemoteObject,
+                MediaRemoteCommitSemantics::QuorumDurableAck,
+                self.commit_ref,
+            );
+        }
+
+        RemoteCommitFacts::new(
+            MediaPersistenceDomain::Unknown,
+            MediaFlushOrderingClass::Unknown,
+            MediaAtomicityClass::Unknown,
+            MediaProtocolGeometryClass::RemoteObject,
+            MediaRemoteCommitSemantics::VolatileAckOnly,
+            self.commit_ref,
+        )
+    }
+
+    #[must_use]
+    pub const fn to_health_facts(self) -> RemoteHealthFacts {
+        let health = if matches!(
+            self.write_class,
+            RemoteReplicatedObjectWriteClass::RefusedNoQuorum
+        ) || !self.digests_matched
+        {
+            MediaHealthState::Failed
+        } else if matches!(
+            self.write_class,
+            RemoteReplicatedObjectWriteClass::DegradedCommitted
+        ) || self.needs_repair
+            || self.acks_count < self.target_count
+            || self.skipped_unhealthy_count > 0
+        {
+            MediaHealthState::Degraded
+        } else if self.write_class.is_quorum_success()
+            && self.placement_receipt_bound
+            && self.recovery_ref.is_bound()
+        {
+            MediaHealthState::Healthy
+        } else {
+            MediaHealthState::Unknown
+        };
+
+        RemoteHealthFacts::new(health, self.recovery_ref)
+    }
+
+    #[must_use]
+    pub const fn apply_to(self, facts: RemoteMediaCapabilityFacts) -> RemoteMediaCapabilityFacts {
+        facts
+            .with_commit(self.to_commit_facts())
+            .with_health(self.to_health_facts())
     }
 }
 
@@ -648,6 +823,100 @@ pub const fn remote_authority_preflight_refusal(
     StorageIntentRefusalReason::None
 }
 
+/// Validate that a #913 evidence-query cut includes the exact runtime refs.
+#[must_use]
+pub const fn remote_authority_evidence_cut_refusal(
+    facts: RemoteMediaCapabilityFacts,
+    evidence_cut: StorageIntentEvidenceQuerySnapshot,
+) -> StorageIntentRefusalReason {
+    let cut_refusal = evidence_cut.authority_refusal();
+    if !matches!(cut_refusal, StorageIntentRefusalReason::None) {
+        return cut_refusal;
+    }
+    if !evidence_cut
+        .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence)
+        || !evidence_cut.included_refs.contains_ref(facts.evidence)
+        || !evidence_cut
+            .included_refs
+            .contains_ref(facts.commit.remote_commit_ref)
+    {
+        return StorageIntentRefusalReason::MissingMediaCapabilityEvidence;
+    }
+    if !evidence_cut
+        .included_refs
+        .contains_ref(facts.identity.stable_identity_ref)
+        || !evidence_cut
+            .included_refs
+            .contains_ref(facts.identity.namespace_identity_ref)
+    {
+        return StorageIntentRefusalReason::UnstableNamespaceIdentity;
+    }
+    if !evidence_cut
+        .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::TransportPathEvidence)
+        || !evidence_cut.included_refs.contains_ref(facts.path.path_ref)
+    {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+    if !evidence_cut.authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::TemporalEvidence)
+        || !evidence_cut
+            .included_refs
+            .contains_ref(facts.freshness.freshness_ref)
+    {
+        return StorageIntentRefusalReason::DurabilityOrRpoNotMet;
+    }
+    if !evidence_cut.authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::TrustDomainEvidence)
+        || !evidence_cut
+            .included_refs
+            .contains_ref(facts.trust.trust_ref)
+    {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+    if !evidence_cut.authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCostWearLedger)
+        || !evidence_cut
+            .included_refs
+            .contains_ref(facts.cost_recovery.cost_ref)
+    {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+    if !evidence_cut
+        .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::RecoveryDegradationEvidence)
+        || !evidence_cut
+            .included_refs
+            .contains_ref(facts.cost_recovery.recovery_ref)
+        || !evidence_cut
+            .included_refs
+            .contains_ref(facts.health.health_ref)
+    {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+    if remote_target_is_archive(facts)
+        && !evidence_cut
+            .included_refs
+            .contains_ref(facts.archive.archive_restore_ref)
+    {
+        return StorageIntentRefusalReason::UnknownArchiveRestoreRetention;
+    }
+    remote_authority_preflight_refusal(facts)
+}
+
+/// Produce a record only when the #913 evidence cut carries all cited refs.
+#[must_use]
+pub const fn produce_remote_media_capability_from_evidence_cut(
+    facts: RemoteMediaCapabilityFacts,
+    evidence_cut: StorageIntentEvidenceQuerySnapshot,
+) -> StorageIntentMediaCapabilityRecord {
+    if matches!(
+        remote_authority_evidence_cut_refusal(facts, evidence_cut),
+        StorageIntentRefusalReason::None
+    ) {
+        return produce_remote_media_capability(facts);
+    }
+
+    let mut refused = facts;
+    refused.freshness.freshness = MediaCapabilityFreshnessState::Refused;
+    produce_remote_media_capability(refused)
+}
+
 const fn remote_authority_ready(facts: RemoteMediaCapabilityFacts) -> bool {
     matches!(
         remote_authority_preflight_refusal(facts),
@@ -757,8 +1026,13 @@ pub const fn produce_remote_media_capability(
 mod tests {
     use super::*;
     use tidefs_storage_intent_core::{
-        media_capability_satisfies_role, MediaRoleRequirement, ReceiptPredicateResult,
-        StorageIntentGuaranteeClass, StorageMediaRole,
+        media_capability_satisfies_role, EvidenceCompletenessVerdict, EvidenceConsumerClass,
+        EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet, EvidenceFamilyFreshnessState,
+        EvidenceQueryContextClass, EvidenceQuerySubjectScope, EvidenceQuerySubjectScopeClass,
+        EvidenceRetentionClass, MediaRoleRequirement, ReceiptPredicateResult,
+        StorageIntentDomainId, StorageIntentEvidenceRefs, StorageIntentGuaranteeClass,
+        StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
+        StorageMediaRole,
     };
 
     fn evidence(kind: StorageIntentEvidenceKind, seed: u8) -> StorageIntentEvidenceRef {
@@ -772,6 +1046,113 @@ mod tests {
 
     fn media_evidence(seed: u8) -> StorageIntentEvidenceRef {
         evidence(StorageIntentEvidenceKind::MediaCapabilityEvidence, seed)
+    }
+
+    fn push_ref(refs: &mut StorageIntentEvidenceRefs, evidence_ref: StorageIntentEvidenceRef) {
+        if evidence_ref.is_bound() {
+            refs.push(evidence_ref).unwrap();
+        }
+    }
+
+    fn push_family(
+        families: &mut EvidenceFamilyFreshnessSet,
+        kind: StorageIntentEvidenceKind,
+        evidence_ref: StorageIntentEvidenceRef,
+    ) {
+        families
+            .push(EvidenceFamilyFreshness {
+                kind,
+                state: EvidenceFamilyFreshnessState::Fresh,
+                source_index_generation: 1,
+                producer_generation: 1,
+                freshness_frontier_ms: 1,
+                allowed_staleness_ms: 0,
+                evidence_ref,
+            })
+            .unwrap();
+    }
+
+    fn authority_evidence_cut_for(
+        facts: RemoteMediaCapabilityFacts,
+    ) -> StorageIntentEvidenceQuerySnapshot {
+        let mut refs = StorageIntentEvidenceRefs::EMPTY;
+        push_ref(&mut refs, facts.evidence);
+        push_ref(&mut refs, facts.identity.stable_identity_ref);
+        push_ref(&mut refs, facts.identity.namespace_identity_ref);
+        push_ref(&mut refs, facts.path.path_ref);
+        push_ref(&mut refs, facts.commit.remote_commit_ref);
+        push_ref(&mut refs, facts.archive.archive_restore_ref);
+        push_ref(&mut refs, facts.freshness.freshness_ref);
+        push_ref(&mut refs, facts.trust.trust_ref);
+        push_ref(&mut refs, facts.cost_recovery.cost_ref);
+        push_ref(&mut refs, facts.cost_recovery.recovery_ref);
+        push_ref(&mut refs, facts.health.health_ref);
+
+        let mut families = EvidenceFamilyFreshnessSet::EMPTY;
+        push_family(
+            &mut families,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            facts.evidence,
+        );
+        push_family(
+            &mut families,
+            StorageIntentEvidenceKind::TransportPathEvidence,
+            facts.path.path_ref,
+        );
+        push_family(
+            &mut families,
+            StorageIntentEvidenceKind::TemporalEvidence,
+            facts.freshness.freshness_ref,
+        );
+        push_family(
+            &mut families,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            facts.trust.trust_ref,
+        );
+        push_family(
+            &mut families,
+            StorageIntentEvidenceKind::MediaCostWearLedger,
+            facts.cost_recovery.cost_ref,
+        );
+        push_family(
+            &mut families,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            facts.cost_recovery.recovery_ref,
+        );
+
+        StorageIntentEvidenceQuerySnapshot {
+            snapshot_id: StorageIntentEvidenceId([61; 32]),
+            query_id: StorageIntentEvidenceId([62; 32]),
+            consumer: EvidenceConsumerClass::Planner,
+            context: EvidenceQueryContextClass::RequestAdmission,
+            subject: EvidenceQuerySubjectScope {
+                scope_class: EvidenceQuerySubjectScopeClass::Pool,
+                object_scope: StorageIntentObjectScope::default(),
+                pool_id: StorageIntentDomainId([63; 16]),
+                domain_id: StorageIntentDomainId::ZERO,
+                request_ref: EMPTY_EVIDENCE_REF,
+                action_ref: EMPTY_EVIDENCE_REF,
+                validation_ref: EMPTY_EVIDENCE_REF,
+            },
+            policy_id: StorageIntentPolicyId([64; 16]),
+            policy_revision: StorageIntentPolicyRevision(1),
+            temporal_frontier_ms: 1,
+            freshness_frontier_ms: 1,
+            allowed_staleness_ms: 0,
+            source_catalog_ref: evidence(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 65),
+            source_index_ref: evidence(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 66),
+            source_index_generation: 1,
+            producer_generation: 1,
+            producer_watermark_ms: 1,
+            compaction_generation: 0,
+            redaction_generation: 0,
+            included_refs: refs,
+            family_freshness: families,
+            completeness: EvidenceCompletenessVerdict::CompleteForPurpose,
+            retention: EvidenceRetentionClass::ExactRequired,
+            retention_ref: evidence(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 67),
+            refusal: StorageIntentRefusalReason::None,
+        }
     }
 
     fn strong_object_facts() -> RemoteMediaCapabilityFacts {
@@ -917,6 +1298,115 @@ mod tests {
             placement_result(record).refusal,
             StorageIntentRefusalReason::UnsupportedRemoteCommitSemantics
         );
+    }
+
+    #[test]
+    fn object_io_visibility_without_finalize_stays_non_authority() {
+        let sample = RemoteObjectIoVisibilitySample {
+            put_observed: true,
+            get_observed: true,
+            transform_verified: true,
+            finalize_or_commit_proven: false,
+            visibility_ref: media_evidence(68),
+        };
+        let facts = strong_object_facts().with_commit(sample.to_commit_facts());
+        let record = produce_remote_media_capability(facts);
+
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::UnsupportedRemoteCommitSemantics
+        );
+        assert_eq!(
+            placement_result(record).refusal,
+            StorageIntentRefusalReason::UnsupportedRemoteCommitSemantics
+        );
+    }
+
+    #[test]
+    fn receipt_bound_quorum_sample_can_supply_remote_commit_facts() {
+        let sample = RemoteReplicatedObjectCommitSample {
+            write_class: RemoteReplicatedObjectWriteClass::Committed,
+            acks_count: 3,
+            target_count: 3,
+            quorum_size: 2,
+            needs_repair: false,
+            digests_matched: true,
+            placement_receipt_bound: true,
+            skipped_unhealthy_count: 0,
+            commit_ref: media_evidence(69),
+            recovery_ref: evidence(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 70),
+        };
+        let facts = sample.apply_to(strong_object_facts());
+        let cut = authority_evidence_cut_for(facts);
+        let record = produce_remote_media_capability_from_evidence_cut(facts, cut);
+
+        assert_eq!(
+            facts.commit.remote_commit,
+            MediaRemoteCommitSemantics::QuorumDurableAck
+        );
+        assert_eq!(facts.health.health, MediaHealthState::Healthy);
+        assert_eq!(
+            remote_authority_evidence_cut_refusal(facts, cut),
+            StorageIntentRefusalReason::None
+        );
+        assert!(placement_result(record).satisfied);
+    }
+
+    #[test]
+    fn degraded_quorum_sample_is_visible_but_not_authority() {
+        let sample = RemoteReplicatedObjectCommitSample {
+            write_class: RemoteReplicatedObjectWriteClass::DegradedCommitted,
+            acks_count: 2,
+            target_count: 3,
+            quorum_size: 2,
+            needs_repair: true,
+            digests_matched: true,
+            placement_receipt_bound: true,
+            skipped_unhealthy_count: 1,
+            commit_ref: media_evidence(71),
+            recovery_ref: evidence(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 72),
+        };
+        let facts = sample.apply_to(strong_object_facts());
+        let cut = authority_evidence_cut_for(facts);
+
+        assert_eq!(
+            facts.commit.remote_commit,
+            MediaRemoteCommitSemantics::QuorumDurableAck
+        );
+        assert_eq!(facts.health.health, MediaHealthState::Degraded);
+        assert_eq!(
+            remote_authority_evidence_cut_refusal(facts, cut),
+            StorageIntentRefusalReason::DegradedMediaHealth
+        );
+    }
+
+    #[test]
+    fn missing_evidence_cut_membership_strips_remote_authority() {
+        let sample = RemoteReplicatedObjectCommitSample {
+            write_class: RemoteReplicatedObjectWriteClass::Committed,
+            acks_count: 3,
+            target_count: 3,
+            quorum_size: 2,
+            needs_repair: false,
+            digests_matched: true,
+            placement_receipt_bound: true,
+            skipped_unhealthy_count: 0,
+            commit_ref: media_evidence(73),
+            recovery_ref: evidence(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 74),
+        };
+        let facts = sample.apply_to(strong_object_facts());
+        let mut cut = authority_evidence_cut_for(facts);
+        cut.included_refs = StorageIntentEvidenceRefs::EMPTY;
+        let record = produce_remote_media_capability_from_evidence_cut(facts, cut);
+
+        assert_eq!(
+            remote_authority_evidence_cut_refusal(facts, cut),
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        );
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
+        assert_eq!(record.freshness, MediaCapabilityFreshnessState::Refused);
     }
 
     #[test]

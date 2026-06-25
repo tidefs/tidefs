@@ -46,6 +46,10 @@ use tidefs_replication_model::{
 };
 #[cfg(test)]
 use tidefs_replication_model::{ReplicaMovementClass, VerificationStatus};
+use tidefs_storage_intent_core::StorageIntentEvidenceRef;
+use tidefs_storage_intent_remote_media_capability::{
+    RemoteReplicatedObjectCommitSample, RemoteReplicatedObjectWriteClass,
+};
 use tidefs_types_transport_session::EndpointFamily;
 use tidefs_verification_engine::{verify_transfer_and_emit_receipt, VerificationContext};
 use tidefs_witness_set::{WitnessAnchor, WitnessLifecycle, WitnessQuorumClass, WitnessSet};
@@ -147,6 +151,36 @@ pub struct ReplicatedPutResult {
     pub quorum_summary: QuorumWriteSummary,
     /// Replicas skipped due to health-tracker suspicion.
     pub skipped_unhealthy: Vec<usize>,
+}
+
+impl ReplicatedPutResult {
+    /// Project this write result into #961 remote media-capability input facts.
+    #[must_use]
+    pub fn remote_media_commit_sample(
+        &self,
+        commit_ref: StorageIntentEvidenceRef,
+        recovery_ref: StorageIntentEvidenceRef,
+    ) -> RemoteReplicatedObjectCommitSample {
+        let write_class = match self.write_class {
+            WriteClass::Committed => RemoteReplicatedObjectWriteClass::Committed,
+            WriteClass::DegradedCommitted => RemoteReplicatedObjectWriteClass::DegradedCommitted,
+            WriteClass::RefusedNoQuorum => RemoteReplicatedObjectWriteClass::RefusedNoQuorum,
+        };
+        let skipped_unhealthy_count = self.skipped_unhealthy.len().min(u32::MAX as usize) as u32;
+
+        RemoteReplicatedObjectCommitSample {
+            write_class,
+            acks_count: self.acks_count,
+            target_count: self.target_count,
+            quorum_size: self.quorum_size,
+            needs_repair: self.needs_repair,
+            digests_matched: self.quorum_result.digests_matched,
+            placement_receipt_bound: !self.quorum_result.placement_receipts.is_empty(),
+            skipped_unhealthy_count,
+            commit_ref,
+            recovery_ref,
+        }
+    }
 }
 
 /// Per-replica degraded read statistics with latency tracking.

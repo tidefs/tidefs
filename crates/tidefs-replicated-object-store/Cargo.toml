@@ -23,6 +23,8 @@ tidefs-rebuild-runtime = { workspace = true }
 tidefs-transport = { workspace = true }
 tidefs-replication = { workspace = true }
 tidefs-replication-model = { workspace = true }
+tidefs-storage-intent-core = { workspace = true }
+tidefs-storage-intent-remote-media-capability = { workspace = true }
 tidefs-verification-engine = { workspace = true }
 tidefs-types-transport-session = { workspace = true }
 tracing = { workspace = true }
