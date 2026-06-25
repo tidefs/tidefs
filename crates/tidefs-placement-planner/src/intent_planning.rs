@@ -47,6 +47,7 @@ const AUTHORITY_HARD_GATE_EVIDENCE: &[StorageIntentEvidenceKind] = &[
     StorageIntentEvidenceKind::TrustDomainEvidence,
     StorageIntentEvidenceKind::TransportPathEvidence,
     StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
     StorageIntentEvidenceKind::RecoveryDegradationEvidence,
     StorageIntentEvidenceKind::PolicyRolloutEvidence,
     StorageIntentEvidenceKind::TenantIsolationEvidence,
@@ -2112,6 +2113,7 @@ mod tests {
         StorageIntentEvidenceKind::TrustDomainEvidence,
         StorageIntentEvidenceKind::TransportPathEvidence,
         StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+        StorageIntentEvidenceKind::SchedulerAdmissionRecord,
         StorageIntentEvidenceKind::RecoveryDegradationEvidence,
         StorageIntentEvidenceKind::PolicyRolloutEvidence,
         StorageIntentEvidenceKind::TenantIsolationEvidence,
@@ -2124,7 +2126,6 @@ mod tests {
         StorageIntentEvidenceKind::MediaCostWearLedger,
         StorageIntentEvidenceKind::RelocationReceipt,
         StorageIntentEvidenceKind::MeasurementAttributionEvidence,
-        StorageIntentEvidenceKind::WorkloadEvidence,
         StorageIntentEvidenceKind::LifecycleGenerationEvidence,
     ];
 
@@ -2145,6 +2146,34 @@ mod tests {
         missing: StorageIntentEvidenceKind,
     ) -> StorageIntentEvidenceQuerySnapshot {
         evidence_cut_filter(policy, |kind| kind != missing)
+    }
+
+    fn cache_only_evidence_cut(policy: StorageIntentPolicy) -> StorageIntentEvidenceQuerySnapshot {
+        cache_only_evidence_cut_filter(policy, |_| true)
+    }
+
+    fn cache_only_evidence_cut_filter<F>(
+        policy: StorageIntentPolicy,
+        keep: F,
+    ) -> StorageIntentEvidenceQuerySnapshot
+    where
+        F: Fn(StorageIntentEvidenceKind) -> bool,
+    {
+        evidence_cut_filter_with(
+            policy,
+            &[StorageIntentEvidenceKind::WorkloadEvidence],
+            |kind| {
+                matches!(
+                    kind,
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence
+                        | StorageIntentEvidenceKind::TrustDomainEvidence
+                        | StorageIntentEvidenceKind::TransportPathEvidence
+                        | StorageIntentEvidenceKind::DecisionFrontierEvidence
+                        | StorageIntentEvidenceKind::LifecycleGenerationEvidence
+                        | StorageIntentEvidenceKind::WorkloadEvidence
+                ) && keep(kind)
+            },
+        )
     }
 
     fn evidence_cut_with_preflight_without_decision_frontier(
@@ -3069,7 +3098,7 @@ mod tests {
             StorageIntentPlacementRole::CacheOnlyHotServingTrial,
             1,
             1,
-            evidence_cut_filter(policy, |kind| {
+            cache_only_evidence_cut_filter(policy, |kind| {
                 !matches!(
                     kind,
                     StorageIntentEvidenceKind::DataShapeEvidence
@@ -3841,11 +3870,12 @@ mod tests {
         ));
 
         let plan = plan_storage_intent_placement(
-            &request(
+            &StorageIntentPlacementRequest::new(
                 policy,
                 StorageIntentPlacementRole::CacheOnlyHotServingTrial,
                 1,
                 1,
+                cache_only_evidence_cut(policy),
             ),
             &[candidate],
         );
@@ -4161,11 +4191,9 @@ mod tests {
             2,
             2,
         );
-        request.evidence_query = evidence_cut_filter_with(
-            policy,
-            &[StorageIntentEvidenceKind::SchedulerAdmissionRecord],
-            |kind| kind != StorageIntentEvidenceKind::WorkloadEvidence,
-        );
+        request.evidence_query = evidence_cut_filter(policy, |kind| {
+            kind != StorageIntentEvidenceKind::WorkloadEvidence
+        });
         let candidates = [
             candidate(
                 1,
@@ -4223,7 +4251,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_refuses_admitted_plan_without_scheduler_admission_evidence() {
+    fn authority_placement_refuses_before_scoring_without_scheduler_admission_evidence() {
         let policy = policy(
             StorageIntentGuaranteeClass::FullPlacement,
             FailureDomainMask::NODE,
@@ -4246,12 +4274,20 @@ mod tests {
         );
 
         let placement = plan_storage_intent_placement(&request, &[candidate.clone()]);
-        assert!(placement.admitted);
+        assert!(!placement.admitted);
+        assert!(placement.candidate_reports.is_empty());
+        assert!(matches!(
+            placement.reasons.as_slice(),
+            [StorageIntentPlacementReason::EvidenceFamilyNotFresh {
+                kind: StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                state: PlacementEvidenceState::Unknown
+            }]
+        ));
 
         let dispatch = plan_storage_intent_dispatch(&request, &[candidate]);
 
         assert!(!dispatch.dispatchable);
-        assert!(dispatch.placement_plan.admitted);
+        assert!(!dispatch.placement_plan.admitted);
         assert!(dispatch.records.is_empty());
         assert_eq!(
             dispatch.first_refusal(),
@@ -4260,11 +4296,47 @@ mod tests {
         assert!(matches!(
             dispatch.reasons.as_slice(),
             [
-                StorageIntentPlacementDispatchReason::SchedulerAdmissionEvidenceNotFresh {
-                    state: PlacementEvidenceState::Unknown
+                StorageIntentPlacementDispatchReason::PlacementPlanNotAdmitted {
+                    refusal: StorageIntentRefusalReason::EvidenceNotUsable
                 }
             ]
         ));
+    }
+
+    #[test]
+    fn cache_only_trial_does_not_require_scheduler_admission_evidence() {
+        let policy = cache_only_policy();
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::ReadCache,
+            StorageIntentGuaranteeClass::VolatileLocal,
+            FailureDomainMask::EMPTY,
+            StorageMediaClass::SystemRam,
+        );
+        candidate.media_capability = volatile_media();
+
+        let request = StorageIntentPlacementRequest::new(
+            policy,
+            StorageIntentPlacementRole::CacheOnlyHotServingTrial,
+            1,
+            1,
+            cache_only_evidence_cut_filter(policy, |kind| {
+                kind != StorageIntentEvidenceKind::SchedulerAdmissionRecord
+            }),
+        );
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(plan.admitted, "{plan:?}");
+        assert_eq!(plan.selected_targets, vec![1]);
+        assert!(!plan.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::EvidenceFamilyNotFresh {
+                kind: StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -4542,7 +4614,7 @@ mod tests {
             StorageIntentPlacementRole::CacheOnlyHotServingTrial,
             1,
             1,
-            evidence_cut_filter(policy, |kind| {
+            cache_only_evidence_cut_filter(policy, |kind| {
                 !matches!(
                     kind,
                     StorageIntentEvidenceKind::DataShapeEvidence
