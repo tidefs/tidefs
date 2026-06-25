@@ -484,7 +484,7 @@
       "exit_code": 0
     },
     "tidefs-storage-intent-policy": {
-      "warnings": 5,
+      "warnings": 4,
       "exit_code": 0
     },
     "tidefs-storage-intent-read-serving": {
@@ -496,7 +496,7 @@
       "exit_code": 0
     },
     "tidefs-storage-intent-satisfaction": {
-      "warnings": 1,
+      "warnings": 0,
       "exit_code": 0
     },
     "tidefs-storage-node": {
@@ -648,7 +648,7 @@
       "exit_code": 0
     },
     "tidefs-storage-intent-scheduler": {
-      "warnings": 5,
+      "warnings": 0,
       "exit_code": 0
     },
     "tidefs-storage-intent-workload-signals": {
