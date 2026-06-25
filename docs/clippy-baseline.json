@@ -8,7 +8,7 @@
       "exit_code": 1
     },
     "tidefs-anti-entropy-auditor": {
-      "warnings": 55,
+      "warnings": 59,
       "exit_code": 0
     },
     "tidefs-auth": {
@@ -44,7 +44,7 @@
       "exit_code": 0
     },
     "tidefs-block-volume-adapter-daemon": {
-      "warnings": 61,
+      "warnings": 65,
       "exit_code": 1
     },
     "tidefs-block-volume-adapter-ublk-control-runtime": {
@@ -68,7 +68,7 @@
       "exit_code": 0
     },
     "tidefs-chunk-shipper": {
-      "warnings": 55,
+      "warnings": 59,
       "exit_code": 0
     },
     "tidefs-claim-ledger": {
@@ -188,7 +188,7 @@
       "exit_code": 1
     },
     "tidefs-flow-commit-coordinator": {
-      "warnings": 58,
+      "warnings": 62,
       "exit_code": 0
     },
     "tidefs-frame": {
@@ -268,7 +268,7 @@
       "exit_code": 0
     },
     "tidefs-membership-live": {
-      "warnings": 85,
+      "warnings": 89,
       "exit_code": 0
     },
     "tidefs-membership-types": {
@@ -288,7 +288,7 @@
       "exit_code": 0
     },
     "tidefs-node-join": {
-      "warnings": 64,
+      "warnings": 76,
       "exit_code": 0
     },
     "tidefs-object-io": {
@@ -308,7 +308,7 @@
       "exit_code": 0
     },
     "tidefs-partition-runtime": {
-      "warnings": 84,
+      "warnings": 88,
       "exit_code": 0
     },
     "tidefs-performance-contract": {
@@ -324,7 +324,7 @@
       "exit_code": 0
     },
     "tidefs-placement-runtime": {
-      "warnings": 83,
+      "warnings": 87,
       "exit_code": 0
     },
     "tidefs-pool-allocator": {
@@ -372,15 +372,15 @@
       "exit_code": 0
     },
     "tidefs-quorum-write-runtime": {
-      "warnings": 59,
+      "warnings": 63,
       "exit_code": 0
     },
     "tidefs-rebalance-planner": {
-      "warnings": 31,
+      "warnings": 43,
       "exit_code": 0
     },
     "tidefs-rebuild-planner": {
-      "warnings": 22,
+      "warnings": 34,
       "exit_code": 0
     },
     "tidefs-rebuild-runtime": {
@@ -400,7 +400,7 @@
       "exit_code": 0
     },
     "tidefs-recovery-loop": {
-      "warnings": 57,
+      "warnings": 61,
       "exit_code": 0
     },
     "tidefs-relocation-planner": {
@@ -412,11 +412,11 @@
       "exit_code": 0
     },
     "tidefs-replicated-object-store": {
-      "warnings": 62,
+      "warnings": 66,
       "exit_code": 0
     },
     "tidefs-replication": {
-      "warnings": 57,
+      "warnings": 61,
       "exit_code": 0
     },
     "tidefs-replication-model": {
@@ -440,7 +440,7 @@
       "exit_code": 0
     },
     "tidefs-scrub-core": {
-      "warnings": 62,
+      "warnings": 66,
       "exit_code": 0
     },
     "tidefs-secret-key-policy-runtime": {
@@ -516,11 +516,11 @@
       "exit_code": 0
     },
     "tidefs-transport": {
-      "warnings": 67,
+      "warnings": 71,
       "exit_code": 0
     },
     "tidefs-two-node-harness": {
-      "warnings": 84,
+      "warnings": 88,
       "exit_code": 0
     },
     "tidefs-types-cache-lattice-core": {
@@ -604,7 +604,7 @@
       "exit_code": 0
     },
     "tidefs-validation": {
-      "warnings": 66,
+      "warnings": 70,
       "exit_code": 1
     },
     "tidefs-verification-engine": {
