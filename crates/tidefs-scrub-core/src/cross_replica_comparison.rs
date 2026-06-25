@@ -128,6 +128,10 @@ pub struct ReplicaEvidence {
     pub object_key: [u8; 32],
     /// Checksum layer used for this evidence.
     pub checksum_layer: ChecksumLayer,
+    /// Redundancy-policy identity observed with this evidence.
+    pub redundancy_policy_id: u8,
+    /// Number of receipt targets observed with this evidence.
+    pub target_count: u16,
     /// Content generation observed by this replica's local filesystem.
     pub content_generation: u64,
     /// Placement receipt epoch seen by this replica.
@@ -155,6 +159,10 @@ pub enum EvidenceRejectionReason {
     ObjectKeyMismatch,
     /// Checksum layer does not match the candidate.
     ChecksumLayerMismatch,
+    /// Redundancy-policy identity does not match the candidate.
+    RedundancyPolicyMismatch,
+    /// Receipt target count does not match the candidate.
+    TargetCountMismatch,
     /// Placement receipt epoch does not match.
     ReceiptEpochMismatch,
     /// Placement receipt generation does not match.
@@ -224,14 +232,10 @@ pub enum ComparisonClassification {
     },
     /// A current receipt target returned NoChecksum for a block that
     /// requires checksum evidence.
-    MissingChecksumEvidence {
-        replicas_without_checksum: Vec<u64>,
-    },
+    MissingChecksumEvidence { replicas_without_checksum: Vec<u64> },
     /// A current receipt target is unreachable, backpressured, or
     /// epoch-rejected, and no clean replica set can be confirmed.
-    MissingReplicaEvidence {
-        missing_targets: Vec<u64>,
-    },
+    MissingReplicaEvidence { missing_targets: Vec<u64> },
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +252,8 @@ pub struct CrossReplicaComparisonRecord {
     pub subject: ScrubSubject,
     pub object_key: [u8; 32],
     pub checksum_layer: ChecksumLayer,
+    pub redundancy_policy_id: u8,
+    pub target_count: u16,
     pub placement_receipt_epoch: u64,
     pub placement_receipt_generation: u64,
     pub membership_epoch: u64,
@@ -355,6 +361,8 @@ pub fn compare_cross_replica(
         subject: candidate.subject,
         object_key: candidate.object_key,
         checksum_layer: candidate.checksum_layer,
+        redundancy_policy_id: candidate.redundancy_policy_id,
+        target_count: candidate.target_count,
         placement_receipt_epoch: candidate.placement_receipt_epoch,
         placement_receipt_generation: candidate.placement_receipt_generation,
         membership_epoch: candidate.membership_epoch,
@@ -383,6 +391,12 @@ fn evidence_rejection(
     if evidence.checksum_layer != candidate.checksum_layer {
         return Some(EvidenceRejectionReason::ChecksumLayerMismatch);
     }
+    if evidence.redundancy_policy_id != candidate.redundancy_policy_id {
+        return Some(EvidenceRejectionReason::RedundancyPolicyMismatch);
+    }
+    if evidence.target_count != candidate.target_count {
+        return Some(EvidenceRejectionReason::TargetCountMismatch);
+    }
     if evidence.placement_receipt_epoch != candidate.placement_receipt_epoch {
         return Some(EvidenceRejectionReason::ReceiptEpochMismatch);
     }
@@ -404,7 +418,7 @@ fn evidence_rejection(
     }
 
     // Evidence that is receipt-stale.
-    if matches!(evidence.read_outcome, EvidenceReadOutcome::ReceiptStale) {
+    if matches!(&evidence.read_outcome, EvidenceReadOutcome::ReceiptStale) {
         return Some(EvidenceRejectionReason::ReceiptStale);
     }
 
@@ -443,7 +457,7 @@ fn classify(
     // Check for NoChecksum among accepted evidence.
     let no_checksum: Vec<u64> = accepted
         .iter()
-        .filter(|e| matches!(e.read_outcome, EvidenceReadOutcome::NoChecksum))
+        .filter(|e| matches!(&e.read_outcome, EvidenceReadOutcome::NoChecksum))
         .map(|e| e.replica_id)
         .collect();
     if !no_checksum.is_empty() {
@@ -455,7 +469,7 @@ fn classify(
     // Collect clean replicas (those reporting Clean with a checksum).
     let clean: Vec<&ReplicaEvidence> = accepted
         .iter()
-        .filter(|e| matches!(e.read_outcome, EvidenceReadOutcome::Clean { .. }))
+        .filter(|e| matches!(&e.read_outcome, EvidenceReadOutcome::Clean { .. }))
         .copied()
         .collect();
 
@@ -464,31 +478,50 @@ fn classify(
         .iter()
         .filter(|e| {
             matches!(
-                e.read_outcome,
+                &e.read_outcome,
                 EvidenceReadOutcome::Mismatch { .. } | EvidenceReadOutcome::Unreadable
             )
         })
         .copied()
         .collect();
 
-    // Collect transport-failure replicas from accepted (shouldn't normally
-    // happen after rejection, but handle defensively).
-    let transport_failures: Vec<&ReplicaEvidence> = accepted
+    if let Some(expected) = candidate.expected_checksum {
+        let mismatch_expected_disagreement = mismatches.iter().any(|e| {
+            matches!(
+                &e.read_outcome,
+                EvidenceReadOutcome::Mismatch {
+                    expected: reported,
+                    ..
+                } if *reported != expected
+            )
+        });
+        if mismatch_expected_disagreement {
+            return ComparisonClassification::CrossReplicaDisagreement;
+        }
+    }
+
+    // Missing objects and transport failures are evidence gaps, not clean
+    // agreement. Preserve them alongside wholly absent target evidence.
+    let unavailable_replicas: Vec<u64> = accepted
         .iter()
         .filter(|e| {
             matches!(
-                e.read_outcome,
-                EvidenceReadOutcome::TransportFailure { .. }
+                &e.read_outcome,
+                EvidenceReadOutcome::Missing | EvidenceReadOutcome::TransportFailure { .. }
             )
         })
-        .copied()
+        .map(|e| e.replica_id)
         .collect();
+    let mut missing_or_unavailable_targets: Vec<u64> = missing_targets.to_vec();
+    missing_or_unavailable_targets.extend(unavailable_replicas.iter().copied());
+    missing_or_unavailable_targets.sort_unstable();
+    missing_or_unavailable_targets.dedup();
 
-    // If we have transport failures but no clean set, treat as missing.
-    if !transport_failures.is_empty() && clean.is_empty() {
-        let missing: Vec<u64> = transport_failures.iter().map(|e| e.replica_id).collect();
+    // If unavailable replicas leave no clean set, treat the comparison as
+    // missing evidence rather than a checksum disagreement.
+    if !unavailable_replicas.is_empty() && clean.is_empty() {
         return ComparisonClassification::MissingReplicaEvidence {
-            missing_targets: missing,
+            missing_targets: missing_or_unavailable_targets,
         };
     }
 
@@ -497,11 +530,9 @@ fn classify(
         // Collect the set of checksums reported by clean replicas.
         let mut checksums_seen: std::collections::BTreeSet<[u8; 32]> =
             std::collections::BTreeSet::new();
-        let mut clean_ids: Vec<u64> = Vec::new();
         for ev in &clean {
-            if let EvidenceReadOutcome::Clean { checksum } = ev.read_outcome {
-                checksums_seen.insert(checksum);
-                clean_ids.push(ev.replica_id);
+            if let EvidenceReadOutcome::Clean { checksum } = &ev.read_outcome {
+                checksums_seen.insert(*checksum);
             }
         }
 
@@ -520,9 +551,9 @@ fn classify(
 
     if mismatches.is_empty() && !clean.is_empty() {
         // All accepted evidence is clean, but check for missing targets.
-        if !missing_targets.is_empty() {
+        if !missing_or_unavailable_targets.is_empty() {
             return ComparisonClassification::IncompleteComparison {
-                missing_targets: missing_targets.to_vec(),
+                missing_targets: missing_or_unavailable_targets,
             };
         }
 
@@ -541,9 +572,9 @@ fn classify(
         let clean_source_ids: Vec<u64> = clean.iter().map(|e| e.replica_id).collect();
 
         // If there are also missing targets, report incomplete.
-        if !missing_targets.is_empty() {
+        if !missing_or_unavailable_targets.is_empty() {
             return ComparisonClassification::IncompleteComparison {
-                missing_targets: missing_targets.to_vec(),
+                missing_targets: missing_or_unavailable_targets,
             };
         }
 
@@ -577,9 +608,7 @@ fn classify(
 // Source / target set extraction
 // ---------------------------------------------------------------------------
 
-fn source_target_sets(
-    classification: &ComparisonClassification,
-) -> (Vec<u64>, Vec<u64>) {
+fn source_target_sets(classification: &ComparisonClassification) -> (Vec<u64>, Vec<u64>) {
     match classification {
         ComparisonClassification::SingleReplicaCorruption {
             corrupt_replica,
@@ -633,6 +662,8 @@ mod tests {
             subject: cand.subject,
             object_key: cand.object_key,
             checksum_layer: cand.checksum_layer,
+            redundancy_policy_id: cand.redundancy_policy_id,
+            target_count: cand.target_count,
             content_generation: cand.subject.data_version,
             placement_receipt_epoch: cand.placement_receipt_epoch,
             placement_receipt_generation: cand.placement_receipt_generation,
@@ -655,6 +686,8 @@ mod tests {
             subject: cand.subject,
             object_key: cand.object_key,
             checksum_layer: cand.checksum_layer,
+            redundancy_policy_id: cand.redundancy_policy_id,
+            target_count: cand.target_count,
             content_generation: cand.subject.data_version,
             placement_receipt_epoch: cand.placement_receipt_epoch,
             placement_receipt_generation: cand.placement_receipt_generation,
@@ -663,7 +696,6 @@ mod tests {
             read_outcome: EvidenceReadOutcome::Mismatch { expected, actual },
         }
     }
-
 
     // ------------------------------------------------------------------
     // CleanAgreement
@@ -680,7 +712,12 @@ mod tests {
         let targets = vec![1, 2, 3];
 
         let record = compare_cross_replica(&cand, &evidence, &targets);
-        assert_eq!(record.classification, ComparisonClassification::CleanAgreement);
+        assert_eq!(
+            record.classification,
+            ComparisonClassification::CleanAgreement
+        );
+        assert_eq!(record.redundancy_policy_id, cand.redundancy_policy_id);
+        assert_eq!(record.target_count, cand.target_count);
         assert!(record.clean_source_set.is_empty());
         assert!(record.corrupt_target_set.is_empty());
         assert_eq!(record.replica_outcomes.len(), 3);
@@ -698,12 +735,7 @@ mod tests {
     fn single_replica_corruption_local() {
         let cand = candidate(inline_subject());
         let evidence = vec![
-            mismatch_evidence(
-                1,
-                &cand,
-                cand.expected_checksum.unwrap(),
-                [0xCCu8; 32],
-            ),
+            mismatch_evidence(1, &cand, cand.expected_checksum.unwrap(), [0xCCu8; 32]),
             clean_evidence(2, &cand),
             clean_evidence(3, &cand),
         ];
@@ -731,12 +763,7 @@ mod tests {
         let cand = candidate(inline_subject());
         let evidence = vec![
             clean_evidence(1, &cand),
-            mismatch_evidence(
-                2,
-                &cand,
-                cand.expected_checksum.unwrap(),
-                [0xCCu8; 32],
-            ),
+            mismatch_evidence(2, &cand, cand.expected_checksum.unwrap(), [0xCCu8; 32]),
             clean_evidence(3, &cand),
         ];
         // Replica 1 is first → local is clean; replica 2 is remote corrupt.
@@ -762,18 +789,24 @@ mod tests {
     fn two_mismatches_disagreement() {
         let cand = candidate(inline_subject());
         let evidence = vec![
-            mismatch_evidence(
-                1,
-                &cand,
-                cand.expected_checksum.unwrap(),
-                [0xCCu8; 32],
-            ),
-            mismatch_evidence(
-                2,
-                &cand,
-                cand.expected_checksum.unwrap(),
-                [0xDDu8; 32],
-            ),
+            mismatch_evidence(1, &cand, cand.expected_checksum.unwrap(), [0xCCu8; 32]),
+            mismatch_evidence(2, &cand, cand.expected_checksum.unwrap(), [0xDDu8; 32]),
+        ];
+        let targets = vec![1, 2];
+
+        let record = compare_cross_replica(&cand, &evidence, &targets);
+        assert_eq!(
+            record.classification,
+            ComparisonClassification::CrossReplicaDisagreement
+        );
+    }
+
+    #[test]
+    fn mismatch_expected_checksum_disagreement() {
+        let cand = candidate(inline_subject());
+        let evidence = vec![
+            clean_evidence(1, &cand),
+            mismatch_evidence(2, &cand, [0xEEu8; 32], [0xCCu8; 32]),
         ];
         let targets = vec![1, 2];
 
@@ -818,6 +851,8 @@ mod tests {
                 subject: cand.subject,
                 object_key: cand.object_key,
                 checksum_layer: cand.checksum_layer,
+                redundancy_policy_id: cand.redundancy_policy_id,
+                target_count: cand.target_count,
                 content_generation: cand.subject.data_version,
                 placement_receipt_epoch: cand.placement_receipt_epoch,
                 placement_receipt_generation: cand.placement_receipt_generation,
@@ -832,6 +867,8 @@ mod tests {
                 subject: cand.subject,
                 object_key: cand.object_key,
                 checksum_layer: cand.checksum_layer,
+                redundancy_policy_id: cand.redundancy_policy_id,
+                target_count: cand.target_count,
                 content_generation: cand.subject.data_version,
                 placement_receipt_epoch: cand.placement_receipt_epoch,
                 placement_receipt_generation: cand.placement_receipt_generation,
@@ -863,6 +900,8 @@ mod tests {
             subject: cand.subject,
             object_key: cand.object_key,
             checksum_layer: cand.checksum_layer,
+            redundancy_policy_id: cand.redundancy_policy_id,
+            target_count: cand.target_count,
             content_generation: 3, // older than candidate data_version 5
             placement_receipt_epoch: cand.placement_receipt_epoch,
             placement_receipt_generation: cand.placement_receipt_generation,
@@ -896,6 +935,8 @@ mod tests {
             subject: cand.subject,
             object_key: cand.object_key,
             checksum_layer: cand.checksum_layer,
+            redundancy_policy_id: cand.redundancy_policy_id,
+            target_count: cand.target_count,
             content_generation: cand.subject.data_version,
             placement_receipt_epoch: cand.placement_receipt_epoch,
             placement_receipt_generation: 5, // older than candidate 7
@@ -928,6 +969,8 @@ mod tests {
             subject: subject(ScrubSubjectKind::ContentChunk { chunk_index: 0 }, 5),
             object_key: cand.object_key,
             checksum_layer: cand.checksum_layer,
+            redundancy_policy_id: cand.redundancy_policy_id,
+            target_count: cand.target_count,
             content_generation: cand.subject.data_version,
             placement_receipt_epoch: cand.placement_receipt_epoch,
             placement_receipt_generation: cand.placement_receipt_generation,
@@ -955,6 +998,8 @@ mod tests {
             subject: cand.subject,
             object_key: [0xFFu8; 32], // different key
             checksum_layer: cand.checksum_layer,
+            redundancy_policy_id: cand.redundancy_policy_id,
+            target_count: cand.target_count,
             content_generation: cand.subject.data_version,
             placement_receipt_epoch: cand.placement_receipt_epoch,
             placement_receipt_generation: cand.placement_receipt_generation,
@@ -981,6 +1026,8 @@ mod tests {
             subject: cand.subject,
             object_key: cand.object_key,
             checksum_layer: ChecksumLayer::InlineContentBody, // different
+            redundancy_policy_id: cand.redundancy_policy_id,
+            target_count: cand.target_count,
             content_generation: cand.subject.data_version,
             placement_receipt_epoch: cand.placement_receipt_epoch,
             placement_receipt_generation: cand.placement_receipt_generation,
@@ -1000,6 +1047,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mismatched_redundancy_policy() {
+        let cand = candidate(inline_subject());
+        let mut evidence = clean_evidence(1, &cand);
+        evidence.redundancy_policy_id = cand.redundancy_policy_id + 1;
+        let targets = vec![1];
+
+        let record = compare_cross_replica(&cand, &[evidence], &targets);
+        assert_eq!(
+            record.replica_outcomes[0].rejection_reason,
+            Some(EvidenceRejectionReason::RedundancyPolicyMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_target_count() {
+        let cand = candidate(inline_subject());
+        let mut evidence = clean_evidence(1, &cand);
+        evidence.target_count = cand.target_count + 1;
+        let targets = vec![1];
+
+        let record = compare_cross_replica(&cand, &[evidence], &targets);
+        assert_eq!(
+            record.replica_outcomes[0].rejection_reason,
+            Some(EvidenceRejectionReason::TargetCountMismatch)
+        );
+    }
+
+    #[test]
     fn rejects_mismatched_epoch() {
         let cand = candidate(inline_subject());
         let evidence = vec![ReplicaEvidence {
@@ -1007,6 +1082,8 @@ mod tests {
             subject: cand.subject,
             object_key: cand.object_key,
             checksum_layer: cand.checksum_layer,
+            redundancy_policy_id: cand.redundancy_policy_id,
+            target_count: cand.target_count,
             content_generation: cand.subject.data_version,
             placement_receipt_epoch: 99, // different
             placement_receipt_generation: cand.placement_receipt_generation,
@@ -1061,6 +1138,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn missing_read_outcome_is_not_clean_agreement() {
+        let cand = candidate(inline_subject());
+        let mut missing = clean_evidence(2, &cand);
+        missing.read_outcome = EvidenceReadOutcome::Missing;
+        let evidence = vec![clean_evidence(1, &cand), missing];
+        let targets = vec![1, 2];
+
+        let record = compare_cross_replica(&cand, &evidence, &targets);
+        assert_eq!(
+            record.classification,
+            ComparisonClassification::IncompleteComparison {
+                missing_targets: vec![2],
+            }
+        );
+    }
+
     // ------------------------------------------------------------------
     // MissingChecksumEvidence
     // ------------------------------------------------------------------
@@ -1068,20 +1162,20 @@ mod tests {
     #[test]
     fn no_checksum_evidence() {
         let cand = candidate(inline_subject());
-        let evidence = vec![
-            ReplicaEvidence {
-                replica_id: 1,
-                subject: cand.subject,
-                object_key: cand.object_key,
-                checksum_layer: cand.checksum_layer,
-                content_generation: cand.subject.data_version,
-                placement_receipt_epoch: cand.placement_receipt_epoch,
-                placement_receipt_generation: cand.placement_receipt_generation,
-                membership_epoch: cand.membership_epoch,
-                source_epoch: 10,
-                read_outcome: EvidenceReadOutcome::NoChecksum,
-            },
-        ];
+        let evidence = vec![ReplicaEvidence {
+            replica_id: 1,
+            subject: cand.subject,
+            object_key: cand.object_key,
+            checksum_layer: cand.checksum_layer,
+            redundancy_policy_id: cand.redundancy_policy_id,
+            target_count: cand.target_count,
+            content_generation: cand.subject.data_version,
+            placement_receipt_epoch: cand.placement_receipt_epoch,
+            placement_receipt_generation: cand.placement_receipt_generation,
+            membership_epoch: cand.membership_epoch,
+            source_epoch: 10,
+            read_outcome: EvidenceReadOutcome::NoChecksum,
+        }];
         let targets = vec![1];
 
         let record = compare_cross_replica(&cand, &evidence, &targets);
@@ -1122,12 +1216,7 @@ mod tests {
         let cand = candidate(inline_subject());
         let evidence = vec![
             clean_evidence(1, &cand),
-            mismatch_evidence(
-                2,
-                &cand,
-                cand.expected_checksum.unwrap(),
-                [0xCCu8; 32],
-            ),
+            mismatch_evidence(2, &cand, cand.expected_checksum.unwrap(), [0xCCu8; 32]),
             // replica 3 is missing
         ];
         let targets = vec![1, 2, 3];
@@ -1154,6 +1243,8 @@ mod tests {
                 subject: cand.subject,
                 object_key: cand.object_key,
                 checksum_layer: cand.checksum_layer,
+                redundancy_policy_id: cand.redundancy_policy_id,
+                target_count: cand.target_count,
                 content_generation: cand.subject.data_version,
                 placement_receipt_epoch: cand.placement_receipt_epoch,
                 placement_receipt_generation: cand.placement_receipt_generation,
@@ -1168,6 +1259,8 @@ mod tests {
                 subject: cand.subject,
                 object_key: cand.object_key,
                 checksum_layer: cand.checksum_layer,
+                redundancy_policy_id: cand.redundancy_policy_id,
+                target_count: cand.target_count,
                 content_generation: cand.subject.data_version,
                 placement_receipt_epoch: cand.placement_receipt_epoch,
                 placement_receipt_generation: cand.placement_receipt_generation,
@@ -1189,6 +1282,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transport_failure_with_clean_source_is_incomplete() {
+        let cand = candidate(inline_subject());
+        let mut transport_failure = clean_evidence(2, &cand);
+        transport_failure.read_outcome = EvidenceReadOutcome::TransportFailure {
+            reason: TransportFailureReason::Timeout,
+        };
+        let evidence = vec![clean_evidence(1, &cand), transport_failure];
+        let targets = vec![1, 2];
+
+        let record = compare_cross_replica(&cand, &evidence, &targets);
+        assert_eq!(
+            record.classification,
+            ComparisonClassification::IncompleteComparison {
+                missing_targets: vec![2],
+            }
+        );
+    }
+
     // ------------------------------------------------------------------
     // ReceiptStale rejection
     // ------------------------------------------------------------------
@@ -1201,6 +1313,8 @@ mod tests {
             subject: cand.subject,
             object_key: cand.object_key,
             checksum_layer: cand.checksum_layer,
+            redundancy_policy_id: cand.redundancy_policy_id,
+            target_count: cand.target_count,
             content_generation: cand.subject.data_version,
             placement_receipt_epoch: cand.placement_receipt_epoch,
             placement_receipt_generation: cand.placement_receipt_generation,
@@ -1238,6 +1352,8 @@ mod tests {
                 subject: cand.subject,
                 object_key: cand.object_key,
                 checksum_layer: cand.checksum_layer,
+                redundancy_policy_id: cand.redundancy_policy_id,
+                target_count: cand.target_count,
                 content_generation: cand.subject.data_version,
                 placement_receipt_epoch: cand.placement_receipt_epoch,
                 placement_receipt_generation: cand.placement_receipt_generation,
@@ -1252,6 +1368,8 @@ mod tests {
                 subject: cand.subject,
                 object_key: cand.object_key,
                 checksum_layer: cand.checksum_layer,
+                redundancy_policy_id: cand.redundancy_policy_id,
+                target_count: cand.target_count,
                 content_generation: cand.subject.data_version,
                 placement_receipt_epoch: cand.placement_receipt_epoch,
                 placement_receipt_generation: cand.placement_receipt_generation,
