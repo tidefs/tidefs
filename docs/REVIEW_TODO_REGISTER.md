@@ -1238,6 +1238,19 @@ Issue #1267 records the current runtime-fed operator product-surface decision: n
   design-subdir documents as historical input. TFR-019 remains open for any
   per-document source audit needed before promoting additional docs to current
   spec or policy.
+- `TFR-019`: GitHub issue #1136 classifies `docs/REQUEST_CONTRACT.md` as
+  current spec only for the TideFS-owned request/completion contract shape:
+  portable `tidefs-types-vfs-core` records, the v1 `tidefs-schema-codec-vfs`
+  fixed-width little-endian request/completion codecs, strict decoder
+  rejections, and explicit unsupported request payloads. The slice reviewed the
+  request-contract doc, authority register, index, nextgen verification and
+  trace-oracle docs, claim-registry and scanned claims-gate surfaces, FUSE/uBLK
+  environment-model references, model-core and trace-oracle references, and
+  closed issues #282, #528, #751, and #1066 as historical lineage evidence.
+  This reduces request-contract documentation-authority drift but does not
+  close runtime adapter rewiring, FUSE, ublk, kernel VFS, RPC, storage,
+  placement, rebuild, reclaim, offload, mounted-runtime validation,
+  release-readiness, claims-gate closure, or broad TFR-019 debt.
 - `TFR-019`: GitHub issue #1164 classifies
   `docs/design/coordination-pipeline-health-advancement-strategy.md` as
   historical input after reviewing the documentation authority register,

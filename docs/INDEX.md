@@ -26,9 +26,10 @@ Book:
 - `docs/book/tidefs-book.adoc`
 - `docs/book/chapters/05-book-plan.adoc`
 
-The remaining documents are design/reference material. Their authority state is
-scoped by `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`; a path appearing below is
-not automatically current status.
+The remaining documents are design/reference material. Their authority state,
+including the request-contract scope, is scoped by
+`docs/DOCUMENTATION_AUTHORITY_REGISTER.md`; a path appearing below is not
+automatically current status.
 
 Release readiness boundary and evidence inputs:
 
