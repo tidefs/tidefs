@@ -3528,6 +3528,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-storage-intent-prefetch-feedback"
+version = "0.421.0"
+dependencies = [
+ "serde",
+ "tidefs-storage-intent-core",
+ "tidefs-storage-intent-prefetch-executor",
+]
+
+[[package]]
 name = "tidefs-storage-intent-read-serving"
 version = "0.421.0"
 dependencies = [
