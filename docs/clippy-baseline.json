@@ -320,7 +320,7 @@
       "exit_code": 0
     },
     "tidefs-placement-planner": {
-      "warnings": 5,
+      "warnings": 7,
       "exit_code": 0
     },
     "tidefs-placement-runtime": {
