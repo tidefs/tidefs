@@ -323,6 +323,8 @@ pub struct StorageIntentPlacementCandidate {
     pub cost_wear: Option<CostWearRecord>,
     /// Optional #967 prefetch/residency decision input.
     pub prefetch_residency: Option<PrefetchResidencyDecisionRecord>,
+    /// #912 attribution gate for prefetch/residency outcomes used by scoring.
+    pub measurement_attribution: PlacementEvidenceState,
     /// Optional #915 service-objective envelope for this candidate.
     pub service_objective: Option<StorageIntentServiceObjectiveEvidence>,
     /// Exact #915 scope this candidate is trying to satisfy.
@@ -381,6 +383,7 @@ impl StorageIntentPlacementCandidate {
             layout_allocator: None,
             cost_wear: None,
             prefetch_residency: None,
+            measurement_attribution: PlacementEvidenceState::Unknown,
             service_objective: None,
             service_objective_scope: None,
             service_objective_query: None,
@@ -420,6 +423,7 @@ impl StorageIntentPlacementCandidate {
         self.data_shape_state = PlacementEvidenceState::Fresh;
         self.layout_allocator_state = PlacementEvidenceState::Fresh;
         self.service_objective_state = PlacementEvidenceState::Fresh;
+        self.measurement_attribution = PlacementEvidenceState::Fresh;
         self.decision_frontier = PlacementEvidenceState::Fresh;
         self.lifecycle_generation = PlacementEvidenceState::Fresh;
         self
@@ -584,6 +588,7 @@ pub enum CandidateGate {
     DataShape,
     LayoutAllocator,
     ServiceObjective,
+    MeasurementAttribution,
     DecisionFrontier,
 }
 
@@ -1471,7 +1476,7 @@ fn evaluate_candidate(
     evaluate_service_objective(role_requires_service_objective(role), candidate, reasons);
     evaluate_data_shape(request, role_requires_data_shape(role), candidate, reasons);
     evaluate_layout(role_requires_layout_allocator(role), candidate, reasons);
-    evaluate_prefetch_residency_boundary(role, candidate, reasons);
+    evaluate_prefetch_residency_boundary(request, role, candidate, reasons);
     evaluate_cache_authority_boundary(role, candidate, reasons);
     evaluate_transport_proximity(request, candidate, reasons);
     evaluate_geo_remote_boundary(role, candidate, reasons);
@@ -1903,25 +1908,61 @@ fn evaluate_cache_authority_boundary(
 }
 
 fn evaluate_prefetch_residency_boundary(
+    request: &StorageIntentPlacementRequest,
     role: StorageIntentPlacementRole,
     candidate: &StorageIntentPlacementCandidate,
     reasons: &mut Vec<StorageIntentPlacementReason>,
 ) {
+    let Some(decision) = candidate.prefetch_residency else {
+        return;
+    };
+
+    require_prefetch_measurement_attribution(request, candidate, reasons);
+
     if role.is_cache_only() {
         return;
     }
 
-    if let Some(decision) = candidate.prefetch_residency {
-        if let Some(refusal) = prefetch_residency_hard_refusal(decision) {
-            reasons.push(
-                StorageIntentPlacementReason::CandidatePrefetchResidencyRefused {
-                    target_id: candidate.target_id,
-                    outcome: decision.outcome,
-                    refusal,
-                },
-            );
-        }
+    if let Some(refusal) = prefetch_residency_hard_refusal(decision) {
+        reasons.push(
+            StorageIntentPlacementReason::CandidatePrefetchResidencyRefused {
+                target_id: candidate.target_id,
+                outcome: decision.outcome,
+                refusal,
+            },
+        );
     }
+}
+
+fn require_prefetch_measurement_attribution(
+    request: &StorageIntentPlacementRequest,
+    candidate: &StorageIntentPlacementCandidate,
+    reasons: &mut Vec<StorageIntentPlacementReason>,
+) {
+    require_candidate_gate(
+        reasons,
+        candidate.target_id,
+        CandidateGate::MeasurementAttribution,
+        candidate.measurement_attribution,
+        StorageIntentRefusalReason::EvidenceNotUsable,
+    );
+
+    if request
+        .evidence_query
+        .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MeasurementAttributionEvidence)
+    {
+        return;
+    }
+
+    reasons.push(StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+        target_id: candidate.target_id,
+        gate: CandidateGate::MeasurementAttribution,
+        state: family_state(
+            request,
+            StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+        ),
+        refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+    });
 }
 
 fn prefetch_residency_hard_refusal(
@@ -2170,6 +2211,7 @@ mod tests {
                         | StorageIntentEvidenceKind::TransportPathEvidence
                         | StorageIntentEvidenceKind::DecisionFrontierEvidence
                         | StorageIntentEvidenceKind::LifecycleGenerationEvidence
+                        | StorageIntentEvidenceKind::MeasurementAttributionEvidence
                         | StorageIntentEvidenceKind::WorkloadEvidence
                 ) && keep(kind)
             },
@@ -2929,6 +2971,7 @@ mod tests {
             CandidateGate::DataShape => candidate.data_shape_state = state,
             CandidateGate::LayoutAllocator => candidate.layout_allocator_state = state,
             CandidateGate::ServiceObjective => candidate.service_objective_state = state,
+            CandidateGate::MeasurementAttribution => candidate.measurement_attribution = state,
             CandidateGate::DecisionFrontier => candidate.decision_frontier = state,
         }
     }
@@ -3794,6 +3837,104 @@ mod tests {
             StorageIntentPlacementCandidateReason::HardGate(
                 StorageIntentPlacementReason::CandidatePrefetchResidencyRefused {
                     outcome: PrefetchResidencyDecisionOutcome::NeedMoreEvidence,
+                    refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn prefetch_residency_requires_candidate_attribution_before_scoring() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.prefetch_residency = Some(prefetch_decision(
+            PrefetchResidencyCandidateClass::FlashHotServing,
+            PrefetchResidencyStateClass::FlashHotServing,
+            PrefetchResidencyDecisionOutcome::Admitted,
+            StorageIntentRefusalReason::None,
+        ));
+        candidate.measurement_attribution = PlacementEvidenceState::Missing;
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = &plan.candidate_reports[0];
+        assert!(!report.legal);
+        assert_eq!(report.score, 0);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                    gate: CandidateGate::MeasurementAttribution,
+                    state: PlacementEvidenceState::Missing,
+                    refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn prefetch_residency_requires_attribution_in_evidence_cut() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut request = request(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+        );
+        request.evidence_query = evidence_cut_without(
+            policy,
+            StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.prefetch_residency = Some(prefetch_decision(
+            PrefetchResidencyCandidateClass::FlashHotServing,
+            PrefetchResidencyStateClass::FlashHotServing,
+            PrefetchResidencyDecisionOutcome::Admitted,
+            StorageIntentRefusalReason::None,
+        ));
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!plan.admitted);
+        let report = &plan.candidate_reports[0];
+        assert!(!report.legal);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                    gate: CandidateGate::MeasurementAttribution,
+                    state: PlacementEvidenceState::Unknown,
                     refusal: StorageIntentRefusalReason::EvidenceNotUsable,
                     ..
                 }
