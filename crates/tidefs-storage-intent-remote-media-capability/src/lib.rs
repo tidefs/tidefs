@@ -266,6 +266,122 @@ impl RemoteArchiveFacts {
     }
 }
 
+/// Read-only archive write/append/restore sample used to produce archive
+/// commit and retention facts.
+///
+/// This is a model adapter, not a runtime producer: it maps bounded
+/// archive operational outcomes into [`RemoteCommitFacts`] and
+/// [`RemoteArchiveFacts`] without claiming archive durability from
+/// service labels, endpoint names, or unverified append-only vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteArchiveCommitSample {
+    /// Whether the archive append/write was acknowledged by the service.
+    pub append_acknowledged: bool,
+    /// Whether a bounded retention period is known and enforced.
+    pub retention_period_known: bool,
+    /// Retention period in hours (0 when unknown).
+    pub retention_period_hours: u64,
+    /// Whether restore delay has been measured or bounded.
+    pub restore_delay_known: bool,
+    /// Measured or bounded restore delay in milliseconds (0 when unknown).
+    pub restore_delay_ms: u64,
+    /// Whether at least one end-to-end restore has been verified.
+    pub restore_verified: bool,
+    /// Evidence ref for the archive write/append operation.
+    pub append_ref: StorageIntentEvidenceRef,
+    /// Evidence ref for the archive restore verification.
+    pub restore_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for RemoteArchiveCommitSample {
+    fn default() -> Self {
+        Self {
+            append_acknowledged: false,
+            retention_period_known: false,
+            retention_period_hours: 0,
+            restore_delay_known: false,
+            restore_delay_ms: 0,
+            restore_verified: false,
+            append_ref: EMPTY_EVIDENCE_REF,
+            restore_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+impl RemoteArchiveCommitSample {
+    /// Produce commit facts from archive write/append operational evidence.
+    ///
+    /// Archive commit requires an acknowledged append, proven retention,
+    /// and a bound evidence ref. Without all three, partial archive evidence
+    /// preserves archive identity but yields volatile ack only; no sample
+    /// evidence remains unknown.
+    #[must_use]
+    pub const fn to_commit_facts(self) -> RemoteCommitFacts {
+        if self.append_acknowledged
+            && self.retention_period_known
+            && self.retention_period_hours > 0
+            && self.append_ref.is_bound()
+        {
+            return RemoteCommitFacts::new(
+                MediaPersistenceDomain::ArchiveDurable,
+                MediaFlushOrderingClass::ArchiveCommit,
+                MediaAtomicityClass::AppendRecordAtomic,
+                MediaProtocolGeometryClass::ArchiveSequential,
+                MediaRemoteCommitSemantics::ArchiveRetained,
+                self.append_ref,
+            );
+        }
+
+        if self.append_acknowledged || self.append_ref.is_bound() {
+            return RemoteCommitFacts::new(
+                MediaPersistenceDomain::ArchiveDurable,
+                MediaFlushOrderingClass::Unknown,
+                MediaAtomicityClass::AppendRecordAtomic,
+                MediaProtocolGeometryClass::ArchiveSequential,
+                MediaRemoteCommitSemantics::VolatileAckOnly,
+                self.append_ref,
+            );
+        }
+
+        RemoteCommitFacts::UNKNOWN
+    }
+
+    /// Produce archive restore and retention facts from the sample evidence.
+    ///
+    /// Verified end-to-end restore plus known retention yields audited
+    /// semantics. Known retention without verified restore yields retained
+    /// semantics. An acknowledged append without either yields unbounded
+    /// restore (legal for archive identity but not for authority).
+    #[must_use]
+    pub const fn to_archive_facts(self) -> RemoteArchiveFacts {
+        if self.restore_verified
+            && self.retention_period_known
+            && self.retention_period_hours > 0
+            && self.restore_ref.is_bound()
+        {
+            return RemoteArchiveFacts::new(
+                MediaArchiveRestoreSemantics::RestoreAudited,
+                self.restore_ref,
+            );
+        }
+
+        if self.retention_period_known
+            && self.retention_period_hours > 0
+            && self.append_ref.is_bound()
+        {
+            return RemoteArchiveFacts::new(
+                MediaArchiveRestoreSemantics::RestoreRetained,
+                self.append_ref,
+            );
+        }
+
+        RemoteArchiveFacts {
+            restore: MediaArchiveRestoreSemantics::NotArchive,
+            archive_restore_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
 /// Freshness, lag, and timebase facts for a remote target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemoteFreshnessFacts {
@@ -1604,7 +1720,10 @@ mod tests {
                 MediaRemoteCommitSemantics::VolatileAckOnly,
                 media_evidence(5),
             ))
-            .with_archive(RemoteArchiveFacts::default());
+            .with_archive(RemoteArchiveFacts {
+                restore: MediaArchiveRestoreSemantics::NotArchive,
+                archive_restore_ref: EMPTY_EVIDENCE_REF,
+            });
         let record = StorageIntentMediaCapabilityRecord {
             media_class: StorageMediaClass::RemoteRam,
             ..produce_remote_media_capability(facts)
@@ -1627,5 +1746,158 @@ mod tests {
             placement_result(record).refusal,
             StorageIntentRefusalReason::MissingMediaCapabilityEvidence
         );
+    }
+
+    // ── RemoteArchiveCommitSample tests ──────────────────────────
+
+    fn archive_sample_strong() -> RemoteArchiveCommitSample {
+        RemoteArchiveCommitSample {
+            append_acknowledged: true,
+            retention_period_known: true,
+            retention_period_hours: 24 * 365,
+            restore_delay_known: true,
+            restore_delay_ms: 3_600_000,
+            restore_verified: true,
+            append_ref: media_evidence(80),
+            restore_ref: media_evidence(81),
+        }
+    }
+
+    #[test]
+    fn archive_sample_with_all_evidence_yields_durable_archive_commit() {
+        let sample = archive_sample_strong();
+        let commit = sample.to_commit_facts();
+
+        assert_eq!(commit.persistence, MediaPersistenceDomain::ArchiveDurable);
+        assert_eq!(
+            commit.flush_ordering,
+            MediaFlushOrderingClass::ArchiveCommit
+        );
+        assert_eq!(commit.atomicity, MediaAtomicityClass::AppendRecordAtomic);
+        assert_eq!(
+            commit.geometry,
+            MediaProtocolGeometryClass::ArchiveSequential
+        );
+        assert_eq!(
+            commit.remote_commit,
+            MediaRemoteCommitSemantics::ArchiveRetained
+        );
+        assert_eq!(commit.remote_commit_ref, sample.append_ref);
+    }
+
+    #[test]
+    fn archive_sample_with_verified_restore_yields_audited_semantics() {
+        let sample = archive_sample_strong();
+        let archive = sample.to_archive_facts();
+
+        assert_eq!(
+            archive.restore,
+            MediaArchiveRestoreSemantics::RestoreAudited
+        );
+        assert_eq!(archive.archive_restore_ref, sample.restore_ref);
+    }
+
+    #[test]
+    fn archive_sample_missing_append_yields_volatile_ack_not_durable() {
+        let sample = RemoteArchiveCommitSample {
+            append_acknowledged: false,
+            ..archive_sample_strong()
+        };
+        let commit = sample.to_commit_facts();
+
+        assert_eq!(commit.persistence, MediaPersistenceDomain::ArchiveDurable);
+        assert_eq!(commit.flush_ordering, MediaFlushOrderingClass::Unknown);
+        assert_eq!(
+            commit.remote_commit,
+            MediaRemoteCommitSemantics::VolatileAckOnly
+        );
+    }
+
+    #[test]
+    fn archive_sample_missing_retention_yields_volatile_ack() {
+        let sample = RemoteArchiveCommitSample {
+            retention_period_known: false,
+            retention_period_hours: 0,
+            ..archive_sample_strong()
+        };
+        let commit = sample.to_commit_facts();
+
+        assert_eq!(commit.persistence, MediaPersistenceDomain::ArchiveDurable);
+        assert_eq!(commit.flush_ordering, MediaFlushOrderingClass::Unknown);
+        assert_eq!(
+            commit.remote_commit,
+            MediaRemoteCommitSemantics::VolatileAckOnly
+        );
+    }
+
+    #[test]
+    fn archive_sample_retention_without_verified_restore_yields_retained() {
+        let sample = RemoteArchiveCommitSample {
+            restore_verified: false,
+            restore_delay_known: false,
+            ..archive_sample_strong()
+        };
+        let archive = sample.to_archive_facts();
+
+        assert_eq!(
+            archive.restore,
+            MediaArchiveRestoreSemantics::RestoreRetained
+        );
+        assert_eq!(archive.archive_restore_ref, sample.append_ref);
+    }
+
+    #[test]
+    fn archive_sample_default_is_not_archive_and_unknown_commit() {
+        let sample = RemoteArchiveCommitSample::default();
+        let commit = sample.to_commit_facts();
+        let archive = sample.to_archive_facts();
+
+        assert_eq!(commit.persistence, MediaPersistenceDomain::Unknown);
+        assert_eq!(commit.remote_commit, MediaRemoteCommitSemantics::Unknown);
+        assert_eq!(archive.restore, MediaArchiveRestoreSemantics::NotArchive);
+    }
+
+    #[test]
+    fn archive_sample_without_bound_ref_yields_volatile_ack_not_durable() {
+        let sample = RemoteArchiveCommitSample {
+            append_acknowledged: true,
+            retention_period_known: true,
+            retention_period_hours: 24,
+            append_ref: EMPTY_EVIDENCE_REF,
+            ..RemoteArchiveCommitSample::default()
+        };
+        let commit = sample.to_commit_facts();
+
+        assert_eq!(commit.persistence, MediaPersistenceDomain::ArchiveDurable);
+        assert_eq!(commit.flush_ordering, MediaFlushOrderingClass::Unknown);
+        assert_eq!(
+            commit.remote_commit,
+            MediaRemoteCommitSemantics::VolatileAckOnly
+        );
+    }
+
+    #[test]
+    fn archive_sample_integrated_through_strong_archive_facts_satisfies_role() {
+        let facts = strong_archive_facts();
+        let record = produce_remote_media_capability(facts);
+
+        let sample = archive_sample_strong();
+        let archive = sample.to_archive_facts();
+        assert_eq!(
+            archive.restore,
+            MediaArchiveRestoreSemantics::RestoreAudited
+        );
+
+        let commit = sample.to_commit_facts();
+        assert_eq!(
+            commit.remote_commit,
+            MediaRemoteCommitSemantics::ArchiveRetained
+        );
+
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::None
+        );
+        assert!(archive_result(record).satisfied);
     }
 }
