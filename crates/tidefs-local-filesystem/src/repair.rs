@@ -41,6 +41,9 @@ pub enum RepairAuthorityMismatch {
     MissingInode,
     DataVersionStale { candidate: u64, current: u64 },
     BlockKindMismatch,
+    MountedScrubEvidenceStale,
+    MountedScrubChecksumMissing,
+    MountedScrubReceiptNotVerified,
     CurrentAuthorityUnavailable,
 }
 
