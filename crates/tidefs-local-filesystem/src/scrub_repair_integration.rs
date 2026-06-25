@@ -484,6 +484,10 @@ mod tests {
     use tidefs_local_object_store::IntegrityDigest64;
     use tidefs_replication_model::PlacementReceiptRef;
     use tidefs_scrub::repair_scheduling::{RepairBlockKind, RepairCandidateIdentity};
+    use tidefs_scrub::{
+        ChecksumLayer, ComparisonClassification, CrossReplicaComparisonRecord, ScrubSubject,
+        ScrubSubjectKind,
+    };
     use tidefs_types_vfs_core::{Generation, InodeId, NodeKind};
 
     fn make_file_inode(inode_id: u64, data_version: u64, size: u64) -> crate::types::InodeRecord {
@@ -572,11 +576,60 @@ mod tests {
         };
         let entry = make_suspect_entry(inode_id, data_version, offset);
         let receipt = receipt_for_entry(&entry);
+        let comparison = comparison_record_for_entry(&entry, kind);
         RepairAdmissionInput::with_receipt_and_identity(
             entry,
             receipt,
             RepairCandidateIdentity::new(inode_id, data_version, kind),
         )
+        .with_cross_replica_comparison(&comparison)
+    }
+
+    fn comparison_record_for_entry(
+        entry: &tidefs_local_object_store::SuspectEntry,
+        kind: RepairBlockKind,
+    ) -> CrossReplicaComparisonRecord {
+        let receipt = receipt_for_entry(entry);
+        CrossReplicaComparisonRecord {
+            subject: ScrubSubject {
+                inode_id: entry.locator_id,
+                data_version: entry.segment_id,
+                kind: subject_kind_for_repair_kind(kind),
+            },
+            object_key: receipt.object_key,
+            checksum_layer: checksum_layer_for_repair_kind(kind),
+            redundancy_policy_id: 1,
+            target_count: receipt.target_count,
+            placement_receipt_epoch: receipt.receipt_epoch.0,
+            placement_receipt_generation: receipt.receipt_generation,
+            membership_epoch: 1,
+            replica_outcomes: Vec::new(),
+            classification: ComparisonClassification::SingleReplicaCorruption {
+                corrupt_replica: 1,
+                clean_sources: vec![2],
+            },
+            clean_source_set: vec![2],
+            corrupt_target_set: vec![1],
+        }
+    }
+
+    fn subject_kind_for_repair_kind(kind: RepairBlockKind) -> ScrubSubjectKind {
+        match kind {
+            RepairBlockKind::InlineContent => ScrubSubjectKind::InlineContent,
+            RepairBlockKind::ContentManifest => ScrubSubjectKind::ContentManifest,
+            RepairBlockKind::ContentChunk { chunk_index } => {
+                ScrubSubjectKind::ContentChunk { chunk_index }
+            }
+        }
+    }
+
+    fn checksum_layer_for_repair_kind(kind: RepairBlockKind) -> ChecksumLayer {
+        match kind {
+            RepairBlockKind::InlineContent | RepairBlockKind::ContentManifest => {
+                ChecksumLayer::InlineContentBody
+            }
+            RepairBlockKind::ContentChunk { .. } => ChecksumLayer::EncodedContentChunk,
+        }
     }
 
     fn encoded_reconstructable_object() -> (Vec<u8>, Vec<u8>) {

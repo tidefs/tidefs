@@ -198,6 +198,14 @@ pub struct RepairSchedulerStats {
     pub blocked_identity_mismatch: u64,
     /// Entries blocked because the supplied receipt was stale or malformed.
     pub blocked_stale_receipt: u64,
+    /// Entries blocked because no comparison record was supplied.
+    pub blocked_missing_comparison: u64,
+    /// Entries blocked because comparison evidence was stale or mismatched.
+    pub blocked_stale_comparison: u64,
+    /// Entries blocked because replicas disagreed after reconciliation.
+    pub blocked_cross_replica_disagreement: u64,
+    /// Entries blocked because comparison classification forbids writeback.
+    pub blocked_unreconciled_comparison: u64,
     /// Entries where policy is unknown (no layout available).
     pub unknown_policy: u64,
 }
@@ -344,6 +352,30 @@ impl<D: DurabilityQuery> RepairScheduler<D> {
                 } => {
                     self.stats.blocked_stale_receipt += 1;
                 }
+                RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::MissingComparisonRecord,
+                    ..
+                } => {
+                    self.stats.blocked_missing_comparison += 1;
+                }
+                RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::StaleComparisonRecord,
+                    ..
+                } => {
+                    self.stats.blocked_stale_comparison += 1;
+                }
+                RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::CrossReplicaDisagreement,
+                    ..
+                } => {
+                    self.stats.blocked_cross_replica_disagreement += 1;
+                }
+                RepairAdmission::Blocked {
+                    reason: RepairEvidenceRejection::UnreconciledComparison,
+                    ..
+                } => {
+                    self.stats.blocked_unreconciled_comparison += 1;
+                }
                 RepairAdmission::Skipped { .. } => {}
             }
         }
@@ -408,6 +440,10 @@ impl<D: DurabilityQuery> RepairScheduler<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cross_replica_comparison::{
+        ChecksumLayer, ComparisonClassification, CrossReplicaComparisonRecord, ScrubSubject,
+        ScrubSubjectKind,
+    };
     use crate::repair_scheduling::ScrubToRepairBridge;
     use tidefs_durability_layout::DurabilityLayoutV1;
     use tidefs_local_object_store::SuspectEntry;
@@ -446,11 +482,48 @@ mod tests {
 
     fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
         let receipt = receipt_for_entry(&entry);
+        let comparison = comparison_record_for_entry(&entry);
         RepairAdmissionInput::with_receipt(entry, receipt)
+            .with_cross_replica_comparison(&comparison)
     }
 
     fn inputs_with_receipts(entries: &[SuspectEntry]) -> Vec<RepairAdmissionInput> {
         entries.iter().copied().map(input_with_receipt).collect()
+    }
+
+    fn comparison_record_for_entry(entry: &SuspectEntry) -> CrossReplicaComparisonRecord {
+        let receipt = receipt_for_entry(entry);
+        CrossReplicaComparisonRecord {
+            subject: ScrubSubject {
+                inode_id: entry.locator_id,
+                data_version: entry.segment_id,
+                kind: if entry.offset == 0 {
+                    ScrubSubjectKind::InlineContent
+                } else {
+                    ScrubSubjectKind::ContentChunk {
+                        chunk_index: entry.offset,
+                    }
+                },
+            },
+            object_key: receipt.object_key,
+            checksum_layer: if entry.offset == 0 {
+                ChecksumLayer::InlineContentBody
+            } else {
+                ChecksumLayer::EncodedContentChunk
+            },
+            redundancy_policy_id: 1,
+            target_count: receipt.target_count,
+            placement_receipt_epoch: receipt.receipt_epoch.0,
+            placement_receipt_generation: receipt.receipt_generation,
+            membership_epoch: 1,
+            replica_outcomes: Vec::new(),
+            classification: ComparisonClassification::SingleReplicaCorruption {
+                corrupt_replica: 1,
+                clean_sources: vec![2],
+            },
+            clean_source_set: vec![2],
+            corrupt_target_set: vec![1],
+        }
     }
 
     // ── LayoutDurabilityQuery tests ────────────────────────────
@@ -566,6 +639,21 @@ mod tests {
         assert_eq!(scheduler.stats().entries_ingested, 1);
         assert_eq!(scheduler.stats().dispatched, 0);
         assert_eq!(scheduler.stats().blocked_missing_receipt, 1);
+        assert_eq!(scheduler.bridge().pending_count(), 0);
+    }
+
+    #[test]
+    fn scheduler_missing_comparison_counts_admission_block() {
+        let (_q, mut scheduler) = make_scheduler();
+        let entry = make_entry(3, 0);
+        let receipt = receipt_for_entry(&entry);
+        let input = RepairAdmissionInput::with_receipt(entry, receipt);
+
+        scheduler.ingest_with_evidence(&[input]);
+
+        assert_eq!(scheduler.stats().entries_ingested, 1);
+        assert_eq!(scheduler.stats().dispatched, 0);
+        assert_eq!(scheduler.stats().blocked_missing_comparison, 1);
         assert_eq!(scheduler.bridge().pending_count(), 0);
     }
 
@@ -692,6 +780,10 @@ mod tests {
         assert_eq!(stats.blocked_missing_receipt, 0);
         assert_eq!(stats.blocked_identity_mismatch, 0);
         assert_eq!(stats.blocked_stale_receipt, 0);
+        assert_eq!(stats.blocked_missing_comparison, 0);
+        assert_eq!(stats.blocked_stale_comparison, 0);
+        assert_eq!(stats.blocked_cross_replica_disagreement, 0);
+        assert_eq!(stats.blocked_unreconciled_comparison, 0);
         assert_eq!(stats.unknown_policy, 0);
     }
 

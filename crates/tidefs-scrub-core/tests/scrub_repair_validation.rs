@@ -16,7 +16,13 @@ use tidefs_scrub::repair_scheduling::{
     RepairAdmission, RepairAdmissionInput, RepairBlockKind, RepairCandidateIdentity,
     RepairEscalation, RepairEvidenceClass, RepairEvidenceRejection, ScrubToRepairBridge,
 };
-use tidefs_scrub::scrub_repair::{BlockReconstructor, ScrubRepairEngine, ScrubRepairLedger};
+use tidefs_scrub::scrub_repair::{
+    BlockReconstructor, ScrubRepairEngine, ScrubRepairLedger, ScrubRepairOutcome,
+};
+use tidefs_scrub::{
+    ChecksumLayer, ComparisonClassification, CrossReplicaComparisonRecord, ScrubSubject,
+    ScrubSubjectKind,
+};
 
 struct MockReconstructor {
     healthy_blocks: Mutex<HashMap<u64, Vec<u8>>>,
@@ -133,7 +139,15 @@ fn receipt_with_target_count(entry: &SuspectEntry, target_count: u16) -> Placeme
 fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
     let receipt = receipt_for_entry(&entry);
     let identity = identity_for_entry(&entry);
+    let comparison = comparison_record_for_entry(
+        &entry,
+        ComparisonClassification::SingleReplicaCorruption {
+            corrupt_replica: 1,
+            clean_sources: vec![2],
+        },
+    );
     RepairAdmissionInput::with_receipt_and_identity(entry, receipt, identity)
+        .with_cross_replica_comparison(&comparison)
 }
 
 fn identity_for_entry(entry: &SuspectEntry) -> RepairCandidateIdentity {
@@ -147,6 +161,74 @@ fn identity_for_entry(entry: &SuspectEntry) -> RepairCandidateIdentity {
     RepairCandidateIdentity::new(entry.locator_id, entry.segment_id, kind)
 }
 
+fn subject_kind_for_entry(entry: &SuspectEntry) -> ScrubSubjectKind {
+    if entry.offset == 0 {
+        ScrubSubjectKind::InlineContent
+    } else {
+        ScrubSubjectKind::ContentChunk {
+            chunk_index: entry.offset,
+        }
+    }
+}
+
+fn checksum_layer_for_entry(entry: &SuspectEntry) -> ChecksumLayer {
+    if entry.offset == 0 {
+        ChecksumLayer::InlineContentBody
+    } else {
+        ChecksumLayer::EncodedContentChunk
+    }
+}
+
+fn comparison_sets(classification: &ComparisonClassification) -> (Vec<u64>, Vec<u64>) {
+    match classification {
+        ComparisonClassification::SingleReplicaCorruption {
+            corrupt_replica,
+            clean_sources,
+        }
+        | ComparisonClassification::RemoteReplicaCorruption {
+            corrupt_replica,
+            clean_sources,
+        } => (clean_sources.clone(), vec![*corrupt_replica]),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+fn comparison_record_for_entry(
+    entry: &SuspectEntry,
+    classification: ComparisonClassification,
+) -> CrossReplicaComparisonRecord {
+    let receipt = receipt_for_entry(entry);
+    let (clean_source_set, corrupt_target_set) = comparison_sets(&classification);
+    CrossReplicaComparisonRecord {
+        subject: ScrubSubject {
+            inode_id: entry.locator_id,
+            data_version: entry.segment_id,
+            kind: subject_kind_for_entry(entry),
+        },
+        object_key: receipt.object_key,
+        checksum_layer: checksum_layer_for_entry(entry),
+        redundancy_policy_id: 1,
+        target_count: receipt.target_count,
+        placement_receipt_epoch: receipt.receipt_epoch.0,
+        placement_receipt_generation: receipt.receipt_generation,
+        membership_epoch: 1,
+        replica_outcomes: Vec::new(),
+        classification,
+        clean_source_set,
+        corrupt_target_set,
+    }
+}
+
+fn repair_comparison_record() -> CrossReplicaComparisonRecord {
+    comparison_record_for_entry(
+        &make_suspect_entry(1),
+        ComparisonClassification::SingleReplicaCorruption {
+            corrupt_replica: 1,
+            clean_sources: vec![2],
+        },
+    )
+}
+
 // 1. Single-block corruption repaired
 #[test]
 fn single_block_corruption_repaired() {
@@ -157,8 +239,9 @@ fn single_block_corruption_repaired() {
 
     let mut engine = ScrubRepairEngine::new(recon);
     let corrupt_data = make_data(256, 0xFE);
-    let result = engine.repair_one(1, &expected, &corrupt_data);
-    assert!(result);
+    let comparison = repair_comparison_record();
+    let result = engine.repair_one_with_comparison(1, &expected, &corrupt_data, Some(&comparison));
+    assert!(result.is_success());
 
     let ledger = engine.ledger();
     assert_eq!(ledger.repair_count, 1);
@@ -194,7 +277,10 @@ fn multi_block_corruption_all_repaired() {
     let mut engine = ScrubRepairEngine::new(recon);
     for (addr, expected) in &expected_hashes {
         let corrupt = make_data(128, 0xFF);
-        assert!(engine.repair_one(*addr, expected, &corrupt));
+        let comparison = repair_comparison_record();
+        assert!(engine
+            .repair_one_with_comparison(*addr, expected, &corrupt, Some(&comparison))
+            .is_success());
     }
     assert_eq!(engine.ledger().repair_count, 5);
     assert_eq!(engine.ledger().repair_failure_count, 0);
@@ -209,7 +295,10 @@ fn repair_from_replication_reads_healthy_replica() {
     recon.set_healthy_block(100, healthy_data);
     let mut engine = ScrubRepairEngine::new(recon);
     let corrupt_data = make_data(512, 0xCD);
-    assert!(engine.repair_one(100, &expected, &corrupt_data));
+    let comparison = repair_comparison_record();
+    assert!(engine
+        .repair_one_with_comparison(100, &expected, &corrupt_data, Some(&comparison))
+        .is_success());
     assert_eq!(engine.ledger().events()[0].shard_sources, vec![1100]);
 }
 
@@ -221,7 +310,11 @@ fn unrepairable_block_records_failure() {
     let mut engine = ScrubRepairEngine::new(recon);
     let corrupt_data = make_data(256, 0xDE);
     let expected = hash_data(&make_data(256, 0xAD));
-    assert!(!engine.repair_one(999, &expected, &corrupt_data));
+    let comparison = repair_comparison_record();
+    assert_eq!(
+        engine.repair_one_with_comparison(999, &expected, &corrupt_data, Some(&comparison)),
+        ScrubRepairOutcome::ReconstructionFailed
+    );
     assert_eq!(engine.ledger().repair_failure_count, 1);
     assert_eq!(engine.ledger().repair_count, 0);
 }
@@ -266,8 +359,9 @@ fn deterministic_repair_sequence_same_digest() {
     let mut engine1 = ScrubRepairEngine::new(recon1);
     let mut engine2 = ScrubRepairEngine::new(recon2);
     let corrupt = make_data(256, 0x88);
-    engine1.repair_one(10, &expected, &corrupt);
-    engine2.repair_one(10, &expected, &corrupt);
+    let comparison = repair_comparison_record();
+    engine1.repair_one_with_comparison(10, &expected, &corrupt, Some(&comparison));
+    engine2.repair_one_with_comparison(10, &expected, &corrupt, Some(&comparison));
     assert_eq!(
         engine1.ledger().validation_digest(),
         engine2.ledger().validation_digest()
@@ -292,9 +386,103 @@ fn write_back_failure_records_failure() {
     recon.set_fail_write(true);
     let mut engine = ScrubRepairEngine::new(recon);
     let corrupt = make_data(256, 0x66);
-    assert!(!engine.repair_one(1, &expected, &corrupt));
+    let comparison = repair_comparison_record();
+    assert_eq!(
+        engine.repair_one_with_comparison(1, &expected, &corrupt, Some(&comparison)),
+        ScrubRepairOutcome::WritebackFailed
+    );
     assert_eq!(engine.ledger().repair_failure_count, 1);
     assert_eq!(engine.ledger().repair_count, 0);
+}
+
+#[test]
+fn missing_comparison_repair_refuses_before_reconstruction() {
+    let recon = MockReconstructor::new();
+    recon.set_fail_reconstruct(true);
+    let mut engine = ScrubRepairEngine::new(recon);
+    let expected = hash_data(&make_data(256, 0x55));
+    let corrupt = make_data(256, 0x66);
+
+    assert_eq!(
+        engine.repair_one_with_comparison(1, &expected, &corrupt, None),
+        ScrubRepairOutcome::MissingComparisonRecord
+    );
+    assert_eq!(engine.ledger().repair_count, 0);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
+}
+
+#[test]
+fn disagreement_comparison_repair_refuses_before_reconstruction() {
+    let recon = MockReconstructor::new();
+    recon.set_fail_reconstruct(true);
+    let mut engine = ScrubRepairEngine::new(recon);
+    let expected = hash_data(&make_data(256, 0x55));
+    let corrupt = make_data(256, 0x66);
+    let mut comparison = repair_comparison_record();
+    comparison.classification = ComparisonClassification::CrossReplicaDisagreement;
+    comparison.clean_source_set.clear();
+    comparison.corrupt_target_set.clear();
+
+    assert_eq!(
+        engine.repair_one_with_comparison(1, &expected, &corrupt, Some(&comparison)),
+        ScrubRepairOutcome::CrossReplicaDisagreement
+    );
+    assert_eq!(engine.ledger().repair_count, 0);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
+}
+
+#[test]
+fn remote_corruption_comparison_repair_refuses_before_reconstruction() {
+    let recon = MockReconstructor::new();
+    recon.set_fail_reconstruct(true);
+    let mut engine = ScrubRepairEngine::new(recon);
+    let expected = hash_data(&make_data(256, 0x55));
+    let corrupt = make_data(256, 0x66);
+    let mut comparison = comparison_record_for_entry(
+        &make_suspect_entry(1),
+        ComparisonClassification::RemoteReplicaCorruption {
+            corrupt_replica: 2,
+            clean_sources: vec![1],
+        },
+    );
+
+    assert_eq!(
+        engine.repair_one_with_comparison(1, &expected, &corrupt, Some(&comparison)),
+        ScrubRepairOutcome::UnreconciledComparison {
+            classification: "remote-replica-corruption"
+        }
+    );
+    comparison.classification = ComparisonClassification::ChecksumAuthorityDisagreement;
+    comparison.clean_source_set.clear();
+    comparison.corrupt_target_set.clear();
+    assert_eq!(
+        engine.repair_one_with_comparison(1, &expected, &corrupt, Some(&comparison)),
+        ScrubRepairOutcome::CrossReplicaDisagreement
+    );
+    assert_eq!(engine.ledger().repair_count, 0);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
+}
+
+#[test]
+fn stale_comparison_repair_refuses_before_reconstruction() {
+    let recon = MockReconstructor::new();
+    recon.set_fail_reconstruct(true);
+    let mut engine = ScrubRepairEngine::new(recon);
+    let expected = hash_data(&make_data(256, 0x55));
+    let corrupt = make_data(256, 0x66);
+    let mut comparison = repair_comparison_record();
+    comparison.classification = ComparisonClassification::StaleEvidence {
+        stale_replicas: vec![1],
+    };
+    comparison.clean_source_set.clear();
+    comparison.corrupt_target_set.clear();
+
+    assert_eq!(
+        engine.repair_one_with_comparison(1, &expected, &corrupt, Some(&comparison)),
+        ScrubRepairOutcome::StaleComparisonRecord
+    );
+    assert_eq!(engine.ledger().repair_count, 0);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
 }
 
 // 10. repair_batch mixed outcomes
@@ -313,9 +501,9 @@ fn repair_batch_mixed_outcomes() {
         (4, hash_data(&make_data(64, 0x10)), make_data(64, 0x10)),
     ];
     let results = engine.repair_batch(&blocks);
-    assert_eq!(results, vec![true, true, false, true]);
-    assert_eq!(engine.ledger().repair_count, 1);
-    assert_eq!(engine.ledger().repair_failure_count, 1);
+    assert_eq!(results, vec![false, true, false, true]);
+    assert_eq!(engine.ledger().repair_count, 0);
+    assert_eq!(engine.ledger().repair_failure_count, 0);
 }
 
 #[test]
@@ -323,7 +511,7 @@ fn receipt_backed_repair_admission_records_evidence() {
     let mut bridge = ScrubToRepairBridge::new();
     let entry = make_suspect_entry(700);
     let receipt = receipt_for_entry(&entry);
-    let input = RepairAdmissionInput::with_receipt(entry, receipt);
+    let input = input_with_receipt(entry);
 
     let admissions = bridge.ingest_with_evidence(&[input], 2);
 
@@ -345,6 +533,132 @@ fn receipt_backed_repair_admission_records_evidence() {
     assert_eq!(jobs[0].evidence.placement_receipt_ref, receipt);
     assert_eq!(bridge.stats().entries_admitted_with_receipt, 1);
     assert_eq!(bridge.stats().by_evidence_class[0], 1);
+}
+
+#[test]
+fn missing_comparison_repair_admission_blocks_queueing() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(709);
+    let receipt = receipt_for_entry(&entry);
+    let input = RepairAdmissionInput::with_receipt(entry, receipt);
+
+    let admissions = bridge.ingest_with_evidence(&[input], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Blocked {
+            locator_id: 709,
+            reason: RepairEvidenceRejection::MissingComparisonRecord,
+        }]
+    );
+    assert_eq!(bridge.pending_count(), 0);
+    assert_eq!(bridge.stats().entries_blocked_missing_comparison, 1);
+}
+
+#[test]
+fn disagreement_comparison_repair_admission_blocks_queueing() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(710);
+    let receipt = receipt_for_entry(&entry);
+    let comparison =
+        comparison_record_for_entry(&entry, ComparisonClassification::CrossReplicaDisagreement);
+    let input = RepairAdmissionInput::with_receipt(entry, receipt)
+        .with_cross_replica_comparison(&comparison);
+
+    let admissions = bridge.ingest_with_evidence(&[input], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Blocked {
+            locator_id: 710,
+            reason: RepairEvidenceRejection::CrossReplicaDisagreement,
+        }]
+    );
+    assert_eq!(bridge.pending_count(), 0);
+    assert_eq!(bridge.stats().entries_blocked_cross_replica_disagreement, 1);
+}
+
+#[test]
+fn remote_corruption_comparison_repair_admission_blocks_queueing() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(712);
+    let receipt = receipt_for_entry(&entry);
+    let comparison = comparison_record_for_entry(
+        &entry,
+        ComparisonClassification::RemoteReplicaCorruption {
+            corrupt_replica: 2,
+            clean_sources: vec![1],
+        },
+    );
+    let input = RepairAdmissionInput::with_receipt(entry, receipt)
+        .with_cross_replica_comparison(&comparison);
+
+    let admissions = bridge.ingest_with_evidence(&[input], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Blocked {
+            locator_id: 712,
+            reason: RepairEvidenceRejection::UnreconciledComparison,
+        }]
+    );
+    assert_eq!(bridge.pending_count(), 0);
+    assert_eq!(bridge.stats().entries_blocked_unreconciled_comparison, 1);
+}
+
+#[test]
+fn checksum_authority_comparison_repair_admission_blocks_as_disagreement() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(713);
+    let receipt = receipt_for_entry(&entry);
+    let comparison = comparison_record_for_entry(
+        &entry,
+        ComparisonClassification::ChecksumAuthorityDisagreement,
+    );
+    let input = RepairAdmissionInput::with_receipt(entry, receipt)
+        .with_cross_replica_comparison(&comparison);
+
+    let admissions = bridge.ingest_with_evidence(&[input], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Blocked {
+            locator_id: 713,
+            reason: RepairEvidenceRejection::CrossReplicaDisagreement,
+        }]
+    );
+    assert_eq!(bridge.pending_count(), 0);
+    assert_eq!(bridge.stats().entries_blocked_cross_replica_disagreement, 1);
+}
+
+#[test]
+fn stale_comparison_repair_admission_blocks_queueing() {
+    let mut bridge = ScrubToRepairBridge::new();
+    let entry = make_suspect_entry(711);
+    let receipt = receipt_for_entry(&entry);
+    let mut comparison = comparison_record_for_entry(
+        &entry,
+        ComparisonClassification::SingleReplicaCorruption {
+            corrupt_replica: 1,
+            clean_sources: vec![2],
+        },
+    );
+    comparison.placement_receipt_generation =
+        comparison.placement_receipt_generation.saturating_sub(1);
+    let input = RepairAdmissionInput::with_receipt(entry, receipt)
+        .with_cross_replica_comparison(&comparison);
+
+    let admissions = bridge.ingest_with_evidence(&[input], 2);
+
+    assert_eq!(
+        admissions,
+        vec![RepairAdmission::Blocked {
+            locator_id: 711,
+            reason: RepairEvidenceRejection::StaleComparisonRecord,
+        }]
+    );
+    assert_eq!(bridge.pending_count(), 0);
+    assert_eq!(bridge.stats().entries_blocked_stale_comparison, 1);
 }
 
 #[test]
@@ -370,7 +684,15 @@ fn stale_receipt_repair_admission_blocks_queueing() {
     let mut bridge = ScrubToRepairBridge::new();
     let entry = make_suspect_entry(702);
     let stale_receipt = receipt_for_entry(&make_suspect_entry(1702));
-    let input = RepairAdmissionInput::with_receipt(entry, stale_receipt);
+    let comparison = comparison_record_for_entry(
+        &entry,
+        ComparisonClassification::SingleReplicaCorruption {
+            corrupt_replica: 1,
+            clean_sources: vec![2],
+        },
+    );
+    let input = RepairAdmissionInput::with_receipt(entry, stale_receipt)
+        .with_cross_replica_comparison(&comparison);
 
     let admissions = bridge.ingest_with_evidence(&[input], 2);
 
