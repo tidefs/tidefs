@@ -9526,6 +9526,39 @@ pub enum StorageIntentRefusalReason {
     ContradictoryLifecycleEvidence = 104,
     /// Required omitted-content dependency evidence is missing.
     MissingOmittedContentDependency = 105,
+
+    // --- Tenant isolation / budget / noisy-neighbor refusals (issue #902) ---
+
+    /// Missing budget owner evidence for the requested isolation scope.
+    MissingBudgetOwnerEvidence = 106,
+    /// Isolation evidence is stale or from an expired evidence cut.
+    StaleIsolationEvidence = 107,
+    /// Request would exceed the admitted budget ceiling.
+    OverBudget = 108,
+    /// Illegal borrowing from a protected budget class without authorization.
+    IllegalBudgetBorrowing = 109,
+    /// Work would consume or borrow from a reserved/protected reserve.
+    ReserveTheft = 110,
+    /// Starvation state: fair-share window exhausted or starvation not overridden.
+    Starvation = 111,
+    /// Noisy-neighbor pressure exceeds the legal victim harm threshold.
+    NoisyNeighborPressure = 112,
+    /// Required reserve-exemption or emergency override evidence is missing.
+    MissingReserveExemption = 113,
+    /// Exemption or override is not authorized by a recognized operator or role.
+    ExemptionNotAuthorized = 114,
+    /// Policy conflict between two active compiled-policy revisions or scopes.
+    PolicyConflict = 115,
+    /// Required tenant or security-domain evidence is missing or illegitimate.
+    MissingTenantDomainEvidence = 116,
+    /// Work is not owned by any recognized budget owner.
+    UnownedWork = 117,
+    /// Validation-gate evidence is missing, stale, contradictory, or failed.
+    ValidationGateFailed = 118,
+    /// Budget donation was refused by the donor scope or policy.
+    BudgetDonationRefused = 119,
+    /// Borrowed budget debt has not been repaid within the legal window.
+    DebtNotRepaid = 120,
 }
 
 impl StorageIntentRefusalReason {
@@ -9643,6 +9676,21 @@ impl StorageIntentRefusalReason {
             Self::DestroyTombstoneAdmissionConflict => "destroy-tombstone-admission-conflict",
             Self::ContradictoryLifecycleEvidence => "contradictory-lifecycle-evidence",
             Self::MissingOmittedContentDependency => "missing-omitted-content-dependency",
+            Self::MissingBudgetOwnerEvidence => "missing-budget-owner-evidence",
+            Self::StaleIsolationEvidence => "stale-isolation-evidence",
+            Self::OverBudget => "over-budget",
+            Self::IllegalBudgetBorrowing => "illegal-budget-borrowing",
+            Self::ReserveTheft => "reserve-theft",
+            Self::Starvation => "starvation",
+            Self::NoisyNeighborPressure => "noisy-neighbor-pressure",
+            Self::MissingReserveExemption => "missing-reserve-exemption",
+            Self::ExemptionNotAuthorized => "exemption-not-authorized",
+            Self::PolicyConflict => "policy-conflict",
+            Self::MissingTenantDomainEvidence => "missing-tenant-domain-evidence",
+            Self::UnownedWork => "unowned-work",
+            Self::ValidationGateFailed => "validation-gate-failed",
+            Self::BudgetDonationRefused => "budget-donation-refused",
+            Self::DebtNotRepaid => "debt-not-repaid",
         }
     }
 
@@ -9756,6 +9804,21 @@ impl StorageIntentRefusalReason {
             103 => Some(Self::DestroyTombstoneAdmissionConflict),
             104 => Some(Self::ContradictoryLifecycleEvidence),
             105 => Some(Self::MissingOmittedContentDependency),
+            106 => Some(Self::MissingBudgetOwnerEvidence),
+            107 => Some(Self::StaleIsolationEvidence),
+            108 => Some(Self::OverBudget),
+            109 => Some(Self::IllegalBudgetBorrowing),
+            110 => Some(Self::ReserveTheft),
+            111 => Some(Self::Starvation),
+            112 => Some(Self::NoisyNeighborPressure),
+            113 => Some(Self::MissingReserveExemption),
+            114 => Some(Self::ExemptionNotAuthorized),
+            115 => Some(Self::PolicyConflict),
+            116 => Some(Self::MissingTenantDomainEvidence),
+            117 => Some(Self::UnownedWork),
+            118 => Some(Self::ValidationGateFailed),
+            119 => Some(Self::BudgetDonationRefused),
+            120 => Some(Self::DebtNotRepaid),
             _ => None,
         }
     }
@@ -15268,6 +15331,846 @@ pub const fn lifecycle_evidence_is_usable(
     ReceiptPredicateResult::SATISFIED
 }
 
+
+// ---------------------------------------------------------------------------
+// Tenant isolation evidence ─ budget ownership, noisy-neighbor, fairness
+// (issue #902)
+// ---------------------------------------------------------------------------
+
+/// Isolation scope: which resource domain this evidence applies to.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentIsolationScope {
+    /// Sentinel for unspecified scope.
+    #[default]
+    Unknown = 0,
+    /// Pool-level isolation (all tenants/datasets in a pool).
+    Pool = 1,
+    /// Per-dataset isolation.
+    Dataset = 2,
+    /// Per-tenant isolation across all datasets.
+    Tenant = 3,
+    /// Per-workload-class isolation (sync, bulk, archive, geo, repair, rebuild).
+    WorkloadClass = 4,
+    /// Per-media-role isolation (RAM, PMem, flash, HDD, remote, WAN, archive).
+    MediaRole = 5,
+    /// Proximity-domain isolation (same rack, same PDUs, same switch, same AZ).
+    ProximityDomain = 6,
+    /// Transport-path isolation (local, RDMA, TCP, WAN).
+    TransportPath = 7,
+    /// Device-class isolation (NVMe, SAS SSD, SATA HDD, ZNS).
+    DeviceClass = 8,
+    /// Failure-domain isolation (same power, same cooling, same router).
+    FailureDomain = 9,
+    /// Repair/relocation-class isolation.
+    RepairRelocationClass = 10,
+}
+
+impl_u8_canonical!(StorageIntentIsolationScope, {
+    Unknown = 0 => "unknown",
+    Pool = 1 => "pool",
+    Dataset = 2 => "dataset",
+    Tenant = 3 => "tenant",
+    WorkloadClass = 4 => "workload-class",
+    MediaRole = 5 => "media-role",
+    ProximityDomain = 6 => "proximity-domain",
+    TransportPath = 7 => "transport-path",
+    DeviceClass = 8 => "device-class",
+    FailureDomain = 9 => "failure-domain",
+    RepairRelocationClass = 10 => "repair-relocation-class",
+});
+
+/// Identifies the budget owner for one isolation dimension.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentBudgetOwnerRef {
+    /// Tenant identity.
+    pub tenant_id: StorageIntentDomainId,
+    /// Dataset identity.
+    pub dataset_id: StorageIntentDomainId,
+    /// Clone-family identity.
+    pub clone_family_id: StorageIntentDomainId,
+    /// Mount or filesystem identity.
+    pub mount_id: StorageIntentDomainId,
+    /// Workload class for this budget.
+    pub workload_class: StorageIntentIsolationScope,
+    /// Admin domain identity.
+    pub admin_domain: StorageIntentDomainId,
+    /// Security domain identity.
+    pub security_domain: StorageIntentDomainId,
+    /// Internal maintenance reason (zero = not maintenance).
+    pub maintenance_reason: u64,
+    /// Opaque compiled-policy identity that owns this budget.
+    pub policy_id: StorageIntentPolicyId,
+    /// Policy revision at budget-creation time.
+    pub policy_revision: StorageIntentPolicyRevision,
+}
+
+impl StorageIntentBudgetOwnerRef {
+    /// Returns true when at least one owner dimension is bound.
+    #[must_use]
+    pub const fn has_owner(self) -> bool {
+        !self.tenant_id.is_zero()
+            || !self.dataset_id.is_zero()
+            || !self.clone_family_id.is_zero()
+            || !self.mount_id.is_zero()
+            || !self.admin_domain.is_zero()
+            || !self.security_domain.is_zero()
+            || !self.policy_id.is_zero()
+    }
+
+    /// Returns true when tenant identity is present.
+    #[must_use]
+    pub const fn has_tenant(self) -> bool {
+        !self.tenant_id.is_zero()
+    }
+
+    /// Returns true when policy ownership is bound.
+    #[must_use]
+    pub const fn has_policy(self) -> bool {
+        !self.policy_id.is_zero() && self.policy_revision.0 > 0
+    }
+}
+
+/// Per-resource floors and ceilings for one isolation scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentIsolationFloorsCeilings {
+    /// Latency floor (p50) in microseconds.
+    pub latency_p50_floor_us: u64,
+    /// Latency ceiling (p99) in microseconds.
+    pub latency_p99_ceiling_us: u64,
+    /// Throughput floor in bytes/s.
+    pub throughput_floor_bytes_per_sec: u64,
+    /// Throughput ceiling in bytes/s.
+    pub throughput_ceiling_bytes_per_sec: u64,
+    /// Queue-time ceiling in microseconds before throttle/defer/refuse.
+    pub queue_time_ceiling_us: u64,
+    /// Dirty-byte ceiling (uncommitted or not-yet-flushed bytes).
+    pub dirty_bytes_ceiling: u64,
+    /// Memory budget ceiling in bytes.
+    pub memory_ceiling_bytes: u64,
+    /// Transport-window ceiling in bytes (in-flight I/O).
+    pub transport_window_ceiling_bytes: u64,
+    /// Device queue-depth ceiling.
+    pub device_queue_depth_ceiling: u16,
+    /// Capacity-reserve floor in bytes (must remain free for this scope).
+    pub capacity_reserve_floor_bytes: u64,
+    /// Wear-budget ceiling in bytes (estimated physical writes).
+    pub wear_budget_ceiling_bytes: u64,
+    /// Repair-bandwidth ceiling in bytes/s.
+    pub repair_bandwidth_ceiling_bytes_per_sec: u64,
+    /// Relocation-budget ceiling in bytes.
+    pub relocation_budget_ceiling_bytes: u64,
+    /// Geo-backlog ceiling in bytes (RPO lag).
+    pub geo_backlog_ceiling_bytes: u64,
+    /// Operator money/egress budget ceiling (abstract units or bytes).
+    pub operator_egress_budget_ceiling: u64,
+}
+
+/// Fair-share window and starvation state for one isolation scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentFairShareWindow {
+    /// Fair-share window duration in microseconds.
+    pub window_duration_us: u64,
+    /// Burst allowance factor (multiplied by 1000, e.g. 1500 = 1.5x).
+    pub burst_allowance_ppm: u32,
+    /// Starvation state for this scope.
+    pub starvation_state: StorageIntentStarvationState,
+    /// Priority or escalation level (higher = more urgent).
+    pub priority_level: u8,
+    /// Wall-clock timestamp when starvation was first detected (0 = not starving).
+    pub starvation_age_us: u64,
+}
+
+/// Starvation state for one isolation scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentStarvationState {
+    /// Not starving; budget is being served.
+    #[default]
+    NotStarving = 0,
+    /// Fair-share window is constrained but still receiving some budget.
+    Constrained = 1,
+    /// Starving: budget is not being served at all.
+    Starving = 2,
+    /// Starvation overridden by operator or emergency policy.
+    Overridden = 3,
+}
+
+impl_u8_canonical!(StorageIntentStarvationState, {
+    NotStarving = 0 => "not-starving",
+    Constrained = 1 => "constrained",
+    Starving = 2 => "starving",
+    Overridden = 3 => "overridden",
+});
+
+/// Donation and borrowing rules for cross-scope budget transfers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentDonationBorrowingRule {
+    /// True when this scope may donate unused budget to another scope.
+    pub may_donate: bool,
+    /// True when this scope may borrow budget from another scope.
+    pub may_borrow: bool,
+    /// Maximum borrow amount in bytes (or abstract units for non-byte resources).
+    pub max_borrow_bytes: u64,
+    /// Borrow repayment window in microseconds.
+    pub repayment_window_us: u64,
+    /// Outstanding debt in bytes (or abstract units).
+    pub outstanding_debt_bytes: u64,
+    /// Wall-clock timestamp when debt must be repaid (0 = no debt).
+    pub debt_deadline_us: u64,
+    /// True when outstanding debt has not been repaid within the window.
+    pub debt_overdue: bool,
+    /// True when this scope is currently borrowing.
+    pub is_borrowing: bool,
+    /// True when this scope is currently donating.
+    pub is_donating: bool,
+    /// Donor scope identity (zero when not donating).
+    pub donor_scope_id: StorageIntentEvidenceId,
+    /// Borrower scope identity (zero when not lending).
+    pub borrower_scope_id: StorageIntentEvidenceId,
+}
+
+/// Noisy-neighbor evidence: offender, victim, pressure, and mitigation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentNoisyNeighborEvidence {
+    /// Offender budget-owner identity.
+    pub offender_owner: StorageIntentBudgetOwnerRef,
+    /// Victim budget-owner identity.
+    pub victim_owner: StorageIntentBudgetOwnerRef,
+    /// Victim isolation scope.
+    pub victim_scope: StorageIntentIsolationScope,
+    /// Offender isolation scope.
+    pub offender_scope: StorageIntentIsolationScope,
+    /// Measured p95 latency for the victim in microseconds.
+    pub victim_p95_us: u64,
+    /// Measured p99 latency for the victim in microseconds.
+    pub victim_p99_us: u64,
+    /// Queue-depth harm (additional queue entries caused by the offender).
+    pub queue_harm_entries: u64,
+    /// Saturated resource vector bitmask (see StorageIntentSaturatedResourceMask).
+    pub saturated_resources: StorageIntentSaturatedResourceMask,
+    /// Wall-clock timestamp when pressure was first detected.
+    pub pressure_age_us: u64,
+    /// Candidate mitigation class.
+    pub mitigation: StorageIntentNoisyNeighborMitigationClass,
+    /// True when mitigation has been activated.
+    pub mitigation_active: bool,
+}
+
+/// Bitmask of saturated resources in noisy-neighbor evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentSaturatedResourceMask(pub u64);
+
+impl StorageIntentSaturatedResourceMask {
+    pub const EMPTY: Self = Self(0);
+    pub const CPU: Self = Self(1_u64 << 0);
+    pub const MEMORY: Self = Self(1_u64 << 1);
+    pub const DISK_IOPS: Self = Self(1_u64 << 2);
+    pub const DISK_THROUGHPUT: Self = Self(1_u64 << 3);
+    pub const NETWORK: Self = Self(1_u64 << 4);
+    pub const DEVICE_QUEUE: Self = Self(1_u64 << 5);
+    pub const TRANSPORT_WINDOW: Self = Self(1_u64 << 6);
+    pub const DIRTY_BYTES: Self = Self(1_u64 << 7);
+    pub const WEAR_BUDGET: Self = Self(1_u64 << 8);
+    pub const REPAIR_BANDWIDTH: Self = Self(1_u64 << 9);
+    pub const RELOCATION_BANDWIDTH: Self = Self(1_u64 << 10);
+    pub const GEO_BACKLOG: Self = Self(1_u64 << 11);
+    pub const OPERATOR_EGRESS: Self = Self(1_u64 << 12);
+}
+
+/// Noisy-neighbor mitigation class.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentNoisyNeighborMitigationClass {
+    /// No mitigation active or required.
+    #[default]
+    None = 0,
+    /// Throttle the offender.
+    Throttle = 1,
+    /// Defer offender work to a later window.
+    Defer = 2,
+    /// Refuse offender work entirely.
+    Refuse = 3,
+    /// Rebalance work across available resources.
+    Rebalance = 4,
+    /// Evacuate victim work to a different resource domain.
+    Evacuate = 5,
+    /// Escalate to operator for manual intervention.
+    OperatorEscalation = 6,
+}
+
+impl_u8_canonical!(StorageIntentNoisyNeighborMitigationClass, {
+    None = 0 => "none",
+    Throttle = 1 => "throttle",
+    Defer = 2 => "defer",
+    Refuse = 3 => "refuse",
+    Rebalance = 4 => "rebalance",
+    Evacuate = 5 => "evacuate",
+    OperatorEscalation = 6 => "operator-escalation",
+});
+
+/// Reserve-exemption and emergency override authorization.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentReserveExemptionOverride {
+    /// True when a repair operation may consume protected reserve.
+    pub repair_may_consume_reserve: bool,
+    /// True when an evacuation operation may consume protected reserve.
+    pub evacuation_may_consume_reserve: bool,
+    /// True when quorum-safety recovery may consume protected reserve.
+    pub quorum_safety_may_consume_reserve: bool,
+    /// True when degraded-risk reduction may consume protected reserve.
+    pub degraded_risk_reduction_may_consume_reserve: bool,
+    /// True when an operator-authorized priority override is active.
+    pub operator_authorized_override: bool,
+    /// Identity of the operator or role that authorized the override.
+    pub authorizing_operator_id: StorageIntentDomainId,
+    /// Wall-clock timestamp when the exemption expires (0 = no expiry).
+    pub exemption_expiry_us: u64,
+    /// Evidence ref for the exemption authorization.
+    pub exemption_evidence_ref: StorageIntentEvidenceRef,
+}
+
+/// Typed throttle, defer, or refusal reason for isolation decisions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentIsolationThrottleReason {
+    /// No throttle/defer/refusal; work may proceed.
+    #[default]
+    None = 0,
+    /// Work exceeds the admitted budget ceiling.
+    OverBudget = 1,
+    /// Work is not owned by any recognized budget owner.
+    UnownedWork = 2,
+    /// Required tenant or domain evidence is missing.
+    MissingTenantDomainEvidence = 3,
+    /// Illegal budget borrowing without authorization.
+    IllegalBudgetBorrowing = 4,
+    /// Work would consume protected reserves.
+    ReserveTheft = 5,
+    /// Starvation state prevents further budget allocation.
+    Starvation = 6,
+    /// Policy conflict between active scopes.
+    PolicyConflict = 7,
+    /// Isolation evidence is stale or from an expired cut.
+    StaleEvidence = 8,
+    /// Validation-gate evidence is not satisfied.
+    ValidationGateFailed = 9,
+    /// Noisy-neighbor pressure exceeds victim harm threshold.
+    NoisyNeighborPressure = 10,
+    /// Budget donation was refused by the donor.
+    BudgetDonationRefused = 11,
+    /// Borrowed debt has not been repaid.
+    DebtNotRepaid = 12,
+    /// Required reserve-exemption evidence is missing.
+    MissingReserveExemption = 13,
+    /// Exemption is not authorized by a recognized operator or role.
+    ExemptionNotAuthorized = 14,
+}
+
+impl_u8_canonical!(StorageIntentIsolationThrottleReason, {
+    None = 0 => "none",
+    OverBudget = 1 => "over-budget",
+    UnownedWork = 2 => "unowned-work",
+    MissingTenantDomainEvidence = 3 => "missing-tenant-domain-evidence",
+    IllegalBudgetBorrowing = 4 => "illegal-budget-borrowing",
+    ReserveTheft = 5 => "reserve-theft",
+    Starvation = 6 => "starvation",
+    PolicyConflict = 7 => "policy-conflict",
+    StaleEvidence = 8 => "stale-evidence",
+    ValidationGateFailed = 9 => "validation-gate-failed",
+    NoisyNeighborPressure = 10 => "noisy-neighbor-pressure",
+    BudgetDonationRefused = 11 => "budget-donation-refused",
+    DebtNotRepaid = 12 => "debt-not-repaid",
+    MissingReserveExemption = 13 => "missing-reserve-exemption",
+    ExemptionNotAuthorized = 14 => "exemption-not-authorized",
+});
+
+impl StorageIntentIsolationThrottleReason {
+    /// Project isolation-specific throttle/refusal into the shared refusal vocabulary.
+    #[must_use]
+    pub const fn to_storage_intent_refusal(self) -> StorageIntentRefusalReason {
+        match self {
+            Self::None => StorageIntentRefusalReason::None,
+            Self::OverBudget => StorageIntentRefusalReason::OverBudget,
+            Self::UnownedWork => StorageIntentRefusalReason::UnownedWork,
+            Self::MissingTenantDomainEvidence => {
+                StorageIntentRefusalReason::MissingTenantDomainEvidence
+            }
+            Self::IllegalBudgetBorrowing => StorageIntentRefusalReason::IllegalBudgetBorrowing,
+            Self::ReserveTheft => StorageIntentRefusalReason::ReserveTheft,
+            Self::Starvation => StorageIntentRefusalReason::Starvation,
+            Self::PolicyConflict => StorageIntentRefusalReason::PolicyConflict,
+            Self::StaleEvidence => StorageIntentRefusalReason::StaleIsolationEvidence,
+            Self::ValidationGateFailed => StorageIntentRefusalReason::ValidationGateFailed,
+            Self::NoisyNeighborPressure => StorageIntentRefusalReason::NoisyNeighborPressure,
+            Self::BudgetDonationRefused => StorageIntentRefusalReason::BudgetDonationRefused,
+            Self::DebtNotRepaid => StorageIntentRefusalReason::DebtNotRepaid,
+            Self::MissingReserveExemption => StorageIntentRefusalReason::MissingReserveExemption,
+            Self::ExemptionNotAuthorized => StorageIntentRefusalReason::ExemptionNotAuthorized,
+        }
+    }
+
+    /// Returns true when this reason blocks work.
+    #[must_use]
+    pub const fn is_blocking(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Tenant isolation evidence record.
+///
+/// This is the concrete projection for evidence kind
+/// `TenantIsolationEvidence = 15`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentTenantIsolationEvidence {
+    /// Self-referential evidence identity.
+    pub evidence_ref: StorageIntentEvidenceRef,
+    /// Owning policy identity.
+    pub policy_id: StorageIntentPolicyId,
+    /// Owning policy revision.
+    pub policy_revision: StorageIntentPolicyRevision,
+    /// Budget owner identity.
+    pub budget_owner: StorageIntentBudgetOwnerRef,
+    /// Isolation scope for this evidence record.
+    pub isolation_scope: StorageIntentIsolationScope,
+    /// Per-resource floors and ceilings.
+    pub bounds: StorageIntentIsolationFloorsCeilings,
+    /// Fair-share window and starvation state.
+    pub fair_share: StorageIntentFairShareWindow,
+    /// Donation/borrowing rule and debt state.
+    pub borrowing: StorageIntentDonationBorrowingRule,
+    /// Noisy-neighbor evidence when pressure is detected.
+    pub noisy_neighbor: StorageIntentNoisyNeighborEvidence,
+    /// Reserve-exemption and emergency override authorization.
+    pub exemption_override: StorageIntentReserveExemptionOverride,
+    /// Typed throttle/defer/refusal reason.
+    pub throttle: StorageIntentIsolationThrottleReason,
+    /// Evidence refs for this isolation evidence cut.
+    pub evidence_refs: StorageIntentEvidenceRefs,
+    /// Trust-domain evidence ref for tenant/security/admin validation.
+    pub trust_evidence_ref: StorageIntentEvidenceRef,
+    /// Temporal evidence ref for freshness/window/expiry validation.
+    pub temporal_evidence_ref: StorageIntentEvidenceRef,
+    /// Decision-frontier evidence ref when an isolation decision was made.
+    pub decision_evidence_ref: StorageIntentEvidenceRef,
+    /// Service-objective evidence ref for latency/throughput/tail claims.
+    pub service_objective_evidence_ref: StorageIntentEvidenceRef,
+    /// Capacity-admission evidence ref for reserve/capacity validation.
+    pub capacity_evidence_ref: StorageIntentEvidenceRef,
+    /// Cost/wear-ledger evidence ref for wear-budget validation.
+    pub cost_wear_evidence_ref: StorageIntentEvidenceRef,
+    /// Preflight simulation evidence ref for what-if budget scenarios.
+    pub preflight_evidence_ref: StorageIntentEvidenceRef,
+    /// Workload-classification evidence ref.
+    pub workload_evidence_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentTenantIsolationEvidence {
+    /// Returns true when the evidence identity is bound.
+    #[must_use]
+    pub const fn has_evidence_identity(self) -> bool {
+        matches!(
+            self.evidence_ref.kind,
+            StorageIntentEvidenceKind::TenantIsolationEvidence
+        ) && evidence_ref_has_id(self.evidence_ref)
+            && !self.policy_id.is_zero()
+            && self.policy_revision.0 > 0
+
+    }
+
+    /// Returns true when the isolation scope is specified.
+    #[must_use]
+    pub const fn has_isolation_scope(self) -> bool {
+        self.isolation_scope as u8 != StorageIntentIsolationScope::Unknown as u8
+    }
+
+    /// Returns true when trust-domain evidence is referenced.
+    #[must_use]
+    pub const fn has_trust_evidence(self) -> bool {
+        matches!(
+            self.trust_evidence_ref.kind,
+            StorageIntentEvidenceKind::TrustDomainEvidence
+        ) && evidence_ref_has_id(self.trust_evidence_ref)
+    }
+
+    /// Returns true when temporal evidence is referenced.
+    #[must_use]
+    pub const fn has_temporal_evidence(self) -> bool {
+        matches!(
+            self.temporal_evidence_ref.kind,
+            StorageIntentEvidenceKind::TemporalEvidence
+        ) && evidence_ref_has_id(self.temporal_evidence_ref)
+    }
+
+    /// Returns true when noisy-neighbor pressure is active.
+    #[must_use]
+    pub const fn has_noisy_neighbor_pressure(self) -> bool {
+        self.noisy_neighbor.mitigation_active
+            && self.noisy_neighbor.pressure_age_us > 0
+            && self.noisy_neighbor.offender_owner.has_owner()
+            && self.noisy_neighbor.victim_owner.has_owner()
+    }
+
+    /// Returns true when a reserve exemption or emergency override is active.
+    #[must_use]
+    pub const fn has_active_exemption(self) -> bool {
+        self.exemption_override.operator_authorized_override
+            && evidence_ref_has_id(self.exemption_override.exemption_evidence_ref)
+            && !self.exemption_override.authorizing_operator_id.is_zero()
+    }
+
+    /// Returns true when borrowing is active and legal.
+    #[must_use]
+    pub const fn has_legal_borrowing(self) -> bool {
+        self.borrowing.is_borrowing
+            && self.borrowing.may_borrow
+            && self.borrowing.outstanding_debt_bytes > 0
+            && !self.borrowing.debt_overdue
+    }
+
+    /// Returns true when donation is active and legal.
+    #[must_use]
+    pub const fn has_legal_donation(self) -> bool {
+        self.borrowing.is_donating
+            && self.borrowing.may_donate
+            && !bytes32_are_zero(self.borrowing.donor_scope_id.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Isolation predicate functions
+// ---------------------------------------------------------------------------
+
+/// Hard gate: evidence must be present and bound.
+#[must_use]
+pub const fn isolation_evidence_is_present(
+    evidence: StorageIntentTenantIsolationEvidence,
+) -> ReceiptPredicateResult {
+    if !evidence.has_evidence_identity() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingBudgetOwnerEvidence,
+        );
+    }
+    if !evidence.has_isolation_scope() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingBudgetOwnerEvidence,
+        );
+    }
+    // Stale-isolation evidence gate: evidence_ref must have generation > 0.
+    if evidence.evidence_ref.generation == 0 {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::StaleIsolationEvidence,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: budget owner must be identified.
+#[must_use]
+pub const fn isolation_budget_owner_is_identified(
+    evidence: StorageIntentTenantIsolationEvidence,
+) -> ReceiptPredicateResult {
+    let present = isolation_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    if !evidence.budget_owner.has_owner() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingBudgetOwnerEvidence,
+        );
+    }
+    if !evidence.budget_owner.has_policy() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingBudgetOwnerEvidence,
+        );
+    }
+    if !evidence.budget_owner.has_tenant()
+        && evidence.isolation_scope as u8 == StorageIntentIsolationScope::Tenant as u8
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingTenantDomainEvidence,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: trust-domain evidence must validate the budget owner.
+#[must_use]
+pub const fn isolation_trust_evidence_is_usable(
+    evidence: StorageIntentTenantIsolationEvidence,
+) -> ReceiptPredicateResult {
+    let present = isolation_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    // Trust evidence must be present when tenant or domain scope is required.
+    if evidence.isolation_scope as u8 == StorageIntentIsolationScope::Tenant as u8
+        || evidence.isolation_scope as u8 == StorageIntentIsolationScope::Dataset as u8
+    {
+        if !evidence.has_trust_evidence() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::MissingTenantDomainEvidence,
+            );
+        }
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: temporal evidence must be fresh for window/deadline decisions.
+#[must_use]
+pub const fn isolation_temporal_evidence_is_usable(
+    evidence: StorageIntentTenantIsolationEvidence,
+) -> ReceiptPredicateResult {
+    let present = isolation_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    // Temporal evidence is required when fair-share, borrowing, or noisy-neighbor
+    // decisions depend on wall-time freshness.
+    if evidence.fair_share.starvation_age_us > 0
+        || evidence.borrowing.outstanding_debt_bytes > 0
+        || evidence.noisy_neighbor.pressure_age_us > 0
+    {
+        if !evidence.has_temporal_evidence() {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::StaleIsolationEvidence,
+            );
+        }
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: borrowing must be legal and within repayment window.
+#[must_use]
+pub const fn isolation_borrowing_is_legal(
+    evidence: StorageIntentTenantIsolationEvidence,
+) -> ReceiptPredicateResult {
+    let present = isolation_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    // Borrowing without authorization is illegal.
+    if evidence.borrowing.is_borrowing && !evidence.borrowing.may_borrow {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::IllegalBudgetBorrowing,
+        );
+    }
+    // Overdue debt blocks further borrowing.
+    if evidence.borrowing.debt_overdue {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::DebtNotRepaid,
+        );
+    }
+    // Outstanding debt without repayment window is illegal.
+    if evidence.borrowing.outstanding_debt_bytes > 0
+        && evidence.borrowing.repayment_window_us == 0
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::IllegalBudgetBorrowing,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: protected reserves must not be consumed without exemption.
+#[must_use]
+pub const fn isolation_reserve_is_protected(
+    evidence: StorageIntentTenantIsolationEvidence,
+    requires_exemption_for_repair: bool,
+    requires_exemption_for_evacuation: bool,
+) -> ReceiptPredicateResult {
+    let present = isolation_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    // Repair consuming protected reserve without exemption is illegal.
+    if requires_exemption_for_repair
+        && !evidence.exemption_override.repair_may_consume_reserve
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::ReserveTheft,
+        );
+    }
+    // Evacuation consuming protected reserve without exemption is illegal.
+    if requires_exemption_for_evacuation
+        && !evidence.exemption_override.evacuation_may_consume_reserve
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::ReserveTheft,
+        );
+    }
+    // Active exemption must be authorized.
+    if evidence.has_active_exemption()
+        && !evidence.exemption_override.operator_authorized_override
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::ExemptionNotAuthorized,
+        );
+    }
+    // Active exemption must have evidence.
+    if evidence.exemption_override.operator_authorized_override
+        && !evidence_ref_has_id(evidence.exemption_override.exemption_evidence_ref)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingReserveExemption,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: noisy-neighbor pressure must be below victim harm threshold.
+#[must_use]
+pub const fn isolation_noisy_neighbor_is_below_threshold(
+    evidence: StorageIntentTenantIsolationEvidence,
+    victim_p99_harm_threshold_us: u64,
+    victim_queue_harm_threshold_entries: u64,
+) -> ReceiptPredicateResult {
+    let present = isolation_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    if !evidence.has_noisy_neighbor_pressure() {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    // P99 harm exceeds threshold: noisy-neighbor refusal.
+    if evidence.noisy_neighbor.victim_p99_us > victim_p99_harm_threshold_us {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::NoisyNeighborPressure,
+        );
+    }
+    // Queue harm exceeds threshold: noisy-neighbor refusal.
+    if evidence.noisy_neighbor.queue_harm_entries > victim_queue_harm_threshold_entries {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::NoisyNeighborPressure,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: starvation must be addressed (overridden or resolved).
+#[must_use]
+pub const fn isolation_starvation_is_resolved(
+    evidence: StorageIntentTenantIsolationEvidence,
+) -> ReceiptPredicateResult {
+    let present = isolation_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    match evidence.fair_share.starvation_state {
+        StorageIntentStarvationState::NotStarving => ReceiptPredicateResult::SATISFIED,
+        StorageIntentStarvationState::Overridden => {
+            // Overridden starvation still requires temporal evidence.
+            if !evidence.has_temporal_evidence() {
+                return ReceiptPredicateResult::refused(
+                    StorageIntentRefusalReason::StaleIsolationEvidence,
+                );
+            }
+            ReceiptPredicateResult::SATISFIED
+        }
+        StorageIntentStarvationState::Constrained | StorageIntentStarvationState::Starving => {
+            ReceiptPredicateResult::refused(StorageIntentRefusalReason::Starvation)
+        }
+    }
+}
+
+/// Hard gate: work must have a recognized budget owner.
+#[must_use]
+pub const fn isolation_work_has_budget_owner(
+    evidence: StorageIntentTenantIsolationEvidence,
+) -> ReceiptPredicateResult {
+    let present = isolation_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    if !evidence.budget_owner.has_owner() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnownedWork,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Returns true when isolation evidence is usable for admission, scheduling,
+/// relocation, and explanation decisions.
+///
+/// This combines the minimum set of hard gates that every consumer must pass
+/// before acting on isolation state.
+#[must_use]
+pub const fn isolation_evidence_is_usable(
+    evidence: StorageIntentTenantIsolationEvidence,
+) -> ReceiptPredicateResult {
+    let present = isolation_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    let owner = isolation_budget_owner_is_identified(evidence);
+    if !owner.satisfied {
+        return owner;
+    }
+    let trust = isolation_trust_evidence_is_usable(evidence);
+    if !trust.satisfied {
+        return trust;
+    }
+    let temporal = isolation_temporal_evidence_is_usable(evidence);
+    if !temporal.satisfied {
+        return temporal;
+    }
+    let borrowing = isolation_borrowing_is_legal(evidence);
+    if !borrowing.satisfied {
+        return borrowing;
+    }
+    let starvation = isolation_starvation_is_resolved(evidence);
+    if !starvation.satisfied {
+        return starvation;
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: does the isolation throttle state block work?
+#[must_use]
+pub const fn isolation_throttle_permits_work(
+    evidence: StorageIntentTenantIsolationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.throttle.is_blocking() {
+        return ReceiptPredicateResult::refused(
+            evidence.throttle.to_storage_intent_refusal(),
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: does the borrowing state permit budget consumption?
+#[must_use]
+pub const fn isolation_borrowing_permits_consumption(
+    evidence: StorageIntentTenantIsolationEvidence,
+    requested_bytes: u64,
+) -> ReceiptPredicateResult {
+    let legal = isolation_borrowing_is_legal(evidence);
+    if !legal.satisfied {
+        return legal;
+    }
+    // If borrowing, requested bytes must not exceed max borrow.
+    if evidence.borrowing.is_borrowing
+        && requested_bytes > evidence.borrowing.max_borrow_bytes
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::OverBudget,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -21909,4 +22812,608 @@ mod tests {
         assert!(result.satisfied);
     }
 
+
+    // -------------------------------------------------------------------
+    // Tenant isolation evidence model tests (issue #902)
+    // -------------------------------------------------------------------
+
+    const ISOLATION_DOMAIN_A: StorageIntentDomainId = StorageIntentDomainId([10_u8; 16]);
+    const ISOLATION_DOMAIN_B: StorageIntentDomainId = StorageIntentDomainId([20_u8; 16]);
+    const ISOLATION_DOMAIN_C: StorageIntentDomainId = StorageIntentDomainId([30_u8; 16]);
+
+    const fn isolation_evidence_ref(id_byte: u8) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = id_byte;
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::TenantIsolationEvidence,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    const fn trust_evidence_ref(id_byte: u8) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = id_byte;
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::TrustDomainEvidence,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    const fn exemption_evidence_ref(id_byte: u8) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = id_byte;
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::TrustDomainEvidence,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    fn healthy_isolation_record() -> StorageIntentTenantIsolationEvidence {
+        StorageIntentTenantIsolationEvidence {
+            evidence_ref: isolation_evidence_ref(1),
+            policy_id: StorageIntentPolicyId([1_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(1),
+            budget_owner: StorageIntentBudgetOwnerRef {
+                tenant_id: ISOLATION_DOMAIN_A,
+                dataset_id: ISOLATION_DOMAIN_B,
+                clone_family_id: StorageIntentDomainId::ZERO,
+                mount_id: StorageIntentDomainId::ZERO,
+                workload_class: StorageIntentIsolationScope::Tenant,
+                admin_domain: StorageIntentDomainId::ZERO,
+                security_domain: StorageIntentDomainId::ZERO,
+                maintenance_reason: 0,
+                policy_id: StorageIntentPolicyId([1_u8; 16]),
+                policy_revision: StorageIntentPolicyRevision(1),
+            },
+            isolation_scope: StorageIntentIsolationScope::Tenant,
+            bounds: StorageIntentIsolationFloorsCeilings {
+                latency_p50_floor_us: 100,
+                latency_p99_ceiling_us: 1000,
+                throughput_floor_bytes_per_sec: 1_000_000,
+                throughput_ceiling_bytes_per_sec: 10_000_000,
+                queue_time_ceiling_us: 5000,
+                dirty_bytes_ceiling: 1_000_000,
+                memory_ceiling_bytes: 128_000_000,
+                transport_window_ceiling_bytes: 1_000_000,
+                device_queue_depth_ceiling: 32,
+                capacity_reserve_floor_bytes: 1_000_000_000,
+                wear_budget_ceiling_bytes: 10_000_000_000,
+                repair_bandwidth_ceiling_bytes_per_sec: 100_000_000,
+                relocation_budget_ceiling_bytes: 5_000_000_000,
+                geo_backlog_ceiling_bytes: 1_000_000_000,
+                operator_egress_budget_ceiling: 0,
+            },
+            fair_share: StorageIntentFairShareWindow {
+                window_duration_us: 1_000_000,
+                burst_allowance_ppm: 1500,
+                starvation_state: StorageIntentStarvationState::NotStarving,
+                priority_level: 5,
+                starvation_age_us: 0,
+            },
+            borrowing: StorageIntentDonationBorrowingRule {
+                may_donate: false,
+                may_borrow: false,
+                max_borrow_bytes: 0,
+                repayment_window_us: 0,
+                outstanding_debt_bytes: 0,
+                debt_deadline_us: 0,
+                debt_overdue: false,
+                is_borrowing: false,
+                is_donating: false,
+                donor_scope_id: StorageIntentEvidenceId::ZERO,
+                borrower_scope_id: StorageIntentEvidenceId::ZERO,
+            },
+            noisy_neighbor: StorageIntentNoisyNeighborEvidence::default(),
+            exemption_override: StorageIntentReserveExemptionOverride::default(),
+            throttle: StorageIntentIsolationThrottleReason::None,
+            evidence_refs: StorageIntentEvidenceRefs::EMPTY,
+            trust_evidence_ref: trust_evidence_ref(10),
+            temporal_evidence_ref: temporal_evidence_ref(
+                StorageIntentEvidenceKind::TemporalEvidence,
+                20,
+            ),
+            decision_evidence_ref: StorageIntentEvidenceRef::default(),
+            service_objective_evidence_ref: StorageIntentEvidenceRef::default(),
+            capacity_evidence_ref: StorageIntentEvidenceRef::default(),
+            cost_wear_evidence_ref: StorageIntentEvidenceRef::default(),
+            preflight_evidence_ref: StorageIntentEvidenceRef::default(),
+            workload_evidence_ref: StorageIntentEvidenceRef::default(),
+        }
+    }
+
+    #[test]
+    fn isolation_scope_roundtrip() {
+        let scopes = [
+            StorageIntentIsolationScope::Unknown,
+            StorageIntentIsolationScope::Pool,
+            StorageIntentIsolationScope::Dataset,
+            StorageIntentIsolationScope::Tenant,
+            StorageIntentIsolationScope::WorkloadClass,
+            StorageIntentIsolationScope::MediaRole,
+            StorageIntentIsolationScope::ProximityDomain,
+            StorageIntentIsolationScope::TransportPath,
+            StorageIntentIsolationScope::DeviceClass,
+            StorageIntentIsolationScope::FailureDomain,
+            StorageIntentIsolationScope::RepairRelocationClass,
+        ];
+        for s in &scopes {
+            let disc = s.to_discriminant();
+            let decoded = StorageIntentIsolationScope::from_discriminant(disc);
+            assert_eq!(decoded, Some(*s), "roundtrip failed for {:?}", s.as_str());
+        }
+    }
+
+    #[test]
+    fn starvation_state_roundtrip() {
+        let states = [
+            StorageIntentStarvationState::NotStarving,
+            StorageIntentStarvationState::Constrained,
+            StorageIntentStarvationState::Starving,
+            StorageIntentStarvationState::Overridden,
+        ];
+        for s in &states {
+            let disc = s.to_discriminant();
+            let decoded = StorageIntentStarvationState::from_discriminant(disc);
+            assert_eq!(decoded, Some(*s), "roundtrip failed for {:?}", s.as_str());
+        }
+    }
+
+    #[test]
+    fn noisy_neighbor_mitigation_roundtrip() {
+        let mitigations = [
+            StorageIntentNoisyNeighborMitigationClass::None,
+            StorageIntentNoisyNeighborMitigationClass::Throttle,
+            StorageIntentNoisyNeighborMitigationClass::Defer,
+            StorageIntentNoisyNeighborMitigationClass::Refuse,
+            StorageIntentNoisyNeighborMitigationClass::Rebalance,
+            StorageIntentNoisyNeighborMitigationClass::Evacuate,
+            StorageIntentNoisyNeighborMitigationClass::OperatorEscalation,
+        ];
+        for m in &mitigations {
+            let disc = m.to_discriminant();
+            let decoded = StorageIntentNoisyNeighborMitigationClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*m), "roundtrip failed for {:?}", m.as_str());
+        }
+    }
+
+    #[test]
+    fn isolation_throttle_reason_roundtrip() {
+        let reasons = [
+            StorageIntentIsolationThrottleReason::None,
+            StorageIntentIsolationThrottleReason::OverBudget,
+            StorageIntentIsolationThrottleReason::UnownedWork,
+            StorageIntentIsolationThrottleReason::MissingTenantDomainEvidence,
+            StorageIntentIsolationThrottleReason::IllegalBudgetBorrowing,
+            StorageIntentIsolationThrottleReason::ReserveTheft,
+            StorageIntentIsolationThrottleReason::Starvation,
+            StorageIntentIsolationThrottleReason::PolicyConflict,
+            StorageIntentIsolationThrottleReason::StaleEvidence,
+            StorageIntentIsolationThrottleReason::ValidationGateFailed,
+            StorageIntentIsolationThrottleReason::NoisyNeighborPressure,
+            StorageIntentIsolationThrottleReason::BudgetDonationRefused,
+            StorageIntentIsolationThrottleReason::DebtNotRepaid,
+            StorageIntentIsolationThrottleReason::MissingReserveExemption,
+            StorageIntentIsolationThrottleReason::ExemptionNotAuthorized,
+        ];
+        for r in &reasons {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentIsolationThrottleReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+    }
+
+    #[test]
+    fn isolation_throttle_reason_to_refusal_roundtrip() {
+        let reasons = [
+            StorageIntentIsolationThrottleReason::OverBudget,
+            StorageIntentIsolationThrottleReason::UnownedWork,
+            StorageIntentIsolationThrottleReason::MissingTenantDomainEvidence,
+            StorageIntentIsolationThrottleReason::IllegalBudgetBorrowing,
+            StorageIntentIsolationThrottleReason::ReserveTheft,
+            StorageIntentIsolationThrottleReason::Starvation,
+            StorageIntentIsolationThrottleReason::PolicyConflict,
+            StorageIntentIsolationThrottleReason::StaleEvidence,
+            StorageIntentIsolationThrottleReason::ValidationGateFailed,
+            StorageIntentIsolationThrottleReason::NoisyNeighborPressure,
+            StorageIntentIsolationThrottleReason::BudgetDonationRefused,
+            StorageIntentIsolationThrottleReason::DebtNotRepaid,
+            StorageIntentIsolationThrottleReason::MissingReserveExemption,
+            StorageIntentIsolationThrottleReason::ExemptionNotAuthorized,
+        ];
+        for r in &reasons {
+            let disc = r.to_storage_intent_refusal().to_discriminant();
+            let decoded = StorageIntentRefusalReason::from_discriminant(disc);
+            assert!(decoded.is_some(), "refusal roundtrip failed for {:?}", r.as_str());
+            assert!(!matches!(decoded, Some(StorageIntentRefusalReason::None)));
+        }
+    }
+
+    #[test]
+    fn missing_isolation_evidence_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.evidence_ref = StorageIntentEvidenceRef::default();
+        let result = isolation_evidence_is_present(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::MissingBudgetOwnerEvidence);
+    }
+
+    #[test]
+    fn stale_isolation_evidence_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.evidence_ref.generation = 0;
+        let result = isolation_evidence_is_present(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::StaleIsolationEvidence);
+    }
+
+    #[test]
+    fn missing_budget_owner_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.budget_owner.tenant_id = StorageIntentDomainId::ZERO;
+        record.budget_owner.dataset_id = StorageIntentDomainId::ZERO;
+        record.budget_owner.policy_id = StorageIntentPolicyId::ZERO;
+        record.budget_owner.policy_revision = StorageIntentPolicyRevision(0);
+        let result = isolation_budget_owner_is_identified(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::MissingBudgetOwnerEvidence);
+    }
+
+    #[test]
+    fn missing_trust_evidence_for_tenant_scope_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.isolation_scope = StorageIntentIsolationScope::Tenant;
+        record.trust_evidence_ref = StorageIntentEvidenceRef::default();
+        let result = isolation_trust_evidence_is_usable(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::MissingTenantDomainEvidence);
+    }
+
+    #[test]
+    fn illegal_borrowing_without_authorization_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.borrowing.is_borrowing = true;
+        record.borrowing.may_borrow = false;
+        record.borrowing.outstanding_debt_bytes = 1000;
+        let result = isolation_borrowing_is_legal(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::IllegalBudgetBorrowing);
+    }
+
+    #[test]
+    fn overdue_debt_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.borrowing.is_borrowing = true;
+        record.borrowing.may_borrow = true;
+        record.borrowing.outstanding_debt_bytes = 1000;
+        record.borrowing.repayment_window_us = 1_000_000;
+        record.borrowing.debt_overdue = true;
+        let result = isolation_borrowing_is_legal(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::DebtNotRepaid);
+    }
+
+    #[test]
+    fn legal_borrowing_passes() {
+        let mut record = healthy_isolation_record();
+        record.borrowing.is_borrowing = true;
+        record.borrowing.may_borrow = true;
+        record.borrowing.outstanding_debt_bytes = 1000;
+        record.borrowing.repayment_window_us = 1_000_000;
+        record.borrowing.debt_overdue = false;
+        let result = isolation_borrowing_is_legal(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn repair_without_exemption_is_reserve_theft() {
+        let mut record = healthy_isolation_record();
+        record.exemption_override.repair_may_consume_reserve = false;
+        let result = isolation_reserve_is_protected(record, true, false);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::ReserveTheft);
+    }
+
+    #[test]
+    fn repair_with_exemption_passes() {
+        let mut record = healthy_isolation_record();
+        record.exemption_override.repair_may_consume_reserve = true;
+        let result = isolation_reserve_is_protected(record, true, false);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn evacuation_without_exemption_is_reserve_theft() {
+        let mut record = healthy_isolation_record();
+        record.exemption_override.evacuation_may_consume_reserve = false;
+        let result = isolation_reserve_is_protected(record, false, true);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::ReserveTheft);
+    }
+
+    #[test]
+    fn active_exemption_without_evidence_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.exemption_override.operator_authorized_override = true;
+        record.exemption_override.authorizing_operator_id = ISOLATION_DOMAIN_C;
+        // exemption_evidence_ref is default (no id).
+        let result = isolation_reserve_is_protected(record, false, false);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::MissingReserveExemption);
+    }
+
+    #[test]
+    fn active_exemption_with_evidence_passes() {
+        let mut record = healthy_isolation_record();
+        record.exemption_override.operator_authorized_override = true;
+        record.exemption_override.authorizing_operator_id = ISOLATION_DOMAIN_C;
+        record.exemption_override.exemption_evidence_ref = exemption_evidence_ref(50);
+        let result = isolation_reserve_is_protected(record, false, false);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn noisy_neighbor_below_threshold_passes() {
+        let mut record = healthy_isolation_record();
+        record.noisy_neighbor.mitigation_active = true;
+        record.noisy_neighbor.pressure_age_us = 1000;
+        record.noisy_neighbor.offender_owner = StorageIntentBudgetOwnerRef {
+            tenant_id: ISOLATION_DOMAIN_B,
+            dataset_id: StorageIntentDomainId::ZERO,
+            clone_family_id: StorageIntentDomainId::ZERO,
+            mount_id: StorageIntentDomainId::ZERO,
+            workload_class: StorageIntentIsolationScope::Tenant,
+            admin_domain: StorageIntentDomainId::ZERO,
+            security_domain: StorageIntentDomainId::ZERO,
+            maintenance_reason: 0,
+            policy_id: StorageIntentPolicyId([2_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(1),
+        };
+        record.noisy_neighbor.victim_owner = StorageIntentBudgetOwnerRef {
+            tenant_id: ISOLATION_DOMAIN_A,
+            dataset_id: StorageIntentDomainId::ZERO,
+            clone_family_id: StorageIntentDomainId::ZERO,
+            mount_id: StorageIntentDomainId::ZERO,
+            workload_class: StorageIntentIsolationScope::Tenant,
+            admin_domain: StorageIntentDomainId::ZERO,
+            security_domain: StorageIntentDomainId::ZERO,
+            maintenance_reason: 0,
+            policy_id: StorageIntentPolicyId([1_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(1),
+        };
+        record.noisy_neighbor.victim_p99_us = 500;
+        record.noisy_neighbor.queue_harm_entries = 10;
+        // Thresholds are 1000 us and 100 entries.
+        let result = isolation_noisy_neighbor_is_below_threshold(record, 1000, 100);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn noisy_neighbor_p99_exceeds_threshold_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.noisy_neighbor.mitigation_active = true;
+        record.noisy_neighbor.pressure_age_us = 1000;
+        record.noisy_neighbor.offender_owner = StorageIntentBudgetOwnerRef {
+            tenant_id: ISOLATION_DOMAIN_B,
+            ..Default::default()
+        };
+        record.noisy_neighbor.offender_owner.policy_id = StorageIntentPolicyId([2_u8; 16]);
+        record.noisy_neighbor.offender_owner.policy_revision = StorageIntentPolicyRevision(1);
+        record.noisy_neighbor.victim_owner = StorageIntentBudgetOwnerRef {
+            tenant_id: ISOLATION_DOMAIN_A,
+            ..Default::default()
+        };
+        record.noisy_neighbor.victim_owner.policy_id = StorageIntentPolicyId([1_u8; 16]);
+        record.noisy_neighbor.victim_owner.policy_revision = StorageIntentPolicyRevision(1);
+        record.noisy_neighbor.victim_p99_us = 1500; // exceeds 1000 threshold
+        record.noisy_neighbor.queue_harm_entries = 10;
+        let result = isolation_noisy_neighbor_is_below_threshold(record, 1000, 100);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::NoisyNeighborPressure);
+    }
+
+    #[test]
+    fn noisy_neighbor_queue_harm_exceeds_threshold_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.noisy_neighbor.mitigation_active = true;
+        record.noisy_neighbor.pressure_age_us = 1000;
+        record.noisy_neighbor.offender_owner = StorageIntentBudgetOwnerRef {
+            tenant_id: ISOLATION_DOMAIN_B,
+            ..Default::default()
+        };
+        record.noisy_neighbor.offender_owner.policy_id = StorageIntentPolicyId([2_u8; 16]);
+        record.noisy_neighbor.offender_owner.policy_revision = StorageIntentPolicyRevision(1);
+        record.noisy_neighbor.victim_owner = StorageIntentBudgetOwnerRef {
+            tenant_id: ISOLATION_DOMAIN_A,
+            ..Default::default()
+        };
+        record.noisy_neighbor.victim_owner.policy_id = StorageIntentPolicyId([1_u8; 16]);
+        record.noisy_neighbor.victim_owner.policy_revision = StorageIntentPolicyRevision(1);
+        record.noisy_neighbor.victim_p99_us = 500;
+        record.noisy_neighbor.queue_harm_entries = 200; // exceeds 100 threshold
+        let result = isolation_noisy_neighbor_is_below_threshold(record, 1000, 100);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::NoisyNeighborPressure);
+    }
+
+    #[test]
+    fn starvation_not_resolved_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.fair_share.starvation_state = StorageIntentStarvationState::Starving;
+        let result = isolation_starvation_is_resolved(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::Starvation);
+    }
+
+    #[test]
+    fn starvation_constrained_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.fair_share.starvation_state = StorageIntentStarvationState::Constrained;
+        let result = isolation_starvation_is_resolved(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::Starvation);
+    }
+
+    #[test]
+    fn starvation_overridden_with_temporal_evidence_passes() {
+        let mut record = healthy_isolation_record();
+        record.fair_share.starvation_state = StorageIntentStarvationState::Overridden;
+        record.temporal_evidence_ref = temporal_evidence_ref(
+            StorageIntentEvidenceKind::TemporalEvidence,
+            30,
+        );
+        let result = isolation_starvation_is_resolved(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn starvation_overridden_without_temporal_evidence_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.fair_share.starvation_state = StorageIntentStarvationState::Overridden;
+        record.temporal_evidence_ref = StorageIntentEvidenceRef::default();
+        let result = isolation_starvation_is_resolved(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::StaleIsolationEvidence);
+    }
+
+    #[test]
+    fn unowned_work_is_refused() {
+        let mut record = healthy_isolation_record();
+        record.budget_owner.tenant_id = StorageIntentDomainId::ZERO;
+        record.budget_owner.dataset_id = StorageIntentDomainId::ZERO;
+        record.budget_owner.policy_id = StorageIntentPolicyId::ZERO;
+        let result = isolation_work_has_budget_owner(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::UnownedWork);
+    }
+
+    #[test]
+    fn throttle_blocks_work() {
+        let mut record = healthy_isolation_record();
+        record.throttle = StorageIntentIsolationThrottleReason::OverBudget;
+        let result = isolation_throttle_permits_work(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::OverBudget);
+    }
+
+    #[test]
+    fn no_throttle_permits_work() {
+        let record = healthy_isolation_record();
+        let result = isolation_throttle_permits_work(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn borrowing_exceeds_max_is_over_budget() {
+        let mut record = healthy_isolation_record();
+        record.borrowing.is_borrowing = true;
+        record.borrowing.may_borrow = true;
+        record.borrowing.max_borrow_bytes = 1000;
+        record.borrowing.outstanding_debt_bytes = 500;
+        record.borrowing.repayment_window_us = 1_000_000;
+        let result = isolation_borrowing_permits_consumption(record, 2000); // exceeds max_borrow_bytes
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::OverBudget);
+    }
+
+    #[test]
+    fn borrowing_within_max_passes() {
+        let mut record = healthy_isolation_record();
+        record.borrowing.is_borrowing = true;
+        record.borrowing.may_borrow = true;
+        record.borrowing.max_borrow_bytes = 1000;
+        record.borrowing.outstanding_debt_bytes = 500;
+        record.borrowing.repayment_window_us = 1_000_000;
+        let result = isolation_borrowing_permits_consumption(record, 500); // within max
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn complete_isolation_evidence_is_usable() {
+        let record = healthy_isolation_record();
+        let result = isolation_evidence_is_usable(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn isolation_evidence_missing_trust_for_tenant_fails_usable() {
+        let mut record = healthy_isolation_record();
+        record.isolation_scope = StorageIntentIsolationScope::Tenant;
+        record.trust_evidence_ref = StorageIntentEvidenceRef::default();
+        let result = isolation_evidence_is_usable(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::MissingTenantDomainEvidence);
+    }
+
+    #[test]
+    fn has_evidence_identity_fails_on_wrong_kind() {
+        let mut record = healthy_isolation_record();
+        record.evidence_ref.kind = StorageIntentEvidenceKind::Unknown;
+        assert!(!record.has_evidence_identity());
+    }
+
+    #[test]
+    fn has_evidence_identity_fails_on_zero_policy() {
+        let mut record = healthy_isolation_record();
+        record.policy_id = StorageIntentPolicyId::ZERO;
+        assert!(!record.has_evidence_identity());
+    }
+
+    #[test]
+    fn has_noisy_neighbor_pressure_detects_inactive() {
+        let record = healthy_isolation_record();
+        assert!(!record.has_noisy_neighbor_pressure());
+    }
+
+    #[test]
+    fn has_legal_borrowing_detects_overdue() {
+        let mut record = healthy_isolation_record();
+        record.borrowing.is_borrowing = true;
+        record.borrowing.may_borrow = true;
+        record.borrowing.outstanding_debt_bytes = 1000;
+        record.borrowing.debt_overdue = true;
+        assert!(!record.has_legal_borrowing());
+    }
+
+    #[test]
+    fn saturated_resource_mask_operations() {
+        let mask = StorageIntentSaturatedResourceMask(
+            StorageIntentSaturatedResourceMask::CPU.0
+                | StorageIntentSaturatedResourceMask::DISK_IOPS.0,
+        );
+        assert!(mask.0 & StorageIntentSaturatedResourceMask::CPU.0 != 0);
+        assert!(mask.0 & StorageIntentSaturatedResourceMask::DISK_IOPS.0 != 0);
+        assert!(mask.0 & StorageIntentSaturatedResourceMask::MEMORY.0 == 0);
+    }
+
+    #[test]
+    fn refusal_reason_new_variants_roundtrip() {
+        let refusals = [
+            StorageIntentRefusalReason::MissingBudgetOwnerEvidence,
+            StorageIntentRefusalReason::StaleIsolationEvidence,
+            StorageIntentRefusalReason::OverBudget,
+            StorageIntentRefusalReason::IllegalBudgetBorrowing,
+            StorageIntentRefusalReason::ReserveTheft,
+            StorageIntentRefusalReason::Starvation,
+            StorageIntentRefusalReason::NoisyNeighborPressure,
+            StorageIntentRefusalReason::MissingReserveExemption,
+            StorageIntentRefusalReason::ExemptionNotAuthorized,
+            StorageIntentRefusalReason::PolicyConflict,
+            StorageIntentRefusalReason::MissingTenantDomainEvidence,
+            StorageIntentRefusalReason::UnownedWork,
+            StorageIntentRefusalReason::ValidationGateFailed,
+            StorageIntentRefusalReason::BudgetDonationRefused,
+            StorageIntentRefusalReason::DebtNotRepaid,
+        ];
+        for r in &refusals {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+    }
 }
