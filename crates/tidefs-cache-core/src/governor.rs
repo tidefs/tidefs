@@ -710,48 +710,15 @@ impl Governor {
             return Ok(GovernorAutoTuneDecision::Disabled);
         }
 
+        for record in evidence {
+            Self::validate_auto_tune_record(record)?;
+        }
+
         let mut updated = [false; 6];
         for record in evidence {
             let category = record
                 .category
-                .ok_or(GovernorAutoTuneError::AmbiguousInput("missing category"))?;
-            let owner = record
-                .owner
-                .ok_or(GovernorAutoTuneError::AmbiguousInput("missing owner"))?;
-            let _unit = record
-                .unit
-                .ok_or(GovernorAutoTuneError::AmbiguousInput("missing unit"))?;
-            let freshness_ms = record
-                .freshness_ms
-                .ok_or(GovernorAutoTuneError::AmbiguousInput("missing freshness"))?;
-            if freshness_ms > AUTO_TUNE_MAX_FRESHNESS_MS {
-                return Err(GovernorAutoTuneError::StaleInput {
-                    freshness_ms,
-                    max_freshness_ms: AUTO_TUNE_MAX_FRESHNESS_MS,
-                });
-            }
-            if record.pressure_score > 100 {
-                return Err(GovernorAutoTuneError::PressureOutOfRange {
-                    pressure_score: record.pressure_score,
-                });
-            }
-            let safety = record.safety.ok_or(GovernorAutoTuneError::AmbiguousInput(
-                "missing safety effect",
-            ))?;
-            if !safety.preserves_all_limits() {
-                return Err(GovernorAutoTuneError::UnsafeInput {
-                    category,
-                    reason: "input would weaken a protected safety limit",
-                });
-            }
-            if owner == GovernorAutoTuneOwner::DirtyBytePressure
-                && category != BudgetCategory::DirtyBytes
-            {
-                return Err(GovernorAutoTuneError::AmbiguousInput(
-                    "dirty-byte pressure must target dirty_bytes",
-                ));
-            }
-
+                .expect("auto-tune evidence category was validated");
             let idx = Self::category_index(category);
             let base = inner.category_configs[idx].base_soft_fraction;
             let tuned = Self::tuned_soft_fraction(category, base, record.pressure_score);
@@ -854,6 +821,54 @@ impl Governor {
 
     fn caps_from_fractions(total: u64, fractions: [f64; 6]) -> [u64; 6] {
         std::array::from_fn(|idx| (total as f64 * fractions[idx]) as u64)
+    }
+
+    fn validate_auto_tune_record(
+        record: &GovernorAutoTuneEvidence,
+    ) -> Result<BudgetCategory, GovernorAutoTuneError> {
+        let category = record
+            .category
+            .ok_or(GovernorAutoTuneError::AmbiguousInput("missing category"))?;
+        let owner = record
+            .owner
+            .ok_or(GovernorAutoTuneError::AmbiguousInput("missing owner"))?;
+        let _unit = record
+            .unit
+            .ok_or(GovernorAutoTuneError::AmbiguousInput("missing unit"))?;
+        let freshness_ms = record
+            .freshness_ms
+            .ok_or(GovernorAutoTuneError::AmbiguousInput("missing freshness"))?;
+        if freshness_ms > AUTO_TUNE_MAX_FRESHNESS_MS {
+            return Err(GovernorAutoTuneError::StaleInput {
+                freshness_ms,
+                max_freshness_ms: AUTO_TUNE_MAX_FRESHNESS_MS,
+            });
+        }
+        if record.pressure_score > 100 {
+            return Err(GovernorAutoTuneError::PressureOutOfRange {
+                pressure_score: record.pressure_score,
+            });
+        }
+        let safety = record
+            .safety
+            .ok_or(GovernorAutoTuneError::AmbiguousInput(
+                "missing safety effect",
+            ))?;
+        if !safety.preserves_all_limits() {
+            return Err(GovernorAutoTuneError::UnsafeInput {
+                category,
+                reason: "input would weaken a protected safety limit",
+            });
+        }
+        if owner == GovernorAutoTuneOwner::DirtyBytePressure
+            && category != BudgetCategory::DirtyBytes
+        {
+            return Err(GovernorAutoTuneError::AmbiguousInput(
+                "dirty-byte pressure must target dirty_bytes",
+            ));
+        }
+
+        Ok(category)
     }
 
     fn tuned_soft_fraction(
@@ -1352,6 +1367,47 @@ mod tests {
         );
 
         assert_eq!(g.category_soft_watermark(BudgetCategory::DataCache), 700);
+    }
+
+    #[test]
+    fn auto_tune_rejects_invalid_batch_without_partial_watermark_changes() {
+        let config = GovernorConfig {
+            total_budget_bytes: 1000,
+            data_cache_fraction: 0.5,
+            meta_cache_fraction: 0.5,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+            auto_tune: true,
+        };
+        let g = Governor::new(config).unwrap();
+        let data_before = g.category_soft_watermark(BudgetCategory::DataCache);
+        let meta_before = g.category_soft_watermark(BudgetCategory::MetaCache);
+        let stale_meta = GovernorAutoTuneEvidence::pressure(
+            BudgetCategory::MetaCache,
+            GovernorAutoTuneOwner::CacheAdmission,
+            GovernorAutoTuneUnit::Ratio0To100,
+            AUTO_TUNE_MAX_FRESHNESS_MS + 1,
+            80,
+        );
+
+        assert_eq!(
+            g.apply_auto_tune(&[data_pressure(100), stale_meta]),
+            Err(GovernorAutoTuneError::StaleInput {
+                freshness_ms: AUTO_TUNE_MAX_FRESHNESS_MS + 1,
+                max_freshness_ms: AUTO_TUNE_MAX_FRESHNESS_MS,
+            })
+        );
+
+        assert_eq!(
+            g.category_soft_watermark(BudgetCategory::DataCache),
+            data_before
+        );
+        assert_eq!(
+            g.category_soft_watermark(BudgetCategory::MetaCache),
+            meta_before
+        );
     }
 
     #[test]
