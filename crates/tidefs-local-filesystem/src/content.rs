@@ -12,6 +12,7 @@ use tidefs_local_object_store::{
 };
 use tidefs_types_vfs_core::InodeId;
 
+use crate::ack_receipt::{classify_read_receipt, ReadReceiptEvidence};
 use crate::checksum::{BlockChecksum, FastBlockChecksum};
 use crate::constants::*;
 use crate::dedup::DedupIndex;
@@ -720,38 +721,103 @@ fn read_chunk_bytes_with_receipt(
     chunk_ref: &ContentChunkRef,
     key: ObjectKey,
 ) -> Result<Vec<u8>> {
-    // Fast path: receiptless chunk or no pool — use raw store.
-    if chunk_ref.placement_receipt_generation == 0 || pool.is_none() {
+    // Fast path: no receipt generation recorded, or no pool available —
+    // use raw store without receipt authority gating.
+    if chunk_ref.placement_receipt_generation == 0 {
         return store.get(key)?.ok_or(FileSystemError::CorruptState {
             reason: "content manifest references a missing chunk object",
         });
     }
 
-    let pool = pool.unwrap();
-    match pool.placement_receipt_for_key(DeviceIoClass::Data, key) {
-        Ok(Some(receipt)) if receipt.generation == chunk_ref.placement_receipt_generation => {
-            // Receipt generation matches: route through pool for
+    let Some(pool) = pool else {
+        return store.get(key)?.ok_or(FileSystemError::CorruptState {
+            reason: "content manifest references a missing chunk object",
+        });
+    };
+    let expected_gen = chunk_ref.placement_receipt_generation;
+
+    // Query the pool receipt authority for this key.
+    let receipt = match pool.placement_receipt_for_key(DeviceIoClass::Data, key) {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => {
+            return Err(FileSystemError::ReceiptAuthorityMissing {
+                object_key: key,
+                expected_generation: expected_gen,
+            });
+        }
+        Err(_) => {
+            return Err(FileSystemError::ReceiptAuthorityUnavailable {
+                object_key: key,
+                expected_generation: expected_gen,
+            });
+        }
+    };
+
+    // Classify the receipt evidence against the chunk ref's recorded generation.
+    match classify_read_receipt(&receipt, expected_gen) {
+        ReadReceiptEvidence::Valid { .. } => {
+            // Receipt is committed authority: route through pool for
             // receipt-verified device selection.
             match pool.get(DeviceIoClass::Data, key) {
-                Ok(Some(bytes)) => return Ok(bytes),
-                Ok(None) => {}
-                Err(_) => {}
+                Ok(Some(bytes)) => Ok(bytes),
+                Ok(None) => Err(FileSystemError::CorruptState {
+                    reason: "content chunk receipt verified but pool read returned no data",
+                }),
+                Err(e) => Err(FileSystemError::Store(e)),
             }
         }
-        Ok(Some(receipt)) => {
-            eprintln!(
-                "TideFS: content chunk {:?} receipt generation mismatch                  (stored {} != pool {}); falling back to topology lookup",
-                key, chunk_ref.placement_receipt_generation, receipt.generation,
-            );
+        ReadReceiptEvidence::Unavailable { .. } => {
+            Err(FileSystemError::ReceiptAuthorityUnavailable {
+                object_key: key,
+                expected_generation: expected_gen,
+            })
         }
-        Ok(None) => {}
-        Err(_) => {}
+        ReadReceiptEvidence::Missing { .. } => {
+            Err(FileSystemError::ReceiptAuthorityMissing {
+                object_key: key,
+                expected_generation: expected_gen,
+            })
+        }
+        ReadReceiptEvidence::Stale { observed_generation, .. } => {
+            Err(FileSystemError::ReceiptAuthorityStale {
+                object_key: key,
+                expected_generation: expected_gen,
+                observed_generation,
+            })
+        }
+        ReadReceiptEvidence::Synthetic { .. } => {
+            Err(FileSystemError::ReceiptAuthoritySynthetic {
+                object_key: key,
+                expected_generation: expected_gen,
+            })
+        }
+        ReadReceiptEvidence::MalformedPolicy { generation } => {
+            Err(FileSystemError::ReceiptAuthorityMalformedPolicy {
+                object_key: key,
+                generation,
+            })
+        }
+        ReadReceiptEvidence::UnderWidth {
+            generation,
+            target_count,
+            required_width,
+        } => Err(FileSystemError::ReceiptAuthorityUnderWidth {
+            object_key: key,
+            generation,
+            target_count,
+            required_width,
+        }),
+        ReadReceiptEvidence::OverWidth {
+            generation,
+            target_count,
+            required_width,
+        } => Err(FileSystemError::ReceiptAuthorityOverWidth {
+            object_key: key,
+            generation,
+            target_count,
+            required_width,
+        }),
     }
-
-    // Fallback: raw store get without receipt authority.
-    store.get(key)?.ok_or(FileSystemError::CorruptState {
-        reason: "content manifest references a missing chunk object",
-    })
 }
 
 fn encode_new_canonical_chunk<S: ContentWriteStore>(
@@ -2809,6 +2875,315 @@ mod tests {
         let result = read_content_chunk_from_store(&store, InodeId::new(30), &hole_ref, None)
             .expect("read hole chunk");
         assert_eq!(result.bytes, vec![0u8; 128]);
+    }
+}
+
+#[cfg(test)]
+mod receipt_readback_authority_tests {
+    use super::*;
+    use crate::ack_receipt::{classify_read_receipt, ReadReceiptEvidence};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tidefs_local_object_store::pool::{Pool, PoolConfig, PoolProperties};
+    use tidefs_local_object_store::{
+        DeviceBacking, DeviceClass, DeviceConfig, DeviceIoClass, DeviceKind, StoreOptions,
+    };
+
+    fn temp_pool(label: &str) -> Pool {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tidefs-rdbk-auth-{label}-{nanos}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let data_dir = root.join("data");
+        let config = PoolConfig {
+            name: "testpool".into(),
+            root_path: root.clone(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: data_dir.clone(),
+                backing: DeviceBacking::DirectoryObjectStoreCompat,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Single { path: data_dir },
+                encryption: None,
+                compression: None,
+            }],
+        };
+        Pool::create(
+            config,
+            PoolProperties::default(),
+            &StoreOptions::test_fast(),
+        )
+        .expect("create temp pool")
+    }
+
+    /// Valid receipt: generation matches and receipt is committed authority.
+    /// Read should succeed through pool's receipt-verified path.
+    #[test]
+    fn valid_receipt_reads_through_pool() {
+        let mut pool = temp_pool("valid-rdbk");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"chunk-valid");
+        let payload = b"receipt-validated read payload";
+
+        let (_stored, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, key, payload)
+            .expect("put_with_receipt");
+
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: 1,
+            len: payload.len() as u32,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: receipt.generation,
+        };
+
+        let result = read_chunk_bytes_with_receipt(
+            pool.raw_primary_store(),
+            Some(&pool),
+            &chunk_ref,
+            key,
+        )
+        .expect("valid receipt should read through pool");
+        assert_eq!(result, payload);
+    }
+
+    /// Missing receipt: chunk ref expects a receipt generation, but pool
+    /// has no receipt for that key. Returns ReceiptAuthorityMissing.
+    #[test]
+    fn missing_receipt_returns_error() {
+        let mut pool = temp_pool("missing-rdbk");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"chunk-missing");
+        let payload = b"missing receipt payload";
+
+        // Write through raw store (no pool receipt generated).
+        {
+            let store = pool.raw_primary_store_mut();
+            store.put(key, payload).expect("raw put");
+        }
+
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: 1,
+            len: payload.len() as u32,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: 42,
+        };
+
+        let result = read_chunk_bytes_with_receipt(
+            pool.raw_primary_store(),
+            Some(&pool),
+            &chunk_ref,
+            key,
+        );
+        match result {
+            Err(FileSystemError::ReceiptAuthorityMissing { expected_generation: 42, .. }) => {}
+            other => panic!("expected ReceiptAuthorityMissing, got {other:?}"),
+        }
+    }
+
+    /// Stale receipt: chunk ref expects one generation, pool has a
+    /// different (higher) generation from a later rewrite.
+    #[test]
+    fn stale_receipt_returns_error() {
+        let mut pool = temp_pool("stale-rdbk");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"chunk-stale");
+
+        let (_s1, receipt1) = pool
+            .put_with_receipt(DeviceIoClass::Data, key, b"first write")
+            .expect("put 1");
+        let (_s2, receipt2) = pool
+            .put_with_receipt(DeviceIoClass::Data, key, b"second write")
+            .expect("put 2");
+
+        assert!(receipt2.generation > receipt1.generation);
+
+        let chunk_ref = ContentChunkRef {
+            chunk_index: 0,
+            data_version: 1,
+            len: 11,
+            checksum: IntegrityDigest64(0),
+            placement_receipt_generation: receipt1.generation,
+        };
+
+        let result = read_chunk_bytes_with_receipt(
+            pool.raw_primary_store(),
+            Some(&pool),
+            &chunk_ref,
+            key,
+        );
+        match result {
+            Err(FileSystemError::ReceiptAuthorityStale {
+                expected_generation,
+                observed_generation,
+                ..
+            }) => {
+                assert_eq!(expected_generation, receipt1.generation);
+                assert_eq!(observed_generation, receipt2.generation);
+            }
+            other => panic!("expected ReceiptAuthorityStale, got {other:?}"),
+        }
+    }
+
+    /// classify_read_receipt returns Valid for a well-formed committed receipt.
+    #[test]
+    fn classify_valid_receipt() {
+        let mut pool = temp_pool("classify-valid");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"classify-key");
+        let (_stored, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, key, b"payload")
+            .expect("put");
+
+        let evidence = classify_read_receipt(&receipt, receipt.generation);
+        assert!(matches!(evidence, ReadReceiptEvidence::Valid { .. }));
+        assert!(evidence.is_committed());
+    }
+
+    /// classify_read_receipt returns Stale when generations differ.
+    #[test]
+    fn classify_stale_receipt() {
+        let mut pool = temp_pool("classify-stale");
+        let key = tidefs_local_object_store::ObjectKey::from_name(b"stale-key");
+        let (_stored, receipt) = pool
+            .put_with_receipt(DeviceIoClass::Data, key, b"payload")
+            .expect("put");
+
+        let evidence = classify_read_receipt(&receipt, receipt.generation + 1);
+        assert!(matches!(evidence, ReadReceiptEvidence::Stale { .. }));
+        assert!(!evidence.is_committed());
+    }
+
+    /// classify_read_receipt returns Synthetic when pool receipt generation is 0.
+    #[test]
+    fn classify_synthetic_receipt() {
+        use tidefs_local_object_store::pool::PlacementReceipt;
+        let synthetic = PlacementReceipt {
+            object_key: tidefs_local_object_store::ObjectKey::from_name(b"synth"),
+            epoch: 0,
+            generation: 0,
+            policy: Default::default(),
+            failure_domain_level: tidefs_durability_layout::FailureDomainLevel::Device,
+            payload_len: 0,
+            shard_len: 0,
+            payload_digest: [0u8; 32],
+            targets: vec![],
+            planner_replay_receipt: None,
+        };
+
+        let evidence = classify_read_receipt(&synthetic, 1);
+        assert!(matches!(evidence, ReadReceiptEvidence::Synthetic { .. }));
+        assert!(!evidence.is_committed());
+        assert_eq!(evidence.label(), "synthetic");
+    }
+
+    /// classify_read_receipt reports MalformedPolicy for an ill-formed policy.
+    #[test]
+    fn classify_malformed_policy_receipt() {
+        use tidefs_local_object_store::pool::{PlacementReceipt, PoolRedundancyPolicy};
+        let malformed = PlacementReceipt {
+            object_key: tidefs_local_object_store::ObjectKey::from_name(b"malformed"),
+            epoch: 0,
+            generation: 1,
+            policy: PoolRedundancyPolicy::Erasure {
+                data_shards: 0,
+                parity_shards: 1,
+            },
+            failure_domain_level: tidefs_durability_layout::FailureDomainLevel::Device,
+            payload_len: 0,
+            shard_len: 0,
+            payload_digest: [0u8; 32],
+            targets: vec![],
+            planner_replay_receipt: None,
+        };
+
+        let evidence = classify_read_receipt(&malformed, 1);
+        assert!(matches!(evidence, ReadReceiptEvidence::MalformedPolicy { .. }));
+        assert_eq!(evidence.label(), "malformed-policy");
+    }
+
+    /// classify_read_receipt reports UnderWidth when target_count < required_width.
+    #[test]
+    fn classify_under_width_receipt() {
+        use tidefs_local_object_store::pool::{PlacementReceipt, PoolRedundancyPolicy};
+        let under = PlacementReceipt {
+            object_key: tidefs_local_object_store::ObjectKey::from_name(b"under"),
+            epoch: 0,
+            generation: 1,
+            policy: PoolRedundancyPolicy::Replicated { copies: 2 },
+            failure_domain_level: tidefs_durability_layout::FailureDomainLevel::Device,
+            payload_len: 0,
+            shard_len: 0,
+            payload_digest: [0u8; 32],
+            targets: vec![],
+            planner_replay_receipt: None,
+        };
+
+        let evidence = classify_read_receipt(&under, 1);
+        assert!(matches!(evidence, ReadReceiptEvidence::UnderWidth { .. }));
+        assert_eq!(evidence.label(), "under-width");
+    }
+
+    /// classify_read_receipt reports OverWidth when target_count > required_width.
+    #[test]
+    fn classify_over_width_receipt() {
+        use tidefs_local_object_store::pool::{PlacementReceipt, PlacementReceiptTarget, PoolRedundancyPolicy};
+        let over = PlacementReceipt {
+            object_key: tidefs_local_object_store::ObjectKey::from_name(b"over"),
+            epoch: 0,
+            generation: 1,
+            policy: PoolRedundancyPolicy::Replicated { copies: 1 },
+            failure_domain_level: tidefs_durability_layout::FailureDomainLevel::Device,
+            payload_len: 0,
+            shard_len: 0,
+            payload_digest: [0u8; 32],
+            targets: vec![
+                PlacementReceiptTarget {
+                    device_index: 0,
+                    device_guid: [0u8; 16],
+                    shard_index: 0,
+                    role: tidefs_local_object_store::pool::PlacementTargetRole::Data,
+                    stored_digest: [0u8; 32],
+                },
+                PlacementReceiptTarget {
+                    device_index: 1,
+                    device_guid: [0u8; 16],
+                    shard_index: 0,
+                    role: tidefs_local_object_store::pool::PlacementTargetRole::Data,
+                    stored_digest: [0u8; 32],
+                },
+            ],
+            planner_replay_receipt: None,
+        };
+
+        let evidence = classify_read_receipt(&over, 1);
+        assert!(matches!(evidence, ReadReceiptEvidence::OverWidth { .. }));
+        assert_eq!(evidence.label(), "over-width");
+    }
+
+    /// classify_read_receipt returns Unavailable as a stale variant wrapper.
+    #[test]
+    fn classify_label_covers_all_variants() {
+        // Smoke-test: every variant has a non-empty label.
+        let variants = [
+            ReadReceiptEvidence::Valid { generation: 1 },
+            ReadReceiptEvidence::Unavailable { expected_generation: 1 },
+            ReadReceiptEvidence::Missing { expected_generation: 1 },
+            ReadReceiptEvidence::Stale { expected_generation: 1, observed_generation: 2 },
+            ReadReceiptEvidence::Synthetic { expected_generation: 1, observed_generation: 0 },
+            ReadReceiptEvidence::MalformedPolicy { generation: 1 },
+            ReadReceiptEvidence::UnderWidth { generation: 1, target_count: 0, required_width: 2 },
+            ReadReceiptEvidence::OverWidth { generation: 1, target_count: 3, required_width: 2 },
+        ];
+        for v in &variants {
+            assert!(!v.label().is_empty(), "label empty for {v:?}");
+        }
+        // Only Valid is committed.
+        assert!(variants[0].is_committed());
+        for v in &variants[1..] {
+            assert!(!v.is_committed(), "{v:?} should not be committed");
+        }
     }
 }
 

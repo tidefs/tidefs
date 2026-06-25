@@ -222,6 +222,56 @@ pub enum FileSystemError {
     StaleSenderGeneration {
         reason: &'static str,
     },
+    /// Local readback or degraded-read source selection could not verify
+    /// the pool placement receipt for an object key because the pool is
+    /// unavailable (I/O error, device fault, or pool not open).
+    ReceiptAuthorityUnavailable {
+        object_key: tidefs_local_object_store::ObjectKey,
+        expected_generation: u64,
+    },
+    /// No placement receipt exists in the pool for the referenced object
+    /// key. The chunk ref carries a receipt generation that was never
+    /// committed by the pool.
+    ReceiptAuthorityMissing {
+        object_key: tidefs_local_object_store::ObjectKey,
+        expected_generation: u64,
+    },
+    /// The pool's placement receipt generation differs from the chunk
+    /// ref's recorded generation. A replacement may have been written
+    /// without a durable receipt, or the receipt was rotated too early.
+    ReceiptAuthorityStale {
+        object_key: tidefs_local_object_store::ObjectKey,
+        expected_generation: u64,
+        observed_generation: u64,
+    },
+    /// The pool receipt carries generation zero (synthetic/uncommitted)
+    /// while the chunk ref expects a committed receipt.
+    ReceiptAuthoritySynthetic {
+        object_key: tidefs_local_object_store::ObjectKey,
+        expected_generation: u64,
+    },
+    /// The pool receipt's redundancy policy is not well-formed (e.g.
+    /// zero copies or zero data/parity shards).
+    ReceiptAuthorityMalformedPolicy {
+        object_key: tidefs_local_object_store::ObjectKey,
+        generation: u64,
+    },
+    /// The pool receipt's target count is less than the policy's
+    /// required placement width.
+    ReceiptAuthorityUnderWidth {
+        object_key: tidefs_local_object_store::ObjectKey,
+        generation: u64,
+        target_count: u16,
+        required_width: u16,
+    },
+    /// The pool receipt's target count exceeds the policy's required
+    /// placement width.
+    ReceiptAuthorityOverWidth {
+        object_key: tidefs_local_object_store::ObjectKey,
+        generation: u64,
+        target_count: u16,
+        required_width: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,6 +425,27 @@ impl fmt::Display for FileSystemError {
             }
             Self::StaleSenderGeneration { reason } => {
                 write!(f, "stale sender generation: {reason}")
+            }
+            Self::ReceiptAuthorityUnavailable { object_key, expected_generation } => {
+                write!(f, "placement receipt authority unavailable for object key {object_key:?}: expected generation {expected_generation}")
+            }
+            Self::ReceiptAuthorityMissing { object_key, expected_generation } => {
+                write!(f, "placement receipt missing for object key {object_key:?}: expected generation {expected_generation}")
+            }
+            Self::ReceiptAuthorityStale { object_key, expected_generation, observed_generation } => {
+                write!(f, "placement receipt stale for object key {object_key:?}: expected generation {expected_generation}, observed {observed_generation}")
+            }
+            Self::ReceiptAuthoritySynthetic { object_key, expected_generation } => {
+                write!(f, "placement receipt synthetic for object key {object_key:?}: expected generation {expected_generation}, pool receipt generation is zero")
+            }
+            Self::ReceiptAuthorityMalformedPolicy { object_key, generation } => {
+                write!(f, "placement receipt malformed policy for object key {object_key:?} generation {generation}")
+            }
+            Self::ReceiptAuthorityUnderWidth { object_key, generation, target_count, required_width } => {
+                write!(f, "placement receipt under-width for object key {object_key:?} generation {generation}: target_count {target_count} < required_width {required_width}")
+            }
+            Self::ReceiptAuthorityOverWidth { object_key, generation, target_count, required_width } => {
+                write!(f, "placement receipt over-width for object key {object_key:?} generation {generation}: target_count {target_count} > required_width {required_width}")
             }
         }
     }
