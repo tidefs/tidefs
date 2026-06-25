@@ -53,6 +53,7 @@ const AUTHORITY_HARD_GATE_EVIDENCE: &[StorageIntentEvidenceKind] = &[
     StorageIntentEvidenceKind::DataShapeEvidence,
     StorageIntentEvidenceKind::LayoutAllocatorEvidence,
     StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+    StorageIntentEvidenceKind::LifecycleGenerationEvidence,
     StorageIntentEvidenceKind::DecisionFrontierEvidence,
 ];
 
@@ -62,6 +63,7 @@ const CACHE_ONLY_HARD_GATE_EVIDENCE: &[StorageIntentEvidenceKind] = &[
     StorageIntentEvidenceKind::TransportPathEvidence,
     StorageIntentEvidenceKind::WorkloadEvidence,
     StorageIntentEvidenceKind::DecisionFrontierEvidence,
+    StorageIntentEvidenceKind::LifecycleGenerationEvidence,
 ];
 
 const MOVEMENT_HARD_GATE_EVIDENCE: &[StorageIntentEvidenceKind] = &[
@@ -336,6 +338,8 @@ pub struct StorageIntentPlacementCandidate {
     pub service_objective_state: PlacementEvidenceState,
     /// Decision-frontier evidence gate.
     pub decision_frontier: PlacementEvidenceState,
+    /// Lifecycle/generation evidence gate (#881).
+    pub lifecycle_generation: PlacementEvidenceState,
 }
 
 impl StorageIntentPlacementCandidate {
@@ -370,6 +374,7 @@ impl StorageIntentPlacementCandidate {
             layout_allocator_state: PlacementEvidenceState::Unknown,
             service_objective_state: PlacementEvidenceState::Unknown,
             decision_frontier: PlacementEvidenceState::Unknown,
+            lifecycle_generation: PlacementEvidenceState::Unknown,
         }
     }
 
@@ -387,6 +392,7 @@ impl StorageIntentPlacementCandidate {
         self.layout_allocator_state = PlacementEvidenceState::Fresh;
         self.service_objective_state = PlacementEvidenceState::Fresh;
         self.decision_frontier = PlacementEvidenceState::Fresh;
+        self.lifecycle_generation = PlacementEvidenceState::Fresh;
         self
     }
 
@@ -1856,6 +1862,7 @@ mod tests {
         StorageIntentEvidenceKind::RelocationReceipt,
         StorageIntentEvidenceKind::MeasurementAttributionEvidence,
         StorageIntentEvidenceKind::WorkloadEvidence,
+        StorageIntentEvidenceKind::LifecycleGenerationEvidence,
     ];
 
     fn evidence_id(byte: u8) -> StorageIntentEvidenceId {
@@ -3728,4 +3735,191 @@ mod tests {
             assert!(result.admitted, "max_proximity={max_proximity}");
         }
     }
+
+    #[test]
+    fn lifecycle_generation_evidence_absent_refuses_authority_role() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let request = StorageIntentPlacementRequest::new(
+            policy.clone(),
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+            evidence_cut_without(policy, StorageIntentEvidenceKind::LifecycleGenerationEvidence),
+        );
+
+        let candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+
+        let result = evaluate_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!result.admitted);
+        assert!(result.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::EvidenceFamilyNotFresh {
+                kind: StorageIntentEvidenceKind::LifecycleGenerationEvidence,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn cache_only_role_with_fresh_lifecycle_evidence_admits() {
+        let policy = cache_only_policy();
+        let request = StorageIntentPlacementRequest::new(
+            policy.clone(),
+            StorageIntentPlacementRole::CacheOnlyHotServingTrial,
+            1,
+            1,
+            evidence_cut_filter(policy, |kind| {
+                !matches!(
+                    kind,
+                    StorageIntentEvidenceKind::DataShapeEvidence
+                        | StorageIntentEvidenceKind::LayoutAllocatorEvidence
+                )
+            }),
+        );
+
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::ReadCache,
+            StorageIntentGuaranteeClass::VolatileLocal,
+            FailureDomainMask::EMPTY,
+            StorageMediaClass::SystemRam,
+        );
+        candidate.media_capability = volatile_media();
+        candidate.data_shape = None;
+        candidate.data_shape_state = PlacementEvidenceState::Unknown;
+        candidate.layout_allocator = None;
+        candidate.layout_allocator_state = PlacementEvidenceState::Unknown;
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(plan.admitted, "{plan:?}");
+    }
+
+    #[test]
+    fn candidate_contradictory_trust_domain_state_refuses_hard_gate() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.trust_domain = PlacementEvidenceState::Contradictory;
+
+        let result = evaluate_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!result.admitted);
+        assert!(result.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                gate: CandidateGate::TrustDomain,
+                state: PlacementEvidenceState::Contradictory,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn candidate_refused_capacity_admission_state_blocks_scoring() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.capacity_admission = PlacementEvidenceState::Refused;
+
+        let result = evaluate_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!result.admitted);
+        assert!(result.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                gate: CandidateGate::CapacityAdmission,
+                state: PlacementEvidenceState::Refused,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn lifecycle_generation_candidate_state_starts_unknown() {
+        let candidate = StorageIntentPlacementCandidate::new(
+            1,
+            10,
+            receipt(
+                StorageMediaRole::PlacementAuthority,
+                StorageIntentGuaranteeClass::FullPlacement,
+                FailureDomainMask::NODE,
+                StorageMediaClass::NvmeFlash,
+            ),
+            durable_media(StorageMediaClass::NvmeFlash),
+        );
+
+        assert_eq!(
+            candidate.lifecycle_generation,
+            PlacementEvidenceState::Unknown
+        );
+    }
+
+    #[test]
+    fn lifecycle_generation_candidate_state_fresh_after_hard_gates() {
+        let candidate = StorageIntentPlacementCandidate::new(
+            1,
+            10,
+            receipt(
+                StorageMediaRole::PlacementAuthority,
+                StorageIntentGuaranteeClass::FullPlacement,
+                FailureDomainMask::NODE,
+                StorageMediaClass::NvmeFlash,
+            ),
+            durable_media(StorageMediaClass::NvmeFlash),
+        )
+        .with_fresh_hard_gates();
+
+        assert_eq!(
+            candidate.lifecycle_generation,
+            PlacementEvidenceState::Fresh
+        );
+    }
+
 }
