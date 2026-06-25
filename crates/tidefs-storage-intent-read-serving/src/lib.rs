@@ -302,6 +302,12 @@ impl ReadServingRejectionMask {
     pub const fn intersects(self, other: Self) -> bool {
         (self.0 & other.0) != 0
     }
+
+    /// Returns true when no rejection bit is present.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
 }
 
 /// Compiled read-serving policy envelope consumed by this model.
@@ -784,6 +790,36 @@ const fn read_serving_evidence_cut_missing_required_family(
     {
         return true;
     }
+    if read_serving_requires_policy_rollout(source)
+        && !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::PolicyRolloutEvidence)
+    {
+        return true;
+    }
+    if read_serving_requires_tenant_isolation(source)
+        && !evidence_cut_has_fresh_family(input, StorageIntentEvidenceKind::TenantIsolationEvidence)
+    {
+        return true;
+    }
+    if read_serving_requires_service_objective(source)
+        && !evidence_cut_has_fresh_family(
+            input,
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+        )
+    {
+        return true;
+    }
+    if read_serving_requires_capacity_admission(
+        input.candidate.read_repair_requested,
+        input.policy.allow_read_repair,
+    ) && (!evidence_cut_has_fresh_family(
+        input,
+        StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+    ) || !evidence_cut_has_fresh_family(
+        input,
+        StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+    )) {
+        return true;
+    }
     false
 }
 
@@ -794,6 +830,187 @@ pub const fn read_serving_evidence_cut_has_required_families(
     input: ReadServingDecisionInput,
 ) -> bool {
     !read_serving_evidence_cut_missing_required_family(input)
+}
+
+/// Return candidate-local evidence ref gaps for the policy/source combination.
+///
+/// A #913-compatible cut can only authorize a decision when the candidate also
+/// cites the typed refs for the families it consumes. This predicate does not
+/// execute or infer those producers; it only preserves their authority boundary.
+#[must_use]
+pub const fn read_serving_candidate_missing_required_ref_reasons(
+    input: ReadServingDecisionInput,
+) -> ReadServingRejectionMask {
+    let source = input.candidate.source_class;
+    let refs = input.candidate.evidence_refs;
+    let mut missing = ReadServingRejectionMask::EMPTY;
+
+    if !evidence_ref_has_kind(
+        refs.compiled_policy_ref,
+        StorageIntentEvidenceKind::LocalIntentRecord,
+    ) || !evidence_ref_has_kind(
+        refs.freshness_ref,
+        StorageIntentEvidenceKind::ReadFreshnessEvidence,
+    ) {
+        missing = missing.union(ReadServingRejectionMask::MISSING_EVIDENCE_REF);
+    }
+    if !evidence_ref_has_kind(
+        refs.temporal_ref,
+        StorageIntentEvidenceKind::TemporalEvidence,
+    ) {
+        missing = missing.union(ReadServingRejectionMask::MISSING_TEMPORAL_EVIDENCE);
+    }
+    if (input.policy.required_namespace_generation > 0
+        || matches!(source, StorageIntentReadSourceClass::SnapshotGeneration))
+        && !evidence_ref_has_kind(
+            refs.namespace_generation_ref,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+        )
+    {
+        missing = missing.union(ReadServingRejectionMask::MISSING_EVIDENCE_REF);
+    }
+    if input.policy.required_layout_generation > 0
+        && !evidence_ref_has_kind(
+            refs.layout_allocator_ref,
+            StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+        )
+    {
+        missing = missing.union(ReadServingRejectionMask::MISSING_EVIDENCE_REF);
+    }
+    if read_source_requires_receipt(source)
+        && !evidence_ref_has_kind(
+            refs.placement_receipt_ref,
+            StorageIntentEvidenceKind::PlacementReceipt,
+        )
+    {
+        missing = missing.union(ReadServingRejectionMask::RECEIPT_MISSING);
+    }
+    if read_source_is_cache_or_trial(source) {
+        if !evidence_ref_has_kind(
+            refs.cache_anchor_ref,
+            StorageIntentEvidenceKind::ReadFreshnessEvidence,
+        ) {
+            missing = missing.union(ReadServingRejectionMask::CACHE_ANCHOR_INVALID);
+        }
+        if !evidence_ref_has_kind(
+            refs.cache_fence_ref,
+            StorageIntentEvidenceKind::OrderingEvidence,
+        ) {
+            missing = missing.union(ReadServingRejectionMask::MISSING_ORDERING_EVIDENCE);
+        }
+    }
+    if input.policy.require_digest_verification
+        && !matches!(source, StorageIntentReadSourceClass::DirtyPageCacheVisible)
+        && (!evidence_ref_has_kind(
+            refs.data_shape_ref,
+            StorageIntentEvidenceKind::DataShapeEvidence,
+        ) || !evidence_ref_has_kind(
+            refs.digest_checksum_ref,
+            StorageIntentEvidenceKind::DataShapeEvidence,
+        ))
+    {
+        missing = missing.union(ReadServingRejectionMask::DIGEST_OR_SHAPE_MISMATCH);
+    }
+    if source_uses_volatile_or_pmem_authority(source)
+        && (!evidence_ref_has_kind(
+            refs.ram_authority_ref,
+            StorageIntentEvidenceKind::RamAuthorityEvidence,
+        ) || !evidence_ref_has_kind(
+            refs.membership_epoch_ref,
+            StorageIntentEvidenceKind::MembershipEvidence,
+        ) || !evidence_ref_has_kind(
+            refs.lease_epoch_ref,
+            StorageIntentEvidenceKind::MembershipEvidence,
+        ))
+    {
+        missing = missing.union(ReadServingRejectionMask::MISSING_EVIDENCE_REF);
+    }
+    if matches!(source, StorageIntentReadSourceClass::AuthoritativePmem)
+        && !evidence_ref_has_kind(
+            refs.media_capability_ref,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+        )
+    {
+        missing = missing.union(ReadServingRejectionMask::PMEM_MISSING_MEDIA_CAPABILITY);
+    }
+    if source_uses_remote_path(source)
+        && (!evidence_ref_has_kind(
+            refs.membership_epoch_ref,
+            StorageIntentEvidenceKind::MembershipEvidence,
+        ) || !evidence_ref_has_kind(
+            refs.lease_epoch_ref,
+            StorageIntentEvidenceKind::MembershipEvidence,
+        ) || !evidence_ref_has_kind(
+            refs.transport_path_ref,
+            StorageIntentEvidenceKind::TransportPathEvidence,
+        ) || !evidence_ref_has_kind(
+            refs.trust_domain_ref,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+        ))
+    {
+        missing = missing.union(ReadServingRejectionMask::REMOTE_TRUST_OR_TRANSPORT_MISSING);
+    }
+    if source_uses_degradation_or_recovery(source)
+        && !evidence_ref_has_kind(
+            refs.recovery_degradation_ref,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+        )
+    {
+        missing = missing.union(ReadServingRejectionMask::DIGEST_OR_SHAPE_MISMATCH);
+    }
+    if matches!(source, StorageIntentReadSourceClass::DegradedReconstruction)
+        && (!evidence_ref_has_kind(
+            refs.trust_domain_ref,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+        ) || !evidence_ref_has_kind(
+            refs.redundancy_ref,
+            StorageIntentEvidenceKind::DataShapeEvidence,
+        ))
+    {
+        missing = missing.union(ReadServingRejectionMask::DIGEST_OR_SHAPE_MISMATCH);
+    }
+    if matches!(source, StorageIntentReadSourceClass::CacheOnlyServingTrial)
+        && !evidence_ref_has_kind(
+            refs.prefetch_decision_ref,
+            StorageIntentEvidenceKind::DecisionFrontierEvidence,
+        )
+    {
+        missing = missing.union(ReadServingRejectionMask::CACHE_CANNOT_BE_AUTHORITY);
+    }
+    if read_serving_requires_policy_rollout(source)
+        && !evidence_ref_has_kind(
+            refs.policy_rollout_ref,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+        )
+    {
+        missing = missing.union(ReadServingRejectionMask::MISSING_POLICY_ROLLOUT_EVIDENCE);
+    }
+    if read_serving_requires_tenant_isolation(source)
+        && !evidence_ref_has_kind(
+            refs.tenant_isolation_ref,
+            StorageIntentEvidenceKind::TenantIsolationEvidence,
+        )
+    {
+        missing = missing.union(ReadServingRejectionMask::MISSING_TENANT_ISOLATION_EVIDENCE);
+    }
+    if read_serving_requires_service_objective(source)
+        && !evidence_ref_has_kind(
+            refs.service_objective_ref,
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+        )
+    {
+        missing = missing.union(ReadServingRejectionMask::MISSING_SERVICE_OBJECTIVE_EVIDENCE);
+    }
+
+    missing
+}
+
+/// Returns true when candidate-local refs match the required evidence families.
+#[must_use]
+pub const fn read_serving_candidate_refs_have_required_families(
+    input: ReadServingDecisionInput,
+) -> bool {
+    read_serving_candidate_missing_required_ref_reasons(input).is_empty()
 }
 
 /// Classify an evidence-query snapshot for #877 callers.
@@ -924,7 +1141,11 @@ const fn read_repair_disposition(input: ReadServingDecisionInput) -> ReadRepairD
     }
     if input.policy.repair_requires_reserve
         && (!evidence_ref_has_id(input.candidate.evidence_refs.scheduler_admission_ref)
-            || !evidence_ref_has_id(input.candidate.evidence_refs.repair_budget_ref))
+            || !evidence_ref_has_id(input.candidate.evidence_refs.repair_budget_ref)
+            || !evidence_ref_has_kind(
+                input.candidate.evidence_refs.capacity_admission_ref,
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+            ))
     {
         return ReadRepairDisposition::ReserveRequired;
     }
@@ -1097,20 +1318,18 @@ const fn cache_refusal(
     if matches!(
         input.candidate.source_class,
         StorageIntentReadSourceClass::CacheOnlyServingTrial
-    ) {
-        if !input.policy.allow_serving_trial
-            || !evidence_ref_has_id(input.candidate.evidence_refs.prefetch_decision_ref)
-            || !matches!(
-                input.candidate.prefetch_outcome,
-                PrefetchResidencyDecisionOutcome::CacheOnly
-                    | PrefetchResidencyDecisionOutcome::ServingTrial
-            )
-        {
-            return Some((
-                StorageIntentRefusalReason::CacheCannotBeAuthority,
-                ReadServingRejectionMask::CACHE_CANNOT_BE_AUTHORITY,
-            ));
-        }
+    ) && (!input.policy.allow_serving_trial
+        || !evidence_ref_has_id(input.candidate.evidence_refs.prefetch_decision_ref)
+        || !matches!(
+            input.candidate.prefetch_outcome,
+            PrefetchResidencyDecisionOutcome::CacheOnly
+                | PrefetchResidencyDecisionOutcome::ServingTrial
+        ))
+    {
+        return Some((
+            StorageIntentRefusalReason::CacheCannotBeAuthority,
+            ReadServingRejectionMask::CACHE_CANNOT_BE_AUTHORITY,
+        ));
     }
     None
 }
@@ -1321,12 +1540,26 @@ pub const fn read_serving_decide(input: ReadServingDecisionInput) -> ReadServing
     if let Some((refusal, rejected)) = source_refusal(input) {
         return decision_from_parts(input, ReadServingDecisionState::Refused, refusal, rejected);
     }
+    let missing_candidate_refs = read_serving_candidate_missing_required_ref_reasons(input);
+    if !missing_candidate_refs.is_empty() {
+        return decision_from_parts(
+            input,
+            ReadServingDecisionState::Unavailable,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+            missing_candidate_refs,
+        );
+    }
 
     decision_from_parts(
         input,
         success_state(input),
         StorageIntentRefusalReason::None,
         if matches!(
+            read_repair_disposition(input),
+            ReadRepairDisposition::ReserveRequired
+        ) {
+            ReadServingRejectionMask::MISSING_CAPACITY_ADMISSION_EVIDENCE
+        } else if matches!(
             read_repair_disposition(input),
             ReadRepairDisposition::ReplacementReceiptPending
         ) {
@@ -1627,9 +1860,18 @@ mod tests {
             result_refusal_ref: evidence_ref(StorageIntentEvidenceKind::ResultRefusalEvidence, 23),
             ordering_evidence_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 24),
             policy_rollout_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 25),
-            tenant_isolation_ref: evidence_ref(StorageIntentEvidenceKind::TenantIsolationEvidence, 26),
-            service_objective_ref: evidence_ref(StorageIntentEvidenceKind::ServiceObjectiveEvidence, 27),
-            capacity_admission_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 28),
+            tenant_isolation_ref: evidence_ref(
+                StorageIntentEvidenceKind::TenantIsolationEvidence,
+                26,
+            ),
+            service_objective_ref: evidence_ref(
+                StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                27,
+            ),
+            capacity_admission_ref: evidence_ref(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                28,
+            ),
         }
     }
 
@@ -1682,13 +1924,6 @@ mod tests {
     }
 
     fn snapshot_base() -> StorageIntentEvidenceQuerySnapshot {
-        let mut included_refs = StorageIntentEvidenceRefs::EMPTY;
-        included_refs
-            .push(evidence_ref(
-                StorageIntentEvidenceKind::EvidenceQuerySnapshot,
-                2,
-            ))
-            .unwrap();
         StorageIntentEvidenceQuerySnapshot {
             snapshot_id: StorageIntentEvidenceId([31_u8; 32]),
             query_id: StorageIntentEvidenceId([32_u8; 32]),
@@ -1715,7 +1950,7 @@ mod tests {
             producer_watermark_ms: 1000,
             compaction_generation: 0,
             redaction_generation: 0,
-            included_refs,
+            included_refs: StorageIntentEvidenceRefs::EMPTY,
             family_freshness: Default::default(),
             completeness: EvidenceCompletenessVerdict::CompleteForPurpose,
             retention: EvidenceRetentionClass::ExactRequired,
@@ -1724,7 +1959,7 @@ mod tests {
         }
     }
 
-    const DEFAULT_FRESH_FAMILIES: [StorageIntentEvidenceKind; 17] = [
+    const DEFAULT_FRESH_FAMILIES: [StorageIntentEvidenceKind; 20] = [
         StorageIntentEvidenceKind::LocalIntentRecord,
         StorageIntentEvidenceKind::ReadFreshnessEvidence,
         StorageIntentEvidenceKind::TemporalEvidence,
@@ -1742,6 +1977,9 @@ mod tests {
         StorageIntentEvidenceKind::SchedulerAdmissionRecord,
         StorageIntentEvidenceKind::CapacityAdmissionEvidence,
         StorageIntentEvidenceKind::DecisionFrontierEvidence,
+        StorageIntentEvidenceKind::PolicyRolloutEvidence,
+        StorageIntentEvidenceKind::TenantIsolationEvidence,
+        StorageIntentEvidenceKind::ServiceObjectiveEvidence,
     ];
 
     fn snapshot_with_families(
@@ -2117,6 +2355,129 @@ mod tests {
         assert_eq!(explanation.decision_state, decision.decision_state);
         assert_eq!(explanation.chosen_source, decision.chosen_source);
         assert_eq!(explanation.rejected_reasons, decision.rejected_reasons);
+    }
+
+    #[test]
+    fn local_receipt_requires_tenant_isolation_candidate_ref() {
+        let mut candidate = candidate(StorageIntentReadSourceClass::LocalPlacementReceipt);
+        candidate.evidence_refs.tenant_isolation_ref = EMPTY_EVIDENCE_REF;
+        let input = ReadServingDecisionInput {
+            policy: policy(ReadFreshnessProfile::LatestLocal),
+            candidate,
+            evidence_cut_state: ReadServingEvidenceCutState::Bound,
+            evidence_query_snapshot: snapshot(),
+        };
+
+        assert!(!read_serving_candidate_refs_have_required_families(input));
+        assert!(read_serving_candidate_missing_required_ref_reasons(input)
+            .intersects(ReadServingRejectionMask::MISSING_TENANT_ISOLATION_EVIDENCE));
+        let decision = read_serving_decide(input);
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_TENANT_ISOLATION_EVIDENCE));
+    }
+
+    #[test]
+    fn remote_receipt_requires_policy_rollout_candidate_ref() {
+        let mut candidate = candidate(StorageIntentReadSourceClass::RemotePlacementReceipt);
+        candidate.evidence_refs.policy_rollout_ref = EMPTY_EVIDENCE_REF;
+        let decision = decide(policy(ReadFreshnessProfile::LatestLocal), candidate);
+
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_POLICY_ROLLOUT_EVIDENCE));
+    }
+
+    #[test]
+    fn ram_authority_requires_service_objective_candidate_ref() {
+        let mut candidate = candidate(StorageIntentReadSourceClass::AuthoritativeRam);
+        candidate.evidence_refs.service_objective_ref = EMPTY_EVIDENCE_REF;
+        let decision = decide(policy(ReadFreshnessProfile::LatestLocal), candidate);
+
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert_eq!(
+            decision.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_SERVICE_OBJECTIVE_EVIDENCE));
+    }
+
+    #[test]
+    fn read_repair_requires_capacity_family_in_evidence_cut() {
+        let mut candidate = candidate(StorageIntentReadSourceClass::LocalPlacementReceipt);
+        candidate.read_repair_requested = true;
+        candidate.action_class = StorageIntentActionClass::ReadTriggeredRepair;
+        let families = [
+            StorageIntentEvidenceKind::LocalIntentRecord,
+            StorageIntentEvidenceKind::ReadFreshnessEvidence,
+            StorageIntentEvidenceKind::TemporalEvidence,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+            StorageIntentEvidenceKind::DataShapeEvidence,
+            StorageIntentEvidenceKind::PlacementReceipt,
+            StorageIntentEvidenceKind::OrderingEvidence,
+            StorageIntentEvidenceKind::MembershipEvidence,
+            StorageIntentEvidenceKind::TransportPathEvidence,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            StorageIntentEvidenceKind::RamAuthorityEvidence,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            StorageIntentEvidenceKind::DecisionFrontierEvidence,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            StorageIntentEvidenceKind::TenantIsolationEvidence,
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+        ];
+        let decision = decide_with_snapshot(
+            policy(ReadFreshnessProfile::LatestLocal),
+            candidate,
+            snapshot_with_families(&families),
+        );
+
+        assert_eq!(
+            decision.decision_state,
+            ReadServingDecisionState::Unavailable
+        );
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_FRESH_EVIDENCE_FAMILY));
+    }
+
+    #[test]
+    fn read_repair_without_capacity_ref_is_reserve_required() {
+        let mut candidate = candidate(StorageIntentReadSourceClass::LocalPlacementReceipt);
+        candidate.read_repair_requested = true;
+        candidate.action_class = StorageIntentActionClass::ReadTriggeredRepair;
+        candidate.evidence_refs.capacity_admission_ref = EMPTY_EVIDENCE_REF;
+        let decision = decide(policy(ReadFreshnessProfile::LatestLocal), candidate);
+
+        assert_eq!(decision.decision_state, ReadServingDecisionState::Available);
+        assert_eq!(decision.read_repair, ReadRepairDisposition::ReserveRequired);
+        assert!(!read_repair_may_retire_old_receipt(decision));
+        assert!(decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::MISSING_CAPACITY_ADMISSION_EVIDENCE));
     }
 
     #[test]
