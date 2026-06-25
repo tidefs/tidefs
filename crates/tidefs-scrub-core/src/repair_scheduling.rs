@@ -37,6 +37,9 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use crate::cross_replica_comparison::{
+    ChecksumLayer, ComparisonClassification, CrossReplicaComparisonRecord, ScrubSubjectKind,
+};
 use tidefs_background_scheduler::ServicePriority;
 use tidefs_local_object_store::SuspectEntry;
 use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
@@ -242,6 +245,135 @@ impl RepairCandidateIdentity {
 }
 
 // ---------------------------------------------------------------------------
+// RepairComparisonEvidence — reconciled cross-replica admission evidence
+// ---------------------------------------------------------------------------
+
+/// Compact repair-dispatch projection of a reconciled comparison record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairComparisonEvidence {
+    pub subject: RepairCandidateIdentity,
+    pub object_key: [u8; 32],
+    pub checksum_layer: ChecksumLayer,
+    pub target_count: u16,
+    pub placement_receipt_epoch: u64,
+    pub placement_receipt_generation: u64,
+    pub membership_epoch: u64,
+    pub classification: RepairComparisonClassification,
+    pub clean_source_count: u16,
+    pub corrupt_target_count: u16,
+}
+
+impl RepairComparisonEvidence {
+    #[must_use]
+    pub fn from_record(record: &CrossReplicaComparisonRecord) -> Self {
+        Self {
+            subject: RepairCandidateIdentity::new(
+                record.subject.inode_id,
+                record.subject.data_version,
+                repair_block_kind_from_subject(record.subject.kind),
+            ),
+            object_key: record.object_key,
+            checksum_layer: record.checksum_layer,
+            target_count: record.target_count,
+            placement_receipt_epoch: record.placement_receipt_epoch,
+            placement_receipt_generation: record.placement_receipt_generation,
+            membership_epoch: record.membership_epoch,
+            classification: RepairComparisonClassification::from(&record.classification),
+            clean_source_count: saturating_replica_count(record.clean_source_set.len()),
+            corrupt_target_count: saturating_replica_count(record.corrupt_target_set.len()),
+        }
+    }
+
+    #[must_use]
+    pub const fn has_repair_source_and_target(self) -> bool {
+        self.clean_source_count > 0 && self.corrupt_target_count > 0
+    }
+}
+
+/// Repair-admission view of comparison classifications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairComparisonClassification {
+    CleanAgreement,
+    SingleReplicaCorruption,
+    RemoteReplicaCorruption,
+    IncompleteComparison,
+    CrossReplicaDisagreement,
+    ChecksumAuthorityDisagreement,
+    StaleEvidence,
+    MissingChecksumEvidence,
+    MissingReplicaEvidence,
+}
+
+impl RepairComparisonClassification {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CleanAgreement => "clean-agreement",
+            Self::SingleReplicaCorruption => "single-replica-corruption",
+            Self::RemoteReplicaCorruption => "remote-replica-corruption",
+            Self::IncompleteComparison => "incomplete-comparison",
+            Self::CrossReplicaDisagreement => "cross-replica-disagreement",
+            Self::ChecksumAuthorityDisagreement => "checksum-authority-disagreement",
+            Self::StaleEvidence => "stale-evidence",
+            Self::MissingChecksumEvidence => "missing-checksum-evidence",
+            Self::MissingReplicaEvidence => "missing-replica-evidence",
+        }
+    }
+
+    #[must_use]
+    pub const fn permits_writeback(self) -> bool {
+        matches!(self, Self::SingleReplicaCorruption)
+    }
+}
+
+impl From<&ComparisonClassification> for RepairComparisonClassification {
+    fn from(classification: &ComparisonClassification) -> Self {
+        match classification {
+            ComparisonClassification::CleanAgreement => Self::CleanAgreement,
+            ComparisonClassification::SingleReplicaCorruption { .. } => {
+                Self::SingleReplicaCorruption
+            }
+            ComparisonClassification::RemoteReplicaCorruption { .. } => {
+                Self::RemoteReplicaCorruption
+            }
+            ComparisonClassification::IncompleteComparison { .. } => Self::IncompleteComparison,
+            ComparisonClassification::CrossReplicaDisagreement => Self::CrossReplicaDisagreement,
+            ComparisonClassification::ChecksumAuthorityDisagreement => {
+                Self::ChecksumAuthorityDisagreement
+            }
+            ComparisonClassification::StaleEvidence { .. } => Self::StaleEvidence,
+            ComparisonClassification::MissingChecksumEvidence { .. } => {
+                Self::MissingChecksumEvidence
+            }
+            ComparisonClassification::MissingReplicaEvidence { .. } => Self::MissingReplicaEvidence,
+        }
+    }
+}
+
+fn repair_block_kind_from_subject(kind: ScrubSubjectKind) -> RepairBlockKind {
+    match kind {
+        ScrubSubjectKind::InlineContent => RepairBlockKind::InlineContent,
+        ScrubSubjectKind::ContentManifest => RepairBlockKind::ContentManifest,
+        ScrubSubjectKind::ContentChunk { chunk_index } => {
+            RepairBlockKind::ContentChunk { chunk_index }
+        }
+    }
+}
+
+fn checksum_layer_for_repair_kind(kind: RepairBlockKind) -> ChecksumLayer {
+    match kind {
+        RepairBlockKind::InlineContent | RepairBlockKind::ContentManifest => {
+            ChecksumLayer::InlineContentBody
+        }
+        RepairBlockKind::ContentChunk { .. } => ChecksumLayer::EncodedContentChunk,
+    }
+}
+
+fn saturating_replica_count(len: usize) -> u16 {
+    len.min(u16::MAX as usize) as u16
+}
+
+// ---------------------------------------------------------------------------
 // RepairEvidence — placement authority required before scheduling repair
 // ---------------------------------------------------------------------------
 
@@ -272,6 +404,14 @@ pub enum RepairEvidenceRejection {
     MissingReceipt,
     /// The supplied receipt is synthetic, malformed, or for another object.
     StaleReceipt,
+    /// Multi-replica repair was requested without a comparison record.
+    MissingComparisonRecord,
+    /// The comparison record no longer matches the candidate or receipt.
+    StaleComparisonRecord,
+    /// The reconciled comparison found contradictory replica evidence.
+    CrossReplicaDisagreement,
+    /// The comparison classification does not authorize writeback.
+    UnreconciledComparison,
 }
 
 impl RepairEvidenceRejection {
@@ -281,6 +421,10 @@ impl RepairEvidenceRejection {
             Self::CandidateIdentityMismatch => "candidate-identity-mismatch",
             Self::MissingReceipt => "missing-receipt",
             Self::StaleReceipt => "stale-receipt",
+            Self::MissingComparisonRecord => "missing-comparison-record",
+            Self::StaleComparisonRecord => "stale-comparison-record",
+            Self::CrossReplicaDisagreement => "cross-replica-disagreement",
+            Self::UnreconciledComparison => "unreconciled-comparison",
         }
     }
 }
@@ -301,6 +445,7 @@ pub struct RepairEvidence {
     pub offset: u64,
     pub source_set: RepairSourceSet,
     pub placement_receipt_ref: PlacementReceiptRef,
+    pub comparison_evidence: Option<RepairComparisonEvidence>,
 }
 
 impl RepairEvidence {
@@ -326,8 +471,65 @@ impl RepairEvidence {
                 target_count: receipt.target_count,
             },
             placement_receipt_ref: receipt,
+            comparison_evidence: None,
         })
     }
+
+    /// Build repair evidence from admission input, including comparison proof
+    /// for multi-replica writeback candidates.
+    pub fn from_admission_input(
+        input: &RepairAdmissionInput,
+    ) -> Result<Self, RepairEvidenceRejection> {
+        let receipt = input
+            .placement_receipt_ref
+            .ok_or(RepairEvidenceRejection::MissingReceipt)?;
+        let mut evidence = Self::from_placement_receipt(&input.entry, receipt)?;
+
+        if receipt.target_count > 1 {
+            let comparison = input
+                .cross_replica_comparison
+                .ok_or(RepairEvidenceRejection::MissingComparisonRecord)?;
+            validate_comparison_for_writeback(input, receipt, comparison)?;
+            evidence.comparison_evidence = Some(comparison);
+        }
+
+        Ok(evidence)
+    }
+}
+
+fn validate_comparison_for_writeback(
+    input: &RepairAdmissionInput,
+    receipt: PlacementReceiptRef,
+    comparison: RepairComparisonEvidence,
+) -> Result<(), RepairEvidenceRejection> {
+    if comparison.subject != input.candidate_identity
+        || comparison.object_key != receipt.object_key
+        || comparison.checksum_layer
+            != checksum_layer_for_repair_kind(input.candidate_identity.kind)
+        || comparison.target_count != receipt.target_count
+        || comparison.placement_receipt_epoch != receipt.receipt_epoch.0
+        || comparison.placement_receipt_generation != receipt.receipt_generation
+    {
+        return Err(RepairEvidenceRejection::StaleComparisonRecord);
+    }
+
+    match comparison.classification {
+        RepairComparisonClassification::CrossReplicaDisagreement
+        | RepairComparisonClassification::ChecksumAuthorityDisagreement => {
+            return Err(RepairEvidenceRejection::CrossReplicaDisagreement);
+        }
+        RepairComparisonClassification::StaleEvidence => {
+            return Err(RepairEvidenceRejection::StaleComparisonRecord);
+        }
+        _ => {}
+    }
+
+    if !comparison.classification.permits_writeback() || !comparison.has_repair_source_and_target()
+    {
+        return Err(RepairEvidenceRejection::UnreconciledComparison);
+    }
+
+    Ok(())
 }
 
 /// Scrub finding plus the evidence needed to admit repair scheduling.
@@ -336,6 +538,7 @@ pub struct RepairAdmissionInput {
     pub entry: SuspectEntry,
     pub candidate_identity: RepairCandidateIdentity,
     pub placement_receipt_ref: Option<PlacementReceiptRef>,
+    pub cross_replica_comparison: Option<RepairComparisonEvidence>,
     pub degraded_read_active: bool,
 }
 
@@ -355,6 +558,7 @@ impl RepairAdmissionInput {
             entry,
             candidate_identity,
             placement_receipt_ref: None,
+            cross_replica_comparison: None,
             degraded_read_active: false,
         }
     }
@@ -375,8 +579,15 @@ impl RepairAdmissionInput {
             entry,
             candidate_identity,
             placement_receipt_ref: Some(receipt),
+            cross_replica_comparison: None,
             degraded_read_active: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_cross_replica_comparison(mut self, record: &CrossReplicaComparisonRecord) -> Self {
+        self.cross_replica_comparison = Some(RepairComparisonEvidence::from_record(record));
+        self
     }
 
     #[must_use]
@@ -596,6 +807,14 @@ pub struct BridgeStats {
     pub entries_blocked_missing_receipt: u64,
     /// Entries blocked because the supplied receipt was stale or malformed.
     pub entries_blocked_stale_receipt: u64,
+    /// Entries blocked because no comparison record was supplied.
+    pub entries_blocked_missing_comparison: u64,
+    /// Entries blocked because comparison evidence was stale or mismatched.
+    pub entries_blocked_stale_comparison: u64,
+    /// Entries blocked because replicas disagreed after reconciliation.
+    pub entries_blocked_cross_replica_disagreement: u64,
+    /// Entries blocked because comparison classification forbids writeback.
+    pub entries_blocked_unreconciled_comparison: u64,
     /// Entries rejected at dispatch because current local authority advanced.
     pub entries_blocked_authority_mismatch: u64,
     /// Entries dispatched to repair (mirror or EC).
@@ -621,6 +840,10 @@ impl BridgeStats {
         self.entries_blocked_identity_mismatch
             + self.entries_blocked_missing_receipt
             + self.entries_blocked_stale_receipt
+            + self.entries_blocked_missing_comparison
+            + self.entries_blocked_stale_comparison
+            + self.entries_blocked_cross_replica_disagreement
+            + self.entries_blocked_unreconciled_comparison
     }
 }
 
@@ -714,17 +937,9 @@ impl ScrubToRepairBridge {
                 continue;
             }
 
-            let evidence = match input.placement_receipt_ref {
-                Some(receipt) => match RepairEvidence::from_placement_receipt(&entry, receipt) {
-                    Ok(evidence) => evidence,
-                    Err(reason) => {
-                        self.record_evidence_block(locator_id, reason);
-                        admissions.push(RepairAdmission::Blocked { locator_id, reason });
-                        continue;
-                    }
-                },
-                None => {
-                    let reason = RepairEvidenceRejection::MissingReceipt;
+            let evidence = match RepairEvidence::from_admission_input(input) {
+                Ok(evidence) => evidence,
+                Err(reason) => {
                     self.record_evidence_block(locator_id, reason);
                     admissions.push(RepairAdmission::Blocked { locator_id, reason });
                     continue;
@@ -785,6 +1000,18 @@ impl ScrubToRepairBridge {
             }
             RepairEvidenceRejection::StaleReceipt => {
                 self.stats.entries_blocked_stale_receipt += 1;
+            }
+            RepairEvidenceRejection::MissingComparisonRecord => {
+                self.stats.entries_blocked_missing_comparison += 1;
+            }
+            RepairEvidenceRejection::StaleComparisonRecord => {
+                self.stats.entries_blocked_stale_comparison += 1;
+            }
+            RepairEvidenceRejection::CrossReplicaDisagreement => {
+                self.stats.entries_blocked_cross_replica_disagreement += 1;
+            }
+            RepairEvidenceRejection::UnreconciledComparison => {
+                self.stats.entries_blocked_unreconciled_comparison += 1;
             }
         }
         self.audit_trace.push(RepairAuditEntry {
@@ -1009,6 +1236,14 @@ pub struct RebakeSchedulingBridge {
     entries_blocked_identity_mismatch: u64,
     /// Entries blocked because the supplied receipt was stale or malformed.
     entries_blocked_stale_receipt: u64,
+    /// Entries blocked because no comparison record was supplied.
+    entries_blocked_missing_comparison: u64,
+    /// Entries blocked because comparison evidence was stale or mismatched.
+    entries_blocked_stale_comparison: u64,
+    /// Entries blocked because replicas disagreed after reconciliation.
+    entries_blocked_cross_replica_disagreement: u64,
+    /// Entries blocked because comparison classification forbids writeback.
+    entries_blocked_unreconciled_comparison: u64,
     /// Set of (locator_id, segment_id, offset) tuples already generated.
     /// Prevents duplicate entries when generate_rebake_entries is called
     /// multiple times with the same suspect entries.
@@ -1026,6 +1261,10 @@ impl RebakeSchedulingBridge {
             entries_blocked_missing_receipt: 0,
             entries_blocked_identity_mismatch: 0,
             entries_blocked_stale_receipt: 0,
+            entries_blocked_missing_comparison: 0,
+            entries_blocked_stale_comparison: 0,
+            entries_blocked_cross_replica_disagreement: 0,
+            entries_blocked_unreconciled_comparison: 0,
             generated_entry_ids: std::collections::HashSet::new(),
         }
     }
@@ -1081,16 +1320,10 @@ impl RebakeSchedulingBridge {
                 continue;
             }
 
-            let evidence = match input.placement_receipt_ref {
-                Some(receipt) => match RepairEvidence::from_placement_receipt(suspect, receipt) {
-                    Ok(evidence) => evidence,
-                    Err(reason) => {
-                        self.record_evidence_block(reason);
-                        continue;
-                    }
-                },
-                None => {
-                    self.record_evidence_block(RepairEvidenceRejection::MissingReceipt);
+            let evidence = match RepairEvidence::from_admission_input(input) {
+                Ok(evidence) => evidence,
+                Err(reason) => {
+                    self.record_evidence_block(reason);
                     continue;
                 }
             };
@@ -1128,6 +1361,18 @@ impl RebakeSchedulingBridge {
             RepairEvidenceRejection::StaleReceipt => {
                 self.entries_blocked_stale_receipt += 1;
             }
+            RepairEvidenceRejection::MissingComparisonRecord => {
+                self.entries_blocked_missing_comparison += 1;
+            }
+            RepairEvidenceRejection::StaleComparisonRecord => {
+                self.entries_blocked_stale_comparison += 1;
+            }
+            RepairEvidenceRejection::CrossReplicaDisagreement => {
+                self.entries_blocked_cross_replica_disagreement += 1;
+            }
+            RepairEvidenceRejection::UnreconciledComparison => {
+                self.entries_blocked_unreconciled_comparison += 1;
+            }
         }
     }
 
@@ -1160,6 +1405,26 @@ impl RebakeSchedulingBridge {
     #[must_use]
     pub fn entries_blocked_stale_receipt(&self) -> u64 {
         self.entries_blocked_stale_receipt
+    }
+
+    #[must_use]
+    pub fn entries_blocked_missing_comparison(&self) -> u64 {
+        self.entries_blocked_missing_comparison
+    }
+
+    #[must_use]
+    pub fn entries_blocked_stale_comparison(&self) -> u64 {
+        self.entries_blocked_stale_comparison
+    }
+
+    #[must_use]
+    pub fn entries_blocked_cross_replica_disagreement(&self) -> u64 {
+        self.entries_blocked_cross_replica_disagreement
+    }
+
+    #[must_use]
+    pub fn entries_blocked_unreconciled_comparison(&self) -> u64 {
+        self.entries_blocked_unreconciled_comparison
     }
 
     /// Number of pending entries not yet drained.
@@ -1209,6 +1474,9 @@ fn suspect_to_object_key(entry: &SuspectEntry) -> tidefs_types_reclaim_queue_cor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cross_replica_comparison::{
+        ComparisonClassification, CrossReplicaComparisonRecord, ScrubSubject, ScrubSubjectKind,
+    };
     use tidefs_local_object_store::SuspectEntry;
     use tidefs_replication_model::PlacementReceiptRef;
 
@@ -1259,7 +1527,15 @@ mod tests {
 
     fn input_with_receipt(entry: SuspectEntry) -> RepairAdmissionInput {
         let receipt = receipt_for_entry(&entry);
+        let comparison = comparison_record_for_entry(
+            &entry,
+            ComparisonClassification::SingleReplicaCorruption {
+                corrupt_replica: 1,
+                clean_sources: vec![2],
+            },
+        );
         RepairAdmissionInput::with_receipt(entry, receipt)
+            .with_cross_replica_comparison(&comparison)
     }
 
     fn inputs_with_receipts(entries: &[SuspectEntry]) -> Vec<RepairAdmissionInput> {
@@ -1267,8 +1543,66 @@ mod tests {
     }
 
     fn evidence_for_entry(entry: &SuspectEntry) -> RepairEvidence {
-        RepairEvidence::from_placement_receipt(entry, receipt_for_entry(entry))
-            .expect("test receipt should be admissible")
+        RepairEvidence::from_admission_input(&input_with_receipt(*entry))
+            .expect("test admission should carry repair evidence")
+    }
+
+    fn subject_kind_for_entry(entry: &SuspectEntry) -> ScrubSubjectKind {
+        if entry.offset == 0 {
+            ScrubSubjectKind::InlineContent
+        } else {
+            ScrubSubjectKind::ContentChunk {
+                chunk_index: entry.offset,
+            }
+        }
+    }
+
+    fn checksum_layer_for_entry(entry: &SuspectEntry) -> ChecksumLayer {
+        if entry.offset == 0 {
+            ChecksumLayer::InlineContentBody
+        } else {
+            ChecksumLayer::EncodedContentChunk
+        }
+    }
+
+    fn comparison_sets(classification: &ComparisonClassification) -> (Vec<u64>, Vec<u64>) {
+        match classification {
+            ComparisonClassification::SingleReplicaCorruption {
+                corrupt_replica,
+                clean_sources,
+            }
+            | ComparisonClassification::RemoteReplicaCorruption {
+                corrupt_replica,
+                clean_sources,
+            } => (clean_sources.clone(), vec![*corrupt_replica]),
+            _ => (Vec::new(), Vec::new()),
+        }
+    }
+
+    fn comparison_record_for_entry(
+        entry: &SuspectEntry,
+        classification: ComparisonClassification,
+    ) -> CrossReplicaComparisonRecord {
+        let receipt = receipt_for_entry(entry);
+        let (clean_source_set, corrupt_target_set) = comparison_sets(&classification);
+        CrossReplicaComparisonRecord {
+            subject: ScrubSubject {
+                inode_id: entry.locator_id,
+                data_version: entry.segment_id,
+                kind: subject_kind_for_entry(entry),
+            },
+            object_key: receipt.object_key,
+            checksum_layer: checksum_layer_for_entry(entry),
+            redundancy_policy_id: 1,
+            target_count: receipt.target_count,
+            placement_receipt_epoch: receipt.receipt_epoch.0,
+            placement_receipt_generation: receipt.receipt_generation,
+            membership_epoch: 1,
+            replica_outcomes: Vec::new(),
+            classification,
+            clean_source_set,
+            corrupt_target_set,
+        }
     }
 
     fn make_job(entry: SuspectEntry, replicas_remaining: u32) -> RepairJob {
@@ -1522,6 +1856,55 @@ mod tests {
         assert_eq!(bridge.stats().entries_ingested, 0);
         assert_eq!(bridge.stats().entries_blocked_missing_receipt, 1);
         assert_eq!(bridge.stats().entries_blocked_by_evidence(), 1);
+    }
+
+    #[test]
+    fn bridge_rejects_missing_comparison_evidence() {
+        let mut bridge = ScrubToRepairBridge::new();
+        let entry = make_entry(107, 1);
+        let input = RepairAdmissionInput::with_receipt(entry, receipt_for_entry(&entry));
+
+        let admissions = bridge.ingest_with_evidence(&[input], 3);
+
+        assert_eq!(
+            admissions,
+            vec![RepairAdmission::Blocked {
+                locator_id: 107,
+                reason: RepairEvidenceRejection::MissingComparisonRecord,
+            }]
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.stats().entries_blocked_missing_comparison, 1);
+        assert_eq!(bridge.stats().entries_blocked_by_evidence(), 1);
+    }
+
+    #[test]
+    fn bridge_rejects_wrong_layer_comparison_evidence() {
+        let mut bridge = ScrubToRepairBridge::new();
+        let entry = make_entry(108, 1);
+        let receipt = receipt_for_entry(&entry);
+        let mut comparison = comparison_record_for_entry(
+            &entry,
+            ComparisonClassification::SingleReplicaCorruption {
+                corrupt_replica: 1,
+                clean_sources: vec![2],
+            },
+        );
+        comparison.checksum_layer = ChecksumLayer::EncodedContentChunk;
+        let input = RepairAdmissionInput::with_receipt(entry, receipt)
+            .with_cross_replica_comparison(&comparison);
+
+        let admissions = bridge.ingest_with_evidence(&[input], 3);
+
+        assert_eq!(
+            admissions,
+            vec![RepairAdmission::Blocked {
+                locator_id: 108,
+                reason: RepairEvidenceRejection::StaleComparisonRecord,
+            }]
+        );
+        assert_eq!(bridge.pending_count(), 0);
+        assert_eq!(bridge.stats().entries_blocked_stale_comparison, 1);
     }
 
     #[test]

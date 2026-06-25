@@ -32,6 +32,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cross_replica_comparison::{ComparisonClassification, CrossReplicaComparisonRecord};
 use tidefs_checksum_tree::{DomainKey, DomainTag};
 use tidefs_verification_engine::ObjectVerificationOutcome;
 
@@ -213,6 +214,40 @@ pub trait BlockReconstructor: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// ScrubRepairOutcome — typed writeback admission and repair result
+// ---------------------------------------------------------------------------
+
+/// Result of a scrub repair writeback attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScrubRepairOutcome {
+    /// The local bytes already matched the expected checksum.
+    Clean,
+    /// Repair writeback succeeded.
+    Repaired { bytes_repaired: u64 },
+    /// The candidate did not carry the comparison record required for writeback.
+    MissingComparisonRecord,
+    /// The comparison record carried stale generation or receipt evidence.
+    StaleComparisonRecord,
+    /// Reconciled comparison found contradictory replica evidence.
+    CrossReplicaDisagreement,
+    /// The comparison classification does not authorize writeback.
+    UnreconciledComparison { classification: &'static str },
+    /// Reconstruction failed before a candidate writeback was available.
+    ReconstructionFailed,
+    /// Reconstructed bytes did not match the expected checksum.
+    VerificationFailed,
+    /// Repaired bytes were verified but writeback failed.
+    WritebackFailed,
+}
+
+impl ScrubRepairOutcome {
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        matches!(self, Self::Clean | Self::Repaired { .. })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ScrubRepairEngine — detect-repair-verify pipeline
 // ---------------------------------------------------------------------------
 
@@ -259,21 +294,51 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
     /// data read from storage.
     ///
     /// Returns `true` if the block is clean or was successfully repaired.
-    /// Returns `false` if the block is corrupt and unrepairable.
+    /// Returns `false` if the block is corrupt, lacks comparison evidence,
+    /// or is otherwise not writeback-eligible.
     pub fn repair_one(
         &mut self,
         block_address: u64,
         expected_hash: &[u8; 32],
         actual_data: &[u8],
     ) -> bool {
+        self.repair_one_with_comparison(block_address, expected_hash, actual_data, None)
+            .is_success()
+    }
+
+    /// Run repair for one block using a reconciled comparison record.
+    pub fn repair_one_with_comparison(
+        &mut self,
+        block_address: u64,
+        expected_hash: &[u8; 32],
+        actual_data: &[u8],
+        comparison_record: Option<&CrossReplicaComparisonRecord>,
+    ) -> ScrubRepairOutcome {
         // 1. Compute actual hash and compare.
         let actual_hash: [u8; 32] = blake3::hash(actual_data).into();
 
         if &actual_hash == expected_hash {
             // Block is clean — no repair needed.
-            return true;
+            return ScrubRepairOutcome::Clean;
         }
 
+        let comparison_record = match comparison_record {
+            Some(record) => record,
+            None => return ScrubRepairOutcome::MissingComparisonRecord,
+        };
+        if let Err(outcome) = comparison_permits_writeback(comparison_record) {
+            return outcome;
+        }
+
+        self.repair_corrupt_block(block_address, expected_hash, actual_hash)
+    }
+
+    fn repair_corrupt_block(
+        &mut self,
+        block_address: u64,
+        expected_hash: &[u8; 32],
+        actual_hash: [u8; 32],
+    ) -> ScrubRepairOutcome {
         // 2. Attempt reconstruction.
         let (rebuilt_data, shard_sources) =
             match self.reconstructor.reconstruct(block_address, expected_hash) {
@@ -298,7 +363,7 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
                     // Record the failure reason in the failure_count — the event
                     // is already pushed by record_failure.
                     let _ = reason;
-                    return false;
+                    return ScrubRepairOutcome::ReconstructionFailed;
                 }
             };
 
@@ -322,7 +387,7 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
                 success: false,
                 integrity_outcome: Some(integrity),
             });
-            return false;
+            return ScrubRepairOutcome::VerificationFailed;
         }
 
         // 4. Write back the repaired data.
@@ -340,10 +405,11 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
                 integrity_outcome: Some(integrity),
             });
             let _ = reason;
-            return false;
+            return ScrubRepairOutcome::WritebackFailed;
         }
 
         // 5. Record successful repair.
+        let bytes_repaired = rebuilt_data.len() as u64;
         let integrity = ObjectVerificationOutcome::Match;
         let timestamp = current_timestamp_secs();
         self.ledger.record_repair(ScrubRepairEvent {
@@ -357,7 +423,7 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
             integrity_outcome: Some(integrity),
         });
 
-        true
+        ScrubRepairOutcome::Repaired { bytes_repaired }
     }
 
     /// Run the repair pipeline for multiple blocks.
@@ -370,6 +436,47 @@ impl<R: BlockReconstructor> ScrubRepairEngine<R> {
             .iter()
             .map(|(addr, expected, data)| self.repair_one(*addr, expected, data))
             .collect()
+    }
+}
+
+fn comparison_permits_writeback(
+    record: &CrossReplicaComparisonRecord,
+) -> Result<(), ScrubRepairOutcome> {
+    match &record.classification {
+        ComparisonClassification::SingleReplicaCorruption { .. } => {
+            if record.clean_source_set.is_empty() || record.corrupt_target_set.is_empty() {
+                return Err(ScrubRepairOutcome::UnreconciledComparison {
+                    classification: comparison_classification_label(&record.classification),
+                });
+            }
+            Ok(())
+        }
+        ComparisonClassification::CrossReplicaDisagreement
+        | ComparisonClassification::ChecksumAuthorityDisagreement => {
+            Err(ScrubRepairOutcome::CrossReplicaDisagreement)
+        }
+        ComparisonClassification::StaleEvidence { .. } => {
+            Err(ScrubRepairOutcome::StaleComparisonRecord)
+        }
+        other => Err(ScrubRepairOutcome::UnreconciledComparison {
+            classification: comparison_classification_label(other),
+        }),
+    }
+}
+
+fn comparison_classification_label(classification: &ComparisonClassification) -> &'static str {
+    match classification {
+        ComparisonClassification::CleanAgreement => "clean-agreement",
+        ComparisonClassification::SingleReplicaCorruption { .. } => "single-replica-corruption",
+        ComparisonClassification::RemoteReplicaCorruption { .. } => "remote-replica-corruption",
+        ComparisonClassification::IncompleteComparison { .. } => "incomplete-comparison",
+        ComparisonClassification::CrossReplicaDisagreement => "cross-replica-disagreement",
+        ComparisonClassification::ChecksumAuthorityDisagreement => {
+            "checksum-authority-disagreement"
+        }
+        ComparisonClassification::StaleEvidence { .. } => "stale-evidence",
+        ComparisonClassification::MissingChecksumEvidence { .. } => "missing-checksum-evidence",
+        ComparisonClassification::MissingReplicaEvidence { .. } => "missing-replica-evidence",
     }
 }
 
@@ -392,6 +499,7 @@ fn current_timestamp_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cross_replica_comparison::{ChecksumLayer, ScrubSubject, ScrubSubjectKind};
     use std::sync::Mutex;
 
     // ── MockBlockReconstructor ──────────────────────────────────────
@@ -469,6 +577,30 @@ mod tests {
 
     fn hash_data(data: &[u8]) -> [u8; 32] {
         blake3::hash(data).into()
+    }
+
+    fn repair_comparison_record() -> CrossReplicaComparisonRecord {
+        CrossReplicaComparisonRecord {
+            subject: ScrubSubject {
+                inode_id: 1,
+                data_version: 1,
+                kind: ScrubSubjectKind::InlineContent,
+            },
+            object_key: [0x11; 32],
+            checksum_layer: ChecksumLayer::InlineContentBody,
+            redundancy_policy_id: 1,
+            target_count: 2,
+            placement_receipt_epoch: 1,
+            placement_receipt_generation: 1,
+            membership_epoch: 1,
+            replica_outcomes: Vec::new(),
+            classification: ComparisonClassification::SingleReplicaCorruption {
+                corrupt_replica: 1,
+                clean_sources: vec![2],
+            },
+            clean_source_set: vec![2],
+            corrupt_target_set: vec![1],
+        }
     }
 
     // ── ScrubRepairLedger tests ─────────────────────────────────────
@@ -720,10 +852,12 @@ mod tests {
 
         // The data on disk is corrupted.
         let corrupt_data = make_block_data(0xFE);
+        let comparison = repair_comparison_record();
 
-        let result = engine.repair_one(1, &expected, &corrupt_data);
+        let result =
+            engine.repair_one_with_comparison(1, &expected, &corrupt_data, Some(&comparison));
         assert!(
-            result,
+            result.is_success(),
             "repair should succeed with healthy replica available"
         );
         assert_eq!(engine.ledger().repair_count, 1);
@@ -746,9 +880,10 @@ mod tests {
 
         let data = make_block_data(0xDE);
         let expected: [u8; 32] = [0x11; 32]; // different from anything
+        let comparison = repair_comparison_record();
 
-        let result = engine.repair_one(1, &expected, &data);
-        assert!(!result);
+        let result = engine.repair_one_with_comparison(1, &expected, &data, Some(&comparison));
+        assert_eq!(result, ScrubRepairOutcome::ReconstructionFailed);
         assert_eq!(engine.ledger().repair_count, 0);
         assert_eq!(engine.ledger().repair_failure_count, 1);
     }
@@ -764,9 +899,11 @@ mod tests {
         let expected = hash_data(&make_block_data(0xDD)); // neither actual nor healthy
 
         let mut engine = ScrubRepairEngine::new(recon);
+        let comparison = repair_comparison_record();
 
-        let result = engine.repair_one(1, &expected, &actual_data);
-        assert!(!result, "reconstruction with wrong data should fail");
+        let result =
+            engine.repair_one_with_comparison(1, &expected, &actual_data, Some(&comparison));
+        assert_eq!(result, ScrubRepairOutcome::VerificationFailed);
         assert_eq!(engine.ledger().repair_failure_count, 1);
     }
 
@@ -780,9 +917,11 @@ mod tests {
 
         let mut engine = ScrubRepairEngine::new(recon);
         let corrupt_data = make_block_data(0xAB);
+        let comparison = repair_comparison_record();
 
-        let result = engine.repair_one(1, &expected, &corrupt_data);
-        assert!(!result);
+        let result =
+            engine.repair_one_with_comparison(1, &expected, &corrupt_data, Some(&comparison));
+        assert_eq!(result, ScrubRepairOutcome::WritebackFailed);
         assert_eq!(engine.ledger().repair_failure_count, 1);
         assert_eq!(engine.ledger().repair_count, 0);
     }
@@ -800,15 +939,15 @@ mod tests {
         let mut engine = ScrubRepairEngine::new(recon);
 
         let blocks = vec![
-            (1, expected_a, make_block_data(0xFE)), // corrupt → repairable
+            (1, expected_a, make_block_data(0xFE)), // corrupt → missing comparison
             (2, expected_b, healthy_b.clone()),     // clean
-            (3, [0x99; 32], make_block_data(0xAB)), // corrupt → no replica
+            (3, [0x99; 32], make_block_data(0xAB)), // corrupt → missing comparison
         ];
 
         let results = engine.repair_batch(&blocks);
-        assert_eq!(results, vec![true, true, false]);
-        assert_eq!(engine.ledger().repair_count, 1); // block 1 repaired
-        assert_eq!(engine.ledger().repair_failure_count, 1); // block 3 failed
+        assert_eq!(results, vec![false, true, false]);
+        assert_eq!(engine.ledger().repair_count, 0);
+        assert_eq!(engine.ledger().repair_failure_count, 0);
     }
 
     #[test]
@@ -822,9 +961,20 @@ mod tests {
 
         let mut engine1 = ScrubRepairEngine::new(recon1);
         let mut engine2 = ScrubRepairEngine::new(recon2);
+        let comparison = repair_comparison_record();
 
-        engine1.repair_one(10, &expected, &make_block_data(0xAD));
-        engine2.repair_one(10, &expected, &make_block_data(0xAD));
+        engine1.repair_one_with_comparison(
+            10,
+            &expected,
+            &make_block_data(0xAD),
+            Some(&comparison),
+        );
+        engine2.repair_one_with_comparison(
+            10,
+            &expected,
+            &make_block_data(0xAD),
+            Some(&comparison),
+        );
 
         assert_eq!(
             engine1.ledger().validation_digest(),
@@ -840,7 +990,8 @@ mod tests {
         recon.set_healthy_block(1, healthy);
 
         let mut engine = ScrubRepairEngine::new(recon);
-        engine.repair_one(1, &expected, &make_block_data(0x99));
+        let comparison = repair_comparison_record();
+        engine.repair_one_with_comparison(1, &expected, &make_block_data(0x99), Some(&comparison));
 
         let ledger = engine.ledger_mut();
         assert_eq!(ledger.repair_count, 1);
