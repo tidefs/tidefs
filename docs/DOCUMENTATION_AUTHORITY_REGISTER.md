@@ -95,7 +95,6 @@ historical-input examples, including
 `docs/design/production-erasure-coding-crush-placement-g4-pillar.md`, remain
 historical input under their existing rows. Unclassified status/matrix
 leftovers in
-`docs/design/1813-pool-import-export-device-topology-management-design.md`,
 `docs/design/1971-pool-import-export-7-phase-implementation-plan.md`,
 `docs/design/coordination-pipeline-cluster-services-design-seal.md`,
 `docs/design/coordination-pipeline-status-update-1767.md`,
@@ -609,3 +608,24 @@ documents.
 | `docs/UNRELEASED_AUTHORITY_POLICY.md` | Current policy | Binding guardrail that forbids adding or preserving legacy, backward-compatibility, migration, downgrade, or fallback behavior for unreleased TideFS data by default. Requires released external boundaries (Linux, POSIX, kernel, third-party), shipped wire/format/operator surfaces, or a temporary bridge explicitly tracked by a GitHub issue before compatibility work is permitted. Names pre-release code paths explicitly (current authority, retired pre-release path, historical input, receiptless path) instead of using "legacy." Includes a review checklist for compatibility additions. Classified as current policy consistent with its own "current policy guardrail" maturity label and live enforcement through PR review conventions. |
 | `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` | Current spec | Source-of-truth for the production-depth performance-budget, SLO, and regression-gate law. Defines the typed gate language (`family.performance_budget.performance_budget_0`) replacing benchmark folklore with first-class workload envelopes, environment profiles, KPI families, numeric budget thresholds, regression locks, and gate receipts. Section 12 documents live-source implementation evidence in `crates/tidefs-validation/src/performance_gate/`. The `GateReceipt.release_ready` field (section 12.12.5) is a **performance-gate-local** receipt requiring subject completeness, zero artifact gap, and zero budget gap; it is not a whole-product release-readiness verdict. Many categories (workload-envelope classes, environment profiles, noise policies, baseline policy families) remain at 0 implemented; the document records these gaps explicitly. The verdict contract (#1279) identifies P10-03 as a required evidence-family input and maps #1283 for the `release_ready` field rename and scope-qualified rendering. |
 | `docs/GITHUB_CI.md` | Current policy | Documents the live GitHub Actions CI surface: secret boundary (GitHub is not a TideFS secret store), self-hosted runner contract, workflow shape (`Rust Fast`, `Clippy`, `Focused Rust`, `Focused Claim Validation`, `Secret Policy`, `QEMU Smoke`, `xfstests`, `RDMA`, `Release Candidate`), path-filtered PR validation, draft-PR CI skip rules, and `TIDEFS_SELF_HOSTED_READY` gating. Live-source inspection of the named workflow YAML files confirms the documented attributes match current behavior. The Release Candidate workflow is a manual-only self-hosted composition that uploads a `release-candidate-evidence-index` artifact without making a product-readiness claim. This document is a binding CI reference that complements the workflow YAML; it is not a product admission or release-readiness verdict. |
+
+### Pool Import/Export Device Topology Design (TFR-019 / #1137)
+
+Classified for TFR-019 / GitHub issue #1137 on 2026-06-26 after reviewing this
+register's authority rule and review method, the TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, the imported 1813 pool import/export design
+document, the already-classified
+`docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` register row, live source in
+`crates/tidefs-types-pool-label-core/`,
+`crates/tidefs-local-object-store/src/pool_importer.rs`,
+`crates/tidefs-local-object-store/src/pool_exporter.rs`,
+`crates/tidefs-local-object-store/src/device_manager.rs`, and
+`crates/tidefs-local-object-store/src/device_health.rs`,
+`validation/claims.toml` (no pool import/export claims), closed #931/#934
+incumbent-comparison audit evidence, and the #952 leftover list in this
+register. This slice does not edit product source, Cargo manifests,
+CI workflows, validation artifacts, or `validation/claims.toml`.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/1813-pool-import-export-device-topology-management-design.md` | Historical input | Imported Forgejo-era #1813 design iteration for pool import/export and online device topology management. It preserves the PoolLabelV1 data structure design, import/export protocol algorithms, device failure state machine, and 7-phase implementation plan as historical design lineage. Its "design-sealed" and "frozen" language, Forgejo issue references, and phase-status claims (Phases 2–5 and 7 marked "deferred to wire-up") are stale: live source in `tidefs-local-object-store/src/pool_importer.rs`, `pool_exporter.rs`, and `device_manager.rs` implements pool import/export and device topology management referencing `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` as its design authority. The PoolLabelV1 on-device label format is implemented in `tidefs-types-pool-label-core/lib.rs`. The ZFS/Ceph prior-art comparison table in §10 is incumbent-comparison context preserved as historical design input under the #931/#934 cluster boundary; it is not a current capability, availability, durability, or product claim. No `validation/claims.toml` entries exist for pool import/export, device topology, hot-spare, evacuation, or cluster-aware pool ownership. The file is not current policy, current spec, implementation status, or product authority. |
