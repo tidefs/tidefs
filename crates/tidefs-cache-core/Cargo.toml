@@ -18,6 +18,8 @@ adapter-workers-io = ["dep:tidefs-posix-filesystem-adapter-workers-io"]
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
+tidefs-background-scheduler = { workspace = true }
+tidefs-incremental-job-core = { workspace = true }
 tidefs-types-cache-lattice-core = { workspace = true }
 tidefs-cache-coherency = { workspace = true }
 tidefs-posix-filesystem-adapter-workers-io = { workspace = true, optional = true }
@@ -25,6 +27,7 @@ tidefs-posix-filesystem-adapter-workers-io = { workspace = true, optional = true
 [dev-dependencies]
 tidefs-types-cache-lattice-core = { workspace = true }
 tidefs-cache-coherency = { workspace = true }
+tidefs-types-incremental-job-core = { workspace = true }
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
 
 [lib]

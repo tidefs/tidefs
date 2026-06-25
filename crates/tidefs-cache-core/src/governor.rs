@@ -12,6 +12,10 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use tidefs_background_scheduler::{
+    BackgroundService, ServiceBudget, ServiceError, ServicePriority, TickReport,
+};
+use tidefs_incremental_job_core::IncrementalJob;
 use tidefs_types_cache_lattice_core::{CacheClass, CacheEntryHeader};
 
 // ── Budget categories ────────────────────────────────────────────────────
@@ -156,6 +160,149 @@ impl fmt::Display for BackpressureSignal {
             Self::HardPressure => write!(f, "hard"),
         }
     }
+}
+
+// ── Reclaim ladder state ─────────────────────────────────────────────────
+
+/// Governor reclaim ladder stage selected for a pressure snapshot.
+///
+/// Stages 1 through 4 can become bounded background work. Stage 5 is an
+/// admission/backpressure signal only; it is intentionally not converted into
+/// a background service tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReclaimStage {
+    /// Stage 1: evict cold read/prefetch/cache entries.
+    EvictColdCache,
+    /// Stage 2: shrink metadata-facing cache state after soft pressure persists.
+    ShrinkMetadataCaches,
+    /// Stage 3: flush dirty/writeback bytes through an existing flush surface.
+    FlushDirtyData,
+    /// Stage 4: request the existing commit/sync boundary for hard dirty pressure.
+    ForceCommitGroupSync,
+    /// Stage 5: terminal admission/backpressure signal, not background work.
+    AdmissionBackpressure,
+}
+
+impl ReclaimStage {
+    /// Numeric stage in the design ladder.
+    #[must_use]
+    pub const fn number(self) -> u8 {
+        match self {
+            Self::EvictColdCache => 1,
+            Self::ShrinkMetadataCaches => 2,
+            Self::FlushDirtyData => 3,
+            Self::ForceCommitGroupSync => 4,
+            Self::AdmissionBackpressure => 5,
+        }
+    }
+
+    /// Returns `true` if this stage can be claimed by a background service.
+    #[must_use]
+    pub const fn is_background_work(self) -> bool {
+        !matches!(self, Self::AdmissionBackpressure)
+    }
+}
+
+impl fmt::Display for ReclaimStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EvictColdCache => write!(f, "stage1_evict_cold_cache"),
+            Self::ShrinkMetadataCaches => write!(f, "stage2_shrink_metadata_caches"),
+            Self::FlushDirtyData => write!(f, "stage3_flush_dirty_data"),
+            Self::ForceCommitGroupSync => write!(f, "stage4_force_commit_group_sync"),
+            Self::AdmissionBackpressure => write!(f, "stage5_admission_backpressure"),
+        }
+    }
+}
+
+/// Class of scheduler service that may claim a reclaim request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReclaimWorkKind {
+    /// Stage 1/2 cache maintenance at latency-sensitive priority.
+    CacheMaintenance,
+    /// Stage 3 dirty-byte flush at throughput priority.
+    DirtyFlush,
+    /// Stage 4 existing commit/sync boundary request at critical priority.
+    CommitBoundary,
+}
+
+/// Read-only pressure state for one governor category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GovernorPressureState {
+    /// Budget category whose pressure was sampled.
+    pub category: BudgetCategory,
+    /// Current backpressure signal for the category.
+    pub signal: BackpressureSignal,
+    /// Current category usage in bytes.
+    pub used: u64,
+    /// Category cap in bytes.
+    pub cap: u64,
+    /// Soft watermark in bytes.
+    pub soft_watermark: u64,
+    /// Number of completed pressure claims while this pressure instance persists.
+    pub pressure_ticks: u64,
+    /// Current reclaim ladder stage, if any.
+    pub stage: Option<ReclaimStage>,
+    /// Whether a background reclaim request is already claimed for this pressure.
+    pub reclaim_inflight: bool,
+}
+
+/// Bounded reclaim work claimed from a governor pressure snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReclaimRequest {
+    /// Budget category requiring reclaim or sync-boundary attention.
+    pub category: BudgetCategory,
+    /// Ladder stage to execute.
+    pub stage: ReclaimStage,
+    /// Pressure signal observed when the work was claimed.
+    pub signal: BackpressureSignal,
+    /// Usage observed when the work was claimed.
+    pub used: u64,
+    /// Category cap observed when the work was claimed.
+    pub cap: u64,
+    /// Soft watermark observed when the work was claimed.
+    pub soft_watermark: u64,
+    /// Target bytes to reclaim or flush for this bounded tick.
+    pub target_bytes: u64,
+    /// Pressure ticks already claimed for this pressure instance.
+    pub pressure_ticks: u64,
+    /// Generation token invalidated when pressure clears or a newer claim supersedes it.
+    pub generation: u64,
+}
+
+impl ReclaimRequest {
+    /// Return the service class that may execute this request, if any.
+    #[must_use]
+    pub const fn work_kind(self) -> Option<ReclaimWorkKind> {
+        match self.stage {
+            ReclaimStage::EvictColdCache | ReclaimStage::ShrinkMetadataCaches => {
+                Some(ReclaimWorkKind::CacheMaintenance)
+            }
+            ReclaimStage::FlushDirtyData => Some(ReclaimWorkKind::DirtyFlush),
+            ReclaimStage::ForceCommitGroupSync => Some(ReclaimWorkKind::CommitBoundary),
+            ReclaimStage::AdmissionBackpressure => None,
+        }
+    }
+}
+
+/// Result of one bounded reclaim worker invocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReclaimOutcome {
+    /// Items processed by the worker.
+    pub items_processed: u64,
+    /// Bytes scanned, flushed, or otherwise consumed by the worker.
+    pub bytes_processed: u64,
+    /// Bytes that should be released from the request category in the governor.
+    pub bytes_released: u64,
+}
+
+impl ReclaimOutcome {
+    /// Zero-work outcome.
+    pub const ZERO: Self = Self {
+        items_processed: 0,
+        bytes_processed: 0,
+        bytes_released: 0,
+    };
 }
 
 // ── Budget error ─────────────────────────────────────────────────────────
@@ -423,6 +570,12 @@ struct CategoryState {
     soft_pressure: bool,
     /// Whether the hard-pressure signal is currently raised.
     hard_pressure: bool,
+    /// Number of bounded reclaim claims made while this pressure instance persists.
+    pressure_ticks: u64,
+    /// Currently claimed reclaim work, if any.
+    reclaim_inflight: Option<InflightReclaim>,
+    /// Generation token bumped when pressure starts, clears, or a claim is made.
+    reclaim_generation: u64,
 }
 
 impl CategoryState {
@@ -431,8 +584,17 @@ impl CategoryState {
             used: 0,
             soft_pressure: false,
             hard_pressure: false,
+            pressure_ticks: 0,
+            reclaim_inflight: None,
+            reclaim_generation: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InflightReclaim {
+    stage: ReclaimStage,
+    generation: u64,
 }
 
 // ── Governor configuration ───────────────────────────────────────────────
@@ -586,8 +748,6 @@ impl Governor {
 
         let idx = Self::category_index(category);
         let hard_limit = inner.category_configs[idx].hard_limit;
-        let soft_watermark = inner.category_configs[idx].soft_watermark;
-        let cap = inner.category_configs[idx].cap;
         let used = inner.categories[idx].used;
         let total_budget = inner.config.total_budget_bytes;
 
@@ -614,11 +774,7 @@ impl Governor {
         inner.total_used = new_total;
         inner.categories[idx].used = new_used;
 
-        // Recompute pressure signals.
-        let (soft_pressure, hard_pressure) =
-            Self::pressure_flags(new_used, cap, soft_watermark);
-        inner.categories[idx].hard_pressure = hard_pressure;
-        inner.categories[idx].soft_pressure = soft_pressure;
+        Self::refresh_pressure_locked(&mut inner, idx);
 
         Ok(AdmissionTicket { category, size })
     }
@@ -806,6 +962,117 @@ impl Governor {
         self.inner.lock().unwrap().config.total_budget_bytes
     }
 
+    /// Return a read-only pressure snapshot for every budget category.
+    ///
+    /// This records which category and reclaim stage need attention without
+    /// executing reclaim while the governor lock is held.
+    #[must_use]
+    pub fn pressure_state(&self) -> Vec<GovernorPressureState> {
+        let inner = self.inner.lock().unwrap();
+        Self::CATEGORIES
+            .iter()
+            .enumerate()
+            .map(|(idx, &category)| Self::pressure_state_for_locked(&inner, idx, category))
+            .collect()
+    }
+
+    /// Return pending admission/backpressure signals for stage 5.
+    ///
+    /// Stage 5 remains an admission signal for FUSE/transport follow-up
+    /// consumers and is not returned by [`claim_reclaim_work`](Self::claim_reclaim_work).
+    #[must_use]
+    pub fn admission_backpressure_requests(&self) -> Vec<GovernorPressureState> {
+        self.pressure_state()
+            .into_iter()
+            .filter(|state| state.stage == Some(ReclaimStage::AdmissionBackpressure))
+            .collect()
+    }
+
+    /// Return `true` when the requested scheduler service can claim work.
+    #[must_use]
+    pub fn has_reclaim_work(&self, kind: ReclaimWorkKind) -> bool {
+        let inner = self.inner.lock().unwrap();
+        Self::CATEGORIES.iter().enumerate().any(|(idx, &category)| {
+            let state = Self::pressure_state_for_locked(&inner, idx, category);
+            state.stage.and_then(Self::work_kind_for_stage) == Some(kind) && !state.reclaim_inflight
+        })
+    }
+
+    /// Claim one bounded reclaim request for the requested scheduler service.
+    ///
+    /// The returned request is a small data record.  Callers execute reclaim
+    /// outside the governor lock, then call
+    /// [`finish_reclaim_work`](Self::finish_reclaim_work).
+    pub fn claim_reclaim_work(&self, kind: ReclaimWorkKind) -> Option<ReclaimRequest> {
+        let mut inner = self.inner.lock().unwrap();
+        for (idx, &category) in Self::CATEGORIES.iter().enumerate() {
+            let signal = Self::backpressure_signal_locked(&inner.categories[idx]);
+            let Some(stage) =
+                Self::stage_for_pressure(category, signal, inner.categories[idx].pressure_ticks)
+            else {
+                continue;
+            };
+            if Self::work_kind_for_stage(stage) != Some(kind) {
+                continue;
+            }
+            if inner.categories[idx].reclaim_inflight.is_some() {
+                continue;
+            }
+
+            inner.categories[idx].pressure_ticks =
+                inner.categories[idx].pressure_ticks.saturating_add(1);
+            inner.categories[idx].reclaim_generation =
+                inner.categories[idx].reclaim_generation.saturating_add(1);
+            let generation = inner.categories[idx].reclaim_generation;
+            inner.categories[idx].reclaim_inflight = Some(InflightReclaim { stage, generation });
+
+            let cfg = &inner.category_configs[idx];
+            let used = inner.categories[idx].used;
+            return Some(ReclaimRequest {
+                category,
+                stage,
+                signal,
+                used,
+                cap: cfg.cap,
+                soft_watermark: cfg.soft_watermark,
+                target_bytes: Self::target_bytes_for_stage(stage, used, cfg.soft_watermark),
+                pressure_ticks: inner.categories[idx].pressure_ticks,
+                generation,
+            });
+        }
+        None
+    }
+
+    /// Return `true` if a previously claimed request still matches live pressure.
+    #[must_use]
+    pub fn reclaim_request_active(&self, request: ReclaimRequest) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let idx = Self::category_index(request.category);
+        let state = &inner.categories[idx];
+        matches!(
+            state.reclaim_inflight,
+            Some(inflight)
+                if inflight.stage == request.stage
+                    && inflight.generation == request.generation
+                    && Self::backpressure_signal_locked(state) != BackpressureSignal::None
+        )
+    }
+
+    /// Mark a claimed reclaim request as finished.
+    pub fn finish_reclaim_work(&self, request: ReclaimRequest) {
+        let mut inner = self.inner.lock().unwrap();
+        let idx = Self::category_index(request.category);
+        if matches!(
+            inner.categories[idx].reclaim_inflight,
+            Some(inflight)
+                if inflight.stage == request.stage
+                    && inflight.generation == request.generation
+        ) {
+            inner.categories[idx].reclaim_inflight = None;
+        }
+        Self::refresh_pressure_locked(&mut inner, idx);
+    }
+
     // ── internal helpers ──────────────────────────────────────────────
 
     fn category_index(category: BudgetCategory) -> usize {
@@ -891,6 +1158,90 @@ impl Governor {
         tuned.clamp(min, max)
     }
 
+    fn backpressure_signal_locked(state: &CategoryState) -> BackpressureSignal {
+        if state.hard_pressure {
+            BackpressureSignal::HardPressure
+        } else if state.soft_pressure {
+            BackpressureSignal::SoftPressure
+        } else {
+            BackpressureSignal::None
+        }
+    }
+
+    fn pressure_state_for_locked(
+        inner: &GovernorInner,
+        idx: usize,
+        category: BudgetCategory,
+    ) -> GovernorPressureState {
+        let state = &inner.categories[idx];
+        let cfg = &inner.category_configs[idx];
+        let signal = Self::backpressure_signal_locked(state);
+        GovernorPressureState {
+            category,
+            signal,
+            used: state.used,
+            cap: cfg.cap,
+            soft_watermark: cfg.soft_watermark,
+            pressure_ticks: state.pressure_ticks,
+            stage: Self::stage_for_pressure(category, signal, state.pressure_ticks),
+            reclaim_inflight: state.reclaim_inflight.is_some(),
+        }
+    }
+
+    fn stage_for_pressure(
+        category: BudgetCategory,
+        signal: BackpressureSignal,
+        pressure_ticks: u64,
+    ) -> Option<ReclaimStage> {
+        match signal {
+            BackpressureSignal::None => None,
+            BackpressureSignal::HardPressure => {
+                if category == BudgetCategory::DirtyBytes {
+                    Some(ReclaimStage::ForceCommitGroupSync)
+                } else {
+                    Some(ReclaimStage::AdmissionBackpressure)
+                }
+            }
+            BackpressureSignal::SoftPressure => match category {
+                BudgetCategory::DataCache | BudgetCategory::InodeState => {
+                    Some(ReclaimStage::EvictColdCache)
+                }
+                BudgetCategory::MetaCache => {
+                    if pressure_ticks == 0 {
+                        Some(ReclaimStage::EvictColdCache)
+                    } else {
+                        Some(ReclaimStage::ShrinkMetadataCaches)
+                    }
+                }
+                BudgetCategory::DirtyBytes => Some(ReclaimStage::FlushDirtyData),
+                BudgetCategory::ClusterQueues | BudgetCategory::Misc => {
+                    Some(ReclaimStage::AdmissionBackpressure)
+                }
+            },
+        }
+    }
+
+    const fn work_kind_for_stage(stage: ReclaimStage) -> Option<ReclaimWorkKind> {
+        match stage {
+            ReclaimStage::EvictColdCache | ReclaimStage::ShrinkMetadataCaches => {
+                Some(ReclaimWorkKind::CacheMaintenance)
+            }
+            ReclaimStage::FlushDirtyData => Some(ReclaimWorkKind::DirtyFlush),
+            ReclaimStage::ForceCommitGroupSync => Some(ReclaimWorkKind::CommitBoundary),
+            ReclaimStage::AdmissionBackpressure => None,
+        }
+    }
+
+    fn target_bytes_for_stage(stage: ReclaimStage, used: u64, soft_watermark: u64) -> u64 {
+        match stage {
+            ReclaimStage::ForceCommitGroupSync => used,
+            ReclaimStage::AdmissionBackpressure => 0,
+            ReclaimStage::EvictColdCache
+            | ReclaimStage::ShrinkMetadataCaches
+            | ReclaimStage::FlushDirtyData => used.saturating_sub(soft_watermark),
+        }
+    }
+
     fn pressure_flags(used: u64, cap: u64, soft_watermark: u64) -> (bool, bool) {
         if used == 0 || cap == 0 {
             return (false, false);
@@ -901,14 +1252,367 @@ impl Governor {
     }
 
     fn refresh_pressure_locked(inner: &mut GovernorInner, idx: usize) {
+        let was_under_pressure =
+            inner.categories[idx].soft_pressure || inner.categories[idx].hard_pressure;
         let used = inner.categories[idx].used;
         let cap = inner.category_configs[idx].cap;
         let soft_watermark = inner.category_configs[idx].soft_watermark;
-        let (soft_pressure, hard_pressure) =
-            Self::pressure_flags(used, cap, soft_watermark);
+        let (soft_pressure, hard_pressure) = Self::pressure_flags(used, cap, soft_watermark);
         inner.categories[idx].hard_pressure = hard_pressure;
         inner.categories[idx].soft_pressure = soft_pressure;
+        let is_under_pressure = soft_pressure || hard_pressure;
+        if !is_under_pressure {
+            inner.categories[idx].pressure_ticks = 0;
+            inner.categories[idx].reclaim_inflight = None;
+            inner.categories[idx].reclaim_generation =
+                inner.categories[idx].reclaim_generation.saturating_add(1);
+        } else if !was_under_pressure {
+            inner.categories[idx].pressure_ticks = 0;
+            inner.categories[idx].reclaim_inflight = None;
+            inner.categories[idx].reclaim_generation =
+                inner.categories[idx].reclaim_generation.saturating_add(1);
+        }
     }
+}
+
+// ── Scheduler reclaim services ────────────────────────────────────────────
+
+/// Worker used by [`GovernorCacheReclaimService`] to execute stage 1/2 work.
+pub trait CacheReclaimWorker: Send {
+    /// Execute one bounded cache-maintenance reclaim tick.
+    fn reclaim_cache(
+        &mut self,
+        request: ReclaimRequest,
+        budget: ServiceBudget,
+    ) -> Result<ReclaimOutcome, ServiceError>;
+}
+
+/// Worker used by [`GovernorDirtyFlushService`] to execute stage 3 work.
+pub trait DirtyReclaimWorker: Send {
+    /// Execute one bounded dirty-byte flush tick.
+    fn flush_dirty(
+        &mut self,
+        request: ReclaimRequest,
+        budget: ServiceBudget,
+    ) -> Result<ReclaimOutcome, ServiceError>;
+}
+
+/// Worker used by [`GovernorCommitBoundaryService`] to execute stage 4 work.
+pub trait CommitBoundaryWorker: Send {
+    /// Record or invoke the existing commit/sync boundary for hard dirty pressure.
+    fn force_commit_boundary(
+        &mut self,
+        request: ReclaimRequest,
+        budget: ServiceBudget,
+    ) -> Result<ReclaimOutcome, ServiceError>;
+}
+
+/// Wrap an existing [`IncrementalJob`] as a dirty-byte reclaim worker.
+///
+/// This is the generic bridge for cleaner/writeback jobs that already honor
+/// the shared `WorkBudget` contract.  It does not introduce a second dirty
+/// data authority; the wrapped job remains responsible for the actual flush or
+/// cleaner action.
+pub struct GovernorIncrementalReclaimWorker<J: IncrementalJob> {
+    job: J,
+    last_items_processed: u64,
+    last_bytes_processed: u64,
+    complete: bool,
+}
+
+impl<J: IncrementalJob> GovernorIncrementalReclaimWorker<J> {
+    /// Create a dirty reclaim worker from an existing incremental job.
+    #[must_use]
+    pub fn new(job: J) -> Self {
+        Self {
+            job,
+            last_items_processed: 0,
+            last_bytes_processed: 0,
+            complete: false,
+        }
+    }
+
+    /// Borrow the wrapped job.
+    #[must_use]
+    pub fn inner(&self) -> &J {
+        &self.job
+    }
+
+    /// Borrow the wrapped job mutably.
+    #[must_use]
+    pub fn inner_mut(&mut self) -> &mut J {
+        &mut self.job
+    }
+}
+
+impl<J: IncrementalJob> DirtyReclaimWorker for GovernorIncrementalReclaimWorker<J> {
+    fn flush_dirty(
+        &mut self,
+        _request: ReclaimRequest,
+        budget: ServiceBudget,
+    ) -> Result<ReclaimOutcome, ServiceError> {
+        if self.complete {
+            return Ok(ReclaimOutcome::ZERO);
+        }
+        let step =
+            self.job
+                .step(budget.to_work_budget())
+                .map_err(|error| ServiceError::JobError {
+                    service: GovernorDirtyFlushService::<Self>::NAME,
+                    error,
+                })?;
+        let items = step
+            .checkpoint
+            .progress
+            .items_processed
+            .saturating_sub(self.last_items_processed);
+        let bytes = step
+            .checkpoint
+            .progress
+            .bytes_processed
+            .saturating_sub(self.last_bytes_processed);
+        self.last_items_processed = step.checkpoint.progress.items_processed;
+        self.last_bytes_processed = step.checkpoint.progress.bytes_processed;
+        self.complete = step.is_complete;
+        Ok(ReclaimOutcome {
+            items_processed: items,
+            bytes_processed: bytes,
+            bytes_released: bytes,
+        })
+    }
+}
+
+/// Scheduler service for stage 1/2 cache maintenance.
+pub struct GovernorCacheReclaimService<W: CacheReclaimWorker> {
+    governor: Governor,
+    worker: W,
+}
+
+impl<W: CacheReclaimWorker> GovernorCacheReclaimService<W> {
+    /// Stable service name used in scheduler reports.
+    pub const NAME: &'static str = "governor-cache-reclaim";
+    /// Hard per-tick budget for latency-sensitive cache reclaim.
+    pub const TICK_BUDGET: ServiceBudget = ServiceBudget {
+        max_items: 64,
+        max_bytes: 4 * 1024 * 1024,
+        max_ms: 10,
+    };
+
+    /// Create a cache reclaim service.
+    #[must_use]
+    pub fn new(governor: Governor, worker: W) -> Self {
+        Self { governor, worker }
+    }
+}
+
+impl<W: CacheReclaimWorker> BackgroundService for GovernorCacheReclaimService<W> {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn priority(&self) -> ServicePriority {
+        ServicePriority::LatencySensitive
+    }
+
+    fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        let Some(request) = self
+            .governor
+            .claim_reclaim_work(ReclaimWorkKind::CacheMaintenance)
+        else {
+            return Ok(TickReport::default());
+        };
+        if !self.governor.reclaim_request_active(request) {
+            self.governor.finish_reclaim_work(request);
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: self.has_work(),
+                ..TickReport::default()
+            });
+        }
+
+        let bounded = bounded_service_budget(*budget, Self::TICK_BUDGET);
+        let outcome = self.worker.reclaim_cache(request, bounded)?;
+        finish_reclaim_tick(Self::NAME, &self.governor, request, bounded, outcome)
+    }
+
+    fn has_work(&self) -> bool {
+        self.governor
+            .has_reclaim_work(ReclaimWorkKind::CacheMaintenance)
+    }
+}
+
+/// Scheduler service for stage 3 dirty-byte flush work.
+pub struct GovernorDirtyFlushService<W: DirtyReclaimWorker> {
+    governor: Governor,
+    worker: W,
+}
+
+impl<W: DirtyReclaimWorker> GovernorDirtyFlushService<W> {
+    /// Stable service name used in scheduler reports.
+    pub const NAME: &'static str = "governor-dirty-flush";
+    /// Hard per-tick budget for throughput dirty-byte flush work.
+    pub const TICK_BUDGET: ServiceBudget = ServiceBudget {
+        max_items: 128,
+        max_bytes: 16 * 1024 * 1024,
+        max_ms: 50,
+    };
+
+    /// Create a dirty flush service.
+    #[must_use]
+    pub fn new(governor: Governor, worker: W) -> Self {
+        Self { governor, worker }
+    }
+}
+
+impl<W: DirtyReclaimWorker> BackgroundService for GovernorDirtyFlushService<W> {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn priority(&self) -> ServicePriority {
+        ServicePriority::Throughput
+    }
+
+    fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        let Some(request) = self
+            .governor
+            .claim_reclaim_work(ReclaimWorkKind::DirtyFlush)
+        else {
+            return Ok(TickReport::default());
+        };
+        if !self.governor.reclaim_request_active(request) {
+            self.governor.finish_reclaim_work(request);
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: self.has_work(),
+                ..TickReport::default()
+            });
+        }
+
+        let bounded = bounded_service_budget(*budget, Self::TICK_BUDGET);
+        let outcome = self.worker.flush_dirty(request, bounded)?;
+        finish_reclaim_tick(Self::NAME, &self.governor, request, bounded, outcome)
+    }
+
+    fn has_work(&self) -> bool {
+        self.governor.has_reclaim_work(ReclaimWorkKind::DirtyFlush)
+    }
+}
+
+/// Scheduler service for stage 4 hard dirty pressure.
+pub struct GovernorCommitBoundaryService<W: CommitBoundaryWorker> {
+    governor: Governor,
+    worker: W,
+}
+
+impl<W: CommitBoundaryWorker> GovernorCommitBoundaryService<W> {
+    /// Stable service name used in scheduler reports.
+    pub const NAME: &'static str = "governor-commit-boundary";
+    /// Hard per-tick budget for one commit/sync boundary request.
+    pub const TICK_BUDGET: ServiceBudget = ServiceBudget {
+        max_items: 1,
+        max_bytes: 0,
+        max_ms: 10,
+    };
+
+    /// Create a commit-boundary service.
+    #[must_use]
+    pub fn new(governor: Governor, worker: W) -> Self {
+        Self { governor, worker }
+    }
+}
+
+impl<W: CommitBoundaryWorker> BackgroundService for GovernorCommitBoundaryService<W> {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn priority(&self) -> ServicePriority {
+        ServicePriority::Critical
+    }
+
+    fn tick(&mut self, budget: &ServiceBudget) -> Result<TickReport, ServiceError> {
+        let Some(request) = self
+            .governor
+            .claim_reclaim_work(ReclaimWorkKind::CommitBoundary)
+        else {
+            return Ok(TickReport::default());
+        };
+        if !self.governor.reclaim_request_active(request) {
+            self.governor.finish_reclaim_work(request);
+            return Ok(TickReport {
+                skipped: 1,
+                has_more: self.has_work(),
+                ..TickReport::default()
+            });
+        }
+
+        let bounded = bounded_service_budget(*budget, Self::TICK_BUDGET);
+        let outcome = self.worker.force_commit_boundary(request, bounded)?;
+        finish_reclaim_tick(Self::NAME, &self.governor, request, bounded, outcome)
+    }
+
+    fn has_work(&self) -> bool {
+        self.governor
+            .has_reclaim_work(ReclaimWorkKind::CommitBoundary)
+    }
+}
+
+fn bounded_service_budget(outer: ServiceBudget, cap: ServiceBudget) -> ServiceBudget {
+    ServiceBudget {
+        max_items: bounded_limit(outer.max_items, cap.max_items),
+        max_bytes: bounded_limit(outer.max_bytes, cap.max_bytes),
+        max_ms: bounded_limit(outer.max_ms, cap.max_ms),
+    }
+}
+
+fn bounded_limit(outer: u64, cap: u64) -> u64 {
+    match (outer, cap) {
+        (0, value) | (value, 0) => value,
+        (outer, cap) => outer.min(cap),
+    }
+}
+
+fn finish_reclaim_tick(
+    service: &'static str,
+    governor: &Governor,
+    request: ReclaimRequest,
+    budget: ServiceBudget,
+    outcome: ReclaimOutcome,
+) -> Result<TickReport, ServiceError> {
+    if budget.max_items > 0 && outcome.items_processed > budget.max_items {
+        governor.finish_reclaim_work(request);
+        return Err(ServiceError::BudgetExceeded {
+            service,
+            limit: budget.max_items,
+            actual: outcome.items_processed,
+        });
+    }
+    if budget.max_bytes > 0 && outcome.bytes_processed > budget.max_bytes {
+        governor.finish_reclaim_work(request);
+        return Err(ServiceError::BudgetExceeded {
+            service,
+            limit: budget.max_bytes,
+            actual: outcome.bytes_processed,
+        });
+    }
+
+    let released = outcome.bytes_released.min(request.used);
+    if released > 0 {
+        governor.release(request.category, released);
+    }
+    governor.finish_reclaim_work(request);
+    Ok(TickReport {
+        processed: outcome.items_processed,
+        skipped: 0,
+        errors: 0,
+        items_consumed: outcome.items_processed,
+        bytes_consumed: outcome.bytes_processed,
+        has_more: request
+            .work_kind()
+            .map(|kind| governor.has_reclaim_work(kind))
+            .unwrap_or(false),
+    })
 }
 
 impl fmt::Debug for Governor {
@@ -938,8 +1642,13 @@ impl fmt::Debug for Governor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tidefs_background_scheduler::{BackgroundScheduler, ServiceBudget, ServicePriority};
     use tidefs_types_cache_lattice_core::{
         DirtyStateClass, MemoryDomain, PosixWritebackState, RebuildCostClass,
+    };
+    use tidefs_types_incremental_job_core::{
+        Checkpoint, CursorState, JobError, JobId, JobKind, JobProgress, StepResult, WorkBudget,
     };
 
     fn test_config() -> GovernorConfig {
@@ -966,6 +1675,29 @@ mod tests {
         }
     }
 
+    fn single_category_budget_config(
+        category: BudgetCategory,
+        total_budget_bytes: u64,
+    ) -> GovernorConfig {
+        let fraction = |candidate| {
+            if candidate == category {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        GovernorConfig {
+            total_budget_bytes,
+            data_cache_fraction: fraction(BudgetCategory::DataCache),
+            meta_cache_fraction: fraction(BudgetCategory::MetaCache),
+            dirty_bytes_fraction: fraction(BudgetCategory::DirtyBytes),
+            inode_state_fraction: fraction(BudgetCategory::InodeState),
+            cluster_queues_fraction: fraction(BudgetCategory::ClusterQueues),
+            misc_fraction: fraction(BudgetCategory::Misc),
+            auto_tune: false,
+        }
+    }
+
     fn data_pressure(score: u16) -> GovernorAutoTuneEvidence {
         GovernorAutoTuneEvidence::pressure(
             BudgetCategory::DataCache,
@@ -984,6 +1716,168 @@ mod tests {
             1_000,
             score,
         )
+    }
+
+    fn pressure_state_for(g: &Governor, category: BudgetCategory) -> GovernorPressureState {
+        g.pressure_state()
+            .into_iter()
+            .find(|state| state.category == category)
+            .unwrap()
+    }
+
+    #[derive(Clone, Default)]
+    struct ReclaimCallLog {
+        calls: Arc<Mutex<Vec<(ReclaimRequest, ServiceBudget)>>>,
+    }
+
+    impl ReclaimCallLog {
+        fn record(&self, request: ReclaimRequest, budget: ServiceBudget) {
+            self.calls.lock().unwrap().push((request, budget));
+        }
+
+        fn calls(&self) -> Vec<(ReclaimRequest, ServiceBudget)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    struct ReleasingCacheWorker {
+        log: ReclaimCallLog,
+        release_bytes: u64,
+    }
+
+    impl CacheReclaimWorker for ReleasingCacheWorker {
+        fn reclaim_cache(
+            &mut self,
+            request: ReclaimRequest,
+            budget: ServiceBudget,
+        ) -> Result<ReclaimOutcome, ServiceError> {
+            self.log.record(request, budget);
+            Ok(ReclaimOutcome {
+                items_processed: 1,
+                bytes_processed: self.release_bytes,
+                bytes_released: self.release_bytes,
+            })
+        }
+    }
+
+    struct ReleasingDirtyWorker {
+        log: ReclaimCallLog,
+        release_bytes: u64,
+    }
+
+    impl DirtyReclaimWorker for ReleasingDirtyWorker {
+        fn flush_dirty(
+            &mut self,
+            request: ReclaimRequest,
+            budget: ServiceBudget,
+        ) -> Result<ReclaimOutcome, ServiceError> {
+            self.log.record(request, budget);
+            Ok(ReclaimOutcome {
+                items_processed: 1,
+                bytes_processed: self.release_bytes,
+                bytes_released: self.release_bytes,
+            })
+        }
+    }
+
+    struct RecordingCommitWorker {
+        log: ReclaimCallLog,
+    }
+
+    impl CommitBoundaryWorker for RecordingCommitWorker {
+        fn force_commit_boundary(
+            &mut self,
+            request: ReclaimRequest,
+            budget: ServiceBudget,
+        ) -> Result<ReclaimOutcome, ServiceError> {
+            self.log.record(request, budget);
+            Ok(ReclaimOutcome {
+                items_processed: 1,
+                bytes_processed: 0,
+                bytes_released: 0,
+            })
+        }
+    }
+
+    struct FakeIncrementalDirtyJob {
+        steps: Vec<(u64, u64, bool)>,
+        calls: Arc<Mutex<Vec<WorkBudget>>>,
+        total_items: u64,
+        total_bytes: u64,
+    }
+
+    impl FakeIncrementalDirtyJob {
+        fn new(steps: Vec<(u64, u64, bool)>) -> (Self, Arc<Mutex<Vec<WorkBudget>>>) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    steps,
+                    calls: calls.clone(),
+                    total_items: 0,
+                    total_bytes: 0,
+                },
+                calls,
+            )
+        }
+
+        fn checkpoint(&self, is_complete: bool) -> StepResult {
+            let checkpoint = Checkpoint {
+                job_id: JobId::NONE,
+                job_kind: JobKind::DataCleaner,
+                epoch: 1,
+                cursor_state: CursorState::empty(),
+                progress: JobProgress {
+                    items_processed: self.total_items,
+                    items_total_estimate: 0,
+                    bytes_processed: self.total_bytes,
+                    bytes_total_estimate: 0,
+                    elapsed_ms: 0,
+                },
+            };
+            if is_complete {
+                StepResult::complete(checkpoint)
+            } else {
+                StepResult::in_progress(checkpoint)
+            }
+        }
+    }
+
+    impl IncrementalJob for FakeIncrementalDirtyJob {
+        fn resume(_state: Option<Checkpoint>) -> Result<Self, JobError>
+        where
+            Self: Sized,
+        {
+            Ok(Self {
+                steps: Vec::new(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                total_items: 0,
+                total_bytes: 0,
+            })
+        }
+
+        fn step(&mut self, budget: WorkBudget) -> Result<StepResult, JobError> {
+            self.calls.lock().unwrap().push(budget);
+            let (items, bytes, is_complete) = self.steps.remove(0);
+            self.total_items = self.total_items.saturating_add(items);
+            self.total_bytes = self.total_bytes.saturating_add(bytes);
+            Ok(self.checkpoint(is_complete))
+        }
+
+        fn persist_checkpoint(&self, _checkpoint: &Checkpoint) -> Result<(), JobError> {
+            Ok(())
+        }
+
+        fn complete(self) -> Result<(), JobError> {
+            Ok(())
+        }
+
+        fn job_id(&self) -> JobId {
+            JobId::NONE
+        }
+
+        fn job_kind(&self) -> JobKind {
+            JobKind::DataCleaner
+        }
     }
 
     #[test]
@@ -1434,6 +2328,232 @@ mod tests {
         assert_eq!(format!("{}", BackpressureSignal::None), "none");
         assert_eq!(format!("{}", BackpressureSignal::SoftPressure), "soft");
         assert_eq!(format!("{}", BackpressureSignal::HardPressure), "hard");
+    }
+
+    #[test]
+    fn pressure_state_records_stage_without_claiming_work() {
+        let g =
+            Governor::new(single_category_budget_config(BudgetCategory::DataCache, 1000)).unwrap();
+        g.admit(BudgetCategory::DataCache, 701).unwrap();
+
+        let state = pressure_state_for(&g, BudgetCategory::DataCache);
+        assert_eq!(state.signal, BackpressureSignal::SoftPressure);
+        assert_eq!(state.stage, Some(ReclaimStage::EvictColdCache));
+        assert_eq!(state.pressure_ticks, 0);
+        assert!(!state.reclaim_inflight);
+        assert!(g.has_reclaim_work(ReclaimWorkKind::CacheMaintenance));
+    }
+
+    #[test]
+    fn metadata_pressure_escalates_to_stage_two_after_one_claimed_tick() {
+        let g =
+            Governor::new(single_category_budget_config(BudgetCategory::MetaCache, 1000)).unwrap();
+        g.admit(BudgetCategory::MetaCache, 701).unwrap();
+
+        let first = g
+            .claim_reclaim_work(ReclaimWorkKind::CacheMaintenance)
+            .unwrap();
+        assert_eq!(first.stage, ReclaimStage::EvictColdCache);
+        assert_eq!(
+            g.claim_reclaim_work(ReclaimWorkKind::CacheMaintenance),
+            None
+        );
+
+        g.finish_reclaim_work(first);
+        let second = g
+            .claim_reclaim_work(ReclaimWorkKind::CacheMaintenance)
+            .unwrap();
+        assert_eq!(second.stage, ReclaimStage::ShrinkMetadataCaches);
+        assert_eq!(second.pressure_ticks, 2);
+    }
+
+    #[test]
+    fn stale_reclaim_request_is_invalidated_when_pressure_clears() {
+        let g =
+            Governor::new(single_category_budget_config(BudgetCategory::DataCache, 1000)).unwrap();
+        g.admit(BudgetCategory::DataCache, 800).unwrap();
+        let request = g
+            .claim_reclaim_work(ReclaimWorkKind::CacheMaintenance)
+            .unwrap();
+
+        g.release(BudgetCategory::DataCache, 200);
+
+        assert!(!g.reclaim_request_active(request));
+        g.finish_reclaim_work(request);
+        assert_eq!(
+            g.claim_reclaim_work(ReclaimWorkKind::CacheMaintenance),
+            None
+        );
+        assert_eq!(
+            g.backpressure(BudgetCategory::DataCache),
+            BackpressureSignal::None
+        );
+    }
+
+    #[test]
+    fn stage_five_is_admission_signal_not_background_work() {
+        let g =
+            Governor::new(single_category_budget_config(BudgetCategory::DataCache, 1000)).unwrap();
+        g.admit(BudgetCategory::DataCache, 950).unwrap();
+
+        let state = pressure_state_for(&g, BudgetCategory::DataCache);
+        assert_eq!(state.signal, BackpressureSignal::HardPressure);
+        assert_eq!(state.stage, Some(ReclaimStage::AdmissionBackpressure));
+        assert!(!g.has_reclaim_work(ReclaimWorkKind::CacheMaintenance));
+        assert_eq!(g.admission_backpressure_requests(), vec![state]);
+    }
+
+    #[test]
+    fn cache_reclaim_service_runs_bounded_latency_sensitive_tick() {
+        let g =
+            Governor::new(single_category_budget_config(BudgetCategory::DataCache, 1000)).unwrap();
+        g.admit(BudgetCategory::DataCache, 800).unwrap();
+        let log = ReclaimCallLog::default();
+        let worker = ReleasingCacheWorker {
+            log: log.clone(),
+            release_bytes: 200,
+        };
+        let mut scheduler = BackgroundScheduler::new(ServiceBudget::UNBOUNDED);
+        scheduler.register(Box::new(GovernorCacheReclaimService::new(
+            g.clone(),
+            worker,
+        )));
+
+        let registered = scheduler.registered_services();
+        assert_eq!(registered[0].priority, ServicePriority::LatencySensitive);
+
+        let report = scheduler.run_cycle();
+        assert_eq!(report.services_ran, 1);
+        assert_eq!(report.total_processed, 1);
+        let calls = log.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.stage, ReclaimStage::EvictColdCache);
+        assert_eq!(
+            calls[0].1.max_items,
+            GovernorCacheReclaimService::<ReleasingCacheWorker>::TICK_BUDGET.max_items
+        );
+        assert_eq!(
+            calls[0].1.max_bytes,
+            GovernorCacheReclaimService::<ReleasingCacheWorker>::TICK_BUDGET.max_bytes
+        );
+        assert_eq!(
+            calls[0].1.max_ms,
+            GovernorCacheReclaimService::<ReleasingCacheWorker>::TICK_BUDGET.max_ms
+        );
+        assert_eq!(g.category_used(BudgetCategory::DataCache), 600);
+        assert_eq!(
+            g.backpressure(BudgetCategory::DataCache),
+            BackpressureSignal::None
+        );
+
+        let idle = scheduler.run_cycle();
+        assert_eq!(idle.services_ran, 0);
+    }
+
+    #[test]
+    fn dirty_flush_service_runs_bounded_throughput_tick() {
+        let g =
+            Governor::new(single_category_budget_config(BudgetCategory::DirtyBytes, 1000)).unwrap();
+        g.admit(BudgetCategory::DirtyBytes, 600).unwrap();
+        let log = ReclaimCallLog::default();
+        let worker = ReleasingDirtyWorker {
+            log: log.clone(),
+            release_bytes: 150,
+        };
+        let mut scheduler = BackgroundScheduler::new(ServiceBudget::UNBOUNDED);
+        scheduler.register(Box::new(GovernorDirtyFlushService::new(g.clone(), worker)));
+
+        let registered = scheduler.registered_services();
+        assert_eq!(registered[0].priority, ServicePriority::Throughput);
+
+        let report = scheduler.run_cycle();
+        assert_eq!(report.services_ran, 1);
+        let calls = log.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.stage, ReclaimStage::FlushDirtyData);
+        assert_eq!(
+            calls[0].1.max_items,
+            GovernorDirtyFlushService::<ReleasingDirtyWorker>::TICK_BUDGET.max_items
+        );
+        assert_eq!(
+            calls[0].1.max_bytes,
+            GovernorDirtyFlushService::<ReleasingDirtyWorker>::TICK_BUDGET.max_bytes
+        );
+        assert_eq!(
+            calls[0].1.max_ms,
+            GovernorDirtyFlushService::<ReleasingDirtyWorker>::TICK_BUDGET.max_ms
+        );
+        assert_eq!(g.category_used(BudgetCategory::DirtyBytes), 450);
+        assert_eq!(
+            g.backpressure(BudgetCategory::DirtyBytes),
+            BackpressureSignal::None
+        );
+    }
+
+    #[test]
+    fn dirty_flush_service_drives_existing_incremental_job_surface() {
+        let g =
+            Governor::new(single_category_budget_config(BudgetCategory::DirtyBytes, 1000)).unwrap();
+        g.admit(BudgetCategory::DirtyBytes, 600).unwrap();
+        let (job, calls) = FakeIncrementalDirtyJob::new(vec![(2, 150, false)]);
+        let worker = GovernorIncrementalReclaimWorker::new(job);
+        let mut scheduler = BackgroundScheduler::new(ServiceBudget::UNBOUNDED);
+        scheduler.register(Box::new(GovernorDirtyFlushService::new(g.clone(), worker)));
+
+        let report = scheduler.run_cycle();
+
+        assert_eq!(report.services_ran, 1);
+        assert_eq!(report.total_processed, 2);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        type FakeDirtyFlushService =
+            GovernorDirtyFlushService<GovernorIncrementalReclaimWorker<FakeIncrementalDirtyJob>>;
+        assert_eq!(
+            calls[0].max_items,
+            FakeDirtyFlushService::TICK_BUDGET.max_items
+        );
+        assert_eq!(
+            calls[0].max_bytes,
+            FakeDirtyFlushService::TICK_BUDGET.max_bytes
+        );
+        assert_eq!(g.category_used(BudgetCategory::DirtyBytes), 450);
+    }
+
+    #[test]
+    fn hard_dirty_pressure_records_commit_boundary_without_new_authority() {
+        let g =
+            Governor::new(single_category_budget_config(BudgetCategory::DirtyBytes, 1000)).unwrap();
+        g.admit(BudgetCategory::DirtyBytes, 950).unwrap();
+        let log = ReclaimCallLog::default();
+        let worker = RecordingCommitWorker { log: log.clone() };
+        let mut scheduler = BackgroundScheduler::new(ServiceBudget::UNBOUNDED);
+        scheduler.register(Box::new(GovernorCommitBoundaryService::new(
+            g.clone(),
+            worker,
+        )));
+
+        let registered = scheduler.registered_services();
+        assert_eq!(registered[0].priority, ServicePriority::Critical);
+
+        let report = scheduler.run_cycle();
+        assert_eq!(report.services_ran, 1);
+        let calls = log.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.stage, ReclaimStage::ForceCommitGroupSync);
+        assert_eq!(
+            calls[0].1.max_items,
+            GovernorCommitBoundaryService::<RecordingCommitWorker>::TICK_BUDGET.max_items
+        );
+        assert_eq!(
+            calls[0].1.max_bytes,
+            GovernorCommitBoundaryService::<RecordingCommitWorker>::TICK_BUDGET.max_bytes
+        );
+        assert_eq!(
+            calls[0].1.max_ms,
+            GovernorCommitBoundaryService::<RecordingCommitWorker>::TICK_BUDGET.max_ms
+        );
+        assert_eq!(g.category_used(BudgetCategory::DirtyBytes), 950);
+        assert!(g.has_reclaim_work(ReclaimWorkKind::CommitBoundary));
     }
 
     #[test]
