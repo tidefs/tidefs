@@ -1876,6 +1876,928 @@ const fn measurement_subject_scope_is_bound(subject: EvidenceQuerySubjectScope) 
     }
 }
 
+/// State published by a compiled service-objective envelope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentServiceObjectiveState {
+    /// No usable objective evidence was found.
+    #[default]
+    UnknownEvidence = 0,
+    /// The objective envelope is satisfied for its exact scope.
+    Satisfied = 1,
+    /// The objective is lawful but still converging.
+    Converging = 2,
+    /// The objective may proceed only while degradation is visible.
+    DegradedVisible = 3,
+    /// The objective is explicitly cache-only and non-authoritative.
+    CacheOnly = 4,
+    /// A prerequisite or budget blocks the objective.
+    Blocked = 5,
+    /// Policy or evidence refused the objective.
+    Refused = 6,
+    /// Policy permits an unsafe result only as visible state.
+    UnsafeVisible = 7,
+}
+
+/// Workload phase bound to a service objective.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentServiceObjectiveWorkloadPhase {
+    #[default]
+    Unknown = 0,
+    ForegroundSync = 1,
+    ForegroundMetadata = 2,
+    ForegroundRead = 3,
+    BackgroundIngest = 4,
+    RepairRecovery = 5,
+    RelocationOptimizer = 6,
+    GeoArchive = 7,
+    ClaimValidation = 8,
+}
+
+/// Caller-visible operation semantics bound to a service objective.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentServiceObjectiveOperation {
+    #[default]
+    Unknown = 0,
+    SyncWrite = 1,
+    Fsync = 2,
+    Fdatasync = 3,
+    ODsync = 4,
+    FuaBarrier = 5,
+    StableWrite = 6,
+    MetadataMutation = 7,
+    FsyncDir = 8,
+    Read = 9,
+    Prefetch = 10,
+    MmapSync = 11,
+    DirectIo = 12,
+    Repair = 13,
+    Rebuild = 14,
+    Relocation = 15,
+    Rebake = 16,
+    GeoCatchUp = 17,
+    ArchiveRestore = 18,
+    RamAuthority = 19,
+    PmemDurable = 20,
+}
+
+/// Topology/distance class bound to a service objective.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentServiceObjectiveTopologyClass {
+    #[default]
+    Unknown = 0,
+    SameHost = 1,
+    SameRack = 2,
+    SameDatacenter = 3,
+    CrossDatacenter = 4,
+    WanInternet = 5,
+    ObjectStore = 6,
+    OfflineArchive = 7,
+}
+
+/// Transport profile bound to a service objective.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentServiceObjectiveTransportClass {
+    #[default]
+    Unknown = 0,
+    LocalOnly = 1,
+    TcpLocal = 2,
+    RdmaPresent = 3,
+    RdmaAbsentBaseline = 4,
+    WanTcp = 5,
+    WanInternet = 6,
+    ObjectApi = 7,
+    ArchiveOffline = 8,
+}
+
+/// Failure/degradation state bound to a service objective.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentServiceObjectiveFailureState {
+    #[default]
+    Unknown = 0,
+    Nominal = 1,
+    DegradedVisible = 2,
+    RecoveryPending = 3,
+    Partitioned = 4,
+    NoQuorum = 5,
+    UnsafeVisible = 6,
+}
+
+/// Comparator or claim scope attached to an objective.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentServiceObjectiveComparatorScope {
+    #[default]
+    Unknown = 0,
+    None = 1,
+    SameObjective = 2,
+    SameWorkloadOperation = 3,
+    SameMediaTopology = 4,
+    SameAckDegradation = 5,
+    PublicClaim = 6,
+}
+
+impl_u8_canonical!(StorageIntentServiceObjectiveState, {
+    UnknownEvidence = 0 => "unknown-evidence",
+    Satisfied = 1 => "satisfied",
+    Converging = 2 => "converging",
+    DegradedVisible = 3 => "degraded-visible",
+    CacheOnly = 4 => "cache-only",
+    Blocked = 5 => "blocked",
+    Refused = 6 => "refused",
+    UnsafeVisible = 7 => "unsafe-visible",
+});
+
+impl_u8_canonical!(StorageIntentServiceObjectiveWorkloadPhase, {
+    Unknown = 0 => "unknown",
+    ForegroundSync = 1 => "foreground-sync",
+    ForegroundMetadata = 2 => "foreground-metadata",
+    ForegroundRead = 3 => "foreground-read",
+    BackgroundIngest = 4 => "background-ingest",
+    RepairRecovery = 5 => "repair-recovery",
+    RelocationOptimizer = 6 => "relocation-optimizer",
+    GeoArchive = 7 => "geo-archive",
+    ClaimValidation = 8 => "claim-validation",
+});
+
+impl_u8_canonical!(StorageIntentServiceObjectiveOperation, {
+    Unknown = 0 => "unknown",
+    SyncWrite = 1 => "sync-write",
+    Fsync = 2 => "fsync",
+    Fdatasync = 3 => "fdatasync",
+    ODsync = 4 => "o-dsync",
+    FuaBarrier = 5 => "fua-barrier",
+    StableWrite = 6 => "stable-write",
+    MetadataMutation = 7 => "metadata-mutation",
+    FsyncDir = 8 => "fsyncdir",
+    Read = 9 => "read",
+    Prefetch = 10 => "prefetch",
+    MmapSync = 11 => "mmap-sync",
+    DirectIo = 12 => "direct-io",
+    Repair = 13 => "repair",
+    Rebuild = 14 => "rebuild",
+    Relocation = 15 => "relocation",
+    Rebake = 16 => "rebake",
+    GeoCatchUp = 17 => "geo-catch-up",
+    ArchiveRestore = 18 => "archive-restore",
+    RamAuthority = 19 => "ram-authority",
+    PmemDurable = 20 => "pmem-durable",
+});
+
+impl_u8_canonical!(StorageIntentServiceObjectiveTopologyClass, {
+    Unknown = 0 => "unknown",
+    SameHost = 1 => "same-host",
+    SameRack = 2 => "same-rack",
+    SameDatacenter = 3 => "same-datacenter",
+    CrossDatacenter = 4 => "cross-datacenter",
+    WanInternet = 5 => "wan-internet",
+    ObjectStore = 6 => "object-store",
+    OfflineArchive = 7 => "offline-archive",
+});
+
+impl_u8_canonical!(StorageIntentServiceObjectiveTransportClass, {
+    Unknown = 0 => "unknown",
+    LocalOnly = 1 => "local-only",
+    TcpLocal = 2 => "tcp-local",
+    RdmaPresent = 3 => "rdma-present",
+    RdmaAbsentBaseline = 4 => "rdma-absent-baseline",
+    WanTcp = 5 => "wan-tcp",
+    WanInternet = 6 => "wan-internet",
+    ObjectApi = 7 => "object-api",
+    ArchiveOffline = 8 => "archive-offline",
+});
+
+impl_u8_canonical!(StorageIntentServiceObjectiveFailureState, {
+    Unknown = 0 => "unknown",
+    Nominal = 1 => "nominal",
+    DegradedVisible = 2 => "degraded-visible",
+    RecoveryPending = 3 => "recovery-pending",
+    Partitioned = 4 => "partitioned",
+    NoQuorum = 5 => "no-quorum",
+    UnsafeVisible = 6 => "unsafe-visible",
+});
+
+impl_u8_canonical!(StorageIntentServiceObjectiveComparatorScope, {
+    Unknown = 0 => "unknown",
+    None = 1 => "none",
+    SameObjective = 2 => "same-objective",
+    SameWorkloadOperation = 3 => "same-workload-operation",
+    SameMediaTopology = 4 => "same-media-topology",
+    SameAckDegradation = 5 => "same-ack-degradation",
+    PublicClaim = 6 => "public-claim",
+});
+
+/// Exact scope whose evidence may satisfy, measure, or claim one objective.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentServiceObjectiveScope {
+    pub policy_id: StorageIntentPolicyId,
+    pub policy_revision: StorageIntentPolicyRevision,
+    pub subject_scope: StorageIntentObjectScope,
+    pub tenant_id: StorageIntentDomainId,
+    pub budget_owner_id: StorageIntentDomainId,
+    pub workload_class: AccessPatternClass,
+    pub workload_phase: StorageIntentServiceObjectiveWorkloadPhase,
+    pub operation: StorageIntentServiceObjectiveOperation,
+    pub ack_class: StorageIntentGuaranteeClass,
+    pub media_class: StorageMediaClass,
+    pub media_role: StorageMediaRole,
+    pub topology_class: StorageIntentServiceObjectiveTopologyClass,
+    pub transport_class: StorageIntentServiceObjectiveTransportClass,
+    pub failure_state: StorageIntentServiceObjectiveFailureState,
+    pub comparator_scope: StorageIntentServiceObjectiveComparatorScope,
+}
+
+/// Latency percentile, tail, jitter, and dwell envelope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentServiceObjectiveLatencyEnvelope {
+    pub p50_ceiling_us: u64,
+    pub p95_ceiling_us: u64,
+    pub p99_ceiling_us: u64,
+    pub tail_ceiling_us: u64,
+    pub max_queue_us: u64,
+    pub max_admission_us: u64,
+    pub max_device_dwell_us: u64,
+    pub max_transport_dwell_us: u64,
+    pub jitter_ppm: u32,
+    pub tail_amplification_ppm: u32,
+    pub warmup_ref: StorageIntentEvidenceRef,
+    pub censoring_ref: StorageIntentEvidenceRef,
+    pub breach_refusal: StorageIntentRefusalReason,
+}
+
+impl StorageIntentServiceObjectiveLatencyEnvelope {
+    /// Returns true when tail-sensitive dimensions are explicit.
+    #[must_use]
+    pub const fn has_tail_bounds(self) -> bool {
+        self.p99_ceiling_us > 0
+            && self.tail_ceiling_us > 0
+            && self.max_queue_us > 0
+            && self.max_admission_us > 0
+            && self.tail_amplification_ppm > 0
+    }
+}
+
+/// Throughput floor/ceiling, burst, dwell, queue, and batching envelope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentServiceObjectiveThroughputEnvelope {
+    pub floor_bytes_per_sec: u64,
+    pub ceiling_bytes_per_sec: u64,
+    pub burst_bytes: u64,
+    pub burst_window_ms: u64,
+    pub dwell_window_ms: u64,
+    pub max_concurrency: u32,
+    pub max_queue_depth: u32,
+    pub dirty_window_bytes: u64,
+    pub coalescing_ref: StorageIntentEvidenceRef,
+    pub batching_ref: StorageIntentEvidenceRef,
+    pub backpressure_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentServiceObjectiveThroughputEnvelope {
+    /// Returns true when queue and dwell limits are explicit.
+    #[must_use]
+    pub const fn has_queue_profile(self) -> bool {
+        self.dwell_window_ms > 0 && self.max_concurrency > 0 && self.max_queue_depth > 0
+    }
+}
+
+/// Ack, recovery, degradation, stale-read, RPO, and RTO envelope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentServiceObjectiveRecoveryFloor {
+    pub required_ack: StorageIntentGuaranteeClass,
+    pub durability_floor: DurabilityState,
+    pub stale_read_allowed: bool,
+    pub degraded_visible_allowed: bool,
+    pub explicit_volatile_allowed: bool,
+    pub explicit_unsafe_visible_allowed: bool,
+    pub rpo_lag_ceiling_ms: u64,
+    pub rto_ceiling_ms: u64,
+    pub partition_refusal: StorageIntentRefusalReason,
+}
+
+impl StorageIntentServiceObjectiveRecoveryFloor {
+    /// Returns true when RPO/RTO ties are explicit for authority use.
+    #[must_use]
+    pub const fn has_recovery_bounds(self) -> bool {
+        self.rpo_lag_ceiling_ms > 0 && self.rto_ceiling_ms > 0
+    }
+}
+
+/// Topology, media, environment, persistence, and transport profile.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentServiceObjectiveEnvironmentProfile {
+    pub source_media: StorageMediaClass,
+    pub target_media: StorageMediaClass,
+    pub media_role: StorageMediaRole,
+    pub topology_class: StorageIntentServiceObjectiveTopologyClass,
+    pub transport_class: StorageIntentServiceObjectiveTransportClass,
+    pub thermal_health_ref: StorageIntentEvidenceRef,
+    pub namespace_identity_ref: StorageIntentEvidenceRef,
+    pub residency_ref: StorageIntentEvidenceRef,
+    pub environment_ref: StorageIntentEvidenceRef,
+}
+
+/// Evidence refs that make one objective replayable and fail-closed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentServiceObjectiveEvidenceRefs {
+    pub workload_ref: StorageIntentEvidenceRef,
+    pub workload_scope_ref: StorageIntentEvidenceRef,
+    pub prediction_ref: StorageIntentEvidenceRef,
+    pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
+    pub scheduler_admission_ref: StorageIntentEvidenceRef,
+    pub queue_admission_ref: StorageIntentEvidenceRef,
+    pub degradation_ref: StorageIntentEvidenceRef,
+    pub recovery_ref: StorageIntentEvidenceRef,
+    pub rpo_rto_ref: StorageIntentEvidenceRef,
+    pub topology_ref: StorageIntentEvidenceRef,
+    pub media_capability_ref: StorageIntentEvidenceRef,
+    pub isolation_ref: StorageIntentEvidenceRef,
+    pub protected_p99_owner_ref: StorageIntentEvidenceRef,
+    pub capacity_ref: StorageIntentEvidenceRef,
+    pub reserve_ref: StorageIntentEvidenceRef,
+    pub cost_ref: StorageIntentEvidenceRef,
+    pub wear_ref: StorageIntentEvidenceRef,
+    pub waf_ref: StorageIntentEvidenceRef,
+    pub decision_frontier_ref: StorageIntentEvidenceRef,
+    pub hard_gate_ref: StorageIntentEvidenceRef,
+    pub action_execution_ref: StorageIntentEvidenceRef,
+    pub result_refusal_ref: StorageIntentEvidenceRef,
+    pub measurement_attribution_ref: StorageIntentEvidenceRef,
+    pub performance_row_ref: StorageIntentEvidenceRef,
+    pub fault_row_ref: StorageIntentEvidenceRef,
+    pub comparator_ref: StorageIntentEvidenceRef,
+    pub claim_ref: StorageIntentEvidenceRef,
+    pub retention_ref: StorageIntentEvidenceRef,
+    pub ordering_ref: StorageIntentEvidenceRef,
+    pub pmem_persistence_ref: StorageIntentEvidenceRef,
+    pub pmem_flush_fence_ref: StorageIntentEvidenceRef,
+    pub rdma_absent_correctness_ref: StorageIntentEvidenceRef,
+    pub remote_commit_ref: StorageIntentEvidenceRef,
+    pub trust_ref: StorageIntentEvidenceRef,
+    pub seek_payback_ref: StorageIntentEvidenceRef,
+    pub foreground_p99_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentServiceObjectiveEvidenceRefs {
+    /// Returns true when the source-model refs named by #915 are bound.
+    #[must_use]
+    pub const fn has_required_model_refs(self) -> bool {
+        evidence_ref_has_id(self.workload_ref)
+            && evidence_ref_has_id(self.workload_scope_ref)
+            && evidence_ref_has_id(self.prediction_ref)
+            && evidence_ref_has_id(self.evidence_query_snapshot_ref)
+            && evidence_ref_has_id(self.scheduler_admission_ref)
+            && evidence_ref_has_id(self.queue_admission_ref)
+            && evidence_ref_has_id(self.degradation_ref)
+            && evidence_ref_has_id(self.recovery_ref)
+            && evidence_ref_has_id(self.rpo_rto_ref)
+            && evidence_ref_has_id(self.topology_ref)
+            && evidence_ref_has_id(self.media_capability_ref)
+            && evidence_ref_has_id(self.isolation_ref)
+            && evidence_ref_has_id(self.protected_p99_owner_ref)
+            && evidence_ref_has_id(self.capacity_ref)
+            && evidence_ref_has_id(self.reserve_ref)
+            && evidence_ref_has_id(self.cost_ref)
+            && evidence_ref_has_id(self.wear_ref)
+            && evidence_ref_has_id(self.waf_ref)
+            && evidence_ref_has_id(self.decision_frontier_ref)
+            && evidence_ref_has_id(self.hard_gate_ref)
+            && evidence_ref_has_id(self.action_execution_ref)
+            && evidence_ref_has_id(self.result_refusal_ref)
+            && evidence_ref_has_id(self.measurement_attribution_ref)
+            && evidence_ref_has_id(self.performance_row_ref)
+            && evidence_ref_has_id(self.fault_row_ref)
+            && evidence_ref_has_id(self.comparator_ref)
+            && evidence_ref_has_id(self.claim_ref)
+            && evidence_ref_has_id(self.retention_ref)
+            && evidence_ref_has_id(self.ordering_ref)
+            && evidence_ref_has_id(self.trust_ref)
+    }
+}
+
+/// Compiled #915 service-objective source evidence envelope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentServiceObjectiveEvidence {
+    pub evidence_ref: StorageIntentEvidenceRef,
+    pub objective_id: StorageIntentEvidenceId,
+    pub producer_component_ref: StorageIntentEvidenceRef,
+    pub producer_version: u64,
+    pub objective_generation: u64,
+    pub rollout_stage_ref: StorageIntentEvidenceRef,
+    pub temporal_ref: StorageIntentEvidenceRef,
+    pub scope: StorageIntentServiceObjectiveScope,
+    pub request_mix_ref: StorageIntentEvidenceRef,
+    pub confidence_ref: StorageIntentEvidenceRef,
+    pub latency: StorageIntentServiceObjectiveLatencyEnvelope,
+    pub throughput: StorageIntentServiceObjectiveThroughputEnvelope,
+    pub recovery_floor: StorageIntentServiceObjectiveRecoveryFloor,
+    pub environment: StorageIntentServiceObjectiveEnvironmentProfile,
+    pub refs: StorageIntentServiceObjectiveEvidenceRefs,
+    pub state: StorageIntentServiceObjectiveState,
+    pub state_reason_ref: StorageIntentEvidenceRef,
+    pub refusal: StorageIntentRefusalReason,
+}
+
+impl StorageIntentServiceObjectiveEvidence {
+    /// Returns true when identity, policy revision, rollout, subject, and producer are bound.
+    #[must_use]
+    pub const fn identity_is_bound(self) -> bool {
+        self.evidence_ref.kind as u16 == StorageIntentEvidenceKind::ServiceObjectiveEvidence as u16
+            && evidence_ref_has_id(self.evidence_ref)
+            && !bytes32_are_zero(self.objective_id.0)
+            && evidence_ref_has_id(self.producer_component_ref)
+            && self.producer_version > 0
+            && self.objective_generation > 0
+            && !self.scope.policy_id.is_zero()
+            && self.scope.policy_revision.0 > 0
+            && service_objective_subject_scope_is_bound(self.scope.subject_scope)
+            && !self.scope.tenant_id.is_zero()
+            && !self.scope.budget_owner_id.is_zero()
+            && evidence_ref_has_id(self.rollout_stage_ref)
+            && evidence_ref_has_id(self.temporal_ref)
+            && evidence_ref_has_id(self.request_mix_ref)
+            && evidence_ref_has_id(self.confidence_ref)
+    }
+
+    /// Returns true when #915 model refs and envelope limits are explicit.
+    #[must_use]
+    pub const fn envelope_is_bound(self) -> bool {
+        self.refs.has_required_model_refs()
+            && self.latency.has_tail_bounds()
+            && self.throughput.has_queue_profile()
+            && self.recovery_floor.has_recovery_bounds()
+            && !matches!(
+                self.scope.workload_class,
+                AccessPatternClass::Unknown
+            )
+            && !matches!(
+                self.scope.workload_phase,
+                StorageIntentServiceObjectiveWorkloadPhase::Unknown
+            )
+            && !matches!(
+                self.scope.operation,
+                StorageIntentServiceObjectiveOperation::Unknown
+            )
+            && !matches!(
+                self.scope.topology_class,
+                StorageIntentServiceObjectiveTopologyClass::Unknown
+            )
+            && !matches!(
+                self.scope.transport_class,
+                StorageIntentServiceObjectiveTransportClass::Unknown
+            )
+            && !matches!(
+                self.scope.failure_state,
+                StorageIntentServiceObjectiveFailureState::Unknown
+            )
+            && !matches!(
+                self.scope.comparator_scope,
+                StorageIntentServiceObjectiveComparatorScope::Unknown
+            )
+    }
+
+    /// Returns true when the evidence query cut is complete and includes this objective.
+    #[must_use]
+    pub const fn has_required_evidence_cut(
+        self,
+        snapshot: StorageIntentEvidenceQuerySnapshot,
+    ) -> bool {
+        self.identity_is_bound()
+            && self.envelope_is_bound()
+            && service_objective_query_snapshot_matches(self, snapshot)
+            && snapshot.is_authority_admissible()
+            && snapshot.has_fresh_service_objective()
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::WorkloadEvidence)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::SchedulerAdmissionRecord)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::CapacityAdmissionEvidence)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::TenantIsolationEvidence)
+            && snapshot.has_fresh_media_capability()
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::RecoveryDegradationEvidence)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::PolicyRolloutEvidence)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::TransportPathEvidence)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::TemporalEvidence)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::MediaCostWearLedger)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::DecisionFrontierEvidence)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::ActionExecutionEvidence)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::ResultRefusalEvidence)
+            && snapshot.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+            )
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::ComparatorEvidence)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::ClaimGateEvidence)
+            && snapshot
+                .contains_fresh_authority_family(StorageIntentEvidenceKind::EvidenceRetentionEvidence)
+    }
+
+    /// Returns true when candidate scope exactly matches the compiled envelope.
+    #[must_use]
+    pub const fn scope_matches(self, candidate: StorageIntentServiceObjectiveScope) -> bool {
+        service_objective_scope_matches(self.scope, candidate)
+    }
+
+    /// Returns the typed reason why the objective state cannot admit authority.
+    #[must_use]
+    pub const fn state_refusal(self) -> StorageIntentRefusalReason {
+        if self.refusal as u16 != StorageIntentRefusalReason::None as u16 {
+            return self.refusal;
+        }
+        match self.state {
+            StorageIntentServiceObjectiveState::Satisfied => StorageIntentRefusalReason::None,
+            StorageIntentServiceObjectiveState::DegradedVisible => {
+                if self.recovery_floor.degraded_visible_allowed {
+                    StorageIntentRefusalReason::None
+                } else {
+                    StorageIntentRefusalReason::DurabilityOrRpoNotMet
+                }
+            }
+            StorageIntentServiceObjectiveState::CacheOnly => {
+                if service_objective_operation_is_cache_only(self.scope.operation) {
+                    StorageIntentRefusalReason::None
+                } else {
+                    StorageIntentRefusalReason::CacheCannotBeAuthority
+                }
+            }
+            StorageIntentServiceObjectiveState::UnsafeVisible => {
+                if self.recovery_floor.explicit_unsafe_visible_allowed {
+                    StorageIntentRefusalReason::None
+                } else {
+                    StorageIntentRefusalReason::UnsafeVolatileWriteCache
+                }
+            }
+            StorageIntentServiceObjectiveState::Converging => {
+                StorageIntentRefusalReason::PendingOrderingConvergence
+            }
+            StorageIntentServiceObjectiveState::UnknownEvidence => {
+                StorageIntentRefusalReason::EvidenceNotUsable
+            }
+            StorageIntentServiceObjectiveState::Blocked => StorageIntentRefusalReason::NoLegalReceiptSet,
+            StorageIntentServiceObjectiveState::Refused => StorageIntentRefusalReason::NoLegalReceiptSet,
+        }
+    }
+
+    /// Returns the typed refusal for media/operation hard laws.
+    #[must_use]
+    pub const fn media_operation_refusal(self) -> StorageIntentRefusalReason {
+        let durable_operation =
+            service_objective_operation_requires_durable_barrier(self.scope.operation);
+        if durable_operation
+            && matches!(self.state, StorageIntentServiceObjectiveState::CacheOnly)
+        {
+            return StorageIntentRefusalReason::CacheCannotBeAuthority;
+        }
+        if durable_operation
+            && matches!(
+                self.environment.media_role,
+                StorageMediaRole::ReadCache | StorageMediaRole::RamCache
+            )
+        {
+            return StorageIntentRefusalReason::CacheCannotBeAuthority;
+        }
+        if durable_operation
+            && matches!(
+                self.environment.target_media,
+                StorageMediaClass::SystemRam | StorageMediaClass::RemoteRam
+            )
+            && !matches!(
+                self.environment.media_role,
+                StorageMediaRole::RamIntentBackedAuthority
+            )
+        {
+            return StorageIntentRefusalReason::VolatileRamCannotSatisfyDurableIntent;
+        }
+        if durable_operation && !service_objective_ack_is_durable(self.scope.ack_class) {
+            return StorageIntentRefusalReason::GuaranteeFloorNotMet;
+        }
+        if (matches!(
+            self.environment.target_media,
+            StorageMediaClass::PersistentMemory
+        ) || matches!(
+            self.scope.operation,
+            StorageIntentServiceObjectiveOperation::PmemDurable
+        )) && (!evidence_ref_has_id(self.refs.pmem_persistence_ref)
+            || !evidence_ref_has_id(self.refs.pmem_flush_fence_ref))
+        {
+            return StorageIntentRefusalReason::PmemFlushFenceMissing;
+        }
+        if self.environment.target_media.charges_rewrite_wear()
+            && (!evidence_ref_has_id(self.refs.wear_ref)
+                || !evidence_ref_has_id(self.refs.waf_ref)
+                || !evidence_ref_has_id(self.refs.reserve_ref))
+        {
+            return StorageIntentRefusalReason::FlashWearBudgetExceeded;
+        }
+        if matches!(
+            self.environment.target_media,
+            StorageMediaClass::HddRotational | StorageMediaClass::ZonedHdd
+        ) && (!evidence_ref_has_id(self.refs.seek_payback_ref)
+            || !evidence_ref_has_id(self.refs.foreground_p99_ref))
+        {
+            return StorageIntentRefusalReason::MovementDebtNotPaidBack;
+        }
+        if service_objective_is_wan_object_or_archive(self.environment)
+            && !evidence_ref_has_id(self.refs.rdma_absent_correctness_ref)
+        {
+            return StorageIntentRefusalReason::RdmaRequiredForCorrectness;
+        }
+        if service_objective_is_wan_object_or_archive(self.environment)
+            && (!evidence_ref_has_id(self.refs.remote_commit_ref)
+                || !evidence_ref_has_id(self.refs.rpo_rto_ref)
+                || !evidence_ref_has_id(self.refs.trust_ref)
+                || !evidence_ref_has_id(self.refs.cost_ref))
+        {
+            return StorageIntentRefusalReason::UnsupportedRemoteCommitSemantics;
+        }
+        StorageIntentRefusalReason::None
+    }
+
+    /// Hard-gate predicate for one candidate before scoring or admission.
+    #[must_use]
+    pub const fn can_gate_candidate(
+        self,
+        candidate: StorageIntentServiceObjectiveScope,
+        snapshot: StorageIntentEvidenceQuerySnapshot,
+    ) -> ReceiptPredicateResult {
+        if !self.scope_matches(candidate) || !self.has_required_evidence_cut(snapshot) {
+            return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+        }
+        let state_refusal = self.state_refusal();
+        if state_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+            return ReceiptPredicateResult::refused(state_refusal);
+        }
+        let media_refusal = self.media_operation_refusal();
+        if media_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+            return ReceiptPredicateResult::refused(media_refusal);
+        }
+        ReceiptPredicateResult::SATISFIED
+    }
+
+    /// Returns true when a #912 measurement may transfer to this objective scope.
+    #[must_use]
+    pub const fn allows_attribution_transfer(
+        self,
+        candidate: StorageIntentServiceObjectiveScope,
+        attribution: StorageIntentMeasurementAttributionEvidence,
+        snapshot: StorageIntentEvidenceQuerySnapshot,
+        requested: StorageIntentMeasurementAttributionUseMask,
+    ) -> bool {
+        if requested.is_empty()
+            || !self.has_required_evidence_cut(snapshot)
+            || !service_objective_query_snapshot_matches(self, snapshot)
+            || !evidence_ref_equal(self.evidence_ref, attribution.service_objective_ref)
+            || !evidence_ref_equal(self.refs.measurement_attribution_ref, attribution.evidence_ref)
+            || !evidence_ref_equal(
+                self.refs.evidence_query_snapshot_ref,
+                attribution.evidence_query_snapshot_ref,
+            )
+            || !attribution.authorizes_use(requested)
+        {
+            return false;
+        }
+        if self.scope_matches(candidate) {
+            return true;
+        }
+        attribution
+            .transfer_scope
+            .contains_all(StorageIntentMeasurementTransferScopeMask::CROSS_SCOPE_ELIGIBILITY)
+            && evidence_ref_has_id(attribution.transfer_scope_ref)
+            && evidence_ref_has_id(self.refs.measurement_attribution_ref)
+            && evidence_ref_has_id(self.refs.evidence_query_snapshot_ref)
+    }
+
+    /// Returns true when #875/#928/#931 wording may use this objective.
+    #[must_use]
+    pub const fn allows_claim_wording(
+        self,
+        candidate: StorageIntentServiceObjectiveScope,
+        attribution: StorageIntentMeasurementAttributionEvidence,
+        snapshot: StorageIntentEvidenceQuerySnapshot,
+    ) -> bool {
+        self.allows_attribution_transfer(
+            candidate,
+            attribution,
+            snapshot,
+            StorageIntentMeasurementAttributionUseMask::SUPPORT_PUBLIC_OR_COMPARATOR_CLAIM,
+        ) && evidence_ref_equal(self.refs.comparator_ref, attribution.comparator.comparator_ref)
+            && evidence_ref_has_id(self.refs.claim_ref)
+    }
+}
+
+/// Predicate wrapper for candidate hard gates.
+#[must_use]
+pub const fn service_objective_gate_candidate(
+    evidence: StorageIntentServiceObjectiveEvidence,
+    candidate: StorageIntentServiceObjectiveScope,
+    snapshot: StorageIntentEvidenceQuerySnapshot,
+) -> ReceiptPredicateResult {
+    evidence.can_gate_candidate(candidate, snapshot)
+}
+
+/// Prove the service-objective hard gate is present before score/admission use.
+#[must_use]
+pub const fn service_objective_hard_gate_precedes_scoring_and_admission(
+    evidence: StorageIntentServiceObjectiveEvidence,
+    decision: StorageIntentDecisionEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.state_refusal() as u16 != StorageIntentRefusalReason::None as u16
+        || evidence.media_operation_refusal() as u16 != StorageIntentRefusalReason::None as u16
+        || !decision.illegal_candidates_are_unscored()
+        || !decision.selected_candidate.is_admitted()
+        || !decision.authority_mode.may_admit_authority_change()
+        || !service_objective_decision_has_passing_gate(evidence, decision)
+    {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+const fn service_objective_subject_scope_is_bound(scope: StorageIntentObjectScope) -> bool {
+    !scope.dataset_id.is_zero()
+        && !bytes32_are_zero(scope.object_id.0)
+        && scope.range_len > 0
+        && scope.generation > 0
+}
+
+const fn service_objective_scope_matches(
+    objective: StorageIntentServiceObjectiveScope,
+    candidate: StorageIntentServiceObjectiveScope,
+) -> bool {
+    bytes16_equal(objective.policy_id.0, candidate.policy_id.0)
+        && objective.policy_revision.0 == candidate.policy_revision.0
+        && service_objective_object_scope_equal(objective.subject_scope, candidate.subject_scope)
+        && bytes16_equal(objective.tenant_id.0, candidate.tenant_id.0)
+        && bytes16_equal(objective.budget_owner_id.0, candidate.budget_owner_id.0)
+        && objective.workload_class as u8 == candidate.workload_class as u8
+        && objective.workload_phase as u8 == candidate.workload_phase as u8
+        && objective.operation as u8 == candidate.operation as u8
+        && objective.ack_class as u8 == candidate.ack_class as u8
+        && objective.media_class as u8 == candidate.media_class as u8
+        && objective.media_role as u8 == candidate.media_role as u8
+        && objective.topology_class as u8 == candidate.topology_class as u8
+        && objective.transport_class as u8 == candidate.transport_class as u8
+        && objective.failure_state as u8 == candidate.failure_state as u8
+        && objective.comparator_scope as u8 == candidate.comparator_scope as u8
+}
+
+const fn service_objective_object_scope_equal(
+    left: StorageIntentObjectScope,
+    right: StorageIntentObjectScope,
+) -> bool {
+    bytes16_equal(left.dataset_id.0, right.dataset_id.0)
+        && bytes32_equal(left.object_id.0, right.object_id.0)
+        && left.range_start == right.range_start
+        && left.range_len == right.range_len
+        && left.generation == right.generation
+}
+
+const fn service_objective_query_snapshot_matches(
+    evidence: StorageIntentServiceObjectiveEvidence,
+    snapshot: StorageIntentEvidenceQuerySnapshot,
+) -> bool {
+    evidence.refs.evidence_query_snapshot_ref.kind as u16
+        == StorageIntentEvidenceKind::EvidenceQuerySnapshot as u16
+        && bytes32_equal(
+            evidence.refs.evidence_query_snapshot_ref.id.0,
+            snapshot.snapshot_id.0,
+        )
+        && bytes16_equal(evidence.scope.policy_id.0, snapshot.policy_id.0)
+        && evidence.scope.policy_revision.0 == snapshot.policy_revision.0
+        && service_objective_snapshot_subject_matches(evidence.scope.subject_scope, snapshot.subject)
+        && snapshot.included_refs.contains_ref(evidence.evidence_ref)
+}
+
+const fn service_objective_snapshot_subject_matches(
+    objective: StorageIntentObjectScope,
+    subject: EvidenceQuerySubjectScope,
+) -> bool {
+    match subject.scope_class {
+        EvidenceQuerySubjectScopeClass::ObjectRange => {
+            service_objective_object_scope_equal(objective, subject.object_scope)
+        }
+        EvidenceQuerySubjectScopeClass::Dataset => {
+            bytes16_equal(objective.dataset_id.0, subject.object_scope.dataset_id.0)
+        }
+        _ => false,
+    }
+}
+
+const fn service_objective_operation_is_cache_only(
+    operation: StorageIntentServiceObjectiveOperation,
+) -> bool {
+    matches!(
+        operation,
+        StorageIntentServiceObjectiveOperation::Read
+            | StorageIntentServiceObjectiveOperation::Prefetch
+    )
+}
+
+const fn service_objective_operation_requires_durable_barrier(
+    operation: StorageIntentServiceObjectiveOperation,
+) -> bool {
+    matches!(
+        operation,
+        StorageIntentServiceObjectiveOperation::SyncWrite
+            | StorageIntentServiceObjectiveOperation::Fsync
+            | StorageIntentServiceObjectiveOperation::Fdatasync
+            | StorageIntentServiceObjectiveOperation::ODsync
+            | StorageIntentServiceObjectiveOperation::FuaBarrier
+            | StorageIntentServiceObjectiveOperation::StableWrite
+            | StorageIntentServiceObjectiveOperation::FsyncDir
+            | StorageIntentServiceObjectiveOperation::MmapSync
+            | StorageIntentServiceObjectiveOperation::DirectIo
+            | StorageIntentServiceObjectiveOperation::PmemDurable
+    )
+}
+
+const fn service_objective_ack_is_durable(ack: StorageIntentGuaranteeClass) -> bool {
+    matches!(
+        ack,
+        StorageIntentGuaranteeClass::LocalIntent
+            | StorageIntentGuaranteeClass::RemoteVolatilePlusLocal
+            | StorageIntentGuaranteeClass::QuorumIntent
+            | StorageIntentGuaranteeClass::FullPlacement
+            | StorageIntentGuaranteeClass::GeoIntent
+            | StorageIntentGuaranteeClass::GeoFullPlacement
+            | StorageIntentGuaranteeClass::ArchiveEc
+    )
+}
+
+const fn service_objective_is_wan_object_or_archive(
+    environment: StorageIntentServiceObjectiveEnvironmentProfile,
+) -> bool {
+    environment.target_media.is_object_like()
+        || environment.target_media.is_archive()
+        || matches!(
+            environment.topology_class,
+            StorageIntentServiceObjectiveTopologyClass::CrossDatacenter
+                | StorageIntentServiceObjectiveTopologyClass::WanInternet
+                | StorageIntentServiceObjectiveTopologyClass::ObjectStore
+                | StorageIntentServiceObjectiveTopologyClass::OfflineArchive
+        )
+        || matches!(
+            environment.transport_class,
+            StorageIntentServiceObjectiveTransportClass::WanTcp
+                | StorageIntentServiceObjectiveTransportClass::WanInternet
+                | StorageIntentServiceObjectiveTransportClass::ObjectApi
+                | StorageIntentServiceObjectiveTransportClass::ArchiveOffline
+        )
+}
+
+const fn service_objective_decision_has_passing_gate(
+    evidence: StorageIntentServiceObjectiveEvidence,
+    decision: StorageIntentDecisionEvidence,
+) -> bool {
+    let mut index = 0;
+    while index < decision_frontier_len(decision.hard_gates.len) {
+        let gate = decision.hard_gates.gates[index];
+        if gate.gate as u8 == StorageIntentDecisionHardGateKind::ServiceObjective as u8
+            && gate.verdict as u8 == StorageIntentDecisionHardGateVerdict::Passed as u8
+            && gate.refusal as u16 == StorageIntentRefusalReason::None as u16
+            && bytes32_equal(
+                gate.candidate_id.0,
+                decision.selected_candidate.selected_plan_id.0,
+            )
+            && evidence_ref_equal(gate.evidence_ref, evidence.evidence_ref)
+        {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 /// Bounded candidate records retained by one decision frontier.
 pub const STORAGE_INTENT_DECISION_FRONTIER_CANDIDATES: usize = 16;
 
@@ -18277,6 +19199,266 @@ mod tests {
         }
     }
 
+    fn service_objective_scope() -> StorageIntentServiceObjectiveScope {
+        StorageIntentServiceObjectiveScope {
+            policy_id: StorageIntentPolicyId([47_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(8),
+            subject_scope: StorageIntentObjectScope {
+                dataset_id: DOMAIN_A,
+                object_id: StorageIntentEvidenceId([42_u8; 32]),
+                range_start: 0,
+                range_len: 4096,
+                generation: 7,
+            },
+            tenant_id: DOMAIN_A,
+            budget_owner_id: DOMAIN_A,
+            workload_class: AccessPatternClass::DatabaseWalFsync,
+            workload_phase: StorageIntentServiceObjectiveWorkloadPhase::ForegroundSync,
+            operation: StorageIntentServiceObjectiveOperation::Fsync,
+            ack_class: StorageIntentGuaranteeClass::LocalIntent,
+            media_class: StorageMediaClass::NvmeFlash,
+            media_role: StorageMediaRole::SyncIntent,
+            topology_class: StorageIntentServiceObjectiveTopologyClass::SameHost,
+            transport_class: StorageIntentServiceObjectiveTransportClass::LocalOnly,
+            failure_state: StorageIntentServiceObjectiveFailureState::Nominal,
+            comparator_scope: StorageIntentServiceObjectiveComparatorScope::SameObjective,
+        }
+    }
+
+    fn service_objective_refs() -> StorageIntentServiceObjectiveEvidenceRefs {
+        StorageIntentServiceObjectiveEvidenceRefs {
+            workload_ref: evidence_ref(StorageIntentEvidenceKind::WorkloadEvidence, 71),
+            workload_scope_ref: evidence_ref(StorageIntentEvidenceKind::WorkloadEvidence, 72),
+            prediction_ref: evidence_ref(StorageIntentEvidenceKind::PredictionEvidence, 73),
+            evidence_query_snapshot_ref: evidence_ref(
+                StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+                40,
+            ),
+            scheduler_admission_ref: evidence_ref(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                74,
+            ),
+            queue_admission_ref: evidence_ref(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                75,
+            ),
+            degradation_ref: evidence_ref(
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                76,
+            ),
+            recovery_ref: evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 77),
+            rpo_rto_ref: evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 78),
+            topology_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 79),
+            media_capability_ref: evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                80,
+            ),
+            isolation_ref: evidence_ref(StorageIntentEvidenceKind::TenantIsolationEvidence, 81),
+            protected_p99_owner_ref: evidence_ref(
+                StorageIntentEvidenceKind::TenantIsolationEvidence,
+                82,
+            ),
+            capacity_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 83),
+            reserve_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 84),
+            cost_ref: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 85),
+            wear_ref: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 86),
+            waf_ref: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 87),
+            decision_frontier_ref: evidence_ref(
+                StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                88,
+            ),
+            hard_gate_ref: evidence_ref(StorageIntentEvidenceKind::DecisionFrontierEvidence, 89),
+            action_execution_ref: evidence_ref(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                90,
+            ),
+            result_refusal_ref: evidence_ref(StorageIntentEvidenceKind::ResultRefusalEvidence, 91),
+            measurement_attribution_ref: evidence_ref(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                110,
+            ),
+            performance_row_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 92),
+            fault_row_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 93),
+            comparator_ref: evidence_ref(StorageIntentEvidenceKind::ComparatorEvidence, 142),
+            claim_ref: evidence_ref(StorageIntentEvidenceKind::ClaimGateEvidence, 94),
+            retention_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 95),
+            ordering_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 96),
+            pmem_persistence_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 97),
+            pmem_flush_fence_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 98),
+            rdma_absent_correctness_ref: evidence_ref(
+                StorageIntentEvidenceKind::TransportPathEvidence,
+                99,
+            ),
+            remote_commit_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 100),
+            trust_ref: evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, 135),
+            seek_payback_ref: evidence_ref(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                101,
+            ),
+            foreground_p99_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 102),
+        }
+    }
+
+    fn service_objective_evidence() -> StorageIntentServiceObjectiveEvidence {
+        let scope = service_objective_scope();
+        StorageIntentServiceObjectiveEvidence {
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::ServiceObjectiveEvidence, 70),
+            objective_id: StorageIntentEvidenceId([170_u8; 32]),
+            producer_component_ref: evidence_ref(
+                StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                171,
+            ),
+            producer_version: 1,
+            objective_generation: 2,
+            rollout_stage_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 172),
+            temporal_ref: evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 173),
+            scope,
+            request_mix_ref: evidence_ref(StorageIntentEvidenceKind::WorkloadEvidence, 174),
+            confidence_ref: evidence_ref(StorageIntentEvidenceKind::PredictionEvidence, 175),
+            latency: StorageIntentServiceObjectiveLatencyEnvelope {
+                p50_ceiling_us: 500,
+                p95_ceiling_us: 800,
+                p99_ceiling_us: 1000,
+                tail_ceiling_us: 1500,
+                max_queue_us: 250,
+                max_admission_us: 250,
+                max_device_dwell_us: 600,
+                max_transport_dwell_us: 100,
+                jitter_ppm: 10_000,
+                tail_amplification_ppm: 20_000,
+                warmup_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 176),
+                censoring_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 177),
+                breach_refusal: StorageIntentRefusalReason::DurabilityOrRpoNotMet,
+            },
+            throughput: StorageIntentServiceObjectiveThroughputEnvelope {
+                floor_bytes_per_sec: 4096,
+                ceiling_bytes_per_sec: 1024 * 1024 * 1024,
+                burst_bytes: 128 * 1024,
+                burst_window_ms: 1000,
+                dwell_window_ms: 1000,
+                max_concurrency: 8,
+                max_queue_depth: 32,
+                dirty_window_bytes: 256 * 1024,
+                coalescing_ref: evidence_ref(StorageIntentEvidenceKind::SchedulerAdmissionRecord, 178),
+                batching_ref: evidence_ref(StorageIntentEvidenceKind::SchedulerAdmissionRecord, 179),
+                backpressure_ref: evidence_ref(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    180,
+                ),
+            },
+            recovery_floor: StorageIntentServiceObjectiveRecoveryFloor {
+                required_ack: StorageIntentGuaranteeClass::LocalIntent,
+                durability_floor: DurabilityState::DurableIntent,
+                stale_read_allowed: false,
+                degraded_visible_allowed: false,
+                explicit_volatile_allowed: false,
+                explicit_unsafe_visible_allowed: false,
+                rpo_lag_ceiling_ms: 1,
+                rto_ceiling_ms: 10_000,
+                partition_refusal: StorageIntentRefusalReason::DurabilityOrRpoNotMet,
+            },
+            environment: StorageIntentServiceObjectiveEnvironmentProfile {
+                source_media: StorageMediaClass::NvmeFlash,
+                target_media: StorageMediaClass::NvmeFlash,
+                media_role: scope.media_role,
+                topology_class: scope.topology_class,
+                transport_class: scope.transport_class,
+                thermal_health_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 181),
+                namespace_identity_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    182,
+                ),
+                residency_ref: evidence_ref(StorageIntentEvidenceKind::ReadFreshnessEvidence, 183),
+                environment_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 184),
+            },
+            refs: service_objective_refs(),
+            state: StorageIntentServiceObjectiveState::Satisfied,
+            state_reason_ref: evidence_ref(StorageIntentEvidenceKind::ResultRefusalEvidence, 185),
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
+    fn service_objective_snapshot() -> StorageIntentEvidenceQuerySnapshot {
+        let mut snapshot = base_query_snapshot(
+            EvidenceConsumerClass::Planner,
+            EvidenceQueryContextClass::RequestAdmission,
+        );
+        let families = [
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+            StorageIntentEvidenceKind::WorkloadEvidence,
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+            StorageIntentEvidenceKind::TenantIsolationEvidence,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            StorageIntentEvidenceKind::PolicyRolloutEvidence,
+            StorageIntentEvidenceKind::TransportPathEvidence,
+            StorageIntentEvidenceKind::TemporalEvidence,
+            StorageIntentEvidenceKind::MediaCostWearLedger,
+            StorageIntentEvidenceKind::DecisionFrontierEvidence,
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+            StorageIntentEvidenceKind::ComparatorEvidence,
+            StorageIntentEvidenceKind::ClaimGateEvidence,
+            StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+        ];
+
+        for (offset, kind) in families.into_iter().enumerate() {
+            let byte = if matches!(kind, StorageIntentEvidenceKind::ServiceObjectiveEvidence) {
+                70
+            } else {
+                190 + offset as u8
+            };
+            push_family_freshness(
+                &mut snapshot,
+                kind,
+                EvidenceFamilyFreshnessState::Fresh,
+                byte,
+            );
+        }
+        snapshot
+    }
+
+    fn service_objective_attribution(
+        objective: StorageIntentServiceObjectiveEvidence,
+    ) -> StorageIntentMeasurementAttributionEvidence {
+        let mut attribution = measurement_attribution();
+        attribution.policy_id = objective.scope.policy_id;
+        attribution.policy_revision = objective.scope.policy_revision;
+        attribution.tenant_id = objective.scope.tenant_id;
+        attribution.budget_owner_id = objective.scope.budget_owner_id;
+        attribution.subject = EvidenceQuerySubjectScope {
+            scope_class: EvidenceQuerySubjectScopeClass::Dataset,
+            object_scope: objective.scope.subject_scope,
+            pool_id: StorageIntentDomainId([43_u8; 16]),
+            domain_id: objective.scope.tenant_id,
+            request_ref: evidence_ref(StorageIntentEvidenceKind::LocalIntentRecord, 44),
+            action_ref: evidence_ref(StorageIntentEvidenceKind::ActionExecutionEvidence, 45),
+            validation_ref: evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 46),
+        };
+        attribution.workload_envelope_ref = objective.refs.workload_ref;
+        attribution.workload_scope_ref = objective.refs.workload_scope_ref;
+        attribution.environment_profile_ref = objective.refs.topology_ref;
+        attribution.service_objective_ref = objective.evidence_ref;
+        attribution.evidence_query_snapshot_ref = objective.refs.evidence_query_snapshot_ref;
+        attribution.decision_frontier_ref = objective.refs.decision_frontier_ref;
+        attribution.action_execution_ref = objective.refs.action_execution_ref;
+        attribution.admission_ref = objective.refs.queue_admission_ref;
+        attribution.scheduler_ref = objective.refs.scheduler_admission_ref;
+        attribution.isolation_ref = objective.refs.isolation_ref;
+        attribution.capacity_ref = objective.refs.capacity_ref;
+        attribution.source_media_ref = objective.refs.media_capability_ref;
+        attribution.target_media_ref = objective.refs.media_capability_ref;
+        attribution.trust_domain_ref = objective.refs.trust_ref;
+        attribution.transport_path_ref = objective.refs.topology_ref;
+        attribution.recovery_ref = objective.refs.recovery_ref;
+        attribution.rollout_ref = objective.rollout_stage_ref;
+        attribution.comparator.comparator_ref = objective.refs.comparator_ref;
+        attribution.retention_ref = objective.refs.retention_ref;
+        attribution
+    }
+
     fn decision_candidate_id(byte: u8) -> StorageIntentEvidenceId {
         StorageIntentEvidenceId([byte; 32])
     }
@@ -21612,6 +22794,235 @@ mod tests {
             demotion.evidence_refs.service_objective_ref
         ));
     }
+
+    #[test]
+    fn service_objective_state_discriminants_fail_closed() {
+        assert_eq!(
+            StorageIntentServiceObjectiveState::from_discriminant(1),
+            Some(StorageIntentServiceObjectiveState::Satisfied)
+        );
+        assert_eq!(
+            StorageIntentServiceObjectiveState::from_discriminant(99),
+            None
+        );
+        assert_eq!(
+            StorageIntentServiceObjectiveState::DegradedVisible.as_str(),
+            "degraded-visible"
+        );
+        assert_eq!(
+            StorageIntentServiceObjectiveOperation::FuaBarrier.as_str(),
+            "fua-barrier"
+        );
+        assert_eq!(
+            StorageIntentServiceObjectiveComparatorScope::PublicClaim.as_str(),
+            "public-claim"
+        );
+    }
+
+    #[test]
+    fn service_objective_gates_candidates_before_scoring_and_admission() {
+        let objective = service_objective_evidence();
+        let snapshot = service_objective_snapshot();
+
+        assert!(objective.identity_is_bound());
+        assert!(objective.envelope_is_bound());
+        assert!(objective.has_required_evidence_cut(snapshot));
+        assert_eq!(
+            service_objective_gate_candidate(objective, objective.scope, snapshot),
+            ReceiptPredicateResult::SATISFIED
+        );
+
+        let mut frontier = decision_frontier();
+        assert_eq!(
+            service_objective_hard_gate_precedes_scoring_and_admission(objective, frontier)
+                .refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        frontier
+            .hard_gates
+            .push(StorageIntentDecisionHardGateResult {
+                candidate_id: decision_candidate_id(1),
+                gate: StorageIntentDecisionHardGateKind::ServiceObjective,
+                verdict: StorageIntentDecisionHardGateVerdict::Passed,
+                refusal: StorageIntentRefusalReason::None,
+                evidence_ref: objective.evidence_ref,
+            })
+            .unwrap();
+
+        assert_eq!(
+            service_objective_hard_gate_precedes_scoring_and_admission(objective, frontier),
+            ReceiptPredicateResult::SATISFIED
+        );
+
+        let mut scored_illegal = frontier;
+        let mut candidates = StorageIntentDecisionCandidateSet {
+            candidate_set_digest: decision_candidate_id(199),
+            ..StorageIntentDecisionCandidateSet::EMPTY
+        };
+        candidates
+            .push(decision_candidate(
+                1,
+                StorageIntentDecisionCandidateStatus::Legal,
+                true,
+            ))
+            .unwrap();
+        candidates
+            .push(decision_candidate(
+                2,
+                StorageIntentDecisionCandidateStatus::Illegal,
+                true,
+            ))
+            .unwrap();
+        scored_illegal.candidates = candidates;
+
+        assert_eq!(
+            service_objective_hard_gate_precedes_scoring_and_admission(
+                objective,
+                scored_illegal,
+            )
+            .refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn service_objective_transfer_requires_attribution_and_query_refs() {
+        let objective = service_objective_evidence();
+        let snapshot = service_objective_snapshot();
+        let attribution = service_objective_attribution(objective);
+        let mut workload = objective.scope;
+        workload.workload_class = AccessPatternClass::AsyncBulkWrite;
+        let mut operation = objective.scope;
+        operation.operation = StorageIntentServiceObjectiveOperation::ArchiveRestore;
+        let mut media = objective.scope;
+        media.media_class = StorageMediaClass::CloudObject;
+        let mut topology = objective.scope;
+        topology.topology_class = StorageIntentServiceObjectiveTopologyClass::WanInternet;
+        let mut ack = objective.scope;
+        ack.ack_class = StorageIntentGuaranteeClass::GeoAsync;
+        let mut tenant = objective.scope;
+        tenant.tenant_id = DOMAIN_B;
+        let mut failure = objective.scope;
+        failure.failure_state = StorageIntentServiceObjectiveFailureState::DegradedVisible;
+        let mut comparator = objective.scope;
+        comparator.comparator_scope = StorageIntentServiceObjectiveComparatorScope::PublicClaim;
+        let mut cross_attribution = attribution;
+        cross_attribution.transfer_scope =
+            StorageIntentMeasurementTransferScopeMask::EXACT_AUTHORITY_SCOPE
+                .union(StorageIntentMeasurementTransferScopeMask::CROSS_SCOPE_ELIGIBILITY);
+
+        let candidates = [
+            workload, operation, media, topology, ack, tenant, failure, comparator,
+        ];
+
+        for candidate in candidates {
+            assert!(!objective.scope_matches(candidate));
+            assert!(!objective.allows_attribution_transfer(
+                candidate,
+                attribution,
+                snapshot,
+                StorageIntentMeasurementAttributionUseMask::SUPPORT_PERFORMANCE_EVIDENCE,
+            ));
+            assert!(objective.allows_attribution_transfer(
+                candidate,
+                cross_attribution,
+                snapshot,
+                StorageIntentMeasurementAttributionUseMask::SUPPORT_PERFORMANCE_EVIDENCE,
+            ));
+
+            let mut no_attribution_ref = objective;
+            no_attribution_ref.refs.measurement_attribution_ref =
+                StorageIntentEvidenceRef::default();
+            assert!(!no_attribution_ref.allows_attribution_transfer(
+                candidate,
+                cross_attribution,
+                snapshot,
+                StorageIntentMeasurementAttributionUseMask::SUPPORT_PERFORMANCE_EVIDENCE,
+            ));
+
+            let mut no_query_ref = objective;
+            no_query_ref.refs.evidence_query_snapshot_ref = StorageIntentEvidenceRef::default();
+            assert!(!no_query_ref.allows_attribution_transfer(
+                candidate,
+                cross_attribution,
+                snapshot,
+                StorageIntentMeasurementAttributionUseMask::SUPPORT_PERFORMANCE_EVIDENCE,
+            ));
+        }
+
+        assert!(objective.allows_claim_wording(objective.scope, attribution, snapshot));
+    }
+
+    #[test]
+    fn service_objective_media_and_operation_floors_fail_closed() {
+        let objective = service_objective_evidence();
+        assert_eq!(
+            objective.media_operation_refusal(),
+            StorageIntentRefusalReason::None
+        );
+
+        let mut cache_only = objective;
+        cache_only.state = StorageIntentServiceObjectiveState::CacheOnly;
+        assert_eq!(
+            cache_only.state_refusal(),
+            StorageIntentRefusalReason::CacheCannotBeAuthority
+        );
+
+        let mut volatile_ram = objective;
+        volatile_ram.environment.target_media = StorageMediaClass::SystemRam;
+        volatile_ram.environment.media_role = StorageMediaRole::RamVolatileAuthority;
+        assert_eq!(
+            volatile_ram.media_operation_refusal(),
+            StorageIntentRefusalReason::VolatileRamCannotSatisfyDurableIntent
+        );
+
+        let mut pmem_missing_flush = objective;
+        pmem_missing_flush.environment.target_media = StorageMediaClass::PersistentMemory;
+        pmem_missing_flush.refs.pmem_flush_fence_ref = StorageIntentEvidenceRef::default();
+        assert_eq!(
+            pmem_missing_flush.media_operation_refusal(),
+            StorageIntentRefusalReason::PmemFlushFenceMissing
+        );
+
+        let mut flash_missing_waf = objective;
+        flash_missing_waf.refs.waf_ref = StorageIntentEvidenceRef::default();
+        assert_eq!(
+            flash_missing_waf.media_operation_refusal(),
+            StorageIntentRefusalReason::FlashWearBudgetExceeded
+        );
+
+        let mut hdd_missing_payback = objective;
+        hdd_missing_payback.environment.target_media = StorageMediaClass::HddRotational;
+        hdd_missing_payback.refs.foreground_p99_ref = StorageIntentEvidenceRef::default();
+        assert_eq!(
+            hdd_missing_payback.media_operation_refusal(),
+            StorageIntentRefusalReason::MovementDebtNotPaidBack
+        );
+
+        let mut wan_missing_baseline = objective;
+        wan_missing_baseline.environment.target_media = StorageMediaClass::CloudObject;
+        wan_missing_baseline.environment.topology_class =
+            StorageIntentServiceObjectiveTopologyClass::WanInternet;
+        wan_missing_baseline.environment.transport_class =
+            StorageIntentServiceObjectiveTransportClass::WanTcp;
+        wan_missing_baseline.refs.rdma_absent_correctness_ref =
+            StorageIntentEvidenceRef::default();
+        assert_eq!(
+            wan_missing_baseline.media_operation_refusal(),
+            StorageIntentRefusalReason::RdmaRequiredForCorrectness
+        );
+
+        let mut wan_missing_commit = wan_missing_baseline;
+        wan_missing_commit.refs.rdma_absent_correctness_ref =
+            objective.refs.rdma_absent_correctness_ref;
+        wan_missing_commit.refs.remote_commit_ref = StorageIntentEvidenceRef::default();
+        assert_eq!(
+            wan_missing_commit.media_operation_refusal(),
+            StorageIntentRefusalReason::UnsupportedRemoteCommitSemantics
+        );
+    }
+
     #[test]
     fn decision_frontier_discriminants_fail_closed() {
         assert_eq!(
