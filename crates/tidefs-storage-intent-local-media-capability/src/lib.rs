@@ -10,7 +10,6 @@
 //! [`StorageIntentMediaCapabilityRecord`] so downstream storage-intent
 //! consumers can use the #904 role predicate instead of device labels.
 
-use tidefs_kernel_storage_io::KernelStorageIoCapabilities;
 use tidefs_storage_intent_core::{
     MediaArchiveRestoreSemantics, MediaAtomicityClass, MediaCapabilityFlags,
     MediaCapabilityFreshnessState, MediaFlushOrderingClass, MediaHealthState,
@@ -135,6 +134,52 @@ impl LocalDecodedPoolLabel {
             device_class,
             device_capacity_bytes: 0,
             device_health: 0,
+        }
+    }
+}
+
+/// Local block-I/O capability sample for producer facts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LocalBlockIoCapabilities {
+    pub read: bool,
+    pub write: bool,
+    pub flush: bool,
+    pub discard: bool,
+    pub write_zeroes: bool,
+    pub zero_range: bool,
+    pub teardown: bool,
+    pub sector_size: u32,
+    pub capacity_sectors: u64,
+}
+
+impl LocalBlockIoCapabilities {
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self {
+            read: false,
+            write: false,
+            flush: false,
+            discard: false,
+            write_zeroes: false,
+            zero_range: false,
+            teardown: false,
+            sector_size: 0,
+            capacity_sectors: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn read_write_flush(sector_size: u32, capacity_sectors: u64, teardown: bool) -> Self {
+        Self {
+            read: true,
+            write: true,
+            flush: true,
+            discard: false,
+            write_zeroes: false,
+            zero_range: false,
+            teardown,
+            sector_size,
+            capacity_sectors,
         }
     }
 }
@@ -378,7 +423,7 @@ impl LocalPersistenceSnapshot {
 }
 
 /// ublk queue and request-shape sample, not lower-media durability proof.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LocalUblkShapeParams {
     pub basic_shape_present: bool,
     pub discard_shape_present: bool,
@@ -394,27 +439,6 @@ pub struct LocalUblkShapeParams {
     pub max_discard_sectors: u32,
     pub max_write_zeroes_sectors: u32,
     pub max_zone_append_sectors: u32,
-}
-
-impl Default for LocalUblkShapeParams {
-    fn default() -> Self {
-        Self {
-            basic_shape_present: false,
-            discard_shape_present: false,
-            zoned_shape_present: false,
-            fua_advertised: false,
-            rotational: false,
-            volatile_write_cache: false,
-            zoned_feature_advertised: false,
-            logical_bs_shift: 0,
-            physical_bs_shift: 0,
-            io_opt_shift: 0,
-            dev_sectors: 0,
-            max_discard_sectors: 0,
-            max_write_zeroes_sectors: 0,
-            max_zone_append_sectors: 0,
-        }
-    }
 }
 
 impl LocalUblkShapeParams {
@@ -488,7 +512,7 @@ impl LocalUblkShapeParams {
 }
 
 /// Normalized ublk queue and request-shape sample, not ublk ABI ownership.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LocalUblkRequestShapeSnapshot {
     pub params: LocalUblkShapeParams,
     pub queue_depth: u16,
@@ -497,20 +521,6 @@ pub struct LocalUblkRequestShapeSnapshot {
     pub flush_passthrough_proven: bool,
     pub fua_passthrough_proven: bool,
     pub ordering_limitations_absent: bool,
-}
-
-impl Default for LocalUblkRequestShapeSnapshot {
-    fn default() -> Self {
-        Self {
-            params: LocalUblkShapeParams::default(),
-            queue_depth: 0,
-            observed_flush_request: false,
-            observed_fua_write: false,
-            flush_passthrough_proven: false,
-            fua_passthrough_proven: false,
-            ordering_limitations_absent: false,
-        }
-    }
 }
 
 impl LocalUblkRequestShapeSnapshot {
@@ -554,7 +564,7 @@ impl LocalUblkRequestShapeSnapshot {
         } else {
             0
         };
-        let capabilities = KernelStorageIoCapabilities {
+        let capabilities = LocalBlockIoCapabilities {
             read: logical_block_bytes != 0 && self.params.dev_sectors != 0,
             write: logical_block_bytes != 0 && self.params.dev_sectors != 0,
             flush: self.observed_flush_request || self.flush_passthrough_proven,
@@ -728,7 +738,7 @@ impl LocalPersistenceFacts {
 /// Local block-I/O shape and ordering facts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalBlockIoFacts {
-    pub capabilities: KernelStorageIoCapabilities,
+    pub capabilities: LocalBlockIoCapabilities,
     pub flush_ordering: MediaFlushOrderingClass,
     pub discard_zeroes_shape_proven: bool,
     pub max_queue_depth: u32,
@@ -738,7 +748,7 @@ pub struct LocalBlockIoFacts {
 impl Default for LocalBlockIoFacts {
     fn default() -> Self {
         Self {
-            capabilities: KernelStorageIoCapabilities::unsupported(),
+            capabilities: LocalBlockIoCapabilities::unsupported(),
             flush_ordering: MediaFlushOrderingClass::Unknown,
             discard_zeroes_shape_proven: false,
             max_queue_depth: 0,
@@ -748,12 +758,12 @@ impl Default for LocalBlockIoFacts {
 }
 
 impl LocalBlockIoFacts {
-    /// Convert generic kernel-storage capability booleans into conservative
-    /// producer input. `flush = true` becomes `FlushOnly`; it is not FUA or
+    /// Convert local block capability booleans into conservative producer
+    /// input. `flush = true` becomes `FlushOnly`; it is not FUA or
     /// power-loss-safety proof.
     #[must_use]
-    pub const fn from_kernel_capabilities(
-        capabilities: KernelStorageIoCapabilities,
+    pub const fn from_block_capabilities(
+        capabilities: LocalBlockIoCapabilities,
         flush_ref: StorageIntentEvidenceRef,
     ) -> Self {
         let flush_ordering = if capabilities.flush {
@@ -951,7 +961,7 @@ impl LocalMediaCapabilityFacts {
                 persistence_ref: EMPTY_EVIDENCE_REF,
             },
             block_io: LocalBlockIoFacts {
-                capabilities: KernelStorageIoCapabilities {
+                capabilities: LocalBlockIoCapabilities {
                     read: false,
                     write: false,
                     flush: false,
@@ -1150,7 +1160,7 @@ mod tests {
     }
 
     fn strong_nvme_facts() -> LocalMediaCapabilityFacts {
-        let block = KernelStorageIoCapabilities {
+        let block = LocalBlockIoCapabilities {
             read: true,
             write: true,
             flush: true,
@@ -1173,7 +1183,7 @@ mod tests {
                 evidence(4),
             ))
             .with_block_io(
-                LocalBlockIoFacts::from_kernel_capabilities(block, evidence(5))
+                LocalBlockIoFacts::from_block_capabilities(block, evidence(5))
                     .with_flush_ordering(MediaFlushOrderingClass::FlushAndFua)
                     .with_discard_zeroes_shape()
                     .with_max_queue_depth(64),
@@ -1257,8 +1267,8 @@ mod tests {
 
     #[test]
     fn kernel_flush_boolean_alone_does_not_prove_durable_ordering() {
-        let kernel_flush_only = LocalBlockIoFacts::from_kernel_capabilities(
-            KernelStorageIoCapabilities::read_write_flush(4096, 1024, true),
+        let kernel_flush_only = LocalBlockIoFacts::from_block_capabilities(
+            LocalBlockIoCapabilities::read_write_flush(4096, 1024, true),
             evidence(5),
         );
         let record = produce_local_media_capability(
@@ -1642,8 +1652,8 @@ mod tests {
                     evidence(4),
                 ))
                 .with_block_io(
-                    LocalBlockIoFacts::from_kernel_capabilities(
-                        KernelStorageIoCapabilities::read_write_flush(4096, 1024, true),
+                    LocalBlockIoFacts::from_block_capabilities(
+                        LocalBlockIoCapabilities::read_write_flush(4096, 1024, true),
                         evidence(5),
                     )
                     .with_flush_ordering(MediaFlushOrderingClass::FlushAndFua),
