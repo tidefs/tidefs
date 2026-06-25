@@ -210,6 +210,11 @@ unsafe impl Sync for TidefsBlockModule {}
 /// This callback establishes the device-specific ioctl entrypoint for
 /// TideFS private ioctls (discard submit, discard stats).  All
 /// unrecognised commands return `-ENOTTY`.
+///
+/// # Safety
+///
+/// The Linux block layer must call this with a live `struct block_device *`
+/// whose gendisk/queue remain registered for the duration of the ioctl.
 unsafe extern "C" fn tidefs_block_ioctl(
     bdev: *mut bindings::block_device,
     _mode: bindings::blk_mode_t,
@@ -296,6 +301,8 @@ impl kernel::Module for TidefsBlockModule {
         // The module parameters are:
         //   cluster_node_id=N   (optional, sets BLOCK_CLUSTER_NODE_ID)
         //   transport_carrier=X (optional, sets BLOCK_TRANSPORT_CARRIER)
+        // SAFETY: module parameters are written during module setup before init
+        // records them; these &'static byte slices are read-only afterward.
         let cluster_node_id: Option<&[u8]> = unsafe { BLOCK_CLUSTER_NODE_ID };
         let transport_carrier: Option<&[u8]> = unsafe { BLOCK_TRANSPORT_CARRIER };
         let cluster_active = cluster_node_id.is_some() || transport_carrier.is_some();
@@ -685,6 +692,8 @@ impl Operations for TidefsBlockDriver {
         let op = cmd_flags & REQ_OP_MASK;
         let needs_preflush = (cmd_flags & REQ_PREFLUSH) != 0;
         let needs_fua = (cmd_flags & REQ_FUA) != 0;
+        // SAFETY: rq_ptr is the live blk-mq request pointer described above;
+        // these scalar fields are stable for the dispatch callback duration.
         let start_sector = unsafe { (*rq_ptr).__sector };
         let bytes = unsafe { (*rq_ptr).__data_len as usize };
 
@@ -802,6 +811,11 @@ fn request_ptr(rq: &ARef<mq::Request<TidefsBlockDriver>>) -> *mut bindings::requ
 /// copies segment data at `bv_offset` accounting for partial-completion
 /// (`bi_bvec_done`), and validates that the total copied bytes match the
 /// expected buffer length.
+///
+/// # Safety
+///
+/// `rq` must be the live blk-mq request pointer currently owned by this
+/// dispatch callback, and `buf` must cover the exact payload length.
 unsafe fn copy_request_payload(
     rq: *mut bindings::request,
     buf: &mut [u8],
@@ -869,6 +883,8 @@ unsafe fn copy_request_payload(
                     );
                 }
             } else {
+                // SAFETY: same mapped-page and buf bounds as the read branch
+                // above, with copy direction reversed for write requests.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         buf.as_ptr().add(copied),

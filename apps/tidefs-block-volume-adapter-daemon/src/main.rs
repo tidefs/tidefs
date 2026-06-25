@@ -1699,7 +1699,11 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
     // are caught by the dedicated sigwait thread. SIGUSR1 is used to unblock
     // the sigwait thread for clean shutdown join.
     {
+        // SAFETY: sigset_t is a C signal-set object; it is immediately
+        // initialized by sigemptyset before pthread_sigmask observes it.
         let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: sigemptyset/sigaddset mutate only the local sigset, and
+        // pthread_sigmask reads that initialized mask for this process thread.
         unsafe {
             libc::sigemptyset(&mut sigset);
             libc::sigaddset(&mut sigset, libc::SIGINT);
@@ -1724,7 +1728,11 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
     // after the I/O loop completes (by raising SIGUSR1 via pthread_kill or
     // kill(2)). This allows us to join the thread before exit.
     let signal_thread = std::thread::spawn(move || {
+        // SAFETY: sigset_t is a C signal-set object; it is initialized by
+        // sigemptyset/sigaddset before sigwait reads it.
         let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the signal thread owns this stack sigset while constructing
+        // the exact mask passed to sigwait.
         unsafe {
             libc::sigemptyset(&mut sigset);
             libc::sigaddset(&mut sigset, libc::SIGINT);
@@ -1734,6 +1742,8 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
         }
         loop {
             let mut caught_sig: libc::c_int = 0;
+            // SAFETY: sigwait reads the initialized mask and writes one c_int
+            // to the stack caught_sig slot.
             let rc = unsafe { libc::sigwait(&sigset, &mut caught_sig) };
             if rc != 0 {
                 continue;
@@ -1900,6 +1910,8 @@ fn run_ublk_serve(io_uring_enabled: bool, cli_nr_hw_queues: u16) -> Result<(), A
     // Unblock the sigwait thread: SIGUSR1 is blocked in the main thread mask
     // but included in the sigset watched by sigwait. Raising it unblocks
     // sigwait so the thread can exit cleanly and we can join.
+    // SAFETY: raise(3) delivers SIGUSR1 to this process; the signal is part of
+    // the dedicated sigwait mask and carries no Rust references.
     unsafe {
         libc::raise(libc::SIGUSR1);
     }

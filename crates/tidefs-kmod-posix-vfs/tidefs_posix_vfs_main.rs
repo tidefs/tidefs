@@ -3091,6 +3091,8 @@ impl KernelEngine {
                 if take > 0 {
                     let write_len = u32::try_from(take)
                         .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EOVERFLOW)?;
+                    // SAFETY: write_fn is the live C shim block write callback;
+                    // the data subslice is initialized for write_len bytes.
                     let ret = unsafe {
                         write_fn(sector, data[cursor..cursor + take].as_ptr(), write_len)
                     };
@@ -3114,6 +3116,8 @@ impl KernelEngine {
                 *byte = 0;
             }
             if let Some(read_fn) = io_ctx.read_sectors_fn {
+                // SAFETY: read_fn is the live C shim block read callback and
+                // sector_buf has sector_size writable bytes.
                 let ret = unsafe { read_fn(sector, sector_buf.as_mut_ptr(), io_ctx.sector_size) };
                 if ret != 0 {
                     return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
@@ -3130,6 +3134,8 @@ impl KernelEngine {
                 sector_buf[sector_cursor..sector_cursor + take]
                     .copy_from_slice(&data[cursor..cursor + take]);
             }
+            // SAFETY: write_fn is the live C shim block write callback and
+            // sector_buf contains a full sector-sized initialized buffer.
             let ret = unsafe { write_fn(sector, sector_buf.as_ptr(), io_ctx.sector_size) };
             if ret != 0 {
                 return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
@@ -3174,6 +3180,8 @@ impl KernelEngine {
                 if take > 0 {
                     let read_len = u32::try_from(take)
                         .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EOVERFLOW)?;
+                    // SAFETY: read_fn is the live C shim block read callback;
+                    // the output subslice is writable for read_len bytes.
                     let ret = unsafe {
                         read_fn(sector, out[cursor..cursor + take].as_mut_ptr(), read_len)
                     };
@@ -3193,6 +3201,8 @@ impl KernelEngine {
                     return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
                 }
             }
+            // SAFETY: read_fn is the live C shim block read callback and
+            // sector_buf has sector_size writable bytes.
             let ret = unsafe { read_fn(sector, sector_buf.as_mut_ptr(), io_ctx.sector_size) };
             if ret != 0 {
                 return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
@@ -3494,6 +3504,8 @@ impl KernelEngine {
                 }
                 if sector_cursor != 0 {
                     if let Some(read_fn) = io_ctx.read_sectors_fn {
+                        // SAFETY: read_fn is the live C shim block read callback
+                        // and sector_buf is a writable sector-sized buffer.
                         let ret = unsafe {
                             read_fn(current_sector, sector_buf.as_mut_ptr(), sector_size)
                         };
@@ -4071,6 +4083,8 @@ impl KernelEngine {
 
         let write_len = u32::try_from(image.len())
             .map_err(|_| crate::tidefs_kmod_bridge::kernel_types::Errno::EOVERFLOW)?;
+        // SAFETY: write_fn is the live C shim block write callback and image
+        // is an initialized snapshot buffer of write_len bytes.
         let ret = unsafe { write_fn(byte_offset / ss as u64, image.as_ptr(), write_len) };
         if ret != 0 {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
@@ -4118,6 +4132,8 @@ impl KernelEngine {
         if header.len() != header_len {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
         }
+        // SAFETY: read_fn is the live C shim block read callback and header
+        // is writable for the requested header_len bytes.
         let ret = unsafe {
             read_fn(
                 byte_offset / ss as u64,
@@ -4159,6 +4175,8 @@ impl KernelEngine {
         if image.len() != payload_len {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::ENOMEM);
         }
+        // SAFETY: read_fn is the live C shim block read callback and image is
+        // writable for the validated payload_len bytes.
         let ret = unsafe {
             read_fn(
                 byte_offset / ss as u64,
@@ -4543,6 +4561,8 @@ impl KernelEngine {
         let start_sector = byte_offset / ss as u64;
         let mut buf = [0u8; 4096];
         let buf_len = core::cmp::min(buf.len() as u32, ss);
+        // SAFETY: read_fn is the live C shim block read callback and buf is a
+        // writable stack buffer of buf_len bytes.
         let ret = unsafe { read_fn(start_sector, buf.as_mut_ptr(), buf_len) };
         if ret != 0 {
             return Ok(None);
@@ -4588,6 +4608,8 @@ impl KernelEngine {
         let off = (byte_offset % ss as u64) as usize;
         buf[off..off + 8].copy_from_slice(&next_ino.to_le_bytes());
         buf[off + 8..off + 16].copy_from_slice(&generation.to_le_bytes());
+        // SAFETY: write_fn is the live C shim block write callback and buf is
+        // an initialized stack buffer of buf_len bytes.
         let ret = unsafe { write_fn(start_sector, buf.as_ptr(), buf_len) };
         if ret != 0 {
             return Err(crate::tidefs_kmod_bridge::kernel_types::Errno::EIO);
@@ -7801,6 +7823,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_encode_committed_root_ledger(
         return -28;
     }
 
+    // SAFETY: out_buf/written_len were checked non-null above, and ledger.len()
+    // is bounded by out_capacity before copying to the C shim buffer.
     unsafe {
         core::ptr::copy_nonoverlapping(ledger.as_ptr(), out_buf, ledger.len());
         *written_len = ledger.len() as core::ffi::c_ulong;
@@ -7882,6 +7906,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_encode_committed_root_vrbt(
     let pointer_hash: [u8; 32] = crate::blake3::hash(&pointer[..TIDEFS_VCRP_HEADER_SIZE]).into();
     pointer[TIDEFS_VCRP_HASH_OFFSET..TIDEFS_VCRP_RECORD_SIZE].copy_from_slice(&pointer_hash);
 
+    // SAFETY: root/pointer output buffers and written-len pointers were
+    // validated by the C shim and checked before encoding.
     unsafe {
         core::ptr::copy_nonoverlapping(root.as_ptr(), root_buf, root.len());
         *root_written_len = root.len() as core::ffi::c_ulong;
@@ -7996,6 +8022,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_replay_getattr(
     };
 
     // Populate the output struct with canonical inode attributes.
+    // SAFETY: out was checked non-null above and points to a C shim-owned
+    // TidefsReplayGetattrOut for this call.
     unsafe {
         (*out).mode = record.mode;
         (*out).uid = record.uid;
@@ -8076,11 +8104,15 @@ pub extern "C" fn tidefs_posix_vfs_engine_replay_lookup(
     let name_slice = unsafe { core::slice::from_raw_parts(name_buf, name_len as usize) };
 
     match crate::replay_integration::lookup_dir_page(dir_slice, name_slice) {
+        // SAFETY: out was checked non-null above and points to C shim-owned
+        // readdir output storage for this call.
         Some(result) => unsafe {
             (*out).ino = result.ino;
             (*out).entry_type = result.entry_type;
             (*out).kind = result.kind;
         },
+        // SAFETY: out was checked non-null above and points to C shim-owned
+        // readdir output storage for this call.
         None => unsafe {
             // Entry not found in on-disk DirPage — caller falls back
             // to the fixed table via the C shim's fallback path.
@@ -8143,6 +8175,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_readdir(
         return -22; // EINVAL
     }
     if !ENGINE_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
+        // SAFETY: out was checked non-null above and points to C shim-owned
+        // readdir output storage for this call.
         unsafe {
             (*out).ino = 0;
             (*out).entry_type = 0;
@@ -8153,6 +8187,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_readdir(
         return -19; // ENODEV
     }
 
+    // SAFETY: with_mounted_engine holds MOUNTED_ENGINE_LOCK while borrowing
+    // the kernel-resident engine's interior dir_entries table.
     let result = with_mounted_engine(-19, |engine| unsafe {
         let dir_entries = engine.dir_entries.borrow();
         let mut best_index: Option<usize> = None;
@@ -8228,6 +8264,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_readdir_name(
         return -19; // ENODEV
     }
 
+    // SAFETY: with_mounted_engine holds MOUNTED_ENGINE_LOCK while borrowing
+    // the kernel-resident engine's interior dir_entries table.
     with_mounted_engine(-19, |engine| unsafe {
         let dir_entries = engine.dir_entries.borrow();
         for entry in dir_entries.iter() {
@@ -8295,6 +8333,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_replay_readdir(
     let dir_slice = unsafe { core::slice::from_raw_parts(dir_page_buf, dir_page_len as usize) };
 
     match crate::replay_integration::iterate_dir_page(dir_slice, cookie) {
+        // SAFETY: out was checked non-null above and points to C shim-owned
+        // readdir output storage for this call.
         Some(entry) => unsafe {
             (*out).ino = entry.ino;
             (*out).entry_type = entry.entry_type;
@@ -8302,6 +8342,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_replay_readdir(
             (*out).name_len = entry.name_len;
             (*out).next_cookie = entry.next_cookie;
         },
+        // SAFETY: out was checked non-null above and points to C shim-owned
+        // readdir output storage for this call.
         None => unsafe {
             // No more entries — caller uses ino=0 as end-of-directory.
             (*out).ino = 0;
@@ -8371,6 +8413,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_replay_extent_lookup(
     let page_slice =
         unsafe { core::slice::from_raw_parts(extent_page_buf, extent_page_len as usize) };
     match crate::replay_integration::lookup_exmp_extent(page_slice, logical_offset) {
+        // SAFETY: out was checked non-null above and points to C shim-owned
+        // extent output storage for this call.
         Ok(entry) => unsafe {
             (*out).locator_id = entry.locator_id;
             (*out).extent_internal_offset = logical_offset - entry.logical_offset;
@@ -8381,6 +8425,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_replay_extent_lookup(
         Err(_e) => {
             // Extent not found or page corrupt.
             // Return 0 with locator_id=0 to signal hole/ENOENT.
+            // SAFETY: out was checked non-null above and points to C
+            // shim-owned extent output storage for this call.
             unsafe {
                 (*out).locator_id = 0;
                 (*out).extent_internal_offset = 0;
@@ -8418,6 +8464,8 @@ fn with_mounted_engine<R>(missing: R, f: impl FnOnce(&KernelEngine) -> R) -> R {
         return missing;
     }
 
+    // SAFETY: MOUNTED_ENGINE_LOCK is held and ENGINE_INITIALIZED was checked
+    // after acquiring it, so the shared borrow cannot race teardown.
     unsafe {
         let engine_ptr: *const Option<KernelEngine> = &raw const MOUNTED_ENGINE;
         match &*engine_ptr {
@@ -8437,6 +8485,8 @@ fn with_mounted_engine_mut<R>(missing: R, f: impl FnOnce(&mut KernelEngine) -> R
         return missing;
     }
 
+    // SAFETY: MOUNTED_ENGINE_LOCK is held and ENGINE_INITIALIZED was checked
+    // after acquiring it, so this mutable borrow is exclusive until unlock.
     unsafe {
         let engine_ptr: *mut Option<KernelEngine> = &raw mut MOUNTED_ENGINE;
         match &mut *engine_ptr {
@@ -8463,11 +8513,20 @@ static mut TRANSPORT_CARRIER: Option<crate::tidefs_kmod_bridge::kernel_types::Km
 /// sector_size, sb_offset, sb_size, device_capacity_bytes: mounted block geometry.
 /// committed_txg, root_ino: from the committed-root ledger.
 /// pool_uuid: 32-byte pool UUID.
+///
+/// # Safety
+///
+/// The C shim must provide callback function pointers that remain valid while
+/// the mounted engine is active, and `pool_uuid` must reference 32 bytes.
 #[no_mangle]
 pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
+    // SAFETY: C shim callbacks remain valid while the mounted engine is active.
     write_fn: Option<unsafe extern "C" fn(u64, *const u8, u32) -> core::ffi::c_int>,
+    // SAFETY: C shim callbacks remain valid while the mounted engine is active.
     read_fn: Option<unsafe extern "C" fn(u64, *mut u8, u32) -> core::ffi::c_int>,
+    // SAFETY: C shim callbacks remain valid while the mounted engine is active.
     flush_fn: Option<unsafe extern "C" fn() -> core::ffi::c_int>,
+    // SAFETY: C shim callbacks remain valid while the mounted engine is active.
     teardown_fn: Option<unsafe extern "C" fn() -> core::ffi::c_int>,
     sector_size: u32,
     sb_offset: u64,
@@ -8615,6 +8674,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_init_mounted(
     }
     {
         let _guard = MOUNTED_ENGINE_LOCK.lock();
+        // SAFETY: MOUNTED_ENGINE_LOCK is held, so replacing the global mounted
+        // engine cannot race sync_fs, VFS callbacks, or teardown.
         unsafe {
             let engine_ptr: *mut Option<KernelEngine> = &raw mut MOUNTED_ENGINE;
             *engine_ptr = Some(engine);
@@ -8666,6 +8727,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_sync_namespace(
     let mode_slice = unsafe { core::slice::from_raw_parts(modes, count as usize) };
     let name_len_slice = unsafe { core::slice::from_raw_parts(name_lens, count as usize) };
     let data_len_slice = unsafe { core::slice::from_raw_parts(data_lens, count as usize) };
+    // SAFETY: names_ptr points to count C shim-owned name pointers matching
+    // name_lens; each element is validated before per-name slicing below.
     let names_slice = unsafe { core::slice::from_raw_parts(names_ptr, count as usize) };
 
     let ret = with_mounted_engine_mut(-19, |engine| {
@@ -8682,6 +8745,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_sync_namespace(
             if name_ptr.is_null() {
                 continue;
             }
+            // SAFETY: name_ptr came from names_slice and is non-null here;
+            // name_len was bounds checked to the kernel name limit above.
             let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
 
             // Determine kind from mode: S_IFDIR(0040000) or S_IFREG(0100000)
@@ -8765,6 +8830,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_teardown_mounted() -> core::ffi::c_int
     if !ENGINE_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
         return 0;
     }
+    // SAFETY: MOUNTED_ENGINE_LOCK is held and ENGINE_INITIALIZED was checked
+    // after lock acquisition, so the shared engine reference cannot race reset.
     let teardown_result = unsafe {
         let engine_ptr: *const Option<KernelEngine> = &raw const MOUNTED_ENGINE;
         match (*engine_ptr).as_ref() {
@@ -8773,6 +8840,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_teardown_mounted() -> core::ffi::c_int
         }
     };
     ENGINE_INITIALIZED.store(false, core::sync::atomic::Ordering::Release);
+    // SAFETY: MOUNTED_ENGINE_LOCK is still held, so clearing the global engine
+    // cannot race callbacks using with_mounted_engine.
     unsafe {
         let engine_ptr: *mut Option<KernelEngine> = &raw mut MOUNTED_ENGINE;
         *engine_ptr = None;
@@ -8834,11 +8903,15 @@ pub extern "C" fn tidefs_posix_vfs_engine_open(
     );
 
     match result {
+        // SAFETY: out was checked non-null above and points to C shim-owned
+        // file-handle output storage for this open callback.
         Ok(fh) => unsafe {
             (*out).ok = 1;
             (*out).fh_ino = fh.inode_id.get();
             (*out).fh_id = fh.fh_id.0;
         },
+        // SAFETY: out was checked non-null above and points to C shim-owned
+        // file-handle output storage for this open callback.
         Err(_e) => unsafe {
             (*out).ok = 0;
             (*out).fh_ino = 0;
@@ -8890,11 +8963,15 @@ pub extern "C" fn tidefs_posix_vfs_engine_opendir(
     );
 
     match result {
+        // SAFETY: out was checked non-null above and points to C shim-owned
+        // directory-handle output storage for this opendir callback.
         Ok(dh) => unsafe {
             (*out).ok = 1;
             (*out).fh_ino = dh.inode_id.get();
             (*out).fh_id = dh.dh_id.0;
         },
+        // SAFETY: out was checked non-null above and points to C shim-owned
+        // directory-handle output storage for this opendir callback.
         Err(_e) => unsafe {
             (*out).ok = 0;
             (*out).fh_ino = 0;
@@ -8945,6 +9022,8 @@ fn fill_engine_attr_out(
     out: *mut TidefsEngineAttrOut,
     attr: &crate::tidefs_kmod_bridge::kernel_types::InodeAttr,
 ) {
+    // SAFETY: callers validate out before passing it here; attr is a live Rust
+    // reference and every assigned field is a plain C-compatible scalar.
     unsafe {
         (*out).ino = attr.inode_id.get();
         (*out).generation = attr.generation.0;
@@ -8989,6 +9068,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_lookup(
     }
 
     let parent = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(parent_ino);
+    // SAFETY: name_ptr/name_len are provided by the kernel VFS lookup handler
+    // and were validated above for non-null and bounded length.
     let name_slice: &[u8] = unsafe { core::slice::from_raw_parts(name_ptr, name_len as usize) };
     let ctx = crate::tidefs_kmod_bridge::kernel_types::RequestCtx::default();
     let result = with_mounted_engine(
@@ -9172,6 +9253,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_copy_file_range(
         return -(crate::tidefs_kmod_bridge::kernel_types::Errno::EINVAL.0 as core::ffi::c_int);
     }
     if length == 0 {
+        // SAFETY: out_copied was checked non-null above and points to a C
+        // shim-owned output slot.
         unsafe {
             *out_copied = 0;
         }
@@ -9201,6 +9284,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_copy_file_range(
 
     match result {
         Ok(copied) => {
+            // SAFETY: out_copied was checked non-null above and points to a C
+            // shim-owned output slot.
             unsafe {
                 *out_copied = copied;
             }
@@ -9270,6 +9355,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_getxattr(
     match result {
         Ok(value) => {
             let req_len = value.len() as u32;
+            // SAFETY: out_len was checked non-null above and points to a C
+            // shim-owned output slot.
             unsafe {
                 *out_len = req_len;
             }
@@ -9280,6 +9367,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_getxattr(
                 return -(crate::tidefs_kmod_bridge::kernel_types::Errno::ERANGE.0
                     as core::ffi::c_int);
             }
+            // SAFETY: value_ptr/value_size were checked for the C buffer, and
+            // value_size >= req_len ensures the copy fits.
             unsafe {
                 core::ptr::copy_nonoverlapping(value.as_ptr(), value_ptr, req_len as usize);
             }
@@ -9316,6 +9405,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_listxattr(
     match result {
         Ok(list) => {
             let req_len = list.len() as u32;
+            // SAFETY: out_len was checked non-null above and points to a C
+            // shim-owned output slot.
             unsafe {
                 *out_len = req_len;
             }
@@ -9326,6 +9417,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_listxattr(
                 return -(crate::tidefs_kmod_bridge::kernel_types::Errno::ERANGE.0
                     as core::ffi::c_int);
             }
+            // SAFETY: buf_ptr/buf_size were checked for the C buffer, and
+            // buf_size >= req_len ensures the copy fits.
             unsafe {
                 core::ptr::copy_nonoverlapping(list.as_ptr(), buf_ptr, req_len as usize);
             }
@@ -9481,6 +9574,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_create(
     );
 
     match result {
+        // SAFETY: output pointers were checked non-null above and point to C
+        // shim-owned slots for this create callback.
         Ok((attr, _fh)) => unsafe {
             *out_ino = attr.inode_id.get();
             *out_mode = attr.posix.mode;
@@ -9518,6 +9613,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_tmpfile(
     );
 
     match result {
+        // SAFETY: output pointers were checked non-null above and point to C
+        // shim-owned slots for this tmpfile callback.
         Ok((attr, _fh)) => unsafe {
             *out_ino = attr.inode_id.get();
             *out_mode = attr.posix.mode;
@@ -9566,6 +9663,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_mkdir(
     );
 
     match result {
+        // SAFETY: output pointers were checked non-null above and point to C
+        // shim-owned slots for this mkdir callback.
         Ok(attr) => unsafe {
             *out_ino = attr.inode_id.get();
             *out_mode = attr.posix.mode;
@@ -9729,6 +9828,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_link(
         |engine| engine.link(target, new_parent, name_slice, &ctx),
     );
     match result {
+        // SAFETY: output pointers were checked non-null above and point to C
+        // shim-owned slots for this link callback.
         Ok(attr) => unsafe {
             *out_ino = attr.inode_id.get();
             *out_mode = attr.posix.mode;
@@ -9759,14 +9860,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_symlink(
             as core::ffi::c_int);
     }
     let parent = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(parent_ino);
-    // SAFETY: name_ptr and name_len are provided by the kernel VFS
-    // xattr handler; null and zero-length are validated above.
-    // SAFETY: name_ptr and name_len are provided by the kernel VFS
-    // xattr handler; validated above.
-    // SAFETY: name_ptr and name_len are provided by the kernel VFS
-    // lookup handler; validated above.
-    // SAFETY: name_ptr and name_len are provided by the kernel VFS
-    // getattr handler; validated above.
+    // SAFETY: name_ptr/name_len and target_ptr/target_len are kernel VFS
+    // buffers validated above for non-null and bounded lengths.
     let name_slice: &[u8] = unsafe { core::slice::from_raw_parts(name_ptr, name_len as usize) };
     let target_slice: &[u8] =
         unsafe { core::slice::from_raw_parts(target_ptr, target_len as usize) };
@@ -9776,6 +9871,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_symlink(
         |engine| engine.symlink(parent, name_slice, target_slice, &ctx),
     );
     match result {
+        // SAFETY: output pointers were checked non-null above and point to C
+        // shim-owned slots for this symlink callback.
         Ok(attr) => unsafe {
             *out_ino = attr.inode_id.get();
             *out_mode = attr.posix.mode;
@@ -9802,6 +9899,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_mknod(
         return -(e.0 as core::ffi::c_int);
     }
     let parent = crate::tidefs_kmod_bridge::kernel_types::InodeId::new(parent_ino);
+    // SAFETY: name_ptr/name_len are kernel VFS buffers validated above for
+    // non-null and bounded name length.
     let name_slice: &[u8] = unsafe { core::slice::from_raw_parts(name_ptr, name_len as usize) };
     let ctx = crate::tidefs_kmod_bridge::kernel_types::RequestCtx::default();
     let result = with_mounted_engine(
@@ -9809,6 +9908,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_mknod(
         |engine| engine.mknod(parent, name_slice, mode, rdev, &ctx),
     );
     match result {
+        // SAFETY: output pointers were checked non-null above and point to C
+        // shim-owned slots for this mknod callback.
         Ok(attr) => unsafe {
             *out_ino = attr.inode_id.get();
             *out_mode = attr.posix.mode;
@@ -9837,6 +9938,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_readlink(
     match result {
         Ok(target) => {
             let copy_len = core::cmp::min(target.len(), out_buf_size as usize);
+            // SAFETY: out_buf/out_len were checked non-null above and copy_len
+            // is bounded by the C shim-provided output buffer length.
             unsafe {
                 core::ptr::copy_nonoverlapping(target.as_ptr(), out_buf, copy_len);
                 *out_len = copy_len as u32;
@@ -9900,6 +10003,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_setattr(
     );
 
     match result {
+        // SAFETY: output pointers were checked non-null above and point to C
+        // shim-owned slots for this setattr callback.
         Ok(attr) => unsafe {
             *out_mode = attr.posix.mode;
             *out_uid = attr.posix.uid;
@@ -9936,6 +10041,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_get_generation(
     );
 
     match result {
+        // SAFETY: out_generation was checked non-null above and points to a C
+        // shim-owned output slot.
         Ok(gen) => unsafe {
             *out_generation = gen;
         },
@@ -10074,6 +10181,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_fiemap(
             let to_copy = core::cmp::min(max_extents as usize, extents.len());
             if to_copy > 0 {
                 for (idx, extent) in extents.iter().take(to_copy).enumerate() {
+                    // SAFETY: extents_out was checked non-null above and idx
+                    // is bounded by max_extents/to_copy.
                     unsafe {
                         *extents_out.add(idx) = TidefsFiemapExtentOut {
                             logical: extent.fe_logical,
@@ -10085,6 +10194,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_fiemap(
                     }
                 }
             }
+            // SAFETY: mapped_extents and available_extents were checked
+            // non-null above and point to C shim-owned output slots.
             unsafe {
                 *mapped_extents = to_copy as u32;
                 *available_extents = available;
@@ -10176,6 +10287,8 @@ pub extern "C" fn tidefs_posix_vfs_engine_fallocate(
     );
 
     match result {
+        // SAFETY: out_size/out_blocks were checked non-null above and point to
+        // C shim-owned output slots.
         Ok((size, blocks)) => unsafe {
             *out_size = size;
             *out_blocks = blocks;
@@ -10288,7 +10401,11 @@ struct TidefsPosixVfs {
 
 impl kernel::Module for TidefsPosixVfs {
     fn init(_module: &'static ThisModule) -> Result<Self> {
+        // SAFETY: the global mutex is initialized once during module init
+        // before filesystem registration exposes callbacks.
         unsafe { MOUNTED_ENGINE_LOCK.init() };
+        // SAFETY: the extern registration function matches the local C shim
+        // module ABI and is called once during module init.
         let ret = unsafe { tidefs_posix_vfs_register_fs() };
         to_result(ret)?;
         pr_info!("tidefs_posix_vfs: loaded and registered filesystem type 'tidefs'\n");
@@ -10298,6 +10415,8 @@ impl kernel::Module for TidefsPosixVfs {
 impl Drop for TidefsPosixVfs {
     fn drop(&mut self) {
         if self.registered {
+            // SAFETY: unregister pairs the successful registration from init
+            // and runs before the module is unloaded.
             unsafe { tidefs_posix_vfs_unregister_fs() };
             self.registered = false;
         }

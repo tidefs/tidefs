@@ -195,7 +195,11 @@ fn query_port_attributes(
     context: *mut ffi::ibv_context,
     port_num: u8,
 ) -> Result<PortAttributes, String> {
+    // SAFETY: ibv_port_attr is a plain C out-parameter struct; libibverbs
+    // fully initializes it through ibv_query_port on success.
     let mut attr: ffi::ibv_port_attr = unsafe { std::mem::zeroed() };
+    // SAFETY: context is an open ibv_context owned by RdmaDevice, port_num is
+    // selected by the caller, and attr points to writable stack storage.
     let ret = unsafe { ffi::ibv_query_port(context, port_num, &mut attr) };
     if ret != 0 {
         return Err(format!(
@@ -219,11 +223,17 @@ fn select_preferred_gid(
 ) -> Option<GidInfo> {
     let mut best: Option<(u8, GidInfo)> = None;
     for index in 0..gid_tbl_len.clamp(0, 256) {
+        // SAFETY: ibv_gid is a C union/out-parameter; zeroed storage is valid
+        // before libibverbs fills it through ibv_query_gid.
         let mut gid: ffi::ibv_gid = unsafe { std::mem::zeroed() };
+        // SAFETY: context is a live ibv_context and gid points to writable
+        // stack storage for this probed GID-table index.
         let ret = unsafe { ffi::ibv_query_gid(context, port_num, index, &mut gid) };
         if ret != 0 {
             continue;
         }
+        // SAFETY: ibv_query_gid succeeded, so reading the raw union member is
+        // the libibverbs-reported 16-byte GID value.
         let raw = unsafe { gid.raw };
         let rank = gid_rank(&raw);
         if rank == 0 {

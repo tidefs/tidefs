@@ -167,6 +167,8 @@ mod tests {
     #[test]
     fn opaque_super_block_from_and_as_ptr() {
         let sentinel: *const core::ffi::c_void = core::ptr::null();
+        // SAFETY: this unit test exercises the opaque facade with a sentinel
+        // null pointer and only verifies round-trip storage.
         let sb = unsafe { OpaqueSuperBlock::from_ptr(sentinel) };
         assert_eq!(sb.as_ptr(), sentinel);
     }
@@ -174,6 +176,8 @@ mod tests {
     #[test]
     fn opaque_dentry_from_and_as_ptr() {
         let sentinel: *const core::ffi::c_void = core::ptr::null();
+        // SAFETY: this unit test exercises the opaque facade with a sentinel
+        // null pointer and only verifies round-trip storage.
         let d = unsafe { OpaqueDentry::from_ptr(sentinel) };
         assert_eq!(d.as_ptr(), sentinel);
     }
@@ -181,6 +185,8 @@ mod tests {
     #[test]
     fn opaque_inode_from_and_as_ptr() {
         let sentinel = core::ptr::null();
+        // SAFETY: this unit test exercises the opaque facade with a sentinel
+        // null pointer and only verifies round-trip storage.
         let i = unsafe { OpaqueInode::from_ptr(sentinel) };
         assert_eq!(i.as_ptr(), sentinel);
     }
@@ -188,6 +194,8 @@ mod tests {
     #[test]
     fn opaque_file_from_and_as_ptr() {
         let sentinel = core::ptr::null();
+        // SAFETY: this unit test exercises the opaque facade with a sentinel
+        // null pointer and only verifies round-trip storage.
         let f = unsafe { OpaqueFile::from_ptr(sentinel) };
         assert_eq!(f.as_ptr(), sentinel);
     }
@@ -195,6 +203,8 @@ mod tests {
     #[test]
     fn opaque_folio_from_and_as_ptr() {
         let sentinel = core::ptr::null();
+        // SAFETY: this unit test exercises the opaque facade with a sentinel
+        // null pointer and only verifies round-trip storage.
         let f = unsafe { OpaqueFolio::from_ptr(sentinel) };
         assert_eq!(f.as_ptr(), sentinel);
     }
@@ -202,6 +212,8 @@ mod tests {
     #[test]
     fn opaque_bio_from_and_as_ptr() {
         let sentinel = core::ptr::null();
+        // SAFETY: this unit test exercises the opaque facade with a sentinel
+        // null pointer and only verifies round-trip storage.
         let b = unsafe { OpaqueBio::from_ptr(sentinel) };
         assert_eq!(b.as_ptr(), sentinel);
     }
@@ -209,6 +221,8 @@ mod tests {
     #[test]
     fn opaque_request_queue_from_and_as_ptr() {
         let sentinel = core::ptr::null();
+        // SAFETY: this unit test exercises the opaque facade with a sentinel
+        // null pointer and only verifies round-trip storage.
         let rq = unsafe { OpaqueRequestQueue::from_ptr(sentinel) };
         assert_eq!(rq.as_ptr(), sentinel);
     }
@@ -216,10 +230,14 @@ mod tests {
     #[test]
     fn opaque_types_debug_format() {
         let null = core::ptr::null();
+        // SAFETY: this unit test exercises the opaque facade with a sentinel
+        // null pointer and only verifies Debug output.
         let sb = unsafe { OpaqueSuperBlock::from_ptr(null) };
         let dbg = format!("{sb:?}");
         assert!(dbg.contains("OpaqueSuperBlock"), "debug: {dbg}");
 
+        // SAFETY: this unit test exercises the opaque facade with a sentinel
+        // null pointer and only verifies Debug output.
         let d = unsafe { OpaqueDentry::from_ptr(null) };
         assert!(format!("{d:?}").contains("OpaqueDentry"));
     }
@@ -230,6 +248,8 @@ mod tests {
 
     #[test]
     fn folio_window_construction() {
+        // SAFETY: this unit test uses a sentinel null opaque pointer and never
+        // dereferences it.
         let folio = unsafe { OpaqueFolio::from_ptr(core::ptr::null()) };
         let w = FolioWindow {
             file_offset: 4096,

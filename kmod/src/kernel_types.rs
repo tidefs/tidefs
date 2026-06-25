@@ -2774,11 +2774,27 @@ mod kbuild_impl {
     /// gate on Mounted state. The committed root is tracked externally;
     /// see KernelEngine for the kernel-side committed-root protocol.
 
+    /// # Safety
+    ///
+    /// The C shim must provide a live block-device write callback. `data`
+    /// must point to `len` initialized bytes for the duration of the call.
     pub type KernelPoolWriteSectorsFn =
         unsafe extern "C" fn(start_sector: u64, data: *const u8, len: u32) -> core::ffi::c_int;
+    /// # Safety
+    ///
+    /// The C shim must provide a live block-device read callback. `buf` must
+    /// point to `len` writable bytes for the duration of the call.
     pub type KernelPoolReadSectorsFn =
         unsafe extern "C" fn(start_sector: u64, buf: *mut u8, len: u32) -> core::ffi::c_int;
+    /// # Safety
+    ///
+    /// The C shim must provide a live lower-device flush callback that may be
+    /// called only while the committed-root I/O context is active.
     pub type KernelPoolFlushFn = unsafe extern "C" fn() -> core::ffi::c_int;
+    /// # Safety
+    ///
+    /// The C shim must provide a live teardown callback that is called only
+    /// once the lower-device authority is being released.
     pub type KernelPoolTeardownFn = unsafe extern "C" fn() -> core::ffi::c_int;
 
     /// C-provided I/O context for writing committed-root records to disk.
@@ -2869,6 +2885,8 @@ mod kbuild_impl {
 
         pub fn flush(&self) -> Result<(), Errno> {
             let flush_fn = self.flush_fn.ok_or(Errno::ENODEV)?;
+            // SAFETY: is_active/capability setup records a live C flush
+            // callback for the mounted committed-root I/O context.
             let ret = unsafe { flush_fn() };
             if ret < 0 {
                 return Err(Errno((-ret) as u16));
@@ -2878,6 +2896,8 @@ mod kbuild_impl {
 
         pub fn teardown(&self) -> Result<(), Errno> {
             let teardown_fn = self.teardown_fn.ok_or(Errno::ENODEV)?;
+            // SAFETY: teardown_fn is provided by the C shim for this active
+            // committed-root I/O context and takes no Rust references.
             let ret = unsafe { teardown_fn() };
             if ret < 0 {
                 return Err(Errno((-ret) as u16));
@@ -3054,6 +3074,8 @@ pub use kbuild_impl::*;
 mod tests {
     use super::*;
 
+    // SAFETY: test callback matching KernelPoolWriteSectorsFn; it ignores the
+    // raw pointer and returns success for contract-shape tests.
     unsafe extern "C" fn write_ok(
         _start_sector: u64,
         _data: *const u8,
@@ -3062,14 +3084,18 @@ mod tests {
         0
     }
 
+    // SAFETY: test callback matching KernelPoolReadSectorsFn; it ignores the
+    // raw pointer and returns success for contract-shape tests.
     unsafe extern "C" fn read_ok(_start_sector: u64, _buf: *mut u8, _len: u32) -> core::ffi::c_int {
         0
     }
 
+    // SAFETY: test callback matching KernelPoolFlushFn.
     unsafe extern "C" fn flush_ok() -> core::ffi::c_int {
         0
     }
 
+    // SAFETY: test callback matching KernelPoolTeardownFn.
     unsafe extern "C" fn teardown_ok() -> core::ffi::c_int {
         0
     }

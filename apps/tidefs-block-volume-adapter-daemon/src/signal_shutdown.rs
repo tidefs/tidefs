@@ -13,6 +13,8 @@ pub struct SignalShutdownThread {
 
 impl SignalShutdownThread {
     pub fn finish(mut self) {
+        // SAFETY: raise(3) targets the current process with SIGUSR1, which this
+        // module reserves for waking the sigwait thread during orderly join.
         unsafe {
             libc::raise(libc::SIGUSR1);
         }
@@ -33,7 +35,11 @@ pub fn install_signal_shutdown_thread(
     log_prefix: &'static str,
     shutdown: Arc<AtomicBool>,
 ) -> Result<SignalShutdownThread, String> {
+    // SAFETY: sigset_t is a plain C signal-set object; POSIX requires callers
+    // to initialize it with sigemptyset before passing it to pthread_sigmask.
     let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: sigemptyset/sigaddset initialize only the stack sigset above,
+    // and pthread_sigmask reads that initialized mask in the calling thread.
     unsafe {
         libc::sigemptyset(&mut sigset);
         libc::sigaddset(&mut sigset, libc::SIGINT);
@@ -46,7 +52,11 @@ pub fn install_signal_shutdown_thread(
     }
 
     let handle = std::thread::spawn(move || {
+        // SAFETY: sigset_t is zeroed only to allocate the C object; the
+        // following sigemptyset/sigaddset calls establish the valid mask.
         let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the thread owns this stack sigset while building the mask
+        // consumed by sigwait below.
         unsafe {
             libc::sigemptyset(&mut sigset);
             libc::sigaddset(&mut sigset, libc::SIGINT);
@@ -56,6 +66,8 @@ pub fn install_signal_shutdown_thread(
 
         loop {
             let mut caught_sig: libc::c_int = 0;
+            // SAFETY: sigwait writes one c_int to caught_sig and reads the
+            // initialized mask local to this signal thread.
             let rc = unsafe { libc::sigwait(&sigset, &mut caught_sig) };
             if rc != 0 {
                 continue;

@@ -3433,6 +3433,8 @@ impl UblkDataQueueRuntime {
             .io_buffer_file_offset(q_id, tag, 0)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid q_id/tag"))?;
         let len = buf.len();
+        // SAFETY: pread(2) writes at most buf.len() bytes into the valid mutable
+        // slice pointer; pos is produced by the ublk q_id/tag bounds check.
         let read = unsafe {
             libc::pread(
                 self.data_queue_file.as_raw_fd(),
@@ -3454,6 +3456,8 @@ impl UblkDataQueueRuntime {
             .io_buffer_file_offset(q_id, tag, 0)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid q_id/tag"))?;
         let len = data.len();
+        // SAFETY: pwrite(2) reads at most data.len() bytes from a valid slice
+        // pointer; pos is produced by the ublk q_id/tag bounds check.
         let written = unsafe {
             libc::pwrite(
                 self.data_queue_file.as_raw_fd(),
@@ -3481,6 +3485,8 @@ impl UblkDataQueueRuntime {
         let offset = (tag as usize) * desc_size + desc_size;
         let buf_size = (1usize << UBLK_IO_BUF_BITS) - desc_size;
         let cmd_buf = self.cmd_buf_ptrs.first()?;
+        // SAFETY: cmd_buf points to the live read-only ublk command-buffer
+        // mmap held by self; tag was bounds checked against queue_depth above.
         unsafe {
             let ptr = cmd_buf.add(offset);
             Some(std::slice::from_raw_parts(ptr, buf_size))
@@ -3505,6 +3511,8 @@ impl UblkDataQueueRuntime {
         let q_idx = q_id as usize;
         let offset = (tag as usize) * core::mem::size_of::<UblkSrvIoDesc>();
         let cmd_buf = self.cmd_buf_ptrs.get(q_idx)?;
+        // SAFETY: cmd_buf is the live mmap for q_id and tag was bounds checked;
+        // the kernel lays out UblkSrvIoDesc records at this fixed stride.
         unsafe {
             let ptr = cmd_buf.add(offset) as *const UblkSrvIoDesc;
             Some(&*ptr)
@@ -3532,6 +3540,8 @@ impl UblkDataQueueRuntime {
         let offset = (tag as usize) * desc_size + desc_size;
         let buf_size = (1usize << UBLK_IO_BUF_BITS) - desc_size;
         let cmd_buf = self.cmd_buf_ptrs.get(q_id as usize)?;
+        // SAFETY: cmd_buf is the live read-only mmap for q_id, and q_id/tag
+        // bounds above keep offset..offset+buf_size inside the queue buffer.
         unsafe {
             let ptr = cmd_buf.add(offset);
             Some(std::slice::from_raw_parts(ptr, buf_size))
@@ -3587,6 +3597,8 @@ impl Drop for UblkDataQueueRuntime {
         self.drain_completions(crate::target_reset_guard::DEFAULT_DRAIN_TIMEOUT);
         for (&ptr, &len) in self.cmd_buf_ptrs.iter().zip(self.cmd_buf_lens.iter()) {
             if !ptr.is_null() && len > 0 {
+                // SAFETY: ptr/len pairs were returned by mmap in open_data_queue_runtime
+                // and are unmapped exactly once during Drop.
                 unsafe {
                     libc::munmap(ptr as *mut libc::c_void, len);
                 }
@@ -3657,6 +3669,8 @@ pub fn open_data_queue_runtime(
     // Stride = PAGE_SIZE stride: all queues alias q0; nr_hw_queues=1() matching kernel's max_sz.
     for q_id in 0..nr_hw_queues {
         let mmap_offset = (q_id * 4096) as libc::off_t; /* PAGE_SIZE stride; nr_hw_queues=1 ensures all queues alias q0 */
+        // SAFETY: data_queue_file is the open /dev/ublkcN fd; the kernel ublk
+        // mmap contract provides a read-only command buffer for this offset.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -3669,6 +3683,8 @@ pub fn open_data_queue_runtime(
         };
         if ptr == libc::MAP_FAILED {
             for &prev_ptr in &cmd_buf_ptrs {
+                // SAFETY: prev_ptr was returned by an earlier successful mmap
+                // in this function and has not been handed to the runtime yet.
                 unsafe {
                     libc::munmap(prev_ptr as *mut libc::c_void, cmd_buf_size_per_queue);
                 }
