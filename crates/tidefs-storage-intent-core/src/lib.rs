@@ -7448,6 +7448,7 @@ pub const fn prefetch_residency_decision_is_cache_only(
             | PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch
             | PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage
             | PrefetchResidencyCandidateClass::CacheOnlyTrial
+            | PrefetchResidencyCandidateClass::VolatileRamTrial
     )
 }
 
@@ -24699,6 +24700,7 @@ mod tests {
             proven_media_capability(StorageMediaClass::SystemRam, 101);
 
         let trial_decision = prefetch_residency_decide(ram_trial_context);
+        assert!(prefetch_residency_decision_is_cache_only(trial_decision));
         assert!(!prefetch_residency_decision_may_request_authority_change(
             trial_decision
         ));
