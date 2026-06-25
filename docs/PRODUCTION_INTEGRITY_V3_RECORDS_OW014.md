@@ -1,4 +1,4 @@
-# Production integrity v3 records (OW-014) (v0.414)
+# Production integrity v3 records
 
 > TFR-019 authority note: this imported implementation note is review material,
 > the behavior below as needing reconciliation with current source,
@@ -86,5 +86,6 @@ The stable implementation-tracked non-release command name is
 
 ## Follow-on root authentication
 
-root authentication is delivered by OW-015 in v0.415. This OW-014 slice does
+root authentication is delivered by the root-authentication slice. This
+production-integrity v3 slice does
 not store raw root authentication keys, implement sealed-key handling, perform

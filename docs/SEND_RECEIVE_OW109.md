@@ -1,4 +1,4 @@
-# Send/receive changed-record stream (OW-109) (v0.417)
+# Send/receive changed-record stream
 
 > TFR-019 authority note: this imported implementation note is review material,
 > the behavior below as needing reconciliation with current source,

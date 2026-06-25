@@ -1,4 +1,4 @@
-# Chunked File Layout (OW-101)
+# Chunked File Layout
 
 > TFR-019 authority note: this imported implementation note is review material,
 > the behavior below as needing reconciliation with current source,
@@ -41,5 +41,5 @@ cargo run -p tidefs-xtask -- check-chunked-file-layout
 tidefs-xtask check-chunked-file-layout
 ```
 
-This check binds the source markers, documentation, filesystem demo markers,
-tracking is in Forgejo.
+This check binds the source markers, documentation, and filesystem demo
+markers. Current tracking is through GitHub issues and TFR-019 review state.

@@ -1,4 +1,4 @@
-# Local Object Store on-disk format (OW-005/OW-014) (v0.414)
+# Local Object Store on-disk format
 
 > TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 
@@ -8,9 +8,9 @@
 
 Historical tracker wording: item 005.
 
-This document describes the historical `OW-005` Local Object Store on-disk
-format. v0.414 adds `OW-014`: the current writer now emits record version `3`
-with a BLAKE3-256 production-integrity trailer. v1 and v2 records remain
+This document describes the historical Local Object Store on-disk
+format. The current writer now emits record version `3` with a BLAKE3-256
+production-integrity trailer. v1 and v2 records remain
 
 ## Scope
 

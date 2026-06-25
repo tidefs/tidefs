@@ -5,7 +5,7 @@
 //! reconstruction from authoritative pool labels) with the object-store
 //! [`rebuild_replica_from_surviving`] function (which executes the data
 //! copy).  Together they implement the mirror-rebuild path required by
-//! NEXT-STOR-032.
+//! the mirror-rebuild authority.
 //!
 //! # Authority Flow
 //!

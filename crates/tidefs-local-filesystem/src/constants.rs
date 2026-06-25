@@ -46,12 +46,12 @@ pub fn content_chunk_size() -> u32 {
     })
 }
 
-pub const HOT_READ_CACHE_SPEC: &str = "publishing checklist item PC-003 hot read cache: LocalFileSystem read_file/read_symlink use a bounded, non-authoritative, inode/data-version/size keyed cache that accelerates reads without becoming publication, recovery, or allocator truth";
+pub const HOT_READ_CACHE_SPEC: &str = "hot read cache: LocalFileSystem read_file/read_symlink use a bounded, non-authoritative, inode/data-version/size keyed cache that accelerates reads without becoming publication, recovery, or allocator truth";
 pub const DEFAULT_HOT_READ_CACHE_MAX_ENTRIES: usize = 64;
 pub const DEFAULT_HOT_READ_CACHE_MAX_BYTES: u64 = 256 * 1024;
 pub const LOCAL_STORAGE_ALLOCATOR_GRAIN_BYTES: u64 = DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE as u64;
 
-/// PC-009: inode metadata cache: default max entries (adaptive ARC).
+/// Inode metadata cache: default max entries (adaptive ARC).
 pub const DEFAULT_INODE_CACHE_MAX_ENTRIES: usize = 1024;
 pub const DEFAULT_INODE_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub const FILESYSTEM_CONTENT_CHUNK_SIZE: usize = DEFAULT_FILESYSTEM_CONTENT_CHUNK_SIZE as usize;

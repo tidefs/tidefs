@@ -489,8 +489,8 @@ use crate::helpers::*;
 use crate::hot_read_cache::*;
 pub(crate) use crate::inode_authority::DatasetInodeAuthority;
 use crate::inode_cache::*;
-// PC-008 intent-log module (types used via glob re-export)
-// PC-008 intent-log module (re-exported for future use)
+// Intent-log sync write latency module (types used via glob re-export)
+// Intent-log sync write latency module (re-exported for future use)
 use crate::admission::LocalWriteAdmission;
 use crate::background_cleaner::{BackgroundCleaner, BackgroundCleanerConfig};
 use crate::capacity_authority::{
@@ -12589,7 +12589,7 @@ impl LocalFileSystem {
 
     /// Derive PoolPhysicalCountersV1 from the single capacity authority.
     ///
-    /// As of NEXT-STOR-038, both `phys_total_bytes` and `phys_free_bytes`
+    /// Both `phys_total_bytes` and `phys_free_bytes`
     /// derive from [`CapacityAuthority`] — the single source of truth for
     /// used/free/reserved byte counters.
     fn derive_pool_physical_counters(&self) -> PoolPhysicalCountersV1 {

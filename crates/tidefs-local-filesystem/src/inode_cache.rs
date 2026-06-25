@@ -552,7 +552,7 @@ impl Default for InodeCachePolicy {
     }
 }
 
-pub(crate) const INODE_CACHE_SPEC: &str = "publishing checklist item PC-009 inode cache: LocalFileSystem uses a bounded, non-authoritative, inode-id keyed ARC cache that accelerates inode record lookups without becoming publication, recovery, or allocator truth";
+pub(crate) const INODE_CACHE_SPEC: &str = "inode cache: LocalFileSystem uses a bounded, non-authoritative, inode-id keyed ARC cache that accelerates inode record lookups without becoming publication, recovery, or allocator truth";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InodeCacheReport {

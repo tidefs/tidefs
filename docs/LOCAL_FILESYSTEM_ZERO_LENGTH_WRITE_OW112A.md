@@ -1,6 +1,6 @@
-# Local Filesystem Zero-Length Write OW-112A
+# Local Filesystem Zero-Length Write
 
-OW-112A hardens `LocalFileSystem::write_file` in
+This note hardens `LocalFileSystem::write_file` in
 `crates/tidefs-local-filesystem`.
 
 It must not extend a file to the supplied offset, create new content objects,

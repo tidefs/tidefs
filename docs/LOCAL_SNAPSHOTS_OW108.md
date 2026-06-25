@@ -1,4 +1,4 @@
-# Local snapshots and rollback (OW-108) (v0.416)
+# Local snapshots and rollback
 
 > TFR-019 authority note: this imported implementation note is review material,
 > the behavior below as needing reconciliation with current source,

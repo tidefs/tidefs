@@ -1,4 +1,4 @@
-# Formal no-production-fsck failure model (OW-004) (v0.403; last design review - needs refresh)
+# Formal no-production-fsck failure model
 
 > TFR-019 authority classification: Historical input. See `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
 
@@ -8,7 +8,7 @@
 
 Historical tracker wording: item 004.
 
-This document describes the historical `OW-004` failure model that the Local
+This document describes the historical failure model that the Local
 Filesystem recovery protocol must satisfy. It is deliberately narrower than a
 complete storage-system certification model. The point is to state what normal
 production recovery can decide automatically, what it must reject explicitly,

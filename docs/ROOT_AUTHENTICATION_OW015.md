@@ -1,4 +1,4 @@
-# Root authentication (OW-015) (v0.415)
+# Root authentication
 
 > TFR-019 authority note: this imported implementation note is review material,
 > the behavior below as needing reconciliation with current source,

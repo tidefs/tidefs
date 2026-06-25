@@ -6,8 +6,8 @@
 //! triggers the rejection gate (StoreError::FormatIncompatible) on open.
 //!
 //! These tests exercise the full store create/open/reopen path and
-//! constitute Tier 3 mounted userspace/storage runtime validation for
-//! NEXT-STOR-035.
+//! constitute Tier 3 mounted userspace/storage runtime validation for the
+//! format-manifest compatibility gate.
 
 use std::fs;
 use std::path::PathBuf;

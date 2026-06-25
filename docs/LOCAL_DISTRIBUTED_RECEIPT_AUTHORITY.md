@@ -1,7 +1,6 @@
 # Local/Distributed Placement Receipt Authority
 
-Maturity: live implementation note tracking issue #18 receipt-authority
-progress.
+Authority note: live implementation note for receipt-authority progress.
 This document is not a closure claim for the full
 local-filesystem, distributed transport, rebake, rebuild, and runtime
 validation surface.

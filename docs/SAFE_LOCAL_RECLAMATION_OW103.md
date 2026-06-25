@@ -1,4 +1,4 @@
-# Safe local reclamation (OW-103) (v0.413)
+# Safe local reclamation
 
 > TFR-019 authority note: this imported implementation note is review material,
 > the behavior below as needing reconciliation with current source,
@@ -71,7 +71,7 @@ The stable implementation-tracked non-release command name is
 
 ## Non-goals
 
-This OW-103 slice does not implement online scrub, block export, or distributed
+This historical reclamation slice does not implement online scrub, block export, or distributed
 snapshot roots to reclamation protection. v0.417 changed-record send/receive
 This slice also does not rewrite protected root-slot records, because exact
 root-slot fallback locations are part of the no-production-fsck recovery proof.

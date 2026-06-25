@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Corruption resolver and repair outcome recording (PC-019B.3).
+//! Corruption resolver and repair outcome recording.
 //!
 //! The resolver consumes scrub violations and produces repair strategies
 //! based on available redundancy surface, block type, and corruption

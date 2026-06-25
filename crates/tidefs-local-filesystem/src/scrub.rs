@@ -5,11 +5,11 @@
 //! content scrub/read authority and reports checksum-layer evidence without
 //! making lower-layer bytes the mounted repair identity.
 //! It is consumed by the online verifier and reports corruptions that
-//! the resolver (#590 / PC-019B.3) can attempt to repair.
+//! the resolver tracked by #590 can attempt to repair.
 //!
-//! This module implements PC-019B.2 (scrub pipeline) using the
+//! This module implements the scrub pipeline using the
 //! `FastBlockChecksum` and `ProductionBlockChecksum` implementations
-//! from PC-019B.1 (#588).
+//! from the checksum authority tracked by #588.
 
 use std::collections::BTreeMap;
 
@@ -586,7 +586,7 @@ pub(crate) fn scrub_inodes_content_with_pool(
     Ok(report)
 }
 
-// ── Resolver skeleton (PC-019B.3) ─────────────────────────────────────
+// ── Resolver skeleton ─────────────────────────────────────────────────
 
 /// Possible actions for resolving a corrupt block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

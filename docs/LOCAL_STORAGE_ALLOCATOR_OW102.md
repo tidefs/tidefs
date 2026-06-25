@@ -1,12 +1,11 @@
-# Local Storage Allocator (OW-102 / PC-006)
+# Local Storage Allocator
 
 > TFR-019 authority note: this imported implementation note is review material,
 > the behavior below as needing reconciliation with current source,
 > `docs/REVIEW_TODO_REGISTER.md`, and `docs/WHOLE_REPO_REVIEW.md`.
 
-This document records the historical tracker item 102 allocator/free-space
-accounting slice and the publishing-checklist `PC-006` space-management/ENOSPC
-slice for review.
+This document records the historical allocator/free-space accounting slice and
+the space-management/ENOSPC slice for review.
 
 ## Implemented State
 
@@ -20,9 +19,9 @@ The allocator is enforced before publishing a new root. A mutation that would ex
 
 Content accounting is chunk-graph based. The allocator counts unique chunk/content objects referenced by the proposed current namespace plus content still protected by committed fallback roots. The protected committed roots set is therefore part of allocator admission. This means rewriting a chunk can require temporary capacity for both the old protected chunk and the new chunk until later reclamation can prove the old chunk is no longer protected.
 
-## PC-006 Scope
+## Space-Management Scope
 
-`PC-006` is covered for the current local preview by implementation-tracked non-release design and
+Space management is covered for the current local preview by implementation-tracked non-release design and
 tests for:
 
 - finite content-grain and inode capacity accounting before publication;
@@ -69,9 +68,9 @@ cargo run -p tidefs-xtask -- check-local-storage-allocator
 tidefs-xtask check-local-storage-allocator
 ```
 
-This check binds the source markers, documentation, FUSE preview
-historical tracker item 102 and publishing-checklist item `PC-006`. Live
-work-state tracking is in Forgejo; tracking issue: #1872.
+This check binds the source markers, documentation, and FUSE preview
+space-management/ENOSPC review notes. Current work-state tracking is in GitHub
+and TFR-019 review state.
 
 
 
@@ -79,5 +78,6 @@ work-state tracking is in Forgejo; tracking issue: #1872.
 
 This slice does not implement mutating compaction or garbage collection. It
 deliberately treats protected committed-root content as unavailable for reuse.
-Later `OW-103` work must prove root-retention safety before reclaiming old
-and sparse reservation modes remain out of scope for `PC-006`.
+Later safe-local-reclamation work must prove root-retention safety before
+reclaiming old roots, and sparse reservation modes remain out of scope for this
+space-management slice.
