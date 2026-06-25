@@ -67,6 +67,7 @@ const CACHE_ONLY_HARD_GATE_EVIDENCE: &[StorageIntentEvidenceKind] = &[
 ];
 
 const MOVEMENT_HARD_GATE_EVIDENCE: &[StorageIntentEvidenceKind] = &[
+    StorageIntentEvidenceKind::PredictionEvidence,
     StorageIntentEvidenceKind::MediaCostWearLedger,
     StorageIntentEvidenceKind::RelocationReceipt,
     StorageIntentEvidenceKind::MeasurementAttributionEvidence,
@@ -1950,12 +1951,12 @@ mod tests {
         StorageIntentEvidenceKind::RecoveryDegradationEvidence,
         StorageIntentEvidenceKind::PolicyRolloutEvidence,
         StorageIntentEvidenceKind::TenantIsolationEvidence,
-        StorageIntentEvidenceKind::SchedulerAdmissionRecord,
         StorageIntentEvidenceKind::TemporalEvidence,
         StorageIntentEvidenceKind::DataShapeEvidence,
         StorageIntentEvidenceKind::LayoutAllocatorEvidence,
         StorageIntentEvidenceKind::ServiceObjectiveEvidence,
         StorageIntentEvidenceKind::DecisionFrontierEvidence,
+        StorageIntentEvidenceKind::PredictionEvidence,
         StorageIntentEvidenceKind::MediaCostWearLedger,
         StorageIntentEvidenceKind::RelocationReceipt,
         StorageIntentEvidenceKind::MeasurementAttributionEvidence,
@@ -3257,6 +3258,46 @@ mod tests {
     }
 
     #[test]
+    fn authority_movement_requires_prediction_evidence_family() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut request = request(
+            policy,
+            StorageIntentPlacementRole::AuthoritativeHotServingReplica,
+            1,
+            1,
+        );
+        request.evidence_query =
+            evidence_cut_without(policy, StorageIntentEvidenceKind::PredictionEvidence);
+        let candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::ServingDataHot,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!plan.admitted);
+        assert!(plan.candidate_reports.is_empty());
+        assert!(matches!(
+            plan.reasons.as_slice(),
+            [StorageIntentPlacementReason::EvidenceFamilyNotFresh {
+                kind: StorageIntentEvidenceKind::PredictionEvidence,
+                state: PlacementEvidenceState::Unknown
+            }]
+        ));
+        assert_eq!(
+            plan.first_refusal(),
+            Some(StorageIntentRefusalReason::EvidenceNotUsable)
+        );
+    }
+
+    #[test]
     fn durable_placement_refuses_unusable_prefetch_residency_decision() {
         let policy = policy(
             StorageIntentGuaranteeClass::FullPlacement,
@@ -3689,11 +3730,16 @@ mod tests {
             StorageIntentGuaranteeClass::FullPlacement,
             FailureDomainMask::NODE,
         );
-        let request = request(
+        let mut request = request(
             policy,
             StorageIntentPlacementRole::DurableFullPlacement,
             2,
             2,
+        );
+        request.evidence_query = evidence_cut_filter_with(
+            policy,
+            &[StorageIntentEvidenceKind::SchedulerAdmissionRecord],
+            |kind| kind != StorageIntentEvidenceKind::WorkloadEvidence,
         );
         let candidates = [
             candidate(
