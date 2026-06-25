@@ -15845,7 +15845,7 @@ impl StorageIntentTenantIsolationEvidence {
     pub const fn has_legal_donation(self) -> bool {
         self.borrowing.is_donating
             && self.borrowing.may_donate
-            && self.borrowing.donor_scope_id.0 != [0_u8; 32]
+            && !bytes32_are_zero(self.borrowing.donor_scope_id.0)
     }
 }
 
