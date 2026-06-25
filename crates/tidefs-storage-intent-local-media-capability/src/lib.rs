@@ -10,6 +10,7 @@
 //! [`StorageIntentMediaCapabilityRecord`] so downstream storage-intent
 //! consumers can use the #904 role predicate instead of device labels.
 
+use tidefs_kernel_storage_io::KernelStorageIoCapabilities;
 use tidefs_storage_intent_core::{
     MediaArchiveRestoreSemantics, MediaAtomicityClass, MediaCapabilityFlags,
     MediaCapabilityFreshnessState, MediaFlushOrderingClass, MediaHealthState,
@@ -180,6 +181,21 @@ impl LocalBlockIoCapabilities {
             teardown,
             sector_size,
             capacity_sectors,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_kernel_storage_io(capabilities: KernelStorageIoCapabilities) -> Self {
+        Self {
+            read: capabilities.read,
+            write: capabilities.write,
+            flush: capabilities.flush,
+            discard: capabilities.discard,
+            write_zeroes: capabilities.write_zeroes,
+            zero_range: capabilities.zero_range,
+            teardown: capabilities.teardown,
+            sector_size: capabilities.sector_size,
+            capacity_sectors: capabilities.capacity_sectors,
         }
     }
 }
@@ -778,6 +794,17 @@ impl LocalBlockIoFacts {
             max_queue_depth: 0,
             flush_ref,
         }
+    }
+
+    #[must_use]
+    pub const fn from_kernel_storage_io_capabilities(
+        capabilities: KernelStorageIoCapabilities,
+        flush_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        let local = LocalBlockIoCapabilities::from_kernel_storage_io(capabilities);
+        let mut facts = Self::from_block_capabilities(local, flush_ref);
+        facts.discard_zeroes_shape_proven = local.discard || local.write_zeroes || local.zero_range;
+        facts
     }
 
     #[must_use]
@@ -1486,6 +1513,64 @@ mod tests {
             StorageIntentRefusalReason::UnsupportedFlushFuaSemantics
         );
         assert_eq!(record.flush_ordering, MediaFlushOrderingClass::FlushOnly);
+    }
+
+    #[test]
+    fn kernel_storage_io_capabilities_preserve_shape_but_not_ordering_proof() {
+        let kernel = KernelStorageIoCapabilities {
+            read: true,
+            write: true,
+            flush: true,
+            discard: true,
+            write_zeroes: true,
+            zero_range: true,
+            teardown: true,
+            sector_size: 512,
+            capacity_sectors: 4096,
+        };
+        let facts = LocalBlockIoFacts::from_kernel_storage_io_capabilities(kernel, evidence(5))
+            .with_max_queue_depth(16);
+        let record = produce_local_media_capability(strong_nvme_facts().with_block_io(facts));
+        let result = durable_sync_result(record);
+
+        assert_eq!(
+            facts.capabilities,
+            LocalBlockIoCapabilities::from_kernel_storage_io(kernel)
+        );
+        assert_eq!(record.logical_block_bytes, 512);
+        assert_eq!(record.max_queue_depth, 16);
+        assert_eq!(record.flush_ordering, MediaFlushOrderingClass::FlushOnly);
+        assert!(record
+            .flags
+            .contains_all(MediaCapabilityFlags::DISCARD_ZEROES_SHAPE));
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnsupportedFlushFuaSemantics
+        );
+    }
+
+    #[test]
+    fn kernel_storage_io_missing_flush_is_unsupported_for_durable_role() {
+        let kernel = KernelStorageIoCapabilities {
+            read: true,
+            write: true,
+            flush: false,
+            discard: false,
+            write_zeroes: false,
+            zero_range: false,
+            teardown: true,
+            sector_size: 4096,
+            capacity_sectors: 1024,
+        };
+        let facts = LocalBlockIoFacts::from_kernel_storage_io_capabilities(kernel, evidence(5));
+        let record = produce_local_media_capability(strong_nvme_facts().with_block_io(facts));
+        let result = durable_sync_result(record);
+
+        assert_eq!(record.flush_ordering, MediaFlushOrderingClass::None);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnsupportedFlushFuaSemantics
+        );
     }
 
     #[test]
