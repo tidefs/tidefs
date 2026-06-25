@@ -408,7 +408,14 @@ use tidefs_reserve_ledger::{BudgetDomain, ReserveClass};
 use tidefs_space_accounting::{
     DatasetQuotaHierarchy, SpaceAccounting, SpaceDomainRegistry, StatfsResult,
 };
-use tidefs_storage_intent_core::{StorageIntentGuaranteeClass, StorageIntentRefusalReason};
+use tidefs_storage_intent_core::{
+    StorageIntentDomainId, StorageIntentEvidenceId, StorageIntentGuaranteeClass,
+    StorageIntentObjectScope, StorageIntentRefusalReason,
+};
+use tidefs_storage_intent_read_serving::{
+    read_serving_decide, ReadServingDecisionInput, ReadServingDecisionRecord,
+    ReadServingDecisionState, StorageIntentReadSourceClass,
+};
 use tidefs_types_claim_ledger_core::StorageAuthorityToken;
 use tidefs_types_claim_ledger_core::{
     BudgetDomainId, ClaimEntry, ClaimId, ClaimReason, ObligationLedger,
@@ -435,6 +442,20 @@ use tidefs_types_reclaim_queue_core::{QueueFamily, ReclaimQueueEntry};
 use tidefs_types_vfs_owned::DirEntry as OwnedDirEntry;
 
 pub type Result<T> = std::result::Result<T, FileSystemError>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadServingRuntimeRead {
+    pub decision: ReadServingDecisionRecord,
+    pub bytes: Option<Vec<u8>>,
+}
+
+impl ReadServingRuntimeRead {
+    #[must_use]
+    pub fn served_bytes(&self) -> Option<&[u8]> {
+        self.bytes.as_deref()
+    }
+}
+
 pub use crate::constants::*;
 pub use crate::dedup::DedupStats;
 pub use crate::error::*;
@@ -6401,6 +6422,172 @@ impl LocalFileSystem {
             .quota_table
             .apply_delta(&inode_ancestors, delta_bytes, 1);
         Ok(record)
+    }
+
+    fn read_serving_scope_for_local_read(
+        &self,
+        inode_id: InodeId,
+        record: &InodeRecord,
+        offset: u64,
+        requested_len: u64,
+    ) -> StorageIntentObjectScope {
+        let mut object_id = [0_u8; 32];
+        object_id[0..8].copy_from_slice(&inode_id.get().to_le_bytes());
+        object_id[8..16].copy_from_slice(&record.data_version.to_le_bytes());
+        object_id[16..24].copy_from_slice(&record.size.to_le_bytes());
+
+        let range_len = if offset >= record.size {
+            0
+        } else {
+            record.size.saturating_sub(offset).min(requested_len)
+        };
+
+        StorageIntentObjectScope {
+            dataset_id: StorageIntentDomainId(self.mounted_dataset_id),
+            object_id: StorageIntentEvidenceId(object_id),
+            range_start: offset,
+            range_len,
+            generation: record.data_version,
+        }
+    }
+
+    fn project_local_read_serving_input(
+        &self,
+        mut input: ReadServingDecisionInput,
+        inode_id: InodeId,
+        record: &InodeRecord,
+        offset: u64,
+        requested_len: u64,
+    ) -> ReadServingDecisionInput {
+        input.candidate.policy_id = input.policy.policy_id;
+        input.candidate.policy_revision = input.policy.policy_revision;
+        input.candidate.scope =
+            self.read_serving_scope_for_local_read(inode_id, record, offset, requested_len);
+
+        if matches!(
+            input.candidate.source_class,
+            StorageIntentReadSourceClass::Unknown
+        ) {
+            input.candidate.source_class = StorageIntentReadSourceClass::LocalPlacementReceipt;
+        }
+        if input.candidate.object_generation == 0 {
+            input.candidate.object_generation = record.data_version;
+        }
+        if input.candidate.namespace_generation == 0 {
+            input.candidate.namespace_generation = self
+                .state
+                .generation
+                .max(record.metadata_version)
+                .max(record.generation.get());
+        }
+        if input.candidate.layout_generation == 0 {
+            input.candidate.layout_generation = record.data_version;
+        }
+        if input.candidate.cache_anchor_generation == 0 {
+            input.candidate.cache_anchor_generation = record.data_version;
+        }
+        if input.candidate.cache_fence_generation == 0 {
+            input.candidate.cache_fence_generation = record.data_version;
+        }
+        if input.candidate.freshness_frontier_ms == 0 {
+            input.candidate.freshness_frontier_ms =
+                input.evidence_query_snapshot.freshness_frontier_ms;
+        }
+
+        input
+    }
+
+    fn read_serving_decision_allows_bytes(decision: &ReadServingDecisionRecord) -> bool {
+        decision.refusal == StorageIntentRefusalReason::None
+            && matches!(
+                decision.decision_state,
+                ReadServingDecisionState::Available
+                    | ReadServingDecisionState::CacheOnly
+                    | ReadServingDecisionState::ServingTrial
+                    | ReadServingDecisionState::DegradedVisible
+            )
+    }
+
+    pub fn read_file_with_read_serving(
+        &self,
+        path: impl AsRef<str>,
+        decision_input: ReadServingDecisionInput,
+    ) -> Result<ReadServingRuntimeRead> {
+        let path = path.as_ref();
+        let parts = parse_absolute_path(path)?;
+        let inode_id = self.resolve_parts(&parts, path)?;
+        let record = self.inode(inode_id)?;
+        if record.kind() != NodeKind::File {
+            if record.kind() == NodeKind::Dir {
+                return Err(FileSystemError::IsDirectory {
+                    path: path.to_string(),
+                });
+            }
+            return Err(FileSystemError::NotFile {
+                path: path.to_string(),
+                kind: record.kind(),
+            });
+        }
+
+        let input =
+            self.project_local_read_serving_input(decision_input, inode_id, &record, 0, record.size);
+        let decision = read_serving_decide(input);
+        if !Self::read_serving_decision_allows_bytes(&decision) {
+            return Ok(ReadServingRuntimeRead {
+                decision,
+                bytes: None,
+            });
+        }
+
+        Ok(ReadServingRuntimeRead {
+            decision,
+            bytes: Some(self.read_content(inode_id, &record)?),
+        })
+    }
+
+    pub fn read_file_range_with_read_serving(
+        &self,
+        path: impl AsRef<str>,
+        offset: u64,
+        length: usize,
+        decision_input: ReadServingDecisionInput,
+    ) -> Result<ReadServingRuntimeRead> {
+        let path = path.as_ref();
+        let parts = parse_absolute_path(path)?;
+        let inode_id = self.resolve_parts(&parts, path)?;
+        let record = self.inode(inode_id)?;
+        if record.kind() != NodeKind::File {
+            if record.kind() == NodeKind::Dir {
+                return Err(FileSystemError::IsDirectory {
+                    path: path.to_string(),
+                });
+            }
+            return Err(FileSystemError::NotFile {
+                path: path.to_string(),
+                kind: record.kind(),
+            });
+        }
+
+        let requested_len = u64::try_from(length).unwrap_or(u64::MAX);
+        let input = self.project_local_read_serving_input(
+            decision_input,
+            inode_id,
+            &record,
+            offset,
+            requested_len,
+        );
+        let decision = read_serving_decide(input);
+        if !Self::read_serving_decision_allows_bytes(&decision) {
+            return Ok(ReadServingRuntimeRead {
+                decision,
+                bytes: None,
+            });
+        }
+
+        Ok(ReadServingRuntimeRead {
+            decision,
+            bytes: Some(self.read_content_range(inode_id, &record, offset, length)?),
+        })
     }
 
     pub fn read_file(&self, path: impl AsRef<str>) -> Result<Vec<u8>> {
