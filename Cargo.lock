@@ -2886,6 +2886,8 @@ dependencies = [
  "tidefs-extent-map",
  "tidefs-frame",
  "tidefs-local-object-store",
+ "tidefs-storage-intent-core",
+ "tidefs-storage-intent-remote-media-capability",
  "tidefs-types-extent-map-core",
 ]
 
