@@ -161,7 +161,7 @@ Each auto-tune evidence record must name:
   hit/miss pressure, dirty-byte pressure, cache churn, or an explicit workload
   signal record;
 - a unit;
-- freshness not older than `AUTO_TUNE_INTERVAL_MS`;
+- freshness not older than `AUTO_TUNE_MAX_FRESHNESS_MS`;
 - a bounded pressure score in `0..=100`;
 - safety effects for durability, dirty-byte, and cluster-queue limits.
 
@@ -595,6 +595,7 @@ Gate: `tidefs-xtask check-resource-governor`.
 | `EVICTION_LADDER_TICK_INTERVAL_MS` | 100 | Min interval between eviction ladder ticks |
 | `RECONCILIATION_INTERVAL_MS` | 5000 | Interval for atomic-counter reconciliation |
 | `AUTO_TUNE_INTERVAL_MS` | 30000 | Interval for workload-signal-based auto-tuning |
+| `AUTO_TUNE_MAX_FRESHNESS_MS` | 30000 | Maximum age for accepted auto-tune evidence |
 | `AUTO_TUNE_MAX_FRACTION_SHIFT` | 0.20 | Maximum per-category soft-watermark fraction shift |
 
 ## 13. Error Hierarchy
