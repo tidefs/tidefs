@@ -404,7 +404,7 @@ impl CategoryConfig {
     }
 
     fn soft_watermark(cap: u64, soft_fraction: f64) -> u64 {
-        (cap as f64 * soft_fraction) as u64
+        (cap as f64 * soft_fraction).round().min(cap as f64) as u64
     }
 
     fn set_soft_fraction(&mut self, soft_fraction: f64) {
