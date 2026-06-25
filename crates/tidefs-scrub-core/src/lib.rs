@@ -16,6 +16,7 @@
 //! (self-healing), and distributed resilver.
 
 pub mod detector;
+pub mod cross_replica_comparison;
 pub mod integrity_verifier;
 pub mod multi_node_scrub;
 pub mod object_scanner;
@@ -27,6 +28,12 @@ pub mod scrub_repair;
 pub use multi_node_scrub::{
     FanoutAuditEntry, MultiNodeScrubAudit, PeerVerificationOutcome, ScrubFanoutCoordinator,
     ScrubFanoutRequest, ScrubFanoutResponse,
+};
+pub use cross_replica_comparison::{
+    ChecksumLayer, ComparisonCandidate, ComparisonClassification,
+    CrossReplicaComparisonRecord, EvidenceReadOutcome, EvidenceRejectionReason,
+    PerReplicaOutcome, ReplicaEvidence, ScrubSubject, ScrubSubjectKind, TransportFailureReason,
+    compare_cross_replica,
 };
 use std::path::{Path, PathBuf};
 pub use tidefs_recovery_loop::RecoveryPolicy;
