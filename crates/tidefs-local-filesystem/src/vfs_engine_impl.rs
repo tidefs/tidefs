@@ -640,41 +640,32 @@ impl VfsLocalFileSystem {
         outcomes.push_back(outcome);
     }
 
-    fn issue_planned_readahead(
-        &self,
-        path: &str,
-        inode_id: InodeId,
-        read_offset: u64,
-        read_size: u32,
-        file_size: u64,
-        readahead_offset: u64,
-        readahead_len: u64,
-    ) {
+    fn issue_planned_readahead(&self, request: VfsReadaheadExecutorRequest) {
         let Some(hook) = &self.readahead_executor_input_hook else {
             crate::readahead::issue_readahead(
                 &self.fs.borrow(),
-                path,
-                readahead_offset,
-                readahead_len,
+                &request.path,
+                request.readahead_offset,
+                request.readahead_len,
             );
             return;
         };
 
-        let request = VfsReadaheadExecutorRequest {
-            inode_id,
-            path: path.to_string(),
-            read_offset,
-            read_size,
-            file_size,
-            readahead_offset,
-            readahead_len,
+        let hook_request = VfsReadaheadExecutorRequest {
+            inode_id: request.inode_id,
+            path: request.path.clone(),
+            read_offset: request.read_offset,
+            read_size: request.read_size,
+            file_size: request.file_size,
+            readahead_offset: request.readahead_offset,
+            readahead_len: request.readahead_len,
         };
-        let executor_input = hook(request).unwrap_or_default();
+        let executor_input = hook(hook_request).unwrap_or_default();
         let outcome = crate::readahead::issue_readahead_with_executor(
             &self.fs.borrow(),
-            path,
-            readahead_offset,
-            readahead_len,
+            &request.path,
+            request.readahead_offset,
+            request.readahead_len,
             executor_input,
         );
         self.record_readahead_executor_outcome(VfsReadaheadExecutorOutcome {
@@ -4187,14 +4178,15 @@ impl VfsLocalFileSystem {
         }
 
         if let Some((ra_offset, ra_len)) = readahead_plan {
-            self.issue_planned_readahead(
-                &path,
-                fh.inode_id,
-                offset,
-                size,
+            self.issue_planned_readahead(VfsReadaheadExecutorRequest {
+                inode_id: fh.inode_id,
+                path,
+                read_offset: offset,
+                read_size: size,
                 file_size,
-                ra_offset,
-                ra_len,
+                readahead_offset: ra_offset,
+                readahead_len: ra_len,
+            },
             );
         }
 
