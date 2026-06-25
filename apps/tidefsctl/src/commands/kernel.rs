@@ -11,8 +11,14 @@ use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 
+use super::classification::StatusSource;
+
 const DEFAULT_KERNEL_CONTROL_DEVICE: &str = "/dev/tidefs-control";
-const RUNTIME_INVENTORY_SOURCE: &str = "static-source-inventory";
+const CONTROL_DEVICE_SOURCE: &str = StatusSource::CommandLineParse.label();
+const DEVICE_PROBE_SOURCE: &str = StatusSource::CachedLocalMetadata.label();
+const PASSIVE_BOUNDARY_SOURCE: &str = StatusSource::UnsupportedOrOffline.label();
+const RUNTIME_INVENTORY: &str = "static-source-inventory";
+const RUNTIME_INVENTORY_SOURCE: &str = StatusSource::StaticConfiguration.label();
 
 #[derive(Subcommand, Debug)]
 pub enum KernelCommand {
@@ -51,7 +57,7 @@ fn handle_status(control_dev: &Path, json: bool) {
 struct KernelControlStatus {
     control_device: PathBuf,
     device_state: DeviceState,
-    runtime_inventory_source: &'static str,
+    runtime_inventory: &'static str,
     control_endpoint_opened: bool,
     production_uapi_wired: bool,
     mutating_ioctls_issued: bool,
@@ -65,7 +71,7 @@ impl KernelControlStatus {
         Self {
             control_device: control_device.to_path_buf(),
             device_state: DeviceState::probe(control_device),
-            runtime_inventory_source: RUNTIME_INVENTORY_SOURCE,
+            runtime_inventory: RUNTIME_INVENTORY,
             control_endpoint_opened: false,
             production_uapi_wired: false,
             mutating_ioctls_issued: false,
@@ -79,20 +85,34 @@ impl KernelControlStatus {
         let value = serde_json::json!({
             "probe_completed": true,
             "control_device": self.control_device.display().to_string(),
+            "control_device_source": CONTROL_DEVICE_SOURCE,
             "device_state": self.device_state.label(),
+            "device_state_source": DEVICE_PROBE_SOURCE,
             "device_kind": self.device_state.kind_label(),
-            "runtime_inventory_source": self.runtime_inventory_source,
+            "device_kind_source": DEVICE_PROBE_SOURCE,
+            "runtime_inventory": self.runtime_inventory,
+            "runtime_inventory_source": RUNTIME_INVENTORY_SOURCE,
             "status_is_passive": self.status_is_passive(),
+            "status_is_passive_source": PASSIVE_BOUNDARY_SOURCE,
             "control_endpoint_opened": self.control_endpoint_opened,
+            "control_endpoint_opened_source": PASSIVE_BOUNDARY_SOURCE,
             "control_device_present": self.control_device_present(),
+            "control_device_present_source": DEVICE_PROBE_SOURCE,
             "control_device_character": self.control_device_character(),
+            "control_device_character_source": DEVICE_PROBE_SOURCE,
             "production_uapi_wired": self.production_uapi_wired,
+            "production_uapi_wired_source": PASSIVE_BOUNDARY_SOURCE,
             "control_uapi_usable": self.control_uapi_usable(),
+            "control_uapi_usable_source": PASSIVE_BOUNDARY_SOURCE,
             "mutating_ioctls_issued": self.mutating_ioctls_issued,
+            "mutating_ioctls_issued_source": PASSIVE_BOUNDARY_SOURCE,
             "owner_manifest_authority": self.owner_manifest_authority,
+            "owner_manifest_authority_source": PASSIVE_BOUNDARY_SOURCE,
             "tidefs_owned_kthreads": self.tidefs_owned_kthreads.label(),
+            "tidefs_owned_kthreads_source": self.tidefs_owned_kthreads.source_label(),
             "tidefs_owned_kthreads_wired": self.tidefs_owned_kthreads.is_wired(),
             "tidefs_owned_workqueues": self.tidefs_owned_workqueues.label(),
+            "tidefs_owned_workqueues_source": self.tidefs_owned_workqueues.source_label(),
             "tidefs_owned_workqueues_wired": self.tidefs_owned_workqueues.is_wired(),
             "message": self.message(),
         });
@@ -147,6 +167,12 @@ impl RuntimeSurfaceState {
     fn is_wired(self) -> bool {
         match self {
             Self::NotWired => false,
+        }
+    }
+
+    fn source_label(self) -> &'static str {
+        match self {
+            Self::NotWired => PASSIVE_BOUNDARY_SOURCE,
         }
     }
 }
@@ -232,50 +258,72 @@ impl DeviceKind {
 }
 
 fn print_plain(report: &KernelControlStatus) {
-    println!("kernel_control_device: {}", report.control_device.display());
-    println!("device_state: {}", report.device_state.label());
-    println!("device_kind: {}", report.device_state.kind_label());
-    println!(
-        "runtime_inventory_source: {}",
-        report.runtime_inventory_source
-    );
-    println!("status_is_passive: {}", report.status_is_passive());
-    println!(
-        "control_endpoint_opened: {}",
-        report.control_endpoint_opened
-    );
-    println!(
-        "control_device_present: {}",
-        report.control_device_present()
-    );
-    println!(
-        "control_device_character: {}",
-        report.control_device_character()
-    );
-    println!("production_uapi_wired: {}", report.production_uapi_wired);
-    println!("control_uapi_usable: {}", report.control_uapi_usable());
-    println!("mutating_ioctls_issued: {}", report.mutating_ioctls_issued);
-    println!(
-        "owner_manifest_authority: {}",
-        report.owner_manifest_authority
-    );
-    println!(
-        "tidefs_owned_kthreads: {}",
-        report.tidefs_owned_kthreads.label()
-    );
-    println!(
-        "tidefs_owned_kthreads_wired: {}",
-        report.tidefs_owned_kthreads.is_wired()
-    );
-    println!(
-        "tidefs_owned_workqueues: {}",
-        report.tidefs_owned_workqueues.label()
-    );
-    println!(
-        "tidefs_owned_workqueues_wired: {}",
-        report.tidefs_owned_workqueues.is_wired()
-    );
-    println!("message: {}", report.message());
+    for line in plain_lines(report) {
+        println!("{line}");
+    }
+}
+
+fn plain_lines(report: &KernelControlStatus) -> Vec<String> {
+    vec![
+        format!("kernel_control_device: {}", report.control_device.display()),
+        format!("kernel_control_device_source: {CONTROL_DEVICE_SOURCE}"),
+        format!("device_state: {}", report.device_state.label()),
+        format!("device_state_source: {DEVICE_PROBE_SOURCE}"),
+        format!("device_kind: {}", report.device_state.kind_label()),
+        format!("device_kind_source: {DEVICE_PROBE_SOURCE}"),
+        format!("runtime_inventory: {}", report.runtime_inventory),
+        format!("runtime_inventory_source: {RUNTIME_INVENTORY_SOURCE}"),
+        format!("status_is_passive: {}", report.status_is_passive()),
+        format!("status_is_passive_source: {PASSIVE_BOUNDARY_SOURCE}"),
+        format!("control_endpoint_opened: {}", report.control_endpoint_opened),
+        format!("control_endpoint_opened_source: {PASSIVE_BOUNDARY_SOURCE}"),
+        format!(
+            "control_device_present: {}",
+            report.control_device_present()
+        ),
+        format!("control_device_present_source: {DEVICE_PROBE_SOURCE}"),
+        format!(
+            "control_device_character: {}",
+            report.control_device_character()
+        ),
+        format!("control_device_character_source: {DEVICE_PROBE_SOURCE}"),
+        format!("production_uapi_wired: {}", report.production_uapi_wired),
+        format!("production_uapi_wired_source: {PASSIVE_BOUNDARY_SOURCE}"),
+        format!("control_uapi_usable: {}", report.control_uapi_usable()),
+        format!("control_uapi_usable_source: {PASSIVE_BOUNDARY_SOURCE}"),
+        format!("mutating_ioctls_issued: {}", report.mutating_ioctls_issued),
+        format!("mutating_ioctls_issued_source: {PASSIVE_BOUNDARY_SOURCE}"),
+        format!(
+            "owner_manifest_authority: {}",
+            report.owner_manifest_authority
+        ),
+        format!("owner_manifest_authority_source: {PASSIVE_BOUNDARY_SOURCE}"),
+        format!(
+            "tidefs_owned_kthreads: {}",
+            report.tidefs_owned_kthreads.label()
+        ),
+        format!(
+            "tidefs_owned_kthreads_source: {}",
+            report.tidefs_owned_kthreads.source_label()
+        ),
+        format!(
+            "tidefs_owned_kthreads_wired: {}",
+            report.tidefs_owned_kthreads.is_wired()
+        ),
+        format!(
+            "tidefs_owned_workqueues: {}",
+            report.tidefs_owned_workqueues.label()
+        ),
+        format!(
+            "tidefs_owned_workqueues_source: {}",
+            report.tidefs_owned_workqueues.source_label()
+        ),
+        format!(
+            "tidefs_owned_workqueues_wired: {}",
+            report.tidefs_owned_workqueues.is_wired()
+        ),
+        format!("message: {}", report.message()),
+    ]
 }
 
 #[cfg(test)]
@@ -290,7 +338,7 @@ mod tests {
         let report = KernelControlStatus::probe(&missing);
 
         assert_eq!(report.device_state, DeviceState::Missing);
-        assert_eq!(report.runtime_inventory_source, RUNTIME_INVENTORY_SOURCE);
+        assert_eq!(report.runtime_inventory, RUNTIME_INVENTORY);
         assert!(report.status_is_passive());
         assert!(!report.control_endpoint_opened);
         assert!(!report.production_uapi_wired);
@@ -306,6 +354,12 @@ mod tests {
         assert!(!report.control_device_present());
         assert!(!report.control_device_character());
         assert!(!report.control_uapi_usable());
+
+        let json = status_json(&report);
+        assert_json_sources(&json);
+        assert_passive_boundary_json(&json);
+        assert_eq!(json["device_state"], "missing");
+        assert_eq!(json["device_kind"], "missing");
     }
 
     #[test]
@@ -319,19 +373,51 @@ mod tests {
 
         assert_eq!(json["probe_completed"], true);
         assert_eq!(json["control_device"], missing.display().to_string());
+        assert_eq!(json["control_device_source"], CONTROL_DEVICE_SOURCE);
         assert_eq!(json["device_state"], "missing");
+        assert_eq!(json["device_state_source"], DEVICE_PROBE_SOURCE);
+        assert_eq!(json["device_kind_source"], DEVICE_PROBE_SOURCE);
+        assert_eq!(json["runtime_inventory"], RUNTIME_INVENTORY);
         assert_eq!(json["runtime_inventory_source"], RUNTIME_INVENTORY_SOURCE);
         assert_eq!(json["status_is_passive"], true);
+        assert_eq!(json["status_is_passive_source"], PASSIVE_BOUNDARY_SOURCE);
         assert_eq!(json["control_endpoint_opened"], false);
+        assert_eq!(
+            json["control_endpoint_opened_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
         assert_eq!(json["control_device_present"], false);
+        assert_eq!(json["control_device_present_source"], DEVICE_PROBE_SOURCE);
         assert_eq!(json["control_device_character"], false);
+        assert_eq!(json["control_device_character_source"], DEVICE_PROBE_SOURCE);
         assert_eq!(json["production_uapi_wired"], false);
+        assert_eq!(
+            json["production_uapi_wired_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
         assert_eq!(json["control_uapi_usable"], false);
+        assert_eq!(json["control_uapi_usable_source"], PASSIVE_BOUNDARY_SOURCE);
         assert_eq!(json["mutating_ioctls_issued"], false);
+        assert_eq!(
+            json["mutating_ioctls_issued_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
         assert_eq!(json["owner_manifest_authority"], false);
+        assert_eq!(
+            json["owner_manifest_authority_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
         assert_eq!(json["tidefs_owned_kthreads"], "not-wired");
+        assert_eq!(
+            json["tidefs_owned_kthreads_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
         assert_eq!(json["tidefs_owned_kthreads_wired"], false);
         assert_eq!(json["tidefs_owned_workqueues"], "not-wired");
+        assert_eq!(
+            json["tidefs_owned_workqueues_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
         assert_eq!(json["tidefs_owned_workqueues_wired"], false);
     }
 
@@ -355,6 +441,15 @@ mod tests {
         assert!(report.status_is_passive());
         assert!(!report.tidefs_owned_kthreads.is_wired());
         assert!(!report.tidefs_owned_workqueues.is_wired());
+
+        let json = status_json(&report);
+        assert_json_sources(&json);
+        assert_passive_boundary_json(&json);
+        assert_eq!(json["device_state"], "wrong-type");
+        assert_eq!(json["device_kind"], "regular-file");
+        assert_eq!(json["control_device_present"], true);
+        assert_eq!(json["control_device_character"], false);
+        assert_eq!(json["control_uapi_usable"], false);
     }
 
     #[test]
@@ -376,5 +471,99 @@ mod tests {
         assert!(!report.control_endpoint_opened);
         assert!(!report.tidefs_owned_kthreads.is_wired());
         assert!(!report.tidefs_owned_workqueues.is_wired());
+
+        let json = status_json(&report);
+        assert_json_sources(&json);
+        assert_passive_boundary_json(&json);
+        assert_eq!(json["device_state"], "character-device-present");
+        assert_eq!(json["device_kind"], "character-device");
+        assert_eq!(json["control_device_present"], true);
+        assert_eq!(json["control_device_character"], true);
+        assert_eq!(json["control_uapi_usable"], false);
+    }
+
+    #[test]
+    fn kernel_status_plain_output_includes_source_classifications() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("missing-control");
+        let report = KernelControlStatus::probe(&missing);
+        let lines = plain_lines(&report);
+
+        assert!(lines.contains(&format!(
+            "kernel_control_device_source: {CONTROL_DEVICE_SOURCE}"
+        )));
+        assert!(lines.contains(&format!("device_state_source: {DEVICE_PROBE_SOURCE}")));
+        assert!(lines.contains(&format!("device_kind_source: {DEVICE_PROBE_SOURCE}")));
+        assert!(lines.contains(&format!(
+            "control_device_present_source: {DEVICE_PROBE_SOURCE}"
+        )));
+        assert!(lines.contains(&format!(
+            "control_device_character_source: {DEVICE_PROBE_SOURCE}"
+        )));
+        assert!(lines.contains(&format!(
+            "runtime_inventory_source: {RUNTIME_INVENTORY_SOURCE}"
+        )));
+        assert!(lines.contains(&format!(
+            "tidefs_owned_kthreads_source: {PASSIVE_BOUNDARY_SOURCE}"
+        )));
+        assert!(lines.contains(&format!(
+            "tidefs_owned_workqueues_source: {PASSIVE_BOUNDARY_SOURCE}"
+        )));
+    }
+
+    fn status_json(report: &KernelControlStatus) -> serde_json::Value {
+        serde_json::from_str(&report.to_json()).expect("status JSON parses")
+    }
+
+    fn assert_json_sources(json: &serde_json::Value) {
+        assert_eq!(json["control_device_source"], CONTROL_DEVICE_SOURCE);
+        assert_eq!(json["device_state_source"], DEVICE_PROBE_SOURCE);
+        assert_eq!(json["device_kind_source"], DEVICE_PROBE_SOURCE);
+        assert_eq!(json["runtime_inventory"], RUNTIME_INVENTORY);
+        assert_eq!(json["runtime_inventory_source"], RUNTIME_INVENTORY_SOURCE);
+        assert_eq!(json["control_device_present_source"], DEVICE_PROBE_SOURCE);
+        assert_eq!(
+            json["control_device_character_source"],
+            DEVICE_PROBE_SOURCE
+        );
+        assert_eq!(
+            json["tidefs_owned_kthreads_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+        assert_eq!(
+            json["tidefs_owned_workqueues_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+    }
+
+    fn assert_passive_boundary_json(json: &serde_json::Value) {
+        assert_eq!(json["status_is_passive"], true);
+        assert_eq!(json["status_is_passive_source"], PASSIVE_BOUNDARY_SOURCE);
+        assert_eq!(json["control_endpoint_opened"], false);
+        assert_eq!(
+            json["control_endpoint_opened_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+        assert_eq!(json["production_uapi_wired"], false);
+        assert_eq!(
+            json["production_uapi_wired_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+        assert_eq!(json["control_uapi_usable"], false);
+        assert_eq!(json["control_uapi_usable_source"], PASSIVE_BOUNDARY_SOURCE);
+        assert_eq!(json["mutating_ioctls_issued"], false);
+        assert_eq!(
+            json["mutating_ioctls_issued_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+        assert_eq!(json["owner_manifest_authority"], false);
+        assert_eq!(
+            json["owner_manifest_authority_source"],
+            PASSIVE_BOUNDARY_SOURCE
+        );
+        assert_eq!(json["tidefs_owned_kthreads"], "not-wired");
+        assert_eq!(json["tidefs_owned_kthreads_wired"], false);
+        assert_eq!(json["tidefs_owned_workqueues"], "not-wired");
+        assert_eq!(json["tidefs_owned_workqueues_wired"], false);
     }
 }
