@@ -1,7 +1,7 @@
 {
   "command": "cargo clippy -p <crate> --locked --all-targets --message-format=json",
   "workspace_root": ".",
-  "generated_at": "2026-06-25T03:30:00Z",
+  "generated_at": "2026-06-25T12:00:00Z",
   "crates": {
     "fuser": {
       "warnings": 52,
@@ -236,7 +236,7 @@
       "exit_code": 0
     },
     "tidefs-kmod-posix-vfs": {
-      "warnings": 124,
+      "warnings": 125,
       "exit_code": 0
     },
     "tidefs-lease": {
@@ -248,7 +248,7 @@
       "exit_code": 0
     },
     "tidefs-local-filesystem": {
-      "warnings": 162,
+      "warnings": 163,
       "exit_code": 0
     },
     "tidefs-local-object-store": {
@@ -436,11 +436,11 @@
       "exit_code": 0
     },
     "tidefs-scrub": {
-      "warnings": 111,
+      "warnings": 112,
       "exit_code": 0
     },
     "tidefs-scrub-core": {
-      "warnings": 60,
+      "warnings": 62,
       "exit_code": 0
     },
     "tidefs-secret-key-policy-runtime": {
@@ -500,7 +500,7 @@
       "exit_code": 0
     },
     "tidefs-storage-node": {
-      "warnings": 175,
+      "warnings": 176,
       "exit_code": 0
     },
     "tidefs-store-demo": {
@@ -512,11 +512,11 @@
       "exit_code": 0
     },
     "tidefs-trace-oracle": {
-      "warnings": 111,
+      "warnings": 112,
       "exit_code": 0
     },
     "tidefs-transport": {
-      "warnings": 66,
+      "warnings": 67,
       "exit_code": 0
     },
     "tidefs-two-node-harness": {
@@ -632,11 +632,11 @@
       "exit_code": 0
     },
     "tidefs-xtask": {
-      "warnings": 137,
+      "warnings": 138,
       "exit_code": 0
     },
     "tidefsctl": {
-      "warnings": 88,
+      "warnings": 90,
       "exit_code": 1
     },
     "tidefs-relocation-governor": {
@@ -649,10 +649,6 @@
     },
     "tidefs-storage-intent-scheduler": {
       "warnings": 0,
-      "exit_code": 0
-    },
-    "tidefs-storage-intent-satisfaction": {
-      "warnings": 7,
       "exit_code": 0
     },
     "tidefs-storage-intent-workload-signals": {
