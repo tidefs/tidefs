@@ -15787,7 +15787,7 @@ impl StorageIntentTenantIsolationEvidence {
         ) && evidence_ref_has_id(self.evidence_ref)
             && !self.policy_id.is_zero()
             && self.policy_revision.0 > 0
-            && self.budget_owner.has_owner()
+
     }
 
     /// Returns true when the isolation scope is specified.
