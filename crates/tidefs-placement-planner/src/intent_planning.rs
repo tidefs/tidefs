@@ -492,6 +492,12 @@ pub enum StorageIntentPlacementReason {
         role: StorageIntentTrustRole,
         refusal: StorageIntentRefusalReason,
     },
+    /// Candidate's #967 prefetch/residency decision is not usable authority.
+    CandidatePrefetchResidencyRefused {
+        target_id: u64,
+        outcome: PrefetchResidencyDecisionOutcome,
+        refusal: StorageIntentRefusalReason,
+    },
     /// Candidate transport proximity is farther than the policy maximum.
     CandidateProximityRefused {
         target_id: u64,
@@ -525,6 +531,7 @@ impl StorageIntentPlacementReason {
             | Self::CandidateEvidenceGateRefused { refusal, .. }
             | Self::CandidateServiceObjectiveRefused { refusal, .. }
             | Self::CandidateTrustDomainRefused { refusal, .. }
+            | Self::CandidatePrefetchResidencyRefused { refusal, .. }
             | Self::CandidateMovementDebtRefused { refusal, .. } => Some(*refusal),
             Self::PreflightSimulationNotAuthoritative => {
                 Some(StorageIntentRefusalReason::EvidenceNotUsable)
@@ -1441,6 +1448,7 @@ fn evaluate_candidate(
     evaluate_service_objective(role_requires_service_objective(role), candidate, reasons);
     evaluate_data_shape(role_requires_data_shape(role), candidate, reasons);
     evaluate_layout(role_requires_layout_allocator(role), candidate, reasons);
+    evaluate_prefetch_residency_boundary(role, candidate, reasons);
     evaluate_cache_authority_boundary(role, candidate, reasons);
     evaluate_transport_proximity(request, candidate, reasons);
     evaluate_geo_remote_boundary(role, candidate, reasons);
@@ -1727,6 +1735,47 @@ fn evaluate_cache_authority_boundary(
                 },
             );
         }
+    }
+}
+
+fn evaluate_prefetch_residency_boundary(
+    role: StorageIntentPlacementRole,
+    candidate: &StorageIntentPlacementCandidate,
+    reasons: &mut Vec<StorageIntentPlacementReason>,
+) {
+    if role.is_cache_only() {
+        return;
+    }
+
+    if let Some(decision) = candidate.prefetch_residency {
+        if let Some(refusal) = prefetch_residency_hard_refusal(decision) {
+            reasons.push(
+                StorageIntentPlacementReason::CandidatePrefetchResidencyRefused {
+                    target_id: candidate.target_id,
+                    outcome: decision.outcome,
+                    refusal,
+                },
+            );
+        }
+    }
+}
+
+fn prefetch_residency_hard_refusal(
+    decision: PrefetchResidencyDecisionRecord,
+) -> Option<StorageIntentRefusalReason> {
+    if decision.refusal != StorageIntentRefusalReason::None {
+        return Some(decision.refusal);
+    }
+
+    match decision.outcome {
+        PrefetchResidencyDecisionOutcome::Refused
+        | PrefetchResidencyDecisionOutcome::NeedMoreEvidence => {
+            Some(StorageIntentRefusalReason::EvidenceNotUsable)
+        }
+        PrefetchResidencyDecisionOutcome::Cooldown => {
+            Some(StorageIntentRefusalReason::MovementDebtNotPaidBack)
+        }
+        _ => None,
     }
 }
 
@@ -2269,6 +2318,34 @@ mod tests {
             skipped_reason: SkippedMoveReason::None,
             evidence: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 71),
             ..CostWearRecord::default()
+        }
+    }
+
+    fn prefetch_decision(
+        selected_candidate: PrefetchResidencyCandidateClass,
+        selected_residency: PrefetchResidencyStateClass,
+        outcome: PrefetchResidencyDecisionOutcome,
+        refusal: StorageIntentRefusalReason,
+    ) -> PrefetchResidencyDecisionRecord {
+        PrefetchResidencyDecisionRecord {
+            policy_id: POLICY_ID,
+            policy_revision: StorageIntentPolicyRevision(1),
+            scope: StorageIntentObjectScope::default(),
+            pool_id: DOMAIN_A,
+            budget_owner: DOMAIN_A,
+            access_pattern: AccessPatternClass::SmallRandomHotset,
+            confidence: PredictionConfidence::High,
+            requested_candidate: selected_candidate,
+            selected_candidate,
+            selected_residency,
+            outcome,
+            refusal,
+            source_media: StorageMediaClass::HddRotational,
+            target_media: StorageMediaClass::NvmeFlash,
+            source_media_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 80),
+            target_media_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 81),
+            topology_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 82),
+            ..PrefetchResidencyDecisionRecord::default()
         }
     }
 
@@ -3177,6 +3254,147 @@ mod tests {
             StorageIntentPlacementReason::CandidateLowPredictionConfidence { .. }
         )));
         assert!(result.has_refusal(StorageIntentRefusalReason::MovementDebtNotPaidBack));
+    }
+
+    #[test]
+    fn durable_placement_refuses_unusable_prefetch_residency_decision() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.prefetch_residency = Some(prefetch_decision(
+            PrefetchResidencyCandidateClass::FlashHotServing,
+            PrefetchResidencyStateClass::FlashHotServing,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        ));
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = &plan.candidate_reports[0];
+        assert!(!report.legal);
+        assert_eq!(report.score, 0);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidatePrefetchResidencyRefused {
+                    outcome: PrefetchResidencyDecisionOutcome::NeedMoreEvidence,
+                    refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn durable_placement_maps_prefetch_cooldown_to_movement_debt_refusal() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.prefetch_residency = Some(prefetch_decision(
+            PrefetchResidencyCandidateClass::Cooldown,
+            PrefetchResidencyStateClass::Unknown,
+            PrefetchResidencyDecisionOutcome::Cooldown,
+            StorageIntentRefusalReason::None,
+        ));
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = &plan.candidate_reports[0];
+        assert_eq!(
+            report.first_refusal(),
+            Some(StorageIntentRefusalReason::MovementDebtNotPaidBack)
+        );
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| matches!(
+                reason,
+                StorageIntentPlacementCandidateReason::HardGate(
+                    StorageIntentPlacementReason::CandidatePrefetchResidencyRefused {
+                        outcome: PrefetchResidencyDecisionOutcome::Cooldown,
+                        refusal: StorageIntentRefusalReason::MovementDebtNotPaidBack,
+                        ..
+                    }
+                )
+            )));
+    }
+
+    #[test]
+    fn cache_only_trial_accepts_cache_only_prefetch_residency_decision() {
+        let policy = cache_only_policy();
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::ReadCache,
+            StorageIntentGuaranteeClass::VolatileLocal,
+            FailureDomainMask::EMPTY,
+            StorageMediaClass::SystemRam,
+        );
+        candidate.media_capability = volatile_media();
+        candidate.prefetch_residency = Some(prefetch_decision(
+            PrefetchResidencyCandidateClass::CacheOnlyTrial,
+            PrefetchResidencyStateClass::CacheOnlyRam,
+            PrefetchResidencyDecisionOutcome::CacheOnly,
+            StorageIntentRefusalReason::None,
+        ));
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::CacheOnlyHotServingTrial,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(plan.admitted, "{plan:?}");
+        let report = &plan.candidate_reports[0];
+        assert!(report.legal);
+        assert!(report.selected);
+        assert!(!report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidatePrefetchResidencyRefused { .. }
+                    | StorageIntentPlacementReason::CandidateCacheOnlyCannotSatisfyAuthority { .. }
+            )
+        )));
     }
 
     #[test]
