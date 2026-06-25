@@ -1214,29 +1214,40 @@ impl MembershipRuntime {
         }
 
         // 3. Handle pending transition
-        if let Some(ref pending) = self.pending_transition {
-            // Check if we've received enough accepts to commit
-            if pending.accepts_received >= pending.required_accepts {
-                // If we're the proposer, commit
-                if pending.proposal.proposer == self.my_id {
-                    if let Ok(commit) = self
-                        .epoch_engine
-                        .commit(pending.proposal_id, &self.signing_key)
-                    {
-                        let applied = AppliedTransition {
-                            from_epoch: pending.proposal.from_epoch,
-                            to_epoch: commit.new_epoch,
-                            reason: pending.proposal.reason,
-                            members_added: pending.proposal.members_added.clone(),
-                            members_removed: pending.proposal.members_removed.clone(),
-                            committed_at_millis: commit.committed_at_millis,
-                        };
-                        result.epoch_transitioned = true;
-                        result.new_epoch = Some(commit.new_epoch);
-                        self.fire_transition_callbacks(&applied);
-                        self.pending_transition = None;
+        let ready_pending = self
+            .pending_transition
+            .as_ref()
+            .filter(|pending| {
+                pending.accepts_received >= pending.required_accepts
+                    && pending.proposal.proposer == self.my_id
+            })
+            .map(|pending| (pending.proposal_id, pending.proposal.clone()));
+
+        if let Some((proposal_id, proposal)) = ready_pending {
+            match self.epoch_engine.commit(proposal_id, &self.signing_key) {
+                Ok(commit) => {
+                    let applied = AppliedTransition {
+                        from_epoch: proposal.from_epoch,
+                        to_epoch: commit.new_epoch,
+                        reason: proposal.reason,
+                        members_added: proposal.members_added.clone(),
+                        members_removed: proposal.members_removed.clone(),
+                        committed_at_millis: commit.committed_at_millis,
+                    };
+                    result.epoch_transitioned = true;
+                    result.new_epoch = Some(commit.new_epoch);
+                    self.fire_transition_callbacks(&applied);
+                    if !self.clear_terminal_pending_transition() {
+                        self.release_forced_fence_epoch_barrier(
+                            &applied.members_removed,
+                            applied.to_epoch,
+                        );
                     }
                 }
+                Err(_err) if proposal.fence_token.is_some() => {
+                    self.clear_terminal_pending_transition();
+                }
+                Err(_err) => {}
             }
         }
 
@@ -1424,7 +1435,7 @@ impl MembershipRuntime {
             self.epoch_engine
                 .accept(&proposal, self.my_id, &alive_voters, &self.signing_key)
         {
-            self.pending_transition = Some(PendingTransition {
+            self.replace_pending_transition(PendingTransition {
                 proposal_id: proposal.proposal_id,
                 proposal,
                 my_accept: Some(accept),
@@ -1432,7 +1443,7 @@ impl MembershipRuntime {
                 required_accepts: required,
             });
         } else {
-            self.pending_transition = Some(PendingTransition {
+            self.replace_pending_transition(PendingTransition {
                 proposal_id: proposal.proposal_id,
                 proposal,
                 my_accept: None,
@@ -1479,7 +1490,7 @@ impl MembershipRuntime {
         // Track this as pending if we're not the proposer
         if proposal.proposer != self.my_id {
             let required = (alive_voters.len() / 2) + 1;
-            self.pending_transition = Some(PendingTransition {
+            self.replace_pending_transition(PendingTransition {
                 proposal_id: proposal.proposal_id,
                 proposal: proposal.clone(),
                 my_accept: Some(accept),
@@ -1529,6 +1540,47 @@ impl MembershipRuntime {
         Ok(status)
     }
 
+    fn replace_pending_transition(&mut self, pending: PendingTransition) {
+        self.clear_terminal_pending_transition();
+        self.pending_transition = Some(pending);
+    }
+
+    fn clear_terminal_pending_transition(&mut self) -> bool {
+        if let Some(pending) = self.pending_transition.take() {
+            return self.release_pending_forced_fence_epoch_barrier(&pending.proposal);
+        }
+
+        false
+    }
+
+    fn release_pending_forced_fence_epoch_barrier(
+        &mut self,
+        proposal: &EpochTransitionProposal,
+    ) -> bool {
+        if proposal.fence_token.is_none() {
+            return false;
+        }
+
+        self.release_forced_fence_epoch_barrier(&proposal.members_removed, proposal.to_epoch)
+    }
+
+    fn release_forced_fence_epoch_barrier(
+        &mut self,
+        members_removed: &[MemberId],
+        to_epoch: EpochId,
+    ) -> bool {
+        for &member_id in members_removed {
+            if self
+                .fencing
+                .release_epoch_barrier_for_transition(member_id, to_epoch)
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Receive a commit and apply the epoch transition.
     pub fn receive_commit(
         &mut self,
@@ -1539,7 +1591,9 @@ impl MembershipRuntime {
                 .receive_commit(commit, &self.verifying_keys, &mut self.detector)?;
 
         self.fire_transition_callbacks(&applied);
-        self.pending_transition = None;
+        if !self.clear_terminal_pending_transition() {
+            self.release_forced_fence_epoch_barrier(&applied.members_removed, applied.to_epoch);
+        }
 
         Ok(applied)
     }
@@ -1953,6 +2007,23 @@ mod tests {
             class,
             id,
         )
+    }
+
+    fn forced_fence_validation(subject: MemberId) -> Vec<SuspicionRecord> {
+        vec![
+            SuspicionRecord::new(
+                subject,
+                MemberId::new(1),
+                now_millis(),
+                SuspicionSource::DirectTimeout,
+            ),
+            SuspicionRecord::new(
+                subject,
+                MemberId::new(99),
+                now_millis(),
+                SuspicionSource::IndirectAllTimeout,
+            ),
+        ]
     }
 
     #[test]
@@ -2395,6 +2466,72 @@ mod tests {
 
         let pm = pm.lock().unwrap();
         assert!(pm.current_epoch() > 0, "epoch={}", pm.current_epoch());
+    }
+
+    #[test]
+    fn forced_fence_terminal_commit_releases_epoch_barrier_without_clear_fence() {
+        let mut rt = make_runtime(1, MemberClass::Voter);
+        rt.epoch_engine.set_voter_count(1);
+        let fenced = MemberId::new(2);
+        rt.add_peer(fenced, MemberClass::Learner, 2);
+
+        let token = rt.fencing.manual_fence(fenced, rt.current_epoch().0).unwrap();
+        assert_eq!(token.value(), 1);
+        assert!(rt.fencing.forced_fence_barrier_blocked());
+        assert_eq!(rt.fencing.pending_epoch(), Some(EpochId::new(2)));
+
+        rt.initiate_epoch_transition(
+            vec![],
+            vec![fenced],
+            TransitionReason::FailureDetected,
+            forced_fence_validation(fenced),
+            Some(token),
+        );
+
+        let result = rt.tick();
+        assert!(result.epoch_transitioned, "tick result: {result:?}");
+        assert_eq!(rt.current_epoch(), EpochId::new(2));
+        assert!(rt.pending_transition.is_none());
+        assert!(!rt.fencing.forced_fence_barrier_blocked());
+        assert_eq!(rt.fencing.pending_epoch(), None);
+        assert!(
+            rt.fencing.is_fenced(fenced),
+            "terminal release must not clear the fence itself"
+        );
+
+        rt.fencing.clear_fence(fenced, token).unwrap();
+        let next_token = rt.fencing.manual_fence(fenced, rt.current_epoch().0).unwrap();
+        assert_eq!(next_token.value(), 2);
+        assert!(rt.fencing.forced_fence_barrier_blocked());
+        assert_eq!(rt.fencing.pending_epoch(), Some(EpochId::new(3)));
+    }
+
+    #[test]
+    fn forced_fence_failed_commit_releases_epoch_barrier() {
+        let mut rt = make_runtime(1, MemberClass::Voter);
+        rt.epoch_engine.set_voter_count(1);
+        let fenced = MemberId::new(2);
+        rt.add_peer(fenced, MemberClass::Learner, 2);
+
+        let token = rt.fencing.manual_fence(fenced, rt.current_epoch().0).unwrap();
+        rt.initiate_epoch_transition(
+            vec![],
+            vec![fenced],
+            TransitionReason::FailureDetected,
+            forced_fence_validation(fenced),
+            Some(token),
+        );
+        let pending = rt.pending_transition.as_mut().expect("pending transition");
+        pending.proposal_id = u64::MAX;
+        pending.accepts_received = pending.required_accepts;
+
+        let result = rt.tick();
+        assert!(!result.epoch_transitioned, "tick result: {result:?}");
+        assert!(rt.pending_transition.is_none());
+        assert!(!rt.fencing.forced_fence_barrier_blocked());
+        assert_eq!(rt.fencing.pending_epoch(), None);
+        assert!(rt.fencing.is_fenced(fenced));
+        assert_eq!(rt.fencing.token_for(fenced), token);
     }
 
     #[test]

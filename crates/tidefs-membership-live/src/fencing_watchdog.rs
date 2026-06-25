@@ -89,6 +89,18 @@ impl FencingWatchdog {
         self.fencing.fenced_node_ids()
     }
 
+    /// Returns true while forced fencing holds the epoch-transition barrier.
+    #[must_use]
+    pub fn forced_fence_barrier_blocked(&self) -> bool {
+        self.fencing.lease_acquisition_blocked()
+    }
+
+    /// Return the pending epoch guarded by the forced-fence barrier, if any.
+    #[must_use]
+    pub fn pending_epoch(&self) -> Option<EpochId> {
+        self.fencing.pending_epoch()
+    }
+
     /// Update the fence timeout for testing or runtime reconfiguration.
     pub fn set_fence_timeout_ms(&mut self, ms: u64) {
         self.fencing.set_fence_timeout_ms(ms);
@@ -226,6 +238,31 @@ impl FencingWatchdog {
         presented: FenceToken,
     ) -> Result<(), FencingError> {
         self.fencing.clear_fence(node_id, presented)
+    }
+
+    /// Release the forced-fence epoch barrier when the membership runtime
+    /// reaches the matching terminal transition.
+    ///
+    /// The barrier is released only if the active forced-fence transition
+    /// matches both the fenced node and target epoch, leaving unrelated
+    /// membership transitions and other active fences untouched.
+    pub fn release_epoch_barrier_for_transition(
+        &mut self,
+        node_id: MemberId,
+        to_epoch: EpochId,
+    ) -> bool {
+        if self
+            .fencing
+            .active_epoch_transition()
+            .is_some_and(|transition| {
+                transition.node_id() == node_id && transition.to_epoch() == to_epoch
+            })
+        {
+            self.fencing.release_epoch_barrier();
+            return true;
+        }
+
+        false
     }
 
     /// Manual fence by operator command.
@@ -400,6 +437,32 @@ mod tests {
         }
 
         assert_eq!(wd.stats().nodes_fenced, 2);
+    }
+
+    #[test]
+    fn test_watchdog_terminal_release_matches_active_transition() {
+        let mut wd = FencingWatchdog::with_config(ForcedFencingConfig {
+            fence_timeout_ms: 1000,
+            max_consecutive_fences: 5,
+        });
+
+        wd.record_healthy(node(1), 0);
+        let peers = vec![(node(1), HealthClass::Down, 0)];
+        let action = wd.tick(&peers, 2000, 1);
+        assert!(matches!(action, FencingAction::FenceNode { .. }));
+        assert!(wd.forced_fence_barrier_blocked());
+        assert_eq!(wd.pending_epoch(), Some(EpochId::new(2)));
+
+        assert!(!wd.release_epoch_barrier_for_transition(node(2), EpochId::new(2)));
+        assert!(wd.forced_fence_barrier_blocked());
+
+        assert!(!wd.release_epoch_barrier_for_transition(node(1), EpochId::new(3)));
+        assert!(wd.forced_fence_barrier_blocked());
+
+        assert!(wd.release_epoch_barrier_for_transition(node(1), EpochId::new(2)));
+        assert!(!wd.forced_fence_barrier_blocked());
+        assert_eq!(wd.pending_epoch(), None);
+        assert!(wd.is_fenced(node(1)));
     }
 
     #[test]
