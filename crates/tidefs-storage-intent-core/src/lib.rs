@@ -18643,7 +18643,7 @@ impl MetadataLocalityRoleFlags {
     /// Namespace revision counter is local to this metadata scope.
     pub const NAMESPACE_REVISION_LOCAL: Self = Self(1 << 9);
 
-    /// Returns true when at least one flag is set.
+    /// Returns true when no locality role flag is set.
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -19064,10 +19064,10 @@ pub const fn metadata_namespace_locality_is_legal(
             StorageIntentRefusalReason::EvidenceNotUsable,
         );
     }
-    // Metadata-hot requires sync-barrier evidence for fsyncdir or file fsync metadata dep.
+    // Sync-intent metadata requires a sync-barrier operation.
     if evidence
         .locality_roles
-        .contains(MetadataLocalityRoleFlags::METADATA_HOT)
+        .contains(MetadataLocalityRoleFlags::SYNC_INTENT_METADATA)
         && !evidence.operation_kind.is_sync_barrier()
     {
         return ReceiptPredicateResult::refused(
@@ -28421,8 +28421,8 @@ mod tests {
         let result = metadata_namespace_evidence_is_present(evidence);
         assert!(!result.satisfied);
         assert_eq!(
-            result.refusal(),
-            Some(StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable)
+            result.refusal,
+            StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable
         );
     }
 
@@ -28433,8 +28433,8 @@ mod tests {
         let result = metadata_namespace_evidence_is_present(evidence);
         assert!(!result.satisfied);
         assert_eq!(
-            result.refusal(),
-            Some(StorageIntentRefusalReason::MetadataReserveExhausted)
+            result.refusal,
+            StorageIntentRefusalReason::MetadataReserveExhausted
         );
     }
 
@@ -28452,8 +28452,8 @@ mod tests {
         let result = metadata_namespace_vfs_authority_is_bound(evidence);
         assert!(!result.satisfied);
         assert_eq!(
-            result.refusal(),
-            Some(StorageIntentRefusalReason::MetadataStaleInodeGeneration)
+            result.refusal,
+            StorageIntentRefusalReason::MetadataStaleInodeGeneration
         );
     }
 
@@ -28471,8 +28471,8 @@ mod tests {
         let result = metadata_namespace_ordering_is_bound(evidence);
         assert!(!result.satisfied);
         assert_eq!(
-            result.refusal(),
-            Some(StorageIntentRefusalReason::MissingOrderingEvidence)
+            result.refusal,
+            StorageIntentRefusalReason::MissingOrderingEvidence
         );
     }
 
@@ -28490,20 +28490,32 @@ mod tests {
         let result = metadata_namespace_locality_is_legal(evidence);
         assert!(!result.satisfied);
         assert_eq!(
-            result.refusal(),
-            Some(StorageIntentRefusalReason::EvidenceNotUsable)
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
 
     #[test]
-    fn metadata_locality_legal_refused_when_metadata_hot_without_sync_barrier() {
+    fn metadata_locality_legal_allows_metadata_hot_lookup_without_sync_intent() {
         let mut evidence = make_metadata_evidence();
         evidence.operation_kind = MetadataNamespaceOperationKind::Lookup;
+        evidence.locality_roles = MetadataLocalityRoleFlags::METADATA_HOT
+            .union(MetadataLocalityRoleFlags::LOOKUP_CACHE_PROJECTION);
+        let result = metadata_namespace_locality_is_legal(evidence);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn metadata_locality_legal_refused_when_sync_intent_without_sync_barrier() {
+        let mut evidence = make_metadata_evidence();
+        evidence.operation_kind = MetadataNamespaceOperationKind::Lookup;
+        evidence.locality_roles = MetadataLocalityRoleFlags::METADATA_HOT
+            .union(MetadataLocalityRoleFlags::SYNC_INTENT_METADATA);
         let result = metadata_namespace_locality_is_legal(evidence);
         assert!(!result.satisfied);
         assert_eq!(
-            result.refusal(),
-            Some(StorageIntentRefusalReason::MetadataFsyncdirObjectiveMissed)
+            result.refusal,
+            StorageIntentRefusalReason::MetadataFsyncdirObjectiveMissed
         );
     }
 
@@ -28518,8 +28530,8 @@ mod tests {
         let result = metadata_namespace_locality_is_legal(evidence);
         assert!(!result.satisfied);
         assert_eq!(
-            result.refusal(),
-            Some(StorageIntentRefusalReason::MetadataNamespaceConflict)
+            result.refusal,
+            StorageIntentRefusalReason::MetadataNamespaceConflict
         );
     }
 
