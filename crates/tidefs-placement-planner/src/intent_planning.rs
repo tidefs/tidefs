@@ -11,19 +11,20 @@
 use std::collections::BTreeSet;
 
 use tidefs_storage_intent_core::{
-    ack_receipt_satisfies_requested_floor, evaluate_receipt_against_policy,
-    media_capability_satisfies_role, prefetch_residency_decision_is_cache_only,
+    ack_receipt_satisfies_requested_floor, data_shape_hard_gate_check,
+    evaluate_receipt_against_policy, media_capability_satisfies_role,
+    prefetch_residency_decision_is_cache_only,
     prefetch_residency_decision_may_request_authority_change, proximity_satisfies_max,
     service_objective_gate_candidate, trust_domain_role_requirement, trust_domain_role_satisfies,
-    AllocationClass, CostWearRecord, DataShapeRecord, EvidenceFamilyFreshnessState,
-    LayoutAllocatorRecord, MediaRoleMask, MediaRoleRequirement, PredictionConfidence,
-    PrefetchResidencyDecisionOutcome, PrefetchResidencyDecisionRecord, ProximityClass,
-    ReceiptPredicateResult, SkippedMoveReason, StorageIntentActionClass, StorageIntentEvidenceKind,
-    StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef, StorageIntentGuaranteeClass,
-    StorageIntentPolicy, StorageIntentReceipt, StorageIntentReceiptId, StorageIntentRefusalReason,
+    AllocationClass, AllocationRefusalReason, CostWearRecord, DataShapePolicy, DataShapeRecord,
+    EvidenceFamilyFreshnessState, FreeSpacePressureClass, LayoutAllocatorRecord, MediaRoleMask,
+    MediaRoleRequirement, PredictionConfidence, PrefetchResidencyDecisionOutcome,
+    PrefetchResidencyDecisionRecord, ProximityClass, ReceiptPredicateResult, SkippedMoveReason,
+    StorageIntentActionClass, StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot,
+    StorageIntentEvidenceRef, StorageIntentGuaranteeClass, StorageIntentPolicy,
+    StorageIntentReceipt, StorageIntentReceiptId, StorageIntentRefusalReason,
     StorageIntentServiceObjectiveEvidence, StorageIntentServiceObjectiveScope,
-    StorageIntentTrustRole, StorageMediaRole, TransformRefusalClass, TrustDomainRequirement,
-    TrustEvidenceRecord,
+    StorageIntentTrustRole, StorageMediaRole, TrustDomainRequirement, TrustEvidenceRecord,
 };
 
 use crate::TierGoal;
@@ -266,6 +267,8 @@ pub struct StorageIntentPlacementRequest {
     pub min_distinct_failure_domains: usize,
     /// Bounded evidence query cut used for hard-gate admission.
     pub evidence_query: StorageIntentEvidenceQuerySnapshot,
+    /// Compiled #878 data-shape policy consumed as an input, not recomputed.
+    pub data_shape_policy: Option<DataShapePolicy>,
     /// State of the compiled policy input when the #855 producer is absent.
     pub compiled_policy_state: PlacementEvidenceState,
 }
@@ -287,8 +290,16 @@ impl StorageIntentPlacementRequest {
             required_target_count,
             min_distinct_failure_domains,
             evidence_query,
+            data_shape_policy: None,
             compiled_policy_state: PlacementEvidenceState::Fresh,
         }
+    }
+
+    /// Attach the compiled #878 data-shape policy for hard-gate checks.
+    #[must_use]
+    pub const fn with_data_shape_policy(mut self, data_shape_policy: DataShapePolicy) -> Self {
+        self.data_shape_policy = Some(data_shape_policy);
+        self
     }
 }
 
@@ -471,7 +482,7 @@ pub enum StorageIntentPlacementReason {
     /// Data-shape transform evidence rejected the target.
     CandidateDataShapeRefused {
         target_id: u64,
-        refusal: TransformRefusalClass,
+        refusal: StorageIntentRefusalReason,
     },
     /// Layout/allocator evidence rejected the target.
     CandidateLayoutRefused {
@@ -530,12 +541,13 @@ impl StorageIntentPlacementReason {
             | Self::CandidateReceiptRefused { refusal, .. }
             | Self::CandidateMediaCapabilityRefused { refusal, .. }
             | Self::CandidateEvidenceGateRefused { refusal, .. }
+            | Self::CandidateDataShapeRefused { refusal, .. }
             | Self::CandidateServiceObjectiveRefused { refusal, .. }
             | Self::CandidateTrustDomainRefused { refusal, .. }
             | Self::CandidatePrefetchResidencyRefused { refusal, .. }
             | Self::CandidateMovementDebtRefused { refusal, .. } => Some(*refusal),
-            Self::EvidenceFamilyNotFresh { .. }
-            | Self::PreflightSimulationNotAuthoritative => {
+            Self::CandidateLayoutRefused { refusal, .. } => Some(layout_refusal_reason(*refusal)),
+            Self::EvidenceFamilyNotFresh { .. } | Self::PreflightSimulationNotAuthoritative => {
                 Some(StorageIntentRefusalReason::EvidenceNotUsable)
             }
             Self::CandidateGuaranteeFloorNotMet { .. } => {
@@ -579,8 +591,16 @@ pub enum CandidateGate {
 pub enum LayoutRefusal {
     MissingEvidence,
     UnknownAllocationClass,
+    EvidenceAuthorityInsufficient,
+    FreeSpaceUnavailable,
+    FreeRunUnavailable,
+    CriticalReserveProtection,
     PendingFreeUnsafe,
     StaleMirror,
+    ZoneWritePointerBlocked,
+    AlignmentIncompatible,
+    RegionClassUnavailable,
+    ReclaimDebtTooHigh,
 }
 
 /// Result of storage-intent placement hard-gate admission.
@@ -1448,7 +1468,7 @@ fn evaluate_candidate(
     );
 
     evaluate_service_objective(role_requires_service_objective(role), candidate, reasons);
-    evaluate_data_shape(role_requires_data_shape(role), candidate, reasons);
+    evaluate_data_shape(request, role_requires_data_shape(role), candidate, reasons);
     evaluate_layout(role_requires_layout_allocator(role), candidate, reasons);
     evaluate_prefetch_residency_boundary(role, candidate, reasons);
     evaluate_cache_authority_boundary(role, candidate, reasons);
@@ -1633,6 +1653,7 @@ fn evaluate_service_objective(
 }
 
 fn evaluate_data_shape(
+    request: &StorageIntentPlacementRequest,
     required: bool,
     candidate: &StorageIntentPlacementCandidate,
     reasons: &mut Vec<StorageIntentPlacementReason>,
@@ -1659,11 +1680,45 @@ fn evaluate_data_shape(
         return;
     };
 
-    if data_shape.transform_refusal != TransformRefusalClass::None {
+    let Some(data_shape_policy) = request.data_shape_policy else {
         reasons.push(StorageIntentPlacementReason::CandidateDataShapeRefused {
             target_id: candidate.target_id,
-            refusal: data_shape.transform_refusal,
+            refusal: StorageIntentRefusalReason::UnknownDataShapeEvidence,
         });
+        return;
+    };
+
+    push_predicate_refusal(
+        reasons,
+        candidate.target_id,
+        data_shape_hard_gate_check(data_shape, data_shape_policy),
+        |target_id, refusal| StorageIntentPlacementReason::CandidateDataShapeRefused {
+            target_id,
+            refusal,
+        },
+    );
+}
+
+const fn layout_refusal_reason(refusal: LayoutRefusal) -> StorageIntentRefusalReason {
+    match refusal {
+        LayoutRefusal::MissingEvidence
+        | LayoutRefusal::UnknownAllocationClass
+        | LayoutRefusal::EvidenceAuthorityInsufficient
+        | LayoutRefusal::StaleMirror => StorageIntentRefusalReason::EvidenceNotUsable,
+        LayoutRefusal::FreeSpaceUnavailable
+        | LayoutRefusal::FreeRunUnavailable
+        | LayoutRefusal::RegionClassUnavailable => StorageIntentRefusalReason::NoLegalReceiptSet,
+        LayoutRefusal::CriticalReserveProtection => {
+            StorageIntentRefusalReason::ProtectedReserveWouldBeBreached
+        }
+        LayoutRefusal::PendingFreeUnsafe => StorageIntentRefusalReason::PendingFreeNotSafe,
+        LayoutRefusal::ZoneWritePointerBlocked => {
+            StorageIntentRefusalReason::UnsupportedZoneWritePointer
+        }
+        LayoutRefusal::AlignmentIncompatible => {
+            StorageIntentRefusalReason::WrongAtomicityGranularity
+        }
+        LayoutRefusal::ReclaimDebtTooHigh => StorageIntentRefusalReason::ReclaimDebtNotSafe,
     }
 }
 
@@ -1692,10 +1747,51 @@ fn evaluate_layout(
         return;
     };
 
+    let requested_bytes = layout_requested_bytes(candidate);
+
+    if !layout.has_evidence() {
+        reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
+            target_id: candidate.target_id,
+            refusal: LayoutRefusal::MissingEvidence,
+        });
+    }
     if layout.allocation_class == AllocationClass::Unknown {
         reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
             target_id: candidate.target_id,
             refusal: LayoutRefusal::UnknownAllocationClass,
+        });
+    }
+    if !layout.has_usable_authority() {
+        reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
+            target_id: candidate.target_id,
+            refusal: LayoutRefusal::EvidenceAuthorityInsufficient,
+        });
+    }
+    if !layout.has_free_space() {
+        reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
+            target_id: candidate.target_id,
+            refusal: LayoutRefusal::FreeSpaceUnavailable,
+        });
+    }
+    if layout.allocation_refusal != AllocationRefusalReason::None {
+        reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
+            target_id: candidate.target_id,
+            refusal: layout_refusal_from_allocation_refusal(layout.allocation_refusal),
+        });
+    }
+    if !layout.free_run_is_available(requested_bytes, layout.extent_alignment_bytes) {
+        reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
+            target_id: candidate.target_id,
+            refusal: LayoutRefusal::FreeRunUnavailable,
+        });
+    }
+    if requested_bytes > 0
+        && layout.largest_free_run_bytes >= requested_bytes
+        && !layout.critical_reserve_is_protected(requested_bytes)
+    {
+        reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
+            target_id: candidate.target_id,
+            refusal: LayoutRefusal::CriticalReserveProtection,
         });
     }
     if layout.pending_free_bytes > 0 && !layout.pending_free_is_safe() {
@@ -1709,6 +1805,71 @@ fn evaluate_layout(
             target_id: candidate.target_id,
             refusal: LayoutRefusal::StaleMirror,
         });
+    }
+    if !layout.zone_is_compatible(requested_bytes) {
+        reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
+            target_id: candidate.target_id,
+            refusal: LayoutRefusal::ZoneWritePointerBlocked,
+        });
+    }
+    if !layout
+        .block_volume_alignment_is_satisfied(layout_requested_block_volume_alignment(candidate))
+    {
+        reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
+            target_id: candidate.target_id,
+            refusal: LayoutRefusal::AlignmentIncompatible,
+        });
+    }
+    if layout.free_space_pressure == FreeSpacePressureClass::Critical {
+        reasons.push(StorageIntentPlacementReason::CandidateLayoutRefused {
+            target_id: candidate.target_id,
+            refusal: LayoutRefusal::CriticalReserveProtection,
+        });
+    }
+}
+
+fn layout_requested_bytes(candidate: &StorageIntentPlacementCandidate) -> u64 {
+    candidate
+        .data_shape
+        .map(|shape| u64::from(shape.record_size_bytes))
+        .or_else(|| {
+            candidate
+                .cost_wear
+                .map(|cost_wear| cost_wear.expected_write_bytes)
+        })
+        .unwrap_or(0)
+}
+
+fn layout_requested_block_volume_alignment(candidate: &StorageIntentPlacementCandidate) -> u32 {
+    candidate
+        .media_capability
+        .logical_block_bytes
+        .max(candidate.media_capability.physical_block_bytes)
+        .max(candidate.media_capability.atomic_write_unit_bytes)
+}
+
+fn layout_refusal_from_allocation_refusal(refusal: AllocationRefusalReason) -> LayoutRefusal {
+    match refusal {
+        AllocationRefusalReason::None => LayoutRefusal::MissingEvidence,
+        AllocationRefusalReason::NoFreeRun | AllocationRefusalReason::Fragmented => {
+            LayoutRefusal::FreeRunUnavailable
+        }
+        AllocationRefusalReason::ZoneWritePointerBlocked => LayoutRefusal::ZoneWritePointerBlocked,
+        AllocationRefusalReason::CriticalReserveExhausted => {
+            LayoutRefusal::CriticalReserveProtection
+        }
+        AllocationRefusalReason::PendingFreeUnsafe => LayoutRefusal::PendingFreeUnsafe,
+        AllocationRefusalReason::ReclaimDebtTooHigh => LayoutRefusal::ReclaimDebtTooHigh,
+        AllocationRefusalReason::StaleAllocatorGeneration => LayoutRefusal::StaleMirror,
+        AllocationRefusalReason::AlignmentImpossible
+        | AllocationRefusalReason::BlockVolumeAlignmentViolation
+        | AllocationRefusalReason::EraseBlockAlignmentViolation => {
+            LayoutRefusal::AlignmentIncompatible
+        }
+        AllocationRefusalReason::RegionClassExhausted => LayoutRefusal::RegionClassUnavailable,
+        AllocationRefusalReason::EvidenceAuthorityInsufficient => {
+            LayoutRefusal::EvidenceAuthorityInsufficient
+        }
     }
 }
 
@@ -1912,8 +2073,10 @@ fn skipped_move_refusal(reason: SkippedMoveReason) -> StorageIntentRefusalReason
 mod tests {
     use super::*;
     use tidefs_storage_intent_core::{
-        AccessPatternClass, CompromiseState, DedupSharingCompatibilityState,
-        DurabilityReceiptState, DurabilityRequirement, DurabilityState,
+        AccessPatternClass, AllocatorEvidenceAuthority, CoalescingModeClass,
+        CompressionAlgorithmClass, CompressionOrderingClass, CompromiseState,
+        DedupFingerprintScopeClass, DedupSharingCompatibilityState, DigestSuiteClass,
+        DurabilityReceiptState, DurabilityRequirement, DurabilityState, ECArchiveShape,
         EvidenceCompletenessVerdict, EvidenceConsumerClass, EvidenceFamilyFreshness,
         EvidenceFamilyFreshnessSet, EvidenceQueryContextClass, EvidenceQuerySubjectScope,
         EvidenceQuerySubjectScopeClass, FailureDomainMask, MediaArchiveRestoreSemantics,
@@ -1922,12 +2085,12 @@ mod tests {
         MediaProtocolGeometryClass, MediaRemoteCommitSemantics, PendingFreeSafetyClass,
         PrefetchResidencyCandidateClass, PrefetchResidencyDecisionEvidenceRefs,
         PrefetchResidencyDecisionOutcome, PrefetchResidencyStateClass, ProximityClass,
-        QuarantineState, ReadServingSourceClass, ResidencyScope, SegmentRegionClass,
-        SessionSecurityClass, SharingDomainClass, StorageIntentActionClass, StorageIntentDomainId,
-        StorageIntentEvidenceId, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
-        StorageIntentMediaCapabilityRecord, StorageIntentObjectScope, StorageIntentPolicyId,
-        StorageIntentPolicyRevision, StorageIntentReceiptId,
-        StorageIntentServiceObjectiveComparatorScope,
+        QuarantineState, ReadServingSourceClass, RebakeEligibilityClass, RecordSizeClass,
+        ResidencyScope, SegmentRegionClass, SessionSecurityClass, SharingDomainClass,
+        StorageIntentActionClass, StorageIntentDomainId, StorageIntentEvidenceId,
+        StorageIntentEvidenceRef, StorageIntentEvidenceRefs, StorageIntentMediaCapabilityRecord,
+        StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
+        StorageIntentReceiptId, StorageIntentServiceObjectiveComparatorScope,
         StorageIntentServiceObjectiveEnvironmentProfile, StorageIntentServiceObjectiveEvidence,
         StorageIntentServiceObjectiveEvidenceRefs, StorageIntentServiceObjectiveFailureState,
         StorageIntentServiceObjectiveLatencyEnvelope, StorageIntentServiceObjectiveOperation,
@@ -2096,6 +2259,25 @@ mod tests {
             },
             media: MediaRoleRequirement::AUTHORITY,
             ..StorageIntentPolicy::default()
+        }
+    }
+
+    fn data_shape_policy(policy: StorageIntentPolicy) -> DataShapePolicy {
+        DataShapePolicy {
+            policy_id: policy.policy_id,
+            policy_revision: policy.revision,
+            record_size_class: RecordSizeClass::Medium,
+            compression_algorithm: CompressionAlgorithmClass::ZstdFast,
+            compression_ordering: CompressionOrderingClass::CompressThenEncrypt,
+            digest_suite: DigestSuiteClass::Crc32cPlusBlake3,
+            dedup_scope: DedupFingerprintScopeClass::NoDedup,
+            encryption_domain: StorageIntentDomainId::ZERO,
+            encryption_key_epoch_min: 0,
+            ec_archive_shape: ECArchiveShape::REPLICATION,
+            coalescing_mode: CoalescingModeClass::NoCoalescing,
+            rebake_eligibility: RebakeEligibilityClass::RebakeForbidden,
+            sharing_domain: StorageIntentDomainId::ZERO,
+            ..DataShapePolicy::default()
         }
     }
 
@@ -2295,6 +2477,17 @@ mod tests {
     fn data_shape() -> DataShapeRecord {
         DataShapeRecord {
             record_size_bytes: 131_072,
+            record_size_class: RecordSizeClass::Medium,
+            compression_class: CompressionAlgorithmClass::ZstdFast,
+            compression_ordering: CompressionOrderingClass::CompressThenEncrypt,
+            digest_suite: DigestSuiteClass::Crc32cPlusBlake3,
+            dedup_scope: DedupFingerprintScopeClass::NoDedup,
+            encryption_domain: StorageIntentDomainId::ZERO,
+            ec_archive_shape: ECArchiveShape::REPLICATION,
+            coalescing_mode: CoalescingModeClass::NoCoalescing,
+            rebake_eligibility: RebakeEligibilityClass::RebakeForbidden,
+            policy_id: POLICY_ID,
+            policy_revision: StorageIntentPolicyRevision(1),
             evidence: evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 60),
             ..DataShapeRecord::default()
         }
@@ -2304,7 +2497,16 @@ mod tests {
         LayoutAllocatorRecord {
             allocation_class: AllocationClass::LargeSequential,
             region_class: SegmentRegionClass::Warm,
+            grain_bytes: 4096,
+            extent_alignment_bytes: 4096,
+            largest_free_run_bytes: 1_048_576,
+            open_segment_remaining_bytes: 1_048_576,
+            critical_reserve_floor_bytes: 65_536,
+            free_space_pressure: FreeSpacePressureClass::None,
             pending_free_safety: PendingFreeSafetyClass::Safe,
+            evidence_authority: AllocatorEvidenceAuthority::DurableRecords,
+            confidence_ppm: 1_000_000,
+            block_volume_alignment_bytes: 4096,
             evidence: evidence_ref(StorageIntentEvidenceKind::LayoutAllocatorEvidence, 61),
             ..LayoutAllocatorRecord::default()
         }
@@ -2709,6 +2911,7 @@ mod tests {
         domains: usize,
     ) -> StorageIntentPlacementRequest {
         StorageIntentPlacementRequest::new(policy, role, required, domains, evidence_cut(policy))
+            .with_data_shape_policy(data_shape_policy(policy))
     }
 
     #[test]
@@ -2944,6 +3147,230 @@ mod tests {
             StorageIntentPlacementCandidateReason::HardGate(
                 StorageIntentPlacementReason::CandidateLayoutRefused {
                     refusal: LayoutRefusal::MissingEvidence,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn durable_placement_requires_compiled_data_shape_policy() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        let request = StorageIntentPlacementRequest::new(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+            evidence_cut(policy),
+        );
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateDataShapeRefused {
+                    refusal: StorageIntentRefusalReason::UnknownDataShapeEvidence,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn stale_data_shape_policy_identity_refuses_durable_candidate() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate
+            .data_shape
+            .as_mut()
+            .expect("data shape exists")
+            .policy_revision = StorageIntentPolicyRevision(0);
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateDataShapeRefused {
+                    refusal: StorageIntentRefusalReason::StaleDataShapeEvidence,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn topology_scan_layout_evidence_refuses_durable_candidate() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate
+            .layout_allocator
+            .as_mut()
+            .expect("layout evidence exists")
+            .evidence_authority = AllocatorEvidenceAuthority::TopologyScan;
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateLayoutRefused {
+                    refusal: LayoutRefusal::EvidenceAuthorityInsufficient,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn free_run_shortage_refuses_durable_candidate_before_scoring() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate
+            .layout_allocator
+            .as_mut()
+            .expect("layout evidence exists")
+            .largest_free_run_bytes = 4096;
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateLayoutRefused {
+                    refusal: LayoutRefusal::FreeRunUnavailable,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn block_volume_alignment_shortage_refuses_durable_candidate_before_scoring() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate
+            .layout_allocator
+            .as_mut()
+            .expect("layout evidence exists")
+            .block_volume_alignment_bytes = 512;
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateLayoutRefused {
+                    refusal: LayoutRefusal::AlignmentIncompatible,
                     ..
                 }
             )
@@ -3382,19 +3809,16 @@ mod tests {
             report.first_refusal(),
             Some(StorageIntentRefusalReason::MovementDebtNotPaidBack)
         );
-        assert!(report
-            .reasons
-            .iter()
-            .any(|reason| matches!(
-                reason,
-                StorageIntentPlacementCandidateReason::HardGate(
-                    StorageIntentPlacementReason::CandidatePrefetchResidencyRefused {
-                        outcome: PrefetchResidencyDecisionOutcome::Cooldown,
-                        refusal: StorageIntentRefusalReason::MovementDebtNotPaidBack,
-                        ..
-                    }
-                )
-            )));
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidatePrefetchResidencyRefused {
+                    outcome: PrefetchResidencyDecisionOutcome::Cooldown,
+                    refusal: StorageIntentRefusalReason::MovementDebtNotPaidBack,
+                    ..
+                }
+            )
+        )));
     }
 
     #[test]
@@ -3976,7 +4400,8 @@ mod tests {
                 1,
                 1,
                 evidence_cut(tight_policy),
-            ),
+            )
+            .with_data_shape_policy(data_shape_policy(tight_policy)),
             &[far],
         );
 
@@ -4085,7 +4510,8 @@ mod tests {
                 policy,
                 StorageIntentEvidenceKind::LifecycleGenerationEvidence,
             ),
-        );
+        )
+        .with_data_shape_policy(data_shape_policy(policy));
 
         let candidate = candidate(
             1,
