@@ -10948,6 +10948,39 @@ pub enum StorageIntentRefusalReason {
     EvidenceRetentionMissingPurgeFrontier = 135,
     /// Evidence generation has not crossed the safe-purge frontier.
     EvidenceRetentionSafePurgeFrontierNotReached = 136,
+    // --- Metadata/namespace refusals (issue #922) ---
+    /// Inode generation is stale; namespace operation conflicts with a newer generation.
+    MetadataStaleInodeGeneration = 137,
+    /// Parent inode does not match the directory expected by the VFS authority.
+    MetadataWrongParentInode = 138,
+    /// Namespace conflict: link-count, cookie, raw-name, or conflict-guard mismatch.
+    MetadataNamespaceConflict = 139,
+    /// Directory shape or index format is not supported for the requested operation.
+    MetadataUnsupportedDirectoryShape = 140,
+    /// Small-file repack would be unsafe under current retention or snapshot state.
+    MetadataUnsafeSmallFileRepack = 141,
+    /// Metadata reserve or inode-table reserve is exhausted for this scope.
+    MetadataReserveExhausted = 142,
+    /// Fsyncdir objective was not met: latency, completeness, or ordering barrier.
+    MetadataFsyncdirObjectiveMissed = 143,
+    /// Media role is not eligible for the requested metadata placement class.
+    MetadataUnsupportedMediaRole = 144,
+    /// Lookup cache or directory projection is stale and cannot serve authority.
+    MetadataStaleLookupCacheProjection = 145,
+    /// Metadata retention proof is missing for the required evidence cut.
+    MetadataMissingRetentionProof = 146,
+    /// Metadata namespace evidence is missing, stale, contradictory, or refused.
+    MetadataNamespaceEvidenceNotUsable = 147,
+    /// Metadata-storm p99 latency exceeded the hard service-objective gate.
+    MetadataStormP99Exceeded = 148,
+    /// Lookup or readdir latency exceeded the hard service-objective gate.
+    MetadataLookupReaddirLatencyExceeded = 149,
+    /// Fsyncdir latency exceeded the hard service-objective gate.
+    MetadataFsyncdirLatencyExceeded = 150,
+    /// Rename or unlink tail latency exceeded the hard service-objective gate.
+    MetadataRenameUnlinkTailExceeded = 151,
+    /// Small-file write amplification exceeded the hard service-objective gate.
+    MetadataSmallFileWriteAmplificationExceeded = 152,
 }
 
 impl StorageIntentRefusalReason {
@@ -11096,6 +11129,22 @@ impl StorageIntentRefusalReason {
             Self::EvidenceRetentionSupersededMissingReplacement => "evidence-retention-superseded-missing-replacement",
             Self::EvidenceRetentionMissingPurgeFrontier => "evidence-retention-missing-purge-frontier",
             Self::EvidenceRetentionSafePurgeFrontierNotReached => "evidence-retention-safe-purge-frontier-not-reached",
+            Self::MetadataStaleInodeGeneration => "metadata-stale-inode-generation",
+            Self::MetadataWrongParentInode => "metadata-wrong-parent-inode",
+            Self::MetadataNamespaceConflict => "metadata-namespace-conflict",
+            Self::MetadataUnsupportedDirectoryShape => "metadata-unsupported-directory-shape",
+            Self::MetadataUnsafeSmallFileRepack => "metadata-unsafe-small-file-repack",
+            Self::MetadataReserveExhausted => "metadata-reserve-exhausted",
+            Self::MetadataFsyncdirObjectiveMissed => "metadata-fsyncdir-objective-missed",
+            Self::MetadataUnsupportedMediaRole => "metadata-unsupported-media-role",
+            Self::MetadataStaleLookupCacheProjection => "metadata-stale-lookup-cache-projection",
+            Self::MetadataMissingRetentionProof => "metadata-missing-retention-proof",
+            Self::MetadataNamespaceEvidenceNotUsable => "metadata-namespace-evidence-not-usable",
+            Self::MetadataStormP99Exceeded => "metadata-storm-p99-exceeded",
+            Self::MetadataLookupReaddirLatencyExceeded => "metadata-lookup-readdir-latency-exceeded",
+            Self::MetadataFsyncdirLatencyExceeded => "metadata-fsyncdir-latency-exceeded",
+            Self::MetadataRenameUnlinkTailExceeded => "metadata-rename-unlink-tail-exceeded",
+            Self::MetadataSmallFileWriteAmplificationExceeded => "metadata-small-file-write-amplification-exceeded",
         }
     }
 
@@ -11240,6 +11289,22 @@ impl StorageIntentRefusalReason {
             134 => Some(Self::EvidenceRetentionSupersededMissingReplacement),
             135 => Some(Self::EvidenceRetentionMissingPurgeFrontier),
             136 => Some(Self::EvidenceRetentionSafePurgeFrontierNotReached),
+            137 => Some(Self::MetadataStaleInodeGeneration),
+            138 => Some(Self::MetadataWrongParentInode),
+            139 => Some(Self::MetadataNamespaceConflict),
+            140 => Some(Self::MetadataUnsupportedDirectoryShape),
+            141 => Some(Self::MetadataUnsafeSmallFileRepack),
+            142 => Some(Self::MetadataReserveExhausted),
+            143 => Some(Self::MetadataFsyncdirObjectiveMissed),
+            144 => Some(Self::MetadataUnsupportedMediaRole),
+            145 => Some(Self::MetadataStaleLookupCacheProjection),
+            146 => Some(Self::MetadataMissingRetentionProof),
+            147 => Some(Self::MetadataNamespaceEvidenceNotUsable),
+            148 => Some(Self::MetadataStormP99Exceeded),
+            149 => Some(Self::MetadataLookupReaddirLatencyExceeded),
+            150 => Some(Self::MetadataFsyncdirLatencyExceeded),
+            151 => Some(Self::MetadataRenameUnlinkTailExceeded),
+            152 => Some(Self::MetadataSmallFileWriteAmplificationExceeded),
             _ => None,
         }
     }
@@ -18320,6 +18385,747 @@ pub const fn retention_evidence_is_usable(
     let proof = retention_compaction_preserves_proof_root(retention);
     if !proof.satisfied {
         return proof;
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+// ---------------------------------------------------------------------------
+// Metadata/namespace evidence types (issue #922)
+// ---------------------------------------------------------------------------
+
+/// Version of the metadata/namespace evidence surface.
+pub const STORAGE_INTENT_METADATA_NAMESPACE_VERSION: u16 = 1;
+
+/// Stable diagnostic identifier for evidence and fixture tests.
+pub const STORAGE_INTENT_METADATA_NAMESPACE_SPEC: &str =
+    "tidefs-storage-intent-metadata-namespace-v1-issue-922";
+
+/// Maximum inline metadata-operation entries in one evidence record.
+pub const MAX_METADATA_OPERATIONS: usize = 16;
+
+/// Maximum inline VFS authority refs carried by the record.
+pub const MAX_VFS_AUTHORITY_REFS: usize = 8;
+
+/// Maximum inline namespace receipt refs carried by the record.
+pub const MAX_NAMESPACE_RECEIPT_REFS: usize = 8;
+
+/// Classification of the metadata/namespace subject scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MetadataSubjectClass {
+    /// No subject class assigned.
+    #[default]
+    Unknown = 0,
+    /// Full dataset scope.
+    Dataset = 1,
+    /// Single directory inode.
+    DirectoryInode = 2,
+    /// Inode and byte range.
+    InodeRange = 3,
+    /// xattr or ACL namespace on one inode or directory tree.
+    XattrAclNamespace = 4,
+    /// Cohort of small objects sharing shape and locality.
+    SmallObjectCohort = 5,
+    /// Directory index or btree projection.
+    DirectoryIndex = 6,
+    /// Transaction group or epoch-scoped mutation group.
+    TransactionGroup = 7,
+    /// Namespace mutation set (rename, link, unlink batch).
+    NamespaceMutationSet = 8,
+}
+
+impl MetadataSubjectClass {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Dataset => "dataset",
+            Self::DirectoryInode => "directory-inode",
+            Self::InodeRange => "inode-range",
+            Self::XattrAclNamespace => "xattr-acl-namespace",
+            Self::SmallObjectCohort => "small-object-cohort",
+            Self::DirectoryIndex => "directory-index",
+            Self::TransactionGroup => "transaction-group",
+            Self::NamespaceMutationSet => "namespace-mutation-set",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Dataset),
+            2 => Some(Self::DirectoryInode),
+            3 => Some(Self::InodeRange),
+            4 => Some(Self::XattrAclNamespace),
+            5 => Some(Self::SmallObjectCohort),
+            6 => Some(Self::DirectoryIndex),
+            7 => Some(Self::TransactionGroup),
+            8 => Some(Self::NamespaceMutationSet),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for MetadataSubjectClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Kinds of metadata and namespace operations under evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MetadataNamespaceOperationKind {
+    /// No operation assigned.
+    #[default]
+    Unknown = 0,
+    /// Regular file or special-node create.
+    Create = 1,
+    /// Directory mkdir.
+    Mkdir = 2,
+    /// Hard link.
+    Link = 3,
+    /// Unlink / remove.
+    Unlink = 4,
+    /// Rename (source and target within the same filesystem).
+    Rename = 5,
+    /// Atomic exchange of two directory entries.
+    Exchange = 6,
+    /// Setattr: mode, owner, timestamps, size truncation.
+    Setattr = 7,
+    /// Truncate of metadata-only state (e.g. no data blocks freed).
+    TruncateMetadata = 8,
+    /// xattr set, replace, or remove.
+    XattrMutation = 9,
+    /// ACL set, replace, or remove.
+    AclMutation = 10,
+    /// readdir (enumerate directory entries).
+    Readdir = 11,
+    /// readdirplus (enumerate with stat).
+    Readdirplus = 12,
+    /// Lookup by name within a directory.
+    Lookup = 13,
+    /// Directory fsync (fsyncdir) barrier.
+    Fsyncdir = 14,
+    /// File fsync that carries a metadata dependency on directory/namespace state.
+    FileFsyncMetadataDep = 15,
+    /// Orphan (open-but-unlinked) admission or close handling.
+    OrphanOpenUnlink = 16,
+    /// Small-file transition from external to inline storage.
+    SmallFileInlineTransition = 17,
+    /// Small-file transition from inline to external storage.
+    SmallFileExternalTransition = 18,
+}
+
+impl MetadataNamespaceOperationKind {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Create => "create",
+            Self::Mkdir => "mkdir",
+            Self::Link => "link",
+            Self::Unlink => "unlink",
+            Self::Rename => "rename",
+            Self::Exchange => "exchange",
+            Self::Setattr => "setattr",
+            Self::TruncateMetadata => "truncate-metadata",
+            Self::XattrMutation => "xattr-mutation",
+            Self::AclMutation => "acl-mutation",
+            Self::Readdir => "readdir",
+            Self::Readdirplus => "readdirplus",
+            Self::Lookup => "lookup",
+            Self::Fsyncdir => "fsyncdir",
+            Self::FileFsyncMetadataDep => "file-fsync-metadata-dep",
+            Self::OrphanOpenUnlink => "orphan-open-unlink",
+            Self::SmallFileInlineTransition => "small-file-inline-transition",
+            Self::SmallFileExternalTransition => "small-file-external-transition",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Create),
+            2 => Some(Self::Mkdir),
+            3 => Some(Self::Link),
+            4 => Some(Self::Unlink),
+            5 => Some(Self::Rename),
+            6 => Some(Self::Exchange),
+            7 => Some(Self::Setattr),
+            8 => Some(Self::TruncateMetadata),
+            9 => Some(Self::XattrMutation),
+            10 => Some(Self::AclMutation),
+            11 => Some(Self::Readdir),
+            12 => Some(Self::Readdirplus),
+            13 => Some(Self::Lookup),
+            14 => Some(Self::Fsyncdir),
+            15 => Some(Self::FileFsyncMetadataDep),
+            16 => Some(Self::OrphanOpenUnlink),
+            17 => Some(Self::SmallFileInlineTransition),
+            18 => Some(Self::SmallFileExternalTransition),
+            _ => None,
+        }
+    }
+
+    /// Returns true when this operation carries a durability barrier.
+    #[must_use]
+    pub const fn is_sync_barrier(self) -> bool {
+        matches!(self, Self::Fsyncdir | Self::FileFsyncMetadataDep)
+    }
+
+    /// Returns true when this operation mutates namespace state.
+    #[must_use]
+    pub const fn is_namespace_mutation(self) -> bool {
+        matches!(
+            self,
+            Self::Create
+                | Self::Mkdir
+                | Self::Link
+                | Self::Unlink
+                | Self::Rename
+                | Self::Exchange
+        )
+    }
+}
+
+impl fmt::Display for MetadataNamespaceOperationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Bit-set of metadata locality roles asserted or requested by evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct MetadataLocalityRoleFlags(pub u64);
+
+impl MetadataLocalityRoleFlags {
+    pub const EMPTY: Self = Self(0);
+    /// Metadata is classified as hot for latency-sensitive serving.
+    pub const METADATA_HOT: Self = Self(1 << 0);
+    /// Sync-intent metadata requires fsync/fdatasync/fsyncdir durability.
+    pub const SYNC_INTENT_METADATA: Self = Self(1 << 1);
+    /// Directory index locality prefers co-located or shard-local index blocks.
+    pub const DIRECTORY_INDEX_LOCALITY: Self = Self(1 << 2);
+    /// xattr storage locality prefers dedicated or co-located blocks.
+    pub const XATTR_LOCALITY: Self = Self(1 << 3);
+    /// ACL storage locality prefers dedicated or co-located blocks.
+    pub const ACL_LOCALITY: Self = Self(1 << 4);
+    /// Small file stored inline in the inode or a packed inode group.
+    pub const SMALL_FILE_INLINE: Self = Self(1 << 5);
+    /// Small file stored in a packed small-object segment.
+    pub const SMALL_FILE_PACKED: Self = Self(1 << 6);
+    /// Small file stored externally in its own data blocks.
+    pub const SMALL_FILE_EXTERNAL: Self = Self(1 << 7);
+    /// Lookup cache or directory projection is active for this scope.
+    pub const LOOKUP_CACHE_PROJECTION: Self = Self(1 << 8);
+    /// Namespace revision counter is local to this metadata scope.
+    pub const NAMESPACE_REVISION_LOCAL: Self = Self(1 << 9);
+
+    /// Returns true when at least one flag is set.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns true when all bits in `other` are set.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Union of two flag sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns true when any small-file shape flag is set.
+    #[must_use]
+    pub const fn has_small_file_shape(self) -> bool {
+        (self.0
+            & (Self::SMALL_FILE_INLINE.0
+                | Self::SMALL_FILE_PACKED.0
+                | Self::SMALL_FILE_EXTERNAL.0))
+            != 0
+    }
+}
+
+/// Shape of a small object or metadata record on media.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum MetadataSmallObjectShape {
+    /// Unknown or unset.
+    #[default]
+    Unknown = 0,
+    /// Inline in the inode record.
+    Inline = 1,
+    /// Packed in a small-object cohort segment.
+    Packed = 2,
+    /// Stored externally with its own data-block allocation.
+    External = 3,
+}
+
+impl MetadataSmallObjectShape {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Inline => "inline",
+            Self::Packed => "packed",
+            Self::External => "external",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Inline),
+            2 => Some(Self::Packed),
+            3 => Some(Self::External),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for MetadataSmallObjectShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Inode-authority reference carried by metadata/namespace evidence.
+///
+/// These refs cite `docs/VFS_ENGINE_API_CONTRACT.md` and
+/// `docs/INODE_NAMESPACE_AUTHORITY.md` for inode identity, generation,
+/// parent/child relation, link-count, cookie, raw-name, and conflict-guard
+/// fields without replacing the VFS semantic contract.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct VfsNamespaceAuthorityRef {
+    /// Inode number asserted by the VFS/namespace authority.
+    pub inode_number: u64,
+    /// Inode generation asserted by the VFS/namespace authority.
+    pub inode_generation: u64,
+    /// Parent inode number for this directory entry.
+    pub parent_inode: u64,
+    /// Link count at the time evidence was produced.
+    pub link_count: u32,
+    /// Directory cookie or position offset.
+    pub directory_cookie: u64,
+    /// Opaque raw-name hash for conflict-guard verification.
+    pub raw_name_hash: StorageIntentEvidenceId,
+    /// Opaque conflict-guard token from the VFS authority.
+    pub conflict_guard: StorageIntentEvidenceId,
+}
+
+impl VfsNamespaceAuthorityRef {
+    pub const EMPTY: Self = Self {
+        inode_number: 0,
+        inode_generation: 0,
+        parent_inode: 0,
+        link_count: 0,
+        directory_cookie: 0,
+        raw_name_hash: StorageIntentEvidenceId::ZERO,
+        conflict_guard: StorageIntentEvidenceId::ZERO,
+    };
+
+    /// Returns true when the ref carries a non-zero inode identity.
+    #[must_use]
+    pub const fn has_inode_identity(self) -> bool {
+        self.inode_number != 0 && self.inode_generation != 0
+    }
+
+    /// Returns true when parent identity is bound.
+    #[must_use]
+    pub const fn has_parent_identity(self) -> bool {
+        self.parent_inode != 0
+    }
+}
+
+/// Metadata and namespace evidence record (issue #922).
+///
+/// This record binds metadata-subject scope, operation semantics, VFS/namespace
+/// authority refs, ordering and ack-receipt refs, metadata locality roles,
+/// small-object shape, evidence-family refs for cost, wear, media-capability,
+/// layout, lifecycle, capacity, isolation, service-objective, decision-frontier,
+/// action-execution, result/refusal, attribution, and retention, plus a typed
+/// metadata-specific refusal reason.
+///
+/// It does not replace the VFS semantic contract, inode namespace authority,
+/// page-cache/writeback authority, or response/result law. It composes their
+/// refs into storage-intent metadata decisions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentMetadataNamespaceEvidence {
+    /// Own evidence identity.
+    pub evidence_ref: StorageIntentEvidenceRef,
+    /// Unique evidence artifact id.
+    pub evidence_id: StorageIntentEvidenceId,
+    /// Compiled-policy identity that produced or governs this record.
+    pub policy_id: StorageIntentPolicyId,
+    /// Compiled-policy revision.
+    pub policy_revision: StorageIntentPolicyRevision,
+    /// Classification of the metadata subject scope.
+    pub subject_class: MetadataSubjectClass,
+    /// Operation kind under evidence.
+    pub operation_kind: MetadataNamespaceOperationKind,
+    /// Object or dataset scope.
+    pub subject_scope: StorageIntentObjectScope,
+    /// VFS/namespace authority refs.
+    pub vfs_authority: VfsNamespaceAuthorityRef,
+    /// Additional VFS/namespace authority refs (e.g. for multi-inode rename).
+    pub vfs_authority_refs: [VfsNamespaceAuthorityRef; MAX_VFS_AUTHORITY_REFS],
+    /// Number of populated entries in `vfs_authority_refs`.
+    pub vfs_authority_refs_len: u8,
+    /// Ordering evidence ref for this metadata operation.
+    pub ordering_ref: StorageIntentEvidenceRef,
+    /// Ordering evidence dependency refs.
+    pub ordering_dependency_refs: StorageIntentEvidenceRefs,
+    /// Ack-receipt refs for namespace or fsyncdir intent.
+    pub namespace_receipt_refs: [StorageIntentEvidenceRef; MAX_NAMESPACE_RECEIPT_REFS],
+    /// Number of populated entries in `namespace_receipt_refs`.
+    pub namespace_receipt_refs_len: u8,
+    /// Root-publication evidence ref (for directory fsync / namespace root).
+    pub root_publication_ref: StorageIntentEvidenceRef,
+    /// Replay-idempotency evidence ref.
+    pub replay_idempotency_ref: StorageIntentEvidenceRef,
+    /// Metadata locality roles claimed by this evidence.
+    pub locality_roles: MetadataLocalityRoleFlags,
+    /// Small-object shape for the subject (when applicable).
+    pub small_object_shape: MetadataSmallObjectShape,
+    /// Data-shape evidence ref (from #878).
+    pub data_shape_ref: StorageIntentEvidenceRef,
+    /// Layout evidence ref (from #880).
+    pub layout_ref: StorageIntentEvidenceRef,
+    /// Lifecycle evidence ref (from #881).
+    pub lifecycle_ref: StorageIntentEvidenceRef,
+    /// Media-capability evidence ref (from #904).
+    pub media_capability_ref: StorageIntentEvidenceRef,
+    /// Capacity/reserve evidence ref (from #898).
+    pub capacity_ref: StorageIntentEvidenceRef,
+    /// Isolation evidence ref (from #902).
+    pub isolation_ref: StorageIntentEvidenceRef,
+    /// Service-objective evidence ref (from #915).
+    pub service_objective_ref: StorageIntentEvidenceRef,
+    /// Evidence-query snapshot ref (from #913).
+    pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
+    /// Decision-frontier evidence ref (from #905).
+    pub decision_frontier_ref: StorageIntentEvidenceRef,
+    /// Action-execution evidence ref (from #911).
+    pub action_execution_ref: StorageIntentEvidenceRef,
+    /// Result/refusal evidence ref (from #920).
+    pub result_refusal_ref: StorageIntentEvidenceRef,
+    /// Attribution evidence ref (from #912).
+    pub attribution_ref: StorageIntentEvidenceRef,
+    /// Retention evidence ref (from #910).
+    pub retention_ref: StorageIntentEvidenceRef,
+    /// Wear and non-wear cost evidence refs (from #844, #856).
+    pub wear_cost_ref: StorageIntentEvidenceRef,
+    /// Non-wear cost evidence ref (from #856).
+    pub non_wear_cost_ref: StorageIntentEvidenceRef,
+    /// Refusal reason when evidence is incomplete, blocked, or refused.
+    pub refusal: StorageIntentRefusalReason,
+}
+
+impl StorageIntentMetadataNamespaceEvidence {
+    /// Returns true when evidence identity, policy, subject, and operation are bound.
+    #[must_use]
+    pub const fn has_identity(self) -> bool {
+        self.evidence_ref.kind as u16
+            == StorageIntentEvidenceKind::MetadataNamespaceEvidence as u16
+            && evidence_ref_has_id(self.evidence_ref)
+            && !bytes32_are_zero(self.evidence_id.0)
+            && !self.policy_id.is_zero()
+            && self.policy_revision.0 > 0
+            && self.subject_class as u8 != MetadataSubjectClass::Unknown as u8
+            && self.operation_kind as u8 != MetadataNamespaceOperationKind::Unknown as u8
+    }
+
+    /// Returns true when VFS/namespace authority refs are bound.
+    #[must_use]
+    pub const fn has_vfs_authority(self) -> bool {
+        self.vfs_authority.has_inode_identity()
+    }
+
+    /// Returns true when ordering and ack-receipt spine refs are present.
+    #[must_use]
+    pub const fn has_ordering_spine(self) -> bool {
+        evidence_ref_has_id(self.ordering_ref)
+            && evidence_ref_has_id(self.replay_idempotency_ref)
+    }
+
+    /// Returns true when metadata locality roles are explicitly set.
+    #[must_use]
+    pub const fn has_locality_roles(self) -> bool {
+        !self.locality_roles.is_empty()
+    }
+
+    /// Returns true when small-object shape is explicitly set.
+    #[must_use]
+    pub const fn has_small_object_shape(self) -> bool {
+        self.small_object_shape as u8 != MetadataSmallObjectShape::Unknown as u8
+            && self.locality_roles.has_small_file_shape()
+    }
+
+    /// Returns true when all required evidence-family refs cite the correct kind.
+    #[must_use]
+    pub const fn has_evidence_family_refs(self) -> bool {
+        let has_data_shape = self.data_shape_ref.kind as u16
+            == StorageIntentEvidenceKind::DataShapeEvidence as u16
+            && evidence_ref_has_id(self.data_shape_ref);
+        let has_layout = self.layout_ref.kind as u16
+            == StorageIntentEvidenceKind::LayoutAllocatorEvidence as u16
+            && evidence_ref_has_id(self.layout_ref);
+        let has_lifecycle = self.lifecycle_ref.kind as u16
+            == StorageIntentEvidenceKind::LifecycleGenerationEvidence as u16
+            && evidence_ref_has_id(self.lifecycle_ref);
+        let has_media = self.media_capability_ref.kind as u16
+            == StorageIntentEvidenceKind::MediaCapabilityEvidence as u16
+            && evidence_ref_has_id(self.media_capability_ref);
+        let has_capacity = self.capacity_ref.kind as u16
+            == StorageIntentEvidenceKind::CapacityAdmissionEvidence as u16
+            && evidence_ref_has_id(self.capacity_ref);
+        let has_isolation = self.isolation_ref.kind as u16
+            == StorageIntentEvidenceKind::TenantIsolationEvidence as u16
+            && evidence_ref_has_id(self.isolation_ref);
+        let has_service_objective = self.service_objective_ref.kind as u16
+            == StorageIntentEvidenceKind::ServiceObjectiveEvidence as u16
+            && evidence_ref_has_id(self.service_objective_ref);
+        let has_query_snapshot = self.evidence_query_snapshot_ref.kind as u16
+            == StorageIntentEvidenceKind::EvidenceQuerySnapshot as u16
+            && evidence_ref_has_id(self.evidence_query_snapshot_ref);
+        let has_decision = self.decision_frontier_ref.kind as u16
+            == StorageIntentEvidenceKind::DecisionFrontierEvidence as u16
+            && evidence_ref_has_id(self.decision_frontier_ref);
+        let has_action = self.action_execution_ref.kind as u16
+            == StorageIntentEvidenceKind::ActionExecutionEvidence as u16
+            && evidence_ref_has_id(self.action_execution_ref);
+        let has_result = self.result_refusal_ref.kind as u16
+            == StorageIntentEvidenceKind::ResultRefusalEvidence as u16
+            && evidence_ref_has_id(self.result_refusal_ref);
+        let has_attribution = self.attribution_ref.kind as u16
+            == StorageIntentEvidenceKind::MeasurementAttributionEvidence as u16
+            && evidence_ref_has_id(self.attribution_ref);
+        let has_retention = self.retention_ref.kind as u16
+            == StorageIntentEvidenceKind::EvidenceRetentionEvidence as u16
+            && evidence_ref_has_id(self.retention_ref);
+        let has_wear_cost = self.wear_cost_ref.kind as u16
+            == StorageIntentEvidenceKind::MediaCostWearLedger as u16
+            && evidence_ref_has_id(self.wear_cost_ref);
+        let has_non_wear_cost = self.non_wear_cost_ref.kind as u16
+            == StorageIntentEvidenceKind::MediaCostWearLedger as u16
+            && evidence_ref_has_id(self.non_wear_cost_ref);
+
+        has_data_shape
+            && has_layout
+            && has_lifecycle
+            && has_media
+            && has_capacity
+            && has_isolation
+            && has_service_objective
+            && has_query_snapshot
+            && has_decision
+            && has_action
+            && has_result
+            && has_attribution
+            && has_retention
+            && has_wear_cost
+            && has_non_wear_cost
+    }
+
+    /// Returns true when the evidence record is not refused.
+    #[must_use]
+    pub const fn is_not_refused(self) -> bool {
+        self.refusal as u16 == StorageIntentRefusalReason::None as u16
+    }
+
+    /// Returns true when this record is usable for authority decisions.
+    #[must_use]
+    pub const fn is_authority_usable(self) -> bool {
+        self.has_identity()
+            && self.has_vfs_authority()
+            && self.has_ordering_spine()
+            && self.is_not_refused()
+    }
+
+    /// Returns true when metadata service objectives are represented.
+    #[must_use]
+    pub const fn has_service_objective_gate(self) -> bool {
+        evidence_ref_has_id(self.service_objective_ref)
+    }
+}
+
+/// Predicate: metadata namespace evidence is present and not refused.
+#[must_use]
+pub const fn metadata_namespace_evidence_is_present(
+    evidence: StorageIntentMetadataNamespaceEvidence,
+) -> ReceiptPredicateResult {
+    if !evidence.has_identity() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable,
+        );
+    }
+    if !evidence.is_not_refused() {
+        return ReceiptPredicateResult::refused(evidence.refusal);
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: VFS/namespace authority refs are consistent.
+#[must_use]
+pub const fn metadata_namespace_vfs_authority_is_bound(
+    evidence: StorageIntentMetadataNamespaceEvidence,
+) -> ReceiptPredicateResult {
+    let present = metadata_namespace_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    if !evidence.has_vfs_authority() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+    if evidence.vfs_authority.inode_generation == 0 {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MetadataStaleInodeGeneration,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: ordering and namespace receipt spine is complete.
+#[must_use]
+pub const fn metadata_namespace_ordering_is_bound(
+    evidence: StorageIntentMetadataNamespaceEvidence,
+) -> ReceiptPredicateResult {
+    let present = metadata_namespace_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    if !evidence.has_ordering_spine() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingOrderingEvidence,
+        );
+    }
+    if evidence.ordering_ref.kind as u16
+        != StorageIntentEvidenceKind::OrderingEvidence as u16
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingOrderingEvidence,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Predicate: metadata locality roles are legal for the declared operation.
+#[must_use]
+pub const fn metadata_namespace_locality_is_legal(
+    evidence: StorageIntentMetadataNamespaceEvidence,
+) -> ReceiptPredicateResult {
+    let present = metadata_namespace_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    // When locality roles are unset, evidence can only be diagnostic.
+    if evidence.locality_roles.is_empty() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+    // Metadata-hot requires sync-barrier evidence for fsyncdir or file fsync metadata dep.
+    if evidence
+        .locality_roles
+        .contains(MetadataLocalityRoleFlags::METADATA_HOT)
+        && !evidence.operation_kind.is_sync_barrier()
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MetadataFsyncdirObjectiveMissed,
+        );
+    }
+    // Small-file shape flags must be consistent.
+    let small_count = if evidence
+        .locality_roles
+        .contains(MetadataLocalityRoleFlags::SMALL_FILE_INLINE)
+    {
+        1_u8
+    } else {
+        0_u8
+    } + if evidence
+        .locality_roles
+        .contains(MetadataLocalityRoleFlags::SMALL_FILE_PACKED)
+    {
+        1_u8
+    } else {
+        0_u8
+    } + if evidence
+        .locality_roles
+        .contains(MetadataLocalityRoleFlags::SMALL_FILE_EXTERNAL)
+    {
+        1_u8
+    } else {
+        0_u8
+    };
+    if small_count > 1 {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MetadataNamespaceConflict,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Combined gate: metadata namespace evidence is usable for planners, schedulers,
+/// read-serving, relocation, validation, and explanation consumers.
+#[must_use]
+pub const fn metadata_namespace_evidence_is_usable(
+    evidence: StorageIntentMetadataNamespaceEvidence,
+) -> ReceiptPredicateResult {
+    let present = metadata_namespace_evidence_is_present(evidence);
+    if !present.satisfied {
+        return present;
+    }
+    let vfs = metadata_namespace_vfs_authority_is_bound(evidence);
+    if !vfs.satisfied {
+        return vfs;
+    }
+    let ordering = metadata_namespace_ordering_is_bound(evidence);
+    if !ordering.satisfied {
+        return ordering;
+    }
+    let locality = metadata_namespace_locality_is_legal(evidence);
+    if !locality.satisfied {
+        return locality;
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -27297,6 +28103,501 @@ mod tests {
         for r in &reasons {
             let disc = r.to_discriminant();
             let decoded = StorageIntentEvidenceRetentionRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Metadata/namespace evidence tests (issue #922)
+    // ------------------------------------------------------------------
+
+    const META_POLICY_ID: StorageIntentPolicyId = StorageIntentPolicyId([0xAA_u8; 16]);
+    const META_EVIDENCE_ID: StorageIntentEvidenceId =
+        StorageIntentEvidenceId([0xBB_u8; 32]);
+
+    fn make_metadata_evidence() -> StorageIntentMetadataNamespaceEvidence {
+        StorageIntentMetadataNamespaceEvidence {
+            evidence_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+                id: META_EVIDENCE_ID,
+                generation: 1,
+                version: STORAGE_INTENT_METADATA_NAMESPACE_VERSION,
+            },
+            evidence_id: META_EVIDENCE_ID,
+            policy_id: META_POLICY_ID,
+            policy_revision: StorageIntentPolicyRevision(1),
+            subject_class: MetadataSubjectClass::DirectoryInode,
+            operation_kind: MetadataNamespaceOperationKind::Fsyncdir,
+            subject_scope: StorageIntentObjectScope {
+                dataset_id: DOMAIN_A,
+                object_id: StorageIntentEvidenceId([0xCC_u8; 32]),
+                range_start: 0,
+                range_len: 0,
+                generation: 1,
+            },
+            vfs_authority: VfsNamespaceAuthorityRef {
+                inode_number: 42,
+                inode_generation: 3,
+                parent_inode: 1,
+                link_count: 2,
+                directory_cookie: 0,
+                raw_name_hash: StorageIntentEvidenceId::ZERO,
+                conflict_guard: StorageIntentEvidenceId::ZERO,
+            },
+            vfs_authority_refs: [VfsNamespaceAuthorityRef::EMPTY; MAX_VFS_AUTHORITY_REFS],
+            vfs_authority_refs_len: 0,
+            ordering_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::OrderingEvidence,
+                id: StorageIntentEvidenceId([0xDD_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            ordering_dependency_refs: StorageIntentEvidenceRefs::EMPTY,
+            namespace_receipt_refs: [StorageIntentEvidenceRef::default();
+                MAX_NAMESPACE_RECEIPT_REFS],
+            namespace_receipt_refs_len: 0,
+            root_publication_ref: StorageIntentEvidenceRef::default(),
+            replay_idempotency_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::OrderingEvidence,
+                id: StorageIntentEvidenceId([0xEE_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            locality_roles: MetadataLocalityRoleFlags::METADATA_HOT
+                .union(MetadataLocalityRoleFlags::SYNC_INTENT_METADATA)
+                .union(MetadataLocalityRoleFlags::DIRECTORY_INDEX_LOCALITY),
+            small_object_shape: MetadataSmallObjectShape::Unknown,
+            data_shape_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::DataShapeEvidence,
+                id: StorageIntentEvidenceId([1_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            layout_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+                id: StorageIntentEvidenceId([2_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            lifecycle_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::LifecycleGenerationEvidence,
+                id: StorageIntentEvidenceId([3_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            media_capability_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                id: StorageIntentEvidenceId([4_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            capacity_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                id: StorageIntentEvidenceId([5_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            isolation_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::TenantIsolationEvidence,
+                id: StorageIntentEvidenceId([6_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            service_objective_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                id: StorageIntentEvidenceId([7_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            evidence_query_snapshot_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+                id: StorageIntentEvidenceId([8_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            decision_frontier_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                id: StorageIntentEvidenceId([9_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            action_execution_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::ActionExecutionEvidence,
+                id: StorageIntentEvidenceId([10_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            result_refusal_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::ResultRefusalEvidence,
+                id: StorageIntentEvidenceId([11_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            attribution_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                id: StorageIntentEvidenceId([12_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            retention_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                id: StorageIntentEvidenceId([13_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            wear_cost_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::MediaCostWearLedger,
+                id: StorageIntentEvidenceId([14_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            non_wear_cost_ref: StorageIntentEvidenceRef {
+                kind: StorageIntentEvidenceKind::MediaCostWearLedger,
+                id: StorageIntentEvidenceId([15_u8; 32]),
+                generation: 1,
+                version: 1,
+            },
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
+    #[test]
+    fn metadata_subject_class_roundtrip() {
+        let classes = [
+            MetadataSubjectClass::Unknown,
+            MetadataSubjectClass::Dataset,
+            MetadataSubjectClass::DirectoryInode,
+            MetadataSubjectClass::InodeRange,
+            MetadataSubjectClass::XattrAclNamespace,
+            MetadataSubjectClass::SmallObjectCohort,
+            MetadataSubjectClass::DirectoryIndex,
+            MetadataSubjectClass::TransactionGroup,
+            MetadataSubjectClass::NamespaceMutationSet,
+        ];
+        for c in &classes {
+            let disc = c.to_discriminant();
+            let decoded = MetadataSubjectClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*c), "roundtrip failed for {:?}", c.as_str());
+        }
+        assert_eq!(MetadataSubjectClass::from_discriminant(255), None);
+    }
+
+    #[test]
+    fn metadata_namespace_operation_kind_roundtrip() {
+        let ops = [
+            MetadataNamespaceOperationKind::Unknown,
+            MetadataNamespaceOperationKind::Create,
+            MetadataNamespaceOperationKind::Mkdir,
+            MetadataNamespaceOperationKind::Link,
+            MetadataNamespaceOperationKind::Unlink,
+            MetadataNamespaceOperationKind::Rename,
+            MetadataNamespaceOperationKind::Exchange,
+            MetadataNamespaceOperationKind::Setattr,
+            MetadataNamespaceOperationKind::TruncateMetadata,
+            MetadataNamespaceOperationKind::XattrMutation,
+            MetadataNamespaceOperationKind::AclMutation,
+            MetadataNamespaceOperationKind::Readdir,
+            MetadataNamespaceOperationKind::Readdirplus,
+            MetadataNamespaceOperationKind::Lookup,
+            MetadataNamespaceOperationKind::Fsyncdir,
+            MetadataNamespaceOperationKind::FileFsyncMetadataDep,
+            MetadataNamespaceOperationKind::OrphanOpenUnlink,
+            MetadataNamespaceOperationKind::SmallFileInlineTransition,
+            MetadataNamespaceOperationKind::SmallFileExternalTransition,
+        ];
+        for op in &ops {
+            let disc = op.to_discriminant();
+            let decoded = MetadataNamespaceOperationKind::from_discriminant(disc);
+            assert_eq!(decoded, Some(*op), "roundtrip failed for {:?}", op.as_str());
+        }
+    }
+
+    #[test]
+    fn metadata_locality_role_flags_ops() {
+        let flags = MetadataLocalityRoleFlags::METADATA_HOT
+            .union(MetadataLocalityRoleFlags::SYNC_INTENT_METADATA);
+        assert!(!flags.is_empty());
+        assert!(flags.contains(MetadataLocalityRoleFlags::METADATA_HOT));
+        assert!(flags.contains(MetadataLocalityRoleFlags::SYNC_INTENT_METADATA));
+        assert!(!flags.contains(MetadataLocalityRoleFlags::XATTR_LOCALITY));
+    }
+
+    #[test]
+    fn metadata_locality_role_small_file_shape_detection() {
+        let inline_flags = MetadataLocalityRoleFlags::SMALL_FILE_INLINE;
+        assert!(inline_flags.has_small_file_shape());
+
+        let packed_flags = MetadataLocalityRoleFlags::SMALL_FILE_PACKED;
+        assert!(packed_flags.has_small_file_shape());
+
+        let ext_flags = MetadataLocalityRoleFlags::SMALL_FILE_EXTERNAL;
+        assert!(ext_flags.has_small_file_shape());
+
+        let hot_flags = MetadataLocalityRoleFlags::METADATA_HOT;
+        assert!(!hot_flags.has_small_file_shape());
+
+        let empty = MetadataLocalityRoleFlags::EMPTY;
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn metadata_small_object_shape_roundtrip() {
+        let shapes = [
+            MetadataSmallObjectShape::Unknown,
+            MetadataSmallObjectShape::Inline,
+            MetadataSmallObjectShape::Packed,
+            MetadataSmallObjectShape::External,
+        ];
+        for s in &shapes {
+            let disc = s.to_discriminant();
+            let decoded = MetadataSmallObjectShape::from_discriminant(disc);
+            assert_eq!(decoded, Some(*s));
+        }
+    }
+
+    #[test]
+    fn vfs_namespace_authority_ref_empty() {
+        let empty = VfsNamespaceAuthorityRef::EMPTY;
+        assert!(!empty.has_inode_identity());
+        assert!(!empty.has_parent_identity());
+    }
+
+    #[test]
+    fn vfs_namespace_authority_ref_bound() {
+        let ref_ = VfsNamespaceAuthorityRef {
+            inode_number: 100,
+            inode_generation: 5,
+            parent_inode: 1,
+            link_count: 3,
+            directory_cookie: 0,
+            raw_name_hash: StorageIntentEvidenceId::ZERO,
+            conflict_guard: StorageIntentEvidenceId::ZERO,
+        };
+        assert!(ref_.has_inode_identity());
+        assert!(ref_.has_parent_identity());
+    }
+
+    #[test]
+    fn metadata_evidence_has_identity_when_bound() {
+        let evidence = make_metadata_evidence();
+        assert!(evidence.has_identity());
+        assert!(evidence.has_vfs_authority());
+        assert!(evidence.has_ordering_spine());
+        assert!(evidence.is_authority_usable());
+    }
+
+    #[test]
+    fn metadata_evidence_identity_missing_when_policy_is_zero() {
+        let mut evidence = make_metadata_evidence();
+        evidence.policy_id = StorageIntentPolicyId::ZERO;
+        assert!(!evidence.has_identity());
+    }
+
+    #[test]
+    fn metadata_evidence_identity_missing_when_subject_class_is_unknown() {
+        let mut evidence = make_metadata_evidence();
+        evidence.subject_class = MetadataSubjectClass::Unknown;
+        assert!(!evidence.has_identity());
+    }
+
+    #[test]
+    fn metadata_evidence_identity_missing_when_operation_is_unknown() {
+        let mut evidence = make_metadata_evidence();
+        evidence.operation_kind = MetadataNamespaceOperationKind::Unknown;
+        assert!(!evidence.has_identity());
+    }
+
+    #[test]
+    fn metadata_evidence_present_predicate_satisfied() {
+        let evidence = make_metadata_evidence();
+        let result = metadata_namespace_evidence_is_present(evidence);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn metadata_evidence_present_predicate_refused_on_missing_identity() {
+        let mut evidence = make_metadata_evidence();
+        evidence.policy_id = StorageIntentPolicyId::ZERO;
+        let result = metadata_namespace_evidence_is_present(evidence);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal(),
+            Some(StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable)
+        );
+    }
+
+    #[test]
+    fn metadata_evidence_present_predicate_refused_on_explicit_refusal() {
+        let mut evidence = make_metadata_evidence();
+        evidence.refusal = StorageIntentRefusalReason::MetadataReserveExhausted;
+        let result = metadata_namespace_evidence_is_present(evidence);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal(),
+            Some(StorageIntentRefusalReason::MetadataReserveExhausted)
+        );
+    }
+
+    #[test]
+    fn metadata_vfs_authority_bound_predicate_satisfied() {
+        let evidence = make_metadata_evidence();
+        let result = metadata_namespace_vfs_authority_is_bound(evidence);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn metadata_vfs_authority_bound_refused_when_inode_generation_is_zero() {
+        let mut evidence = make_metadata_evidence();
+        evidence.vfs_authority.inode_generation = 0;
+        let result = metadata_namespace_vfs_authority_is_bound(evidence);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal(),
+            Some(StorageIntentRefusalReason::MetadataStaleInodeGeneration)
+        );
+    }
+
+    #[test]
+    fn metadata_ordering_bound_predicate_satisfied() {
+        let evidence = make_metadata_evidence();
+        let result = metadata_namespace_ordering_is_bound(evidence);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn metadata_ordering_bound_refused_when_ordering_ref_is_missing() {
+        let mut evidence = make_metadata_evidence();
+        evidence.ordering_ref = StorageIntentEvidenceRef::default();
+        let result = metadata_namespace_ordering_is_bound(evidence);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal(),
+            Some(StorageIntentRefusalReason::MissingOrderingEvidence)
+        );
+    }
+
+    #[test]
+    fn metadata_locality_legal_satisfied_for_sync_barrier_with_metadata_hot() {
+        let evidence = make_metadata_evidence();
+        let result = metadata_namespace_locality_is_legal(evidence);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn metadata_locality_legal_refused_when_locality_is_empty() {
+        let mut evidence = make_metadata_evidence();
+        evidence.locality_roles = MetadataLocalityRoleFlags::EMPTY;
+        let result = metadata_namespace_locality_is_legal(evidence);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal(),
+            Some(StorageIntentRefusalReason::EvidenceNotUsable)
+        );
+    }
+
+    #[test]
+    fn metadata_locality_legal_refused_when_metadata_hot_without_sync_barrier() {
+        let mut evidence = make_metadata_evidence();
+        evidence.operation_kind = MetadataNamespaceOperationKind::Lookup;
+        let result = metadata_namespace_locality_is_legal(evidence);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal(),
+            Some(StorageIntentRefusalReason::MetadataFsyncdirObjectiveMissed)
+        );
+    }
+
+    #[test]
+    fn metadata_locality_legal_refused_when_multiple_small_file_shapes() {
+        let mut evidence = make_metadata_evidence();
+        evidence.operation_kind = MetadataNamespaceOperationKind::Fsyncdir;
+        evidence.locality_roles = MetadataLocalityRoleFlags::METADATA_HOT
+            .union(MetadataLocalityRoleFlags::SYNC_INTENT_METADATA)
+            .union(MetadataLocalityRoleFlags::SMALL_FILE_INLINE)
+            .union(MetadataLocalityRoleFlags::SMALL_FILE_PACKED);
+        let result = metadata_namespace_locality_is_legal(evidence);
+        assert!(!result.satisfied);
+        assert_eq!(
+            result.refusal(),
+            Some(StorageIntentRefusalReason::MetadataNamespaceConflict)
+        );
+    }
+
+    #[test]
+    fn metadata_evidence_is_usable_combined_predicate_satisfied() {
+        let evidence = make_metadata_evidence();
+        let result = metadata_namespace_evidence_is_usable(evidence);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn metadata_evidence_is_usable_refused_on_missing_vfs_authority() {
+        let mut evidence = make_metadata_evidence();
+        evidence.vfs_authority.inode_number = 0;
+        let result = metadata_namespace_evidence_is_usable(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn metadata_evidence_has_service_objective_gate() {
+        let evidence = make_metadata_evidence();
+        assert!(evidence.has_service_objective_gate());
+    }
+
+    #[test]
+    fn metadata_evidence_evidence_family_refs_are_correct_kinds() {
+        let evidence = make_metadata_evidence();
+        assert!(evidence.has_evidence_family_refs());
+    }
+
+    #[test]
+    fn metadata_evidence_family_refs_fail_on_wrong_kind() {
+        let mut evidence = make_metadata_evidence();
+        evidence.data_shape_ref.kind = StorageIntentEvidenceKind::Unknown;
+        assert!(!evidence.has_evidence_family_refs());
+    }
+
+    #[test]
+    fn metadata_namespace_operation_kind_sync_barrier_detection() {
+        assert!(MetadataNamespaceOperationKind::Fsyncdir.is_sync_barrier());
+        assert!(MetadataNamespaceOperationKind::FileFsyncMetadataDep.is_sync_barrier());
+        assert!(!MetadataNamespaceOperationKind::Create.is_sync_barrier());
+        assert!(!MetadataNamespaceOperationKind::Lookup.is_sync_barrier());
+    }
+
+    #[test]
+    fn metadata_namespace_operation_kind_namespace_mutation_detection() {
+        assert!(MetadataNamespaceOperationKind::Create.is_namespace_mutation());
+        assert!(MetadataNamespaceOperationKind::Mkdir.is_namespace_mutation());
+        assert!(MetadataNamespaceOperationKind::Link.is_namespace_mutation());
+        assert!(MetadataNamespaceOperationKind::Unlink.is_namespace_mutation());
+        assert!(MetadataNamespaceOperationKind::Rename.is_namespace_mutation());
+        assert!(MetadataNamespaceOperationKind::Exchange.is_namespace_mutation());
+        assert!(!MetadataNamespaceOperationKind::Lookup.is_namespace_mutation());
+        assert!(!MetadataNamespaceOperationKind::Readdir.is_namespace_mutation());
+        assert!(!MetadataNamespaceOperationKind::Fsyncdir.is_namespace_mutation());
+    }
+
+    #[test]
+    fn metadata_stale_inode_generation_refusal_roundtrip() {
+        let r = StorageIntentRefusalReason::MetadataStaleInodeGeneration;
+        let disc = r.to_discriminant();
+        let decoded = StorageIntentRefusalReason::from_discriminant(disc);
+        assert_eq!(decoded, Some(r));
+    }
+
+    #[test]
+    fn metadata_service_objective_refusals_roundtrip() {
+        let reasons = [
+            StorageIntentRefusalReason::MetadataStormP99Exceeded,
+            StorageIntentRefusalReason::MetadataLookupReaddirLatencyExceeded,
+            StorageIntentRefusalReason::MetadataFsyncdirLatencyExceeded,
+            StorageIntentRefusalReason::MetadataRenameUnlinkTailExceeded,
+            StorageIntentRefusalReason::MetadataSmallFileWriteAmplificationExceeded,
+        ];
+        for r in &reasons {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentRefusalReason::from_discriminant(disc);
             assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
         }
     }
