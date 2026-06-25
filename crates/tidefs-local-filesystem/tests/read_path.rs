@@ -12,6 +12,21 @@ use std::fs;
 use std::path::PathBuf;
 
 use tidefs_local_filesystem::{LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
+use tidefs_storage_intent_core::{
+    EvidenceCompletenessVerdict, EvidenceConsumerClass, EvidenceFamilyFreshness,
+    EvidenceFamilyFreshnessSet, EvidenceFamilyFreshnessState, EvidenceQueryContextClass,
+    EvidenceQuerySubjectScope, EvidenceQuerySubjectScopeClass, EvidenceRetentionClass,
+    StorageIntentDomainId, StorageIntentEvidenceId, StorageIntentEvidenceKind,
+    StorageIntentEvidenceRef, StorageIntentEvidenceRefs as CoreEvidenceRefs,
+    StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
+    StorageIntentReceiptId, StorageIntentRefusalReason,
+};
+use tidefs_storage_intent_read_serving::{
+    DegradedReadPolicy, ReadFreshnessProfile, ReadServingCandidateRecord,
+    ReadServingDecisionInput, ReadServingDecisionState, ReadServingEvidenceCutState,
+    ReadServingEvidenceRefs, ReadServingPolicy, ReadServingRejectionMask,
+    StorageIntentReadSourceClass,
+};
 use tidefs_types_vfs_core::{InodeId, NodeKind, S_IFREG};
 
 // Helpers
@@ -43,6 +58,210 @@ fn make_data(seed: u8, len: usize) -> Vec<u8> {
         val = val.wrapping_add(1);
     }
     buf
+}
+
+const POLICY_ID: StorageIntentPolicyId = StorageIntentPolicyId([0x31; 16]);
+const POLICY_REVISION: StorageIntentPolicyRevision = StorageIntentPolicyRevision(7);
+const DATASET_ID: StorageIntentDomainId = StorageIntentDomainId([0x41; 16]);
+const OBJECT_ID: StorageIntentEvidenceId = StorageIntentEvidenceId([0x51; 32]);
+const SOURCE_RECEIPT: StorageIntentReceiptId = StorageIntentReceiptId([0x61; 16]);
+
+fn evidence_ref(kind: StorageIntentEvidenceKind, seed: u8) -> StorageIntentEvidenceRef {
+    StorageIntentEvidenceRef::new(kind, StorageIntentEvidenceId([seed; 32]), 1, 1)
+}
+
+fn read_serving_refs() -> ReadServingEvidenceRefs {
+    ReadServingEvidenceRefs {
+        compiled_policy_ref: evidence_ref(StorageIntentEvidenceKind::LocalIntentRecord, 1),
+        evidence_query_snapshot_ref: evidence_ref(
+            StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+            2,
+        ),
+        freshness_ref: evidence_ref(StorageIntentEvidenceKind::ReadFreshnessEvidence, 3),
+        namespace_generation_ref: evidence_ref(
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            4,
+        ),
+        placement_receipt_ref: evidence_ref(StorageIntentEvidenceKind::PlacementReceipt, 5),
+        cache_anchor_ref: evidence_ref(StorageIntentEvidenceKind::ReadFreshnessEvidence, 6),
+        cache_fence_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 7),
+        membership_epoch_ref: evidence_ref(StorageIntentEvidenceKind::MembershipEvidence, 8),
+        lease_epoch_ref: evidence_ref(StorageIntentEvidenceKind::MembershipEvidence, 9),
+        transport_path_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 10),
+        trust_domain_ref: evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, 11),
+        data_shape_ref: evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 12),
+        layout_allocator_ref: evidence_ref(StorageIntentEvidenceKind::LayoutAllocatorEvidence, 13),
+        digest_checksum_ref: evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 14),
+        media_capability_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 15),
+        ram_authority_ref: evidence_ref(StorageIntentEvidenceKind::RamAuthorityEvidence, 16),
+        recovery_degradation_ref: evidence_ref(
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            17,
+        ),
+        redundancy_ref: evidence_ref(StorageIntentEvidenceKind::DataShapeEvidence, 18),
+        temporal_ref: evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 19),
+        scheduler_admission_ref: evidence_ref(
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            20,
+        ),
+        repair_budget_ref: evidence_ref(StorageIntentEvidenceKind::CapacityAdmissionEvidence, 21),
+        replacement_receipt_ref: StorageIntentEvidenceRef::default(),
+        prefetch_decision_ref: evidence_ref(
+            StorageIntentEvidenceKind::DecisionFrontierEvidence,
+            22,
+        ),
+        result_refusal_ref: evidence_ref(StorageIntentEvidenceKind::ResultRefusalEvidence, 23),
+        ordering_evidence_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 24),
+        policy_rollout_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 25),
+        tenant_isolation_ref: evidence_ref(StorageIntentEvidenceKind::TenantIsolationEvidence, 26),
+        service_objective_ref: evidence_ref(
+            StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+            27,
+        ),
+        capacity_admission_ref: evidence_ref(
+            StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+            28,
+        ),
+    }
+}
+
+fn family_ref(
+    kind: StorageIntentEvidenceKind,
+    refs: ReadServingEvidenceRefs,
+) -> StorageIntentEvidenceRef {
+    match kind {
+        StorageIntentEvidenceKind::LocalIntentRecord => refs.compiled_policy_ref,
+        StorageIntentEvidenceKind::ReadFreshnessEvidence => refs.freshness_ref,
+        StorageIntentEvidenceKind::TemporalEvidence => refs.temporal_ref,
+        StorageIntentEvidenceKind::MetadataNamespaceEvidence => refs.namespace_generation_ref,
+        StorageIntentEvidenceKind::LayoutAllocatorEvidence => refs.layout_allocator_ref,
+        StorageIntentEvidenceKind::PlacementReceipt => refs.placement_receipt_ref,
+        StorageIntentEvidenceKind::OrderingEvidence => refs.cache_fence_ref,
+        StorageIntentEvidenceKind::DataShapeEvidence => refs.data_shape_ref,
+        StorageIntentEvidenceKind::MembershipEvidence => refs.membership_epoch_ref,
+        StorageIntentEvidenceKind::TransportPathEvidence => refs.transport_path_ref,
+        StorageIntentEvidenceKind::TrustDomainEvidence => refs.trust_domain_ref,
+        StorageIntentEvidenceKind::DecisionFrontierEvidence => refs.prefetch_decision_ref,
+        StorageIntentEvidenceKind::PolicyRolloutEvidence => refs.policy_rollout_ref,
+        StorageIntentEvidenceKind::TenantIsolationEvidence => refs.tenant_isolation_ref,
+        StorageIntentEvidenceKind::ServiceObjectiveEvidence => refs.service_objective_ref,
+        StorageIntentEvidenceKind::CapacityAdmissionEvidence => refs.capacity_admission_ref,
+        _ => evidence_ref(kind, 90),
+    }
+}
+
+fn read_serving_policy(profile: ReadFreshnessProfile) -> ReadServingPolicy {
+    ReadServingPolicy {
+        policy_id: POLICY_ID,
+        policy_revision: POLICY_REVISION,
+        freshness_profile: profile,
+        required_object_generation: 0,
+        required_namespace_generation: 0,
+        required_layout_generation: 0,
+        required_snapshot_generation: 0,
+        max_remote_lag_ms: 0,
+        degraded_read_policy: DegradedReadPolicy::ServeWhenVerified,
+        allow_cache_only: matches!(profile, ReadFreshnessProfile::CacheOnlyAcceleration),
+        allow_serving_trial: matches!(profile, ReadFreshnessProfile::CacheOnlyAcceleration),
+        allow_read_repair: false,
+        repair_requires_reserve: true,
+        require_digest_verification: true,
+    }
+}
+
+fn read_serving_snapshot(
+    policy: ReadServingPolicy,
+    refs: ReadServingEvidenceRefs,
+    families: &[StorageIntentEvidenceKind],
+) -> tidefs_storage_intent_core::StorageIntentEvidenceQuerySnapshot {
+    let mut included_refs = CoreEvidenceRefs::EMPTY;
+    let mut family_freshness = EvidenceFamilyFreshnessSet::EMPTY;
+    for &kind in families {
+        let evidence = family_ref(kind, refs);
+        included_refs.push(evidence).expect("push included evidence");
+        family_freshness
+            .push(EvidenceFamilyFreshness {
+                kind,
+                state: EvidenceFamilyFreshnessState::Fresh,
+                source_index_generation: 1,
+                producer_generation: 1,
+                freshness_frontier_ms: 1000,
+                allowed_staleness_ms: 0,
+                evidence_ref: evidence,
+            })
+            .expect("push family freshness");
+    }
+
+    tidefs_storage_intent_core::StorageIntentEvidenceQuerySnapshot {
+        snapshot_id: StorageIntentEvidenceId([0x71; 32]),
+        query_id: StorageIntentEvidenceId([0x72; 32]),
+        consumer: EvidenceConsumerClass::ReadPath,
+        context: EvidenceQueryContextClass::ReadServing,
+        subject: EvidenceQuerySubjectScope {
+            scope_class: EvidenceQuerySubjectScopeClass::ObjectRange,
+            object_scope: StorageIntentObjectScope {
+                dataset_id: DATASET_ID,
+                object_id: OBJECT_ID,
+                range_start: 0,
+                range_len: 0,
+                generation: 1,
+            },
+            pool_id: StorageIntentDomainId::ZERO,
+            domain_id: StorageIntentDomainId::ZERO,
+            request_ref: StorageIntentEvidenceRef::default(),
+            action_ref: StorageIntentEvidenceRef::default(),
+            validation_ref: StorageIntentEvidenceRef::default(),
+        },
+        policy_id: policy.policy_id,
+        policy_revision: policy.policy_revision,
+        temporal_frontier_ms: 1000,
+        freshness_frontier_ms: 1000,
+        allowed_staleness_ms: 0,
+        source_catalog_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 73),
+        source_index_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceQuerySnapshot, 74),
+        source_index_generation: 1,
+        producer_generation: 1,
+        producer_watermark_ms: 1000,
+        compaction_generation: 0,
+        redaction_generation: 0,
+        included_refs,
+        family_freshness,
+        completeness: EvidenceCompletenessVerdict::CompleteForPurpose,
+        retention: EvidenceRetentionClass::ExactRequired,
+        retention_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 75),
+        refusal: StorageIntentRefusalReason::None,
+    }
+}
+
+fn read_serving_input(source: StorageIntentReadSourceClass) -> ReadServingDecisionInput {
+    let policy = read_serving_policy(ReadFreshnessProfile::LatestLocal);
+    let refs = read_serving_refs();
+    let families = [
+        StorageIntentEvidenceKind::LocalIntentRecord,
+        StorageIntentEvidenceKind::ReadFreshnessEvidence,
+        StorageIntentEvidenceKind::TemporalEvidence,
+        StorageIntentEvidenceKind::PlacementReceipt,
+        StorageIntentEvidenceKind::DataShapeEvidence,
+        StorageIntentEvidenceKind::OrderingEvidence,
+        StorageIntentEvidenceKind::TenantIsolationEvidence,
+    ];
+
+    ReadServingDecisionInput {
+        policy,
+        candidate: ReadServingCandidateRecord {
+            policy_id: policy.policy_id,
+            policy_revision: policy.policy_revision,
+            source_class: source,
+            source_receipt: SOURCE_RECEIPT,
+            lag_known: true,
+            freshness_frontier_ms: 1000,
+            digest_verified: true,
+            evidence_refs: refs,
+            ..ReadServingCandidateRecord::default()
+        },
+        evidence_cut_state: ReadServingEvidenceCutState::Bound,
+        evidence_query_snapshot: read_serving_snapshot(policy, refs, &families),
+    }
 }
 
 // getattr after create
@@ -240,6 +459,152 @@ fn read_file_range_at_zero_len_returns_empty() {
         .read_file_range("/data.bin", 64, 0)
         .expect("read zero len");
     assert!(chunk.is_empty(), "zero-length read returns empty");
+}
+
+#[test]
+fn read_serving_missing_evidence_cut_refuses_without_bytes() {
+    set_test_key();
+    let dir = temp_dir("rs_missing_cut");
+    let payload = make_data(0x33, 512);
+
+    let mut fs = open_fs(&dir);
+    fs.create_file("/gated.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create");
+    fs.write_file("/gated.bin", 0, &payload).expect("write");
+    fs.sync_all().expect("sync");
+
+    let result = fs
+        .read_file_range_with_read_serving(
+            "/gated.bin",
+            0,
+            payload.len(),
+            ReadServingDecisionInput::default(),
+        )
+        .expect("read-serving decision");
+
+    assert!(result.bytes.is_none(), "missing cut must not serve bytes");
+    assert_eq!(
+        result.decision.requested_source,
+        StorageIntentReadSourceClass::LocalPlacementReceipt
+    );
+    assert_eq!(
+        result.decision.decision_state,
+        ReadServingDecisionState::Unavailable
+    );
+    assert_eq!(
+        result.decision.rejected_reasons,
+        ReadServingRejectionMask::MISSING_EVIDENCE_CUT
+    );
+}
+
+#[test]
+fn read_serving_clean_cache_refuses_latest_local_authority() {
+    set_test_key();
+    let dir = temp_dir("rs_clean_cache");
+    let payload = make_data(0x44, 768);
+
+    let mut fs = open_fs(&dir);
+    fs.create_file("/cache.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create");
+    fs.write_file("/cache.bin", 0, &payload).expect("write");
+    fs.sync_all().expect("sync");
+
+    let result = fs
+        .read_file_range_with_read_serving(
+            "/cache.bin",
+            0,
+            payload.len(),
+            read_serving_input(StorageIntentReadSourceClass::CleanCache),
+        )
+        .expect("read-serving decision");
+
+    assert!(result.bytes.is_none(), "clean cache is acceleration only");
+    assert_eq!(
+        result.decision.requested_source,
+        StorageIntentReadSourceClass::CleanCache
+    );
+    assert_eq!(result.decision.decision_state, ReadServingDecisionState::Refused);
+    assert_eq!(
+        result.decision.refusal,
+        StorageIntentRefusalReason::CacheCannotBeAuthority
+    );
+    assert!(
+        result
+            .decision
+            .rejected_reasons
+            .intersects(ReadServingRejectionMask::CACHE_CANNOT_BE_AUTHORITY)
+    );
+}
+
+#[test]
+fn read_serving_stale_evidence_cut_refuses_without_bytes() {
+    set_test_key();
+    let dir = temp_dir("rs_stale_cut");
+    let payload = make_data(0x55, 1024);
+
+    let mut fs = open_fs(&dir);
+    fs.create_file("/stale.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create");
+    fs.write_file("/stale.bin", 0, &payload).expect("write");
+    fs.sync_all().expect("sync");
+
+    let mut input = read_serving_input(StorageIntentReadSourceClass::LocalPlacementReceipt);
+    input.evidence_cut_state = ReadServingEvidenceCutState::Stale;
+    let result = fs
+        .read_file_range_with_read_serving("/stale.bin", 0, payload.len(), input)
+        .expect("read-serving decision");
+
+    assert!(result.bytes.is_none(), "stale cut must not serve bytes");
+    assert_eq!(
+        result.decision.decision_state,
+        ReadServingDecisionState::Unavailable
+    );
+    assert_eq!(
+        result.decision.evidence_cut_state,
+        ReadServingEvidenceCutState::Stale
+    );
+    assert_eq!(
+        result.decision.rejected_reasons,
+        ReadServingRejectionMask::MISSING_EVIDENCE_CUT
+    );
+}
+
+#[test]
+fn read_serving_local_receipt_projection_serves_and_preserves_refs() {
+    set_test_key();
+    let dir = temp_dir("rs_local_receipt");
+    let payload = make_data(0x66, 2048);
+
+    let mut fs = open_fs(&dir);
+    fs.create_file("/receipt.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create");
+    fs.write_file("/receipt.bin", 0, &payload).expect("write");
+    fs.sync_all().expect("sync");
+
+    let input = read_serving_input(StorageIntentReadSourceClass::LocalPlacementReceipt);
+    let placement_ref = input.candidate.evidence_refs.placement_receipt_ref;
+    let result = fs
+        .read_file_range_with_read_serving("/receipt.bin", 128, 512, input)
+        .expect("read-serving decision");
+
+    assert_eq!(result.served_bytes(), Some(&payload[128..640]));
+    assert_eq!(
+        result.decision.decision_state,
+        ReadServingDecisionState::Available
+    );
+    assert_eq!(
+        result.decision.chosen_source,
+        StorageIntentReadSourceClass::LocalPlacementReceipt
+    );
+    assert_eq!(result.decision.source_receipt, SOURCE_RECEIPT);
+    assert_eq!(
+        result.decision.evidence_refs.placement_receipt_ref,
+        placement_ref
+    );
+    assert_eq!(result.decision.scope.range_start, 128);
+    assert_eq!(result.decision.scope.range_len, 512);
+    assert!(result.decision.object_generation > 0);
+    assert!(result.decision.layout_generation > 0);
 }
 
 // ── Full-file sequential read ─────────────────────────────────────────

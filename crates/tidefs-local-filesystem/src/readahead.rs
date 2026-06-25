@@ -216,7 +216,13 @@ impl ReadaheadTracker {
 /// Errors are silently discarded — readahead is an optimisation, not a
 /// correctness requirement.
 pub(crate) fn issue_readahead(fs: &LocalFileSystem, path: &str, offset: u64, length: u64) {
-    let _ = fs.read_file_range(path, offset, length as usize);
+    let length = usize::try_from(length).unwrap_or(usize::MAX);
+    let _ = fs.read_file_range_with_read_serving(
+        path,
+        offset,
+        length,
+        tidefs_storage_intent_read_serving::ReadServingDecisionInput::default(),
+    );
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -224,6 +230,26 @@ pub(crate) fn issue_readahead(fs: &LocalFileSystem, path: &str, offset: u64, len
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+
+    use crate::DEFAULT_FILE_PERMISSIONS;
+
+    fn set_test_key() {
+        std::env::set_var("TIDEFS_ROOT_AUTHENTICATION_KEY_HEX", "A".repeat(64));
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tidefs-ra-{label}-{ts}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     fn make_inode(id: u64) -> InodeId {
         InodeId::new(id)
@@ -469,5 +495,24 @@ mod tests {
                                                       // Still only count = 2 (zero-length counted as sequential)
         let plan = tracker.record_read(ino, 4096, 4096, file_size);
         assert!(plan.is_some());
+    }
+
+    #[test]
+    fn issue_readahead_without_evidence_does_not_warm_hot_read_cache() {
+        set_test_key();
+        let dir = temp_dir("missing-evidence");
+        let payload = vec![0xAB; 256 * 1024];
+
+        let mut fs = LocalFileSystem::open(&dir).expect("open filesystem");
+        fs.create_file("/warm.bin", DEFAULT_FILE_PERMISSIONS)
+            .expect("create");
+        fs.write_file("/warm.bin", 0, &payload).expect("write");
+        fs.sync_all().expect("sync");
+
+        issue_readahead(&fs, "/warm.bin", 0, payload.len() as u64);
+
+        let report = fs.hot_read_cache_report();
+        assert_eq!(report.insertions, 0, "readahead has no authority evidence");
+        assert_eq!(report.resident_entries, 0, "cache remains cold");
     }
 }
