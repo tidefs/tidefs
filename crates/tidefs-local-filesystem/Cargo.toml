@@ -49,6 +49,7 @@ tidefs-intent-log = { workspace = true }
 tidefs-recovery-loop = { workspace = true }
 tidefs-send-stream = { workspace = true }
 tidefs-receive-stream = { workspace = true }
+tidefs-storage-intent-cost = { workspace = true }
 tidefs-storage-intent-core = { workspace = true }
 tidefs-storage-intent-read-serving = { workspace = true }
 tidefs-storage-intent-prefetch-executor = { workspace = true }
