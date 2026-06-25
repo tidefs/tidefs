@@ -541,6 +541,31 @@ pub(crate) const COMMAND_SURFACES: &[CommandSurface] = &[
             "render supplied storage-intent policy, receipt, and evidence-query records read-only",
     },
     CommandSurface {
+        path: "storage-intent policy set",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::NoLivePoolState,
+        summary: "stage dataset prefetch/residency policy source through #855 without activation",
+    },
+    CommandSurface {
+        path: "storage-intent policy clear",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::NoLivePoolState,
+        summary: "stage dataset prefetch/residency policy clears through #855 without activation",
+    },
+    CommandSurface {
+        path: "storage-intent policy show",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::PassiveDiagnostic,
+        summary: "render staged dataset prefetch/residency policy source documents",
+    },
+    CommandSurface {
+        path: "storage-intent policy dry-run",
+        class: CommandClass::PublicOperator,
+        routing: RoutingSemantics::PassiveDiagnostic,
+        summary:
+            "compile staged dataset prefetch/residency policy source and render blocked support",
+    },
+    CommandSurface {
         path: "mount",
         class: CommandClass::UserspaceHarness,
         routing: RoutingSemantics::UserspaceHarness,

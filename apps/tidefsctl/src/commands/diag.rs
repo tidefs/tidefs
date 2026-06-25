@@ -394,30 +394,36 @@ mod tests {
         assert_eq!(summary.latest_txg, None);
     }
 
-
     #[test]
     fn command_registry_digest_is_stable_across_calls() {
         let digest_a = super::super::classification::compute_command_registry_digest();
         let digest_b = super::super::classification::compute_command_registry_digest();
 
-        assert_eq!(digest_a, digest_b,
-            "registry digest must be deterministic across repeated calls");
+        assert_eq!(
+            digest_a, digest_b,
+            "registry digest must be deterministic across repeated calls"
+        );
         assert!(!digest_a.is_empty(), "registry digest must be non-empty");
         // blake3 hex output is always 64 chars (32 bytes)
-        assert_eq!(digest_a.len(), 64,
-            "registry digest must be a blake3 hex digest (64 hex chars)");
+        assert_eq!(
+            digest_a.len(),
+            64,
+            "registry digest must be a blake3 hex digest (64 hex chars)"
+        );
     }
 
     #[test]
     fn json_bundle_contains_registry_digest_field() {
         let bundle = build_diag_bundle(&[]);
-        let json = serde_json::to_value(&bundle)
-            .expect("support bundle must serialize to JSON");
+        let json = serde_json::to_value(&bundle).expect("support bundle must serialize to JSON");
 
         let digest = json["command_surface"]["registry_digest"]
             .as_str()
             .expect("command_surface.registry_digest must be a JSON string field");
-        assert!(!digest.is_empty(), "registry_digest must be non-empty in JSON");
+        assert!(
+            !digest.is_empty(),
+            "registry_digest must be non-empty in JSON"
+        );
     }
 
     #[test]

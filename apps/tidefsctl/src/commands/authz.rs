@@ -60,6 +60,8 @@ const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "dataset rotate-key",
     "dataset upgrade",
     "dataset set",
+    "storage-intent policy set",
+    "storage-intent policy clear",
     "defrag",
 ];
 
@@ -78,6 +80,8 @@ const UNGUARDED_COMMANDS: &[&str] = &[
     "dataset get",
     "dataset list-props",
     "storage-intent explain",
+    "storage-intent policy show",
+    "storage-intent policy dry-run",
     "mount",
     "pool mount",
     "pool integrity-check",
@@ -268,12 +272,30 @@ mod tests {
     #[cfg(test)]
     fn is_mutating_command_path(path: &str) -> bool {
         const MUTATION_VERBS: &[&str] = &[
-            "create", "destroy", "delete", "set", "remove", "attach",
-            "detach", "send", "receive", "rollback", "prune", "defrag",
-            "rename", "seal-key", "rotate-key", "upgrade", "promote",
-            "hold", "release", "import", "export",
+            "create",
+            "destroy",
+            "delete",
+            "set",
+            "remove",
+            "attach",
+            "detach",
+            "send",
+            "receive",
+            "rollback",
+            "prune",
+            "defrag",
+            "rename",
+            "seal-key",
+            "rotate-key",
+            "upgrade",
+            "promote",
+            "hold",
+            "release",
+            "import",
+            "export",
         ];
-        path.split_whitespace().any(|word| MUTATION_VERBS.contains(&word))
+        path.split_whitespace()
+            .any(|word| MUTATION_VERBS.contains(&word))
     }
 
     #[test]
@@ -282,11 +304,12 @@ mod tests {
             .iter()
             .filter(|surface| surface.class == CommandClass::PublicOperator)
         {
-            let admission = command_admission(surface.path)
-                .unwrap_or_else(|| panic!(
+            let admission = command_admission(surface.path).unwrap_or_else(|| {
+                panic!(
                     "public operator command {} lacks admission metadata",
                     surface.path
-                ));
+                )
+            });
             // Mutating public-operator commands must not be Unguarded.
             if is_mutating_command_path(surface.path) {
                 assert!(

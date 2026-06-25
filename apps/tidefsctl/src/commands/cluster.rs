@@ -759,7 +759,10 @@ fn handle_placement_exercise(epoch: u64, json: bool) {
         });
         println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
     } else {
-        println!("PlacementMap development diagnostic (epoch {}):", pm.epoch());
+        println!(
+            "PlacementMap development diagnostic (epoch {}):",
+            pm.epoch()
+        );
         println!("  surface:     {CLUSTER_EXERCISE_SURFACE_CLASS}/{CLUSTER_EXERCISE_ROUTING}");
         println!("  boundary:    {CLUSTER_EXERCISE_BOUNDARY}");
         println!("  members:     {}", pm.member_count());
@@ -1301,7 +1304,9 @@ mod tests {
             cmd: super::ClusterCommand,
         }
         let args = TestCli::try_parse_from(["test", "status"]);
-        assert!(args.is_err(), "cluster status without pool name must be rejected");
+        assert!(
+            args.is_err(),
+            "cluster status without pool name must be rejected"
+        );
     }
-
 }

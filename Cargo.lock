@@ -4011,6 +4011,7 @@ dependencies = [
  "tidefs-recovery-loop",
  "tidefs-replication-model",
  "tidefs-storage-intent-core",
+ "tidefs-storage-intent-policy",
  "tidefs-transport",
  "tidefs-types-dataset-feature-flags-core",
  "tidefs-types-pool-label-core",
