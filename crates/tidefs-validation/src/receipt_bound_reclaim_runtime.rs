@@ -55,16 +55,35 @@ pub struct ReceiptBoundReclaimCaseEvidence {
     pub expected_decision: String,
     pub actual_decision: String,
     pub refusal_reason: Option<String>,
+    pub receipt_facts: ReceiptBoundReclaimReceiptFacts,
     pub publish_accepted: Option<bool>,
     pub queue_depth_after_replay: usize,
     pub receipt_bound_eligible_after_replay: usize,
     pub dequeue_batch_len: usize,
     pub ack_removed: usize,
     pub queue_depth_after_decision: usize,
+    pub failure_domain: String,
     pub allocator_path_invoked: bool,
     pub segment_cleaner_path_invoked: bool,
     pub harness_failure: bool,
     pub passed: bool,
+}
+
+/// Receipt facts serialized with each row case so refusal evidence can be
+/// separated from allocator, segment-cleaner, or harness failures.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReceiptBoundReclaimReceiptFacts {
+    pub receipt_present: bool,
+    pub receipt_epoch: Option<u64>,
+    pub receipt_generation: Option<u64>,
+    pub receipt_policy: Option<String>,
+    pub receipt_policy_well_formed: Option<bool>,
+    pub receipt_policy_target_width: Option<u16>,
+    pub receipt_target_count: Option<u16>,
+    pub receipt_is_synthetic: Option<bool>,
+    pub receipt_generation_stable: Option<bool>,
+    pub receipt_authorizes_reclaim: Option<bool>,
+    pub receipt_authorizes_reclaim_at_stable_generation: Option<bool>,
 }
 
 /// Execute the isolated receipt-bound obsolete-location trim row.
@@ -122,7 +141,7 @@ pub fn run_receipt_bound_obsolete_location_trim_gate() -> ReceiptBoundReclaimRun
 
     let passed = cases.iter().all(|case| case.passed);
     ReceiptBoundReclaimRuntimeEvidence {
-        manifest_version: 1,
+        manifest_version: 2,
         row_id: RECEIPT_BOUND_RECLAIM_ROW_ID.to_string(),
         source_issue: "https://github.com/tidefs/tidefs/issues/999".to_string(),
         parent_tracker: "https://github.com/tidefs/tidefs/issues/676".to_string(),
@@ -146,7 +165,9 @@ fn valid_publication_and_replay_case(
     let key = object_key(0x21);
     let mut queue = DeadObjectReclaimQueue::new();
     assert!(queue.enqueue(entry_without_receipt(key)));
-    let publish_accepted = queue.publish_replacement_receipt(&key, valid_receipt(key));
+    let receipt = valid_receipt(key);
+    let receipt_facts = receipt_facts(key, Some(receipt), stable_generation);
+    let publish_accepted = queue.publish_replacement_receipt(&key, receipt);
     let mut queue = replay_queue(queue);
 
     let queue_depth_after_replay = queue.len();
@@ -181,15 +202,17 @@ fn valid_publication_and_replay_case(
             "queued".to_string()
         },
         refusal_reason: None,
+        receipt_facts,
         publish_accepted: Some(publish_accepted),
         queue_depth_after_replay,
         receipt_bound_eligible_after_replay: eligible,
         dequeue_batch_len: batch.len(),
         ack_removed,
         queue_depth_after_decision,
+        failure_domain: "none".to_string(),
         allocator_path_invoked: false,
         segment_cleaner_path_invoked: false,
-        harness_failure: !passed,
+        harness_failure: false,
         passed,
     }
 }
@@ -205,7 +228,9 @@ fn refused_publish_case(
     let key = object_key(key_byte);
     let mut queue = DeadObjectReclaimQueue::new();
     assert!(queue.enqueue(entry_without_receipt(key)));
-    let publish_accepted = queue.publish_replacement_receipt(&key, receipt_builder(key));
+    let receipt = receipt_builder(key);
+    let receipt_facts = receipt_facts(key, Some(receipt), stable_generation);
+    let publish_accepted = queue.publish_replacement_receipt(&key, receipt);
     let mut queue = replay_queue(queue);
 
     let queue_depth_after_replay = queue.len();
@@ -235,21 +260,25 @@ fn refused_publish_case(
         name: name.to_string(),
         receipt_evidence: "rejected replacement receipt publication".to_string(),
         expected_decision: "refused".to_string(),
-        actual_decision: if publish_accepted {
+        actual_decision: if ack_removed > 0 {
             "reclaimed".to_string()
+        } else if publish_accepted {
+            "queued".to_string()
         } else {
             "refused".to_string()
         },
         refusal_reason: Some(reason.to_string()),
+        receipt_facts,
         publish_accepted: Some(publish_accepted),
         queue_depth_after_replay,
         receipt_bound_eligible_after_replay: eligible,
         dequeue_batch_len: batch.len(),
         ack_removed,
         queue_depth_after_decision,
+        failure_domain: "receipt-safety".to_string(),
         allocator_path_invoked: false,
         segment_cleaner_path_invoked: false,
-        harness_failure: !passed,
+        harness_failure: false,
         passed,
     }
 }
@@ -264,7 +293,9 @@ fn queued_invalid_receipt_case(
 ) -> ReceiptBoundReclaimCaseEvidence {
     let key = object_key(key_byte);
     let mut queue = DeadObjectReclaimQueue::new();
-    assert!(queue.enqueue(entry_with_receipt(key, receipt_builder(key))));
+    let receipt = receipt_builder(key);
+    let receipt_facts = receipt_facts(key, Some(receipt), stable_generation);
+    assert!(queue.enqueue(entry_with_receipt(key, receipt)));
     let mut queue = replay_queue(queue);
 
     let queue_depth_after_replay = queue.len();
@@ -299,15 +330,17 @@ fn queued_invalid_receipt_case(
             "reclaimed".to_string()
         },
         refusal_reason: Some(reason.to_string()),
+        receipt_facts,
         publish_accepted: None,
         queue_depth_after_replay,
         receipt_bound_eligible_after_replay: eligible,
         dequeue_batch_len: batch.len(),
         ack_removed,
         queue_depth_after_decision,
+        failure_domain: "receipt-safety".to_string(),
         allocator_path_invoked: false,
         segment_cleaner_path_invoked: false,
-        harness_failure: !passed,
+        harness_failure: false,
         passed,
     }
 }
@@ -353,16 +386,65 @@ fn receiptless_replay_case(
             "reclaimed".to_string()
         },
         refusal_reason: Some("missing replacement receipt evidence".to_string()),
+        receipt_facts: receipt_facts(key, None, stable_generation),
         publish_accepted: None,
         queue_depth_after_replay,
         receipt_bound_eligible_after_replay: eligible,
         dequeue_batch_len: batch.len(),
         ack_removed,
         queue_depth_after_decision,
+        failure_domain: "receipt-safety".to_string(),
         allocator_path_invoked: false,
         segment_cleaner_path_invoked: false,
-        harness_failure: !passed,
+        harness_failure: false,
         passed,
+    }
+}
+
+fn receipt_facts(
+    key: ObjectKey,
+    receipt: Option<DeadObjectReplacementReceipt>,
+    stable_generation: u64,
+) -> ReceiptBoundReclaimReceiptFacts {
+    match receipt {
+        Some(receipt) => ReceiptBoundReclaimReceiptFacts {
+            receipt_present: true,
+            receipt_epoch: Some(receipt.receipt_epoch),
+            receipt_generation: Some(receipt.receipt_generation),
+            receipt_policy: Some(receipt_policy_label(receipt.redundancy_policy)),
+            receipt_policy_well_formed: Some(receipt.redundancy_policy.is_well_formed()),
+            receipt_policy_target_width: Some(receipt.redundancy_policy.target_width()),
+            receipt_target_count: Some(receipt.target_count),
+            receipt_is_synthetic: Some(receipt.is_synthetic()),
+            receipt_generation_stable: Some(receipt.receipt_generation <= stable_generation),
+            receipt_authorizes_reclaim: Some(receipt.authorizes_reclaim_for(key)),
+            receipt_authorizes_reclaim_at_stable_generation: Some(
+                receipt.authorizes_reclaim_for_with_stable_generation(key, stable_generation),
+            ),
+        },
+        None => ReceiptBoundReclaimReceiptFacts {
+            receipt_present: false,
+            receipt_epoch: None,
+            receipt_generation: None,
+            receipt_policy: None,
+            receipt_policy_well_formed: None,
+            receipt_policy_target_width: None,
+            receipt_target_count: None,
+            receipt_is_synthetic: None,
+            receipt_generation_stable: None,
+            receipt_authorizes_reclaim: None,
+            receipt_authorizes_reclaim_at_stable_generation: None,
+        },
+    }
+}
+
+fn receipt_policy_label(policy: DeadObjectReceiptPolicy) -> String {
+    match policy {
+        DeadObjectReceiptPolicy::Replicated { copies } => format!("replicated:{copies}"),
+        DeadObjectReceiptPolicy::Erasure {
+            data_shards,
+            parity_shards,
+        } => format!("erasure:{data_shards}+{parity_shards}"),
     }
 }
 
@@ -457,17 +539,29 @@ mod tests {
     fn receipt_bound_obsolete_location_trim_gate_passes() {
         let evidence = run_receipt_bound_obsolete_location_trim_gate();
         evidence.assert_passed().expect("row should pass");
+        assert_eq!(evidence.manifest_version, 2);
         assert_eq!(evidence.cases.len(), 7);
         assert!(evidence.cases.iter().any(|case| {
             case.name == "durable-valid-replacement-reclaims-after-replay"
                 && case.actual_decision == "reclaimed"
+                && case
+                    .receipt_facts
+                    .receipt_authorizes_reclaim_at_stable_generation
+                    == Some(true)
         }));
         assert!(evidence.cases.iter().any(|case| {
             case.name == "under-width-erasure-remains-queued"
                 && case.actual_decision == "queued"
+                && case.receipt_facts.receipt_policy_target_width == Some(3)
+                && case.receipt_facts.receipt_target_count == Some(2)
                 && case.refusal_reason.as_deref().is_some_and(|reason| {
                     reason.contains("below redundancy width")
                 })
+        }));
+        assert!(evidence.cases.iter().any(|case| {
+            case.name == "stale-generation-remains-queued"
+                && case.receipt_facts.receipt_generation == Some(2)
+                && case.receipt_facts.receipt_generation_stable == Some(false)
         }));
     }
 
