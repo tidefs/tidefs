@@ -224,7 +224,7 @@ impl RemoteObjectIoVisibilitySample {
 
         if self.put_observed || self.get_observed || self.transform_verified {
             return RemoteCommitFacts::new(
-                MediaPersistenceDomain::Unknown,
+                MediaPersistenceDomain::ObjectDurable,
                 MediaFlushOrderingClass::Unknown,
                 MediaAtomicityClass::IdempotentObjectPut,
                 MediaProtocolGeometryClass::RemoteObject,
