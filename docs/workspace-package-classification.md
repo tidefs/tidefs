@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 164 |
+| Workspace packages | 165 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 169 |
-| Classified package roots | 169 |
+| Discovered package manifests | 170 |
+| Classified package roots | 170 |
 
 ## TFR-002 Category Mapping
 
