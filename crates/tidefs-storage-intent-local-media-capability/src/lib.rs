@@ -18,9 +18,6 @@ use tidefs_storage_intent_core::{
     StorageIntentEvidenceId, StorageIntentEvidenceKind, StorageIntentEvidenceRef,
     StorageIntentMediaCapabilityRecord, StorageMediaClass,
 };
-use tidefs_types_pool_label_core::{
-    DeviceClass as LabelDeviceClass, PoolLabelV1, PoolState as LabelPoolState,
-};
 
 /// Version of the local media-capability producer record shape.
 pub const LOCAL_MEDIA_CAPABILITY_PRODUCER_VERSION: u16 = 1;
@@ -55,14 +52,16 @@ const fn block_bytes_from_shift(shift: u8) -> u32 {
     }
 }
 
-const fn label_media_class(device_class: LabelDeviceClass) -> StorageMediaClass {
+const fn label_media_class(device_class: LocalPoolDeviceClass) -> StorageMediaClass {
     match device_class {
-        LabelDeviceClass::Hdd => StorageMediaClass::HddRotational,
-        LabelDeviceClass::Ssd => StorageMediaClass::SsdFlash,
-        LabelDeviceClass::Nvme | LabelDeviceClass::LogDevice => StorageMediaClass::NvmeFlash,
-        LabelDeviceClass::Cache => StorageMediaClass::SsdFlash,
-        LabelDeviceClass::Special => StorageMediaClass::SsdFlash,
-        LabelDeviceClass::Spare => StorageMediaClass::HddRotational,
+        LocalPoolDeviceClass::Hdd => StorageMediaClass::HddRotational,
+        LocalPoolDeviceClass::Ssd => StorageMediaClass::SsdFlash,
+        LocalPoolDeviceClass::Nvme | LocalPoolDeviceClass::LogDevice => {
+            StorageMediaClass::NvmeFlash
+        }
+        LocalPoolDeviceClass::Cache => StorageMediaClass::SsdFlash,
+        LocalPoolDeviceClass::Special => StorageMediaClass::SsdFlash,
+        LocalPoolDeviceClass::Spare => StorageMediaClass::HddRotational,
     }
 }
 
@@ -72,6 +71,71 @@ const fn label_health(device_health: u8) -> MediaHealthState {
         1 => MediaHealthState::Degraded,
         2 => MediaHealthState::Failed,
         _ => MediaHealthState::Unknown,
+    }
+}
+
+/// Decoded operational state from a local pool-label sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalPoolLabelState {
+    Active,
+    Exported,
+    Destroyed,
+}
+
+impl LocalPoolLabelState {
+    #[must_use]
+    pub const fn is_importable(self) -> bool {
+        matches!(self, Self::Active | Self::Exported)
+    }
+}
+
+/// Decoded allocation class from a local pool-label sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalPoolDeviceClass {
+    Hdd,
+    Ssd,
+    Nvme,
+    LogDevice,
+    Cache,
+    Special,
+    Spare,
+}
+
+/// Stable fields decoded from one local pool label.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalDecodedPoolLabel {
+    pub pool_guid: [u8; 16],
+    pub device_guid: [u8; 16],
+    pub pool_state: LocalPoolLabelState,
+    pub label_commit_group: u64,
+    pub topology_generation: u64,
+    pub device_index: u32,
+    pub device_count: u32,
+    pub device_class: LocalPoolDeviceClass,
+    pub device_capacity_bytes: u64,
+    pub device_health: u8,
+}
+
+impl LocalDecodedPoolLabel {
+    #[must_use]
+    pub const fn new(
+        pool_guid: [u8; 16],
+        device_guid: [u8; 16],
+        pool_state: LocalPoolLabelState,
+        device_class: LocalPoolDeviceClass,
+    ) -> Self {
+        Self {
+            pool_guid,
+            device_guid,
+            pool_state,
+            label_commit_group: 0,
+            topology_generation: 0,
+            device_index: 0,
+            device_count: 0,
+            device_class,
+            device_capacity_bytes: 0,
+            device_health: 0,
+        }
     }
 }
 
@@ -120,12 +184,12 @@ impl LocalFirmwareSettingsSnapshot {
 pub struct LocalPoolMemberIdentitySnapshot {
     pub pool_guid: [u8; 16],
     pub device_guid: [u8; 16],
-    pub pool_state: LabelPoolState,
+    pub pool_state: LocalPoolLabelState,
     pub label_commit_group: u64,
     pub topology_generation: u64,
     pub device_index: u32,
     pub device_count: u32,
-    pub device_class: LabelDeviceClass,
+    pub device_class: LocalPoolDeviceClass,
     pub device_capacity_bytes: u64,
     pub device_health: u8,
     pub checksum_verified: bool,
@@ -138,8 +202,8 @@ pub struct LocalPoolMemberIdentitySnapshot {
 impl LocalPoolMemberIdentitySnapshot {
     /// Capture the stable fields from a decoded pool label plus attach proof.
     #[must_use]
-    pub const fn from_pool_label(
-        label: &PoolLabelV1,
+    pub const fn from_decoded_label(
+        label: LocalDecodedPoolLabel,
         checksum_verified: bool,
         namespace_matches_current_attach: bool,
         path_identity: LocalPathIdentityClass,
@@ -231,7 +295,7 @@ impl LocalPoolMemberIdentitySnapshot {
     }
 
     const fn device_health_code(self) -> u8 {
-        if self.device_class as u8 == LabelDeviceClass::Spare as u8 {
+        if matches!(self.device_class, LocalPoolDeviceClass::Spare) {
             return 3;
         }
         if self.device_count == 0 {
@@ -1145,13 +1209,17 @@ mod tests {
         )
     }
 
-    fn pool_label() -> PoolLabelV1 {
-        let mut label = PoolLabelV1::new([0xAA; 16], [0xBB; 16], "pool");
+    fn pool_label() -> LocalDecodedPoolLabel {
+        let mut label = LocalDecodedPoolLabel::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            LocalPoolLabelState::Active,
+            LocalPoolDeviceClass::Nvme,
+        );
         label.label_commit_group = 42;
         label.topology_generation = 7;
         label.device_count = 2;
         label.device_index = 1;
-        label.device_class = LabelDeviceClass::Nvme;
         label.device_capacity_bytes = 4 * 1024 * 1024;
         label.device_health = 0;
         label
@@ -1223,8 +1291,8 @@ mod tests {
 
     #[test]
     fn pool_label_identity_without_firmware_generation_refuses_authority() {
-        let identity = LocalPoolMemberIdentitySnapshot::from_pool_label(
-            &pool_label(),
+        let identity = LocalPoolMemberIdentitySnapshot::from_decoded_label(
+            pool_label(),
             true,
             true,
             LocalPathIdentityClass::StableMultipath,
@@ -1254,8 +1322,8 @@ mod tests {
 
     #[test]
     fn stale_reattach_turns_pool_identity_into_stale_evidence() {
-        let identity = LocalPoolMemberIdentitySnapshot::from_pool_label(
-            &pool_label(),
+        let identity = LocalPoolMemberIdentitySnapshot::from_decoded_label(
+            pool_label(),
             true,
             true,
             LocalPathIdentityClass::StableSinglePath,
@@ -1284,8 +1352,8 @@ mod tests {
 
     #[test]
     fn path_only_pool_label_identity_refuses_authority() {
-        let identity = LocalPoolMemberIdentitySnapshot::from_pool_label(
-            &pool_label(),
+        let identity = LocalPoolMemberIdentitySnapshot::from_decoded_label(
+            pool_label(),
             true,
             true,
             LocalPathIdentityClass::PathOnly,
@@ -1327,8 +1395,8 @@ mod tests {
     fn pool_label_degraded_health_refuses_durable_role() {
         let mut label = pool_label();
         label.device_health = 1;
-        let identity = LocalPoolMemberIdentitySnapshot::from_pool_label(
-            &label,
+        let identity = LocalPoolMemberIdentitySnapshot::from_decoded_label(
+            label,
             true,
             true,
             LocalPathIdentityClass::StableMultipath,
@@ -1368,8 +1436,8 @@ mod tests {
 
     #[test]
     fn ublk_and_pool_snapshots_can_produce_durable_local_capability() {
-        let identity = LocalPoolMemberIdentitySnapshot::from_pool_label(
-            &pool_label(),
+        let identity = LocalPoolMemberIdentitySnapshot::from_decoded_label(
+            pool_label(),
             true,
             true,
             LocalPathIdentityClass::StableMultipath,
