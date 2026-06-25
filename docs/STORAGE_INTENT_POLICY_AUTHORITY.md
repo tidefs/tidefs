@@ -1033,6 +1033,9 @@ successor. Instead, it is the storage-intent outcome record that the response
 or refusal runtime consumes when a write, read, fsync, FUA, placement decision,
 relocation action, operator request, or retry becomes caller-visible.
 
+`docs/STORAGE_INTENT_RESULT_REFUSAL_EVIDENCE_DESIGN.md` is the focused #920
+model record for this boundary.
+
 This boundary exists because a precise internal policy decision is not enough.
 The last inch can still lie: a no-quorum refusal can become generic `EIO`, a
 stale evidence cut can become a timeout, a degraded read can look exact, a
