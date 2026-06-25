@@ -656,7 +656,6 @@ impl ScrubWorker {
                     let (expected_root, locator_token) = self
                         .store
                         .object_checksum_root(id)
-                        .map(|(root, lt)| (root, lt))
                         .unwrap_or_else(|| (Digest::default(), None));
                     match self.verifier.verify(&data, &expected_root, locator_token.as_ref()) {
                         Ok(()) => ScrubOutcome::Clean {
