@@ -16,6 +16,7 @@ use tidefs_storage_intent_core::{
     StorageIntentRefusal, StorageIntentRefusalReason, StorageMediaClass, StorageMediaRole,
     TrustEvidenceState,
 };
+use tidefs_local_object_store::pool::PlacementReceipt;
 
 /// Local filesystem receipt surface version for issue #842.
 pub const LOCAL_ACK_RECEIPT_SPEC: &str = "tidefs-local-ack-receipt-v1-issue-842";
@@ -496,6 +497,70 @@ impl LocalAckReceipt {
     }
 }
 
+// ---------------------------------------------------------------------
+// Readback receipt authority evidence
+// ---------------------------------------------------------------------
+
+/// Evidence classification for a pool placement receipt queried during
+/// local readback or degraded-read source selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadReceiptEvidence {
+    /// Receipt generation matches the chunk ref; receipt is committed authority.
+    Valid { generation: u64 },
+    /// Pool lookup failed (I/O error, device unavailable).
+    Unavailable { expected_generation: u64 },
+    /// No receipt exists in the pool for this object key.
+    Missing { expected_generation: u64 },
+    /// Pool receipt generation differs from the chunk ref's recorded generation.
+    Stale {
+        expected_generation: u64,
+        observed_generation: u64,
+    },
+    /// Receipt exists but generation is zero (synthetic/uncommitted).
+    Synthetic {
+        expected_generation: u64,
+        observed_generation: u64,
+    },
+    /// Receipt's redundancy policy is not well-formed.
+    MalformedPolicy { generation: u64 },
+    /// Receipt target_count is less than the policy's required width.
+    UnderWidth {
+        generation: u64,
+        target_count: u16,
+        required_width: u16,
+    },
+    /// Receipt target_count exceeds the policy's required width.
+    OverWidth {
+        generation: u64,
+        target_count: u16,
+        required_width: u16,
+    },
+}
+
+impl ReadReceiptEvidence {
+    /// True when the receipt is committed placement authority suitable for
+    /// receipt-verified device selection.
+    #[must_use]
+    pub const fn is_committed(&self) -> bool {
+        matches!(self, Self::Valid { .. })
+    }
+
+    /// Human-readable classification label for diagnostics.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Valid { .. } => "valid",
+            Self::Unavailable { .. } => "unavailable",
+            Self::Missing { .. } => "missing",
+            Self::Stale { .. } => "stale",
+            Self::Synthetic { .. } => "synthetic",
+            Self::MalformedPolicy { .. } => "malformed-policy",
+            Self::UnderWidth { .. } => "under-width",
+            Self::OverWidth { .. } => "over-width",
+        }
+    }
+}
+
 /// Bounded latest-receipt side-channel owned by `LocalFileSystem`.
 #[derive(Clone, Debug)]
 pub struct LocalAckReceiptLedger {
@@ -709,6 +774,61 @@ fn hash_refusal_context(
     hasher.update(&attempted_receipt.0);
     hasher.update(&reason.to_discriminant().to_le_bytes());
     *hasher.finalize().as_bytes()
+}
+// ---------------------------------------------------------------------
+// Readback receipt authority classification
+// ---------------------------------------------------------------------
+
+/// Classify a pool placement receipt against an expected generation for
+/// local readback source selection.
+///
+/// Returns [`ReadReceiptEvidence`] describing whether the receipt can serve
+/// as committed placement authority or what typed deficiency it exhibits.
+pub fn classify_read_receipt(
+    receipt: &PlacementReceipt,
+    expected_generation: u64,
+) -> ReadReceiptEvidence {
+    // Synthetic / zero-generation receipt: not committed authority.
+    if receipt.generation == 0 {
+        return ReadReceiptEvidence::Synthetic {
+            expected_generation,
+            observed_generation: 0,
+        };
+    }
+
+    // Check generation match.
+    if receipt.generation != expected_generation {
+        return ReadReceiptEvidence::Stale {
+            expected_generation,
+            observed_generation: receipt.generation,
+        };
+    }
+
+    // Check policy well-formedness via projection to the shared receipt model.
+    let rp = receipt.policy.to_receipt_redundancy_policy();
+    if !rp.is_well_formed() {
+        return ReadReceiptEvidence::MalformedPolicy { generation: receipt.generation };
+    }
+
+    // Check target width.
+    let required_width = rp.target_width();
+    let target_count = u16::try_from(receipt.targets.len()).unwrap_or(u16::MAX);
+    if target_count < required_width {
+        return ReadReceiptEvidence::UnderWidth {
+            generation: receipt.generation,
+            target_count,
+            required_width,
+        };
+    }
+    if target_count > required_width {
+        return ReadReceiptEvidence::OverWidth {
+            generation: receipt.generation,
+            target_count,
+            required_width,
+        };
+    }
+
+    ReadReceiptEvidence::Valid { generation: receipt.generation }
 }
 
 #[cfg(test)]
