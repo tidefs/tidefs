@@ -2,6 +2,7 @@
 use std::fmt;
 
 use tidefs_local_object_store::StoreError;
+use tidefs_storage_intent_read_serving::ReadServingDecisionRecord;
 use tidefs_types_space_accounting_core::AdmissionResult;
 use tidefs_types_vfs_core::{InodeId, NodeKind};
 
@@ -155,6 +156,11 @@ pub enum FileSystemError {
     },
     SizeOverflow {
         requested: u64,
+    },
+    /// Runtime read-serving refused a byte-serving path before content was
+    /// fetched from cache, local storage, or a remote source.
+    ReadServingRefused {
+        decision: Box<ReadServingDecisionRecord>,
     },
     /// Claim rejected by the obligation ledger — authority scarcity gate.
     /// The request has been denied because the budget domain is exhausted
@@ -324,6 +330,14 @@ impl fmt::Display for FileSystemError {
             Self::SizeOverflow { requested } => {
                 write!(f, "file size or offset is too large: {requested}")
             }
+            Self::ReadServingRefused { decision } => write!(
+                f,
+                "read-serving refused bytes: state={:?} requested_source={:?} refusal={:?} rejected=0x{:x}",
+                decision.decision_state,
+                decision.requested_source,
+                decision.refusal,
+                decision.rejected_reasons.0,
+            ),
             Self::ClaimRejected {
                 budget_domain,
                 reason,

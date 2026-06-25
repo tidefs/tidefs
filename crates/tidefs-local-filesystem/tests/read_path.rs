@@ -11,7 +11,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use tidefs_local_filesystem::{LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
+use tidefs_local_filesystem::{FileSystemError, LocalFileSystem, DEFAULT_FILE_PERMISSIONS};
 use tidefs_storage_intent_core::{
     EvidenceCompletenessVerdict, EvidenceConsumerClass, EvidenceFamilyFreshness,
     EvidenceFamilyFreshnessSet, EvidenceFamilyFreshnessState, EvidenceQueryContextClass,
@@ -22,10 +22,9 @@ use tidefs_storage_intent_core::{
     StorageIntentReceiptId, StorageIntentRefusalReason,
 };
 use tidefs_storage_intent_read_serving::{
-    DegradedReadPolicy, ReadFreshnessProfile, ReadServingCandidateRecord,
-    ReadServingDecisionInput, ReadServingDecisionState, ReadServingEvidenceCutState,
-    ReadServingEvidenceRefs, ReadServingPolicy, ReadServingRejectionMask,
-    StorageIntentReadSourceClass,
+    DegradedReadPolicy, ReadFreshnessProfile, ReadServingCandidateRecord, ReadServingDecisionInput,
+    ReadServingDecisionState, ReadServingEvidenceCutState, ReadServingEvidenceRefs,
+    ReadServingPolicy, ReadServingRejectionMask, StorageIntentReadSourceClass,
 };
 use tidefs_types_vfs_core::{InodeId, NodeKind, S_IFREG};
 
@@ -178,7 +177,9 @@ fn read_serving_snapshot(
     let mut family_freshness = EvidenceFamilyFreshnessSet::EMPTY;
     for &kind in families {
         let evidence = family_ref(kind, refs);
-        included_refs.push(evidence).expect("push included evidence");
+        included_refs
+            .push(evidence)
+            .expect("push included evidence");
         family_freshness
             .push(EvidenceFamilyFreshness {
                 kind,
@@ -523,17 +524,18 @@ fn read_serving_clean_cache_refuses_latest_local_authority() {
         result.decision.requested_source,
         StorageIntentReadSourceClass::CleanCache
     );
-    assert_eq!(result.decision.decision_state, ReadServingDecisionState::Refused);
+    assert_eq!(
+        result.decision.decision_state,
+        ReadServingDecisionState::Refused
+    );
     assert_eq!(
         result.decision.refusal,
         StorageIntentRefusalReason::CacheCannotBeAuthority
     );
-    assert!(
-        result
-            .decision
-            .rejected_reasons
-            .intersects(ReadServingRejectionMask::CACHE_CANNOT_BE_AUTHORITY)
-    );
+    assert!(result
+        .decision
+        .rejected_reasons
+        .intersects(ReadServingRejectionMask::CACHE_CANNOT_BE_AUTHORITY));
 }
 
 #[test]
@@ -566,6 +568,114 @@ fn read_serving_stale_evidence_cut_refuses_without_bytes() {
     assert_eq!(
         result.decision.rejected_reasons,
         ReadServingRejectionMask::MISSING_EVIDENCE_CUT
+    );
+}
+
+#[test]
+fn read_serving_required_range_maps_missing_cut_to_typed_error() {
+    set_test_key();
+    let dir = temp_dir("rs_required_missing_cut");
+    let payload = make_data(0x57, 640);
+
+    let mut fs = open_fs(&dir);
+    fs.create_file("/required.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create");
+    fs.write_file("/required.bin", 0, &payload).expect("write");
+    fs.sync_all().expect("sync");
+
+    let err = fs
+        .read_file_range_with_required_read_serving(
+            "/required.bin",
+            0,
+            payload.len(),
+            ReadServingDecisionInput::default(),
+        )
+        .expect_err("missing evidence cut refuses byte-serving read");
+
+    let decision = match err {
+        FileSystemError::ReadServingRefused { decision } => decision,
+        other => panic!("unexpected read-serving error: {other:?}"),
+    };
+    assert_eq!(
+        decision.decision_state,
+        ReadServingDecisionState::Unavailable
+    );
+    assert_eq!(
+        decision.requested_source,
+        StorageIntentReadSourceClass::LocalPlacementReceipt
+    );
+    assert_eq!(
+        decision.rejected_reasons,
+        ReadServingRejectionMask::MISSING_EVIDENCE_CUT
+    );
+}
+
+#[test]
+fn read_serving_required_range_maps_clean_cache_refusal_to_typed_error() {
+    set_test_key();
+    let dir = temp_dir("rs_required_clean_cache");
+    let payload = make_data(0x59, 896);
+
+    let mut fs = open_fs(&dir);
+    fs.create_file("/cache-required.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create");
+    fs.write_file("/cache-required.bin", 0, &payload)
+        .expect("write");
+    fs.sync_all().expect("sync");
+
+    let err = fs
+        .read_file_range_with_required_read_serving(
+            "/cache-required.bin",
+            0,
+            payload.len(),
+            read_serving_input(StorageIntentReadSourceClass::CleanCache),
+        )
+        .expect_err("clean cache cannot satisfy latest-local byte read");
+
+    let decision = match err {
+        FileSystemError::ReadServingRefused { decision } => decision,
+        other => panic!("unexpected read-serving error: {other:?}"),
+    };
+    assert_eq!(decision.decision_state, ReadServingDecisionState::Refused);
+    assert_eq!(
+        decision.refusal,
+        StorageIntentRefusalReason::CacheCannotBeAuthority
+    );
+    assert!(decision
+        .rejected_reasons
+        .intersects(ReadServingRejectionMask::CACHE_CANNOT_BE_AUTHORITY));
+}
+
+#[test]
+fn read_serving_required_range_maps_stale_cut_to_typed_error() {
+    set_test_key();
+    let dir = temp_dir("rs_required_stale_cut");
+    let payload = make_data(0x5B, 1152);
+
+    let mut fs = open_fs(&dir);
+    fs.create_file("/stale-required.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create");
+    fs.write_file("/stale-required.bin", 0, &payload)
+        .expect("write");
+    fs.sync_all().expect("sync");
+
+    let mut input = read_serving_input(StorageIntentReadSourceClass::LocalPlacementReceipt);
+    input.evidence_cut_state = ReadServingEvidenceCutState::Stale;
+    let err = fs
+        .read_file_range_with_required_read_serving("/stale-required.bin", 0, payload.len(), input)
+        .expect_err("stale evidence cut refuses byte-serving read");
+
+    let decision = match err {
+        FileSystemError::ReadServingRefused { decision } => decision,
+        other => panic!("unexpected read-serving error: {other:?}"),
+    };
+    assert_eq!(
+        decision.decision_state,
+        ReadServingDecisionState::Unavailable
+    );
+    assert_eq!(
+        decision.evidence_cut_state,
+        ReadServingEvidenceCutState::Stale
     );
 }
 
@@ -605,6 +715,29 @@ fn read_serving_local_receipt_projection_serves_and_preserves_refs() {
     assert_eq!(result.decision.scope.range_len, 512);
     assert!(result.decision.object_generation > 0);
     assert!(result.decision.layout_generation > 0);
+}
+
+#[test]
+fn read_serving_required_full_read_serves_receipt_backed_bytes() {
+    set_test_key();
+    let dir = temp_dir("rs_required_local_receipt");
+    let payload = make_data(0x67, 1536);
+
+    let mut fs = open_fs(&dir);
+    fs.create_file("/receipt-required.bin", DEFAULT_FILE_PERMISSIONS)
+        .expect("create");
+    fs.write_file("/receipt-required.bin", 0, &payload)
+        .expect("write");
+    fs.sync_all().expect("sync");
+
+    let bytes = fs
+        .read_file_with_required_read_serving(
+            "/receipt-required.bin",
+            read_serving_input(StorageIntentReadSourceClass::LocalPlacementReceipt),
+        )
+        .expect("receipt-backed read-serving source");
+
+    assert_eq!(bytes, payload);
 }
 
 // ── Full-file sequential read ─────────────────────────────────────────
