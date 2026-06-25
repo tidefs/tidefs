@@ -21333,6 +21333,285 @@ mod tests {
         assert_eq!(decision.refusal, StorageIntentRefusalReason::None);
     }
 
+    /// AC: low-confidence hints do not trigger authority-changing promotion.
+    #[test]
+    fn low_confidence_signals_do_not_trigger_authority_promotion() {
+        let low_confidence_signal = WorkloadSignalRecord {
+            confidence: PredictionConfidence::Low,
+            candidate: PrefetchResidencyCandidateClass::AuthorityPromotionCandidate,
+            ..workload_signal(
+                DOMAIN_A,
+                AccessPatternClass::SmallRandomHotset,
+                PrefetchResidencyCandidateClass::AuthorityPromotionCandidate,
+                WorkloadSignalFlags::EMPTY,
+            )
+        };
+
+        assert!(!workload_signal_can_train_upward(low_confidence_signal));
+        assert_eq!(
+            workload_signal_lowered_candidate(low_confidence_signal),
+            PrefetchResidencyCandidateClass::CacheOnlyTrial
+        );
+
+        let unknown_confidence_signal = WorkloadSignalRecord {
+            confidence: PredictionConfidence::Unknown,
+            candidate: PrefetchResidencyCandidateClass::PmemDurable,
+            ..workload_signal(
+                DOMAIN_A,
+                AccessPatternClass::SmallRandomHotset,
+                PrefetchResidencyCandidateClass::PmemDurable,
+                WorkloadSignalFlags::EMPTY,
+            )
+        };
+        assert!(!workload_signal_can_train_upward(unknown_confidence_signal));
+
+        let high_confidence_signal = workload_signal(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::AuthorityPromotionCandidate,
+            WorkloadSignalFlags::EMPTY,
+        );
+        assert!(workload_signal_can_train_upward(high_confidence_signal));
+    }
+
+    /// AC: prefetched cache/trial hits cannot satisfy durable receipts
+    /// or latest-read guarantees.
+    #[test]
+    fn cache_only_decisions_cannot_satisfy_durable_authority() {
+        let cache_decision = prefetch_residency_decide(decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        ));
+
+        assert!(prefetch_residency_decision_is_cache_only(cache_decision));
+        assert!(!prefetch_residency_decision_may_request_authority_change(
+            cache_decision
+        ));
+        assert!(!prefetch_candidate_changes_authority(
+            cache_decision.selected_candidate
+        ));
+        assert_eq!(cache_decision.refusal, StorageIntentRefusalReason::None);
+
+        let mut ram_trial_context = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::VolatileRamTrial,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        );
+        ram_trial_context.signal.target_media = StorageMediaClass::SystemRam;
+        ram_trial_context.signal.target_media_ref = evidence_ref(
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            101,
+        );
+        ram_trial_context.target_media =
+            proven_media_capability(StorageMediaClass::SystemRam, 101);
+
+        let trial_decision = prefetch_residency_decide(ram_trial_context);
+        assert!(!prefetch_residency_decision_may_request_authority_change(
+            trial_decision
+        ));
+
+        let mut no_read_serving = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        );
+        no_read_serving
+            .policy
+            .evidence_refs
+            .read_serving_boundary_ref = StorageIntentEvidenceRef::default();
+
+        let refused = prefetch_residency_decide(no_read_serving);
+        assert_eq!(
+            refused.outcome,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+        );
+        assert_eq!(
+            refused.refusal,
+            StorageIntentRefusalReason::CacheCannotBeAuthority
+        );
+        assert_eq!(
+            refused.selected_candidate,
+            PrefetchResidencyCandidateClass::NeedMoreEvidence
+        );
+    }
+
+    /// AC: WAN/object/archive prefetch is refused or degraded-visible when
+    /// RPO, restore, trust, egress, or timebase evidence is missing.
+    #[test]
+    fn wan_archive_prefetch_refused_when_evidence_is_missing() {
+        let mut no_egress = decision_context_with_media(
+            DOMAIN_A,
+            AccessPatternClass::WanGeoDelta,
+            PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+            proven_hdd_capability(71),
+            proven_cloud_object_capability(72),
+        );
+        no_egress
+            .policy
+            .evidence_refs
+            .egress_restore_cost_ref = StorageIntentEvidenceRef::default();
+
+        let wan_refused = prefetch_residency_decide(no_egress);
+        assert_eq!(
+            wan_refused.outcome,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+        );
+        assert_eq!(
+            wan_refused.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        // Signal with UNKNOWN_EGRESS_OR_RESTORE_COST and WanGeoDelta
+        // access pattern is lowered to NoPrefetch before the evidence-refusal
+        // layer runs.
+        let mut unknown_egress_signal = decision_context_with_media(
+            DOMAIN_A,
+            AccessPatternClass::WanGeoDelta,
+            PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch,
+            WorkloadSignalFlags::UNKNOWN_EGRESS_OR_RESTORE_COST,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+            proven_hdd_capability(73),
+            proven_cloud_object_capability(74),
+        );
+        unknown_egress_signal
+            .policy
+            .evidence_refs
+            .egress_restore_cost_ref = StorageIntentEvidenceRef::default();
+
+        let wan_unknown_egress = prefetch_residency_decide(unknown_egress_signal);
+        assert_eq!(
+            wan_unknown_egress.outcome,
+            PrefetchResidencyDecisionOutcome::NoAction
+        );
+
+        let mut no_trust = decision_context_with_media(
+            DOMAIN_A,
+            AccessPatternClass::ObjectArchiveRestore,
+            PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+            proven_hdd_capability(75),
+            proven_archive_capability(76),
+        );
+        no_trust.policy.evidence_refs.trust_domain_ref =
+            StorageIntentEvidenceRef::default();
+
+        let archive_no_trust = prefetch_residency_decide(no_trust);
+        assert_eq!(
+            archive_no_trust.outcome,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+        );
+        assert_eq!(
+            archive_no_trust.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut no_transport = decision_context_with_media(
+            DOMAIN_A,
+            AccessPatternClass::ObjectArchiveRestore,
+            PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+            proven_hdd_capability(77),
+            proven_archive_capability(78),
+        );
+        no_transport
+            .policy
+            .evidence_refs
+            .transport_budget_ref = StorageIntentEvidenceRef::default();
+
+        let archive_no_transport = prefetch_residency_decide(no_transport);
+        assert_eq!(
+            archive_no_transport.outcome,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+        );
+        assert_eq!(
+            archive_no_transport.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    /// AC: demotion does not violate service objectives or retire receipts
+    /// before replacement/source-retirement evidence exists.
+    #[test]
+    fn demotion_requires_evidence_and_does_not_change_authority_prematurely() {
+        let mut no_service_obj = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::DemotionCandidate,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        );
+        no_service_obj
+            .policy
+            .evidence_refs
+            .service_objective_ref = StorageIntentEvidenceRef::default();
+        no_service_obj.signal.service_objective_ref =
+            StorageIntentEvidenceRef::default();
+
+        let demotion_no_svc = prefetch_residency_decide(no_service_obj);
+        assert_eq!(
+            demotion_no_svc.outcome,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+        );
+        assert_eq!(
+            demotion_no_svc.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut no_reloc = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::DemotionCandidate,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        );
+        no_reloc
+            .policy
+            .evidence_refs
+            .relocation_boundary_ref = StorageIntentEvidenceRef::default();
+
+        let demotion_no_reloc = prefetch_residency_decide(no_reloc);
+        assert_eq!(
+            demotion_no_reloc.outcome,
+            PrefetchResidencyDecisionOutcome::NeedMoreEvidence
+        );
+        assert_eq!(
+            demotion_no_reloc.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let demotion = prefetch_residency_decide(decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::DemotionCandidate,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        ));
+        assert_eq!(
+            demotion.outcome,
+            PrefetchResidencyDecisionOutcome::DemotionCandidate
+        );
+        assert!(prefetch_residency_decision_may_request_authority_change(
+            demotion
+        ));
+        assert_eq!(demotion.refusal, StorageIntentRefusalReason::None);
+        assert!(evidence_ref_has_id(
+            demotion.evidence_refs.relocation_boundary_ref
+        ));
+        assert!(evidence_ref_has_id(
+            demotion.evidence_refs.service_objective_ref
+        ));
+    }
     #[test]
     fn decision_frontier_discriminants_fail_closed() {
         assert_eq!(
