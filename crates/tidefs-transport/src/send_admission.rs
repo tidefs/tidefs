@@ -12,6 +12,10 @@ use crate::lane_demux::LaneClass;
 use crate::send_scheduler::SendPriority;
 use crate::types::SessionId;
 use crate::PeerId;
+use tidefs_cache_core::{
+    AdmissionTicket, BackpressureSignal as GovernorBackpressureSignal, BudgetCategory, BudgetError,
+    Governor,
+};
 
 /// High-level outcome of a send admission decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +59,8 @@ pub enum SendCapacityClass {
     ConnectionState,
     /// Peer frame-buffer memory cap.
     BufferMemory,
+    /// Unified governor `cluster_queues` memory budget.
+    GovernorClusterQueues,
 }
 
 /// Configured policy or gate that produced the decision.
@@ -80,6 +86,8 @@ pub enum SendAdmissionPolicy {
     ConnectionState,
     /// Queue or session shutdown.
     Shutdown,
+    /// Unified governor budget admission.
+    GovernorBudget,
 }
 
 /// Whether a drain or close wake was observed for a waiting producer.
@@ -97,6 +105,189 @@ pub enum SendWakeEvidence {
     ClosedObserved,
     /// The notifying side disappeared while the producer was waiting.
     SenderDropped,
+}
+
+/// Governor pressure observed for the transport `cluster_queues` budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterQueuePressure {
+    /// No cluster-queue memory pressure was observed.
+    None,
+    /// Cluster queues are above the governor soft watermark.
+    SoftPressure,
+    /// Cluster queues are at or above the governor hard-pressure watermark.
+    HardPressure,
+}
+
+impl ClusterQueuePressure {
+    /// Return true when the pressure should reduce non-critical admission.
+    #[must_use]
+    pub const fn is_pressure(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Return true when non-critical cluster work should be refused.
+    #[must_use]
+    pub const fn refuses_non_critical(self) -> bool {
+        matches!(self, Self::HardPressure)
+    }
+}
+
+impl From<GovernorBackpressureSignal> for ClusterQueuePressure {
+    fn from(value: GovernorBackpressureSignal) -> Self {
+        match value {
+            GovernorBackpressureSignal::None => Self::None,
+            GovernorBackpressureSignal::SoftPressure => Self::SoftPressure,
+            GovernorBackpressureSignal::HardPressure => Self::HardPressure,
+        }
+    }
+}
+
+/// Transport allocation class charged to `BudgetCategory::ClusterQueues`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterQueueAllocationKind {
+    /// Serialized RPC or control frame held by transport.
+    RpcFrame,
+    /// Bytes queued in a per-peer send buffer.
+    SendBuffer,
+    /// Memory held by the transport duplicate-response window.
+    DedupWindow,
+    /// BULK transfer token or token-associated admission state.
+    BulkTransferToken,
+}
+
+/// Priority class for cluster-queue governor admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterQueueAdmissionClass {
+    /// Required correctness work such as drain, fence, receipt, and closure
+    /// semantics. Still bounded by the governor hard budget cap.
+    Critical,
+    /// Ordinary foreground cluster work.
+    Normal,
+    /// Speculative transport work that can be conservatively refused under
+    /// soft pressure.
+    Speculative,
+    /// BULK transfer admission token or transfer-window work.
+    Bulk,
+}
+
+impl ClusterQueueAdmissionClass {
+    /// Return true when this work may still be admitted under hard pressure.
+    #[must_use]
+    pub const fn is_critical(self) -> bool {
+        matches!(self, Self::Critical)
+    }
+
+    /// Return true when this work may be admitted at the sampled pressure.
+    #[must_use]
+    pub const fn admits_under_pressure(self, pressure: ClusterQueuePressure) -> bool {
+        match pressure {
+            ClusterQueuePressure::None => true,
+            ClusterQueuePressure::SoftPressure => !matches!(self, Self::Speculative | Self::Bulk),
+            ClusterQueuePressure::HardPressure => self.is_critical(),
+        }
+    }
+}
+
+/// Observable transport pressure reason attached to admission evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendPressureReason {
+    /// The unified governor constrained `BudgetCategory::ClusterQueues`.
+    ClusterQueues {
+        /// Pressure sampled from the governor.
+        pressure: ClusterQueuePressure,
+        /// Allocation kind being admitted or refused.
+        kind: ClusterQueueAllocationKind,
+        /// Admission class supplied by the caller.
+        admission_class: ClusterQueueAdmissionClass,
+        /// Cluster-queue bytes used at the decision point.
+        used: usize,
+        /// Cluster-queue hard cap at the decision point.
+        limit: usize,
+    },
+}
+
+impl SendPressureReason {
+    /// Build a cluster-queue pressure reason from governor state.
+    #[must_use]
+    pub fn cluster_queues(
+        governor: &Governor,
+        pressure: ClusterQueuePressure,
+        kind: ClusterQueueAllocationKind,
+        admission_class: ClusterQueueAdmissionClass,
+    ) -> Self {
+        Self::ClusterQueues {
+            pressure,
+            kind,
+            admission_class,
+            used: saturating_usize(governor.category_used(BudgetCategory::ClusterQueues)),
+            limit: saturating_usize(governor.category_cap(BudgetCategory::ClusterQueues)),
+        }
+    }
+}
+
+/// RAII guard for bytes admitted against `BudgetCategory::ClusterQueues`.
+///
+/// Dropping the guard releases the governor budget, so completion,
+/// cancellation, timeout, and peer drain paths only need to drop their owned
+/// guard to return cluster-queue memory.
+#[derive(Debug)]
+pub struct ClusterQueueBudgetGuard {
+    governor: Governor,
+    ticket: Option<AdmissionTicket>,
+    kind: ClusterQueueAllocationKind,
+    admission_class: ClusterQueueAdmissionClass,
+}
+
+impl ClusterQueueBudgetGuard {
+    fn new(
+        governor: &Governor,
+        ticket: AdmissionTicket,
+        kind: ClusterQueueAllocationKind,
+        admission_class: ClusterQueueAdmissionClass,
+    ) -> Self {
+        debug_assert_eq!(ticket.category, BudgetCategory::ClusterQueues);
+        Self {
+            governor: governor.clone(),
+            ticket: Some(ticket),
+            kind,
+            admission_class,
+        }
+    }
+
+    /// Return the allocation kind charged by this guard.
+    #[must_use]
+    pub const fn kind(&self) -> ClusterQueueAllocationKind {
+        self.kind
+    }
+
+    /// Return the admission class used to acquire this guard.
+    #[must_use]
+    pub const fn admission_class(&self) -> ClusterQueueAdmissionClass {
+        self.admission_class
+    }
+
+    /// Return the number of admitted bytes still held by this guard.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.ticket.as_ref().map_or(0, |ticket| ticket.size)
+    }
+
+    /// Release the governor budget before dropping the guard.
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            self.governor.release(ticket.category, ticket.size);
+        }
+    }
+}
+
+impl Drop for ClusterQueueBudgetGuard {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
 }
 
 /// Capacity values observed at the decision point.
@@ -204,6 +395,9 @@ pub struct SendAdmissionEvidence {
     pub wake: SendWakeEvidence,
     /// Dropped older work, if admission used a drop-oldest policy.
     pub dropped: Vec<DroppedSendEvidence>,
+    /// Observable pressure/refusal reason, when admission was affected by a
+    /// cross-transport resource authority.
+    pub pressure_reason: Option<SendPressureReason>,
 }
 
 impl SendAdmissionEvidence {
@@ -224,6 +418,7 @@ impl SendAdmissionEvidence {
             policy: None,
             wake: SendWakeEvidence::NotApplicable,
             dropped: Vec::new(),
+            pressure_reason: None,
         }
     }
 
@@ -298,6 +493,12 @@ impl SendAdmissionEvidence {
         self.dropped = dropped;
         self
     }
+
+    #[must_use]
+    pub fn with_pressure_reason(mut self, reason: SendPressureReason) -> Self {
+        self.pressure_reason = Some(reason);
+        self
+    }
 }
 
 /// Admission evidence plus an optional accepted/cancelled return value.
@@ -338,5 +539,224 @@ impl<T> SendAdmission<T> {
                 | SendAdmissionOutcome::Blocked
                 | SendAdmissionOutcome::DroppedOldest
         )
+    }
+}
+
+/// Admit a transport allocation against the governor `cluster_queues` budget.
+///
+/// Non-critical work is refused while hard pressure is already active.
+/// Speculative and BULK work are also refused under soft pressure so callers
+/// can shrink speculative windows before consuming more cluster memory.
+#[must_use]
+pub fn admit_cluster_queue_budget(
+    governor: &Governor,
+    bytes: u64,
+    kind: ClusterQueueAllocationKind,
+    admission_class: ClusterQueueAdmissionClass,
+) -> SendAdmission<ClusterQueueBudgetGuard> {
+    let pressure = ClusterQueuePressure::from(governor.backpressure(BudgetCategory::ClusterQueues));
+    if !admission_class.admits_under_pressure(pressure) {
+        let reason = SendPressureReason::cluster_queues(governor, pressure, kind, admission_class);
+        let evidence = cluster_queue_evidence(
+            SendAdmissionOutcome::Backpressured,
+            governor,
+            bytes,
+            Some(reason),
+        )
+        .with_policy(SendAdmissionPolicy::GovernorBudget)
+        .with_wake(SendWakeEvidence::Unavailable);
+        return SendAdmission::without_value(evidence);
+    }
+
+    match governor.admit(BudgetCategory::ClusterQueues, bytes) {
+        Ok(ticket) => {
+            let pressure =
+                ClusterQueuePressure::from(governor.backpressure(BudgetCategory::ClusterQueues));
+            let reason = pressure.is_pressure().then(|| {
+                SendPressureReason::cluster_queues(governor, pressure, kind, admission_class)
+            });
+            let evidence =
+                cluster_queue_evidence(SendAdmissionOutcome::Accepted, governor, bytes, reason)
+                    .with_policy(SendAdmissionPolicy::GovernorBudget);
+            SendAdmission::with_value(
+                evidence,
+                ClusterQueueBudgetGuard::new(governor, ticket, kind, admission_class),
+            )
+        }
+        Err(err) => {
+            let pressure =
+                ClusterQueuePressure::from(governor.backpressure(BudgetCategory::ClusterQueues));
+            let reason = Some(SendPressureReason::cluster_queues(
+                governor,
+                pressure,
+                kind,
+                admission_class,
+            ));
+            let evidence = cluster_queue_budget_error_evidence(err, governor, bytes, reason)
+                .with_policy(SendAdmissionPolicy::GovernorBudget)
+                .with_wake(SendWakeEvidence::Unavailable);
+            SendAdmission::without_value(evidence)
+        }
+    }
+}
+
+fn cluster_queue_budget_error_evidence(
+    err: BudgetError,
+    governor: &Governor,
+    requested: u64,
+    reason: Option<SendPressureReason>,
+) -> SendAdmissionEvidence {
+    let available = match err {
+        BudgetError::OverBudget { available, .. }
+        | BudgetError::GlobalOverBudget { available, .. } => Some(saturating_usize(available)),
+        BudgetError::UnknownCategory => None,
+    };
+    let mut evidence = SendAdmissionEvidence::new(SendAdmissionOutcome::Backpressured)
+        .with_capacity(SendCapacityEvidence::new(
+            SendCapacityClass::GovernorClusterQueues,
+            saturating_usize(governor.category_used(BudgetCategory::ClusterQueues)),
+            Some(saturating_usize(requested)),
+            Some(saturating_usize(
+                governor.category_cap(BudgetCategory::ClusterQueues),
+            )),
+        ));
+    if let Some(reason) = reason {
+        evidence = evidence.with_pressure_reason(reason);
+    }
+    if let Some(available) = available {
+        evidence.byte_depth = Some(available);
+    }
+    evidence
+}
+
+fn cluster_queue_evidence(
+    outcome: SendAdmissionOutcome,
+    governor: &Governor,
+    requested: u64,
+    reason: Option<SendPressureReason>,
+) -> SendAdmissionEvidence {
+    let mut evidence =
+        SendAdmissionEvidence::new(outcome).with_capacity(SendCapacityEvidence::new(
+            SendCapacityClass::GovernorClusterQueues,
+            saturating_usize(governor.category_used(BudgetCategory::ClusterQueues)),
+            Some(saturating_usize(requested)),
+            Some(saturating_usize(
+                governor.category_cap(BudgetCategory::ClusterQueues),
+            )),
+        ));
+    if let Some(reason) = reason {
+        evidence = evidence.with_pressure_reason(reason);
+    }
+    evidence
+}
+
+fn saturating_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tidefs_cache_core::GovernorConfig;
+
+    fn cluster_only_governor() -> Governor {
+        Governor::new(GovernorConfig {
+            total_budget_bytes: 1_000,
+            data_cache_fraction: 0.0,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 1.0,
+            misc_fraction: 0.0,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn cluster_queue_guard_releases_budget_on_drop() {
+        let governor = cluster_only_governor();
+
+        let admission = admit_cluster_queue_budget(
+            &governor,
+            128,
+            ClusterQueueAllocationKind::DedupWindow,
+            ClusterQueueAdmissionClass::Normal,
+        );
+
+        assert!(admission.admitted());
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 128);
+        drop(admission.value);
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 0);
+    }
+
+    #[test]
+    fn soft_pressure_refuses_bulk_and_reports_reason() {
+        let governor = cluster_only_governor();
+        let _held = governor
+            .admit(BudgetCategory::ClusterQueues, 701)
+            .expect("seed soft pressure");
+
+        let admission = admit_cluster_queue_budget(
+            &governor,
+            1,
+            ClusterQueueAllocationKind::BulkTransferToken,
+            ClusterQueueAdmissionClass::Bulk,
+        );
+
+        assert!(!admission.admitted());
+        assert_eq!(
+            admission.evidence.outcome,
+            SendAdmissionOutcome::Backpressured
+        );
+        assert_eq!(
+            admission.evidence.policy,
+            Some(SendAdmissionPolicy::GovernorBudget)
+        );
+        assert!(matches!(
+            admission.evidence.pressure_reason,
+            Some(SendPressureReason::ClusterQueues {
+                pressure: ClusterQueuePressure::SoftPressure,
+                kind: ClusterQueueAllocationKind::BulkTransferToken,
+                admission_class: ClusterQueueAdmissionClass::Bulk,
+                ..
+            })
+        ));
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 701);
+    }
+
+    #[test]
+    fn hard_pressure_refuses_non_critical_but_preserves_critical_admission() {
+        let governor = cluster_only_governor();
+        let _held = governor
+            .admit(BudgetCategory::ClusterQueues, 950)
+            .expect("seed hard pressure");
+
+        let refused = admit_cluster_queue_budget(
+            &governor,
+            1,
+            ClusterQueueAllocationKind::RpcFrame,
+            ClusterQueueAdmissionClass::Normal,
+        );
+        assert!(!refused.admitted());
+        assert!(matches!(
+            refused.evidence.pressure_reason,
+            Some(SendPressureReason::ClusterQueues {
+                pressure: ClusterQueuePressure::HardPressure,
+                admission_class: ClusterQueueAdmissionClass::Normal,
+                ..
+            })
+        ));
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 950);
+
+        let critical = admit_cluster_queue_budget(
+            &governor,
+            1,
+            ClusterQueueAllocationKind::RpcFrame,
+            ClusterQueueAdmissionClass::Critical,
+        );
+        assert!(critical.admitted());
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 951);
+        drop(critical.value);
+        assert_eq!(governor.category_used(BudgetCategory::ClusterQueues), 950);
     }
 }

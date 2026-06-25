@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
+use crate::send_admission::ClusterQueuePressure;
 use crate::send_admission::SendWakeEvidence;
 use crate::send_scheduler::SendPriority;
 
@@ -136,6 +137,23 @@ impl SendWatermarkConfig {
         Ok(())
     }
 
+    /// Return this config with high/low watermarks reduced for observed
+    /// governor `cluster_queues` pressure.
+    ///
+    /// A zero high watermark remains disabled. Soft pressure halves the
+    /// window; hard pressure leaves only a minimal drain/receipt window so
+    /// producers see pressure quickly without closing the transport path.
+    #[must_use]
+    pub fn adjusted_for_cluster_pressure(&self, pressure: ClusterQueuePressure) -> Self {
+        let mut adjusted = self.clone();
+        for priority in SendPriority::all() {
+            let (high, low) =
+                pressure_adjusted_watermarks(self.high(priority), self.low(priority), pressure);
+            adjusted.set(priority, high, low);
+        }
+        adjusted
+    }
+
     /// Get the high watermark for a given priority class.
     pub fn high(&self, pri: SendPriority) -> usize {
         match pri {
@@ -162,6 +180,49 @@ impl SendWatermarkConfig {
     pub fn is_enabled(&self, pri: SendPriority) -> bool {
         self.high(pri) > 0
     }
+
+    fn set(&mut self, pri: SendPriority, high: usize, low: usize) {
+        match pri {
+            SendPriority::Control => {
+                self.control_high = high;
+                self.control_low = low;
+            }
+            SendPriority::Membership => {
+                self.membership_high = high;
+                self.membership_low = low;
+            }
+            SendPriority::IntentLog => {
+                self.intent_log_high = high;
+                self.intent_log_low = low;
+            }
+            SendPriority::Data => {
+                self.data_high = high;
+                self.data_low = low;
+            }
+            SendPriority::Bulk => {
+                self.bulk_high = high;
+                self.bulk_low = low;
+            }
+        }
+    }
+}
+
+fn pressure_adjusted_watermarks(
+    high: usize,
+    low: usize,
+    pressure: ClusterQueuePressure,
+) -> (usize, usize) {
+    if high == 0 {
+        return (0, 0);
+    }
+    let scale = match pressure {
+        ClusterQueuePressure::None => return (high, low),
+        ClusterQueuePressure::SoftPressure => 2,
+        ClusterQueuePressure::HardPressure => 4,
+    };
+    let adjusted_high = (high / scale).max(1);
+    let adjusted_low = (low / scale).min(adjusted_high.saturating_sub(1));
+    (adjusted_high, adjusted_low)
 }
 
 // ---------------------------------------------------------------------------
@@ -306,9 +367,20 @@ impl SendCapacitySet {
     /// signals available. If `depth` ≥ high watermark and not already
     /// under pressure, signals full.
     pub fn check_after_dequeue(&self, pri: SendPriority, depth: usize) {
+        self.check_after_dequeue_with_cluster_pressure(pri, depth, ClusterQueuePressure::None);
+    }
+
+    /// Check watermarks using pressure-adjusted high/low values from the
+    /// unified governor `cluster_queues` budget.
+    pub fn check_after_dequeue_with_cluster_pressure(
+        &self,
+        pri: SendPriority,
+        depth: usize,
+        pressure: ClusterQueuePressure,
+    ) {
         let idx = pri as usize;
-        let high = self.config.high(pri);
-        let low = self.config.low(pri);
+        let (high, low) =
+            pressure_adjusted_watermarks(self.config.high(pri), self.config.low(pri), pressure);
         self.depths[idx].store(depth, std::sync::atomic::Ordering::Release);
 
         if high == 0 {
@@ -689,5 +761,42 @@ mod tests {
         let cfg = SendWatermarkConfig::default();
         let set = SendCapacitySet::new(&cfg);
         assert_eq!(set.config().control_high, 48);
+    }
+
+    #[test]
+    fn cluster_pressure_adjusts_watermark_config() {
+        let cfg = SendWatermarkConfig::uniform(100, 20);
+
+        let soft = cfg.adjusted_for_cluster_pressure(ClusterQueuePressure::SoftPressure);
+        assert_eq!(soft.high(SendPriority::Data), 50);
+        assert_eq!(soft.low(SendPriority::Data), 10);
+
+        let hard = cfg.adjusted_for_cluster_pressure(ClusterQueuePressure::HardPressure);
+        assert_eq!(hard.high(SendPriority::Bulk), 25);
+        assert_eq!(hard.low(SendPriority::Bulk), 5);
+    }
+
+    #[tokio::test]
+    async fn pressure_adjusted_check_marks_queue_full_earlier() {
+        let cfg = SendWatermarkConfig::uniform(10, 4);
+        let set = SendCapacitySet::new(&cfg);
+        let cap = set.capacity(SendPriority::Bulk);
+
+        set.check_after_dequeue(SendPriority::Bulk, 6);
+        assert!(cap.is_available());
+
+        set.check_after_dequeue_with_cluster_pressure(
+            SendPriority::Bulk,
+            6,
+            ClusterQueuePressure::SoftPressure,
+        );
+        assert!(!cap.is_available());
+
+        set.check_after_dequeue_with_cluster_pressure(
+            SendPriority::Bulk,
+            2,
+            ClusterQueuePressure::SoftPressure,
+        );
+        assert!(cap.is_available());
     }
 }

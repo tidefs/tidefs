@@ -69,6 +69,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use tidefs_membership_epoch::MemberId;
 
+use crate::send_admission::ClusterQueuePressure;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -212,10 +214,62 @@ impl CreditWindow {
         self.max_window_bytes.saturating_sub(self.available_credits)
     }
 
+    /// Return the effective receive-window cap after applying governor
+    /// `cluster_queues` pressure.
+    #[must_use]
+    pub fn max_window_bytes_under_cluster_pressure(&self, pressure: ClusterQueuePressure) -> u64 {
+        pressure_adjusted_window_bytes(self.max_window_bytes, pressure)
+    }
+
+    /// Return the effective low watermark after applying governor
+    /// `cluster_queues` pressure.
+    #[must_use]
+    pub fn low_watermark_under_cluster_pressure(&self, pressure: ClusterQueuePressure) -> u64 {
+        pressure_adjusted_low_watermark(self.low_watermark, pressure)
+    }
+
+    /// Return the credits that should be advertised under governor
+    /// `cluster_queues` pressure.
+    #[must_use]
+    pub fn advertised_credits_under_cluster_pressure(&self, pressure: ClusterQueuePressure) -> u64 {
+        self.available_credits
+            .min(self.max_window_bytes_under_cluster_pressure(pressure))
+    }
+
+    /// Compute how many credits to grant to refill the pressure-adjusted
+    /// window.
+    #[must_use]
+    pub fn refill_amount_under_cluster_pressure(&self, pressure: ClusterQueuePressure) -> u64 {
+        self.max_window_bytes_under_cluster_pressure(pressure)
+            .saturating_sub(self.advertised_credits_under_cluster_pressure(pressure))
+    }
+
     /// Whether the window is fully exhausted.
     #[must_use]
     pub fn is_exhausted(&self) -> bool {
         self.available_credits == 0
+    }
+}
+
+fn pressure_adjusted_window_bytes(bytes: u64, pressure: ClusterQueuePressure) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    match pressure {
+        ClusterQueuePressure::None => bytes,
+        ClusterQueuePressure::SoftPressure => (bytes / 2).max(1),
+        ClusterQueuePressure::HardPressure => (bytes / 4).max(1),
+    }
+}
+
+fn pressure_adjusted_low_watermark(bytes: u64, pressure: ClusterQueuePressure) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    match pressure {
+        ClusterQueuePressure::None => bytes,
+        ClusterQueuePressure::SoftPressure => (bytes / 2).max(1),
+        ClusterQueuePressure::HardPressure => (bytes / 4).max(1),
     }
 }
 
@@ -312,6 +366,37 @@ impl FlowController {
         }
         // Refill immediately so we don't double-grant.
         self.window.grant(credits);
+        let frame = FlowControlFrame::CreditGrant {
+            stream_id: self.stream_id,
+            credits,
+        };
+        self.next_grant_seq = self.next_grant_seq.wrapping_add(1);
+        Some(frame)
+    }
+
+    /// Build a credit grant capped by governor `cluster_queues` pressure.
+    ///
+    /// This preserves the existing flow-control semantics while advertising a
+    /// reduced receive window under memory pressure.
+    #[must_use]
+    pub fn maybe_send_credit_grant_under_cluster_pressure(
+        &mut self,
+        pressure: ClusterQueuePressure,
+    ) -> Option<FlowControlFrame> {
+        let available = self
+            .window
+            .advertised_credits_under_cluster_pressure(pressure);
+        let low = self.window.low_watermark_under_cluster_pressure(pressure);
+        if available >= low {
+            return None;
+        }
+        let credits = self.window.refill_amount_under_cluster_pressure(pressure);
+        if credits == 0 {
+            return None;
+        }
+        self.window.available_credits = self
+            .window
+            .max_window_bytes_under_cluster_pressure(pressure);
         let frame = FlowControlFrame::CreditGrant {
             stream_id: self.stream_id,
             credits,
@@ -2717,5 +2802,47 @@ mod tests {
         // Helper produces same result
         let helper_frame = build_window_advertisement(65536);
         assert_eq!(encoded, helper_frame);
+    }
+
+    #[test]
+    fn cluster_pressure_reduces_advertised_receive_window() {
+        let mut window = CreditWindow::new(100, 40);
+        window.consume(30).unwrap();
+
+        assert_eq!(
+            window.max_window_bytes_under_cluster_pressure(ClusterQueuePressure::None),
+            100
+        );
+        assert_eq!(
+            window.max_window_bytes_under_cluster_pressure(ClusterQueuePressure::SoftPressure),
+            50
+        );
+        assert_eq!(
+            window.advertised_credits_under_cluster_pressure(ClusterQueuePressure::SoftPressure),
+            50
+        );
+        assert_eq!(
+            window.max_window_bytes_under_cluster_pressure(ClusterQueuePressure::HardPressure),
+            25
+        );
+    }
+
+    #[test]
+    fn pressure_aware_credit_grant_refills_only_reduced_window() {
+        let mut controller = FlowController::new(7, CreditWindow::new(100, 40));
+        controller.consume_credits(90).unwrap();
+
+        let grant = controller
+            .maybe_send_credit_grant_under_cluster_pressure(ClusterQueuePressure::SoftPressure)
+            .unwrap();
+
+        assert_eq!(
+            grant,
+            FlowControlFrame::CreditGrant {
+                stream_id: 7,
+                credits: 40
+            }
+        );
+        assert_eq!(controller.window.available_credits, 50);
     }
 }
