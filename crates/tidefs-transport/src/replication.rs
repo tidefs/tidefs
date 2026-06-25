@@ -143,6 +143,7 @@ impl ScrubComparisonResponse {
     #[must_use]
     pub fn echoes_probe_identity(&self, probe: &ScrubComparisonProbe) -> bool {
         self.correlation_id == probe.correlation_id
+            && self.responder_peer_id == probe.target_peer_id
             && self.subject == probe.subject
             && self.object_key == probe.object_key
             && self.checksum_layer == probe.checksum_layer
@@ -546,6 +547,9 @@ mod tests {
         };
         assert!(response.echoes_probe_identity(&probe));
         response.placement_receipt_ref.receipt_generation += 1;
+        assert!(!response.echoes_probe_identity(&probe));
+        response.placement_receipt_ref.receipt_generation -= 1;
+        response.responder_peer_id += 1;
         assert!(!response.echoes_probe_identity(&probe));
     }
 

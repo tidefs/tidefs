@@ -238,6 +238,7 @@ impl ScrubComparisonResponse {
     #[must_use]
     pub fn echoes_probe_identity(&self, probe: &ScrubComparisonProbe) -> bool {
         self.correlation_id == probe.correlation_id
+            && self.responder_peer_id == probe.target_peer_id
             && self.subject == probe.subject
             && self.object_key == probe.object_key
             && self.checksum_layer == probe.checksum_layer
@@ -1307,6 +1308,10 @@ mod tests {
         let mut stale_response = response.clone();
         stale_response.object_key = mk_key(b"other-object").as_bytes32();
         assert!(!stale_response.echoes_probe_identity(probe));
+
+        let mut wrong_responder = response.clone();
+        wrong_responder.responder_peer_id = 999;
+        assert!(!wrong_responder.echoes_probe_identity(probe));
     }
 
     #[test]
