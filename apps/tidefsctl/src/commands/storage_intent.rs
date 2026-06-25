@@ -660,6 +660,7 @@ fn policy_document_from_set(args: &StorageIntentPolicySetArgs) -> PolicySourceDo
 fn policy_document_from_clear(args: &StorageIntentPolicyClearArgs) -> PolicySourceDocument {
     let target = parse_policy_target(&args.target, "clear");
     let budget_owner = format!("{}/{}", target.pool, target.dataset);
+    let revision = args.revision.to_string();
 
     PolicySourceDocument {
         version: POLICY_SOURCE_DOCUMENT_VERSION,
@@ -671,7 +672,7 @@ fn policy_document_from_clear(args: &StorageIntentPolicyClearArgs) -> PolicySour
         revision: args.revision,
         generation: args.revision,
         epoch: args.revision,
-        policy_id: deterministic_id_hex("policy-clear", &[&args.target, &args.revision.to_string()]),
+        policy_id: deterministic_id_hex("policy-clear", &[&args.target, &revision]),
         pool_id: deterministic_id_hex("pool", &[&target.pool]),
         dataset_id: deterministic_id_hex("dataset", &[&args.target]),
         budget_owner_id: deterministic_id_hex("budget-owner", &[&budget_owner]),
@@ -1238,11 +1239,11 @@ fn render_policy_dry_run_text(report: &PolicyDryRunReport) -> String {
     ));
     out.push_str(&format!(
         "    allowed-actions: {}\n",
-        comma_or_none(&report.envelope.allowed_actions)
+        comma_or_none(report.envelope.allowed_actions.iter().map(String::as_str))
     ));
     out.push_str(&format!(
         "    flags: {}\n",
-        comma_or_none(&report.envelope.flags)
+        comma_or_none(report.envelope.flags.iter().map(String::as_str))
     ));
     out.push_str(&format!(
         "    caps: prefetch={} staging={}\n",
@@ -1355,34 +1356,32 @@ fn policy_change_class_label(class: PolicySourceChangeClass) -> &'static str {
 }
 
 fn rollout_requirements_label(requirements: StorageIntentPolicyRolloutRequirements) -> String {
-    let mut labels = Vec::new();
-    for (flag, label) in [
-        (
-            StorageIntentPolicyRolloutRequirements::OPERATOR_CONSENT,
-            "operator-consent",
-        ),
-        (
-            StorageIntentPolicyRolloutRequirements::NEW_WRITES_ONLY,
-            "new-writes-only",
-        ),
-        (
-            StorageIntentPolicyRolloutRequirements::RECEIPT_VISIBLE_DEGRADATION,
-            "receipt-visible-degradation",
-        ),
-        (
-            StorageIntentPolicyRolloutRequirements::CONVERGENCE_REQUIRED,
-            "convergence-required",
-        ),
-        (
-            StorageIntentPolicyRolloutRequirements::ROLLOUT_EVIDENCE,
-            "rollout-evidence",
-        ),
-    ] {
-        if requirements.contains_all(flag) {
-            labels.push(label.to_string());
-        }
-    }
-    comma_or_none(&labels)
+    comma_or_none(
+        [
+            (
+                StorageIntentPolicyRolloutRequirements::OPERATOR_CONSENT,
+                "operator-consent",
+            ),
+            (
+                StorageIntentPolicyRolloutRequirements::NEW_WRITES_ONLY,
+                "new-writes-only",
+            ),
+            (
+                StorageIntentPolicyRolloutRequirements::RECEIPT_VISIBLE_DEGRADATION,
+                "receipt-visible-degradation",
+            ),
+            (
+                StorageIntentPolicyRolloutRequirements::CONVERGENCE_REQUIRED,
+                "convergence-required",
+            ),
+            (
+                StorageIntentPolicyRolloutRequirements::ROLLOUT_EVIDENCE,
+                "rollout-evidence",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(flag, label)| requirements.contains_all(flag).then_some(label)),
+    )
 }
 
 fn policy_source_state_label(state: PolicySourceState) -> &'static str {
@@ -1393,27 +1392,25 @@ fn policy_source_state_label(state: PolicySourceState) -> &'static str {
 }
 
 fn policy_action_args_label(actions: &[PolicyActionArg]) -> String {
-    let labels = actions
-        .iter()
-        .map(|action| action.to_candidate().as_str().to_string())
-        .collect::<Vec<_>>();
-    comma_or_none(&labels)
+    comma_or_none(actions.iter().map(|action| action.to_candidate().as_str()))
 }
 
 fn policy_flag_args_label(flags: &[PolicyFlagArg]) -> String {
-    let labels = flags
-        .iter()
-        .map(|flag| flag.label().to_string())
-        .collect::<Vec<_>>();
-    comma_or_none(&labels)
+    comma_or_none(flags.iter().map(|flag| flag.label()))
 }
 
-fn comma_or_none(values: &[String]) -> String {
-    if values.is_empty() {
-        "none".to_string()
-    } else {
-        values.join(",")
+fn comma_or_none<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    let mut values = values.into_iter();
+    let Some(first) = values.next() else {
+        return "none".to_string();
+    };
+
+    let mut out = first.to_string();
+    for value in values {
+        out.push(',');
+        out.push_str(value);
     }
+    out
 }
 
 fn policy_limit_label(value: u64) -> String {
