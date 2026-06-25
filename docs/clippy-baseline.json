@@ -236,7 +236,7 @@
       "exit_code": 0
     },
     "tidefs-kmod-posix-vfs": {
-      "warnings": 125,
+      "warnings": 126,
       "exit_code": 0
     },
     "tidefs-lease": {
@@ -248,7 +248,7 @@
       "exit_code": 0
     },
     "tidefs-local-filesystem": {
-      "warnings": 163,
+      "warnings": 165,
       "exit_code": 0
     },
     "tidefs-local-object-store": {
@@ -436,7 +436,7 @@
       "exit_code": 0
     },
     "tidefs-scrub": {
-      "warnings": 112,
+      "warnings": 113,
       "exit_code": 0
     },
     "tidefs-scrub-core": {
@@ -500,7 +500,7 @@
       "exit_code": 0
     },
     "tidefs-storage-node": {
-      "warnings": 176,
+      "warnings": 177,
       "exit_code": 0
     },
     "tidefs-store-demo": {
@@ -512,7 +512,7 @@
       "exit_code": 0
     },
     "tidefs-trace-oracle": {
-      "warnings": 112,
+      "warnings": 113,
       "exit_code": 0
     },
     "tidefs-transport": {
@@ -632,7 +632,7 @@
       "exit_code": 0
     },
     "tidefs-xtask": {
-      "warnings": 138,
+      "warnings": 139,
       "exit_code": 0
     },
     "tidefsctl": {
