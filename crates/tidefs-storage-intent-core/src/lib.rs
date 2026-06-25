@@ -19131,6 +19131,1105 @@ pub const fn metadata_namespace_evidence_is_usable(
     }
     ReceiptPredicateResult::SATISFIED
 }
+
+// ===== Storage Intent Preflight Simulation Evidence (Issue #926) =====
+
+/// Zero-value evidence ref sentinel.
+const PREFLIGHT_EMPTY_EVIDENCE_REF: StorageIntentEvidenceRef = StorageIntentEvidenceRef {
+    kind: StorageIntentEvidenceKind::Unknown,
+    id: StorageIntentEvidenceId::ZERO,
+    generation: 0,
+    version: 0,
+};
+
+
+/// Fidelity class of a preflight simulation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentPreflightFidelityClass {
+    /// Unknown or unset fidelity.
+    #[default]
+    Unknown = 0,
+    /// Static policy compile preview: no live evidence.
+    StaticPolicyCompile = 1,
+    /// Evidence-snapshot scoring preview: single-epoch evidence snapshot.
+    EvidenceSnapshotScoring = 2,
+    /// Sampled/cohort dry-run: representative subset of the scope.
+    SampledCohortDryRun = 3,
+    /// Shadow execution without authority change.
+    ShadowExecution = 4,
+    /// Staged preflight with reserved-but-unspent budgets.
+    StagedPreflightReservedUnspent = 5,
+}
+
+impl StorageIntentPreflightFidelityClass {
+    /// Number of defined fidelity classes (excluding Unknown).
+    pub const COUNT: usize = 6;
+
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::StaticPolicyCompile => "static-policy-compile",
+            Self::EvidenceSnapshotScoring => "evidence-snapshot-scoring",
+            Self::SampledCohortDryRun => "sampled-cohort-dry-run",
+            Self::ShadowExecution => "shadow-execution",
+            Self::StagedPreflightReservedUnspent => "staged-preflight-reserved-unspent",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::StaticPolicyCompile),
+            2 => Some(Self::EvidenceSnapshotScoring),
+            3 => Some(Self::SampledCohortDryRun),
+            4 => Some(Self::ShadowExecution),
+            5 => Some(Self::StagedPreflightReservedUnspent),
+            _ => None,
+        }
+    }
+
+    /// Returns true when the simulation involves any live evidence.
+    #[must_use]
+    pub const fn involves_live_evidence(self) -> bool {
+        matches!(
+            self,
+            Self::EvidenceSnapshotScoring
+                | Self::SampledCohortDryRun
+                | Self::ShadowExecution
+                | Self::StagedPreflightReservedUnspent
+        )
+    }
+
+    /// Returns true when the simulation reserves budgets or resources.
+    #[must_use]
+    pub const fn reserves_budgets(self) -> bool {
+        matches!(self, Self::StagedPreflightReservedUnspent)
+    }
+
+    /// Returns true when the simulation may execute shadow work.
+    #[must_use]
+    pub const fn may_execute_shadow_work(self) -> bool {
+        matches!(self, Self::ShadowExecution | Self::StagedPreflightReservedUnspent)
+    }
+}
+
+impl fmt::Display for StorageIntentPreflightFidelityClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Recommendation state for a preflight simulation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentPreflightRecommendation {
+    /// Unknown or unset recommendation.
+    #[default]
+    Unknown = 0,
+    /// Safe to stage or activate the proposed revision.
+    SafeToStage = 1,
+    /// Shadow-only: must run shadow before activation.
+    ShadowOnly = 2,
+    /// Requires a representative sample before staging.
+    RequireSample = 3,
+    /// Requires operator review before proceeding.
+    RequireOperatorReview = 4,
+    /// Blocked: cannot activate with this evidence.
+    Blocked = 5,
+    /// Refused: the simulation itself was refused or invalid.
+    Refused = 6,
+    /// Rollback risk: activation may need a rollback plan.
+    RollbackRisk = 7,
+    /// Superseded: a newer simulation exists.
+    Superseded = 8,
+    /// Expired: the simulation temporal window has passed.
+    Expired = 9,
+    /// Non-representative: simulation scope or evidence is not representative.
+    NonRepresentative = 10,
+}
+
+impl StorageIntentPreflightRecommendation {
+    /// Number of defined recommendation states (excluding Unknown).
+    pub const COUNT: usize = 11;
+
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::SafeToStage => "safe-to-stage",
+            Self::ShadowOnly => "shadow-only",
+            Self::RequireSample => "require-sample",
+            Self::RequireOperatorReview => "require-operator-review",
+            Self::Blocked => "blocked",
+            Self::Refused => "refused",
+            Self::RollbackRisk => "rollback-risk",
+            Self::Superseded => "superseded",
+            Self::Expired => "expired",
+            Self::NonRepresentative => "non-representative",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::SafeToStage),
+            2 => Some(Self::ShadowOnly),
+            3 => Some(Self::RequireSample),
+            4 => Some(Self::RequireOperatorReview),
+            5 => Some(Self::Blocked),
+            6 => Some(Self::Refused),
+            7 => Some(Self::RollbackRisk),
+            8 => Some(Self::Superseded),
+            9 => Some(Self::Expired),
+            10 => Some(Self::NonRepresentative),
+            _ => None,
+        }
+    }
+
+    /// Returns true when the recommendation permits staging.
+    #[must_use]
+    pub const fn permits_staging(self) -> bool {
+        matches!(self, Self::SafeToStage)
+    }
+
+    /// Returns true when the recommendation requires no further action.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Blocked | Self::Refused | Self::Superseded | Self::Expired
+        )
+    }
+
+    /// Returns true when the recommendation is degraded by coverage issues.
+    #[must_use]
+    pub const fn is_degraded(self) -> bool {
+        matches!(
+            self,
+            Self::ShadowOnly
+                | Self::RequireSample
+                | Self::RequireOperatorReview
+                | Self::RollbackRisk
+                | Self::NonRepresentative
+        )
+    }
+}
+
+impl fmt::Display for StorageIntentPreflightRecommendation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ===== Preflight activation blocker dimensions =====
+
+/// Maximum activation blockers retained by one simulation.
+pub const STORAGE_INTENT_PREFLIGHT_ACTIVATION_BLOCKERS: usize = 20;
+
+/// Hard-gate dimensions that can block activation of a preflight simulation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentPreflightActivationBlockerKind {
+    #[default]
+    Unknown = 0,
+    /// Guarantee floor cannot be satisfied.
+    Guarantee = 1,
+    /// Ordering or replay barrier evidence is insufficient.
+    Ordering = 2,
+    /// Membership, quorum, or fence evidence is insufficient.
+    Membership = 3,
+    /// Trust, domain, or authorization evidence is insufficient.
+    TrustDomain = 4,
+    /// Temporal evidence is stale, skewed, or missing.
+    Temporal = 5,
+    /// Media capability evidence is insufficient for the role.
+    MediaCapability = 6,
+    /// Data shape constraints would be violated.
+    DataShape = 7,
+    /// Layout or allocator constraints would be violated.
+    Layout = 8,
+    /// Lifecycle or generation constraints would be violated.
+    Lifecycle = 9,
+    /// Capacity headroom or reserve would be exhausted.
+    Capacity = 10,
+    /// Recovery or degradation state blocks the change.
+    Recovery = 11,
+    /// Policy rollout stage or convergence blocks the change.
+    Rollout = 12,
+    /// Tenant isolation or budget-owner constraints would be violated.
+    Isolation = 13,
+    /// Prediction or action-class constraints block the change.
+    PredictionActionClass = 14,
+    /// Transport path, latency, or route constraints would be violated.
+    Transport = 15,
+    /// Flash wear budget would be exceeded.
+    Wear = 16,
+    /// Cost budget would be exceeded.
+    Cost = 17,
+    /// Metadata or namespace constraints would be violated.
+    MetadataNamespace = 18,
+    /// Service objective would not be met.
+    ServiceObjective = 19,
+    /// Validation evidence is insufficient.
+    Validation = 20,
+    /// Retention or proof-lifetime constraints would be violated.
+    Retention = 21,
+    /// Operator policy explicitly blocks the change.
+    OperatorPolicy = 22,
+}
+
+impl StorageIntentPreflightActivationBlockerKind {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Guarantee => "guarantee",
+            Self::Ordering => "ordering",
+            Self::Membership => "membership",
+            Self::TrustDomain => "trust-domain",
+            Self::Temporal => "temporal",
+            Self::MediaCapability => "media-capability",
+            Self::DataShape => "data-shape",
+            Self::Layout => "layout",
+            Self::Lifecycle => "lifecycle",
+            Self::Capacity => "capacity",
+            Self::Recovery => "recovery",
+            Self::Rollout => "rollout",
+            Self::Isolation => "isolation",
+            Self::PredictionActionClass => "prediction-action-class",
+            Self::Transport => "transport",
+            Self::Wear => "wear",
+            Self::Cost => "cost",
+            Self::MetadataNamespace => "metadata-namespace",
+            Self::ServiceObjective => "service-objective",
+            Self::Validation => "validation",
+            Self::Retention => "retention",
+            Self::OperatorPolicy => "operator-policy",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Guarantee),
+            2 => Some(Self::Ordering),
+            3 => Some(Self::Membership),
+            4 => Some(Self::TrustDomain),
+            5 => Some(Self::Temporal),
+            6 => Some(Self::MediaCapability),
+            7 => Some(Self::DataShape),
+            8 => Some(Self::Layout),
+            9 => Some(Self::Lifecycle),
+            10 => Some(Self::Capacity),
+            11 => Some(Self::Recovery),
+            12 => Some(Self::Rollout),
+            13 => Some(Self::Isolation),
+            14 => Some(Self::PredictionActionClass),
+            15 => Some(Self::Transport),
+            16 => Some(Self::Wear),
+            17 => Some(Self::Cost),
+            18 => Some(Self::MetadataNamespace),
+            19 => Some(Self::ServiceObjective),
+            20 => Some(Self::Validation),
+            21 => Some(Self::Retention),
+            22 => Some(Self::OperatorPolicy),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for StorageIntentPreflightActivationBlockerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One retained activation-blocker verdict from a preflight simulation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentPreflightActivationBlocker {
+    /// Blocker dimension.
+    pub kind: StorageIntentPreflightActivationBlockerKind,
+    /// Whether the gate passed, failed, is blocked, or was refused.
+    pub verdict: StorageIntentDecisionHardGateVerdict,
+    /// Refusal reason when the gate did not pass.
+    pub refusal: StorageIntentRefusalReason,
+    /// Evidence reference that supports or refuses the verdict.
+    pub evidence_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentPreflightActivationBlocker {
+    pub const EMPTY: Self = Self {
+        kind: StorageIntentPreflightActivationBlockerKind::Unknown,
+        verdict: StorageIntentDecisionHardGateVerdict::Unknown,
+        refusal: StorageIntentRefusalReason::None,
+        evidence_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+    };
+
+    /// Returns true when this blocker would prevent activation.
+    #[must_use]
+    pub const fn blocks_activation(self) -> bool {
+        !self.verdict.admits_scoring()
+            || self.refusal as u16 != StorageIntentRefusalReason::None as u16
+    }
+}
+
+// ===== Preflight projected deltas =====
+
+/// Maximum metric entries in one projected-delta vector.
+pub const STORAGE_INTENT_PREFLIGHT_PROJECTED_DELTA_ENTRIES: usize = 24;
+
+/// Projected delta dimension for a preflight simulation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentPreflightProjectedDeltaKind {
+    #[default]
+    Unknown = 0,
+    /// Bytes moved (logical).
+    BytesMoved = 1,
+    /// Metadata writes (count).
+    MetadataWrites = 2,
+    /// Signal-persistence writes (count).
+    SignalPersistenceWrites = 3,
+    /// Logical write amplification factor * 100.
+    LogicalWriteAmplification = 4,
+    /// Physical write amplification factor * 100.
+    PhysicalWriteAmplification = 5,
+    /// Flash wear (program/erase cycles).
+    FlashWear = 6,
+    /// Capacity headroom change in bytes.
+    CapacityHeadroomBytes = 7,
+    /// Reserve consumption in bytes.
+    ReserveConsumptionBytes = 8,
+    /// Dirty bytes pending writeback.
+    DirtyBytes = 9,
+    /// Memory bytes consumed.
+    MemoryBytes = 10,
+    /// CPU seconds consumed.
+    CpuSeconds = 11,
+    /// Read amplification factor * 100.
+    ReadAmplification = 12,
+    /// Network egress in bytes.
+    NetworkEgressBytes = 13,
+    /// Latency delta in microseconds.
+    LatencyDeltaMicros = 14,
+    /// Tail latency delta in microseconds.
+    TailLatencyDeltaMicros = 15,
+    /// Throughput delta in bytes/second.
+    ThroughputDeltaBytesPerSec = 16,
+    /// RPO lag delta in milliseconds.
+    RpoLagDeltaMs = 17,
+    /// RTO delta in milliseconds.
+    RtoDeltaMs = 18,
+    /// Rebuild or repair risk (0-100 percentage).
+    RebuildRepairRiskPercent = 19,
+    /// Foreground disruption (0-100 percentage).
+    ForegroundDisruptionPercent = 20,
+    /// Tenant-harm score (0-100).
+    TenantHarmScore = 21,
+    /// Operator money cost in micro-units.
+    OperatorMoneyCostMicro = 22,
+    /// Operator power cost in microwatts.
+    OperatorPowerCostMicroW = 23,
+}
+
+impl StorageIntentPreflightProjectedDeltaKind {
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::BytesMoved => "bytes-moved",
+            Self::MetadataWrites => "metadata-writes",
+            Self::SignalPersistenceWrites => "signal-persistence-writes",
+            Self::LogicalWriteAmplification => "logical-write-amplification",
+            Self::PhysicalWriteAmplification => "physical-write-amplification",
+            Self::FlashWear => "flash-wear",
+            Self::CapacityHeadroomBytes => "capacity-headroom-bytes",
+            Self::ReserveConsumptionBytes => "reserve-consumption-bytes",
+            Self::DirtyBytes => "dirty-bytes",
+            Self::MemoryBytes => "memory-bytes",
+            Self::CpuSeconds => "cpu-seconds",
+            Self::ReadAmplification => "read-amplification",
+            Self::NetworkEgressBytes => "network-egress-bytes",
+            Self::LatencyDeltaMicros => "latency-delta-micros",
+            Self::TailLatencyDeltaMicros => "tail-latency-delta-micros",
+            Self::ThroughputDeltaBytesPerSec => "throughput-delta-bytes-per-sec",
+            Self::RpoLagDeltaMs => "rpo-lag-delta-ms",
+            Self::RtoDeltaMs => "rto-delta-ms",
+            Self::RebuildRepairRiskPercent => "rebuild-repair-risk-percent",
+            Self::ForegroundDisruptionPercent => "foreground-disruption-percent",
+            Self::TenantHarmScore => "tenant-harm-score",
+            Self::OperatorMoneyCostMicro => "operator-money-cost-micro",
+            Self::OperatorPowerCostMicroW => "operator-power-cost-micro-w",
+        }
+    }
+
+    /// Encode to a stable discriminant.
+    #[must_use]
+    pub const fn to_discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from a stable discriminant. Unknown values fail closed.
+    #[must_use]
+    pub const fn from_discriminant(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::BytesMoved),
+            2 => Some(Self::MetadataWrites),
+            3 => Some(Self::SignalPersistenceWrites),
+            4 => Some(Self::LogicalWriteAmplification),
+            5 => Some(Self::PhysicalWriteAmplification),
+            6 => Some(Self::FlashWear),
+            7 => Some(Self::CapacityHeadroomBytes),
+            8 => Some(Self::ReserveConsumptionBytes),
+            9 => Some(Self::DirtyBytes),
+            10 => Some(Self::MemoryBytes),
+            11 => Some(Self::CpuSeconds),
+            12 => Some(Self::ReadAmplification),
+            13 => Some(Self::NetworkEgressBytes),
+            14 => Some(Self::LatencyDeltaMicros),
+            15 => Some(Self::TailLatencyDeltaMicros),
+            16 => Some(Self::ThroughputDeltaBytesPerSec),
+            17 => Some(Self::RpoLagDeltaMs),
+            18 => Some(Self::RtoDeltaMs),
+            19 => Some(Self::RebuildRepairRiskPercent),
+            20 => Some(Self::ForegroundDisruptionPercent),
+            21 => Some(Self::TenantHarmScore),
+            22 => Some(Self::OperatorMoneyCostMicro),
+            23 => Some(Self::OperatorPowerCostMicroW),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for StorageIntentPreflightProjectedDeltaKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One projected delta entry with value and confidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentPreflightProjectedDeltaEntry {
+    /// Delta dimension.
+    pub kind: StorageIntentPreflightProjectedDeltaKind,
+    /// Projected signed delta value.
+    pub value: i64,
+    /// Confidence interval lower bound.
+    pub confidence_low: i64,
+    /// Confidence interval upper bound.
+    pub confidence_high: i64,
+    /// Whether the delta is unknown (evidence insufficient).
+    pub is_unknown: bool,
+}
+
+impl StorageIntentPreflightProjectedDeltaEntry {
+    pub const EMPTY: Self = Self {
+        kind: StorageIntentPreflightProjectedDeltaKind::Unknown,
+        value: 0,
+        confidence_low: 0,
+        confidence_high: 0,
+        is_unknown: true,
+    };
+}
+
+/// Projected deltas from a preflight simulation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentPreflightProjectedDeltas {
+    /// Bounded list of projected delta entries.
+    pub entries: [StorageIntentPreflightProjectedDeltaEntry;
+        STORAGE_INTENT_PREFLIGHT_PROJECTED_DELTA_ENTRIES],
+    /// Number of populated entries.
+    pub len: u8,
+}
+
+impl StorageIntentPreflightProjectedDeltas {
+    pub const EMPTY: Self = Self {
+        entries: [StorageIntentPreflightProjectedDeltaEntry::EMPTY;
+            STORAGE_INTENT_PREFLIGHT_PROJECTED_DELTA_ENTRIES],
+        len: 0,
+    };
+
+    /// Returns true when no deltas are populated.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns true when any delta is unknown.
+    #[must_use]
+    pub const fn has_unknown_delta(self) -> bool {
+        let mut index = 0;
+        while index < self.len as usize && index < STORAGE_INTENT_PREFLIGHT_PROJECTED_DELTA_ENTRIES {
+            if self.entries[index].is_unknown {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+}
+
+// ===== Preflight simulation scope =====
+
+/// Scope of a preflight simulation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentPreflightScope {
+    /// Pool identifier.
+    pub pool_id: StorageIntentEvidenceId,
+    /// Dataset identifier.
+    pub dataset_id: StorageIntentEvidenceId,
+    /// Mount or namespace identifier.
+    pub mount_id: StorageIntentEvidenceId,
+    /// File or object identifier for file/range scope; zero for dataset-wide.
+    pub object_id: StorageIntentEvidenceId,
+    /// Byte range start when scoped to a range.
+    pub range_start: u64,
+    /// Byte range length when scoped to a range; zero for full object.
+    pub range_len: u64,
+    /// Generation or cohort identifier; zero for current.
+    pub generation: u64,
+    /// Tenant identifier.
+    pub tenant_id: StorageIntentDomainId,
+    /// Workload class identifier.
+    pub workload_class: u8,
+    /// Media role scoped by the simulation.
+    pub media_role: StorageMediaRole,
+    /// Proximity class constraint.
+    pub proximity_class: ProximityClass,
+    /// Whether the simulation covers a representative sample.
+    pub is_sampled: bool,
+    /// Sample fraction when sampled (0-100 percentage).
+    pub sample_fraction_percent: u8,
+    /// Coverage verdict.
+    pub coverage_verdict: EvidenceCompletenessVerdict,
+}
+
+impl StorageIntentPreflightScope {
+    pub const EMPTY: Self = Self {
+        pool_id: StorageIntentEvidenceId::ZERO,
+        dataset_id: StorageIntentEvidenceId::ZERO,
+        mount_id: StorageIntentEvidenceId::ZERO,
+        object_id: StorageIntentEvidenceId::ZERO,
+        range_start: 0,
+        range_len: 0,
+        generation: 0,
+        tenant_id: StorageIntentDomainId::ZERO,
+        workload_class: 0,
+        media_role: StorageMediaRole::SyncIntent,
+        proximity_class: ProximityClass::InProcess,
+        is_sampled: false,
+        sample_fraction_percent: 0,
+        coverage_verdict: EvidenceCompletenessVerdict::UnknownEvidence,
+    };
+
+    /// Returns true when the scope is a full pool/dataset scope.
+    #[must_use]
+    pub const fn is_full_scope(self) -> bool {
+        !bytes32_are_zero(self.pool_id.0)
+            && !bytes32_are_zero(self.dataset_id.0)
+            && bytes32_are_zero(self.object_id.0)
+            && self.range_len == 0
+    }
+
+    /// Returns true when the scope is file/range scoped.
+    #[must_use]
+    pub const fn is_file_range_scope(self) -> bool {
+        !bytes32_are_zero(self.object_id.0) && self.range_len > 0
+    }
+}
+
+// ===== Preflight evidence basis =====
+
+/// Evidence references that form the basis of a preflight simulation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentPreflightEvidenceBasis {
+    /// Evidence query snapshot that anchors the evidence cut.
+    pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
+    /// Service objective evidence ref.
+    pub service_objective_ref: StorageIntentEvidenceRef,
+    /// Workload or prediction evidence ref.
+    pub workload_prediction_ref: StorageIntentEvidenceRef,
+    /// Media capability evidence ref.
+    pub media_capability_ref: StorageIntentEvidenceRef,
+    /// Capacity and admission evidence ref.
+    pub capacity_admission_ref: StorageIntentEvidenceRef,
+    /// Tenant isolation evidence ref.
+    pub isolation_ref: StorageIntentEvidenceRef,
+    /// Wear and cost evidence ref.
+    pub wear_cost_ref: StorageIntentEvidenceRef,
+    /// Trust and domain evidence ref.
+    pub trust_domain_ref: StorageIntentEvidenceRef,
+    /// Recovery and degradation evidence ref.
+    pub recovery_degradation_ref: StorageIntentEvidenceRef,
+    /// Policy rollout evidence ref.
+    pub rollout_ref: StorageIntentEvidenceRef,
+    /// Metadata and namespace evidence ref.
+    pub metadata_namespace_ref: StorageIntentEvidenceRef,
+    /// Layout and lifecycle evidence ref.
+    pub layout_lifecycle_ref: StorageIntentEvidenceRef,
+    /// Whether evidence is missing, stale, or refused for any family.
+    pub has_missing_evidence: bool,
+    pub has_stale_evidence: bool,
+    pub has_refused_evidence: bool,
+}
+
+impl StorageIntentPreflightEvidenceBasis {
+    pub const EMPTY: Self = Self {
+        evidence_query_snapshot_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        service_objective_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        workload_prediction_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        media_capability_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        capacity_admission_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        isolation_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        wear_cost_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        trust_domain_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        recovery_degradation_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        rollout_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        metadata_namespace_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        layout_lifecycle_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        has_missing_evidence: false,
+        has_stale_evidence: false,
+        has_refused_evidence: false,
+    };
+
+    /// Returns true when any evidence family is missing, stale, or refused.
+    #[must_use]
+    pub const fn has_degraded_evidence(self) -> bool {
+        self.has_missing_evidence || self.has_stale_evidence || self.has_refused_evidence
+    }
+}
+
+// ===== Preflight simulated decision set =====
+
+/// Maximum decision frontier refs retained by one preflight simulation.
+pub const STORAGE_INTENT_PREFLIGHT_DECISION_REFS: usize =
+    STORAGE_INTENT_DECISION_FRONTIER_CANDIDATES;
+
+/// Summary counts of legal/illegal/unknown/refused decisions in a simulation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentPreflightDecisionSummary {
+    /// Number of legal candidates.
+    pub legal_count: u8,
+    /// Number of illegal candidates.
+    pub illegal_count: u8,
+    /// Number of candidates with unknown status.
+    pub unknown_count: u8,
+    /// Number of refused candidates.
+    pub refused_count: u8,
+    /// Number of candidates that reached scoring.
+    pub scored_count: u8,
+    /// Number of candidates that were selected.
+    pub selected_count: u8,
+}
+
+impl StorageIntentPreflightDecisionSummary {
+    pub const EMPTY: Self = Self {
+        legal_count: 0,
+        illegal_count: 0,
+        unknown_count: 0,
+        refused_count: 0,
+        scored_count: 0,
+        selected_count: 0,
+    };
+
+    /// Returns true when no decision has been simulated.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.legal_count == 0
+            && self.illegal_count == 0
+            && self.unknown_count == 0
+            && self.refused_count == 0
+    }
+
+    /// Returns true when any decision is illegal, unknown, or refused.
+    #[must_use]
+    pub const fn has_non_legal_decision(self) -> bool {
+        self.illegal_count > 0 || self.unknown_count > 0 || self.refused_count > 0
+    }
+
+    /// Total number of simulated decisions.
+    #[must_use]
+    pub const fn total(self) -> u8 {
+        self.legal_count
+            .wrapping_add(self.illegal_count)
+            .wrapping_add(self.unknown_count)
+            .wrapping_add(self.refused_count)
+    }
+}
+
+/// Simulated decision set within a preflight simulation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentPreflightDecisionSet {
+    /// Bounded list of decision frontier evidence refs.
+    pub decision_refs: [StorageIntentEvidenceRef;
+        STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
+    /// Number of populated decision refs.
+    pub decision_len: u8,
+    /// Summary counts across the decision set.
+    pub summary: StorageIntentPreflightDecisionSummary,
+    /// Candidate classes covered by the simulation.
+    pub covered_candidate_classes: [StorageIntentDecisionCandidateClass;
+        STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
+    /// Number of covered candidate classes.
+    pub covered_classes_len: u8,
+}
+
+impl StorageIntentPreflightDecisionSet {
+    pub const EMPTY: Self = Self {
+        decision_refs: [PREFLIGHT_EMPTY_EVIDENCE_REF;
+            STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
+        decision_len: 0,
+        summary: StorageIntentPreflightDecisionSummary::EMPTY,
+        covered_candidate_classes: [StorageIntentDecisionCandidateClass::Unknown;
+            STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
+        covered_classes_len: 0,
+    };
+
+    /// Returns true when no decisions are populated.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.decision_len == 0
+    }
+}
+
+// ===== Preflight non-authority marker =====
+
+/// Non-authority marker proving a simulation cannot carry authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentPreflightNonAuthorityMarker {
+    /// The simulation explicitly denies acknowledgment receipt authority.
+    pub denies_acknowledgment_receipt: bool,
+    /// The simulation explicitly denies placement receipt authority.
+    pub denies_placement_receipt: bool,
+    /// The simulation explicitly denies policy activation authority.
+    pub denies_policy_activation: bool,
+    /// The simulation explicitly denies action execution authority.
+    pub denies_action_execution: bool,
+    /// The simulation explicitly denies satisfaction state authority.
+    pub denies_satisfaction_state: bool,
+    /// The simulation explicitly denies payback closure authority.
+    pub denies_payback_closure: bool,
+    /// The simulation explicitly denies measurement attribution authority.
+    pub denies_measurement_attribution: bool,
+    /// The simulation explicitly denies product-claim evidence authority.
+    pub denies_claim_evidence: bool,
+    /// Non-authority proof is syntactically present and all denials are set.
+    pub marker_present: bool,
+}
+
+impl StorageIntentPreflightNonAuthorityMarker {
+    /// Fully populated non-authority marker.
+    pub const ACTIVE: Self = Self {
+        denies_acknowledgment_receipt: true,
+        denies_placement_receipt: true,
+        denies_policy_activation: true,
+        denies_action_execution: true,
+        denies_satisfaction_state: true,
+        denies_payback_closure: true,
+        denies_measurement_attribution: true,
+        denies_claim_evidence: true,
+        marker_present: true,
+    };
+
+    /// Returns true when the marker is present and all denials are set.
+    #[must_use]
+    pub const fn is_authority_safe(self) -> bool {
+        self.marker_present
+            && self.denies_acknowledgment_receipt
+            && self.denies_placement_receipt
+            && self.denies_policy_activation
+            && self.denies_action_execution
+            && self.denies_satisfaction_state
+            && self.denies_payback_closure
+            && self.denies_measurement_attribution
+            && self.denies_claim_evidence
+    }
+}
+
+// ===== Main preflight simulation evidence record =====
+
+/// Bounded per-simulation activation-blocker records.
+pub const STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS: usize = STORAGE_INTENT_PREFLIGHT_ACTIVATION_BLOCKERS;
+
+/// The preflight simulation evidence record (#926).
+///
+/// This record provides non-authoritative what-if simulation results. It may
+/// explain, compare, block, recommend shadow evaluation, or require operator
+/// review, but it must not acknowledge writes, satisfy placement, retire
+/// receipts, activate policy, close payback, or support product claims by
+/// itself.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentPreflightSimulationEvidence {
+    /// Evidence identity for this simulation record.
+    pub evidence_ref: StorageIntentEvidenceRef,
+
+    // Simulation identity
+    /// Unique simulation identifier.
+    pub simulation_id: StorageIntentEvidenceId,
+    /// Actor component identifier.
+    pub actor_component_ref: StorageIntentEvidenceRef,
+    /// Actor version.
+    pub actor_version: u64,
+    /// Purpose description (opaque ref to operator-facing text).
+    pub purpose_ref: StorageIntentEvidenceRef,
+    /// Request source (component or operator that requested the simulation).
+    pub request_source_ref: StorageIntentEvidenceRef,
+    /// Policy identifier under simulation.
+    pub policy_id: StorageIntentPolicyId,
+    /// Proposed policy revision under simulation.
+    pub proposed_revision: StorageIntentPolicyRevision,
+    /// Baseline policy revision for comparison.
+    pub baseline_revision: StorageIntentPolicyRevision,
+    /// Temporal evidence ref for the simulation timebase.
+    pub temporal_ref: StorageIntentEvidenceRef,
+    /// Creation epoch.
+    pub created_epoch: u64,
+    /// Expiry epoch; zero for no expiry.
+    pub expiry_epoch: u64,
+    /// Whether the simulation has expired.
+    pub is_expired: bool,
+
+    // Simulation class
+    /// Fidelity class of the simulation.
+    pub fidelity: StorageIntentPreflightFidelityClass,
+
+    // Scope
+    /// Simulation scope.
+    pub scope: StorageIntentPreflightScope,
+
+    // Evidence basis
+    /// Evidence references forming the basis.
+    pub evidence_basis: StorageIntentPreflightEvidenceBasis,
+
+    // Simulated decision set
+    /// Decision frontier refs and summary.
+    pub decision_set: StorageIntentPreflightDecisionSet,
+
+    // Projected deltas
+    /// Projected change deltas.
+    pub projected_deltas: StorageIntentPreflightProjectedDeltas,
+
+    // Activation blockers
+    /// Bounded activation blocker records.
+    pub blockers: [StorageIntentPreflightActivationBlocker;
+        STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS],
+    /// Number of populated blocker records.
+    pub blocker_len: u8,
+
+    // Recommendation
+    /// Recommendation state.
+    pub recommendation: StorageIntentPreflightRecommendation,
+
+    // Non-authority marker
+    /// Proof this simulation is not authority.
+    pub non_authority: StorageIntentPreflightNonAuthorityMarker,
+
+    // Refusal state
+    /// Refusal reason when the simulation itself was refused.
+    pub refusal: StorageIntentRefusalReason,
+    /// Evidence retention ref.
+    pub retention_ref: StorageIntentEvidenceRef,
+}
+
+impl StorageIntentPreflightSimulationEvidence {
+    pub const EMPTY: Self = Self {
+        evidence_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        simulation_id: StorageIntentEvidenceId::ZERO,
+        actor_component_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        actor_version: 0,
+        purpose_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        request_source_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        policy_id: StorageIntentPolicyId::ZERO,
+        proposed_revision: StorageIntentPolicyRevision(0),
+        baseline_revision: StorageIntentPolicyRevision(0),
+        temporal_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        created_epoch: 0,
+        expiry_epoch: 0,
+        is_expired: false,
+        fidelity: StorageIntentPreflightFidelityClass::Unknown,
+        scope: StorageIntentPreflightScope::EMPTY,
+        evidence_basis: StorageIntentPreflightEvidenceBasis::EMPTY,
+        decision_set: StorageIntentPreflightDecisionSet::EMPTY,
+        projected_deltas: StorageIntentPreflightProjectedDeltas::EMPTY,
+        blockers: [StorageIntentPreflightActivationBlocker::EMPTY;
+            STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS],
+        blocker_len: 0,
+        recommendation: StorageIntentPreflightRecommendation::Unknown,
+        non_authority: StorageIntentPreflightNonAuthorityMarker::ACTIVE,
+        refusal: StorageIntentRefusalReason::None,
+        retention_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+    };
+}
+
+// ===== Preflight predicates =====
+
+/// Returns true when the simulation has a valid identity.
+#[must_use]
+pub const fn preflight_simulation_has_identity(
+    evidence: StorageIntentPreflightSimulationEvidence,
+) -> bool {
+    matches!(
+        evidence.evidence_ref.kind,
+        StorageIntentEvidenceKind::PreflightSimulationEvidence
+    ) && evidence_ref_has_id(evidence.evidence_ref)
+        && !bytes32_are_zero(evidence.simulation_id.0)
+        && evidence_ref_has_id(evidence.actor_component_ref)
+        && evidence.actor_version > 0
+        && matches!(
+            evidence.temporal_ref.kind,
+            StorageIntentEvidenceKind::TemporalEvidence
+        )
+        && evidence.created_epoch > 0
+}
+
+/// Returns true when the non-authority marker is present and complete.
+#[must_use]
+pub const fn preflight_simulation_is_non_authoritative(
+    evidence: StorageIntentPreflightSimulationEvidence,
+) -> bool {
+    evidence.non_authority.is_authority_safe()
+}
+
+/// Returns true when the simulation has no activation blockers.
+#[must_use]
+pub const fn preflight_simulation_has_no_blockers(
+    evidence: StorageIntentPreflightSimulationEvidence,
+) -> bool {
+    let mut index = 0;
+    while index < evidence.blocker_len as usize
+        && index < STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS
+    {
+        if evidence.blockers[index].blocks_activation() {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Returns true when the evidence basis is not degraded.
+#[must_use]
+pub const fn preflight_simulation_evidence_is_complete(
+    evidence: StorageIntentPreflightSimulationEvidence,
+) -> bool {
+    !evidence.evidence_basis.has_degraded_evidence()
+}
+
+/// Returns true when the projected deltas are fully known.
+#[must_use]
+pub const fn preflight_simulation_deltas_are_known(
+    evidence: StorageIntentPreflightSimulationEvidence,
+) -> bool {
+    !evidence.projected_deltas.has_unknown_delta()
+}
+
+/// Combined gate: simulation evidence is usable for preflight preview.
+#[must_use]
+pub const fn preflight_simulation_evidence_is_usable(
+    evidence: StorageIntentPreflightSimulationEvidence,
+) -> ReceiptPredicateResult {
+    if evidence.refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return ReceiptPredicateResult::refused(evidence.refusal);
+    }
+    if !preflight_simulation_has_identity(evidence) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if !preflight_simulation_is_non_authoritative(evidence) {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
+    }
+    if evidence.is_expired {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::ExpiredTemporalLease,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Returns true when a stale/partial-coverage simulation has reduced
+/// recommendation authority.
+#[must_use]
+pub const fn preflight_simulation_has_full_coverage(
+    evidence: StorageIntentPreflightSimulationEvidence,
+) -> bool {
+    preflight_simulation_evidence_is_complete(evidence)
+        && preflight_simulation_deltas_are_known(evidence)
+        && !evidence.scope.is_sampled
+        && evidence.scope.coverage_verdict as u8
+            == EvidenceCompletenessVerdict::CompleteForPurpose as u8
+}
+
+/// Returns true when the simulation may be used for preview but not authority.
+#[must_use]
+pub const fn preflight_simulation_is_preview_only(
+    evidence: StorageIntentPreflightSimulationEvidence,
+) -> bool {
+    // The non-authority marker is the hard gate: simulation evidence can
+    // never become authority regardless of fidelity or coverage.
+    // Fidelity classes StaticPolicyCompile through StagedPreflightReservedUnspent
+    // are all non-authoritative by definition; Unknown is rejected.
+    preflight_simulation_is_non_authoritative(evidence)
+        && evidence.fidelity.to_discriminant() != StorageIntentPreflightFidelityClass::Unknown.to_discriminant()
+}
+
+/// Returns true when the simulation does not claim to be authority.
+/// This is a stronger check: even if fidelity were live, the marker must hold.
+#[must_use]
+pub const fn preflight_simulation_cannot_be_authority(
+    evidence: StorageIntentPreflightSimulationEvidence,
+) -> bool {
+    // Fidelity can never be Live in a preflight simulation, but even if a
+    // caller bypasses that constraint, the non-authority marker is the
+    // binding gate.
+    !matches!(
+        evidence.fidelity,
+        StorageIntentPreflightFidelityClass::Unknown
+    ) && preflight_simulation_is_non_authoritative(evidence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28627,4 +29726,684 @@ mod tests {
             assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
         }
     }
+
+    // === Preflight simulation evidence tests (Issue #926) ===
+
+    fn preflight_evidence_ref(byte: u8) -> StorageIntentEvidenceRef {
+        evidence_ref(StorageIntentEvidenceKind::PreflightSimulationEvidence, byte)
+    }
+
+    fn make_preflight_simulation_evidence() -> StorageIntentPreflightSimulationEvidence {
+        StorageIntentPreflightSimulationEvidence {
+            evidence_ref: preflight_evidence_ref(200),
+            simulation_id: StorageIntentEvidenceId([201_u8; 32]),
+            actor_component_ref: evidence_ref(
+                StorageIntentEvidenceKind::PolicyRolloutEvidence,
+                202,
+            ),
+            actor_version: 1,
+            purpose_ref: evidence_ref(
+                StorageIntentEvidenceKind::OperatorExplanationProjection,
+                203,
+            ),
+            request_source_ref: evidence_ref(
+                StorageIntentEvidenceKind::OperatorExplanationProjection,
+                204,
+            ),
+            policy_id: StorageIntentPolicyId([205_u8; 16]),
+            proposed_revision: StorageIntentPolicyRevision(42),
+            baseline_revision: StorageIntentPolicyRevision(41),
+            temporal_ref: evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 206),
+            created_epoch: 1000,
+            expiry_epoch: 2000,
+            is_expired: false,
+            fidelity: StorageIntentPreflightFidelityClass::EvidenceSnapshotScoring,
+            scope: StorageIntentPreflightScope {
+                pool_id: StorageIntentEvidenceId([207_u8; 32]),
+                dataset_id: StorageIntentEvidenceId([208_u8; 32]),
+                mount_id: StorageIntentEvidenceId([209_u8; 32]),
+                object_id: StorageIntentEvidenceId::ZERO,
+                range_start: 0,
+                range_len: 0,
+                generation: 1,
+                tenant_id: DOMAIN_A,
+                workload_class: 3,
+                media_role: StorageMediaRole::ServingDataHot,
+                proximity_class: ProximityClass::Node,
+                is_sampled: false,
+                sample_fraction_percent: 100,
+                coverage_verdict: EvidenceCompletenessVerdict::CompleteForPurpose,
+            },
+            evidence_basis: StorageIntentPreflightEvidenceBasis {
+                evidence_query_snapshot_ref: evidence_ref(
+                    StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+                    210,
+                ),
+                service_objective_ref: evidence_ref(
+                    StorageIntentEvidenceKind::ServiceObjectiveEvidence,
+                    211,
+                ),
+                workload_prediction_ref: evidence_ref(
+                    StorageIntentEvidenceKind::PredictionEvidence,
+                    212,
+                ),
+                media_capability_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MediaCostWearLedger,
+                    213,
+                ),
+                capacity_admission_ref: evidence_ref(
+                    StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+                    214,
+                ),
+                isolation_ref: evidence_ref(
+                    StorageIntentEvidenceKind::TenantIsolationEvidence,
+                    215,
+                ),
+                wear_cost_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MediaCostWearLedger,
+                    216,
+                ),
+                trust_domain_ref: evidence_ref(
+                    StorageIntentEvidenceKind::TrustDomainEvidence,
+                    217,
+                ),
+                recovery_degradation_ref: evidence_ref(
+                    StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+                    218,
+                ),
+                rollout_ref: evidence_ref(
+                    StorageIntentEvidenceKind::PolicyRolloutEvidence,
+                    219,
+                ),
+                metadata_namespace_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+                    220,
+                ),
+                layout_lifecycle_ref: evidence_ref(
+                    StorageIntentEvidenceKind::LayoutAllocatorEvidence,
+                    221,
+                ),
+                has_missing_evidence: false,
+                has_stale_evidence: false,
+                has_refused_evidence: false,
+            },
+            decision_set: StorageIntentPreflightDecisionSet {
+                decision_refs: [
+                    evidence_ref(
+                        StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                        230,
+                    );
+                    STORAGE_INTENT_PREFLIGHT_DECISION_REFS
+                ],
+                decision_len: 2,
+                summary: StorageIntentPreflightDecisionSummary {
+                    legal_count: 2,
+                    illegal_count: 0,
+                    unknown_count: 0,
+                    refused_count: 0,
+                    scored_count: 2,
+                    selected_count: 1,
+                },
+                covered_candidate_classes: [
+                    StorageIntentDecisionCandidateClass::PlacementPlan,
+                    StorageIntentDecisionCandidateClass::ReadServingPlan,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                    StorageIntentDecisionCandidateClass::Unknown,
+                ],
+                covered_classes_len: 2,
+            },
+            projected_deltas: StorageIntentPreflightProjectedDeltas::EMPTY,
+            blockers: [StorageIntentPreflightActivationBlocker::EMPTY;
+                STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS],
+            blocker_len: 0,
+            recommendation: StorageIntentPreflightRecommendation::SafeToStage,
+            non_authority: StorageIntentPreflightNonAuthorityMarker::ACTIVE,
+            refusal: StorageIntentRefusalReason::None,
+            retention_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 240),
+        }
+    }
+
+    #[test]
+    fn preflight_fidelity_class_roundtrip() {
+        let classes = [
+            StorageIntentPreflightFidelityClass::Unknown,
+            StorageIntentPreflightFidelityClass::StaticPolicyCompile,
+            StorageIntentPreflightFidelityClass::EvidenceSnapshotScoring,
+            StorageIntentPreflightFidelityClass::SampledCohortDryRun,
+            StorageIntentPreflightFidelityClass::ShadowExecution,
+            StorageIntentPreflightFidelityClass::StagedPreflightReservedUnspent,
+        ];
+        for &c in &classes {
+            let disc = c.to_discriminant();
+            let decoded = StorageIntentPreflightFidelityClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(c), "roundtrip failed for {:?}", c.as_str());
+        }
+    }
+
+    #[test]
+    fn preflight_fidelity_class_unknown_rejected() {
+        assert_eq!(
+            StorageIntentPreflightFidelityClass::from_discriminant(255),
+            None
+        );
+    }
+
+    #[test]
+    fn static_policy_compile_does_not_involve_live_evidence() {
+        assert!(
+            !StorageIntentPreflightFidelityClass::StaticPolicyCompile
+                .involves_live_evidence()
+        );
+    }
+
+    #[test]
+    fn shadow_execution_involves_live_evidence() {
+        assert!(
+            StorageIntentPreflightFidelityClass::ShadowExecution
+                .involves_live_evidence()
+        );
+    }
+
+    #[test]
+    fn staged_preflight_reserves_budgets() {
+        assert!(
+            StorageIntentPreflightFidelityClass::StagedPreflightReservedUnspent
+                .reserves_budgets()
+        );
+        assert!(
+            !StorageIntentPreflightFidelityClass::ShadowExecution
+                .reserves_budgets()
+        );
+    }
+
+    #[test]
+    fn preflight_recommendation_roundtrip() {
+        let recs = [
+            StorageIntentPreflightRecommendation::Unknown,
+            StorageIntentPreflightRecommendation::SafeToStage,
+            StorageIntentPreflightRecommendation::ShadowOnly,
+            StorageIntentPreflightRecommendation::RequireSample,
+            StorageIntentPreflightRecommendation::RequireOperatorReview,
+            StorageIntentPreflightRecommendation::Blocked,
+            StorageIntentPreflightRecommendation::Refused,
+            StorageIntentPreflightRecommendation::RollbackRisk,
+            StorageIntentPreflightRecommendation::Superseded,
+            StorageIntentPreflightRecommendation::Expired,
+            StorageIntentPreflightRecommendation::NonRepresentative,
+        ];
+        for &r in &recs {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentPreflightRecommendation::from_discriminant(disc);
+            assert_eq!(decoded, Some(r), "roundtrip failed for {:?}", r.as_str());
+        }
+    }
+
+    #[test]
+    fn safe_to_stage_permits_staging() {
+        assert!(
+            StorageIntentPreflightRecommendation::SafeToStage
+                .permits_staging()
+        );
+        assert!(
+            !StorageIntentPreflightRecommendation::Blocked
+                .permits_staging()
+        );
+        assert!(
+            !StorageIntentPreflightRecommendation::ShadowOnly
+                .permits_staging()
+        );
+    }
+
+    #[test]
+    fn blocked_refused_superseded_expired_are_terminal() {
+        assert!(
+            StorageIntentPreflightRecommendation::Blocked
+                .is_terminal()
+        );
+        assert!(
+            StorageIntentPreflightRecommendation::Refused
+                .is_terminal()
+        );
+        assert!(
+            StorageIntentPreflightRecommendation::Superseded
+                .is_terminal()
+        );
+        assert!(
+            StorageIntentPreflightRecommendation::Expired
+                .is_terminal()
+        );
+        assert!(
+            !StorageIntentPreflightRecommendation::SafeToStage
+                .is_terminal()
+        );
+    }
+
+    #[test]
+    fn shadow_only_is_degraded_recommendation() {
+        assert!(
+            StorageIntentPreflightRecommendation::ShadowOnly
+                .is_degraded()
+        );
+        assert!(
+            !StorageIntentPreflightRecommendation::SafeToStage
+                .is_degraded()
+        );
+    }
+
+    #[test]
+    fn preflight_activation_blocker_kind_roundtrip() {
+        let kinds = [
+            StorageIntentPreflightActivationBlockerKind::Unknown,
+            StorageIntentPreflightActivationBlockerKind::Guarantee,
+            StorageIntentPreflightActivationBlockerKind::Ordering,
+            StorageIntentPreflightActivationBlockerKind::Membership,
+            StorageIntentPreflightActivationBlockerKind::TrustDomain,
+            StorageIntentPreflightActivationBlockerKind::Temporal,
+            StorageIntentPreflightActivationBlockerKind::MediaCapability,
+            StorageIntentPreflightActivationBlockerKind::DataShape,
+            StorageIntentPreflightActivationBlockerKind::Layout,
+            StorageIntentPreflightActivationBlockerKind::Lifecycle,
+            StorageIntentPreflightActivationBlockerKind::Capacity,
+            StorageIntentPreflightActivationBlockerKind::Recovery,
+            StorageIntentPreflightActivationBlockerKind::Rollout,
+            StorageIntentPreflightActivationBlockerKind::Isolation,
+            StorageIntentPreflightActivationBlockerKind::PredictionActionClass,
+            StorageIntentPreflightActivationBlockerKind::Transport,
+            StorageIntentPreflightActivationBlockerKind::Wear,
+            StorageIntentPreflightActivationBlockerKind::Cost,
+            StorageIntentPreflightActivationBlockerKind::MetadataNamespace,
+            StorageIntentPreflightActivationBlockerKind::ServiceObjective,
+            StorageIntentPreflightActivationBlockerKind::Validation,
+            StorageIntentPreflightActivationBlockerKind::Retention,
+            StorageIntentPreflightActivationBlockerKind::OperatorPolicy,
+        ];
+        for &k in &kinds {
+            let disc = k.to_discriminant();
+            let decoded =
+                StorageIntentPreflightActivationBlockerKind::from_discriminant(disc);
+            assert_eq!(decoded, Some(k), "roundtrip failed for {:?}", k.as_str());
+        }
+    }
+
+    #[test]
+    fn preflight_projected_delta_kind_roundtrip() {
+        let deltas = [
+            StorageIntentPreflightProjectedDeltaKind::Unknown,
+            StorageIntentPreflightProjectedDeltaKind::BytesMoved,
+            StorageIntentPreflightProjectedDeltaKind::MetadataWrites,
+            StorageIntentPreflightProjectedDeltaKind::SignalPersistenceWrites,
+            StorageIntentPreflightProjectedDeltaKind::LogicalWriteAmplification,
+            StorageIntentPreflightProjectedDeltaKind::PhysicalWriteAmplification,
+            StorageIntentPreflightProjectedDeltaKind::FlashWear,
+            StorageIntentPreflightProjectedDeltaKind::CapacityHeadroomBytes,
+            StorageIntentPreflightProjectedDeltaKind::ReserveConsumptionBytes,
+            StorageIntentPreflightProjectedDeltaKind::DirtyBytes,
+            StorageIntentPreflightProjectedDeltaKind::MemoryBytes,
+            StorageIntentPreflightProjectedDeltaKind::CpuSeconds,
+            StorageIntentPreflightProjectedDeltaKind::ReadAmplification,
+            StorageIntentPreflightProjectedDeltaKind::NetworkEgressBytes,
+            StorageIntentPreflightProjectedDeltaKind::LatencyDeltaMicros,
+            StorageIntentPreflightProjectedDeltaKind::TailLatencyDeltaMicros,
+            StorageIntentPreflightProjectedDeltaKind::ThroughputDeltaBytesPerSec,
+            StorageIntentPreflightProjectedDeltaKind::RpoLagDeltaMs,
+            StorageIntentPreflightProjectedDeltaKind::RtoDeltaMs,
+            StorageIntentPreflightProjectedDeltaKind::RebuildRepairRiskPercent,
+            StorageIntentPreflightProjectedDeltaKind::ForegroundDisruptionPercent,
+            StorageIntentPreflightProjectedDeltaKind::TenantHarmScore,
+            StorageIntentPreflightProjectedDeltaKind::OperatorMoneyCostMicro,
+            StorageIntentPreflightProjectedDeltaKind::OperatorPowerCostMicroW,
+        ];
+        for &d in &deltas {
+            let disc = d.to_discriminant();
+            let decoded =
+                StorageIntentPreflightProjectedDeltaKind::from_discriminant(disc);
+            assert_eq!(decoded, Some(d), "roundtrip failed for {:?}", d.as_str());
+        }
+    }
+
+    #[test]
+    fn preflight_non_authority_marker_is_active() {
+        let marker = StorageIntentPreflightNonAuthorityMarker::ACTIVE;
+        assert!(marker.is_authority_safe());
+        assert!(marker.denies_acknowledgment_receipt);
+        assert!(marker.denies_placement_receipt);
+        assert!(marker.denies_policy_activation);
+        assert!(marker.denies_action_execution);
+        assert!(marker.denies_satisfaction_state);
+        assert!(marker.denies_payback_closure);
+        assert!(marker.denies_measurement_attribution);
+        assert!(marker.denies_claim_evidence);
+        assert!(marker.marker_present);
+    }
+
+    #[test]
+    fn default_non_authority_marker_is_not_safe() {
+        let marker = StorageIntentPreflightNonAuthorityMarker::default();
+        assert!(!marker.is_authority_safe());
+    }
+
+    #[test]
+    fn test_preflight_simulation_has_identity() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(preflight_simulation_has_identity(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_zero_identity_fails() {
+        let evidence = StorageIntentPreflightSimulationEvidence::EMPTY;
+        assert!(!preflight_simulation_has_identity(evidence));
+    }
+
+    #[test]
+    fn test_preflight_simulation_is_non_authoritative() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(preflight_simulation_is_non_authoritative(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_without_marker_is_not_non_authoritative() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.non_authority = StorageIntentPreflightNonAuthorityMarker::default();
+        assert!(!preflight_simulation_is_non_authoritative(evidence));
+    }
+
+    #[test]
+    fn test_preflight_simulation_cannot_be_authority() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(preflight_simulation_cannot_be_authority(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_unknown_fidelity_cannot_be_authority() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.fidelity = StorageIntentPreflightFidelityClass::Unknown;
+        assert!(!preflight_simulation_cannot_be_authority(evidence));
+    }
+
+    #[test]
+    fn test_preflight_simulation_is_preview_only() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(preflight_simulation_is_preview_only(evidence));
+    }
+
+    #[test]
+    fn test_preflight_simulation_evidence_is_usable() {
+        let evidence = make_preflight_simulation_evidence();
+        let result = preflight_simulation_evidence_is_usable(evidence);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn preflight_simulation_refused_when_self_refused() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.refusal = StorageIntentRefusalReason::EvidenceNotUsable;
+        let result = preflight_simulation_evidence_is_usable(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn preflight_simulation_refused_when_expired() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.is_expired = true;
+        let result = preflight_simulation_evidence_is_usable(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn preflight_simulation_refused_when_non_authority_marker_missing() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.non_authority = StorageIntentPreflightNonAuthorityMarker::default();
+        let result = preflight_simulation_evidence_is_usable(evidence);
+        assert!(!result.satisfied);
+    }
+
+    #[test]
+    fn test_preflight_simulation_has_full_coverage() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(preflight_simulation_has_full_coverage(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_stale_evidence_reduces_coverage() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.evidence_basis.has_stale_evidence = true;
+        assert!(!preflight_simulation_has_full_coverage(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_sampled_scope_reduces_coverage() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.scope.is_sampled = true;
+        assert!(!preflight_simulation_has_full_coverage(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_unknown_deltas_reduce_coverage() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.projected_deltas.entries[0] = StorageIntentPreflightProjectedDeltaEntry {
+            kind: StorageIntentPreflightProjectedDeltaKind::BytesMoved,
+            value: 0,
+            confidence_low: 0,
+            confidence_high: 0,
+            is_unknown: true,
+        };
+        evidence.projected_deltas.len = 1;
+        assert!(evidence.projected_deltas.has_unknown_delta());
+        assert!(!preflight_simulation_has_full_coverage(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_empty_deltas_have_no_unknowns() {
+        let deltas = StorageIntentPreflightProjectedDeltas::EMPTY;
+        assert!(!deltas.has_unknown_delta());
+    }
+
+    #[test]
+    fn preflight_decision_summary_empty() {
+        let summary = StorageIntentPreflightDecisionSummary::EMPTY;
+        assert!(summary.is_empty());
+        assert!(!summary.has_non_legal_decision());
+        assert_eq!(summary.total(), 0);
+    }
+
+    #[test]
+    fn preflight_decision_summary_with_illegal() {
+        let summary = StorageIntentPreflightDecisionSummary {
+            legal_count: 2,
+            illegal_count: 1,
+            unknown_count: 0,
+            refused_count: 0,
+            scored_count: 2,
+            selected_count: 1,
+        };
+        assert!(!summary.is_empty());
+        assert!(summary.has_non_legal_decision());
+        assert_eq!(summary.total(), 3);
+    }
+
+    #[test]
+    fn preflight_activation_blocker_empty_does_block() {
+        // An empty/unknown blocker has Unknown verdict, which does not
+        // admit scoring, so it blocks activation by default.
+        let blocker = StorageIntentPreflightActivationBlocker::EMPTY;
+        assert!(blocker.blocks_activation());
+    }
+
+    #[test]
+    fn preflight_activation_blocker_passed_without_refusal_does_not_block() {
+        let blocker = StorageIntentPreflightActivationBlocker {
+            kind: StorageIntentPreflightActivationBlockerKind::Guarantee,
+            verdict: StorageIntentDecisionHardGateVerdict::Passed,
+            refusal: StorageIntentRefusalReason::None,
+            evidence_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        };
+        assert!(!blocker.blocks_activation());
+    }
+
+    #[test]
+    fn preflight_activation_blocker_with_failure_blocks() {
+        let blocker = StorageIntentPreflightActivationBlocker {
+            kind: StorageIntentPreflightActivationBlockerKind::Capacity,
+            verdict: StorageIntentDecisionHardGateVerdict::Failed,
+            refusal: StorageIntentRefusalReason::CapacityHeadroomExhausted,
+            evidence_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        };
+        assert!(blocker.blocks_activation());
+    }
+
+    #[test]
+    fn preflight_activation_blocker_with_refusal_blocks() {
+        let blocker = StorageIntentPreflightActivationBlocker {
+            kind: StorageIntentPreflightActivationBlockerKind::Wear,
+            verdict: StorageIntentDecisionHardGateVerdict::Passed,
+            refusal: StorageIntentRefusalReason::FlashWearBudgetExceeded,
+            evidence_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        };
+        assert!(blocker.blocks_activation());
+    }
+
+    #[test]
+    fn preflight_scope_full_scope_detection() {
+        let scope = StorageIntentPreflightScope {
+            pool_id: StorageIntentEvidenceId([1_u8; 32]),
+            dataset_id: StorageIntentEvidenceId([2_u8; 32]),
+            ..StorageIntentPreflightScope::EMPTY
+        };
+        assert!(scope.is_full_scope());
+        assert!(!scope.is_file_range_scope());
+    }
+
+    #[test]
+    fn preflight_scope_file_range_detection() {
+        let scope = StorageIntentPreflightScope {
+            pool_id: StorageIntentEvidenceId([1_u8; 32]),
+            dataset_id: StorageIntentEvidenceId([2_u8; 32]),
+            object_id: StorageIntentEvidenceId([3_u8; 32]),
+            range_start: 0,
+            range_len: 4096,
+            ..StorageIntentPreflightScope::EMPTY
+        };
+        assert!(!scope.is_full_scope());
+        assert!(scope.is_file_range_scope());
+    }
+
+    #[test]
+    fn preflight_evidence_basis_no_degradation() {
+        let basis = StorageIntentPreflightEvidenceBasis::EMPTY;
+        assert!(!basis.has_degraded_evidence());
+    }
+
+    #[test]
+    fn preflight_evidence_basis_with_missing_evidence() {
+        let mut basis = StorageIntentPreflightEvidenceBasis::EMPTY;
+        basis.has_missing_evidence = true;
+        assert!(basis.has_degraded_evidence());
+    }
+
+    #[test]
+    fn preflight_simulation_cannot_activate_policy() {
+        // Even at the highest fidelity with full coverage, a preflight
+        // simulation record carries a non-authority marker that denies
+        // policy activation. The marker is the binding gate.
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.fidelity =
+            StorageIntentPreflightFidelityClass::StagedPreflightReservedUnspent;
+        assert!(evidence.non_authority.denies_policy_activation);
+        assert!(preflight_simulation_is_non_authoritative(evidence));
+        assert!(preflight_simulation_is_preview_only(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_cannot_acknowledge_writes() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(evidence.non_authority.denies_acknowledgment_receipt);
+        assert!(preflight_simulation_is_non_authoritative(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_cannot_satisfy_placement() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(evidence.non_authority.denies_placement_receipt);
+        assert!(preflight_simulation_is_non_authoritative(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_cannot_retire_receipts() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(evidence.non_authority.denies_payback_closure);
+        assert!(preflight_simulation_is_non_authoritative(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_cannot_support_claims() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(evidence.non_authority.denies_claim_evidence);
+        assert!(preflight_simulation_is_non_authoritative(evidence));
+    }
+
+    #[test]
+    fn preflight_simulation_cannot_close_payback() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(evidence.non_authority.denies_payback_closure);
+        assert!(preflight_simulation_is_non_authoritative(evidence));
+    }
+
+    #[test]
+    fn stale_coverage_lowers_recommendation_state() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.evidence_basis.has_stale_evidence = true;
+        assert!(!preflight_simulation_has_full_coverage(evidence));
+        // Coverage is degraded; callers must check this before treating the
+        // simulation as a safety proof.
+    }
+
+    #[test]
+    fn partial_coverage_lowers_recommendation_state() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.scope.is_sampled = true;
+        assert!(!preflight_simulation_has_full_coverage(evidence));
+    }
+
+    #[test]
+    fn reserved_but_unspent_preflight_simulation_has_authority_marker() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.fidelity =
+            StorageIntentPreflightFidelityClass::StagedPreflightReservedUnspent;
+        assert!(evidence.fidelity.reserves_budgets());
+        // Even with reserved budgets, non-authority marker still holds.
+        assert!(preflight_simulation_is_non_authoritative(evidence));
+        assert!(preflight_simulation_cannot_be_authority(evidence));
+    }
+
+    #[test]
+    fn preflight_activation_blocker_no_blockers_passes() {
+        let evidence = make_preflight_simulation_evidence();
+        assert!(preflight_simulation_has_no_blockers(evidence));
+    }
+
+    #[test]
+    fn preflight_activation_blocker_detects_blocking() {
+        let mut evidence = make_preflight_simulation_evidence();
+        evidence.blockers[0] = StorageIntentPreflightActivationBlocker {
+            kind: StorageIntentPreflightActivationBlockerKind::Capacity,
+            verdict: StorageIntentDecisionHardGateVerdict::Failed,
+            refusal: StorageIntentRefusalReason::CapacityHeadroomExhausted,
+            evidence_ref: PREFLIGHT_EMPTY_EVIDENCE_REF,
+        };
+        evidence.blocker_len = 1;
+        assert!(!preflight_simulation_has_no_blockers(evidence));
+    }
+
 }
