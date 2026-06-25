@@ -196,6 +196,22 @@ impl PrefetchExecutorActionFamily {
     pub const fn is_negative_enforcement(self) -> bool {
         matches!(self, Self::ExplicitNoPrefetch)
     }
+
+    #[must_use]
+    pub const fn can_start_runtime_dispatch(self) -> bool {
+        matches!(
+            self,
+            Self::BoundedSequentialReadahead
+                | Self::StridedVectorRangePrefetch
+                | Self::MetadataNamespaceWalkPrefetch
+                | Self::SmallRandomHotsetCacheTrial
+                | Self::ManifestIndexFanout
+                | Self::SnapshotCloneRepeatedRead
+                | Self::DegradedReadReconstruction
+                | Self::WanGeoDeltaPrefetch
+                | Self::ObjectArchiveRestoreStaging
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -431,6 +447,130 @@ impl PrefetchExecutorCostRequirementMask {
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorRuntimeSupportMask(pub u64);
+
+impl PrefetchExecutorRuntimeSupportMask {
+    pub const EMPTY: Self = Self(0);
+    pub const BOUNDED_SEQUENTIAL_READAHEAD: Self = Self(1_u64 << 0);
+    pub const STRIDED_VECTOR_RANGE_PREFETCH: Self = Self(1_u64 << 1);
+    pub const METADATA_NAMESPACE_WALK_PREFETCH: Self = Self(1_u64 << 2);
+    pub const SMALL_RANDOM_HOTSET_CACHE_TRIAL: Self = Self(1_u64 << 3);
+    pub const MANIFEST_INDEX_FANOUT: Self = Self(1_u64 << 4);
+    pub const SNAPSHOT_CLONE_REPEATED_READ: Self = Self(1_u64 << 5);
+    pub const DEGRADED_READ_RECONSTRUCTION: Self = Self(1_u64 << 6);
+    pub const WAN_GEO_DELTA_PREFETCH: Self = Self(1_u64 << 7);
+    pub const OBJECT_ARCHIVE_RESTORE_STAGING: Self = Self(1_u64 << 8);
+    pub const ALL_MODELLED_DISPATCH: Self = Self(
+        Self::BOUNDED_SEQUENTIAL_READAHEAD.0
+            | Self::STRIDED_VECTOR_RANGE_PREFETCH.0
+            | Self::METADATA_NAMESPACE_WALK_PREFETCH.0
+            | Self::SMALL_RANDOM_HOTSET_CACHE_TRIAL.0
+            | Self::MANIFEST_INDEX_FANOUT.0
+            | Self::SNAPSHOT_CLONE_REPEATED_READ.0
+            | Self::DEGRADED_READ_RECONSTRUCTION.0
+            | Self::WAN_GEO_DELTA_PREFETCH.0
+            | Self::OBJECT_ARCHIVE_RESTORE_STAGING.0,
+    );
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    #[must_use]
+    pub const fn for_action_family(family: PrefetchExecutorActionFamily) -> Self {
+        match family {
+            PrefetchExecutorActionFamily::BoundedSequentialReadahead => {
+                Self::BOUNDED_SEQUENTIAL_READAHEAD
+            }
+            PrefetchExecutorActionFamily::StridedVectorRangePrefetch => {
+                Self::STRIDED_VECTOR_RANGE_PREFETCH
+            }
+            PrefetchExecutorActionFamily::MetadataNamespaceWalkPrefetch => {
+                Self::METADATA_NAMESPACE_WALK_PREFETCH
+            }
+            PrefetchExecutorActionFamily::SmallRandomHotsetCacheTrial => {
+                Self::SMALL_RANDOM_HOTSET_CACHE_TRIAL
+            }
+            PrefetchExecutorActionFamily::ManifestIndexFanout => Self::MANIFEST_INDEX_FANOUT,
+            PrefetchExecutorActionFamily::SnapshotCloneRepeatedRead => {
+                Self::SNAPSHOT_CLONE_REPEATED_READ
+            }
+            PrefetchExecutorActionFamily::DegradedReadReconstruction => {
+                Self::DEGRADED_READ_RECONSTRUCTION
+            }
+            PrefetchExecutorActionFamily::WanGeoDeltaPrefetch => Self::WAN_GEO_DELTA_PREFETCH,
+            PrefetchExecutorActionFamily::ObjectArchiveRestoreStaging => {
+                Self::OBJECT_ARCHIVE_RESTORE_STAGING
+            }
+            PrefetchExecutorActionFamily::Unknown
+            | PrefetchExecutorActionFamily::ExplicitNoPrefetch
+            | PrefetchExecutorActionFamily::AuthorityChangingHandoff
+            | PrefetchExecutorActionFamily::Unsupported => Self::EMPTY,
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_family(self, family: PrefetchExecutorActionFamily) -> bool {
+        family.can_start_runtime_dispatch() && self.contains(Self::for_action_family(family))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorRuntimeSupport {
+    pub supported: PrefetchExecutorRuntimeSupportMask,
+    pub support_ref: StorageIntentEvidenceRef,
+    pub refusal: StorageIntentRefusalReason,
+}
+
+impl Default for PrefetchExecutorRuntimeSupport {
+    fn default() -> Self {
+        Self {
+            supported: PrefetchExecutorRuntimeSupportMask::EMPTY,
+            support_ref: EMPTY_EVIDENCE_REF,
+            refusal: StorageIntentRefusalReason::EvidenceNotUsable,
+        }
+    }
+}
+
+impl PrefetchExecutorRuntimeSupport {
+    #[must_use]
+    pub const fn supported(
+        supported: PrefetchExecutorRuntimeSupportMask,
+        support_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        Self {
+            supported,
+            support_ref,
+            refusal: StorageIntentRefusalReason::None,
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_family(self, family: PrefetchExecutorActionFamily) -> bool {
+        self.support_ref.kind as u16 == StorageIntentEvidenceKind::ActionExecutionEvidence as u16
+            && self.support_ref.is_bound()
+            && self.supported.supports_family(family)
+    }
+
+    #[must_use]
+    pub const fn refusal_reason(self) -> StorageIntentRefusalReason {
+        if matches!(self.refusal, StorageIntentRefusalReason::None) {
+            StorageIntentRefusalReason::EvidenceNotUsable
+        } else {
+            self.refusal
+        }
     }
 }
 
@@ -796,6 +936,7 @@ pub struct PrefetchExecutorInput {
     pub media_path: PrefetchExecutorMediaPath,
     pub cost_state: PrefetchExecutorCostState,
     pub result_detail: PrefetchExecutorResultDetail,
+    pub runtime_support: PrefetchExecutorRuntimeSupport,
     pub action_family: PrefetchExecutorActionFamily,
     pub freshness_rpo_floor_ms: u64,
     pub anti_waste: PrefetchExecutorAntiWasteMask,
@@ -814,6 +955,7 @@ impl Default for PrefetchExecutorInput {
             media_path: PrefetchExecutorMediaPath::default(),
             cost_state: PrefetchExecutorCostState::default(),
             result_detail: PrefetchExecutorResultDetail::default(),
+            runtime_support: PrefetchExecutorRuntimeSupport::default(),
             action_family: PrefetchExecutorActionFamily::Unknown,
             freshness_rpo_floor_ms: 0,
             anti_waste: PrefetchExecutorAntiWasteMask::EMPTY,
@@ -1135,6 +1277,13 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                     PrefetchExecutorByteState::Blocked,
                     StorageIntentRefusalReason::EvidenceNotUsable,
                 )
+            } else if !input.runtime_support.supports_family(family) {
+                terminal(
+                    record,
+                    PrefetchExecutorOutcome::Unavailable,
+                    PrefetchExecutorByteState::Unavailable,
+                    input.runtime_support.refusal_reason(),
+                )
             } else {
                 record.executor_byte_state = byte_state_for_decision(input.decision, family);
                 record.outcome = PrefetchExecutorOutcome::Started;
@@ -1303,6 +1452,10 @@ fn required_families_fresh(
         && (family.is_negative_enforcement()
             || snapshot.contains_fresh_authority_family(
                 StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            ))
+        && (!family.can_start_runtime_dispatch()
+            || snapshot.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
             ))
         && (!family.needs_metadata_namespace_evidence()
             || snapshot.contains_fresh_authority_family(
@@ -1503,6 +1656,7 @@ mod tests {
     const ATTRIBUTION: StorageIntentEvidenceId = StorageIntentEvidenceId([15; 32]);
     const RETENTION: StorageIntentEvidenceId = StorageIntentEvidenceId([16; 32]);
     const VALIDATION: StorageIntentEvidenceId = StorageIntentEvidenceId([17; 32]);
+    const ACTION: StorageIntentEvidenceId = StorageIntentEvidenceId([18; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -1594,6 +1748,11 @@ mod tests {
             &mut snapshot,
             StorageIntentEvidenceKind::ReadFreshnessEvidence,
             READ,
+        );
+        add_fresh(
+            &mut snapshot,
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            ACTION,
         );
         if let Some(kind) = extra_kind {
             add_fresh(&mut snapshot, kind, TRANSPORT);
@@ -1690,6 +1849,10 @@ mod tests {
                 isolation_ref: evidence(StorageIntentEvidenceKind::TenantIsolationEvidence, ISO),
                 ..PrefetchExecutorCostState::default()
             },
+            runtime_support: PrefetchExecutorRuntimeSupport::supported(
+                PrefetchExecutorRuntimeSupportMask::ALL_MODELLED_DISPATCH,
+                evidence(StorageIntentEvidenceKind::ActionExecutionEvidence, ACTION),
+            ),
             decision,
             require_budget_owner: true,
             require_isolation_evidence: true,
@@ -1909,6 +2072,38 @@ mod tests {
         assert_eq!(
             record.refusal,
             StorageIntentRefusalReason::NoisyNeighborPressure
+        );
+    }
+
+    #[test]
+    fn missing_runtime_support_keeps_admitted_action_unavailable() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.runtime_support = PrefetchExecutorRuntimeSupport::default();
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Unavailable);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Unavailable
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(!record.can_satisfy_durable_sync());
+    }
+
+    #[test]
+    fn runtime_support_mask_must_cover_selected_family() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.runtime_support = PrefetchExecutorRuntimeSupport::supported(
+            PrefetchExecutorRuntimeSupportMask::STRIDED_VECTOR_RANGE_PREFETCH,
+            evidence(StorageIntentEvidenceKind::ActionExecutionEvidence, ACTION),
+        );
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Unavailable);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Unavailable
         );
     }
 
