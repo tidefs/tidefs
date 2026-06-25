@@ -9559,6 +9559,41 @@ pub enum StorageIntentRefusalReason {
     BudgetDonationRefused = 119,
     /// Borrowed budget debt has not been repaid within the legal window.
     DebtNotRepaid = 120,
+
+    // --- Evidence-retention refusals (issue #910) ---
+
+    /// Evidence-retention evidence is missing, unknown, or not a retention artifact.
+    UnknownEvidenceRetention = 121,
+    /// Retention class for the governed evidence is unknown.
+    UnknownRetentionClassForEvidence = 122,
+    /// Live receipt dependency blocks evidence purge.
+    EvidenceRetentionLiveReceiptDependency = 123,
+    /// Live decision-frontier dependency blocks evidence purge.
+    EvidenceRetentionLiveDecisionDependency = 124,
+    /// Unresolved cooldown or payback window blocks evidence purge.
+    EvidenceRetentionUnresolvedCooldown = 125,
+    /// Mixed policy rollout still needs this evidence for explanation.
+    EvidenceRetentionMixedPolicyRollout = 126,
+    /// Active recovery or degradation obligation blocks evidence purge.
+    EvidenceRetentionActiveRecoveryObligation = 127,
+    /// Active claim artifact dependency blocks evidence purge.
+    EvidenceRetentionActiveClaimDependency = 128,
+    /// Active audit or legal hold blocks evidence purge.
+    EvidenceRetentionActiveAuditLegalHold = 129,
+    /// Compaction would lose rejected, unknown, or refusal states.
+    EvidenceRetentionCompactionWouldLoseState = 130,
+    /// Evidence storage budget exhausted; optional telemetry refused.
+    EvidenceRetentionStorageBudgetExhausted = 131,
+    /// Authority evidence must not be evicted for budget reasons.
+    EvidenceRetentionCannotEvictAuthority = 132,
+    /// Tombstoned evidence is missing the required proof-root anchor.
+    EvidenceRetentionTombstoneWithoutProofRoot = 133,
+    /// Superseded evidence is missing the replacement evidence ref.
+    EvidenceRetentionSupersededMissingReplacement = 134,
+    /// Safe-purge frontier is not defined for this evidence.
+    EvidenceRetentionMissingPurgeFrontier = 135,
+    /// Evidence generation has not crossed the safe-purge frontier.
+    EvidenceRetentionSafePurgeFrontierNotReached = 136,
 }
 
 impl StorageIntentRefusalReason {
@@ -9691,6 +9726,22 @@ impl StorageIntentRefusalReason {
             Self::ValidationGateFailed => "validation-gate-failed",
             Self::BudgetDonationRefused => "budget-donation-refused",
             Self::DebtNotRepaid => "debt-not-repaid",
+            Self::UnknownEvidenceRetention => "unknown-evidence-retention",
+            Self::UnknownRetentionClassForEvidence => "unknown-retention-class-for-evidence",
+            Self::EvidenceRetentionLiveReceiptDependency => "evidence-retention-live-receipt-dependency",
+            Self::EvidenceRetentionLiveDecisionDependency => "evidence-retention-live-decision-dependency",
+            Self::EvidenceRetentionUnresolvedCooldown => "evidence-retention-unresolved-cooldown",
+            Self::EvidenceRetentionMixedPolicyRollout => "evidence-retention-mixed-policy-rollout",
+            Self::EvidenceRetentionActiveRecoveryObligation => "evidence-retention-active-recovery-obligation",
+            Self::EvidenceRetentionActiveClaimDependency => "evidence-retention-active-claim-dependency",
+            Self::EvidenceRetentionActiveAuditLegalHold => "evidence-retention-active-audit-legal-hold",
+            Self::EvidenceRetentionCompactionWouldLoseState => "evidence-retention-compaction-would-lose-state",
+            Self::EvidenceRetentionStorageBudgetExhausted => "evidence-retention-storage-budget-exhausted",
+            Self::EvidenceRetentionCannotEvictAuthority => "evidence-retention-cannot-evict-authority",
+            Self::EvidenceRetentionTombstoneWithoutProofRoot => "evidence-retention-tombstone-without-proof-root",
+            Self::EvidenceRetentionSupersededMissingReplacement => "evidence-retention-superseded-missing-replacement",
+            Self::EvidenceRetentionMissingPurgeFrontier => "evidence-retention-missing-purge-frontier",
+            Self::EvidenceRetentionSafePurgeFrontierNotReached => "evidence-retention-safe-purge-frontier-not-reached",
         }
     }
 
@@ -9819,6 +9870,22 @@ impl StorageIntentRefusalReason {
             118 => Some(Self::ValidationGateFailed),
             119 => Some(Self::BudgetDonationRefused),
             120 => Some(Self::DebtNotRepaid),
+            121 => Some(Self::UnknownEvidenceRetention),
+            122 => Some(Self::UnknownRetentionClassForEvidence),
+            123 => Some(Self::EvidenceRetentionLiveReceiptDependency),
+            124 => Some(Self::EvidenceRetentionLiveDecisionDependency),
+            125 => Some(Self::EvidenceRetentionUnresolvedCooldown),
+            126 => Some(Self::EvidenceRetentionMixedPolicyRollout),
+            127 => Some(Self::EvidenceRetentionActiveRecoveryObligation),
+            128 => Some(Self::EvidenceRetentionActiveClaimDependency),
+            129 => Some(Self::EvidenceRetentionActiveAuditLegalHold),
+            130 => Some(Self::EvidenceRetentionCompactionWouldLoseState),
+            131 => Some(Self::EvidenceRetentionStorageBudgetExhausted),
+            132 => Some(Self::EvidenceRetentionCannotEvictAuthority),
+            133 => Some(Self::EvidenceRetentionTombstoneWithoutProofRoot),
+            134 => Some(Self::EvidenceRetentionSupersededMissingReplacement),
+            135 => Some(Self::EvidenceRetentionMissingPurgeFrontier),
+            136 => Some(Self::EvidenceRetentionSafePurgeFrontierNotReached),
             _ => None,
         }
     }
@@ -16168,6 +16235,740 @@ pub const fn isolation_borrowing_permits_consumption(
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::OverBudget,
         );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+// ---------------------------------------------------------------------------
+// Evidence-retention types (issue #910)
+// ---------------------------------------------------------------------------
+
+/// Evidence-retention class: governs how long and under what compaction
+/// discipline evidence must be retained.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentEvidenceRetentionClass {
+    /// Unknown or unclassified retention.
+    #[default]
+    Unknown = 0,
+    /// Replay-critical: must be exact; purge would corrupt ordering/replay.
+    ReplayCritical = 1,
+    /// Receipt-authority: backs write-durability, fsync, or placement receipts.
+    ReceiptAuthority = 2,
+    /// Decision-proof: backs planner candidate sets, scores, and selected plans.
+    DecisionProof = 3,
+    /// Outcome-learning: backs prediction payback, cooldown, and anti-thrash.
+    OutcomeLearning = 4,
+    /// Operator-explanation: backs operator UAPI, traces, and support bundles.
+    OperatorExplanation = 5,
+    /// Validation/fault: backs fault artifacts, corruption evidence, and regression rows.
+    ValidationFault = 6,
+    /// Claim-artifact: backs product-claim gates and claim-scope evidence.
+    ClaimArtifact = 7,
+    /// Audit/legal: backs audit trail, legal-hold, and compliance evidence.
+    AuditLegal = 8,
+    /// Short-lived telemetry: optional, low-cost, bounded retention for tuning.
+    ShortLivedTelemetry = 9,
+    /// Compactable aggregate: summarizable into histograms, sketches, or top-K.
+    CompactableAggregate = 10,
+}
+
+impl_u8_canonical!(StorageIntentEvidenceRetentionClass, {
+    Unknown = 0 => "unknown",
+    ReplayCritical = 1 => "replay-critical",
+    ReceiptAuthority = 2 => "receipt-authority",
+    DecisionProof = 3 => "decision-proof",
+    OutcomeLearning = 4 => "outcome-learning",
+    OperatorExplanation = 5 => "operator-explanation",
+    ValidationFault = 6 => "validation-fault",
+    ClaimArtifact = 7 => "claim-artifact",
+    AuditLegal = 8 => "audit-legal",
+    ShortLivedTelemetry = 9 => "short-lived-telemetry",
+    CompactableAggregate = 10 => "compactable-aggregate",
+});
+
+impl StorageIntentEvidenceRetentionClass {
+    /// Returns true when evidence of this class must never be purged without
+    /// explicit tombstone or dependency-closure evidence.
+    #[must_use]
+    pub const fn is_authority(self) -> bool {
+        matches!(
+            self,
+            Self::ReplayCritical
+                | Self::ReceiptAuthority
+                | Self::DecisionProof
+        )
+    }
+
+    /// Returns true when this class may be compacted (summarized, sketched,
+    /// redacted) but not silently purged.
+    #[must_use]
+    pub const fn may_compact(self) -> bool {
+        matches!(
+            self,
+            Self::OutcomeLearning
+                | Self::OperatorExplanation
+                | Self::ValidationFault
+                | Self::ClaimArtifact
+                | Self::ShortLivedTelemetry
+                | Self::CompactableAggregate
+        )
+    }
+
+    /// Returns true when this class is optional and may be refused or evicted
+    /// under budget pressure before authority-evidence is evicted.
+    #[must_use]
+    pub const fn is_optional(self) -> bool {
+        matches!(
+            self,
+            Self::ShortLivedTelemetry
+                | Self::CompactableAggregate
+                | Self::OperatorExplanation
+        )
+    }
+
+    /// Returns true when this class supports audit/legal holds.
+    #[must_use]
+    pub const fn supports_legal_hold(self) -> bool {
+        matches!(self, Self::AuditLegal | Self::ReceiptAuthority | Self::ClaimArtifact)
+    }
+}
+
+/// Compaction or summarization rule for evidence retention.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentEvidenceCompactionRule {
+    /// Unknown or undefined compaction rule.
+    #[default]
+    Unknown = 0,
+    /// Must be retained exact; no lossy summarization permitted.
+    Exact = 1,
+    /// Digest-preserving summary: cryptographic or content-hash summary that
+    /// proves the original content without transmitting all bytes.
+    DigestPreservingSummary = 2,
+    /// Histogram, sketch, or top-K summary: statistical summary preserving
+    /// distribution shape, tail, and rejected-candidate counts.
+    HistogramSketchTopKSummary = 3,
+    /// Redacted/audited summary: sensitive fields removed while preserving
+    /// refusal, rejection, budget-owner, and state-transition evidence.
+    RedactedAuditedSummary = 4,
+    /// Expired: retention window closed; safe to purge unless legal-hold or
+    /// dependency refs block it.
+    Expired = 5,
+    /// Tombstoned: content purged but a tombstone ref is retained for
+    /// dependency-graph integrity and explanation.
+    Tombstoned = 6,
+    /// Superseded: replaced by newer evidence; old version may be purged.
+    Superseded = 7,
+    /// Refused-to-compact: compaction was attempted but blocked by
+    /// dependency, cooldown, or audit evidence.
+    RefusedToCompact = 8,
+}
+
+impl_u8_canonical!(StorageIntentEvidenceCompactionRule, {
+    Unknown = 0 => "unknown",
+    Exact = 1 => "exact",
+    DigestPreservingSummary = 2 => "digest-preserving-summary",
+    HistogramSketchTopKSummary = 3 => "histogram-sketch-topk-summary",
+    RedactedAuditedSummary = 4 => "redacted-audited-summary",
+    Expired = 5 => "expired",
+    Tombstoned = 6 => "tombstoned",
+    Superseded = 7 => "superseded",
+    RefusedToCompact = 8 => "refused-to-compact",
+});
+
+impl StorageIntentEvidenceCompactionRule {
+    /// Returns true when the compaction rule preserves exact content.
+    #[must_use]
+    pub const fn preserves_exact(self) -> bool {
+        matches!(self, Self::Exact)
+    }
+
+    /// Returns true when the compaction rule has reduced or removed content.
+    #[must_use]
+    pub const fn is_lossy(self) -> bool {
+        matches!(
+            self,
+            Self::DigestPreservingSummary
+                | Self::HistogramSketchTopKSummary
+                | Self::RedactedAuditedSummary
+        )
+    }
+
+    /// Returns true when the compaction state allows purge.
+    #[must_use]
+    pub const fn allows_purge(self) -> bool {
+        matches!(self, Self::Expired | Self::Superseded)
+    }
+
+    /// Returns true when the compaction state has removed content but left a
+    /// tombstone or digest anchor.
+    #[must_use]
+    pub const fn is_posthumous(self) -> bool {
+        matches!(
+            self,
+            Self::Tombstoned | Self::DigestPreservingSummary
+        )
+    }
+
+    /// Returns true when compaction was attempted but refused.
+    #[must_use]
+    pub const fn is_refused(self) -> bool {
+        matches!(self, Self::RefusedToCompact)
+    }
+}
+
+/// Refusal reason scoped to evidence retention.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum StorageIntentEvidenceRetentionRefusalReason {
+    /// No refusal.
+    #[default]
+    None = 0,
+    /// Retention evidence is missing or not a retention artifact.
+    MissingRetentionEvidence = 1,
+    /// Retention evidence is stale or superseded.
+    StaleRetentionEvidence = 2,
+    /// Retention class is unknown; cannot decide retention policy.
+    UnknownRetentionClass = 3,
+    /// Live receipt still depends on this evidence; purge blocked.
+    LiveReceiptDependency = 4,
+    /// Live decision-frontier still depends on this evidence; purge blocked.
+    LiveDecisionFrontierDependency = 5,
+    /// Unresolved cooldown or payback window; purge blocked.
+    UnresolvedCooldownPayback = 6,
+    /// Mixed policy rollout still needs this evidence for explanation.
+    MixedPolicyRolloutActive = 7,
+    /// Active recovery or degradation obligation references this evidence.
+    ActiveRecoveryObligation = 8,
+    /// Active claim artifact references this evidence; purge blocked.
+    ActiveClaimDependency = 9,
+    /// Active audit or legal hold references this evidence.
+    ActiveAuditLegalHold = 10,
+    /// Compaction was attempted but blocked by dependency graph.
+    CompactionBlockedByDependency = 11,
+    /// Compaction would lose rejected, unknown, or refusal states.
+    CompactionWouldLoseRejectedState = 12,
+    /// Evidence storage budget exhausted; new optional telemetry refused.
+    EvidenceStorageBudgetExhausted = 13,
+    /// Evidence write budget exhausted; new evidence refused.
+    EvidenceWriteBudgetExhausted = 14,
+    /// Tenant or privacy envelope requires redaction before retention.
+    PrivacyEnvelopeRequiresRedaction = 15,
+    /// Redaction would destroy budget-owner attribution.
+    RedactionWouldDestroyAttribution = 16,
+    /// Tombstone would break dependency-graph closure.
+    TombstoneWouldBreakDependencyGraph = 17,
+    /// Superseding evidence is missing or invalid.
+    SupersedingEvidenceMissing = 18,
+    /// Safe-purge frontier has not been reached.
+    SafePurgeFrontierNotReached = 19,
+    /// Receipt retirement frontier not crossed.
+    ReceiptRetirementFrontierNotCrossed = 20,
+    /// Claim retention boundary not crossed.
+    ClaimRetentionBoundaryNotCrossed = 21,
+    /// Rollback or re-entry blocker state is active.
+    RollbackReentryBlockerActive = 22,
+    /// Required retention proof root is missing.
+    MissingRetentionProofRoot = 23,
+}
+
+impl_u8_canonical!(StorageIntentEvidenceRetentionRefusalReason, {
+    None = 0 => "none",
+    MissingRetentionEvidence = 1 => "missing-retention-evidence",
+    StaleRetentionEvidence = 2 => "stale-retention-evidence",
+    UnknownRetentionClass = 3 => "unknown-retention-class",
+    LiveReceiptDependency = 4 => "live-receipt-dependency",
+    LiveDecisionFrontierDependency = 5 => "live-decision-frontier-dependency",
+    UnresolvedCooldownPayback = 6 => "unresolved-cooldown-payback",
+    MixedPolicyRolloutActive = 7 => "mixed-policy-rollout-active",
+    ActiveRecoveryObligation = 8 => "active-recovery-obligation",
+    ActiveClaimDependency = 9 => "active-claim-dependency",
+    ActiveAuditLegalHold = 10 => "active-audit-legal-hold",
+    CompactionBlockedByDependency = 11 => "compaction-blocked-by-dependency",
+    CompactionWouldLoseRejectedState = 12 => "compaction-would-lose-rejected-state",
+    EvidenceStorageBudgetExhausted = 13 => "evidence-storage-budget-exhausted",
+    EvidenceWriteBudgetExhausted = 14 => "evidence-write-budget-exhausted",
+    PrivacyEnvelopeRequiresRedaction = 15 => "privacy-envelope-requires-redaction",
+    RedactionWouldDestroyAttribution = 16 => "redaction-would-destroy-attribution",
+    TombstoneWouldBreakDependencyGraph = 17 => "tombstone-would-break-dependency-graph",
+    SupersedingEvidenceMissing = 18 => "superseding-evidence-missing",
+    SafePurgeFrontierNotReached = 19 => "safe-purge-frontier-not-reached",
+    ReceiptRetirementFrontierNotCrossed = 20 => "receipt-retirement-frontier-not-crossed",
+    ClaimRetentionBoundaryNotCrossed = 21 => "claim-retention-boundary-not-crossed",
+    RollbackReentryBlockerActive = 22 => "rollback-reentry-blocker-active",
+    MissingRetentionProofRoot = 23 => "missing-retention-proof-root",
+});
+
+impl StorageIntentEvidenceRetentionRefusalReason {
+    /// Returns true when a refusal reason is present.
+    #[must_use]
+    pub const fn is_refused(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Safe-purge-frontier predicates for evidence retention.
+///
+/// A cleaner must not purge evidence until every named frontier has been
+/// crossed or explicitly released.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentSafePurgeFrontier {
+    /// Sequence or generation frontier below which purge is legal.
+    pub sequence_frontier: u64,
+    /// Wall-clock frontier below which purge is legal (zero = none).
+    pub wall_clock_frontier_us: u64,
+    /// Policy revision frontier: evidence from older revisions may be purged
+    /// if no active mixed-revision explanation dependency exists.
+    pub policy_revision_frontier: StorageIntentPolicyRevision,
+    /// Receipt-retirement frontier: receipts older than this have been retired.
+    pub receipt_retirement_frontier_generation: u64,
+    /// Claim-retention boundary generation.
+    pub claim_retention_boundary_generation: u64,
+    /// Cooldown closure frontier: payback/cooldown windows resolved below this.
+    pub cooldown_closure_frontier_generation: u64,
+    /// Rollback/re-entry blocker frontier: must be zero (no active blockers).
+    pub rollback_reentry_blocker_frontier_generation: u64,
+}
+
+impl StorageIntentSafePurgeFrontier {
+    /// Returns true when all frontiers are zero (no purge frontier defined).
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.sequence_frontier == 0
+            && self.wall_clock_frontier_us == 0
+            && self.policy_revision_frontier.0 == 0
+            && self.receipt_retirement_frontier_generation == 0
+            && self.claim_retention_boundary_generation == 0
+            && self.cooldown_closure_frontier_generation == 0
+            && self.rollback_reentry_blocker_frontier_generation == 0
+    }
+
+    /// Returns true when the given generation is below all defined frontiers
+    /// and purge is legal.
+    #[must_use]
+    pub const fn generation_is_below_frontier(self, generation: u64) -> bool {
+        if self.sequence_frontier > 0 && generation >= self.sequence_frontier {
+            return false;
+        }
+        if self.receipt_retirement_frontier_generation > 0
+            && generation >= self.receipt_retirement_frontier_generation
+        {
+            return false;
+        }
+        if self.claim_retention_boundary_generation > 0
+            && generation >= self.claim_retention_boundary_generation
+        {
+            return false;
+        }
+        if self.cooldown_closure_frontier_generation > 0
+            && generation >= self.cooldown_closure_frontier_generation
+        {
+            return false;
+        }
+        if self.rollback_reentry_blocker_frontier_generation > 0
+            && generation >= self.rollback_reentry_blocker_frontier_generation
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// Cost and privacy envelope for evidence retention.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentEvidenceRetentionEnvelope {
+    /// Maximum metadata-write budget in bytes for this evidence family.
+    pub metadata_write_budget_bytes: u64,
+    /// Maximum storage budget in bytes for retained evidence.
+    pub storage_budget_bytes: u64,
+    /// Tenant attribution: which budget owner pays for retention.
+    pub budget_owner: StorageIntentBudgetOwnerRef,
+    /// Redaction required: true when privacy rules require field-level redaction.
+    pub redaction_required: bool,
+    /// Anonymization required: true when tenant-identifying fields must be removed.
+    pub anonymization_required: bool,
+    /// Retention refusal at the envelope level.
+    pub refusal: StorageIntentEvidenceRetentionRefusalReason,
+}
+
+impl StorageIntentEvidenceRetentionEnvelope {
+    /// Returns true when the metadata write budget is exhausted.
+    #[must_use]
+    pub const fn metadata_write_budget_exhausted(self, consumed: u64) -> bool {
+        self.metadata_write_budget_bytes > 0 && consumed >= self.metadata_write_budget_bytes
+    }
+
+    /// Returns true when the storage budget is exhausted.
+    #[must_use]
+    pub const fn storage_budget_exhausted(self, consumed: u64) -> bool {
+        self.storage_budget_bytes > 0 && consumed >= self.storage_budget_bytes
+    }
+
+    /// Returns true when privacy rules require pre-retention treatment.
+    #[must_use]
+    pub const fn requires_privacy_treatment(self) -> bool {
+        self.redaction_required || self.anonymization_required
+    }
+}
+
+/// Inline evidence references for retention evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentEvidenceRetentionRefs {
+    /// Receipt dependency ref.
+    pub receipt_ref: StorageIntentEvidenceRef,
+    /// Decision-frontier dependency ref.
+    pub decision_frontier_ref: StorageIntentEvidenceRef,
+    /// Prediction-outcome dependency ref.
+    pub prediction_outcome_ref: StorageIntentEvidenceRef,
+    /// Cooldown/payback dependency ref.
+    pub cooldown_payback_ref: StorageIntentEvidenceRef,
+    /// Recovery/degradation obligation ref.
+    pub recovery_obligation_ref: StorageIntentEvidenceRef,
+    /// Policy-rollout mixed-revision explanation ref.
+    pub policy_rollout_ref: StorageIntentEvidenceRef,
+    /// Operator-explanation dependency ref.
+    pub operator_explanation_ref: StorageIntentEvidenceRef,
+    /// Performance-row dependency ref.
+    pub performance_row_ref: StorageIntentEvidenceRef,
+    /// Fault-artifact dependency ref.
+    pub fault_artifact_ref: StorageIntentEvidenceRef,
+    /// Claim-artifact dependency ref.
+    pub claim_ref: StorageIntentEvidenceRef,
+    /// Audit/legal-hold dependency ref.
+    pub audit_legal_hold_ref: StorageIntentEvidenceRef,
+    /// Superseding evidence ref (if compacted or replaced).
+    pub superseding_evidence_ref: StorageIntentEvidenceRef,
+    /// Tombstone ref (if purged but anchor kept).
+    pub tombstone_ref: StorageIntentEvidenceRef,
+    /// Proof-root ref: integrity or content-digest anchor.
+    pub proof_root_ref: StorageIntentEvidenceRef,
+    /// Budget-owner attribution evidence ref.
+    pub budget_owner_evidence_ref: StorageIntentEvidenceRef,
+}
+
+/// Storage-intent evidence-retention record.
+///
+/// This is the concrete projection for evidence kind
+/// `EvidenceRetentionEvidence = 22` as prescribed by
+/// `docs/STORAGE_INTENT_POLICY_AUTHORITY.md` and owned by issue #910.
+///
+/// It records what evidence is retained, how it may be compacted or summarized,
+/// which dependency references still block purge, and what safe-purge frontiers
+/// and cost/privacy envelopes govern its lifecycle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct StorageIntentEvidenceRetention {
+    /// Self-referential evidence identity.
+    pub evidence_ref: StorageIntentEvidenceRef,
+    /// Owning policy identity.
+    pub policy_id: StorageIntentPolicyId,
+    /// Owning policy revision.
+    pub policy_revision: StorageIntentPolicyRevision,
+    /// Subject scope (evidence family, dataset, or global).
+    pub subject_scope: StorageIntentObjectScope,
+    /// The evidence id whose retention is governed by this record.
+    pub governed_evidence_id: StorageIntentEvidenceId,
+    /// The evidence kind of the governed artifact.
+    pub governed_evidence_kind: StorageIntentEvidenceKind,
+    /// Producer identity (which authority or component produced the evidence).
+    pub producer: StorageIntentDomainId,
+    /// Generation or epoch when this evidence was produced.
+    pub generation: u64,
+    /// Temporal reference for freshness/staleness.
+    pub temporal_ref: StorageIntentEvidenceRef,
+    /// Integrity or content-digest ref for the governed evidence.
+    pub integrity_ref: StorageIntentEvidenceRef,
+    /// Retention class: governs retention discipline and purge priority.
+    pub retention_class: StorageIntentEvidenceRetentionClass,
+    /// Compaction/summarization rule currently applied.
+    pub compaction_rule: StorageIntentEvidenceCompactionRule,
+    /// Safe-purge-frontier predicates.
+    pub safe_purge_frontier: StorageIntentSafePurgeFrontier,
+    /// Cost and privacy envelope.
+    pub envelope: StorageIntentEvidenceRetentionEnvelope,
+    /// Dependency-graph refs: downstream evidence that still relies on this.
+    pub refs: StorageIntentEvidenceRetentionRefs,
+    /// Retention refusal at the record level.
+    pub refusal: StorageIntentEvidenceRetentionRefusalReason,
+}
+
+impl StorageIntentEvidenceRetention {
+    /// Returns true when the record cites a bound evidence-retention artifact.
+    #[must_use]
+    pub const fn has_retention_identity(self) -> bool {
+        self.evidence_ref.kind as u16
+            == StorageIntentEvidenceKind::EvidenceRetentionEvidence as u16
+            && evidence_ref_has_id(self.evidence_ref)
+            && !self.policy_id.is_zero()
+            && self.policy_revision.0 > 0
+    }
+
+    /// Returns true when governed evidence identity is bound.
+    #[must_use]
+    pub const fn has_governed_identity(self) -> bool {
+        self.governed_evidence_kind as u16 != StorageIntentEvidenceKind::Unknown as u16
+            && !bytes32_are_zero(self.governed_evidence_id.0)
+    }
+
+    /// Returns true when the retention class is authority-class evidence.
+    #[must_use]
+    pub const fn is_authority_evidence(self) -> bool {
+        self.retention_class.is_authority()
+    }
+
+    /// Returns true when the retention class is optional and may be evicted
+    /// under budget pressure.
+    #[must_use]
+    pub const fn is_optional_evidence(self) -> bool {
+        self.retention_class.is_optional()
+    }
+
+    /// Returns true when any live dependency reference still blocks purge.
+    #[must_use]
+    pub const fn has_live_dependency(self) -> bool {
+        evidence_ref_has_id(self.refs.receipt_ref)
+            || evidence_ref_has_id(self.refs.decision_frontier_ref)
+            || evidence_ref_has_id(self.refs.prediction_outcome_ref)
+            || evidence_ref_has_id(self.refs.cooldown_payback_ref)
+            || evidence_ref_has_id(self.refs.recovery_obligation_ref)
+            || evidence_ref_has_id(self.refs.policy_rollout_ref)
+            || evidence_ref_has_id(self.refs.claim_ref)
+            || evidence_ref_has_id(self.refs.audit_legal_hold_ref)
+    }
+
+    /// Returns true when the compaction rule allows safe purge.
+    #[must_use]
+    pub const fn compaction_allows_purge(self) -> bool {
+        self.compaction_rule.allows_purge()
+    }
+
+    /// Returns true when the retention record has a valid proof-root anchor.
+    #[must_use]
+    pub const fn has_proof_root(self) -> bool {
+        evidence_ref_has_id(self.refs.proof_root_ref)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Evidence-retention predicate functions (issue #910)
+// ---------------------------------------------------------------------------
+
+/// Hard gate: retention evidence must be present and bound.
+#[must_use]
+pub const fn retention_evidence_is_present(
+    retention: StorageIntentEvidenceRetention,
+) -> ReceiptPredicateResult {
+    if !retention.has_retention_identity() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnknownEvidenceRetention,
+        );
+    }
+    if !retention.has_governed_identity() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnknownEvidenceRetention,
+        );
+    }
+    if retention.retention_class as u8
+        == StorageIntentEvidenceRetentionClass::Unknown as u8
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::UnknownRetentionClassForEvidence,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: purge is blocked while any live dependency reference exists.
+#[must_use]
+pub const fn retention_purge_is_safe(
+    retention: StorageIntentEvidenceRetention,
+) -> ReceiptPredicateResult {
+    let present = retention_evidence_is_present(retention);
+    if !present.satisfied {
+        return present;
+    }
+    if !retention.has_live_dependency() {
+        return ReceiptPredicateResult::SATISFIED;
+    }
+    // Check each dependency class for a blocking purge refusal.
+    if evidence_ref_has_id(retention.refs.receipt_ref) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionLiveReceiptDependency,
+        );
+    }
+    if evidence_ref_has_id(retention.refs.decision_frontier_ref) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionLiveDecisionDependency,
+        );
+    }
+    if evidence_ref_has_id(retention.refs.prediction_outcome_ref) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionUnresolvedCooldown,
+        );
+    }
+    if evidence_ref_has_id(retention.refs.cooldown_payback_ref) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionUnresolvedCooldown,
+        );
+    }
+    if evidence_ref_has_id(retention.refs.policy_rollout_ref) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionMixedPolicyRollout,
+        );
+    }
+    if evidence_ref_has_id(retention.refs.recovery_obligation_ref) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionActiveRecoveryObligation,
+        );
+    }
+    if evidence_ref_has_id(retention.refs.claim_ref) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionActiveClaimDependency,
+        );
+    }
+    if evidence_ref_has_id(retention.refs.audit_legal_hold_ref) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionActiveAuditLegalHold,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: safe-purge frontier must be reached for this generation.
+#[must_use]
+pub const fn retention_safe_purge_frontier_is_reached(
+    retention: StorageIntentEvidenceRetention,
+) -> ReceiptPredicateResult {
+    let present = retention_evidence_is_present(retention);
+    if !present.satisfied {
+        return present;
+    }
+    if retention.safe_purge_frontier.is_empty() {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionMissingPurgeFrontier,
+        );
+    }
+    if !retention.safe_purge_frontier.generation_is_below_frontier(retention.generation) {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionSafePurgeFrontierNotReached,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: compaction must preserve refused, rejected, and unknown states.
+#[must_use]
+pub const fn retention_compaction_preserves_refused_state(
+    retention: StorageIntentEvidenceRetention,
+) -> ReceiptPredicateResult {
+    let present = retention_evidence_is_present(retention);
+    if !present.satisfied {
+        return present;
+    }
+    // Compaction rules that would lose rejection/refusal information are illegal.
+    if retention.compaction_rule.is_lossy()
+        && !retention.compaction_rule.preserves_exact()
+    {
+        // Redacted/audited summaries are acceptable if they preserve refusal.
+        if retention.compaction_rule as u8
+            != StorageIntentEvidenceCompactionRule::RedactedAuditedSummary as u8
+        {
+            return ReceiptPredicateResult::refused(
+                StorageIntentRefusalReason::EvidenceRetentionCompactionWouldLoseState,
+            );
+        }
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: evidence storage budget must not evict authority evidence
+/// before optional telemetry.
+#[must_use]
+pub const fn retention_storage_budget_respects_authority(
+    retention: StorageIntentEvidenceRetention,
+    storage_consumed_bytes: u64,
+) -> ReceiptPredicateResult {
+    let present = retention_evidence_is_present(retention);
+    if !present.satisfied {
+        return present;
+    }
+    // Optional evidence may be refused when budget is exhausted.
+    if retention.is_optional_evidence()
+        && retention.envelope.storage_budget_exhausted(storage_consumed_bytes)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionStorageBudgetExhausted,
+        );
+    }
+    // Authority evidence must not be evicted for budget reasons alone.
+    if retention.is_authority_evidence()
+        && retention.envelope.storage_budget_exhausted(storage_consumed_bytes)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionCannotEvictAuthority,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Hard gate: compaction must preserve proof-root integrity.
+#[must_use]
+pub const fn retention_compaction_preserves_proof_root(
+    retention: StorageIntentEvidenceRetention,
+) -> ReceiptPredicateResult {
+    let present = retention_evidence_is_present(retention);
+    if !present.satisfied {
+        return present;
+    }
+    // Tombstoning without a proof-root anchor is illegal.
+    if retention.compaction_rule as u8
+        == StorageIntentEvidenceCompactionRule::Tombstoned as u8
+        && !retention.has_proof_root()
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionTombstoneWithoutProofRoot,
+        );
+    }
+    // Superseded without a superseding evidence ref is illegal.
+    if retention.compaction_rule as u8
+        == StorageIntentEvidenceCompactionRule::Superseded as u8
+        && !evidence_ref_has_id(retention.refs.superseding_evidence_ref)
+    {
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::EvidenceRetentionSupersededMissingReplacement,
+        );
+    }
+    ReceiptPredicateResult::SATISFIED
+}
+
+/// Combined gate: evidence retention is usable for explanation, cleanup,
+/// performance, fault, claims, recovery, and rollout consumers.
+#[must_use]
+pub const fn retention_evidence_is_usable(
+    retention: StorageIntentEvidenceRetention,
+) -> ReceiptPredicateResult {
+    let present = retention_evidence_is_present(retention);
+    if !present.satisfied {
+        return present;
+    }
+    let purge = retention_purge_is_safe(retention);
+    if !purge.satisfied {
+        return purge;
+    }
+    let compaction = retention_compaction_preserves_refused_state(retention);
+    if !compaction.satisfied {
+        return compaction;
+    }
+    let proof = retention_compaction_preserves_proof_root(retention);
+    if !proof.satisfied {
+        return proof;
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -23409,10 +24210,490 @@ mod tests {
             StorageIntentRefusalReason::ValidationGateFailed,
             StorageIntentRefusalReason::BudgetDonationRefused,
             StorageIntentRefusalReason::DebtNotRepaid,
+            StorageIntentRefusalReason::UnknownEvidenceRetention,
+            StorageIntentRefusalReason::UnknownRetentionClassForEvidence,
+            StorageIntentRefusalReason::EvidenceRetentionLiveReceiptDependency,
+            StorageIntentRefusalReason::EvidenceRetentionLiveDecisionDependency,
+            StorageIntentRefusalReason::EvidenceRetentionUnresolvedCooldown,
+            StorageIntentRefusalReason::EvidenceRetentionMixedPolicyRollout,
+            StorageIntentRefusalReason::EvidenceRetentionActiveRecoveryObligation,
+            StorageIntentRefusalReason::EvidenceRetentionActiveClaimDependency,
+            StorageIntentRefusalReason::EvidenceRetentionActiveAuditLegalHold,
+            StorageIntentRefusalReason::EvidenceRetentionCompactionWouldLoseState,
+            StorageIntentRefusalReason::EvidenceRetentionStorageBudgetExhausted,
+            StorageIntentRefusalReason::EvidenceRetentionCannotEvictAuthority,
+            StorageIntentRefusalReason::EvidenceRetentionTombstoneWithoutProofRoot,
+            StorageIntentRefusalReason::EvidenceRetentionSupersededMissingReplacement,
+            StorageIntentRefusalReason::EvidenceRetentionMissingPurgeFrontier,
+            StorageIntentRefusalReason::EvidenceRetentionSafePurgeFrontierNotReached,
         ];
         for r in &refusals {
             let disc = r.to_discriminant();
             let decoded = StorageIntentRefusalReason::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Evidence-retention model tests (issue #910)
+    // -------------------------------------------------------------------
+
+    const RETENTION_DOMAIN_PRODUCER: StorageIntentDomainId = StorageIntentDomainId([42_u8; 16]);
+
+    const fn retention_evidence_ref(id_byte: u8) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = id_byte;
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    const fn governed_evidence_ref(id_byte: u8, kind: StorageIntentEvidenceKind) -> StorageIntentEvidenceRef {
+        let mut id = [0_u8; 32];
+        id[0] = id_byte;
+        StorageIntentEvidenceRef {
+            kind,
+            id: StorageIntentEvidenceId(id),
+            generation: 1,
+            version: 1,
+        }
+    }
+
+    fn healthy_retention_record() -> StorageIntentEvidenceRetention {
+        StorageIntentEvidenceRetention {
+            evidence_ref: retention_evidence_ref(1),
+            policy_id: StorageIntentPolicyId([42_u8; 16]),
+            policy_revision: StorageIntentPolicyRevision(1),
+            subject_scope: StorageIntentObjectScope::default(),
+            governed_evidence_id: StorageIntentEvidenceId([1_u8; 32]),
+            governed_evidence_kind: StorageIntentEvidenceKind::PlacementReceipt,
+            producer: RETENTION_DOMAIN_PRODUCER,
+            generation: 5,
+            temporal_ref: StorageIntentEvidenceRef::default(),
+            integrity_ref: StorageIntentEvidenceRef::default(),
+            retention_class: StorageIntentEvidenceRetentionClass::ReceiptAuthority,
+            compaction_rule: StorageIntentEvidenceCompactionRule::Exact,
+            safe_purge_frontier: StorageIntentSafePurgeFrontier {
+                sequence_frontier: 100,
+                wall_clock_frontier_us: 0,
+                policy_revision_frontier: StorageIntentPolicyRevision(0),
+                receipt_retirement_frontier_generation: 50,
+                claim_retention_boundary_generation: 0,
+                cooldown_closure_frontier_generation: 0,
+                rollback_reentry_blocker_frontier_generation: 0,
+            },
+            envelope: StorageIntentEvidenceRetentionEnvelope {
+                metadata_write_budget_bytes: 1_000_000,
+                storage_budget_bytes: 10_000_000,
+                budget_owner: StorageIntentBudgetOwnerRef::default(),
+                redaction_required: false,
+                anonymization_required: false,
+                refusal: StorageIntentEvidenceRetentionRefusalReason::None,
+            },
+            refs: StorageIntentEvidenceRetentionRefs::default(),
+            refusal: StorageIntentEvidenceRetentionRefusalReason::None,
+        }
+    }
+
+    #[test]
+    fn retention_identity_present_passes() {
+        let record = healthy_retention_record();
+        assert!(record.has_retention_identity());
+    }
+
+    #[test]
+    fn retention_identity_fails_on_wrong_kind() {
+        let mut record = healthy_retention_record();
+        record.evidence_ref.kind = StorageIntentEvidenceKind::Unknown;
+        assert!(!record.has_retention_identity());
+    }
+
+    #[test]
+    fn retention_identity_fails_on_zero_policy() {
+        let mut record = healthy_retention_record();
+        record.policy_id = StorageIntentPolicyId::ZERO;
+        assert!(!record.has_retention_identity());
+    }
+
+    #[test]
+    fn governed_identity_present_passes() {
+        let record = healthy_retention_record();
+        assert!(record.has_governed_identity());
+    }
+
+    #[test]
+    fn governed_identity_fails_on_unknown_kind() {
+        let mut record = healthy_retention_record();
+        record.governed_evidence_kind = StorageIntentEvidenceKind::Unknown;
+        assert!(!record.has_governed_identity());
+    }
+
+    #[test]
+    fn retention_class_is_authority_detected() {
+        let record = healthy_retention_record();
+        assert!(record.is_authority_evidence());
+    }
+
+    #[test]
+    fn retention_class_optional_detected() {
+        let mut record = healthy_retention_record();
+        record.retention_class = StorageIntentEvidenceRetentionClass::ShortLivedTelemetry;
+        assert!(record.is_optional_evidence());
+    }
+
+    #[test]
+    fn retention_evidence_is_present_passes() {
+        let record = healthy_retention_record();
+        let result = retention_evidence_is_present(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn retention_evidence_is_present_fails_on_missing_identity() {
+        let mut record = healthy_retention_record();
+        record.evidence_ref.kind = StorageIntentEvidenceKind::Unknown;
+        let result = retention_evidence_is_present(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::UnknownEvidenceRetention);
+    }
+
+    #[test]
+    fn retention_evidence_is_present_fails_on_unknown_retention_class() {
+        let mut record = healthy_retention_record();
+        record.retention_class = StorageIntentEvidenceRetentionClass::Unknown;
+        let result = retention_evidence_is_present(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::UnknownRetentionClassForEvidence);
+    }
+
+    #[test]
+    fn retention_purge_is_safe_with_no_dependencies() {
+        let record = healthy_retention_record();
+        let result = retention_purge_is_safe(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn retention_purge_blocked_by_live_receipt() {
+        let mut record = healthy_retention_record();
+        record.refs.receipt_ref = governed_evidence_ref(10, StorageIntentEvidenceKind::PlacementReceipt);
+        let result = retention_purge_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionLiveReceiptDependency);
+    }
+
+    #[test]
+    fn retention_purge_blocked_by_live_decision_frontier() {
+        let mut record = healthy_retention_record();
+        record.refs.decision_frontier_ref = governed_evidence_ref(11, StorageIntentEvidenceKind::DecisionFrontierEvidence);
+        let result = retention_purge_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionLiveDecisionDependency);
+    }
+
+    #[test]
+    fn retention_purge_blocked_by_active_recovery_obligation() {
+        let mut record = healthy_retention_record();
+        record.refs.recovery_obligation_ref = governed_evidence_ref(12, StorageIntentEvidenceKind::RecoveryDegradationEvidence);
+        let result = retention_purge_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionActiveRecoveryObligation);
+    }
+
+    #[test]
+    fn retention_purge_blocked_by_active_claim_dependency() {
+        let mut record = healthy_retention_record();
+        record.refs.claim_ref = governed_evidence_ref(13, StorageIntentEvidenceKind::ClaimGateEvidence);
+        let result = retention_purge_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionActiveClaimDependency);
+    }
+
+    #[test]
+    fn retention_purge_blocked_by_active_audit_legal_hold() {
+        let mut record = healthy_retention_record();
+        record.refs.audit_legal_hold_ref = governed_evidence_ref(14, StorageIntentEvidenceKind::TrustDomainEvidence);
+        let result = retention_purge_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionActiveAuditLegalHold);
+    }
+
+    #[test]
+    fn retention_purge_blocked_by_unresolved_cooldown() {
+        let mut record = healthy_retention_record();
+        record.refs.cooldown_payback_ref = governed_evidence_ref(15, StorageIntentEvidenceKind::PredictionEvidence);
+        let result = retention_purge_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionUnresolvedCooldown);
+    }
+
+    #[test]
+    fn retention_purge_blocked_by_prediction_outcome_dependency() {
+        let mut record = healthy_retention_record();
+        record.refs.prediction_outcome_ref = governed_evidence_ref(16, StorageIntentEvidenceKind::PredictionEvidence);
+        let result = retention_purge_is_safe(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionUnresolvedCooldown);
+    }
+
+    #[test]
+    fn retention_safe_purge_frontier_reached_passes() {
+        let record = healthy_retention_record();
+        let result = retention_safe_purge_frontier_is_reached(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn retention_safe_purge_frontier_blocked_when_empty() {
+        let mut record = healthy_retention_record();
+        record.safe_purge_frontier = StorageIntentSafePurgeFrontier::default();
+        let result = retention_safe_purge_frontier_is_reached(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionMissingPurgeFrontier);
+    }
+
+    #[test]
+    fn retention_safe_purge_frontier_blocked_when_below_frontier() {
+        let mut record = healthy_retention_record();
+        record.generation = 200; // above the sequence_frontier of 100
+        let result = retention_safe_purge_frontier_is_reached(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionSafePurgeFrontierNotReached);
+    }
+
+    #[test]
+    fn retention_compaction_preserves_refused_state_passes_exact() {
+        let mut record = healthy_retention_record();
+        record.compaction_rule = StorageIntentEvidenceCompactionRule::Exact;
+        let result = retention_compaction_preserves_refused_state(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn retention_compaction_redacted_summary_preserves_state() {
+        let mut record = healthy_retention_record();
+        record.compaction_rule = StorageIntentEvidenceCompactionRule::RedactedAuditedSummary;
+        let result = retention_compaction_preserves_refused_state(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn retention_compaction_lossy_without_redaction_fails() {
+        let mut record = healthy_retention_record();
+        record.compaction_rule = StorageIntentEvidenceCompactionRule::HistogramSketchTopKSummary;
+        let result = retention_compaction_preserves_refused_state(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionCompactionWouldLoseState);
+    }
+
+    #[test]
+    fn retention_storage_budget_authority_not_evicted() {
+        let record = healthy_retention_record();
+        let result = retention_storage_budget_respects_authority(record, 10_000_000);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionCannotEvictAuthority);
+    }
+
+    #[test]
+    fn retention_storage_budget_optional_refused_when_exhausted() {
+        let mut record = healthy_retention_record();
+        record.retention_class = StorageIntentEvidenceRetentionClass::ShortLivedTelemetry;
+        let result = retention_storage_budget_respects_authority(record, 10_000_000);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionStorageBudgetExhausted);
+    }
+
+    #[test]
+    fn retention_tombstone_without_proof_root_fails() {
+        let mut record = healthy_retention_record();
+        record.compaction_rule = StorageIntentEvidenceCompactionRule::Tombstoned;
+        let result = retention_compaction_preserves_proof_root(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionTombstoneWithoutProofRoot);
+    }
+
+    #[test]
+    fn retention_tombstone_with_proof_root_passes() {
+        let mut record = healthy_retention_record();
+        record.compaction_rule = StorageIntentEvidenceCompactionRule::Tombstoned;
+        record.refs.proof_root_ref = governed_evidence_ref(20, StorageIntentEvidenceKind::EvidenceRetentionEvidence);
+        let result = retention_compaction_preserves_proof_root(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn retention_superseded_without_replacement_fails() {
+        let mut record = healthy_retention_record();
+        record.compaction_rule = StorageIntentEvidenceCompactionRule::Superseded;
+        let result = retention_compaction_preserves_proof_root(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionSupersededMissingReplacement);
+    }
+
+    #[test]
+    fn retention_superseded_with_replacement_passes() {
+        let mut record = healthy_retention_record();
+        record.compaction_rule = StorageIntentEvidenceCompactionRule::Superseded;
+        record.refs.superseding_evidence_ref = governed_evidence_ref(21, StorageIntentEvidenceKind::EvidenceRetentionEvidence);
+        let result = retention_compaction_preserves_proof_root(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn retention_evidence_is_usable_complete_passes() {
+        let record = healthy_retention_record();
+        let result = retention_evidence_is_usable(record);
+        assert!(result.satisfied);
+    }
+
+    #[test]
+    fn retention_evidence_is_usable_fails_on_purge_blocked() {
+        let mut record = healthy_retention_record();
+        record.refs.receipt_ref = governed_evidence_ref(10, StorageIntentEvidenceKind::PlacementReceipt);
+        let result = retention_evidence_is_usable(record);
+        assert!(!result.satisfied);
+        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionLiveReceiptDependency);
+    }
+
+    #[test]
+    fn retention_class_roundtrip_discriminant() {
+        let classes = [
+            StorageIntentEvidenceRetentionClass::ReplayCritical,
+            StorageIntentEvidenceRetentionClass::ReceiptAuthority,
+            StorageIntentEvidenceRetentionClass::DecisionProof,
+            StorageIntentEvidenceRetentionClass::OutcomeLearning,
+            StorageIntentEvidenceRetentionClass::OperatorExplanation,
+            StorageIntentEvidenceRetentionClass::ValidationFault,
+            StorageIntentEvidenceRetentionClass::ClaimArtifact,
+            StorageIntentEvidenceRetentionClass::AuditLegal,
+            StorageIntentEvidenceRetentionClass::ShortLivedTelemetry,
+            StorageIntentEvidenceRetentionClass::CompactableAggregate,
+        ];
+        for c in &classes {
+            let disc = c.to_discriminant();
+            let decoded = StorageIntentEvidenceRetentionClass::from_discriminant(disc);
+            assert_eq!(decoded, Some(*c), "roundtrip failed for {:?}", c.as_str());
+        }
+    }
+
+    #[test]
+    fn compaction_rule_roundtrip_discriminant() {
+        let rules = [
+            StorageIntentEvidenceCompactionRule::Exact,
+            StorageIntentEvidenceCompactionRule::DigestPreservingSummary,
+            StorageIntentEvidenceCompactionRule::HistogramSketchTopKSummary,
+            StorageIntentEvidenceCompactionRule::RedactedAuditedSummary,
+            StorageIntentEvidenceCompactionRule::Expired,
+            StorageIntentEvidenceCompactionRule::Tombstoned,
+            StorageIntentEvidenceCompactionRule::Superseded,
+            StorageIntentEvidenceCompactionRule::RefusedToCompact,
+        ];
+        for r in &rules {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentEvidenceCompactionRule::from_discriminant(disc);
+            assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
+        }
+    }
+
+    #[test]
+    fn safe_purge_frontier_is_empty_detected() {
+        let frontier = StorageIntentSafePurgeFrontier::default();
+        assert!(frontier.is_empty());
+    }
+
+    #[test]
+    fn safe_purge_frontier_not_empty_when_set() {
+        let frontier = StorageIntentSafePurgeFrontier {
+            sequence_frontier: 1,
+            ..StorageIntentSafePurgeFrontier::default()
+        };
+        assert!(!frontier.is_empty());
+    }
+
+    #[test]
+    fn generation_below_frontier_passes() {
+        let frontier = StorageIntentSafePurgeFrontier {
+            sequence_frontier: 100,
+            receipt_retirement_frontier_generation: 50,
+            ..StorageIntentSafePurgeFrontier::default()
+        };
+        assert!(frontier.generation_is_below_frontier(3));
+    }
+
+    #[test]
+    fn generation_at_frontier_is_blocked() {
+        let frontier = StorageIntentSafePurgeFrontier {
+            sequence_frontier: 100,
+            ..StorageIntentSafePurgeFrontier::default()
+        };
+        assert!(!frontier.generation_is_below_frontier(100));
+    }
+
+    #[test]
+    fn generation_above_frontier_is_blocked() {
+        let frontier = StorageIntentSafePurgeFrontier {
+            sequence_frontier: 100,
+            ..StorageIntentSafePurgeFrontier::default()
+        };
+        assert!(!frontier.generation_is_below_frontier(200));
+    }
+
+    #[test]
+    fn retention_envelope_budget_exhausted_detected() {
+        let env = StorageIntentEvidenceRetentionEnvelope {
+            metadata_write_budget_bytes: 1000,
+            storage_budget_bytes: 5000,
+            ..StorageIntentEvidenceRetentionEnvelope::default()
+        };
+        assert!(env.metadata_write_budget_exhausted(1000));
+        assert!(!env.metadata_write_budget_exhausted(999));
+        assert!(env.storage_budget_exhausted(5000));
+        assert!(!env.storage_budget_exhausted(4999));
+    }
+
+    #[test]
+    fn retention_envelope_privacy_treatment_detected() {
+        let env = StorageIntentEvidenceRetentionEnvelope {
+            redaction_required: true,
+            anonymization_required: false,
+            ..StorageIntentEvidenceRetentionEnvelope::default()
+        };
+        assert!(env.requires_privacy_treatment());
+    }
+
+    #[test]
+    fn retention_refusal_reason_roundtrip() {
+        let reasons = [
+            StorageIntentEvidenceRetentionRefusalReason::MissingRetentionEvidence,
+            StorageIntentEvidenceRetentionRefusalReason::StaleRetentionEvidence,
+            StorageIntentEvidenceRetentionRefusalReason::UnknownRetentionClass,
+            StorageIntentEvidenceRetentionRefusalReason::LiveReceiptDependency,
+            StorageIntentEvidenceRetentionRefusalReason::LiveDecisionFrontierDependency,
+            StorageIntentEvidenceRetentionRefusalReason::UnresolvedCooldownPayback,
+            StorageIntentEvidenceRetentionRefusalReason::MixedPolicyRolloutActive,
+            StorageIntentEvidenceRetentionRefusalReason::ActiveRecoveryObligation,
+            StorageIntentEvidenceRetentionRefusalReason::ActiveClaimDependency,
+            StorageIntentEvidenceRetentionRefusalReason::ActiveAuditLegalHold,
+            StorageIntentEvidenceRetentionRefusalReason::CompactionBlockedByDependency,
+            StorageIntentEvidenceRetentionRefusalReason::CompactionWouldLoseRejectedState,
+            StorageIntentEvidenceRetentionRefusalReason::EvidenceStorageBudgetExhausted,
+            StorageIntentEvidenceRetentionRefusalReason::EvidenceWriteBudgetExhausted,
+            StorageIntentEvidenceRetentionRefusalReason::PrivacyEnvelopeRequiresRedaction,
+            StorageIntentEvidenceRetentionRefusalReason::RedactionWouldDestroyAttribution,
+            StorageIntentEvidenceRetentionRefusalReason::TombstoneWouldBreakDependencyGraph,
+            StorageIntentEvidenceRetentionRefusalReason::SupersedingEvidenceMissing,
+            StorageIntentEvidenceRetentionRefusalReason::SafePurgeFrontierNotReached,
+            StorageIntentEvidenceRetentionRefusalReason::ReceiptRetirementFrontierNotCrossed,
+            StorageIntentEvidenceRetentionRefusalReason::ClaimRetentionBoundaryNotCrossed,
+            StorageIntentEvidenceRetentionRefusalReason::RollbackReentryBlockerActive,
+            StorageIntentEvidenceRetentionRefusalReason::MissingRetentionProofRoot,
+        ];
+        for r in &reasons {
+            let disc = r.to_discriminant();
+            let decoded = StorageIntentEvidenceRetentionRefusalReason::from_discriminant(disc);
             assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
         }
     }
