@@ -3495,6 +3495,7 @@ dependencies = [
 name = "tidefs-storage-intent-local-media-capability"
 version = "0.421.0"
 dependencies = [
+ "tidefs-kernel-storage-io",
  "tidefs-storage-intent-core",
 ]
 
