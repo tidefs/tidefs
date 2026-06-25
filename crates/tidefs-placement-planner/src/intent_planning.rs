@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use tidefs_storage_intent_core::{
     ack_receipt_satisfies_requested_floor, data_shape_hard_gate_check,
     evaluate_receipt_against_policy, media_capability_satisfies_role,
+    metadata_namespace_evidence_is_usable,
     prefetch_residency_decision_is_cache_only,
     prefetch_residency_decision_may_request_authority_change,
     preflight_simulation_evidence_is_usable, preflight_simulation_has_no_blockers,
@@ -24,10 +25,10 @@ use tidefs_storage_intent_core::{
     PrefetchResidencyDecisionRecord, ProximityClass, ReceiptPredicateResult, SkippedMoveReason,
     StorageIntentActionClass, StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot,
     StorageIntentEvidenceRef, StorageIntentGuaranteeClass, StorageIntentPolicy,
-    StorageIntentPreflightSimulationEvidence, StorageIntentReceipt, StorageIntentReceiptId,
-    StorageIntentRefusalReason, StorageIntentServiceObjectiveEvidence,
-    StorageIntentServiceObjectiveScope, StorageIntentTrustRole, StorageMediaRole,
-    TrustDomainRequirement, TrustEvidenceRecord,
+    StorageIntentMetadataNamespaceEvidence, StorageIntentPreflightSimulationEvidence,
+    StorageIntentReceipt, StorageIntentReceiptId, StorageIntentRefusalReason,
+    StorageIntentServiceObjectiveEvidence, StorageIntentServiceObjectiveScope,
+    StorageIntentTrustRole, StorageMediaRole, TrustDomainRequirement, TrustEvidenceRecord,
 };
 
 use crate::TierGoal;
@@ -328,6 +329,8 @@ pub struct StorageIntentPlacementCandidate {
     pub prefetch_residency: Option<PrefetchResidencyDecisionRecord>,
     /// #912 attribution gate for prefetch/residency outcomes used by scoring.
     pub measurement_attribution: PlacementEvidenceState,
+    /// Optional #922 metadata/namespace evidence for metadata-shaped work.
+    pub metadata_namespace: Option<StorageIntentMetadataNamespaceEvidence>,
     /// Optional #915 service-objective envelope for this candidate.
     pub service_objective: Option<StorageIntentServiceObjectiveEvidence>,
     /// Exact #915 scope this candidate is trying to satisfy.
@@ -362,6 +365,8 @@ pub struct StorageIntentPlacementCandidate {
     pub data_shape_state: PlacementEvidenceState,
     /// Layout/allocator evidence gate.
     pub layout_allocator_state: PlacementEvidenceState,
+    /// Metadata/namespace evidence gate (#922) for metadata-shaped work.
+    pub metadata_namespace_state: PlacementEvidenceState,
     /// Service-objective evidence gate.
     pub service_objective_state: PlacementEvidenceState,
     /// Decision-frontier evidence gate.
@@ -391,6 +396,7 @@ impl StorageIntentPlacementCandidate {
             cost_wear: None,
             prefetch_residency: None,
             measurement_attribution: PlacementEvidenceState::Unknown,
+            metadata_namespace: None,
             service_objective: None,
             service_objective_scope: None,
             service_objective_query: None,
@@ -408,6 +414,7 @@ impl StorageIntentPlacementCandidate {
             trust_domain: PlacementEvidenceState::Unknown,
             data_shape_state: PlacementEvidenceState::Unknown,
             layout_allocator_state: PlacementEvidenceState::Unknown,
+            metadata_namespace_state: PlacementEvidenceState::Unknown,
             service_objective_state: PlacementEvidenceState::Unknown,
             decision_frontier: PlacementEvidenceState::Unknown,
             preflight_simulation_state: PlacementEvidenceState::Unknown,
@@ -431,6 +438,7 @@ impl StorageIntentPlacementCandidate {
         });
         self.data_shape_state = PlacementEvidenceState::Fresh;
         self.layout_allocator_state = PlacementEvidenceState::Fresh;
+        self.metadata_namespace_state = PlacementEvidenceState::Fresh;
         self.service_objective_state = PlacementEvidenceState::Fresh;
         self.measurement_attribution = PlacementEvidenceState::Fresh;
         self.decision_frontier = PlacementEvidenceState::Fresh;
@@ -509,6 +517,11 @@ pub enum StorageIntentPlacementReason {
         target_id: u64,
         refusal: StorageIntentRefusalReason,
     },
+    /// Metadata/namespace evidence rejected the target.
+    CandidateMetadataNamespaceRefused {
+        target_id: u64,
+        refusal: StorageIntentRefusalReason,
+    },
     /// Cache-only or trial state attempted to satisfy durable authority.
     CandidateCacheOnlyCannotSatisfyAuthority { target_id: u64 },
     /// Geo or remote role lacked geo/remote evidence.
@@ -563,6 +576,7 @@ impl StorageIntentPlacementReason {
             | Self::CandidateEvidenceGateRefused { refusal, .. }
             | Self::CandidateDataShapeRefused { refusal, .. }
             | Self::CandidateServiceObjectiveRefused { refusal, .. }
+            | Self::CandidateMetadataNamespaceRefused { refusal, .. }
             | Self::CandidateTrustDomainRefused { refusal, .. }
             | Self::CandidatePrefetchResidencyRefused { refusal, .. }
             | Self::CandidatePreflightSimulationRefused { refusal, .. }
@@ -603,6 +617,7 @@ pub enum CandidateGate {
     TrustDomain,
     DataShape,
     LayoutAllocator,
+    MetadataNamespace,
     ServiceObjective,
     MeasurementAttribution,
     DecisionFrontier,
@@ -1099,6 +1114,13 @@ fn request_level_reasons(
     for kind in request.role.hard_gate_evidence() {
         require_fresh_evidence_family(&mut reasons, request, *kind);
     }
+    if request_policy_requires_metadata_namespace(request) {
+        require_fresh_evidence_family(
+            &mut reasons,
+            request,
+            StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+        );
+    }
     if request.role.requires_movement_payback() {
         for kind in MOVEMENT_HARD_GATE_EVIDENCE {
             require_fresh_evidence_family(&mut reasons, request, *kind);
@@ -1492,6 +1514,7 @@ fn evaluate_candidate(
 
     evaluate_service_objective(role_requires_service_objective(role), candidate, reasons);
     evaluate_preflight_simulation_boundary(request, candidate, reasons);
+    evaluate_metadata_namespace(request, candidate, reasons);
     evaluate_data_shape(request, role_requires_data_shape(role), candidate, reasons);
     evaluate_layout(role_requires_layout_allocator(role), candidate, reasons);
     evaluate_prefetch_residency_boundary(request, role, candidate, reasons);
@@ -1617,6 +1640,74 @@ fn role_requires_layout_allocator(role: StorageIntentPlacementRole) -> bool {
 
 fn role_requires_service_objective(role: StorageIntentPlacementRole) -> bool {
     !role.is_cache_only()
+}
+
+fn request_policy_requires_metadata_namespace(request: &StorageIntentPlacementRequest) -> bool {
+    request.policy.workload.shape == tidefs_storage_intent_core::WorkloadShape::MetadataHotset
+}
+
+fn candidate_requires_metadata_namespace(
+    request: &StorageIntentPlacementRequest,
+    candidate: &StorageIntentPlacementCandidate,
+) -> bool {
+    request_policy_requires_metadata_namespace(request)
+        || candidate.metadata_namespace.is_some()
+        || candidate.prefetch_residency.is_some_and(|decision| {
+            decision.access_pattern
+                == tidefs_storage_intent_core::AccessPatternClass::MetadataNamespace
+                || decision.selected_candidate
+                    == tidefs_storage_intent_core::PrefetchResidencyCandidateClass::MetadataNamespacePrefetch
+        })
+}
+
+fn evaluate_metadata_namespace(
+    request: &StorageIntentPlacementRequest,
+    candidate: &StorageIntentPlacementCandidate,
+    reasons: &mut Vec<StorageIntentPlacementReason>,
+) {
+    if !candidate_requires_metadata_namespace(request, candidate) {
+        return;
+    }
+
+    require_candidate_gate(
+        reasons,
+        candidate.target_id,
+        CandidateGate::MetadataNamespace,
+        candidate.metadata_namespace_state,
+        StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable,
+    );
+
+    if !request
+        .evidence_query
+        .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MetadataNamespaceEvidence)
+    {
+        reasons.push(StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+            target_id: candidate.target_id,
+            gate: CandidateGate::MetadataNamespace,
+            state: family_state(request, StorageIntentEvidenceKind::MetadataNamespaceEvidence),
+            refusal: StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable,
+        });
+    }
+
+    let Some(evidence) = candidate.metadata_namespace else {
+        reasons.push(
+            StorageIntentPlacementReason::CandidateMetadataNamespaceRefused {
+                target_id: candidate.target_id,
+                refusal: StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable,
+            },
+        );
+        return;
+    };
+
+    push_predicate_refusal(
+        reasons,
+        candidate.target_id,
+        metadata_namespace_evidence_is_usable(evidence),
+        |target_id, refusal| StorageIntentPlacementReason::CandidateMetadataNamespaceRefused {
+            target_id,
+            refusal,
+        },
+    );
 }
 
 fn evaluate_service_objective(
@@ -2231,15 +2322,17 @@ mod tests {
         EvidenceQuerySubjectScopeClass, FailureDomainMask, MediaArchiveRestoreSemantics,
         MediaAtomicityClass, MediaCapabilityFlags, MediaCapabilityFreshnessState,
         MediaFlushOrderingClass, MediaHealthState, MediaPersistenceDomain,
-        MediaProtocolGeometryClass, MediaRemoteCommitSemantics, PendingFreeSafetyClass,
+        MediaProtocolGeometryClass, MediaRemoteCommitSemantics, MetadataLocalityRoleFlags,
+        MetadataNamespaceOperationKind, MetadataSubjectClass, PendingFreeSafetyClass,
         PrefetchResidencyCandidateClass, PrefetchResidencyDecisionEvidenceRefs,
         PrefetchResidencyDecisionOutcome, PrefetchResidencyStateClass, ProximityClass,
         QuarantineState, ReadServingSourceClass, RebakeEligibilityClass, RecordSizeClass,
         ResidencyScope, SegmentRegionClass, SessionSecurityClass, SharingDomainClass,
         StorageIntentActionClass, StorageIntentDecisionHardGateVerdict, StorageIntentDomainId,
         StorageIntentEvidenceId, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
-        StorageIntentMediaCapabilityRecord, StorageIntentObjectScope, StorageIntentPolicyId,
-        StorageIntentPolicyRevision, StorageIntentPreflightActivationBlocker,
+        StorageIntentMediaCapabilityRecord, StorageIntentMetadataNamespaceEvidence,
+        StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
+        StorageIntentPreflightActivationBlocker,
         StorageIntentPreflightActivationBlockerKind, StorageIntentPreflightFidelityClass,
         StorageIntentPreflightNonAuthorityMarker, StorageIntentPreflightSimulationEvidence,
         StorageIntentReceiptId, StorageIntentServiceObjectiveComparatorScope,
@@ -2251,7 +2344,7 @@ mod tests {
         StorageIntentServiceObjectiveTopologyClass, StorageIntentServiceObjectiveTransportClass,
         StorageIntentServiceObjectiveWorkloadPhase, StorageMediaClass, TrustEvidenceFlags,
         TrustEvidenceFreshnessState, TrustEvidenceState, TrustKeyLifecycleState, TrustRequirement,
-        TrustRevocationState,
+        TrustRevocationState, VfsNamespaceAuthorityRef, WorkloadShape,
     };
 
     const POLICY_ID: StorageIntentPolicyId = StorageIntentPolicyId([7_u8; 16]);
@@ -2301,6 +2394,14 @@ mod tests {
 
     fn cache_only_evidence_cut(policy: StorageIntentPolicy) -> StorageIntentEvidenceQuerySnapshot {
         cache_only_evidence_cut_filter(policy, |_| true)
+    }
+
+    fn metadata_evidence_cut(policy: StorageIntentPolicy) -> StorageIntentEvidenceQuerySnapshot {
+        evidence_cut_filter_with(
+            policy,
+            &[StorageIntentEvidenceKind::MetadataNamespaceEvidence],
+            |kind| kind != StorageIntentEvidenceKind::RelocationReceipt,
+        )
     }
 
     fn cache_only_evidence_cut_filter<F>(
@@ -2771,6 +2872,31 @@ mod tests {
         evidence
     }
 
+    fn metadata_namespace_evidence() -> StorageIntentMetadataNamespaceEvidence {
+        StorageIntentMetadataNamespaceEvidence {
+            evidence_ref: evidence_ref(StorageIntentEvidenceKind::MetadataNamespaceEvidence, 88),
+            evidence_id: evidence_id(89),
+            policy_id: POLICY_ID,
+            policy_revision: StorageIntentPolicyRevision(1),
+            subject_class: MetadataSubjectClass::DirectoryInode,
+            operation_kind: MetadataNamespaceOperationKind::Fsyncdir,
+            vfs_authority: VfsNamespaceAuthorityRef {
+                inode_number: 42,
+                inode_generation: 7,
+                parent_inode: 1,
+                link_count: 2,
+                directory_cookie: 0,
+                raw_name_hash: evidence_id(90),
+                conflict_guard: evidence_id(91),
+            },
+            ordering_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 92),
+            replay_idempotency_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 93),
+            locality_roles: MetadataLocalityRoleFlags::METADATA_HOT
+                .union(MetadataLocalityRoleFlags::SYNC_INTENT_METADATA),
+            ..StorageIntentMetadataNamespaceEvidence::default()
+        }
+    }
+
     fn service_objective_object_scope() -> StorageIntentObjectScope {
         StorageIntentObjectScope {
             dataset_id: DOMAIN_A,
@@ -3117,6 +3243,7 @@ mod tests {
             CandidateGate::TrustDomain => candidate.trust_domain = state,
             CandidateGate::DataShape => candidate.data_shape_state = state,
             CandidateGate::LayoutAllocator => candidate.layout_allocator_state = state,
+            CandidateGate::MetadataNamespace => candidate.metadata_namespace_state = state,
             CandidateGate::ServiceObjective => candidate.service_objective_state = state,
             CandidateGate::MeasurementAttribution => candidate.measurement_attribution = state,
             CandidateGate::DecisionFrontier => candidate.decision_frontier = state,
@@ -3407,6 +3534,216 @@ mod tests {
             StorageIntentPlacementCandidateReason::HardGate(
                 StorageIntentPlacementReason::CandidateDataShapeRefused {
                     refusal: StorageIntentRefusalReason::UnknownDataShapeEvidence,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn metadata_hotset_request_requires_metadata_namespace_family() {
+        let mut policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        policy.workload.shape = WorkloadShape::MetadataHotset;
+        let candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        assert!(plan.candidate_reports.is_empty());
+        assert!(matches!(
+            plan.reasons.as_slice(),
+            [StorageIntentPlacementReason::EvidenceFamilyNotFresh {
+                kind: StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+                state: PlacementEvidenceState::Unknown
+            }]
+        ));
+    }
+
+    #[test]
+    fn metadata_hotset_candidate_requires_metadata_namespace_record() {
+        let mut policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        policy.workload.shape = WorkloadShape::MetadataHotset;
+        let request = StorageIntentPlacementRequest::new(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+            metadata_evidence_cut(policy),
+        )
+        .with_data_shape_policy(data_shape_policy(policy));
+        let candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(!report.legal);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateMetadataNamespaceRefused {
+                    refusal: StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn metadata_hotset_candidate_accepts_usable_metadata_namespace_record() {
+        let mut policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        policy.workload.shape = WorkloadShape::MetadataHotset;
+        let request = StorageIntentPlacementRequest::new(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+            metadata_evidence_cut(policy),
+        )
+        .with_data_shape_policy(data_shape_policy(policy));
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.metadata_namespace = Some(metadata_namespace_evidence());
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(plan.admitted, "{plan:?}");
+        assert_eq!(plan.selected_targets, vec![1]);
+    }
+
+    #[test]
+    fn metadata_namespace_prefetch_candidate_requires_metadata_namespace_evidence() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.prefetch_residency = Some(prefetch_decision(
+            PrefetchResidencyCandidateClass::MetadataNamespacePrefetch,
+            PrefetchResidencyStateClass::FlashHotServing,
+            PrefetchResidencyDecisionOutcome::Admitted,
+            StorageIntentRefusalReason::None,
+        ));
+
+        let plan = plan_storage_intent_placement(
+            &request(
+                policy,
+                StorageIntentPlacementRole::DurableFullPlacement,
+                1,
+                1,
+            ),
+            &[candidate],
+        );
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(!report.legal);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                    gate: CandidateGate::MetadataNamespace,
+                    state: PlacementEvidenceState::Unknown,
+                    refusal: StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn metadata_namespace_conflict_refuses_candidate_before_scoring() {
+        let mut policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        policy.workload.shape = WorkloadShape::MetadataHotset;
+        let request = StorageIntentPlacementRequest::new(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+            metadata_evidence_cut(policy),
+        )
+        .with_data_shape_policy(data_shape_policy(policy));
+        let mut evidence = metadata_namespace_evidence();
+        evidence.locality_roles = MetadataLocalityRoleFlags::METADATA_HOT
+            .union(MetadataLocalityRoleFlags::SYNC_INTENT_METADATA)
+            .union(MetadataLocalityRoleFlags::SMALL_FILE_INLINE)
+            .union(MetadataLocalityRoleFlags::SMALL_FILE_PACKED);
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        candidate.metadata_namespace = Some(evidence);
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(!report.legal);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateMetadataNamespaceRefused {
+                    refusal: StorageIntentRefusalReason::MetadataNamespaceConflict,
                     ..
                 }
             )
