@@ -6114,6 +6114,9 @@ mod tests {
     const PREFETCH_COST: StorageIntentEvidenceId = StorageIntentEvidenceId([0x67; 32]);
     const PREFETCH_ISOLATION: StorageIntentEvidenceId = StorageIntentEvidenceId([0x68; 32]);
     const PREFETCH_ACTION: StorageIntentEvidenceId = StorageIntentEvidenceId([0x69; 32]);
+    const PREFETCH_SOURCE_PATH: StorageIntentEvidenceId = StorageIntentEvidenceId([0x6a; 32]);
+    const PREFETCH_TARGET_DESTINATION: StorageIntentEvidenceId =
+        StorageIntentEvidenceId([0x6b; 32]);
 
     fn prefetch_evidence(
         kind: StorageIntentEvidenceKind,
@@ -6208,6 +6211,20 @@ mod tests {
             PREFETCH_ACTION,
         );
         snapshot
+            .included_refs
+            .push(prefetch_evidence(
+                StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                PREFETCH_SOURCE_PATH,
+            ))
+            .expect("push source path evidence");
+        snapshot
+            .included_refs
+            .push(prefetch_evidence(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                PREFETCH_TARGET_DESTINATION,
+            ))
+            .expect("push target destination evidence");
+        snapshot
     }
 
     fn admitted_readahead_input(range_start: u64, range_len: u64) -> PrefetchExecutorInput {
@@ -6281,6 +6298,14 @@ mod tests {
             media_path: PrefetchExecutorMediaPath {
                 source_media: decision.source_media,
                 target_media: decision.target_media,
+                source_path_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                    PREFETCH_SOURCE_PATH,
+                ),
+                target_destination_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    PREFETCH_TARGET_DESTINATION,
+                ),
                 media_capability_ref: prefetch_evidence(
                     StorageIntentEvidenceKind::MediaCapabilityEvidence,
                     PREFETCH_MEDIA,

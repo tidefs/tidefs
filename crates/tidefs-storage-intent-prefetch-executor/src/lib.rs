@@ -1293,6 +1293,15 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                     PrefetchExecutorByteState::Blocked,
                     StorageIntentRefusalReason::EvidenceNotUsable,
                 )
+            } else if runtime_dispatch_evidence_refusal(input, family) as u16
+                != StorageIntentRefusalReason::None as u16
+            {
+                terminal(
+                    record,
+                    PrefetchExecutorOutcome::Blocked,
+                    PrefetchExecutorByteState::Blocked,
+                    runtime_dispatch_evidence_refusal(input, family),
+                )
             } else if !input.runtime_support.supports_family(family) {
                 terminal(
                     record,
@@ -1483,17 +1492,97 @@ fn required_families_fresh(
                 && snapshot.contains_fresh_authority_family(
                     StorageIntentEvidenceKind::TrustDomainEvidence,
                 )))
-        && (!matches!(
-            family,
-            PrefetchExecutorActionFamily::ObjectArchiveRestoreStaging
-                | PrefetchExecutorActionFamily::WanGeoDeltaPrefetch
-                | PrefetchExecutorActionFamily::BoundedSequentialReadahead
-                | PrefetchExecutorActionFamily::StridedVectorRangePrefetch
-                | PrefetchExecutorActionFamily::SmallRandomHotsetCacheTrial
-        ) || snapshot
-            .contains_fresh_authority_family(StorageIntentEvidenceKind::MediaCapabilityEvidence))
+        && (!family.can_start_runtime_dispatch()
+            || snapshot.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            ))
         && snapshot
             .contains_fresh_authority_family(StorageIntentEvidenceKind::ReadFreshnessEvidence)
+}
+
+fn runtime_dispatch_evidence_refusal(
+    input: PrefetchExecutorInput,
+    family: PrefetchExecutorActionFamily,
+) -> StorageIntentRefusalReason {
+    if !family.can_start_runtime_dispatch() {
+        return StorageIntentRefusalReason::None;
+    }
+
+    let media_capability_ref = first_bound(
+        input.media_path.media_capability_ref,
+        input.decision.evidence_refs.media_capability_ref,
+    );
+    if !input.decision.source_media_ref.is_bound()
+        || !input.decision.target_media_ref.is_bound()
+        || !media_capability_ref.is_bound()
+        || !snapshot_contains_ref(input, input.decision.source_media_ref)
+        || !snapshot_contains_ref(input, input.decision.target_media_ref)
+        || !snapshot_contains_ref(input, media_capability_ref)
+    {
+        return StorageIntentRefusalReason::MissingMediaCapabilityEvidence;
+    }
+
+    if !input.media_path.source_path_ref.is_bound()
+        || !input.media_path.target_destination_ref.is_bound()
+    {
+        return StorageIntentRefusalReason::UnstableNamespaceIdentity;
+    }
+    if !snapshot_contains_ref(input, input.media_path.source_path_ref)
+        || !snapshot_contains_ref(input, input.media_path.target_destination_ref)
+    {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+
+    if runtime_dispatch_needs_transport_or_trust(input, family) {
+        let transport_path_ref = first_bound(
+            input.media_path.transport_path_ref,
+            input.decision.evidence_refs.transport_budget_ref,
+        );
+        if !transport_path_ref.is_bound() || !snapshot_contains_ref(input, transport_path_ref) {
+            return StorageIntentRefusalReason::EvidenceNotUsable;
+        }
+        let trust_domain_ref = first_bound(
+            input.media_path.trust_domain_ref,
+            input.decision.evidence_refs.trust_domain_ref,
+        );
+        if !trust_domain_ref.is_bound() || !snapshot_contains_ref(input, trust_domain_ref) {
+            return StorageIntentRefusalReason::StaleTrustEvidence;
+        }
+    }
+
+    StorageIntentRefusalReason::None
+}
+
+fn snapshot_contains_ref(
+    input: PrefetchExecutorInput,
+    evidence_ref: StorageIntentEvidenceRef,
+) -> bool {
+    input
+        .evidence_query_snapshot
+        .included_refs
+        .contains_ref(evidence_ref)
+}
+
+fn runtime_dispatch_needs_transport_or_trust(
+    input: PrefetchExecutorInput,
+    family: PrefetchExecutorActionFamily,
+) -> bool {
+    family.needs_remote_path_evidence()
+        || media_needs_transport_or_trust(input.decision.source_media)
+        || media_needs_transport_or_trust(input.decision.target_media)
+        || media_needs_transport_or_trust(input.media_path.source_media)
+        || media_needs_transport_or_trust(input.media_path.target_media)
+}
+
+const fn media_needs_transport_or_trust(media: StorageMediaClass) -> bool {
+    matches!(
+        media,
+        StorageMediaClass::RemoteRam
+            | StorageMediaClass::ObjectAppliance
+            | StorageMediaClass::CloudObject
+            | StorageMediaClass::OpticalArchive
+            | StorageMediaClass::TapeArchive
+    )
 }
 
 fn no_prefetch_decision(decision: PrefetchResidencyDecisionRecord) -> bool {
@@ -1673,6 +1762,9 @@ mod tests {
     const RETENTION: StorageIntentEvidenceId = StorageIntentEvidenceId([16; 32]);
     const VALIDATION: StorageIntentEvidenceId = StorageIntentEvidenceId([17; 32]);
     const ACTION: StorageIntentEvidenceId = StorageIntentEvidenceId([18; 32]);
+    const SOURCE_PATH: StorageIntentEvidenceId = StorageIntentEvidenceId([19; 32]);
+    const TARGET_DESTINATION: StorageIntentEvidenceId = StorageIntentEvidenceId([20; 32]);
+    const OUTSIDE_CUT: StorageIntentEvidenceId = StorageIntentEvidenceId([21; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -1770,6 +1862,20 @@ mod tests {
             StorageIntentEvidenceKind::ActionExecutionEvidence,
             ACTION,
         );
+        snapshot
+            .included_refs
+            .push(evidence(
+                StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                SOURCE_PATH,
+            ))
+            .unwrap();
+        snapshot
+            .included_refs
+            .push(evidence(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                TARGET_DESTINATION,
+            ))
+            .unwrap();
         if let Some(kind) = extra_kind {
             add_fresh(&mut snapshot, kind, TRANSPORT);
         }
@@ -1846,6 +1952,14 @@ mod tests {
             media_path: PrefetchExecutorMediaPath {
                 source_media: decision.source_media,
                 target_media: decision.target_media,
+                source_path_ref: evidence(
+                    StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                    SOURCE_PATH,
+                ),
+                target_destination_ref: evidence(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    TARGET_DESTINATION,
+                ),
                 media_capability_ref: evidence(
                     StorageIntentEvidenceKind::MediaCapabilityEvidence,
                     MEDIA,
@@ -2120,6 +2234,139 @@ mod tests {
         assert_eq!(
             record.executor_byte_state,
             PrefetchExecutorByteState::Unavailable
+        );
+    }
+
+    #[test]
+    fn admitted_runtime_dispatch_requires_source_and_destination_refs() {
+        let mut missing_source = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_source.media_path.source_path_ref = EMPTY_EVIDENCE_REF;
+        let missing_source_record = evaluate_prefetch_execution(missing_source);
+        assert_eq!(
+            missing_source_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_source_record.refusal,
+            StorageIntentRefusalReason::UnstableNamespaceIdentity
+        );
+
+        let mut missing_target = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_target.media_path.target_destination_ref = EMPTY_EVIDENCE_REF;
+        let missing_target_record = evaluate_prefetch_execution(missing_target);
+        assert_eq!(
+            missing_target_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_target_record.refusal,
+            StorageIntentRefusalReason::UnstableNamespaceIdentity
+        );
+
+        let mut outside_cut = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        outside_cut.media_path.target_destination_ref = evidence(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            OUTSIDE_CUT,
+        );
+        let outside_cut_record = evaluate_prefetch_execution(outside_cut);
+        assert_eq!(outside_cut_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            outside_cut_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn admitted_runtime_dispatch_requires_media_capability_refs() {
+        let mut missing_source_media =
+            admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_source_media.decision.source_media_ref = EMPTY_EVIDENCE_REF;
+        let missing_source_media_record = evaluate_prefetch_execution(missing_source_media);
+        assert_eq!(
+            missing_source_media_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_source_media_record.refusal,
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        );
+
+        let mut missing_target_media =
+            admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_target_media.decision.target_media_ref = EMPTY_EVIDENCE_REF;
+        let missing_target_media_record = evaluate_prefetch_execution(missing_target_media);
+        assert_eq!(
+            missing_target_media_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_target_media_record.refusal,
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        );
+
+        let mut missing_role_media =
+            admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_role_media.media_path.media_capability_ref = EMPTY_EVIDENCE_REF;
+        missing_role_media
+            .decision
+            .evidence_refs
+            .media_capability_ref = EMPTY_EVIDENCE_REF;
+        let missing_role_media_record = evaluate_prefetch_execution(missing_role_media);
+        assert_eq!(
+            missing_role_media_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_role_media_record.refusal,
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        );
+    }
+
+    #[test]
+    fn remote_runtime_dispatch_requires_transport_and_trust_refs() {
+        let mut missing_transport =
+            admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        missing_transport.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut missing_transport.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        missing_transport
+            .decision
+            .evidence_refs
+            .transport_budget_ref = EMPTY_EVIDENCE_REF;
+        missing_transport.media_path.transport_path_ref = EMPTY_EVIDENCE_REF;
+        let missing_transport_record = evaluate_prefetch_execution(missing_transport);
+        assert_eq!(
+            missing_transport_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_transport_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut missing_trust =
+            admitted_input(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage);
+        missing_trust.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut missing_trust.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        missing_trust.decision.evidence_refs.trust_domain_ref = EMPTY_EVIDENCE_REF;
+        missing_trust.media_path.trust_domain_ref = EMPTY_EVIDENCE_REF;
+        let missing_trust_record = evaluate_prefetch_execution(missing_trust);
+        assert_eq!(
+            missing_trust_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_trust_record.refusal,
+            StorageIntentRefusalReason::StaleTrustEvidence
         );
     }
 
