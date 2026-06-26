@@ -1456,6 +1456,45 @@ pub struct TransportReplicatedPutResult {
     pub recorded_receipt_ref: Option<PlacementReceiptRef>,
 }
 
+impl TransportReplicatedPutResult {
+    /// Project this transport-backed write result into #961 remote media input facts.
+    ///
+    /// Only a quorum write with a committed placement receipt can prove remote
+    /// durable commit. Receiptless or synthetic-receipt successes remain
+    /// volatile acknowledgements so transport reachability and ack counts do
+    /// not satisfy remote durable placement by themselves.
+    #[must_use]
+    pub fn remote_media_commit_sample(
+        &self,
+        commit_ref: StorageIntentEvidenceRef,
+        recovery_ref: StorageIntentEvidenceRef,
+    ) -> RemoteReplicatedObjectCommitSample {
+        let write_class = if !self.quorum_reached {
+            RemoteReplicatedObjectWriteClass::RefusedNoQuorum
+        } else if self.fully_committed {
+            RemoteReplicatedObjectWriteClass::Committed
+        } else {
+            RemoteReplicatedObjectWriteClass::DegradedCommitted
+        };
+        let receipt_is_authoritative = self
+            .recorded_receipt_ref
+            .is_some_and(PlacementReceiptRef::is_committed_authority);
+
+        RemoteReplicatedObjectCommitSample {
+            write_class,
+            acks_count: self.acks as u64,
+            target_count: self.total_targets as u64,
+            quorum_size: self.quorum_size as u64,
+            needs_repair: self.quorum_reached && !self.fully_committed,
+            digests_matched: self.quorum_reached && receipt_is_authoritative,
+            placement_receipt_bound: self.quorum_reached && receipt_is_authoritative,
+            skipped_unhealthy_count: 0,
+            commit_ref,
+            recovery_ref,
+        }
+    }
+}
+
 /// Successful peer placement read-map installation over a replica control session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerPlacementMapRequestReport {
@@ -3918,6 +3957,11 @@ mod tests {
     use super::*;
     use std::fs;
     use tidefs_replica_health::suspicion::SuspicionLevel;
+    use tidefs_storage_intent_core::{
+        MediaFlushOrderingClass, MediaHealthState, MediaPersistenceDomain,
+        MediaRemoteCommitSemantics, StorageIntentEvidenceId, StorageIntentEvidenceKind,
+    };
+
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tidefs-rep-{label}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -3932,6 +3976,145 @@ mod tests {
 
     fn make_paths(n: usize, label: &str) -> Vec<PathBuf> {
         (0..n).map(|i| temp_dir(&format!("{label}-r{i}"))).collect()
+    }
+
+    fn evidence_ref(kind: StorageIntentEvidenceKind, seed: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            kind,
+            StorageIntentEvidenceId([seed; 32]),
+            u64::from(seed),
+            1,
+        )
+    }
+
+    fn committed_receipt(copies: u8) -> PlacementReceiptRef {
+        PlacementReceiptRef::replicated(42, [0x42; 32], EpochId(7), 5, copies, 4096, [0x24; 32])
+    }
+
+    #[test]
+    fn transport_replicated_put_result_projects_receipt_bound_remote_commit() {
+        let result = TransportReplicatedPutResult {
+            key: ObjectKey::from_name("receipt-bound-remote-commit"),
+            acks: 3,
+            total_targets: 3,
+            quorum_size: 2,
+            quorum_reached: true,
+            fully_committed: true,
+            recorded_receipt_ref: Some(committed_receipt(3)),
+        };
+
+        let sample = result.remote_media_commit_sample(
+            evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 9),
+            evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 10),
+        );
+
+        assert_eq!(
+            sample.write_class,
+            RemoteReplicatedObjectWriteClass::Committed
+        );
+        assert!(sample.digests_matched);
+        assert!(sample.placement_receipt_bound);
+        assert!(!sample.needs_repair);
+        let commit = sample.to_commit_facts();
+        assert_eq!(commit.persistence, MediaPersistenceDomain::ObjectDurable);
+        assert_eq!(
+            commit.flush_ordering,
+            MediaFlushOrderingClass::OrderedRemoteCommit
+        );
+        assert_eq!(
+            commit.remote_commit,
+            MediaRemoteCommitSemantics::QuorumDurableAck
+        );
+        assert_eq!(sample.to_health_facts().health, MediaHealthState::Healthy);
+    }
+
+    #[test]
+    fn transport_replicated_put_result_without_receipt_stays_volatile() {
+        let result = TransportReplicatedPutResult {
+            key: ObjectKey::from_name("receiptless-remote-commit"),
+            acks: 3,
+            total_targets: 3,
+            quorum_size: 2,
+            quorum_reached: true,
+            fully_committed: true,
+            recorded_receipt_ref: None,
+        };
+
+        let sample = result.remote_media_commit_sample(
+            evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 11),
+            evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 12),
+        );
+
+        assert_eq!(
+            sample.write_class,
+            RemoteReplicatedObjectWriteClass::Committed
+        );
+        assert!(!sample.digests_matched);
+        assert!(!sample.placement_receipt_bound);
+        let commit = sample.to_commit_facts();
+        assert_eq!(commit.persistence, MediaPersistenceDomain::Unknown);
+        assert_eq!(
+            commit.remote_commit,
+            MediaRemoteCommitSemantics::VolatileAckOnly
+        );
+        assert_eq!(sample.to_health_facts().health, MediaHealthState::Unknown);
+    }
+
+    #[test]
+    fn transport_replicated_put_result_synthetic_receipt_stays_volatile() {
+        let result = TransportReplicatedPutResult {
+            key: ObjectKey::from_name("synthetic-receipt-remote-commit"),
+            acks: 3,
+            total_targets: 3,
+            quorum_size: 2,
+            quorum_reached: true,
+            fully_committed: true,
+            recorded_receipt_ref: Some(PlacementReceiptRef::synthetic_for_subject(
+                ReplicatedSubjectId::new(42),
+            )),
+        };
+
+        let sample = result.remote_media_commit_sample(
+            evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 13),
+            evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 14),
+        );
+
+        assert!(!sample.digests_matched);
+        assert!(!sample.placement_receipt_bound);
+        assert_eq!(
+            sample.to_commit_facts().remote_commit,
+            MediaRemoteCommitSemantics::VolatileAckOnly
+        );
+    }
+
+    #[test]
+    fn transport_replicated_put_result_no_quorum_refuses_remote_commit() {
+        let result = TransportReplicatedPutResult {
+            key: ObjectKey::from_name("no-quorum-remote-commit"),
+            acks: 1,
+            total_targets: 3,
+            quorum_size: 2,
+            quorum_reached: false,
+            fully_committed: false,
+            recorded_receipt_ref: Some(committed_receipt(3)),
+        };
+
+        let sample = result.remote_media_commit_sample(
+            evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 15),
+            evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 16),
+        );
+
+        assert_eq!(
+            sample.write_class,
+            RemoteReplicatedObjectWriteClass::RefusedNoQuorum
+        );
+        assert!(!sample.digests_matched);
+        assert!(!sample.placement_receipt_bound);
+        assert_eq!(
+            sample.to_commit_facts().remote_commit,
+            MediaRemoteCommitSemantics::VolatileAckOnly
+        );
+        assert_eq!(sample.to_health_facts().health, MediaHealthState::Failed);
     }
 
     // --- Single replica (no replication, just primary) ---
