@@ -346,6 +346,8 @@ pub struct StorageIntentPlacementCandidate {
     pub transport_path_evidence: Option<TransportPathRecord>,
     /// Predictor confidence for authority-changing movement.
     pub prediction_confidence: PredictionConfidence,
+    /// Ordering/replay evidence gate (#894).
+    pub ordering_replay: PlacementEvidenceState,
     /// Capacity/admission gate.
     pub capacity_admission: PlacementEvidenceState,
     /// Recovery/degradation source gate.
@@ -404,6 +406,7 @@ impl StorageIntentPlacementCandidate {
             transport_path_evidence: None,
             trust_domain_evidence: None,
             prediction_confidence: PredictionConfidence::Unknown,
+            ordering_replay: PlacementEvidenceState::Unknown,
             capacity_admission: PlacementEvidenceState::Unknown,
             recovery_degradation: PlacementEvidenceState::Unknown,
             policy_rollout: PlacementEvidenceState::Unknown,
@@ -429,6 +432,7 @@ impl StorageIntentPlacementCandidate {
         self.policy_rollout = PlacementEvidenceState::Fresh;
         self.tenant_isolation = PlacementEvidenceState::Fresh;
         self.temporal = PlacementEvidenceState::Fresh;
+        self.ordering_replay = PlacementEvidenceState::Fresh;
         self.transport_path = PlacementEvidenceState::Fresh;
         self.trust_domain = PlacementEvidenceState::Fresh;
         self.proximity = ProximityClass::InProcess;
@@ -610,6 +614,7 @@ impl StorageIntentPlacementReason {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum CandidateGate {
     CapacityAdmission,
+    OrderingReplay,
     RecoveryDegradation,
     PolicyRollout,
     TenantIsolation,
@@ -1555,6 +1560,7 @@ fn evaluate_authority_candidate_evidence_gates(
     }
 
     for (gate, state) in [
+        (CandidateGate::OrderingReplay, candidate.ordering_replay),
         (
             CandidateGate::RecoveryDegradation,
             candidate.recovery_degradation,
@@ -3260,6 +3266,7 @@ mod tests {
     ) {
         match gate {
             CandidateGate::CapacityAdmission => candidate.capacity_admission = state,
+            CandidateGate::OrderingReplay => candidate.ordering_replay = state,
             CandidateGate::RecoveryDegradation => candidate.recovery_degradation = state,
             CandidateGate::PolicyRollout => candidate.policy_rollout = state,
             CandidateGate::TenantIsolation => candidate.tenant_isolation = state,
@@ -5737,6 +5744,7 @@ mod tests {
     #[test]
     fn authority_candidate_remaining_evidence_gates_refuse_before_scoring() {
         for gate in [
+            CandidateGate::OrderingReplay,
             CandidateGate::RecoveryDegradation,
             CandidateGate::PolicyRollout,
             CandidateGate::TenantIsolation,
@@ -5788,7 +5796,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_generation_candidate_state_starts_unknown() {
+    fn ordering_and_lifecycle_candidate_state_starts_unknown() {
         let candidate = StorageIntentPlacementCandidate::new(
             1,
             10,
@@ -5806,6 +5814,10 @@ mod tests {
             PlacementEvidenceState::Unknown
         );
         assert_eq!(
+            candidate.ordering_replay,
+            PlacementEvidenceState::Unknown
+        );
+        assert_eq!(
             candidate.recovery_degradation,
             PlacementEvidenceState::Unknown
         );
@@ -5815,7 +5827,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_generation_candidate_state_fresh_after_hard_gates() {
+    fn ordering_and_lifecycle_candidate_state_fresh_after_hard_gates() {
         let candidate = StorageIntentPlacementCandidate::new(
             1,
             10,
@@ -5831,6 +5843,10 @@ mod tests {
 
         assert_eq!(
             candidate.lifecycle_generation,
+            PlacementEvidenceState::Fresh
+        );
+        assert_eq!(
+            candidate.ordering_replay,
             PlacementEvidenceState::Fresh
         );
         assert_eq!(
