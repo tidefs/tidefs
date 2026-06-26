@@ -24,6 +24,7 @@ serde = ["dep:serde", "tidefs-storage-intent-core/serde"]
 
 [dependencies]
 tidefs-storage-intent-core = { workspace = true }
+tidefs-storage-intent-remote-media-capability = { workspace = true }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 
 [lib]

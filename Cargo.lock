@@ -3498,6 +3498,7 @@ version = "0.421.0"
 dependencies = [
  "serde",
  "tidefs-storage-intent-core",
+ "tidefs-storage-intent-remote-media-capability",
 ]
 
 [[package]]
