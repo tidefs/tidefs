@@ -2,6 +2,7 @@
 fn main() {
     let mut shim = cc::Build::new();
     shim.file("src/rdma/verbs_shim.c");
+    shim.opt_level(1);
 
     if let Some(include_dir) = find_host_rdma_core_include() {
         shim.include(include_dir);
