@@ -13,12 +13,14 @@
 
 use tidefs_storage_intent_core::{
     temporal_evidence_supports_freshness_claim, temporal_evidence_supports_wall_clock_rpo,
-    timebase_is_sequence_only, MediaArchiveRestoreSemantics, MediaAtomicityClass,
-    MediaCapabilityFlags, MediaCapabilityFreshnessState, MediaFlushOrderingClass, MediaHealthState,
-    MediaPersistenceDomain, MediaProtocolGeometryClass, MediaRemoteCommitSemantics,
-    StorageIntentEvidenceId, StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot,
-    StorageIntentEvidenceRef, StorageIntentMediaCapabilityRecord, StorageIntentRefusalReason,
-    StorageIntentTemporalEvidence, StorageIntentTemporalRefusalReason, StorageMediaClass,
+    timebase_is_sequence_only, EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet,
+    EvidenceFamilyFreshnessState, EvidenceRefsError, MediaArchiveRestoreSemantics,
+    MediaAtomicityClass, MediaCapabilityFlags, MediaCapabilityFreshnessState,
+    MediaFlushOrderingClass, MediaHealthState, MediaPersistenceDomain, MediaProtocolGeometryClass,
+    MediaRemoteCommitSemantics, StorageIntentEvidenceId, StorageIntentEvidenceKind,
+    StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
+    StorageIntentMediaCapabilityRecord, StorageIntentRefusalReason, StorageIntentTemporalEvidence,
+    StorageIntentTemporalRefusalReason, StorageMediaClass,
 };
 
 /// Version of the remote media-capability producer record shape.
@@ -34,6 +36,32 @@ const EMPTY_EVIDENCE_REF: StorageIntentEvidenceRef = StorageIntentEvidenceRef {
     generation: 0,
     version: 0,
 };
+
+/// Replay and freshness metadata used to populate #913 family rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteAuthorityEvidenceCutMetadata {
+    pub source_index_generation: u64,
+    pub producer_generation: u64,
+    pub freshness_frontier_ms: u64,
+    pub allowed_staleness_ms: u64,
+}
+
+impl RemoteAuthorityEvidenceCutMetadata {
+    #[must_use]
+    pub const fn new(
+        source_index_generation: u64,
+        producer_generation: u64,
+        freshness_frontier_ms: u64,
+        allowed_staleness_ms: u64,
+    ) -> Self {
+        Self {
+            source_index_generation,
+            producer_generation,
+            freshness_frontier_ms,
+            allowed_staleness_ms,
+        }
+    }
+}
 
 /// Stable identity and generation facts for a remote target.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1186,6 +1214,135 @@ const fn remote_target_is_archive(facts: RemoteMediaCapabilityFacts) -> bool {
         )
 }
 
+fn push_required_ref(
+    refs: &mut StorageIntentEvidenceRefs,
+    evidence_ref: StorageIntentEvidenceRef,
+) -> Result<(), EvidenceRefsError> {
+    if evidence_ref.is_bound() && !refs.contains_ref(evidence_ref) {
+        refs.push(evidence_ref)?;
+    }
+    Ok(())
+}
+
+fn push_required_family(
+    families: &mut EvidenceFamilyFreshnessSet,
+    evidence_ref: StorageIntentEvidenceRef,
+    metadata: RemoteAuthorityEvidenceCutMetadata,
+) -> Result<(), EvidenceRefsError> {
+    if !evidence_ref.is_bound()
+        || evidence_ref.kind as u16 == StorageIntentEvidenceKind::Unknown as u16
+        || families.contains_kind(evidence_ref.kind)
+    {
+        return Ok(());
+    }
+
+    families.push(EvidenceFamilyFreshness {
+        kind: evidence_ref.kind,
+        state: EvidenceFamilyFreshnessState::Fresh,
+        source_index_generation: metadata.source_index_generation,
+        producer_generation: metadata.producer_generation,
+        freshness_frontier_ms: metadata.freshness_frontier_ms,
+        allowed_staleness_ms: metadata.allowed_staleness_ms,
+        evidence_ref,
+    })
+}
+
+fn push_required_ref_and_family(
+    refs: &mut StorageIntentEvidenceRefs,
+    families: &mut EvidenceFamilyFreshnessSet,
+    evidence_ref: StorageIntentEvidenceRef,
+    metadata: RemoteAuthorityEvidenceCutMetadata,
+) -> Result<(), EvidenceRefsError> {
+    push_required_ref(refs, evidence_ref)?;
+    push_required_family(families, evidence_ref, metadata)
+}
+
+/// Return the exact evidence refs that a #913 cut must include for remote authority.
+pub fn remote_authority_required_evidence_refs(
+    facts: RemoteMediaCapabilityFacts,
+) -> Result<StorageIntentEvidenceRefs, EvidenceRefsError> {
+    let mut refs = StorageIntentEvidenceRefs::EMPTY;
+    push_required_ref(&mut refs, facts.evidence)?;
+    push_required_ref(&mut refs, facts.identity.stable_identity_ref)?;
+    push_required_ref(&mut refs, facts.identity.namespace_identity_ref)?;
+    push_required_ref(&mut refs, facts.path.path_ref)?;
+    push_required_ref(&mut refs, facts.commit.remote_commit_ref)?;
+    push_required_ref(&mut refs, facts.archive.archive_restore_ref)?;
+    push_required_ref(&mut refs, facts.freshness.freshness_ref)?;
+    push_required_ref(&mut refs, facts.trust.trust_ref)?;
+    push_required_ref(&mut refs, facts.cost_recovery.cost_ref)?;
+    push_required_ref(&mut refs, facts.cost_recovery.recovery_ref)?;
+    push_required_ref(&mut refs, facts.health.health_ref)?;
+    Ok(refs)
+}
+
+/// Return fresh #913 family rows for every cited remote-authority evidence family.
+pub fn remote_authority_required_family_freshness(
+    facts: RemoteMediaCapabilityFacts,
+    metadata: RemoteAuthorityEvidenceCutMetadata,
+) -> Result<EvidenceFamilyFreshnessSet, EvidenceRefsError> {
+    let mut families = EvidenceFamilyFreshnessSet::EMPTY;
+    let mut refs = StorageIntentEvidenceRefs::EMPTY;
+
+    push_required_ref_and_family(&mut refs, &mut families, facts.evidence, metadata)?;
+    push_required_ref_and_family(
+        &mut refs,
+        &mut families,
+        facts.identity.stable_identity_ref,
+        metadata,
+    )?;
+    push_required_ref_and_family(
+        &mut refs,
+        &mut families,
+        facts.identity.namespace_identity_ref,
+        metadata,
+    )?;
+    push_required_ref_and_family(&mut refs, &mut families, facts.path.path_ref, metadata)?;
+    push_required_ref_and_family(
+        &mut refs,
+        &mut families,
+        facts.commit.remote_commit_ref,
+        metadata,
+    )?;
+    push_required_ref_and_family(
+        &mut refs,
+        &mut families,
+        facts.archive.archive_restore_ref,
+        metadata,
+    )?;
+    push_required_ref_and_family(
+        &mut refs,
+        &mut families,
+        facts.freshness.freshness_ref,
+        metadata,
+    )?;
+    push_required_ref_and_family(&mut refs, &mut families, facts.trust.trust_ref, metadata)?;
+    push_required_ref_and_family(
+        &mut refs,
+        &mut families,
+        facts.cost_recovery.cost_ref,
+        metadata,
+    )?;
+    push_required_ref_and_family(
+        &mut refs,
+        &mut families,
+        facts.cost_recovery.recovery_ref,
+        metadata,
+    )?;
+    push_required_ref_and_family(&mut refs, &mut families, facts.health.health_ref, metadata)?;
+
+    Ok(families)
+}
+
+const fn evidence_cut_authorizes_ref(
+    evidence_cut: StorageIntentEvidenceQuerySnapshot,
+    evidence_ref: StorageIntentEvidenceRef,
+) -> bool {
+    evidence_ref.is_bound()
+        && evidence_cut.included_refs.contains_ref(evidence_ref)
+        && evidence_cut.authorizes_fresh_evidence_kind(evidence_ref.kind)
+}
+
 /// Return the first authority-blocking reason for a remote durable role.
 #[must_use]
 pub const fn remote_authority_preflight_refusal(
@@ -1292,66 +1449,35 @@ pub const fn remote_authority_evidence_cut_refusal(
     if !matches!(cut_refusal, StorageIntentRefusalReason::None) {
         return cut_refusal;
     }
-    if !evidence_cut
-        .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCapabilityEvidence)
-        || !evidence_cut.included_refs.contains_ref(facts.evidence)
-        || !evidence_cut
-            .included_refs
-            .contains_ref(facts.commit.remote_commit_ref)
+    if !evidence_cut_authorizes_ref(evidence_cut, facts.evidence)
+        || !evidence_cut_authorizes_ref(evidence_cut, facts.commit.remote_commit_ref)
     {
         return StorageIntentRefusalReason::MissingMediaCapabilityEvidence;
     }
-    if !evidence_cut
-        .included_refs
-        .contains_ref(facts.identity.stable_identity_ref)
-        || !evidence_cut
-            .included_refs
-            .contains_ref(facts.identity.namespace_identity_ref)
+    if !evidence_cut_authorizes_ref(evidence_cut, facts.identity.stable_identity_ref)
+        || !evidence_cut_authorizes_ref(evidence_cut, facts.identity.namespace_identity_ref)
     {
         return StorageIntentRefusalReason::UnstableNamespaceIdentity;
     }
-    if !evidence_cut
-        .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::TransportPathEvidence)
-        || !evidence_cut.included_refs.contains_ref(facts.path.path_ref)
-    {
+    if !evidence_cut_authorizes_ref(evidence_cut, facts.path.path_ref) {
         return StorageIntentRefusalReason::EvidenceNotUsable;
     }
-    if !evidence_cut.authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::TemporalEvidence)
-        || !evidence_cut
-            .included_refs
-            .contains_ref(facts.freshness.freshness_ref)
-    {
+    if !evidence_cut_authorizes_ref(evidence_cut, facts.freshness.freshness_ref) {
         return StorageIntentRefusalReason::DurabilityOrRpoNotMet;
     }
-    if !evidence_cut.authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::TrustDomainEvidence)
-        || !evidence_cut
-            .included_refs
-            .contains_ref(facts.trust.trust_ref)
-    {
+    if !evidence_cut_authorizes_ref(evidence_cut, facts.trust.trust_ref) {
         return StorageIntentRefusalReason::EvidenceNotUsable;
     }
-    if !evidence_cut.authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::MediaCostWearLedger)
-        || !evidence_cut
-            .included_refs
-            .contains_ref(facts.cost_recovery.cost_ref)
-    {
+    if !evidence_cut_authorizes_ref(evidence_cut, facts.cost_recovery.cost_ref) {
         return StorageIntentRefusalReason::EvidenceNotUsable;
     }
-    if !evidence_cut
-        .authorizes_fresh_evidence_kind(StorageIntentEvidenceKind::RecoveryDegradationEvidence)
-        || !evidence_cut
-            .included_refs
-            .contains_ref(facts.cost_recovery.recovery_ref)
-        || !evidence_cut
-            .included_refs
-            .contains_ref(facts.health.health_ref)
+    if !evidence_cut_authorizes_ref(evidence_cut, facts.cost_recovery.recovery_ref)
+        || !evidence_cut_authorizes_ref(evidence_cut, facts.health.health_ref)
     {
         return StorageIntentRefusalReason::EvidenceNotUsable;
     }
     if remote_target_is_archive(facts)
-        && !evidence_cut
-            .included_refs
-            .contains_ref(facts.archive.archive_restore_ref)
+        && !evidence_cut_authorizes_ref(evidence_cut, facts.archive.archive_restore_ref)
     {
         return StorageIntentRefusalReason::UnknownArchiveRestoreRetention;
     }
@@ -1492,8 +1618,7 @@ mod tests {
     use super::*;
     use tidefs_storage_intent_core::{
         media_capability_satisfies_role, ClockHealthFlags, EvidenceCompletenessVerdict,
-        EvidenceConsumerClass, EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet,
-        EvidenceFamilyFreshnessState, EvidenceQueryContextClass, EvidenceQuerySubjectScope,
+        EvidenceConsumerClass, EvidenceQueryContextClass, EvidenceQuerySubjectScope,
         EvidenceQuerySubjectScopeClass, EvidenceRetentionClass, MediaRoleRequirement,
         ReceiptPredicateResult, StorageIntentClockHealth, StorageIntentClockSourceClass,
         StorageIntentDomainId, StorageIntentEventFrontierClass, StorageIntentEvidenceRefs,
@@ -1515,77 +1640,15 @@ mod tests {
         evidence(StorageIntentEvidenceKind::MediaCapabilityEvidence, seed)
     }
 
-    fn push_ref(refs: &mut StorageIntentEvidenceRefs, evidence_ref: StorageIntentEvidenceRef) {
-        if evidence_ref.is_bound() {
-            refs.push(evidence_ref).unwrap();
-        }
-    }
-
-    fn push_family(
-        families: &mut EvidenceFamilyFreshnessSet,
-        kind: StorageIntentEvidenceKind,
-        evidence_ref: StorageIntentEvidenceRef,
-    ) {
-        families
-            .push(EvidenceFamilyFreshness {
-                kind,
-                state: EvidenceFamilyFreshnessState::Fresh,
-                source_index_generation: 1,
-                producer_generation: 1,
-                freshness_frontier_ms: 1,
-                allowed_staleness_ms: 0,
-                evidence_ref,
-            })
-            .unwrap();
-    }
-
     fn authority_evidence_cut_for(
         facts: RemoteMediaCapabilityFacts,
     ) -> StorageIntentEvidenceQuerySnapshot {
-        let mut refs = StorageIntentEvidenceRefs::EMPTY;
-        push_ref(&mut refs, facts.evidence);
-        push_ref(&mut refs, facts.identity.stable_identity_ref);
-        push_ref(&mut refs, facts.identity.namespace_identity_ref);
-        push_ref(&mut refs, facts.path.path_ref);
-        push_ref(&mut refs, facts.commit.remote_commit_ref);
-        push_ref(&mut refs, facts.archive.archive_restore_ref);
-        push_ref(&mut refs, facts.freshness.freshness_ref);
-        push_ref(&mut refs, facts.trust.trust_ref);
-        push_ref(&mut refs, facts.cost_recovery.cost_ref);
-        push_ref(&mut refs, facts.cost_recovery.recovery_ref);
-        push_ref(&mut refs, facts.health.health_ref);
-
-        let mut families = EvidenceFamilyFreshnessSet::EMPTY;
-        push_family(
-            &mut families,
-            StorageIntentEvidenceKind::MediaCapabilityEvidence,
-            facts.evidence,
-        );
-        push_family(
-            &mut families,
-            StorageIntentEvidenceKind::TransportPathEvidence,
-            facts.path.path_ref,
-        );
-        push_family(
-            &mut families,
-            StorageIntentEvidenceKind::TemporalEvidence,
-            facts.freshness.freshness_ref,
-        );
-        push_family(
-            &mut families,
-            StorageIntentEvidenceKind::TrustDomainEvidence,
-            facts.trust.trust_ref,
-        );
-        push_family(
-            &mut families,
-            StorageIntentEvidenceKind::MediaCostWearLedger,
-            facts.cost_recovery.cost_ref,
-        );
-        push_family(
-            &mut families,
-            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
-            facts.cost_recovery.recovery_ref,
-        );
+        let refs = remote_authority_required_evidence_refs(facts).unwrap();
+        let families = remote_authority_required_family_freshness(
+            facts,
+            RemoteAuthorityEvidenceCutMetadata::new(1, 1, 1, 0),
+        )
+        .unwrap();
 
         StorageIntentEvidenceQuerySnapshot {
             snapshot_id: StorageIntentEvidenceId([61; 32]),
@@ -1920,6 +1983,42 @@ mod tests {
             .flags
             .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
         assert_eq!(record.freshness, MediaCapabilityFreshnessState::Refused);
+    }
+
+    #[test]
+    fn required_evidence_cut_helpers_emit_runtime_refs_and_families() {
+        let facts = strong_object_facts();
+        let refs = remote_authority_required_evidence_refs(facts).unwrap();
+        let families = remote_authority_required_family_freshness(
+            facts,
+            RemoteAuthorityEvidenceCutMetadata::new(11, 12, 13, 14),
+        )
+        .unwrap();
+
+        assert!(refs.contains_ref(facts.evidence));
+        assert!(refs.contains_ref(facts.identity.stable_identity_ref));
+        assert!(refs.contains_ref(facts.identity.namespace_identity_ref));
+        assert!(refs.contains_ref(facts.path.path_ref));
+        assert!(refs.contains_ref(facts.commit.remote_commit_ref));
+        assert!(refs.contains_ref(facts.freshness.freshness_ref));
+        assert!(refs.contains_ref(facts.trust.trust_ref));
+        assert!(refs.contains_ref(facts.cost_recovery.cost_ref));
+        assert!(refs.contains_ref(facts.cost_recovery.recovery_ref));
+        assert!(refs.contains_ref(facts.health.health_ref));
+
+        assert!(families
+            .family_is_fresh_for_authority(StorageIntentEvidenceKind::MediaCapabilityEvidence));
+        assert!(families
+            .family_is_fresh_for_authority(StorageIntentEvidenceKind::TransportPathEvidence));
+        assert!(families.family_is_fresh_for_authority(StorageIntentEvidenceKind::TemporalEvidence));
+        assert!(
+            families.family_is_fresh_for_authority(StorageIntentEvidenceKind::TrustDomainEvidence)
+        );
+        assert!(
+            families.family_is_fresh_for_authority(StorageIntentEvidenceKind::MediaCostWearLedger)
+        );
+        assert!(families
+            .family_is_fresh_for_authority(StorageIntentEvidenceKind::RecoveryDegradationEvidence));
     }
 
     #[test]
@@ -2427,6 +2526,34 @@ mod tests {
             MediaCapabilityFlags::ARCHIVE_RESTORE_RETENTION
                 .union(MediaCapabilityFlags::TRANSPORT_RDMA_ABSENT_LEGAL)
         ));
+    }
+
+    #[test]
+    fn archive_restore_ref_requires_fresh_evidence_cut_family() {
+        let facts = strong_archive_facts().with_archive(RemoteArchiveFacts::new(
+            MediaArchiveRestoreSemantics::RestoreAudited,
+            evidence(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 42),
+        ));
+        let mut cut = authority_evidence_cut_for(facts);
+
+        assert!(cut
+            .family_freshness
+            .family_is_fresh_for_authority(StorageIntentEvidenceKind::EvidenceRetentionEvidence));
+        assert_eq!(
+            remote_authority_evidence_cut_refusal(facts, cut),
+            StorageIntentRefusalReason::None
+        );
+
+        cut.family_freshness = remote_authority_required_family_freshness(
+            facts.with_archive(RemoteArchiveFacts::default()),
+            RemoteAuthorityEvidenceCutMetadata::new(1, 1, 1, 0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            remote_authority_evidence_cut_refusal(facts, cut),
+            StorageIntentRefusalReason::UnknownArchiveRestoreRetention
+        );
     }
 
     #[test]
