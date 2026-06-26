@@ -789,7 +789,7 @@ fn evidence_ref_has_kind(
     evidence_ref: StorageIntentEvidenceRef,
     kind: StorageIntentEvidenceKind,
 ) -> bool {
-    evidence_ref.is_bound() && evidence_ref.kind as u16 == kind as u16
+    evidence_ref.is_bound() && evidence_ref.kind == kind
 }
 
 // ---------------------------------------------------------------------------

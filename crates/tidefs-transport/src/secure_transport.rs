@@ -172,7 +172,7 @@ impl SecureTransportStats {
         trust_ref: StorageIntentEvidenceRef,
     ) -> RemoteTrustFacts {
         let trust_ref_is_bound = trust_ref.is_bound()
-            && trust_ref.kind as u16 == StorageIntentEvidenceKind::TrustDomainEvidence as u16;
+            && trust_ref.kind == StorageIntentEvidenceKind::TrustDomainEvidence;
         let observed_authenticated_frames = self.total_frames_sent() > 0
             && self.total_frames_received() > 0
             && self.total_failures() == 0;
