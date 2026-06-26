@@ -37,7 +37,8 @@ use crate::device::{
 use crate::device_health::{DeviceHealth, DeviceHealthState, DeviceHealthTransition};
 use crate::device_layout::{
     decode_device_layout_v1, encode_device_layout_v1, DeviceClassPolicy, DeviceLayoutPolicy,
-    DeviceLayoutStats, DeviceLayoutV1, DeviceMediaClass, WriteAllocator,
+    DeviceLayoutPolicyDiscriminant, DeviceLayoutStats, DeviceLayoutV1, DeviceMediaClass,
+    WriteAllocator,
 };
 use crate::device_manager::{DeviceManager, SparePolicy};
 use crate::io_scheduler::IoClass as SchedClass;
@@ -1345,12 +1346,13 @@ impl Pool {
                 reason: "pool label DeviceLayoutV1 count does not match devices",
             });
         }
-        for (device, layout) in devices.iter().zip(label_device_layouts.iter()) {
-            if layout.device_size_bytes != device.store().capacity_bytes() {
-                return Err(StoreError::InvalidOptions {
-                    reason: "pool label DeviceLayoutV1 device size mismatch",
-                });
-            }
+        for ((device_config, device), layout) in config
+            .devices
+            .iter()
+            .zip(devices.iter())
+            .zip(label_device_layouts.iter())
+        {
+            validate_imported_device_layout(device_config, device, layout)?;
         }
 
         // Build device-class-aware layout state.
@@ -4192,6 +4194,46 @@ fn label_file_path(device_root: &Path) -> PathBuf {
     device_root.join(".tidefs_label")
 }
 
+fn validate_imported_device_layout(
+    device_config: &DeviceConfig,
+    device: &Device,
+    layout: &DeviceLayoutV1,
+) -> Result<()> {
+    validate_device_layout_policy_record(layout)?;
+    if device_config.backing.is_byte_addressable_pool_member()
+        && layout.device_size_bytes != device.store().capacity_bytes()
+    {
+        return Err(StoreError::InvalidOptions {
+            reason: "pool label DeviceLayoutV1 device size mismatch",
+        });
+    }
+    Ok(())
+}
+
+fn validate_device_layout_policy_record(layout: &DeviceLayoutV1) -> Result<()> {
+    let policy = match layout.policy {
+        DeviceLayoutPolicyDiscriminant::Slice0Small => DeviceLayoutPolicy::Slice0Small,
+        DeviceLayoutPolicyDiscriminant::Auto => DeviceLayoutPolicy::Auto,
+        DeviceLayoutPolicyDiscriminant::Custom => DeviceLayoutPolicy::Custom {
+            data_segment_size: layout.data_segment_size,
+            metadata_segment_size: layout.metadata_segment_size,
+            journal_segment_size: layout.poolmap_segment_size,
+        },
+    };
+    let expected =
+        policy
+            .compute(layout.device_size_bytes)
+            .map_err(|_| StoreError::InvalidOptions {
+                reason: "pool label DeviceLayoutV1 record is invalid",
+            })?;
+    if expected != *layout {
+        return Err(StoreError::InvalidOptions {
+            reason: "pool label DeviceLayoutV1 record does not match layout policy",
+        });
+    }
+    Ok(())
+}
+
 fn pool_config_has_label_authority(config: &PoolConfig) -> bool {
     config.devices.iter().any(device_config_has_label_authority)
 }
@@ -4468,6 +4510,24 @@ mod tests {
             kind: DeviceKind::Block { path },
             encryption: None,
             compression: None,
+        }
+    }
+
+    fn regular_file_pool_config(root: &Path, name: &str, size: u64) -> PoolConfig {
+        let dev_path = root.join("pool.img");
+        create_regular_file_device_with_size(&dev_path, size);
+        PoolConfig {
+            name: name.into(),
+            root_path: root.to_path_buf(),
+            devices: vec![DeviceConfig {
+                media_class: Default::default(),
+                path: dev_path.clone(),
+                backing: DeviceBacking::RegularFileDev,
+                class: DeviceClass::Data,
+                kind: DeviceKind::Block { path: dev_path },
+                encryption: None,
+                compression: None,
+            }],
         }
     }
 
@@ -6703,23 +6763,7 @@ mod tests {
     fn create_persists_device_layout_and_open_uses_label_record() {
         let root = temp_dir("layout-label-reopen");
         let _ = std::fs::remove_dir_all(&root);
-        let dev_path = root.join("pool.img");
-        create_regular_file_device_with_size(&dev_path, 300 * 1024 * 1024);
-        let config = PoolConfig {
-            name: "layout-label-reopen".into(),
-            root_path: root.clone(),
-            devices: vec![DeviceConfig {
-                media_class: Default::default(),
-                path: dev_path.clone(),
-                backing: DeviceBacking::RegularFileDev,
-                class: DeviceClass::Data,
-                kind: DeviceKind::Block {
-                    path: dev_path.clone(),
-                },
-                encryption: None,
-                compression: None,
-            }],
-        };
+        let config = regular_file_pool_config(&root, "layout-label-reopen", 300 * 1024 * 1024);
         let mut options = test_options();
         options.max_segment_bytes = 16 * 1024;
         let custom_policy = DeviceLayoutPolicy::Custom {
@@ -6753,6 +6797,80 @@ mod tests {
 
         let reopened = Pool::open(config, PoolProperties::default(), &options).unwrap();
         assert_eq!(reopened.device_layouts()[0], created_layout);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn directory_pool_reopens_when_layout_size_differs_from_current_capacity() {
+        let root = temp_dir("directory-layout-capacity-drift");
+        let _ = std::fs::remove_dir_all(&root);
+        let config = single_device_config(&root);
+        let options = test_options();
+
+        let pool = Pool::create(config.clone(), PoolProperties::default(), &options).unwrap();
+        let current_capacity = pool.devices[0].store().capacity_bytes();
+        let persisted_layout = DeviceLayoutPolicy::Auto
+            .compute(current_capacity / 2)
+            .expect("alternate directory layout");
+        assert_ne!(persisted_layout.device_size_bytes, current_capacity);
+
+        let device_root = device_root_path(&config.devices[0]);
+        let label_path = label_file_path(&device_root);
+        let mut label = pool_label::decode_label(&fs::read(&label_path).unwrap()).unwrap();
+        label.device_capacity_bytes = persisted_layout.device_size_bytes;
+        write_pool_label(
+            &config.devices[0],
+            label,
+            Some(&persisted_layout),
+            "test_write_directory_layout_capacity_drift_label",
+        )
+        .unwrap();
+        drop(pool);
+
+        let reopened = Pool::open(config, PoolProperties::default(), &options).unwrap();
+        assert_eq!(reopened.device_layouts()[0], persisted_layout);
+        assert_ne!(
+            reopened.devices[0].store().capacity_bytes(),
+            persisted_layout.device_size_bytes,
+            "directory shim capacity is not a pool-label authority boundary"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn byte_addressable_pool_rejects_mismatched_label_layout_size() {
+        let root = temp_dir("byte-layout-capacity-mismatch");
+        let _ = std::fs::remove_dir_all(&root);
+        let config =
+            regular_file_pool_config(&root, "byte-layout-capacity-mismatch", 300 * 1024 * 1024);
+        let options = test_options();
+
+        let pool = Pool::create(config.clone(), PoolProperties::default(), &options).unwrap();
+        let created_size = pool.device_layouts()[0].device_size_bytes;
+        let mismatched_layout = DeviceLayoutPolicy::Auto
+            .compute(created_size - 64 * 1024 * 1024)
+            .expect("mismatched byte-addressable layout");
+
+        let mut label_bytes = vec![0u8; pool_label::POOL_LABEL_SIZE];
+        let mut label_file = fs::File::open(device_root_path(&config.devices[0])).unwrap();
+        label_file.read_exact(&mut label_bytes).unwrap();
+        let mut label = pool_label::decode_label(&label_bytes).unwrap();
+        label.device_capacity_bytes = mismatched_layout.device_size_bytes;
+        write_pool_label(
+            &config.devices[0],
+            label,
+            Some(&mismatched_layout),
+            "test_write_byte_layout_capacity_mismatch_label",
+        )
+        .unwrap();
+        drop(pool);
+
+        assert_invalid_options_reason_contains(
+            Pool::open(config, PoolProperties::default(), &options),
+            "DeviceLayoutV1 device size mismatch",
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
