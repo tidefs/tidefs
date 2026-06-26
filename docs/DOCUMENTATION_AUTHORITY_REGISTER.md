@@ -93,9 +93,9 @@ historical-input examples, including
 `docs/design/coordination-review-roadmap-priorities-update-1953.md`,
 `docs/design/openzfs-ceph-successor-claim.md`, and
 `docs/design/production-erasure-coding-crush-placement-g4-pillar.md`, remain
-historical input under their existing rows. Unclassified status/matrix
-leftovers in
-`docs/design/1971-pool-import-export-7-phase-implementation-plan.md`,
+historical input under their existing rows. The
+`docs/design/1971-pool-import-export-7-phase-implementation-plan.md` leftover
+is classified below by #1152. Remaining unclassified status/matrix leftovers in
 `docs/design/coordination-pipeline-cluster-services-design-seal.md`,
 `docs/design/coordination-pipeline-status-update-1767.md`,
 `docs/design/coordination-pipeline-status-update-1839.md`,
@@ -629,3 +629,25 @@ CI workflows, validation artifacts, or `validation/claims.toml`.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/design/1813-pool-import-export-device-topology-management-design.md` | Historical input | Imported Forgejo-era #1813 design iteration for pool import/export and online device topology management. It preserves the PoolLabelV1 data structure design, import/export protocol algorithms, device failure state machine, and 7-phase implementation plan as historical design lineage. Its "design-sealed" and "frozen" language, Forgejo issue references, and phase-status claims (Phases 2–5 and 7 marked "deferred to wire-up") are stale: live source in `tidefs-local-object-store/src/pool_importer.rs`, `pool_exporter.rs`, and `device_manager.rs` implements pool import/export and device topology management referencing `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` as its design authority. The PoolLabelV1 on-device label format is implemented in `tidefs-types-pool-label-core/lib.rs`. The ZFS/Ceph prior-art comparison table in §10 is incumbent-comparison context preserved as historical design input under the #931/#934 cluster boundary; it is not a current capability, availability, durability, or product claim. No `validation/claims.toml` entries exist for pool import/export, device topology, hot-spare, evacuation, or cluster-aware pool ownership. The file is not current policy, current spec, implementation status, or product authority. |
+
+### Pool Import/Export 7-Phase Implementation Plan (TFR-019 / #1152)
+
+Classified for TFR-019 / GitHub issue #1152 on 2026-06-26 after reviewing this
+register's authority rule and review method, the TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, the imported Forgejo #1971 phase-plan document,
+closed #931/#934 incumbent-comparison evidence, the sibling #1137 classification
+for the imported 1813 pool import/export design, bounded source/doc searches,
+live source in `crates/tidefs-types-pool-label-core/`,
+`crates/tidefs-local-object-store/src/pool_importer.rs`,
+`crates/tidefs-local-object-store/src/pool_exporter.rs`,
+`crates/tidefs-local-object-store/src/device_manager.rs`, and
+`crates/tidefs-local-object-store/src/device_health.rs`, plus
+`validation/claims.toml` and `docs/CLAIM_REGISTRY.md` (no pool import/export,
+device topology, hot-spare, evacuation, or cluster-aware pool ownership claim
+entries). This slice does not edit product source, Cargo manifests, CI
+workflows, validation artifacts, generated claim registries, or
+`validation/claims.toml`.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/1971-pool-import-export-7-phase-implementation-plan.md` | Historical input | Imported Forgejo-era #1971 companion implementation plan for the pool import/export and device-topology design lineage. It preserves per-phase data-structure sketches, pseudocode, tradeoff notes, and dependency mapping as historical design input. Its `design-spec` status, sealed-canonical-design wording, "DONE" and "NOT YET IMPLEMENTED" phase labels, "new" source-file notes, Forgejo issue links, and phase-completion criteria are not current implementation status, product readiness, or current authority. Live source now contains pool import/export and device-manager code paths in `tidefs-local-object-store/src/pool_importer.rs`, `pool_exporter.rs`, `device_manager.rs`, and `device_health.rs`, and PoolLabelV1 lives in `tidefs-types-pool-label-core/`; current behavior must be checked against source and current claim evidence rather than this phase plan. The ZFS prior-art, hot-spare, evacuation, online topology, cluster-lease, and public-capability wording is retained only as non-claim historical input under the #931/#934 comparator boundary. No `validation/claims.toml` or generated claim-registry entries exist for broad pool import/export, hot-spare, evacuation, device topology, or cluster-aware ownership claims. The file is not current policy, current spec, implementation status, release-readiness evidence, or product authority. |

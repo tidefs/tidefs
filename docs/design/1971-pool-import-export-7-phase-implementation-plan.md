@@ -1,5 +1,23 @@
 # Pool Import/Export — 7-Phase Implementation Plan
 
+**Documentation authority**: Historical input for TFR-019 / GitHub
+issue [#1152](https://github.com/tidefs/tidefs/issues/1152). This file is
+not current TideFS policy, current spec, implementation status,
+release-readiness evidence, or product authority.
+
+The sealed design-spec status, phase completion labels, "new" source-file
+notes, "not yet implemented" phase markers, Forgejo issue references, and pool
+import/export, hot-spare, evacuation, online topology, and cluster-lease
+lifecycle statements below are historical Forgejo-era implementation-planning
+input. Live source now contains pool importer/exporter and device-manager code
+paths in `crates/tidefs-local-object-store/`, and PoolLabelV1 lives in
+`crates/tidefs-types-pool-label-core/`; check current source and claim evidence
+directly before citing any behavior. The #931/#934 incumbent-comparison
+boundary still applies: ZFS/Ceph prior-art, hot-spare, evacuation, online
+topology, operational-safety, and public-capability wording here is non-claim
+historical context unless a future slice explicitly backs it with #875 claim
+ids and #928/#930 comparator evidence.
+
 **Issue**: [#1971](http://172.16.106.12/forgejo/forgeadmin/tidefs/issues/1971)
 **Canonical design**: [`docs/design/pool-import-export-device-topology-management.md`](pool-import-export-device-topology-management.md) (sealed via #1944)
 **Status**: design-spec

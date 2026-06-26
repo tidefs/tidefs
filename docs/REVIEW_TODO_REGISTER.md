@@ -1289,6 +1289,24 @@ Issue #1267 records the current runtime-fed operator product-surface decision: n
   automation, implementation-status, release-readiness, or worker-scheduling
   claim.
 
+- `TFR-019`: GitHub issue #1152 classifies
+  `docs/design/1971-pool-import-export-7-phase-implementation-plan.md` as
+  historical input after reviewing the documentation authority register, this
+  TFR-019 note set, the imported Forgejo #1971 phase plan, closed #931/#934
+  incumbent-comparison evidence, sibling #1137 context, bounded source/doc
+  searches, `crates/tidefs-types-pool-label-core/`,
+  `crates/tidefs-local-object-store/src/pool_importer.rs`,
+  `crates/tidefs-local-object-store/src/pool_exporter.rs`,
+  `crates/tidefs-local-object-store/src/device_manager.rs`,
+  `crates/tidefs-local-object-store/src/device_health.rs`,
+  `validation/claims.toml`, and `docs/CLAIM_REGISTRY.md`. The retained
+  design-spec status, phase labels, "new"/"not yet implemented" source notes,
+  Forgejo links, hot-spare, evacuation, online topology, cluster-lease, and
+  public-capability wording are historical implementation-planning context
+  only. This reduces the #952 status/matrix leftover set but does not promote a
+  current pool import/export spec, product readiness, or broad pool lifecycle
+  claim.
+
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
   `xfstests-runner` as a diagnostic scoreboard wrapper, and sends output under
   runner help path no longer carries a bare `--per-test` command or duplicate
