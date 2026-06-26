@@ -513,6 +513,132 @@ pub struct RepairEvidence {
     pub comparison_evidence: Option<RepairComparisonEvidence>,
 }
 
+/// Reason replacement receipt evidence was rejected after repair writeback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairReplacementReceiptRejection {
+    PolicyRevisionMissing,
+    MissingReplacementReceiptId,
+    SourceReceiptNotCommitted,
+    ReplacementReceiptNotCommitted,
+    SubjectMismatch,
+    MountedScrubEvidenceStale,
+    MountedScrubReceiptNotVerified,
+    ReplacementReceiptObjectMismatch,
+    ReplacementReceiptDigestMismatch,
+    ReplacementReceiptGenerationNotNewer {
+        source_generation: u64,
+        replacement_generation: u64,
+    },
+}
+
+/// Durable completion evidence published after repair writeback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairReplacementReceiptEvidence {
+    pub subject: RepairCandidateIdentity,
+    pub policy_revision: u64,
+    pub source_placement_receipt_ref: PlacementReceiptRef,
+    pub mounted_scrub_evidence: RepairMountedScrubEvidence,
+    pub replacement_receipt_ref: PlacementReceiptRef,
+    pub replacement_receipt_id: [u8; 16],
+}
+
+/// Receipt-only projection for rebuild, reclaim, and rebake consumers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairReplacementReceiptConsumerEvidence {
+    pub subject: RepairCandidateIdentity,
+    pub policy_revision: u64,
+    pub source_placement_receipt_ref: PlacementReceiptRef,
+    pub replacement_receipt_ref: PlacementReceiptRef,
+    pub replacement_receipt_id: [u8; 16],
+}
+
+impl RepairReplacementReceiptEvidence {
+    pub fn new(
+        subject: RepairCandidateIdentity,
+        policy_revision: u64,
+        source_placement_receipt_ref: PlacementReceiptRef,
+        mounted_scrub_evidence: RepairMountedScrubEvidence,
+        replacement_receipt_ref: PlacementReceiptRef,
+        replacement_receipt_id: [u8; 16],
+    ) -> Result<Self, RepairReplacementReceiptRejection> {
+        if policy_revision == 0 {
+            return Err(RepairReplacementReceiptRejection::PolicyRevisionMissing);
+        }
+        if replacement_receipt_id == [0; 16] {
+            return Err(RepairReplacementReceiptRejection::MissingReplacementReceiptId);
+        }
+        if !source_placement_receipt_ref.is_committed_authority() {
+            return Err(RepairReplacementReceiptRejection::SourceReceiptNotCommitted);
+        }
+        if !replacement_receipt_ref.is_committed_authority() {
+            return Err(RepairReplacementReceiptRejection::ReplacementReceiptNotCommitted);
+        }
+        if mounted_scrub_evidence.subject != subject {
+            return Err(RepairReplacementReceiptRejection::SubjectMismatch);
+        }
+        if mounted_scrub_evidence.checksum.expected
+            != Some(source_placement_receipt_ref.payload_digest)
+            || mounted_scrub_evidence.checksum.expected
+                == Some(mounted_scrub_evidence.checksum.actual)
+        {
+            return Err(RepairReplacementReceiptRejection::MountedScrubEvidenceStale);
+        }
+        match mounted_scrub_evidence.receipt_status {
+            RepairMountedReceiptEvidenceStatus::ReceiptVerified { generation }
+                if generation == source_placement_receipt_ref.receipt_generation => {}
+            RepairMountedReceiptEvidenceStatus::ReceiptVerified { .. } => {
+                return Err(RepairReplacementReceiptRejection::MountedScrubEvidenceStale);
+            }
+            _ => return Err(RepairReplacementReceiptRejection::MountedScrubReceiptNotVerified),
+        }
+        if replacement_receipt_ref.object_id != source_placement_receipt_ref.object_id
+            || replacement_receipt_ref.object_key != source_placement_receipt_ref.object_key
+        {
+            return Err(RepairReplacementReceiptRejection::ReplacementReceiptObjectMismatch);
+        }
+        if replacement_receipt_ref.payload_len != source_placement_receipt_ref.payload_len
+            || replacement_receipt_ref.payload_digest != source_placement_receipt_ref.payload_digest
+        {
+            return Err(RepairReplacementReceiptRejection::ReplacementReceiptDigestMismatch);
+        }
+        if replacement_receipt_ref.receipt_generation
+            <= source_placement_receipt_ref.receipt_generation
+        {
+            return Err(
+                RepairReplacementReceiptRejection::ReplacementReceiptGenerationNotNewer {
+                    source_generation: source_placement_receipt_ref.receipt_generation,
+                    replacement_generation: replacement_receipt_ref.receipt_generation,
+                },
+            );
+        }
+
+        Ok(Self {
+            subject,
+            policy_revision,
+            source_placement_receipt_ref,
+            mounted_scrub_evidence,
+            replacement_receipt_ref,
+            replacement_receipt_id,
+        })
+    }
+
+    #[must_use]
+    pub const fn replacement_receipt_generation(self) -> u64 {
+        self.replacement_receipt_ref.receipt_generation
+    }
+
+    #[must_use]
+    pub const fn downstream_evidence(self) -> RepairReplacementReceiptConsumerEvidence {
+        RepairReplacementReceiptConsumerEvidence {
+            subject: self.subject,
+            policy_revision: self.policy_revision,
+            source_placement_receipt_ref: self.source_placement_receipt_ref,
+            replacement_receipt_ref: self.replacement_receipt_ref,
+            replacement_receipt_id: self.replacement_receipt_id,
+        }
+    }
+}
+
 impl RepairEvidence {
     /// Build repair evidence from a durable placement receipt.
     pub fn from_placement_receipt(
@@ -1787,6 +1913,26 @@ mod tests {
         )
     }
 
+    fn replacement_receipt_for_source(
+        source: PlacementReceiptRef,
+        generation: u64,
+    ) -> PlacementReceiptRef {
+        PlacementReceiptRef::new(
+            source.object_id,
+            source.object_key,
+            source.receipt_epoch,
+            generation,
+            source.redundancy_policy,
+            source.payload_len,
+            source.payload_digest,
+            source.target_count,
+        )
+    }
+
+    fn replacement_receipt_id(byte: u8) -> [u8; 16] {
+        [byte; 16]
+    }
+
     fn comparison_sets(classification: &ComparisonClassification) -> (Vec<u64>, Vec<u64>) {
         match classification {
             ComparisonClassification::SingleReplicaCorruption {
@@ -2029,6 +2175,61 @@ mod tests {
         job.record_failure(); // 1
         job.record_failure(); // 2 → Urgent
         assert_eq!(job.service_priority(), ServicePriority::Critical);
+    }
+
+    #[test]
+    fn replacement_receipt_evidence_exports_downstream_view() {
+        let entry = make_entry(14, 1);
+        let source = receipt_for_entry(&entry);
+        let replacement =
+            replacement_receipt_for_source(source, source.receipt_generation.saturating_add(1));
+        let evidence = RepairReplacementReceiptEvidence::new(
+            RepairCandidateIdentity::from_suspect_entry(&entry),
+            7,
+            source,
+            mounted_scrub_evidence_for_entry(&entry, source.receipt_generation),
+            replacement,
+            replacement_receipt_id(0x44),
+        )
+        .expect("replacement evidence should validate");
+
+        assert_eq!(
+            evidence.replacement_receipt_generation(),
+            source.receipt_generation + 1
+        );
+        let downstream = evidence.downstream_evidence();
+        assert_eq!(downstream.policy_revision, 7);
+        assert_eq!(downstream.source_placement_receipt_ref, source);
+        assert_eq!(downstream.replacement_receipt_ref, replacement);
+        assert_eq!(
+            downstream.replacement_receipt_id,
+            replacement_receipt_id(0x44)
+        );
+    }
+
+    #[test]
+    fn replacement_receipt_evidence_rejects_stale_generation() {
+        let entry = make_entry(15, 1);
+        let source = receipt_for_entry(&entry);
+        let stale_replacement = replacement_receipt_for_source(source, source.receipt_generation);
+
+        let rejected = RepairReplacementReceiptEvidence::new(
+            RepairCandidateIdentity::from_suspect_entry(&entry),
+            7,
+            source,
+            mounted_scrub_evidence_for_entry(&entry, source.receipt_generation),
+            stale_replacement,
+            replacement_receipt_id(0x45),
+        )
+        .expect_err("same-generation replacement must be refused");
+
+        assert_eq!(
+            rejected,
+            RepairReplacementReceiptRejection::ReplacementReceiptGenerationNotNewer {
+                source_generation: source.receipt_generation,
+                replacement_generation: source.receipt_generation,
+            }
+        );
     }
 
     // ── ScrubToRepairBridge ──────────────────────────────────────

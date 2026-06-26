@@ -9,6 +9,7 @@
 use crate::scrub::{RepairStrategy, ScrubBlockId, ScrubBlockKind, ScrubReport, ScrubViolation};
 use crate::types::InodeRecord;
 use std::sync::Arc;
+use tidefs_scrub::repair_scheduling::RepairReplacementReceiptEvidence;
 
 // ── Repair outcome recording ──────────────────────────────────────────
 
@@ -27,12 +28,46 @@ pub enum RepairOutcome {
     Truncated { new_size: u64 },
     /// Block marked as corrupt; reads will return I/O errors.
     MarkedCorrupt,
-    /// Reconstructed from erasure-coding parity and durably written back to the object store.
-    Reconstructed { bytes_written: usize },
+    /// Reconstructed and completed by publishing durable replacement receipt evidence.
+    Reconstructed {
+        bytes_written: usize,
+        replacement_receipt: Box<RepairReplacementReceiptEvidence>,
+    },
+    /// Reconstructed bytes were written, but replacement receipt publication did not happen.
+    WritebackMissingReplacementReceipt { bytes_written: usize },
     /// Candidate no longer matches the current local filesystem authority.
     AuthorityMismatch { reason: RepairAuthorityMismatch },
+    /// Storage read or write failed while applying repair.
+    StorageIoFailure { operation: RepairStorageOperation },
+    /// The candidate could not be reconstructed from available evidence.
+    Unrepairable { reason: RepairUnrepairableReason },
     /// Repair was not possible; no action taken.
     Skipped,
+}
+
+impl RepairOutcome {
+    /// Durable replacement evidence that downstream consumers may use.
+    pub fn replacement_receipt_evidence(&self) -> Option<RepairReplacementReceiptEvidence> {
+        match self {
+            Self::Reconstructed {
+                replacement_receipt,
+                ..
+            } => Some(**replacement_receipt),
+            _ => None,
+        }
+    }
+
+    /// True only after replacement receipt publication made repair authoritative.
+    #[must_use]
+    pub fn permits_downstream_receipt_consumers(&self) -> bool {
+        self.replacement_receipt_evidence().is_some()
+    }
+
+    /// Old placement receipt retirement stays behind replacement publication.
+    #[must_use]
+    pub fn permits_old_receipt_retirement(&self) -> bool {
+        self.replacement_receipt_evidence().is_some()
+    }
 }
 
 /// Why a scheduled repair candidate was rejected before writeback.
@@ -45,6 +80,23 @@ pub enum RepairAuthorityMismatch {
     MountedScrubChecksumMissing,
     MountedScrubReceiptNotVerified,
     CurrentAuthorityUnavailable,
+}
+
+/// Storage operation that failed during repair application.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepairStorageOperation {
+    ReadSourceObject,
+    WriteRepairedObject,
+}
+
+/// Why reconstruction could not produce repaired bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepairUnrepairableReason {
+    MissingSourceObject,
+    NotErasureEncoded,
+    InvalidErasureHeader,
+    UnsupportedParityCount,
+    ReconstructionFailed,
 }
 
 /// Log of repairs applied during a resolver pass.
@@ -338,12 +390,26 @@ pub(crate) fn apply_one_repair(
     store: &mut LocalObjectStore,
     content_layout_cache: &mut BTreeMap<InodeId, ContentLayout>,
 ) -> RepairOutcome {
+    apply_one_repair_with_replacement_evidence(entry, state, store, content_layout_cache, None)
+}
+
+pub(crate) fn apply_one_repair_with_replacement_evidence(
+    entry: &RepairEntry,
+    state: &mut FileSystemState,
+    store: &mut LocalObjectStore,
+    content_layout_cache: &mut BTreeMap<InodeId, ContentLayout>,
+    replacement_receipt: Option<RepairReplacementReceiptEvidence>,
+) -> RepairOutcome {
     let inode_id = InodeId::new(entry.block_id.inode_id);
 
     match entry.strategy {
-        crate::scrub::RepairStrategy::Reconstruct => {
-            apply_reconstruct(inode_id, entry.block_id.data_version, state, store)
-        }
+        crate::scrub::RepairStrategy::Reconstruct => apply_reconstruct(
+            inode_id,
+            entry.block_id.data_version,
+            state,
+            store,
+            replacement_receipt,
+        ),
         crate::scrub::RepairStrategy::Truncate => {
             apply_truncate(inode_id, entry, state, store, content_layout_cache)
         }
@@ -413,43 +479,86 @@ fn apply_truncate(
 /// shard_len u32 LE). If found, collects surviving shards and calls the
 /// erasure coding engine's `reconstruct()` to rebuild the payload.
 ///
-/// Returns `Skipped` when the content was never erasure-encoded.
+/// Returns `Unrepairable(NotErasureEncoded)` when the content was never
+/// erasure-encoded.
 fn apply_reconstruct(
     inode_id: InodeId,
     data_version: u64,
     state: &mut FileSystemState,
     store: &mut LocalObjectStore,
+    replacement_receipt: Option<RepairReplacementReceiptEvidence>,
 ) -> RepairOutcome {
     let content_key = crate::object_keys::content_object_key_for_version(inode_id, data_version);
     let raw = match store.get(content_key) {
         Ok(Some(bytes)) => bytes,
-        _ => return RepairOutcome::Skipped,
+        Ok(None) => {
+            return RepairOutcome::Unrepairable {
+                reason: RepairUnrepairableReason::MissingSourceObject,
+            }
+        }
+        Err(_) => {
+            return RepairOutcome::StorageIoFailure {
+                operation: RepairStorageOperation::ReadSourceObject,
+            }
+        }
     };
 
     // Minimum erasure-coding header is 9 bytes:
     // [stripe_width: u16 LE][data_shards: u16 LE][parity_shards: u8][shard_len: u32 LE]
     if raw.len() < 9 {
-        return RepairOutcome::Skipped;
+        return RepairOutcome::Unrepairable {
+            reason: RepairUnrepairableReason::NotErasureEncoded,
+        };
     }
 
-    let stripe_width = u16::from_le_bytes([raw[0], raw[1]]) as usize;
-    let data_shards = u16::from_le_bytes([raw[2], raw[3]]) as usize;
+    let stripe_width = usize::from(u16::from_le_bytes([raw[0], raw[1]]));
+    let data_shards = usize::from(u16::from_le_bytes([raw[2], raw[3]]));
     let parity_count_raw = raw[4];
-    let shard_len = u32::from_le_bytes([raw[5], raw[6], raw[7], raw[8]]) as usize;
+    let shard_len = match usize::try_from(u32::from_le_bytes([raw[5], raw[6], raw[7], raw[8]])) {
+        Ok(shard_len) => shard_len,
+        Err(_) => {
+            return RepairOutcome::Unrepairable {
+                reason: RepairUnrepairableReason::InvalidErasureHeader,
+            }
+        }
+    };
 
     if parity_count_raw == 0 || data_shards == 0 || shard_len == 0 {
-        return RepairOutcome::Skipped;
+        return RepairOutcome::Unrepairable {
+            reason: RepairUnrepairableReason::NotErasureEncoded,
+        };
     }
-    if stripe_width != data_shards + parity_count_raw as usize {
-        return RepairOutcome::Skipped;
+    if stripe_width != data_shards + usize::from(parity_count_raw) {
+        return RepairOutcome::Unrepairable {
+            reason: RepairUnrepairableReason::NotErasureEncoded,
+        };
     }
 
     let parity_count = match parity_count_raw {
         1 => 1,
         2 => 2,
         3 => 3,
-        _ => return RepairOutcome::Skipped,
+        _ => {
+            return RepairOutcome::Unrepairable {
+                reason: RepairUnrepairableReason::UnsupportedParityCount,
+            }
+        }
     };
+
+    let header_size = 9usize;
+    let Some(expected_len) = stripe_width
+        .checked_mul(shard_len)
+        .and_then(|shard_bytes| header_size.checked_add(shard_bytes))
+    else {
+        return RepairOutcome::Unrepairable {
+            reason: RepairUnrepairableReason::InvalidErasureHeader,
+        };
+    };
+    if raw.len() < expected_len {
+        return RepairOutcome::Unrepairable {
+            reason: RepairUnrepairableReason::InvalidErasureHeader,
+        };
+    }
 
     let config = tidefs_erasure_coding::StripeConfig {
         data_shards,
@@ -457,7 +566,6 @@ fn apply_reconstruct(
         shard_len,
     };
 
-    let header_size = 9;
     let total_shards = stripe_width;
     let available_shards: Vec<Option<tidefs_erasure_coding::ErasureShard>> = (0..total_shards)
         .map(|idx| {
@@ -478,21 +586,28 @@ fn apply_reconstruct(
         })
         .collect();
 
-    match tidefs_erasure_coding::reconstruct(&config, &available_shards, None) {
-        Some(reconstruction) => {
-            // Write reconstructed payload back to the object store so the
-            // repair is durable. A subsequent commit will publish it.
-            match store.put(content_key, &reconstruction.payload) {
-                Ok(_stored) => {
-                    state.dirty_content.insert(inode_id);
-                    RepairOutcome::Reconstructed {
-                        bytes_written: reconstruction.payload.len(),
-                    }
-                }
-                Err(_) => RepairOutcome::Skipped,
+    let Some(reconstruction) = tidefs_erasure_coding::reconstruct(&config, &available_shards, None)
+    else {
+        return RepairOutcome::Unrepairable {
+            reason: RepairUnrepairableReason::ReconstructionFailed,
+        };
+    };
+
+    let bytes_written = reconstruction.payload.len();
+    match store.put(content_key, &reconstruction.payload) {
+        Ok(_stored) => {
+            state.dirty_content.insert(inode_id);
+            match replacement_receipt {
+                Some(replacement_receipt) => RepairOutcome::Reconstructed {
+                    bytes_written,
+                    replacement_receipt: Box::new(replacement_receipt),
+                },
+                None => RepairOutcome::WritebackMissingReplacementReceipt { bytes_written },
             }
         }
-        None => RepairOutcome::Skipped,
+        Err(_) => RepairOutcome::StorageIoFailure {
+            operation: RepairStorageOperation::WriteRepairedObject,
+        },
     }
 }
 
@@ -502,6 +617,12 @@ mod apply_tests {
     use crate::scrub::{
         RepairStrategy, ScrubBlockId, ScrubBlockKind, ScrubBlockOutcome, ScrubViolation,
     };
+    use tidefs_replication_model::{PlacementReceiptRef, ReceiptRedundancyPolicy};
+    use tidefs_scrub::repair_scheduling::{
+        RepairBlockKind, RepairCandidateIdentity, RepairMountedChecksumEvidence,
+        RepairMountedReceiptEvidenceStatus, RepairMountedScrubEvidence,
+    };
+    use tidefs_scrub::ChecksumLayer;
 
     fn make_violation(chunk_index: u64) -> (ScrubViolation, InodeId) {
         let inode_id = 100;
@@ -520,6 +641,81 @@ mod apply_tests {
             },
             InodeId::new(inode_id),
         )
+    }
+
+    fn repair_kind_from_scrub_kind(kind: ScrubBlockKind) -> RepairBlockKind {
+        match kind {
+            ScrubBlockKind::InlineContent => RepairBlockKind::InlineContent,
+            ScrubBlockKind::ContentManifest => RepairBlockKind::ContentManifest,
+            ScrubBlockKind::ContentChunk { chunk_index } => {
+                RepairBlockKind::ContentChunk { chunk_index }
+            }
+        }
+    }
+
+    fn checksum_layer_from_scrub_kind(kind: ScrubBlockKind) -> ChecksumLayer {
+        match kind {
+            ScrubBlockKind::InlineContent | ScrubBlockKind::ContentManifest => {
+                ChecksumLayer::InlineContentBody
+            }
+            ScrubBlockKind::ContentChunk { .. } => ChecksumLayer::EncodedContentChunk,
+        }
+    }
+
+    fn replacement_evidence_for(
+        block_id: ScrubBlockId,
+        payload_key: tidefs_local_object_store::ObjectKey,
+        payload: &[u8],
+    ) -> RepairReplacementReceiptEvidence {
+        let payload_digest = *blake3::hash(payload).as_bytes();
+        let payload_len = u64::try_from(payload.len()).expect("test payload length fits u64");
+        let source = PlacementReceiptRef::new(
+            block_id.inode_id,
+            payload_key.as_bytes32(),
+            Default::default(),
+            11,
+            ReceiptRedundancyPolicy::Replicated { copies: 2 },
+            payload_len,
+            payload_digest,
+            2,
+        );
+        let replacement = PlacementReceiptRef::new(
+            source.object_id,
+            source.object_key,
+            source.receipt_epoch,
+            source.receipt_generation + 1,
+            source.redundancy_policy,
+            source.payload_len,
+            source.payload_digest,
+            source.target_count,
+        );
+        let mounted = RepairMountedScrubEvidence {
+            subject: RepairCandidateIdentity::new(
+                block_id.inode_id,
+                block_id.data_version,
+                repair_kind_from_scrub_kind(block_id.kind),
+            ),
+            expected_plaintext_len: payload_len,
+            observed_plaintext_len: Some(payload_len),
+            checksum: RepairMountedChecksumEvidence {
+                layer: checksum_layer_from_scrub_kind(block_id.kind),
+                expected: Some(payload_digest),
+                actual: [0x5a; 32],
+                encoded_len: payload_len,
+            },
+            receipt_status: RepairMountedReceiptEvidenceStatus::ReceiptVerified {
+                generation: source.receipt_generation,
+            },
+        };
+        RepairReplacementReceiptEvidence::new(
+            mounted.subject,
+            crate::ack_receipt::LOCAL_ACK_POLICY_REVISION.0,
+            source,
+            mounted,
+            replacement,
+            [0x7a; 16],
+        )
+        .expect("replacement receipt evidence should validate")
     }
 
     #[test]
@@ -564,7 +760,7 @@ mod apply_tests {
     }
 
     #[test]
-    fn reconstruct_on_non_ec_object_returns_skipped() {
+    fn reconstruct_on_non_ec_object_returns_unrepairable() {
         let (v, _) = make_violation(3);
         let entry = RepairEntry {
             block_id: v.block_id.clone(),
@@ -583,7 +779,12 @@ mod apply_tests {
 
         let outcome = apply_one_repair(&entry, &mut state, &mut store, &mut BTreeMap::new());
 
-        assert_eq!(outcome, RepairOutcome::Skipped);
+        assert_eq!(
+            outcome,
+            RepairOutcome::Unrepairable {
+                reason: RepairUnrepairableReason::NotErasureEncoded
+            }
+        );
     }
 
     #[test]
@@ -623,7 +824,12 @@ mod apply_tests {
 
         let outcome = apply_one_repair(&entry, &mut state, &mut store, &mut BTreeMap::new());
 
-        assert_eq!(outcome, RepairOutcome::Reconstructed { bytes_written: 16 });
+        assert_eq!(
+            outcome,
+            RepairOutcome::WritebackMissingReplacementReceipt { bytes_written: 16 }
+        );
+        assert!(!outcome.permits_downstream_receipt_consumers());
+        assert!(!outcome.permits_old_receipt_retirement());
 
         // Verify the reconstructed bytes were durably written back to the store.
         let stored = store.get(content_key).unwrap().unwrap();
@@ -632,6 +838,91 @@ mod apply_tests {
         assert!(state
             .dirty_content
             .contains(&InodeId::new(v.block_id.inode_id)));
+    }
+
+    #[test]
+    fn reconstruct_with_replacement_receipt_publishes_authoritative_completion() {
+        let (v, _) = make_violation(3);
+        let entry = RepairEntry {
+            block_id: v.block_id.clone(),
+            strategy: RepairStrategy::Reconstruct,
+            outcome: RepairOutcome::Skipped,
+        };
+
+        let config = tidefs_erasure_coding::StripeConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 8,
+        };
+        let payload: Vec<u8> = (0..16).collect();
+        let encoded = tidefs_erasure_coding::encode(&config, &payload).unwrap();
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(config.stripe_width() as u16).to_le_bytes());
+        raw.extend_from_slice(&(config.data_shards as u16).to_le_bytes());
+        raw.push(config.parity_shards as u8);
+        raw.extend_from_slice(&(config.shard_len as u32).to_le_bytes());
+        for shard in &encoded.shards {
+            raw.extend_from_slice(&shard.bytes);
+        }
+
+        let mut state = crate::recovery::initial_state();
+        let mut store = unreachable_store();
+        let content_key = crate::object_keys::content_object_key_for_version(
+            InodeId::new(v.block_id.inode_id),
+            v.block_id.data_version,
+        );
+        store.put(content_key, &raw).unwrap();
+        let replacement_evidence =
+            replacement_evidence_for(v.block_id.clone(), content_key, &payload);
+
+        let outcome = apply_one_repair_with_replacement_evidence(
+            &entry,
+            &mut state,
+            &mut store,
+            &mut BTreeMap::new(),
+            Some(replacement_evidence),
+        );
+
+        assert_eq!(
+            outcome,
+            RepairOutcome::Reconstructed {
+                bytes_written: 16,
+                replacement_receipt: Box::new(replacement_evidence),
+            }
+        );
+        assert_eq!(
+            outcome.replacement_receipt_evidence(),
+            Some(replacement_evidence)
+        );
+        let recorded = outcome
+            .replacement_receipt_evidence()
+            .expect("replacement evidence");
+        assert_eq!(
+            recorded.subject,
+            RepairCandidateIdentity::new(
+                v.block_id.inode_id,
+                v.block_id.data_version,
+                RepairBlockKind::ContentChunk { chunk_index: 3 },
+            )
+        );
+        assert_eq!(
+            recorded.policy_revision,
+            crate::ack_receipt::LOCAL_ACK_POLICY_REVISION.0
+        );
+        assert_eq!(recorded.source_placement_receipt_ref.receipt_generation, 11);
+        assert_eq!(
+            recorded.mounted_scrub_evidence.receipt_status,
+            RepairMountedReceiptEvidenceStatus::ReceiptVerified { generation: 11 }
+        );
+        assert_eq!(recorded.replacement_receipt_generation(), 12);
+        assert_eq!(recorded.replacement_receipt_id, [0x7a; 16]);
+        assert!(outcome.permits_downstream_receipt_consumers());
+        assert!(outcome.permits_old_receipt_retirement());
+        assert_eq!(
+            recorded.downstream_evidence().replacement_receipt_id,
+            [0x7a; 16]
+        );
     }
 
     #[test]
