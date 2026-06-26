@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use tidefs_cache_core::{
-    budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor,
+    budget_category_for_cache_level, BudgetCategory, BudgetPartitionKey, CacheBudgetLevel, Governor,
 };
 use tidefs_types_vfs_core::InodeId;
 
@@ -78,6 +78,7 @@ pub(crate) struct InodeCache {
     poisoned_on_validate: u64,
     monotonic_counter: u64,
     governor: Option<Governor>,
+    budget_partition: Option<BudgetPartitionKey>,
 }
 
 fn approx_entry_size(cached: &CachedInode) -> u64 {
@@ -138,12 +139,27 @@ impl InodeCache {
             poisoned_on_validate: 0,
             monotonic_counter: 0,
             governor: None,
+            budget_partition: None,
         }
     }
 
     /// Attach resource-governor accounting for per-inode cache state.
-    pub(crate) fn set_governor(&mut self, governor: Governor) {
+    pub(crate) fn set_governor(
+        &mut self,
+        governor: Governor,
+        partition: Option<BudgetPartitionKey>,
+    ) {
+        self.clear();
         self.governor = Some(governor);
+        self.budget_partition = partition;
+    }
+
+    /// Update the mounted-dataset budget partition for future admissions.
+    pub(crate) fn set_budget_partition(&mut self, partition: BudgetPartitionKey) {
+        if self.budget_partition != Some(partition) {
+            self.clear();
+            self.budget_partition = Some(partition);
+        }
     }
 
     fn budget_category() -> BudgetCategory {
@@ -152,9 +168,13 @@ impl InodeCache {
 
     fn admit_budget(&mut self, bytes: u64) -> bool {
         if let Some(ref governor) = self.governor {
-            if governor.admit(Self::budget_category(), bytes).is_err() {
-                self.admission_rejected_budget =
-                    self.admission_rejected_budget.saturating_add(1);
+            let result = if let Some(partition) = self.budget_partition {
+                governor.admit_for_partition(partition, Self::budget_category(), bytes)
+            } else {
+                governor.admit(Self::budget_category(), bytes)
+            };
+            if result.is_err() {
+                self.admission_rejected_budget = self.admission_rejected_budget.saturating_add(1);
                 return false;
             }
         }
@@ -163,7 +183,11 @@ impl InodeCache {
 
     fn release_budget(&self, bytes: u64) {
         if let Some(ref governor) = self.governor {
-            governor.release(Self::budget_category(), bytes);
+            if let Some(partition) = self.budget_partition {
+                governor.release_for_partition(partition, Self::budget_category(), bytes);
+            } else {
+                governor.release(Self::budget_category(), bytes);
+            }
         }
     }
 
@@ -631,11 +655,15 @@ mod tests {
         .unwrap()
     }
 
+    fn partition_key(byte: u8) -> BudgetPartitionKey {
+        BudgetPartitionKey::from_bytes([byte; 16])
+    }
+
     #[test]
     fn governor_charges_inode_entries_to_inode_state() {
         let governor = inode_governor();
         let mut cache = InodeCache::new(policy());
-        cache.set_governor(governor.clone());
+        cache.set_governor(governor.clone(), None);
         let id = InodeId::new(1);
         let entry = cached(1);
         let entry_size = approx_entry_size(&entry);
@@ -648,6 +676,34 @@ mod tests {
         assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
 
         cache.invalidate(id);
+        assert_eq!(governor.category_used(BudgetCategory::InodeState), 0);
+    }
+
+    #[test]
+    fn governor_charges_inode_entries_to_dataset_partition() {
+        let governor = inode_governor();
+        let partition = partition_key(0x22);
+        let mut cache = InodeCache::new(policy());
+        cache.set_governor(governor.clone(), Some(partition));
+        let id = InodeId::new(1);
+        let entry = cached(1);
+        let entry_size = approx_entry_size(&entry);
+
+        cache.insert(id, entry);
+        assert_eq!(
+            governor.partition_used(partition, BudgetCategory::InodeState),
+            entry_size
+        );
+        assert_eq!(
+            governor.category_used(BudgetCategory::InodeState),
+            entry_size
+        );
+
+        cache.invalidate(id);
+        assert_eq!(
+            governor.partition_used(partition, BudgetCategory::InodeState),
+            0
+        );
         assert_eq!(governor.category_used(BudgetCategory::InodeState), 0);
     }
 

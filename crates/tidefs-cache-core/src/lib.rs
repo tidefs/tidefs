@@ -91,12 +91,12 @@ pub use weighted_arc::{ArcList, ArcWeightStats, WeightedArc, WeightedArcEntry};
 // Re-exports from governor
 pub use governor::{
     budget_category_for_cache_class, budget_category_for_cache_level, budget_category_for_entry,
-    AdmissionTicket, BackpressureSignal, BudgetCategory, BudgetError, CacheBudgetLevel,
-    CacheReclaimWorker, CommitBoundaryWorker, DirtyReclaimWorker, Governor,
-    GovernorAutoTuneDecision, GovernorAutoTuneError, GovernorAutoTuneEvidence,
-    GovernorAutoTuneOwner, GovernorAutoTuneSafety, GovernorAutoTuneSafetyEffect,
-    GovernorAutoTuneUnit, GovernorCacheReclaimService, GovernorCommitBoundaryService,
-    GovernorConfig,
+    AdmissionTicket, BackpressureSignal, BudgetCategory, BudgetError, BudgetPartitionKey,
+    BudgetPartitionPolicy, CacheBudgetLevel, CacheReclaimWorker, CommitBoundaryWorker,
+    DirtyReclaimWorker, Governor, GovernorAutoTuneDecision, GovernorAutoTuneError,
+    GovernorAutoTuneEvidence, GovernorAutoTuneOwner, GovernorAutoTuneSafety,
+    GovernorAutoTuneSafetyEffect, GovernorAutoTuneUnit, GovernorCacheReclaimService,
+    GovernorCommitBoundaryService, GovernorConfig, GovernorPartitionConfig,
     GovernorDirtyFlushService, GovernorIncrementalReclaimWorker, GovernorPressureState,
     ReclaimOutcome, ReclaimRequest, ReclaimStage, ReclaimWorkKind, AUTO_TUNE_MAX_FRACTION_SHIFT,
     AUTO_TUNE_MAX_FRESHNESS_MS,

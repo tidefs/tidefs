@@ -2019,10 +2019,25 @@ impl LocalFileSystem {
     /// Set the dataset ID for the currently mounted filesystem.
     ///
     /// Used as the anchor for quota hierarchy ancestor-chain traversal
-    /// during statfs derivation and ENOSPC gating.
+    /// during statfs derivation, ENOSPC gating, and cache-governor budget
+    /// partition accounting.
     pub fn set_mounted_dataset_id(&mut self, id: [u8; 16]) {
+        let dataset_changed = self.mounted_dataset_id != id;
+        if dataset_changed {
+            self.clear_hot_read_cache();
+            self.inode_cache.borrow_mut().clear();
+        }
         self.mounted_dataset_id = id;
         self.state.set_inode_authority_dataset_id(id);
+        if dataset_changed {
+            let partition = self.cache_budget_partition();
+            self.hot_read_cache
+                .borrow_mut()
+                .set_budget_partition(partition);
+            self.inode_cache
+                .borrow_mut()
+                .set_budget_partition(partition);
+        }
     }
 
     /// Set the current placement epoch for send/receive stream attribution.
@@ -2035,6 +2050,10 @@ impl LocalFileSystem {
     #[must_use]
     pub fn mounted_dataset_id(&self) -> [u8; 16] {
         self.mounted_dataset_id
+    }
+
+    fn cache_budget_partition(&self) -> tidefs_cache_core::BudgetPartitionKey {
+        tidefs_cache_core::BudgetPartitionKey::from_bytes(self.mounted_dataset_id)
     }
 
     /// Install a nested dataset quota hierarchy for multi-dataset quota
@@ -4955,12 +4974,18 @@ impl LocalFileSystem {
     ///
     /// Hot-read resident bytes charge L1 [`tidefs_cache_core::BudgetCategory::DataCache`],
     /// while inode-record and directory-associated state charges
-    /// [`tidefs_cache_core::BudgetCategory::InodeState`].
+    /// [`tidefs_cache_core::BudgetCategory::InodeState`]. Both are charged to
+    /// the current mounted dataset's governor budget partition.
     pub fn set_cache_governor(&self, governor: tidefs_cache_core::Governor) {
+        let partition = self.cache_budget_partition();
+        self.clear_hot_read_cache();
+        self.inode_cache.borrow_mut().clear();
         self.hot_read_cache
             .borrow_mut()
-            .set_governor(governor.clone());
-        self.inode_cache.borrow_mut().set_governor(governor);
+            .set_governor(governor.clone(), Some(partition));
+        self.inode_cache
+            .borrow_mut()
+            .set_governor(governor, Some(partition));
     }
 
     pub const fn allocator_policy(&self) -> LocalStorageAllocatorPolicy {
