@@ -480,7 +480,8 @@ fn apply_truncate(
 /// shard_len u32 LE). If found, collects surviving shards and calls the
 /// erasure coding engine's `reconstruct()` to rebuild the payload.
 ///
-/// Returns `Skipped` when the content was never erasure-encoded.
+/// Returns `Unrepairable(NotErasureEncoded)` when the content was never
+/// erasure-encoded.
 fn apply_reconstruct(
     inode_id: InodeId,
     data_version: u64,
@@ -518,12 +519,12 @@ fn apply_reconstruct(
 
     if parity_count_raw == 0 || data_shards == 0 || shard_len == 0 {
         return RepairOutcome::Unrepairable {
-            reason: RepairUnrepairableReason::InvalidErasureHeader,
+            reason: RepairUnrepairableReason::NotErasureEncoded,
         };
     }
     if stripe_width != data_shards + parity_count_raw as usize {
         return RepairOutcome::Unrepairable {
-            reason: RepairUnrepairableReason::InvalidErasureHeader,
+            reason: RepairUnrepairableReason::NotErasureEncoded,
         };
     }
 
@@ -538,13 +539,27 @@ fn apply_reconstruct(
         }
     };
 
+    let header_size = 9usize;
+    let Some(expected_len) = stripe_width
+        .checked_mul(shard_len)
+        .and_then(|shard_bytes| header_size.checked_add(shard_bytes))
+    else {
+        return RepairOutcome::Unrepairable {
+            reason: RepairUnrepairableReason::InvalidErasureHeader,
+        };
+    };
+    if raw.len() < expected_len {
+        return RepairOutcome::Unrepairable {
+            reason: RepairUnrepairableReason::InvalidErasureHeader,
+        };
+    }
+
     let config = tidefs_erasure_coding::StripeConfig {
         data_shards,
         parity_shards: parity_count,
         shard_len,
     };
 
-    let header_size = 9;
     let total_shards = stripe_width;
     let available_shards: Vec<Option<tidefs_erasure_coding::ErasureShard>> = (0..total_shards)
         .map(|idx| {
