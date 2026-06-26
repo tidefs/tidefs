@@ -668,13 +668,14 @@ mod apply_tests {
         payload: &[u8],
     ) -> RepairReplacementReceiptEvidence {
         let payload_digest = *blake3::hash(payload).as_bytes();
+        let payload_len = u64::try_from(payload.len()).expect("test payload length fits u64");
         let source = PlacementReceiptRef::new(
             block_id.inode_id,
             payload_key.as_bytes32(),
             Default::default(),
             11,
             ReceiptRedundancyPolicy::Replicated { copies: 2 },
-            payload.len() as u64,
+            payload_len,
             payload_digest,
             2,
         );
@@ -694,13 +695,13 @@ mod apply_tests {
                 block_id.data_version,
                 repair_kind_from_scrub_kind(block_id.kind),
             ),
-            expected_plaintext_len: payload.len() as u64,
-            observed_plaintext_len: Some(payload.len() as u64),
+            expected_plaintext_len: payload_len,
+            observed_plaintext_len: Some(payload_len),
             checksum: RepairMountedChecksumEvidence {
                 layer: checksum_layer_from_scrub_kind(block_id.kind),
                 expected: Some(payload_digest),
                 actual: [0x5a; 32],
-                encoded_len: payload.len() as u64,
+                encoded_len: payload_len,
             },
             receipt_status: RepairMountedReceiptEvidenceStatus::ReceiptVerified {
                 generation: source.receipt_generation,
