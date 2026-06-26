@@ -4,6 +4,8 @@ use std::fmt;
 pub use tidefs_auth::NodeIdentity;
 pub use tidefs_auth::NodeIdentity as NodeIdentityPublic;
 use tidefs_clock_timing::types::HlcValue;
+use tidefs_storage_intent_core::{StorageIntentEvidenceKind, StorageIntentEvidenceRef};
+use tidefs_storage_intent_remote_media_capability::RemoteTargetIdentityFacts;
 
 // ---------------------------------------------------------------------------
 // Core identifiers
@@ -190,5 +192,205 @@ impl CohortMembership {
     /// Create a new CohortMembership with the given domain IDs and epoch.
     pub fn new(domain_ids: Vec<u64>, epoch: u64) -> Self {
         Self { domain_ids, epoch }
+    }
+}
+
+/// Bounded transport-session identity sample for #961 remote media inputs.
+///
+/// The sample is read-only: it records session, node identity, HLC, fence, and
+/// cohort facts already owned by transport/membership/auth layers. It does not
+/// originate placement, durability, trust-domain, or endpoint-measurement
+/// authority by itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteMediaTransportIdentitySample {
+    pub session_id: SessionId,
+    pub local_node_id: u64,
+    pub remote_node_id: u64,
+    pub observed_at: HlcTimestamp,
+    pub fence_version: FenceVersion,
+    pub cohort_epoch: u64,
+    pub cohort_member_count: u16,
+    pub remote_identity_version: u64,
+    pub stable_identity_ref: StorageIntentEvidenceRef,
+    pub namespace_identity_ref: StorageIntentEvidenceRef,
+}
+
+fn evidence_ref_has_kind(
+    evidence_ref: StorageIntentEvidenceRef,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    evidence_ref.is_bound() && evidence_ref.kind == kind
+}
+
+impl RemoteMediaTransportIdentitySample {
+    #[must_use]
+    pub fn from_authenticated_session(
+        session_id: SessionId,
+        local_identity: &NodeIdentity,
+        remote_identity: &NodeIdentity,
+        observed_at: HlcTimestamp,
+        fence_version: FenceVersion,
+        cohort: &CohortMembership,
+        stable_identity_ref: StorageIntentEvidenceRef,
+        namespace_identity_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        let cohort_member_count = cohort.domain_ids.len().min(u16::MAX as usize) as u16;
+        Self {
+            session_id,
+            local_node_id: local_identity.node_id,
+            remote_node_id: remote_identity.node_id,
+            observed_at,
+            fence_version,
+            cohort_epoch: cohort.epoch,
+            cohort_member_count,
+            remote_identity_version: remote_identity.identity_version,
+            stable_identity_ref,
+            namespace_identity_ref,
+        }
+    }
+
+    #[must_use]
+    pub fn to_remote_target_identity_facts(self) -> RemoteTargetIdentityFacts {
+        let observed_hlc = self.observed_at.as_hlc_value();
+        if self.session_id.0 == 0
+            || self.local_node_id == 0
+            || self.remote_node_id == 0
+            || self.local_node_id == self.remote_node_id
+            || self.fence_version.0 == 0
+            || self.cohort_epoch == 0
+            || self.cohort_member_count == 0
+            || self.remote_identity_version == 0
+            || observed_hlc.physical_ns() == 0
+            || !evidence_ref_has_kind(
+                self.stable_identity_ref,
+                StorageIntentEvidenceKind::TrustDomainEvidence,
+            )
+            || !evidence_ref_has_kind(
+                self.namespace_identity_ref,
+                StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            )
+        {
+            return RemoteTargetIdentityFacts::default();
+        }
+
+        RemoteTargetIdentityFacts {
+            stable_target_identity: true,
+            stable_namespace_identity: true,
+            pool_member_binding: true,
+            endpoint_generation_proven: true,
+            credential_key_epoch_proven: true,
+            identity_generation: self.remote_identity_version,
+            namespace_generation: self.cohort_epoch,
+            endpoint_generation: self.session_id.0,
+            credential_key_epoch: self.remote_identity_version,
+            pool_member_generation: self.fence_version.0,
+            stable_identity_ref: self.stable_identity_ref,
+            namespace_identity_ref: self.namespace_identity_ref,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tidefs_storage_intent_core::StorageIntentEvidenceId;
+
+    fn evidence_ref(kind: StorageIntentEvidenceKind, seed: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            kind,
+            StorageIntentEvidenceId([seed; 32]),
+            u64::from(seed),
+            1,
+        )
+    }
+
+    fn node_identity(node_id: u64, identity_version: u64) -> NodeIdentity {
+        NodeIdentity {
+            node_id,
+            verifying_key_bytes: [node_id as u8; 32],
+            attested_at_millis: 1,
+            identity_version,
+            self_signature: vec![identity_version as u8; 64],
+        }
+    }
+
+    #[test]
+    fn authenticated_session_projects_remote_identity_facts() {
+        let local = node_identity(11, 1);
+        let remote = node_identity(22, 7);
+        let cohort = CohortMembership::new(vec![11, 22, 33], 5);
+        let stable_ref = evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, 41);
+        let namespace_ref = evidence_ref(StorageIntentEvidenceKind::MetadataNamespaceEvidence, 42);
+
+        let sample = RemoteMediaTransportIdentitySample::from_authenticated_session(
+            SessionId::new(99),
+            &local,
+            &remote,
+            HlcTimestamp::new(1_700_000_000, 3),
+            FenceVersion::new(13),
+            &cohort,
+            stable_ref,
+            namespace_ref,
+        );
+        let facts = sample.to_remote_target_identity_facts();
+
+        assert!(facts.stable_target_identity);
+        assert!(facts.stable_namespace_identity);
+        assert!(facts.pool_member_binding);
+        assert!(facts.endpoint_generation_proven);
+        assert!(facts.credential_key_epoch_proven);
+        assert_eq!(facts.identity_generation, 7);
+        assert_eq!(facts.namespace_generation, 5);
+        assert_eq!(facts.endpoint_generation, 99);
+        assert_eq!(facts.credential_key_epoch, 7);
+        assert_eq!(facts.pool_member_generation, 13);
+        assert_eq!(facts.stable_identity_ref, stable_ref);
+        assert_eq!(facts.namespace_identity_ref, namespace_ref);
+    }
+
+    #[test]
+    fn endpoint_name_only_identity_sample_rejects() {
+        let local = node_identity(11, 1);
+        let remote = node_identity(22, 7);
+        let cohort = CohortMembership::new(vec![11, 22], 5);
+
+        let sample = RemoteMediaTransportIdentitySample::from_authenticated_session(
+            SessionId::new(99),
+            &local,
+            &remote,
+            HlcTimestamp::new(1_700_000_000, 3),
+            FenceVersion::new(13),
+            &cohort,
+            StorageIntentEvidenceRef::default(),
+            StorageIntentEvidenceRef::default(),
+        );
+
+        assert_eq!(
+            sample.to_remote_target_identity_facts(),
+            RemoteTargetIdentityFacts::default()
+        );
+    }
+
+    #[test]
+    fn wrong_identity_ref_kind_rejects() {
+        let local = node_identity(11, 1);
+        let remote = node_identity(22, 7);
+        let cohort = CohortMembership::new(vec![11, 22], 5);
+
+        let sample = RemoteMediaTransportIdentitySample::from_authenticated_session(
+            SessionId::new(99),
+            &local,
+            &remote,
+            HlcTimestamp::new(1_700_000_000, 3),
+            FenceVersion::new(13),
+            &cohort,
+            evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 43),
+            evidence_ref(StorageIntentEvidenceKind::MetadataNamespaceEvidence, 44),
+        );
+
+        assert_eq!(
+            sample.to_remote_target_identity_facts(),
+            RemoteTargetIdentityFacts::default()
+        );
     }
 }

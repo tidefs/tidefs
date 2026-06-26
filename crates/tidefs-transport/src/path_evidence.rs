@@ -43,6 +43,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{Duration, SystemTime};
+use tidefs_storage_intent_core::{StorageIntentEvidenceKind, StorageIntentEvidenceRef};
+use tidefs_storage_intent_remote_media_capability::{RemotePathFacts, RemoteTrustFacts};
 
 // ---------------------------------------------------------------------------
 // Path evidence identity
@@ -116,10 +118,7 @@ impl PathProximityDomain {
     /// crosses administrative or geographic boundaries.
     #[must_use]
     pub const fn is_wan(self) -> bool {
-        matches!(
-            self,
-            Self::RegionalWan | Self::LongHaulWan | Self::Internet
-        )
+        matches!(self, Self::RegionalWan | Self::LongHaulWan | Self::Internet)
     }
 
     /// True when this domain is a local or same-machine path.
@@ -761,6 +760,38 @@ impl Default for WanInternetEvidence {
     }
 }
 
+/// Remote-media policy boundary for consuming transport path evidence.
+///
+/// This is policy input, not a transport measurement. Transport can say which
+/// carrier/path facts were observed, while the remote-media producer still
+/// needs the requested policy to decide whether non-RDMA carriers may support
+/// the target role.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RemoteMediaTransportPathPolicy {
+    /// TCP/TLS/WAN/internet paths may be legal when the rest of the evidence
+    /// envelope allows their latency, RPO, freshness, trust, and cost.
+    #[default]
+    NonRdmaCarrierAllowed = 0,
+    /// The requested role is still RDMA-only. Remote-media authority must fail
+    /// closed instead of converting RDMA availability into correctness.
+    RdmaRequiredForCorrectness = 1,
+}
+
+impl RemoteMediaTransportPathPolicy {
+    #[must_use]
+    pub const fn rdma_absent_is_legal(self) -> bool {
+        matches!(self, Self::NonRdmaCarrierAllowed)
+    }
+}
+
+fn evidence_ref_has_kind(
+    evidence_ref: StorageIntentEvidenceRef,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    evidence_ref.is_bound() && evidence_ref.kind == kind
+}
+
 // ---------------------------------------------------------------------------
 // Transport path evidence — the main record
 // ---------------------------------------------------------------------------
@@ -1009,16 +1040,111 @@ impl TransportPathEvidence {
     pub const fn is_mutually_authenticated(&self) -> bool {
         self.encryption_context.is_mutually_authenticated()
     }
+
+    /// Project this #846 path snapshot into #961 remote-media path facts.
+    ///
+    /// The projection is intentionally conservative: absent, stale,
+    /// contradictory, endpoint-name-only, local-loopback, high-loss, or
+    /// underbounded WAN evidence returns default/unknown path facts. It never
+    /// treats RDMA as a correctness requirement unless the caller supplies an
+    /// explicit RDMA-only policy.
+    #[must_use]
+    pub fn remote_media_path_facts(
+        &self,
+        path_ref: StorageIntentEvidenceRef,
+        policy: RemoteMediaTransportPathPolicy,
+    ) -> RemotePathFacts {
+        if !evidence_ref_has_kind(path_ref, StorageIntentEvidenceKind::TransportPathEvidence)
+            || !self.remote_media_path_evidence_is_usable()
+        {
+            return RemotePathFacts::default();
+        }
+
+        if policy.rdma_absent_is_legal() {
+            RemotePathFacts::tcp_or_internet_legal(path_ref)
+        } else {
+            RemotePathFacts::rdma_only(path_ref)
+        }
+    }
+
+    /// Project only the authenticated-frame part of transport evidence into
+    /// remote trust facts.
+    ///
+    /// This is not a trust-domain decision. Domain compatibility,
+    /// authorization, audit, and residency remain false so #897 evidence must
+    /// still complete the trust envelope before remote authority can pass.
+    #[must_use]
+    pub fn remote_media_transport_authentication_facts(
+        &self,
+        trust_ref: StorageIntentEvidenceRef,
+    ) -> RemoteTrustFacts {
+        if !evidence_ref_has_kind(trust_ref, StorageIntentEvidenceKind::TrustDomainEvidence)
+            || !self.is_fresh()
+            || self.local_peer.is_empty()
+            || self.remote_peer.is_empty()
+            || !self.encryption_context.is_encrypted()
+            || !self.encryption_context.is_mutually_authenticated()
+        {
+            return RemoteTrustFacts::default();
+        }
+
+        RemoteTrustFacts {
+            authenticated_principal: true,
+            domain_compatible: false,
+            key_epoch_fresh: true,
+            authorization_present: false,
+            audit_present: false,
+            residency_compatible: false,
+            trust_ref,
+        }
+    }
+
+    fn remote_media_path_evidence_is_usable(&self) -> bool {
+        if !self.is_fresh()
+            || self.local_peer.is_empty()
+            || self.remote_peer.is_empty()
+            || self.proximity_domain.is_local()
+            || self.loss_class.is_degraded()
+        {
+            return false;
+        }
+
+        if !matches!(
+            self.carrier_family,
+            PathCarrierFamily::Tcp | PathCarrierFamily::Tls | PathCarrierFamily::Rdma
+        ) {
+            return false;
+        }
+
+        if self.proximity_domain.is_wan() {
+            return self.wan_evidence_bounds_remote_media_path();
+        }
+
+        true
+    }
+
+    fn wan_evidence_bounds_remote_media_path(&self) -> bool {
+        let loss_known = self.wan_evidence.packet_loss.is_some()
+            || !matches!(self.loss_class, PathLossClass::Unknown);
+        let jitter_known =
+            self.wan_evidence.observed_jitter.is_some() || self.latency.jitter.is_some();
+        let bandwidth_known = self
+            .wan_evidence
+            .bandwidth_clamp_bytes_per_second
+            .unwrap_or(self.bandwidth.bytes_per_second)
+            > 0;
+        let congestion_known = self.wan_evidence.congestion_window_bytes.is_some()
+            || self.queue_state.congestion_window_bytes.is_some()
+            || self.queue_state.high_watermark > 0;
+        let carrier_known = !matches!(self.wan_evidence.carrier_class, PathCarrierClass::Unknown);
+
+        loss_known && jitter_known && bandwidth_known && congestion_known && carrier_known
+    }
 }
 
 impl Default for TransportPathEvidence {
     fn default() -> Self {
-        Self::absent(
-            PathEvidenceGeneration::new(0),
-            "",
-            "",
-            "default",
-        )
+        Self::absent(PathEvidenceGeneration::new(0), "", "", "default")
     }
 }
 
@@ -1108,6 +1234,44 @@ impl TransportPathEvidenceRegistry {
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+    use tidefs_storage_intent_core::StorageIntentEvidenceId;
+
+    fn evidence_ref(kind: StorageIntentEvidenceKind, seed: u8) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(
+            kind,
+            StorageIntentEvidenceId([seed; 32]),
+            u64::from(seed),
+            1,
+        )
+    }
+
+    fn bounded_wan_tcp_evidence() -> TransportPathEvidence {
+        let now = SystemTime::now();
+        let window = Duration::from_secs(60);
+
+        TransportPathEvidence::fresh_measured(
+            PathEvidenceGeneration::new(91),
+            "node-a",
+            "node-remote",
+            PathProximityDomain::Internet,
+            PathLatency::measured(Duration::from_millis(48), Some(Duration::from_millis(8))),
+            PathBandwidth::measured(125_000_000),
+            PathLossClass::Low,
+            PathQueueState::new(32, 128, false, Some(64 * 1024)),
+            PathCarrierFamily::Tcp,
+            now,
+            window,
+        )
+        .with_wan_evidence(WanInternetEvidence {
+            packet_loss: Some(0.001),
+            observed_jitter: Some(Duration::from_millis(8)),
+            bandwidth_clamp_bytes_per_second: Some(100_000_000),
+            congestion_window_bytes: Some(64 * 1024),
+            backpressure_active: false,
+            carrier_class: PathCarrierClass::PublicInternet,
+            cost_egress_ref: Some("cost-ledger:egress:transport-test".into()),
+        })
+    }
 
     // -----------------------------------------------------------------------
     // Proximity domain
@@ -1448,10 +1612,7 @@ mod tests {
         // Stale evidence cannot silently satisfy low-latency, quorum,
         // or geo-intent planning.
         assert!(evidence.is_unsafe_for_planning());
-        assert_eq!(
-            evidence.staleness.confidence,
-            PathEvidenceConfidence::Stale
-        );
+        assert_eq!(evidence.staleness.confidence, PathEvidenceConfidence::Stale);
     }
 
     #[test]
@@ -1472,8 +1633,115 @@ mod tests {
             window,
         );
 
-        evidence.staleness = PathEvidenceStaleness::contradictory("RTT probes diverge: 50us vs 500us");
+        evidence.staleness =
+            PathEvidenceStaleness::contradictory("RTT probes diverge: 50us vs 500us");
         assert!(evidence.is_unsafe_for_planning());
+    }
+
+    #[test]
+    fn bounded_tcp_wan_projects_remote_media_path_facts() {
+        let path_ref = evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 101);
+        let facts = bounded_wan_tcp_evidence().remote_media_path_facts(
+            path_ref,
+            RemoteMediaTransportPathPolicy::NonRdmaCarrierAllowed,
+        );
+
+        assert!(facts.rdma_absent_is_legal);
+        assert!(!facts.rdma_required_for_correctness);
+        assert_eq!(facts.path_ref, path_ref);
+    }
+
+    #[test]
+    fn stale_path_evidence_does_not_project_remote_media_facts() {
+        let mut evidence = bounded_wan_tcp_evidence();
+        evidence.staleness = PathEvidenceStaleness::stale(
+            SystemTime::now() - Duration::from_secs(120),
+            Duration::from_secs(60),
+            "last path sample aged out",
+        );
+
+        let facts = evidence.remote_media_path_facts(
+            evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 102),
+            RemoteMediaTransportPathPolicy::NonRdmaCarrierAllowed,
+        );
+
+        assert_eq!(facts, RemotePathFacts::default());
+    }
+
+    #[test]
+    fn underbounded_wan_does_not_project_remote_media_facts() {
+        let now = SystemTime::now();
+        let evidence = TransportPathEvidence::fresh_measured(
+            PathEvidenceGeneration::new(92),
+            "node-a",
+            "node-remote",
+            PathProximityDomain::Internet,
+            PathLatency::measured(Duration::from_millis(48), None),
+            PathBandwidth::measured(125_000_000),
+            PathLossClass::Low,
+            PathQueueState::absent(),
+            PathCarrierFamily::Tcp,
+            now,
+            Duration::from_secs(60),
+        );
+
+        let facts = evidence.remote_media_path_facts(
+            evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 103),
+            RemoteMediaTransportPathPolicy::NonRdmaCarrierAllowed,
+        );
+
+        assert_eq!(facts, RemotePathFacts::default());
+    }
+
+    #[test]
+    fn rdma_only_policy_projects_visible_refusal_fact() {
+        let path_ref = evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 104);
+        let facts = bounded_wan_tcp_evidence().remote_media_path_facts(
+            path_ref,
+            RemoteMediaTransportPathPolicy::RdmaRequiredForCorrectness,
+        );
+
+        assert!(!facts.rdma_absent_is_legal);
+        assert!(facts.rdma_required_for_correctness);
+        assert_eq!(facts.path_ref, path_ref);
+    }
+
+    #[test]
+    fn transport_authentication_projection_is_partial_trust() {
+        let mut evidence = bounded_wan_tcp_evidence();
+        evidence.encryption_context = PathEncryptionContext::encrypted_session(
+            "TLS_CHACHA20_POLY1305_SHA256",
+            true,
+            Some("trust-domain:transport-auth-test".into()),
+        );
+        let trust_ref = evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, 105);
+        let facts = evidence.remote_media_transport_authentication_facts(trust_ref);
+
+        assert!(facts.authenticated_principal);
+        assert!(facts.key_epoch_fresh);
+        assert!(!facts.domain_compatible);
+        assert!(!facts.authorization_present);
+        assert!(!facts.audit_present);
+        assert!(!facts.residency_compatible);
+        assert_eq!(facts.trust_ref, trust_ref);
+    }
+
+    #[test]
+    fn unencrypted_transport_authentication_projection_rejects() {
+        let mut evidence = bounded_wan_tcp_evidence();
+        evidence.encryption_context = PathEncryptionContext {
+            encrypted: false,
+            mutually_authenticated: true,
+            cipher_suite: None,
+            session_security_evidence_ref: Some("trust-domain:unencrypted".into()),
+        };
+
+        let facts = evidence.remote_media_transport_authentication_facts(evidence_ref(
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            106,
+        ));
+
+        assert_eq!(facts, RemoteTrustFacts::default());
     }
 
     // -----------------------------------------------------------------------

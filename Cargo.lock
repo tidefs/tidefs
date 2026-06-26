@@ -3687,6 +3687,8 @@ dependencies = [
  "tidefs-membership-types",
  "tidefs-placement-planner",
  "tidefs-replication-model",
+ "tidefs-storage-intent-core",
+ "tidefs-storage-intent-remote-media-capability",
  "tidefs-tdma-scheduler",
  "tidefs-types-transport-session",
  "tokio",

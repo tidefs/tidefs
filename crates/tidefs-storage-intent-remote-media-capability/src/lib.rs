@@ -880,6 +880,12 @@ pub const fn remote_authority_preflight_refusal(
     {
         return StorageIntentRefusalReason::UnstableNamespaceIdentity;
     }
+    if !evidence_ref_has_kind(
+        facts.path.path_ref,
+        StorageIntentEvidenceKind::TransportPathEvidence,
+    ) {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
     if matches!(facts.health.health, MediaHealthState::Unknown) {
         return StorageIntentRefusalReason::EvidenceNotUsable;
     }
@@ -1046,6 +1052,11 @@ pub const fn produce_remote_media_capability(
     facts: RemoteMediaCapabilityFacts,
 ) -> StorageIntentMediaCapabilityRecord {
     let mut flags = MediaCapabilityFlags::EMPTY;
+    let remote_authority_is_ready = remote_authority_ready(facts);
+    let transport_path_ref_is_bound = evidence_ref_has_kind(
+        facts.path.path_ref,
+        StorageIntentEvidenceKind::TransportPathEvidence,
+    );
 
     if facts.identity.stable_target_identity {
         flags = flags.union(MediaCapabilityFlags::STABLE_DEVICE_IDENTITY);
@@ -1086,16 +1097,17 @@ pub const fn produce_remote_media_capability(
     if facts.path.rdma_absent_is_legal {
         flags = flags.union(MediaCapabilityFlags::TRANSPORT_RDMA_ABSENT_LEGAL);
     }
-    if remote_authority_ready(facts)
-        || facts.path.rdma_required_for_correctness
-        || matches!(
-            facts.commit.remote_commit,
-            MediaRemoteCommitSemantics::RdmaRequiredOnly
-        )
+    if remote_authority_is_ready
+        || (transport_path_ref_is_bound
+            && (facts.path.rdma_required_for_correctness
+                || matches!(
+                    facts.commit.remote_commit,
+                    MediaRemoteCommitSemantics::RdmaRequiredOnly
+                )))
     {
         flags = flags.union(MediaCapabilityFlags::REMOTE_COMMIT);
     }
-    if remote_authority_ready(facts)
+    if remote_authority_is_ready
         && facts.archive.restore.supports_retained_restore()
         && !facts.path.rdma_required_for_correctness
     {
@@ -1550,6 +1562,47 @@ mod tests {
             placement_result(record).refusal,
             StorageIntentRefusalReason::RdmaRequiredForCorrectness
         );
+    }
+
+    #[test]
+    fn missing_transport_path_ref_refuses_remote_authority() {
+        let facts = strong_object_facts().with_path(RemotePathFacts::default());
+        let record = produce_remote_media_capability(facts);
+
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
+    }
+
+    #[test]
+    fn rdma_only_commit_without_transport_path_ref_does_not_advertise_commit() {
+        let facts = strong_object_facts()
+            .with_path(RemotePathFacts {
+                rdma_absent_is_legal: false,
+                rdma_required_for_correctness: true,
+                path_ref: StorageIntentEvidenceRef::default(),
+            })
+            .with_commit(RemoteCommitFacts::new(
+                MediaPersistenceDomain::ObjectDurable,
+                MediaFlushOrderingClass::ObjectCommit,
+                MediaAtomicityClass::IdempotentObjectPut,
+                MediaProtocolGeometryClass::RemoteObject,
+                MediaRemoteCommitSemantics::RdmaRequiredOnly,
+                media_evidence(5),
+            ));
+        let record = produce_remote_media_capability(facts);
+
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
     }
 
     #[test]

@@ -47,6 +47,8 @@ tidefs-cluster = { workspace = true }
 tidefs-replication-model = { workspace = true }
 tidefs-placement-planner = { workspace = true }
 tidefs-durability-layout = { workspace = true }
+tidefs-storage-intent-core = { workspace = true }
+tidefs-storage-intent-remote-media-capability = { workspace = true }
 chacha20poly1305 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
