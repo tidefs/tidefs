@@ -6563,6 +6563,17 @@ pub const fn prefetch_candidate_changes_authority(
     )
 }
 
+const fn prefetch_candidate_requires_movement_payback(
+    candidate: PrefetchResidencyCandidateClass,
+) -> bool {
+    prefetch_candidate_changes_authority(candidate)
+        || matches!(
+            candidate,
+            PrefetchResidencyCandidateClass::FlashHotServing
+                | PrefetchResidencyCandidateClass::HddLocalityOptimized
+        )
+}
+
 const fn evidence_ref_has_id(evidence: StorageIntentEvidenceRef) -> bool {
     evidence.kind as u16 != StorageIntentEvidenceKind::Unknown as u16
         && !bytes32_are_zero(evidence.id.0)
@@ -7346,12 +7357,7 @@ const fn prefetch_residency_cost_refusal(
     {
         return StorageIntentRefusalReason::FlashWearBudgetExceeded;
     }
-    if (prefetch_candidate_changes_authority(candidate)
-        || matches!(
-            candidate,
-            PrefetchResidencyCandidateClass::FlashHotServing
-                | PrefetchResidencyCandidateClass::PmemDurable
-        ))
+    if prefetch_candidate_requires_movement_payback(candidate)
         && context
             .policy
             .flags
@@ -24607,6 +24613,60 @@ mod tests {
             PrefetchResidencyDecisionOutcome::PromotionCandidate
         );
         assert!(prefetch_residency_decision_may_request_authority_change(
+            admitted
+        ));
+    }
+
+    #[test]
+    fn hdd_locality_trials_require_payback_before_serving() {
+        let mut no_payback = decision_context_with_media(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::HddLocalityOptimized,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+            proven_nvme_capability(),
+            proven_hdd_capability(105),
+        );
+        no_payback.cost_wear.payback_evidence = StorageIntentEvidenceRef::default();
+        no_payback.cost_wear.payback_window_ms = 0;
+
+        let cooled = prefetch_residency_decide(no_payback);
+        assert_eq!(cooled.outcome, PrefetchResidencyDecisionOutcome::Cooldown);
+        assert_eq!(
+            cooled.refusal,
+            StorageIntentRefusalReason::MovementDebtNotPaidBack
+        );
+        assert_eq!(
+            cooled.selected_candidate,
+            PrefetchResidencyCandidateClass::Cooldown
+        );
+        assert!(!prefetch_residency_decision_is_cache_only(cooled));
+
+        let admitted = prefetch_residency_decide(decision_context_with_media(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::HddLocalityOptimized,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+            proven_nvme_capability(),
+            proven_hdd_capability(106),
+        ));
+
+        assert_eq!(
+            admitted.selected_candidate,
+            PrefetchResidencyCandidateClass::HddLocalityOptimized
+        );
+        assert_eq!(
+            admitted.outcome,
+            PrefetchResidencyDecisionOutcome::ServingTrial
+        );
+        assert_eq!(
+            admitted.selected_residency,
+            PrefetchResidencyStateClass::HddColdLocalityOptimized
+        );
+        assert_eq!(admitted.refusal, StorageIntentRefusalReason::None);
+        assert!(!prefetch_residency_decision_may_request_authority_change(
             admitted
         ));
     }
