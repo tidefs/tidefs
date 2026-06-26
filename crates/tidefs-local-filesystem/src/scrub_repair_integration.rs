@@ -441,7 +441,11 @@ pub fn dispatch_repair_from_bridge(
             crate::repair::RepairOutcome::AuthorityMismatch { .. } => {
                 bridge.mark_authority_mismatch(locator_id);
             }
-            crate::repair::RepairOutcome::MarkedCorrupt | crate::repair::RepairOutcome::Skipped => {
+            crate::repair::RepairOutcome::MarkedCorrupt
+            | crate::repair::RepairOutcome::WritebackMissingReplacementReceipt { .. }
+            | crate::repair::RepairOutcome::StorageIoFailure { .. }
+            | crate::repair::RepairOutcome::Unrepairable { .. }
+            | crate::repair::RepairOutcome::Skipped => {
                 bridge.mark_failed(locator_id);
             }
         }
@@ -1011,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_fresh_generation_reconstructs_current_object() {
+    fn dispatch_fresh_generation_writeback_requires_replacement_receipt() {
         let inode_id = 510;
         let data_version = 1;
         let mut state = crate::recovery::initial_state();
@@ -1036,10 +1040,11 @@ mod tests {
         assert_eq!(applied.len(), 1);
         assert_eq!(
             applied.entries[0].outcome,
-            crate::repair::RepairOutcome::Reconstructed { bytes_written: 16 }
+            crate::repair::RepairOutcome::WritebackMissingReplacementReceipt { bytes_written: 16 }
         );
         assert_eq!(store.get(key).expect("read key").expect("stored"), payload);
-        assert_eq!(bridge.repaired_count(), 1);
+        assert_eq!(bridge.repaired_count(), 0);
+        assert_eq!(bridge.pending_count(), 1);
         assert_eq!(bridge.stats().entries_blocked_authority_mismatch, 0);
     }
 
