@@ -738,7 +738,7 @@ mod apply_tests {
     }
 
     #[test]
-    fn reconstruct_on_non_ec_object_returns_skipped() {
+    fn reconstruct_on_non_ec_object_returns_unrepairable() {
         let (v, _) = make_violation(3);
         let entry = RepairEntry {
             block_id: v.block_id.clone(),
@@ -757,7 +757,12 @@ mod apply_tests {
 
         let outcome = apply_one_repair(&entry, &mut state, &mut store, &mut BTreeMap::new());
 
-        assert_eq!(outcome, RepairOutcome::Skipped);
+        assert_eq!(
+            outcome,
+            RepairOutcome::Unrepairable {
+                reason: RepairUnrepairableReason::NotErasureEncoded
+            }
+        );
     }
 
     #[test]
