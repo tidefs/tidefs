@@ -320,8 +320,8 @@
       "exit_code": 0
     },
     "tidefs-placement-planner": {
-      "warnings": 7,
-      "exit_code": 0
+      "warnings": 4,
+      "exit_code": 101
     },
     "tidefs-placement-runtime": {
       "warnings": 87,
@@ -540,7 +540,7 @@
       "exit_code": 0
     },
     "tidefs-transport": {
-      "warnings": 71,
+      "warnings": 72,
       "exit_code": 0
     },
     "tidefs-two-node-harness": {
