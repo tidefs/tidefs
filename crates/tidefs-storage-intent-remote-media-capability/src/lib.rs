@@ -464,6 +464,96 @@ impl RemoteTrustFacts {
     }
 }
 
+/// Bounded trust-domain, authorization, audit, and residency sample.
+///
+/// This read-only adapter maps already-produced trust evidence into #961
+/// remote-media facts. It does not decide tenant policy, authorize operations,
+/// classify trust domains, or infer residency from endpoint/service labels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteTrustResidencySample {
+    pub authenticated_principal: bool,
+    pub admin_domain_compatible: bool,
+    pub security_domain_compatible: bool,
+    pub tenant_domain_compatible: bool,
+    pub sharing_domain_compatible: bool,
+    pub key_epoch_fresh: bool,
+    pub authorization_present: bool,
+    pub audit_present: bool,
+    pub residency_compatible: bool,
+    pub quarantined_or_compromised: bool,
+    pub trust_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for RemoteTrustResidencySample {
+    fn default() -> Self {
+        Self {
+            authenticated_principal: false,
+            admin_domain_compatible: false,
+            security_domain_compatible: false,
+            tenant_domain_compatible: false,
+            sharing_domain_compatible: false,
+            key_epoch_fresh: false,
+            authorization_present: false,
+            audit_present: false,
+            residency_compatible: false,
+            quarantined_or_compromised: false,
+            trust_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+impl RemoteTrustResidencySample {
+    #[must_use]
+    pub const fn fully_authorized(trust_ref: StorageIntentEvidenceRef) -> Self {
+        Self {
+            authenticated_principal: true,
+            admin_domain_compatible: true,
+            security_domain_compatible: true,
+            tenant_domain_compatible: true,
+            sharing_domain_compatible: true,
+            key_epoch_fresh: true,
+            authorization_present: true,
+            audit_present: true,
+            residency_compatible: true,
+            quarantined_or_compromised: false,
+            trust_ref,
+        }
+    }
+
+    #[must_use]
+    pub const fn to_trust_facts(self) -> RemoteTrustFacts {
+        let trust_ref_is_bound = evidence_ref_has_kind(
+            self.trust_ref,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+        );
+        let domain_compatible = trust_ref_is_bound
+            && self.admin_domain_compatible
+            && self.security_domain_compatible
+            && self.tenant_domain_compatible
+            && self.sharing_domain_compatible
+            && !self.quarantined_or_compromised;
+
+        RemoteTrustFacts {
+            authenticated_principal: trust_ref_is_bound && self.authenticated_principal,
+            domain_compatible,
+            key_epoch_fresh: trust_ref_is_bound && self.key_epoch_fresh,
+            authorization_present: trust_ref_is_bound && self.authorization_present,
+            audit_present: trust_ref_is_bound && self.audit_present,
+            residency_compatible: domain_compatible && self.residency_compatible,
+            trust_ref: if trust_ref_is_bound {
+                self.trust_ref
+            } else {
+                EMPTY_EVIDENCE_REF
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn apply_to(self, facts: RemoteMediaCapabilityFacts) -> RemoteMediaCapabilityFacts {
+        facts.with_trust(self.to_trust_facts())
+    }
+}
+
 /// Cost, egress, restore, and degraded-recovery visibility facts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemoteCostRecoveryFacts {
@@ -1681,6 +1771,118 @@ mod tests {
             placement_result(produce_remote_media_capability(missing_audit)).refusal,
             StorageIntentRefusalReason::UnsupportedRemoteCommitSemantics
         );
+    }
+
+    #[test]
+    fn trust_residency_sample_with_full_evidence_preserves_authority() {
+        let sample = RemoteTrustResidencySample::fully_authorized(evidence(
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            91,
+        ));
+        let facts = sample.apply_to(strong_object_facts());
+        let cut = authority_evidence_cut_for(facts);
+        let record = produce_remote_media_capability_from_evidence_cut(facts, cut);
+
+        assert_eq!(facts.trust, sample.to_trust_facts());
+        assert_eq!(
+            remote_authority_evidence_cut_refusal(facts, cut),
+            StorageIntentRefusalReason::None
+        );
+        assert!(placement_result(record).satisfied);
+    }
+
+    #[test]
+    fn trust_residency_sample_missing_authorization_or_audit_refuses() {
+        let missing_authorization = RemoteTrustResidencySample {
+            authorization_present: false,
+            ..RemoteTrustResidencySample::fully_authorized(evidence(
+                StorageIntentEvidenceKind::TrustDomainEvidence,
+                92,
+            ))
+        }
+        .apply_to(strong_object_facts());
+        let missing_audit = RemoteTrustResidencySample {
+            audit_present: false,
+            ..RemoteTrustResidencySample::fully_authorized(evidence(
+                StorageIntentEvidenceKind::TrustDomainEvidence,
+                93,
+            ))
+        }
+        .apply_to(strong_object_facts());
+
+        assert_eq!(
+            remote_authority_preflight_refusal(missing_authorization),
+            StorageIntentRefusalReason::MissingAuthorization
+        );
+        assert_eq!(
+            remote_authority_preflight_refusal(missing_audit),
+            StorageIntentRefusalReason::MissingAudit
+        );
+        assert!(!produce_remote_media_capability(missing_authorization)
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
+        assert!(!produce_remote_media_capability(missing_audit)
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
+    }
+
+    #[test]
+    fn trust_residency_sample_wrong_domain_or_residency_refuses() {
+        let wrong_domain = RemoteTrustResidencySample {
+            tenant_domain_compatible: false,
+            ..RemoteTrustResidencySample::fully_authorized(evidence(
+                StorageIntentEvidenceKind::TrustDomainEvidence,
+                94,
+            ))
+        }
+        .apply_to(strong_object_facts());
+        let wrong_residency = RemoteTrustResidencySample {
+            residency_compatible: false,
+            ..RemoteTrustResidencySample::fully_authorized(evidence(
+                StorageIntentEvidenceKind::TrustDomainEvidence,
+                95,
+            ))
+        }
+        .apply_to(strong_object_facts());
+
+        assert_eq!(
+            remote_authority_preflight_refusal(wrong_domain),
+            StorageIntentRefusalReason::WrongDomain
+        );
+        assert_eq!(
+            remote_authority_preflight_refusal(wrong_residency),
+            StorageIntentRefusalReason::ResidencyViolation
+        );
+    }
+
+    #[test]
+    fn trust_residency_sample_quarantine_or_wrong_ref_fails_closed() {
+        let quarantined = RemoteTrustResidencySample {
+            quarantined_or_compromised: true,
+            ..RemoteTrustResidencySample::fully_authorized(evidence(
+                StorageIntentEvidenceKind::TrustDomainEvidence,
+                96,
+            ))
+        }
+        .apply_to(strong_object_facts());
+        let wrong_kind = RemoteTrustResidencySample::fully_authorized(media_evidence(97))
+            .apply_to(strong_object_facts());
+
+        assert_eq!(
+            remote_authority_preflight_refusal(quarantined),
+            StorageIntentRefusalReason::WrongDomain
+        );
+        assert_eq!(
+            remote_authority_preflight_refusal(wrong_kind),
+            StorageIntentRefusalReason::MissingAuthenticatedPrincipal
+        );
+        assert_eq!(
+            wrong_kind.trust.trust_ref,
+            StorageIntentEvidenceRef::default()
+        );
+        assert!(!produce_remote_media_capability(wrong_kind)
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
     }
 
     #[test]
