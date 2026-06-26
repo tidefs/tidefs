@@ -1109,11 +1109,11 @@ impl TransportPathEvidence {
             return false;
         }
 
-        match self.carrier_family {
-            PathCarrierFamily::Tcp | PathCarrierFamily::Tls | PathCarrierFamily::Rdma => {}
-            PathCarrierFamily::Unknown | PathCarrierFamily::Unix | PathCarrierFamily::Loopback => {
-                return false;
-            }
+        if !matches!(
+            self.carrier_family,
+            PathCarrierFamily::Tcp | PathCarrierFamily::Tls | PathCarrierFamily::Rdma
+        ) {
+            return false;
         }
 
         if self.proximity_domain.is_wan() {
