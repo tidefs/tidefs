@@ -1479,6 +1479,11 @@ impl TransportReplicatedPutResult {
         let receipt_is_authoritative = self
             .recorded_receipt_ref
             .is_some_and(PlacementReceiptRef::is_committed_authority);
+        let quorum_acknowledged = self.quorum_reached
+            && self.acks >= self.quorum_size
+            && self.quorum_size > 0
+            && self.total_targets > 0
+            && self.acks <= self.total_targets;
 
         RemoteReplicatedObjectCommitSample {
             write_class,
@@ -1486,7 +1491,7 @@ impl TransportReplicatedPutResult {
             target_count: self.total_targets as u64,
             quorum_size: self.quorum_size as u64,
             needs_repair: self.quorum_reached && !self.fully_committed,
-            digests_matched: self.quorum_reached && receipt_is_authoritative,
+            digests_matched: quorum_acknowledged,
             placement_receipt_bound: self.quorum_reached && receipt_is_authoritative,
             skipped_unhealthy_count: 0,
             commit_ref,
@@ -4049,7 +4054,7 @@ mod tests {
             sample.write_class,
             RemoteReplicatedObjectWriteClass::Committed
         );
-        assert!(!sample.digests_matched);
+        assert!(sample.digests_matched);
         assert!(!sample.placement_receipt_bound);
         let commit = sample.to_commit_facts();
         assert_eq!(commit.persistence, MediaPersistenceDomain::Unknown);
@@ -4079,12 +4084,13 @@ mod tests {
             evidence_ref(StorageIntentEvidenceKind::RecoveryDegradationEvidence, 14),
         );
 
-        assert!(!sample.digests_matched);
+        assert!(sample.digests_matched);
         assert!(!sample.placement_receipt_bound);
         assert_eq!(
             sample.to_commit_facts().remote_commit,
             MediaRemoteCommitSemantics::VolatileAckOnly
         );
+        assert_eq!(sample.to_health_facts().health, MediaHealthState::Unknown);
     }
 
     #[test]
