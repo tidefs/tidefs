@@ -31,7 +31,7 @@ pub enum RepairOutcome {
     /// Reconstructed and completed by publishing durable replacement receipt evidence.
     Reconstructed {
         bytes_written: usize,
-        replacement_receipt: RepairReplacementReceiptEvidence,
+        replacement_receipt: Box<RepairReplacementReceiptEvidence>,
     },
     /// Reconstructed bytes were written, but replacement receipt publication did not happen.
     WritebackMissingReplacementReceipt { bytes_written: usize },
@@ -52,7 +52,7 @@ impl RepairOutcome {
             Self::Reconstructed {
                 replacement_receipt,
                 ..
-            } => Some(*replacement_receipt),
+            } => Some(**replacement_receipt),
             _ => None,
         }
     }
@@ -600,7 +600,7 @@ fn apply_reconstruct(
             match replacement_receipt {
                 Some(replacement_receipt) => RepairOutcome::Reconstructed {
                     bytes_written,
-                    replacement_receipt,
+                    replacement_receipt: Box::new(replacement_receipt),
                 },
                 None => RepairOutcome::WritebackMissingReplacementReceipt { bytes_written },
             }
@@ -888,7 +888,7 @@ mod apply_tests {
             outcome,
             RepairOutcome::Reconstructed {
                 bytes_written: 16,
-                replacement_receipt: replacement_evidence,
+                replacement_receipt: Box::new(replacement_evidence),
             }
         );
         assert_eq!(

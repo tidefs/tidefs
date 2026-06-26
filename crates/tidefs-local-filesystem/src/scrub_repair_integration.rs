@@ -1115,7 +1115,7 @@ mod tests {
         assert_eq!(applied.len(), 1);
         let crate::repair::RepairOutcome::Reconstructed {
             bytes_written,
-            replacement_receipt,
+            ref replacement_receipt,
         } = applied.entries[0].outcome
         else {
             panic!(
