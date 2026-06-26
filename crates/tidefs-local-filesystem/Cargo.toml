@@ -55,6 +55,7 @@ tidefs-storage-intent-prefetch-executor = { workspace = true }
 
 tidefs-background-scheduler = { workspace = true }
 tidefs-compaction = { workspace = true }
+tidefs-replication-model = { workspace = true }
 tidefs-scrub-core = { workspace = true }
 tidefs-reclaim-queue-core = { workspace = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
@@ -84,7 +85,6 @@ tempfile = { workspace = true }
 tidefs-local-object-store = { workspace = true }
 criterion = { workspace = true }
 proptest = { version = "=1.9.0", default-features = false, features = ["std"] }
-tidefs-replication-model = { workspace = true }
 tidefs-types-dataset-lifecycle-core = { workspace = true }
 tidefs-reclaim = { workspace = true }
 

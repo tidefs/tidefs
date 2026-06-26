@@ -534,8 +534,12 @@ fn replacement_receipt_id_for_job(
     hasher.update(&job.candidate_identity.inode_id.to_le_bytes());
     hasher.update(&job.candidate_identity.data_version.to_le_bytes());
     match job.candidate_identity.kind {
-        RepairBlockKind::InlineContent => hasher.update(&[0]),
-        RepairBlockKind::ContentManifest => hasher.update(&[1]),
+        RepairBlockKind::InlineContent => {
+            hasher.update(&[0]);
+        }
+        RepairBlockKind::ContentManifest => {
+            hasher.update(&[1]);
+        }
         RepairBlockKind::ContentChunk { chunk_index } => {
             hasher.update(&[2]);
             hasher.update(&chunk_index.to_le_bytes());
