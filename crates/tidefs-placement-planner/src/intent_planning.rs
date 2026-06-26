@@ -13,8 +13,7 @@ use std::collections::BTreeSet;
 use tidefs_storage_intent_core::{
     ack_receipt_satisfies_requested_floor, data_shape_hard_gate_check,
     evaluate_receipt_against_policy, media_capability_satisfies_role,
-    metadata_namespace_evidence_is_usable,
-    prefetch_residency_decision_is_cache_only,
+    metadata_namespace_evidence_is_usable, prefetch_residency_decision_is_cache_only,
     prefetch_residency_decision_may_request_authority_change,
     preflight_simulation_evidence_is_usable, preflight_simulation_has_no_blockers,
     preflight_simulation_is_preview_only, proximity_satisfies_max,
@@ -24,11 +23,11 @@ use tidefs_storage_intent_core::{
     MediaRoleRequirement, PredictionConfidence, PrefetchResidencyDecisionOutcome,
     PrefetchResidencyDecisionRecord, ProximityClass, ReceiptPredicateResult, SkippedMoveReason,
     StorageIntentActionClass, StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot,
-    StorageIntentEvidenceRef, StorageIntentGuaranteeClass, StorageIntentPolicy,
-    StorageIntentMetadataNamespaceEvidence, StorageIntentPreflightSimulationEvidence,
-    StorageIntentReceipt, StorageIntentReceiptId, StorageIntentRefusalReason,
-    StorageIntentServiceObjectiveEvidence, StorageIntentServiceObjectiveScope,
-    StorageIntentTrustRole, StorageMediaRole, TrustDomainRequirement, TrustEvidenceRecord,
+    StorageIntentEvidenceRef, StorageIntentGuaranteeClass, StorageIntentMetadataNamespaceEvidence,
+    StorageIntentPolicy, StorageIntentPreflightSimulationEvidence, StorageIntentReceipt,
+    StorageIntentReceiptId, StorageIntentRefusalReason, StorageIntentServiceObjectiveEvidence,
+    StorageIntentServiceObjectiveScope, StorageIntentTrustRole, StorageMediaRole,
+    TrustDomainRequirement, TrustEvidenceRecord,
 };
 
 use crate::TierGoal;
@@ -582,7 +581,9 @@ impl StorageIntentPlacementReason {
             | Self::CandidatePreflightSimulationRefused { refusal, .. }
             | Self::CandidateMovementDebtRefused { refusal, .. } => Some(*refusal),
             Self::CandidateLayoutRefused { refusal, .. } => Some(layout_refusal_reason(*refusal)),
-            Self::EvidenceFamilyNotFresh { .. } | Self::PreflightSimulationNotAuthoritative => {
+            Self::CompiledPolicyEvidence { .. }
+            | Self::EvidenceFamilyNotFresh { .. }
+            | Self::PreflightSimulationNotAuthoritative => {
                 Some(StorageIntentRefusalReason::EvidenceNotUsable)
             }
             Self::CandidateGuaranteeFloorNotMet { .. } => {
@@ -675,6 +676,8 @@ impl StorageIntentPlacementEvaluation {
 pub enum StorageIntentPlacementCandidateReason {
     /// Candidate failed one of the hard gates.
     HardGate(StorageIntentPlacementReason),
+    /// Compiled policy was absent and only a conservative default was used.
+    CompiledPolicyConservativeDefault,
     /// Predictor confidence is not enough to treat a candidate as ordinary.
     LowPredictionConfidence { confidence: PredictionConfidence },
     /// A one-pass scan signal must not train placement upward.
@@ -699,6 +702,7 @@ impl StorageIntentPlacementCandidateReason {
     pub fn refusal_reason(&self) -> Option<StorageIntentRefusalReason> {
         match self {
             Self::HardGate(reason) => reason.refusal_reason(),
+            Self::CompiledPolicyConservativeDefault => None,
             Self::LowPredictionConfidence { .. }
             | Self::OnePassScan
             | Self::PhaseChangeContradiction { .. }
@@ -1228,6 +1232,11 @@ fn score_candidate(
     candidate: &StorageIntentPlacementCandidate,
     reasons: &mut Vec<StorageIntentPlacementCandidateReason>,
 ) -> i64 {
+    if request.compiled_policy_state.is_conservative_default() {
+        reasons.push(StorageIntentPlacementCandidateReason::CompiledPolicyConservativeDefault);
+        return 0;
+    }
+
     let mut score = confidence_score(candidate.prediction_confidence, reasons);
 
     if request.policy.workload.shape
@@ -1688,7 +1697,10 @@ fn evaluate_metadata_namespace(
         reasons.push(StorageIntentPlacementReason::CandidateEvidenceGateRefused {
             target_id: candidate.target_id,
             gate: CandidateGate::MetadataNamespace,
-            state: family_state(request, StorageIntentEvidenceKind::MetadataNamespaceEvidence),
+            state: family_state(
+                request,
+                StorageIntentEvidenceKind::MetadataNamespaceEvidence,
+            ),
             refusal: StorageIntentRefusalReason::MetadataNamespaceEvidenceNotUsable,
         });
     }
@@ -2316,6 +2328,7 @@ fn skipped_move_refusal(reason: SkippedMoveReason) -> StorageIntentRefusalReason
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tidefs_storage_intent_core::PrefetchResidencyAdmissionLane;
     use tidefs_storage_intent_core::{
         AccessPatternClass, AllocatorEvidenceAuthority, CoalescingModeClass,
         CompressionAlgorithmClass, CompressionOrderingClass, CompromiseState,
@@ -2336,10 +2349,10 @@ mod tests {
         StorageIntentEvidenceId, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
         StorageIntentMediaCapabilityRecord, StorageIntentMetadataNamespaceEvidence,
         StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
-        StorageIntentPreflightActivationBlocker,
-        StorageIntentPreflightActivationBlockerKind, StorageIntentPreflightFidelityClass,
-        StorageIntentPreflightNonAuthorityMarker, StorageIntentPreflightSimulationEvidence,
-        StorageIntentReceiptId, StorageIntentServiceObjectiveComparatorScope,
+        StorageIntentPreflightActivationBlocker, StorageIntentPreflightActivationBlockerKind,
+        StorageIntentPreflightFidelityClass, StorageIntentPreflightNonAuthorityMarker,
+        StorageIntentPreflightSimulationEvidence, StorageIntentReceiptId,
+        StorageIntentServiceObjectiveComparatorScope,
         StorageIntentServiceObjectiveEnvironmentProfile, StorageIntentServiceObjectiveEvidence,
         StorageIntentServiceObjectiveEvidenceRefs, StorageIntentServiceObjectiveFailureState,
         StorageIntentServiceObjectiveLatencyEnvelope, StorageIntentServiceObjectiveOperation,
@@ -4262,6 +4275,7 @@ mod tests {
             requested_candidate: PrefetchResidencyCandidateClass::AuthorityPromotionCandidate,
             selected_candidate: PrefetchResidencyCandidateClass::AuthorityPromotionCandidate,
             selected_residency: PrefetchResidencyStateClass::FlashHotServing,
+            admission_lane: PrefetchResidencyAdmissionLane::AuthorityMovementCandidate,
             outcome: PrefetchResidencyDecisionOutcome::PromotionCandidate,
             refusal: StorageIntentRefusalReason::None,
             source_media: StorageMediaClass::HddRotational,
@@ -5273,6 +5287,105 @@ mod tests {
             StorageIntentPlacementReason::TierGoalIsNotStorageIntentModel(TierGoal::Primary)
         )));
     }
+
+    #[test]
+    fn compiled_policy_conservative_default_is_visible_and_neutralizes_scoring() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut request = request(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+        );
+        request.compiled_policy_state = PlacementEvidenceState::ConservativeDefault;
+
+        let mut high_score_without_default = candidate(
+            2,
+            20,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        high_score_without_default
+            .layout_allocator
+            .as_mut()
+            .expect("candidate fixture carries layout allocator evidence")
+            .locality_score_ppm = 1_000_000;
+        let mut lower_id = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+        lower_id
+            .layout_allocator
+            .as_mut()
+            .expect("candidate fixture carries layout allocator evidence")
+            .locality_score_ppm = 0;
+
+        let plan = plan_storage_intent_placement(&request, &[high_score_without_default, lower_id]);
+
+        assert!(plan.admitted, "{plan:?}");
+        assert_eq!(plan.selected_targets, vec![1]);
+        assert!(plan.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::CompiledPolicyConservativeDefault
+        )));
+        for report in &plan.candidate_reports {
+            assert!(report.legal);
+            assert_eq!(report.score, 0);
+            assert!(report.reasons.iter().any(|reason| matches!(
+                reason,
+                StorageIntentPlacementCandidateReason::CompiledPolicyConservativeDefault
+            )));
+            assert!(!report.has_refusal(StorageIntentRefusalReason::EvidenceNotUsable));
+        }
+    }
+
+    #[test]
+    fn missing_compiled_policy_blocks_before_candidate_scoring() {
+        let policy = policy(
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+        );
+        let mut request = request(
+            policy,
+            StorageIntentPlacementRole::DurableFullPlacement,
+            1,
+            1,
+        );
+        request.compiled_policy_state = PlacementEvidenceState::Missing;
+        let candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::PlacementAuthority,
+            StorageIntentGuaranteeClass::FullPlacement,
+            FailureDomainMask::NODE,
+            StorageMediaClass::NvmeFlash,
+        );
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!plan.admitted);
+        assert!(plan.candidate_reports.is_empty());
+        assert!(plan.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementReason::CompiledPolicyEvidence {
+                state: PlacementEvidenceState::Missing,
+            }
+        )));
+        assert_eq!(
+            plan.first_refusal(),
+            Some(StorageIntentRefusalReason::EvidenceNotUsable)
+        );
+    }
+
     #[test]
     fn transport_proximity_farther_than_policy_max_is_refused() {
         let mut tight_policy = policy(
@@ -5413,7 +5526,7 @@ mod tests {
             FailureDomainMask::NODE,
         );
         let request = StorageIntentPlacementRequest::new(
-            policy.clone(),
+            policy,
             StorageIntentPlacementRole::DurableFullPlacement,
             1,
             1,
@@ -5449,7 +5562,7 @@ mod tests {
     fn cache_only_role_with_fresh_lifecycle_evidence_admits() {
         let policy = cache_only_policy();
         let request = StorageIntentPlacementRequest::new(
-            policy.clone(),
+            policy,
             StorageIntentPlacementRole::CacheOnlyHotServingTrial,
             1,
             1,
