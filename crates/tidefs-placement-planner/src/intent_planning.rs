@@ -623,6 +623,7 @@ pub enum CandidateGate {
     MeasurementAttribution,
     DecisionFrontier,
     PreflightSimulation,
+    LifecycleGeneration,
 }
 
 /// Layout/allocator refusal classes preserved for explanation.
@@ -1522,6 +1523,13 @@ fn evaluate_candidate(
         candidate.target_id,
         CandidateGate::DecisionFrontier,
         candidate.decision_frontier,
+        StorageIntentRefusalReason::EvidenceNotUsable,
+    );
+    require_candidate_gate(
+        reasons,
+        candidate.target_id,
+        CandidateGate::LifecycleGeneration,
+        candidate.lifecycle_generation,
         StorageIntentRefusalReason::EvidenceNotUsable,
     );
 
@@ -3265,6 +3273,7 @@ mod tests {
             CandidateGate::MeasurementAttribution => candidate.measurement_attribution = state,
             CandidateGate::DecisionFrontier => candidate.decision_frontier = state,
             CandidateGate::PreflightSimulation => candidate.preflight_simulation_state = state,
+            CandidateGate::LifecycleGeneration => candidate.lifecycle_generation = state,
         }
     }
 
@@ -5599,6 +5608,59 @@ mod tests {
     }
 
     #[test]
+    fn cache_only_role_refuses_stale_candidate_lifecycle_state() {
+        let policy = cache_only_policy();
+        let request = StorageIntentPlacementRequest::new(
+            policy,
+            StorageIntentPlacementRole::CacheOnlyHotServingTrial,
+            1,
+            1,
+            cache_only_evidence_cut_filter(policy, |kind| {
+                !matches!(
+                    kind,
+                    StorageIntentEvidenceKind::DataShapeEvidence
+                        | StorageIntentEvidenceKind::LayoutAllocatorEvidence
+                )
+            }),
+        );
+
+        let mut candidate = candidate(
+            1,
+            10,
+            StorageMediaRole::ReadCache,
+            StorageIntentGuaranteeClass::VolatileLocal,
+            FailureDomainMask::EMPTY,
+            StorageMediaClass::SystemRam,
+        );
+        candidate.media_capability = volatile_media();
+        candidate.data_shape = None;
+        candidate.data_shape_state = PlacementEvidenceState::Unknown;
+        candidate.layout_allocator = None;
+        candidate.layout_allocator_state = PlacementEvidenceState::Unknown;
+        candidate.lifecycle_generation = PlacementEvidenceState::Stale;
+
+        let plan = plan_storage_intent_placement(&request, &[candidate]);
+
+        assert!(!plan.admitted);
+        let report = plan
+            .candidate_reports
+            .first()
+            .expect("candidate report exists");
+        assert!(!report.legal);
+        assert_eq!(report.score, 0);
+        assert!(report.reasons.iter().any(|reason| matches!(
+            reason,
+            StorageIntentPlacementCandidateReason::HardGate(
+                StorageIntentPlacementReason::CandidateEvidenceGateRefused {
+                    gate: CandidateGate::LifecycleGeneration,
+                    state: PlacementEvidenceState::Stale,
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
     fn candidate_contradictory_trust_domain_state_refuses_hard_gate() {
         let policy = policy(
             StorageIntentGuaranteeClass::FullPlacement,
@@ -5679,6 +5741,7 @@ mod tests {
             CandidateGate::PolicyRollout,
             CandidateGate::TenantIsolation,
             CandidateGate::Temporal,
+            CandidateGate::LifecycleGeneration,
         ] {
             let policy = policy(
                 StorageIntentGuaranteeClass::FullPlacement,
