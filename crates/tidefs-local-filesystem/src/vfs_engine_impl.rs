@@ -8,7 +8,7 @@
 //! path reconstruction.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -69,6 +69,16 @@ const O_EXCL: u32 = 0o200;
 const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
 const COPY_FILE_RANGE_DIRECT_FALLBACK_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RECORDED_READAHEAD_EXECUTOR_OUTCOMES: usize = 64;
+
+type ReadaheadExecutorInputHook = Arc<
+    dyn Fn(
+            VfsReadaheadExecutorRequest,
+        ) -> Option<tidefs_storage_intent_prefetch_executor::PrefetchExecutorInput>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 fn open_flags_allow_read(flags: u32) -> bool {
     flags & O_ACCMODE != O_WRONLY
@@ -147,6 +157,23 @@ fn map_errno(err: &FileSystemError) -> Errno {
 /// Maintains a lazy inode→path cache that bridges the VfsEngine inode
 /// space to LocalFileSystem path space.  The cache is populated by a
 /// single tree walk from root on first miss and invalidated as needed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VfsReadaheadExecutorRequest {
+    pub inode_id: InodeId,
+    pub path: String,
+    pub read_offset: u64,
+    pub read_size: u32,
+    pub file_size: u64,
+    pub readahead_offset: u64,
+    pub readahead_len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VfsReadaheadExecutorOutcome {
+    pub executor_record: tidefs_storage_intent_prefetch_executor::PrefetchExecutorRecord,
+    pub bytes_issued: Option<u64>,
+}
+
 pub struct VfsLocalFileSystem {
     fs: RefCell<LocalFileSystem>,
     read_only: bool,
@@ -169,6 +196,8 @@ pub struct VfsLocalFileSystem {
     /// Per-dataset write-acknowledgment durability guarantee.
     sync_guarantee: SyncGuarantee,
     readahead_tracker: ReadaheadTracker,
+    readahead_executor_input_hook: Option<ReadaheadExecutorInputHook>,
+    readahead_executor_outcomes: RefCell<VecDeque<VfsReadaheadExecutorOutcome>>,
 }
 
 // ActiveFileHandle replaced by FileHandleState from open_dispatch
@@ -498,6 +527,8 @@ impl VfsLocalFileSystem {
             timestamp_policy: TimestampPolicy::Relatime,
             readahead_tracker: ReadaheadTracker::new(),
             sync_guarantee: SyncGuarantee::Local,
+            readahead_executor_input_hook: None,
+            readahead_executor_outcomes: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -529,6 +560,37 @@ impl VfsLocalFileSystem {
     pub fn with_read_only(mut self) -> Self {
         self.read_only = true;
         self
+    }
+
+    /// Install a storage-intent hook for planned VFS readahead.
+    ///
+    /// When this hook is set, every planned readahead window is evaluated by
+    /// the #972 executor adapter before dispatch. Returning `None` is treated
+    /// as missing #967/#913 evidence: the executor records a conservative
+    /// refusal and no readahead bytes are issued.
+    pub fn set_readahead_executor_input_hook<F>(&mut self, hook: F)
+    where
+        F: Fn(
+                VfsReadaheadExecutorRequest,
+            )
+                -> Option<tidefs_storage_intent_prefetch_executor::PrefetchExecutorInput>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.readahead_executor_input_hook = Some(Arc::new(hook));
+    }
+
+    /// Drain executor outcomes recorded by storage-intent-gated readahead.
+    ///
+    /// These records are cache/trial/staged execution evidence only; callers
+    /// must not treat them as durable placement, receipt-retirement, source
+    /// retirement, latest-read, or sync authority.
+    pub fn drain_readahead_executor_outcomes(&self) -> Vec<VfsReadaheadExecutorOutcome> {
+        self.readahead_executor_outcomes
+            .borrow_mut()
+            .drain(..)
+            .collect()
     }
 
     #[must_use]
@@ -568,6 +630,48 @@ impl VfsLocalFileSystem {
     /// entries to warm the in-memory cache.
     pub fn set_inode_table(&mut self, table: Arc<InodeTable>) {
         self.inode_table = Some(table);
+    }
+
+    fn record_readahead_executor_outcome(&self, outcome: VfsReadaheadExecutorOutcome) {
+        let mut outcomes = self.readahead_executor_outcomes.borrow_mut();
+        if outcomes.len() == MAX_RECORDED_READAHEAD_EXECUTOR_OUTCOMES {
+            outcomes.pop_front();
+        }
+        outcomes.push_back(outcome);
+    }
+
+    fn issue_planned_readahead(&self, request: VfsReadaheadExecutorRequest) {
+        let Some(hook) = &self.readahead_executor_input_hook else {
+            crate::readahead::issue_readahead(
+                &self.fs.borrow(),
+                &request.path,
+                request.readahead_offset,
+                request.readahead_len,
+            );
+            return;
+        };
+
+        let hook_request = VfsReadaheadExecutorRequest {
+            inode_id: request.inode_id,
+            path: request.path.clone(),
+            read_offset: request.read_offset,
+            read_size: request.read_size,
+            file_size: request.file_size,
+            readahead_offset: request.readahead_offset,
+            readahead_len: request.readahead_len,
+        };
+        let executor_input = hook(hook_request).unwrap_or_default();
+        let outcome = crate::readahead::issue_readahead_with_executor(
+            &self.fs.borrow(),
+            &request.path,
+            request.readahead_offset,
+            request.readahead_len,
+            executor_input,
+        );
+        self.record_readahead_executor_outcome(VfsReadaheadExecutorOutcome {
+            executor_record: outcome.executor_record,
+            bytes_issued: outcome.bytes_issued,
+        });
     }
 
     /// Set the mount-level atime policy for automatic timestamp updates.
@@ -4074,7 +4178,16 @@ impl VfsLocalFileSystem {
         }
 
         if let Some((ra_offset, ra_len)) = readahead_plan {
-            crate::readahead::issue_readahead(&self.fs.borrow(), &path, ra_offset, ra_len);
+            self.issue_planned_readahead(VfsReadaheadExecutorRequest {
+                inode_id: fh.inode_id,
+                path,
+                read_offset: offset,
+                read_size: size,
+                file_size,
+                readahead_offset: ra_offset,
+                readahead_len: ra_len,
+            },
+            );
         }
 
         Ok(data)
@@ -5943,7 +6056,25 @@ mod tests {
     use crate::write_buffer::WriteBufferConfig;
     use crate::RootAuthenticationKey;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tidefs_space_accounting::{DatasetQuotaConfig, DatasetQuotaHierarchy};
+    use tidefs_storage_intent_core::{
+        EvidenceCompletenessVerdict, EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet,
+        EvidenceFamilyFreshnessState, EvidenceQuerySubjectScope, EvidenceQuerySubjectScopeClass,
+        PrefetchResidencyCandidateClass, PrefetchResidencyDecisionEvidenceRefs,
+        PrefetchResidencyDecisionOutcome, PrefetchResidencyDecisionRecord,
+        PrefetchResidencyStateClass, StorageIntentDomainId, StorageIntentEvidenceId,
+        StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef,
+        StorageIntentEvidenceRefs, StorageIntentObjectScope, StorageIntentPolicyId,
+        StorageIntentPolicyRevision, StorageMediaClass,
+    };
+    use tidefs_storage_intent_prefetch_executor::{
+        PrefetchExecutorActionFamily, PrefetchExecutorAdmissionRecord, PrefetchExecutorCostState,
+        PrefetchExecutorInput, PrefetchExecutorMediaPath, PrefetchExecutorOutcome,
+        PrefetchExecutorRuntimeSupport, PrefetchExecutorRuntimeSupportMask,
+        PrefetchExecutorSchedulerLane,
+    };
     use tidefs_types_vfs_core::{
         FileHandleId, FATTR_ATIME, FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE,
         FATTR_UID, RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFDIR, S_IFMT, S_ISGID, XATTR_CREATE,
@@ -5969,6 +6100,337 @@ mod tests {
 
     fn cached_path(engine: &VfsLocalFileSystem, inode: InodeId) -> Option<String> {
         engine.path_cache.borrow().get(&inode).cloned()
+    }
+
+    const PREFETCH_POLICY: StorageIntentPolicyId = StorageIntentPolicyId([0x31; 16]);
+    const PREFETCH_BUDGET: StorageIntentDomainId = StorageIntentDomainId([0x41; 16]);
+    const PREFETCH_OBJECT: StorageIntentEvidenceId = StorageIntentEvidenceId([0x51; 32]);
+    const PREFETCH_QUERY: StorageIntentEvidenceId = StorageIntentEvidenceId([0x61; 32]);
+    const PREFETCH_SNAPSHOT: StorageIntentEvidenceId = StorageIntentEvidenceId([0x62; 32]);
+    const PREFETCH_DECISION: StorageIntentEvidenceId = StorageIntentEvidenceId([0x63; 32]);
+    const PREFETCH_SCHED: StorageIntentEvidenceId = StorageIntentEvidenceId([0x64; 32]);
+    const PREFETCH_MEDIA: StorageIntentEvidenceId = StorageIntentEvidenceId([0x65; 32]);
+    const PREFETCH_READ: StorageIntentEvidenceId = StorageIntentEvidenceId([0x66; 32]);
+    const PREFETCH_COST: StorageIntentEvidenceId = StorageIntentEvidenceId([0x67; 32]);
+    const PREFETCH_ISOLATION: StorageIntentEvidenceId = StorageIntentEvidenceId([0x68; 32]);
+    const PREFETCH_ACTION: StorageIntentEvidenceId = StorageIntentEvidenceId([0x69; 32]);
+
+    fn prefetch_evidence(
+        kind: StorageIntentEvidenceKind,
+        id: StorageIntentEvidenceId,
+    ) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef::new(kind, id, 1, 1)
+    }
+
+    fn prefetch_scope(range_start: u64, range_len: u64) -> StorageIntentObjectScope {
+        StorageIntentObjectScope {
+            dataset_id: PREFETCH_BUDGET,
+            object_id: PREFETCH_OBJECT,
+            range_start,
+            range_len,
+            generation: 1,
+        }
+    }
+
+    fn add_prefetch_family(
+        snapshot: &mut StorageIntentEvidenceQuerySnapshot,
+        kind: StorageIntentEvidenceKind,
+        id: StorageIntentEvidenceId,
+    ) {
+        let evidence_ref = prefetch_evidence(kind, id);
+        snapshot
+            .included_refs
+            .push(evidence_ref)
+            .expect("push included evidence");
+        snapshot
+            .family_freshness
+            .push(EvidenceFamilyFreshness {
+                kind,
+                state: EvidenceFamilyFreshnessState::Fresh,
+                source_index_generation: 1,
+                producer_generation: 1,
+                freshness_frontier_ms: 100,
+                allowed_staleness_ms: 0,
+                evidence_ref,
+            })
+            .expect("push family freshness");
+    }
+
+    fn prefetch_snapshot(range_start: u64, range_len: u64) -> StorageIntentEvidenceQuerySnapshot {
+        let mut snapshot = StorageIntentEvidenceQuerySnapshot {
+            snapshot_id: PREFETCH_SNAPSHOT,
+            query_id: PREFETCH_QUERY,
+            subject: EvidenceQuerySubjectScope {
+                scope_class: EvidenceQuerySubjectScopeClass::ObjectRange,
+                object_scope: prefetch_scope(range_start, range_len),
+                ..EvidenceQuerySubjectScope::default()
+            },
+            policy_id: PREFETCH_POLICY,
+            policy_revision: StorageIntentPolicyRevision(7),
+            temporal_frontier_ms: 100,
+            freshness_frontier_ms: 100,
+            source_index_generation: 1,
+            producer_generation: 1,
+            producer_watermark_ms: 100,
+            included_refs: StorageIntentEvidenceRefs::EMPTY,
+            family_freshness: EvidenceFamilyFreshnessSet::EMPTY,
+            completeness: EvidenceCompletenessVerdict::CompleteForPurpose,
+            ..StorageIntentEvidenceQuerySnapshot::default()
+        };
+        add_prefetch_family(
+            &mut snapshot,
+            StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+            PREFETCH_SNAPSHOT,
+        );
+        add_prefetch_family(
+            &mut snapshot,
+            StorageIntentEvidenceKind::DecisionFrontierEvidence,
+            PREFETCH_DECISION,
+        );
+        add_prefetch_family(
+            &mut snapshot,
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            PREFETCH_SCHED,
+        );
+        add_prefetch_family(
+            &mut snapshot,
+            StorageIntentEvidenceKind::MediaCapabilityEvidence,
+            PREFETCH_MEDIA,
+        );
+        add_prefetch_family(
+            &mut snapshot,
+            StorageIntentEvidenceKind::ReadFreshnessEvidence,
+            PREFETCH_READ,
+        );
+        add_prefetch_family(
+            &mut snapshot,
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            PREFETCH_ACTION,
+        );
+        snapshot
+    }
+
+    fn admitted_readahead_input(range_start: u64, range_len: u64) -> PrefetchExecutorInput {
+        let scope = prefetch_scope(range_start, range_len);
+        let decision = PrefetchResidencyDecisionRecord {
+            policy_id: PREFETCH_POLICY,
+            policy_revision: StorageIntentPolicyRevision(7),
+            scope,
+            budget_owner: PREFETCH_BUDGET,
+            requested_candidate: PrefetchResidencyCandidateClass::BoundedReadahead,
+            selected_candidate: PrefetchResidencyCandidateClass::BoundedReadahead,
+            selected_residency: PrefetchResidencyStateClass::CacheOnlyRam,
+            outcome: PrefetchResidencyDecisionOutcome::Admitted,
+            source_media: StorageMediaClass::HddRotational,
+            target_media: StorageMediaClass::SystemRam,
+            source_media_ref: prefetch_evidence(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                PREFETCH_MEDIA,
+            ),
+            target_media_ref: prefetch_evidence(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                PREFETCH_MEDIA,
+            ),
+            max_prefetch_window_bytes: range_len.max(1),
+            evidence_refs: PrefetchResidencyDecisionEvidenceRefs {
+                evidence_query_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::EvidenceQuerySnapshot,
+                    PREFETCH_SNAPSHOT,
+                ),
+                decision_frontier_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    PREFETCH_DECISION,
+                ),
+                scheduler_admission_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    PREFETCH_SCHED,
+                ),
+                media_capability_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    PREFETCH_MEDIA,
+                ),
+                read_serving_boundary_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::ReadFreshnessEvidence,
+                    PREFETCH_READ,
+                ),
+                cost_wear_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::MediaCostWearLedger,
+                    PREFETCH_COST,
+                ),
+                tenant_isolation_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::TenantIsolationEvidence,
+                    PREFETCH_ISOLATION,
+                ),
+                ..PrefetchResidencyDecisionEvidenceRefs::default()
+            },
+            ..PrefetchResidencyDecisionRecord::default()
+        };
+
+        PrefetchExecutorInput {
+            decision,
+            evidence_query_snapshot: prefetch_snapshot(range_start, range_len),
+            admission: PrefetchExecutorAdmissionRecord::admitted(
+                PrefetchExecutorSchedulerLane::Speculative,
+                PREFETCH_BUDGET,
+                prefetch_evidence(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    PREFETCH_SCHED,
+                ),
+            )
+            .with_speculative_controls(true, true, true),
+            media_path: PrefetchExecutorMediaPath {
+                source_media: decision.source_media,
+                target_media: decision.target_media,
+                media_capability_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    PREFETCH_MEDIA,
+                ),
+                ..PrefetchExecutorMediaPath::default()
+            },
+            cost_state: PrefetchExecutorCostState {
+                cost_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::MediaCostWearLedger,
+                    PREFETCH_COST,
+                ),
+                isolation_ref: prefetch_evidence(
+                    StorageIntentEvidenceKind::TenantIsolationEvidence,
+                    PREFETCH_ISOLATION,
+                ),
+                ..PrefetchExecutorCostState::default()
+            },
+            runtime_support: PrefetchExecutorRuntimeSupport::supported(
+                PrefetchExecutorRuntimeSupportMask::ALL_MODELLED_DISPATCH,
+                prefetch_evidence(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    PREFETCH_ACTION,
+                ),
+            ),
+            action_family: PrefetchExecutorActionFamily::BoundedSequentialReadahead,
+            require_budget_owner: true,
+            require_isolation_evidence: true,
+            ..PrefetchExecutorInput::default()
+        }
+    }
+
+    #[test]
+    fn vfs_readahead_executor_hook_records_missing_evidence_refusal() {
+        let (mut engine, _dir) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).expect("root inode");
+        let (attr, fh) = engine
+            .create(root, b"prefetch.bin", 0o644, O_RDWR, &ctx())
+            .expect("create file");
+        let payload = vec![0xAB; 512 * 1024];
+        engine.write(&fh, 0, &payload, &ctx()).expect("write file");
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        let expected_inode = attr.inode_id;
+        engine.set_readahead_executor_input_hook(move |request| {
+            hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.inode_id, expected_inode);
+            assert_eq!(request.path, "/prefetch.bin");
+            assert_eq!(request.read_offset, 8192);
+            assert_eq!(request.read_size, 4096);
+            assert!(request.readahead_len > 0);
+            None
+        });
+
+        assert_eq!(
+            engine.read(&fh, 0, 4096, &ctx()).expect("first read").len(),
+            4096
+        );
+        assert_eq!(
+            engine
+                .read(&fh, 4096, 4096, &ctx())
+                .expect("second read")
+                .len(),
+            4096
+        );
+        assert!(
+            engine.drain_readahead_executor_outcomes().is_empty(),
+            "executor should not run before the readahead threshold"
+        );
+        assert_eq!(
+            engine
+                .read(&fh, 8192, 4096, &ctx())
+                .expect("third read")
+                .len(),
+            4096
+        );
+
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        let outcomes = engine.drain_readahead_executor_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_ne!(
+            outcomes[0].executor_record.outcome,
+            PrefetchExecutorOutcome::Started
+        );
+        assert!(
+            outcomes[0].bytes_issued.is_none(),
+            "missing #967/#913 evidence must not dispatch readahead"
+        );
+        assert!(!outcomes[0]
+            .executor_record
+            .can_publish_replacement_receipt());
+        assert!(!outcomes[0].executor_record.can_retire_source_receipt());
+        assert!(!outcomes[0].executor_record.can_satisfy_durable_sync());
+    }
+
+    #[test]
+    fn vfs_readahead_executor_hook_records_started_cache_only_dispatch() {
+        let (mut engine, _dir) = temp_fs();
+        let root = engine.get_root_inode(&ctx()).expect("root inode");
+        let (_attr, fh) = engine
+            .create(root, b"started.bin", 0o644, O_RDWR, &ctx())
+            .expect("create file");
+        let payload = vec![0xCD; 512 * 1024];
+        engine.write(&fh, 0, &payload, &ctx()).expect("write file");
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        engine.set_readahead_executor_input_hook(move |request| {
+            hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            Some(admitted_readahead_input(
+                request.readahead_offset,
+                request.readahead_len,
+            ))
+        });
+
+        assert_eq!(
+            engine.read(&fh, 0, 4096, &ctx()).expect("first read").len(),
+            4096
+        );
+        assert_eq!(
+            engine
+                .read(&fh, 4096, 4096, &ctx())
+                .expect("second read")
+                .len(),
+            4096
+        );
+        assert_eq!(
+            engine
+                .read(&fh, 8192, 4096, &ctx())
+                .expect("third read")
+                .len(),
+            4096
+        );
+
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        let outcomes = engine.drain_readahead_executor_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].executor_record.outcome,
+            PrefetchExecutorOutcome::Started
+        );
+        assert_eq!(outcomes[0].bytes_issued, Some(512 * 1024 - 8192));
+        assert_eq!(
+            outcomes[0].executor_record.action_family,
+            PrefetchExecutorActionFamily::BoundedSequentialReadahead
+        );
+        assert!(
+            !outcomes[0].executor_record.can_satisfy_durable_sync(),
+            "cache-only readahead cannot become durable sync authority"
+        );
     }
 
     #[test]
