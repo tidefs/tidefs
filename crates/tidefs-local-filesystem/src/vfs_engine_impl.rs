@@ -6069,7 +6069,6 @@ mod tests {
         StorageIntentEvidenceRefs, StorageIntentObjectScope, StorageIntentPolicyId,
         StorageIntentPolicyRevision, StorageMediaClass,
     };
-    use tidefs_storage_intent_cost::{StorageIntentCostEvidenceState, StorageIntentCostSnapshot};
     use tidefs_storage_intent_prefetch_executor::{
         PrefetchExecutorActionFamily, PrefetchExecutorAdmissionRecord, PrefetchExecutorCostState,
         PrefetchExecutorInput, PrefetchExecutorMediaPath, PrefetchExecutorOutcome,
@@ -6289,14 +6288,6 @@ mod tests {
                 ..PrefetchExecutorMediaPath::default()
             },
             cost_state: PrefetchExecutorCostState {
-                snapshot: StorageIntentCostSnapshot {
-                    evidence_id: PREFETCH_COST,
-                    policy_id: PREFETCH_POLICY,
-                    policy_revision: StorageIntentPolicyRevision(7),
-                    budget_owner: PREFETCH_BUDGET,
-                    evidence_state: StorageIntentCostEvidenceState::FRESH,
-                    ..StorageIntentCostSnapshot::default()
-                },
                 cost_ref: prefetch_evidence(
                     StorageIntentEvidenceKind::MediaCostWearLedger,
                     PREFETCH_COST,

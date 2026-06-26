@@ -2690,7 +2690,6 @@ dependencies = [
  "tidefs-send-stream",
  "tidefs-space-accounting",
  "tidefs-storage-intent-core",
- "tidefs-storage-intent-cost",
  "tidefs-storage-intent-prefetch-executor",
  "tidefs-storage-intent-read-serving",
  "tidefs-types-cache-lattice-core",
