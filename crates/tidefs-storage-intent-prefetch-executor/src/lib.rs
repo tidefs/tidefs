@@ -605,48 +605,52 @@ impl Default for PrefetchExecutorCostState {
 impl PrefetchExecutorCostState {
     #[must_use]
     pub fn missing_required_cost(self) -> bool {
-        (self
-            .required
-            .contains(PrefetchExecutorCostRequirementMask::EGRESS)
-            && class_missing_or_unknown(
-                self.snapshot.evidence_state,
-                StorageIntentCostClass::NetworkEgress,
-            ))
-            || (self
-                .required
-                .contains(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS)
-                && class_missing_or_unknown(
-                    self.snapshot.evidence_state,
-                    StorageIntentCostClass::RestoreTime,
-                ))
-            || (self
-                .required
-                .contains(PrefetchExecutorCostRequirementMask::CPU)
-                && class_missing_or_unknown(
-                    self.snapshot.evidence_state,
-                    StorageIntentCostClass::CpuProcessing,
-                ))
-            || (self
-                .required
-                .contains(PrefetchExecutorCostRequirementMask::MEMORY)
-                && class_missing_or_unknown(
-                    self.snapshot.evidence_state,
-                    StorageIntentCostClass::MemoryUsage,
-                ))
-            || (self
-                .required
-                .contains(PrefetchExecutorCostRequirementMask::STAGING_CAPACITY)
-                && class_missing_or_unknown(
-                    self.snapshot.evidence_state,
-                    StorageIntentCostClass::CapacityMediaClass,
-                ))
-            || (self
-                .required
-                .contains(PrefetchExecutorCostRequirementMask::FOREGROUND_DISRUPTION)
-                && class_missing_or_unknown(
-                    self.snapshot.evidence_state,
-                    StorageIntentCostClass::ForegroundDisruption,
-                ))
+        self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::FLASH_WRITES,
+            StorageIntentCostClass::CapacityMediaClass,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::CACHE_DEVICE_INDEXES,
+            StorageIntentCostClass::CapacityMediaClass,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::PREDICTOR_CHECKPOINTS,
+            StorageIntentCostClass::TransformProcessing,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::RETAINED_EVIDENCE,
+            StorageIntentCostClass::ColdRetention,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::RAM_PMEM_CAPACITY,
+            StorageIntentCostClass::CapacityMediaClass,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::CPU,
+            StorageIntentCostClass::CpuProcessing,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::MEMORY,
+            StorageIntentCostClass::MemoryUsage,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH,
+            StorageIntentCostClass::NetworkIngress,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::EGRESS,
+            StorageIntentCostClass::NetworkEgress,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS,
+            StorageIntentCostClass::RestoreTime,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::STAGING_CAPACITY,
+            StorageIntentCostClass::CapacityMediaClass,
+        ) || self.missing_required_cost_class(
+            PrefetchExecutorCostRequirementMask::FOREGROUND_DISRUPTION,
+            StorageIntentCostClass::ForegroundDisruption,
+        )
+    }
+
+    fn missing_required_cost_class(
+        self,
+        requirement: PrefetchExecutorCostRequirementMask,
+        cost_class: StorageIntentCostClass,
+    ) -> bool {
+        self.required.contains(requirement)
+            && class_missing_or_unknown(self.snapshot.evidence_state, cost_class)
     }
 }
 
@@ -1210,7 +1214,11 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         );
     }
 
-    if input.require_known_waf
+    if (input.require_known_waf
+        || input
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::FLASH_WRITES))
         && (input.cost_state.unknown_waf
             || input
                 .anti_waste
@@ -1224,7 +1232,15 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         );
     }
 
-    if input.require_known_egress_restore_cost
+    if (input.require_known_egress_restore_cost
+        || input
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::EGRESS)
+        || input
+            .cost_state
+            .required
+            .contains(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS))
         && (input.cost_state.unknown_egress_or_restore_cost
             || input
                 .anti_waste
@@ -2154,6 +2170,128 @@ mod tests {
         assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
         assert_eq!(
             record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn every_required_executor_cost_class_refuses_missing_evidence() {
+        let cases = [
+            (
+                PrefetchExecutorCostRequirementMask::FLASH_WRITES,
+                StorageIntentCostClass::CapacityMediaClass,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::CACHE_DEVICE_INDEXES,
+                StorageIntentCostClass::CapacityMediaClass,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::PREDICTOR_CHECKPOINTS,
+                StorageIntentCostClass::TransformProcessing,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::RETAINED_EVIDENCE,
+                StorageIntentCostClass::ColdRetention,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::RAM_PMEM_CAPACITY,
+                StorageIntentCostClass::CapacityMediaClass,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::CPU,
+                StorageIntentCostClass::CpuProcessing,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::MEMORY,
+                StorageIntentCostClass::MemoryUsage,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::WAN_BANDWIDTH,
+                StorageIntentCostClass::NetworkIngress,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::EGRESS,
+                StorageIntentCostClass::NetworkEgress,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS,
+                StorageIntentCostClass::RestoreTime,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::STAGING_CAPACITY,
+                StorageIntentCostClass::CapacityMediaClass,
+            ),
+            (
+                PrefetchExecutorCostRequirementMask::FOREGROUND_DISRUPTION,
+                StorageIntentCostClass::ForegroundDisruption,
+            ),
+        ];
+
+        for (requirement, cost_class) in cases {
+            let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+            input.cost_state.required = requirement;
+            input.cost_state.snapshot.evidence_state =
+                StorageIntentCostEvidenceState::FRESH.with_missing(cost_class);
+
+            let record = evaluate_prefetch_execution(input);
+            assert_eq!(
+                record.outcome,
+                PrefetchExecutorOutcome::Refused,
+                "requirement {requirement:?} did not refuse missing {cost_class:?}"
+            );
+            assert_eq!(
+                record.refusal,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+                "requirement {requirement:?} reported the wrong refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn required_flash_and_remote_costs_reject_unknown_cost_state() {
+        let mut flash = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        flash.cost_state.required = PrefetchExecutorCostRequirementMask::FLASH_WRITES;
+        flash.cost_state.unknown_waf = true;
+        let flash_record = evaluate_prefetch_execution(flash);
+        assert_eq!(flash_record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            flash_record.refusal,
+            StorageIntentRefusalReason::FlashWearBudgetExceeded
+        );
+
+        let mut egress = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        egress.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut egress.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        egress.cost_state.required = PrefetchExecutorCostRequirementMask::EGRESS;
+        egress.cost_state.unknown_egress_or_restore_cost = true;
+        let egress_record = evaluate_prefetch_execution(egress);
+        assert_eq!(egress_record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            egress_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut restore =
+            admitted_input(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage);
+        restore.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut restore.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        restore.cost_state.required =
+            PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS;
+        restore.anti_waste = PrefetchExecutorAntiWasteMask::UNKNOWN_EGRESS_OR_RESTORE_COST;
+        let restore_record = evaluate_prefetch_execution(restore);
+        assert_eq!(restore_record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            restore_record.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
