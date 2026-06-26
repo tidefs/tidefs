@@ -553,7 +553,6 @@ pub struct RepairReplacementReceiptConsumerEvidence {
 }
 
 impl RepairReplacementReceiptEvidence {
-    #[must_use]
     pub fn new(
         subject: RepairCandidateIdentity,
         policy_revision: u64,

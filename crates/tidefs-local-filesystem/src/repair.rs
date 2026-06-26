@@ -47,7 +47,6 @@ pub enum RepairOutcome {
 
 impl RepairOutcome {
     /// Durable replacement evidence that downstream consumers may use.
-    #[must_use]
     pub fn replacement_receipt_evidence(&self) -> Option<RepairReplacementReceiptEvidence> {
         match self {
             Self::Reconstructed {
@@ -512,17 +511,24 @@ fn apply_reconstruct(
         };
     }
 
-    let stripe_width = u16::from_le_bytes([raw[0], raw[1]]) as usize;
-    let data_shards = u16::from_le_bytes([raw[2], raw[3]]) as usize;
+    let stripe_width = usize::from(u16::from_le_bytes([raw[0], raw[1]]));
+    let data_shards = usize::from(u16::from_le_bytes([raw[2], raw[3]]));
     let parity_count_raw = raw[4];
-    let shard_len = u32::from_le_bytes([raw[5], raw[6], raw[7], raw[8]]) as usize;
+    let shard_len = match usize::try_from(u32::from_le_bytes([raw[5], raw[6], raw[7], raw[8]])) {
+        Ok(shard_len) => shard_len,
+        Err(_) => {
+            return RepairOutcome::Unrepairable {
+                reason: RepairUnrepairableReason::InvalidErasureHeader,
+            }
+        }
+    };
 
     if parity_count_raw == 0 || data_shards == 0 || shard_len == 0 {
         return RepairOutcome::Unrepairable {
             reason: RepairUnrepairableReason::NotErasureEncoded,
         };
     }
-    if stripe_width != data_shards + parity_count_raw as usize {
+    if stripe_width != data_shards + usize::from(parity_count_raw) {
         return RepairOutcome::Unrepairable {
             reason: RepairUnrepairableReason::NotErasureEncoded,
         };
