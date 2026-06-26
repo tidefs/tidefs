@@ -16,10 +16,11 @@
 
 use core::fmt;
 use tidefs_storage_intent_core::{
-    ProximityClass, RelocationReasonClass, StorageIntentDomainId, StorageIntentEvidenceKind,
-    StorageIntentEvidenceId, StorageIntentEvidenceRef, StorageIntentPolicyId,
+    ProximityClass, RelocationReasonClass, StorageIntentDomainId, StorageIntentEvidenceId,
+    StorageIntentEvidenceKind, StorageIntentEvidenceRef, StorageIntentPolicyId,
     StorageIntentPolicyRevision,
 };
+use tidefs_storage_intent_remote_media_capability::RemoteCostRecoveryFacts;
 
 // ---------------------------------------------------------------------------
 // Crate identity and version bounds
@@ -400,7 +401,10 @@ impl StorageIntentNetworkCarrierClass {
     /// Returns true when this carrier class may incur a monetary egress charge.
     #[must_use]
     pub const fn may_incur_egress_cost(self) -> bool {
-        matches!(self, Self::MeteredProvider | Self::InternetTransit | Self::Satellite)
+        matches!(
+            self,
+            Self::MeteredProvider | Self::InternetTransit | Self::Satellite
+        )
     }
 }
 
@@ -941,6 +945,17 @@ impl Default for StorageIntentCostSnapshot {
 }
 
 impl StorageIntentCostSnapshot {
+    /// Evidence ref naming this read-only cost snapshot.
+    #[must_use]
+    pub const fn evidence_ref(self) -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::MediaCostWearLedger,
+            id: self.evidence_id,
+            generation: self.generation,
+            version: STORAGE_INTENT_COST_VERSION,
+        }
+    }
+
     /// Sum cost across all charges for a given cost class, or return
     /// `u64::MAX` when evidence for that class is missing/stale.
     #[must_use]
@@ -1025,10 +1040,8 @@ impl StorageIntentCostSnapshot {
         let mut i: usize = 0;
         while i < self.payback_entry_count as usize && i < MAX_PAYBACK_ENTRIES {
             if self.payback_entries[i].payback_achieved {
-                total = saturating_add_u64(
-                    total,
-                    self.payback_entries[i].money_power_saved_microunits,
-                );
+                total =
+                    saturating_add_u64(total, self.payback_entries[i].money_power_saved_microunits);
             }
             i += 1;
         }
@@ -1131,6 +1144,123 @@ impl StorageIntentCostSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Remote media cost/recovery projection
+// ---------------------------------------------------------------------------
+
+/// Read-only cost-ledger projection for #961 remote/object/archive facts.
+///
+/// This adapter does not choose placement or execute recovery. It only maps a
+/// bounded #856 cost snapshot plus a caller-provided #900 recovery/degradation
+/// ref into the cost booleans consumed by the remote media-capability producer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct RemoteMediaCostRecoverySample {
+    pub snapshot: StorageIntentCostSnapshot,
+    pub egress_budget_known: bool,
+    pub egress_budget_microunits: u64,
+    pub recovery_bandwidth_budget_known: bool,
+    pub recovery_bandwidth_budget_bytes: u64,
+    pub degraded_visibility_known: bool,
+    pub recovery_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for RemoteMediaCostRecoverySample {
+    fn default() -> Self {
+        Self {
+            snapshot: StorageIntentCostSnapshot::default(),
+            egress_budget_known: false,
+            egress_budget_microunits: 0,
+            recovery_bandwidth_budget_known: false,
+            recovery_bandwidth_budget_bytes: 0,
+            degraded_visibility_known: false,
+            recovery_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+impl RemoteMediaCostRecoverySample {
+    #[must_use]
+    pub const fn bounded(
+        snapshot: StorageIntentCostSnapshot,
+        egress_budget_microunits: u64,
+        recovery_bandwidth_budget_bytes: u64,
+        recovery_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        Self {
+            snapshot,
+            egress_budget_known: true,
+            egress_budget_microunits,
+            recovery_bandwidth_budget_known: true,
+            recovery_bandwidth_budget_bytes,
+            degraded_visibility_known: true,
+            recovery_ref,
+        }
+    }
+
+    /// Project bounded cost and recovery visibility into #961 remote facts.
+    ///
+    /// Unknown, stale, refused, or missing-ref evidence fails closed by
+    /// leaving the corresponding fact false. Over-budget egress stays visible
+    /// as an explicit exhausted fact. The remote media preflight then refuses
+    /// the target instead of treating absent cost data as cheap or safe.
+    #[must_use]
+    pub const fn to_remote_cost_recovery_facts(self) -> RemoteCostRecoveryFacts {
+        let snapshot_cost_ref = self.snapshot.evidence_ref();
+        let cost_ref_bound = evidence_ref_has_kind(
+            snapshot_cost_ref,
+            StorageIntentEvidenceKind::MediaCostWearLedger,
+        );
+        let recovery_ref_bound = evidence_ref_has_kind(
+            self.recovery_ref,
+            StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+        );
+        let cost_ref = if cost_ref_bound {
+            snapshot_cost_ref
+        } else {
+            EMPTY_EVIDENCE_REF
+        };
+        let recovery_ref = if recovery_ref_bound {
+            self.recovery_ref
+        } else {
+            EMPTY_EVIDENCE_REF
+        };
+
+        let egress_cost = self
+            .snapshot
+            .class_cost_or_missing(StorageIntentCostClass::NetworkEgress);
+        let egress_budget_known =
+            cost_ref_bound && self.egress_budget_known && egress_cost != u64::MAX;
+        let egress_budget_exhausted =
+            egress_budget_known && egress_cost > self.egress_budget_microunits;
+
+        let restore_cost_known = cost_ref_bound
+            && self
+                .snapshot
+                .class_cost_or_missing(StorageIntentCostClass::RestoreTime)
+                != u64::MAX;
+
+        let recovery_bytes = self
+            .snapshot
+            .class_byte_count_or_missing(StorageIntentCostClass::RecoveryBandwidth);
+        let recovery_bandwidth_known = cost_ref_bound
+            && recovery_ref_bound
+            && self.recovery_bandwidth_budget_known
+            && recovery_bytes != u64::MAX
+            && recovery_bytes <= self.recovery_bandwidth_budget_bytes;
+
+        RemoteCostRecoveryFacts {
+            egress_budget_known,
+            egress_budget_exhausted,
+            restore_cost_known,
+            recovery_bandwidth_known,
+            degraded_visibility_known: recovery_ref_bound && self.degraded_visibility_known,
+            cost_ref,
+            recovery_ref,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cost snapshot builder (not no_std — downstream callers provide alloc)
 // ---------------------------------------------------------------------------
 
@@ -1218,10 +1348,7 @@ impl StorageIntentCostSnapshotBuilder {
 
     /// Set operator policy weights.
     #[must_use]
-    pub fn with_operator_weights(
-        mut self,
-        weights: StorageIntentOperatorPolicyWeights,
-    ) -> Self {
+    pub fn with_operator_weights(mut self, weights: StorageIntentOperatorPolicyWeights) -> Self {
         self.snapshot.operator_weights = weights;
         self
     }
@@ -1239,10 +1366,7 @@ impl StorageIntentCostSnapshotBuilder {
 
     /// Add a network path cost weight.
     #[must_use]
-    pub fn with_network_path_weight(
-        mut self,
-        weight: StorageIntentNetworkPathCostWeight,
-    ) -> Self {
+    pub fn with_network_path_weight(mut self, weight: StorageIntentNetworkPathCostWeight) -> Self {
         let idx = self.snapshot.network_path_weight_count as usize;
         if idx < MAX_NETWORK_PATH_WEIGHTS {
             self.snapshot.network_path_weights[idx] = weight;
@@ -1276,6 +1400,13 @@ impl StorageIntentCostSnapshotBuilder {
 // Helpers
 // ---------------------------------------------------------------------------
 
+const EMPTY_EVIDENCE_REF: StorageIntentEvidenceRef = StorageIntentEvidenceRef {
+    kind: StorageIntentEvidenceKind::Unknown,
+    id: StorageIntentEvidenceId::ZERO,
+    generation: 0,
+    version: 0,
+};
+
 const fn bytes32_are_zero(bytes: [u8; 32]) -> bool {
     let mut index = 0;
     while index < bytes.len() {
@@ -1285,6 +1416,13 @@ const fn bytes32_are_zero(bytes: [u8; 32]) -> bool {
         index += 1;
     }
     true
+}
+
+const fn evidence_ref_has_kind(
+    evidence_ref: StorageIntentEvidenceRef,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    evidence_ref.kind as u16 == kind as u16 && evidence_ref.is_bound()
 }
 
 const fn saturating_add_u64(a: u64, b: u64) -> u64 {
@@ -1360,6 +1498,48 @@ mod tests {
         }
     }
 
+    fn recovery_ref() -> StorageIntentEvidenceRef {
+        StorageIntentEvidenceRef {
+            kind: StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            id: StorageIntentEvidenceId([3u8; 32]),
+            generation: 3,
+            version: 1,
+        }
+    }
+
+    fn remote_cost_snapshot() -> StorageIntentCostSnapshot {
+        let mut charges = [StorageIntentCostCharge::ZERO; MAX_COST_CHARGES];
+        charges[0] = StorageIntentCostCharge {
+            cost_class: StorageIntentCostClass::NetworkEgress,
+            reason_code: 1,
+            byte_count: 1_000,
+            cost_microunits: 100,
+            evidence: evidence_ref_1(),
+        };
+        charges[1] = StorageIntentCostCharge {
+            cost_class: StorageIntentCostClass::RestoreTime,
+            reason_code: 2,
+            byte_count: 0,
+            cost_microunits: 30,
+            evidence: evidence_ref_1(),
+        };
+        charges[2] = StorageIntentCostCharge {
+            cost_class: StorageIntentCostClass::RecoveryBandwidth,
+            reason_code: 3,
+            byte_count: 2_048,
+            cost_microunits: 0,
+            evidence: evidence_ref_2(),
+        };
+
+        StorageIntentCostSnapshot {
+            evidence_id: StorageIntentEvidenceId([9u8; 32]),
+            generation: 9,
+            charges,
+            charge_count: 3,
+            ..StorageIntentCostSnapshot::default()
+        }
+    }
+
     // ------------------------------------------------------------------
     // Cost class discriminants
     // ------------------------------------------------------------------
@@ -1371,10 +1551,7 @@ mod tests {
             1
         );
         assert_eq!(StorageIntentCostClass::NetworkEgress.to_discriminant(), 5);
-        assert_eq!(
-            StorageIntentCostClass::ReplicationSync.to_discriminant(),
-            7
-        );
+        assert_eq!(StorageIntentCostClass::ReplicationSync.to_discriminant(), 7);
         assert_eq!(StorageIntentCostClass::CpuProcessing.to_discriminant(), 13);
         assert_eq!(StorageIntentCostClass::ColdRetention.to_discriminant(), 17);
         assert_eq!(StorageIntentCostClass::Fragmentation.to_discriminant(), 20);
@@ -1560,15 +1737,13 @@ mod tests {
         let state = StorageIntentCostEvidenceState::FRESH;
         assert!(state.is_fresh());
         assert!(!state.has_any_missing());
-        assert!(!state.class_is_missing(
-            StorageIntentCostClass::NetworkEgress
-        ));
+        assert!(!state.class_is_missing(StorageIntentCostClass::NetworkEgress));
     }
 
     #[test]
     fn evidence_state_missing_detection() {
-        let state =
-            StorageIntentCostEvidenceState::FRESH.with_missing(StorageIntentCostClass::NetworkEgress);
+        let state = StorageIntentCostEvidenceState::FRESH
+            .with_missing(StorageIntentCostClass::NetworkEgress);
         assert!(!state.is_fresh());
         assert!(state.has_any_missing());
         assert!(state.class_is_missing(StorageIntentCostClass::NetworkEgress));
@@ -1909,14 +2084,8 @@ mod tests {
             ProximityClass::InProcess,
             StorageIntentNetworkCarrierClass::InternetTransit,
         );
-        assert_eq!(
-            found.egress_cost_per_byte_microunits,
-            u64::MAX
-        );
-        assert_eq!(
-            found.ingress_cost_per_byte_microunits,
-            u64::MAX
-        );
+        assert_eq!(found.egress_cost_per_byte_microunits, u64::MAX);
+        assert_eq!(found.ingress_cost_per_byte_microunits, u64::MAX);
         assert_eq!(
             snapshot.egress_cost_for_bytes(
                 StorageIntentNetworkPathClass::Internet,
@@ -1926,6 +2095,108 @@ mod tests {
             ),
             u64::MAX
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #961 remote media cost/recovery projection
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn remote_media_cost_sample_projects_bounded_facts() {
+        let snapshot = remote_cost_snapshot();
+        let facts = RemoteMediaCostRecoverySample::bounded(snapshot, 150, 4_096, recovery_ref())
+            .to_remote_cost_recovery_facts();
+
+        assert!(facts.egress_budget_known);
+        assert!(!facts.egress_budget_exhausted);
+        assert!(facts.restore_cost_known);
+        assert!(facts.recovery_bandwidth_known);
+        assert!(facts.degraded_visibility_known);
+        assert_eq!(facts.cost_ref, snapshot.evidence_ref());
+        assert_eq!(facts.recovery_ref, recovery_ref());
+    }
+
+    #[test]
+    fn remote_media_cost_sample_exposes_egress_budget_exhaustion() {
+        let facts = RemoteMediaCostRecoverySample::bounded(
+            remote_cost_snapshot(),
+            99,
+            4_096,
+            recovery_ref(),
+        )
+        .to_remote_cost_recovery_facts();
+
+        assert!(facts.egress_budget_known);
+        assert!(facts.egress_budget_exhausted);
+        assert!(facts.recovery_bandwidth_known);
+    }
+
+    #[test]
+    fn remote_media_cost_sample_requires_egress_evidence() {
+        let snapshot = StorageIntentCostSnapshot {
+            evidence_id: StorageIntentEvidenceId([9u8; 32]),
+            generation: 9,
+            evidence_state: StorageIntentCostEvidenceState::FRESH
+                .with_missing(StorageIntentCostClass::NetworkEgress),
+            ..remote_cost_snapshot()
+        };
+        let facts = RemoteMediaCostRecoverySample::bounded(snapshot, 150, 4_096, recovery_ref())
+            .to_remote_cost_recovery_facts();
+
+        assert!(!facts.egress_budget_known);
+        assert!(!facts.egress_budget_exhausted);
+        assert!(facts.restore_cost_known);
+    }
+
+    #[test]
+    fn remote_media_cost_sample_fails_closed_on_stale_restore_or_recovery() {
+        let snapshot = StorageIntentCostSnapshot {
+            evidence_state: StorageIntentCostEvidenceState::FRESH
+                .with_stale(StorageIntentCostClass::RestoreTime)
+                .with_refused(StorageIntentCostClass::RecoveryBandwidth),
+            ..remote_cost_snapshot()
+        };
+        let facts = RemoteMediaCostRecoverySample::bounded(snapshot, 150, 4_096, recovery_ref())
+            .to_remote_cost_recovery_facts();
+
+        assert!(facts.egress_budget_known);
+        assert!(!facts.restore_cost_known);
+        assert!(!facts.recovery_bandwidth_known);
+        assert!(facts.degraded_visibility_known);
+    }
+
+    #[test]
+    fn remote_media_cost_sample_requires_recovery_visibility_ref() {
+        let facts = RemoteMediaCostRecoverySample::bounded(
+            remote_cost_snapshot(),
+            150,
+            4_096,
+            evidence_ref_1(),
+        )
+        .to_remote_cost_recovery_facts();
+
+        assert!(facts.egress_budget_known);
+        assert!(!facts.recovery_bandwidth_known);
+        assert!(!facts.degraded_visibility_known);
+        assert!(!facts.recovery_ref.is_bound());
+    }
+
+    #[test]
+    fn remote_media_cost_sample_requires_bound_cost_snapshot_ref() {
+        let snapshot = StorageIntentCostSnapshot {
+            evidence_id: StorageIntentEvidenceId::ZERO,
+            generation: 0,
+            ..remote_cost_snapshot()
+        };
+        let facts = RemoteMediaCostRecoverySample::bounded(snapshot, 150, 4_096, recovery_ref())
+            .to_remote_cost_recovery_facts();
+
+        assert!(!facts.egress_budget_known);
+        assert!(!facts.restore_cost_known);
+        assert!(!facts.recovery_bandwidth_known);
+        assert!(facts.degraded_visibility_known);
+        assert!(!facts.cost_ref.is_bound());
+        assert_eq!(facts.recovery_ref, recovery_ref());
     }
 
     // ------------------------------------------------------------------
