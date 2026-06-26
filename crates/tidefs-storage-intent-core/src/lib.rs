@@ -6409,6 +6409,30 @@ pub enum PrefetchResidencyStateClass {
     Refused = 10,
 }
 
+/// Queue/admission lane requested by the #967 decision model.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchResidencyAdmissionLane {
+    /// No scheduler/admission lane is proven.
+    #[default]
+    Unknown = 0,
+    /// No runtime work should be queued.
+    NoWork = 1,
+    /// Speculative prefetch that remains droppable under foreground pressure.
+    SpeculativePrefetch = 2,
+    /// Non-authority serving trial or cache-admission work.
+    CacheServingTrial = 3,
+    /// WAN/object/archive staging work with transport or restore budgets.
+    RemoteRestoreStaging = 4,
+    /// Candidate for relocation/action authority, not execution authority.
+    AuthorityMovementCandidate = 5,
+    /// Missing evidence or cooldown keeps the action out of runnable lanes.
+    EvidenceHold = 6,
+    /// Policy or evidence refused the work.
+    Refused = 7,
+}
+
 /// Input snapshot for a prefetch/residency decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -6435,6 +6459,7 @@ pub struct PrefetchResidencyDecisionRecord {
     pub requested_candidate: PrefetchResidencyCandidateClass,
     pub selected_candidate: PrefetchResidencyCandidateClass,
     pub selected_residency: PrefetchResidencyStateClass,
+    pub admission_lane: PrefetchResidencyAdmissionLane,
     pub outcome: PrefetchResidencyDecisionOutcome,
     pub refusal: StorageIntentRefusalReason,
     pub source_media: StorageMediaClass,
@@ -6460,6 +6485,7 @@ impl Default for PrefetchResidencyDecisionRecord {
             requested_candidate: PrefetchResidencyCandidateClass::NoPrefetch,
             selected_candidate: PrefetchResidencyCandidateClass::NoPrefetch,
             selected_residency: PrefetchResidencyStateClass::Unknown,
+            admission_lane: PrefetchResidencyAdmissionLane::Unknown,
             outcome: PrefetchResidencyDecisionOutcome::NoAction,
             refusal: StorageIntentRefusalReason::None,
             source_media: StorageMediaClass::SystemRam,
@@ -6856,6 +6882,46 @@ pub const fn prefetch_residency_candidate_state(
     }
 }
 
+/// Map a selected #967 candidate to its non-executing admission lane.
+#[must_use]
+pub const fn prefetch_residency_candidate_admission_lane(
+    candidate: PrefetchResidencyCandidateClass,
+) -> PrefetchResidencyAdmissionLane {
+    match candidate {
+        PrefetchResidencyCandidateClass::NoPrefetch => PrefetchResidencyAdmissionLane::NoWork,
+        PrefetchResidencyCandidateClass::BoundedReadahead
+        | PrefetchResidencyCandidateClass::StridedVectorPrefetch
+        | PrefetchResidencyCandidateClass::MetadataNamespacePrefetch
+        | PrefetchResidencyCandidateClass::SmallRandomHotsetTrial
+        | PrefetchResidencyCandidateClass::ManifestIndexPrefetch
+        | PrefetchResidencyCandidateClass::SnapshotClonePrefetch
+        | PrefetchResidencyCandidateClass::DegradedReadPrefetch => {
+            PrefetchResidencyAdmissionLane::SpeculativePrefetch
+        }
+        PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch
+        | PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage => {
+            PrefetchResidencyAdmissionLane::RemoteRestoreStaging
+        }
+        PrefetchResidencyCandidateClass::CacheOnlyTrial
+        | PrefetchResidencyCandidateClass::VolatileRamTrial
+        | PrefetchResidencyCandidateClass::FlashHotServing
+        | PrefetchResidencyCandidateClass::HddLocalityOptimized => {
+            PrefetchResidencyAdmissionLane::CacheServingTrial
+        }
+        PrefetchResidencyCandidateClass::IntentBackedRam
+        | PrefetchResidencyCandidateClass::PmemDurable
+        | PrefetchResidencyCandidateClass::AuthorityPromotionCandidate
+        | PrefetchResidencyCandidateClass::DemotionCandidate => {
+            PrefetchResidencyAdmissionLane::AuthorityMovementCandidate
+        }
+        PrefetchResidencyCandidateClass::Cooldown
+        | PrefetchResidencyCandidateClass::NeedMoreEvidence => {
+            PrefetchResidencyAdmissionLane::EvidenceHold
+        }
+        PrefetchResidencyCandidateClass::Refused => PrefetchResidencyAdmissionLane::Refused,
+    }
+}
+
 const fn prefetch_residency_record(
     context: PrefetchResidencyDecisionContext,
     selected_candidate: PrefetchResidencyCandidateClass,
@@ -6876,6 +6942,7 @@ const fn prefetch_residency_record(
             selected_candidate,
             context.signal.target_media,
         ),
+        admission_lane: prefetch_residency_candidate_admission_lane(selected_candidate),
         outcome,
         refusal,
         source_media: context.signal.source_media,
@@ -10125,6 +10192,17 @@ impl_u8_canonical!(PrefetchResidencyDecisionOutcome, {
     Cooldown = 7 => "cooldown",
     NeedMoreEvidence = 8 => "need-more-evidence",
     Refused = 9 => "refused",
+});
+
+impl_u8_canonical!(PrefetchResidencyAdmissionLane, {
+    Unknown = 0 => "unknown",
+    NoWork = 1 => "no-work",
+    SpeculativePrefetch = 2 => "speculative-prefetch",
+    CacheServingTrial = 3 => "cache-serving-trial",
+    RemoteRestoreStaging = 4 => "remote-restore-staging",
+    AuthorityMovementCandidate = 5 => "authority-movement-candidate",
+    EvidenceHold = 6 => "evidence-hold",
+    Refused = 7 => "refused",
 });
 
 impl_u8_canonical!(StorageIntentActionClass, {
@@ -23951,6 +24029,14 @@ mod tests {
             "need-more-evidence"
         );
         assert_eq!(
+            PrefetchResidencyAdmissionLane::from_discriminant(5),
+            Some(PrefetchResidencyAdmissionLane::AuthorityMovementCandidate)
+        );
+        assert_eq!(
+            PrefetchResidencyAdmissionLane::RemoteRestoreStaging.as_str(),
+            "remote-restore-staging"
+        );
+        assert_eq!(
             SignalMaterializationMode::from_discriminant(5),
             Some(SignalMaterializationMode::DurableSummary)
         );
@@ -24300,6 +24386,111 @@ mod tests {
         assert_eq!(
             operator_ref_decision.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn prefetch_residency_decision_records_admission_lanes() {
+        let no_work = prefetch_residency_decide(decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::NoPrefetch,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        ));
+        assert_eq!(no_work.outcome, PrefetchResidencyDecisionOutcome::NoAction);
+        assert_eq!(
+            no_work.admission_lane,
+            PrefetchResidencyAdmissionLane::NoWork
+        );
+
+        let prefetch = prefetch_residency_decide(decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        ));
+        assert_eq!(
+            prefetch.admission_lane,
+            PrefetchResidencyAdmissionLane::SpeculativePrefetch
+        );
+        assert!(prefetch_residency_decision_is_cache_only(prefetch));
+
+        let serving_trial = prefetch_residency_decide(decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::FlashHotServing,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        ));
+        assert_eq!(
+            serving_trial.outcome,
+            PrefetchResidencyDecisionOutcome::ServingTrial
+        );
+        assert_eq!(
+            serving_trial.admission_lane,
+            PrefetchResidencyAdmissionLane::CacheServingTrial
+        );
+
+        let remote_stage = prefetch_residency_decide(decision_context_with_media(
+            DOMAIN_A,
+            AccessPatternClass::ObjectArchiveRestore,
+            PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+            proven_hdd_capability(79),
+            proven_archive_capability(80),
+        ));
+        assert_eq!(
+            remote_stage.admission_lane,
+            PrefetchResidencyAdmissionLane::RemoteRestoreStaging
+        );
+
+        let authority_candidate = prefetch_residency_decide(decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SmallRandomHotset,
+            PrefetchResidencyCandidateClass::AuthorityPromotionCandidate,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::ALL_DEFINED,
+        ));
+        assert_eq!(
+            authority_candidate.admission_lane,
+            PrefetchResidencyAdmissionLane::AuthorityMovementCandidate
+        );
+        assert!(prefetch_residency_decision_may_request_authority_change(
+            authority_candidate
+        ));
+
+        let mut missing_policy_ref = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        );
+        missing_policy_ref
+            .policy
+            .evidence_refs
+            .compiled_policy_ref = StorageIntentEvidenceRef::default();
+        let held = prefetch_residency_decide(missing_policy_ref);
+        assert_eq!(
+            held.admission_lane,
+            PrefetchResidencyAdmissionLane::EvidenceHold
+        );
+
+        let mut refused_policy = decision_context(
+            DOMAIN_A,
+            AccessPatternClass::SequentialRead,
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            WorkloadSignalFlags::EMPTY,
+            PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
+        );
+        refused_policy.policy.policy_scope = PrefetchResidencyPolicyScope::PoolDefault;
+        let refused = prefetch_residency_decide(refused_policy);
+        assert_eq!(
+            refused.admission_lane,
+            PrefetchResidencyAdmissionLane::Refused
         );
     }
 
