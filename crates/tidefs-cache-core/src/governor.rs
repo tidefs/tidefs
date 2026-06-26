@@ -10,6 +10,7 @@
 //! Full 6-level migration and cluster backpressure are deferred to follow-up
 //! slices (see `docs/UNIFIED_RESOURCE_GOVERNOR_DESIGN.md`).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use tidefs_background_scheduler::{
@@ -160,6 +161,117 @@ impl fmt::Display for BackpressureSignal {
             Self::HardPressure => write!(f, "hard"),
         }
     }
+}
+
+// ── Budget partitions ────────────────────────────────────────────────────
+
+/// Stable governor budget partition key.
+///
+/// This is intentionally a small opaque key instead of a direct dependency on a
+/// dataset crate: mounted filesystems, prefetch, and future budget-owner
+/// evidence can all project their owner identity into this governor key without
+/// making the governor redefine those authorities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BudgetPartitionKey([u8; 16]);
+
+impl BudgetPartitionKey {
+    /// Create a partition key from a stable 128-bit owner/dataset identifier.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Return the raw stable key bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl From<[u8; 16]> for BudgetPartitionKey {
+    fn from(value: [u8; 16]) -> Self {
+        Self::from_bytes(value)
+    }
+}
+
+impl fmt::Display for BudgetPartitionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Policy for budget left unused by other partitions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BudgetPartitionPolicy {
+    /// A partition cannot exceed its protected per-category cap.
+    #[default]
+    Strict,
+    /// A partition may borrow currently unused category capacity.
+    ShareUnused,
+}
+
+/// Per-partition budget policy layered below category and global hard limits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GovernorPartitionConfig {
+    /// Whether unused category budget can be borrowed by another partition.
+    pub policy: BudgetPartitionPolicy,
+    /// Protected fraction of each category cap available to one partition.
+    pub category_fraction: f64,
+    /// Soft-pressure fraction of the current partition limit.
+    pub soft_fraction: f64,
+}
+
+impl Default for GovernorPartitionConfig {
+    fn default() -> Self {
+        Self {
+            policy: BudgetPartitionPolicy::Strict,
+            category_fraction: 0.50,
+            soft_fraction: 0.70,
+        }
+    }
+}
+
+impl GovernorPartitionConfig {
+    /// Validate partition policy fractions.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(0.0..=1.0).contains(&self.category_fraction) {
+            let category_fraction = self.category_fraction;
+            return Err(format!(
+                "partition category fraction {category_fraction} out of range [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.soft_fraction) {
+            let soft_fraction = self.soft_fraction;
+            return Err(format!(
+                "partition soft fraction {soft_fraction} out of range [0, 1]"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read-only pressure state for one budget partition within one category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GovernorPartitionPressureState {
+    /// Partition whose pressure was sampled.
+    pub partition: BudgetPartitionKey,
+    /// Budget category whose partition usage was sampled.
+    pub category: BudgetCategory,
+    /// Current per-partition pressure signal.
+    pub signal: BackpressureSignal,
+    /// Current partition usage in bytes for this category.
+    pub used: u64,
+    /// Effective current partition limit.
+    pub limit: u64,
+    /// Protected cap before optional unused-budget sharing.
+    pub protected_limit: u64,
+    /// Soft watermark derived from the effective partition limit.
+    pub soft_watermark: u64,
+    /// Extra limit currently available from unused category budget sharing.
+    pub shared_unused_bytes: u64,
 }
 
 // ── Reclaim ladder state ─────────────────────────────────────────────────
@@ -317,10 +429,7 @@ pub enum BudgetError {
         available: u64,
     },
     /// Requested allocation exceeds the global hard limit.
-    GlobalOverBudget {
-        requested: u64,
-        available: u64,
-    },
+    GlobalOverBudget { requested: u64, available: u64 },
     /// Category is not recognised (defensive).
     UnknownCategory,
 }
@@ -359,6 +468,7 @@ impl fmt::Display for BudgetError {
 pub struct AdmissionTicket {
     pub category: BudgetCategory,
     pub size: u64,
+    pub partition: Option<BudgetPartitionKey>,
 }
 
 // ── Auto-tune evidence ─────────────────────────────────────────────────────
@@ -591,6 +701,29 @@ impl CategoryState {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct PartitionState {
+    categories: [PartitionCategoryState; 6],
+}
+
+impl PartitionState {
+    fn is_empty(&self) -> bool {
+        self.categories.iter().all(|category| category.used == 0)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PartitionCategoryState {
+    used: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PartitionLimit {
+    limit: u64,
+    protected_limit: u64,
+    shared_unused_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InflightReclaim {
     stage: ReclaimStage,
@@ -607,15 +740,15 @@ pub struct GovernorConfig {
     pub total_budget_bytes: u64,
 
     /// Per-category fractions (must sum to 1.0).
-    pub data_cache_fraction: f64,       // default 0.40
-    pub meta_cache_fraction: f64,       // default 0.20
-    pub dirty_bytes_fraction: f64,      // default 0.25
-    pub inode_state_fraction: f64,      // default 0.08
-    pub cluster_queues_fraction: f64,   // default 0.05
-    pub misc_fraction: f64,             // default 0.02
+    pub data_cache_fraction: f64, // default 0.40
+    pub meta_cache_fraction: f64,     // default 0.20
+    pub dirty_bytes_fraction: f64,    // default 0.25
+    pub inode_state_fraction: f64,    // default 0.08
+    pub cluster_queues_fraction: f64, // default 0.05
+    pub misc_fraction: f64,           // default 0.02
 
     /// Whether to auto-tune soft watermarks from explicit bounded evidence.
-    pub auto_tune: bool,                // default false
+    pub auto_tune: bool, // default false
 }
 
 impl Default for GovernorConfig {
@@ -636,7 +769,6 @@ impl Default for GovernorConfig {
 impl GovernorConfig {
     /// Validate that fractions sum to 1.0 within a small epsilon and each
     /// fraction is non-negative.
-    #[must_use]
     pub fn validate(&self) -> Result<(), String> {
         let sum = self.data_cache_fraction
             + self.meta_cache_fraction
@@ -655,7 +787,7 @@ impl GovernorConfig {
             ("cluster_queues", self.cluster_queues_fraction),
             ("misc", self.misc_fraction),
         ] {
-            if f < 0.0 || f > 1.0 {
+            if !(0.0..=1.0).contains(&f) {
                 return Err(format!("{name} fraction {f} out of range [0, 1]"));
             }
         }
@@ -691,8 +823,10 @@ pub struct Governor {
 
 struct GovernorInner {
     config: GovernorConfig,
+    partition_config: GovernorPartitionConfig,
     categories: [CategoryState; 6],
     category_configs: [CategoryConfig; 6],
+    partitions: HashMap<BudgetPartitionKey, PartitionState>,
     /// Total bytes currently allocated across all categories.
     total_used: u64,
 }
@@ -715,7 +849,19 @@ impl Governor {
     ///
     /// Returns an error if the configuration fails validation.
     pub fn new(config: GovernorConfig) -> Result<Self, String> {
+        Self::new_with_partition_config(config, GovernorPartitionConfig::default())
+    }
+
+    /// Create a new governor with an explicit partition policy.
+    ///
+    /// Category/global caps remain the hard outer boundary. Partitioned
+    /// admission must also pass the configured per-partition limit.
+    pub fn new_with_partition_config(
+        config: GovernorConfig,
+        partition_config: GovernorPartitionConfig,
+    ) -> Result<Self, String> {
         config.validate()?;
+        partition_config.validate()?;
         let total = config.total_budget_bytes;
         let caps = Self::caps_from_fractions(total, config.category_fractions());
         // Soft watermarks per the design spec.
@@ -727,8 +873,10 @@ impl Governor {
         Ok(Self {
             inner: Arc::new(Mutex::new(GovernorInner {
                 config,
+                partition_config,
                 categories: std::array::from_fn(|_| CategoryState::new()),
                 category_configs,
+                partitions: HashMap::new(),
                 total_used: 0,
             })),
         })
@@ -743,6 +891,28 @@ impl Governor {
         &self,
         category: BudgetCategory,
         size: u64,
+    ) -> Result<AdmissionTicket, BudgetError> {
+        self.admit_partitioned(category, size, None)
+    }
+
+    /// Request admission of `size` bytes into `category` for one partition.
+    ///
+    /// The request must pass the global hard limit, the category hard limit,
+    /// and the configured partition limit before any usage is charged.
+    pub fn admit_for_partition(
+        &self,
+        partition: BudgetPartitionKey,
+        category: BudgetCategory,
+        size: u64,
+    ) -> Result<AdmissionTicket, BudgetError> {
+        self.admit_partitioned(category, size, Some(partition))
+    }
+
+    fn admit_partitioned(
+        &self,
+        category: BudgetCategory,
+        size: u64,
+        partition: Option<BudgetPartitionKey>,
     ) -> Result<AdmissionTicket, BudgetError> {
         let mut inner = self.inner.lock().unwrap();
 
@@ -770,13 +940,34 @@ impl Governor {
             });
         }
 
+        if let Some(partition) = partition {
+            let partition_used = Self::partition_used_locked(&inner, partition, idx);
+            let partition_limit = Self::partition_limit_locked(&inner, partition, idx).limit;
+            let new_partition_used = partition_used.saturating_add(size);
+            if new_partition_used > partition_limit {
+                return Err(BudgetError::OverBudget {
+                    category,
+                    requested: size,
+                    available: partition_limit.saturating_sub(partition_used),
+                });
+            }
+        }
+
         // Update state.
         inner.total_used = new_total;
         inner.categories[idx].used = new_used;
+        if let Some(partition) = partition.filter(|_| size > 0) {
+            let state = inner.partitions.entry(partition).or_default();
+            state.categories[idx].used = state.categories[idx].used.saturating_add(size);
+        }
 
         Self::refresh_pressure_locked(&mut inner, idx);
 
-        Ok(AdmissionTicket { category, size })
+        Ok(AdmissionTicket {
+            category,
+            size,
+            partition,
+        })
     }
 
     /// Release `size` bytes back to `category` and the global budget.
@@ -784,11 +975,50 @@ impl Governor {
     /// If the category was previously over its soft watermark and the
     /// release brings it back under, the soft-pressure signal is cleared.
     pub fn release(&self, category: BudgetCategory, size: u64) {
+        self.release_partitioned(category, size, None);
+    }
+
+    /// Release `size` bytes from a partition and the enclosing category/global
+    /// budget.
+    ///
+    /// Over-release is scoped to the named partition, so it cannot reclaim
+    /// bytes charged to another partition or to unpartitioned category usage.
+    pub fn release_for_partition(
+        &self,
+        partition: BudgetPartitionKey,
+        category: BudgetCategory,
+        size: u64,
+    ) {
+        self.release_partitioned(category, size, Some(partition));
+    }
+
+    fn release_partitioned(
+        &self,
+        category: BudgetCategory,
+        size: u64,
+        partition: Option<BudgetPartitionKey>,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         let idx = Self::category_index(category);
 
-        let released = inner.categories[idx].used.min(size);
-        inner.categories[idx].used -= released;
+        let released = if let Some(partition) = partition {
+            let (released, remove_partition) =
+                if let Some(state) = inner.partitions.get_mut(&partition) {
+                    let released = state.categories[idx].used.min(size);
+                    state.categories[idx].used -= released;
+                    (released, state.is_empty())
+                } else {
+                    (0, false)
+                };
+            if remove_partition {
+                inner.partitions.remove(&partition);
+            }
+            released
+        } else {
+            inner.categories[idx].used.min(size)
+        };
+
+        inner.categories[idx].used = inner.categories[idx].used.saturating_sub(released);
         inner.total_used = inner.total_used.saturating_sub(released);
 
         Self::refresh_pressure_locked(&mut inner, idx);
@@ -847,6 +1077,80 @@ impl Governor {
         inner.categories[from_idx].used = used_from - size;
         inner.categories[to_idx].used = new_used_to;
         inner.total_used = total_after_transfer;
+        Self::refresh_pressure_locked(&mut inner, from_idx);
+        Self::refresh_pressure_locked(&mut inner, to_idx);
+        Ok(())
+    }
+
+    /// Move an already-admitted allocation between categories while preserving
+    /// the partition identity attached to the allocation.
+    pub fn transfer_for_partition(
+        &self,
+        partition: BudgetPartitionKey,
+        from: BudgetCategory,
+        to: BudgetCategory,
+        size: u64,
+    ) -> Result<(), BudgetError> {
+        if from == to || size == 0 {
+            return Ok(());
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+        let from_idx = Self::category_index(from);
+        let to_idx = Self::category_index(to);
+        let partition_from_used = Self::partition_used_locked(&inner, partition, from_idx);
+        if partition_from_used < size {
+            return Err(BudgetError::OverBudget {
+                category: from,
+                requested: size,
+                available: partition_from_used,
+            });
+        }
+
+        let used_from = inner.categories[from_idx].used;
+        if used_from < size {
+            return Err(BudgetError::OverBudget {
+                category: from,
+                requested: size,
+                available: used_from,
+            });
+        }
+
+        let hard_limit = inner.category_configs[to_idx].hard_limit;
+        let used_to = inner.categories[to_idx].used;
+        let new_used_to = used_to.saturating_add(size);
+        if new_used_to > hard_limit {
+            return Err(BudgetError::OverBudget {
+                category: to,
+                requested: size,
+                available: hard_limit.saturating_sub(used_to),
+            });
+        }
+
+        let partition_to_used = Self::partition_used_locked(&inner, partition, to_idx);
+        let partition_limit = Self::partition_limit_locked(&inner, partition, to_idx).limit;
+        let new_partition_to_used = partition_to_used.saturating_add(size);
+        if new_partition_to_used > partition_limit {
+            return Err(BudgetError::OverBudget {
+                category: to,
+                requested: size,
+                available: partition_limit.saturating_sub(partition_to_used),
+            });
+        }
+
+        inner.categories[from_idx].used = used_from - size;
+        inner.categories[to_idx].used = new_used_to;
+
+        let remove_partition = {
+            let state = inner.partitions.entry(partition).or_default();
+            state.categories[from_idx].used -= size;
+            state.categories[to_idx].used = state.categories[to_idx].used.saturating_add(size);
+            state.is_empty()
+        };
+        if remove_partition {
+            inner.partitions.remove(&partition);
+        }
+
         Self::refresh_pressure_locked(&mut inner, from_idx);
         Self::refresh_pressure_locked(&mut inner, to_idx);
         Ok(())
@@ -942,6 +1246,64 @@ impl Governor {
         let inner = self.inner.lock().unwrap();
         let idx = Self::category_index(category);
         inner.category_configs[idx].soft_watermark
+    }
+
+    /// Return the active partition accounting policy.
+    #[must_use]
+    pub fn partition_config(&self) -> GovernorPartitionConfig {
+        self.inner.lock().unwrap().partition_config
+    }
+
+    /// Return the active unused-budget sharing policy.
+    #[must_use]
+    pub fn partition_policy(&self) -> BudgetPartitionPolicy {
+        self.inner.lock().unwrap().partition_config.policy
+    }
+
+    /// Return bytes currently charged to a partition in one category.
+    #[must_use]
+    pub fn partition_used(&self, partition: BudgetPartitionKey, category: BudgetCategory) -> u64 {
+        let inner = self.inner.lock().unwrap();
+        let idx = Self::category_index(category);
+        Self::partition_used_locked(&inner, partition, idx)
+    }
+
+    /// Return the protected per-partition cap before unused-budget sharing.
+    #[must_use]
+    pub fn partition_protected_limit(&self, category: BudgetCategory) -> u64 {
+        let inner = self.inner.lock().unwrap();
+        let idx = Self::category_index(category);
+        Self::partition_protected_limit_locked(&inner, idx)
+    }
+
+    /// Return the effective current limit for a partition in one category.
+    #[must_use]
+    pub fn partition_limit(&self, partition: BudgetPartitionKey, category: BudgetCategory) -> u64 {
+        let inner = self.inner.lock().unwrap();
+        let idx = Self::category_index(category);
+        Self::partition_limit_locked(&inner, partition, idx).limit
+    }
+
+    /// Return the backpressure signal for a partition in one category.
+    #[must_use]
+    pub fn partition_backpressure(
+        &self,
+        partition: BudgetPartitionKey,
+        category: BudgetCategory,
+    ) -> BackpressureSignal {
+        self.partition_pressure_state(partition, category).signal
+    }
+
+    /// Return a read-only pressure snapshot for a partition in one category.
+    #[must_use]
+    pub fn partition_pressure_state(
+        &self,
+        partition: BudgetPartitionKey,
+        category: BudgetCategory,
+    ) -> GovernorPartitionPressureState {
+        let inner = self.inner.lock().unwrap();
+        let idx = Self::category_index(category);
+        Self::partition_pressure_state_for_locked(&inner, partition, idx, category)
     }
 
     /// Return whether auto-tune is enabled.
@@ -1086,6 +1448,87 @@ impl Governor {
         }
     }
 
+    fn partition_used_locked(
+        inner: &GovernorInner,
+        partition: BudgetPartitionKey,
+        idx: usize,
+    ) -> u64 {
+        inner
+            .partitions
+            .get(&partition)
+            .map_or(0, |state| state.categories[idx].used)
+    }
+
+    fn partition_protected_limit_locked(inner: &GovernorInner, idx: usize) -> u64 {
+        let hard_limit = inner.category_configs[idx].hard_limit;
+        (hard_limit as f64 * inner.partition_config.category_fraction)
+            .round()
+            .min(hard_limit as f64) as u64
+    }
+
+    fn partition_limit_locked(
+        inner: &GovernorInner,
+        partition: BudgetPartitionKey,
+        idx: usize,
+    ) -> PartitionLimit {
+        let protected_limit = Self::partition_protected_limit_locked(inner, idx);
+        match inner.partition_config.policy {
+            BudgetPartitionPolicy::Strict => PartitionLimit {
+                limit: protected_limit,
+                protected_limit,
+                shared_unused_bytes: 0,
+            },
+            BudgetPartitionPolicy::ShareUnused => {
+                let used_by_partition = Self::partition_used_locked(inner, partition, idx);
+                let used_by_others = inner.categories[idx].used.saturating_sub(used_by_partition);
+                let limit = inner.category_configs[idx]
+                    .hard_limit
+                    .saturating_sub(used_by_others);
+                PartitionLimit {
+                    limit,
+                    protected_limit,
+                    shared_unused_bytes: limit.saturating_sub(protected_limit),
+                }
+            }
+        }
+    }
+
+    fn partition_soft_watermark_locked(inner: &GovernorInner, limit: u64) -> u64 {
+        (limit as f64 * inner.partition_config.soft_fraction)
+            .round()
+            .min(limit as f64) as u64
+    }
+
+    fn partition_pressure_state_for_locked(
+        inner: &GovernorInner,
+        partition: BudgetPartitionKey,
+        idx: usize,
+        category: BudgetCategory,
+    ) -> GovernorPartitionPressureState {
+        let used = Self::partition_used_locked(inner, partition, idx);
+        let limit = Self::partition_limit_locked(inner, partition, idx);
+        let soft_watermark = Self::partition_soft_watermark_locked(inner, limit.limit);
+        let (soft_pressure, hard_pressure) =
+            Self::pressure_flags(used, limit.limit, soft_watermark);
+        let signal = if hard_pressure {
+            BackpressureSignal::HardPressure
+        } else if soft_pressure {
+            BackpressureSignal::SoftPressure
+        } else {
+            BackpressureSignal::None
+        };
+        GovernorPartitionPressureState {
+            partition,
+            category,
+            signal,
+            used,
+            limit: limit.limit,
+            protected_limit: limit.protected_limit,
+            soft_watermark,
+            shared_unused_bytes: limit.shared_unused_bytes,
+        }
+    }
+
     fn caps_from_fractions(total: u64, fractions: [f64; 6]) -> [u64; 6] {
         std::array::from_fn(|idx| (total as f64 * fractions[idx]) as u64)
     }
@@ -1116,11 +1559,9 @@ impl Governor {
                 pressure_score: record.pressure_score,
             });
         }
-        let safety = record
-            .safety
-            .ok_or(GovernorAutoTuneError::AmbiguousInput(
-                "missing safety effect",
-            ))?;
+        let safety = record.safety.ok_or(GovernorAutoTuneError::AmbiguousInput(
+            "missing safety effect",
+        ))?;
         if !safety.preserves_all_limits() {
             return Err(GovernorAutoTuneError::UnsafeInput {
                 category,
@@ -1261,12 +1702,7 @@ impl Governor {
         inner.categories[idx].hard_pressure = hard_pressure;
         inner.categories[idx].soft_pressure = soft_pressure;
         let is_under_pressure = soft_pressure || hard_pressure;
-        if !is_under_pressure {
-            inner.categories[idx].pressure_ticks = 0;
-            inner.categories[idx].reclaim_inflight = None;
-            inner.categories[idx].reclaim_generation =
-                inner.categories[idx].reclaim_generation.saturating_add(1);
-        } else if !was_under_pressure {
+        if !is_under_pressure || !was_under_pressure {
             inner.categories[idx].pressure_ticks = 0;
             inner.categories[idx].reclaim_inflight = None;
             inner.categories[idx].reclaim_generation =
@@ -1746,6 +2182,10 @@ mod tests {
             .unwrap()
     }
 
+    fn partition_key(byte: u8) -> BudgetPartitionKey {
+        BudgetPartitionKey::from_bytes([byte; 16])
+    }
+
     #[derive(Clone, Default)]
     struct ReclaimCallLog {
         calls: Arc<Mutex<Vec<(ReclaimRequest, ServiceBudget)>>>,
@@ -1954,8 +2394,8 @@ mod tests {
         // when global total is exhausted.
         let config = GovernorConfig {
             total_budget_bytes: 1000,
-            data_cache_fraction: 0.5,   // cap 500
-            meta_cache_fraction: 0.5,   // cap 500
+            data_cache_fraction: 0.5, // cap 500
+            meta_cache_fraction: 0.5, // cap 500
             dirty_bytes_fraction: 0.0,
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 0.0,
@@ -2078,8 +2518,8 @@ mod tests {
     fn global_backpressure_reports_worst_category() {
         let config = GovernorConfig {
             total_budget_bytes: 2000,
-            data_cache_fraction: 0.5,  // 1000
-            meta_cache_fraction: 0.5,  // 1000
+            data_cache_fraction: 0.5, // 1000
+            meta_cache_fraction: 0.5, // 1000
             dirty_bytes_fraction: 0.0,
             inode_state_fraction: 0.0,
             cluster_queues_fraction: 0.0,
@@ -2168,8 +2608,10 @@ mod tests {
 
     #[test]
     fn config_validation_rejects_bad_fractions() {
-        let mut cfg = GovernorConfig::default();
-        cfg.data_cache_fraction = 1.0;
+        let cfg = GovernorConfig {
+            data_cache_fraction: 1.0,
+            ..GovernorConfig::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
@@ -2368,8 +2810,11 @@ mod tests {
 
     #[test]
     fn pressure_state_records_stage_without_claiming_work() {
-        let g =
-            Governor::new(single_category_budget_config(BudgetCategory::DataCache, 1000)).unwrap();
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DataCache,
+            1000,
+        ))
+        .unwrap();
         g.admit(BudgetCategory::DataCache, 701).unwrap();
 
         let state = pressure_state_for(&g, BudgetCategory::DataCache);
@@ -2382,8 +2827,11 @@ mod tests {
 
     #[test]
     fn metadata_pressure_escalates_to_stage_two_after_one_claimed_tick() {
-        let g =
-            Governor::new(single_category_budget_config(BudgetCategory::MetaCache, 1000)).unwrap();
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::MetaCache,
+            1000,
+        ))
+        .unwrap();
         g.admit(BudgetCategory::MetaCache, 701).unwrap();
 
         let first = g
@@ -2405,8 +2853,11 @@ mod tests {
 
     #[test]
     fn stale_reclaim_request_is_invalidated_when_pressure_clears() {
-        let g =
-            Governor::new(single_category_budget_config(BudgetCategory::DataCache, 1000)).unwrap();
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DataCache,
+            1000,
+        ))
+        .unwrap();
         g.admit(BudgetCategory::DataCache, 800).unwrap();
         let request = g
             .claim_reclaim_work(ReclaimWorkKind::CacheMaintenance)
@@ -2428,8 +2879,11 @@ mod tests {
 
     #[test]
     fn stage_five_is_admission_signal_not_background_work() {
-        let g =
-            Governor::new(single_category_budget_config(BudgetCategory::DataCache, 1000)).unwrap();
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DataCache,
+            1000,
+        ))
+        .unwrap();
         g.admit(BudgetCategory::DataCache, 950).unwrap();
 
         let state = pressure_state_for(&g, BudgetCategory::DataCache);
@@ -2441,8 +2895,11 @@ mod tests {
 
     #[test]
     fn cache_reclaim_service_runs_bounded_latency_sensitive_tick() {
-        let g =
-            Governor::new(single_category_budget_config(BudgetCategory::DataCache, 1000)).unwrap();
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DataCache,
+            1000,
+        ))
+        .unwrap();
         g.admit(BudgetCategory::DataCache, 800).unwrap();
         let log = ReclaimCallLog::default();
         let worker = ReleasingCacheWorker {
@@ -2488,8 +2945,11 @@ mod tests {
 
     #[test]
     fn failed_reclaim_tick_clears_inflight_request_for_retry() {
-        let g =
-            Governor::new(single_category_budget_config(BudgetCategory::DataCache, 1000)).unwrap();
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DataCache,
+            1000,
+        ))
+        .unwrap();
         g.admit(BudgetCategory::DataCache, 800).unwrap();
         let mut service = GovernorCacheReclaimService::new(g.clone(), FailingCacheWorker);
 
@@ -2504,8 +2964,11 @@ mod tests {
 
     #[test]
     fn dirty_flush_service_runs_bounded_throughput_tick() {
-        let g =
-            Governor::new(single_category_budget_config(BudgetCategory::DirtyBytes, 1000)).unwrap();
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DirtyBytes,
+            1000,
+        ))
+        .unwrap();
         g.admit(BudgetCategory::DirtyBytes, 600).unwrap();
         let log = ReclaimCallLog::default();
         let worker = ReleasingDirtyWorker {
@@ -2544,8 +3007,11 @@ mod tests {
 
     #[test]
     fn dirty_flush_service_drives_existing_incremental_job_surface() {
-        let g =
-            Governor::new(single_category_budget_config(BudgetCategory::DirtyBytes, 1000)).unwrap();
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DirtyBytes,
+            1000,
+        ))
+        .unwrap();
         g.admit(BudgetCategory::DirtyBytes, 600).unwrap();
         let (job, calls) = FakeIncrementalDirtyJob::new(vec![(2, 150, false)]);
         let worker = GovernorIncrementalReclaimWorker::new(job);
@@ -2573,8 +3039,11 @@ mod tests {
 
     #[test]
     fn hard_dirty_pressure_records_commit_boundary_without_new_authority() {
-        let g =
-            Governor::new(single_category_budget_config(BudgetCategory::DirtyBytes, 1000)).unwrap();
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DirtyBytes,
+            1000,
+        ))
+        .unwrap();
         g.admit(BudgetCategory::DirtyBytes, 950).unwrap();
         let log = ReclaimCallLog::default();
         let worker = RecordingCommitWorker { log: log.clone() };
@@ -2648,13 +3117,22 @@ mod tests {
             RebuildCostClass::Cheap,
             1,
         );
-        assert_eq!(budget_category_for_entry(&header), BudgetCategory::MetaCache);
+        assert_eq!(
+            budget_category_for_entry(&header),
+            BudgetCategory::MetaCache
+        );
 
         header.cache_class = CacheClass::PosixPageWriteback;
-        assert_eq!(budget_category_for_entry(&header), BudgetCategory::DataCache);
+        assert_eq!(
+            budget_category_for_entry(&header),
+            BudgetCategory::DataCache
+        );
 
         header.dirty_state = DirtyStateClass::PosixWriteback(PosixWritebackState::DirtyOpen);
-        assert_eq!(budget_category_for_entry(&header), BudgetCategory::DirtyBytes);
+        assert_eq!(
+            budget_category_for_entry(&header),
+            BudgetCategory::DirtyBytes
+        );
     }
 
     #[test]
@@ -2709,5 +3187,219 @@ mod tests {
         assert_eq!(g.category_used(BudgetCategory::DataCache), 128);
         assert_eq!(g.category_used(BudgetCategory::DirtyBytes), 0);
         assert_eq!(g.total_used(), 128);
+    }
+
+    #[test]
+    fn partitioned_admit_tracks_partition_and_category_usage() {
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DataCache,
+            1000,
+        ))
+        .unwrap();
+        let dataset = partition_key(0x11);
+
+        let ticket = g
+            .admit_for_partition(dataset, BudgetCategory::DataCache, 400)
+            .unwrap();
+
+        assert_eq!(ticket.category, BudgetCategory::DataCache);
+        assert_eq!(ticket.size, 400);
+        assert_eq!(ticket.partition, Some(dataset));
+        assert_eq!(g.category_used(BudgetCategory::DataCache), 400);
+        assert_eq!(g.total_used(), 400);
+        assert_eq!(g.partition_used(dataset, BudgetCategory::DataCache), 400);
+        assert_eq!(g.partition_protected_limit(BudgetCategory::DataCache), 500);
+        assert_eq!(g.partition_limit(dataset, BudgetCategory::DataCache), 500);
+    }
+
+    #[test]
+    fn partitioned_admit_rejects_over_partition_without_changing_usage() {
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DataCache,
+            1000,
+        ))
+        .unwrap();
+        let dataset = partition_key(0x22);
+
+        g.admit_for_partition(dataset, BudgetCategory::DataCache, 500)
+            .unwrap();
+        let err = g
+            .admit_for_partition(dataset, BudgetCategory::DataCache, 1)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            BudgetError::OverBudget {
+                category: BudgetCategory::DataCache,
+                requested: 1,
+                available: 0,
+            }
+        );
+        assert_eq!(g.category_used(BudgetCategory::DataCache), 500);
+        assert_eq!(g.partition_used(dataset, BudgetCategory::DataCache), 500);
+    }
+
+    #[test]
+    fn partitioned_admit_still_rejects_global_over_budget_across_datasets() {
+        let g = Governor::new_with_partition_config(
+            single_category_budget_config(BudgetCategory::DataCache, 1000),
+            GovernorPartitionConfig {
+                policy: BudgetPartitionPolicy::Strict,
+                category_fraction: 1.0,
+                soft_fraction: 0.70,
+            },
+        )
+        .unwrap();
+        let first = partition_key(0x31);
+        let second = partition_key(0x32);
+
+        g.admit_for_partition(first, BudgetCategory::DataCache, 600)
+            .unwrap();
+        g.admit_for_partition(second, BudgetCategory::DataCache, 400)
+            .unwrap();
+        let err = g
+            .admit_for_partition(second, BudgetCategory::DataCache, 1)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            BudgetError::GlobalOverBudget {
+                requested: 1,
+                available: 0,
+            }
+        );
+        assert_eq!(g.total_used(), 1000);
+        assert_eq!(g.partition_used(first, BudgetCategory::DataCache), 600);
+        assert_eq!(g.partition_used(second, BudgetCategory::DataCache), 400);
+    }
+
+    #[test]
+    fn partition_release_allows_retry_without_reclaiming_other_partition_usage() {
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DataCache,
+            1000,
+        ))
+        .unwrap();
+        let first = partition_key(0x41);
+        let second = partition_key(0x42);
+
+        g.admit_for_partition(first, BudgetCategory::DataCache, 500)
+            .unwrap();
+        g.admit_for_partition(second, BudgetCategory::DataCache, 250)
+            .unwrap();
+        assert!(matches!(
+            g.admit_for_partition(first, BudgetCategory::DataCache, 1),
+            Err(BudgetError::OverBudget { .. })
+        ));
+
+        g.release_for_partition(first, BudgetCategory::DataCache, 200);
+        g.admit_for_partition(first, BudgetCategory::DataCache, 200)
+            .unwrap();
+
+        assert_eq!(g.partition_used(first, BudgetCategory::DataCache), 500);
+        assert_eq!(g.partition_used(second, BudgetCategory::DataCache), 250);
+        assert_eq!(g.category_used(BudgetCategory::DataCache), 750);
+        assert_eq!(g.total_used(), 750);
+    }
+
+    #[test]
+    fn partition_pressure_reports_dataset_local_signal() {
+        let g = Governor::new(single_category_budget_config(
+            BudgetCategory::DataCache,
+            1000,
+        ))
+        .unwrap();
+        let dataset = partition_key(0x55);
+
+        g.admit_for_partition(dataset, BudgetCategory::DataCache, 350)
+            .unwrap();
+        let soft = g.partition_pressure_state(dataset, BudgetCategory::DataCache);
+
+        assert_eq!(soft.partition, dataset);
+        assert_eq!(soft.category, BudgetCategory::DataCache);
+        assert_eq!(soft.used, 350);
+        assert_eq!(soft.limit, 500);
+        assert_eq!(soft.protected_limit, 500);
+        assert_eq!(soft.soft_watermark, 350);
+        assert_eq!(soft.signal, BackpressureSignal::SoftPressure);
+        assert_eq!(
+            g.backpressure(BudgetCategory::DataCache),
+            BackpressureSignal::None
+        );
+
+        g.admit_for_partition(dataset, BudgetCategory::DataCache, 125)
+            .unwrap();
+        assert_eq!(
+            g.partition_backpressure(dataset, BudgetCategory::DataCache),
+            BackpressureSignal::HardPressure
+        );
+    }
+
+    #[test]
+    fn share_unused_partition_policy_is_explicit_and_observable() {
+        let g = Governor::new_with_partition_config(
+            single_category_budget_config(BudgetCategory::DataCache, 1000),
+            GovernorPartitionConfig {
+                policy: BudgetPartitionPolicy::ShareUnused,
+                category_fraction: 0.25,
+                soft_fraction: 0.70,
+            },
+        )
+        .unwrap();
+        let dataset = partition_key(0x66);
+
+        assert_eq!(g.partition_policy(), BudgetPartitionPolicy::ShareUnused);
+        assert_eq!(
+            g.partition_config(),
+            GovernorPartitionConfig {
+                policy: BudgetPartitionPolicy::ShareUnused,
+                category_fraction: 0.25,
+                soft_fraction: 0.70,
+            }
+        );
+        assert_eq!(g.partition_protected_limit(BudgetCategory::DataCache), 250);
+        assert_eq!(g.partition_limit(dataset, BudgetCategory::DataCache), 1000);
+
+        g.admit_for_partition(dataset, BudgetCategory::DataCache, 600)
+            .unwrap();
+        let state = g.partition_pressure_state(dataset, BudgetCategory::DataCache);
+
+        assert_eq!(state.used, 600);
+        assert_eq!(state.limit, 1000);
+        assert_eq!(state.protected_limit, 250);
+        assert_eq!(state.shared_unused_bytes, 750);
+        assert_eq!(state.signal, BackpressureSignal::None);
+    }
+
+    #[test]
+    fn partitioned_transfer_preserves_partition_identity() {
+        let config = GovernorConfig {
+            total_budget_bytes: 1000,
+            data_cache_fraction: 0.5,
+            meta_cache_fraction: 0.0,
+            dirty_bytes_fraction: 0.5,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+            auto_tune: false,
+        };
+        let g = Governor::new(config).unwrap();
+        let dataset = partition_key(0x77);
+
+        g.admit_for_partition(dataset, BudgetCategory::DataCache, 200)
+            .unwrap();
+        g.transfer_for_partition(
+            dataset,
+            BudgetCategory::DataCache,
+            BudgetCategory::DirtyBytes,
+            200,
+        )
+        .unwrap();
+
+        assert_eq!(g.partition_used(dataset, BudgetCategory::DataCache), 0);
+        assert_eq!(g.partition_used(dataset, BudgetCategory::DirtyBytes), 200);
+        assert_eq!(g.category_used(BudgetCategory::DataCache), 0);
+        assert_eq!(g.category_used(BudgetCategory::DirtyBytes), 200);
+        assert_eq!(g.total_used(), 200);
     }
 }
