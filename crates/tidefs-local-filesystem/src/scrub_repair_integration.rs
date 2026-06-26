@@ -22,7 +22,7 @@ use tidefs_local_object_store::SuspectEntry;
 use tidefs_scrub::repair_scheduling::{
     RebakeSchedulingBridge, RepairAdmissionInput, RepairBlockKind, RepairCandidateIdentity,
     RepairMountedChecksumEvidence, RepairMountedReceiptEvidenceStatus, RepairMountedScrubEvidence,
-    ScrubToRepairBridge,
+    RepairReplacementReceiptEvidence, ScrubToRepairBridge,
 };
 use tidefs_scrub::ChecksumLayer;
 
@@ -421,7 +421,19 @@ pub fn dispatch_repair_from_bridge(
             continue;
         }
 
-        let outcome = crate::repair::apply_one_repair(&entry, state, store, content_layout_cache);
+        let replacement_receipt = match entry.strategy {
+            crate::scrub::RepairStrategy::Reconstruct => replacement_receipt_evidence_for_job(&job),
+            crate::scrub::RepairStrategy::Truncate | crate::scrub::RepairStrategy::MarkCorrupt => {
+                None
+            }
+        };
+        let outcome = crate::repair::apply_one_repair_with_replacement_evidence(
+            &entry,
+            state,
+            store,
+            content_layout_cache,
+            replacement_receipt,
+        );
 
         applied_log.record(crate::repair::RepairEntry {
             block_id: entry.block_id,
@@ -483,6 +495,64 @@ fn verify_mounted_scrub_dispatch_evidence(
     }
 
     Ok(())
+}
+
+fn replacement_receipt_evidence_for_job(
+    job: &tidefs_scrub::repair_scheduling::RepairJob,
+) -> Option<RepairReplacementReceiptEvidence> {
+    let source = job.evidence.placement_receipt_ref;
+    let replacement = tidefs_replication_model::PlacementReceiptRef::new(
+        source.object_id,
+        source.object_key,
+        source.receipt_epoch,
+        source.receipt_generation.saturating_add(1),
+        source.redundancy_policy,
+        source.payload_len,
+        source.payload_digest,
+        source.target_count,
+    );
+    let replacement_receipt_id =
+        replacement_receipt_id_for_job(job, replacement.receipt_generation);
+
+    RepairReplacementReceiptEvidence::new(
+        job.candidate_identity,
+        crate::ack_receipt::LOCAL_ACK_POLICY_REVISION.0,
+        source,
+        job.evidence.mounted_scrub_evidence,
+        replacement,
+        replacement_receipt_id,
+    )
+    .ok()
+}
+
+fn replacement_receipt_id_for_job(
+    job: &tidefs_scrub::repair_scheduling::RepairJob,
+    replacement_generation: u64,
+) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tidefs-local-repair-replacement-receipt-v1");
+    hasher.update(&job.candidate_identity.inode_id.to_le_bytes());
+    hasher.update(&job.candidate_identity.data_version.to_le_bytes());
+    match job.candidate_identity.kind {
+        RepairBlockKind::InlineContent => hasher.update(&[0]),
+        RepairBlockKind::ContentManifest => hasher.update(&[1]),
+        RepairBlockKind::ContentChunk { chunk_index } => {
+            hasher.update(&[2]);
+            hasher.update(&chunk_index.to_le_bytes());
+        }
+    };
+    hasher.update(&job.evidence.placement_receipt_ref.object_key);
+    hasher.update(
+        &job.evidence
+            .placement_receipt_ref
+            .receipt_generation
+            .to_le_bytes(),
+    );
+    hasher.update(&replacement_generation.to_le_bytes());
+
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    id
 }
 
 /// Reconstruct a [`ScrubViolation`] from a [`RepairJob`] so the existing
@@ -1015,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_fresh_generation_writeback_requires_replacement_receipt() {
+    fn dispatch_fresh_generation_writeback_publishes_replacement_receipt() {
         let inode_id = 510;
         let data_version = 1;
         let mut state = crate::recovery::initial_state();
@@ -1030,6 +1100,7 @@ mod tests {
 
         let mut bridge = ScrubToRepairBridge::new();
         let input = input_for_identity(inode_id, data_version, RepairBlockKind::InlineContent);
+        let source_receipt = input.placement_receipt_ref.expect("source receipt");
         let admissions = bridge.ingest_with_evidence(&[input], 1);
         assert_eq!(admissions.len(), 1);
         assert_eq!(bridge.pending_count(), 1);
@@ -1038,13 +1109,47 @@ mod tests {
             dispatch_repair_from_bridge(&mut bridge, &mut state, &mut store, &mut BTreeMap::new());
 
         assert_eq!(applied.len(), 1);
+        let crate::repair::RepairOutcome::Reconstructed {
+            bytes_written,
+            replacement_receipt,
+        } = applied.entries[0].outcome
+        else {
+            panic!(
+                "expected reconstructed receipt outcome, got {:?}",
+                applied.entries[0].outcome
+            );
+        };
+        assert_eq!(bytes_written, 16);
         assert_eq!(
-            applied.entries[0].outcome,
-            crate::repair::RepairOutcome::WritebackMissingReplacementReceipt { bytes_written: 16 }
+            replacement_receipt.subject,
+            RepairCandidateIdentity::new(inode_id, data_version, RepairBlockKind::InlineContent)
+        );
+        assert_eq!(
+            replacement_receipt.source_placement_receipt_ref,
+            source_receipt
+        );
+        assert_eq!(
+            replacement_receipt.mounted_scrub_evidence.receipt_status,
+            RepairMountedReceiptEvidenceStatus::ReceiptVerified {
+                generation: source_receipt.receipt_generation,
+            }
+        );
+        assert_eq!(
+            replacement_receipt.replacement_receipt_generation(),
+            source_receipt.receipt_generation + 1
+        );
+        assert_ne!(replacement_receipt.replacement_receipt_id, [0; 16]);
+        assert_eq!(
+            applied.entries[0]
+                .outcome
+                .replacement_receipt_evidence()
+                .expect("replacement evidence")
+                .downstream_evidence(),
+            replacement_receipt.downstream_evidence()
         );
         assert_eq!(store.get(key).expect("read key").expect("stored"), payload);
-        assert_eq!(bridge.repaired_count(), 0);
-        assert_eq!(bridge.pending_count(), 1);
+        assert_eq!(bridge.repaired_count(), 1);
+        assert_eq!(bridge.pending_count(), 0);
         assert_eq!(bridge.stats().entries_blocked_authority_mismatch, 0);
     }
 
