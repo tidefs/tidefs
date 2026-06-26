@@ -1202,16 +1202,69 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         );
     }
 
-    if input.require_isolation_evidence
-        && (input.cost_state.missing_isolation_evidence
-            || !input.cost_state.isolation_ref.is_bound())
-    {
-        return terminal(
-            record,
-            PrefetchExecutorOutcome::Refused,
-            PrefetchExecutorByteState::Refused,
-            StorageIntentRefusalReason::MissingTenantDomainEvidence,
+    if input.require_budget_owner {
+        if input.admission.budget_owner.is_zero() {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::Refused,
+                PrefetchExecutorByteState::Refused,
+                StorageIntentRefusalReason::MissingBudgetOwnerEvidence,
+            );
+        }
+        if input.admission.budget_owner != input.decision.budget_owner {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::Refused,
+                PrefetchExecutorByteState::Refused,
+                StorageIntentRefusalReason::PolicyConflict,
+            );
+        }
+    }
+
+    let isolation_ref = first_bound(
+        input.cost_state.isolation_ref,
+        input.decision.evidence_refs.tenant_isolation_ref,
+    );
+    if input.require_isolation_evidence {
+        if input.cost_state.missing_isolation_evidence || !isolation_ref.is_bound() {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::Refused,
+                PrefetchExecutorByteState::Refused,
+                StorageIntentRefusalReason::MissingTenantDomainEvidence,
+            );
+        }
+        if !snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::TenantIsolationEvidence,
+            isolation_ref,
+        ) {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::Refused,
+                PrefetchExecutorByteState::Refused,
+                StorageIntentRefusalReason::StaleIsolationEvidence,
+            );
+        }
+    }
+
+    if input.cost_state.required != PrefetchExecutorCostRequirementMask::EMPTY {
+        let cost_ref = first_bound(
+            input.cost_state.cost_ref,
+            input.decision.evidence_refs.cost_wear_ref,
         );
+        if !snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::MediaCostWearLedger,
+            cost_ref,
+        ) {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::Refused,
+                PrefetchExecutorByteState::Refused,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            );
+        }
     }
 
     if (input.require_known_waf
@@ -1286,7 +1339,9 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
 
     match input.admission.outcome {
         PrefetchExecutorAdmissionOutcome::Admitted => {
-            if !input.admission.scheduler_admission_ref.is_bound() {
+            if !input.admission.scheduler_admission_ref.is_bound()
+                || !snapshot_contains_ref(input, input.admission.scheduler_admission_ref)
+            {
                 terminal(
                     record,
                     PrefetchExecutorOutcome::Blocked,
@@ -1308,6 +1363,13 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                     PrefetchExecutorOutcome::Unavailable,
                     PrefetchExecutorByteState::Unavailable,
                     input.runtime_support.refusal_reason(),
+                )
+            } else if !snapshot_contains_ref(input, input.runtime_support.support_ref) {
+                terminal(
+                    record,
+                    PrefetchExecutorOutcome::Blocked,
+                    PrefetchExecutorByteState::Blocked,
+                    StorageIntentRefusalReason::EvidenceNotUsable,
                 )
             } else {
                 record.executor_byte_state = byte_state_for_decision(input.decision, family);
@@ -1561,6 +1623,18 @@ fn snapshot_contains_ref(
         .evidence_query_snapshot
         .included_refs
         .contains_ref(evidence_ref)
+}
+
+fn snapshot_contains_fresh_ref(
+    input: PrefetchExecutorInput,
+    kind: StorageIntentEvidenceKind,
+    evidence_ref: StorageIntentEvidenceRef,
+) -> bool {
+    evidence_ref.kind == kind
+        && input
+            .evidence_query_snapshot
+            .contains_fresh_authority_family(kind)
+        && snapshot_contains_ref(input, evidence_ref)
 }
 
 fn runtime_dispatch_needs_transport_or_trust(
@@ -1851,6 +1925,16 @@ mod tests {
             &mut snapshot,
             StorageIntentEvidenceKind::MediaCapabilityEvidence,
             MEDIA,
+        );
+        add_fresh(
+            &mut snapshot,
+            StorageIntentEvidenceKind::MediaCostWearLedger,
+            COST,
+        );
+        add_fresh(
+            &mut snapshot,
+            StorageIntentEvidenceKind::TenantIsolationEvidence,
+            ISO,
         );
         add_fresh(
             &mut snapshot,
@@ -2206,6 +2290,76 @@ mod tests {
     }
 
     #[test]
+    fn admitted_scheduler_ref_must_be_inside_evidence_cut() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.admission.scheduler_admission_ref = evidence(
+            StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            OUTSIDE_CUT,
+        );
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn admitted_budget_owner_must_match_decision_owner() {
+        let mut missing_owner = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_owner.admission.budget_owner = StorageIntentDomainId::ZERO;
+
+        let missing_owner_record = evaluate_prefetch_execution(missing_owner);
+        assert_eq!(
+            missing_owner_record.outcome,
+            PrefetchExecutorOutcome::Refused
+        );
+        assert_eq!(
+            missing_owner_record.refusal,
+            StorageIntentRefusalReason::MissingBudgetOwnerEvidence
+        );
+
+        let mut mismatched_owner =
+            admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        mismatched_owner.admission.budget_owner = StorageIntentDomainId([9; 16]);
+
+        let mismatched_owner_record = evaluate_prefetch_execution(mismatched_owner);
+        assert_eq!(
+            mismatched_owner_record.outcome,
+            PrefetchExecutorOutcome::Refused
+        );
+        assert_eq!(
+            mismatched_owner_record.refusal,
+            StorageIntentRefusalReason::PolicyConflict
+        );
+    }
+
+    #[test]
+    fn required_isolation_ref_must_be_inside_evidence_cut() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.cost_state.isolation_ref = evidence(
+            StorageIntentEvidenceKind::TenantIsolationEvidence,
+            OUTSIDE_CUT,
+        );
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::StaleIsolationEvidence
+        );
+    }
+
+    #[test]
     fn missing_runtime_support_keeps_admitted_action_unavailable() {
         let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
         input.runtime_support = PrefetchExecutorRuntimeSupport::default();
@@ -2234,6 +2388,29 @@ mod tests {
         assert_eq!(
             record.executor_byte_state,
             PrefetchExecutorByteState::Unavailable
+        );
+    }
+
+    #[test]
+    fn runtime_support_ref_must_be_inside_evidence_cut() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.runtime_support = PrefetchExecutorRuntimeSupport::supported(
+            PrefetchExecutorRuntimeSupportMask::BOUNDED_SEQUENTIAL_READAHEAD,
+            evidence(
+                StorageIntentEvidenceKind::ActionExecutionEvidence,
+                OUTSIDE_CUT,
+            ),
+        );
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
 
@@ -2415,6 +2592,25 @@ mod tests {
             .with_missing(StorageIntentCostClass::NetworkEgress);
         let record = evaluate_prefetch_execution(input);
         assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn required_cost_ref_must_be_inside_evidence_cut() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.cost_state.required = PrefetchExecutorCostRequirementMask::FLASH_WRITES;
+        input.cost_state.cost_ref =
+            evidence(StorageIntentEvidenceKind::MediaCostWearLedger, OUTSIDE_CUT);
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
         assert_eq!(
             record.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
