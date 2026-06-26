@@ -6469,6 +6469,11 @@ pub struct PrefetchResidencyDecisionRecord {
     pub topology_ref: StorageIntentEvidenceRef,
     pub max_prefetch_window_bytes: u64,
     pub max_staging_bytes: u64,
+    pub dwell_min_ms: u64,
+    pub cooldown_ms: u64,
+    pub payback_window_ms: u64,
+    pub payback_evidence: StorageIntentEvidenceRef,
+    pub cooldown_until_ms: u64,
     pub evidence_refs: PrefetchResidencyDecisionEvidenceRefs,
 }
 
@@ -6495,6 +6500,11 @@ impl Default for PrefetchResidencyDecisionRecord {
             topology_ref: StorageIntentEvidenceRef::default(),
             max_prefetch_window_bytes: 0,
             max_staging_bytes: 0,
+            dwell_min_ms: 0,
+            cooldown_ms: 0,
+            payback_window_ms: 0,
+            payback_evidence: StorageIntentEvidenceRef::default(),
+            cooldown_until_ms: 0,
             evidence_refs: PrefetchResidencyDecisionEvidenceRefs::default(),
         }
     }
@@ -6963,6 +6973,11 @@ const fn prefetch_residency_record(
         topology_ref: context.signal.topology_ref,
         max_prefetch_window_bytes: context.policy.max_prefetch_window_bytes,
         max_staging_bytes: context.policy.max_staging_bytes,
+        dwell_min_ms: context.policy.dwell_min_ms,
+        cooldown_ms: context.policy.cooldown_ms,
+        payback_window_ms: context.cost_wear.payback_window_ms,
+        payback_evidence: context.cost_wear.payback_evidence,
+        cooldown_until_ms: context.cost_wear.cooldown_until_ms,
         evidence_refs: context.policy.evidence_refs,
     }
 }
@@ -24593,6 +24608,7 @@ mod tests {
         );
         no_payback.cost_wear.payback_evidence = StorageIntentEvidenceRef::default();
         no_payback.cost_wear.payback_window_ms = 0;
+        no_payback.cost_wear.cooldown_until_ms = 120_000;
 
         let cooled = prefetch_residency_decide(no_payback);
         assert_eq!(cooled.outcome, PrefetchResidencyDecisionOutcome::Cooldown);
@@ -24600,6 +24616,14 @@ mod tests {
             cooled.refusal,
             StorageIntentRefusalReason::MovementDebtNotPaidBack
         );
+        assert_eq!(cooled.dwell_min_ms, 60_000);
+        assert_eq!(cooled.cooldown_ms, 300_000);
+        assert_eq!(cooled.payback_window_ms, 0);
+        assert_eq!(
+            cooled.payback_evidence,
+            StorageIntentEvidenceRef::default()
+        );
+        assert_eq!(cooled.cooldown_until_ms, 120_000);
 
         let admitted = prefetch_residency_decide(decision_context(
             DOMAIN_A,
@@ -24612,6 +24636,14 @@ mod tests {
             admitted.outcome,
             PrefetchResidencyDecisionOutcome::PromotionCandidate
         );
+        assert_eq!(admitted.dwell_min_ms, 60_000);
+        assert_eq!(admitted.cooldown_ms, 300_000);
+        assert_eq!(admitted.payback_window_ms, 60_000);
+        assert_eq!(
+            admitted.payback_evidence,
+            evidence_ref(StorageIntentEvidenceKind::MeasurementAttributionEvidence, 51)
+        );
+        assert_eq!(admitted.cooldown_until_ms, 0);
         assert!(prefetch_residency_decision_may_request_authority_change(
             admitted
         ));
@@ -24630,6 +24662,7 @@ mod tests {
         );
         no_payback.cost_wear.payback_evidence = StorageIntentEvidenceRef::default();
         no_payback.cost_wear.payback_window_ms = 0;
+        no_payback.cost_wear.cooldown_until_ms = 180_000;
 
         let cooled = prefetch_residency_decide(no_payback);
         assert_eq!(cooled.outcome, PrefetchResidencyDecisionOutcome::Cooldown);
@@ -24641,6 +24674,14 @@ mod tests {
             cooled.selected_candidate,
             PrefetchResidencyCandidateClass::Cooldown
         );
+        assert_eq!(cooled.dwell_min_ms, 60_000);
+        assert_eq!(cooled.cooldown_ms, 300_000);
+        assert_eq!(cooled.payback_window_ms, 0);
+        assert_eq!(
+            cooled.payback_evidence,
+            StorageIntentEvidenceRef::default()
+        );
+        assert_eq!(cooled.cooldown_until_ms, 180_000);
         assert!(!prefetch_residency_decision_is_cache_only(cooled));
 
         let admitted = prefetch_residency_decide(decision_context_with_media(
@@ -24666,6 +24707,14 @@ mod tests {
             PrefetchResidencyStateClass::HddColdLocalityOptimized
         );
         assert_eq!(admitted.refusal, StorageIntentRefusalReason::None);
+        assert_eq!(admitted.dwell_min_ms, 60_000);
+        assert_eq!(admitted.cooldown_ms, 300_000);
+        assert_eq!(admitted.payback_window_ms, 60_000);
+        assert_eq!(
+            admitted.payback_evidence,
+            evidence_ref(StorageIntentEvidenceKind::MeasurementAttributionEvidence, 51)
+        );
+        assert_eq!(admitted.cooldown_until_ms, 0);
         assert!(!prefetch_residency_decision_may_request_authority_change(
             admitted
         ));

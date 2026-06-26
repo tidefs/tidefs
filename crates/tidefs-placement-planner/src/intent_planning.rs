@@ -4302,6 +4302,7 @@ mod tests {
             max_prefetch_window_bytes: 0,
             max_staging_bytes: 0,
             evidence_refs: PrefetchResidencyDecisionEvidenceRefs::default(),
+            ..PrefetchResidencyDecisionRecord::default()
         });
 
         let result = evaluate_storage_intent_placement(
