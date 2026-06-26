@@ -8932,6 +8932,76 @@ fn mounted_dataset_spacebook_counters_use_mounted_dataset_id() {
 }
 
 #[test]
+fn cache_governor_charges_mounted_dataset_partition() {
+    let root = temp_root("mounted-dataset-cache-governor");
+    let mounted_dataset_id = [0x73; 16];
+    let next_dataset_id = [0x74; 16];
+    let payload = b"dataset-owned cache payload";
+
+    let mut fs = LocalFileSystem::open_with_root_authentication_key(
+        &root,
+        options(),
+        RootAuthenticationKey::demo_key(),
+    )
+    .expect("open fs");
+    fs.set_mounted_dataset_id(mounted_dataset_id);
+    let governor = tidefs_cache_core::Governor::new(tidefs_cache_core::GovernorConfig {
+        total_budget_bytes: 16 * 1024,
+        data_cache_fraction: 0.5,
+        meta_cache_fraction: 0.0,
+        dirty_bytes_fraction: 0.0,
+        inode_state_fraction: 0.5,
+        cluster_queues_fraction: 0.0,
+        misc_fraction: 0.0,
+        auto_tune: false,
+    })
+    .expect("governor config");
+    fs.set_cache_governor(governor.clone());
+
+    fs.create_file("/cache-owned.bin", 0o644)
+        .expect("create file");
+    fs.write_file("/cache-owned.bin", 0, payload)
+        .expect("write file");
+    assert_eq!(
+        fs.read_file("/cache-owned.bin").expect("read file"),
+        payload.to_vec()
+    );
+    fs.stat_path("/cache-owned.bin").expect("stat file");
+
+    let mounted_partition = tidefs_cache_core::BudgetPartitionKey::from_bytes(mounted_dataset_id);
+    let root_partition = tidefs_cache_core::BudgetPartitionKey::from_bytes(ROOT_DATASET_ID);
+    assert_eq!(
+        governor.partition_used(mounted_partition, tidefs_cache_core::BudgetCategory::DataCache),
+        payload.len() as u64
+    );
+    assert!(
+        governor.partition_used(mounted_partition, tidefs_cache_core::BudgetCategory::InodeState)
+            > 0,
+        "inode cache state must be charged to the mounted dataset partition"
+    );
+    assert_eq!(
+        governor.partition_used(root_partition, tidefs_cache_core::BudgetCategory::DataCache),
+        0
+    );
+    assert_eq!(
+        governor.partition_used(root_partition, tidefs_cache_core::BudgetCategory::InodeState),
+        0
+    );
+
+    fs.set_mounted_dataset_id(next_dataset_id);
+    assert_eq!(
+        governor.partition_used(mounted_partition, tidefs_cache_core::BudgetCategory::DataCache),
+        0
+    );
+    assert_eq!(
+        governor.partition_used(mounted_partition, tidefs_cache_core::BudgetCategory::InodeState),
+        0
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn block_device_flush_file_does_not_publish_new_file_metadata() {
     let root = temp_root("block-device-flush-no-commit-meta");
     let dev0 = temp_root("block-device-flush-no-commit-dev0");
