@@ -1536,18 +1536,10 @@ impl Governor {
     fn validate_auto_tune_record(
         record: &GovernorAutoTuneEvidence,
     ) -> Result<BudgetCategory, GovernorAutoTuneError> {
-        let category = record
-            .category
-            .ok_or(GovernorAutoTuneError::AmbiguousInput("missing category"))?;
-        let owner = record
-            .owner
-            .ok_or(GovernorAutoTuneError::AmbiguousInput("missing owner"))?;
-        let _unit = record
-            .unit
-            .ok_or(GovernorAutoTuneError::AmbiguousInput("missing unit"))?;
-        let freshness_ms = record
-            .freshness_ms
-            .ok_or(GovernorAutoTuneError::AmbiguousInput("missing freshness"))?;
+        let category = Self::require_auto_tune_field(record.category, "missing category")?;
+        let owner = Self::require_auto_tune_field(record.owner, "missing owner")?;
+        let _unit = Self::require_auto_tune_field(record.unit, "missing unit")?;
+        let freshness_ms = Self::require_auto_tune_field(record.freshness_ms, "missing freshness")?;
         if freshness_ms > AUTO_TUNE_MAX_FRESHNESS_MS {
             return Err(GovernorAutoTuneError::StaleInput {
                 freshness_ms,
@@ -1559,9 +1551,7 @@ impl Governor {
                 pressure_score: record.pressure_score,
             });
         }
-        let safety = record.safety.ok_or(GovernorAutoTuneError::AmbiguousInput(
-            "missing safety effect",
-        ))?;
+        let safety = Self::require_auto_tune_field(record.safety, "missing safety effect")?;
         if !safety.preserves_all_limits() {
             return Err(GovernorAutoTuneError::UnsafeInput {
                 category,
@@ -1577,6 +1567,13 @@ impl Governor {
         }
 
         Ok(category)
+    }
+
+    fn require_auto_tune_field<T>(
+        field: Option<T>,
+        reason: &'static str,
+    ) -> Result<T, GovernorAutoTuneError> {
+        field.ok_or(GovernorAutoTuneError::AmbiguousInput(reason))
     }
 
     fn tuned_soft_fraction(
@@ -2696,15 +2693,50 @@ mod tests {
     }
 
     #[test]
-    fn auto_tune_refuses_ambiguous_stale_or_unsafe_input() {
+    fn auto_tune_refuses_missing_required_evidence_fields() {
         let g = Governor::new(single_category_config(BudgetCategory::DataCache, true)).unwrap();
 
-        let mut missing_owner = data_pressure(10);
-        missing_owner.owner = None;
-        assert_eq!(
-            g.apply_auto_tune(&[missing_owner]),
-            Err(GovernorAutoTuneError::AmbiguousInput("missing owner"))
-        );
+        let missing_fields = [
+            ({
+                let mut record = data_pressure(10);
+                record.category = None;
+                (record, "missing category")
+            }),
+            ({
+                let mut record = data_pressure(10);
+                record.owner = None;
+                (record, "missing owner")
+            }),
+            ({
+                let mut record = data_pressure(10);
+                record.unit = None;
+                (record, "missing unit")
+            }),
+            ({
+                let mut record = data_pressure(10);
+                record.freshness_ms = None;
+                (record, "missing freshness")
+            }),
+            ({
+                let mut record = data_pressure(10);
+                record.safety = None;
+                (record, "missing safety effect")
+            }),
+        ];
+
+        for (record, reason) in missing_fields {
+            assert_eq!(
+                g.apply_auto_tune(&[record]),
+                Err(GovernorAutoTuneError::AmbiguousInput(reason))
+            );
+        }
+
+        assert_eq!(g.category_soft_watermark(BudgetCategory::DataCache), 700);
+    }
+
+    #[test]
+    fn auto_tune_refuses_stale_out_of_range_or_mistargeted_input() {
+        let g = Governor::new(single_category_config(BudgetCategory::DataCache, true)).unwrap();
 
         let mut stale = data_pressure(10);
         stale.freshness_ms = Some(AUTO_TUNE_MAX_FRESHNESS_MS + 1);
@@ -2724,19 +2756,56 @@ mod tests {
             })
         );
 
-        let mut unsafe_input = data_pressure(10);
-        unsafe_input.safety = Some(GovernorAutoTuneSafety {
-            durability: GovernorAutoTuneSafetyEffect::WeakensLimit,
-            dirty_bytes: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
-            cluster_queues: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
-        });
-        assert_eq!(
-            g.apply_auto_tune(&[unsafe_input]),
-            Err(GovernorAutoTuneError::UnsafeInput {
-                category: BudgetCategory::DataCache,
-                reason: "input would weaken a protected safety limit",
-            })
+        let mistargeted_dirty_pressure = GovernorAutoTuneEvidence::pressure(
+            BudgetCategory::DataCache,
+            GovernorAutoTuneOwner::DirtyBytePressure,
+            GovernorAutoTuneUnit::Ratio0To100,
+            1_000,
+            10,
         );
+        assert_eq!(
+            g.apply_auto_tune(&[mistargeted_dirty_pressure]),
+            Err(GovernorAutoTuneError::AmbiguousInput(
+                "dirty-byte pressure must target dirty_bytes"
+            ))
+        );
+
+        assert_eq!(g.category_soft_watermark(BudgetCategory::DataCache), 700);
+    }
+
+    #[test]
+    fn auto_tune_refuses_any_unsafe_limit_effect() {
+        let g = Governor::new(single_category_config(BudgetCategory::DataCache, true)).unwrap();
+
+        let unsafe_safety_inputs = [
+            GovernorAutoTuneSafety {
+                durability: GovernorAutoTuneSafetyEffect::WeakensLimit,
+                dirty_bytes: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+                cluster_queues: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+            },
+            GovernorAutoTuneSafety {
+                durability: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+                dirty_bytes: GovernorAutoTuneSafetyEffect::WeakensLimit,
+                cluster_queues: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+            },
+            GovernorAutoTuneSafety {
+                durability: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+                dirty_bytes: GovernorAutoTuneSafetyEffect::PreservesExistingLimit,
+                cluster_queues: GovernorAutoTuneSafetyEffect::WeakensLimit,
+            },
+        ];
+
+        for safety in unsafe_safety_inputs {
+            let mut unsafe_input = data_pressure(10);
+            unsafe_input.safety = Some(safety);
+            assert_eq!(
+                g.apply_auto_tune(&[unsafe_input]),
+                Err(GovernorAutoTuneError::UnsafeInput {
+                    category: BudgetCategory::DataCache,
+                    reason: "input would weaken a protected safety limit",
+                })
+            );
+        }
 
         assert_eq!(g.category_soft_watermark(BudgetCategory::DataCache), 700);
     }
