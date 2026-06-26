@@ -1174,6 +1174,17 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         return record;
     }
 
+    let freshness_rpo_refusal =
+        freshness_rpo_floor_refusal(input.evidence_query_snapshot, input.freshness_rpo_floor_ms);
+    if freshness_rpo_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            freshness_rpo_refusal,
+        );
+    }
+
     if decision_refused_or_needs_more_evidence(input.decision) {
         return terminal(
             record,
@@ -1615,6 +1626,63 @@ fn runtime_dispatch_evidence_refusal(
     StorageIntentRefusalReason::None
 }
 
+fn freshness_rpo_floor_refusal(
+    snapshot: StorageIntentEvidenceQuerySnapshot,
+    floor_ms: u64,
+) -> StorageIntentRefusalReason {
+    if floor_ms == 0 {
+        return StorageIntentRefusalReason::None;
+    }
+    if !snapshot.has_frontiers() || snapshot.allowed_staleness_ms == 0 {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+    if snapshot.freshness_frontier_ms > snapshot.temporal_frontier_ms {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+    if snapshot
+        .temporal_frontier_ms
+        .saturating_sub(snapshot.freshness_frontier_ms)
+        > floor_ms
+        || snapshot.allowed_staleness_ms > floor_ms
+    {
+        return StorageIntentRefusalReason::DurabilityOrRpoNotMet;
+    }
+
+    let (families, len) = snapshot.family_freshness.as_parts();
+    let mut index = 0;
+    let mut found = false;
+    while index < len as usize {
+        let family = families[index];
+        if family.kind as u16 == StorageIntentEvidenceKind::ReadFreshnessEvidence as u16 {
+            if found
+                || !family.state.is_fresh_for_authority()
+                || !family.evidence_ref.is_bound()
+                || family.freshness_frontier_ms == 0
+                || family.allowed_staleness_ms == 0
+                || family.freshness_frontier_ms > snapshot.temporal_frontier_ms
+            {
+                return StorageIntentRefusalReason::EvidenceNotUsable;
+            }
+            if snapshot
+                .temporal_frontier_ms
+                .saturating_sub(family.freshness_frontier_ms)
+                > floor_ms
+                || family.allowed_staleness_ms > floor_ms
+            {
+                return StorageIntentRefusalReason::DurabilityOrRpoNotMet;
+            }
+            found = true;
+        }
+        index += 1;
+    }
+
+    if found {
+        StorageIntentRefusalReason::None
+    } else {
+        StorageIntentRefusalReason::EvidenceNotUsable
+    }
+}
+
 fn snapshot_contains_ref(
     input: PrefetchExecutorInput,
     evidence_ref: StorageIntentEvidenceRef,
@@ -1880,6 +1948,27 @@ mod tests {
         let family = fresh(kind, id);
         snapshot.included_refs.push(family.evidence_ref).unwrap();
         snapshot.family_freshness.push(family).unwrap();
+    }
+
+    fn rewrite_family_freshness(
+        snapshot: &mut StorageIntentEvidenceQuerySnapshot,
+        kind: StorageIntentEvidenceKind,
+        freshness_frontier_ms: u64,
+        allowed_staleness_ms: u64,
+    ) {
+        let (families, len) = snapshot.family_freshness.as_parts();
+        let mut rewritten = EvidenceFamilyFreshnessSet::EMPTY;
+        let mut index = 0;
+        while index < len as usize {
+            let mut family = families[index];
+            if family.kind == kind {
+                family.freshness_frontier_ms = freshness_frontier_ms;
+                family.allowed_staleness_ms = allowed_staleness_ms;
+            }
+            rewritten.push(family).unwrap();
+            index += 1;
+        }
+        snapshot.family_freshness = rewritten;
     }
 
     fn snapshot(
@@ -2177,6 +2266,85 @@ mod tests {
         assert_eq!(
             record.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn freshness_rpo_floor_is_preserved_when_proven() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.freshness_rpo_floor_ms = 5;
+        input.evidence_query_snapshot.allowed_staleness_ms = 1;
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(record.freshness_rpo_floor_ms, 5);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::CacheOnly
+        );
+    }
+
+    #[test]
+    fn freshness_rpo_floor_requires_known_snapshot_staleness() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.freshness_rpo_floor_ms = 5;
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn no_prefetch_enforcement_preserves_floor_without_positive_dispatch() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
+        input.freshness_rpo_floor_ms = 5;
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
+        input.admission = PrefetchExecutorAdmissionRecord::default();
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Completed);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::NoPrefetchEnforced
+        );
+        assert_eq!(record.freshness_rpo_floor_ms, 5);
+        assert!(!record.can_satisfy_durable_sync());
+    }
+
+    #[test]
+    fn stale_snapshot_frontier_misses_freshness_rpo_floor() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.freshness_rpo_floor_ms = 1;
+        input.evidence_query_snapshot.allowed_staleness_ms = 1;
+        input.evidence_query_snapshot.freshness_frontier_ms = 8;
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::DurabilityOrRpoNotMet
+        );
+    }
+
+    #[test]
+    fn read_freshness_family_must_satisfy_rpo_floor() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.freshness_rpo_floor_ms = 1;
+        input.evidence_query_snapshot.allowed_staleness_ms = 1;
+        rewrite_family_freshness(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::ReadFreshnessEvidence,
+            10,
+            3,
+        );
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::DurabilityOrRpoNotMet
         );
     }
 
