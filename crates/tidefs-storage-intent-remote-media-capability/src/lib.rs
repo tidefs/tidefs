@@ -12,12 +12,13 @@
 //! reachability, object `put`, service labels, or RDMA capability as proof.
 
 use tidefs_storage_intent_core::{
-    MediaArchiveRestoreSemantics, MediaAtomicityClass, MediaCapabilityFlags,
-    MediaCapabilityFreshnessState, MediaFlushOrderingClass, MediaHealthState,
+    temporal_evidence_supports_freshness_claim, temporal_evidence_supports_wall_clock_rpo,
+    timebase_is_sequence_only, MediaArchiveRestoreSemantics, MediaAtomicityClass,
+    MediaCapabilityFlags, MediaCapabilityFreshnessState, MediaFlushOrderingClass, MediaHealthState,
     MediaPersistenceDomain, MediaProtocolGeometryClass, MediaRemoteCommitSemantics,
     StorageIntentEvidenceId, StorageIntentEvidenceKind, StorageIntentEvidenceQuerySnapshot,
     StorageIntentEvidenceRef, StorageIntentMediaCapabilityRecord, StorageIntentRefusalReason,
-    StorageMediaClass,
+    StorageIntentTemporalEvidence, StorageIntentTemporalRefusalReason, StorageMediaClass,
 };
 
 /// Version of the remote media-capability producer record shape.
@@ -420,6 +421,252 @@ impl RemoteFreshnessFacts {
     pub const fn with_lag_ms(mut self, lag_ms: u64) -> Self {
         self.rpo_lag_ms = lag_ms;
         self
+    }
+}
+
+/// Policy envelope for projecting temporal evidence into remote freshness.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RemoteTemporalFreshnessPolicy {
+    pub required_rpo_ms: u64,
+    pub max_freshness_age_ms: u64,
+    pub max_clock_sample_age_ms: u64,
+    pub max_archive_restore_delay_ms: u64,
+    pub allow_sequence_only_degraded: bool,
+}
+
+impl RemoteTemporalFreshnessPolicy {
+    #[must_use]
+    pub const fn authority(
+        required_rpo_ms: u64,
+        max_freshness_age_ms: u64,
+        max_clock_sample_age_ms: u64,
+    ) -> Self {
+        Self {
+            required_rpo_ms,
+            max_freshness_age_ms,
+            max_clock_sample_age_ms,
+            max_archive_restore_delay_ms: 0,
+            allow_sequence_only_degraded: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_archive_restore_delay_ms(
+        mut self,
+        max_archive_restore_delay_ms: u64,
+    ) -> Self {
+        self.max_archive_restore_delay_ms = max_archive_restore_delay_ms;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_sequence_only_degraded(mut self, allowed: bool) -> Self {
+        self.allow_sequence_only_degraded = allowed;
+        self
+    }
+}
+
+/// Read-only #903 temporal sample for #961 remote freshness/RPO facts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RemoteTemporalFreshnessSample {
+    pub temporal: StorageIntentTemporalEvidence,
+    pub rpo_lag_known: bool,
+    pub observed_rpo_lag_ms: u64,
+    pub sequence_frontier_known: bool,
+    pub archive_restore_delay_known: bool,
+    pub archive_restore_delay_ms: u64,
+}
+
+impl RemoteTemporalFreshnessSample {
+    #[must_use]
+    pub const fn to_freshness_facts(
+        self,
+        policy: RemoteTemporalFreshnessPolicy,
+    ) -> RemoteFreshnessFacts {
+        let freshness_ref = temporal_freshness_ref(self.temporal);
+        if !freshness_ref.is_bound() {
+            return RemoteFreshnessFacts {
+                freshness: MediaCapabilityFreshnessState::Missing,
+                rpo_lag_known: false,
+                rpo_lag_ms: 0,
+                timebase_fresh: false,
+                freshness_ref: EMPTY_EVIDENCE_REF,
+            };
+        }
+
+        if self.temporal.refusal as u8 != StorageIntentTemporalRefusalReason::None as u8 {
+            return RemoteFreshnessFacts {
+                freshness: temporal_refusal_freshness_state(self.temporal.refusal),
+                rpo_lag_known: false,
+                rpo_lag_ms: self.observed_rpo_lag_ms,
+                timebase_fresh: false,
+                freshness_ref,
+            };
+        }
+
+        if !self.temporal.has_timebase()
+            || !self.temporal.has_clock_health()
+            || !self.temporal.has_event_frontier()
+            || !self.temporal.has_lag_staleness()
+        {
+            return RemoteFreshnessFacts {
+                freshness: MediaCapabilityFreshnessState::Missing,
+                rpo_lag_known: false,
+                rpo_lag_ms: self.observed_rpo_lag_ms,
+                timebase_fresh: false,
+                freshness_ref,
+            };
+        }
+
+        if policy.max_archive_restore_delay_ms > 0
+            && (!self.archive_restore_delay_known
+                || self.archive_restore_delay_ms > policy.max_archive_restore_delay_ms)
+        {
+            return RemoteFreshnessFacts {
+                freshness: MediaCapabilityFreshnessState::Refused,
+                rpo_lag_known: false,
+                rpo_lag_ms: self.observed_rpo_lag_ms,
+                timebase_fresh: false,
+                freshness_ref,
+            };
+        }
+
+        let effective_lag_ms = remote_effective_lag_ms(
+            self.observed_rpo_lag_ms,
+            self.archive_restore_delay_known,
+            self.archive_restore_delay_ms,
+        );
+
+        let wall_clock_rpo_ok = temporal_evidence_supports_wall_clock_rpo(
+            self.temporal,
+            policy.required_rpo_ms,
+            effective_lag_ms,
+            policy.max_clock_sample_age_ms,
+        );
+        let freshness_ok = temporal_evidence_supports_freshness_claim(
+            self.temporal,
+            policy.max_freshness_age_ms,
+            policy.max_clock_sample_age_ms,
+        );
+
+        if self.rpo_lag_known && wall_clock_rpo_ok && freshness_ok {
+            return RemoteFreshnessFacts {
+                freshness: MediaCapabilityFreshnessState::Fresh,
+                rpo_lag_known: true,
+                rpo_lag_ms: effective_lag_ms,
+                timebase_fresh: true,
+                freshness_ref,
+            };
+        }
+
+        if !self.rpo_lag_known && freshness_ok {
+            return RemoteFreshnessFacts {
+                freshness: MediaCapabilityFreshnessState::Fresh,
+                rpo_lag_known: false,
+                rpo_lag_ms: effective_lag_ms,
+                timebase_fresh: true,
+                freshness_ref,
+            };
+        }
+
+        if timebase_is_sequence_only(self.temporal.timebase)
+            && policy.allow_sequence_only_degraded
+            && self.sequence_frontier_known
+        {
+            return RemoteFreshnessFacts {
+                freshness: MediaCapabilityFreshnessState::Fresh,
+                rpo_lag_known: false,
+                rpo_lag_ms: effective_lag_ms,
+                timebase_fresh: false,
+                freshness_ref,
+            };
+        }
+
+        if self.temporal.clock_health.sample_age_ms > policy.max_clock_sample_age_ms {
+            return RemoteFreshnessFacts {
+                freshness: MediaCapabilityFreshnessState::Stale,
+                rpo_lag_known: false,
+                rpo_lag_ms: effective_lag_ms,
+                timebase_fresh: false,
+                freshness_ref,
+            };
+        }
+
+        if self.temporal.clock_health.has_known_skew()
+            && self.temporal.clock_health.no_backwards_step()
+        {
+            return RemoteFreshnessFacts {
+                freshness: MediaCapabilityFreshnessState::Stale,
+                rpo_lag_known: false,
+                rpo_lag_ms: effective_lag_ms,
+                timebase_fresh: false,
+                freshness_ref,
+            };
+        }
+
+        RemoteFreshnessFacts {
+            freshness: MediaCapabilityFreshnessState::Refused,
+            rpo_lag_known: false,
+            rpo_lag_ms: effective_lag_ms,
+            timebase_fresh: false,
+            freshness_ref,
+        }
+    }
+
+    #[must_use]
+    pub const fn apply_to(
+        self,
+        facts: RemoteMediaCapabilityFacts,
+        policy: RemoteTemporalFreshnessPolicy,
+    ) -> RemoteMediaCapabilityFacts {
+        facts.with_freshness(self.to_freshness_facts(policy))
+    }
+}
+
+const fn temporal_freshness_ref(
+    temporal: StorageIntentTemporalEvidence,
+) -> StorageIntentEvidenceRef {
+    if evidence_ref_has_kind(
+        temporal.evidence,
+        StorageIntentEvidenceKind::TemporalEvidence,
+    ) {
+        temporal.evidence
+    } else {
+        EMPTY_EVIDENCE_REF
+    }
+}
+
+const fn temporal_refusal_freshness_state(
+    refusal: StorageIntentTemporalRefusalReason,
+) -> MediaCapabilityFreshnessState {
+    match refusal {
+        StorageIntentTemporalRefusalReason::None => MediaCapabilityFreshnessState::Fresh,
+        StorageIntentTemporalRefusalReason::MissingTimebase => {
+            MediaCapabilityFreshnessState::Missing
+        }
+        StorageIntentTemporalRefusalReason::StaleSample => MediaCapabilityFreshnessState::Stale,
+        StorageIntentTemporalRefusalReason::ContradictoryFrontier => {
+            MediaCapabilityFreshnessState::Contradictory
+        }
+        StorageIntentTemporalRefusalReason::UnknownSkew
+        | StorageIntentTemporalRefusalReason::CrossedExpiry
+        | StorageIntentTemporalRefusalReason::BackwardsTime
+        | StorageIntentTemporalRefusalReason::InsufficientSequenceFrontier
+        | StorageIntentTemporalRefusalReason::UnsupportedCrossDomainComparison => {
+            MediaCapabilityFreshnessState::Refused
+        }
+    }
+}
+
+const fn remote_effective_lag_ms(
+    observed_rpo_lag_ms: u64,
+    archive_restore_delay_known: bool,
+    archive_restore_delay_ms: u64,
+) -> u64 {
+    if archive_restore_delay_known && archive_restore_delay_ms > observed_rpo_lag_ms {
+        archive_restore_delay_ms
+    } else {
+        observed_rpo_lag_ms
     }
 }
 
@@ -1244,12 +1491,14 @@ pub const fn produce_remote_media_capability(
 mod tests {
     use super::*;
     use tidefs_storage_intent_core::{
-        media_capability_satisfies_role, EvidenceCompletenessVerdict, EvidenceConsumerClass,
-        EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet, EvidenceFamilyFreshnessState,
-        EvidenceQueryContextClass, EvidenceQuerySubjectScope, EvidenceQuerySubjectScopeClass,
-        EvidenceRetentionClass, MediaRoleRequirement, ReceiptPredicateResult,
-        StorageIntentDomainId, StorageIntentEvidenceRefs, StorageIntentGuaranteeClass,
-        StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
+        media_capability_satisfies_role, ClockHealthFlags, EvidenceCompletenessVerdict,
+        EvidenceConsumerClass, EvidenceFamilyFreshness, EvidenceFamilyFreshnessSet,
+        EvidenceFamilyFreshnessState, EvidenceQueryContextClass, EvidenceQuerySubjectScope,
+        EvidenceQuerySubjectScopeClass, EvidenceRetentionClass, MediaRoleRequirement,
+        ReceiptPredicateResult, StorageIntentClockHealth, StorageIntentClockSourceClass,
+        StorageIntentDomainId, StorageIntentEventFrontierClass, StorageIntentEvidenceRefs,
+        StorageIntentGuaranteeClass, StorageIntentObjectScope, StorageIntentPolicyId,
+        StorageIntentPolicyRevision, StorageIntentStalenessClass, StorageIntentTimebaseClass,
         StorageMediaRole,
     };
 
@@ -1459,6 +1708,52 @@ mod tests {
                 media_evidence(41),
             ))
             .with_latency_class_us(5_000_000)
+    }
+
+    fn temporal_policy() -> RemoteTemporalFreshnessPolicy {
+        RemoteTemporalFreshnessPolicy::authority(5_000, 30_000, 5_000)
+    }
+
+    fn healthy_remote_temporal(seed: u8) -> StorageIntentTemporalEvidence {
+        StorageIntentTemporalEvidence {
+            evidence: evidence(StorageIntentEvidenceKind::TemporalEvidence, seed),
+            timebase: StorageIntentTimebaseClass::ClusterConsensusTime,
+            timebase_ref: evidence(StorageIntentEvidenceKind::TemporalEvidence, seed + 1),
+            clock_health: StorageIntentClockHealth {
+                source: StorageIntentClockSourceClass::ClusterConsensusDerived,
+                sync_domain: StorageIntentDomainId::ZERO,
+                skew_bound_us: 100,
+                flags: ClockHealthFlags::from_flag(
+                    ClockHealthFlags::MONOTONIC
+                        | ClockHealthFlags::KNOWN_SKEW
+                        | ClockHealthFlags::NO_BACKWARDS_STEP,
+                ),
+                sample_age_ms: 1_000,
+                sample_ref: evidence(StorageIntentEvidenceKind::TemporalEvidence, seed + 2),
+                health_ref: evidence(StorageIntentEvidenceKind::TemporalEvidence, seed + 3),
+            },
+            clock_health_ref: evidence(StorageIntentEvidenceKind::TemporalEvidence, seed + 4),
+            event_frontier: StorageIntentEventFrontierClass::RemoteApply,
+            event_frontier_ref: evidence(StorageIntentEvidenceKind::TemporalEvidence, seed + 5),
+            staleness_class: StorageIntentStalenessClass::GeoRpoLag,
+            staleness_ref: evidence(StorageIntentEvidenceKind::TemporalEvidence, seed + 6),
+            expiry_deadline_class: Default::default(),
+            expiry_deadline_ref: EMPTY_EVIDENCE_REF,
+            sequence_time_conversion: Default::default(),
+            refusal: StorageIntentTemporalRefusalReason::None,
+            refusal_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+
+    fn temporal_freshness_sample(seed: u8) -> RemoteTemporalFreshnessSample {
+        RemoteTemporalFreshnessSample {
+            temporal: healthy_remote_temporal(seed),
+            rpo_lag_known: true,
+            observed_rpo_lag_ms: 1_000,
+            sequence_frontier_known: true,
+            archive_restore_delay_known: false,
+            archive_restore_delay_ms: 0,
+        }
     }
 
     fn placement_result(record: StorageIntentMediaCapabilityRecord) -> ReceiptPredicateResult {
@@ -1742,6 +2037,176 @@ mod tests {
             placement_result(produce_remote_media_capability(stale)).refusal,
             StorageIntentRefusalReason::StaleMediaCapabilityEvidence
         );
+    }
+
+    #[test]
+    fn temporal_freshness_sample_with_wall_clock_rpo_preserves_authority() {
+        let sample = temporal_freshness_sample(100);
+        let facts = sample.apply_to(strong_object_facts(), temporal_policy());
+        let cut = authority_evidence_cut_for(facts);
+        let record = produce_remote_media_capability_from_evidence_cut(facts, cut);
+
+        assert_eq!(
+            facts.freshness.freshness,
+            MediaCapabilityFreshnessState::Fresh
+        );
+        assert!(facts.freshness.rpo_lag_known);
+        assert_eq!(facts.freshness.rpo_lag_ms, 1_000);
+        assert!(facts.freshness.timebase_fresh);
+        assert_eq!(
+            remote_authority_evidence_cut_refusal(facts, cut),
+            StorageIntentRefusalReason::None
+        );
+        assert!(placement_result(record).satisfied);
+    }
+
+    #[test]
+    fn temporal_freshness_sample_unknown_rpo_lag_degrades_visible() {
+        let sample = RemoteTemporalFreshnessSample {
+            rpo_lag_known: false,
+            ..temporal_freshness_sample(110)
+        };
+        let facts = sample.apply_to(strong_object_facts(), temporal_policy());
+        let record = produce_remote_media_capability(facts);
+
+        assert_eq!(
+            facts.freshness.freshness,
+            MediaCapabilityFreshnessState::Fresh
+        );
+        assert!(!facts.freshness.rpo_lag_known);
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::DurabilityOrRpoNotMet
+        );
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
+    }
+
+    #[test]
+    fn temporal_freshness_sample_stale_clock_health_fails_closed() {
+        let mut temporal = healthy_remote_temporal(120);
+        temporal.clock_health.sample_age_ms = 30_000;
+        let sample = RemoteTemporalFreshnessSample {
+            temporal,
+            ..temporal_freshness_sample(120)
+        };
+        let facts = sample.apply_to(strong_object_facts(), temporal_policy());
+        let record = produce_remote_media_capability(facts);
+
+        assert_eq!(
+            facts.freshness.freshness,
+            MediaCapabilityFreshnessState::Stale
+        );
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::StaleMediaCapabilityEvidence
+        );
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
+    }
+
+    #[test]
+    fn temporal_freshness_sample_unknown_skew_refuses_authority() {
+        let mut temporal = healthy_remote_temporal(130);
+        temporal.clock_health.skew_bound_us = 0;
+        temporal.clock_health.flags = ClockHealthFlags::from_flag(
+            ClockHealthFlags::MONOTONIC | ClockHealthFlags::NO_BACKWARDS_STEP,
+        );
+        let sample = RemoteTemporalFreshnessSample {
+            temporal,
+            ..temporal_freshness_sample(130)
+        };
+        let facts = sample.apply_to(strong_object_facts(), temporal_policy());
+        let record = produce_remote_media_capability(facts);
+
+        assert_eq!(
+            facts.freshness.freshness,
+            MediaCapabilityFreshnessState::Refused
+        );
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
+    }
+
+    #[test]
+    fn temporal_freshness_sample_sequence_only_cannot_satisfy_wall_clock_rpo() {
+        let mut temporal = healthy_remote_temporal(140);
+        temporal.timebase = StorageIntentTimebaseClass::SequenceOnly;
+        let sample = RemoteTemporalFreshnessSample {
+            temporal,
+            ..temporal_freshness_sample(140)
+        };
+        let facts = sample.apply_to(
+            strong_object_facts(),
+            temporal_policy().with_sequence_only_degraded(true),
+        );
+        let record = produce_remote_media_capability(facts);
+
+        assert_eq!(
+            facts.freshness.freshness,
+            MediaCapabilityFreshnessState::Fresh
+        );
+        assert!(!facts.freshness.rpo_lag_known);
+        assert!(!facts.freshness.timebase_fresh);
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::DurabilityOrRpoNotMet
+        );
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
+    }
+
+    #[test]
+    fn temporal_freshness_sample_wrong_ref_kind_is_missing() {
+        let mut temporal = healthy_remote_temporal(150);
+        temporal.evidence = media_evidence(150);
+        let sample = RemoteTemporalFreshnessSample {
+            temporal,
+            ..temporal_freshness_sample(150)
+        };
+        let facts = sample.apply_to(strong_object_facts(), temporal_policy());
+
+        assert_eq!(
+            facts.freshness.freshness,
+            MediaCapabilityFreshnessState::Missing
+        );
+        assert_eq!(
+            facts.freshness.freshness_ref,
+            StorageIntentEvidenceRef::default()
+        );
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        );
+    }
+
+    #[test]
+    fn temporal_freshness_sample_archive_restore_uncertainty_refuses() {
+        let sample = temporal_freshness_sample(160);
+        let facts = sample.apply_to(
+            strong_archive_facts(),
+            temporal_policy().with_archive_restore_delay_ms(3_600_000),
+        );
+        let record = produce_remote_media_capability(facts);
+
+        assert_eq!(
+            facts.freshness.freshness,
+            MediaCapabilityFreshnessState::Refused
+        );
+        assert_eq!(
+            remote_authority_preflight_refusal(facts),
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(!record
+            .flags
+            .contains_all(MediaCapabilityFlags::REMOTE_COMMIT));
     }
 
     #[test]
