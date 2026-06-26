@@ -162,7 +162,7 @@ fn rebuild_many_objects() {
 }
 
 // ---------------------------------------------------------------------------
-// Throttled rebuild tests (NEXT-MN-016: background rebuild backpressure)
+// Throttled rebuild tests: background rebuild backpressure.
 // ---------------------------------------------------------------------------
 
 #[test]

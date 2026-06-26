@@ -1,4 +1,4 @@
-# Production integrity policy (OW-006/OW-014/OW-015) (v0.415)
+# Production integrity policy
 
 > TFR-019 authority note: this imported implementation note is review material,
 > the behavior below as needing reconciliation with current source,
@@ -6,12 +6,12 @@
 
 Historical tracker wording: item 006.
 
-This document describes the historical `OW-006` design-contract level. It
-replaces the development checksum/key policy with a production integrity target
-and names the migration boundary for the data path. v0.414 describes `OW-014`
-for the Local Object Store record layer: new records are version `3` and carry
-BLAKE3-256 production-integrity trailers. v0.415 describes `OW-015` for
-committed-root authentication.
+This document describes the historical production-integrity design-contract
+level. It replaces the development checksum/key policy with a production
+integrity target and names the migration boundary for the data path. For the
+Local Object Store record layer, new records are version `3` and carry
+BLAKE3-256 production-integrity trailers. Committed-root authentication is
+covered by the root-authentication note.
 
 ## Chosen algorithms
 

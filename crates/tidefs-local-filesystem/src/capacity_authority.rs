@@ -32,7 +32,7 @@
 //!   this authority through the engine, and no adapter-local reservation
 //!   lifecycle runs alongside the engine path.
 //!
-//! # Single-Authority Chain (NEXT-STOR-038 audit)
+//! # Single-Authority Chain
 //!
 //! Every filesystem statfs, quota, pool, and device counter derives from
 //! this one documented authority. The chain below is the result of the
@@ -73,11 +73,11 @@
 //! The former FUSE adapter `CapacityFacade` is quarantined behind
 //! `#[cfg(test)]` and excluded from the production mount path. The
 //! `pool_free_bytes_for_quota()` path previously queried the allocator
-//! report independently of the authority; as of NEXT-STOR-038 it routes
+//! report independently of the authority; the capacity-authority audit routes it
 //! through [`CapacityAuthority::free_bytes`]. The
 //! `derive_pool_physical_counters()` path previously built
 //! `PoolPhysicalCountersV1` from `allocator_policy.content_capacity_bytes`
-//! and the allocator report; as of NEXT-STOR-038 both `phys_total_bytes`
+//! and the allocator report; both `phys_total_bytes`
 //! and `phys_free_bytes` derive from [`CapacityAuthority`].
 
 //! # Production Call Graph

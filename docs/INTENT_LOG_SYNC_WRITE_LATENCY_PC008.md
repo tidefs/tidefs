@@ -1,9 +1,10 @@
-# Intent-log sync write latency model (PC-008)
+# Intent-log sync write latency model
 
-Maturity: **implemented-source** specification for publishing checklist item
-`PC-008`.
+TFR-019 authority classification: historical input. This imported note records
+the intent-log sync write latency model for review; it is not production WAL,
+kernel block, ublk, or measured latency authority.
 
-This document binds the current PC-008 closeout to source without claiming a
+This document binds the historical intent-log sync write latency closeout to source without claiming a
 production persistent WAL, kernel block path, ublk path, or measured latency
 SLO pass.
 
@@ -54,16 +55,17 @@ bound sync write latency:
    normal committed root or reject it as an explicit integrity/media error.
    Partial mounted truth is forbidden.
 
-## Relationship to PC-007 and OW-204
+## Relationship to transaction and cache authority
 
-PC-008 does not replace the transaction model. It constrains the fast path that
-may exist before the full root-slot publication boundary is reached.
-`PC-007` defines commit groups, dirty buffers, `fsync`, and `O_DSYNC`
-semantics. PC-008 says which subset of those operations may use a bounded
-intent-log analogue before normal publication finishes.
+The intent-log latency model does not replace the transaction model. It
+constrains the fast path that may exist before the full root-slot publication
+boundary is reached. The transaction model defines commit groups, dirty
+buffers, `fsync`, and `O_DSYNC` semantics. This model says which subset of
+those operations may use a bounded intent-log analogue before normal
+publication finishes.
 
-`OW-204` already binds page-cache/writeback/mmap state as non-authoritative.
-The PC-008 `shared-mmap-msync-sync` case consumes that law: shared mmap dirty
+The page-cache/writeback/mmap authority model already binds cache state as
+non-authoritative. The `shared-mmap-msync-sync` case consumes that law: shared mmap dirty
 completion can be reported.
 
 ## Non-claims
@@ -73,4 +75,3 @@ This closeout does not implement:
 - a production persistent WAL or journal execution path;
 - kernelspace, ublk, or block-volume sync write handling;
 - a recovery daemon that mutates mounted truth.
-

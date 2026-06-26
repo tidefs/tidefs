@@ -1,18 +1,19 @@
-# transaction model / commit groups / dirty buffers PC-007
+# transaction model / commit groups / dirty buffers
 
-Maturity: **implemented-source** for the current local filesystem and FUSE
-preview durability boundary; **design-law** for future `O_DSYNC` flag handling.
+TFR-019 authority classification: historical input. This imported note records
+the transaction-model closeout wording for review; it is not release authority
+without reconciliation against current source and validation evidence.
 
-This document is the implementation-tracked non-release closeout for **PC-007** in the current
-preview scope. It does not add a new transaction engine. It binds the existing
+This document is the implementation-tracked non-release transaction-model note
+for the current preview scope. It does not add a new transaction engine. It binds the existing
 Local Filesystem transaction-root implementation, transaction manifests,
 root-slot publication, dirty content/chunk staging, sync failure behavior, and
 FUSE fsync boundary into one explicit release-gate model.
 
 ## Claim Boundary
 
-PC-007 is closed for the current local/FUSE implementation as an implemented-source
-transaction model:
+The historical closeout treated the current local/FUSE implementation as an
+implemented-source transaction model:
 
 - commit groups are local root transactions identified by a transaction id;
 - dirty buffers are staged as content/chunk, inode, directory, superblock, and
@@ -94,8 +95,8 @@ stricter:
 - none of these modes may treat page-cache cleanliness, FUSE session state, or
   object-store append visibility as publication by itself.
 
-This binds PC-007 to the `publication_pipeline` class
-`seal.publication_pipeline.caller_barrier.s4` and to the OW-106 fsync boundary.
+This binds the transaction model to the `publication_pipeline` class
+`seal.publication_pipeline.caller_barrier.s4` and to the local fsync boundary.
 
 ## Source Coverage
 

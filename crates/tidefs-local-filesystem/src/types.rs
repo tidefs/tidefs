@@ -269,7 +269,7 @@ pub const POSIX_SUBSET_ENTRIES: &[PosixSubsetEntry] = &[
         operation: "read/write/truncate",
         support: PosixSupport::IncludedInCurrentUserspaceImpl,
         errno: "ENOENT/EISDIR/EIO",
-        rule: "Byte reads, sparse writes, append-by-offset, and size truncation are included over the OW-101 chunked content layout.",
+        rule: "Byte reads, sparse writes, append-by-offset, and size truncation are included over the chunked content layout.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::MkdirRmdir,
@@ -283,14 +283,14 @@ pub const POSIX_SUBSET_ENTRIES: &[PosixSubsetEntry] = &[
         operation: "link/unlink",
         support: PosixSupport::IncludedInCurrentUserspaceImpl,
         errno: "ENOENT/EISDIR/EIO",
-        rule: "Hard links and closed-path unlink are included in the current userspace implementation; OW-106 adds unlink-while-open handle retention as a separate included row.",
+        rule: "Hard links and closed-path unlink are included in the current userspace implementation; unlink-while-open handle retention remains a separate included row.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::Rename,
         operation: "rename",
         support: PosixSupport::IncludedInCurrentUserspaceImpl,
         errno: "ENOENT/ENOTDIR/EISDIR/ENOTEMPTY/EINVAL/EIO",
-        rule: "Rename is included; OW-106 adds replacement semantics as a separate included row while renameat2 flags remain rejected.",
+        rule: "Rename is included; replacement semantics remain a separate included row while renameat2 flags remain rejected.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::SymlinkReadlink,
@@ -304,77 +304,77 @@ pub const POSIX_SUBSET_ENTRIES: &[PosixSubsetEntry] = &[
         operation: "fsync-file",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "EIO",
-        rule: "OW-106 binds file fsync success to the root-slot publication and Local Object Store sync boundary.",
+        rule: "File fsync success is bound to the root-slot publication and Local Object Store sync boundary.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::FsyncDurability,
         operation: "fsync-directory",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "EIO",
-        rule: "OW-106 maps directory fsync to the same committed namespace root-slot and Local Object Store sync boundary.",
+        rule: "Directory fsync maps to the same committed namespace root-slot and Local Object Store sync boundary.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::OpenHandleLifetime,
         operation: "unlink-while-open",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "ENOENT/EISDIR/EIO",
-        rule: "OW-106 preserves last-link regular-file content in FUSE session open-handle state until the final release.",
+        rule: "Last-link regular-file content is preserved in FUSE session open-handle state until the final release.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::Rename,
         operation: "rename-over-target",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "ENOENT/ENOTDIR/EISDIR/ENOTEMPTY/EINVAL/EIO",
-        rule: "OW-106 commits replacement rename atomically in the local filesystem and preserves replaced open regular-file handles in FUSE session state.",
+        rule: "Replacement rename commits atomically in the local filesystem and preserves replaced open regular-file handles in FUSE session state.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::StatfsCapacity,
         operation: "statfs",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "EIO",
-        rule: "OW-102 maps statfs to the finite local storage allocator report; free blocks exclude content still protected by committed fallback roots.",
+        rule: "Statfs maps to the finite local storage allocator report; free blocks exclude content still protected by committed fallback roots.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::MetadataMutation,
         operation: "chmod/chown/utimens",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "ENOENT",
-        rule: "PC-001M stores ownership and mode mutations in FUSE session metadata; these are visible through getattr within the session but are not persisted across remounts.",
+        rule: "The current FUSE session metadata model stores ownership and mode mutations; these are visible through getattr within the session but are not persisted across remounts.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::ExtendedAttributes,
         operation: "xattr/acl",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "ENODATA/EINVAL/EPERM/EOPNOTSUPP",
-        rule: "setxattr/getxattr/listxattr/removexattr wired (PC-006, v0.418). POSIX ACL access/default xattrs are validated and stored through tidefs_posix_acl; unsupported namespaces and structurally invalid ACL payloads still fail explicitly.",
+        rule: "setxattr/getxattr/listxattr/removexattr are wired. POSIX ACL access/default xattrs are validated and stored through tidefs_posix_acl; unsupported namespaces and structurally invalid ACL payloads still fail explicitly.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::FileLocking,
         operation: "flock/posix-locks",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "EOPNOTSUPP",
-        rule: "getlk/setlk handlers wired (PC-007, v0.419) and exercised through mounted byte-range lock coverage (#2931). getlk reports tracked conflicts, non-blocking locks update LockTracker, shared read locks coexist, overlapping write locks conflict, adjacent ranges remain independent, and close/flush releases PID-owned ranges. Blocking/cancelable setlkw semantics remain Review debt TFR-008.",
+        rule: "getlk/setlk handlers are wired and exercised through mounted byte-range lock coverage (#2931). getlk reports tracked conflicts, non-blocking locks update LockTracker, shared read locks coexist, overlapping write locks conflict, adjacent ranges remain independent, and close/flush releases PID-owned ranges. Blocking/cancelable setlkw semantics remain Review debt TFR-008.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::SpaceManagement,
         operation: "fallocate",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "ENOSPC/EOPNOTSUPP",
-        rule: "OW-102 includes fallocate mode 0 as allocator-admitted zero extension over the chunked content layout; unsupported mode flags still return EOPNOTSUPP.",
+        rule: "Space-management authority includes fallocate mode 0 as allocator-admitted zero extension over the chunked content layout; unsupported mode flags still return EOPNOTSUPP.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::MmapCoherency,
         operation: "mmap-coherency",
         support: PosixSupport::DeferredAfterCurrentImpl,
         errno: "EOPNOTSUPP",
-        rule: "OW-204 specifies page-cache/writeback/mmap law, but live mmap coherency remains deferred until runtime implementation and live mmap tests exist.",
+        rule: "The page-cache/writeback/mmap authority model specifies cache visibility law, but live mmap coherency remains deferred until runtime implementation and live mmap tests exist.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::SparseDiscovery,
         operation: "lseek: SEEK_SET/SEEK_END/SEEK_DATA/SEEK_HOLE",
         support: PosixSupport::IncludedAfterCurrentUserspaceImpl,
         errno: "EINVAL/ENXIO/EOPNOTSUPP",
-        rule: "PC-004B includes extent-map-backed FUSE lseek answers: SEEK_SET and SEEK_END report valid offsets, SEEK_DATA and SEEK_HOLE are derived from VfsEngine::data_ranges sparse intervals, offsets at or beyond EOF return ENXIO, and SEEK_CUR remains EOPNOTSUPP until current-offset authority exists.",
+        rule: "Extent-map-backed FUSE lseek answers are included: SEEK_SET and SEEK_END report valid offsets, SEEK_DATA and SEEK_HOLE are derived from VfsEngine::data_ranges sparse intervals, offsets at or beyond EOF return ENXIO, and SEEK_CUR remains EOPNOTSUPP until current-offset authority exists.",
     },
     PosixSubsetEntry {
         topic: PosixTopic::SparseDiscovery,
@@ -553,7 +553,7 @@ pub const fn page_cache_writeback_mmap_acceptance_cases() -> &'static [PageCache
     PAGE_CACHE_WRITEBACK_MMAP_ACCEPTANCE_CASES
 }
 
-pub const INTENT_LOG_SYNC_WRITE_LATENCY_SPEC: &str = "publishing checklist item PC-008 intent-log analogue: sync writes, O_DSYNC ranges, fsync drains, and synchronous mmap writes must either complete through existing durable publication or record a replayable intent receipt under an explicit latency budget before reporting bounded sync completion";
+pub const INTENT_LOG_SYNC_WRITE_LATENCY_SPEC: &str = "intent-log sync write latency model: sync writes, O_DSYNC ranges, fsync drains, and synchronous mmap writes must either complete through existing durable publication or record a replayable intent receipt under an explicit latency budget before reporting bounded sync completion";
 pub const INTENT_LOG_SYNC_WRITE_LATENCY_POLICY_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

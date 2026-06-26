@@ -16,7 +16,7 @@ use tidefs_local_object_store::StoreError;
 use crate::Result;
 
 // ---------------------------------------------------------------------------
-// Intent log entry types per PC-008
+// Intent log entry types for the sync write latency model.
 // ---------------------------------------------------------------------------
 
 // ── LOG_DEVICE: Separate intent LOG device ────────────────────────────────────────

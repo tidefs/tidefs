@@ -5,7 +5,7 @@
 //! verify that the filesystem layer correctly handles write failures,
 //! byte corruption, ENOSPC conditions, and combined faults.
 //!
-//! PC-001T reference:
+//! Crash-injection authority reference:
 //! - Single-node crash injection coverage for the NO_PRODUCTION_FSCK claim
 //! - Write failure → recovery fallback
 //! - Byte corruption → checksum detection
@@ -1659,7 +1659,7 @@ fn missing_device_graceful_detection() {
 // Test: ENOSPC during txg commit -- committed root integrity after partial
 // writes across multiple transaction groups.
 //
-// NEXT-STOR-030: ENOSPC recovery after partial txg publication.
+// ENOSPC recovery after partial txg publication.
 // Fault-injection validation proves no partially published txg corrupts
 // namespace or data.
 // ---------------------------------------------------------------------------
@@ -1796,7 +1796,7 @@ fn enospc_during_txg_commit_preserves_committed_root_chain() {
 // Chaos soak campaign: multi-cycle crash-recovery through every injection point
 // ============================================================================
 //
-// NEXT-STOR-040: Storage durability long-haul chaos soak.
+// Storage durability long-haul chaos soak.
 // This test runs a bounded campaign across every wired CrashInjectionPoint,
 // injecting combined faults (write failures + byte corruption) during each
 // cycle and verifying committed data integrity after every recovery.
@@ -1931,7 +1931,7 @@ fn chaos_cycle_child_workload() {
 /// Chaos soak campaign: crash at every wired injection point, recover,
 /// verify committed data integrity, and prove clean import at the end.
 ///
-/// NEXT-STOR-040: full injection-point campaign, not just one or two
+/// Full injection-point campaign, not just one or two
 /// crashes. Each cycle also injects write-failure and byte-corruption
 /// faults to simulate a degraded environment.
 #[test]
@@ -2070,7 +2070,7 @@ fn chaos_soak_crash_recovery_campaign() {
 
 // ── Tier 3: Mounted repair-cycle idempotence under repeated failures ─────
 
-/// Tier 3 validation for NEXT-STOR-021: prove that repeated repair_cycle()
+/// Tier 3 validation: prove that repeated repair_cycle()
 /// calls on a mounted filesystem are idempotent and auditable.
 ///
 /// Creates a filesystem with data, runs repair_cycle() multiple times under

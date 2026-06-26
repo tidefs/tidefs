@@ -4076,10 +4076,16 @@ fn posix_subset_covers_storage_104_acceptance_gate() {
             "POSIX subset should name {operation}"
         );
     }
-    assert!(entries.iter().any(|entry| entry.rule.contains("OW-106")));
-    assert!(entries.iter().any(|entry| entry.rule.contains("OW-101")));
-    assert!(entries.iter().any(|entry| entry.rule.contains("OW-102")));
-    assert!(entries.iter().any(|entry| entry.rule.contains("PC-004B")
+    assert!(entries
+        .iter()
+        .any(|entry| entry.rule.contains("root-slot publication")));
+    assert!(entries
+        .iter()
+        .any(|entry| entry.rule.contains("chunked content layout")));
+    assert!(entries
+        .iter()
+        .any(|entry| entry.rule.contains("local storage allocator report")));
+    assert!(entries.iter().any(|entry| entry.rule.contains("FUSE lseek")
         && entry.rule.contains("SEEK_HOLE")
         && entry.support == PosixSupport::IncludedAfterCurrentUserspaceImpl));
 }
@@ -4104,7 +4110,7 @@ fn page_cache_writeback_mmap_spec_covers_storage_204_acceptance_gate() {
             cases
                 .iter()
                 .any(|case| case.coherency_class == coherency_class),
-            "OW-204 should cover {}",
+            "page-cache/writeback/mmap cases should cover {}",
             coherency_class.human_name()
         );
         assert!(coherency_class.stable_id().starts_with("cache_coherency_"));
@@ -4121,7 +4127,7 @@ fn page_cache_writeback_mmap_spec_covers_storage_204_acceptance_gate() {
             cases
                 .iter()
                 .any(|case| case.visibility_state == visibility_state),
-            "OW-204 should cover {}",
+            "page-cache/writeback/mmap cases should cover {}",
             visibility_state.stable_id()
         );
     }
@@ -4136,7 +4142,7 @@ fn page_cache_writeback_mmap_spec_covers_storage_204_acceptance_gate() {
     ] {
         assert!(
             cases.iter().any(|case| case.operation == operation),
-            "OW-204 should name {operation}"
+            "page-cache/writeback/mmap cases should name {operation}"
         );
     }
 
@@ -4196,7 +4202,7 @@ fn page_cache_writeback_mmap_cases_preserve_non_authoritative_boundary() {
         .find(|entry| entry.operation == "mmap-coherency")
         .expect("mmap row");
     assert_eq!(mmap_row.support, PosixSupport::DeferredAfterCurrentImpl);
-    assert!(mmap_row.rule.contains("OW-204"));
+    assert!(mmap_row.rule.contains("page-cache/writeback/mmap"));
     assert!(mmap_row
         .rule
         .contains("live mmap coherency remains deferred"));
@@ -4206,7 +4212,7 @@ fn page_cache_writeback_mmap_cases_preserve_non_authoritative_boundary() {
 fn intent_log_sync_write_latency_spec_covers_publishing_checklist_acceptance_gate() {
     let cases = intent_log_sync_write_latency_cases();
     assert_eq!(INTENT_LOG_SYNC_WRITE_LATENCY_POLICY_VERSION, 1);
-    assert!(INTENT_LOG_SYNC_WRITE_LATENCY_SPEC.contains("PC-008"));
+    assert!(INTENT_LOG_SYNC_WRITE_LATENCY_SPEC.contains("intent-log sync write latency"));
     assert!(INTENT_LOG_SYNC_WRITE_LATENCY_SPEC.contains("latency budget"));
     assert_eq!(cases, INTENT_LOG_SYNC_WRITE_LATENCY_CASES);
     assert!(cases.len() >= 7);
@@ -4222,7 +4228,7 @@ fn intent_log_sync_write_latency_spec_covers_publishing_checklist_acceptance_gat
     ] {
         assert!(
             cases.iter().any(|case| case.latency_class == latency_class),
-            "PC-008 should cover {}",
+            "intent-log sync write latency cases should cover {}",
             latency_class.human_name()
         );
         assert!(latency_class.stable_id().starts_with("intent_latency_"));
@@ -4239,7 +4245,7 @@ fn intent_log_sync_write_latency_spec_covers_publishing_checklist_acceptance_gat
     ] {
         assert!(
             cases.iter().any(|case| case.operation == operation),
-            "PC-008 should name {operation}"
+            "intent-log sync write latency cases should name {operation}"
         );
     }
 

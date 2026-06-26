@@ -208,7 +208,7 @@ pub fn check_local_object_store_on_disk_format_current_workspace() -> Result<(),
         stale_patterns,
         &mut missing,
     );
-    // OW-014 production-integrity records doc
+    // Production-integrity records doc
     check_forbidden_markers(
         &root,
         "docs/PRODUCTION_INTEGRITY_V3_RECORDS_OW014.md",
@@ -382,7 +382,7 @@ pub fn check_production_integrity_policy_current_workspace() -> Result<(), Stora
 
 pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-014 production integrity v3 record source check",
+        title: "production integrity v3 record source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -443,7 +443,7 @@ pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCh
             "BLAKE3-256",
             "production-integrity trailer",
             "v1/v2 compatibility",
-            "root authentication is delivered by OW-015",
+            "root authentication is delivered by the root-authentication slice",
             "tidefs-xtask check-production-integrity-v3",
         ],
         &mut missing,
@@ -475,11 +475,11 @@ pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCh
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-014 production integrity v3 records ok: new records carry BLAKE3-256 trailers, v1/v2 replay remains compatibility-only, and root authentication is handled by OW-015");
+        println!("production integrity v3 records ok: new records carry BLAKE3-256 trailers, v1/v2 replay remains compatibility-only, and root authentication is handled by the root-authentication slice");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-014 production integrity v3 record source check",
+            title: "production integrity v3 record source check",
             missing,
         })
     }
@@ -487,7 +487,7 @@ pub fn check_production_integrity_v3_current_workspace() -> Result<(), StorageCh
 
 pub fn check_root_authentication_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-015 root authentication source check",
+        title: "root authentication source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -590,11 +590,11 @@ pub fn check_root_authentication_current_workspace() -> Result<(), StorageCheckE
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-015 root authentication ok: committed filesystem roots require keyed BLAKE3-256 authentication over root metadata and manifest/superblock digests, with explicit key entrypoints for demos and mounts");
+        println!("root authentication ok: committed filesystem roots require keyed BLAKE3-256 authentication over root metadata and manifest/superblock digests, with explicit key entrypoints for demos and mounts");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-015 root authentication source check",
+            title: "root authentication source check",
             missing,
         })
     }
@@ -602,7 +602,7 @@ pub fn check_root_authentication_current_workspace() -> Result<(), StorageCheckE
 
 pub fn check_local_snapshots_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-108 local snapshots source check",
+        title: "local snapshots source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -679,11 +679,11 @@ pub fn check_local_snapshots_current_workspace() -> Result<(), StorageCheckError
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-108 local snapshots ok: named snapshots retain authenticated committed roots, rollback publishes a new authenticated root, and safe reclamation protects snapshot roots");
+        println!("local snapshots ok: named snapshots retain authenticated committed roots, rollback publishes a new authenticated root, and safe reclamation protects snapshot roots");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-108 local snapshots source check",
+            title: "local snapshots source check",
             missing,
         })
     }
@@ -691,7 +691,7 @@ pub fn check_local_snapshots_current_workspace() -> Result<(), StorageCheckError
 
 pub fn check_send_receive_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-109 send/receive source check",
+        title: "send/receive source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -766,11 +766,11 @@ pub fn check_send_receive_current_workspace() -> Result<(), StorageCheckError> {
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-109 send/receive ok: VFSSEND1 changed-record streams round-trip authenticated committed roots, receive validates in staging, re-signs with the destination key, and preserves snapshot rollback");
+        println!("send/receive ok: VFSSEND1 changed-record streams round-trip authenticated committed roots, receive validates in staging, re-signs with the destination key, and preserves snapshot rollback");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-109 send/receive source check",
+            title: "send/receive source check",
             missing,
         })
     }
@@ -778,7 +778,7 @@ pub fn check_send_receive_current_workspace() -> Result<(), StorageCheckError> {
 
 pub fn check_online_verifier_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-110 online verifier source check",
+        title: "online verifier source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -885,11 +885,11 @@ pub fn check_online_verifier_current_workspace() -> Result<(), StorageCheckError
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-110 online verifier ok: committed roots, manifests, authenticated roots, namespace invariants, content chunks, and snapshot roots are verified without repair or namespace mutation");
+        println!("online verifier ok: committed roots, manifests, authenticated roots, namespace invariants, content chunks, and snapshot roots are verified without repair or namespace mutation");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-110 online verifier source check",
+            title: "online verifier source check",
             missing,
         })
     }
@@ -1023,7 +1023,7 @@ pub fn check_local_filesystem_current_workspace() -> Result<(), StorageCheckErro
 
 pub fn check_chunked_file_layout_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-101 chunked file layout source check",
+        title: "chunked file layout source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -1103,11 +1103,11 @@ pub fn check_chunked_file_layout_current_workspace() -> Result<(), StorageCheckE
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-101 chunked file layout ok: versioned content manifests, per-chunk objects, retained unchanged chunk refs, and transaction-manifest chunk protection are implementation-tracked non-release");
+        println!("chunked file layout ok: versioned content manifests, per-chunk objects, retained unchanged chunk refs, and transaction-manifest chunk protection are implementation-tracked non-release");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-101 chunked file layout source check",
+            title: "chunked file layout source check",
             missing,
         })
     }
@@ -1115,7 +1115,7 @@ pub fn check_chunked_file_layout_current_workspace() -> Result<(), StorageCheckE
 
 pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-102/PC-006 local storage allocator source check",
+        title: "local storage allocator source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -1179,7 +1179,7 @@ pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCh
         &root,
         "docs/LOCAL_STORAGE_ALLOCATOR_OW102.md",
         &[
-            "PC-006",
+            "space-management/ENOSPC",
             "ENOSPC",
             "statfs",
             "fallocate",
@@ -1207,11 +1207,11 @@ pub fn check_local_storage_allocator_current_workspace() -> Result<(), StorageCh
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-102/PC-006 local storage allocator ok: finite content/inode capacity, protected-root accounting, ENOSPC, statfs, and fallocate mode-zero validation are implementation-tracked non-release");
+        println!("local storage allocator ok: finite content/inode capacity, protected-root accounting, ENOSPC, statfs, and fallocate mode-zero validation are implementation-tracked non-release");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-102/PC-006 local storage allocator source check",
+            title: "local storage allocator source check",
             missing,
         })
     }
@@ -1808,7 +1808,6 @@ pub fn check_preview_posix_subset_current_workspace() -> Result<(), StorageCheck
             "lookup/getattr",
             "fsync-file",
             "rename-over-target",
-            "PC-004B",
             "dense-file",
             "SEEK_DATA",
             "SEEK_HOLE",
@@ -1955,7 +1954,6 @@ pub fn check_fuse_mount_path_current_workspace() -> Result<(), StorageCheckError
         &root,
         "docs/FUSE_LSEEK_PREVIEW_PC004B.md",
         &[
-            "PC-004B",
             "SEEK_SET",
             "SEEK_END",
             "SEEK_DATA",
@@ -1998,7 +1996,7 @@ pub fn check_fuse_mount_path_current_workspace() -> Result<(), StorageCheckError
 
 pub fn check_posix_semantics_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-106 POSIX semantics source check",
+        title: "POSIX semantics source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -2112,11 +2110,11 @@ pub fn check_posix_semantics_current_workspace() -> Result<(), StorageCheckError
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-106 POSIX semantics ok: fsync, directory fsync, unlink-while-open, rename-over-target, and posix-semantics crate are implementation-tracked non-release");
+        println!("POSIX semantics ok: fsync, directory fsync, unlink-while-open, rename-over-target, and posix-semantics crate are implementation-tracked non-release");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-106 POSIX semantics source check",
+            title: "POSIX semantics source check",
             missing,
         })
     }
@@ -2124,7 +2122,7 @@ pub fn check_posix_semantics_current_workspace() -> Result<(), StorageCheckError
 
 pub fn check_seek_hole_data_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "PC-004B FUSE lseek preview source check",
+        title: "FUSE lseek preview source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -2140,12 +2138,10 @@ pub fn check_seek_hole_data_current_workspace() -> Result<(), StorageCheckError>
         &root,
         "crates/tidefs-local-filesystem",
         &[
-            "PC-004B",
             "SEEK_HOLE",
             "SEEK_DATA",
             "lseek: SEEK_SET/SEEK_END/SEEK_DATA/SEEK_HOLE",
-            "dense-file FUSE lseek answers",
-            "PC-004B includes dense-file FUSE lseek answers",
+            "Extent-map-backed FUSE lseek answers",
         ],
         &mut missing,
     );
@@ -2166,7 +2162,6 @@ pub fn check_seek_hole_data_current_workspace() -> Result<(), StorageCheckError>
         &root,
         "docs/FUSE_LSEEK_PREVIEW_PC004B.md",
         &[
-            "PC-004B",
             "SEEK_SET",
             "SEEK_END",
             "SEEK_DATA",
@@ -2201,11 +2196,11 @@ pub fn check_seek_hole_data_current_workspace() -> Result<(), StorageCheckError>
         &mut missing,
     );
     if missing.is_empty() {
-        println!("PC-004B FUSE lseek preview ok: SEEK_SET/SEEK_END/SEEK_DATA/SEEK_HOLE are implementation-tracked non-release with dense-file semantics");
+        println!("FUSE lseek preview ok: SEEK_SET/SEEK_END/SEEK_DATA/SEEK_HOLE are implementation-tracked non-release with dense-file semantics");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "PC-004B FUSE lseek preview source check",
+            title: "FUSE lseek preview source check",
             missing,
         })
     }
@@ -2213,7 +2208,7 @@ pub fn check_seek_hole_data_current_workspace() -> Result<(), StorageCheckError>
 
 pub fn check_rename_exchange_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-108 RENAME_EXCHANGE source check",
+        title: "RENAME_EXCHANGE source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -2266,11 +2261,11 @@ pub fn check_rename_exchange_current_workspace() -> Result<(), StorageCheckError
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-108 RENAME_EXCHANGE ok: atomic exchange via renameat2 is implementation-tracked non-release with path swap, type-mismatch reject, and missing-path errors");
+        println!("RENAME_EXCHANGE ok: atomic exchange via renameat2 is implementation-tracked non-release with path swap, type-mismatch reject, and missing-path errors");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-108 RENAME_EXCHANGE source check",
+            title: "RENAME_EXCHANGE source check",
             missing,
         })
     }
@@ -2407,7 +2402,7 @@ pub fn check_file_locking_current_workspace() -> Result<(), StorageCheckError> {
 
 pub fn check_mmap_coherency_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-204 mmap coherency source check",
+        title: "mmap coherency source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -2434,7 +2429,7 @@ pub fn check_mmap_coherency_current_workspace() -> Result<(), StorageCheckError>
             "private-mmap-cow",
             "requires_dirty_epoch",
             "requires_writeback_batch",
-            "OW-204",
+            "page-cache/writeback/mmap",
         ],
         &mut missing,
     );
@@ -2442,7 +2437,7 @@ pub fn check_mmap_coherency_current_workspace() -> Result<(), StorageCheckError>
         &root,
         "docs/PAGE_CACHE_WRITEBACK_MMAP_INTEGRATION_P5-03.md",
         &[
-            "OW-204",
+            "page-cache/writeback/mmap",
             "P5-03",
             "page-cache / writeback / mmap integration",
             "PAGE_CACHE_WRITEBACK_MMAP_SPEC",
@@ -2459,7 +2454,7 @@ pub fn check_mmap_coherency_current_workspace() -> Result<(), StorageCheckError>
     check_source_markers(
         &root,
         "docs/PREVIEW_POSIX_SUBSET.md",
-        &["mmap-coherency", "OW-204", "page-cache/writeback/mmap"],
+        &["mmap-coherency", "page-cache/writeback/mmap"],
         &mut missing,
     );
 
@@ -2482,11 +2477,11 @@ pub fn check_mmap_coherency_current_workspace() -> Result<(), StorageCheckError>
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-204 mmap coherency ok: page-cache/writeback/mmap law is implementation-tracked non-release with coherency classes, dirty-epoch tracking, and non-authoritative page-cache mandate");
+        println!("mmap coherency ok: page-cache/writeback/mmap law is implementation-tracked non-release with coherency classes, dirty-epoch tracking, and non-authoritative page-cache mandate");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-204 mmap coherency source check",
+            title: "mmap coherency source check",
             missing,
         })
     }
@@ -2593,7 +2588,7 @@ pub fn check_fallocate_mode0_current_workspace() -> Result<(), StorageCheckError
         &[
             "fallocate_file",
             "fallocate_extends_through_allocator_and_reports_statfs",
-            "OW-102",
+            "allocator-admitted",
             "fallocate mode 0",
             "allocator-admitted",
             "EOPNOTSUPP",
@@ -2876,7 +2871,7 @@ pub fn check_space_management_current_workspace() -> Result<(), StorageCheckErro
 }
 pub fn check_transaction_model_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "PC-007 transaction model source check",
+        title: "transaction model source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -2924,7 +2919,7 @@ pub fn check_transaction_model_current_workspace() -> Result<(), StorageCheckErr
         &root,
         "docs/TRANSACTION_COMMIT_GROUPS_PC007.md",
         &[
-            "PC-007",
+            "commit groups",
             "commit_group",
             "dirty_buffer",
             "transaction model",
@@ -2959,11 +2954,11 @@ pub fn check_transaction_model_current_workspace() -> Result<(), StorageCheckErr
         &mut missing,
     );
     if missing.is_empty() {
-        println!("PC-007 transaction model ok: per-inode dirty tracking, begin/commit/rollback, fsync/O_DSYNC, and transaction lifecycle tests are implementation-tracked non-release");
+        println!("transaction model ok: per-inode dirty tracking, begin/commit/rollback, fsync/O_DSYNC, and transaction lifecycle tests are implementation-tracked non-release");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "PC-007 transaction model source check",
+            title: "transaction model source check",
             missing,
         })
     }
@@ -3088,7 +3083,7 @@ pub fn check_xfstests_harness_current_workspace() -> Result<(), StorageCheckErro
 
 pub fn check_posix_scoreboard_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-107 POSIX scoreboard source check",
+        title: "POSIX scoreboard source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -3231,11 +3226,11 @@ pub fn check_posix_scoreboard_current_workspace() -> Result<(), StorageCheckErro
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-107 POSIX scoreboard ok: live FUSE, fio, fsx, fsstress, pjdfstest, and xfstests pass/fail/skip validation surfaces are implementation-tracked non-release; xfstests runner and exclude list wired");
+        println!("POSIX scoreboard ok: live FUSE, fio, fsx, fsstress, pjdfstest, and xfstests pass/fail/skip validation surfaces are implementation-tracked non-release; xfstests runner and exclude list wired");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-107 POSIX scoreboard source check",
+            title: "POSIX scoreboard source check",
             missing,
         })
     }
@@ -3327,7 +3322,7 @@ pub fn check_root_retention_current_workspace() -> Result<(), StorageCheckError>
 
 pub fn check_safe_local_reclamation_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "OW-103 safe local reclamation source check",
+        title: "safe local reclamation source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -3415,11 +3410,11 @@ pub fn check_safe_local_reclamation_current_workspace() -> Result<(), StorageChe
         &mut missing,
     );
     if missing.is_empty() {
-        println!("OW-103 safe local reclamation ok: protected-root checks, exact root-slot locations, protected-object copies, tombstones, segment retirement, and reopen verification are implementation-tracked non-release");
+        println!("safe local reclamation ok: protected-root checks, exact root-slot locations, protected-object copies, tombstones, segment retirement, and reopen verification are implementation-tracked non-release");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "OW-103 safe local reclamation source check",
+            title: "safe local reclamation source check",
             missing,
         })
     }
@@ -3427,7 +3422,7 @@ pub fn check_safe_local_reclamation_current_workspace() -> Result<(), StorageChe
 
 pub fn check_hot_read_cache_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "PC-003 hot read cache source check",
+        title: "hot read cache source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -3478,7 +3473,7 @@ pub fn check_hot_read_cache_current_workspace() -> Result<(), StorageCheckError>
         &root,
         "docs/HOT_READ_CACHE_PC003.md",
         &[
-            "PC-003",
+            "hot read cache",
             "bounded runtime mirror",
             "not authority",
             "inode id",
@@ -3525,11 +3520,11 @@ pub fn check_hot_read_cache_current_workspace() -> Result<(), StorageCheckError>
         &mut missing,
     );
     if missing.is_empty() {
-        println!("PC-003 hot read cache ok: read_file/read_symlink use a bounded non-authoritative cache keyed by inode/data-version/size, with mutation invalidation and source validation");
+        println!("hot read cache ok: read_file/read_symlink use a bounded non-authoritative cache keyed by inode/data-version/size, with mutation invalidation and source validation");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "PC-003 hot read cache source check",
+            title: "hot read cache source check",
             missing,
         })
     }
@@ -3537,7 +3532,7 @@ pub fn check_hot_read_cache_current_workspace() -> Result<(), StorageCheckError>
 
 pub fn check_module_owners_current_workspace() -> Result<(), StorageCheckError> {
     let root = find_workspace_root().ok_or_else(|| StorageCheckError {
-        title: "PC-002 module owners source check",
+        title: "module owners source check",
         missing: vec!["could not locate workspace root Cargo.toml".to_string()],
     })?;
     let mut missing = Vec::new();
@@ -3554,7 +3549,6 @@ pub fn check_module_owners_current_workspace() -> Result<(), StorageCheckError> 
         &root,
         "docs/MODULE_OWNERS_INVARIANTS_PC002.md",
         &[
-            "PC-002",
             "module owner",
             "Invariant boundaries",
             "Validation",
@@ -3602,11 +3596,11 @@ pub fn check_module_owners_current_workspace() -> Result<(), StorageCheckError> 
         &mut missing,
     );
     if missing.is_empty() {
-        println!("PC-002 module owners ok: major subsystem owner paths, invariant boundaries, validation, and non-claims are documented and implementation-tracked non-release");
+        println!("module owners ok: major subsystem owner paths, invariant boundaries, validation, and non-claims are documented and implementation-tracked non-release");
         Ok(())
     } else {
         Err(StorageCheckError {
-            title: "PC-002 module owners source check",
+            title: "module owners source check",
             missing,
         })
     }
@@ -4362,7 +4356,6 @@ pub fn check_mounted_transform_authority_current_workspace() -> Result<(), Stora
             "compression_uncompressed_backward_compat",
             "compression_reduces_object_size",
             "compression_mixed_mode_full_stack_validation",
-            "NEXT-STOR-025 compression mixed-mode full-stack validation",
         ],
         &mut missing,
     );

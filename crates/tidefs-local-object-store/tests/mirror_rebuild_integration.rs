@@ -2,7 +2,7 @@
 //! Mirror rebuild integration test: device-loss simulation and rebuild
 //! from surviving replica.
 //!
-//! Covers the full rebuild pipeline for NEXT-STOR-032:
+//! Covers the full mirror-rebuild pipeline:
 //! 1. Create a mirror-configured store (primary + mirror replica)
 //! 2. Write objects through the primary store
 //! 3. Verify the mirror holds a complete copy

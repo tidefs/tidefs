@@ -1,11 +1,11 @@
-# Hot Read Cache PC-003
+# Hot Read Cache
 
 > TFR-019 authority note: this imported implementation note is review material,
 > the behavior below as needing reconciliation with current source,
 > `docs/REVIEW_TODO_REGISTER.md`, and `docs/WHOLE_REPO_REVIEW.md`.
 
-This document covers publishing-checklist item `PC-003`: caching is integrated
-into hot read paths, not only policy modules.
+This historical note covers hot read cache integration into read paths, not only
+policy modules.
 
 ## Scope
 
