@@ -23,7 +23,7 @@ use tidefs_cluster::{
 };
 use tidefs_cluster::{ClusterPlacementPolicy, ClusterRedundancy};
 use tidefs_durability_layout::DurabilityLayoutV1;
-use tidefs_local_filesystem::{self as vfs, ChangedRecordExport, RootAuthenticationKey};
+use tidefs_local_filesystem::{self as vfs, RootAuthenticationKey};
 use tidefs_local_object_store::device_layout::DeviceMediaClass;
 use tidefs_local_object_store::pool::{
     PlacementReceipt, Pool, PoolConfig as ObjectPoolConfig, PoolProperties,
@@ -4783,6 +4783,39 @@ fn transport_primary_put_requires_receipt(store: &TransportReplicatedStore) -> b
     store.configured_replica_count() > 1 || store.connected_replica_count() > 1
 }
 
+fn receive_vfssend2_frame_export(
+    fs_root: &Path,
+    export: &[u8],
+    auth_key: RootAuthenticationKey,
+) -> Result<vfs::ChangedRecordImportReport, String> {
+    let decoded = vfs::vfssend2_bridge::receive_vfssend2_to_changed_records(export)
+        .map_err(|e| format!("VFSSEND2 receive decode: {e}"))?;
+
+    if decoded.incremental {
+        vfs::LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
+            fs_root,
+            StoreOptions::default(),
+            &decoded,
+            auth_key,
+            [0u8; 16],
+            [0u8; 16],
+            None,
+            None,
+        )
+    } else {
+        vfs::LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
+            fs_root,
+            StoreOptions::default(),
+            &decoded,
+            auth_key,
+            [0u8; 16],
+            [0u8; 16],
+            None,
+        )
+    }
+    .map_err(|e| format!("receive: {e}"))
+}
+
 fn handle_frame_ctx(
     session_id: tidefs_transport::SessionId,
     frame: &Frame,
@@ -5263,24 +5296,7 @@ fn handle_frame_ctx(
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(root_authentication_key);
             let auth_key = RootAuthenticationKey::from_bytes32(key_bytes);
-            let decoded = match ChangedRecordExport::decode(export) {
-                Ok(d) => d,
-                Err(e) => {
-                    return Some(Frame::Error {
-                        message: format!("decode export: {e}"),
-                    })
-                }
-            };
-            let report = if decoded.incremental {
-                vfs::LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
-                    fs_root, StoreOptions::default(), &decoded, auth_key, [0u8; 16], [0u8; 16], None, None,
-                )
-            } else {
-                vfs::LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
-                    fs_root, StoreOptions::default(), &decoded, auth_key, [0u8; 16], [0u8; 16], None,
-                )
-            };
-            match report {
+            match receive_vfssend2_frame_export(fs_root, export, auth_key) {
                 Ok(r) => {
                     let json = serde_json::json!({
                         "spec": r.spec,
@@ -5299,9 +5315,7 @@ fn handle_frame_ctx(
                         report_json: json.to_string(),
                     })
                 }
-                Err(e) => Some(Frame::Error {
-                    message: format!("receive: {e}"),
-                }),
+                Err(message) => Some(Frame::Error { message }),
             }
         }
         Frame::SnapshotBarrier {
@@ -5948,46 +5962,16 @@ fn handle_vsnp_push(
     let fs_root = ctx.config.fs_root.as_ref().ok_or("no fs_root configured")?;
     let auth_key = RootAuthenticationKey::from_bytes32(auth_key_bytes);
 
-    let export = vfs::vfssend2_bridge::decode_any_stream_to_changed_records(export_bytes)
-        .map_err(|e| format!("decode stream: {e}"))?;
-
-    let report = if export.incremental {
-        vfs::LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
-            fs_root,
-            tidefs_local_object_store::StoreOptions::default(),
-            &export,
-            auth_key,
-            [0u8; 16],
-            [0u8; 16],
-            None,
-            None,
-        )
-    } else {
-        vfs::LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
-            fs_root,
-            tidefs_local_object_store::StoreOptions::default(),
-            &export,
-            auth_key,
-            [0u8; 16],
-            [0u8; 16],
-            None,
-        )
-    };
-
-    match report {
-        Ok(r) => {
-            let ack = format!(
-                "received stream (roots={}, records={}, payload={}, snapshots={}, tx={})",
-                r.imported_roots,
-                r.imported_records,
-                r.imported_payload_bytes,
-                r.snapshot_catalog_entries,
-                r.selected_transaction_id,
-            );
-            Ok(Some(build_vsnp_ack(&ack)))
-        }
-        Err(e) => Err(format!("receive: {e}")),
-    }
+    let report = receive_vfssend2_frame_export(fs_root, export_bytes, auth_key)?;
+    let ack = format!(
+        "received stream (roots={}, records={}, payload={}, snapshots={}, tx={})",
+        report.imported_roots,
+        report.imported_records,
+        report.imported_payload_bytes,
+        report.snapshot_catalog_entries,
+        report.selected_transaction_id,
+    );
+    Ok(Some(build_vsnp_ack(&ack)))
 }
 
 fn handle_vsnp_pull_request(
@@ -6133,6 +6117,103 @@ mod cluster_pool_handler_tests {
             fence_validator: None,
             lease_runtime: None,
             split_brain_guard: None,
+        }
+    }
+
+    fn frame_local_store() -> (tempfile::TempDir, Arc<Mutex<StoreBackend>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().join("store")];
+        let store = ReplicatedObjectStore::open(&paths, ReplicatedStoreConfig::default()).unwrap();
+        let backend = Arc::new(Mutex::new(StoreBackend::Local(Box::new(store))));
+        (dir, backend)
+    }
+
+    fn full_send_exports(auth_key: RootAuthenticationKey) -> (Vec<u8>, Vec<u8>) {
+        let source_dir = tempfile::tempdir().unwrap();
+        let mut source = vfs::LocalFileSystem::open_with_root_authentication_key(
+            source_dir.path(),
+            StoreOptions::default(),
+            auth_key,
+        )
+        .unwrap();
+
+        source.create_dir("/data", 0o755).unwrap();
+        source.create_file("/data/payload.bin", 0o644).unwrap();
+        source
+            .write_file("/data/payload.bin", 0, b"storage-node-vfssend2-receive")
+            .unwrap();
+        source.sync_all().unwrap();
+
+        let vfssend1 = source.export_changed_records().unwrap().encode();
+        let vfssend2 = source.export_vfssend2([1u8; 16], [2u8; 16]).unwrap();
+        (vfssend1, vfssend2)
+    }
+
+    #[test]
+    fn frame_receive_accepts_vfssend2_export() {
+        let auth_key = RootAuthenticationKey::demo_key();
+        let (_, vfssend2) = full_send_exports(auth_key);
+        let (_store_dir, store) = frame_local_store();
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut ctx = frame_test_context(Arc::clone(&store));
+        ctx.config.fs_root = Some(target_dir.path().join("target-fs"));
+
+        let response = handle_frame_ctx(
+            tidefs_transport::SessionId::new(88),
+            &Frame::Receive {
+                export: vfssend2,
+                root_authentication_key: auth_key.as_bytes32().to_vec(),
+            },
+            &store,
+            &ctx,
+        )
+        .expect("receive response");
+
+        let report_json = match response {
+            Frame::ReceiveResponse { report_json } => report_json,
+            other => panic!("expected receive response, got {other:?}"),
+        };
+        let report: serde_json::Value = serde_json::from_str(&report_json).unwrap();
+        assert!(
+            report["imported_records"].as_u64().unwrap_or(0) > 0,
+            "receive should import VFSSEND2 records: {report_json}"
+        );
+        assert!(
+            report["staging_validated_before_publish"]
+                .as_bool()
+                .unwrap_or(false),
+            "receive should preserve staging validation evidence: {report_json}"
+        );
+    }
+
+    #[test]
+    fn frame_receive_rejects_vfssend1_export() {
+        let auth_key = RootAuthenticationKey::demo_key();
+        let (vfssend1, _) = full_send_exports(auth_key);
+        let (_store_dir, store) = frame_local_store();
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut ctx = frame_test_context(Arc::clone(&store));
+        ctx.config.fs_root = Some(target_dir.path().join("target-fs"));
+
+        let response = handle_frame_ctx(
+            tidefs_transport::SessionId::new(89),
+            &Frame::Receive {
+                export: vfssend1,
+                root_authentication_key: auth_key.as_bytes32().to_vec(),
+            },
+            &store,
+            &ctx,
+        )
+        .expect("receive response");
+
+        match response {
+            Frame::Error { message } => {
+                assert!(
+                    message.contains("VFSSEND2 receive decode"),
+                    "expected VFSSEND2 decode refusal, got {message}"
+                );
+            }
+            other => panic!("expected VFSSEND1 receive rejection, got {other:?}"),
         }
     }
 
