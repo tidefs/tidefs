@@ -16,6 +16,7 @@ on:
           - kernel-mmap-validation
           - kernel-teardown-validation
           - kernel-no-daemon-teardown-validation
+          - two-node-carrier-validation
           - fuse-vm-test
           - qemu-ublk-smoke
           - receipt-bound-reclaim-runtime
@@ -63,6 +64,10 @@ jobs:
             name: kernel-no-daemon-teardown-validation
             command: nix run .#kernel-no-daemon-teardown-validation -- --timeout 600
             output_dir: /tmp/tidefs-validation/kernel-no-daemon-teardown-validation
+          - id: two-node-carrier-validation
+            name: two-node-carrier-validation
+            command: nix run .#two-node-carrier-validation -- --timeout 600 --validation-dir /tmp/tidefs-validation/two-node-carrier-validation
+            output_dir: /tmp/tidefs-validation/two-node-carrier-validation
           - id: fuse-vm-test
             name: fuse-vm-test
             command: nix run .#fuse-vm-test -- --timeout 900 --validation-dir /tmp/tidefs-validation/fuse-vm-test --queue-depth-artifact /tmp/tidefs-validation/fuse-vm-test/performance/queue-depth-runtime.json

@@ -28,6 +28,8 @@ use tidefs_transport::harness::{
 pub use tidefs_transport::harness::SimMessage;
 
 pub mod placement_integration;
+#[cfg(feature = "qemu")]
+pub mod qemu_carrier;
 pub mod scenario;
 
 #[cfg(test)]

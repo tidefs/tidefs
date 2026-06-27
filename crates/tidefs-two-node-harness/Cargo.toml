@@ -16,6 +16,11 @@ description = "Deterministic two-node transport harness with storage+transport s
 default = []
 qemu = []
 
+[[bin]]
+name = "tidefs-two-node-qemu-carrier-validation"
+path = "src/bin/qemu_tcp_carrier_validation.rs"
+required-features = ["qemu"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 bincode = { workspace = true }
