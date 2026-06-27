@@ -104,11 +104,15 @@ impl ChildLock {
             return;
         }
         let byte = [1u8];
+        // SAFETY: `release_write_fd` is owned by this child-handle object, and
+        // `byte` is a valid one-byte buffer used to release the child wait.
         unsafe {
             let _ = libc::write(self.release_write_fd, byte.as_ptr().cast(), byte.len());
             let _ = libc::close(self.release_write_fd);
         }
         let mut status = 0;
+        // SAFETY: `pid` is the forked child tracked by this object, and
+        // `status` is valid output storage for waitpid.
         unsafe {
             let _ = libc::waitpid(self.pid, &mut status, 0);
         }
@@ -145,6 +149,8 @@ fn get_lock(
     len: i64,
 ) -> io::Result<libc::flock> {
     let mut lock = flock(lock_type, start, len);
+    // SAFETY: the fd is borrowed from a live `File`, and `lock` is initialized
+    // output storage for F_GETLK.
     let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) };
     if result == 0 {
         Ok(lock)
@@ -155,6 +161,8 @@ fn get_lock(
 
 fn set_lock_fd(fd: libc::c_int, lock_type: libc::c_short, start: i64, len: i64) -> io::Result<()> {
     let lock = flock(lock_type, start, len);
+    // SAFETY: the caller supplies an open fd, and `lock` is an initialized
+    // lock request alive for the fcntl call.
     let result = unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) };
     if result == 0 {
         Ok(())
@@ -166,6 +174,8 @@ fn set_lock_fd(fd: libc::c_int, lock_type: libc::c_short, start: i64, len: i64) 
 fn setlkw_fd(fd: libc::c_int, lock_type: libc::c_short, start: i64, len: i64) -> io::Result<()> {
     let lock = flock(lock_type, start, len);
     loop {
+        // SAFETY: the caller supplies an open fd, and `lock` is an initialized
+        // lock request alive for the blocking fcntl call.
         let result = unsafe { libc::fcntl(fd, libc::F_SETLKW, &lock) };
         if result == 0 {
             return Ok(());
@@ -215,6 +225,8 @@ fn spawn_child_holding_lock(
     pipe(&mut ready_pipe)?;
     pipe(&mut release_pipe)?;
 
+    // SAFETY: fork is used only by this process-control test; both parent and
+    // child close their inherited pipe fds on the paths below.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let err = io::Error::last_os_error();
@@ -228,6 +240,8 @@ fn spawn_child_holding_lock(
     if pid == 0 {
         close_fd(ready_pipe[0]);
         close_fd(release_pipe[1]);
+        // SAFETY: `path` is a NUL-terminated CString that remains alive in the
+        // child for the duration of the open call; the returned fd is child-owned.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         let errno = if fd < 0 {
             errno()
@@ -236,6 +250,8 @@ fn spawn_child_holding_lock(
             if result == 0 {
                 write_i32_fd(ready_pipe[1], 0);
                 let mut byte = [0u8; 1];
+                // SAFETY: `release_pipe[0]` is open in the child, and `byte`
+                // is valid one-byte storage for the release signal.
                 let _ = unsafe { libc::read(release_pipe[0], byte.as_mut_ptr().cast(), 1) };
                 0
             } else {
@@ -250,6 +266,8 @@ fn spawn_child_holding_lock(
         }
         close_fd(ready_pipe[1]);
         close_fd(release_pipe[0]);
+        // SAFETY: the child exits immediately without running parent cleanup
+        // code after writing its result through the pipe.
         unsafe {
             libc::_exit(if errno == 0 { 0 } else { 1 });
         }
@@ -268,6 +286,8 @@ fn spawn_child_holding_lock(
     } else {
         close_fd(release_pipe[1]);
         let mut status = 0;
+        // SAFETY: `pid` is the forked child for this helper, and `status` is
+        // valid output storage for waitpid.
         unsafe {
             let _ = libc::waitpid(pid, &mut status, 0);
         }
@@ -285,6 +305,8 @@ fn child_lock_attempt(
     let mut result_pipe = [-1; 2];
     pipe(&mut result_pipe)?;
 
+    // SAFETY: fork is used only by this process-control test; parent and child
+    // close their inherited pipe fds on the paths below.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let err = io::Error::last_os_error();
@@ -295,6 +317,8 @@ fn child_lock_attempt(
 
     if pid == 0 {
         close_fd(result_pipe[0]);
+        // SAFETY: `path` is a NUL-terminated CString that remains alive in the
+        // child for the duration of the open call; the returned fd is child-owned.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         let errno = if fd < 0 {
             errno()
@@ -306,6 +330,8 @@ fn child_lock_attempt(
             close_fd(fd);
         }
         close_fd(result_pipe[1]);
+        // SAFETY: the child exits immediately without running parent cleanup
+        // code after writing its result through the pipe.
         unsafe {
             libc::_exit(if errno == 0 { 0 } else { 1 });
         }
@@ -315,6 +341,8 @@ fn child_lock_attempt(
     let errno = read_i32_fd(result_pipe[0]);
     close_fd(result_pipe[0]);
     let mut status = 0;
+    // SAFETY: `pid` is the forked child for this helper, and `status` is valid
+    // output storage for waitpid.
     unsafe {
         let _ = libc::waitpid(pid, &mut status, 0);
     }
@@ -348,6 +376,8 @@ fn child_lock_attempt_until_success(
 
 fn child_set_lock_fd(fd: libc::c_int, lock_type: libc::c_short, start: i64, len: i64) -> i32 {
     let lock = flock(lock_type, start, len);
+    // SAFETY: the child supplies an open fd, and `lock` is an initialized lock
+    // request alive for the fcntl call.
     let result = unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) };
     if result == 0 {
         0
@@ -362,6 +392,7 @@ fn c_path(path: &Path) -> io::Result<CString> {
 }
 
 fn pipe(fds: &mut [libc::c_int; 2]) -> io::Result<()> {
+    // SAFETY: `fds` is valid two-element output storage for libc::pipe.
     let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if result == 0 {
         Ok(())
@@ -374,6 +405,8 @@ fn write_i32_fd(fd: libc::c_int, value: i32) {
     let bytes = value.to_ne_bytes();
     let mut written = 0;
     while written < bytes.len() {
+        // SAFETY: `fd` is caller-supplied and open, and the remaining byte
+        // slice is valid readable storage for the requested write length.
         let result = unsafe {
             libc::write(
                 fd,
@@ -392,6 +425,8 @@ fn read_i32_fd(fd: libc::c_int) -> i32 {
     let mut bytes = [0u8; std::mem::size_of::<i32>()];
     let mut read = 0;
     while read < bytes.len() {
+        // SAFETY: `fd` is caller-supplied and open, and the remaining byte
+        // slice is valid writable storage for the requested read length.
         let result = unsafe {
             libc::read(
                 fd,
@@ -409,6 +444,8 @@ fn read_i32_fd(fd: libc::c_int) -> i32 {
 
 fn close_fd(fd: libc::c_int) {
     if fd >= 0 {
+        // SAFETY: callers transfer fd cleanup to this helper and do not use the
+        // descriptor after the close path that passes it here.
         unsafe {
             let _ = libc::close(fd);
         }
@@ -614,10 +651,14 @@ fn process_sigkill_releases_locks_and_unblocks_setlkw_waiter() {
     // SIGKILL the child; close its release fd so Drop does not try to signal it
     close_fd(child.release_write_fd);
     child.release_write_fd = -1;
+    // SAFETY: `child_pid` is the forked lock holder for this test; SIGKILL is
+    // deliberately used to validate lock release on process death.
     unsafe {
         libc::kill(child_pid, libc::SIGKILL);
     }
     let mut status = 0;
+    // SAFETY: `child_pid` names the killed child, and `status` is valid output
+    // storage for waitpid.
     unsafe {
         libc::waitpid(child_pid, &mut status, 0);
     }
@@ -642,6 +683,8 @@ extern "C" {
 }
 
 fn bsd_flock(file: &File, operation: libc::c_int) -> io::Result<()> {
+    // SAFETY: the fd is borrowed from a live `File`, and operation is a libc
+    // flock operation selected by the test.
     let result = unsafe { sys_flock(file.as_raw_fd(), operation) };
     if result == 0 {
         Ok(())
@@ -657,6 +700,8 @@ fn spawn_child_holding_flock(path: &Path, operation: libc::c_int) -> io::Result<
     pipe(&mut ready_pipe)?;
     pipe(&mut release_pipe)?;
 
+    // SAFETY: fork is used only by this process-control test; both parent and
+    // child close their inherited pipe fds on the paths below.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let err = io::Error::last_os_error();
@@ -670,14 +715,20 @@ fn spawn_child_holding_flock(path: &Path, operation: libc::c_int) -> io::Result<
     if pid == 0 {
         close_fd(ready_pipe[0]);
         close_fd(release_pipe[1]);
+        // SAFETY: `path` is a NUL-terminated CString that remains alive in the
+        // child for the duration of the open call; the returned fd is child-owned.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         let errno = if fd < 0 {
             errno()
         } else {
+            // SAFETY: `fd` is open and child-owned, and operation is a libc
+            // flock operation selected by the test.
             let result = unsafe { sys_flock(fd, operation) };
             if result == 0 {
                 write_i32_fd(ready_pipe[1], 0);
                 let mut byte = [0u8; 1];
+                // SAFETY: `release_pipe[0]` is open in the child, and `byte`
+                // is valid one-byte storage for the release signal.
                 let _ = unsafe { libc::read(release_pipe[0], byte.as_mut_ptr().cast(), 1) };
                 0
             } else {
@@ -692,6 +743,8 @@ fn spawn_child_holding_flock(path: &Path, operation: libc::c_int) -> io::Result<
         }
         close_fd(ready_pipe[1]);
         close_fd(release_pipe[0]);
+        // SAFETY: the child exits immediately without running parent cleanup
+        // code after writing its result through the pipe.
         unsafe {
             libc::_exit(if errno == 0 { 0 } else { 1 });
         }
@@ -710,6 +763,8 @@ fn spawn_child_holding_flock(path: &Path, operation: libc::c_int) -> io::Result<
     } else {
         close_fd(release_pipe[1]);
         let mut status = 0;
+        // SAFETY: `pid` is the forked child for this helper, and `status` is
+        // valid output storage for waitpid.
         unsafe {
             let _ = libc::waitpid(pid, &mut status, 0);
         }
@@ -722,6 +777,8 @@ fn child_flock_attempt(path: &Path, operation: libc::c_int) -> io::Result<()> {
     let mut result_pipe = [-1; 2];
     pipe(&mut result_pipe)?;
 
+    // SAFETY: fork is used only by this process-control test; parent and child
+    // close their inherited pipe fds on the paths below.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let err = io::Error::last_os_error();
@@ -732,10 +789,14 @@ fn child_flock_attempt(path: &Path, operation: libc::c_int) -> io::Result<()> {
 
     if pid == 0 {
         close_fd(result_pipe[0]);
+        // SAFETY: `path` is a NUL-terminated CString that remains alive in the
+        // child for the duration of the open call; the returned fd is child-owned.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         let errno = if fd < 0 {
             errno()
         } else {
+            // SAFETY: `fd` is open and child-owned, and operation is a libc
+            // flock operation selected by the test.
             let result = unsafe { sys_flock(fd, operation) };
             if result == 0 {
                 0
@@ -748,6 +809,8 @@ fn child_flock_attempt(path: &Path, operation: libc::c_int) -> io::Result<()> {
             close_fd(fd);
         }
         close_fd(result_pipe[1]);
+        // SAFETY: the child exits immediately without running parent cleanup
+        // code after writing its result through the pipe.
         unsafe {
             libc::_exit(if errno == 0 { 0 } else { 1 });
         }
@@ -757,6 +820,8 @@ fn child_flock_attempt(path: &Path, operation: libc::c_int) -> io::Result<()> {
     let errno = read_i32_fd(result_pipe[0]);
     close_fd(result_pipe[0]);
     let mut status = 0;
+    // SAFETY: `pid` is the forked child for this helper, and `status` is valid
+    // output storage for waitpid.
     unsafe {
         let _ = libc::waitpid(pid, &mut status, 0);
     }
@@ -894,10 +959,14 @@ fn flock_process_exit_releases_locks() {
     // SIGKILL the lock holder
     close_fd(child.release_write_fd);
     child.release_write_fd = -1;
+    // SAFETY: `child_pid` is the forked lock holder for this test; SIGKILL is
+    // deliberately used to validate lock release on process death.
     unsafe {
         libc::kill(child_pid, libc::SIGKILL);
     }
     let mut status = 0;
+    // SAFETY: `child_pid` names the killed child, and `status` is valid output
+    // storage for waitpid.
     unsafe {
         libc::waitpid(child_pid, &mut status, 0);
     }

@@ -101,6 +101,8 @@ fn renameat2(old_path: &Path, new_path: &Path, flags: u32) -> io::Result<()> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "old path contains nul byte"))?;
     let new_c = CString::new(new_path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "new path contains nul byte"))?;
+    // SAFETY: both path buffers are NUL-terminated and alive for the
+    // renameat2 syscall; AT_FDCWD and flags are copied scalar arguments.
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,

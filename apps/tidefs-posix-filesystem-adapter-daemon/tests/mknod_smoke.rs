@@ -90,6 +90,8 @@ struct UmaskRestore {
 
 impl Drop for UmaskRestore {
     fn drop(&mut self) {
+        // SAFETY: restoring the saved scalar umask value has no pointer or fd
+        // preconditions.
         unsafe {
             libc::umask(self.previous);
         }
@@ -100,6 +102,8 @@ fn with_umask<T>(umask: libc::mode_t, f: impl FnOnce() -> T) -> T {
     let _guard = UMASK_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    // SAFETY: umask only updates the process mask from a scalar mode and
+    // returns the previous value for restoration under `UMASK_LOCK`.
     let previous = unsafe { libc::umask(umask) };
     let _restore = UmaskRestore { previous };
     f()
@@ -108,6 +112,8 @@ fn with_umask<T>(umask: libc::mode_t, f: impl FnOnce() -> T) -> T {
 fn mknod_path(path: &Path, mode: libc::mode_t, rdev: libc::dev_t) -> io::Result<()> {
     let cpath = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains nul byte"))?;
+    // SAFETY: `cpath` is a NUL-terminated path alive for the mknod call, and
+    // mode/rdev are copied scalar arguments supplied by the test.
     let result = unsafe { libc::mknod(cpath.as_ptr(), mode, rdev) };
     if result == 0 {
         Ok(())

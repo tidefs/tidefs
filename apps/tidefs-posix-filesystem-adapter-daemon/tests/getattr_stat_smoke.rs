@@ -102,6 +102,8 @@ fn create_file(path: &Path, mode: u32, payload: &[u8]) -> File {
 }
 
 fn current_uid_gid() -> (u32, u32) {
+    // SAFETY: `geteuid`/`getegid` read the current process credentials and do
+    // not require pointer, fd, or buffer invariants.
     let uid = unsafe { libc::geteuid() } as u32;
     let gid = unsafe { libc::getegid() } as u32;
     (uid, gid)
@@ -110,6 +112,8 @@ fn current_uid_gid() -> (u32, u32) {
 fn mknod_fifo(path: &Path, mode: libc::mode_t) -> io::Result<()> {
     let cpath = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains nul byte"))?;
+    // SAFETY: `cpath` is a NUL-terminated path alive for the mknod call; FIFO
+    // creation passes a zero device id as required.
     let result = unsafe { libc::mknod(cpath.as_ptr(), libc::S_IFIFO | mode, 0) };
     if result == 0 {
         Ok(())

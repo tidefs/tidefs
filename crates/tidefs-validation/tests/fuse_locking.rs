@@ -771,6 +771,8 @@ fn non_overlapping_write_locks_independent() {
         panic!("fork failed");
     }
     if child_pid == 0 {
+        // SAFETY: the child closes its inherited read end before opening the
+        // target file and never uses `read_fd` afterward.
         unsafe {
             libc::close(read_fd);
         }

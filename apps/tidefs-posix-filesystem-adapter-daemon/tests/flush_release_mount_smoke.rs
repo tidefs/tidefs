@@ -108,6 +108,8 @@ impl Drop for MountedVfs {
 }
 
 fn close_fd(fd: RawFd) -> io::Result<()> {
+    // SAFETY: ownership of `fd` is transferred to this helper, and callers do
+    // not use it after this close attempt.
     let result = unsafe { libc::close(fd) };
     if result < 0 {
         Err(io::Error::last_os_error())
@@ -117,10 +119,14 @@ fn close_fd(fd: RawFd) -> io::Result<()> {
 }
 
 fn duplicate_fd(fd: RawFd) -> io::Result<File> {
+    // SAFETY: `fd` is an open descriptor owned by the caller; `dup` returns a
+    // new descriptor with independent ownership on success.
     let duplicate = unsafe { libc::dup(fd) };
     if duplicate < 0 {
         Err(io::Error::last_os_error())
     } else {
+        // SAFETY: `duplicate` is the fresh descriptor returned by `dup`; this
+        // transfers ownership into `File` exactly once.
         Ok(unsafe { File::from_raw_fd(duplicate) })
     }
 }
