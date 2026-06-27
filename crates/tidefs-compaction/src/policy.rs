@@ -226,10 +226,7 @@ impl Ord for CompactionPolicyCandidate {
         self.write_amplification
             .cmp(&other.write_amplification)
             .then_with(|| other.dead_bytes.cmp(&self.dead_bytes))
-            .then_with(|| {
-                self.creation_commit_group
-                    .cmp(&other.creation_commit_group)
-            })
+            .then_with(|| self.creation_commit_group.cmp(&other.creation_commit_group))
             .then_with(|| self.segment_id.cmp(&other.segment_id))
     }
 }
@@ -579,7 +576,10 @@ mod tests {
             CompactionTriggerInput::scheduled(WorkBudget::DEFAULT_TICK),
         );
 
-        assert_eq!(report.write_amplification_cap, WriteAmplification::SCHEDULED_CAP);
+        assert_eq!(
+            report.write_amplification_cap,
+            WriteAmplification::SCHEDULED_CAP
+        );
         assert_eq!(report.candidates_admitted, 1);
         assert_eq!(report.rejected_write_amplification, 1);
         assert_eq!(report.admitted_candidates[0].segment_id, 2);
@@ -597,7 +597,10 @@ mod tests {
             CompactionTriggerInput::pressure_escalated(CompactionPressureLevel::Auto, budget),
         );
 
-        assert_eq!(report.write_amplification_cap, WriteAmplification::PRESSURE_CAP);
+        assert_eq!(
+            report.write_amplification_cap,
+            WriteAmplification::PRESSURE_CAP
+        );
         assert_eq!(report.effective_relocate_bytes_budget, 128_000);
         assert_eq!(report.candidates_admitted, 1);
         assert_eq!(report.rejected_write_amplification, 1);

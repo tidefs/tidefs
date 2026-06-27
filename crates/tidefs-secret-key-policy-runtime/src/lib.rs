@@ -830,12 +830,14 @@ pub fn rotate_leaf_secret_with_dual_validity_and_successor<S: SealProvider>(
             envelope_id: predecessor_envelope_id,
         });
     }
-    let predecessor = store.lookup_envelope(predecessor_envelope_id).map_err(|_| {
-        SecretKeyPolicyRuntimeError::RotationPredecessorNotFound {
-            plan_id: rotation_plan.rotation_plan_id,
-            envelope_id: predecessor_envelope_id,
-        }
-    })?;
+    let predecessor = store
+        .lookup_envelope(predecessor_envelope_id)
+        .map_err(
+            |_| SecretKeyPolicyRuntimeError::RotationPredecessorNotFound {
+                plan_id: rotation_plan.rotation_plan_id,
+                envelope_id: predecessor_envelope_id,
+            },
+        )?;
     if predecessor.handle_id != handle_id
         || predecessor.envelope_version != rotation_plan.predecessor_envelope_version
     {

@@ -22,7 +22,6 @@ use crate::Result;
 
 pub use tidefs_send_stream::{Id128, SenderAuthority, SenderAuthorityEvidence};
 
-
 /// Per-receive authorization for a cross-pool receive stream.
 ///
 /// The authorization names the exact sender pool identity tuple that the
@@ -53,7 +52,6 @@ impl CrossPoolReceiveAuthorization {
             && self.sender_membership_generation == sender.sender_membership_generation
     }
 }
-
 
 /// Identity of a content block being scrubbed.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

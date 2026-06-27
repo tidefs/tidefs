@@ -1073,9 +1073,11 @@ impl RequestEnvelope {
                 payload_flags: self.payload_flags,
             });
         }
-        self.version.validate().map_err(|e| RequestEnvelopeValidateError {
-            payload_flags: e.version as u32,
-        })?;
+        self.version
+            .validate()
+            .map_err(|e| RequestEnvelopeValidateError {
+                payload_flags: e.version as u32,
+            })?;
         Ok(())
     }
 }
@@ -1193,9 +1195,11 @@ impl TideCompletion {
                 result_flags: self.result_flags,
             });
         }
-        self.version.validate().map_err(|e| TideCompletionValidateError {
-            result_flags: e.version as u32,
-        })?;
+        self.version
+            .validate()
+            .map_err(|e| TideCompletionValidateError {
+                result_flags: e.version as u32,
+            })?;
         Ok(())
     }
 }

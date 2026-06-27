@@ -310,7 +310,6 @@ pub struct UnmountAck {
     pub status: LockServiceStatus,
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum RecallReason {
@@ -1122,7 +1121,11 @@ impl LockServiceLeader {
 
     /// Release every lock and pending request scoped to a dataset mount
     /// identity. Used on unmount or forced unmount.
-    pub fn unmount_mount(&mut self, dataset_mount_id: DatasetMountId, epoch: EpochId) -> UnmountAck {
+    pub fn unmount_mount(
+        &mut self,
+        dataset_mount_id: DatasetMountId,
+        epoch: EpochId,
+    ) -> UnmountAck {
         let released = self.table.release_by_mount(dataset_mount_id.0, epoch);
         UnmountAck {
             dataset_mount_id,
@@ -1432,11 +1435,7 @@ mod tests {
         LockServiceLeader::new(LockServiceConfig::default())
     }
 
-    fn configured_leader(
-        dataset_id: u64,
-        mount_id: u64,
-        epoch: u64,
-    ) -> LockServiceLeader {
+    fn configured_leader(dataset_id: u64, mount_id: u64, epoch: u64) -> LockServiceLeader {
         LockServiceLeader::new(LockServiceConfig {
             current_mount_identity: mount_identity(dataset_id, mount_id, epoch),
             current_epoch: EpochId::new(epoch),
@@ -1486,7 +1485,7 @@ mod tests {
                 version: 2,
             }),
             LockPayload::Release(ReleaseRequest {
-                    dataset_mount_id: DatasetMountId(1),
+                dataset_mount_id: DatasetMountId(1),
                 lease_id: 1,
                 owner,
                 epoch: EpochId::new(1),
@@ -1679,7 +1678,7 @@ mod tests {
         assert_eq!(renew.version, 2);
 
         let release = leader.release(ReleaseRequest {
-                    dataset_mount_id: DatasetMountId(1),
+            dataset_mount_id: DatasetMountId(1),
             lease_id: ack.lease_id,
             owner,
             epoch: EpochId::new(1),
@@ -1732,7 +1731,7 @@ mod tests {
     fn blocking_setlkw_queues_on_conflict() {
         let mut leader = leader();
         let write = SetlkRequest {
-                dataset_mount_id: DatasetMountId(1),
+            dataset_mount_id: DatasetMountId(1),
             dataset_id: 9,
             ino: 99,
             owner: owner(1, 10, 1),
@@ -1748,7 +1747,7 @@ mod tests {
         assert_eq!(first.status, LockServiceStatus::Granted);
 
         let blocked = SetlkRequest {
-                dataset_mount_id: DatasetMountId(1),
+            dataset_mount_id: DatasetMountId(1),
             dataset_id: 9,
             ino: 99,
             owner: owner(2, 20, 2),
@@ -1790,7 +1789,7 @@ mod tests {
         assert_eq!(first.status, LockServiceStatus::Granted);
 
         let ack = leader.getlk(GetlkRequest {
-                dataset_mount_id: DatasetMountId(1),
+            dataset_mount_id: DatasetMountId(1),
             dataset_id: 2,
             ino: 8,
             owner: owner(2, 2, 2),
@@ -1848,33 +1847,30 @@ mod tests {
             other => panic!("unexpected payload: {other:?}"),
         }
 
-        handle.accept_acquire_ack(
-            &AcquireAck {
-                status: LockStatus::Granted,
-                lease_id: 1,
-                dataset_mount_id: DatasetMountId(1),
-                target: LeaseTarget::Inode {
-                    dataset_id: 3,
-                    ino: 44,
-                    parent_lease_id: 0,
+        handle
+            .accept_acquire_ack(
+                &AcquireAck {
+                    status: LockStatus::Granted,
+                    lease_id: 1,
+                    dataset_mount_id: DatasetMountId(1),
+                    target: LeaseTarget::Inode {
+                        dataset_id: 3,
+                        ino: 44,
+                        parent_lease_id: 0,
+                    },
+                    mode: LockMode::Shared,
+                    term: 1,
+                    epoch: EpochId::new(1),
+                    expires_at_millis: 31_000,
+                    conflict_holder: None,
+                    conflict_lease_id: None,
                 },
-                mode: LockMode::Shared,
-                term: 1,
-                epoch: EpochId::new(1),
-                expires_at_millis: 31_000,
-                conflict_holder: None,
-                conflict_lease_id: None,
-            },
-            1_000,
-        )
-        .expect("matching acquire ack");
+                1_000,
+            )
+            .expect("matching acquire ack");
         assert_eq!(handle.held_lease_ids(), vec![1]);
         assert_eq!(
-            handle
-                .held
-                .get(&1)
-                .expect("held grant")
-                .mount_identity,
+            handle.held.get(&1).expect("held grant").mount_identity,
             mount_identity
         );
         handle.accept_release_ack(&ReleaseAck {
@@ -1930,8 +1926,7 @@ mod tests {
                 DatasetMountIdentity::ZERO
             ))
         ));
-        let mut handle =
-            LockServiceHandle::new(owner, mount_identity(3, 11, 1)).expect("handle");
+        let mut handle = LockServiceHandle::new(owner, mount_identity(3, 11, 1)).expect("handle");
         let mismatch = handle.accept_acquire_ack(
             &AcquireAck {
                 status: LockStatus::Granted,
@@ -2250,7 +2245,11 @@ impl LockService {
     }
     /// Release every lock and pending request scoped to a dataset mount
     /// identity. Used on unmount or forced unmount.
-    pub fn unmount_mount(&mut self, dataset_mount_id: DatasetMountId, epoch: EpochId) -> UnmountAck {
+    pub fn unmount_mount(
+        &mut self,
+        dataset_mount_id: DatasetMountId,
+        epoch: EpochId,
+    ) -> UnmountAck {
         let released = self.table.release_by_mount(dataset_mount_id.0, epoch);
         UnmountAck {
             dataset_mount_id,

@@ -2,7 +2,6 @@
 //! Shared heuristic types for relocation action classification, HDD/SSD/WAN
 //! heuristics, and prediction confidence.
 
-
 use crate::reasons::GovernorRelocationReason;
 
 // ── Relocation action class ──────────────────────────────────────────
@@ -229,10 +228,7 @@ impl HeuristicResult {
 
     /// Recommended result with the given action class.
     #[must_use]
-    pub const fn recommended(
-        action_class: RelocationActionClass,
-        summary: &'static str,
-    ) -> Self {
+    pub const fn recommended(action_class: RelocationActionClass, summary: &'static str) -> Self {
         HeuristicResult {
             action_class,
             recommend: true,
@@ -283,9 +279,9 @@ impl GovernorRelocationReason {
             GovernorRelocationReason::SsdCompaction => 1, // Low
             GovernorRelocationReason::WearRebalance => 2, // Medium
             GovernorRelocationReason::PolicySatisfaction => 2, // Medium
-            GovernorRelocationReason::Rebake => 2, // Medium
+            GovernorRelocationReason::Rebake => 2,    // Medium
             GovernorRelocationReason::Promotion => 2, // Medium
-            GovernorRelocationReason::Demotion => 2, // Medium
+            GovernorRelocationReason::Demotion => 2,  // Medium
             GovernorRelocationReason::GeoCatchup => 2, // Medium
         }
     }
@@ -307,12 +303,8 @@ mod tests {
         assert!(RelocationActionClass::None < RelocationActionClass::CacheOnly);
         assert!(RelocationActionClass::CacheOnly < RelocationActionClass::ServingTrial);
         assert!(RelocationActionClass::ServingTrial < RelocationActionClass::Optimization);
-        assert!(
-            RelocationActionClass::Optimization < RelocationActionClass::AuthorityMovement
-        );
-        assert!(
-            RelocationActionClass::AuthorityMovement < RelocationActionClass::Necessity
-        );
+        assert!(RelocationActionClass::Optimization < RelocationActionClass::AuthorityMovement);
+        assert!(RelocationActionClass::AuthorityMovement < RelocationActionClass::Necessity);
     }
 
     #[test]
@@ -358,7 +350,10 @@ mod tests {
 
     #[test]
     fn repair_has_zero_min_confidence() {
-        assert_eq!(GovernorRelocationReason::Repair.minimum_prediction_confidence(), 0);
+        assert_eq!(
+            GovernorRelocationReason::Repair.minimum_prediction_confidence(),
+            0
+        );
     }
 
     #[test]

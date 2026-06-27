@@ -280,8 +280,7 @@ impl fmt::Display for EvacuationReceiptError {
                 write!(
                     f,
                     "evacuation receipt bound to node {} but drain targets node {}",
-                    receipt_node.0,
-                    draining_node.0,
+                    receipt_node.0, draining_node.0,
                 )
             }
         }

@@ -295,7 +295,6 @@ pub fn map_namespace_error(err: tidefs_namespace::NamespaceError) -> Errno {
         NamespaceError::StaleCursor => Errno(libc::EAGAIN as u16),
 
         NamespaceError::DatasetIdentityMismatch { .. } => Errno(libc::EIO as u16),
-
     }
 }
 

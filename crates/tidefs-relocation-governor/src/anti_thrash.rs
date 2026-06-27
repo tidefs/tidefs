@@ -4,7 +4,6 @@
 //! Prevents flip-flop churn, movement-debt abuse, failed-payback loops,
 //! and one-off hotness from triggering authority movement.
 
-
 use crate::reasons::GovernorRelocationReason;
 
 // ── Movement debt ────────────────────────────────────────────────────
@@ -302,11 +301,7 @@ impl AntiThrashState {
     /// Evaluate whether a new relocation proposal should be blocked by
     /// anti-thrash rules at the given time.
     #[must_use]
-    pub fn evaluate(
-        &self,
-        now_ms: u64,
-        reason: GovernorRelocationReason,
-    ) -> AntiThrashDecision {
+    pub fn evaluate(&self, now_ms: u64, reason: GovernorRelocationReason) -> AntiThrashDecision {
         // 1. Cooldown check
         if let Some(ref cooldown) = self.cooldown {
             if cooldown.is_active(now_ms) {
@@ -403,9 +398,7 @@ pub enum AntiThrashDecision {
     },
 
     /// Indefinite cooldown (too many failed paybacks).
-    IndefiniteCooldown {
-        skip_reason: &'static str,
-    },
+    IndefiniteCooldown { skip_reason: &'static str },
 
     /// A previous payback failed.
     PaybackFailed {
@@ -415,19 +408,13 @@ pub enum AntiThrashDecision {
     },
 
     /// Last prediction was contradicted by observed outcome.
-    ContradictorySignal {
-        skip_reason: &'static str,
-    },
+    ContradictorySignal { skip_reason: &'static str },
 
     /// Prediction confidence has collapsed.
-    ConfidenceCollapsed {
-        skip_reason: &'static str,
-    },
+    ConfidenceCollapsed { skip_reason: &'static str },
 
     /// Prediction confidence is declining.
-    ConfidenceDeclining {
-        skip_reason: &'static str,
-    },
+    ConfidenceDeclining { skip_reason: &'static str },
 }
 
 impl AntiThrashDecision {
@@ -446,12 +433,8 @@ impl AntiThrashDecision {
             | AntiThrashDecision::IndefiniteCooldown { skip_reason, .. }
             | AntiThrashDecision::ContradictorySignal { skip_reason, .. }
             | AntiThrashDecision::ConfidenceCollapsed { skip_reason, .. }
-            | AntiThrashDecision::ConfidenceDeclining { skip_reason, .. } => {
-                Some(skip_reason)
-            }
-            AntiThrashDecision::MovementDebtActive { .. } => {
-                Some("movement-debt-active")
-            }
+            | AntiThrashDecision::ConfidenceDeclining { skip_reason, .. } => Some(skip_reason),
+            AntiThrashDecision::MovementDebtActive { .. } => Some("movement-debt-active"),
             AntiThrashDecision::PaybackFailed { .. } => Some("payback-failed"),
         }
     }

@@ -922,28 +922,17 @@ pub enum LayoutPolicyError {
         minimum_required_bytes: u64,
     },
     /// Input buffer is too small.
-    BufferTooSmall {
-        expected: usize,
-        actual: usize,
-    },
+    BufferTooSmall { expected: usize, actual: usize },
     /// Magic bytes do not match.
-    BadMagic {
-        expected: [u8; 8],
-        found: [u8; 8],
-    },
+    BadMagic { expected: [u8; 8], found: [u8; 8] },
     /// Unrecognized format version.
     UnsupportedVersion(u16),
     /// Bad policy discriminant value.
     BadPolicyDiscriminant(u16),
     /// CRC32C checksum mismatch.
-    ChecksumMismatch {
-        expected: u32,
-        computed: u32,
-    },
+    ChecksumMismatch { expected: u32, computed: u32 },
     /// Custom layout had an invalid segment size.
-    InvalidSegmentSize {
-        reason: InvalidSegmentSizeReason,
-    },
+    InvalidSegmentSize { reason: InvalidSegmentSizeReason },
     /// Custom layout region sizes exceed device capacity.
     RegionOverflow {
         device_size_bytes: u64,
@@ -1035,10 +1024,7 @@ pub const fn is_power_of_two_u64(n: u64) -> bool {
 ///
 /// Returns a power-of-two in [`MIN_SEGMENT_SIZE_BYTES`, `MAX_SEGMENT_SIZE_BYTES`].
 #[must_use]
-pub fn choose_segment_size_bytes(
-    region_size_bytes: u64,
-    target_segments: u64,
-) -> u64 {
+pub fn choose_segment_size_bytes(region_size_bytes: u64, target_segments: u64) -> u64 {
     if region_size_bytes == 0 {
         return MIN_SEGMENT_SIZE_BYTES;
     }
@@ -1116,9 +1102,7 @@ impl DeviceLayoutPolicy {
     /// Fixed 1 MiB segment sizes for all regions.
     /// For devices too small for the full journal layout, journals are
     /// sized down proportionally so the layout always fits.
-    fn compute_slice0_small(
-        device_size_bytes: u64,
-    ) -> Result<DeviceLayoutV1, LayoutPolicyError> {
+    fn compute_slice0_small(device_size_bytes: u64) -> Result<DeviceLayoutV1, LayoutPolicyError> {
         let seg = SLICE0_SMALL_SEGMENT_BYTES;
 
         // Absolute minimum: one segment for the system area.
@@ -1141,8 +1125,7 @@ impl DeviceLayoutPolicy {
         let metadata_seg = METADATA_JOURNAL_SEGMENTS.min(remaining_after_poolmap / seg / 5);
         let metadata_journal_len = seg * metadata_seg.max(1).min(remaining_after_poolmap / seg);
 
-        let remaining_after_metadata =
-            remaining_after_poolmap.saturating_sub(metadata_journal_len);
+        let remaining_after_metadata = remaining_after_poolmap.saturating_sub(metadata_journal_len);
         let data_journal_len = remaining_after_metadata;
 
         let system_end = system_area_len;
@@ -1169,9 +1152,7 @@ impl DeviceLayoutPolicy {
 
     /// Auto-scaling: pick a segment size that keeps data region segment count
     /// below [`TARGET_DATA_SEGMENTS`], then size journal regions accordingly.
-    fn compute_auto(
-        device_size_bytes: u64,
-    ) -> Result<DeviceLayoutV1, LayoutPolicyError> {
+    fn compute_auto(device_size_bytes: u64) -> Result<DeviceLayoutV1, LayoutPolicyError> {
         // Minimum device size for Auto: system + poolmap + metadata at
         // 1 MiB segment size.  Below this, fall back to Slice0Small.
         let min_seg = MIN_SEGMENT_SIZE_BYTES;
@@ -1188,8 +1169,7 @@ impl DeviceLayoutPolicy {
         }
 
         let data_region_size = device_size_bytes.saturating_sub(fixed_overhead);
-        let data_segment_size =
-            choose_segment_size_bytes(data_region_size, TARGET_DATA_SEGMENTS);
+        let data_segment_size = choose_segment_size_bytes(data_region_size, TARGET_DATA_SEGMENTS);
 
         let system_segment_size = MIN_SEGMENT_SIZE_BYTES; // always 1 MiB
         let poolmap_journal_len = data_segment_size * POOLMAP_JOURNAL_SEGMENTS;
@@ -1395,10 +1375,7 @@ mod layout_policy_tests {
         assert_eq!(layout.system_area_offset, 0);
         assert_eq!(layout.system_area_len, 1024 * 1024);
         // poolmap starts right after system
-        assert_eq!(
-            layout.poolmap_journal_offset,
-            layout.system_area_len
-        );
+        assert_eq!(layout.poolmap_journal_offset, layout.system_area_len);
         assert_eq!(
             layout.poolmap_journal_len,
             1024 * 1024 * POOLMAP_JOURNAL_SEGMENTS
@@ -1461,11 +1438,7 @@ mod layout_policy_tests {
         // Clamped to 256 MiB max.
         assert_eq!(layout.data_segment_size, 256 * 1024 * 1024);
         // Verify segment count is reasonable
-        let segs = approx_segment_count(
-            &layout,
-            layout.data_journal_len,
-            layout.data_segment_size,
-        );
+        let segs = approx_segment_count(&layout, layout.data_journal_len, layout.data_segment_size);
         assert!(
             segs <= TARGET_DATA_SEGMENTS * 11 / 10,
             "data region has {segs} segments, target {TARGET_DATA_SEGMENTS}"
@@ -1615,9 +1588,7 @@ mod layout_policy_tests {
 
     #[test]
     fn encode_decode_roundtrip_auto() {
-        let layout = DeviceLayoutPolicy::Auto
-            .compute(1_000_000_000_000)
-            .unwrap();
+        let layout = DeviceLayoutPolicy::Auto.compute(1_000_000_000_000).unwrap();
         let mut buf = [0u8; DEVICE_LAYOUT_V1_WIRE_SIZE];
         encode_device_layout_v1(&layout, &mut buf);
         let decoded = decode_device_layout_v1(&buf).unwrap();
@@ -1657,10 +1628,7 @@ mod layout_policy_tests {
         // Flip a bit in the CRC region
         buf[DEVICE_LAYOUT_V1_CRC32C_OFFSET] ^= 0xFF;
         let r = decode_device_layout_v1(&buf);
-        assert!(matches!(
-            r,
-            Err(LayoutPolicyError::ChecksumMismatch { .. })
-        ));
+        assert!(matches!(r, Err(LayoutPolicyError::ChecksumMismatch { .. })));
     }
 
     #[test]
@@ -1674,7 +1642,13 @@ mod layout_policy_tests {
 
     #[test]
     fn choose_segment_size_power_of_two_output() {
-        for region_size in [1_000_000, 10_000_000, 100_000_000, 1_000_000_000, 10_000_000_000] {
+        for region_size in [
+            1_000_000,
+            10_000_000,
+            100_000_000,
+            1_000_000_000,
+            10_000_000_000,
+        ] {
             let seg = choose_segment_size_bytes(region_size, 4_000_000);
             assert!(
                 seg.is_power_of_two(),
@@ -1728,8 +1702,7 @@ mod layout_policy_tests {
     #[test]
     fn policy_discriminant_roundtrip() {
         for &v in &[0u16, 1, 2] {
-            let disc = DeviceLayoutPolicyDiscriminant::from_u16(v)
-                .expect("valid discriminant");
+            let disc = DeviceLayoutPolicyDiscriminant::from_u16(v).expect("valid discriminant");
             assert_eq!(disc.to_u16(), v);
         }
     }

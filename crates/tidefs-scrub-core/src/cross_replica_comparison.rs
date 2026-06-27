@@ -615,8 +615,7 @@ fn source_target_sets(classification: &ComparisonClassification) -> (Vec<u64>, V
             corrupt_replica,
             clean_sources,
         }
-        |
-        ComparisonClassification::RemoteReplicaCorruption {
+        | ComparisonClassification::RemoteReplicaCorruption {
             corrupt_replica,
             clean_sources,
         } => (clean_sources.clone(), vec![*corrupt_replica]),

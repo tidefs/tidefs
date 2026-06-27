@@ -15,8 +15,8 @@
 //! Follow-on phases add deep scrub (shard reconstruction), repair
 //! (self-healing), and distributed resilver.
 
-pub mod detector;
 pub mod cross_replica_comparison;
+pub mod detector;
 pub mod integrity_verifier;
 pub mod multi_node_scrub;
 pub mod object_scanner;
@@ -25,15 +25,14 @@ pub mod repair_scheduling;
 pub mod scheduler;
 pub mod scrub_ledger;
 pub mod scrub_repair;
+pub use cross_replica_comparison::{
+    compare_cross_replica, ChecksumLayer, ComparisonCandidate, ComparisonClassification,
+    CrossReplicaComparisonRecord, EvidenceReadOutcome, EvidenceRejectionReason, PerReplicaOutcome,
+    ReplicaEvidence, ScrubSubject, ScrubSubjectKind, TransportFailureReason,
+};
 pub use multi_node_scrub::{
     FanoutAuditEntry, MultiNodeScrubAudit, PeerVerificationOutcome, ScrubFanoutCoordinator,
     ScrubFanoutRequest, ScrubFanoutResponse,
-};
-pub use cross_replica_comparison::{
-    ChecksumLayer, ComparisonCandidate, ComparisonClassification,
-    CrossReplicaComparisonRecord, EvidenceReadOutcome, EvidenceRejectionReason,
-    PerReplicaOutcome, ReplicaEvidence, ScrubSubject, ScrubSubjectKind, TransportFailureReason,
-    compare_cross_replica,
 };
 use std::path::{Path, PathBuf};
 pub use tidefs_recovery_loop::RecoveryPolicy;
@@ -657,7 +656,10 @@ impl ScrubWorker {
                         .store
                         .object_checksum_root(id)
                         .unwrap_or_else(|| (Digest::default(), None));
-                    match self.verifier.verify(&data, &expected_root, locator_token.as_ref()) {
+                    match self
+                        .verifier
+                        .verify(&data, &expected_root, locator_token.as_ref())
+                    {
                         Ok(()) => ScrubOutcome::Clean {
                             object_id: hex_encode(id.as_bytes()),
                         },
@@ -3769,8 +3771,10 @@ mod tests {
         );
         builder_no_loc.ingest(&data);
         let tree_no_loc = builder_no_loc.finish();
-        assert_ne!(tree_no_loc.root_hash, tree.root_hash,
-            "locator-bound root must differ from unbound root");
+        assert_ne!(
+            tree_no_loc.root_hash, tree.root_hash,
+            "locator-bound root must differ from unbound root"
+        );
     }
 
     /// Scrub detects locator mismatch: object was relocated so locator
@@ -3803,13 +3807,17 @@ mod tests {
 
         // Verification with wrong token must fail
         let result_a_with_b = verify_object(&data, &tree_a.root_hash, Some(&token_b));
-        assert!(result_a_with_b.is_err(),
-            "verify with wrong locator token must fail");
+        assert!(
+            result_a_with_b.is_err(),
+            "verify with wrong locator token must fail"
+        );
 
         // Verification with correct token must pass
         let result_a_with_a = verify_object(&data, &tree_a.root_hash, Some(&token_a));
-        assert!(result_a_with_a.is_ok(),
-            "verify with correct locator token must pass");
+        assert!(
+            result_a_with_a.is_ok(),
+            "verify with correct locator token must pass"
+        );
     }
 
     /// ScrubOutcome::LocatorMismatch variant round-trip.
@@ -3825,7 +3833,11 @@ mod tests {
         assert!(!outcome.is_clean());
         assert_eq!(outcome.object_id(), "abc123");
         match &outcome {
-            ScrubOutcome::LocatorMismatch { object_id, bound, supplied } => {
+            ScrubOutcome::LocatorMismatch {
+                object_id,
+                bound,
+                supplied,
+            } => {
                 assert_eq!(object_id, "abc123");
                 assert_eq!(*bound, token_bound);
                 assert_eq!(*supplied, token_supplied);

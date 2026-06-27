@@ -51,9 +51,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use tidefs_types_pool_label_core::{
-    decode_label, DeviceClass, features, LabelError, PoolLabelV1,
-    PoolRedundancyPolicy, PoolState, POOL_LABEL_MAGIC, POOL_LABEL_SIZE,
-    POOL_LABEL_V1_EXT_WIRE_SIZE, POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
+    decode_label, features, DeviceClass, LabelError, PoolLabelV1, PoolRedundancyPolicy, PoolState,
+    POOL_LABEL_MAGIC, POOL_LABEL_SIZE, POOL_LABEL_V1_EXT_WIRE_SIZE,
+    POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE,
 };
 
 pub mod device_removal;
@@ -800,10 +800,8 @@ impl PoolLabelReader {
             return Ok(None);
         }
 
-        let features_compat =
-            u64::from_le_bytes(prefix[371..379].try_into().unwrap());
-        let has_device_layout =
-            features_compat & features::DEVICE_LAYOUT_V1 != 0;
+        let features_compat = u64::from_le_bytes(prefix[371..379].try_into().unwrap());
+        let has_device_layout = features_compat & features::DEVICE_LAYOUT_V1 != 0;
         let wire_size = if has_device_layout {
             POOL_LABEL_V1_WITH_DEVICE_LAYOUT_WIRE_SIZE
         } else {

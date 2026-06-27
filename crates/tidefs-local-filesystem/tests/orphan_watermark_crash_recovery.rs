@@ -242,8 +242,11 @@ fn mixed_ops_crash_recovery() {
         let mut fs = LocalFileSystem::open_with_options(&root, opts()).expect("open");
 
         // Create directory.
-        fs.create_dir("/sub", tidefs_local_filesystem::DEFAULT_DIRECTORY_PERMISSIONS)
-            .expect("mkdir");
+        fs.create_dir(
+            "/sub",
+            tidefs_local_filesystem::DEFAULT_DIRECTORY_PERMISSIONS,
+        )
+        .expect("mkdir");
 
         // Create files in subdirectory.
         fs.create_file("/sub/a.txt", DEFAULT_FILE_PERMISSIONS)

@@ -4,8 +4,8 @@
 #![deny(unsafe_code)]
 
 mod capacity;
-mod coherency_profile;
 mod clustered_mount;
+mod coherency_profile;
 mod dispatch_helpers;
 mod fsync_handler;
 mod fuse_create_unlink_dispatch;
@@ -334,7 +334,8 @@ fn mount_vfs(config: MountVfsConfig) -> Result<(), String> {
         block_devices: None,
     };
 
-    let (mut vfs_engine, writeback_tracker) = if let Some(snapshot_name) = snapshot_name.as_deref() {
+    let (mut vfs_engine, writeback_tracker) = if let Some(snapshot_name) = snapshot_name.as_deref()
+    {
         let session =
             LocalFileSystem::open_snapshot_export(&config.store_root, snapshot_name, open_config)
                 .map_err(|e| format!("open snapshot export `{snapshot_name}`: {e}"))?;

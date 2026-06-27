@@ -617,13 +617,8 @@ mod tests {
 
         let executor_input = Default::default();
 
-        let outcome = issue_readahead_with_executor(
-            &fs,
-            "/rec.bin",
-            0,
-            payload.len() as u64,
-            executor_input,
-        );
+        let outcome =
+            issue_readahead_with_executor(&fs, "/rec.bin", 0, payload.len() as u64, executor_input);
 
         // The outcome carries the full executor record for attribution (#912),
         // retention (#910), and explanation (#849).

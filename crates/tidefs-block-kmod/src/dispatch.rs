@@ -31,12 +31,12 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(CONFIG_RUST)]
+use crate::tidefs_kmod_bridge::kernel_types::blake3;
+#[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge::kernel_types::ByteSliceExt;
 #[cfg(CONFIG_RUST)]
 use crate::tidefs_kmod_bridge::{BridgeError, BridgeResult};
 use crate::{BlockBio, BlockQueueLimits};
-#[cfg(CONFIG_RUST)]
-use crate::tidefs_kmod_bridge::kernel_types::blake3;
 #[cfg(not(CONFIG_RUST))]
 use blake3;
 #[cfg(not(CONFIG_RUST))]

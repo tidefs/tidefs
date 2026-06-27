@@ -124,9 +124,7 @@ impl LocalWriteAdmission {
     /// dirty-byte or dirty-op caps.  The returned [`AdmissionPermit`]
     /// should be pushed into a [`BudgetedQueue`] or released after the
     /// metadata mutation is durably committed.
-    pub fn try_admit_metadata_mutation(
-        &mut self,
-    ) -> Result<AdmissionPermit, AdmissionError> {
+    pub fn try_admit_metadata_mutation(&mut self) -> Result<AdmissionPermit, AdmissionError> {
         let permit = self.state.try_admit_metadata(self.current_tick)?;
         self.update_peaks();
         Ok(permit)

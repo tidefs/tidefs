@@ -100,10 +100,13 @@ fn clone_origin_pins_block_auto_prune() {
         .unwrap();
 
     // Plan with keep_last=0 so snap-origin is a candidate
-    let pruner2 = SnapshotPruner::load(&store, SnapshotRetentionPolicy {
-        keep_last: Some(0),
-        ..Default::default()
-    });
+    let pruner2 = SnapshotPruner::load(
+        &store,
+        SnapshotRetentionPolicy {
+            keep_last: Some(0),
+            ..Default::default()
+        },
+    );
     let result = pruner2.plan_dataset_prune(&store, ds, SystemTime::now());
     assert_eq!(result.clone_origin_protected, 1);
     assert!(result.delete_set.is_empty());
@@ -231,10 +234,13 @@ fn combined_pins_drain_after_clone_removed() {
         .unwrap();
 
     // Both protections should appear in auto-prune plan
-    let pruner2 = SnapshotPruner::load(&store, SnapshotRetentionPolicy {
-        keep_last: Some(0),
-        ..Default::default()
-    });
+    let pruner2 = SnapshotPruner::load(
+        &store,
+        SnapshotRetentionPolicy {
+            keep_last: Some(0),
+            ..Default::default()
+        },
+    );
     let result = pruner2.plan_dataset_prune(&store, ds, SystemTime::now());
     assert_eq!(result.clone_origin_protected, 1);
     assert_eq!(result.deadlist_pin_protected, 1);

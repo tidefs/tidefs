@@ -51,12 +51,8 @@ pub mod scheduling;
 pub mod ssd_heuristics;
 pub mod wan_heuristics;
 
-pub use admission::{
-    AdmissionDecision, AdmissionRecord, AdmissionVerdict,
-};
-pub use anti_thrash::{
-    AntiThrashState, CooldownRecord, MovementDebt, PaybackRecord,
-};
+pub use admission::{AdmissionDecision, AdmissionRecord, AdmissionVerdict};
+pub use anti_thrash::{AntiThrashState, CooldownRecord, MovementDebt, PaybackRecord};
 pub use governor::{RelocationGovernor, RelocationGovernorConfig};
 pub use hard_gates::{HardGateResult, HardGates};
 pub use heuristics::{HeuristicInput, HeuristicResult, RelocationActionClass};

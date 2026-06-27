@@ -193,7 +193,7 @@ fn leader_failover_fences_all_active_leases() {
             60_000,
             0,
             EpochId::new(1),
-        DatasetMountIdentity::ZERO,
+            DatasetMountIdentity::ZERO,
             i * 100,
             3,
             3,

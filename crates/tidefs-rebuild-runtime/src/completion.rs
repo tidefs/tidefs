@@ -1175,7 +1175,6 @@ mod tests {
         assert_refusal_preserves_rebuild_state(&mut completion, &admission, member);
     }
 
-
     #[test]
     fn erasure_receipt_rejects_malformed_zero_data_shards() {
         let mut completion = RebuildCompletion::new();

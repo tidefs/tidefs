@@ -650,5 +650,4 @@ mod tests {
         assert_eq!(decoded.stream_offset, cursor.stream_offset);
         assert_eq!(decoded.stream_digest, cursor.stream_digest);
     }
-
 }

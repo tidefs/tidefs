@@ -19,9 +19,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::{
-    budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor,
-};
+use crate::{budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor};
 
 // ── PathLookupKey ───────────────────────────────────────────────────────
 
@@ -461,7 +459,11 @@ impl<V: Clone> PathLookupCache<V> {
             .entries
             .keys()
             .map(Self::positive_budget_bytes)
-            .chain(self.negative_entries.keys().map(Self::negative_budget_bytes))
+            .chain(
+                self.negative_entries
+                    .keys()
+                    .map(Self::negative_budget_bytes),
+            )
             .sum();
         self.release_budget(released);
         self.entries.clear();

@@ -462,12 +462,8 @@ mod tests {
     fn mismatched_guid_and_bad_digest_fail_closed() {
         let request = matching_request();
         let matching_receipt = receipt([0x42; 16], 9);
-        let mut guid_mismatch = DeviceRemovalAdmissionEvidence::committed(
-            "tank",
-            "/dev/disk2",
-            9,
-            matching_receipt,
-        );
+        let mut guid_mismatch =
+            DeviceRemovalAdmissionEvidence::committed("tank", "/dev/disk2", 9, matching_receipt);
         guid_mismatch.target_device_guid = [0x24; 16];
 
         assert!(matches!(

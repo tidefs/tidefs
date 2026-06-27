@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::error::FileSystemError;
+use crate::types::{ChangedRecordExport, CommittedRootSummary, RecoveryAuditReport};
 use tidefs_local_object_store::ObjectKey;
 use tidefs_types_vfs_owned::DirEntry as OwnedDirEntry;
-use crate::types::{ChangedRecordExport, CommittedRootSummary, RecoveryAuditReport};
 
 pub const RECEIVE_MERGE_NO_COMMON_ANCESTOR_OPERATOR_ACTIONS: &str =
     "delete-and-re-receive into a fresh target, or receive into a new empty target";
@@ -13,7 +13,9 @@ pub const RECEIVE_MERGE_NO_COMMON_ANCESTOR_OPERATOR_ACTIONS: &str =
 const RECEIVE_MERGE_NO_COMMON_ANCESTOR_UNSUPPORTED_REASON: &str =
     "no_common_ancestor: no committed-root identity is present in both the stream lineage manifest and target recovery audit; delete-and-re-receive into a fresh target, or receive into a new empty target";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub struct ReceiveMergeRootIdentity {
     pub transaction_id: u64,
     pub generation: u64,
@@ -232,7 +234,10 @@ impl ReceiveMergePlan {
     ///
     /// Empty plans are valid for conflict-free inventories under any policy.
     #[must_use]
-    pub fn empty(policy: ReceiveMergePolicy, inventory: &crate::encoding::ConflictInventory) -> Self {
+    pub fn empty(
+        policy: ReceiveMergePolicy,
+        inventory: &crate::encoding::ConflictInventory,
+    ) -> Self {
         Self {
             policy,
             common_ancestor_transaction_id: inventory.common_ancestor_transaction_id,
@@ -281,7 +286,10 @@ const RECEIVE_MERGE_MANUAL_POLICY_GUIDANCE: &str =
 impl fmt::Display for ReceiveMergePolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ManualPolicy { conflict_count, guidance } => {
+            Self::ManualPolicy {
+                conflict_count,
+                guidance,
+            } => {
                 write!(
                     f,
                     "manual merge policy: {conflict_count} conflicts require operator resolution; {guidance}",
@@ -414,18 +422,11 @@ pub enum ResolvedInventoryError {
         reason: String,
     },
     /// An entry index is out of bounds.
-    EntryIndexOutOfBounds {
-        index: usize,
-        entry_count: usize,
-    },
+    EntryIndexOutOfBounds { index: usize, entry_count: usize },
     /// An unrecognized conflict class name was provided.
-    UnknownConflictClass {
-        name: String,
-    },
+    UnknownConflictClass { name: String },
     /// An unrecognized resolution kind string was provided.
-    UnknownResolutionKind {
-        kind: String,
-    },
+    UnknownResolutionKind { kind: String },
 }
 
 impl fmt::Display for ResolvedInventoryError {
@@ -588,7 +589,9 @@ impl ResolvedConflictInventory {
 }
 
 /// Parse a conflict class from its snake_case string representation.
-pub fn parse_conflict_class(name: &str) -> Result<crate::encoding::ConflictClass, ResolvedInventoryError> {
+pub fn parse_conflict_class(
+    name: &str,
+) -> Result<crate::encoding::ConflictClass, ResolvedInventoryError> {
     match name {
         "inode_identity" => Ok(crate::encoding::ConflictClass::InodeIdentity),
         "directory_entry" => Ok(crate::encoding::ConflictClass::DirectoryEntry),
@@ -698,8 +701,9 @@ fn classify_inode_identity_conflicts(
     inventory: &mut crate::encoding::ConflictInventory,
 ) {
     #[allow(unused_imports)]
-    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
-        InodeIdentityDivergence};
+    use crate::encoding::{
+        ConflictClass, ConflictDivergence, ConflictEntry, InodeIdentityDivergence,
+    };
 
     // Collect all inode_ids present in either side.
     let mut all_ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
@@ -759,10 +763,7 @@ fn compare_inode_records(
     }
 
     // Permission/ownership changes.
-    if stream.mode != target.mode
-        || stream.uid != target.uid
-        || stream.gid != target.gid
-    {
+    if stream.mode != target.mode || stream.uid != target.uid || stream.gid != target.gid {
         return Some(InodeIdentityDivergence::DifferentPermissionsOwnership);
     }
 
@@ -780,8 +781,9 @@ fn classify_directory_entry_conflicts(
     inventory: &mut crate::encoding::ConflictInventory,
 ) {
     #[allow(unused_imports)]
-    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
-        DirectoryEntryDivergence};
+    use crate::encoding::{
+        ConflictClass, ConflictDivergence, ConflictEntry, DirectoryEntryDivergence,
+    };
 
     let mut all_parents: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     for id in input.stream_dir_entries.keys() {
@@ -851,15 +853,20 @@ fn compare_dir_entries(
     inventory: &mut crate::encoding::ConflictInventory,
 ) {
     #[allow(unused_imports)]
-    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
-        DirectoryEntryDivergence};
+    use crate::encoding::{
+        ConflictClass, ConflictDivergence, ConflictEntry, DirectoryEntryDivergence,
+    };
     #[allow(unused_imports)]
     use std::collections::{BTreeMap, BTreeSet};
 
-    let stream_map: BTreeMap<&[u8], &OwnedDirEntry> =
-        stream_entries.iter().map(|e| (e.name.as_slice(), e)).collect();
-    let target_map: BTreeMap<&[u8], &OwnedDirEntry> =
-        target_entries.iter().map(|e| (e.name.as_slice(), e)).collect();
+    let stream_map: BTreeMap<&[u8], &OwnedDirEntry> = stream_entries
+        .iter()
+        .map(|e| (e.name.as_slice(), e))
+        .collect();
+    let target_map: BTreeMap<&[u8], &OwnedDirEntry> = target_entries
+        .iter()
+        .map(|e| (e.name.as_slice(), e))
+        .collect();
 
     // Entries present in stream but not in target: added on stream side.
     for name in stream_map.keys() {
@@ -921,10 +928,10 @@ fn compare_dir_entries(
                         "dir {parent_id}/{name_str} -> inode {}",
                         t_entry.inode_id.0
                     ),
-                stream_txg: None,
-                target_txg: None,
-                stream_object_key: None,
-                target_object_key: None,
+                    stream_txg: None,
+                    target_txg: None,
+                    stream_object_key: None,
+                    target_object_key: None,
                 });
             }
         }
@@ -937,8 +944,7 @@ fn classify_extent_map_conflicts(
     inventory: &mut crate::encoding::ConflictInventory,
 ) {
     #[allow(unused_imports)]
-    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
-        ExtentMapDivergence};
+    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry, ExtentMapDivergence};
 
     let mut all_ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     for id in input.stream_extent_maps.keys() {
@@ -1000,8 +1006,9 @@ fn classify_snapshot_catalog_conflicts(
     inventory: &mut crate::encoding::ConflictInventory,
 ) {
     #[allow(unused_imports)]
-    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
-        SnapshotCatalogDivergence};
+    use crate::encoding::{
+        ConflictClass, ConflictDivergence, ConflictEntry, SnapshotCatalogDivergence,
+    };
     #[allow(unused_imports)]
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1076,10 +1083,10 @@ fn classify_snapshot_catalog_conflicts(
                         "snapshot {name_str} root txg={} gen={}",
                         t_rec.root.transaction_id, t_rec.root.generation
                     ),
-                stream_txg: None,
-                target_txg: None,
-                stream_object_key: None,
-                target_object_key: None,
+                    stream_txg: None,
+                    target_txg: None,
+                    stream_object_key: None,
+                    target_object_key: None,
                 });
                 continue;
             }
@@ -1092,18 +1099,12 @@ fn classify_snapshot_catalog_conflicts(
                     divergence: ConflictDivergence::SnapshotCatalog(
                         SnapshotCatalogDivergence::HoldPinDivergence,
                     ),
-                    stream_identity: format!(
-                        "snapshot {name_str} hold_count={}",
-                        s_rec.hold_count
-                    ),
-                    target_identity: format!(
-                        "snapshot {name_str} hold_count={}",
-                        t_rec.hold_count
-                    ),
-                stream_txg: None,
-                target_txg: None,
-                stream_object_key: None,
-                target_object_key: None,
+                    stream_identity: format!("snapshot {name_str} hold_count={}", s_rec.hold_count),
+                    target_identity: format!("snapshot {name_str} hold_count={}", t_rec.hold_count),
+                    stream_txg: None,
+                    target_txg: None,
+                    stream_object_key: None,
+                    target_object_key: None,
                 });
             }
 
@@ -1122,10 +1123,10 @@ fn classify_snapshot_catalog_conflicts(
                         "snapshot {name_str} kind={:?} origin={:?}",
                         t_rec.kind, t_rec.origin
                     ),
-                stream_txg: None,
-                target_txg: None,
-                stream_object_key: None,
-                target_object_key: None,
+                    stream_txg: None,
+                    target_txg: None,
+                    stream_object_key: None,
+                    target_object_key: None,
                 });
             }
         }
@@ -1138,8 +1139,9 @@ fn classify_generation_ordering_conflicts(
     inventory: &mut crate::encoding::ConflictInventory,
 ) {
     #[allow(unused_imports)]
-    use crate::encoding::{ConflictClass, ConflictDivergence, ConflictEntry,
-        GenerationOrderingDivergence};
+    use crate::encoding::{
+        ConflictClass, ConflictDivergence, ConflictEntry, GenerationOrderingDivergence,
+    };
 
     let ancestor_txg = input.common_ancestor.identity.transaction_id;
 
@@ -1189,31 +1191,26 @@ fn classify_generation_ordering_conflicts(
                 divergence: ConflictDivergence::GenerationOrdering(
                     GenerationOrderingDivergence::IndependentTxgAdvance,
                 ),
-                stream_identity: format!(
-                    "stream txg range [{ancestor_txg}..{stream_max_txg}]"
-                ),
-                target_identity: format!(
-                    "target txg range [{ancestor_txg}..{target_max_txg}]"
-                ),
-            stream_txg: None,
-            target_txg: None,
-            stream_object_key: None,
-            target_object_key: None,
+                stream_identity: format!("stream txg range [{ancestor_txg}..{stream_max_txg}]"),
+                target_identity: format!("target txg range [{ancestor_txg}..{target_max_txg}]"),
+                stream_txg: None,
+                target_txg: None,
+                stream_object_key: None,
+                target_object_key: None,
             });
         }
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_local_object_store::IntegrityDigest64;
     use crate::encoding::{
         ConflictClass, ConflictDivergence, ConflictEntry, ConflictInventory,
         DirectoryEntryDivergence, ExtentMapDivergence, GenerationOrderingDivergence,
         InodeIdentityDivergence, SnapshotCatalogDivergence,
     };
+    use tidefs_local_object_store::IntegrityDigest64;
     use tidefs_types_vfs_core::NodeKind;
 
     fn root(
@@ -1317,7 +1314,13 @@ mod tests {
 
     // ── Conflict inventory builder tests ──────────────────────────────────────
 
-    fn make_inode(id: u64, kind: NodeKind, data_ver: u64, mode: u32, size: u64) -> crate::types::InodeRecord {
+    fn make_inode(
+        id: u64,
+        kind: NodeKind,
+        data_ver: u64,
+        mode: u32,
+        size: u64,
+    ) -> crate::types::InodeRecord {
         crate::types::InodeRecord {
             rdev: 0,
             inode_id: tidefs_types_vfs_core::InodeId::new(id),
@@ -1378,8 +1381,7 @@ mod tests {
         target_snapshots: Vec<crate::records::SnapshotRecord>,
     ) -> ConflictInventoryInput<'static> {
         // Leak to get 'static lifetime — safe in tests.
-        let ancestor: &'static ReceiveMergeCommonAncestor =
-            Box::leak(Box::new(ancestor.clone()));
+        let ancestor: &'static ReceiveMergeCommonAncestor = Box::leak(Box::new(ancestor.clone()));
         let stream_inodes: &'static BTreeMap<u64, crate::types::InodeRecord> =
             Box::leak(Box::new(stream_inodes));
         let target_inodes: &'static BTreeMap<u64, crate::types::InodeRecord> =
@@ -1388,18 +1390,15 @@ mod tests {
             Box::leak(Box::new(stream_dirs));
         let target_dirs: &'static BTreeMap<u64, Vec<OwnedDirEntry>> =
             Box::leak(Box::new(target_dirs));
-        let stream_extents: &'static BTreeMap<u64, Vec<u8>> =
-            Box::leak(Box::new(stream_extents));
-        let target_extents: &'static BTreeMap<u64, Vec<u8>> =
-            Box::leak(Box::new(target_extents));
+        let stream_extents: &'static BTreeMap<u64, Vec<u8>> = Box::leak(Box::new(stream_extents));
+        let target_extents: &'static BTreeMap<u64, Vec<u8>> = Box::leak(Box::new(target_extents));
         let stream_snapshots: &'static [crate::records::SnapshotRecord] =
             Box::leak(stream_snapshots.into_boxed_slice());
         let target_snapshots: &'static [crate::records::SnapshotRecord] =
             Box::leak(target_snapshots.into_boxed_slice());
-        let stream_lineage: &'static ReceiveMergeStreamLineageManifest =
-            Box::leak(Box::new(ReceiveMergeStreamLineageManifest::from_roots(
-                vec![ancestor.stream_root.clone()],
-            )));
+        let stream_lineage: &'static ReceiveMergeStreamLineageManifest = Box::leak(Box::new(
+            ReceiveMergeStreamLineageManifest::from_roots(vec![ancestor.stream_root.clone()]),
+        ));
         let target_audit: &'static RecoveryAuditReport = Box::leak(Box::new({
             let mut a = RecoveryAuditReport::empty();
             a.valid_committed_roots = vec![ancestor.target_root.clone()];
@@ -1527,7 +1526,9 @@ mod tests {
         assert_eq!(inventory.len(), 1);
         assert!(matches!(
             inventory.entries[0].divergence,
-            ConflictDivergence::InodeIdentity(InodeIdentityDivergence::DifferentPermissionsOwnership)
+            ConflictDivergence::InodeIdentity(
+                InodeIdentityDivergence::DifferentPermissionsOwnership
+            )
         ));
     }
 
@@ -1559,10 +1560,8 @@ mod tests {
     #[test]
     fn directory_entry_child_added_stream_side() {
         let ancestor = ancestor_for_test();
-        let stream_dirs = BTreeMap::from([(
-            1_u64,
-            vec![make_dir_entry("new_file", 2, NodeKind::File)],
-        )]);
+        let stream_dirs =
+            BTreeMap::from([(1_u64, vec![make_dir_entry("new_file", 2, NodeKind::File)])]);
         let target_dirs: BTreeMap<u64, Vec<OwnedDirEntry>> = BTreeMap::new();
         let input = input_from(
             &ancestor,
@@ -1582,9 +1581,9 @@ mod tests {
         assert_eq!(entry.class, ConflictClass::DirectoryEntry);
         assert!(matches!(
             entry.divergence,
-            ConflictDivergence::DirectoryEntry(
-                DirectoryEntryDivergence::ChildAddedOneSideOnly { present_in_stream: true }
-            )
+            ConflictDivergence::DirectoryEntry(DirectoryEntryDivergence::ChildAddedOneSideOnly {
+                present_in_stream: true
+            })
         ));
     }
 
@@ -1592,10 +1591,8 @@ mod tests {
     fn directory_entry_child_added_target_side() {
         let ancestor = ancestor_for_test();
         let stream_dirs: BTreeMap<u64, Vec<OwnedDirEntry>> = BTreeMap::new();
-        let target_dirs = BTreeMap::from([(
-            1_u64,
-            vec![make_dir_entry("new_file", 2, NodeKind::File)],
-        )]);
+        let target_dirs =
+            BTreeMap::from([(1_u64, vec![make_dir_entry("new_file", 2, NodeKind::File)])]);
         let input = input_from(
             &ancestor,
             BTreeMap::new(),
@@ -1612,9 +1609,9 @@ mod tests {
         assert_eq!(inventory.len(), 1);
         assert!(matches!(
             inventory.entries[0].divergence,
-            ConflictDivergence::DirectoryEntry(
-                DirectoryEntryDivergence::ChildAddedOneSideOnly { present_in_stream: false }
-            )
+            ConflictDivergence::DirectoryEntry(DirectoryEntryDivergence::ChildAddedOneSideOnly {
+                present_in_stream: false
+            })
         ));
     }
 
@@ -1645,9 +1642,7 @@ mod tests {
         assert_eq!(inventory.len(), 1);
         assert!(matches!(
             inventory.entries[0].divergence,
-            ConflictDivergence::DirectoryEntry(
-                DirectoryEntryDivergence::SameNameDifferentInode
-            )
+            ConflictDivergence::DirectoryEntry(DirectoryEntryDivergence::SameNameDifferentInode)
         ));
     }
 
@@ -1725,7 +1720,10 @@ mod tests {
                 )
             )
         });
-        assert!(same_name_diff_root, "expected SameNameDifferentRoot conflict");
+        assert!(
+            same_name_diff_root,
+            "expected SameNameDifferentRoot conflict"
+        );
     }
 
     #[test]
@@ -1750,17 +1748,17 @@ mod tests {
         let has_stream_only = inventory.entries.iter().any(|e| {
             matches!(
                 e.divergence,
-                ConflictDivergence::SnapshotCatalog(
-                    SnapshotCatalogDivergence::DifferentNameSets { present_in_stream: true }
-                )
+                ConflictDivergence::SnapshotCatalog(SnapshotCatalogDivergence::DifferentNameSets {
+                    present_in_stream: true
+                })
             )
         });
         let has_target_only = inventory.entries.iter().any(|e| {
             matches!(
                 e.divergence,
-                ConflictDivergence::SnapshotCatalog(
-                    SnapshotCatalogDivergence::DifferentNameSets { present_in_stream: false }
-                )
+                ConflictDivergence::SnapshotCatalog(SnapshotCatalogDivergence::DifferentNameSets {
+                    present_in_stream: false
+                })
             )
         });
         assert!(has_stream_only);
@@ -1827,8 +1825,7 @@ mod tests {
             stream_root,
         ]);
         let mut target_audit = RecoveryAuditReport::empty();
-        target_audit.valid_committed_roots =
-            vec![ancestor_root, shared_root, target_root];
+        target_audit.valid_committed_roots = vec![ancestor_root, shared_root, target_root];
 
         let input = ConflictInventoryInput {
             common_ancestor: Box::leak(Box::new(ancestor)),
@@ -1880,8 +1877,14 @@ mod tests {
     #[test]
     fn policy_keep_local_all_decisions_keep_local() {
         let mut inventory = make_inventory(10, 100);
-        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
-        inventory.entries.push(make_entry(ConflictClass::DirectoryEntry, Some(16), Some(21)));
+        inventory
+            .entries
+            .push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
+        inventory.entries.push(make_entry(
+            ConflictClass::DirectoryEntry,
+            Some(16),
+            Some(21),
+        ));
 
         let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::KeepLocal).unwrap();
         assert_eq!(plan.policy, ReceiveMergePolicy::KeepLocal);
@@ -1895,7 +1898,9 @@ mod tests {
     #[test]
     fn policy_keep_remote_all_decisions_keep_remote() {
         let mut inventory = make_inventory(10, 100);
-        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
+        inventory
+            .entries
+            .push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
 
         let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::KeepRemote).unwrap();
         assert_eq!(plan.policy, ReceiveMergePolicy::KeepRemote);
@@ -1908,7 +1913,9 @@ mod tests {
     fn policy_merge_latest_stream_higher_txg_wins() {
         let mut inventory = make_inventory(10, 100);
         // target_txg=5, stream_txg=15: stream is higher -> KeepRemote
-        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(5)));
+        inventory
+            .entries
+            .push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(5)));
 
         let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::MergeLatest).unwrap();
         assert_eq!(plan.policy, ReceiveMergePolicy::MergeLatest);
@@ -1919,9 +1926,13 @@ mod tests {
     fn policy_merge_latest_target_higher_or_equal_txg_wins() {
         let mut inventory = make_inventory(10, 100);
         // target_txg=20, stream_txg=15: target is higher -> KeepLocal
-        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
+        inventory
+            .entries
+            .push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
         // equal txg -> target wins (KeepLocal)
-        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(10), Some(10)));
+        inventory
+            .entries
+            .push(make_entry(ConflictClass::InodeIdentity, Some(10), Some(10)));
 
         let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::MergeLatest).unwrap();
         assert_eq!(plan.len(), 2);
@@ -1933,10 +1944,16 @@ mod tests {
     fn policy_merge_latest_missing_txg_falls_back_to_keep_local() {
         let mut inventory = make_inventory(10, 100);
         // No txg info: conservative, target wins
-        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, None, None));
+        inventory
+            .entries
+            .push(make_entry(ConflictClass::InodeIdentity, None, None));
         // Only one side has txg: still falls back to target
-        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), None));
-        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, None, Some(20)));
+        inventory
+            .entries
+            .push(make_entry(ConflictClass::InodeIdentity, Some(15), None));
+        inventory
+            .entries
+            .push(make_entry(ConflictClass::InodeIdentity, None, Some(20)));
 
         let plan = resolve_merge_policy(&inventory, ReceiveMergePolicy::MergeLatest).unwrap();
         assert_eq!(plan.len(), 3);
@@ -1948,7 +1965,9 @@ mod tests {
     #[test]
     fn policy_manual_refuses_to_produce_plan() {
         let mut inventory = make_inventory(10, 100);
-        inventory.entries.push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
+        inventory
+            .entries
+            .push(make_entry(ConflictClass::InodeIdentity, Some(15), Some(20)));
 
         let err = resolve_merge_policy(&inventory, ReceiveMergePolicy::Manual).unwrap_err();
         match err {
@@ -2007,8 +2026,14 @@ mod tests {
         let resolved = resolve_merge_policy(&inventory, ReceiveMergePolicy::KeepLocal).unwrap();
         let empty = ReceiveMergePlan::empty(ReceiveMergePolicy::KeepLocal, &inventory);
         assert_eq!(resolved.policy, empty.policy);
-        assert_eq!(resolved.common_ancestor_transaction_id, empty.common_ancestor_transaction_id);
-        assert_eq!(resolved.common_ancestor_generation, empty.common_ancestor_generation);
+        assert_eq!(
+            resolved.common_ancestor_transaction_id,
+            empty.common_ancestor_transaction_id
+        );
+        assert_eq!(
+            resolved.common_ancestor_generation,
+            empty.common_ancestor_generation
+        );
         assert_eq!(resolved.decisions, empty.decisions);
         assert_eq!(resolved.requires_operator, empty.requires_operator);
     }
@@ -2020,7 +2045,6 @@ mod tests {
         assert!(plan.requires_operator);
         assert!(plan.is_empty());
     }
-
 
     // ── Conflict inventory JSON serialization tests ────────────────────────
 
@@ -2112,7 +2136,10 @@ mod tests {
             .expect("resolve entry 0");
         assert_eq!(resolved.resolved_count(), 1);
         assert_eq!(resolved.unresolved_count(), 1);
-        assert_eq!(resolved.resolutions[0], Some(ReceiveMergeDecision::KeepLocal));
+        assert_eq!(
+            resolved.resolutions[0],
+            Some(ReceiveMergeDecision::KeepLocal)
+        );
         assert_eq!(resolved.resolutions[1], None);
     }
 
@@ -2140,16 +2167,22 @@ mod tests {
         );
         assert_eq!(resolved.resolved_count(), 2);
         assert_eq!(resolved.unresolved_count(), 1);
-        assert_eq!(resolved.resolutions[0], Some(ReceiveMergeDecision::KeepRemote));
+        assert_eq!(
+            resolved.resolutions[0],
+            Some(ReceiveMergeDecision::KeepRemote)
+        );
         assert_eq!(resolved.resolutions[1], None);
-        assert_eq!(resolved.resolutions[2], Some(ReceiveMergeDecision::KeepRemote));
+        assert_eq!(
+            resolved.resolutions[2],
+            Some(ReceiveMergeDecision::KeepRemote)
+        );
     }
 
     #[test]
     fn validate_all_resolved_passes_when_all_entries_resolved() {
-        let inventory = make_test_inventory(vec![
-            make_conflict_entry_for_test(ConflictClass::InodeIdentity),
-        ]);
+        let inventory = make_test_inventory(vec![make_conflict_entry_for_test(
+            ConflictClass::InodeIdentity,
+        )]);
         let mut resolved = ResolvedConflictInventory::from_inventory(inventory, None);
         resolved
             .resolve_entry(0, ReceiveMergeDecision::KeepLocal)
@@ -2167,7 +2200,9 @@ mod tests {
         resolved
             .resolve_entry(0, ReceiveMergeDecision::KeepLocal)
             .unwrap();
-        let err = resolved.validate_all_resolved().expect_err("missing resolution");
+        let err = resolved
+            .validate_all_resolved()
+            .expect_err("missing resolution");
         match err {
             ResolvedInventoryError::UnresolvedEntries {
                 unresolved_count,
@@ -2184,7 +2219,9 @@ mod tests {
     fn validate_all_resolved_passes_for_empty_inventory() {
         let inventory = ConflictInventory::empty(10, 100);
         let resolved = ResolvedConflictInventory::from_inventory(inventory, None);
-        resolved.validate_all_resolved().expect("empty is trivially resolved");
+        resolved
+            .validate_all_resolved()
+            .expect("empty is trivially resolved");
     }
 
     // ── Staleness detection tests ──────────────────────────────────────────
@@ -2201,10 +2238,7 @@ mod tests {
     fn staleness_detection_passes_when_anchored_matches_current() {
         let inventory = ConflictInventory::empty(10, 100);
         let anchored = root_identity(5, 50, 0x500);
-        let resolved = ResolvedConflictInventory::from_inventory(
-            inventory,
-            Some(anchored),
-        );
+        let resolved = ResolvedConflictInventory::from_inventory(inventory, Some(anchored));
         let current = root_identity(5, 50, 0x500);
         resolved
             .validate_not_stale(&current)
@@ -2215,10 +2249,7 @@ mod tests {
     fn staleness_detection_fails_when_anchored_differs_from_current() {
         let inventory = ConflictInventory::empty(10, 100);
         let anchored = root_identity(5, 50, 0x500);
-        let resolved = ResolvedConflictInventory::from_inventory(
-            inventory,
-            Some(anchored),
-        );
+        let resolved = ResolvedConflictInventory::from_inventory(inventory, Some(anchored));
         let current = root_identity(6, 60, 0x600);
         let err = resolved
             .validate_not_stale(&current)
@@ -2250,10 +2281,7 @@ mod tests {
             make_conflict_entry_for_test(ConflictClass::DirectoryEntry),
         ]);
         let anchored = root_identity(5, 50, 0x500);
-        let mut resolved = ResolvedConflictInventory::from_inventory(
-            inventory,
-            Some(anchored),
-        );
+        let mut resolved = ResolvedConflictInventory::from_inventory(inventory, Some(anchored));
         resolved
             .resolve_entry(0, ReceiveMergeDecision::KeepLocal)
             .unwrap();
@@ -2269,9 +2297,9 @@ mod tests {
 
     #[test]
     fn resolved_inventory_json_roundtrip_with_null_resolutions() {
-        let inventory = make_test_inventory(vec![
-            make_conflict_entry_for_test(ConflictClass::InodeIdentity),
-        ]);
+        let inventory = make_test_inventory(vec![make_conflict_entry_for_test(
+            ConflictClass::InodeIdentity,
+        )]);
         let resolved = ResolvedConflictInventory::from_inventory(inventory, None);
         let json = resolved.to_json().expect("serialize");
         let parsed = ResolvedConflictInventory::from_json(&json).expect("deserialize");

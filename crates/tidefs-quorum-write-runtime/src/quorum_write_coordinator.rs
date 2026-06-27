@@ -48,9 +48,15 @@ pub enum CoordinatorError {
     /// No membership-epoch token has witnessed the coordinator's current epoch.
     MissingEpochToken { current_epoch: u64 },
     /// A supplied membership-epoch token is older than the coordinator epoch.
-    StaleEpochToken { token_epoch: u64, current_epoch: u64 },
+    StaleEpochToken {
+        token_epoch: u64,
+        current_epoch: u64,
+    },
     /// A supplied membership-epoch token does not match the coordinator epoch.
-    EpochTokenMismatch { token_epoch: u64, current_epoch: u64 },
+    EpochTokenMismatch {
+        token_epoch: u64,
+        current_epoch: u64,
+    },
     /// Slot is stale (epoch too old).
     StaleSlot { slot_epoch: u64, current_epoch: u64 },
     /// Write lease epoch differs from the token-witnessed coordinator epoch.
@@ -299,10 +305,7 @@ impl QuorumWriteCoordinator {
     ///
     /// Returns [`CoordinatorError::StaleEpochToken`] if the token is older than
     /// the coordinator's current epoch.
-    pub fn witness_epoch_token(
-        &mut self,
-        token: EpochToken,
-    ) -> Result<usize, CoordinatorError> {
+    pub fn witness_epoch_token(&mut self, token: EpochToken) -> Result<usize, CoordinatorError> {
         if token.epoch < self.current_epoch {
             return Err(CoordinatorError::StaleEpochToken {
                 token_epoch: token.epoch.0,

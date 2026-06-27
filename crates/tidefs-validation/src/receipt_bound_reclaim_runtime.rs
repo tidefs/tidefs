@@ -41,7 +41,10 @@ impl ReceiptBoundReclaimRuntimeEvidence {
         if failed.is_empty() && self.passed {
             Ok(())
         } else {
-            Err(format!("receipt-bound reclaim row failed: {}", failed.join(", ")))
+            Err(format!(
+                "receipt-bound reclaim row failed: {}",
+                failed.join(", ")
+            ))
         }
     }
 }
@@ -137,7 +140,10 @@ pub fn run_receipt_bound_obsolete_location_trim_gate() -> ReceiptBoundReclaimRun
         STABLE_TXG,
         STABLE_RECEIPT_GENERATION,
     ));
-    cases.push(receiptless_replay_case(STABLE_TXG, STABLE_RECEIPT_GENERATION));
+    cases.push(receiptless_replay_case(
+        STABLE_TXG,
+        STABLE_RECEIPT_GENERATION,
+    ));
 
     let passed = cases.iter().all(|case| case.passed);
     ReceiptBoundReclaimRuntimeEvidence {
@@ -145,12 +151,11 @@ pub fn run_receipt_bound_obsolete_location_trim_gate() -> ReceiptBoundReclaimRun
         row_id: RECEIPT_BOUND_RECLAIM_ROW_ID.to_string(),
         source_issue: "https://github.com/tidefs/tidefs/issues/999".to_string(),
         parent_tracker: "https://github.com/tidefs/tidefs/issues/676".to_string(),
-        parent_tracker_disposition:
-            "narrow regression guard; not by itself a #676 closure claim".to_string(),
+        parent_tracker_disposition: "narrow regression guard; not by itself a #676 closure claim"
+            .to_string(),
         validation_tier: "github-actions-runtime-harness".to_string(),
-        scenario:
-            "dead-object queue replay plus strict receipt-bound stable-generation dequeue"
-                .to_string(),
+        scenario: "dead-object queue replay plus strict receipt-bound stable-generation dequeue"
+            .to_string(),
         stable_committed_txg: STABLE_TXG,
         stable_committed_receipt_generation: STABLE_RECEIPT_GENERATION,
         cases,
@@ -171,15 +176,10 @@ fn valid_publication_and_replay_case(
     let mut queue = replay_queue(queue);
 
     let queue_depth_after_replay = queue.len();
-    let eligible = queue.receipt_bound_eligible_count_with_stable_generation(
-        stable_txg,
-        stable_generation,
-    );
-    let batch = queue.dequeue_receipt_bound_batch_with_stable_generation(
-        16,
-        stable_txg,
-        stable_generation,
-    );
+    let eligible =
+        queue.receipt_bound_eligible_count_with_stable_generation(stable_txg, stable_generation);
+    let batch =
+        queue.dequeue_receipt_bound_batch_with_stable_generation(16, stable_txg, stable_generation);
     let ack_removed = queue.ack_reclaimed(&[key]);
     let queue_depth_after_decision = queue.len();
     let passed = publish_accepted
@@ -234,15 +234,10 @@ fn refused_publish_case(
     let mut queue = replay_queue(queue);
 
     let queue_depth_after_replay = queue.len();
-    let eligible = queue.receipt_bound_eligible_count_with_stable_generation(
-        stable_txg,
-        stable_generation,
-    );
-    let batch = queue.dequeue_receipt_bound_batch_with_stable_generation(
-        16,
-        stable_txg,
-        stable_generation,
-    );
+    let eligible =
+        queue.receipt_bound_eligible_count_with_stable_generation(stable_txg, stable_generation);
+    let batch =
+        queue.dequeue_receipt_bound_batch_with_stable_generation(16, stable_txg, stable_generation);
     let ack_removed = if batch.is_empty() {
         0
     } else {
@@ -299,15 +294,10 @@ fn queued_invalid_receipt_case(
     let mut queue = replay_queue(queue);
 
     let queue_depth_after_replay = queue.len();
-    let eligible = queue.receipt_bound_eligible_count_with_stable_generation(
-        stable_txg,
-        stable_generation,
-    );
-    let batch = queue.dequeue_receipt_bound_batch_with_stable_generation(
-        16,
-        stable_txg,
-        stable_generation,
-    );
+    let eligible =
+        queue.receipt_bound_eligible_count_with_stable_generation(stable_txg, stable_generation);
+    let batch =
+        queue.dequeue_receipt_bound_batch_with_stable_generation(16, stable_txg, stable_generation);
     let ack_removed = if batch.is_empty() {
         0
     } else {
@@ -355,15 +345,10 @@ fn receiptless_replay_case(
     let mut queue = replay_queue(queue);
 
     let queue_depth_after_replay = queue.len();
-    let eligible = queue.receipt_bound_eligible_count_with_stable_generation(
-        stable_txg,
-        stable_generation,
-    );
-    let batch = queue.dequeue_receipt_bound_batch_with_stable_generation(
-        16,
-        stable_txg,
-        stable_generation,
-    );
+    let eligible =
+        queue.receipt_bound_eligible_count_with_stable_generation(stable_txg, stable_generation);
+    let batch =
+        queue.dequeue_receipt_bound_batch_with_stable_generation(16, stable_txg, stable_generation);
     let ack_removed = if batch.is_empty() {
         0
     } else {
@@ -457,10 +442,7 @@ fn entry_without_receipt(key: ObjectKey) -> DeadObjectEntry {
     DeadObjectEntry::new(key, dataset_uuid(key), 5, true, 5)
 }
 
-fn entry_with_receipt(
-    key: ObjectKey,
-    receipt: DeadObjectReplacementReceipt,
-) -> DeadObjectEntry {
+fn entry_with_receipt(key: ObjectKey, receipt: DeadObjectReplacementReceipt) -> DeadObjectEntry {
     entry_without_receipt(key).with_replacement_receipt(receipt)
 }
 
@@ -554,9 +536,10 @@ mod tests {
                 && case.actual_decision == "queued"
                 && case.receipt_facts.receipt_policy_target_width == Some(3)
                 && case.receipt_facts.receipt_target_count == Some(2)
-                && case.refusal_reason.as_deref().is_some_and(|reason| {
-                    reason.contains("below redundancy width")
-                })
+                && case
+                    .refusal_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("below redundancy width"))
         }));
         assert!(evidence.cases.iter().any(|case| {
             case.name == "stale-generation-remains-queued"

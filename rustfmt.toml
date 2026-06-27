@@ -1,0 +1,3 @@
+# TideFS uses stable rustfmt defaults as the workspace formatting policy.
+# Keep this file as the root policy anchor for local and CI formatter checks.
+max_width = 100

@@ -80,8 +80,7 @@ fn empty_chain_verifies_with_zero_head() {
     assert_eq!(ledger.head_digest(), ValidationReceiptDigest::ZERO);
     ledger.verify().unwrap();
 
-    let rebuilt =
-        ValidationReceiptLedger::from_parts(claim_id(), Vec::new(), Vec::new()).unwrap();
+    let rebuilt = ValidationReceiptLedger::from_parts(claim_id(), Vec::new(), Vec::new()).unwrap();
     assert!(rebuilt.is_empty());
     assert_eq!(rebuilt.head_digest(), ValidationReceiptDigest::ZERO);
     assert_eq!(rebuilt.claim_id(), claim_id());
@@ -151,8 +150,7 @@ fn append_and_verify_hash_linked_receipts() {
     assert_eq!(ledger.records()[1].previous_receipt_digest, first_digest);
     ledger.verify().unwrap();
 
-    let roundtrip =
-        ValidationReceiptRecord::deserialize(&ledger.records()[0].serialize()).unwrap();
+    let roundtrip = ValidationReceiptRecord::deserialize(&ledger.records()[0].serialize()).unwrap();
     assert_eq!(roundtrip, ledger.records()[0]);
 }
 
@@ -184,7 +182,9 @@ fn decreasing_sequence_number_is_rejected() {
     let second_digest = ledger.append(receipt(1, first_digest, "pass")).unwrap();
 
     // Try to append with sequence 0 (already used).
-    let err = ledger.append(receipt(0, second_digest, "pass")).unwrap_err();
+    let err = ledger
+        .append(receipt(0, second_digest, "pass"))
+        .unwrap_err();
 
     assert!(matches!(
         err,
@@ -271,12 +271,8 @@ fn retained_head_digest_rejects_silent_chain_replacement() {
 fn mismatched_claim_id_on_append_is_rejected() {
     let mut ledger = ValidationReceiptLedger::new(claim_id());
 
-    let wrong_receipt = receipt_for_claim(
-        0,
-        other_claim_id(),
-        ValidationReceiptDigest::ZERO,
-        "pass",
-    );
+    let wrong_receipt =
+        receipt_for_claim(0, other_claim_id(), ValidationReceiptDigest::ZERO, "pass");
     let err = ledger.append(wrong_receipt).unwrap_err();
 
     assert!(matches!(
@@ -306,8 +302,7 @@ fn mismatched_claim_id_on_load_is_rejected() {
         producer(),
     );
 
-    let err =
-        ValidationReceiptLedger::from_parts(claim_id(), records, digests).unwrap_err();
+    let err = ValidationReceiptLedger::from_parts(claim_id(), records, digests).unwrap_err();
 
     assert!(matches!(
         err,
@@ -319,12 +314,8 @@ fn mismatched_claim_id_on_load_is_rejected() {
 fn mismatched_claim_id_on_replay_is_rejected() {
     let mut ledger = ValidationReceiptLedger::new(claim_id());
 
-    let wrong_receipt = receipt_for_claim(
-        0,
-        other_claim_id(),
-        ValidationReceiptDigest::ZERO,
-        "pass",
-    );
+    let wrong_receipt =
+        receipt_for_claim(0, other_claim_id(), ValidationReceiptDigest::ZERO, "pass");
     let err = ledger.replay(wrong_receipt).unwrap_err();
 
     assert!(matches!(
@@ -362,7 +353,9 @@ fn replay_appends_new_record_at_frontier() {
         .unwrap();
 
     // Replay first, then append second via replay.
-    ledger.replay(receipt(0, ValidationReceiptDigest::ZERO, "pass")).unwrap();
+    ledger
+        .replay(receipt(0, ValidationReceiptDigest::ZERO, "pass"))
+        .unwrap();
     let second_digest = ledger.replay(receipt(1, first_digest, "pass")).unwrap();
 
     assert_eq!(ledger.len(), 2);
@@ -415,7 +408,9 @@ fn replay_preserves_deterministic_iteration() {
     ledger.append(receipt(1, first_digest, "pass")).unwrap();
 
     // Replay both records.
-    ledger.replay(receipt(0, ValidationReceiptDigest::ZERO, "pass")).unwrap();
+    ledger
+        .replay(receipt(0, ValidationReceiptDigest::ZERO, "pass"))
+        .unwrap();
     ledger.replay(receipt(1, first_digest, "pass")).unwrap();
 
     let collected: Vec<&ValidationReceiptRecord> = ledger.iter().collect();

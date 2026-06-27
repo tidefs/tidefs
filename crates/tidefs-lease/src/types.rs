@@ -315,7 +315,9 @@ pub enum LeaseError {
         holder_id: u64,
         lease_holder_id: u64,
     },
-    #[error("mount identity mismatch: lease mount {lease_mount:?} != current mount {current_mount:?}")]
+    #[error(
+        "mount identity mismatch: lease mount {lease_mount:?} != current mount {current_mount:?}"
+    )]
     MountIdentityMismatch {
         lease_mount: DatasetMountIdentity,
         current_mount: DatasetMountIdentity,

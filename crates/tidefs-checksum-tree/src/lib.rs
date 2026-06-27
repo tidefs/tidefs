@@ -214,7 +214,6 @@ fn hex_fmt(bytes: &[u8; 32]) -> alloc::string::String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-
 // ---------------------------------------------------------------------------
 // LocatorToken
 // ---------------------------------------------------------------------------
@@ -1055,10 +1054,7 @@ impl ChecksumTreeVerifier {
     ///
     /// Returns `None` when the check passes (or no binding exists).
     /// Returns `Some(LocatorMismatch)` when the tokens differ.
-    fn check_locator(
-        &self,
-        supplied_token: Option<&LocatorToken>,
-    ) -> Option<VerificationResult> {
+    fn check_locator(&self, supplied_token: Option<&LocatorToken>) -> Option<VerificationResult> {
         match (&self.tree.locator_token, supplied_token) {
             // No binding — no check needed.
             (None, _) => None,
@@ -3980,7 +3976,10 @@ mod validation_tests {
         let token_a = LocatorToken::from_evidence(evidence_a);
         let token_b = LocatorToken::from_evidence(evidence_b);
 
-        assert_ne!(token_a, token_b, "different evidence must produce different tokens");
+        assert_ne!(
+            token_a, token_b,
+            "different evidence must produce different tokens"
+        );
 
         let mut builder = ChecksumTreeBuilder::new(DEFAULT_BLOCK_SIZE);
         builder.set_locator(token_a);

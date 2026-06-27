@@ -13,9 +13,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::{
-    budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor,
-};
+use crate::{budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor};
 
 // ---------------------------------------------------------------------------
 // L2ArcKey — cache lookup key

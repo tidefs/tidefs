@@ -906,7 +906,10 @@ impl WriteAdmissionState {
         self.usage.outstanding_permits = new_permits;
         let permit_id = self.next_permit_id;
         self.next_permit_id = self.next_permit_id.saturating_add(1);
-        Ok(AdmissionPermit::new(permit_id, AdmissionCharge::metadata_mutation(admitted_tick)))
+        Ok(AdmissionPermit::new(
+            permit_id,
+            AdmissionCharge::metadata_mutation(admitted_tick),
+        ))
     }
 
     /// Release an admission permit and return the released charge.
@@ -1649,7 +1652,9 @@ mod tests {
         ));
 
         state.release(first).expect("release first metadata permit");
-        state.release(second).expect("release second metadata permit");
+        state
+            .release(second)
+            .expect("release second metadata permit");
         assert_eq!(state.usage(), WriteAdmissionUsage::default());
     }
 

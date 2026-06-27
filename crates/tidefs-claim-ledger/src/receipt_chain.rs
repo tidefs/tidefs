@@ -22,7 +22,9 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-use tidefs_types_claim_ledger_core::{ValidationReceiptDigest, ValidationReceiptRecord, ValidationReceiptText};
+use tidefs_types_claim_ledger_core::{
+    ValidationReceiptDigest, ValidationReceiptRecord, ValidationReceiptText,
+};
 
 use crate::ClaimEncoding;
 
@@ -65,12 +67,22 @@ impl ValidationReceiptLedger {
         digests: Vec<ValidationReceiptDigest>,
     ) -> Result<Self, ValidationReceiptLedgerError> {
         Self::verify_parts(&claim_id, &records, &digests)?;
-        Ok(Self { claim_id, records, digests })
+        Ok(Self {
+            claim_id,
+            records,
+            digests,
+        })
     }
 
     /// Consume the ledger and return its parts for persistence.
     #[must_use]
-    pub fn into_parts(self) -> (ValidationReceiptText, Vec<ValidationReceiptRecord>, Vec<ValidationReceiptDigest>) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        ValidationReceiptText,
+        Vec<ValidationReceiptRecord>,
+        Vec<ValidationReceiptDigest>,
+    ) {
         (self.claim_id, self.records, self.digests)
     }
 
@@ -309,18 +321,14 @@ pub enum ValidationReceiptLedgerError {
         digest_count: usize,
     },
     /// A sequence number has already been used in this chain.
-    DuplicateSequenceNumber {
-        sequence: u64,
-    },
+    DuplicateSequenceNumber { sequence: u64 },
     /// A receipt's sequence does not follow the previous record's sequence.
     ReorderedReceiptChain {
         expected_sequence: u64,
         actual_sequence: u64,
     },
     /// A replay at an occupied sequence position found a different record.
-    ConflictingReplay {
-        sequence: u64,
-    },
+    ConflictingReplay { sequence: u64 },
     /// A receipt's `previous_receipt_digest` does not match the chain linkage.
     PreviousDigestMismatch {
         sequence: u64,
@@ -339,9 +347,7 @@ pub enum ValidationReceiptLedgerError {
         computed: ValidationReceiptDigest,
     },
     /// Internal invariant violation (records/digests out of sync).
-    InternalInconsistency {
-        detail: &'static str,
-    },
+    InternalInconsistency { detail: &'static str },
 }
 
 impl fmt::Display for ValidationReceiptLedgerError {

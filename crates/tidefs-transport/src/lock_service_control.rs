@@ -178,14 +178,20 @@ mod tests {
 
         assert_eq!(LOCK_CONTROL_ENDPOINT_FAMILY, EndpointFamily::Control);
         assert_eq!(LOCK_CONTROL_LANE, LaneClass::Control);
-        assert_eq!(LOCK_CONTROL_MESSAGE_FAMILY.preferred_lane(), LOCK_CONTROL_LANE);
+        assert_eq!(
+            LOCK_CONTROL_MESSAGE_FAMILY.preferred_lane(),
+            LOCK_CONTROL_LANE
+        );
 
         let queued = receiver.recv().await.expect("peer-side queued frame");
         let io_frame = encode_frame(LOCK_CONTROL_MESSAGE_FAMILY, &queued);
         let (family, payload) = decode_frame(&io_frame).expect("decode transport frame");
 
         assert_eq!(family, LOCK_CONTROL_MESSAGE_FAMILY);
-        assert_eq!(LockFrame::decode(&payload).expect("decode lock frame"), frame);
+        assert_eq!(
+            LockFrame::decode(&payload).expect("decode lock frame"),
+            frame
+        );
     }
 
     #[test]
@@ -198,9 +204,9 @@ mod tests {
             .expect_err("missing peer rejected");
 
         match err {
-            LockServiceError::TransportPeerUnavailable {
-                peer: rejected, ..
-            } => assert_eq!(rejected, peer),
+            LockServiceError::TransportPeerUnavailable { peer: rejected, .. } => {
+                assert_eq!(rejected, peer)
+            }
             other => panic!("expected unavailable peer, got {other:?}"),
         }
     }
@@ -221,9 +227,9 @@ mod tests {
             .expect_err("unhealthy peer rejected");
 
         match err {
-            LockServiceError::TransportPeerUnavailable {
-                peer: rejected, ..
-            } => assert_eq!(rejected, peer),
+            LockServiceError::TransportPeerUnavailable { peer: rejected, .. } => {
+                assert_eq!(rejected, peer)
+            }
             other => panic!("expected unavailable peer, got {other:?}"),
         }
     }

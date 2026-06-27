@@ -131,7 +131,12 @@ pub fn tracker_acquire_flock(
 /// Release the BSD flock on `ino` held by `owner`.
 ///
 /// Does nothing when no flock is held by this owner on this inode.
-pub fn tracker_release_flock(tracker: &mut LockTracker, dataset_mount_id: u64, ino: u64, owner: FlockOwner) {
+pub fn tracker_release_flock(
+    tracker: &mut LockTracker,
+    dataset_mount_id: u64,
+    ino: u64,
+    owner: FlockOwner,
+) {
     let range = LockRange::unlock(0, 0, owner.owner_fd as u32);
     tracker.release(dataset_mount_id, ino, range);
 }
@@ -372,7 +377,9 @@ mod tests {
     #[test]
     fn single_lock_acquire_tracks_range() {
         let mut tracker = LockTracker::new();
-        tracker.acquire(1, 7, LockRange::write(10, 20, 100)).unwrap();
+        tracker
+            .acquire(1, 7, LockRange::write(10, 20, 100))
+            .unwrap();
 
         let locks = tracker.locks_for_mount_inode(1, 7).unwrap().locks();
         assert_eq!(locks, &[LockRange::write(10, 20, 100)]);
@@ -419,7 +426,9 @@ mod tests {
     #[test]
     fn unlock_splits_existing_range() {
         let mut tracker = LockTracker::new();
-        tracker.acquire(1, 7, LockRange::write(0, 100, 100)).unwrap();
+        tracker
+            .acquire(1, 7, LockRange::write(0, 100, 100))
+            .unwrap();
 
         tracker.release(1, 7, LockRange::unlock(40, 20, 100));
 
@@ -453,7 +462,10 @@ mod tests {
                 existing
             }
         );
-        assert_eq!(tracker.locks_for_mount_inode(1, 7).unwrap().locks(), &[existing]);
+        assert_eq!(
+            tracker.locks_for_mount_inode(1, 7).unwrap().locks(),
+            &[existing]
+        );
     }
 
     #[test]
@@ -477,7 +489,9 @@ mod tests {
         let mut tracker = LockTracker::new();
         tracker.acquire(1, 7, LockRange::read(0, 100, 100)).unwrap();
 
-        tracker.acquire(1, 7, LockRange::write(25, 50, 100)).unwrap();
+        tracker
+            .acquire(1, 7, LockRange::write(25, 50, 100))
+            .unwrap();
 
         assert_eq!(
             tracker.locks_for_mount_inode(1, 7).unwrap().locks(),
@@ -811,8 +825,12 @@ mod tests {
     #[test]
     fn cross_dataset_locks_do_not_conflict() {
         let mut tracker = LockTracker::new();
-        tracker.acquire(1, 42, LockRange::write(0, 100, 100)).unwrap();
-        assert!(tracker.acquire(2, 42, LockRange::write(0, 100, 200)).is_ok());
+        tracker
+            .acquire(1, 42, LockRange::write(0, 100, 100))
+            .unwrap();
+        assert!(tracker
+            .acquire(2, 42, LockRange::write(0, 100, 200))
+            .is_ok());
         assert_eq!(tracker.inode_count(), 2);
     }
 
@@ -820,8 +838,12 @@ mod tests {
     fn cross_dataset_inode_collision_isolated() {
         let mut tracker = LockTracker::new();
         tracker.acquire(1, 1, LockRange::write(0, 100, 10)).unwrap();
-        assert!(tracker.query_conflict(2, 1, LockRange::read(0, 100, 20)).is_none());
-        assert!(tracker.query_conflict(1, 1, LockRange::read(0, 100, 20)).is_some());
+        assert!(tracker
+            .query_conflict(2, 1, LockRange::read(0, 100, 20))
+            .is_none());
+        assert!(tracker
+            .query_conflict(1, 1, LockRange::read(0, 100, 20))
+            .is_some());
     }
 
     #[test]
@@ -840,11 +862,17 @@ mod tests {
     #[test]
     fn forced_unmount_clears_stale_locks() {
         let mut tracker = LockTracker::new();
-        tracker.acquire(1, 10, LockRange::write(0, 200, 100)).unwrap();
-        tracker.acquire(1, 20, LockRange::read(100, 50, 100)).unwrap();
+        tracker
+            .acquire(1, 10, LockRange::write(0, 200, 100))
+            .unwrap();
+        tracker
+            .acquire(1, 20, LockRange::read(100, 50, 100))
+            .unwrap();
         assert_eq!(tracker.release_all_for_mount(1), 2);
         assert!(tracker.is_empty());
-        tracker.acquire(2, 10, LockRange::write(0, 200, 200)).unwrap();
+        tracker
+            .acquire(2, 10, LockRange::write(0, 200, 200))
+            .unwrap();
         assert_eq!(tracker.inode_count(), 1);
     }
 
@@ -853,9 +881,15 @@ mod tests {
         let mut tracker = LockTracker::new();
         let owner_a: u64 = 100;
         let owner_b: u64 = 200;
-        tracker.acquire(1, 5, LockRange::new(0, 100, LockType::Write, owner_a, 10)).unwrap();
-        assert!(tracker.acquire(2, 5, LockRange::new(0, 100, LockType::Write, owner_a, 10)).is_ok());
-        assert!(tracker.acquire(1, 5, LockRange::new(0, 100, LockType::Write, owner_b, 20)).is_err());
+        tracker
+            .acquire(1, 5, LockRange::new(0, 100, LockType::Write, owner_a, 10))
+            .unwrap();
+        assert!(tracker
+            .acquire(2, 5, LockRange::new(0, 100, LockType::Write, owner_a, 10))
+            .is_ok());
+        assert!(tracker
+            .acquire(1, 5, LockRange::new(0, 100, LockType::Write, owner_b, 20))
+            .is_err());
     }
 
     #[test]

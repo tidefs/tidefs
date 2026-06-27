@@ -600,11 +600,7 @@ impl<'a, E: VfsEngine> AddressSpaceOps<'a, E> {
         let mut generation_snapshots: crate::TideVec<PageGenerationSnapshot> =
             crate::TideVec::new();
         let sp = page_index(range.offset);
-        let ep = page_index(
-            range
-                .offset
-                .saturating_add(range.length.saturating_sub(1)),
-        );
+        let ep = page_index(range.offset.saturating_add(range.length.saturating_sub(1)));
         for pg in sp..=ep {
             generation_snapshots.push(self.page_authority.generation_snapshot(inode, pg));
         }
@@ -1527,9 +1523,7 @@ mod tests {
         let mut dt = make_dirty_tracker();
         let mut pa = make_page_authority();
         let mut aops = AddressSpaceOps::new(&e, &mut tracker, &mut dt, &mut pa);
-        let before = aops
-            .page_authority
-            .generation_snapshot(InodeId::new(1), 0);
+        let before = aops.page_authority.generation_snapshot(InodeId::new(1), 0);
 
         // Default engine implementation returns Ok(())
         assert_eq!(aops.invalidate_folio(InodeId::new(1), &fh, 0, 8192), Ok(()));

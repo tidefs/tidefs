@@ -7,9 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::{
-    budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor,
-};
+use crate::{budget_category_for_cache_level, BudgetCategory, CacheBudgetLevel, Governor};
 
 /// Tracks recent read offsets per file handle to classify access patterns.
 ///

@@ -483,8 +483,7 @@ const fn derive_posix_filesystem_adapter_lifecycle_id(
     let mut out = [0_u8; 16];
     let mut index = 0;
     while index < out.len() {
-        out[index] =
-            seed.0[index] ^ domain.wrapping_add((index as u8).wrapping_mul(17));
+        out[index] = seed.0[index] ^ domain.wrapping_add((index as u8).wrapping_mul(17));
         index += 1;
     }
     PosixFilesystemAdapterId128(out)
@@ -595,8 +594,14 @@ pub fn materialize_posix_filesystem_adapter_session_thread_sets_from_p5_02_and_p
     }
 
     Ok([
-        thread_set_binding(session.session_id, PosixFilesystemAdapterThreadSetClass::Control),
-        thread_set_binding(session.session_id, PosixFilesystemAdapterThreadSetClass::Request),
+        thread_set_binding(
+            session.session_id,
+            PosixFilesystemAdapterThreadSetClass::Control,
+        ),
+        thread_set_binding(
+            session.session_id,
+            PosixFilesystemAdapterThreadSetClass::Request,
+        ),
         thread_set_binding(
             session.session_id,
             PosixFilesystemAdapterThreadSetClass::PageWriteback,
@@ -609,8 +614,14 @@ pub fn materialize_posix_filesystem_adapter_session_thread_sets_from_p5_02_and_p
             session.session_id,
             PosixFilesystemAdapterThreadSetClass::ResponseBridge,
         ),
-        thread_set_binding(session.session_id, PosixFilesystemAdapterThreadSetClass::Drain),
-        thread_set_binding(session.session_id, PosixFilesystemAdapterThreadSetClass::Recovery),
+        thread_set_binding(
+            session.session_id,
+            PosixFilesystemAdapterThreadSetClass::Drain,
+        ),
+        thread_set_binding(
+            session.session_id,
+            PosixFilesystemAdapterThreadSetClass::Recovery,
+        ),
     ])
 }
 
@@ -740,12 +751,12 @@ pub fn recover_or_quarantine_posix_filesystem_adapter_session_after_crash_or_sup
 
     let requires_quarantine = verdict.requires_quarantine() || verdict.is_fatal();
     let recovery_complete = if verdict.is_servable() { 1 } else { 0 };
-    let recovery_attempt_count = if matches!(verdict, PosixFilesystemAdapterRestartVerdictClass::Clean)
-    {
-        0
-    } else {
-        1
-    };
+    let recovery_attempt_count =
+        if matches!(verdict, PosixFilesystemAdapterRestartVerdictClass::Clean) {
+            0
+        } else {
+            1
+        };
 
     Ok(PosixFilesystemAdapterRestartRecoveryRecord {
         recovery_id: derive_posix_filesystem_adapter_lifecycle_id(incident.incident_id, 0x71),
@@ -1026,7 +1037,10 @@ mod tests {
             .expect("normalized intent is admitted");
         assert!(!admitted.session_id.is_zero());
         assert_eq!(admitted.mount_intent_id, mount_intent_id);
-        assert_eq!(admitted.phase, PosixFilesystemAdapterPhaseClass::Bootstrap.as_u32());
+        assert_eq!(
+            admitted.phase,
+            PosixFilesystemAdapterPhaseClass::Bootstrap.as_u32()
+        );
         assert_eq!(admitted.live_thread_set_count, 0);
 
         let spawned =
@@ -1072,10 +1086,8 @@ mod tests {
             0
         );
 
-        issue_posix_filesystem_adapter_ready_or_refusal_receipt_and_release_mount_helper(
-            &spawned,
-        )
-        .expect("serving session emits ready receipt");
+        issue_posix_filesystem_adapter_ready_or_refusal_receipt_and_release_mount_helper(&spawned)
+            .expect("serving session emits ready receipt");
 
         let drain =
             drain_posix_filesystem_adapter_session_for_unmount_cutover_failover_or_pressure(

@@ -65,15 +65,17 @@ fn auditor_with_divergences(
 
 #[test]
 fn digest_mismatch_emits_receipt() {
-    let mut aud = auditor_with_divergences(&[(
-        1, 2, DivergenceClass::DigestMismatch, 0xCAFE, 0xBABE,
-    )]);
+    let mut aud =
+        auditor_with_divergences(&[(1, 2, DivergenceClass::DigestMismatch, 0xCAFE, 0xBABE)]);
 
     let receipts = aud.emit_repair_receipts("digest mismatch detected");
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].subject_ref, 1);
     assert_eq!(receipts[0].target_node, 2);
-    assert_eq!(receipts[0].divergence_class, DivergenceClass::DigestMismatch);
+    assert_eq!(
+        receipts[0].divergence_class,
+        DivergenceClass::DigestMismatch
+    );
     assert_eq!(receipts[0].expected_digest, 0xCAFE);
     assert_eq!(receipts[0].actual_digest, 0xBABE);
     assert_eq!(receipts[0].trigger_reason, "digest mismatch detected");
@@ -98,13 +100,14 @@ fn multiple_digest_mismatches_emit_receipts() {
 
 #[test]
 fn missing_replica_emits_receipt() {
-    let mut aud = auditor_with_divergences(&[(
-        5, 3, DivergenceClass::MissingReplica, 0xDEAD, 0x0,
-    )]);
+    let mut aud = auditor_with_divergences(&[(5, 3, DivergenceClass::MissingReplica, 0xDEAD, 0x0)]);
 
     let receipts = aud.emit_repair_receipts("missing replica");
     assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].divergence_class, DivergenceClass::MissingReplica);
+    assert_eq!(
+        receipts[0].divergence_class,
+        DivergenceClass::MissingReplica
+    );
     assert_eq!(receipts[0].actual_digest, 0);
 }
 
@@ -118,12 +121,21 @@ fn replica_unhealthy_emits_receipt() {
     aud.begin_compare(NS_PER_MIN, 1);
 
     aud.current_divergences.push(DivergenceRecord::new(
-        7, 4, DivergenceClass::ReplicaUnhealthy, 0xABCD, 0xABCD, 1, NS_PER_MIN,
+        7,
+        4,
+        DivergenceClass::ReplicaUnhealthy,
+        0xABCD,
+        0xABCD,
+        1,
+        NS_PER_MIN,
     ));
 
     let receipts = aud.emit_repair_receipts("replica unhealthy");
     assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].divergence_class, DivergenceClass::ReplicaUnhealthy);
+    assert_eq!(
+        receipts[0].divergence_class,
+        DivergenceClass::ReplicaUnhealthy
+    );
     assert_eq!(receipts[0].subject_ref, 7);
     assert_eq!(receipts[0].target_node, 4);
 }
@@ -140,7 +152,13 @@ fn lag_only_does_not_emit_receipt() {
     aud.begin_compare(NS_PER_MIN, 1);
 
     aud.current_divergences.push(DivergenceRecord::new(
-        1, 1, DivergenceClass::LagBehind, 100, 90, 1, NS_PER_MIN,
+        1,
+        1,
+        DivergenceClass::LagBehind,
+        100,
+        90,
+        1,
+        NS_PER_MIN,
     ));
 
     let receipts = aud.emit_repair_receipts("should be empty");
@@ -155,16 +173,40 @@ fn mixed_lag_and_corruption_only_ticketable_get_receipts() {
     aud.begin_compare(NS_PER_MIN, 4);
 
     aud.current_divergences.push(DivergenceRecord::new(
-        1, 1, DivergenceClass::LagBehind, 100, 100, 1, NS_PER_MIN,
+        1,
+        1,
+        DivergenceClass::LagBehind,
+        100,
+        100,
+        1,
+        NS_PER_MIN,
     ));
     aud.current_divergences.push(DivergenceRecord::new(
-        2, 1, DivergenceClass::DigestMismatch, 200, 300, 1, NS_PER_MIN,
+        2,
+        1,
+        DivergenceClass::DigestMismatch,
+        200,
+        300,
+        1,
+        NS_PER_MIN,
     ));
     aud.current_divergences.push(DivergenceRecord::new(
-        3, 2, DivergenceClass::LagBehind, 400, 400, 1, NS_PER_MIN,
+        3,
+        2,
+        DivergenceClass::LagBehind,
+        400,
+        400,
+        1,
+        NS_PER_MIN,
     ));
     aud.current_divergences.push(DivergenceRecord::new(
-        4, 2, DivergenceClass::DigestMismatch, 500, 600, 1, NS_PER_MIN,
+        4,
+        2,
+        DivergenceClass::DigestMismatch,
+        500,
+        600,
+        1,
+        NS_PER_MIN,
     ));
 
     let receipts = aud.emit_repair_receipts("mixed");
@@ -183,7 +225,13 @@ fn witness_disagreement_does_not_emit_receipt() {
     aud.begin_compare(NS_PER_MIN, 1);
 
     aud.current_divergences.push(DivergenceRecord::new(
-        1, 1, DivergenceClass::WitnessDisagreement, 100, 200, 1, NS_PER_MIN,
+        1,
+        1,
+        DivergenceClass::WitnessDisagreement,
+        100,
+        200,
+        1,
+        NS_PER_MIN,
     ));
 
     let receipts = aud.emit_repair_receipts("witness disagreement");
@@ -200,17 +248,32 @@ fn witness_disagreement_requires_explicit_authority_classification() {
     aud.begin_compare(NS_PER_MIN, 2);
 
     aud.current_divergences.push(DivergenceRecord::new(
-        1, 1, DivergenceClass::WitnessDisagreement, 100, 200, 1, NS_PER_MIN,
+        1,
+        1,
+        DivergenceClass::WitnessDisagreement,
+        100,
+        200,
+        1,
+        NS_PER_MIN,
     ));
     aud.current_divergences.push(DivergenceRecord::new(
-        2, 1, DivergenceClass::DigestMismatch, 300, 400, 1, NS_PER_MIN,
+        2,
+        1,
+        DivergenceClass::DigestMismatch,
+        300,
+        400,
+        1,
+        NS_PER_MIN,
     ));
 
     // Only the DigestMismatch should get a receipt
     let receipts = aud.emit_repair_receipts("mixed with witness");
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].subject_ref, 2);
-    assert_eq!(receipts[0].divergence_class, DivergenceClass::DigestMismatch);
+    assert_eq!(
+        receipts[0].divergence_class,
+        DivergenceClass::DigestMismatch
+    );
 
     // The witness disagreement is still in current_divergences, just not ticketable
     let witness_records: Vec<&DivergenceRecord> = aud
@@ -225,9 +288,7 @@ fn witness_disagreement_requires_explicit_authority_classification() {
 
 #[test]
 fn repeated_emit_returns_empty_after_first_call() {
-    let mut aud = auditor_with_divergences(&[
-        (1, 1, DivergenceClass::DigestMismatch, 100, 200),
-    ]);
+    let mut aud = auditor_with_divergences(&[(1, 1, DivergenceClass::DigestMismatch, 100, 200)]);
 
     let first = aud.emit_repair_receipts("first call");
     assert_eq!(first.len(), 1);
@@ -257,9 +318,7 @@ fn idempotency_with_no_divergences() {
 
 #[test]
 fn idempotency_flag_resets_on_new_scan() {
-    let mut aud = auditor_with_divergences(&[
-        (1, 1, DivergenceClass::DigestMismatch, 100, 200),
-    ]);
+    let mut aud = auditor_with_divergences(&[(1, 1, DivergenceClass::DigestMismatch, 100, 200)]);
 
     let first = aud.emit_repair_receipts("scan 1");
     assert_eq!(first.len(), 1);
@@ -272,7 +331,13 @@ fn idempotency_flag_resets_on_new_scan() {
 
     // New divergence in new scan
     aud.current_divergences.push(DivergenceRecord::new(
-        2, 1, DivergenceClass::DigestMismatch, 300, 400, 2, 3 * NS_PER_MIN,
+        2,
+        1,
+        DivergenceClass::DigestMismatch,
+        300,
+        400,
+        2,
+        3 * NS_PER_MIN,
     ));
 
     // Should be able to emit again for the new cycle
@@ -320,18 +385,36 @@ fn receipt_count_matches_ticketable_divergence_count() {
         (7, 1000, 1100),
     ] {
         aud.current_divergences.push(DivergenceRecord::new(
-            subj, 1, DivergenceClass::DigestMismatch, exp, act, 1, NS_PER_MIN,
+            subj,
+            1,
+            DivergenceClass::DigestMismatch,
+            exp,
+            act,
+            1,
+            NS_PER_MIN,
         ));
     }
 
     // 1 LagBehind — excluded from ticketable
     aud.current_divergences.push(DivergenceRecord::new(
-        4, 1, DivergenceClass::LagBehind, 700, 700, 1, NS_PER_MIN,
+        4,
+        1,
+        DivergenceClass::LagBehind,
+        700,
+        700,
+        1,
+        NS_PER_MIN,
     ));
 
     // 1 WitnessDisagreement — excluded from ticketable (authority gate)
     aud.current_divergences.push(DivergenceRecord::new(
-        6, 1, DivergenceClass::WitnessDisagreement, 10, 20, 1, NS_PER_MIN,
+        6,
+        1,
+        DivergenceClass::WitnessDisagreement,
+        10,
+        20,
+        1,
+        NS_PER_MIN,
     ));
 
     let receipts = aud.emit_repair_receipts("threshold test");
@@ -348,9 +431,11 @@ fn receipt_count_matches_ticketable_divergence_count() {
 fn threshold_escalation_from_receipt_count() {
     // The receipt count can be used for threshold escalation decisions
     // without inspecting internal divergence state.
-    let mut aud = auditor_with_divergences(&(1..=7)
-        .map(|i| (i, 1, DivergenceClass::DigestMismatch, i * 100, i * 100 + 1))
-        .collect::<Vec<_>>());
+    let mut aud = auditor_with_divergences(
+        &(1..=7)
+            .map(|i| (i, 1, DivergenceClass::DigestMismatch, i * 100, i * 100 + 1))
+            .collect::<Vec<_>>(),
+    );
 
     let receipts = aud.emit_repair_receipts("escalation");
     assert_eq!(receipts.len(), 7);
@@ -396,9 +481,7 @@ fn receipt_preserves_all_divergence_evidence() {
 
 #[test]
 fn receipt_without_full_hashes_reports_correctly() {
-    let rec = DivergenceRecord::new(
-        1, 2, DivergenceClass::DigestMismatch, 100, 200, 1, 1000,
-    );
+    let rec = DivergenceRecord::new(1, 2, DivergenceClass::DigestMismatch, 100, 200, 1, 1000);
     let receipt = RepairTriggerReceipt::from_divergence(&rec, "no hashes").unwrap();
     assert!(!receipt.has_full_hashes());
     assert_eq!(receipt.expected_hash, None);
@@ -409,9 +492,7 @@ fn receipt_without_full_hashes_reports_correctly() {
 
 #[test]
 fn drain_divergences_does_not_affect_receipt_emission_state() {
-    let mut aud = auditor_with_divergences(&[
-        (1, 1, DivergenceClass::DigestMismatch, 100, 200),
-    ]);
+    let mut aud = auditor_with_divergences(&[(1, 1, DivergenceClass::DigestMismatch, 100, 200)]);
 
     // Emit receipts first
     let receipts = aud.emit_repair_receipts("before drain");

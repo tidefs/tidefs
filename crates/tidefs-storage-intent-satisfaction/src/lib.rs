@@ -1572,15 +1572,13 @@ const fn reason_for_family_state_kind(
 ) -> StorageIntentSatisfactionReason {
     match kind {
         StorageIntentEvidenceKind::TransportPathEvidence => match state {
-            EvidenceFamilyFreshnessState::Stale
-            | EvidenceFamilyFreshnessState::Missing => {
+            EvidenceFamilyFreshnessState::Stale | EvidenceFamilyFreshnessState::Missing => {
                 StorageIntentSatisfactionReason::StaleTransportPathEvidence
             }
             _ => reason_for_family_state(state),
         },
         StorageIntentEvidenceKind::ReadFreshnessEvidence => match state {
-            EvidenceFamilyFreshnessState::Stale
-            | EvidenceFamilyFreshnessState::Missing => {
+            EvidenceFamilyFreshnessState::Stale | EvidenceFamilyFreshnessState::Missing => {
                 StorageIntentSatisfactionReason::StaleReadServingEvidence
             }
             EvidenceFamilyFreshnessState::Refused => {
@@ -1597,8 +1595,7 @@ const fn reason_for_family_state_kind(
             _ => reason_for_family_state(state),
         },
         StorageIntentEvidenceKind::LayoutAllocatorEvidence => match state {
-            EvidenceFamilyFreshnessState::Missing
-            | EvidenceFamilyFreshnessState::Stale => {
+            EvidenceFamilyFreshnessState::Missing | EvidenceFamilyFreshnessState::Stale => {
                 StorageIntentSatisfactionReason::StaleMirrorOnlyLayoutEvidence
             }
             _ => reason_for_family_state(state),
@@ -2406,7 +2403,10 @@ mod tests {
             &required,
         ));
 
-        assert_eq!(record.state, StorageIntentSatisfactionClass::UnknownEvidence);
+        assert_eq!(
+            record.state,
+            StorageIntentSatisfactionClass::UnknownEvidence
+        );
         assert!(record
             .reasons
             .contains_reason(StorageIntentSatisfactionReason::StaleTransportPathEvidence));
@@ -2613,5 +2613,4 @@ mod tests {
             .reasons
             .contains_reason(StorageIntentSatisfactionReason::RecoveryDegradationRefused));
     }
-
 }

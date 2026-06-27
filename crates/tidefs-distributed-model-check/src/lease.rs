@@ -22,7 +22,10 @@ pub enum LeaseLifecycleModel {
 impl LeaseLifecycleModel {
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Fenced | Self::Released | Self::Expired | Self::Revoked)
+        matches!(
+            self,
+            Self::Fenced | Self::Released | Self::Expired | Self::Revoked
+        )
     }
 
     #[must_use]
@@ -45,10 +48,21 @@ pub struct LeaseState {
 /// Outcome of a lease operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseOutcome {
-    Granted { lease_id: u64 },
-    Revoked { lease_id: u64 },
-    Conflict { lease_id: u64, reason: String },
-    StaleEpoch { lease_id: u64, request_epoch: u64, current_epoch: u64 },
+    Granted {
+        lease_id: u64,
+    },
+    Revoked {
+        lease_id: u64,
+    },
+    Conflict {
+        lease_id: u64,
+        reason: String,
+    },
+    StaleEpoch {
+        lease_id: u64,
+        request_epoch: u64,
+        current_epoch: u64,
+    },
 }
 
 /// Lease model — maintains global lease table for conflict detection.
@@ -63,7 +77,10 @@ pub struct LeaseModel {
 impl LeaseModel {
     #[must_use]
     pub fn new() -> Self {
-        Self { leases: Vec::new(), object_holders: std::collections::BTreeMap::new() }
+        Self {
+            leases: Vec::new(),
+            object_holders: std::collections::BTreeMap::new(),
+        }
     }
 
     /// Attempt to grant a lease.  Returns `Conflict` if another node
@@ -78,7 +95,11 @@ impl LeaseModel {
         current_epoch: u64,
     ) -> LeaseOutcome {
         if epoch < current_epoch {
-            return LeaseOutcome::StaleEpoch { lease_id, request_epoch: epoch, current_epoch };
+            return LeaseOutcome::StaleEpoch {
+                lease_id,
+                request_epoch: epoch,
+                current_epoch,
+            };
         }
         if let Some(&existing_holder) = self.object_holders.get(object_key) {
             if existing_holder != holder {
@@ -89,8 +110,12 @@ impl LeaseModel {
             }
         }
         let ls = LeaseState {
-            lease_id, object_key: object_key.to_string(),
-            holder, epoch, granted: true, revoked: false,
+            lease_id,
+            object_key: object_key.to_string(),
+            holder,
+            epoch,
+            granted: true,
+            revoked: false,
         };
         self.leases.push(ls.clone());
         self.object_holders.insert(object_key.to_string(), holder);

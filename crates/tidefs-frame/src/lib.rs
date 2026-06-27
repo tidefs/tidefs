@@ -467,7 +467,6 @@ impl CompressedExtentPayload {
     }
 }
 
-
 // ── Transform Verification ────────────────────────────────────────────────
 
 /// A verification token that captures the committed compression transform
@@ -511,9 +510,7 @@ impl TransformVerification {
         // compressed_len == 0 means "not stored in the receipt" — the
         // content checksum already covers the compressed payload, so a
         // length mismatch would be caught at the checksum layer.
-        if self.compressed_len != 0
-            && payload.compressed_data.len() as u64 != self.compressed_len
-        {
+        if self.compressed_len != 0 && payload.compressed_data.len() as u64 != self.compressed_len {
             return Err(FrameError::TransformMismatch {
                 field: "compressed_len",
                 expected: self.compressed_len,
@@ -1114,7 +1111,13 @@ mod tests {
         let mut bad_token = payload.to_verification();
         bad_token.algorithm = CompressionAlgorithm::Uncompressed;
         let err = decompress_extent_verified(&payload, &bad_token).unwrap_err();
-        assert!(matches!(err, FrameError::TransformMismatch { field: "algorithm", .. }));
+        assert!(matches!(
+            err,
+            FrameError::TransformMismatch {
+                field: "algorithm",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1125,7 +1128,13 @@ mod tests {
         let mut bad_token = payload.to_verification();
         bad_token.uncompressed_len = 9999;
         let err = decompress_extent_verified(&payload, &bad_token).unwrap_err();
-        assert!(matches!(err, FrameError::TransformMismatch { field: "uncompressed_len", .. }));
+        assert!(matches!(
+            err,
+            FrameError::TransformMismatch {
+                field: "uncompressed_len",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1136,7 +1145,13 @@ mod tests {
         let mut bad_token = payload.to_verification();
         bad_token.compressed_len = 9999;
         let err = decompress_extent_verified(&payload, &bad_token).unwrap_err();
-        assert!(matches!(err, FrameError::TransformMismatch { field: "compressed_len", .. }));
+        assert!(matches!(
+            err,
+            FrameError::TransformMismatch {
+                field: "compressed_len",
+                ..
+            }
+        ));
     }
 
     #[test]

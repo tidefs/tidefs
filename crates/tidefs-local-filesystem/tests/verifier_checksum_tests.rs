@@ -411,7 +411,6 @@ fn corrupted_content_chunk_payload_detected() {
         pre_corruption.checked_content_chunks
     );
 
-
     // Sanity: chunk exists and has data.
     with_raw_primary_store(&root, my_opts.clone(), |store| {
         let loc = store.location_of(chunk_key).unwrap();

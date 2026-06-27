@@ -337,8 +337,8 @@ pub mod xattr_integrity;
 pub mod xfstests_harness;
 
 pub mod capacity;
-pub mod clustered_mount;
 pub mod clustered_lock_forwarder;
+pub mod clustered_mount;
 pub mod fusewire;
 pub mod ingress;
 pub mod maintenance;
@@ -441,7 +441,6 @@ pub struct MountConfig {
     /// does not create a live-owner endpoint, and skips writeback, scrub,
     /// reclaim, and intent-log configuration. Mutually exclusive with
     /// cluster mount authority.
-
     pub snapshot_name: Option<String>,
     /// Authority used to admit the mount as standalone/local or
     /// cluster-lease-authorized.
@@ -588,7 +587,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
     let snapshot_export = config.snapshot_name.is_some();
     if snapshot_export && config.mount_authority.is_cluster_authorized() {
         return Err(
-            "snapshot export mount is not supported with cluster mount authority".to_string()
+            "snapshot export mount is not supported with cluster mount authority".to_string(),
         );
     }
 
@@ -621,11 +620,13 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
         }
     }
 
-    let (base_engine, writeback_tracker, dataset_id) = if let Some(ref snapshot_name) = config.snapshot_name {
+    let (base_engine, writeback_tracker, dataset_id) = if let Some(ref snapshot_name) =
+        config.snapshot_name
+    {
         // Snapshot export: open the snapshot's committed root as a
         // read-only namespace with no writeback, scrub, or reclaim.
-        use tidefs_local_filesystem::LocalStorageAllocatorPolicy;
         use tidefs_local_filesystem::LocalFileSystemOpenConfig;
+        use tidefs_local_filesystem::LocalStorageAllocatorPolicy;
         use tidefs_recovery_loop::RecoveryPolicy;
 
         let open_config = LocalFileSystemOpenConfig {
@@ -649,9 +650,7 @@ pub fn run_mount(config: MountConfig) -> Result<(), String> {
             summary.root_inode_id.get()
         );
         let mut engine = session.into_engine();
-        engine.set_timestamp_policy(
-            tidefs_inode_attributes::timestamp::TimestampPolicy::Noatime,
-        );
+        engine.set_timestamp_policy(tidefs_inode_attributes::timestamp::TimestampPolicy::Noatime);
         engine = engine.with_read_only();
         let dataset_id: Option<DatasetId> = None;
         (engine, None, dataset_id)
@@ -1487,6 +1486,5 @@ mod idmapped_mount_tests {
 // Re-export the clustered POSIX mount admission boundary so callers can use
 // the daemon crate as the mount-runtime API surface.
 pub use clustered_mount::{
-    ClusteredPosixAuthoritySnapshot, ClusteredPosixMountAdmissionError,
-    ClusteredPosixMountRuntime,
+    ClusteredPosixAuthoritySnapshot, ClusteredPosixMountAdmissionError, ClusteredPosixMountRuntime,
 };

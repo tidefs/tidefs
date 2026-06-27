@@ -843,7 +843,11 @@ fn receipt_transfer_put_and_read() {
                 Err(_) => break,
             };
             match msg {
-                ReplicationMessage::PutWithReceipt { name, payload, placement_receipt_ref } => {
+                ReplicationMessage::PutWithReceipt {
+                    name,
+                    payload,
+                    placement_receipt_ref,
+                } => {
                     // Store with receipt authority: record the receipt
                     store_a.put_named(&name, &payload).ok();
                     // Bump generation to simulate durable publication
@@ -915,10 +919,16 @@ fn receipt_transfer_put_and_read() {
     // Receive ack with recorded receipt
     let ack = recv_replication_msg(&mut node_b, sid).expect("recv ack");
     match ack {
-        ReplicationMessage::PutWithReceiptAck { ref key_hash, success, ref recorded_receipt_ref } => {
+        ReplicationMessage::PutWithReceiptAck {
+            ref key_hash,
+            success,
+            ref recorded_receipt_ref,
+        } => {
             assert!(success, "PutWithReceipt should succeed");
             assert_eq!(key_hash, "receipt-obj-1");
-            let recorded = recorded_receipt_ref.as_ref().expect("should have recorded receipt");
+            let recorded = recorded_receipt_ref
+                .as_ref()
+                .expect("should have recorded receipt");
             assert_eq!(recorded.object_key, receipt.object_key);
             assert_eq!(recorded.payload_digest, receipt.payload_digest);
             assert_eq!(recorded.payload_len, receipt.payload_len);
@@ -940,7 +950,10 @@ fn receipt_transfer_put_and_read() {
 
     let response = recv_replication_msg(&mut node_b, sid).expect("recv get_response");
     match response {
-        ReplicationMessage::GetResponse { found, payload: read_payload } => {
+        ReplicationMessage::GetResponse {
+            found,
+            payload: read_payload,
+        } => {
             assert!(found, "Object should be readable after receipt transfer");
             assert_eq!(read_payload, payload, "Payload should match");
         }
@@ -974,7 +987,11 @@ fn receipt_transfer_multiple_objects() {
                 Err(_) => break,
             };
             match msg {
-                ReplicationMessage::PutWithReceipt { name, payload, placement_receipt_ref } => {
+                ReplicationMessage::PutWithReceipt {
+                    name,
+                    payload,
+                    placement_receipt_ref,
+                } => {
                     store_a.put_named(&name, &payload).ok();
                     let recorded = PlacementReceiptRef::replicated(
                         placement_receipt_ref.object_id,
@@ -1031,7 +1048,11 @@ fn receipt_transfer_multiple_objects() {
 
         let ack = recv_replication_msg(&mut node_b, sid).expect("recv ack");
         match ack {
-            ReplicationMessage::PutWithReceiptAck { success, recorded_receipt_ref, .. } => {
+            ReplicationMessage::PutWithReceiptAck {
+                success,
+                recorded_receipt_ref,
+                ..
+            } => {
                 assert!(success);
                 assert!(recorded_receipt_ref.is_some());
                 receipts.push(recorded_receipt_ref.unwrap());
@@ -1043,7 +1064,10 @@ fn receipt_transfer_multiple_objects() {
     assert_eq!(receipts.len(), objects.len());
     // Each receipt should have generation > 0
     for r in &receipts {
-        assert!(r.receipt_generation > 0, "receipt generation should be non-zero");
+        assert!(
+            r.receipt_generation > 0,
+            "receipt generation should be non-zero"
+        );
     }
     // Receipts should have the same object_key and payload_len as their originals
     for ((_name, payload, _id), receipt) in objects.iter().zip(receipts.iter()) {
@@ -1078,10 +1102,15 @@ fn receipt_transfer_rejects_mismatched_digest() {
                 Err(_) => break,
             };
             match msg {
-                ReplicationMessage::PutWithReceipt { name, payload, placement_receipt_ref } => {
+                ReplicationMessage::PutWithReceipt {
+                    name,
+                    payload,
+                    placement_receipt_ref,
+                } => {
                     // Validate digest before storing
                     let actual_digest = blake3::hash(&payload);
-                    let digest_ok = actual_digest.as_bytes() == &placement_receipt_ref.payload_digest;
+                    let digest_ok =
+                        actual_digest.as_bytes() == &placement_receipt_ref.payload_digest;
                     if digest_ok {
                         store_a.put_named(&name, &payload).ok();
                     }
@@ -1123,7 +1152,10 @@ fn receipt_transfer_rejects_mismatched_digest() {
     )
     .expect("send valid");
     let ack = recv_replication_msg(&mut node_b, sid).expect("recv ack");
-    assert!(matches!(ack, ReplicationMessage::PutWithReceiptAck { success: true, .. }));
+    assert!(matches!(
+        ack,
+        ReplicationMessage::PutWithReceiptAck { success: true, .. }
+    ));
 
     // Mismatched payload: receipt claims different digest
     let wrong_payload = b"tampered-data".to_vec();
@@ -1140,7 +1172,10 @@ fn receipt_transfer_rejects_mismatched_digest() {
     .expect("send bad");
     let ack2 = recv_replication_msg(&mut node_b, sid).expect("recv ack2");
     assert!(
-        matches!(ack2, ReplicationMessage::PutWithReceiptAck { success: false, .. }),
+        matches!(
+            ack2,
+            ReplicationMessage::PutWithReceiptAck { success: false, .. }
+        ),
         "Mismatched digest should be rejected"
     );
 

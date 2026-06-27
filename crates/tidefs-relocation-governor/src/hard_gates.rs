@@ -6,7 +6,6 @@
 //! a plan that passes all gates may be admitted subject to budget,
 //! anti-thrash, and scheduling constraints.
 
-
 use crate::heuristics::RelocationActionClass;
 use crate::reasons::GovernorRelocationReason;
 
@@ -294,10 +293,7 @@ pub struct HardGates {
 impl HardGates {
     /// Evaluate all ten hard gates against the given evidence snapshot.
     #[must_use]
-    pub fn evaluate(
-        reason: GovernorRelocationReason,
-        evidence: &HardGateEvidence,
-    ) -> Self {
+    pub fn evaluate(reason: GovernorRelocationReason, evidence: &HardGateEvidence) -> Self {
         let mut results = [HardGateResult::NotApplicable; 10];
 
         // Gate 0: Source receipt authority
@@ -402,9 +398,7 @@ impl HardGates {
     fn evaluate_target_policy(evidence: &HardGateEvidence) -> HardGateResult {
         match evidence.target_satisfies_policy {
             Some(true) => HardGateResult::Pass,
-            Some(false) => {
-                HardGateResult::Fail(HardGateRefusalReason::TargetWouldViolatePolicy)
-            }
+            Some(false) => HardGateResult::Fail(HardGateRefusalReason::TargetWouldViolatePolicy),
             None => HardGateResult::UnknownEvidence,
         }
     }
@@ -435,9 +429,7 @@ impl HardGates {
         }
         match evidence.dirty_memory_budget_available {
             Some(budget) if budget > 0 => HardGateResult::Pass,
-            Some(_) => {
-                HardGateResult::Fail(HardGateRefusalReason::DirtyMemoryBudgetExhausted)
-            }
+            Some(_) => HardGateResult::Fail(HardGateRefusalReason::DirtyMemoryBudgetExhausted),
             None => HardGateResult::UnknownEvidence,
         }
     }
@@ -552,9 +544,7 @@ impl HardGates {
         }
     }
 
-    fn evaluate_replacement_before_retirement(
-        evidence: &HardGateEvidence,
-    ) -> HardGateResult {
+    fn evaluate_replacement_before_retirement(evidence: &HardGateEvidence) -> HardGateResult {
         // This gate is checked at the replacement-published →
         // old-receipt-retired transition. During admission, we
         // verify the plan includes the publication step.
@@ -737,10 +727,9 @@ mod tests {
         let gates = HardGates::evaluate(GovernorRelocationReason::Promotion, &evidence);
         assert!(gates.any_fail());
         let refusals = gates.refusal_reasons();
-        assert!(refusals.iter().any(|(_, r)| matches!(
-            r,
-            HardGateRefusalReason::ContradictoryEvidence
-        )));
+        assert!(refusals
+            .iter()
+            .any(|(_, r)| matches!(r, HardGateRefusalReason::ContradictoryEvidence)));
     }
 
     #[test]
@@ -762,10 +751,9 @@ mod tests {
         let gates = HardGates::evaluate(GovernorRelocationReason::WearRebalance, &evidence);
         assert!(gates.any_fail());
         let refusals = gates.refusal_reasons();
-        assert!(refusals.iter().any(|(_, r)| matches!(
-            r,
-            HardGateRefusalReason::MediaCapabilityMissing
-        )));
+        assert!(refusals
+            .iter()
+            .any(|(_, r)| matches!(r, HardGateRefusalReason::MediaCapabilityMissing)));
     }
 
     #[test]

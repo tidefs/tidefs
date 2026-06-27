@@ -71,12 +71,12 @@
 //! the `cache_coherency` module in `tidefs-validation`.
 
 pub mod directory_listing_cache;
+pub mod governor;
 pub mod l2arc;
 pub mod page_cache;
 pub mod path_lookup_cache;
 pub mod prefetch;
 pub mod weighted_arc;
-pub mod governor;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -96,8 +96,8 @@ pub use governor::{
     DirtyReclaimWorker, Governor, GovernorAutoTuneDecision, GovernorAutoTuneError,
     GovernorAutoTuneEvidence, GovernorAutoTuneOwner, GovernorAutoTuneSafety,
     GovernorAutoTuneSafetyEffect, GovernorAutoTuneUnit, GovernorCacheReclaimService,
-    GovernorCommitBoundaryService, GovernorConfig, GovernorPartitionConfig,
-    GovernorDirtyFlushService, GovernorIncrementalReclaimWorker, GovernorPressureState,
+    GovernorCommitBoundaryService, GovernorConfig, GovernorDirtyFlushService,
+    GovernorIncrementalReclaimWorker, GovernorPartitionConfig, GovernorPressureState,
     ReclaimOutcome, ReclaimRequest, ReclaimStage, ReclaimWorkKind, AUTO_TUNE_MAX_FRACTION_SHIFT,
     AUTO_TUNE_MAX_FRESHNESS_MS,
 };
@@ -835,8 +835,7 @@ impl<K: Eq + std::hash::Hash + Clone + fmt::Debug, V> CacheLatticeRegistry<K, V>
             }
             match gov.admit(category, size) {
                 Ok(_ticket) => {} // granted
-                Err(BudgetError::OverBudget { .. })
-                | Err(BudgetError::GlobalOverBudget { .. }) => {
+                Err(BudgetError::OverBudget { .. }) | Err(BudgetError::GlobalOverBudget { .. }) => {
                     // Try to free space: evict one entry from the same store.
                     if let Some(store) = self.stores.get_mut(&class) {
                         if let Some(victim) = store.evict_one() {
@@ -1392,8 +1391,7 @@ mod tests {
             );
         }
 
-        let count =
-            reg.invalidate_by_key_prefix(CacheClass::PosixNamespaceMirror, |k| *k < 3);
+        let count = reg.invalidate_by_key_prefix(CacheClass::PosixNamespaceMirror, |k| *k < 3);
         assert_eq!(count, 3);
         assert_eq!(reg.entry_count(CacheClass::PosixNamespaceMirror), 2);
     }
@@ -1403,7 +1401,11 @@ mod tests {
         let governor = single_category_governor(BudgetCategory::MetaCache, 1000);
         let mut reg: CacheLatticeRegistry<u64, String> = CacheLatticeRegistry::new();
         reg.set_governor(governor.clone());
-        reg.register_cache(CacheClass::PosixNamespaceMirror, 10, EvictionPolicyKind::Lru);
+        reg.register_cache(
+            CacheClass::PosixNamespaceMirror,
+            10,
+            EvictionPolicyKind::Lru,
+        );
 
         for i in 0..5 {
             let mut h = make_servable_header(i);
@@ -1430,7 +1432,11 @@ mod tests {
         let governor = single_category_governor(BudgetCategory::MetaCache, 100);
         let mut reg: CacheLatticeRegistry<u64, String> = CacheLatticeRegistry::new();
         reg.set_governor(governor.clone());
-        reg.register_cache(CacheClass::PosixNamespaceMirror, 10, EvictionPolicyKind::Lru);
+        reg.register_cache(
+            CacheClass::PosixNamespaceMirror,
+            10,
+            EvictionPolicyKind::Lru,
+        );
 
         let mut old_header = make_servable_header(1);
         old_header.entry_size_bytes = 100;
@@ -1454,9 +1460,7 @@ mod tests {
         assert_eq!(evicted.unwrap().value, "old");
         assert_eq!(governor.category_used(BudgetCategory::MetaCache), 100);
         assert_eq!(
-            reg.get(CacheClass::PosixNamespaceMirror, &1)
-                .unwrap()
-                .value,
+            reg.get(CacheClass::PosixNamespaceMirror, &1).unwrap().value,
             "new"
         );
     }
@@ -1466,7 +1470,11 @@ mod tests {
         let governor = single_category_governor(BudgetCategory::MetaCache, 1000);
         let mut reg: CacheLatticeRegistry<u64, String> = CacheLatticeRegistry::new();
         reg.set_governor(governor.clone());
-        reg.register_cache(CacheClass::PosixNamespaceMirror, 10, EvictionPolicyKind::Lru);
+        reg.register_cache(
+            CacheClass::PosixNamespaceMirror,
+            10,
+            EvictionPolicyKind::Lru,
+        );
 
         let mut first = make_servable_header(1);
         first.entry_size_bytes = 700;

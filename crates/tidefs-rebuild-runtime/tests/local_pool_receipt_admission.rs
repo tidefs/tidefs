@@ -125,7 +125,10 @@ fn rebuild_after_replacement_generates_new_receipt() {
         .put_with_receipt(IoClass::Data, key, payload)
         .expect("initial put_with_receipt");
 
-    assert!(receipt1.generation > 0, "receipt must have non-zero generation");
+    assert!(
+        receipt1.generation > 0,
+        "receipt must have non-zero generation"
+    );
     assert_eq!(receipt1.targets.len(), 2);
     assert!(!receipt1.shared_receipt_ref().unwrap().is_synthetic());
 
@@ -148,7 +151,9 @@ fn rebuild_after_replacement_generates_new_receipt() {
 
     // A shared receipt ref projection from the replacement receipt must not
     // be synthetic and must carry the newer generation.
-    let ref2 = receipt2.shared_receipt_ref().expect("shared receipt ref for replacement");
+    let ref2 = receipt2
+        .shared_receipt_ref()
+        .expect("shared receipt ref for replacement");
     assert!(!ref2.is_synthetic());
     assert_eq!(ref2.receipt_generation, receipt2.generation);
 
@@ -156,10 +161,7 @@ fn rebuild_after_replacement_generates_new_receipt() {
     let receipts = pool
         .placement_receipts(IoClass::Data)
         .expect("placement_receipts after replacement");
-    let key_receipts: Vec<_> = receipts
-        .iter()
-        .filter(|r| r.object_key == key)
-        .collect();
+    let key_receipts: Vec<_> = receipts.iter().filter(|r| r.object_key == key).collect();
     assert_eq!(
         key_receipts.len(),
         1,

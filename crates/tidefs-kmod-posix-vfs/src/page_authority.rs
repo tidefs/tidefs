@@ -436,11 +436,7 @@ impl PageAuthorityTable {
 
     /// Take the generation snapshot that a read, mmap fault, or writeback
     /// must prove before publishing its page-cache result.
-    pub fn generation_snapshot(
-        &self,
-        inode: InodeId,
-        page_idx: u64,
-    ) -> PageGenerationSnapshot {
+    pub fn generation_snapshot(&self, inode: InodeId, page_idx: u64) -> PageGenerationSnapshot {
         PageGenerationSnapshot {
             inode,
             page_idx,

@@ -489,7 +489,7 @@ fn full_fencing_lifecycle_three_nodes() {
             60_000,
             0,
             EpochId::new(1),
-        DatasetMountIdentity::ZERO,
+            DatasetMountIdentity::ZERO,
             1000 + (i as u64) * 100,
             3,
             3,

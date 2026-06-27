@@ -163,7 +163,8 @@ impl LocalFileSystem {
         let live_state = mem::replace(&mut self.state, exported_state);
         let live_write_buffers = mem::take(&mut self.write_buffers);
         let live_auto_commit = mem::replace(&mut self.auto_commit, false);
-        let live_recovery_policy = mem::replace(&mut self.recovery_policy, RecoveryPolicy::ReadOnly);
+        let live_recovery_policy =
+            mem::replace(&mut self.recovery_policy, RecoveryPolicy::ReadOnly);
         let live_pending_permits = mem::take(&mut self.pending_permits);
         let live_dirty_set = mem::take(&mut self.dirty_set);
         self.uncommitted_mutation_count = 0;

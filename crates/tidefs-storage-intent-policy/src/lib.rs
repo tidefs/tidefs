@@ -738,18 +738,36 @@ pub fn resolve_effective_dataset_policy(
         override_if_set(&mut resolved.dataset, &parent.dataset);
         override_if_set(&mut resolved.mount_profile, &parent.mount_profile);
         override_if_set(&mut resolved.product_profile, &parent.product_profile);
-        override_if_set(&mut resolved.admits_subject_range_overrides, &parent.admits_subject_range_overrides);
-        override_if_set(&mut resolved.explicit_unsafe_opt_in, &parent.explicit_unsafe_opt_in);
-        override_if_set(&mut resolved.default_caller_flags, &parent.default_caller_flags);
-        override_if_set(&mut resolved.default_caller_hints, &parent.default_caller_hints);
+        override_if_set(
+            &mut resolved.admits_subject_range_overrides,
+            &parent.admits_subject_range_overrides,
+        );
+        override_if_set(
+            &mut resolved.explicit_unsafe_opt_in,
+            &parent.explicit_unsafe_opt_in,
+        );
+        override_if_set(
+            &mut resolved.default_caller_flags,
+            &parent.default_caller_flags,
+        );
+        override_if_set(
+            &mut resolved.default_caller_hints,
+            &parent.default_caller_hints,
+        );
         override_if_set(
             &mut resolved.default_maintenance_intent,
             &parent.default_maintenance_intent,
         );
-        override_if_set(&mut resolved.prefetch_window_limit, &parent.prefetch_window_limit);
+        override_if_set(
+            &mut resolved.prefetch_window_limit,
+            &parent.prefetch_window_limit,
+        );
         override_if_set(&mut resolved.staging_limit, &parent.staging_limit);
         override_if_set(&mut resolved.min_sample_mass, &parent.min_sample_mass);
-        override_if_set(&mut resolved.min_observation_window_ms, &parent.min_observation_window_ms);
+        override_if_set(
+            &mut resolved.min_observation_window_ms,
+            &parent.min_observation_window_ms,
+        );
         override_if_set(&mut resolved.max_decay_age_ms, &parent.max_decay_age_ms);
         override_if_set(&mut resolved.dwell_min_ms, &parent.dwell_min_ms);
         override_if_set(&mut resolved.cooldown_ms, &parent.cooldown_ms);
@@ -762,18 +780,36 @@ pub fn resolve_effective_dataset_policy(
     override_if_set(&mut resolved.dataset, &local.dataset);
     override_if_set(&mut resolved.mount_profile, &local.mount_profile);
     override_if_set(&mut resolved.product_profile, &local.product_profile);
-    override_if_set(&mut resolved.admits_subject_range_overrides, &local.admits_subject_range_overrides);
-    override_if_set(&mut resolved.explicit_unsafe_opt_in, &local.explicit_unsafe_opt_in);
-    override_if_set(&mut resolved.default_caller_flags, &local.default_caller_flags);
-    override_if_set(&mut resolved.default_caller_hints, &local.default_caller_hints);
+    override_if_set(
+        &mut resolved.admits_subject_range_overrides,
+        &local.admits_subject_range_overrides,
+    );
+    override_if_set(
+        &mut resolved.explicit_unsafe_opt_in,
+        &local.explicit_unsafe_opt_in,
+    );
+    override_if_set(
+        &mut resolved.default_caller_flags,
+        &local.default_caller_flags,
+    );
+    override_if_set(
+        &mut resolved.default_caller_hints,
+        &local.default_caller_hints,
+    );
     override_if_set(
         &mut resolved.default_maintenance_intent,
         &local.default_maintenance_intent,
     );
-    override_if_set(&mut resolved.prefetch_window_limit, &local.prefetch_window_limit);
+    override_if_set(
+        &mut resolved.prefetch_window_limit,
+        &local.prefetch_window_limit,
+    );
     override_if_set(&mut resolved.staging_limit, &local.staging_limit);
     override_if_set(&mut resolved.min_sample_mass, &local.min_sample_mass);
-    override_if_set(&mut resolved.min_observation_window_ms, &local.min_observation_window_ms);
+    override_if_set(
+        &mut resolved.min_observation_window_ms,
+        &local.min_observation_window_ms,
+    );
     override_if_set(&mut resolved.max_decay_age_ms, &local.max_decay_age_ms);
     override_if_set(&mut resolved.dwell_min_ms, &local.dwell_min_ms);
     override_if_set(&mut resolved.cooldown_ms, &local.cooldown_ms);
@@ -878,7 +914,6 @@ fn override_if_set<T: Copy>(target: &mut Option<T>, source: &Option<T>) {
         *target = Some(*v);
     }
 }
-
 
 /// Policy compile status.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -2702,7 +2737,8 @@ mod tests {
         let ds = resolved.dataset.unwrap();
         assert_eq!(ds.class, StorageIntentPolicySourceClass::Dataset);
         assert!(ds
-            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::StridedVectorPrefetch));
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::StridedVectorPrefetch));
 
         // Local limit overrides parent limit
         assert_eq!(resolved.prefetch_window_limit, Some(512 * 1024));
@@ -2735,7 +2771,8 @@ mod tests {
         // Inherited values preserved when local has no override
         let ds = resolved.dataset.unwrap();
         assert!(ds
-            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
         assert_eq!(resolved.prefetch_window_limit, Some(1024 * 1024));
         assert_eq!(resolved.dwell_min_ms, Some(30_000));
         assert_eq!(resolved.revision, 3);
@@ -2767,9 +2804,11 @@ mod tests {
         // The dataset policy (via parent) restricts actions; pool doesn't widen
         let ds = resolved.dataset.unwrap();
         assert!(!ds
-            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
         assert!(ds
-            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::BoundedReadahead));
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::BoundedReadahead));
     }
 
     #[test]
@@ -2827,11 +2866,14 @@ mod tests {
 
         let ds = resolved_c.dataset.unwrap();
         assert!(ds
-            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::BoundedReadahead));
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::BoundedReadahead));
         assert!(ds
-            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::StridedVectorPrefetch));
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::StridedVectorPrefetch));
         assert!(ds
-            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::FlashHotServing));
 
         // Dwell comes from grandparent
         assert_eq!(resolved_c.dwell_min_ms, Some(60_000));
@@ -3073,9 +3115,11 @@ mod tests {
 
         // Dataset A allows several action classes
         assert!(ds_source_a
-            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::BoundedReadahead));
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::BoundedReadahead));
         assert!(ds_source_a
-            .allowed_actions.contains_candidate(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch));
+            .allowed_actions
+            .contains_candidate(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch));
 
         // Dataset B refuses all
         assert!(!ds_source_b.refused_actions.is_empty());
@@ -3149,8 +3193,7 @@ mod tests {
         // Missing wear/freshness evidence should lower flash actions
         assert!(matches!(
             result.status,
-            StorageIntentPolicyCompileStatus::Lowered
-                | StorageIntentPolicyCompileStatus::Refused
+            StorageIntentPolicyCompileStatus::Lowered | StorageIntentPolicyCompileStatus::Refused
         ));
         assert_ne!(result.refusal, StorageIntentRefusalReason::None);
     }

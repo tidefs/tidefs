@@ -3898,10 +3898,7 @@ mod tests {
         // POSIX statfs free/available blocks (#638, #649).
         let expected_free_blocks = 700_000 / block_size;
         assert_eq!(statfs.blocks_free, expected_free_blocks);
-        assert_eq!(
-            reg.get(&id).unwrap().domain_pinned_snapshot_bytes,
-            50_000
-        );
+        assert_eq!(reg.get(&id).unwrap().domain_pinned_snapshot_bytes, 50_000);
         // Avail = free - 5% reserved
         let reserved = (1_000_000 / block_size) / 20;
         assert_eq!(statfs.blocks_avail, expected_free_blocks - reserved);

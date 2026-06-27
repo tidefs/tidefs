@@ -179,7 +179,8 @@ fn receipt_addressed_read_under_partition_then_heal() {
         payload: payload.to_vec(),
     };
 
-    h.state_transfer_a_to_b(&[obj.clone()]).expect("initial transfer");
+    h.state_transfer_a_to_b(&[obj.clone()])
+        .expect("initial transfer");
     let _ = h.state_transfer_b_to_a(&[obj.clone()]);
 
     h.block_a_to_b();
@@ -192,7 +193,9 @@ fn receipt_addressed_read_under_partition_then_heal() {
     assert!(!h.is_a_to_b_blocked());
     assert!(receipt_matches_payload(&receipt, payload));
 
-    let result = h.state_transfer_a_to_b(&[obj]).expect("re-transfer after heal");
+    let result = h
+        .state_transfer_a_to_b(&[obj])
+        .expect("re-transfer after heal");
     assert_eq!(result.object_count, 1);
 }
 
@@ -207,7 +210,10 @@ fn multiple_receipt_generations_coexist() {
     let receipt_gen2 = make_replicated_receipt(0x6001, payload_v2, 2, 2, 2);
 
     assert_eq!(receipt_gen1.object_id, receipt_gen2.object_id);
-    assert_ne!(receipt_gen1.receipt_generation, receipt_gen2.receipt_generation);
+    assert_ne!(
+        receipt_gen1.receipt_generation,
+        receipt_gen2.receipt_generation
+    );
 
     assert!(receipt_matches_payload(&receipt_gen1, payload_v1));
     assert!(receipt_matches_payload(&receipt_gen2, payload_v2));
@@ -223,17 +229,26 @@ fn receipt_read_rejects_malformed_policy() {
     let policy = ReceiptRedundancyPolicy::Replicated { copies: 0 };
     assert!(!policy.is_well_formed());
 
-    let policy = ReceiptRedundancyPolicy::Erasure { data_shards: 0, parity_shards: 1 };
+    let policy = ReceiptRedundancyPolicy::Erasure {
+        data_shards: 0,
+        parity_shards: 1,
+    };
     assert!(!policy.is_well_formed());
 
-    let policy = ReceiptRedundancyPolicy::Erasure { data_shards: 1, parity_shards: 0 };
+    let policy = ReceiptRedundancyPolicy::Erasure {
+        data_shards: 1,
+        parity_shards: 0,
+    };
     assert!(!policy.is_well_formed());
 
     let policy = ReceiptRedundancyPolicy::Replicated { copies: 3 };
     assert!(policy.is_well_formed());
     assert_eq!(policy.target_width(), 3);
 
-    let policy = ReceiptRedundancyPolicy::Erasure { data_shards: 8, parity_shards: 3 };
+    let policy = ReceiptRedundancyPolicy::Erasure {
+        data_shards: 8,
+        parity_shards: 3,
+    };
     assert!(policy.is_well_formed());
     assert_eq!(policy.target_width(), 11);
 }
@@ -252,7 +267,8 @@ fn degraded_read_with_receipt_authority_after_node_loss() {
         object_key: receipt.object_id,
         payload: payload.to_vec(),
     };
-    h.state_transfer_a_to_b(&[obj.clone()]).expect("initial replication A->B");
+    h.state_transfer_a_to_b(&[obj.clone()])
+        .expect("initial replication A->B");
 
     assert!(receipt_matches_payload(&receipt, payload));
 

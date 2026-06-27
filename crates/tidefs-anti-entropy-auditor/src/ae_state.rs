@@ -231,7 +231,6 @@ impl DivergenceRecord {
     }
 }
 
-
 // ── Repair-trigger receipt ───────────────────────────────────────────
 
 /// Durable repair-trigger receipt emitted for ticketable divergences.
@@ -410,7 +409,13 @@ mod tests {
     #[test]
     fn receipt_from_ticketable_divergence() {
         let rec = DivergenceRecord::new(
-            42, 3, DivergenceClass::DigestMismatch, 0xAAAA, 0xBBBB, 7, 9_000_000,
+            42,
+            3,
+            DivergenceClass::DigestMismatch,
+            0xAAAA,
+            0xBBBB,
+            7,
+            9_000_000,
         );
         let receipt = RepairTriggerReceipt::from_divergence(&rec, "test");
         assert!(receipt.is_some());
@@ -434,7 +439,13 @@ mod tests {
     #[test]
     fn receipt_rejected_for_witness_disagreement() {
         let rec = DivergenceRecord::new(
-            1, 2, DivergenceClass::WitnessDisagreement, 100, 200, 1, 1000,
+            1,
+            2,
+            DivergenceClass::WitnessDisagreement,
+            100,
+            200,
+            1,
+            1000,
         );
         assert!(RepairTriggerReceipt::from_divergence(&rec, "test").is_none());
     }
@@ -444,5 +455,4 @@ mod tests {
         let rec = DivergenceRecord::new(5, 1, DivergenceClass::MissingReplica, 0xDEAD, 0, 1, 1000);
         assert!(RepairTriggerReceipt::from_divergence(&rec, "missing").is_some());
     }
-
 }

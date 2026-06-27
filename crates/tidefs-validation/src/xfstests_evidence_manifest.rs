@@ -159,9 +159,9 @@ impl XfstestsEvidenceManifest {
         }
 
         match self.evidence_scope.as_str() {
-            "focused" if self.tests.is_empty() => failures.push(
-                "evidence_scope=focused requires a non-empty tests list".to_string(),
-            ),
+            "focused" if self.tests.is_empty() => {
+                failures.push("evidence_scope=focused requires a non-empty tests list".to_string())
+            }
             "broad" if !self.tests.is_empty() => {
                 failures.push("evidence_scope=broad requires an empty tests list".to_string());
             }
@@ -207,7 +207,9 @@ fn validate_relative_artifact_path(path: &str, failures: &mut Vec<String>) {
             Component::Normal(_) => has_normal = true,
             Component::CurDir => {}
             Component::ParentDir => {
-                failures.push(format!("artifact_paths must not contain `..`, found `{path}`"));
+                failures.push(format!(
+                    "artifact_paths must not contain `..`, found `{path}`"
+                ));
             }
             Component::RootDir | Component::Prefix(_) => {
                 failures.push(format!("artifact_paths must be relative, found `{path}`"));

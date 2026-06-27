@@ -906,10 +906,7 @@ mod tests {
         let hash = DedupHash::compute(b"payload");
         let decision = decide_inline_dedup(&hash, 10, |_| Some(20), |canonical| canonical == 20);
 
-        assert_eq!(
-            decision,
-            InlineDedupDecision::SessionHit { canonical: 20 }
-        );
+        assert_eq!(decision, InlineDedupDecision::SessionHit { canonical: 20 });
     }
 
     #[test]

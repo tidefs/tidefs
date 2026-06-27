@@ -648,7 +648,16 @@ mod tests {
     #[test]
     fn invalidation_message_range_construction() {
         let msg = CacheInvalidationMessage::range(
-            1, 100, 42, 5, 0, 4096, 1, 2, 10, 20,
+            1,
+            100,
+            42,
+            5,
+            0,
+            4096,
+            1,
+            2,
+            10,
+            20,
             CacheInvalidationReason::ConflictingWriteLease,
             InvalidationWaitPolicy::WaitForCleanEviction,
         );
@@ -661,7 +670,10 @@ mod tests {
         assert_eq!(msg.lease_epoch, 10);
         assert_eq!(msg.membership_epoch, 20);
         assert_eq!(msg.reason, CacheInvalidationReason::ConflictingWriteLease);
-        assert_eq!(msg.wait_policy, InvalidationWaitPolicy::WaitForCleanEviction);
+        assert_eq!(
+            msg.wait_policy,
+            InvalidationWaitPolicy::WaitForCleanEviction
+        );
         assert!(msg.is_blocking());
         assert!(!msg.requires_dirty_drain());
         if let CacheInvalidationScope::Range { start, end } = msg.scope {
@@ -675,7 +687,14 @@ mod tests {
     #[test]
     fn invalidation_message_inode_construction() {
         let msg = CacheInvalidationMessage::inode(
-            2, 200, 99, 3, 5, 6, 15, 25,
+            2,
+            200,
+            99,
+            3,
+            5,
+            6,
+            15,
+            25,
             CacheInvalidationReason::EpochTransition,
             InvalidationWaitPolicy::WaitForDirtyDrain,
         );
@@ -688,7 +707,12 @@ mod tests {
     #[test]
     fn invalidation_message_dataset_construction() {
         let msg = CacheInvalidationMessage::dataset(
-            3, 300, 7, 8, 30, 40,
+            3,
+            300,
+            7,
+            8,
+            30,
+            40,
             CacheInvalidationReason::AdminDrain,
             InvalidationWaitPolicy::FenceAndError,
         );
@@ -700,7 +724,16 @@ mod tests {
     #[test]
     fn invalidation_message_display() {
         let msg = CacheInvalidationMessage::range(
-            1, 100, 42, 5, 0, 4096, 1, 2, 10, 20,
+            1,
+            100,
+            42,
+            5,
+            0,
+            4096,
+            1,
+            2,
+            10,
+            20,
             CacheInvalidationReason::ConflictingWriteLease,
             InvalidationWaitPolicy::Advisory,
         );
@@ -712,7 +745,10 @@ mod tests {
 
     #[test]
     fn wait_policy_default_is_advisory() {
-        assert_eq!(InvalidationWaitPolicy::default(), InvalidationWaitPolicy::Advisory);
+        assert_eq!(
+            InvalidationWaitPolicy::default(),
+            InvalidationWaitPolicy::Advisory
+        );
     }
 
     #[test]
@@ -774,7 +810,16 @@ mod tests {
         bus.register(sub.clone());
 
         let msg = CacheInvalidationMessage::range(
-            1, 100, 42, 5, 0, 4096, 1, 2, 10, 20,
+            1,
+            100,
+            42,
+            5,
+            0,
+            4096,
+            1,
+            2,
+            10,
+            20,
             CacheInvalidationReason::ConflictingWriteLease,
             InvalidationWaitPolicy::WaitForDirtyDrain,
         );
@@ -803,7 +848,14 @@ mod tests {
         bus.register(sub2);
 
         let msg = CacheInvalidationMessage::inode(
-            2, 200, 99, 3, 5, 6, 15, 25,
+            2,
+            200,
+            99,
+            3,
+            5,
+            6,
+            15,
+            25,
             CacheInvalidationReason::EpochTransition,
             InvalidationWaitPolicy::WaitForDirtyDrain,
         );

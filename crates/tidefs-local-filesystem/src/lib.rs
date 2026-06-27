@@ -307,9 +307,9 @@ mod dedup;
 mod dedup_refcount;
 pub mod dirty_page_tracker;
 pub mod encoding;
+mod error;
 pub mod export;
 mod extent_map_store_adapter;
-mod error;
 mod fsck;
 pub mod fuse_fsync;
 mod fuse_getattr;
@@ -332,10 +332,10 @@ mod pool_label;
 pub mod posix_acl;
 mod quota;
 mod readahead;
-mod records;
-mod recovery;
 pub mod receive_merge_planner;
 pub mod receive_persistence;
+mod records;
+mod recovery;
 pub mod release_dispatch;
 mod repair;
 mod scrub;
@@ -399,9 +399,7 @@ use tidefs_local_object_store::{
     IoClass, LocalObjectStore, ObjectKey, ObjectLocation, Pool, PoolConfig, PoolProperties,
     StoreEncryptionKey, StoreError, StoreOptions, DEFAULT_MAX_SEGMENT_BYTES, RECORD_OVERHEAD_BYTES,
 };
-use tidefs_orphan_index::{
-    OrphanEntry, OrphanEntryFlags, OrphanIndex, OrphanIndexAdmissionError,
-};
+use tidefs_orphan_index::{OrphanEntry, OrphanEntryFlags, OrphanIndex, OrphanIndexAdmissionError};
 use tidefs_performance_contract::AdmissionPermit;
 use tidefs_quorum_write_runtime::{QuorumConfig, QuorumObjectStore};
 use tidefs_reserve_ledger::{BudgetDomain, ReserveClass};
@@ -434,8 +432,8 @@ use background_orphan_reclamation::BackgroundOrphanReclamation;
 use extent_map_store_adapter::FilesystemExtentMapStore;
 use tidefs_online_defrag::{DefragStats, OnlineDefragService};
 use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
-use tidefs_types_incremental_job_core::JobId;
 pub use tidefs_recovery_loop::RecoveryPolicy;
+use tidefs_types_incremental_job_core::JobId;
 use tidefs_types_reclaim_queue_core::ObjectKey as ReclaimObjectKey;
 use tidefs_types_reclaim_queue_core::QueueFamily as ReclaimQueueFamily;
 use tidefs_types_reclaim_queue_core::{QueueFamily, ReclaimQueueEntry};
@@ -2766,7 +2764,12 @@ impl LocalFileSystem {
             // authority for the device capacity, and resizing the
             // backing file behind the label's back causes a
             // DeviceLayoutV1 device size mismatch on re-open.
-            if len.len() == 0 { file.set_len(target_len) } else { Ok(()) }.map_err(|source| {
+            if len.len() == 0 {
+                file.set_len(target_len)
+            } else {
+                Ok(())
+            }
+            .map_err(|source| {
                 FileSystemError::Store(StoreError::Io {
                     operation: "size_default_development_device_image",
                     path: device_path.clone(),
@@ -4361,8 +4364,7 @@ impl LocalFileSystem {
             return;
         }
 
-        self.receipt_bound_reclaim_idle_ticks_remaining =
-            RECEIPT_BOUND_RECLAIM_IDLE_BACKOFF_TICKS;
+        self.receipt_bound_reclaim_idle_ticks_remaining = RECEIPT_BOUND_RECLAIM_IDLE_BACKOFF_TICKS;
     }
 
     fn drain_receipt_bound_reclaim_for_committed_state(&mut self, local_entries_drained: usize) {
@@ -5277,11 +5279,9 @@ impl LocalFileSystem {
         ino: InodeId,
     ) -> std::result::Result<(u64, u64), FilesystemError> {
         let mut extent_maps = self.state.extent_maps.lock().unwrap();
-        let em = extent_maps
-            .get_mut(&ino)
-            .ok_or(FilesystemError::NotFound {
-                path: format!("inode:{}", ino.get()),
-            })?;
+        let em = extent_maps.get_mut(&ino).ok_or(FilesystemError::NotFound {
+            path: format!("inode:{}", ino.get()),
+        })?;
         Ok(em.defrag())
     }
     /// Find the next data offset at or after `offset` for the given inode.
@@ -5804,7 +5804,11 @@ impl LocalFileSystem {
         authorization: Option<&CrossPoolReceiveAuthorization>,
         merge_plan: Option<&crate::receive_merge_planner::ReceiveMergePlan>,
     ) -> Result<ChangedRecordImportReport> {
-        receive_incremental_changed_records(root.as_ref(), options, export, root_authentication_key,
+        receive_incremental_changed_records(
+            root.as_ref(),
+            options,
+            export,
+            root_authentication_key,
             target_pool_uuid,
             target_dataset_uuid,
             authorization,
@@ -6568,8 +6572,13 @@ impl LocalFileSystem {
             });
         }
 
-        let input =
-            self.project_local_read_serving_input(decision_input, inode_id, &record, 0, record.size);
+        let input = self.project_local_read_serving_input(
+            decision_input,
+            inode_id,
+            &record,
+            0,
+            record.size,
+        );
         let decision = read_serving_decide(input);
         if !Self::read_serving_decision_allows_bytes(&decision) {
             return Ok(ReadServingRuntimeRead {
@@ -9262,11 +9271,7 @@ impl LocalFileSystem {
                     })?;
             let insert_result = {
                 let mut orphan_index = self.orphan_index.lock().unwrap();
-                orphan_index.insert_admitted(
-                    entry.inode_id.get(),
-                    orphan_entry,
-                    &orphan_md_permit,
-                )
+                orphan_index.insert_admitted(entry.inode_id.get(), orphan_entry, &orphan_md_permit)
             };
             if let Err(err) = insert_result {
                 let release_result = self.release_metadata_admission_permit(orphan_md_permit);
@@ -9657,9 +9662,7 @@ impl LocalFileSystem {
 
             // Remove source entry
             if let Err(err) = self.remove_directory_entry(old_parent_id, &old_name, tick) {
-                self.rollback_mutation_delta_and_release_metadata_permit(
-                    &mut rename_md_permit,
-                )?;
+                self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
                 return Err(err);
             }
 
@@ -9669,9 +9672,7 @@ impl LocalFileSystem {
             if let Err(err) =
                 self.insert_directory_entry(new_parent_id, new_name.clone(), renamed, tick)
             {
-                self.rollback_mutation_delta_and_release_metadata_permit(
-                    &mut rename_md_permit,
-                )?;
+                self.rollback_mutation_delta_and_release_metadata_permit(&mut rename_md_permit)?;
                 return Err(err);
             }
 
@@ -11727,7 +11728,11 @@ impl LocalFileSystem {
                 // so each allocate succeeds.
                 let _ = emap.allocate(entry.logical_offset, entry.length);
             }
-            self.state.extent_maps.lock().unwrap().insert(*inode_id, emap);
+            self.state
+                .extent_maps
+                .lock()
+                .unwrap()
+                .insert(*inode_id, emap);
         }
     }
 
@@ -11756,8 +11761,7 @@ impl LocalFileSystem {
                 0,
             )?;
         }
-        let must_persist =
-            self.is_state_dirty() || had_intent_log_entries || flushed_write_buffers;
+        let must_persist = self.is_state_dirty() || had_intent_log_entries || flushed_write_buffers;
 
         // COMMIT_GROUP STATE MACHINE: transition phases only when there is real work.
         // No-op commits (clean state + empty intent log) do not advance the commit_group.
@@ -13645,11 +13649,8 @@ mod orphan_index_integration_tests {
             let extent_maps = Arc::new(Mutex::new(BTreeMap::from([(inode, extent_map)])));
             let store = FilesystemExtentMapStore::new(Arc::clone(&extent_maps));
 
-            let loaded = tidefs_online_defrag::ExtentMapStore::load_extent_map(
-                &store,
-                inode.get(),
-            )
-            .expect("load extent map");
+            let loaded = tidefs_online_defrag::ExtentMapStore::load_extent_map(&store, inode.get())
+                .expect("load extent map");
 
             assert_eq!(loaded.header.file_size, 8192);
         }
@@ -14023,8 +14024,7 @@ mod orphan_index_integration_tests {
 
         fs.record_receipt_bound_reclaim_result(0, 1);
         assert_eq!(
-            fs.receipt_bound_reclaim_idle_ticks_remaining,
-            RECEIPT_BOUND_RECLAIM_IDLE_BACKOFF_TICKS,
+            fs.receipt_bound_reclaim_idle_ticks_remaining, RECEIPT_BOUND_RECLAIM_IDLE_BACKOFF_TICKS,
             "queued receipt-bound reclaim with no segment progress should enter idle backoff"
         );
 

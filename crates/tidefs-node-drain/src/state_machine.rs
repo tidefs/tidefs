@@ -257,9 +257,10 @@ impl DrainProtocolSnapshot {
     /// epoch. Used to verify receipt evidence after checkpoint/recovery.
     #[must_use]
     pub fn receipt_matches_node_and_epoch(&self, node_id: MemberId, epoch_id: EpochId) -> bool {
-        if let (Some(receipt_node), Some(receipt_epoch)) =
-            (self.evacuation_receipt_draining_node, self.evacuation_receipt_epoch)
-        {
+        if let (Some(receipt_node), Some(receipt_epoch)) = (
+            self.evacuation_receipt_draining_node,
+            self.evacuation_receipt_epoch,
+        ) {
             receipt_node == node_id && receipt_epoch == epoch_id
         } else {
             // No receipt evidence present — no mismatch to detect.
@@ -383,12 +384,9 @@ impl DrainProtocolMachine {
             snap.evacuation_receipt_draining_node,
             snap.evacuation_receipt_epoch,
         ) {
-            let mut receipt = EvacuationReceipt::new(
-                draining_node,
-                epoch,
-                "restored-from-snapshot".to_string(),
-            )
-            .with_id(rid);
+            let mut receipt =
+                EvacuationReceipt::new(draining_node, epoch, "restored-from-snapshot".to_string())
+                    .with_id(rid);
             if snap.evacuation_receipt_committed {
                 receipt.all_committed = true;
             }
@@ -1004,12 +1002,16 @@ mod tests {
         m.record_ack().unwrap();
         m.start_draining().unwrap();
 
-        let mut receipt = EvacuationReceipt::new(mid(42), EpochId::new(7), "maintenance".to_string());
+        let mut receipt =
+            EvacuationReceipt::new(mid(42), EpochId::new(7), "maintenance".to_string());
         receipt.record_relocated_receipts([tidefs_replication_model::ReplicatedReceiptId(100)]);
         m.complete_draining_with_evacuation(receipt).unwrap();
 
         let snap = m.snapshot();
-        assert_eq!(snap.evacuation_receipt_id.unwrap(), EvacuationReceiptId::ZERO);
+        assert_eq!(
+            snap.evacuation_receipt_id.unwrap(),
+            EvacuationReceiptId::ZERO
+        );
         assert!(snap.evacuation_receipt_committed);
         assert_eq!(snap.evacuation_receipt_draining_node, Some(mid(42)));
         assert_eq!(snap.evacuation_receipt_epoch, Some(EpochId::new(7)));
@@ -1030,7 +1032,10 @@ mod tests {
         m.complete_draining_with_evacuation(receipt).unwrap();
 
         let snap = m.snapshot();
-        assert_eq!(snap.evacuation_receipt_epoch_boundary, Some(EpochId::new(4)));
+        assert_eq!(
+            snap.evacuation_receipt_epoch_boundary,
+            Some(EpochId::new(4))
+        );
     }
 
     #[test]
@@ -1058,10 +1063,22 @@ mod tests {
 
         let snap2 = m2.snapshot();
         assert_eq!(snap2.evacuation_receipt_id, snap.evacuation_receipt_id);
-        assert_eq!(snap2.evacuation_receipt_committed, snap.evacuation_receipt_committed);
-        assert_eq!(snap2.evacuation_receipt_draining_node, snap.evacuation_receipt_draining_node);
-        assert_eq!(snap2.evacuation_receipt_epoch, snap.evacuation_receipt_epoch);
-        assert_eq!(snap2.evacuation_receipt_epoch_boundary, snap.evacuation_receipt_epoch_boundary);
+        assert_eq!(
+            snap2.evacuation_receipt_committed,
+            snap.evacuation_receipt_committed
+        );
+        assert_eq!(
+            snap2.evacuation_receipt_draining_node,
+            snap.evacuation_receipt_draining_node
+        );
+        assert_eq!(
+            snap2.evacuation_receipt_epoch,
+            snap.evacuation_receipt_epoch
+        );
+        assert_eq!(
+            snap2.evacuation_receipt_epoch_boundary,
+            snap.evacuation_receipt_epoch_boundary
+        );
     }
 
     #[test]
