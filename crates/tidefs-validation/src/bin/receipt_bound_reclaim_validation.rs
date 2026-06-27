@@ -110,8 +110,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             }
             "--help" | "-h" => {
                 return Err(format!(
-                    "usage: receipt-bound-reclaim-validation --row {} --output-dir DIR",
-                    RECEIPT_BOUND_RECLAIM_ROW_ID
+                    "usage: receipt-bound-reclaim-validation --row {RECEIPT_BOUND_RECLAIM_ROW_ID} --output-dir DIR"
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
