@@ -94,9 +94,10 @@ historical-input examples, including
 `docs/design/openzfs-ceph-successor-claim.md`, and
 `docs/design/production-erasure-coding-crush-placement-g4-pillar.md`, remain
 historical input under their existing rows. The
-`docs/design/1971-pool-import-export-7-phase-implementation-plan.md` leftover
-is classified below by #1152. Remaining unclassified status/matrix leftovers in
-`docs/design/coordination-pipeline-cluster-services-design-seal.md`,
+`docs/design/coordination-pipeline-cluster-services-design-seal.md` leftover is
+classified below by #1153, and the
+`docs/design/1971-pool-import-export-7-phase-implementation-plan.md` leftover is
+classified below by #1152. Remaining unclassified status/matrix leftovers in
 `docs/design/coordination-pipeline-status-update-1767.md`,
 `docs/design/coordination-pipeline-status-update-1839.md`,
 `docs/design/coordination-pipeline-status-update-1915.md`,
@@ -629,6 +630,24 @@ CI workflows, validation artifacts, or `validation/claims.toml`.
 | Path | State | Classification note |
 |---|---|---|
 | `docs/design/1813-pool-import-export-device-topology-management-design.md` | Historical input | Imported Forgejo-era #1813 design iteration for pool import/export and online device topology management. It preserves the PoolLabelV1 data structure design, import/export protocol algorithms, device failure state machine, and 7-phase implementation plan as historical design lineage. Its "design-sealed" and "frozen" language, Forgejo issue references, and phase-status claims (Phases 2–5 and 7 marked "deferred to wire-up") are stale: live source in `tidefs-local-object-store/src/pool_importer.rs`, `pool_exporter.rs`, and `device_manager.rs` implements pool import/export and device topology management referencing `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` as its design authority. The PoolLabelV1 on-device label format is implemented in `tidefs-types-pool-label-core/lib.rs`. The ZFS/Ceph prior-art comparison table in §10 is incumbent-comparison context preserved as historical design input under the #931/#934 cluster boundary; it is not a current capability, availability, durability, or product claim. No `validation/claims.toml` entries exist for pool import/export, device topology, hot-spare, evacuation, or cluster-aware pool ownership. The file is not current policy, current spec, implementation status, or product authority. |
+
+### Coordination Pipeline Cluster Services Design Seal (TFR-019 / #1153)
+
+Classified for TFR-019 / GitHub issue #1153 on 2026-06-27 after reviewing this
+register's authority rule and review method, the #952 status/matrix leftover
+list, the TFR-017 and TFR-019 notes in `docs/REVIEW_TODO_REGISTER.md`, the
+imported Forgejo #1738 seal document, the sibling #1754 completion document as
+nearby lineage, closed #931 incumbent-comparison audit guidance, closed #875
+claim-boundary guidance, closed #928 comparator evidence guidance, PR #930,
+bounded source/doc searches, live source in `crates/tidefs-membership-live/`,
+`crates/tidefs-membership-epoch/`, and `crates/tidefs-node-drain/`, plus
+`validation/claims.toml` and `docs/CLAIM_REGISTRY.md`. This slice does not
+edit product source, Cargo manifests, CI workflows, validation artifacts,
+generated claim registries, or `validation/claims.toml`.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/coordination-pipeline-cluster-services-design-seal.md` | Historical input | Imported Forgejo-era #1738 design-phase seal for cluster-wide coordination services. It preserves the old layered inventory, service decomposition, deferral rationale, gate sketch, and design-lineage references as historical input. Its "sealed", "design-sealed", "implemented-source", "models implemented", "3-node cluster", `docs/STATUS.md`, and `docs/FEATURE_MATRIX.md` wording is stale coordination-pipeline status language, not current implementation status, release-readiness evidence, or product authority. Live source now contains membership, epoch, and drain surfaces in `tidefs-membership-live`, `tidefs-membership-epoch`, and `tidefs-node-drain`, but TFR-017 still leaves transport/cluster authority open before multi-node claims. The checked claim evidence records only a planned bounded distributed model-check claim (`distributed.combined_safety.model.v1`) for source-model invariants and blocked successor/comparator boundaries (`storage.intent.successor_comparator.v1`); it does not validate broad cluster-service, distributed-membership, production distributed-runtime, multi-node, or product-scale capability. The retained cluster-service and distributed-membership wording is non-claim historical design lineage under the #931/#875/#928/#930 boundary. The file is not current policy, current spec, implementation status, release-readiness evidence, or product authority. |
 
 ### Pool Import/Export 7-Phase Implementation Plan (TFR-019 / #1152)
 
