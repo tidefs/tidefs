@@ -63,7 +63,7 @@ impl ReceiverRefusalReason {
         match self {
             Self::ReceiverMissingBase => "receiver_missing_base",
             Self::ResumeCheckpointInvalid => "resume_checkpoint_invalid",
-            Self::ReceiverBusy => "receiver_busy",
+            Self::ReceiverBusy => "dataset_slot_in_use",
             Self::SenderAuthorityStale => "sender_authority_stale",
             Self::UnsupportedFeatures | Self::ReceiverRejectedPolicy => "receiver_rejected_policy",
             Self::ResumeStagingMissing => "resume_staging_missing",
@@ -1023,6 +1023,37 @@ mod tests {
                 assert_eq!(
                     refusal.reason.recovery_action(),
                     ReceiverRecoveryAction::FullSeedFallback
+                );
+            }
+            other => panic!("expected receiver refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn busy_staging_reports_dataset_slot_reason() {
+        let stream = full_stream(SendStreamHeader::new(id(1), id(2), id(3)));
+        let view = StaticReceiverAuthorityView::local_only();
+        let admission = ReceiverAdmission::new(&view).with_staging_busy(Some(250));
+
+        let err =
+            ReceiveSession::start(ReceivedDataset::empty(id(2)), &stream, &admission).unwrap_err();
+
+        match err {
+            ReceiveSessionError::Refused(refusal) => {
+                assert_eq!(refusal.reason, ReceiverRefusalReason::ReceiverBusy);
+                assert_eq!(
+                    refusal.reason.scheduler_policy_reason(),
+                    "dataset_slot_in_use"
+                );
+                assert_eq!(
+                    refusal.reason.recovery_action(),
+                    ReceiverRecoveryAction::RetryBackoff
+                );
+                assert_eq!(
+                    refusal.evidence,
+                    ReceiverRefusalEvidence::Busy {
+                        retry_after_millis: Some(250),
+                    }
                 );
             }
             other => panic!("expected receiver refusal, got {other:?}"),
