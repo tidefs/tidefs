@@ -373,7 +373,7 @@ mod tests {
         ChangedRecordExport, ChangedRecordRoot, CommittedRootSummary, RootAuthenticationCode,
         RootAuthenticationDigest,
     };
-    use tidefs_local_object_store::{IntegrityDigest64, ObjectKey};
+    use tidefs_local_object_store::{IntegrityDigest64, ObjectKey, StoreOptions};
 
     fn make_test_root_summary(tx: u64, gen: u64) -> CommittedRootSummary {
         CommittedRootSummary {
@@ -408,6 +408,29 @@ mod tests {
             root_authentication_code: Some(RootAuthenticationCode::from_bytes32([0x33; 32])),
             ..make_test_root_summary(tx, gen)
         }
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tidefs-vfssend2-bridge-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn setup_auth_env() {
+        std::env::set_var("TIDEFS_ROOT_AUTHENTICATION_KEY_HEX", "B".repeat(64));
+    }
+
+    fn root_id_from_summary(summary: &crate::types::SnapshotSummary) -> tidefs_send_stream::Id128 {
+        let mut id = [0u8; 16];
+        id[0..8].copy_from_slice(&summary.source_transaction_id.to_le_bytes());
+        id[8..16].copy_from_slice(&summary.source_generation.to_le_bytes());
+        id
     }
 
     #[test]
@@ -635,6 +658,39 @@ mod tests {
         assert_eq!(decoded.current_root, to_summary);
         assert_eq!(decoded.roots.len(), 1);
         assert_eq!(decoded.roots[0].records, vec![record]);
+    }
+
+    #[test]
+    fn receive_bridge_applies_snapshot_mutation_stream() {
+        setup_auth_env();
+        let root = temp_dir("snapshot-mutation");
+        let mut fs = crate::LocalFileSystem::open_with_options(&root, StoreOptions::default())
+            .expect("open fs");
+        fs.create_snapshot("origin").expect("snapshot");
+        fs.create_clone("myclone", "origin").expect("clone");
+        let root_id = root_id_from_summary(&fs.snapshot_summary("myclone").expect("clone summary"));
+        let delta = tidefs_send_stream::SnapshotDelta::promote([3u8; 16], "myclone", 7, root_id);
+        let header = tidefs_send_stream::SendStreamHeader::new([1u8; 16], [2u8; 16], [3u8; 16]);
+        let stream = tidefs_send_stream::SendBuilder::full(header, vec![delta])
+            .expect("builder")
+            .encode()
+            .expect("encode");
+
+        let reports = receive_vfssend2_snapshot_mutations(&mut fs, &stream).expect("receive");
+
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            &reports[0],
+            crate::SnapshotMutationApplyReport::Promoted(report)
+                if report.name == "myclone" && report.previous_origin == "origin"
+        ));
+        let entry = fs
+            .list_snapshots_extended()
+            .into_iter()
+            .find(|entry| entry.name == "myclone")
+            .expect("promoted entry");
+        assert_eq!(entry.kind, crate::records::SnapshotKind::Snapshot);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -940,6 +996,19 @@ pub fn receive_vfssend2_to_changed_records(
         placement_epoch: None,
         incremental,
     })
+}
+
+/// Decode a VFSSEND2 stream and apply any snapshot-record mutations it carries.
+pub fn receive_vfssend2_snapshot_mutations(
+    fs: &mut crate::LocalFileSystem,
+    stream_bytes: &[u8],
+) -> crate::Result<Vec<crate::SnapshotMutationApplyReport>> {
+    let (_header, dataset) = receive_vfssend2_dataset(stream_bytes)?;
+    let mut reports = Vec::with_capacity(dataset.snapshot_mutations.len());
+    for mutation in &dataset.snapshot_mutations {
+        reports.push(fs.apply_vfssend2_snapshot_mutation(mutation)?);
+    }
+    Ok(reports)
 }
 
 fn receive_vfssend2_dataset(

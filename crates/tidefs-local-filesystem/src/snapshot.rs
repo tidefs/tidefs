@@ -23,11 +23,13 @@ use crate::types::SnapshotSummary;
 use crate::LocalFileSystem;
 use crate::Result;
 use crate::ROOT_INODE_ID;
+use std::fmt::Write as _;
 use tidefs_dataset_lifecycle::{
     BlockPointer, DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
     TraversalRoot, TraversalRootType,
 };
 use tidefs_local_object_store::SnapshotDeadObjectCandidate;
+use tidefs_send_stream::{Id128 as Vfssend2Id128, SnapshotMutation, SnapshotMutationKind};
 
 // ---------------------------------------------------------------------------
 // Public summary types
@@ -68,6 +70,24 @@ pub struct PromoteReport {
     pub name: String,
     pub previous_origin: String,
     pub generation: u64,
+}
+
+/// Deferred deletion reported when a received snapshot mutation hits a hold.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotDeletionDeferral {
+    pub name: String,
+    pub root_id: Vfssend2Id128,
+    pub kind: SnapshotKind,
+    pub hold_count: u32,
+    pub hold_tag: Option<String>,
+}
+
+/// Result of applying a received VFSSEND2 snapshot-record mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnapshotMutationApplyReport {
+    Promoted(PromoteReport),
+    Deleted(SnapshotSummary),
+    DeleteDeferred(SnapshotDeletionDeferral),
 }
 
 /// Retention policy for regular local snapshots.
@@ -124,6 +144,21 @@ pub(crate) fn snapshot_record_retains_data(record: &SnapshotRecord) -> bool {
 
 pub(crate) fn snapshot_record_display_name(record: &SnapshotRecord) -> String {
     String::from_utf8_lossy(&record.name).into_owned()
+}
+
+pub(crate) fn snapshot_record_root_id(record: &SnapshotRecord) -> Vfssend2Id128 {
+    let mut id = [0u8; 16];
+    id[0..8].copy_from_slice(&record.root.transaction_id.to_le_bytes());
+    id[8..16].copy_from_slice(&record.root.generation.to_le_bytes());
+    id
+}
+
+fn snapshot_root_id_hex(root_id: &Vfssend2Id128) -> String {
+    let mut out = String::with_capacity(32);
+    for byte in root_id {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 pub(crate) fn snapshot_record_catalog_name(record: &SnapshotRecord) -> String {
@@ -630,6 +665,95 @@ impl LocalFileSystem {
             previous_origin: origin_str,
             generation,
         })
+    }
+
+    /// Apply a VFSSEND2 snapshot-record mutation through the local lifecycle.
+    pub fn apply_vfssend2_snapshot_mutation(
+        &mut self,
+        mutation: &SnapshotMutation,
+    ) -> Result<SnapshotMutationApplyReport> {
+        match mutation.kind {
+            SnapshotMutationKind::Promote => {
+                let (name, record) =
+                    self.vfssend2_mutation_target(mutation, "clone promotion", "clone root")?;
+                if record.kind != SnapshotKind::Clone {
+                    return Err(FileSystemError::NotAClone { name });
+                }
+                self.promote_clone(&name)
+                    .map(SnapshotMutationApplyReport::Promoted)
+            }
+            SnapshotMutationKind::Delete => {
+                let (name, record) = self.vfssend2_mutation_target(
+                    mutation,
+                    "snapshot-record deletion",
+                    "snapshot root",
+                )?;
+                let result = match record.kind {
+                    SnapshotKind::Snapshot => self.delete_snapshot(&name),
+                    SnapshotKind::Clone => self.delete_clone(&name),
+                    SnapshotKind::Bookmark => {
+                        return Err(FileSystemError::Unsupported {
+                            operation: "apply VFSSEND2 snapshot deletion",
+                            reason: "bookmarks do not retain snapshot data",
+                        });
+                    }
+                };
+                match result {
+                    Ok(summary) => Ok(SnapshotMutationApplyReport::Deleted(summary)),
+                    Err(FileSystemError::SnapshotHeld {
+                        name,
+                        hold_count,
+                        hold_tag,
+                    }) => Ok(SnapshotMutationApplyReport::DeleteDeferred(
+                        SnapshotDeletionDeferral {
+                            name,
+                            root_id: mutation.root_id,
+                            kind: record.kind,
+                            hold_count,
+                            hold_tag,
+                        },
+                    )),
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    }
+
+    fn vfssend2_mutation_target(
+        &self,
+        mutation: &SnapshotMutation,
+        operation: &'static str,
+        root_label: &'static str,
+    ) -> Result<(String, SnapshotRecord)> {
+        let name = String::from_utf8(mutation.snapshot_name.clone()).map_err(|_| {
+            FileSystemError::InvalidName {
+                name: mutation.snapshot_name.clone(),
+                reason: "VFSSEND2 snapshot mutation name must be UTF-8",
+            }
+        })?;
+        let name_bytes = snapshot_name_bytes(&name)?;
+        let record = self
+            .state
+            .snapshots
+            .get(&name_bytes)
+            .cloned()
+            .ok_or_else(|| FileSystemError::LifecycleError {
+                reason: format!(
+                    "VFSSEND2 {operation} references unknown {root_label} {} for '{name}'",
+                    snapshot_root_id_hex(&mutation.root_id)
+                ),
+            })?;
+        let local_root_id = snapshot_record_root_id(&record);
+        if local_root_id != mutation.root_id {
+            return Err(FileSystemError::LifecycleError {
+                reason: format!(
+                    "VFSSEND2 {operation} references unknown {root_label} {} for '{name}' (local root is {})",
+                    snapshot_root_id_hex(&mutation.root_id),
+                    snapshot_root_id_hex(&local_root_id)
+                ),
+            });
+        }
+        Ok((name, record))
     }
 
     /// List all clones in the snapshot catalog.
@@ -1179,6 +1303,12 @@ mod tests {
             .collect()
     }
 
+    fn record_root_id(fs: &LocalFileSystem, name: &str) -> Vfssend2Id128 {
+        let name = snapshot_name_bytes(name).expect("snapshot name");
+        let record = fs.state.snapshots.get(&name).expect("snapshot record");
+        snapshot_record_root_id(record)
+    }
+
     fn snapshot_catalog_pin_count(fs: &LocalFileSystem) -> u32 {
         fs.lifecycle().stats().per_root_pins[TraversalRootType::SnapshotCatalog.to_u8() as usize]
     }
@@ -1489,6 +1619,136 @@ mod tests {
         assert_eq!(snapshot_catalog_pin_count(&fs), 1);
         fs.delete_snapshot("origin").expect("delete origin");
         assert_eq!(snapshot_catalog_pin_count(&fs), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vfssend2_promotion_mutation_uses_clone_lifecycle() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        fs.create_snapshot("origin").expect("snapshot");
+        fs.create_clone("myclone", "origin").expect("clone");
+        let root_id = record_root_id(&fs, "myclone");
+
+        let report = fs
+            .apply_vfssend2_snapshot_mutation(&SnapshotMutation::promote(root_id, "myclone"))
+            .expect("apply promotion");
+
+        match report {
+            SnapshotMutationApplyReport::Promoted(report) => {
+                assert_eq!(report.name, "myclone");
+                assert_eq!(report.previous_origin, "origin");
+            }
+            other => panic!("expected promotion report, got {other:?}"),
+        }
+        let entry = fs
+            .list_snapshots_extended()
+            .into_iter()
+            .find(|entry| entry.name == "myclone")
+            .expect("promoted entry");
+        assert_eq!(entry.kind, SnapshotKind::Snapshot);
+        assert!(entry.origin.is_none());
+        assert!(!catalog_clone_flag(&fs, "myclone"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vfssend2_promotion_rejects_unknown_clone_root() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        fs.create_snapshot("origin").expect("snapshot");
+        fs.create_clone("myclone", "origin").expect("clone");
+        let mut unknown_root_id = record_root_id(&fs, "myclone");
+        unknown_root_id[0] ^= 0xaa;
+
+        let err = fs
+            .apply_vfssend2_snapshot_mutation(&SnapshotMutation::promote(
+                unknown_root_id,
+                "myclone",
+            ))
+            .unwrap_err();
+
+        match err {
+            FileSystemError::LifecycleError { reason } => {
+                assert!(
+                    reason.contains("unknown clone root"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected lifecycle error, got {other:?}"),
+        }
+        let entry = fs
+            .list_snapshots_extended()
+            .into_iter()
+            .find(|entry| entry.name == "myclone")
+            .expect("clone remains");
+        assert_eq!(entry.kind, SnapshotKind::Clone);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vfssend2_deletion_mutation_defers_held_snapshot() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        fs.create_snapshot("held").expect("snapshot");
+        let root_id = record_root_id(&fs, "held");
+        fs.hold_snapshot_tagged("held", Some("receive"))
+            .expect("hold");
+
+        let report = fs
+            .apply_vfssend2_snapshot_mutation(&SnapshotMutation::delete(root_id, "held"))
+            .expect("defer held deletion");
+
+        match report {
+            SnapshotMutationApplyReport::DeleteDeferred(deferral) => {
+                assert_eq!(deferral.name, "held");
+                assert_eq!(deferral.root_id, root_id);
+                assert_eq!(deferral.kind, SnapshotKind::Snapshot);
+                assert_eq!(deferral.hold_count, 1);
+                assert_eq!(deferral.hold_tag.as_deref(), Some("receive"));
+            }
+            other => panic!("expected deferred deletion, got {other:?}"),
+        }
+        assert!(fs.snapshot_summary("held").is_ok());
+
+        fs.release_snapshot("held").expect("release");
+        let report = fs
+            .apply_vfssend2_snapshot_mutation(&SnapshotMutation::delete(root_id, "held"))
+            .expect("delete after release");
+        assert!(matches!(report, SnapshotMutationApplyReport::Deleted(_)));
+        assert!(matches!(
+            fs.snapshot_summary("held"),
+            Err(FileSystemError::SnapshotNotFound { .. })
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vfssend2_deletion_mutation_uses_clone_delete_lifecycle() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        fs.create_snapshot("origin").expect("snapshot");
+        fs.create_clone("clone1", "origin").expect("clone");
+        let root_id = record_root_id(&fs, "clone1");
+
+        let report = fs
+            .apply_vfssend2_snapshot_mutation(&SnapshotMutation::delete(root_id, "clone1"))
+            .expect("delete clone");
+
+        match report {
+            SnapshotMutationApplyReport::Deleted(summary) => assert_eq!(summary.name, "clone1"),
+            other => panic!("expected deletion report, got {other:?}"),
+        }
+        assert!(fs.list_clones().is_empty());
+        assert!(fs.snapshot_summary("origin").is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
