@@ -16,16 +16,23 @@ version = 2
 unmaintained = "workspace"
 # Response to yanked-version advisories: "deny" | "warn" | "allow"
 yanked = "warn"
-# Advisory ids to ignore regardless of severity or policy setting
+# Advisory ids to ignore regardless of severity or policy setting.
+#
+# These are explicit issue-1192 exceptions for dependency surfaces whose safe
+# remediation is broader than a lockfile bump:
+# - bincode 1.x is the current internal wire/snapshot/checkpoint codec across
+#   many TideFS crates; replacing it is a coordinated codec-authority change.
+# - ed25519-dalek 1.x and curve25519-dalek 3.x back pre-alpha membership,
+#   transport, partition, and witness signing surfaces; the dalek 2.x migration
+#   changes keypair/verifying-key APIs and serialization boundaries together.
+# - rand 0.7.3 remains only through ed25519-dalek 1.x key-generation support;
+#   TideFS does not install a custom log logger that recursively calls
+#   ThreadRng from logging callbacks, which is the reported unsoundness trigger.
 ignore = [
-    "RUSTSEC-2022-0093",  # ed25519-dalek double-public-key oracle (pre-existing)
-    "RUSTSEC-2024-0344",  # curve25519-dalek timing variability (pre-existing)
-    "RUSTSEC-2025-0057",  # fxhash unmaintained (pre-existing)
-    "RUSTSEC-2025-0141",  # bincode unmaintained (pre-existing)
-    "RUSTSEC-2026-0097",  # rand unsound with custom logger (pre-existing)
-    # TODO: remediate or replace each pre-existing advisory; these are
-    # acknowledged per DEPENDENCY_ADVISORY_CI.md so that the advisory gate
-    # does not block unrelated PRs.
+    "RUSTSEC-2022-0093",
+    "RUSTSEC-2024-0344",
+    "RUSTSEC-2025-0141",
+    "RUSTSEC-2026-0097",
 ]
 
 [licenses]

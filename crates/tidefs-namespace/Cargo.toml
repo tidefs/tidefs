@@ -24,7 +24,7 @@ tidefs-types-polymorphic-directory-index-core = { workspace = true, features = [
 tidefs-orphan-index = { workspace = true }
 tidefs-types-vfs-core = { workspace = true }
 tidefs-intent-log = { workspace = true }
-fxhash = "0.2"
+rustc-hash = "2"
 tidefs-local-filesystem = { workspace = true, optional = true }
 
 [dev-dependencies]
