@@ -1300,6 +1300,25 @@ Issue #1267 records the current runtime-fed operator product-surface decision: n
   snapshots or promote a current automation, implementation-status,
   release-readiness, worker-scheduling, `STATUS.md`, `FEATURE_MATRIX.md`,
   lane-health, or product claim.
+- `TFR-019`: GitHub issue #1232 classifies
+  `docs/design/coordination-pipeline-status-update-1839.md` as historical input
+  after reviewing the authority register, this TFR-019 note set, the imported
+  #1839 status-update snapshot, `docs/INDEX.md`,
+  `docs/GITHUB_PR_DEVELOPMENT.md`, closed lineage issues #952/#1164/#1165, the
+  already-classified #1174/#1234/#1236 status-update snapshot rows, bounded
+  chronology from the main `coordination-pipeline-status-update.md` architecture
+  document, and live issue #1233 for the separate 1915 slice. The file's
+  design-spec metadata, `STATUS.md`, `FEATURE_MATRIX.md`,
+  lane-health/status-record machinery, cluster-service implementation-status
+  statements, deferred-wire-up, active-lane gate language, and Forgejo
+  issue/scheduling concepts are retired Forgejo-era snapshot artifacts only;
+  current TideFS coordination remains GitHub issues and pull requests plus the
+  repo documentation entry points. This reduces status/matrix drift but does not
+  classify or alter the -1915, -1767, -1954, or -2054 snapshots, the #1164
+  health-strategy classification, or the #1165 status-update-architecture
+  classification, and it does not promote a current automation,
+  implementation-status, release-readiness, worker-scheduling, `STATUS.md`,
+  `FEATURE_MATRIX.md`, lane-health, or product claim.
 - `TFR-019`: GitHub issue #1234 classifies
   `docs/design/coordination-pipeline-status-update-1954.md` as historical input
   after reviewing the authority register, this TFR-019 note set, the imported
