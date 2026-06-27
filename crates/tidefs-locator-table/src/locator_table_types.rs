@@ -308,6 +308,17 @@ pub trait LocatorTableOps {
         old_locator_id: LocatorId,
         new_replica_placement: std::vec::Vec<ReplicaPlacement>,
     ) -> Result<ExtentLocatorValueV1, LocatorTableError>;
+    fn relocate_value(
+        &mut self,
+        old_locator_id: LocatorId,
+        mut new_value: ExtentLocatorValueV1,
+    ) -> Result<ExtentLocatorValueV1, LocatorTableError> {
+        let relocated = self.relocate(old_locator_id, new_value.replica_placement.clone())?;
+        new_value.locator_id = relocated.locator_id;
+        new_value.locator_rev = relocated.locator_rev;
+        new_value.created_commit_group = relocated.created_commit_group;
+        Ok(new_value)
+    }
     fn retire(&mut self, locator_id: LocatorId) -> Result<(), LocatorTableError>;
     fn batch_resolve(
         &self,

@@ -13,12 +13,17 @@
 //! caller-initiated and rehashes both regions.
 
 mod extent_id;
-#[allow(dead_code)]
-mod locator_table_types;
+pub mod locator_table_types;
 #[allow(dead_code)]
 mod spec;
 
 pub use extent_id::ExtentId;
+pub use locator_table_types::{
+    locator_flags, ExtentLocatorTable, ExtentLocatorValueV1, LocatorId, LocatorTableError,
+    LocatorTableOps, LocatorTablePageHeader, ReplicaHealth, ReplicaPlacement, ShardPlacement,
+    LOCATOR_TABLE_DEFAULT_PAGE_SIZE, LOCATOR_TABLE_PAGE_HEADER_SIZE, LOCATOR_TABLE_PAGE_MAGIC,
+    LOCATOR_TABLE_SPEC, LOCATOR_VALUE_V1_FIXED_SIZE,
+};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

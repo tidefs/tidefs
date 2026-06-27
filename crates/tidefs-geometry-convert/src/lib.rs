@@ -5,186 +5,34 @@
 //! Leverages extent_id indirection (#1191): file->extent_id (extent map, unchanged),
 //! extent_id->physical_shards (locator table, rewritten during conversion).
 //!
-//! Implements Phase 1 of the geometry conversion design (#3387).
+//! Implements the geometry conversion design (#3387).
 //! Canonical design spec:
 //! [`docs/design/online-pool-geometry-conversion.md`].
 //!
-//! # Phase 1 scope
+//! # Current scope
 //!
 //! Defines `DurabilityPolicy`, `ConversionScope`, `GeometryConversionProgress`,
-//! the `GeometryConversionJob` as an `IncrementalJob`, and a mock `ExtentStore`
-//! for unit testing the conversion algorithm. Real locator-table and erasure-coding
-//! integration remains Phase 2 work; this crate's current authority is the
-//! standalone cursor, budget, progress, and fail-stop conversion contract.
+//! the `GeometryConversionJob` as an `IncrementalJob`, and a pool-backed
+//! `ExtentStore` adapter over the current `tidefs-locator-table` authority.
+//! Mounted pool release claims remain gated on runtime validation evidence.
 
 #![forbid(unsafe_code)]
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tidefs_erasure_coding::{
+    encode as ec_encode, reconstruct as ec_reconstruct, stripe_fragment_count, ErasureShard,
+    ShardKind, StripeConfig,
+};
+pub use tidefs_locator_table::{
+    locator_flags, ExtentLocatorValueV1 as LocatorValueV1, LocatorId, LocatorTableError,
+    LocatorTableOps, ReplicaHealth, ReplicaPlacement, ShardPlacement,
+};
 use tidefs_types_incremental_job_core::{
     Checkpoint, CursorState, IncrementalJob, JobError, JobId, JobKind, JobProgress, StepResult,
     WorkBudget,
 };
-
-// ---------------------------------------------------------------------------
-// Locator types (Phase 1: local definitions; Phase 2: use tidefs-locator-table)
-// ---------------------------------------------------------------------------
-
-/// Pool-wide unique locator identifier.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct LocatorId(pub u64);
-
-impl LocatorId {
-    pub const NONE: LocatorId = LocatorId(0);
-    #[must_use]
-    pub const fn is_none(self) -> bool {
-        self.0 == 0
-    }
-    #[must_use]
-    pub const fn is_some(self) -> bool {
-        self.0 != 0
-    }
-}
-
-impl fmt::Display for LocatorId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Shard placement within a segment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShardPlacement {
-    pub shard_index: u16,
-    pub segment_id: u64,
-    pub grain_offset: u64,
-    pub grain_count: u64,
-}
-
-impl ShardPlacement {
-    #[must_use]
-    pub const fn new(
-        shard_index: u16,
-        segment_id: u64,
-        grain_offset: u64,
-        grain_count: u64,
-    ) -> Self {
-        Self {
-            shard_index,
-            segment_id,
-            grain_offset,
-            grain_count,
-        }
-    }
-}
-
-/// Replica health state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum ReplicaHealth {
-    Online = 0,
-    Degraded = 1,
-    Offline = 2,
-    Retired = 3,
-    Corrupt = 4,
-}
-
-impl ReplicaHealth {
-    #[must_use]
-    pub const fn is_readable(self) -> bool {
-        matches!(self, ReplicaHealth::Online | ReplicaHealth::Degraded)
-    }
-}
-
-/// Physical placement of one replica (a set of shards on one node/device).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReplicaPlacement {
-    pub node_id: u64,
-    pub device_id: u64,
-    pub shard_placements: Vec<ShardPlacement>,
-    pub health: ReplicaHealth,
-}
-
-impl ReplicaPlacement {
-    #[must_use]
-    pub fn new_unsharded(
-        node_id: u64,
-        device_id: u64,
-        segment_id: u64,
-        grain_offset: u64,
-        grain_count: u64,
-    ) -> Self {
-        Self {
-            node_id,
-            device_id,
-            shard_placements: vec![ShardPlacement::new(
-                0,
-                segment_id,
-                grain_offset,
-                grain_count,
-            )],
-            health: ReplicaHealth::Online,
-        }
-    }
-
-    #[must_use]
-    pub const fn is_readable(&self) -> bool {
-        self.health.is_readable()
-    }
-}
-
-/// Locator flags (mirror locator_flags module from locator-table).
-pub mod locator_flags {
-    pub const SHARDED: u64 = 0x0001;
-    pub const ERASURE_CODED: u64 = 0x0002;
-    pub const COMPRESSED: u64 = 0x0004;
-    pub const ENCRYPTED: u64 = 0x0008;
-    pub const DEADLIST: u64 = 0x0040;
-}
-
-/// On-media locator value for an extent.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocatorValueV1 {
-    pub locator_id: LocatorId,
-    pub locator_rev: u64,
-    pub flags: u64,
-    pub shard_count: u16,
-    pub replica_count: u8,
-    pub replica_placement: Vec<ReplicaPlacement>,
-    pub payload_digest: [u8; 32],
-    pub payload_bytes: u64,
-    pub on_media_bytes: u64,
-    pub created_commit_group: u64,
-}
-
-impl LocatorValueV1 {
-    #[must_use]
-    pub fn new(
-        locator_id: LocatorId,
-        locator_rev: u64,
-        created_commit_group: u64,
-        payload_digest: [u8; 32],
-        payload_bytes: u64,
-    ) -> Self {
-        Self {
-            locator_id,
-            locator_rev,
-            flags: 0,
-            shard_count: 1,
-            replica_count: 0,
-            replica_placement: Vec::new(),
-            payload_digest,
-            payload_bytes,
-            on_media_bytes: payload_bytes,
-            created_commit_group,
-        }
-    }
-
-    pub fn add_replica(&mut self, placement: ReplicaPlacement) {
-        self.replica_placement.push(placement);
-        self.replica_count = self.replica_placement.len() as u8;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // DurabilityPolicy
@@ -311,6 +159,15 @@ pub struct ConversionCursor {
 }
 
 impl ConversionCursor {
+    #[must_use]
+    pub const fn pool_id(&self) -> u64 {
+        match self.scope {
+            ConversionScope::Pool(id)
+            | ConversionScope::Dataset(id)
+            | ConversionScope::ExtentClass(id) => id,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         // scope (tag + id)
@@ -493,13 +350,114 @@ pub struct LocatorEntry {
     pub value: LocatorValueV1,
 }
 
+/// Locator table traversal needed by pool-backed geometry conversion.
+pub trait LocatorEntrySource: Send {
+    /// Total number of locator table entries for the selected pool scope.
+    fn locator_count(&self, pool_id: u64) -> u64;
+
+    /// Walk locator entries from `start_after` (None = from beginning).
+    fn walk_entries(
+        &self,
+        pool_id: u64,
+        start_after: Option<LocatorId>,
+        batch_size: u32,
+    ) -> Vec<LocatorEntry>;
+}
+
+/// Role of a shard materialized by geometry conversion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeometryShardRole {
+    MirrorReplica,
+    EcData,
+    EcParity,
+}
+
+/// One shard payload that must be placed before the locator swap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeometryShardWrite {
+    pub shard_index: u16,
+    pub role: GeometryShardRole,
+    pub bytes: Vec<u8>,
+    pub payload_digest: [u8; 32],
+}
+
+/// Placement planning boundary used by pool-backed conversion.
+pub trait GeometryPlacementPlanner: Send {
+    fn plan_shard_placements(
+        &mut self,
+        locator_id: LocatorId,
+        new_policy: &DurabilityPolicy,
+        writes: &[GeometryShardWrite],
+    ) -> Result<Vec<ReplicaPlacement>, String>;
+}
+
+/// Physical shard I/O boundary used by pool-backed conversion.
+pub trait GeometryShardIo: Send {
+    fn read_shard(
+        &self,
+        locator: &LocatorValueV1,
+        replica: &ReplicaPlacement,
+        shard: &ShardPlacement,
+    ) -> Result<Vec<u8>, String>;
+
+    fn write_shard(
+        &mut self,
+        locator_id: LocatorId,
+        placement: &ReplicaPlacement,
+        write: &GeometryShardWrite,
+    ) -> Result<(), String>;
+}
+
+/// Pool-backed conversion store over locator-table, placement, and shard I/O.
+#[derive(Clone, Debug)]
+pub struct PoolBackedExtentStore<L, P, I> {
+    pool_id: u64,
+    locators: L,
+    placement: P,
+    shard_io: I,
+}
+
+impl<L, P, I> PoolBackedExtentStore<L, P, I> {
+    #[must_use]
+    pub const fn new(pool_id: u64, locators: L, placement: P, shard_io: I) -> Self {
+        Self {
+            pool_id,
+            locators,
+            placement,
+            shard_io,
+        }
+    }
+
+    #[must_use]
+    pub const fn pool_id(&self) -> u64 {
+        self.pool_id
+    }
+
+    #[must_use]
+    pub const fn locators(&self) -> &L {
+        &self.locators
+    }
+
+    #[must_use]
+    pub const fn shard_io(&self) -> &I {
+        &self.shard_io
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (L, P, I) {
+        (self.locators, self.placement, self.shard_io)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ExtentStore trait — abstracted storage for conversion
 // ---------------------------------------------------------------------------
 
 /// Abstract storage backend for geometry conversion.
 ///
-/// Allows testing without real object store / locator table dependencies.
+/// Pool-backed implementations should preserve fail-stop ordering: reads and
+/// writes happen before the atomic locator swap, and cursor advancement happens
+/// only after `update_locator` succeeds.
 pub trait ExtentStore: Send {
     /// Total number of locator table entries for the pool.
     fn locator_count(&self, pool_id: u64) -> u64;
@@ -513,7 +471,11 @@ pub trait ExtentStore: Send {
     ) -> Vec<LocatorEntry>;
 
     /// Read full payload for shards described by the locator value.
-    fn read_payload(&self, value: &LocatorValueV1) -> Result<Vec<u8>, String>;
+    fn read_payload(
+        &self,
+        value: &LocatorValueV1,
+        old_policy: &DurabilityPolicy,
+    ) -> Result<Vec<u8>, String>;
 
     /// Write new shards for a locator entry; returns new replica placements.
     fn write_shards(
@@ -530,7 +492,345 @@ pub trait ExtentStore: Send {
         locator_id: LocatorId,
         new_placements: Vec<ReplicaPlacement>,
         new_policy: &DurabilityPolicy,
+        payload_digest: [u8; 32],
+        payload_bytes: u64,
     ) -> Result<LocatorValueV1, String>;
+}
+
+/// Store reconstruction hook for `IncrementalJob::resume`.
+pub trait ResumeExtentStore: ExtentStore + Sized {
+    fn resume_from_cursor(cursor: &ConversionCursor) -> Result<Self, String>;
+}
+
+impl<L, P, I> ExtentStore for PoolBackedExtentStore<L, P, I>
+where
+    L: LocatorEntrySource + LocatorTableOps + Send,
+    P: GeometryPlacementPlanner + Send,
+    I: GeometryShardIo + Send,
+{
+    fn locator_count(&self, pool_id: u64) -> u64 {
+        self.locators.locator_count(pool_id)
+    }
+
+    fn walk_entries(
+        &self,
+        pool_id: u64,
+        start_after: Option<LocatorId>,
+        batch_size: u32,
+    ) -> Vec<LocatorEntry> {
+        self.locators.walk_entries(pool_id, start_after, batch_size)
+    }
+
+    fn read_payload(
+        &self,
+        value: &LocatorValueV1,
+        old_policy: &DurabilityPolicy,
+    ) -> Result<Vec<u8>, String> {
+        read_payload_from_locator(&self.shard_io, value, old_policy)
+    }
+
+    fn write_shards(
+        &mut self,
+        old_locator_id: LocatorId,
+        new_policy: &DurabilityPolicy,
+        payload: &[u8],
+        payload_digest: [u8; 32],
+    ) -> Result<Vec<ReplicaPlacement>, String> {
+        let writes = materialize_target_shards(new_policy, payload, payload_digest)?;
+        let placements =
+            self.placement
+                .plan_shard_placements(old_locator_id, new_policy, &writes)?;
+        if placements.len() != writes.len() {
+            return Err(format!(
+                "placement count {} does not match shard write count {}",
+                placements.len(),
+                writes.len()
+            ));
+        }
+        for (placement, write) in placements.iter().zip(writes.iter()) {
+            self.shard_io
+                .write_shard(old_locator_id, placement, write)?;
+        }
+        Ok(placements)
+    }
+
+    fn update_locator(
+        &mut self,
+        locator_id: LocatorId,
+        new_placements: Vec<ReplicaPlacement>,
+        new_policy: &DurabilityPolicy,
+        payload_digest: [u8; 32],
+        payload_bytes: u64,
+    ) -> Result<LocatorValueV1, String> {
+        let mut new_value = self
+            .locators
+            .resolve(locator_id)
+            .map_err(|e| format!("resolve before relocate failed: {e}"))?;
+        new_value.replica_placement = new_placements;
+        configure_locator_for_policy(
+            &mut new_value,
+            new_policy,
+            payload_digest,
+            payload_bytes,
+            estimate_on_media_bytes(new_policy, payload_bytes),
+        )?;
+        self.locators
+            .relocate_value(locator_id, new_value)
+            .map_err(|e| format!("atomic locator relocate failed: {e}"))
+    }
+}
+
+fn materialize_target_shards(
+    policy: &DurabilityPolicy,
+    payload: &[u8],
+    payload_digest: [u8; 32],
+) -> Result<Vec<GeometryShardWrite>, String> {
+    match policy {
+        DurabilityPolicy::Mirror { replica_count } => {
+            if *replica_count == 0 {
+                return Err("mirror conversion requires at least one replica".to_string());
+            }
+            Ok((0..*replica_count)
+                .map(|_| GeometryShardWrite {
+                    shard_index: 0,
+                    role: GeometryShardRole::MirrorReplica,
+                    bytes: payload.to_vec(),
+                    payload_digest,
+                })
+                .collect())
+        }
+        DurabilityPolicy::ErasureCoded {
+            data_shards,
+            parity_shards,
+            shard_len,
+        } => {
+            let config = ec_config(*data_shards, *parity_shards, *shard_len)?;
+            let stripe_count = stripe_count(payload.len(), config.data_capacity());
+            let mut shard_bytes = vec![Vec::new(); config.stripe_width()];
+            for stripe_index in 0..stripe_count {
+                let start = stripe_index * config.data_capacity();
+                let end = payload.len().min(start + config.data_capacity());
+                let stripe_payload = &payload[start..end];
+                let encoded = ec_encode(&config, stripe_payload).ok_or_else(|| {
+                    format!(
+                        "failed to encode EC stripe {stripe_index} for {} payload bytes",
+                        stripe_payload.len()
+                    )
+                })?;
+                for shard in encoded.shards {
+                    shard_bytes[shard.index].extend_from_slice(&shard.bytes);
+                }
+            }
+            Ok(shard_bytes
+                .into_iter()
+                .enumerate()
+                .map(|(index, bytes)| GeometryShardWrite {
+                    shard_index: index as u16,
+                    role: if index < config.data_shards {
+                        GeometryShardRole::EcData
+                    } else {
+                        GeometryShardRole::EcParity
+                    },
+                    bytes,
+                    payload_digest,
+                })
+                .collect())
+        }
+    }
+}
+
+fn read_payload_from_locator<I: GeometryShardIo>(
+    shard_io: &I,
+    value: &LocatorValueV1,
+    policy: &DurabilityPolicy,
+) -> Result<Vec<u8>, String> {
+    match policy {
+        DurabilityPolicy::Mirror { .. } => read_mirror_payload(shard_io, value),
+        DurabilityPolicy::ErasureCoded {
+            data_shards,
+            parity_shards,
+            shard_len,
+        } => read_ec_payload(shard_io, value, *data_shards, *parity_shards, *shard_len),
+    }
+}
+
+fn read_mirror_payload<I: GeometryShardIo>(
+    shard_io: &I,
+    value: &LocatorValueV1,
+) -> Result<Vec<u8>, String> {
+    if value.payload_bytes == 0 {
+        return Ok(Vec::new());
+    }
+    for replica in value.replica_placement.iter().filter(|r| r.is_readable()) {
+        let mut placements = replica.shard_placements.clone();
+        placements.sort_by_key(|shard| shard.shard_index);
+        let mut payload = Vec::new();
+        for shard in &placements {
+            payload.extend_from_slice(&shard_io.read_shard(value, replica, shard)?);
+        }
+        payload.truncate(value.payload_bytes as usize);
+        if blake3_digest(&payload) == value.payload_digest {
+            return Ok(payload);
+        }
+    }
+    Err(format!(
+        "no readable mirror replica matched digest for locator {}",
+        value.locator_id
+    ))
+}
+
+fn read_ec_payload<I: GeometryShardIo>(
+    shard_io: &I,
+    value: &LocatorValueV1,
+    data_shards: u16,
+    parity_shards: usize,
+    shard_len: usize,
+) -> Result<Vec<u8>, String> {
+    if value.payload_bytes == 0 {
+        return Ok(Vec::new());
+    }
+    let config = ec_config(data_shards, parity_shards, shard_len)?;
+    let stripe_count = stripe_count(value.payload_bytes as usize, config.data_capacity());
+    let mut shard_buffers: Vec<Option<Vec<u8>>> = vec![None; config.stripe_width()];
+    for replica in value.replica_placement.iter().filter(|r| r.is_readable()) {
+        for shard in &replica.shard_placements {
+            let index = shard.shard_index as usize;
+            if index >= config.stripe_width() || shard_buffers[index].is_some() {
+                continue;
+            }
+            shard_buffers[index] = Some(shard_io.read_shard(value, replica, shard)?);
+        }
+    }
+
+    let mut payload = Vec::with_capacity(value.payload_bytes as usize);
+    for stripe_index in 0..stripe_count {
+        let stripe_start = stripe_index * config.data_capacity();
+        let stripe_payload_len =
+            (value.payload_bytes as usize - stripe_start).min(config.data_capacity());
+        let effective_k = stripe_fragment_count(
+            value.payload_bytes as usize,
+            stripe_index,
+            config.data_shards,
+            config.shard_len,
+        );
+        let mut available = Vec::with_capacity(config.stripe_width());
+        for (index, buffer) in shard_buffers.iter().enumerate() {
+            let shard = buffer.as_ref().and_then(|bytes| {
+                let start = stripe_index * config.shard_len;
+                let end = start + config.shard_len;
+                (bytes.len() >= end).then(|| ErasureShard {
+                    index,
+                    kind: if index < config.data_shards {
+                        ShardKind::Data
+                    } else {
+                        ShardKind::Parity
+                    },
+                    bytes: bytes[start..end].to_vec(),
+                })
+            });
+            available.push(shard);
+        }
+        let reconstructed = ec_reconstruct(&config, &available, Some(effective_k))
+            .ok_or_else(|| format!("insufficient EC shards for locator {}", value.locator_id))?;
+        let mut stripe_payload = reconstructed.payload;
+        stripe_payload.truncate(stripe_payload_len);
+        payload.extend_from_slice(&stripe_payload);
+    }
+    payload.truncate(value.payload_bytes as usize);
+    if blake3_digest(&payload) != value.payload_digest {
+        return Err(format!(
+            "EC payload digest mismatch for locator {}",
+            value.locator_id
+        ));
+    }
+    Ok(payload)
+}
+
+fn configure_locator_for_policy(
+    value: &mut LocatorValueV1,
+    policy: &DurabilityPolicy,
+    payload_digest: [u8; 32],
+    payload_bytes: u64,
+    on_media_bytes: u64,
+) -> Result<(), String> {
+    value.payload_digest = payload_digest;
+    value.payload_bytes = payload_bytes;
+    value.on_media_bytes = on_media_bytes;
+    match policy {
+        DurabilityPolicy::Mirror { replica_count } => {
+            if *replica_count == 0 {
+                return Err("mirror locator update requires at least one replica".to_string());
+            }
+            value.flags &= !locator_flags::ERASURE_CODED;
+            value.flags &= !locator_flags::SHARDED;
+            value.shard_count = 1;
+            value.replica_count = *replica_count;
+        }
+        DurabilityPolicy::ErasureCoded {
+            data_shards,
+            parity_shards,
+            shard_len,
+        } => {
+            let config = ec_config(*data_shards, *parity_shards, *shard_len)?;
+            value.flags |= locator_flags::ERASURE_CODED | locator_flags::SHARDED;
+            value.shard_count = config.stripe_width() as u16;
+            value.replica_count = 0;
+        }
+    }
+    Ok(())
+}
+
+fn estimate_on_media_bytes(policy: &DurabilityPolicy, payload_bytes: u64) -> u64 {
+    match policy {
+        DurabilityPolicy::Mirror { replica_count } => {
+            payload_bytes.saturating_mul(*replica_count as u64)
+        }
+        DurabilityPolicy::ErasureCoded {
+            data_shards,
+            parity_shards,
+            shard_len,
+        } => {
+            let Ok(config) = ec_config(*data_shards, *parity_shards, *shard_len) else {
+                return 0;
+            };
+            let stripes = stripe_count(payload_bytes as usize, config.data_capacity()) as u64;
+            stripes
+                .saturating_mul(config.stripe_width() as u64)
+                .saturating_mul(config.shard_len as u64)
+        }
+    }
+}
+
+fn ec_config(
+    data_shards: u16,
+    parity_shards: usize,
+    shard_len: usize,
+) -> Result<StripeConfig, String> {
+    if data_shards == 0 || parity_shards == 0 || shard_len == 0 {
+        return Err(format!(
+            "invalid EC policy: data_shards={data_shards} parity_shards={parity_shards} shard_len={shard_len}"
+        ));
+    }
+    let data_shards = data_shards as usize;
+    if data_shards + parity_shards > 255 {
+        return Err(format!(
+            "invalid EC policy: total shards {} exceeds GF(2^8) limit",
+            data_shards + parity_shards
+        ));
+    }
+    Ok(StripeConfig {
+        data_shards,
+        parity_shards,
+        shard_len,
+    })
+}
+
+fn stripe_count(payload_len: usize, data_capacity: usize) -> usize {
+    if payload_len == 0 {
+        1
+    } else {
+        payload_len.div_ceil(data_capacity)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -582,18 +882,113 @@ impl<S: ExtentStore> GeometryConversionJob<S> {
     }
 
     fn convert_one(&mut self, entry: &LocatorEntry) -> Result<u64, String> {
-        let payload = self.store.read_payload(&entry.value)?;
+        let payload = self
+            .store
+            .read_payload(&entry.value, &self.cursor.old_policy)?;
         let bytes = payload.len() as u64;
         let digest = blake3_digest(&payload);
         let new_placements =
             self.store
                 .write_shards(entry.locator_id, &self.cursor.new_policy, &payload, digest)?;
-        self.store
-            .update_locator(entry.locator_id, new_placements, &self.cursor.new_policy)?;
+        self.store.update_locator(
+            entry.locator_id,
+            new_placements,
+            &self.cursor.new_policy,
+            digest,
+            bytes,
+        )?;
         self.cursor.entries_converted += 1;
         self.cursor.bytes_converted += bytes;
         self.cursor.last_converted_locator = entry.locator_id.0;
         Ok(bytes)
+    }
+
+    fn from_cursor(id: JobId, epoch: u64, store: S, cursor: ConversionCursor) -> Self {
+        Self {
+            id,
+            store,
+            cursor,
+            epoch,
+        }
+    }
+
+    fn decode_checkpoint_cursor(checkpoint: &Checkpoint) -> Result<ConversionCursor, JobError> {
+        if checkpoint.cursor_state.is_empty() {
+            return Err(JobError::CursorStateInvalid {
+                job_id: checkpoint.job_id,
+                reason: "GeometryConversionJob::resume requires a non-empty cursor (use new() for fresh jobs)",
+            });
+        }
+        ConversionCursor::decode(checkpoint.cursor_state.as_bytes()).ok_or(
+            JobError::CursorStateInvalid {
+                job_id: checkpoint.job_id,
+                reason: "failed to decode ConversionCursor",
+            },
+        )
+    }
+
+    pub fn resume_with_store(checkpoint: Checkpoint, store: S) -> Result<Self, JobError> {
+        let cursor = Self::decode_checkpoint_cursor(&checkpoint)?;
+        Ok(Self::from_cursor(
+            checkpoint.job_id,
+            checkpoint.epoch,
+            store,
+            cursor,
+        ))
+    }
+
+    pub fn step(&mut self, budget: WorkBudget) -> StepResult {
+        if self.cursor.cancelled
+            || self.cursor.failed
+            || self.cursor.entries_converted >= self.cursor.entries_total
+        {
+            return StepResult {
+                checkpoint: self.make_checkpoint(),
+                is_complete: true,
+            };
+        }
+        let max_entries = self.max_entries_for_budget(budget);
+        let pool_id = self.cursor.pool_id();
+        let start_after = if self.cursor.last_converted_locator == 0 {
+            None
+        } else {
+            Some(LocatorId(self.cursor.last_converted_locator))
+        };
+        let batch = self
+            .store
+            .walk_entries(pool_id, start_after, max_entries as u32);
+        if batch.is_empty() {
+            return StepResult {
+                checkpoint: self.make_checkpoint(),
+                is_complete: true,
+            };
+        }
+        for entry in &batch {
+            if let Err(error) = self.convert_one(entry) {
+                self.cursor.failed = true;
+                self.cursor.last_error = Some(format!(
+                    "locator {} conversion failed: {error}",
+                    entry.locator_id
+                ));
+                break;
+            }
+        }
+        let is_complete = self.cursor.failed
+            || self.cursor.entries_converted >= self.cursor.entries_total
+            || batch.len() < max_entries as usize;
+        StepResult {
+            checkpoint: self.make_checkpoint(),
+            is_complete,
+        }
+    }
+
+    pub fn persist_checkpoint(&self) -> Checkpoint {
+        self.make_checkpoint()
+    }
+
+    #[must_use]
+    pub fn into_store(self) -> S {
+        self.store
     }
 
     #[must_use]
@@ -637,82 +1032,37 @@ impl<S: ExtentStore> GeometryConversionJob<S> {
             },
         }
     }
+
+    pub fn job_id(&self) -> JobId {
+        self.id
+    }
+
+    pub fn job_kind(&self) -> JobKind {
+        JobKind::GeometryConvert
+    }
 }
 
-impl<S: ExtentStore + 'static> IncrementalJob for GeometryConversionJob<S> {
+impl<S: ExtentStore + ResumeExtentStore + 'static> IncrementalJob for GeometryConversionJob<S> {
     fn resume(checkpoint: Checkpoint) -> Result<Self, JobError> {
-        if checkpoint.cursor_state.is_empty() {
-            return Err(JobError::CursorStateInvalid {
-                job_id: checkpoint.job_id,
-                reason: "GeometryConversionJob::resume requires a non-empty cursor (use new() for fresh jobs)",
-            });
-        }
-        let _cursor = ConversionCursor::decode(checkpoint.cursor_state.as_bytes()).ok_or(
-            JobError::CursorStateInvalid {
-                job_id: checkpoint.job_id,
-                reason: "failed to decode ConversionCursor",
-            },
-        )?;
-        // resume() cannot provide a store; only used after checkpoint persistence.
-        // For a real implementation, the store would be re-created from pool context.
-        Err(JobError::CursorStateInvalid {
+        let cursor = Self::decode_checkpoint_cursor(&checkpoint)?;
+        let store = S::resume_from_cursor(&cursor).map_err(|_| JobError::CursorStateInvalid {
             job_id: checkpoint.job_id,
-            reason:
-                "GeometryConversionJob::resume requires a store backend (use new() for fresh jobs)",
-        })
+            reason: "failed to recreate GeometryConversionJob store backend from cursor",
+        })?;
+        Ok(Self::from_cursor(
+            checkpoint.job_id,
+            checkpoint.epoch,
+            store,
+            cursor,
+        ))
     }
 
     fn step(&mut self, budget: WorkBudget) -> StepResult {
-        if self.cursor.cancelled
-            || self.cursor.failed
-            || self.cursor.entries_converted >= self.cursor.entries_total
-        {
-            return StepResult {
-                checkpoint: self.make_checkpoint(),
-                is_complete: true,
-            };
-        }
-        let max_entries = self.max_entries_for_budget(budget);
-        let pool_id = match self.cursor.scope {
-            ConversionScope::Pool(id)
-            | ConversionScope::Dataset(id)
-            | ConversionScope::ExtentClass(id) => id,
-        };
-        let start_after = if self.cursor.last_converted_locator == 0 {
-            None
-        } else {
-            Some(LocatorId(self.cursor.last_converted_locator))
-        };
-        let batch = self
-            .store
-            .walk_entries(pool_id, start_after, max_entries as u32);
-        if batch.is_empty() {
-            return StepResult {
-                checkpoint: self.make_checkpoint(),
-                is_complete: true,
-            };
-        }
-        for entry in &batch {
-            if let Err(error) = self.convert_one(entry) {
-                self.cursor.failed = true;
-                self.cursor.last_error = Some(format!(
-                    "locator {} conversion failed: {error}",
-                    entry.locator_id
-                ));
-                break;
-            }
-        }
-        let is_complete = self.cursor.failed
-            || self.cursor.entries_converted >= self.cursor.entries_total
-            || batch.len() < max_entries as usize;
-        StepResult {
-            checkpoint: self.make_checkpoint(),
-            is_complete,
-        }
+        GeometryConversionJob::step(self, budget)
     }
 
     fn persist_checkpoint(&self) -> Checkpoint {
-        self.make_checkpoint()
+        GeometryConversionJob::persist_checkpoint(self)
     }
 
     fn complete(self) {
@@ -765,6 +1115,7 @@ fn blake3_digest(data: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
 
     /// In-memory mock store for testing.
     struct MockStore {
@@ -832,7 +1183,11 @@ mod tests {
                 .collect()
         }
 
-        fn read_payload(&self, value: &LocatorValueV1) -> Result<Vec<u8>, String> {
+        fn read_payload(
+            &self,
+            value: &LocatorValueV1,
+            _old_policy: &DurabilityPolicy,
+        ) -> Result<Vec<u8>, String> {
             let lid = value.locator_id.0;
             if self.fail_read_locator == Some(lid) {
                 return Err("mock read failure".to_string());
@@ -871,6 +1226,8 @@ mod tests {
             locator_id: LocatorId,
             new_placements: Vec<ReplicaPlacement>,
             new_policy: &DurabilityPolicy,
+            payload_digest: [u8; 32],
+            payload_bytes: u64,
         ) -> Result<LocatorValueV1, String> {
             if self.fail_update_locator == Some(locator_id.0) {
                 return Err("mock update failure".to_string());
@@ -878,19 +1235,281 @@ mod tests {
             let entry = self.entries.get_mut(&locator_id.0).ok_or("not found")?;
             entry.value.locator_rev += 1;
             entry.value.replica_placement = new_placements;
-            entry.value.replica_count = entry.value.replica_placement.len() as u8;
-            match new_policy {
-                DurabilityPolicy::Mirror { .. } => {
-                    entry.value.flags &= !locator_flags::ERASURE_CODED;
-                    entry.value.flags &= !locator_flags::SHARDED;
-                }
-                DurabilityPolicy::ErasureCoded { .. } => {
-                    entry.value.flags |= locator_flags::ERASURE_CODED;
-                    entry.value.flags |= locator_flags::SHARDED;
-                }
-            }
-            entry.value.shard_count = new_policy.total_shards() as u16;
+            configure_locator_for_policy(
+                &mut entry.value,
+                new_policy,
+                payload_digest,
+                payload_bytes,
+                estimate_on_media_bytes(new_policy, payload_bytes),
+            )?;
             Ok(entry.value.clone())
+        }
+    }
+
+    type HarnessPoolStore =
+        PoolBackedExtentStore<HarnessLocatorTable, HarnessPlacementPlanner, HarnessShardIo>;
+
+    #[derive(Clone, Debug)]
+    struct HarnessLocatorTable {
+        entries: HashMap<u64, LocatorEntry>,
+        next_locator_id: u64,
+        fail_relocate_locator: Option<u64>,
+    }
+
+    impl HarnessLocatorTable {
+        fn new() -> Self {
+            Self {
+                entries: HashMap::new(),
+                next_locator_id: 1,
+                fail_relocate_locator: None,
+            }
+        }
+
+        fn add_policy_entry(
+            &mut self,
+            placement: &mut HarnessPlacementPlanner,
+            shard_io: &mut HarnessShardIo,
+            policy: &DurabilityPolicy,
+            payload: &[u8],
+        ) -> LocatorId {
+            let locator_id = LocatorId(self.next_locator_id);
+            self.next_locator_id += 1;
+            let digest = blake3_digest(payload);
+            let writes = materialize_target_shards(policy, payload, digest).expect("shards");
+            let placements = placement
+                .plan_shard_placements(locator_id, policy, &writes)
+                .expect("placements");
+            for (placement, write) in placements.iter().zip(writes.iter()) {
+                shard_io
+                    .write_shard(locator_id, placement, write)
+                    .expect("initial shard write");
+            }
+            let mut value = LocatorValueV1::new(locator_id, 1, 0, digest, payload.len() as u64);
+            value.replica_placement = placements;
+            configure_locator_for_policy(
+                &mut value,
+                policy,
+                digest,
+                payload.len() as u64,
+                estimate_on_media_bytes(policy, payload.len() as u64),
+            )
+            .expect("locator policy");
+            self.entries
+                .insert(locator_id.0, LocatorEntry { locator_id, value });
+            locator_id
+        }
+    }
+
+    impl LocatorEntrySource for HarnessLocatorTable {
+        fn locator_count(&self, _pool_id: u64) -> u64 {
+            self.entries.len() as u64
+        }
+
+        fn walk_entries(
+            &self,
+            _pool_id: u64,
+            start_after: Option<LocatorId>,
+            batch_size: u32,
+        ) -> Vec<LocatorEntry> {
+            let start = start_after.map(|id| id.0).unwrap_or(0);
+            let mut ids: Vec<u64> = self.entries.keys().copied().collect();
+            ids.sort_unstable();
+            ids.into_iter()
+                .filter(|id| *id > start)
+                .take(batch_size as usize)
+                .map(|id| self.entries[&id].clone())
+                .collect()
+        }
+    }
+
+    impl LocatorTableOps for HarnessLocatorTable {
+        fn resolve(&self, locator_id: LocatorId) -> Result<LocatorValueV1, LocatorTableError> {
+            self.entries
+                .get(&locator_id.0)
+                .map(|entry| entry.value.clone())
+                .ok_or(LocatorTableError::NotFound)
+        }
+
+        fn allocate(
+            &mut self,
+            payload_bytes: u64,
+            payload_digest: [u8; 32],
+            replica_placement: Vec<ReplicaPlacement>,
+            created_commit_group: u64,
+        ) -> Result<LocatorValueV1, LocatorTableError> {
+            let locator_id = LocatorId(self.next_locator_id);
+            self.next_locator_id += 1;
+            let mut value = LocatorValueV1::new(
+                locator_id,
+                1,
+                created_commit_group,
+                payload_digest,
+                payload_bytes,
+            );
+            value.replica_placement = replica_placement;
+            value.replica_count = value.replica_placement.len() as u8;
+            self.entries.insert(
+                locator_id.0,
+                LocatorEntry {
+                    locator_id,
+                    value: value.clone(),
+                },
+            );
+            Ok(value)
+        }
+
+        fn relocate(
+            &mut self,
+            old_locator_id: LocatorId,
+            new_replica_placement: Vec<ReplicaPlacement>,
+        ) -> Result<LocatorValueV1, LocatorTableError> {
+            let entry = self
+                .entries
+                .get_mut(&old_locator_id.0)
+                .ok_or(LocatorTableError::NotFound)?;
+            entry.value.locator_rev += 1;
+            entry.value.replica_placement = new_replica_placement;
+            entry.value.replica_count = entry.value.replica_placement.len() as u8;
+            Ok(entry.value.clone())
+        }
+
+        fn relocate_value(
+            &mut self,
+            old_locator_id: LocatorId,
+            mut new_value: LocatorValueV1,
+        ) -> Result<LocatorValueV1, LocatorTableError> {
+            if self.fail_relocate_locator == Some(old_locator_id.0) {
+                return Err(LocatorTableError::AllocationFailed);
+            }
+            let entry = self
+                .entries
+                .get_mut(&old_locator_id.0)
+                .ok_or(LocatorTableError::NotFound)?;
+            new_value.locator_rev = entry.value.locator_rev + 1;
+            new_value.locator_id = old_locator_id;
+            entry.value = new_value;
+            Ok(entry.value.clone())
+        }
+
+        fn retire(&mut self, locator_id: LocatorId) -> Result<(), LocatorTableError> {
+            self.entries
+                .remove(&locator_id.0)
+                .map(|_| ())
+                .ok_or(LocatorTableError::NotFound)
+        }
+
+        fn batch_resolve(&self, locator_ids: &[LocatorId]) -> Vec<(LocatorId, LocatorValueV1)> {
+            locator_ids
+                .iter()
+                .filter_map(|id| self.resolve(*id).ok().map(|value| (*id, value)))
+                .collect()
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct HarnessPlacementPlanner {
+        next_segment_id: u64,
+    }
+
+    impl HarnessPlacementPlanner {
+        fn new() -> Self {
+            Self { next_segment_id: 1 }
+        }
+    }
+
+    impl GeometryPlacementPlanner for HarnessPlacementPlanner {
+        fn plan_shard_placements(
+            &mut self,
+            _locator_id: LocatorId,
+            _new_policy: &DurabilityPolicy,
+            writes: &[GeometryShardWrite],
+        ) -> Result<Vec<ReplicaPlacement>, String> {
+            Ok(writes
+                .iter()
+                .map(|write| {
+                    let segment_id = self.next_segment_id;
+                    self.next_segment_id += 1;
+                    ReplicaPlacement {
+                        node_id: segment_id,
+                        device_id: segment_id,
+                        shard_placements: vec![ShardPlacement::new(
+                            write.shard_index,
+                            segment_id,
+                            0,
+                            write.bytes.len() as u64,
+                        )],
+                        health: ReplicaHealth::Online,
+                    }
+                })
+                .collect())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct HarnessShardIo {
+        shards: HashMap<u64, Vec<u8>>,
+        fail_write_locator: Option<u64>,
+    }
+
+    impl HarnessShardIo {
+        fn new() -> Self {
+            Self {
+                shards: HashMap::new(),
+                fail_write_locator: None,
+            }
+        }
+    }
+
+    impl GeometryShardIo for HarnessShardIo {
+        fn read_shard(
+            &self,
+            _locator: &LocatorValueV1,
+            _replica: &ReplicaPlacement,
+            shard: &ShardPlacement,
+        ) -> Result<Vec<u8>, String> {
+            self.shards
+                .get(&shard.segment_id)
+                .cloned()
+                .ok_or_else(|| format!("missing shard segment {}", shard.segment_id))
+        }
+
+        fn write_shard(
+            &mut self,
+            locator_id: LocatorId,
+            placement: &ReplicaPlacement,
+            write: &GeometryShardWrite,
+        ) -> Result<(), String> {
+            if self.fail_write_locator == Some(locator_id.0) {
+                return Err("harness shard write failure".to_string());
+            }
+            for shard in &placement.shard_placements {
+                self.shards.insert(shard.segment_id, write.bytes.clone());
+            }
+            Ok(())
+        }
+    }
+
+    fn harness_store(pool_id: u64) -> HarnessPoolStore {
+        PoolBackedExtentStore::new(
+            pool_id,
+            HarnessLocatorTable::new(),
+            HarnessPlacementPlanner::new(),
+            HarnessShardIo::new(),
+        )
+    }
+
+    fn resume_registry() -> &'static Mutex<HashMap<u64, HarnessPoolStore>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<u64, HarnessPoolStore>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    impl ResumeExtentStore for HarnessPoolStore {
+        fn resume_from_cursor(cursor: &ConversionCursor) -> Result<Self, String> {
+            resume_registry()
+                .lock()
+                .expect("resume registry")
+                .remove(&cursor.pool_id())
+                .ok_or_else(|| format!("no harness store for pool {}", cursor.pool_id()))
         }
     }
 
@@ -1233,7 +1852,7 @@ mod tests {
         assert!(lid.is_some());
         assert!(!lid.is_none());
         assert!(LocatorId::NONE.is_none());
-        assert_eq!(format!("{lid}"), "42");
+        assert_eq!(format!("{lid}"), "000000000000002a");
     }
 
     #[test]
@@ -1311,7 +1930,7 @@ mod tests {
         assert_eq!(job.cursor.last_converted_locator, 0);
         assert_eq!(
             job.last_error(),
-            Some("locator 1 conversion failed: mock write failure")
+            Some("locator 0000000000000001 conversion failed: mock write failure")
         );
         let cp = job.persist_checkpoint();
         let cursor = ConversionCursor::decode(cp.cursor_state.as_bytes()).expect("cursor");
@@ -1319,7 +1938,7 @@ mod tests {
         assert_eq!(cursor.entries_converted, 0);
         assert_eq!(
             cursor.last_error.as_deref(),
-            Some("locator 1 conversion failed: mock write failure")
+            Some("locator 0000000000000001 conversion failed: mock write failure")
         );
     }
 
@@ -1342,7 +1961,224 @@ mod tests {
         assert_eq!(job.cursor.last_converted_locator, 1);
         assert_eq!(
             job.last_error(),
-            Some("locator 2 conversion failed: mock update failure")
+            Some("locator 0000000000000002 conversion failed: mock update failure")
+        );
+    }
+
+    #[test]
+    fn pool_backed_mirror_to_ec_reassembles_writes_and_relocates() {
+        let payload = b"mirror payload converted into EC shards across stripes".repeat(20);
+        let source_policy = DurabilityPolicy::Mirror { replica_count: 2 };
+        let target_policy = DurabilityPolicy::ErasureCoded {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 128,
+        };
+        let mut store = harness_store(21);
+        let locator_id = store.locators.add_policy_entry(
+            &mut store.placement,
+            &mut store.shard_io,
+            &source_policy,
+            &payload,
+        );
+
+        let mut job = GeometryConversionJob::new(
+            store,
+            ConversionScope::Pool(21),
+            source_policy,
+            target_policy.clone(),
+        );
+        let result = job.step(WorkBudget::DEFAULT_TICK);
+        assert!(result.is_complete);
+        assert_eq!(job.cursor.entries_converted, 1);
+
+        let value = job.store.locators.resolve(locator_id).expect("locator");
+        assert!(value.flags & locator_flags::ERASURE_CODED != 0);
+        assert!(value.flags & locator_flags::SHARDED != 0);
+        assert_eq!(value.shard_count, 3);
+        assert_eq!(value.replica_count, 0);
+        let read_back = job
+            .store
+            .read_payload(&value, &target_policy)
+            .expect("read back EC");
+        assert_eq!(read_back, payload);
+    }
+
+    #[test]
+    fn pool_backed_ec_to_mirror_reconstructs_payload() {
+        let payload = b"ec payload survives conversion to mirrors".repeat(17);
+        let source_policy = DurabilityPolicy::ErasureCoded {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 64,
+        };
+        let target_policy = DurabilityPolicy::Mirror { replica_count: 3 };
+        let mut store = harness_store(22);
+        let locator_id = store.locators.add_policy_entry(
+            &mut store.placement,
+            &mut store.shard_io,
+            &source_policy,
+            &payload,
+        );
+
+        let mut job = GeometryConversionJob::new(
+            store,
+            ConversionScope::Pool(22),
+            source_policy,
+            target_policy.clone(),
+        );
+        let result = job.step(WorkBudget::DEFAULT_TICK);
+        assert!(result.is_complete);
+
+        let value = job.store.locators.resolve(locator_id).expect("locator");
+        assert_eq!(value.flags & locator_flags::ERASURE_CODED, 0);
+        assert_eq!(value.flags & locator_flags::SHARDED, 0);
+        assert_eq!(value.shard_count, 1);
+        assert_eq!(value.replica_count, 3);
+        let read_back = job
+            .store
+            .read_payload(&value, &target_policy)
+            .expect("read back mirror");
+        assert_eq!(read_back, payload);
+    }
+
+    #[test]
+    fn pool_backed_ec_family_conversion_materializes_new_width() {
+        let payload = b"ec family conversion payload".repeat(40);
+        let source_policy = DurabilityPolicy::ErasureCoded {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 96,
+        };
+        let target_policy = DurabilityPolicy::ErasureCoded {
+            data_shards: 3,
+            parity_shards: 2,
+            shard_len: 64,
+        };
+        let mut store = harness_store(23);
+        let locator_id = store.locators.add_policy_entry(
+            &mut store.placement,
+            &mut store.shard_io,
+            &source_policy,
+            &payload,
+        );
+
+        let mut job = GeometryConversionJob::new(
+            store,
+            ConversionScope::Pool(23),
+            source_policy,
+            target_policy.clone(),
+        );
+        let result = job.step(WorkBudget::DEFAULT_TICK);
+        assert!(result.is_complete);
+
+        let value = job.store.locators.resolve(locator_id).expect("locator");
+        assert!(value.flags & locator_flags::ERASURE_CODED != 0);
+        assert_eq!(value.shard_count, 5);
+        assert_eq!(value.replica_placement.len(), 5);
+        let read_back = job
+            .store
+            .read_payload(&value, &target_policy)
+            .expect("read back new EC family");
+        assert_eq!(read_back, payload);
+    }
+
+    #[test]
+    fn checkpoint_resume_recreates_pool_store_and_continues() {
+        let source_policy = DurabilityPolicy::Mirror { replica_count: 2 };
+        let target_policy = DurabilityPolicy::ErasureCoded {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_len: 128,
+        };
+        let mut store = harness_store(24);
+        let first = store.locators.add_policy_entry(
+            &mut store.placement,
+            &mut store.shard_io,
+            &source_policy,
+            b"first extent",
+        );
+        let second = store.locators.add_policy_entry(
+            &mut store.placement,
+            &mut store.shard_io,
+            &source_policy,
+            b"second extent",
+        );
+        let mut job = GeometryConversionJob::new(
+            store,
+            ConversionScope::Pool(24),
+            source_policy,
+            target_policy.clone(),
+        );
+        let one_item = WorkBudget {
+            max_items: 1,
+            max_bytes: 0,
+            max_ms: 0,
+        };
+        let first_step = job.step(one_item);
+        assert!(!first_step.is_complete);
+        assert_eq!(job.cursor.last_converted_locator, first.0);
+        let checkpoint = job.persist_checkpoint();
+        let store = job.into_store();
+        resume_registry()
+            .lock()
+            .expect("resume registry")
+            .insert(24, store);
+
+        let mut resumed =
+            <GeometryConversionJob<HarnessPoolStore> as IncrementalJob>::resume(checkpoint)
+                .expect("resume");
+        let second_step = resumed.step(WorkBudget::DEFAULT_TICK);
+        assert!(second_step.is_complete);
+        assert_eq!(resumed.cursor.entries_converted, 2);
+        assert_eq!(resumed.cursor.last_converted_locator, second.0);
+        for locator_id in [first, second] {
+            let value = resumed.store.locators.resolve(locator_id).expect("locator");
+            assert!(value.flags & locator_flags::ERASURE_CODED != 0);
+            assert_eq!(value.shard_count, 3);
+        }
+    }
+
+    #[test]
+    fn pool_backed_relocate_failure_preserves_completed_prefix() {
+        let source_policy = DurabilityPolicy::Mirror { replica_count: 2 };
+        let target_policy = DurabilityPolicy::Mirror { replica_count: 3 };
+        let mut store = harness_store(25);
+        let first = store.locators.add_policy_entry(
+            &mut store.placement,
+            &mut store.shard_io,
+            &source_policy,
+            b"already committed",
+        );
+        let second = store.locators.add_policy_entry(
+            &mut store.placement,
+            &mut store.shard_io,
+            &source_policy,
+            b"fails at relocate",
+        );
+        store.locators.fail_relocate_locator = Some(second.0);
+
+        let mut job = GeometryConversionJob::new(
+            store,
+            ConversionScope::Pool(25),
+            source_policy,
+            target_policy,
+        );
+        let result = job.step(WorkBudget::DEFAULT_TICK);
+        assert!(result.is_complete);
+        assert!(job.is_failed());
+        assert_eq!(job.cursor.entries_converted, 1);
+        assert_eq!(job.cursor.last_converted_locator, first.0);
+
+        let first_value = job.store.locators.resolve(first).expect("first");
+        let second_value = job.store.locators.resolve(second).expect("second");
+        assert_eq!(first_value.replica_count, 3);
+        assert_eq!(second_value.replica_count, 2);
+        assert_eq!(
+            job.last_error(),
+            Some(
+                "locator 0000000000000002 conversion failed: atomic locator relocate failed: allocation failed"
+            )
         );
     }
 }
