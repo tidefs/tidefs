@@ -15,6 +15,7 @@ description = "Networked storage node daemon: bridges tidefs-transport with tide
 [dependencies]
 tokio = { workspace = true, features = ["rt"] }
 tidefs-transport = { workspace = true }
+tidefs-send-stream = { workspace = true }
 tidefs-replicated-object-store = { workspace = true }
 tidefs-local-object-store = { workspace = true }
 tidefs-local-filesystem = { workspace = true }
