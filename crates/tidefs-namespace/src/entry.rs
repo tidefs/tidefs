@@ -7,7 +7,7 @@
 //! storage layer provides durability guarantees.
 
 use crate::{EntryType, Inode};
-use fxhash::FxHasher;
+use rustc_hash::FxHasher;
 use std::hash::Hasher;
 
 // ---------------------------------------------------------------------------
