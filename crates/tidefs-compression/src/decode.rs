@@ -34,9 +34,15 @@ pub fn decompress(framed: &[u8]) -> Result<Vec<u8>> {
         tidefs_frame::FrameError::Lz4DecompressionFailed => {
             CompressionError::DecompressionFailed("lz4 decompression failed".into())
         }
-        tidefs_frame::FrameError::TransformMismatch { field, expected, observed } => {
-            CompressionError::TransformMismatch { field, expected, observed }
-        }
+        tidefs_frame::FrameError::TransformMismatch {
+            field,
+            expected,
+            observed,
+        } => CompressionError::TransformMismatch {
+            field,
+            expected,
+            observed,
+        },
     })
 }
 

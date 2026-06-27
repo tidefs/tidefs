@@ -304,7 +304,10 @@ mod tests {
         let size = listing.size_bytes;
 
         cache.insert(42, listing);
-        assert_eq!(governor.category_used(crate::BudgetCategory::MetaCache), size);
+        assert_eq!(
+            governor.category_used(crate::BudgetCategory::MetaCache),
+            size
+        );
         assert_eq!(governor.category_used(crate::BudgetCategory::DataCache), 0);
 
         cache.invalidate(42);

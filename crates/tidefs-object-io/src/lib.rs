@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use tidefs_frame::{CompressedExtentPayload, decompress_extent_verified, TransformVerification};
+use tidefs_frame::{decompress_extent_verified, CompressedExtentPayload, TransformVerification};
 use tidefs_storage_intent_core::StorageIntentEvidenceRef;
 use tidefs_storage_intent_remote_media_capability::RemoteObjectIoVisibilitySample;
 
@@ -57,8 +57,15 @@ impl fmt::Display for ObjectIoError {
             Self::InvalidChunkSize => f.write_str("invalid object I/O chunk size"),
             Self::MissingObject(key) => write!(f, "extent references missing object {key}"),
             Self::HoleBeyondEof => f.write_str("read entirely in hole past EOF"),
-            Self::TransformMismatch { field, expected, observed } => {
-                write!(f, "transform mismatch: {field} expected {expected}, observed {observed}")
+            Self::TransformMismatch {
+                field,
+                expected,
+                observed,
+            } => {
+                write!(
+                    f,
+                    "transform mismatch: {field} expected {expected}, observed {observed}"
+                )
             }
         }
     }
@@ -289,17 +296,21 @@ fn load_object_verified<S: ObjectStore>(
         .get(&key)
         .map_err(map_store_error)?
         .ok_or(ObjectIoError::MissingObject(key))?;
-    let payload = CompressedExtentPayload::decode(&raw)
-        .ok_or(ObjectIoError::StoreError(Box::new(
-            std::io::Error::other("invalid compressed extent payload"),
-        )))?;
-    decompress_extent_verified(&payload, token)
-        .map_err(|e| match e {
-            tidefs_frame::FrameError::TransformMismatch { field, expected, observed } => {
-                ObjectIoError::TransformMismatch { field, expected, observed }
-            }
-            other => ObjectIoError::StoreError(Box::new(std::io::Error::other(format!("{other:?}")))),
-        })
+    let payload = CompressedExtentPayload::decode(&raw).ok_or(ObjectIoError::StoreError(
+        Box::new(std::io::Error::other("invalid compressed extent payload")),
+    ))?;
+    decompress_extent_verified(&payload, token).map_err(|e| match e {
+        tidefs_frame::FrameError::TransformMismatch {
+            field,
+            expected,
+            observed,
+        } => ObjectIoError::TransformMismatch {
+            field,
+            expected,
+            observed,
+        },
+        other => ObjectIoError::StoreError(Box::new(std::io::Error::other(format!("{other:?}")))),
+    })
 }
 
 fn data_entry<S: ObjectStore>(
@@ -429,7 +440,8 @@ impl ObjectReader {
             let read_len = read_range.len_usize()?;
             if entry.extent_type().is_data() {
                 let key = entry_object_key(&entry);
-                let payload = if let Some((algo, uncompressed_len)) = entry.transform_verification() {
+                let payload = if let Some((algo, uncompressed_len)) = entry.transform_verification()
+                {
                     // Build a TransformVerification token from the extent-map entry.
                     // The compressed_len is not stored in the entry; it is verified
                     // implicitly by the content checksum that covers the full payload.
@@ -685,11 +697,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::error::Error;
+    use tidefs_extent_map::InlineExtentMap;
     use tidefs_storage_intent_core::{
         MediaPersistenceDomain, MediaRemoteCommitSemantics, StorageIntentEvidenceId,
         StorageIntentEvidenceKind,
     };
-    use tidefs_extent_map::InlineExtentMap;
 
     #[derive(Debug, Default)]
     struct MemStore {

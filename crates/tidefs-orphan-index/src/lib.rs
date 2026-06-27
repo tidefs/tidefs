@@ -263,9 +263,7 @@ impl fmt::Display for OrphanIndexAdmissionError {
 
 impl std::error::Error for OrphanIndexAdmissionError {}
 
-fn validate_orphan_index_permit(
-    permit: &AdmissionPermit,
-) -> Result<(), OrphanIndexAdmissionError> {
+fn validate_orphan_index_permit(permit: &AdmissionPermit) -> Result<(), OrphanIndexAdmissionError> {
     let charge = permit.charge();
     if charge.work_class != WorkClass::MetadataMutation {
         return Err(OrphanIndexAdmissionError::WrongWorkClass {

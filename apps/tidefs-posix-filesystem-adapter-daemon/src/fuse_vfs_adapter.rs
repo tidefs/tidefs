@@ -40658,18 +40658,14 @@ mod tests {
         // Write data to populate the tracker.
         fixture
             .adapter
-            .dispatch_write(
-                &ctx,
-                ino,
-                adapter_fh,
-                0,
-                b"hello world",
-                0,
-            )
+            .dispatch_write(&ctx, ino, adapter_fh, 0, b"hello world", 0)
             .expect("write");
 
         // Artificially mark the inode dirty so drain-on-flush is verifiable.
-        tracker.lock().unwrap().mark_dirty(inode, 0, b"hello world".len() as u64);
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode, 0, b"hello world".len() as u64);
         assert!(
             tracker.lock().unwrap().is_dirty(inode),
             "tracker should be dirty before flush"
@@ -40703,18 +40699,14 @@ mod tests {
 
         fixture
             .adapter
-            .dispatch_write(
-                &ctx,
-                ino,
-                adapter_fh,
-                0,
-                b"fsync data",
-                0,
-            )
+            .dispatch_write(&ctx, ino, adapter_fh, 0, b"fsync data", 0)
             .expect("write");
 
         // Artificially mark the inode dirty so drain-on-fsync is verifiable.
-        tracker.lock().unwrap().mark_dirty(inode, 0, b"fsync data".len() as u64);
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode, 0, b"fsync data".len() as u64);
         assert!(tracker.lock().unwrap().is_dirty(inode));
 
         fixture
@@ -40740,18 +40732,14 @@ mod tests {
 
         fixture
             .adapter
-            .dispatch_write(
-                &ctx,
-                ino,
-                adapter_fh,
-                0,
-                b"fdatasync data",
-                0,
-            )
+            .dispatch_write(&ctx, ino, adapter_fh, 0, b"fdatasync data", 0)
             .expect("write");
 
         // Artificially mark the inode dirty so drain-on-fdatasync is verifiable.
-        tracker.lock().unwrap().mark_dirty(inode, 0, b"fdatasync data".len() as u64);
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode, 0, b"fdatasync data".len() as u64);
         assert!(tracker.lock().unwrap().is_dirty(inode));
 
         fixture
@@ -40777,18 +40765,14 @@ mod tests {
 
         fixture
             .adapter
-            .dispatch_write(
-                &ctx,
-                ino,
-                adapter_fh,
-                0,
-                b"release data",
-                0,
-            )
+            .dispatch_write(&ctx, ino, adapter_fh, 0, b"release data", 0)
             .expect("write");
 
         // Artificially mark the inode dirty so drain-on-release is verifiable.
-        tracker.lock().unwrap().mark_dirty(inode, 0, b"release data".len() as u64);
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(inode, 0, b"release data".len() as u64);
         assert!(tracker.lock().unwrap().is_dirty(inode));
 
         // Release with flush=true (kernel-requested flush-on-close).
@@ -40919,8 +40903,14 @@ mod tests {
             .expect("write B");
 
         // Artificially mark both inodes dirty so drain-on-flush is verifiable.
-        tracker.lock().unwrap().mark_dirty(ino_a, 0, b"AAAA".len() as u64);
-        tracker.lock().unwrap().mark_dirty(ino_b, 0, b"BBBB".len() as u64);
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino_a, 0, b"AAAA".len() as u64);
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino_b, 0, b"BBBB".len() as u64);
         assert!(tracker.lock().unwrap().is_dirty(ino_a));
         assert!(tracker.lock().unwrap().is_dirty(ino_b));
 
@@ -41001,8 +40991,14 @@ mod tests {
             .expect("write B");
 
         // Artificially mark both inodes dirty so drain-on-syncfs is verifiable.
-        tracker.lock().unwrap().mark_dirty(ino_a, 0, b"AAAA".len() as u64);
-        tracker.lock().unwrap().mark_dirty(ino_b, 0, b"BBBB".len() as u64);
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino_a, 0, b"AAAA".len() as u64);
+        tracker
+            .lock()
+            .unwrap()
+            .mark_dirty(ino_b, 0, b"BBBB".len() as u64);
         assert!(tracker.lock().unwrap().is_dirty(ino_a));
         assert!(tracker.lock().unwrap().is_dirty(ino_b));
 

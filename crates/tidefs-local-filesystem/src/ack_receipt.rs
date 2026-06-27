@@ -7,6 +7,7 @@
 //! records without claiming transport, distributed quorum, operator UAPI, or
 //! broad crash-validation closure.
 
+use tidefs_local_object_store::pool::PlacementReceipt;
 use tidefs_storage_intent_core::{
     DurabilityReceiptState, DurabilityRequirement, DurabilityState, FailureDomainMask,
     ProximityClass, ReadServingSourceClass, StorageIntentActionClass, StorageIntentEvidenceId,
@@ -16,7 +17,6 @@ use tidefs_storage_intent_core::{
     StorageIntentRefusal, StorageIntentRefusalReason, StorageMediaClass, StorageMediaRole,
     TrustEvidenceState,
 };
-use tidefs_local_object_store::pool::PlacementReceipt;
 
 /// Local filesystem receipt surface version for issue #842.
 pub const LOCAL_ACK_RECEIPT_SPEC: &str = "tidefs-local-ack-receipt-v1-issue-842";
@@ -807,7 +807,9 @@ pub fn classify_read_receipt(
     // Check policy well-formedness via projection to the shared receipt model.
     let rp = receipt.policy.to_receipt_redundancy_policy();
     if !rp.is_well_formed() {
-        return ReadReceiptEvidence::MalformedPolicy { generation: receipt.generation };
+        return ReadReceiptEvidence::MalformedPolicy {
+            generation: receipt.generation,
+        };
     }
 
     // Check target width.
@@ -828,7 +830,9 @@ pub fn classify_read_receipt(
         };
     }
 
-    ReadReceiptEvidence::Valid { generation: receipt.generation }
+    ReadReceiptEvidence::Valid {
+        generation: receipt.generation,
+    }
 }
 
 #[cfg(test)]

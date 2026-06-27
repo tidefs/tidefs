@@ -98,8 +98,7 @@ impl GovernorLifecycleState {
     pub const fn is_active(self) -> bool {
         matches!(
             self,
-            GovernorLifecycleState::AdmittedMove
-                | GovernorLifecycleState::ReplacementPublished
+            GovernorLifecycleState::AdmittedMove | GovernorLifecycleState::ReplacementPublished
         )
     }
 
@@ -219,7 +218,10 @@ mod tests {
     #[test]
     fn happy_path_transitions_are_legal() {
         let happy_path = [
-            (GovernorLifecycleState::Observed, GovernorLifecycleState::ShadowEvaluated),
+            (
+                GovernorLifecycleState::Observed,
+                GovernorLifecycleState::ShadowEvaluated,
+            ),
             (
                 GovernorLifecycleState::ShadowEvaluated,
                 GovernorLifecycleState::ServingTrial,
@@ -243,7 +245,11 @@ mod tests {
         ];
         for (from, to) in &happy_path {
             assert!(
-                LifecycleTransition { from: *from, to: *to }.is_legal(),
+                LifecycleTransition {
+                    from: *from,
+                    to: *to
+                }
+                .is_legal(),
                 "transition {from} -> {to} should be legal"
             );
         }

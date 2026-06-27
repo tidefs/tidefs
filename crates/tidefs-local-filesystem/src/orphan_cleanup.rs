@@ -175,7 +175,13 @@ pub(crate) fn cleanup_orphans(
         }
 
         // 3. Remove extent map if present.
-        if state.extent_maps.lock().unwrap().remove(&inode_id).is_some() {
+        if state
+            .extent_maps
+            .lock()
+            .unwrap()
+            .remove(&inode_id)
+            .is_some()
+        {
             stats.extent_maps_freed += 1;
         }
         state.dirty_extent_maps.remove(&inode_id);

@@ -155,9 +155,7 @@ fn rejects_empty_artifact_path() {
     manifest.artifact_paths = vec!["validation.json".to_string(), " ".to_string()];
     let err = manifest.validate().unwrap_err();
     assert!(
-        err.failures()
-            .iter()
-            .any(|f| f.contains("artifact_paths")),
+        err.failures().iter().any(|f| f.contains("artifact_paths")),
         "{:?}",
         err.failures()
     );
@@ -223,7 +221,9 @@ fn rejects_invalid_manifest_version() {
     manifest.manifest_version = 99;
     let err = manifest.validate().unwrap_err();
     assert!(
-        err.failures().iter().any(|f| f.contains("manifest_version")),
+        err.failures()
+            .iter()
+            .any(|f| f.contains("manifest_version")),
         "{:?}",
         err.failures()
     );

@@ -94,10 +94,8 @@ pub fn evaluate_hdd_defrag(input: &HeuristicInput) -> HeuristicResult {
     let payback_seeks = seek_savings.max(1);
     let estimated_payback_ms = payback_seeks.saturating_mul(5);
 
-    let mut result = HeuristicResult::recommended(
-        RelocationActionClass::Optimization,
-        "hdd-defrag-justified",
-    );
+    let mut result =
+        HeuristicResult::recommended(RelocationActionClass::Optimization, "hdd-defrag-justified");
     result.estimated_payback_ms = Some(estimated_payback_ms);
 
     result
@@ -151,8 +149,8 @@ mod tests {
     fn refuses_when_recently_relocated() {
         let mut input = hdd_defrag_input();
         input.last_relocated_ms = Some(10_000); // 10s ago
-        // With default 40% seek reduction, < 30% (2x threshold) after recent
-        // relocation → should still refuse because threshold is doubled.
+                                                // With default 40% seek reduction, < 30% (2x threshold) after recent
+                                                // relocation → should still refuse because threshold is doubled.
         input.hdd_seek_distance = Some(1000);
         input.hdd_expected_seek_distance = Some(710); // 29% reduction (under 30% double threshold)
         let result = evaluate_hdd_defrag(&input);

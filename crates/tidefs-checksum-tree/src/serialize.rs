@@ -175,7 +175,10 @@ impl core::fmt::Display for DecodeError {
                 crate::FANOUT
             ),
             Self::BadLocatorTokenPresent { value } => {
-                write!(f, "bad locator-token-present flag: {value} (expected 0 or 1)")
+                write!(
+                    f,
+                    "bad locator-token-present flag: {value} (expected 0 or 1)"
+                )
             }
         }
     }

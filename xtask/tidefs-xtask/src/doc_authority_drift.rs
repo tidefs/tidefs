@@ -233,11 +233,7 @@ fn collect_markdown_docs(root: &Path) -> Result<Vec<String>, String> {
     Ok(docs)
 }
 
-fn collect_markdown_docs_in(
-    root: &Path,
-    dir: &Path,
-    docs: &mut Vec<String>,
-) -> Result<(), String> {
+fn collect_markdown_docs_in(root: &Path, dir: &Path, docs: &mut Vec<String>) -> Result<(), String> {
     let entries = fs::read_dir(dir)
         .map_err(|err| format!("cannot read docs directory {}: {err}", dir.display()))?;
     let mut paths = Vec::new();
@@ -384,11 +380,7 @@ fn collect_reference_definition_target(
     }
 }
 
-fn collect_inline_doc_tokens(
-    line: &str,
-    source_rel_path: &str,
-    refs: &mut BTreeSet<DocReference>,
-) {
+fn collect_inline_doc_tokens(line: &str, source_rel_path: &str, refs: &mut BTreeSet<DocReference>) {
     for token in line.split(|ch: char| ch.is_whitespace()) {
         let trimmed = token.trim_matches(|ch: char| {
             matches!(
@@ -402,11 +394,7 @@ fn collect_inline_doc_tokens(
     }
 }
 
-fn add_doc_reference(
-    raw: &str,
-    source_rel_path: &str,
-    refs: &mut BTreeSet<DocReference>,
-) {
+fn add_doc_reference(raw: &str, source_rel_path: &str, refs: &mut BTreeSet<DocReference>) {
     let cleaned = clean_reference(raw);
     if let Some(rel_target) = resolve_doc_reference(&cleaned, source_rel_path) {
         refs.insert(DocReference {
@@ -429,7 +417,19 @@ fn clean_reference(raw: &str) -> String {
         .trim_matches(|ch: char| {
             matches!(
                 ch,
-                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | '.' | ';'
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | '.'
+                    | ';'
                     | ':'
             )
         })
@@ -450,10 +450,7 @@ fn resolve_doc_reference(raw: &str, source_rel_path: &str) -> Option<String> {
         PathBuf::from(raw.trim_start_matches('/'))
     } else if raw.starts_with("docs/") {
         PathBuf::from(raw)
-    } else if raw.starts_with("./")
-        || raw.starts_with("../")
-        || has_doc_extension(raw)
-    {
+    } else if raw.starts_with("./") || raw.starts_with("../") || has_doc_extension(raw) {
         let source_dir = Path::new(source_rel_path)
             .parent()
             .unwrap_or_else(|| Path::new(""));
@@ -618,7 +615,11 @@ mod tests {
 
     fn write_minimal_authority(root: &Path, extra_register_rows: &str) {
         write_file(root, "Cargo.toml", "[workspace]\nmembers = []\n");
-        write_file(root, "xtask/tidefs-xtask/Cargo.toml", "[package]\nname = \"xtask-fixture\"\n");
+        write_file(
+            root,
+            "xtask/tidefs-xtask/Cargo.toml",
+            "[package]\nname = \"xtask-fixture\"\n",
+        );
         write_file(
             root,
             PACKAGE_CLASSIFICATION_DOC,

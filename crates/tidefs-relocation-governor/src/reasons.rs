@@ -89,7 +89,10 @@ impl GovernorRelocationReason {
     /// rather than optimization-class.
     #[must_use]
     pub const fn is_necessity(self) -> bool {
-        matches!(self, GovernorRelocationReason::Repair | GovernorRelocationReason::Evacuation)
+        matches!(
+            self,
+            GovernorRelocationReason::Repair | GovernorRelocationReason::Evacuation
+        )
     }
 
     /// Returns true when this reason changes authority (promotion, demotion,

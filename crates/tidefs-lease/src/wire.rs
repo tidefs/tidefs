@@ -426,10 +426,9 @@ impl LeaseWireCodec {
 
         let total_body = (payload.len() + DIGEST_BYTES) as u64;
 
-        let header =
-            EnvelopeBuilder::new(LEASE_FAMILY, LEASE_TYPE, LEASE_VERSION)
-                .with_checksum_profiles(ChecksumProfile::Crc32c, ChecksumProfile::Blake3_256)
-                .build(0, total_body);
+        let header = EnvelopeBuilder::new(LEASE_FAMILY, LEASE_TYPE, LEASE_VERSION)
+            .with_checksum_profiles(ChecksumProfile::Crc32c, ChecksumProfile::Blake3_256)
+            .build(0, total_body);
 
         let mut out = Vec::with_capacity(HEADER_BYTES + payload.len() + DIGEST_BYTES);
         out.extend_from_slice(&header.encode());
@@ -603,7 +602,16 @@ mod tests {
     #[test]
     fn coherency_to_wire_roundtrip() {
         let coh = CacheInvalidationMessage::range(
-            1, 100, 42, 5, 0, 4096, 1, 2, 10, 20,
+            1,
+            100,
+            42,
+            5,
+            0,
+            4096,
+            1,
+            2,
+            10,
+            20,
             CacheInvalidationReason::ConflictingWriteLease,
             InvalidationWaitPolicy::WaitForCleanEviction,
         );

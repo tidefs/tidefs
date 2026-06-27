@@ -406,8 +406,7 @@ impl IncrementalJob for RebuildRuntime {
                 MovementOutcome::Failed { .. } => {
                     self.stats.objects_failed += 1;
                     self.stats.objects_pending = self.stats.objects_pending.saturating_sub(1);
-                    self.stats.bytes_pending =
-                        self.stats.bytes_pending.saturating_sub(payload_len);
+                    self.stats.bytes_pending = self.stats.bytes_pending.saturating_sub(payload_len);
                     self.next_index += 1;
                     items_processed += 1;
                 }

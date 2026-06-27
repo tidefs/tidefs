@@ -251,9 +251,8 @@ pub(crate) fn planned_chunk_allocation_entries_for_overlay(
             {
                 for chunk_index in first_overlay_chunk..=last_overlay_chunk {
                     let len = content_chunk_len(new_record.size, chunk_index)?;
-                    let old_chunk_is_sparse_zero =
-                        find_chunk_in_manifest(manifest, chunk_index)
-                            .is_none_or(crate::records::ContentChunkRef::is_hole);
+                    let old_chunk_is_sparse_zero = find_chunk_in_manifest(manifest, chunk_index)
+                        .is_none_or(crate::records::ContentChunkRef::is_hole);
                     if old_chunk_is_sparse_zero
                         && overlay_chunk_writes_only_zeros(
                             chunk_index,

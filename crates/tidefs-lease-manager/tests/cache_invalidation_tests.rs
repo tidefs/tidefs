@@ -8,8 +8,7 @@
 use std::sync::{Arc, Mutex};
 use tidefs_cache_coherency::{
     CacheInvalidationMessage, CacheInvalidationReason, CacheInvalidationScope,
-    CacheInvalidationSubscriber, CoherencyEventBus, InvalidationResult,
-    InvalidationWaitPolicy,
+    CacheInvalidationSubscriber, CoherencyEventBus, InvalidationResult, InvalidationWaitPolicy,
 };
 use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseGrant};
 use tidefs_lease::wire::CacheInvalidationPayload;
@@ -89,11 +88,22 @@ fn manager_with_bus(
     (mgr, bus)
 }
 
-fn make_byte_range_grant(lease_id: u64, dataset_id: u64, ino: u64, start: u64, end: u64) -> LeaseGrant {
+fn make_byte_range_grant(
+    lease_id: u64,
+    dataset_id: u64,
+    ino: u64,
+    start: u64,
+    end: u64,
+) -> LeaseGrant {
     LeaseGrant::request(
         lease_id,
         LeaseClass::Exclusive,
-        LeaseDomain::ByteRange { dataset_id, ino, start, end },
+        LeaseDomain::ByteRange {
+            dataset_id,
+            ino,
+            start,
+            end,
+        },
         MemberId(10),
         0,
         30_000,
@@ -133,9 +143,14 @@ fn advisory_invalidation_dispatches_message_to_subscriber() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
+    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory)
+        .unwrap();
 
-    assert_eq!(sub.received_count(), 1, "subscriber should receive one message");
+    assert_eq!(
+        sub.received_count(),
+        1,
+        "subscriber should receive one message"
+    );
 }
 
 #[test]
@@ -144,7 +159,8 @@ fn advisory_invalidation_carries_full_metadata() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
+    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory)
+        .unwrap();
 
     let msgs = sub.messages.lock().unwrap();
     let msg = &msgs[0];
@@ -161,7 +177,8 @@ fn advisory_invalidation_range_scope_correct() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 4096, 8192);
-    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
+    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory)
+        .unwrap();
 
     let msgs = sub.messages.lock().unwrap();
     match &msgs[0].scope {
@@ -179,7 +196,8 @@ fn advisory_invalidation_inode_scope_correct() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_inode_grant(2, 5, 99);
-    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
+    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory)
+        .unwrap();
 
     let msgs = sub.messages.lock().unwrap();
     assert_eq!(msgs[0].scope, CacheInvalidationScope::Inode);
@@ -243,7 +261,8 @@ fn invalidation_message_includes_generation_delta() {
 
     // First invalidation advances from 0 -> 1
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
+    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory)
+        .unwrap();
     {
         let msgs = sub.messages.lock().unwrap();
         assert_eq!(msgs[0].old_range_generation, 0);
@@ -256,7 +275,8 @@ fn invalidation_message_includes_generation_delta() {
 
     // Second invalidation sees old=3, new=4
     let grant2 = make_byte_range_grant(2, 5, 42, 0, 4096);
-    mgr.invalidate_cache_for_domain(&grant2, InvalidationWaitPolicy::Advisory).unwrap();
+    mgr.invalidate_cache_for_domain(&grant2, InvalidationWaitPolicy::Advisory)
+        .unwrap();
 
     let msgs = sub.messages.lock().unwrap();
     assert_eq!(msgs[1].old_range_generation, 3);
@@ -273,7 +293,9 @@ fn wait_for_clean_eviction_is_blocking() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    let result = mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForCleanEviction).unwrap();
+    let result = mgr
+        .invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForCleanEviction)
+        .unwrap();
 
     // Subscriber returned clean(0), so result should be clean.
     assert!(result.dirty_drained);
@@ -286,7 +308,8 @@ fn wait_for_clean_eviction_sees_blocking_flag() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForCleanEviction).unwrap();
+    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForCleanEviction)
+        .unwrap();
 
     let msgs = sub.messages.lock().unwrap();
     assert!(msgs[0].is_blocking());
@@ -327,7 +350,8 @@ fn wait_for_dirty_drain_requires_dirty_flag() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForDirtyDrain).unwrap();
+    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::WaitForDirtyDrain)
+        .unwrap();
 
     let msgs = sub.messages.lock().unwrap();
     assert!(msgs[0].requires_dirty_drain());
@@ -344,7 +368,9 @@ fn fence_and_error_is_not_blocking() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    let _result = mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::FenceAndError).unwrap();
+    let _result = mgr
+        .invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::FenceAndError)
+        .unwrap();
 
     let msgs = sub.messages.lock().unwrap();
     assert!(!msgs[0].is_blocking());
@@ -361,21 +387,33 @@ fn epoch_advance_fences_old_leases_and_dispatches_invalidation() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     // Grant two leases in epoch 1
-    let _g1 = mgr.grant(
-        LeaseClass::Exclusive,
-        LeaseDomain::ByteRange { dataset_id: 5, ino: 42, start: 0, end: 4096 },
-        MemberId(10),
-        3,
-        1000,
-    ).unwrap();
+    let _g1 = mgr
+        .grant(
+            LeaseClass::Exclusive,
+            LeaseDomain::ByteRange {
+                dataset_id: 5,
+                ino: 42,
+                start: 0,
+                end: 4096,
+            },
+            MemberId(10),
+            3,
+            1000,
+        )
+        .unwrap();
 
-    let _g2 = mgr.grant(
-        LeaseClass::Exclusive,
-        LeaseDomain::Inode { dataset_id: 5, ino: 99 },
-        MemberId(11),
-        3,
-        1000,
-    ).unwrap();
+    let _g2 = mgr
+        .grant(
+            LeaseClass::Exclusive,
+            LeaseDomain::Inode {
+                dataset_id: 5,
+                ino: 99,
+            },
+            MemberId(11),
+            3,
+            1000,
+        )
+        .unwrap();
 
     assert_eq!(mgr.grant_count(), 2);
 
@@ -390,7 +428,11 @@ fn epoch_advance_fences_old_leases_and_dispatches_invalidation() {
     }
 
     // Invalidation messages should have been dispatched
-    assert_eq!(sub.received_count(), 2, "two invalidation messages dispatched");
+    assert_eq!(
+        sub.received_count(),
+        2,
+        "two invalidation messages dispatched"
+    );
 
     // Verify epoch in invalidation messages
     let msgs = sub.messages.lock().unwrap();
@@ -432,7 +474,8 @@ fn stats_track_invalidation_dispatches() {
     let (mut mgr, _bus) = manager_with_bus(sub.clone());
 
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
+    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory)
+        .unwrap();
 
     assert_eq!(mgr.stats().invalidations_dispatched, 1);
     assert_eq!(mgr.stats().invalidations_acked, 0); // advisory = fire-and-forget
@@ -449,7 +492,10 @@ fn wire_payload_roundtrip_preserves_all_fields() {
         mount_session_id: 300,
         inode_id: 55,
         inode_generation: 4,
-        scope: tidefs_lease::wire::WireInvalidationScope::Range { start: 1024, end: 2048 },
+        scope: tidefs_lease::wire::WireInvalidationScope::Range {
+            start: 1024,
+            end: 2048,
+        },
         old_range_generation: 1,
         new_range_generation: 2,
         lease_epoch: 10,
@@ -494,7 +540,8 @@ fn invalidation_scoped_to_owning_dataset_no_cross_dataset_lock() {
 
     // Invalidate dataset 5 only
     let grant = make_byte_range_grant(1, 5, 42, 0, 4096);
-    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory).unwrap();
+    mgr.invalidate_cache_for_domain(&grant, InvalidationWaitPolicy::Advisory)
+        .unwrap();
 
     // Both subscribers receive the message (the bus is not dataset-scoped;
     // each subscriber implements its own dataset-scoped filtering).
@@ -521,7 +568,16 @@ fn invalidation_does_not_require_lock_service_types() {
     // Verify that CacheInvalidationMessage does not reference
     // POSIX lock types from the lock service (non-overlap with #633).
     let msg = CacheInvalidationMessage::range(
-        1, 100, 42, 5, 0, 4096, 1, 2, 10, 20,
+        1,
+        100,
+        42,
+        5,
+        0,
+        4096,
+        1,
+        2,
+        10,
+        20,
         CacheInvalidationReason::ConflictingWriteLease,
         InvalidationWaitPolicy::Advisory,
     );
@@ -536,7 +592,14 @@ fn invalidation_does_not_require_cache_admission_types() {
     // Verify that invalidation does not reference cache admission
     // or memory-budget policy types (non-overlap with #685).
     let msg = CacheInvalidationMessage::inode(
-        1, 100, 42, 5, 1, 2, 10, 20,
+        1,
+        100,
+        42,
+        5,
+        1,
+        2,
+        10,
+        20,
         CacheInvalidationReason::EpochTransition,
         InvalidationWaitPolicy::WaitForDirtyDrain,
     );
@@ -577,7 +640,9 @@ fn invalidation_ack_reflects_subscriber_result() {
         InvalidationWaitPolicy::WaitForDirtyDrain,
     );
     let payload = CacheInvalidationPayload::from_coherency(&msg);
-    let response = mgr.process_message(&LeaseMessage::Invalidate(payload), 0).unwrap();
+    let response = mgr
+        .process_message(&LeaseMessage::Invalidate(payload), 0)
+        .unwrap();
 
     match response {
         LeaseMessage::InvalidateAck(ack) => {

@@ -83,9 +83,9 @@ impl RawBlockFile {
     #[cfg(CONFIG_RUST)]
     pub fn open(path: &[u8], block_size: u32) -> Result<Self, Errno> {
         const O_FLAGS: i32 = 0x2 | 0x8000; // O_RDWR | O_LARGEFILE
-        // SAFETY: path is the NUL-terminated module parameter buffer supplied
-        // by the Kbuild entrypoint; filp_open returns either a live filp or an
-        // ERR_PTR/null sentinel checked below.
+                                           // SAFETY: path is the NUL-terminated module parameter buffer supplied
+                                           // by the Kbuild entrypoint; filp_open returns either a live filp or an
+                                           // ERR_PTR/null sentinel checked below.
         let filp = unsafe { filp_open(path.as_ptr() as *const i8, O_FLAGS, 0u16) };
         if filp.is_null() || is_err_ptr(filp) {
             return Err(Errno::EIO);

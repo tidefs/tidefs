@@ -3,7 +3,6 @@
 //! hard gates, anti-thrash rules, and heuristics to admit or refuse
 //! a relocation plan.
 
-
 use crate::anti_thrash::{AntiThrashDecision, AntiThrashState};
 use crate::hard_gates::{HardGateEvidence, HardGateId, HardGates};
 use crate::heuristics::{HeuristicInput, HeuristicResult, RelocationActionClass};
@@ -154,15 +153,15 @@ pub fn evaluate_relocation_admission(
 
     // 2. Media-specific heuristic evaluation
     let heuristic = match reason {
-        GovernorRelocationReason::HddDefrag => Some(hdd_heuristics::evaluate_hdd_defrag(
-            heuristic_input,
-        )),
-        GovernorRelocationReason::SsdCompaction => Some(ssd_heuristics::evaluate_ssd_compaction(
-            heuristic_input,
-        )),
-        GovernorRelocationReason::WearRebalance => Some(
-            ssd_heuristics::evaluate_ssd_wear_rebalance(heuristic_input),
-        ),
+        GovernorRelocationReason::HddDefrag => {
+            Some(hdd_heuristics::evaluate_hdd_defrag(heuristic_input))
+        }
+        GovernorRelocationReason::SsdCompaction => {
+            Some(ssd_heuristics::evaluate_ssd_compaction(heuristic_input))
+        }
+        GovernorRelocationReason::WearRebalance => {
+            Some(ssd_heuristics::evaluate_ssd_wear_rebalance(heuristic_input))
+        }
         GovernorRelocationReason::GeoCatchup => {
             Some(wan_heuristics::evaluate_geo_catchup(heuristic_input))
         }
@@ -225,13 +224,11 @@ pub fn evaluate_relocation_admission(
 
     // 5. Determine verdict and target state
     let (verdict, target_state, summary) = match action_class {
-        RelocationActionClass::CacheOnly | RelocationActionClass::ServingTrial => {
-            (
-                AdmissionVerdict::ServingTrialOnly,
-                GovernorLifecycleState::ServingTrial,
-                "admitted-serving-trial",
-            )
-        }
+        RelocationActionClass::CacheOnly | RelocationActionClass::ServingTrial => (
+            AdmissionVerdict::ServingTrialOnly,
+            GovernorLifecycleState::ServingTrial,
+            "admitted-serving-trial",
+        ),
         _ => {
             let is_authority = action_class.changes_authority();
             if is_authority && hard_gates.any_unknown_but_no_fail() && !reason.is_necessity() {

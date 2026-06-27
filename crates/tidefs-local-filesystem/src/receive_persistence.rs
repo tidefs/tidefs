@@ -29,9 +29,7 @@ use tidefs_local_object_store::ObjectKey;
 /// `verify_incremental_base_root_authority` and fail closed per
 /// `docs/RECEIVE_STREAM_MERGE_POLICY.md` §1.3.
 #[must_use]
-pub fn merge_plan_gate_for_incremental_receive(
-    merge_plan: Option<&ReceiveMergePlan>,
-) -> bool {
+pub fn merge_plan_gate_for_incremental_receive(merge_plan: Option<&ReceiveMergePlan>) -> bool {
     merge_plan.is_some()
 }
 
@@ -46,10 +44,7 @@ pub fn merge_plan_gate_for_incremental_receive(
 ///
 /// When no merge plan is present, all objects are imported (`true`).
 #[must_use]
-pub fn should_import_object(
-    merge_plan: Option<&ReceiveMergePlan>,
-    object_key: &ObjectKey,
-) -> bool {
+pub fn should_import_object(merge_plan: Option<&ReceiveMergePlan>, object_key: &ObjectKey) -> bool {
     match merge_plan {
         Some(plan) => !plan.should_skip(object_key),
         None => true,
@@ -59,27 +54,28 @@ pub fn should_import_object(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoding::{ConflictInventory, ConflictEntry, ConflictClass, ConflictDivergence, InodeIdentityDivergence};
-    use crate::receive_merge_planner::{ReceiveMergePolicy, resolve_merge_policy};
+    use crate::encoding::{
+        ConflictClass, ConflictDivergence, ConflictEntry, ConflictInventory,
+        InodeIdentityDivergence,
+    };
+    use crate::receive_merge_planner::{resolve_merge_policy, ReceiveMergePolicy};
 
     fn make_test_inventory() -> ConflictInventory {
         ConflictInventory {
             common_ancestor_transaction_id: 1,
             common_ancestor_generation: 10,
-            entries: vec![
-                ConflictEntry {
-                    class: ConflictClass::InodeIdentity,
-                    divergence: ConflictDivergence::InodeIdentity(
-                        InodeIdentityDivergence::DifferentContentIdentity,
-                    ),
-                    stream_identity: "inode 100".into(),
-                    target_identity: "inode 100".into(),
-                    stream_txg: Some(5),
-                    target_txg: Some(3),
-                    stream_object_key: Some(ObjectKey::from_bytes32([0x01; 32])),
-                    target_object_key: None,
-                },
-            ],
+            entries: vec![ConflictEntry {
+                class: ConflictClass::InodeIdentity,
+                divergence: ConflictDivergence::InodeIdentity(
+                    InodeIdentityDivergence::DifferentContentIdentity,
+                ),
+                stream_identity: "inode 100".into(),
+                target_identity: "inode 100".into(),
+                stream_txg: Some(5),
+                target_txg: Some(3),
+                stream_object_key: Some(ObjectKey::from_bytes32([0x01; 32])),
+                target_object_key: None,
+            }],
         }
     }
 

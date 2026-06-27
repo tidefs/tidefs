@@ -928,7 +928,17 @@ pub const FATTR_CTIME: u32 = 1 << 10;
 
 /// Bitwise OR of all known FATTR bits. Bits outside this mask are reserved
 /// and must be rejected at the boundary.
-pub const FATTR_VALID_MASK: u32 = FATTR_MODE | FATTR_UID | FATTR_GID | FATTR_SIZE | FATTR_ATIME | FATTR_MTIME | FATTR_FH | FATTR_ATIME_NOW | FATTR_MTIME_NOW | FATTR_LOCKOWNER | FATTR_CTIME;
+pub const FATTR_VALID_MASK: u32 = FATTR_MODE
+    | FATTR_UID
+    | FATTR_GID
+    | FATTR_SIZE
+    | FATTR_ATIME
+    | FATTR_MTIME
+    | FATTR_FH
+    | FATTR_ATIME_NOW
+    | FATTR_MTIME_NOW
+    | FATTR_LOCKOWNER
+    | FATTR_CTIME;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1079,7 +1089,8 @@ impl LockSpec {
     #[must_use]
     pub fn validate(&self) -> Result<(), LockSpecValidateError> {
         let typ_ok = self.typ == F_RDLCK || self.typ == F_WRLCK || self.typ == F_UNLCK;
-        let whence_ok = self.whence == SEEK_SET || self.whence == SEEK_CUR || self.whence == SEEK_END;
+        let whence_ok =
+            self.whence == SEEK_SET || self.whence == SEEK_CUR || self.whence == SEEK_END;
         if typ_ok && whence_ok {
             Ok(())
         } else {
@@ -1382,11 +1393,7 @@ impl LockTracker {
     }
 
     #[must_use]
-    pub fn locks_for_mount_inode(
-        &self,
-        dataset_mount_id: u64,
-        inode: u64,
-    ) -> Option<&LockList> {
+    pub fn locks_for_mount_inode(&self, dataset_mount_id: u64, inode: u64) -> Option<&LockList> {
         self.locks_by_inode.get(&(dataset_mount_id, inode))
     }
 
@@ -1447,12 +1454,7 @@ impl LockTracker {
     }
 
     /// Release all locks held by `pid` on a single inode within a mount.
-    pub fn release_by_pid_mount_inode(
-        &mut self,
-        dataset_mount_id: u64,
-        inode: u64,
-        pid: u32,
-    ) {
+    pub fn release_by_pid_mount_inode(&mut self, dataset_mount_id: u64, inode: u64, pid: u32) {
         let key = (dataset_mount_id, inode);
         let mut remove = false;
         if let Some(lock_list) = self.locks_by_inode.get_mut(&key) {
@@ -1468,12 +1470,7 @@ impl LockTracker {
 
     /// Release all locks held through file-description `owner` on a
     /// single inode within a mount.
-    pub fn release_by_owner_mount_inode(
-        &mut self,
-        dataset_mount_id: u64,
-        inode: u64,
-        owner: u64,
-    ) {
+    pub fn release_by_owner_mount_inode(&mut self, dataset_mount_id: u64, inode: u64, owner: u64) {
         let key = (dataset_mount_id, inode);
         let mut remove = false;
         if let Some(lock_list) = self.locks_by_inode.get_mut(&key) {
@@ -1741,10 +1738,8 @@ impl InodeFlags {
 
     /// Bitwise OR of all known inode flag bits. Bits outside this mask
     /// are reserved and must be rejected.
-    pub const FLAG_VALID_MASK: u32 = Self::FLAG_IMMUTABLE
-        | Self::FLAG_APPEND_ONLY
-        | Self::FLAG_NODUMP
-        | Self::FLAG_NOATIME;
+    pub const FLAG_VALID_MASK: u32 =
+        Self::FLAG_IMMUTABLE | Self::FLAG_APPEND_ONLY | Self::FLAG_NODUMP | Self::FLAG_NOATIME;
 
     /// Encode the flag fields into a raw `u32` suitable for
     /// `tidefs_posix_semantics` enforcement predicates.
@@ -8593,7 +8588,6 @@ mod dir_entry_tests {
     fn dir_entry_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DirEntry>();
-
     }
 }
 
@@ -8604,10 +8598,17 @@ mod setattr_validate_tests {
     #[test]
     fn valid_with_all_known_bits_passes() {
         let sa = SetAttr {
-            valid: FATTR_MODE | FATTR_UID | FATTR_GID | FATTR_SIZE
-                | FATTR_ATIME | FATTR_MTIME | FATTR_FH
-                | FATTR_ATIME_NOW | FATTR_MTIME_NOW
-                | FATTR_LOCKOWNER | FATTR_CTIME,
+            valid: FATTR_MODE
+                | FATTR_UID
+                | FATTR_GID
+                | FATTR_SIZE
+                | FATTR_ATIME
+                | FATTR_MTIME
+                | FATTR_FH
+                | FATTR_ATIME_NOW
+                | FATTR_MTIME_NOW
+                | FATTR_LOCKOWNER
+                | FATTR_CTIME,
             ..SetAttr::default()
         };
         assert!(sa.validate().is_ok());
@@ -8652,7 +8653,9 @@ mod posix_attrs_validate_tests {
 
     #[test]
     fn valid_mode_types_pass() {
-        for mt in [S_IFREG, S_IFDIR, S_IFLNK, S_IFBLK, S_IFCHR, S_IFIFO, S_IFSOCK] {
+        for mt in [
+            S_IFREG, S_IFDIR, S_IFLNK, S_IFBLK, S_IFCHR, S_IFIFO, S_IFSOCK,
+        ] {
             let pa = PosixAttrs {
                 mode: mt | 0o755,
                 ..PosixAttrs::default()
@@ -8732,7 +8735,8 @@ mod inode_flags_validate_tests {
         let err = InodeFlags::from_raw_flags(0x1).expect_err("bit 0 unknown");
         assert_eq!(err.unknown_bits, 0x1);
 
-        let err = InodeFlags::from_raw_flags(InodeFlags::FLAG_VALID_MASK | 0x100).expect_err("bit 8 unknown");
+        let err = InodeFlags::from_raw_flags(InodeFlags::FLAG_VALID_MASK | 0x100)
+            .expect_err("bit 8 unknown");
         assert_eq!(err.unknown_bits, 0x100);
     }
 
@@ -8864,21 +8868,13 @@ mod tide_completion_validate_tests {
 
     #[test]
     fn zero_result_flags_passes() {
-        let tc = TideCompletion::success(
-            RequestId::ZERO,
-            TraceId::ZERO,
-            ContractEpoch::new(1),
-        );
+        let tc = TideCompletion::success(RequestId::ZERO, TraceId::ZERO, ContractEpoch::new(1));
         assert!(tc.validate().is_ok());
     }
 
     #[test]
     fn non_zero_result_flags_rejects() {
-        let mut tc = TideCompletion::success(
-            RequestId::ZERO,
-            TraceId::ZERO,
-            ContractEpoch::new(1),
-        );
+        let mut tc = TideCompletion::success(RequestId::ZERO, TraceId::ZERO, ContractEpoch::new(1));
         tc.result_flags = 0xDEAD;
         let err = tc.validate().expect_err("non-zero flags");
         assert_eq!(err.result_flags, 0xDEAD);

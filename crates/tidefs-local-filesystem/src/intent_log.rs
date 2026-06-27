@@ -1469,12 +1469,13 @@ fn replay_namespace_create_intent(
         });
     }
 
-    let parent_dir = state
-        .directories
-        .get(&intent.parent_inode_id)
-        .ok_or(FileSystemError::CorruptState {
-            reason: "intent log replay: namespace create parent directory not found",
-        })?;
+    let parent_dir =
+        state
+            .directories
+            .get(&intent.parent_inode_id)
+            .ok_or(FileSystemError::CorruptState {
+                reason: "intent log replay: namespace create parent directory not found",
+            })?;
     if let Some(existing) = state.inodes.get(&intent.inode.inode_id) {
         if existing != &intent.inode {
             return Err(FileSystemError::CorruptState {
@@ -2124,13 +2125,11 @@ mod tests {
         let namespace_entry = namespace_entry("null", &inode);
         let entry = IntentLogEntry {
             entry_id: 44,
-            entry_kind: IntentLogEntryKind::NamespaceCreateIntent(
-                NamespaceCreateIntentRecord {
-                    parent_inode_id: ROOT_INODE_ID,
-                    entry: namespace_entry,
-                    inode,
-                },
-            ),
+            entry_kind: IntentLogEntryKind::NamespaceCreateIntent(NamespaceCreateIntentRecord {
+                parent_inode_id: ROOT_INODE_ID,
+                entry: namespace_entry,
+                inode,
+            }),
             root_anchor: test_root_anchor(),
             timestamp_ns: test_timestamp(),
         };
@@ -2934,8 +2933,12 @@ mod tests {
     fn encoded_entry_len_various_kinds() {
         let anchor = test_root_anchor();
         let ts = test_timestamp();
-        let special_node =
-            special_inode(InodeId::new(103), NodeKind::CharDev, S_IFCHR | 0o600, 0x0103);
+        let special_node = special_inode(
+            InodeId::new(103),
+            NodeKind::CharDev,
+            S_IFCHR | 0o600,
+            0x0103,
+        );
 
         let cases: Vec<IntentLogEntry> = vec![
             IntentLogEntry {
@@ -3050,12 +3053,7 @@ mod tests {
         state.observe_explicit_inode_id(inode_id);
     }
 
-    fn special_inode(
-        inode_id: InodeId,
-        kind: NodeKind,
-        mode: u32,
-        rdev: u32,
-    ) -> InodeRecord {
+    fn special_inode(inode_id: InodeId, kind: NodeKind, mode: u32, rdev: u32) -> InodeRecord {
         InodeRecord {
             rdev,
             dir_storage_kind: 0,
@@ -3355,7 +3353,12 @@ mod tests {
     fn replay_namespace_create_intent_is_idempotent() {
         let (mut store, _dir) = test_store();
         let mut state = minimal_state();
-        let inode = special_inode(InodeId::new(250), NodeKind::CharDev, S_IFCHR | 0o600, 0x0105);
+        let inode = special_inode(
+            InodeId::new(250),
+            NodeKind::CharDev,
+            S_IFCHR | 0o600,
+            0x0105,
+        );
         let intent = NamespaceCreateIntentRecord {
             parent_inode_id: ROOT_INODE_ID,
             entry: namespace_entry("tty", &inode),

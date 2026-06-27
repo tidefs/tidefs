@@ -47,9 +47,7 @@ pub enum DedupDecision {
     /// Redirect this logical write to an existing canonical object.
     /// The pipeline still protects the redirect record with whatever
     /// checksum/encryption policy applies.
-    RedirectToCanonical {
-        canonical_key: ObjectKey,
-    },
+    RedirectToCanonical { canonical_key: ObjectKey },
     /// Dedup is disabled or inapplicable for this content class.
     Bypass,
 }
@@ -338,17 +336,13 @@ impl TransformPipelineAuthority {
             None => {
                 // Explicit uncompressed identity frame — return as plaintext.
                 // Strip the 5-byte frame header if present.
-                if compression_frame.len()
-                    >= StoredFrameMetadata::COMPRESSION_FRAME_HEADER_LEN
-                {
+                if compression_frame.len() >= StoredFrameMetadata::COMPRESSION_FRAME_HEADER_LEN {
                     let header_alg =
                         crate::compress::CompressionAlgorithm::from_byte(compression_frame[0]);
                     if header_alg == Some(CompressionAlgorithm::Uncompressed) {
-                        return Ok(
-                            compression_frame
-                                [StoredFrameMetadata::COMPRESSION_FRAME_HEADER_LEN..]
-                                .to_vec(),
-                        );
+                        return Ok(compression_frame
+                            [StoredFrameMetadata::COMPRESSION_FRAME_HEADER_LEN..]
+                            .to_vec());
                     }
                 }
                 Ok(compression_frame.to_vec())
@@ -375,8 +369,8 @@ impl TransformPipelineAuthority {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encrypt::StoreEncryptionKey;
     use crate::compress::CompressionAlgorithm;
+    use crate::encrypt::StoreEncryptionKey;
 
     fn test_compression_config() -> CompressionConfig {
         CompressionConfig {
@@ -522,10 +516,8 @@ mod tests {
     #[test]
     fn encrypted_frame_fails_closed_without_key() {
         let enc_key = test_encryption_config();
-        let encrypt_pipeline = TransformPipelineAuthority::with_encryption(
-            test_compression_config(),
-            enc_key,
-        );
+        let encrypt_pipeline =
+            TransformPipelineAuthority::with_encryption(test_compression_config(), enc_key);
         let plaintext = b"this should fail closed when read without a key";
 
         let (frame, meta) = encrypt_pipeline
@@ -555,12 +547,10 @@ mod tests {
 
         // With zstd, the framed output should have the 5-byte header.
         assert!(framed.len() >= 5);
-        assert!(
-            matches!(
-                decision,
-                CompressionDecision::Compressed(_) | CompressionDecision::UncompressedIdentity
-            )
-        );
+        assert!(matches!(
+            decision,
+            CompressionDecision::Compressed(_) | CompressionDecision::UncompressedIdentity
+        ));
     }
 
     #[test]

@@ -613,8 +613,8 @@ mod tests {
     fn evidence_counters_sum_to_reachable() {
         let mut q = HealthQuorum::new();
         q.add_sample(sample_with_receipt(1, 5, 1000, 10)); // fresh
-        q.add_sample(sample_with_receipt(2, 5, 100, 20));  // stale (old timestamp)
-        q.add_sample(healthy_sample(3, 5, 1000));           // missing receipt
+        q.add_sample(sample_with_receipt(2, 5, 100, 20)); // stale (old timestamp)
+        q.add_sample(healthy_sample(3, 5, 1000)); // missing receipt
         q.add_sample(sample_with_receipt(4, 3, 1000, 30)); // older epoch → missing
         let result = q.compute(EpochId::new(5), 100000, 500);
         // 1 fresh, 1 stale, 2 missing = 4 reachable

@@ -553,8 +553,8 @@ pub enum LockQueueError {
 
 #[cfg(test)]
 mod tests {
-    use tidefs_membership_epoch::DatasetMountIdentity;
     use super::*;
+    use tidefs_membership_epoch::DatasetMountIdentity;
     use tidefs_membership_epoch::EpochId;
 
     fn mid(v: u64) -> MemberId {
@@ -959,8 +959,5 @@ mod tests {
         let json = serde_json::to_string(&owner).unwrap();
         let owner2: LockOwner = serde_json::from_str(&json).unwrap();
         assert_eq!(owner, owner2);
-    
-
-
-}
+    }
 }

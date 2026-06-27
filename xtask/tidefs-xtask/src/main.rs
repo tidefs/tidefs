@@ -977,7 +977,9 @@ fn main() {
             let artifact_path = match args.next() {
                 Some(path) => path,
                 None => {
-                    eprintln!("validate-kernel-teardown-runtime-artifact requires an artifact path");
+                    eprintln!(
+                        "validate-kernel-teardown-runtime-artifact requires an artifact path"
+                    );
                     process::exit(2);
                 }
             };

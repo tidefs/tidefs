@@ -458,7 +458,12 @@ mod tests {
 
     // ── Evidence classification tests ─────────────────────────────
 
-    fn mk_sample(device_id: u64, epoch: u64, timestamp_ns: u64, receipt: Option<u64>) -> HealthSample {
+    fn mk_sample(
+        device_id: u64,
+        epoch: u64,
+        timestamp_ns: u64,
+        receipt: Option<u64>,
+    ) -> HealthSample {
         HealthSample {
             device_id,
             epoch: EpochId::new(epoch),
@@ -532,17 +537,32 @@ mod tests {
 
     #[test]
     fn evidence_class_labels() {
-        assert_eq!(ProbeEvidenceClass::FreshRepairEvidence.label(), "fresh_repair_evidence");
+        assert_eq!(
+            ProbeEvidenceClass::FreshRepairEvidence.label(),
+            "fresh_repair_evidence"
+        );
         assert_eq!(ProbeEvidenceClass::StaleEvidence.label(), "stale_evidence");
-        assert_eq!(ProbeEvidenceClass::MissingReceiptEvidence.label(), "missing_receipt_evidence");
-        assert_eq!(ProbeEvidenceClass::OlderEpochEvidence.label(), "older_epoch_evidence");
+        assert_eq!(
+            ProbeEvidenceClass::MissingReceiptEvidence.label(),
+            "missing_receipt_evidence"
+        );
+        assert_eq!(
+            ProbeEvidenceClass::OlderEpochEvidence.label(),
+            "older_epoch_evidence"
+        );
     }
 
     #[test]
     fn attestation_carries_receipt_id_roundtrip() {
         let probe = test_probe();
         let nonce = probe.generate_nonce();
-        let att = probe.attest(1, EpochId::new(5), &nonce, 1000, Some(ReplicatedReceiptId(123)));
+        let att = probe.attest(
+            1,
+            EpochId::new(5),
+            &nonce,
+            1000,
+            Some(ReplicatedReceiptId(123)),
+        );
         assert_eq!(att.receipt_id, Some(ReplicatedReceiptId(123)));
         assert!(probe.verify(&att));
 
@@ -563,7 +583,13 @@ mod tests {
     fn receipt_included_in_auth_tag() {
         let probe = test_probe();
         let nonce = probe.generate_nonce();
-        let att_with = probe.attest(1, EpochId::new(5), &nonce, 1000, Some(ReplicatedReceiptId(42)));
+        let att_with = probe.attest(
+            1,
+            EpochId::new(5),
+            &nonce,
+            1000,
+            Some(ReplicatedReceiptId(42)),
+        );
         let att_without = probe.attest(1, EpochId::new(5), &nonce, 1000, None);
         assert_ne!(att_with.tag, att_without.tag);
     }

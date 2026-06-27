@@ -501,8 +501,7 @@ impl SimpleFS {
                     // Physical content file size (includes directory descriptors)
                     let content_path = contents_dir.join(inode_num.to_string());
                     if let Ok(meta) = fs::metadata(&content_path) {
-                        physical_content_bytes =
-                            physical_content_bytes.saturating_add(meta.len());
+                        physical_content_bytes = physical_content_bytes.saturating_add(meta.len());
                     }
                 }
             }
@@ -534,11 +533,8 @@ impl SimpleFS {
                     stat.f_bsize as u64
                 })
                 .max(1);
-                let to_blocks = |fragments: u64| {
-                    fragments
-                        .saturating_mul(fragment_size)
-                        .div_ceil(BLOCK_SIZE)
-                };
+                let to_blocks =
+                    |fragments: u64| fragments.saturating_mul(fragment_size).div_ceil(BLOCK_SIZE);
                 (
                     to_blocks(stat.f_blocks as u64).max(used_blocks),
                     to_blocks(stat.f_bfree as u64),
@@ -557,7 +553,6 @@ impl SimpleFS {
             MAX_NAME_LENGTH,
         )
     }
-
 }
 
 impl Filesystem for SimpleFS {

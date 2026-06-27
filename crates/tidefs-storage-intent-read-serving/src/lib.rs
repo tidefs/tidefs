@@ -675,9 +675,7 @@ pub const fn read_source_requires_receipt(source: StorageIntentReadSourceClass) 
 /// Returns true when a source needs metadata/namespace evidence even if the
 /// caller did not request an explicit namespace generation floor.
 #[must_use]
-pub const fn read_source_requires_metadata_namespace(
-    source: StorageIntentReadSourceClass,
-) -> bool {
+pub const fn read_source_requires_metadata_namespace(source: StorageIntentReadSourceClass) -> bool {
     matches!(
         source,
         StorageIntentReadSourceClass::MetadataHotLookup

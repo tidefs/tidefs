@@ -1107,7 +1107,6 @@ impl LocalObjectStore {
         }
     }
 
-
     fn build_compaction_checksum_tree(
         key: ObjectKey,
         target_location: ObjectLocation,

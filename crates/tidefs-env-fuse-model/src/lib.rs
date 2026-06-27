@@ -1154,7 +1154,10 @@ impl FuseAdapterModelBounds {
             canonical_contract_requests: trace
                 .iter()
                 .filter(|step| {
-                    matches!(&step.request, Some(AdapterContractRequest::Canonical { .. }))
+                    matches!(
+                        &step.request,
+                        Some(AdapterContractRequest::Canonical { .. })
+                    )
                 })
                 .count(),
             adapter_only_requests: trace
@@ -1512,11 +1515,12 @@ mod tests {
     fn generated_trace_produces_contract_requests_and_completions() {
         let trace = issue_290_acceptance_trace().expect("issue #290 trace remains legal");
 
-        let canonical = trace
-            .iter()
-            .filter(|step| {
-                matches!(&step.request, Some(AdapterContractRequest::Canonical { .. }))
-            });
+        let canonical = trace.iter().filter(|step| {
+            matches!(
+                &step.request,
+                Some(AdapterContractRequest::Canonical { .. })
+            )
+        });
         assert!(canonical.count() >= 3);
 
         assert!(trace.iter().any(|step| {
@@ -1543,8 +1547,10 @@ mod tests {
         }));
 
         assert!(trace.iter().any(|step| {
-            matches!(&step.request, Some(AdapterContractRequest::Canonical { .. }))
-                && step.completion.is_some()
+            matches!(
+                &step.request,
+                Some(AdapterContractRequest::Canonical { .. })
+            ) && step.completion.is_some()
         }));
     }
 

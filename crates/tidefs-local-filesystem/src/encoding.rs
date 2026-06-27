@@ -337,51 +337,52 @@ pub(crate) fn decode_snapshot_record(bytes: &[u8]) -> Result<SnapshotRecord> {
     validate_snapshot_name(&name)?;
     let created_at_generation = decoder.read_u64()?;
     let root = decode_committed_root_summary(&mut decoder)?;
-    let (kind, origin, hold_count, hold_tag) = if decoder.try_peek_magic(SNAPSHOT_RECORD_V3_MAGIC_BYTES) {
-        // V3: includes hold_tag
-        decoder.expect_magic(SNAPSHOT_RECORD_V3_MAGIC_BYTES)?;
-        let kind_val = decoder.read_u16()?;
-        let kind = match kind_val {
-            0 => SnapshotKind::Snapshot,
-            1 => SnapshotKind::Clone,
-            2 => SnapshotKind::Bookmark,
-            _ => SnapshotKind::Snapshot,
-        };
-        let origin = if decoder.read_u16()? == 1 {
-            let origin_len = decoder.read_u32()? as usize;
-            Some(decoder.read_bytes(origin_len)?.to_vec())
+    let (kind, origin, hold_count, hold_tag) =
+        if decoder.try_peek_magic(SNAPSHOT_RECORD_V3_MAGIC_BYTES) {
+            // V3: includes hold_tag
+            decoder.expect_magic(SNAPSHOT_RECORD_V3_MAGIC_BYTES)?;
+            let kind_val = decoder.read_u16()?;
+            let kind = match kind_val {
+                0 => SnapshotKind::Snapshot,
+                1 => SnapshotKind::Clone,
+                2 => SnapshotKind::Bookmark,
+                _ => SnapshotKind::Snapshot,
+            };
+            let origin = if decoder.read_u16()? == 1 {
+                let origin_len = decoder.read_u32()? as usize;
+                Some(decoder.read_bytes(origin_len)?.to_vec())
+            } else {
+                None
+            };
+            let hold_count = decoder.read_u32()?;
+            let hold_tag = if decoder.read_u16()? == 1 {
+                let tag_len = decoder.read_u32()? as usize;
+                Some(String::from_utf8_lossy(decoder.read_bytes(tag_len)?).into_owned())
+            } else {
+                None
+            };
+            (kind, origin, hold_count, hold_tag)
+        } else if decoder.try_peek_magic(SNAPSHOT_RECORD_V2_MAGIC_BYTES) {
+            // V2: no hold_tag field
+            decoder.expect_magic(SNAPSHOT_RECORD_V2_MAGIC_BYTES)?;
+            let kind_val = decoder.read_u16()?;
+            let kind = match kind_val {
+                0 => SnapshotKind::Snapshot,
+                1 => SnapshotKind::Clone,
+                2 => SnapshotKind::Bookmark,
+                _ => SnapshotKind::Snapshot,
+            };
+            let origin = if decoder.read_u16()? == 1 {
+                let origin_len = decoder.read_u32()? as usize;
+                Some(decoder.read_bytes(origin_len)?.to_vec())
+            } else {
+                None
+            };
+            let hold_count = decoder.read_u32()?;
+            (kind, origin, hold_count, None)
         } else {
-            None
+            (SnapshotKind::Snapshot, None, 0, None)
         };
-        let hold_count = decoder.read_u32()?;
-        let hold_tag = if decoder.read_u16()? == 1 {
-            let tag_len = decoder.read_u32()? as usize;
-            Some(String::from_utf8_lossy(decoder.read_bytes(tag_len)?).into_owned())
-        } else {
-            None
-        };
-        (kind, origin, hold_count, hold_tag)
-    } else if decoder.try_peek_magic(SNAPSHOT_RECORD_V2_MAGIC_BYTES) {
-        // V2: no hold_tag field
-        decoder.expect_magic(SNAPSHOT_RECORD_V2_MAGIC_BYTES)?;
-        let kind_val = decoder.read_u16()?;
-        let kind = match kind_val {
-            0 => SnapshotKind::Snapshot,
-            1 => SnapshotKind::Clone,
-            2 => SnapshotKind::Bookmark,
-            _ => SnapshotKind::Snapshot,
-        };
-        let origin = if decoder.read_u16()? == 1 {
-            let origin_len = decoder.read_u32()? as usize;
-            Some(decoder.read_bytes(origin_len)?.to_vec())
-        } else {
-            None
-        };
-        let hold_count = decoder.read_u32()?;
-        (kind, origin, hold_count, None)
-    } else {
-        (SnapshotKind::Snapshot, None, 0, None)
-    };
     decoder.finish()?;
     Ok(SnapshotRecord {
         name,
@@ -1631,7 +1632,9 @@ pub(crate) fn decode_dedup_redirect(bytes: &[u8]) -> crate::Result<ObjectKey> {
 
 #[allow(dead_code)]
 /// Top-level conflict axis defined by the receive merge planner design §1.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub enum ConflictClass {
     /// Inode identity conflict (§1.1): same inode_id, different record fields.
     InodeIdentity = 1,
@@ -1824,7 +1827,6 @@ impl ConflictInventory {
         serde_json::to_string(self)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

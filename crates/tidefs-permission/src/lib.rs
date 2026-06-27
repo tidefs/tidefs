@@ -1200,10 +1200,16 @@ impl core::fmt::Display for PermissionDefaultAclInheritanceError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::InvalidParentMount { .. } => {
-                write!(f, "invalid parent mount identity for default ACL inheritance")
+                write!(
+                    f,
+                    "invalid parent mount identity for default ACL inheritance"
+                )
             }
             Self::InvalidChildMount { .. } => {
-                write!(f, "invalid child mount identity for default ACL inheritance")
+                write!(
+                    f,
+                    "invalid child mount identity for default ACL inheritance"
+                )
             }
             Self::CrossMountInheritance { .. } => {
                 write!(f, "cross-mount default ACL inheritance is forbidden")
@@ -1245,17 +1251,18 @@ pub fn plan_permission_default_acl_inheritance(
     parent_mount_identity: &MountIdentity,
     child_mount_identity: &MountIdentity,
 ) -> Result<PermissionDefaultAclInheritancePlan, PermissionDefaultAclInheritanceError> {
-    validate_mount_identity(parent_mount_identity).map_err(|source| {
-        PermissionDefaultAclInheritanceError::InvalidParentMount { source }
-    })?;
+    validate_mount_identity(parent_mount_identity)
+        .map_err(|source| PermissionDefaultAclInheritanceError::InvalidParentMount { source })?;
     validate_mount_identity(child_mount_identity)
         .map_err(|source| PermissionDefaultAclInheritanceError::InvalidChildMount { source })?;
 
     if parent_mount_identity != child_mount_identity {
-        return Err(PermissionDefaultAclInheritanceError::CrossMountInheritance {
-            parent: *parent_mount_identity,
-            child: *child_mount_identity,
-        });
+        return Err(
+            PermissionDefaultAclInheritanceError::CrossMountInheritance {
+                parent: *parent_mount_identity,
+                child: *child_mount_identity,
+            },
+        );
     }
 
     let acl_plan = plan_posix_acl_default_inheritance(parent_default_acl, new_mode, is_directory)
@@ -1289,7 +1296,10 @@ pub fn plan_permission_default_acl_xattrs(
         xattrs.push((POSIX_ACL_ACCESS_XATTR, encode_posix_acl_xattr(&access_acl)));
     }
     if let Some(default_acl) = plan.acl_plan.child_default_acl {
-        xattrs.push((POSIX_ACL_DEFAULT_XATTR, encode_posix_acl_xattr(&default_acl)));
+        xattrs.push((
+            POSIX_ACL_DEFAULT_XATTR,
+            encode_posix_acl_xattr(&default_acl),
+        ));
     }
 
     Ok(xattrs)
@@ -2685,14 +2695,9 @@ mod tests {
 
     #[test]
     fn permission_default_acl_inheritance_empty_parent_is_noop() {
-        let plan = plan_permission_default_acl_inheritance(
-            &[],
-            0o755,
-            true,
-            &VALID_MOUNT,
-            &VALID_MOUNT,
-        )
-        .expect("empty parent ACL is a valid no-op");
+        let plan =
+            plan_permission_default_acl_inheritance(&[], 0o755, true, &VALID_MOUNT, &VALID_MOUNT)
+                .expect("empty parent ACL is a valid no-op");
 
         assert_eq!(plan.parent_mount_identity, VALID_MOUNT);
         assert_eq!(plan.child_mount_identity, VALID_MOUNT);
@@ -2788,10 +2793,12 @@ mod tests {
                 &VALID_MOUNT,
                 &child_mount,
             ),
-            Err(PermissionDefaultAclInheritanceError::CrossMountInheritance {
-                parent: VALID_MOUNT,
-                child: child_mount,
-            })
+            Err(
+                PermissionDefaultAclInheritanceError::CrossMountInheritance {
+                    parent: VALID_MOUNT,
+                    child: child_mount,
+                }
+            )
         );
     }
 

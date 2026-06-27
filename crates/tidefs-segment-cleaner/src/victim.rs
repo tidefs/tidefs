@@ -127,7 +127,9 @@ impl VictimSelector {
     /// Returns `None` when no segment meets the criteria.
     #[must_use]
     pub fn select(&self, current_commit_group: u64) -> Option<u64> {
-        self.select_batch(current_commit_group, 1).into_iter().next()
+        self.select_batch(current_commit_group, 1)
+            .into_iter()
+            .next()
     }
 
     /// Select up to `limit` candidates in cleaner-owned order, respecting

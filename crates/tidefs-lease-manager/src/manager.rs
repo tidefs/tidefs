@@ -2,13 +2,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tidefs_cache_coherency::{
-    CacheInvalidationMessage, CacheInvalidationReason, CoherencyEventBus,
-    InvalidationResult, InvalidationWaitPolicy,
+    CacheInvalidationMessage, CacheInvalidationReason, CoherencyEventBus, InvalidationResult,
+    InvalidationWaitPolicy,
 };
 use tidefs_lease::types::{LeaseClass, LeaseDomain, LeaseError, LeaseGrant, LeaseLifecycle};
 use tidefs_lease::{
-    CacheInvalidationPayload, InvalidationAckPayload, LeaseMessage,
-    LeaseMessageCodec, LeaseProtocolError,
+    CacheInvalidationPayload, InvalidationAckPayload, LeaseMessage, LeaseMessageCodec,
+    LeaseProtocolError,
 };
 use tidefs_membership_epoch::{DatasetMountIdentity, EpochId, MemberId};
 
@@ -262,9 +262,7 @@ impl LeaseManager {
                         }
                     }
                     InvalidationWaitPolicy::FenceAndError => {
-                        if result.dirty_remaining > 0
-                            || !result.dirty_drained
-                            || result.needs_retry
+                        if result.dirty_remaining > 0 || !result.dirty_drained || result.needs_retry
                         {
                             self.stats.invalidations_fenced += 1;
                             Err(LeaseManagerError::InvalidationFenced(
@@ -285,7 +283,6 @@ impl LeaseManager {
             Ok(InvalidationResult::clean(0))
         }
     }
-
 
     pub fn grant(
         &mut self,
@@ -567,7 +564,6 @@ impl LeaseManager {
             }))
         }
     }
-
 
     /// Dispatch cache invalidation for a revoked lease's domain.
     ///

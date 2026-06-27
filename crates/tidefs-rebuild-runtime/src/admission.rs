@@ -616,9 +616,7 @@ mod tests {
             err,
             ReceiptIngestionError::SyntheticReceiptRef { object_id: 77 }
         );
-        assert!(err
-            .to_string()
-            .contains("durable source placement receipt"));
+        assert!(err.to_string().contains("durable source placement receipt"));
     }
 
     #[test]

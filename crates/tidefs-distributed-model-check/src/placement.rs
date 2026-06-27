@@ -36,7 +36,11 @@ impl PlacementReceiptState {
         durable: bool,
     ) -> Self {
         let receipt_ref = model_placement_receipt_ref(object_id, object_key_str, epoch);
-        Self { receipt_ref, node_id, durable }
+        Self {
+            receipt_ref,
+            node_id,
+            durable,
+        }
     }
 
     /// The epoch of this receipt.
@@ -112,12 +116,7 @@ impl PlacementModel {
     }
 
     /// Attempt a rebuild or reclaim operation.  Returns true if permitted.
-    pub fn try_rebuild(
-        &mut self,
-        object_key: &str,
-        target_node: u64,
-        epoch: u64,
-    ) -> bool {
+    pub fn try_rebuild(&mut self, object_key: &str, target_node: u64, epoch: u64) -> bool {
         let has_receipt = self.has_durable_receipt(object_key);
         let allowed = match self.policy {
             RebuildPolicy::RequireDurableReceipt => has_receipt,
@@ -155,9 +154,9 @@ pub fn model_placement_receipt_ref(
         EpochId::new(epoch),
         0, // receipt_generation
         ReceiptRedundancyPolicy::Replicated { copies: 1 },
-        0, // payload_len
+        0,         // payload_len
         [0u8; 32], // payload_digest
-        1, // target_count
+        1,         // target_count
     )
 }
 

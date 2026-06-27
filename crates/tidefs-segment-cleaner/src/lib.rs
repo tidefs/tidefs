@@ -314,7 +314,10 @@ pub enum SegmentCleanerError {
     SegmentNotFound(u64),
     CompactionFailed(u64),
     FreeFailed(u64),
-    CompactionHandoffFailed { segment_id: u64, reason: String },
+    CompactionHandoffFailed {
+        segment_id: u64,
+        reason: String,
+    },
     /// A block read, write, or index update failed during relocation.
     RelocationFailed(String),
 }
@@ -1141,7 +1144,10 @@ mod tests {
             &mut self,
             victim: PartialSegmentHandoff,
         ) -> Result<(), SegmentCleanerError> {
-            let result = self.handoff_results.remove(&victim.segment_id).unwrap_or(Ok(()));
+            let result = self
+                .handoff_results
+                .remove(&victim.segment_id)
+                .unwrap_or(Ok(()));
             if result.is_ok() {
                 self.handoffs.push(victim);
             }
@@ -1405,16 +1411,14 @@ mod tests {
         assert!(!format!("{}", SegmentCleanerError::SegmentNotFound(1)).is_empty());
         assert!(!format!("{}", SegmentCleanerError::CompactionFailed(2)).is_empty());
         assert!(!format!("{}", SegmentCleanerError::FreeFailed(3)).is_empty());
-        assert!(
-            !format!(
-                "{}",
-                SegmentCleanerError::CompactionHandoffFailed {
-                    segment_id: 4,
-                    reason: "test".into()
-                }
-            )
-            .is_empty()
-        );
+        assert!(!format!(
+            "{}",
+            SegmentCleanerError::CompactionHandoffFailed {
+                segment_id: 4,
+                reason: "test".into()
+            }
+        )
+        .is_empty());
         assert!(!format!("{}", SegmentCleanerError::RelocationFailed("test".into())).is_empty());
     }
     #[test]

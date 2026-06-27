@@ -4854,9 +4854,7 @@ fn handle_frame_ctx(
                     // put_named_with_receipt and is now carried through
                     // the transport result.
                     match ts.put_named_with_receipt(key, value, *placement_receipt_ref) {
-                        Ok(outcome) if outcome.quorum_reached => {
-                            Ok(outcome.recorded_receipt_ref)
-                        }
+                        Ok(outcome) if outcome.quorum_reached => Ok(outcome.recorded_receipt_ref),
                         Ok(outcome) => Err(format!(
                             "write quorum not reached: {}/{} acknowledgements (need {})",
                             outcome.acks, outcome.total_targets, outcome.quorum_size

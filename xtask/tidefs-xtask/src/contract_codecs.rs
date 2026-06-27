@@ -50,23 +50,24 @@ pub fn check_contract_codecs_current_workspace() -> Result<(), String> {
 
 fn validate_contract_manifest_current_workspace() -> Result<usize, String> {
     let manifest_path = repo_root().join(CONTRACT_MANIFEST_REL);
-    let manifest_dir = manifest_path
-        .parent()
-        .ok_or_else(|| {
-            format!(
-                "format-golden manifest path has no parent directory: {}",
-                manifest_path.display()
-            )
-        })?;
-    let manifest_data = fs::read_to_string(&manifest_path)
-        .map_err(|err| format!("read format-golden manifest {}: {err}", manifest_path.display()))?;
-    let manifest: ContractGoldenManifest = serde_json::from_str(&manifest_data)
-        .map_err(|err| {
-            format!(
-                "parse format-golden manifest {}: {err}",
-                manifest_path.display()
-            )
-        })?;
+    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        format!(
+            "format-golden manifest path has no parent directory: {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest_data = fs::read_to_string(&manifest_path).map_err(|err| {
+        format!(
+            "read format-golden manifest {}: {err}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: ContractGoldenManifest = serde_json::from_str(&manifest_data).map_err(|err| {
+        format!(
+            "parse format-golden manifest {}: {err}",
+            manifest_path.display()
+        )
+    })?;
 
     let mut errors = Vec::new();
     if manifest.format_version != "v1" {

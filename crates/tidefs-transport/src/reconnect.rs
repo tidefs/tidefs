@@ -528,7 +528,11 @@ pub enum ReconnectError {
     /// peer's epoch is stale. This is a terminal error: the reconnecting
     /// peer must obtain the current epoch before retrying.
     #[error("session {session_id} resume rejected: peer reports stale epoch (claimed {claimed_epoch}, current {current_epoch})")]
-    ResumeStaleEpoch { session_id: u64, claimed_epoch: u64, current_epoch: u64 },
+    ResumeStaleEpoch {
+        session_id: u64,
+        claimed_epoch: u64,
+        current_epoch: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -592,7 +596,12 @@ impl ReconnectDriver {
 
     /// Create a new reconnect driver with an explicit membership epoch.
     #[must_use]
-    pub fn with_epoch(session_id: u64, session_key: [u8; 32], config: ReconnectConfig, epoch: u64) -> Self {
+    pub fn with_epoch(
+        session_id: u64,
+        session_key: [u8; 32],
+        config: ReconnectConfig,
+        epoch: u64,
+    ) -> Self {
         let max_retries = config.max_retries;
         let policy = config.to_policy();
         let mut s = ReconnectState::with_policy(policy);
@@ -715,7 +724,12 @@ impl ReconnectDriver {
         &self,
         last_acknowledged_seq: MessageSequenceNumber,
     ) -> SessionResumeRequest {
-        SessionResumeRequest::new(self.session_id, &self.session_key, last_acknowledged_seq, self.epoch)
+        SessionResumeRequest::new(
+            self.session_id,
+            &self.session_key,
+            last_acknowledged_seq,
+            self.epoch,
+        )
     }
 
     /// Verify a `SessionResumeResponse` digest against the stored key.

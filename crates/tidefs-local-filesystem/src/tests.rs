@@ -3020,7 +3020,10 @@ fn changed_record_send_receive_round_trips_current_root_and_snapshot() {
             options(),
             &wrong_spec,
             target_key,
-        [0; 16], [0; 16], None)
+            [0; 16],
+            [0; 16],
+            None,
+        )
         .expect_err("wrong send/receive spec must be rejected");
     assert!(matches!(err, FileSystemError::Decode { .. }));
     assert!(
@@ -3034,7 +3037,10 @@ fn changed_record_send_receive_round_trips_current_root_and_snapshot() {
             options(),
             &decoded,
             target_key,
-        [0; 16], [0; 16], None)
+            [0; 16],
+            [0; 16],
+            None,
+        )
         .expect("receive changed records");
     assert_eq!(report.spec, SEND_RECEIVE_CHANGED_RECORD_SPEC);
     assert_eq!(report.imported_roots, 2);
@@ -3118,7 +3124,10 @@ fn changed_record_send_receive_excludes_unlinked_extent_maps() {
             options(),
             &export,
             target_key,
-        [0; 16], [0; 16], None)
+            [0; 16],
+            [0; 16],
+            None,
+        )
         .expect("receive changed records");
     assert_eq!(report.imported_records, export.total_records);
 
@@ -3175,7 +3184,10 @@ fn changed_record_import_rejects_corrupt_payload_before_publish() {
             options(),
             &export,
             key,
-        [0; 16], [0; 16], None)
+            [0; 16],
+            [0; 16],
+            None,
+        )
         .expect_err("corrupt payload must be rejected");
     assert!(matches!(err, FileSystemError::Decode { .. }));
     assert!(
@@ -7024,7 +7036,10 @@ fn incremental_send_receive_skips_unchanged_objects() {
             options(),
             &full_export,
             target_key,
-        [0; 16], [0; 16], None)
+            [0; 16],
+            [0; 16],
+            None,
+        )
         .expect("receive baseline");
     assert!(!report.production_recovery_requires_operator_repair());
 
@@ -7133,7 +7148,10 @@ fn make_incremental_receive_fixture(
         options(),
         &baseline_export,
         target_key,
-    [0; 16], [0; 16], None)
+        [0; 16],
+        [0; 16],
+        None,
+    )
     .expect("receive baseline");
     if !retain_base_snapshot {
         let mut target =
@@ -7337,7 +7355,10 @@ fn incremental_send_receive_end_to_end() {
         options(),
         &baseline_export,
         target_key,
-    [0; 16], [0; 16], None)
+        [0; 16],
+        [0; 16],
+        None,
+    )
     .expect("receive baseline");
 
     // Verify baseline data in target.
@@ -7388,7 +7409,11 @@ fn incremental_send_receive_end_to_end() {
         options(),
         &incremental_export,
         target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect("receive incremental");
     assert_eq!(report.stream_version, incremental_export.stream_version);
     assert_eq!(report.placement_epoch, None);
@@ -7442,7 +7467,11 @@ fn incremental_receive_rejects_missing_from_root_without_selecting_new_root() {
         options(),
         &export,
         fixture.target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect_err("missing from_root must fail");
     assert!(
         err.to_string()
@@ -7464,7 +7493,11 @@ fn incremental_receive_rejects_replayed_completed_generation() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect("initial incremental receive");
     assert_eq!(
         report.selected_transaction_id,
@@ -7477,7 +7510,11 @@ fn incremental_receive_rejects_replayed_completed_generation() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect_err("replayed completed receive must fail");
     assert!(
         err.to_string()
@@ -7534,7 +7571,11 @@ fn incremental_receive_rejects_target_missing_base_root() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect_err("missing base must fail");
     assert_receive_merge_no_common_ancestor(err);
     let after = selected_root_for_test(&other_root, fixture.target_key);
@@ -7555,7 +7596,11 @@ fn incremental_receive_rejects_loose_unprotected_base_root() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect_err("loose base root without snapshot authority must fail");
     assert_incremental_receive_base_root_conflict(
         err,
@@ -7590,7 +7635,11 @@ fn incremental_receive_rejects_divergent_base_root_identity() {
         options(),
         &export,
         fixture.target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect_err("divergent from_root identity must fail");
     assert!(
         err.to_string()
@@ -7625,7 +7674,11 @@ fn incremental_receive_rejects_missing_unchanged_content() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect_err("missing omitted content must fail");
     assert!(
         err.to_string().contains("missing")
@@ -7650,7 +7703,10 @@ fn full_receive_rejects_incremental_stream_for_empty_target() {
             options(),
             &fixture.incremental_export,
             fixture.target_key,
-        [0; 16], [0; 16], None)
+            [0; 16],
+            [0; 16],
+            None,
+        )
         .expect_err("full receive must reject incremental stream");
     assert!(
         err.to_string()
@@ -7676,7 +7732,11 @@ fn incremental_receive_rejects_full_stream_for_existing_target() {
         options(),
         &full_export,
         fixture.target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect_err("incremental receive must reject full stream");
     assert!(
         err.to_string()
@@ -7697,7 +7757,11 @@ fn incremental_receive_reports_unknown_placement_without_target_epoch() {
         options(),
         &fixture.incremental_export,
         fixture.target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect("receive incremental with sender placement epoch");
     assert_eq!(report.placement_epoch, Some(42));
     assert!(
@@ -7836,7 +7900,10 @@ fn incremental_send_receive_chained_deltas() {
         options(),
         &full_export,
         target_key,
-    [0; 16], [0; 16], None)
+        [0; 16],
+        [0; 16],
+        None,
+    )
     .expect("receive full");
 
     {
@@ -7920,7 +7987,10 @@ fn debug_incremental_validate() {
         options(),
         &baseline_export,
         target_key,
-    [0; 16], [0; 16], None)
+        [0; 16],
+        [0; 16],
+        None,
+    )
     .expect("receive baseline");
 
     LocalFileSystem::receive_incremental_changed_records_with_root_authentication_key(
@@ -7928,7 +7998,11 @@ fn debug_incremental_validate() {
         options(),
         &incr,
         target_key,
-    [0; 16], [0; 16], None, None)
+        [0; 16],
+        [0; 16],
+        None,
+        None,
+    )
     .expect("receive incremental");
 
     {
@@ -8971,12 +9045,17 @@ fn cache_governor_charges_mounted_dataset_partition() {
     let mounted_partition = tidefs_cache_core::BudgetPartitionKey::from_bytes(mounted_dataset_id);
     let root_partition = tidefs_cache_core::BudgetPartitionKey::from_bytes(ROOT_DATASET_ID);
     assert_eq!(
-        governor.partition_used(mounted_partition, tidefs_cache_core::BudgetCategory::DataCache),
+        governor.partition_used(
+            mounted_partition,
+            tidefs_cache_core::BudgetCategory::DataCache
+        ),
         payload.len() as u64
     );
     assert!(
-        governor.partition_used(mounted_partition, tidefs_cache_core::BudgetCategory::InodeState)
-            > 0,
+        governor.partition_used(
+            mounted_partition,
+            tidefs_cache_core::BudgetCategory::InodeState
+        ) > 0,
         "inode cache state must be charged to the mounted dataset partition"
     );
     assert_eq!(
@@ -8984,17 +9063,26 @@ fn cache_governor_charges_mounted_dataset_partition() {
         0
     );
     assert_eq!(
-        governor.partition_used(root_partition, tidefs_cache_core::BudgetCategory::InodeState),
+        governor.partition_used(
+            root_partition,
+            tidefs_cache_core::BudgetCategory::InodeState
+        ),
         0
     );
 
     fs.set_mounted_dataset_id(next_dataset_id);
     assert_eq!(
-        governor.partition_used(mounted_partition, tidefs_cache_core::BudgetCategory::DataCache),
+        governor.partition_used(
+            mounted_partition,
+            tidefs_cache_core::BudgetCategory::DataCache
+        ),
         0
     );
     assert_eq!(
-        governor.partition_used(mounted_partition, tidefs_cache_core::BudgetCategory::InodeState),
+        governor.partition_used(
+            mounted_partition,
+            tidefs_cache_core::BudgetCategory::InodeState
+        ),
         0
     );
 
@@ -9718,11 +9806,9 @@ fn lock_mount_cleanup_preserves_other_mount_identity() {
     );
 
     let tracker = fs.lock_tracker.borrow();
-    assert!(
-        tracker
-            .locks_for_mount_inode(mount_id, inode.get())
-            .is_none()
-    );
+    assert!(tracker
+        .locks_for_mount_inode(mount_id, inode.get())
+        .is_none());
     assert!(
         tracker
             .locks_for_mount_inode(other_mount_id, inode.get())
@@ -11458,21 +11544,33 @@ fn encode_decode_round_trip_preserves_namespace_revisions() {
 
     assert_eq!(decoded.subtree_rev, subtree_rev, "subtree_rev round-trip");
     assert_eq!(decoded.dir_rev, dir_rev, "dir_rev round-trip");
-    assert_ne!(decoded.subtree_rev, decoded.metadata_version,
-        "subtree_rev must not equal metadata_version after decoupling");
-    assert_ne!(decoded.dir_rev, decoded.metadata_version,
-        "dir_rev must not equal metadata_version after decoupling");
+    assert_ne!(
+        decoded.subtree_rev, decoded.metadata_version,
+        "subtree_rev must not equal metadata_version after decoupling"
+    );
+    assert_ne!(
+        decoded.dir_rev, decoded.metadata_version,
+        "dir_rev must not equal metadata_version after decoupling"
+    );
 
     // to_inode_attr must use the stored revision counters, not metadata_version.
     let attr = decoded.to_inode_attr();
-    assert_eq!(attr.subtree_rev, subtree_rev,
-        "InodeAttr subtree_rev must come from InodeRecord.subtree_rev");
-    assert_eq!(attr.dir_rev, dir_rev,
-        "InodeAttr dir_rev must come from InodeRecord.dir_rev");
-    assert_ne!(attr.subtree_rev, metadata_version,
-        "InodeAttr subtree_rev must not be metadata_version");
-    assert_ne!(attr.dir_rev, metadata_version,
-        "InodeAttr dir_rev must not be metadata_version");
+    assert_eq!(
+        attr.subtree_rev, subtree_rev,
+        "InodeAttr subtree_rev must come from InodeRecord.subtree_rev"
+    );
+    assert_eq!(
+        attr.dir_rev, dir_rev,
+        "InodeAttr dir_rev must come from InodeRecord.dir_rev"
+    );
+    assert_ne!(
+        attr.subtree_rev, metadata_version,
+        "InodeAttr subtree_rev must not be metadata_version"
+    );
+    assert_ne!(
+        attr.dir_rev, metadata_version,
+        "InodeAttr dir_rev must not be metadata_version"
+    );
 }
 
 #[test]
@@ -11485,7 +11583,9 @@ fn old_format_inode_record_without_revision_tail_defaults_to_zero() {
         generation: tidefs_types_vfs_core::Generation::new(1),
         facets: tidefs_types_vfs_core::NodeKind::File.to_facets(),
         mode: 0o644 | tidefs_types_vfs_core::S_IFREG as u32,
-        uid: 0, gid: 0, nlink: 1,
+        uid: 0,
+        gid: 0,
+        nlink: 1,
         size: 0,
         data_version: 0,
         metadata_version: 7,
@@ -11500,12 +11600,15 @@ fn old_format_inode_record_without_revision_tail_defaults_to_zero() {
     // Truncate off the 16-byte tail (subtree_rev + dir_rev) to simulate
     // a record written before the tail extension.
     let truncated = &encoded[..encoded.len() - 16];
-    let decoded = crate::encoding::decode_inode(truncated)
-        .expect("old-format decode must succeed");
-    assert_eq!(decoded.subtree_rev, 0,
-        "legacy record without tail must default subtree_rev to 0");
-    assert_eq!(decoded.dir_rev, 0,
-        "legacy record without tail must default dir_rev to 0");
+    let decoded = crate::encoding::decode_inode(truncated).expect("old-format decode must succeed");
+    assert_eq!(
+        decoded.subtree_rev, 0,
+        "legacy record without tail must default subtree_rev to 0"
+    );
+    assert_eq!(
+        decoded.dir_rev, 0,
+        "legacy record without tail must default dir_rev to 0"
+    );
     // metadata_version remains untouched.
     assert_eq!(decoded.metadata_version, 7);
 }
@@ -11525,7 +11628,10 @@ fn metadata_version_bump_does_not_impersonate_dir_rev() {
         generation: tidefs_types_vfs_core::Generation::new(1),
         facets: tidefs_types_vfs_core::NodeKind::Dir.to_facets(),
         mode: 0o755 | tidefs_types_vfs_core::S_IFDIR as u32,
-        uid: 0, gid: 0, nlink: 2, size: 0,
+        uid: 0,
+        gid: 0,
+        nlink: 2,
+        size: 0,
         data_version: 1,
         metadata_version,
         posix_time: crate::types::PosixTimeRecord::new(0, 0, 0, 0),
@@ -11539,19 +11645,29 @@ fn metadata_version_bump_does_not_impersonate_dir_rev() {
     let attr = record.to_inode_attr();
 
     // The InodeAttr must use stored revision counters, not metadata_version.
-    assert_eq!(attr.subtree_rev, subtree_rev,
-        "subtree_rev must come from InodeRecord.subtree_rev, not metadata_version");
-    assert_eq!(attr.dir_rev, dir_rev,
-        "dir_rev must come from InodeRecord.dir_rev, not metadata_version");
-    assert_ne!(attr.subtree_rev, metadata_version,
-        "subtree_rev must not be equal to metadata_version");
-    assert_ne!(attr.dir_rev, metadata_version,
-        "dir_rev must not be equal to metadata_version");
+    assert_eq!(
+        attr.subtree_rev, subtree_rev,
+        "subtree_rev must come from InodeRecord.subtree_rev, not metadata_version"
+    );
+    assert_eq!(
+        attr.dir_rev, dir_rev,
+        "dir_rev must come from InodeRecord.dir_rev, not metadata_version"
+    );
+    assert_ne!(
+        attr.subtree_rev, metadata_version,
+        "subtree_rev must not be equal to metadata_version"
+    );
+    assert_ne!(
+        attr.dir_rev, metadata_version,
+        "dir_rev must not be equal to metadata_version"
+    );
 
     // metadata_version is a separate authority and must not leak into
     // namespace revision counters.
-    assert_eq!(record.metadata_version, metadata_version,
-        "record metadata_version unchanged");
+    assert_eq!(
+        record.metadata_version, metadata_version,
+        "record metadata_version unchanged"
+    );
 }
 
 #[test]
@@ -11709,7 +11825,10 @@ fn validate_sender_authority_local_only_passes() {
         [0u8; 16],
         None,
     );
-    assert!(result.is_ok(), "local-only stream must pass without authorization");
+    assert!(
+        result.is_ok(),
+        "local-only stream must pass without authorization"
+    );
 }
 
 #[test]
@@ -11727,7 +11846,10 @@ fn validate_sender_authority_same_pool_passes() {
         [0u8; 16],
         None,
     );
-    assert!(result.is_ok(), "same-pool receive must pass without authorization");
+    assert!(
+        result.is_ok(),
+        "same-pool receive must pass without authorization"
+    );
 }
 
 #[test]
@@ -11770,7 +11892,10 @@ fn validate_sender_authority_cross_pool_with_matching_authorization() {
         [0u8; 16],
         Some(&auth),
     );
-    assert!(result.is_ok(), "matching cross-pool authorization must pass");
+    assert!(
+        result.is_ok(),
+        "matching cross-pool authorization must pass"
+    );
 }
 
 #[test]
@@ -11835,8 +11960,14 @@ fn error_display_cross_pool_unauthorized() {
         sender_pool_uuid: [0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
     };
     let msg = format!("{err}");
-    assert!(msg.contains("cross-pool receive not authorized"), "message must mention cross-pool: {msg}");
-    assert!(msg.contains("deadbeef"), "message must include sender pool UUID: {msg}");
+    assert!(
+        msg.contains("cross-pool receive not authorized"),
+        "message must mention cross-pool: {msg}"
+    );
+    assert!(
+        msg.contains("deadbeef"),
+        "message must include sender pool UUID: {msg}"
+    );
 }
 
 #[test]
@@ -11845,8 +11976,14 @@ fn error_display_authorization_mismatch() {
         field: "sender_pool_epoch",
     };
     let msg = format!("{err}");
-    assert!(msg.contains("cross-pool receive authorization mismatch"), "message must mention mismatch: {msg}");
-    assert!(msg.contains("sender_pool_epoch"), "message must name the field: {msg}");
+    assert!(
+        msg.contains("cross-pool receive authorization mismatch"),
+        "message must mention mismatch: {msg}"
+    );
+    assert!(
+        msg.contains("sender_pool_epoch"),
+        "message must name the field: {msg}"
+    );
 }
 
 #[test]
@@ -11855,8 +11992,14 @@ fn error_display_malformed_sender_authority() {
         reason: "sender pool uuid is zero",
     };
     let msg = format!("{err}");
-    assert!(msg.contains("malformed sender authority"), "message must mention malformed: {msg}");
-    assert!(msg.contains("sender pool uuid is zero"), "message must include reason: {msg}");
+    assert!(
+        msg.contains("malformed sender authority"),
+        "message must mention malformed: {msg}"
+    );
+    assert!(
+        msg.contains("sender pool uuid is zero"),
+        "message must include reason: {msg}"
+    );
 }
 
 #[test]
@@ -11865,6 +12008,12 @@ fn error_display_stale_sender_generation() {
         reason: "membership generation 3 is older than minimum 5",
     };
     let msg = format!("{err}");
-    assert!(msg.contains("stale sender generation"), "message must mention stale: {msg}");
-    assert!(msg.contains("membership generation"), "message must include reason: {msg}");
+    assert!(
+        msg.contains("stale sender generation"),
+        "message must mention stale: {msg}"
+    );
+    assert!(
+        msg.contains("membership generation"),
+        "message must include reason: {msg}"
+    );
 }

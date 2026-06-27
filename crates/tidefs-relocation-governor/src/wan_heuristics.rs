@@ -158,8 +158,8 @@ mod tests {
 
     fn geo_catchup_input() -> HeuristicInput {
         HeuristicInput {
-            wan_rpo_lag_ms: Some(30_000),     // 30s lag
-            wan_rpo_target_ms: Some(10_000),  // 10s target
+            wan_rpo_lag_ms: Some(30_000),                        // 30s lag
+            wan_rpo_target_ms: Some(10_000),                     // 10s target
             wan_bandwidth_bytes_per_sec: Some(10 * 1024 * 1024), // 10 MiB/s
             wan_egress_cost_microunits_per_byte: Some(1),
             wan_congestion_window_bytes: Some(1024 * 1024),

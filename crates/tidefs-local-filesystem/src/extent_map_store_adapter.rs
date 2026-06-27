@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use tidefs_extent_map::{ExtentMap, InlineExtentMap};
 use tidefs_online_defrag::ExtentMapStore;
-use tidefs_types_extent_map_core::{ExtentMapError, ExtentMapEntryV2, ExtentMapV1};
+use tidefs_types_extent_map_core::{ExtentMapEntryV2, ExtentMapError, ExtentMapV1};
 
 /// Shared-handle adapter that connects the online-defrag service to
 /// the filesystem's in-memory extent maps.

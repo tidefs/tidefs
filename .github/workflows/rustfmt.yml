@@ -1,0 +1,58 @@
+name: Rustfmt
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.github/workflows/rustfmt.yml'
+      - 'rustfmt.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'apps/**/*.rs'
+      - 'apps/**/Cargo.toml'
+      - 'crates/**/*.rs'
+      - 'crates/**/Cargo.toml'
+      - 'kmod/**/*.rs'
+      - 'kmod/Cargo.toml'
+      - 'xtask/**/*.rs'
+      - 'xtask/**/Cargo.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: /var/tmp/tidefs-ci/cargo-home
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: /var/tmp/tidefs-ci/cargo-target/${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    # Draft PRs are not integration candidates; save scarce self-hosted runner
+    # capacity for ready PRs, master pushes, and explicit dispatches.
+    if: ${{ (github.event_name == 'workflow_dispatch' || vars.TIDEFS_SELF_HOSTED_READY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    runs-on: [self-hosted, linux, x64, tidefs, nix]
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare CI scratch
+        run: mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+
+      - name: Check workspace formatting
+        run: nix develop .#ci --command bash -c 'cargo fmt --all -- --check'
+
+      - name: Clean cargo target
+        if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"

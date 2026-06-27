@@ -5814,10 +5814,7 @@ mod tests {
             candidate.lifecycle_generation,
             PlacementEvidenceState::Unknown
         );
-        assert_eq!(
-            candidate.ordering_replay,
-            PlacementEvidenceState::Unknown
-        );
+        assert_eq!(candidate.ordering_replay, PlacementEvidenceState::Unknown);
         assert_eq!(
             candidate.recovery_degradation,
             PlacementEvidenceState::Unknown
@@ -5846,10 +5843,7 @@ mod tests {
             candidate.lifecycle_generation,
             PlacementEvidenceState::Fresh
         );
-        assert_eq!(
-            candidate.ordering_replay,
-            PlacementEvidenceState::Fresh
-        );
+        assert_eq!(candidate.ordering_replay, PlacementEvidenceState::Fresh);
         assert_eq!(
             candidate.recovery_degradation,
             PlacementEvidenceState::Fresh

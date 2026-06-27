@@ -34,8 +34,7 @@ pub mod tracker;
 
 // Re-exports from health_probe and health_quorum modules.
 pub use health_probe::{
-    AuthTag, HealthAttestation, HealthProbe, HealthSample, Nonce,
-    ProbeEvidenceClass, SharedSecret,
+    AuthTag, HealthAttestation, HealthProbe, HealthSample, Nonce, ProbeEvidenceClass, SharedSecret,
 };
 pub use health_quorum::{HealthQuorum, QuorumHealthResult, QuorumHealthStatus};
 
@@ -130,11 +129,17 @@ pub enum StaleEvidence {
     /// No I/O has ever been recorded for this replica.
     NeverSeen,
     /// Last I/O exceeds the stale timeout.
-    TimedOut { last_io_ns: u64, age_ns: u64, timeout_ns: u64 },
+    TimedOut {
+        last_io_ns: u64,
+        age_ns: u64,
+        timeout_ns: u64,
+    },
 }
 
 /// Coarse health class derived from the 0–100 score.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub enum HealthClass {
     /// Score 90–100: excellent health.
     Excellent,
@@ -278,14 +283,16 @@ impl AdmissionSnapshot {
         // Admission decisions: stale and dead replicas are excluded
         // from all I/O. Healthy, Degraded, and Recovering replicas have
         // per-state eligibility.
-        let (eligible_for_placement, eligible_for_rebuild_source,
-             eligible_for_degraded_reads, is_excluded) = if is_stale {
+        let (
+            eligible_for_placement,
+            eligible_for_rebuild_source,
+            eligible_for_degraded_reads,
+            is_excluded,
+        ) = if is_stale {
             (false, false, false, true)
         } else {
             match degradation_state {
-                state_machine::DegradationState::Healthy => {
-                    (true, true, true, false)
-                }
+                state_machine::DegradationState::Healthy => (true, true, true, false),
                 state_machine::DegradationState::Degraded => {
                     // Degraded replicas can still receive placement,
                     // serve rebuild reads, and handle degraded reads,
@@ -298,9 +305,7 @@ impl AdmissionSnapshot {
                     // state), but can serve reads.
                     (false, true, true, false)
                 }
-                state_machine::DegradationState::Dead => {
-                    (false, false, false, true)
-                }
+                state_machine::DegradationState::Dead => (false, false, false, true),
             }
         };
 
@@ -322,7 +327,6 @@ impl AdmissionSnapshot {
         }
     }
 }
-
 
 // ── Per-replica degradation tracking ───────────────────────────────
 // Issue #5165: Replica-level degradation state machine driven by I/O
@@ -510,11 +514,7 @@ impl ReplicaDegradationTracker {
     /// Returns `None` if the replica is not tracked (no transition
     /// engine exists). Staleness is evaluated at `now_ns` against the
     /// configured `stale_timeout_ns`.
-    pub fn snapshot_admission(
-        &self,
-        replica_id: NodeId,
-        now_ns: u64,
-    ) -> Option<AdmissionSnapshot> {
+    pub fn snapshot_admission(&self, replica_id: NodeId, now_ns: u64) -> Option<AdmissionSnapshot> {
         let engine = self.engines.get(&replica_id)?;
         let scorer = self.scorers.get(&replica_id);
         let last_io = self.last_io_ns.get(&replica_id).copied();
@@ -552,7 +552,6 @@ impl ReplicaDegradationTracker {
             })
             .collect()
     }
-
 
     /// Check all tracked replicas for staleness and transition
     /// silent replicas past their timeout to Dead.
@@ -630,7 +629,6 @@ impl ReplicaDegradationTracker {
         )
     }
 }
-
 
 #[cfg(test)]
 mod admission_snapshot_tests {
@@ -811,7 +809,11 @@ mod admission_snapshot_tests {
 
         // Stale evidence should be TimedOut
         match snap.stale_evidence.unwrap() {
-            StaleEvidence::TimedOut { last_io_ns, age_ns, timeout_ns } => {
+            StaleEvidence::TimedOut {
+                last_io_ns,
+                age_ns,
+                timeout_ns,
+            } => {
                 assert_eq!(last_io_ns, 1_000_000_000);
                 assert_eq!(age_ns, 6_000_000_000);
                 assert_eq!(timeout_ns, 5_000_000_000);
@@ -885,10 +887,7 @@ mod admission_snapshot_tests {
             failure_threshold: 10,
             ..state_machine::DegradationConfig::default()
         };
-        let mut t = ReplicaDegradationTracker::new(
-            scoring::ScoreConfig::default(),
-            config,
-        );
+        let mut t = ReplicaDegradationTracker::new(scoring::ScoreConfig::default(), config);
         t.record_success(node, 1_000_000_000, 100);
 
         // One mismatch: Minor (1 <= 5/2=2)
@@ -974,12 +973,24 @@ mod admission_snapshot_tests {
         assert_eq!(deserialized.is_stale, snap.is_stale);
         assert_eq!(deserialized.checksum_mismatches, snap.checksum_mismatches);
         assert_eq!(deserialized.checksum_class, snap.checksum_class);
-        assert_eq!(deserialized.eligible_for_placement, snap.eligible_for_placement);
-        assert_eq!(deserialized.eligible_for_rebuild_source, snap.eligible_for_rebuild_source);
-        assert_eq!(deserialized.eligible_for_degraded_reads, snap.eligible_for_degraded_reads);
+        assert_eq!(
+            deserialized.eligible_for_placement,
+            snap.eligible_for_placement
+        );
+        assert_eq!(
+            deserialized.eligible_for_rebuild_source,
+            snap.eligible_for_rebuild_source
+        );
+        assert_eq!(
+            deserialized.eligible_for_degraded_reads,
+            snap.eligible_for_degraded_reads
+        );
         assert_eq!(deserialized.is_excluded, snap.is_excluded);
         // StaleEvidence roundtrip
-        assert_eq!(deserialized.stale_evidence.is_some(), snap.stale_evidence.is_some());
+        assert_eq!(
+            deserialized.stale_evidence.is_some(),
+            snap.stale_evidence.is_some()
+        );
     }
 
     // ── StaleEvidence serialization roundtrip ────────────────────────
@@ -1002,7 +1013,11 @@ mod admission_snapshot_tests {
         let json = serde_json::to_string(&timed_out).unwrap();
         let back: StaleEvidence = serde_json::from_str(&json).unwrap();
         match back {
-            StaleEvidence::TimedOut { last_io_ns, age_ns, timeout_ns } => {
+            StaleEvidence::TimedOut {
+                last_io_ns,
+                age_ns,
+                timeout_ns,
+            } => {
                 assert_eq!(last_io_ns, 1000);
                 assert_eq!(age_ns, 5000);
                 assert_eq!(timeout_ns, 3000);
@@ -1053,7 +1068,7 @@ mod admission_snapshot_tests {
         let mut t = tracker();
         let node = NodeId::new(1);
         assert!(t.is_placeable(node)); // Healthy → placeable
-        // Degraded → still placeable
+                                       // Degraded → still placeable
         for _ in 0..5 {
             t.record_failure(node, 1_000_000_000, 5000, false);
         }
@@ -1095,11 +1110,16 @@ mod admission_snapshot_tests {
         for _ in 0..50 {
             t2.record_failure(NodeId::new(2), 1_000_000_000, 10000, false);
         }
-        let snap2 = t2.snapshot_admission(NodeId::new(2), 2_000_000_000).unwrap();
-        assert!(snap2.health_score < 70, "expected low score, got {}", snap2.health_score);
+        let snap2 = t2
+            .snapshot_admission(NodeId::new(2), 2_000_000_000)
+            .unwrap();
+        assert!(
+            snap2.health_score < 70,
+            "expected low score, got {}",
+            snap2.health_score
+        );
     }
 }
-
 
 #[cfg(test)]
 mod degradation_tests {

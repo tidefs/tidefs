@@ -2118,7 +2118,9 @@ fn parse_member(root: &Path, manifest_path: &Path) -> Result<Member, String> {
             if current_section.starts_with("[dependencies.") && current_section.ends_with("]") {
                 let inner = &current_section["[dependencies.".len()..current_section.len() - 1];
                 if !inner.is_empty()
-                    && inner.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+                    && inner
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
                 {
                     dependencies.push(inner.to_string());
                 }
@@ -2682,13 +2684,16 @@ fn extract_all_dependency_names(manifest_path: &Path) -> Vec<String> {
             if in_target_section && !dep_sections.contains(&trimmed) {
                 // Table-style entry such as [dependencies.crate-name]:
                 // extract the name from the section header.
-                if let Some(inner) = trimmed.strip_prefix("[dependencies.")
+                if let Some(inner) = trimmed
+                    .strip_prefix("[dependencies.")
                     .or_else(|| trimmed.strip_prefix("[dev-dependencies."))
                     .or_else(|| trimmed.strip_prefix("[build-dependencies."))
                 {
                     if let Some(name) = inner.strip_suffix(']') {
                         if !name.is_empty()
-                            && name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+                            && name
+                                .chars()
+                                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
                         {
                             names.push(name.to_string());
                         }

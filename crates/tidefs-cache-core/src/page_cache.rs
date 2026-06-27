@@ -590,9 +590,7 @@ impl PageCacheInner {
         let mut cleared = 0usize;
         for offset in offsets {
             let key = PageKey { inode, offset };
-            if self.pages.get(&key).is_some_and(Page::is_dirty)
-                && self.clear_dirty_inner(&key)
-            {
+            if self.pages.get(&key).is_some_and(Page::is_dirty) && self.clear_dirty_inner(&key) {
                 cleared += 1;
             }
         }
@@ -663,9 +661,7 @@ impl PageCacheInner {
         let keys: Vec<PageKey> = self
             .pages
             .iter()
-            .filter(|(k, _)| {
-                k.inode == inode && k.offset.saturating_add(page_size) > new_size
-            })
+            .filter(|(k, _)| k.inode == inode && k.offset.saturating_add(page_size) > new_size)
             .map(|(k, _)| *k)
             .collect();
 
@@ -1397,10 +1393,7 @@ impl PageCache {
     /// writeback flag and pin are cleared, but the dirty flag is
     /// preserved so the page remains eligible for retry.
     pub fn abort_writeback_with_token(&self, token: WritebackToken) {
-        self.inner
-            .lock()
-            .unwrap()
-            .abort_writeback_inner(&token.key);
+        self.inner.lock().unwrap().abort_writeback_inner(&token.key);
     }
 
     /// Number of pages currently in the writeback state.
@@ -1427,7 +1420,10 @@ impl PageCache {
     ///
     /// Returns `(pages_removed, dirty_pages_removed)`.
     pub fn truncate_invalidate(&self, inode: u64, new_size: u64) -> (usize, usize) {
-        self.inner.lock().unwrap().truncate_invalidate_inner(inode, new_size)
+        self.inner
+            .lock()
+            .unwrap()
+            .truncate_invalidate_inner(inode, new_size)
     }
 
     /// Unlink invalidation: remove ALL pages (including dirty and
@@ -1449,7 +1445,9 @@ impl PageCache {
     #[must_use]
     pub fn page_keys_for_inode(&self, inode: u64) -> Vec<PageKey> {
         let inner = self.inner.lock().unwrap();
-        inner.pages.iter()
+        inner
+            .pages
+            .iter()
             .filter(|(k, _)| k.inode == inode)
             .map(|(k, _)| *k)
             .collect()
@@ -1463,7 +1461,6 @@ impl PageCache {
         self.inner.lock().unwrap().invalidate_all_clean_inner()
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2597,7 +2594,13 @@ mod tests {
         cache.mark_dirty(1, 0);
 
         let token = cache.start_writeback_token(1, 0).expect("start writeback");
-        assert_eq!(token.key, PageKey { inode: 1, offset: 0 });
+        assert_eq!(
+            token.key,
+            PageKey {
+                inode: 1,
+                offset: 0
+            }
+        );
         assert_eq!(cache.writeback_queue_size(), 1);
 
         // Complete with success: page becomes clean
@@ -2820,12 +2823,15 @@ mod tests {
     #[test]
     fn truncate_invalidate_removes_page_overlapping_boundary() {
         let cache = new_cache(10);
-        cache.insert(1, 0).unwrap();   // [0, 4096)
+        cache.insert(1, 0).unwrap(); // [0, 4096)
         cache.insert(1, 4096).unwrap(); // [4096, 8192)
 
         // Truncate to 3000: page at 0 overlaps (0 < 3000 < 4096) → removed
         let (removed, _) = cache.truncate_invalidate(1, 3000);
-        assert_eq!(removed, 2, "both pages removed: one beyond, one overlapping");
+        assert_eq!(
+            removed, 2,
+            "both pages removed: one beyond, one overlapping"
+        );
         assert_eq!(cache.page_count_for_inode(1), 0);
     }
 
@@ -2938,7 +2944,7 @@ mod tests {
     fn cross_directory_rename_invalidation_is_scoped() {
         // Pages from /dirA/inode are not affected by invalidating /dirB/inode
         let cache = new_cache(10);
-        cache.insert(10, 0).unwrap();   // /dirA file
+        cache.insert(10, 0).unwrap(); // /dirA file
         cache.insert(11, 4096).unwrap(); // /dirB file
         cache.mark_dirty(10, 0);
 
@@ -3002,8 +3008,14 @@ mod tests {
 
         let keys = cache.page_keys_for_inode(1);
         assert_eq!(keys.len(), 2);
-        assert!(keys.contains(&PageKey { inode: 1, offset: 0 }));
-        assert!(keys.contains(&PageKey { inode: 1, offset: 4096 }));
+        assert!(keys.contains(&PageKey {
+            inode: 1,
+            offset: 0
+        }));
+        assert!(keys.contains(&PageKey {
+            inode: 1,
+            offset: 4096
+        }));
     }
 
     #[test]
@@ -3015,6 +3027,12 @@ mod tests {
 
         let keys = cache.writeback_queue_keys();
         assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0], PageKey { inode: 1, offset: 0 });
+        assert_eq!(
+            keys[0],
+            PageKey {
+                inode: 1,
+                offset: 0
+            }
+        );
     }
 }

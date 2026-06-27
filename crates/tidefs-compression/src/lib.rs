@@ -137,8 +137,15 @@ impl fmt::Display for CompressionError {
             Self::DecompressionFailed(reason) => {
                 write!(f, "decompression failed: {reason}")
             }
-            Self::TransformMismatch { field, expected, observed } => {
-                write!(f, "transform mismatch: {field} expected {expected}, observed {observed}")
+            Self::TransformMismatch {
+                field,
+                expected,
+                observed,
+            } => {
+                write!(
+                    f,
+                    "transform mismatch: {field} expected {expected}, observed {observed}"
+                )
             }
             Self::Store(e) => write!(f, "store error: {e}"),
         }
@@ -156,9 +163,15 @@ impl From<StoreError> for CompressionError {
 impl From<tidefs_frame::FrameError> for CompressionError {
     fn from(e: tidefs_frame::FrameError) -> Self {
         match e {
-            tidefs_frame::FrameError::TransformMismatch { field, expected, observed } => {
-                Self::TransformMismatch { field, expected, observed }
-            }
+            tidefs_frame::FrameError::TransformMismatch {
+                field,
+                expected,
+                observed,
+            } => Self::TransformMismatch {
+                field,
+                expected,
+                observed,
+            },
             other => Self::DecompressionFailed(format!("{other:?}")),
         }
     }
@@ -412,9 +425,15 @@ impl CompressedObjectStore {
             tidefs_frame::FrameError::Lz4DecompressionFailed => {
                 CompressionError::DecompressionFailed("lz4 decompression failed".into())
             }
-            tidefs_frame::FrameError::TransformMismatch { field, expected, observed } => {
-                CompressionError::TransformMismatch { field, expected, observed }
-            }
+            tidefs_frame::FrameError::TransformMismatch {
+                field,
+                expected,
+                observed,
+            } => CompressionError::TransformMismatch {
+                field,
+                expected,
+                observed,
+            },
         })
     }
 }

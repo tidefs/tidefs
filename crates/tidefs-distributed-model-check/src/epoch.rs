@@ -30,11 +30,19 @@ impl MembershipEpochModel {
     #[must_use]
     pub fn new(node_count: usize) -> Self {
         let nodes: Vec<EpochState> = (0..node_count as u64)
-            .map(|nid| EpochState { node_id: nid, current_epoch: 0, highest_seen: 0 })
+            .map(|nid| EpochState {
+                node_id: nid,
+                current_epoch: 0,
+                highest_seen: 0,
+            })
             .collect();
         let mut epoch_members = BTreeMap::new();
         epoch_members.insert(0, (0..node_count as u64).collect());
-        Self { nodes, epoch_history: BTreeMap::new(), epoch_members }
+        Self {
+            nodes,
+            epoch_history: BTreeMap::new(),
+            epoch_members,
+        }
     }
 
     /// Record that a node has advanced to `new_epoch`.
@@ -45,14 +53,21 @@ impl MembershipEpochModel {
                 node.highest_seen = new_epoch;
             }
         }
-        self.epoch_history.entry(new_epoch).or_default().push(node_id);
-        self.epoch_members.entry(new_epoch).or_default().push(node_id);
+        self.epoch_history
+            .entry(new_epoch)
+            .or_default()
+            .push(node_id);
+        self.epoch_members
+            .entry(new_epoch)
+            .or_default()
+            .push(node_id);
     }
 
     /// Returns the current epoch for a node.
     #[must_use]
     pub fn epoch_of(&self, node_id: u64) -> u64 {
-        self.nodes.iter()
+        self.nodes
+            .iter()
             .find(|n| n.node_id == node_id)
             .map(|n| n.current_epoch)
             .unwrap_or(0)
@@ -61,7 +76,8 @@ impl MembershipEpochModel {
     /// Returns nodes that have not yet advanced beyond `epoch`.
     #[must_use]
     pub fn lagging_nodes(&self, epoch: u64) -> Vec<u64> {
-        self.nodes.iter()
+        self.nodes
+            .iter()
             .filter(|n| n.current_epoch < epoch)
             .map(|n| n.node_id)
             .collect()

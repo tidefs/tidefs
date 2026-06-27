@@ -1096,9 +1096,7 @@ impl std::error::Error for InvalidationFeedError {}
 ///
 /// Receipt validity is not distributed runtime proof until paired with
 /// transport and runtime artifacts.
-#[derive(
-    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum ValidationTier {
     /// Structural and type-level validation only.
     Model,
@@ -1124,9 +1122,7 @@ impl AcknowledgmentCoverage {
     }
 
     #[must_use]
-    pub fn with_commit_groups(
-        groups: impl IntoIterator<Item = CommitGroupId>,
-    ) -> Self {
+    pub fn with_commit_groups(groups: impl IntoIterator<Item = CommitGroupId>) -> Self {
         Self {
             commit_groups: groups.into_iter().collect(),
         }
@@ -1230,17 +1226,10 @@ impl fmt::Display for ReceiptValidationError {
                 write!(f, "duplicate event ids: {ids:?}")
             }
             Self::SkippedEventIds { expected, found } => {
-                write!(
-                    f,
-                    "skipped event ids: expected {expected}, found {found}"
-                )
+                write!(f, "skipped event ids: expected {expected}, found {found}")
             }
             Self::DuplicateAcknowledgment(group) => {
-                write!(
-                    f,
-                    "duplicate acknowledgment for commit group {}",
-                    group.0
-                )
+                write!(f, "duplicate acknowledgment for commit group {}", group.0)
             }
             Self::StaleAcknowledgment {
                 acked,
@@ -1267,9 +1256,7 @@ pub struct ReceiptValidator;
 
 impl ReceiptValidator {
     /// Validate a single receipt for internal consistency.
-    pub fn validate(
-        receipt: &InvalidationReceipt,
-    ) -> Result<(), Vec<ReceiptValidationError>> {
+    pub fn validate(receipt: &InvalidationReceipt) -> Result<(), Vec<ReceiptValidationError>> {
         if receipt.event_sequence_start > receipt.event_sequence_end {
             return Err(vec![ReceiptValidationError::NonMonotonicRange {
                 start: receipt.event_sequence_start,
@@ -1311,14 +1298,9 @@ impl ReceiptValidator {
 
             if next.event_sequence_start <= prev.event_sequence_end {
                 // Overlap — duplicate event ids.
-                let overlap_end = prev
-                    .event_sequence_end
-                    .min(next.event_sequence_end);
-                let overlapping: Vec<u64> =
-                    (next.event_sequence_start..=overlap_end).collect();
-                errors.push(ReceiptValidationError::DuplicateEventIds(
-                    overlapping,
-                ));
+                let overlap_end = prev.event_sequence_end.min(next.event_sequence_end);
+                let overlapping: Vec<u64> = (next.event_sequence_start..=overlap_end).collect();
+                errors.push(ReceiptValidationError::DuplicateEventIds(overlapping));
             } else if next.event_sequence_start > prev.event_sequence_end + 1 {
                 // Gap — skipped event ids.
                 errors.push(ReceiptValidationError::SkippedEventIds {
@@ -1333,9 +1315,7 @@ impl ReceiptValidator {
         for receipt in receipts {
             for &group in &receipt.acknowledgment_coverage.commit_groups {
                 if !acked.insert(group) {
-                    errors.push(ReceiptValidationError::DuplicateAcknowledgment(
-                        group,
-                    ));
+                    errors.push(ReceiptValidationError::DuplicateAcknowledgment(group));
                 }
             }
         }
@@ -2131,9 +2111,7 @@ mod tests {
             seq_end,
             kinds,
             subscriber.map(NodeId::new),
-            AcknowledgmentCoverage::with_commit_groups(
-                acked.into_iter().map(CommitGroupId::new),
-            ),
+            AcknowledgmentCoverage::with_commit_groups(acked.into_iter().map(CommitGroupId::new)),
             ValidationTier::Source,
         )
     }
@@ -2141,7 +2119,10 @@ mod tests {
     #[test]
     fn receipt_validate_accepts_monotonic_range() {
         let receipt = make_receipt(
-            7, 1, 0, 3,
+            7,
+            1,
+            0,
+            3,
             vec![InvalidationEventKind::Inode, InvalidationEventKind::Entry],
             Some(2),
             vec![1],
@@ -2152,7 +2133,10 @@ mod tests {
     #[test]
     fn receipt_validate_rejects_non_monotonic_range() {
         let receipt = make_receipt(
-            7, 1, 5, 3,
+            7,
+            1,
+            5,
+            3,
             vec![InvalidationEventKind::Inode],
             Some(2),
             vec![1],
@@ -2161,10 +2145,7 @@ mod tests {
         assert_eq!(err.len(), 1);
         assert!(matches!(
             err[0],
-            ReceiptValidationError::NonMonotonicRange {
-                start: 5,
-                end: 3
-            }
+            ReceiptValidationError::NonMonotonicRange { start: 5, end: 3 }
         ));
     }
 
@@ -2172,19 +2153,28 @@ mod tests {
     fn validate_batch_accepts_ordered_non_overlapping_receipts() {
         let receipts = vec![
             make_receipt(
-                7, 1, 0, 3,
+                7,
+                1,
+                0,
+                3,
                 vec![InvalidationEventKind::Inode],
                 Some(2),
                 vec![1],
             ),
             make_receipt(
-                7, 2, 4, 7,
+                7,
+                2,
+                4,
+                7,
                 vec![InvalidationEventKind::Entry],
                 Some(2),
                 vec![2],
             ),
             make_receipt(
-                7, 3, 8, 11,
+                7,
+                3,
+                8,
+                11,
                 vec![InvalidationEventKind::Directory],
                 Some(2),
                 vec![3],
@@ -2197,41 +2187,60 @@ mod tests {
     fn validate_batch_detects_overlapping_event_ids() {
         let receipts = vec![
             make_receipt(
-                7, 1, 0, 5,
+                7,
+                1,
+                0,
+                5,
                 vec![InvalidationEventKind::Inode],
                 Some(2),
                 vec![1],
             ),
             make_receipt(
-                7, 2, 4, 9,
+                7,
+                2,
+                4,
+                9,
                 vec![InvalidationEventKind::Entry],
                 Some(2),
                 vec![2],
             ),
         ];
         let err = ReceiptValidator::validate_batch(&receipts).unwrap_err();
-        let has_duplicate = err.iter().any(|e| matches!(e, ReceiptValidationError::DuplicateEventIds(..)));
-        assert!(has_duplicate, "expected DuplicateEventIds error, got {err:?}");
+        let has_duplicate = err
+            .iter()
+            .any(|e| matches!(e, ReceiptValidationError::DuplicateEventIds(..)));
+        assert!(
+            has_duplicate,
+            "expected DuplicateEventIds error, got {err:?}"
+        );
     }
 
     #[test]
     fn validate_batch_detects_skipped_event_ids() {
         let receipts = vec![
             make_receipt(
-                7, 1, 0, 3,
+                7,
+                1,
+                0,
+                3,
                 vec![InvalidationEventKind::Inode],
                 Some(2),
                 vec![1],
             ),
             make_receipt(
-                7, 2, 10, 13,
+                7,
+                2,
+                10,
+                13,
                 vec![InvalidationEventKind::Entry],
                 Some(2),
                 vec![2],
             ),
         ];
         let err = ReceiptValidator::validate_batch(&receipts).unwrap_err();
-        let has_skipped = err.iter().any(|e| matches!(e, ReceiptValidationError::SkippedEventIds { .. }));
+        let has_skipped = err
+            .iter()
+            .any(|e| matches!(e, ReceiptValidationError::SkippedEventIds { .. }));
         assert!(has_skipped, "expected SkippedEventIds error, got {err:?}");
     }
 
@@ -2239,58 +2248,74 @@ mod tests {
     fn validate_batch_detects_duplicate_acknowledgments() {
         let receipts = vec![
             make_receipt(
-                7, 1, 0, 3,
+                7,
+                1,
+                0,
+                3,
                 vec![InvalidationEventKind::Inode],
                 Some(2),
                 vec![1, 2],
             ),
             make_receipt(
-                7, 2, 4, 7,
+                7,
+                2,
+                4,
+                7,
                 vec![InvalidationEventKind::Entry],
                 Some(2),
                 vec![2, 3],
             ),
         ];
         let err = ReceiptValidator::validate_batch(&receipts).unwrap_err();
-        let has_dup_ack = err.iter().any(|e| matches!(e, ReceiptValidationError::DuplicateAcknowledgment(..)));
-        assert!(has_dup_ack, "expected DuplicateAcknowledgment error, got {err:?}");
+        let has_dup_ack = err
+            .iter()
+            .any(|e| matches!(e, ReceiptValidationError::DuplicateAcknowledgment(..)));
+        assert!(
+            has_dup_ack,
+            "expected DuplicateAcknowledgment error, got {err:?}"
+        );
     }
 
     #[test]
     fn validate_staleness_rejects_expired_acknowledgments() {
         let receipt = make_receipt(
-            7, 5, 20, 23,
+            7,
+            5,
+            20,
+            23,
             vec![InvalidationEventKind::Inode],
             Some(2),
             vec![1, 2, 3],
         );
-        let err = ReceiptValidator::validate_staleness(
-            &receipt,
-            CommitGroupId::new(3),
-        )
-        .unwrap_err();
-        let has_stale = err.iter().any(|e| matches!(e, ReceiptValidationError::StaleAcknowledgment { .. }));
+        let err =
+            ReceiptValidator::validate_staleness(&receipt, CommitGroupId::new(3)).unwrap_err();
+        let has_stale = err
+            .iter()
+            .any(|e| matches!(e, ReceiptValidationError::StaleAcknowledgment { .. }));
         assert!(has_stale, "expected StaleAcknowledgment error, got {err:?}");
     }
 
     #[test]
     fn validate_staleness_accepts_current_acknowledgments() {
         let receipt = make_receipt(
-            7, 5, 20, 23,
+            7,
+            5,
+            20,
+            23,
             vec![InvalidationEventKind::Inode],
             Some(2),
             vec![3, 4, 5],
         );
-        assert!(
-            ReceiptValidator::validate_staleness(&receipt, CommitGroupId::new(3))
-                .is_ok()
-        );
+        assert!(ReceiptValidator::validate_staleness(&receipt, CommitGroupId::new(3)).is_ok());
     }
 
     #[test]
     fn receipt_serialization_roundtrip_is_deterministic() {
         let receipt = make_receipt(
-            7, 1, 0, 3,
+            7,
+            1,
+            0,
+            3,
             vec![
                 InvalidationEventKind::Inode,
                 InvalidationEventKind::Entry,
@@ -2312,7 +2337,10 @@ mod tests {
     #[test]
     fn receipt_serialization_handles_none_subscriber() {
         let receipt = make_receipt(
-            7, 1, 0, 3,
+            7,
+            1,
+            0,
+            3,
             vec![InvalidationEventKind::Dataset],
             None,
             vec![1],

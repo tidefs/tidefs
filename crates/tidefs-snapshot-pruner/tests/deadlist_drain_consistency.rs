@@ -39,8 +39,7 @@ fn dead_object_entry_for_payload(
 /// index must contain those pins.
 #[test]
 fn deadlist_pin_evidence_persisted_on_snapshot() {
-    let dir =
-        std::env::temp_dir().join("tidefs-deadlist-drain-evidence-persist-test");
+    let dir = std::env::temp_dir().join("tidefs-deadlist-drain-evidence-persist-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -60,13 +59,7 @@ fn deadlist_pin_evidence_persisted_on_snapshot() {
     ];
     let pruner = SnapshotPruner::new(SnapshotRetentionPolicy::default());
     pruner
-        .record_snapshot_pin_evidence(
-            &mut store,
-            ds,
-            "snap-1",
-            Vec::new(),
-            deadlist_pins,
-        )
+        .record_snapshot_pin_evidence(&mut store, ds, "snap-1", Vec::new(), deadlist_pins)
         .unwrap();
 
     // Verify evidence is persisted
@@ -134,8 +127,7 @@ fn deadlist_pins_block_auto_prune() {
 /// An explicit destroy must release extent pins held by the snapshot.
 #[test]
 fn explicit_destroy_releases_extent_pins() {
-    let dir =
-        std::env::temp_dir().join("tidefs-deadlist-drain-extent-pin-release-test");
+    let dir = std::env::temp_dir().join("tidefs-deadlist-drain-extent-pin-release-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -152,8 +144,7 @@ fn explicit_destroy_releases_extent_pins() {
     // Pin an extent to the snapshot
     let snapshot_id = "test-ds/snap-1";
     let extent_key = tidefs_types_reclaim_queue_core::ObjectKey(
-        *tidefs_local_object_store::ObjectKey::from_name(b"pinned-extent")
-            .as_bytes(),
+        *tidefs_local_object_store::ObjectKey::from_name(b"pinned-extent").as_bytes(),
     );
     store.pin_snapshot_extent(snapshot_id, extent_key);
 
@@ -184,8 +175,7 @@ fn explicit_destroy_releases_extent_pins() {
 /// prune plan must produce zero deadlist-pin-protected candidates.
 #[test]
 fn deadlist_drain_completes_after_destroy_cleanup() {
-    let dir = std::env::temp_dir()
-        .join("tidefs-deadlist-drain-complete-after-cleanup-test");
+    let dir = std::env::temp_dir().join("tidefs-deadlist-drain-complete-after-cleanup-test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 

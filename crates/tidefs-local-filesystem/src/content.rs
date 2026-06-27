@@ -318,12 +318,12 @@ fn read_mounted_chunk_content_scrub_block(
         });
     }
 
-    let (chunk, resolved_via_dedup) =
-        try_validate_chunk_bytes(store, inode_id, chunk_ref, &encoded).ok_or(
-            FileSystemError::CorruptState {
-                reason: "mounted content scrub authority chunk decode mismatch",
-            },
-        )?;
+    let (chunk, resolved_via_dedup) = try_validate_chunk_bytes(
+        store, inode_id, chunk_ref, &encoded,
+    )
+    .ok_or(FileSystemError::CorruptState {
+        reason: "mounted content scrub authority chunk decode mismatch",
+    })?;
     if !resolved_via_dedup
         && (chunk.inode_id != inode_id
             || chunk.data_version != chunk_ref.data_version
@@ -772,25 +772,22 @@ fn read_chunk_bytes_with_receipt(
                 expected_generation: expected_gen,
             })
         }
-        ReadReceiptEvidence::Missing { .. } => {
-            Err(FileSystemError::ReceiptAuthorityMissing {
-                object_key: key,
-                expected_generation: expected_gen,
-            })
-        }
-        ReadReceiptEvidence::Stale { observed_generation, .. } => {
-            Err(FileSystemError::ReceiptAuthorityStale {
-                object_key: key,
-                expected_generation: expected_gen,
-                observed_generation,
-            })
-        }
-        ReadReceiptEvidence::Synthetic { .. } => {
-            Err(FileSystemError::ReceiptAuthoritySynthetic {
-                object_key: key,
-                expected_generation: expected_gen,
-            })
-        }
+        ReadReceiptEvidence::Missing { .. } => Err(FileSystemError::ReceiptAuthorityMissing {
+            object_key: key,
+            expected_generation: expected_gen,
+        }),
+        ReadReceiptEvidence::Stale {
+            observed_generation,
+            ..
+        } => Err(FileSystemError::ReceiptAuthorityStale {
+            object_key: key,
+            expected_generation: expected_gen,
+            observed_generation,
+        }),
+        ReadReceiptEvidence::Synthetic { .. } => Err(FileSystemError::ReceiptAuthoritySynthetic {
+            object_key: key,
+            expected_generation: expected_gen,
+        }),
         ReadReceiptEvidence::MalformedPolicy { generation } => {
             Err(FileSystemError::ReceiptAuthorityMalformedPolicy {
                 object_key: key,
@@ -2546,8 +2543,7 @@ mod tests {
         .expect("duplicate write should encode redirect");
 
         assert_eq!(
-            decode_dedup_redirect(&duplicate_redirect)
-                .expect("duplicate redirect should decode"),
+            decode_dedup_redirect(&duplicate_redirect).expect("duplicate redirect should decode"),
             canonical_key
         );
         let stats = dedup_index.stats();
@@ -2608,8 +2604,7 @@ mod tests {
         let payload = b"chunk plaintext authority".to_vec();
         let record = test_record(9, 4, payload.len() as u64);
         let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded =
-            encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
         let checksum = FastBlockChecksum::compute(&encoded);
         store.put(key, &encoded).expect("write chunk");
         let chunk_ref = ContentChunkRef {
@@ -2698,8 +2693,7 @@ mod tests {
         let payload = b"receipt-stale chunk".to_vec();
         let record = test_record(11, 5, payload.len() as u64);
         let key = content_chunk_object_key_for_version(record.inode_id, record.data_version, 0);
-        let encoded =
-            encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
+        let encoded = encode_content_chunk(&record, 0, &payload, &ContentCompressionPolicy::off());
         let checksum = FastBlockChecksum::compute(&encoded);
         let (_, receipt) = pool
             .put_with_receipt(DeviceIoClass::Data, key, &encoded)
@@ -2940,13 +2934,9 @@ mod receipt_readback_authority_tests {
             placement_receipt_generation: receipt.generation,
         };
 
-        let result = read_chunk_bytes_with_receipt(
-            pool.raw_primary_store(),
-            Some(&pool),
-            &chunk_ref,
-            key,
-        )
-        .expect("valid receipt should read through pool");
+        let result =
+            read_chunk_bytes_with_receipt(pool.raw_primary_store(), Some(&pool), &chunk_ref, key)
+                .expect("valid receipt should read through pool");
         assert_eq!(result, payload);
     }
 
@@ -2972,14 +2962,13 @@ mod receipt_readback_authority_tests {
             placement_receipt_generation: 42,
         };
 
-        let result = read_chunk_bytes_with_receipt(
-            pool.raw_primary_store(),
-            Some(&pool),
-            &chunk_ref,
-            key,
-        );
+        let result =
+            read_chunk_bytes_with_receipt(pool.raw_primary_store(), Some(&pool), &chunk_ref, key);
         match result {
-            Err(FileSystemError::ReceiptAuthorityMissing { expected_generation: 42, .. }) => {}
+            Err(FileSystemError::ReceiptAuthorityMissing {
+                expected_generation: 42,
+                ..
+            }) => {}
             other => panic!("expected ReceiptAuthorityMissing, got {other:?}"),
         }
     }
@@ -3008,12 +2997,8 @@ mod receipt_readback_authority_tests {
             placement_receipt_generation: receipt1.generation,
         };
 
-        let result = read_chunk_bytes_with_receipt(
-            pool.raw_primary_store(),
-            Some(&pool),
-            &chunk_ref,
-            key,
-        );
+        let result =
+            read_chunk_bytes_with_receipt(pool.raw_primary_store(), Some(&pool), &chunk_ref, key);
         match result {
             Err(FileSystemError::ReceiptAuthorityStale {
                 expected_generation,
@@ -3099,7 +3084,10 @@ mod receipt_readback_authority_tests {
         };
 
         let evidence = classify_read_receipt(&malformed, 1);
-        assert!(matches!(evidence, ReadReceiptEvidence::MalformedPolicy { .. }));
+        assert!(matches!(
+            evidence,
+            ReadReceiptEvidence::MalformedPolicy { .. }
+        ));
         assert_eq!(evidence.label(), "malformed-policy");
     }
 
@@ -3128,7 +3116,9 @@ mod receipt_readback_authority_tests {
     /// classify_read_receipt reports OverWidth when target_count > required_width.
     #[test]
     fn classify_over_width_receipt() {
-        use tidefs_local_object_store::pool::{PlacementReceipt, PlacementReceiptTarget, PoolRedundancyPolicy};
+        use tidefs_local_object_store::pool::{
+            PlacementReceipt, PlacementReceiptTarget, PoolRedundancyPolicy,
+        };
         let over = PlacementReceipt {
             object_key: tidefs_local_object_store::ObjectKey::from_name(b"over"),
             epoch: 0,
@@ -3168,13 +3158,31 @@ mod receipt_readback_authority_tests {
         // Smoke-test: every variant has a non-empty label.
         let variants = [
             ReadReceiptEvidence::Valid { generation: 1 },
-            ReadReceiptEvidence::Unavailable { expected_generation: 1 },
-            ReadReceiptEvidence::Missing { expected_generation: 1 },
-            ReadReceiptEvidence::Stale { expected_generation: 1, observed_generation: 2 },
-            ReadReceiptEvidence::Synthetic { expected_generation: 1, observed_generation: 0 },
+            ReadReceiptEvidence::Unavailable {
+                expected_generation: 1,
+            },
+            ReadReceiptEvidence::Missing {
+                expected_generation: 1,
+            },
+            ReadReceiptEvidence::Stale {
+                expected_generation: 1,
+                observed_generation: 2,
+            },
+            ReadReceiptEvidence::Synthetic {
+                expected_generation: 1,
+                observed_generation: 0,
+            },
             ReadReceiptEvidence::MalformedPolicy { generation: 1 },
-            ReadReceiptEvidence::UnderWidth { generation: 1, target_count: 0, required_width: 2 },
-            ReadReceiptEvidence::OverWidth { generation: 1, target_count: 3, required_width: 2 },
+            ReadReceiptEvidence::UnderWidth {
+                generation: 1,
+                target_count: 0,
+                required_width: 2,
+            },
+            ReadReceiptEvidence::OverWidth {
+                generation: 1,
+                target_count: 3,
+                required_width: 2,
+            },
         ];
         for v in &variants {
             assert!(!v.label().is_empty(), "label empty for {v:?}");
@@ -3472,8 +3480,12 @@ mod rewrite_extent_trimming_tests {
                 compression: None,
             }],
         };
-        Pool::create(config, PoolProperties::default(), &StoreOptions::test_fast())
-            .expect("create temp pool")
+        Pool::create(
+            config,
+            PoolProperties::default(),
+            &StoreOptions::test_fast(),
+        )
+        .expect("create temp pool")
     }
 
     /// Build a ContentChunkRef with a durable receipt (via pool put_with_receipt).
@@ -3543,9 +3555,8 @@ mod rewrite_extent_trimming_tests {
 
         let new_chunks = vec![new_chunk0, new_chunk1];
 
-        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
-            &pool, inode_id, &old_manifest, &new_chunks,
-        );
+        let (trimmable, deferred) =
+            obsolete_extent_keys_for_chunked_rewrite(&pool, inode_id, &old_manifest, &new_chunks);
 
         assert_eq!(trimmable.len(), 2, "both old chunks should be trimmable");
         assert!(deferred.is_empty(), "no chunks should be deferred");
@@ -3577,11 +3588,13 @@ mod rewrite_extent_trimming_tests {
         let new_chunks = vec![new_chunk0];
         let new_key0 = content_chunk_object_key_for_version(inode_id, 2, 0);
 
-        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
-            &pool, inode_id, &old_manifest, &new_chunks,
-        );
+        let (trimmable, deferred) =
+            obsolete_extent_keys_for_chunked_rewrite(&pool, inode_id, &old_manifest, &new_chunks);
 
-        assert!(trimmable.is_empty(), "no chunks should be trimmable when replacement not durable");
+        assert!(
+            trimmable.is_empty(),
+            "no chunks should be trimmable when replacement not durable"
+        );
         assert_eq!(deferred.len(), 1, "old chunk should be deferred");
         assert!(deferred.contains(&(old_key0, new_key0)));
     }
@@ -3606,12 +3619,17 @@ mod rewrite_extent_trimming_tests {
 
         let new_chunks = vec![chunk0]; // same chunk, same data_version
 
-        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
-            &pool, inode_id, &old_manifest, &new_chunks,
-        );
+        let (trimmable, deferred) =
+            obsolete_extent_keys_for_chunked_rewrite(&pool, inode_id, &old_manifest, &new_chunks);
 
-        assert!(trimmable.is_empty(), "retained chunks should not be trimmable");
-        assert!(deferred.is_empty(), "retained chunks should not be deferred");
+        assert!(
+            trimmable.is_empty(),
+            "retained chunks should not be trimmable"
+        );
+        assert!(
+            deferred.is_empty(),
+            "retained chunks should not be deferred"
+        );
     }
 
     #[test]
@@ -3631,9 +3649,8 @@ mod rewrite_extent_trimming_tests {
 
         let new_chunks: Vec<ContentChunkRef> = vec![];
 
-        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
-            &pool, inode_id, &old_manifest, &new_chunks,
-        );
+        let (trimmable, deferred) =
+            obsolete_extent_keys_for_chunked_rewrite(&pool, inode_id, &old_manifest, &new_chunks);
 
         assert!(trimmable.is_empty(), "hole chunks should not be trimmable");
         assert!(deferred.is_empty(), "hole chunks should not be deferred");
@@ -3667,13 +3684,16 @@ mod rewrite_extent_trimming_tests {
             placement_receipt_generation: 1,
         }];
 
-        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
-            &pool, inode_id, &old_manifest, &new_chunks,
-        );
+        let (trimmable, deferred) =
+            obsolete_extent_keys_for_chunked_rewrite(&pool, inode_id, &old_manifest, &new_chunks);
 
         // Chunk 0 is retained (same data_version) — not obsolete.
         // Chunk 1 is past new file size — trimmable unconditionally.
-        assert_eq!(trimmable.len(), 1, "chunk past new size should be trimmable");
+        assert_eq!(
+            trimmable.len(),
+            1,
+            "chunk past new size should be trimmable"
+        );
         assert!(deferred.is_empty());
         assert!(trimmable.contains(&old_key1));
         assert!(!trimmable.contains(&old_key0));
@@ -3707,12 +3727,18 @@ mod rewrite_extent_trimming_tests {
             .expect("put new manifest receipt");
 
         let (trimmable, deferred) = obsolete_extent_keys_for_full_replace(
-            &pool, inode_id, &old_manifest, &new_chunks, new_data_version,
+            &pool,
+            inode_id,
+            &old_manifest,
+            &new_chunks,
+            new_data_version,
         );
 
         let old_manifest_key = content_object_key_for_version(inode_id, 1);
-        assert!(trimmable.contains(&old_manifest_key),
-            "old manifest key should be trimmable when new manifest receipt is durable");
+        assert!(
+            trimmable.contains(&old_manifest_key),
+            "old manifest key should be trimmable when new manifest receipt is durable"
+        );
         // Old chunk + old manifest = 2 entries
         assert_eq!(trimmable.len(), 2);
         assert!(deferred.is_empty());
@@ -3725,8 +3751,7 @@ mod rewrite_extent_trimming_tests {
         let old_key = content_object_key_for_version(inode_id, 1);
         let new_key = content_object_key_for_version(inode_id, 2);
 
-        let (trimmable, deferred) =
-            obsolete_extent_keys_for_inline_replace(&pool, inode_id, 1, 2);
+        let (trimmable, deferred) = obsolete_extent_keys_for_inline_replace(&pool, inode_id, 1, 2);
 
         assert!(trimmable.is_empty());
         assert_eq!(deferred, vec![(old_key, new_key)]);
@@ -3734,8 +3759,7 @@ mod rewrite_extent_trimming_tests {
         pool.put_with_receipt(DeviceIoClass::Data, new_key, b"new inline")
             .expect("put new inline receipt");
 
-        let (trimmable, deferred) =
-            obsolete_extent_keys_for_inline_replace(&pool, inode_id, 1, 2);
+        let (trimmable, deferred) = obsolete_extent_keys_for_inline_replace(&pool, inode_id, 1, 2);
 
         assert_eq!(trimmable, vec![old_key]);
         assert!(deferred.is_empty());
@@ -3760,10 +3784,8 @@ mod rewrite_extent_trimming_tests {
         let mut pool = temp_pool("trim-workflow-dur");
         let inode_id = InodeId(7);
 
-        let (old_key, old_chunk) =
-            durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"old data");
-        let (_new_key, new_chunk) =
-            durable_chunk_ref(&mut pool, inode_id, 2, 0, 4096, b"new data");
+        let (old_key, old_chunk) = durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"old data");
+        let (_new_key, new_chunk) = durable_chunk_ref(&mut pool, inode_id, 2, 0, 4096, b"new data");
 
         let old_manifest = ContentManifestObject {
             inode_id,
@@ -3775,9 +3797,8 @@ mod rewrite_extent_trimming_tests {
 
         let new_chunks = vec![new_chunk];
 
-        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
-            &pool, inode_id, &old_manifest, &new_chunks,
-        );
+        let (trimmable, deferred) =
+            obsolete_extent_keys_for_chunked_rewrite(&pool, inode_id, &old_manifest, &new_chunks);
 
         assert_eq!(trimmable.len(), 1);
         assert!(trimmable.contains(&old_key));
@@ -3791,8 +3812,7 @@ mod rewrite_extent_trimming_tests {
         let mut pool = temp_pool("trim-workflow-nondur");
         let inode_id = InodeId(8);
 
-        let (old_key, old_chunk) =
-            durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"old data");
+        let (old_key, old_chunk) = durable_chunk_ref(&mut pool, inode_id, 1, 0, 4096, b"old data");
 
         // Non-durable replacement: ref exists but no pool receipt.
         let new_chunk = non_durable_chunk_ref(inode_id, 2, 0, 4096);
@@ -3808,9 +3828,8 @@ mod rewrite_extent_trimming_tests {
         let new_chunks = vec![new_chunk];
         let new_key = content_chunk_object_key_for_version(inode_id, 2, 0);
 
-        let (trimmable, deferred) = obsolete_extent_keys_for_chunked_rewrite(
-            &pool, inode_id, &old_manifest, &new_chunks,
-        );
+        let (trimmable, deferred) =
+            obsolete_extent_keys_for_chunked_rewrite(&pool, inode_id, &old_manifest, &new_chunks);
 
         assert!(trimmable.is_empty());
         assert_eq!(deferred.len(), 1);

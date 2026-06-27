@@ -97,7 +97,9 @@ fn smoke_lock_tracker_conflict_and_release(h: &mut SmokeHarness) {
     record_lock_op(h, 7, "workers_locks.acquire", b"write");
     let mut tracker = LockTracker::new();
     let existing = LockRange::write(0, 100, 100);
-    tracker.acquire(TEST_MOUNT, 7, existing).expect("initial write lock");
+    tracker
+        .acquire(TEST_MOUNT, 7, existing)
+        .expect("initial write lock");
     h.assert_eq_ev(
         "tracker has one inode after acquire",
         tracker.inode_count(),
@@ -105,7 +107,10 @@ fn smoke_lock_tracker_conflict_and_release(h: &mut SmokeHarness) {
     );
     h.assert_eq_ev(
         "tracker stores initial range",
-        tracker.locks_for_mount_inode(TEST_MOUNT, 7).expect("inode lock list").locks(),
+        tracker
+            .locks_for_mount_inode(TEST_MOUNT, 7)
+            .expect("inode lock list")
+            .locks(),
         &[existing],
     );
 
@@ -127,7 +132,10 @@ fn smoke_lock_tracker_conflict_and_release(h: &mut SmokeHarness) {
     );
     h.assert_eq_ev(
         "failed acquire leaves existing lock intact",
-        tracker.locks_for_mount_inode(TEST_MOUNT, 7).expect("inode lock list").locks(),
+        tracker
+            .locks_for_mount_inode(TEST_MOUNT, 7)
+            .expect("inode lock list")
+            .locks(),
         &[existing],
     );
 
@@ -140,7 +148,10 @@ fn smoke_lock_tracker_conflict_and_release(h: &mut SmokeHarness) {
         .expect("compatible read lock");
     h.assert_eq_ev(
         "read locks from different pids are compatible",
-        tracker.locks_for_mount_inode(TEST_MOUNT, 8).expect("read lock list").len(),
+        tracker
+            .locks_for_mount_inode(TEST_MOUNT, 8)
+            .expect("read lock list")
+            .len(),
         2,
     );
 

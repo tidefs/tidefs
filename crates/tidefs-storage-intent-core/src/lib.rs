@@ -2345,10 +2345,7 @@ impl StorageIntentServiceObjectiveEvidence {
             && self.latency.has_tail_bounds()
             && self.throughput.has_queue_profile()
             && self.recovery_floor.has_recovery_bounds()
-            && !matches!(
-                self.scope.workload_class,
-                AccessPatternClass::Unknown
-            )
+            && !matches!(self.scope.workload_class, AccessPatternClass::Unknown)
             && !matches!(
                 self.scope.workload_phase,
                 StorageIntentServiceObjectiveWorkloadPhase::Unknown
@@ -2386,27 +2383,29 @@ impl StorageIntentServiceObjectiveEvidence {
             && service_objective_query_snapshot_matches(self, snapshot)
             && snapshot.is_authority_admissible()
             && snapshot.has_fresh_service_objective()
-            && snapshot
-                .contains_fresh_authority_family(StorageIntentEvidenceKind::WorkloadEvidence)
-            && snapshot
-                .contains_fresh_authority_family(StorageIntentEvidenceKind::SchedulerAdmissionRecord)
-            && snapshot
-                .contains_fresh_authority_family(StorageIntentEvidenceKind::CapacityAdmissionEvidence)
+            && snapshot.contains_fresh_authority_family(StorageIntentEvidenceKind::WorkloadEvidence)
+            && snapshot.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+            )
+            && snapshot.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::CapacityAdmissionEvidence,
+            )
             && snapshot
                 .contains_fresh_authority_family(StorageIntentEvidenceKind::TenantIsolationEvidence)
             && snapshot.has_fresh_media_capability()
-            && snapshot
-                .contains_fresh_authority_family(StorageIntentEvidenceKind::RecoveryDegradationEvidence)
+            && snapshot.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::RecoveryDegradationEvidence,
+            )
             && snapshot
                 .contains_fresh_authority_family(StorageIntentEvidenceKind::PolicyRolloutEvidence)
             && snapshot
                 .contains_fresh_authority_family(StorageIntentEvidenceKind::TransportPathEvidence)
-            && snapshot
-                .contains_fresh_authority_family(StorageIntentEvidenceKind::TemporalEvidence)
+            && snapshot.contains_fresh_authority_family(StorageIntentEvidenceKind::TemporalEvidence)
             && snapshot
                 .contains_fresh_authority_family(StorageIntentEvidenceKind::MediaCostWearLedger)
-            && snapshot
-                .contains_fresh_authority_family(StorageIntentEvidenceKind::DecisionFrontierEvidence)
+            && snapshot.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::DecisionFrontierEvidence,
+            )
             && snapshot
                 .contains_fresh_authority_family(StorageIntentEvidenceKind::ActionExecutionEvidence)
             && snapshot
@@ -2418,8 +2417,9 @@ impl StorageIntentServiceObjectiveEvidence {
                 .contains_fresh_authority_family(StorageIntentEvidenceKind::ComparatorEvidence)
             && snapshot
                 .contains_fresh_authority_family(StorageIntentEvidenceKind::ClaimGateEvidence)
-            && snapshot
-                .contains_fresh_authority_family(StorageIntentEvidenceKind::EvidenceRetentionEvidence)
+            && snapshot.contains_fresh_authority_family(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+            )
     }
 
     /// Returns true when candidate scope exactly matches the compiled envelope.
@@ -2463,8 +2463,12 @@ impl StorageIntentServiceObjectiveEvidence {
             StorageIntentServiceObjectiveState::UnknownEvidence => {
                 StorageIntentRefusalReason::EvidenceNotUsable
             }
-            StorageIntentServiceObjectiveState::Blocked => StorageIntentRefusalReason::NoLegalReceiptSet,
-            StorageIntentServiceObjectiveState::Refused => StorageIntentRefusalReason::NoLegalReceiptSet,
+            StorageIntentServiceObjectiveState::Blocked => {
+                StorageIntentRefusalReason::NoLegalReceiptSet
+            }
+            StorageIntentServiceObjectiveState::Refused => {
+                StorageIntentRefusalReason::NoLegalReceiptSet
+            }
         }
     }
 
@@ -2473,8 +2477,7 @@ impl StorageIntentServiceObjectiveEvidence {
     pub const fn media_operation_refusal(self) -> StorageIntentRefusalReason {
         let durable_operation =
             service_objective_operation_requires_durable_barrier(self.scope.operation);
-        if durable_operation
-            && matches!(self.state, StorageIntentServiceObjectiveState::CacheOnly)
+        if durable_operation && matches!(self.state, StorageIntentServiceObjectiveState::CacheOnly)
         {
             return StorageIntentRefusalReason::CacheCannotBeAuthority;
         }
@@ -2577,7 +2580,10 @@ impl StorageIntentServiceObjectiveEvidence {
             || !self.has_required_evidence_cut(snapshot)
             || !service_objective_query_snapshot_matches(self, snapshot)
             || !evidence_ref_equal(self.evidence_ref, attribution.service_objective_ref)
-            || !evidence_ref_equal(self.refs.measurement_attribution_ref, attribution.evidence_ref)
+            || !evidence_ref_equal(
+                self.refs.measurement_attribution_ref,
+                attribution.evidence_ref,
+            )
             || !evidence_ref_equal(
                 self.refs.evidence_query_snapshot_ref,
                 attribution.evidence_query_snapshot_ref,
@@ -2610,8 +2616,10 @@ impl StorageIntentServiceObjectiveEvidence {
             attribution,
             snapshot,
             StorageIntentMeasurementAttributionUseMask::SUPPORT_PUBLIC_OR_COMPARATOR_CLAIM,
-        ) && evidence_ref_equal(self.refs.comparator_ref, attribution.comparator.comparator_ref)
-            && evidence_ref_has_id(self.refs.claim_ref)
+        ) && evidence_ref_equal(
+            self.refs.comparator_ref,
+            attribution.comparator.comparator_ref,
+        ) && evidence_ref_has_id(self.refs.claim_ref)
     }
 }
 
@@ -2694,7 +2702,10 @@ const fn service_objective_query_snapshot_matches(
         )
         && bytes16_equal(evidence.scope.policy_id.0, snapshot.policy_id.0)
         && evidence.scope.policy_revision.0 == snapshot.policy_revision.0
-        && service_objective_snapshot_subject_matches(evidence.scope.subject_scope, snapshot.subject)
+        && service_objective_snapshot_subject_matches(
+            evidence.scope.subject_scope,
+            snapshot.subject,
+        )
         && snapshot.included_refs.contains_ref(evidence.evidence_ref)
 }
 
@@ -8602,8 +8613,7 @@ impl ECArchiveShape {
     /// Returns true when this is a valid shape (k > 0, k+m <= 255).
     #[must_use]
     pub const fn is_valid(self) -> bool {
-        self.ec_data_shards > 0
-            && self.ec_data_shards as u16 + self.ec_parity_shards as u16 <= 255
+        self.ec_data_shards > 0 && self.ec_data_shards as u16 + self.ec_parity_shards as u16 <= 255
     }
 
     /// Total shards (k+m).
@@ -8729,7 +8739,6 @@ pub enum TransformRefusalClass {
     ReplacementReceiptMissing = 7,
 }
 
-
 /// Data-shape specific refusal reasons.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -8763,9 +8772,7 @@ impl DataShapeRefusalReason {
     pub const fn to_storage_intent_refusal(self) -> StorageIntentRefusalReason {
         match self {
             Self::None => StorageIntentRefusalReason::None,
-            Self::UnknownDataShapeEvidence => {
-                StorageIntentRefusalReason::UnknownDataShapeEvidence
-            }
+            Self::UnknownDataShapeEvidence => StorageIntentRefusalReason::UnknownDataShapeEvidence,
             Self::StaleDataShapeEvidence => StorageIntentRefusalReason::StaleDataShapeEvidence,
             Self::WrongDomainForDedup | Self::DedupCrossesTenantDomain => {
                 StorageIntentRefusalReason::DedupCrossesTenantDomain
@@ -8796,7 +8803,6 @@ impl DataShapeRefusalReason {
         }
     }
 }
-
 
 /// Data-shape evidence: proven encoded shape for a range or generation.
 ///
@@ -8917,7 +8923,6 @@ impl DataShapeRecord {
 // Data-shape hard-gate validation predicates.
 // ---------------------------------------------------------------------------
 
-
 /// Const-compatible domain-id equality.
 const fn domain_ids_equal(a: StorageIntentDomainId, b: StorageIntentDomainId) -> bool {
     let mut i = 0;
@@ -8951,18 +8956,17 @@ const fn policy_ids_equal(a: StorageIntentPolicyId, b: StorageIntentPolicyId) ->
 ///
 /// Unknown, missing, or stale data-shape evidence blocks authority.
 #[must_use]
-pub const fn data_shape_evidence_is_usable(
-    record: DataShapeRecord,
-) -> ReceiptPredicateResult {
-    if !evidence_ref_is_kind(record.evidence, StorageIntentEvidenceKind::DataShapeEvidence) {
+pub const fn data_shape_evidence_is_usable(record: DataShapeRecord) -> ReceiptPredicateResult {
+    if !evidence_ref_is_kind(
+        record.evidence,
+        StorageIntentEvidenceKind::DataShapeEvidence,
+    ) {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::UnknownDataShapeEvidence,
         );
     }
     if record.evidence.generation == 0 || record.evidence.version == 0 {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::StaleDataShapeEvidence,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleDataShapeEvidence);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -8971,9 +8975,7 @@ pub const fn data_shape_evidence_is_usable(
 ///
 /// Any transform or data-shape refusal blocks authority.
 #[must_use]
-pub const fn data_shape_transform_is_legal(
-    record: DataShapeRecord,
-) -> ReceiptPredicateResult {
+pub const fn data_shape_transform_is_legal(record: DataShapeRecord) -> ReceiptPredicateResult {
     let refusal = record.shape_refusal();
     if matches!(refusal, StorageIntentRefusalReason::None) {
         return ReceiptPredicateResult::SATISFIED;
@@ -8991,14 +8993,10 @@ pub const fn data_shape_policy_identity_is_current(
     if !policy.policy_id.is_zero()
         && (record.policy_id.is_zero() || !policy_ids_equal(record.policy_id, policy.policy_id))
     {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::StaleDataShapeEvidence,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleDataShapeEvidence);
     }
     if policy.policy_revision.0 > 0 && record.policy_revision.0 < policy.policy_revision.0 {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::StaleDataShapeEvidence,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleDataShapeEvidence);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -9079,9 +9077,7 @@ pub const fn data_shape_compression_ordering_is_legal(
             ReceiptPredicateResult::SATISFIED
         }
         CompressionOrderingClass::Unknown => {
-            ReceiptPredicateResult::refused(
-                StorageIntentRefusalReason::IllegalCompressionOrdering,
-            )
+            ReceiptPredicateResult::refused(StorageIntentRefusalReason::IllegalCompressionOrdering)
         }
     }
 }
@@ -9092,9 +9088,7 @@ pub const fn data_shape_compression_ordering_is_legal(
 /// EC shapes with high rebuild width or restore-time width may block
 /// read-serving unless the policy explicitly permits degraded reads.
 #[must_use]
-pub const fn data_shape_ec_shape_is_legal(
-    shape: ECArchiveShape,
-) -> ReceiptPredicateResult {
+pub const fn data_shape_ec_shape_is_legal(shape: ECArchiveShape) -> ReceiptPredicateResult {
     if shape.is_replication() {
         return ReceiptPredicateResult::SATISFIED;
     }
@@ -9137,15 +9131,11 @@ pub const fn data_shape_rebake_replacement_receipt_is_present(
                 )
             }
         }
-        RebakeEligibilityClass::ReplacementReceiptPending => {
-            ReceiptPredicateResult::refused(
-                StorageIntentRefusalReason::RebakeReplacementReceiptMissing,
-            )
-        }
+        RebakeEligibilityClass::ReplacementReceiptPending => ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::RebakeReplacementReceiptMissing,
+        ),
         RebakeEligibilityClass::PaybackWindowNotMet => {
-            ReceiptPredicateResult::refused(
-                StorageIntentRefusalReason::RebakePaybackWindowNotMet,
-            )
+            ReceiptPredicateResult::refused(StorageIntentRefusalReason::RebakePaybackWindowNotMet)
         }
     }
 }
@@ -9195,10 +9185,7 @@ pub const fn data_shape_hard_gate_check(
         return r;
     }
     // Encryption must not be bypassed if policy requires it.
-    let r = data_shape_encryption_is_not_bypassed(
-        record,
-        !policy.encryption_domain.is_zero(),
-    );
+    let r = data_shape_encryption_is_not_bypassed(record, !policy.encryption_domain.is_zero());
     if !r.satisfied {
         return r;
     }
@@ -9519,8 +9506,7 @@ impl LayoutAllocatorRecord {
     pub const fn has_usable_authority(self) -> bool {
         matches!(
             self.evidence_authority,
-            AllocatorEvidenceAuthority::DurableRecords
-                | AllocatorEvidenceAuthority::RuntimeMirror
+            AllocatorEvidenceAuthority::DurableRecords | AllocatorEvidenceAuthority::RuntimeMirror
         )
     }
 
@@ -9547,7 +9533,11 @@ impl LayoutAllocatorRecord {
     /// Returns true when a free run of at least `requested_bytes` with `required_alignment`
     /// would be legal given the largest free run and alignment constraints.
     #[must_use]
-    pub const fn free_run_is_available(self, requested_bytes: u64, required_alignment: u32) -> bool {
+    pub const fn free_run_is_available(
+        self,
+        requested_bytes: u64,
+        required_alignment: u32,
+    ) -> bool {
         if requested_bytes == 0 {
             return true;
         }
@@ -9573,7 +9563,10 @@ impl LayoutAllocatorRecord {
     /// For conventional media, always returns true.
     #[must_use]
     pub const fn zone_is_compatible(self, requested_bytes: u64) -> bool {
-        if matches!(self.zone_class, ZoneDeviceClass::Conventional | ZoneDeviceClass::Unknown) {
+        if matches!(
+            self.zone_class,
+            ZoneDeviceClass::Conventional | ZoneDeviceClass::Unknown
+        ) {
             return true;
         }
         if self.zone_reset_needed {
@@ -9596,7 +9589,10 @@ impl LayoutAllocatorRecord {
 
     /// Returns true when block-volume alignment is satisfied.
     #[must_use]
-    pub const fn block_volume_alignment_is_satisfied(self, requested_block_volume_alignment: u32) -> bool {
+    pub const fn block_volume_alignment_is_satisfied(
+        self,
+        requested_block_volume_alignment: u32,
+    ) -> bool {
         if requested_block_volume_alignment == 0 {
             return true;
         }
@@ -9630,9 +9626,7 @@ impl LayoutAllocatorRecord {
     /// bytes to be non-zero.
     #[must_use]
     pub const fn is_ready_for_reclaim(self) -> bool {
-        self.reclaim_debt_bytes > 0
-            && self.is_authoritative()
-            && self.safe_to_reuse_bytes > 0
+        self.reclaim_debt_bytes > 0 && self.is_authoritative() && self.safe_to_reuse_bytes > 0
     }
 
     /// Returns the typed allocation refusal reason from this record.
@@ -11030,7 +11024,6 @@ pub enum StorageIntentRefusalReason {
     MissingOmittedContentDependency = 105,
 
     // --- Tenant isolation / budget / noisy-neighbor refusals (issue #902) ---
-
     /// Missing budget owner evidence for the requested isolation scope.
     MissingBudgetOwnerEvidence = 106,
     /// Isolation evidence is stale or from an expired evidence cut.
@@ -11063,7 +11056,6 @@ pub enum StorageIntentRefusalReason {
     DebtNotRepaid = 120,
 
     // --- Evidence-retention refusals (issue #910) ---
-
     /// Evidence-retention evidence is missing, unknown, or not a retention artifact.
     UnknownEvidenceRetention = 121,
     /// Retention class for the governed evidence is unknown.
@@ -11241,7 +11233,9 @@ impl StorageIntentRefusalReason {
             Self::DeadPendingReclaimNotYetFree => "dead-pending-reclaim-not-yet-free",
             Self::YoungByteFlashPromotionBlocked => "young-byte-flash-promotion-blocked",
             Self::SnapshotPinnedFlashPlacementBlocked => "snapshot-pinned-flash-placement-blocked",
-            Self::ReceiveBaseUnprotectedForGeoCatchUp => "receive-base-unprotected-for-geo-catch-up",
+            Self::ReceiveBaseUnprotectedForGeoCatchUp => {
+                "receive-base-unprotected-for-geo-catch-up"
+            }
             Self::BookmarkOnlyCannotRetainBytes => "bookmark-only-cannot-retain-bytes",
             Self::DestroyTombstoneAdmissionConflict => "destroy-tombstone-admission-conflict",
             Self::ContradictoryLifecycleEvidence => "contradictory-lifecycle-evidence",
@@ -11263,20 +11257,44 @@ impl StorageIntentRefusalReason {
             Self::DebtNotRepaid => "debt-not-repaid",
             Self::UnknownEvidenceRetention => "unknown-evidence-retention",
             Self::UnknownRetentionClassForEvidence => "unknown-retention-class-for-evidence",
-            Self::EvidenceRetentionLiveReceiptDependency => "evidence-retention-live-receipt-dependency",
-            Self::EvidenceRetentionLiveDecisionDependency => "evidence-retention-live-decision-dependency",
+            Self::EvidenceRetentionLiveReceiptDependency => {
+                "evidence-retention-live-receipt-dependency"
+            }
+            Self::EvidenceRetentionLiveDecisionDependency => {
+                "evidence-retention-live-decision-dependency"
+            }
             Self::EvidenceRetentionUnresolvedCooldown => "evidence-retention-unresolved-cooldown",
             Self::EvidenceRetentionMixedPolicyRollout => "evidence-retention-mixed-policy-rollout",
-            Self::EvidenceRetentionActiveRecoveryObligation => "evidence-retention-active-recovery-obligation",
-            Self::EvidenceRetentionActiveClaimDependency => "evidence-retention-active-claim-dependency",
-            Self::EvidenceRetentionActiveAuditLegalHold => "evidence-retention-active-audit-legal-hold",
-            Self::EvidenceRetentionCompactionWouldLoseState => "evidence-retention-compaction-would-lose-state",
-            Self::EvidenceRetentionStorageBudgetExhausted => "evidence-retention-storage-budget-exhausted",
-            Self::EvidenceRetentionCannotEvictAuthority => "evidence-retention-cannot-evict-authority",
-            Self::EvidenceRetentionTombstoneWithoutProofRoot => "evidence-retention-tombstone-without-proof-root",
-            Self::EvidenceRetentionSupersededMissingReplacement => "evidence-retention-superseded-missing-replacement",
-            Self::EvidenceRetentionMissingPurgeFrontier => "evidence-retention-missing-purge-frontier",
-            Self::EvidenceRetentionSafePurgeFrontierNotReached => "evidence-retention-safe-purge-frontier-not-reached",
+            Self::EvidenceRetentionActiveRecoveryObligation => {
+                "evidence-retention-active-recovery-obligation"
+            }
+            Self::EvidenceRetentionActiveClaimDependency => {
+                "evidence-retention-active-claim-dependency"
+            }
+            Self::EvidenceRetentionActiveAuditLegalHold => {
+                "evidence-retention-active-audit-legal-hold"
+            }
+            Self::EvidenceRetentionCompactionWouldLoseState => {
+                "evidence-retention-compaction-would-lose-state"
+            }
+            Self::EvidenceRetentionStorageBudgetExhausted => {
+                "evidence-retention-storage-budget-exhausted"
+            }
+            Self::EvidenceRetentionCannotEvictAuthority => {
+                "evidence-retention-cannot-evict-authority"
+            }
+            Self::EvidenceRetentionTombstoneWithoutProofRoot => {
+                "evidence-retention-tombstone-without-proof-root"
+            }
+            Self::EvidenceRetentionSupersededMissingReplacement => {
+                "evidence-retention-superseded-missing-replacement"
+            }
+            Self::EvidenceRetentionMissingPurgeFrontier => {
+                "evidence-retention-missing-purge-frontier"
+            }
+            Self::EvidenceRetentionSafePurgeFrontierNotReached => {
+                "evidence-retention-safe-purge-frontier-not-reached"
+            }
             Self::MetadataStaleInodeGeneration => "metadata-stale-inode-generation",
             Self::MetadataWrongParentInode => "metadata-wrong-parent-inode",
             Self::MetadataNamespaceConflict => "metadata-namespace-conflict",
@@ -11289,10 +11307,14 @@ impl StorageIntentRefusalReason {
             Self::MetadataMissingRetentionProof => "metadata-missing-retention-proof",
             Self::MetadataNamespaceEvidenceNotUsable => "metadata-namespace-evidence-not-usable",
             Self::MetadataStormP99Exceeded => "metadata-storm-p99-exceeded",
-            Self::MetadataLookupReaddirLatencyExceeded => "metadata-lookup-readdir-latency-exceeded",
+            Self::MetadataLookupReaddirLatencyExceeded => {
+                "metadata-lookup-readdir-latency-exceeded"
+            }
             Self::MetadataFsyncdirLatencyExceeded => "metadata-fsyncdir-latency-exceeded",
             Self::MetadataRenameUnlinkTailExceeded => "metadata-rename-unlink-tail-exceeded",
-            Self::MetadataSmallFileWriteAmplificationExceeded => "metadata-small-file-write-amplification-exceeded",
+            Self::MetadataSmallFileWriteAmplificationExceeded => {
+                "metadata-small-file-write-amplification-exceeded"
+            }
         }
     }
 
@@ -14394,37 +14416,25 @@ impl StorageIntentPolicyStageState {
     /// Returns true when the stage represents an active or transitioning state.
     #[must_use]
     pub const fn is_active(self) -> bool {
-        matches!(
-            self,
-            Self::ActiveForNewWrites | Self::ConvergingExisting
-        )
+        matches!(self, Self::ActiveForNewWrites | Self::ConvergingExisting)
     }
 
     /// Returns true when the stage is a terminal state.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Superseded | Self::Retired | Self::Refused
-        )
+        matches!(self, Self::Superseded | Self::Retired | Self::Refused)
     }
 
     /// Returns true when the stage permits new writes.
     #[must_use]
     pub const fn admits_new_writes(self) -> bool {
-        matches!(
-            self,
-            Self::ActiveForNewWrites | Self::ConvergingExisting
-        )
+        matches!(self, Self::ActiveForNewWrites | Self::ConvergingExisting)
     }
 
     /// Returns true when the rollout is blocked but not yet rolled back.
     #[must_use]
     pub const fn requires_intervention(self) -> bool {
-        matches!(
-            self,
-            Self::Blocked | Self::RollbackRequired
-        )
+        matches!(self, Self::Blocked | Self::RollbackRequired)
     }
 }
 
@@ -14487,10 +14497,7 @@ impl StorageIntentOldReceiptTreatment {
     /// Returns true when old receipts remain valid without convergence.
     #[must_use]
     pub const fn preserves_old_receipts(self) -> bool {
-        matches!(
-            self,
-            Self::Grandfathered | Self::UnusableForNewClaims
-        )
+        matches!(self, Self::Grandfathered | Self::UnusableForNewClaims)
     }
 
     /// Returns true when old receipts must be replaced before satisfying the new revision.
@@ -14524,10 +14531,7 @@ impl StorageIntentInFlightOperationFlags {
     pub const ARCHIVE_RESTORE: Self = Self(1 << 7);
     pub const RECEIPT_RETIREMENT: Self = Self(1 << 8);
 
-    pub const ALL_NEW_WRITE: Self = Self(
-        Self::WRITES.0
-            | Self::FSYNC_FUA.0,
-    );
+    pub const ALL_NEW_WRITE: Self = Self(Self::WRITES.0 | Self::FSYNC_FUA.0);
 
     pub const ALL_BACKGROUND: Self = Self(
         Self::READ_REPAIR.0
@@ -14556,8 +14560,7 @@ impl StorageIntentInFlightOperationFlags {
     /// Returns true when new-write operations are fenced.
     #[must_use]
     pub const fn fenced_new_writes(self) -> bool {
-        (self.0 & Self::WRITES.0) != 0
-            && (self.0 & Self::FSYNC_FUA.0) != 0
+        (self.0 & Self::WRITES.0) != 0 && (self.0 & Self::FSYNC_FUA.0) != 0
     }
 
     /// Returns true when at least one background operation is fenced.
@@ -14782,8 +14785,7 @@ impl StorageIntentPolicyRolloutEvidence {
         matches!(
             self.evidence_ref.kind,
             StorageIntentEvidenceKind::PolicyRolloutEvidence
-        )
-            && evidence_ref_has_id(self.evidence_ref)
+        ) && evidence_ref_has_id(self.evidence_ref)
             && !self.compiled_policy_id.is_zero()
             && self.compiled_policy_revision.0 > 0
     }
@@ -14791,15 +14793,13 @@ impl StorageIntentPolicyRolloutEvidence {
     /// Returns true when the rollout has a previous revision to compare against.
     #[must_use]
     pub const fn has_previous_revision(self) -> bool {
-        !self.previous_policy_id.is_zero()
-            && self.previous_policy_revision.0 > 0
+        !self.previous_policy_id.is_zero() && self.previous_policy_revision.0 > 0
     }
 
     /// Returns true when the rollout has a target revision (rollback or supersession).
     #[must_use]
     pub const fn has_target_revision(self) -> bool {
-        !self.target_policy_id.is_zero()
-            && self.target_policy_revision.0 > 0
+        !self.target_policy_id.is_zero() && self.target_policy_revision.0 > 0
     }
 
     /// Returns true when the change class is set to a known value.
@@ -14857,8 +14857,7 @@ impl StorageIntentPolicyRolloutEvidence {
     /// Returns true when the in-flight fence is defined for the current stage.
     #[must_use]
     pub const fn has_in_flight_fence(self) -> bool {
-        evidence_ref_has_id(self.in_flight_fence_ref)
-            && self.in_flight_fence_flags.0 != 0
+        evidence_ref_has_id(self.in_flight_fence_ref) && self.in_flight_fence_flags.0 != 0
     }
 
     /// Returns true when retirement is backed by retention and cleanup proof.
@@ -14984,8 +14983,7 @@ pub const fn rollout_rollback_is_receipt_producing(
     matches!(
         evidence.stage_state,
         StorageIntentPolicyStageState::RolledBack
-    )
-        && evidence.has_target_revision()
+    ) && evidence.has_target_revision()
         && evidence_ref_has_id(evidence.rollback_reentry_ref)
 }
 
@@ -14999,8 +14997,7 @@ pub const fn rollout_superseded_remains_visible_until_clean(
     matches!(
         evidence.stage_state,
         StorageIntentPolicyStageState::Superseded
-    )
-        && evidence_ref_has_id(evidence.supersession_ref)
+    ) && evidence_ref_has_id(evidence.supersession_ref)
 }
 
 // ===== Stage transition predicates =====
@@ -15042,8 +15039,7 @@ pub const fn rollout_can_transition_preflight_admitted_to_staged(
     matches!(
         evidence.stage_state,
         StorageIntentPolicyStageState::PreflightAdmitted
-    )
-        && evidence.has_scope()
+    ) && evidence.has_scope()
         && evidence.has_downgrade_authorization_if_required()
         && evidence.has_in_flight_fence()
 }
@@ -15075,8 +15071,7 @@ pub const fn rollout_can_transition_active_to_converging(
     matches!(
         evidence.stage_state,
         StorageIntentPolicyStageState::ActiveForNewWrites
-    )
-        && evidence_ref_has_id(evidence.convergence_frontier_ref)
+    ) && evidence_ref_has_id(evidence.convergence_frontier_ref)
         && evidence_ref_has_id(evidence.replacement_receipt_set_ref)
 }
 
@@ -15090,8 +15085,7 @@ pub const fn rollout_can_transition_converging_to_superseded(
     matches!(
         evidence.stage_state,
         StorageIntentPolicyStageState::ConvergingExisting
-    )
-        && evidence_ref_has_id(evidence.supersession_ref)
+    ) && evidence_ref_has_id(evidence.supersession_ref)
 }
 
 /// Stage transition: any active state → rollback-required.
@@ -15104,8 +15098,7 @@ pub const fn rollout_can_transition_to_rollback_required(
     evidence.stage_state.admits_new_writes()
         || matches!(
             evidence.stage_state,
-            StorageIntentPolicyStageState::Staged
-                | StorageIntentPolicyStageState::Blocked
+            StorageIntentPolicyStageState::Staged | StorageIntentPolicyStageState::Blocked
         )
 }
 
@@ -15119,17 +15112,14 @@ pub const fn rollout_can_transition_rollback_required_to_rolled_back(
     matches!(
         evidence.stage_state,
         StorageIntentPolicyStageState::RollbackRequired
-    )
-        && evidence_ref_has_id(evidence.rollback_reentry_ref)
+    ) && evidence_ref_has_id(evidence.rollback_reentry_ref)
 }
 
 /// Stage transition: any active or staged state → blocked.
 ///
 /// The rollout becomes blocked when prerequisites are missing.
 #[must_use]
-pub const fn rollout_can_become_blocked(
-    evidence: StorageIntentPolicyRolloutEvidence,
-) -> bool {
+pub const fn rollout_can_become_blocked(evidence: StorageIntentPolicyRolloutEvidence) -> bool {
     matches!(
         evidence.stage_state,
         StorageIntentPolicyStageState::Staged
@@ -15159,8 +15149,7 @@ pub const fn rollout_can_transition_superseded_to_retired(
     matches!(
         evidence.stage_state,
         StorageIntentPolicyStageState::Superseded
-    )
-        && !evidence_ref_has_id(evidence.outstanding_obligation_ref)
+    ) && !evidence_ref_has_id(evidence.outstanding_obligation_ref)
         && evidence.has_safe_retirement_evidence()
 }
 
@@ -15170,8 +15159,7 @@ pub const fn rollout_can_transition_superseded_to_retired(
 pub const fn rollout_fence_splits_new_and_old_writes(
     evidence: StorageIntentPolicyRolloutEvidence,
 ) -> bool {
-    evidence.stage_state.admits_new_writes()
-        && evidence.in_flight_fence_flags.fenced_new_writes()
+    evidence.stage_state.admits_new_writes() && evidence.in_flight_fence_flags.fenced_new_writes()
 }
 
 /// Returns true when old-receipt treatment permits reading old receipts.
@@ -15181,8 +15169,7 @@ pub const fn rollout_permits_reading_old_receipts(
 ) -> bool {
     !matches!(
         evidence.old_receipt_treatment,
-        StorageIntentOldReceiptTreatment::Refuse
-            | StorageIntentOldReceiptTreatment::Unknown
+        StorageIntentOldReceiptTreatment::Refuse | StorageIntentOldReceiptTreatment::Unknown
     )
 }
 
@@ -15195,8 +15182,7 @@ pub const fn rollout_requires_replacement_receipts_for_old_generations(
     matches!(
         evidence.old_receipt_treatment,
         StorageIntentOldReceiptTreatment::RequireConvergence
-    )
-        && evidence_ref_has_id(evidence.replacement_receipt_set_ref)
+    ) && evidence_ref_has_id(evidence.replacement_receipt_set_ref)
 }
 
 // ── Recovery/degradation evidence types (#900) ── //
@@ -15327,7 +15313,10 @@ impl StorageIntentDegradationPolicy {
     /// Returns true when the policy explicitly forbids hiding degradation.
     #[must_use]
     pub const fn forbids_hiding_degradation(self) -> bool {
-        matches!(self.visibility, StorageIntentDegradationVisibility::ForbidHide)
+        matches!(
+            self.visibility,
+            StorageIntentDegradationVisibility::ForbidHide
+        )
     }
 
     /// Returns true when the policy permits degraded-visible reads.
@@ -15600,8 +15589,7 @@ impl StorageIntentRecoveryDegradationEvidence {
     /// Returns true when enough targets are reachable for degraded reconstruction.
     #[must_use]
     pub const fn has_reconstruction_width(self) -> bool {
-        self.reconstruction_width > 0
-            && self.target_present >= self.reconstruction_width
+        self.reconstruction_width > 0 && self.target_present >= self.reconstruction_width
     }
 
     /// Returns true when no target is quarantined, fenced, or wrong-domain.
@@ -15953,7 +15941,9 @@ pub const fn recovery_evidence_supports_receipt_retirement(
         return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
     }
     if !evidence_ref_has_id(evidence.receipt_retirement_ordering_ref) {
-        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::MissingOrderingEvidence);
+        return ReceiptPredicateResult::refused(
+            StorageIntentRefusalReason::MissingOrderingEvidence,
+        );
     }
     if !evidence_ref_has_id(evidence.receipt_retirement_capacity_ref) {
         return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
@@ -16219,10 +16209,7 @@ impl StorageIntentLifecycleClass {
     pub const fn blocks_reclaim(self) -> bool {
         matches!(
             self,
-            Self::SnapshotPinned
-                | Self::CloneHeld
-                | Self::ReceiveBaseHeld
-                | Self::OrphanHeld
+            Self::SnapshotPinned | Self::CloneHeld | Self::ReceiveBaseHeld | Self::OrphanHeld
         )
     }
 
@@ -16295,7 +16282,10 @@ impl StorageIntentAnchorKind {
     /// Returns true when this anchor kind is data-retaining by default.
     #[must_use]
     pub const fn is_data_retaining(self) -> bool {
-        matches!(self, Self::Snapshot | Self::Clone | Self::ReceiveBase | Self::Orphan)
+        matches!(
+            self,
+            Self::Snapshot | Self::Clone | Self::ReceiveBase | Self::Orphan
+        )
     }
 
     /// Returns true when this anchor is non-retaining by default (bookmarks).
@@ -16638,7 +16628,8 @@ impl StorageIntentLifecycleGenerationEvidence {
     #[must_use]
     pub const fn has_bookmark_non_retaining_confirmed(self) -> bool {
         self.anchor_kind as u8 == StorageIntentAnchorKind::Bookmark as u8
-            && self.flags
+            && self
+                .flags
                 .contains_all(StorageIntentLifecycleFlags::BOOKMARK_NON_RETAINING_CONFIRMED)
     }
 
@@ -16661,9 +16652,10 @@ impl StorageIntentLifecycleGenerationEvidence {
 pub const fn lifecycle_evidence_is_present(
     evidence: StorageIntentLifecycleGenerationEvidence,
 ) -> ReceiptPredicateResult {
-    if !evidence.has_lifecycle_identity() || !evidence
-        .flags
-        .contains_all(StorageIntentLifecycleFlags::EVIDENCE_PRESENT)
+    if !evidence.has_lifecycle_identity()
+        || !evidence
+            .flags
+            .contains_all(StorageIntentLifecycleFlags::EVIDENCE_PRESENT)
     {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::UnknownLifecycleEvidence,
@@ -16674,14 +16666,10 @@ pub const fn lifecycle_evidence_is_present(
         .contains_all(StorageIntentLifecycleFlags::FRESH)
         || evidence.evidence_ref.generation == 0
     {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::StaleLifecycleEvidence,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleLifecycleEvidence);
     }
     if evidence.is_refused() {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::LifecycleClassBlocked,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::LifecycleClassBlocked);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -16699,9 +16687,7 @@ pub const fn lifecycle_reclaim_is_safe(
     }
     // Lifecycle class must not be unknown.
     if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::Unknown as u8 {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::LifecycleClassBlocked,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::LifecycleClassBlocked);
     }
     // Snapshot-pinned: reclaim illegal.
     if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::SnapshotPinned as u8 {
@@ -16716,9 +16702,7 @@ pub const fn lifecycle_reclaim_is_safe(
     }
     // Clone-held: reclaim illegal.
     if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::CloneHeld as u8 {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::GenerationHeldByClone,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::GenerationHeldByClone);
     }
     // Receive-base-held: reclaim illegal.
     if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::ReceiveBaseHeld as u8 {
@@ -16728,9 +16712,7 @@ pub const fn lifecycle_reclaim_is_safe(
     }
     // Orphan-held: reclaim illegal.
     if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::OrphanHeld as u8 {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::GenerationHeldByOrphan,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::GenerationHeldByOrphan);
     }
     // Dead-pending-reclaim: not free yet; need frontier + receipt.
     if evidence.lifecycle_class as u8 == StorageIntentLifecycleClass::DeadPendingReclaim as u8 {
@@ -16927,9 +16909,7 @@ pub const fn lifecycle_provenance_is_authoritative_when_required(
         return ReceiptPredicateResult::SATISFIED;
     }
     if !evidence.has_authoritative_provenance() {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::LifecycleClassBlocked,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::LifecycleClassBlocked);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -16955,16 +16935,12 @@ pub const fn lifecycle_evidence_is_usable(
     }
     // 3. Provenance must be authoritative for authority consumers.
     if !evidence.has_authoritative_provenance()
-        && evidence.provenance as u8
-            != StorageIntentLifecycleProvenanceClass::Predictive as u8
+        && evidence.provenance as u8 != StorageIntentLifecycleProvenanceClass::Predictive as u8
     {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::LifecycleClassBlocked,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::LifecycleClassBlocked);
     }
     ReceiptPredicateResult::SATISFIED
 }
-
 
 // ---------------------------------------------------------------------------
 // Tenant isolation evidence ─ budget ownership, noisy-neighbor, fairness
@@ -17421,7 +17397,6 @@ impl StorageIntentTenantIsolationEvidence {
         ) && evidence_ref_has_id(self.evidence_ref)
             && !self.policy_id.is_zero()
             && self.policy_revision.0 > 0
-
     }
 
     /// Returns true when the isolation scope is specified.
@@ -17504,9 +17479,7 @@ pub const fn isolation_evidence_is_present(
     }
     // Stale-isolation evidence gate: evidence_ref must have generation > 0.
     if evidence.evidence_ref.generation == 0 {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::StaleIsolationEvidence,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleIsolationEvidence);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -17550,9 +17523,9 @@ pub const fn isolation_trust_evidence_is_usable(
         return present;
     }
     // Trust evidence must be present when tenant or domain scope is required.
-    let scope_requires_trust =
-        evidence.isolation_scope as u8 == StorageIntentIsolationScope::Tenant as u8
-            || evidence.isolation_scope as u8 == StorageIntentIsolationScope::Dataset as u8;
+    let scope_requires_trust = evidence.isolation_scope as u8
+        == StorageIntentIsolationScope::Tenant as u8
+        || evidence.isolation_scope as u8 == StorageIntentIsolationScope::Dataset as u8;
     if scope_requires_trust && !evidence.has_trust_evidence() {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::MissingTenantDomainEvidence,
@@ -17576,9 +17549,7 @@ pub const fn isolation_temporal_evidence_is_usable(
         || evidence.borrowing.outstanding_debt_bytes > 0
         || evidence.noisy_neighbor.pressure_age_us > 0;
     if temporal_evidence_required && !evidence.has_temporal_evidence() {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::StaleIsolationEvidence,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::StaleIsolationEvidence);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -17594,23 +17565,16 @@ pub const fn isolation_borrowing_is_legal(
     }
     // Borrowing without authorization is illegal.
     if evidence.borrowing.is_borrowing && !evidence.borrowing.may_borrow {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::IllegalBudgetBorrowing,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::IllegalBudgetBorrowing);
     }
     // Overdue debt blocks further borrowing.
     if evidence.borrowing.debt_overdue {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::DebtNotRepaid,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::DebtNotRepaid);
     }
     // Outstanding debt without repayment window is illegal.
-    if evidence.borrowing.outstanding_debt_bytes > 0
-        && evidence.borrowing.repayment_window_us == 0
+    if evidence.borrowing.outstanding_debt_bytes > 0 && evidence.borrowing.repayment_window_us == 0
     {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::IllegalBudgetBorrowing,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::IllegalBudgetBorrowing);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -17627,28 +17591,19 @@ pub const fn isolation_reserve_is_protected(
         return present;
     }
     // Repair consuming protected reserve without exemption is illegal.
-    if requires_exemption_for_repair
-        && !evidence.exemption_override.repair_may_consume_reserve
-    {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::ReserveTheft,
-        );
+    if requires_exemption_for_repair && !evidence.exemption_override.repair_may_consume_reserve {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::ReserveTheft);
     }
     // Evacuation consuming protected reserve without exemption is illegal.
     if requires_exemption_for_evacuation
         && !evidence.exemption_override.evacuation_may_consume_reserve
     {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::ReserveTheft,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::ReserveTheft);
     }
     // Active exemption must be authorized.
-    if evidence.has_active_exemption()
-        && !evidence.exemption_override.operator_authorized_override
+    if evidence.has_active_exemption() && !evidence.exemption_override.operator_authorized_override
     {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::ExemptionNotAuthorized,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::ExemptionNotAuthorized);
     }
     // Active exemption must have evidence.
     if evidence.exemption_override.operator_authorized_override
@@ -17677,15 +17632,11 @@ pub const fn isolation_noisy_neighbor_is_below_threshold(
     }
     // P99 harm exceeds threshold: noisy-neighbor refusal.
     if evidence.noisy_neighbor.victim_p99_us > victim_p99_harm_threshold_us {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::NoisyNeighborPressure,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NoisyNeighborPressure);
     }
     // Queue harm exceeds threshold: noisy-neighbor refusal.
     if evidence.noisy_neighbor.queue_harm_entries > victim_queue_harm_threshold_entries {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::NoisyNeighborPressure,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::NoisyNeighborPressure);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -17726,9 +17677,7 @@ pub const fn isolation_work_has_budget_owner(
         return present;
     }
     if !evidence.budget_owner.has_owner() {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::UnownedWork,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::UnownedWork);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -17775,9 +17724,7 @@ pub const fn isolation_throttle_permits_work(
     evidence: StorageIntentTenantIsolationEvidence,
 ) -> ReceiptPredicateResult {
     if evidence.throttle.is_blocking() {
-        return ReceiptPredicateResult::refused(
-            evidence.throttle.to_storage_intent_refusal(),
-        );
+        return ReceiptPredicateResult::refused(evidence.throttle.to_storage_intent_refusal());
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -17793,12 +17740,8 @@ pub const fn isolation_borrowing_permits_consumption(
         return legal;
     }
     // If borrowing, requested bytes must not exceed max borrow.
-    if evidence.borrowing.is_borrowing
-        && requested_bytes > evidence.borrowing.max_borrow_bytes
-    {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::OverBudget,
-        );
+    if evidence.borrowing.is_borrowing && requested_bytes > evidence.borrowing.max_borrow_bytes {
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::OverBudget);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -17859,9 +17802,7 @@ impl StorageIntentEvidenceRetentionClass {
     pub const fn is_authority(self) -> bool {
         matches!(
             self,
-            Self::ReplayCritical
-                | Self::ReceiptAuthority
-                | Self::DecisionProof
+            Self::ReplayCritical | Self::ReceiptAuthority | Self::DecisionProof
         )
     }
 
@@ -17886,16 +17827,17 @@ impl StorageIntentEvidenceRetentionClass {
     pub const fn is_optional(self) -> bool {
         matches!(
             self,
-            Self::ShortLivedTelemetry
-                | Self::CompactableAggregate
-                | Self::OperatorExplanation
+            Self::ShortLivedTelemetry | Self::CompactableAggregate | Self::OperatorExplanation
         )
     }
 
     /// Returns true when this class supports audit/legal holds.
     #[must_use]
     pub const fn supports_legal_hold(self) -> bool {
-        matches!(self, Self::AuditLegal | Self::ReceiptAuthority | Self::ClaimArtifact)
+        matches!(
+            self,
+            Self::AuditLegal | Self::ReceiptAuthority | Self::ClaimArtifact
+        )
     }
 }
 
@@ -17971,10 +17913,7 @@ impl StorageIntentEvidenceCompactionRule {
     /// tombstone or digest anchor.
     #[must_use]
     pub const fn is_posthumous(self) -> bool {
-        matches!(
-            self,
-            Self::Tombstoned | Self::DigestPreservingSummary
-        )
+        matches!(self, Self::Tombstoned | Self::DigestPreservingSummary)
     }
 
     /// Returns true when compaction was attempted but refused.
@@ -18267,8 +18206,7 @@ impl StorageIntentEvidenceRetention {
     /// Returns true when the record cites a bound evidence-retention artifact.
     #[must_use]
     pub const fn has_retention_identity(self) -> bool {
-        self.evidence_ref.kind as u16
-            == StorageIntentEvidenceKind::EvidenceRetentionEvidence as u16
+        self.evidence_ref.kind as u16 == StorageIntentEvidenceKind::EvidenceRetentionEvidence as u16
             && evidence_ref_has_id(self.evidence_ref)
             && !self.policy_id.is_zero()
             && self.policy_revision.0 > 0
@@ -18339,9 +18277,7 @@ pub const fn retention_evidence_is_present(
             StorageIntentRefusalReason::UnknownEvidenceRetention,
         );
     }
-    if retention.retention_class as u8
-        == StorageIntentEvidenceRetentionClass::Unknown as u8
-    {
+    if retention.retention_class as u8 == StorageIntentEvidenceRetentionClass::Unknown as u8 {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::UnknownRetentionClassForEvidence,
         );
@@ -18419,7 +18355,10 @@ pub const fn retention_safe_purge_frontier_is_reached(
             StorageIntentRefusalReason::EvidenceRetentionMissingPurgeFrontier,
         );
     }
-    if !retention.safe_purge_frontier.generation_is_below_frontier(retention.generation) {
+    if !retention
+        .safe_purge_frontier
+        .generation_is_below_frontier(retention.generation)
+    {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::EvidenceRetentionSafePurgeFrontierNotReached,
         );
@@ -18437,9 +18376,7 @@ pub const fn retention_compaction_preserves_refused_state(
         return present;
     }
     // Compaction rules that would lose rejection/refusal information are illegal.
-    if retention.compaction_rule.is_lossy()
-        && !retention.compaction_rule.preserves_exact()
-    {
+    if retention.compaction_rule.is_lossy() && !retention.compaction_rule.preserves_exact() {
         // Redacted/audited summaries are acceptable if they preserve refusal.
         if retention.compaction_rule as u8
             != StorageIntentEvidenceCompactionRule::RedactedAuditedSummary as u8
@@ -18465,7 +18402,9 @@ pub const fn retention_storage_budget_respects_authority(
     }
     // Optional evidence may be refused when budget is exhausted.
     if retention.is_optional_evidence()
-        && retention.envelope.storage_budget_exhausted(storage_consumed_bytes)
+        && retention
+            .envelope
+            .storage_budget_exhausted(storage_consumed_bytes)
     {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::EvidenceRetentionStorageBudgetExhausted,
@@ -18473,7 +18412,9 @@ pub const fn retention_storage_budget_respects_authority(
     }
     // Authority evidence must not be evicted for budget reasons alone.
     if retention.is_authority_evidence()
-        && retention.envelope.storage_budget_exhausted(storage_consumed_bytes)
+        && retention
+            .envelope
+            .storage_budget_exhausted(storage_consumed_bytes)
     {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::EvidenceRetentionCannotEvictAuthority,
@@ -18492,8 +18433,7 @@ pub const fn retention_compaction_preserves_proof_root(
         return present;
     }
     // Tombstoning without a proof-root anchor is illegal.
-    if retention.compaction_rule as u8
-        == StorageIntentEvidenceCompactionRule::Tombstoned as u8
+    if retention.compaction_rule as u8 == StorageIntentEvidenceCompactionRule::Tombstoned as u8
         && !retention.has_proof_root()
     {
         return ReceiptPredicateResult::refused(
@@ -18501,8 +18441,7 @@ pub const fn retention_compaction_preserves_proof_root(
         );
     }
     // Superseded without a superseding evidence ref is illegal.
-    if retention.compaction_rule as u8
-        == StorageIntentEvidenceCompactionRule::Superseded as u8
+    if retention.compaction_rule as u8 == StorageIntentEvidenceCompactionRule::Superseded as u8
         && !evidence_ref_has_id(retention.refs.superseding_evidence_ref)
     {
         return ReceiptPredicateResult::refused(
@@ -18747,12 +18686,7 @@ impl MetadataNamespaceOperationKind {
     pub const fn is_namespace_mutation(self) -> bool {
         matches!(
             self,
-            Self::Create
-                | Self::Mkdir
-                | Self::Link
-                | Self::Unlink
-                | Self::Rename
-                | Self::Exchange
+            Self::Create | Self::Mkdir | Self::Link | Self::Unlink | Self::Rename | Self::Exchange
         )
     }
 }
@@ -18813,9 +18747,7 @@ impl MetadataLocalityRoleFlags {
     #[must_use]
     pub const fn has_small_file_shape(self) -> bool {
         (self.0
-            & (Self::SMALL_FILE_INLINE.0
-                | Self::SMALL_FILE_PACKED.0
-                | Self::SMALL_FILE_EXTERNAL.0))
+            & (Self::SMALL_FILE_INLINE.0 | Self::SMALL_FILE_PACKED.0 | Self::SMALL_FILE_EXTERNAL.0))
             != 0
     }
 }
@@ -19011,8 +18943,7 @@ impl StorageIntentMetadataNamespaceEvidence {
     /// Returns true when evidence identity, policy, subject, and operation are bound.
     #[must_use]
     pub const fn has_identity(self) -> bool {
-        self.evidence_ref.kind as u16
-            == StorageIntentEvidenceKind::MetadataNamespaceEvidence as u16
+        self.evidence_ref.kind as u16 == StorageIntentEvidenceKind::MetadataNamespaceEvidence as u16
             && evidence_ref_has_id(self.evidence_ref)
             && !bytes32_are_zero(self.evidence_id.0)
             && !self.policy_id.is_zero()
@@ -19030,8 +18961,7 @@ impl StorageIntentMetadataNamespaceEvidence {
     /// Returns true when ordering and ack-receipt spine refs are present.
     #[must_use]
     pub const fn has_ordering_spine(self) -> bool {
-        evidence_ref_has_id(self.ordering_ref)
-            && evidence_ref_has_id(self.replay_idempotency_ref)
+        evidence_ref_has_id(self.ordering_ref) && evidence_ref_has_id(self.replay_idempotency_ref)
     }
 
     /// Returns true when metadata locality roles are explicitly set.
@@ -19160,17 +19090,13 @@ pub const fn metadata_namespace_vfs_authority_is_bound(
     if !present.satisfied {
         return present;
     }
-    if evidence.vfs_authority.inode_number != 0
-        && evidence.vfs_authority.inode_generation == 0
-    {
+    if evidence.vfs_authority.inode_number != 0 && evidence.vfs_authority.inode_generation == 0 {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::MetadataStaleInodeGeneration,
         );
     }
     if !evidence.has_vfs_authority() {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::EvidenceNotUsable,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -19189,9 +19115,7 @@ pub const fn metadata_namespace_ordering_is_bound(
             StorageIntentRefusalReason::MissingOrderingEvidence,
         );
     }
-    if evidence.ordering_ref.kind as u16
-        != StorageIntentEvidenceKind::OrderingEvidence as u16
-    {
+    if evidence.ordering_ref.kind as u16 != StorageIntentEvidenceKind::OrderingEvidence as u16 {
         return ReceiptPredicateResult::refused(
             StorageIntentRefusalReason::MissingOrderingEvidence,
         );
@@ -19210,9 +19134,7 @@ pub const fn metadata_namespace_locality_is_legal(
     }
     // When locality roles are unset, evidence can only be diagnostic.
     if evidence.locality_roles.is_empty() {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::EvidenceNotUsable,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
     }
     // Sync-intent metadata requires a sync-barrier operation.
     if evidence
@@ -19289,7 +19211,6 @@ const PREFLIGHT_EMPTY_EVIDENCE_REF: StorageIntentEvidenceRef = StorageIntentEvid
     generation: 0,
     version: 0,
 };
-
 
 /// Fidelity class of a preflight simulation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -19369,7 +19290,10 @@ impl StorageIntentPreflightFidelityClass {
     /// Returns true when the simulation may execute shadow work.
     #[must_use]
     pub const fn may_execute_shadow_work(self) -> bool {
-        matches!(self, Self::ShadowExecution | Self::StagedPreflightReservedUnspent)
+        matches!(
+            self,
+            Self::ShadowExecution | Self::StagedPreflightReservedUnspent
+        )
     }
 }
 
@@ -19845,7 +19769,8 @@ impl StorageIntentPreflightProjectedDeltas {
     #[must_use]
     pub const fn has_unknown_delta(self) -> bool {
         let mut index = 0;
-        while index < self.len as usize && index < STORAGE_INTENT_PREFLIGHT_PROJECTED_DELTA_ENTRIES {
+        while index < self.len as usize && index < STORAGE_INTENT_PREFLIGHT_PROJECTED_DELTA_ENTRIES
+        {
             if self.entries[index].is_unknown {
                 return true;
             }
@@ -20051,23 +19976,21 @@ impl StorageIntentPreflightDecisionSummary {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct StorageIntentPreflightDecisionSet {
     /// Bounded list of decision frontier evidence refs.
-    pub decision_refs: [StorageIntentEvidenceRef;
-        STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
+    pub decision_refs: [StorageIntentEvidenceRef; STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
     /// Number of populated decision refs.
     pub decision_len: u8,
     /// Summary counts across the decision set.
     pub summary: StorageIntentPreflightDecisionSummary,
     /// Candidate classes covered by the simulation.
-    pub covered_candidate_classes: [StorageIntentDecisionCandidateClass;
-        STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
+    pub covered_candidate_classes:
+        [StorageIntentDecisionCandidateClass; STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
     /// Number of covered candidate classes.
     pub covered_classes_len: u8,
 }
 
 impl StorageIntentPreflightDecisionSet {
     pub const EMPTY: Self = Self {
-        decision_refs: [PREFLIGHT_EMPTY_EVIDENCE_REF;
-            STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
+        decision_refs: [PREFLIGHT_EMPTY_EVIDENCE_REF; STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
         decision_len: 0,
         summary: StorageIntentPreflightDecisionSummary::EMPTY,
         covered_candidate_classes: [StorageIntentDecisionCandidateClass::Unknown;
@@ -20140,7 +20063,8 @@ impl StorageIntentPreflightNonAuthorityMarker {
 // ===== Main preflight simulation evidence record =====
 
 /// Bounded per-simulation activation-blocker records.
-pub const STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS: usize = STORAGE_INTENT_PREFLIGHT_ACTIVATION_BLOCKERS;
+pub const STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS: usize =
+    STORAGE_INTENT_PREFLIGHT_ACTIVATION_BLOCKERS;
 
 /// The preflight simulation evidence record (#926).
 ///
@@ -20203,8 +20127,8 @@ pub struct StorageIntentPreflightSimulationEvidence {
 
     // Activation blockers
     /// Bounded activation blocker records.
-    pub blockers: [StorageIntentPreflightActivationBlocker;
-        STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS],
+    pub blockers:
+        [StorageIntentPreflightActivationBlocker; STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS],
     /// Number of populated blocker records.
     pub blocker_len: u8,
 
@@ -20288,8 +20212,7 @@ pub const fn preflight_simulation_has_no_blockers(
     evidence: StorageIntentPreflightSimulationEvidence,
 ) -> bool {
     let mut index = 0;
-    while index < evidence.blocker_len as usize
-        && index < STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS
+    while index < evidence.blocker_len as usize && index < STORAGE_INTENT_PREFLIGHT_BLOCKER_RECORDS
     {
         if evidence.blockers[index].blocks_activation() {
             return false;
@@ -20330,9 +20253,7 @@ pub const fn preflight_simulation_evidence_is_usable(
         return ReceiptPredicateResult::refused(StorageIntentRefusalReason::EvidenceNotUsable);
     }
     if evidence.is_expired {
-        return ReceiptPredicateResult::refused(
-            StorageIntentRefusalReason::ExpiredTemporalLease,
-        );
+        return ReceiptPredicateResult::refused(StorageIntentRefusalReason::ExpiredTemporalLease);
     }
     ReceiptPredicateResult::SATISFIED
 }
@@ -20360,7 +20281,8 @@ pub const fn preflight_simulation_is_preview_only(
     // Fidelity classes StaticPolicyCompile through StagedPreflightReservedUnspent
     // are all non-authoritative by definition; Unknown is rejected.
     preflight_simulation_is_non_authoritative(evidence)
-        && evidence.fidelity.to_discriminant() != StorageIntentPreflightFidelityClass::Unknown.to_discriminant()
+        && evidence.fidelity.to_discriminant()
+            != StorageIntentPreflightFidelityClass::Unknown.to_discriminant()
 }
 
 /// Returns true when the simulation does not claim to be authority.
@@ -21338,7 +21260,10 @@ mod tests {
             claim_ref: evidence_ref(StorageIntentEvidenceKind::ClaimGateEvidence, 94),
             retention_ref: evidence_ref(StorageIntentEvidenceKind::EvidenceRetentionEvidence, 95),
             ordering_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 96),
-            pmem_persistence_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 97),
+            pmem_persistence_ref: evidence_ref(
+                StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                97,
+            ),
             pmem_flush_fence_ref: evidence_ref(StorageIntentEvidenceKind::OrderingEvidence, 98),
             rdma_absent_correctness_ref: evidence_ref(
                 StorageIntentEvidenceKind::TransportPathEvidence,
@@ -21394,8 +21319,14 @@ mod tests {
                 max_concurrency: 8,
                 max_queue_depth: 32,
                 dirty_window_bytes: 256 * 1024,
-                coalescing_ref: evidence_ref(StorageIntentEvidenceKind::SchedulerAdmissionRecord, 178),
-                batching_ref: evidence_ref(StorageIntentEvidenceKind::SchedulerAdmissionRecord, 179),
+                coalescing_ref: evidence_ref(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    178,
+                ),
+                batching_ref: evidence_ref(
+                    StorageIntentEvidenceKind::SchedulerAdmissionRecord,
+                    179,
+                ),
                 backpressure_ref: evidence_ref(
                     StorageIntentEvidenceKind::SchedulerAdmissionRecord,
                     180,
@@ -21418,13 +21349,19 @@ mod tests {
                 media_role: scope.media_role,
                 topology_class: scope.topology_class,
                 transport_class: scope.transport_class,
-                thermal_health_ref: evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 181),
+                thermal_health_ref: evidence_ref(
+                    StorageIntentEvidenceKind::MediaCapabilityEvidence,
+                    181,
+                ),
                 namespace_identity_ref: evidence_ref(
                     StorageIntentEvidenceKind::MediaCapabilityEvidence,
                     182,
                 ),
                 residency_ref: evidence_ref(StorageIntentEvidenceKind::ReadFreshnessEvidence, 183),
-                environment_ref: evidence_ref(StorageIntentEvidenceKind::TransportPathEvidence, 184),
+                environment_ref: evidence_ref(
+                    StorageIntentEvidenceKind::TransportPathEvidence,
+                    184,
+                ),
             },
             refs: service_objective_refs(),
             state: StorageIntentServiceObjectiveState::Satisfied,
@@ -24490,10 +24427,8 @@ mod tests {
             WorkloadSignalFlags::EMPTY,
             PrefetchResidencyActionMask::LOW_RISK_PREFETCH,
         );
-        missing_policy_ref
-            .policy
-            .evidence_refs
-            .compiled_policy_ref = StorageIntentEvidenceRef::default();
+        missing_policy_ref.policy.evidence_refs.compiled_policy_ref =
+            StorageIntentEvidenceRef::default();
         let held = prefetch_residency_decide(missing_policy_ref);
         assert_eq!(
             held.admission_lane,
@@ -24619,10 +24554,7 @@ mod tests {
         assert_eq!(cooled.dwell_min_ms, 60_000);
         assert_eq!(cooled.cooldown_ms, 300_000);
         assert_eq!(cooled.payback_window_ms, 0);
-        assert_eq!(
-            cooled.payback_evidence,
-            StorageIntentEvidenceRef::default()
-        );
+        assert_eq!(cooled.payback_evidence, StorageIntentEvidenceRef::default());
         assert_eq!(cooled.cooldown_until_ms, 120_000);
 
         let admitted = prefetch_residency_decide(decision_context(
@@ -24641,7 +24573,10 @@ mod tests {
         assert_eq!(admitted.payback_window_ms, 60_000);
         assert_eq!(
             admitted.payback_evidence,
-            evidence_ref(StorageIntentEvidenceKind::MeasurementAttributionEvidence, 51)
+            evidence_ref(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                51
+            )
         );
         assert_eq!(admitted.cooldown_until_ms, 0);
         assert!(prefetch_residency_decision_may_request_authority_change(
@@ -24677,10 +24612,7 @@ mod tests {
         assert_eq!(cooled.dwell_min_ms, 60_000);
         assert_eq!(cooled.cooldown_ms, 300_000);
         assert_eq!(cooled.payback_window_ms, 0);
-        assert_eq!(
-            cooled.payback_evidence,
-            StorageIntentEvidenceRef::default()
-        );
+        assert_eq!(cooled.payback_evidence, StorageIntentEvidenceRef::default());
         assert_eq!(cooled.cooldown_until_ms, 180_000);
         assert!(!prefetch_residency_decision_is_cache_only(cooled));
 
@@ -24712,7 +24644,10 @@ mod tests {
         assert_eq!(admitted.payback_window_ms, 60_000);
         assert_eq!(
             admitted.payback_evidence,
-            evidence_ref(StorageIntentEvidenceKind::MeasurementAttributionEvidence, 51)
+            evidence_ref(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                51
+            )
         );
         assert_eq!(admitted.cooldown_until_ms, 0);
         assert!(!prefetch_residency_decision_may_request_authority_change(
@@ -24992,12 +24927,9 @@ mod tests {
             PrefetchResidencyActionMask::ALL_DEFINED,
         );
         ram_trial_context.signal.target_media = StorageMediaClass::SystemRam;
-        ram_trial_context.signal.target_media_ref = evidence_ref(
-            StorageIntentEvidenceKind::MediaCapabilityEvidence,
-            101,
-        );
-        ram_trial_context.target_media =
-            proven_media_capability(StorageMediaClass::SystemRam, 101);
+        ram_trial_context.signal.target_media_ref =
+            evidence_ref(StorageIntentEvidenceKind::MediaCapabilityEvidence, 101);
+        ram_trial_context.target_media = proven_media_capability(StorageMediaClass::SystemRam, 101);
 
         let trial_decision = prefetch_residency_decide(ram_trial_context);
         assert!(prefetch_residency_decision_is_cache_only(trial_decision));
@@ -25045,10 +24977,8 @@ mod tests {
             proven_hdd_capability(71),
             proven_cloud_object_capability(72),
         );
-        no_egress
-            .policy
-            .evidence_refs
-            .egress_restore_cost_ref = StorageIntentEvidenceRef::default();
+        no_egress.policy.evidence_refs.egress_restore_cost_ref =
+            StorageIntentEvidenceRef::default();
 
         let wan_refused = prefetch_residency_decide(no_egress);
         assert_eq!(
@@ -25092,8 +25022,7 @@ mod tests {
             proven_hdd_capability(75),
             proven_archive_capability(76),
         );
-        no_trust.policy.evidence_refs.trust_domain_ref =
-            StorageIntentEvidenceRef::default();
+        no_trust.policy.evidence_refs.trust_domain_ref = StorageIntentEvidenceRef::default();
 
         let archive_no_trust = prefetch_residency_decide(no_trust);
         assert_eq!(
@@ -25114,10 +25043,8 @@ mod tests {
             proven_hdd_capability(77),
             proven_archive_capability(78),
         );
-        no_transport
-            .policy
-            .evidence_refs
-            .transport_budget_ref = StorageIntentEvidenceRef::default();
+        no_transport.policy.evidence_refs.transport_budget_ref =
+            StorageIntentEvidenceRef::default();
 
         let archive_no_transport = prefetch_residency_decide(no_transport);
         assert_eq!(
@@ -25141,12 +25068,9 @@ mod tests {
             WorkloadSignalFlags::EMPTY,
             PrefetchResidencyActionMask::ALL_DEFINED,
         );
-        no_service_obj
-            .policy
-            .evidence_refs
-            .service_objective_ref = StorageIntentEvidenceRef::default();
-        no_service_obj.signal.service_objective_ref =
+        no_service_obj.policy.evidence_refs.service_objective_ref =
             StorageIntentEvidenceRef::default();
+        no_service_obj.signal.service_objective_ref = StorageIntentEvidenceRef::default();
 
         let demotion_no_svc = prefetch_residency_decide(no_service_obj);
         assert_eq!(
@@ -25165,10 +25089,7 @@ mod tests {
             WorkloadSignalFlags::EMPTY,
             PrefetchResidencyActionMask::ALL_DEFINED,
         );
-        no_reloc
-            .policy
-            .evidence_refs
-            .relocation_boundary_ref = StorageIntentEvidenceRef::default();
+        no_reloc.policy.evidence_refs.relocation_boundary_ref = StorageIntentEvidenceRef::default();
 
         let demotion_no_reloc = prefetch_residency_decide(no_reloc);
         assert_eq!(
@@ -25242,8 +25163,7 @@ mod tests {
 
         let mut frontier = decision_frontier();
         assert_eq!(
-            service_objective_hard_gate_precedes_scoring_and_admission(objective, frontier)
-                .refusal,
+            service_objective_hard_gate_precedes_scoring_and_admission(objective, frontier).refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
 
@@ -25285,11 +25205,8 @@ mod tests {
         scored_illegal.candidates = candidates;
 
         assert_eq!(
-            service_objective_hard_gate_precedes_scoring_and_admission(
-                objective,
-                scored_illegal,
-            )
-            .refusal,
+            service_objective_hard_gate_precedes_scoring_and_admission(objective, scored_illegal,)
+                .refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
@@ -25414,8 +25331,7 @@ mod tests {
             StorageIntentServiceObjectiveTopologyClass::WanInternet;
         wan_missing_baseline.environment.transport_class =
             StorageIntentServiceObjectiveTransportClass::WanTcp;
-        wan_missing_baseline.refs.rdma_absent_correctness_ref =
-            StorageIntentEvidenceRef::default();
+        wan_missing_baseline.refs.rdma_absent_correctness_ref = StorageIntentEvidenceRef::default();
         assert_eq!(
             wan_missing_baseline.media_operation_refusal(),
             StorageIntentRefusalReason::RdmaRequiredForCorrectness
@@ -26404,7 +26320,9 @@ mod tests {
     fn rollout_weakening_classes_require_downgrade_authz() {
         assert!(StorageIntentPolicyChangeClass::Weaken.requires_downgrade_authorization());
         assert!(StorageIntentPolicyChangeClass::Incompatible.requires_downgrade_authorization());
-        assert!(StorageIntentPolicyChangeClass::EmergencyOverride.requires_downgrade_authorization());
+        assert!(
+            StorageIntentPolicyChangeClass::EmergencyOverride.requires_downgrade_authorization()
+        );
         assert!(!StorageIntentPolicyChangeClass::Strengthen.requires_downgrade_authorization());
     }
 
@@ -26465,7 +26383,10 @@ mod tests {
             let decoded = StorageIntentOldReceiptTreatment::from_discriminant(disc);
             assert_eq!(decoded, Some(*t), "roundtrip failed for {:?}", t.as_str());
         }
-        assert_eq!(StorageIntentOldReceiptTreatment::from_discriminant(255), None);
+        assert_eq!(
+            StorageIntentOldReceiptTreatment::from_discriminant(255),
+            None
+        );
     }
 
     #[test]
@@ -26492,7 +26413,10 @@ mod tests {
             let decoded = StorageIntentRolloutRefusalReason::from_discriminant(disc);
             assert_eq!(decoded, Some(*r), "roundtrip failed for {:?}", r.as_str());
         }
-        assert_eq!(StorageIntentRolloutRefusalReason::from_discriminant(255), None);
+        assert_eq!(
+            StorageIntentRolloutRefusalReason::from_discriminant(255),
+            None
+        );
     }
 
     #[test]
@@ -26532,17 +26456,23 @@ mod tests {
     fn test_activation_requires_publication_scope_stage_fence() {
         let mut evidence = build_rollout_base();
         // Missing scope, stage, fence.
-        assert!(!rollout_activation_requires_publication_scope_stage_fence(evidence));
+        assert!(!rollout_activation_requires_publication_scope_stage_fence(
+            evidence
+        ));
 
         // Add publication, scope, stage, and mark not refused.
         evidence.publication_transaction_ref = publication_ref(2);
         evidence.scope_selector.dataset_id = StorageIntentDomainId([1_u8; 16]);
         evidence.stage_state = StorageIntentPolicyStageState::ActiveForNewWrites;
-        assert!(!rollout_activation_requires_publication_scope_stage_fence(evidence));
+        assert!(!rollout_activation_requires_publication_scope_stage_fence(
+            evidence
+        ));
 
         evidence.in_flight_fence_flags = StorageIntentInFlightOperationFlags::ALL_NEW_WRITE;
         evidence.in_flight_fence_ref = rollout_evidence_ref(3);
-        assert!(rollout_activation_requires_publication_scope_stage_fence(evidence));
+        assert!(rollout_activation_requires_publication_scope_stage_fence(
+            evidence
+        ));
     }
 
     #[test]
@@ -26621,15 +26551,24 @@ mod tests {
         let old_revision = StorageIntentPolicyRevision(0);
 
         // Same revision — no boundary crossing.
-        assert!(!rollout_relocation_crosses_revision_boundary(evidence, StorageIntentPolicyRevision(1)));
+        assert!(!rollout_relocation_crosses_revision_boundary(
+            evidence,
+            StorageIntentPolicyRevision(1)
+        ));
 
         // Different revision without replacement receipt set — fails.
-        assert!(!rollout_relocation_crosses_revision_boundary(evidence, old_revision));
+        assert!(!rollout_relocation_crosses_revision_boundary(
+            evidence,
+            old_revision
+        ));
 
         // Add replacement receipt set and outstanding obligation refs.
         evidence.replacement_receipt_set_ref = rollout_evidence_ref(2);
         evidence.outstanding_obligation_ref = rollout_evidence_ref(3);
-        assert!(rollout_relocation_crosses_revision_boundary(evidence, old_revision));
+        assert!(rollout_relocation_crosses_revision_boundary(
+            evidence,
+            old_revision
+        ));
     }
 
     #[test]
@@ -26669,7 +26608,9 @@ mod tests {
         evidence.stage_state = StorageIntentPolicyStageState::DryRun;
         evidence.preflight_evidence_ref = preflight_ref(1);
         evidence.evidence_query_snapshot_ref = query_snapshot_ref(1);
-        assert!(rollout_can_transition_dry_run_to_preflight_admitted(evidence));
+        assert!(rollout_can_transition_dry_run_to_preflight_admitted(
+            evidence
+        ));
     }
 
     #[test]
@@ -26680,15 +26621,21 @@ mod tests {
         evidence.change_class = StorageIntentPolicyChangeClass::Strengthen;
         evidence.in_flight_fence_ref = rollout_evidence_ref(1);
         evidence.in_flight_fence_flags = StorageIntentInFlightOperationFlags::WRITES;
-        assert!(rollout_can_transition_preflight_admitted_to_staged(evidence));
+        assert!(rollout_can_transition_preflight_admitted_to_staged(
+            evidence
+        ));
 
         // Weaken without authorization blocks.
         evidence.change_class = StorageIntentPolicyChangeClass::Weaken;
-        assert!(!rollout_can_transition_preflight_admitted_to_staged(evidence));
+        assert!(!rollout_can_transition_preflight_admitted_to_staged(
+            evidence
+        ));
 
         // Weaken with authorization passes.
         evidence.downgrade_authorization_ref = authz_ref(1);
-        assert!(rollout_can_transition_preflight_admitted_to_staged(evidence));
+        assert!(rollout_can_transition_preflight_admitted_to_staged(
+            evidence
+        ));
     }
 
     #[test]
@@ -26720,7 +26667,9 @@ mod tests {
     fn rollout_blocked_to_rollback_required() {
         let mut evidence = build_rollout_base();
         evidence.stage_state = StorageIntentPolicyStageState::Blocked;
-        assert!(rollout_can_transition_blocked_to_rollback_required(evidence));
+        assert!(rollout_can_transition_blocked_to_rollback_required(
+            evidence
+        ));
     }
 
     #[test]
@@ -26728,10 +26677,14 @@ mod tests {
         let mut evidence = build_rollout_base();
         evidence.stage_state = StorageIntentPolicyStageState::RollbackRequired;
         // Missing rollback reentry ref — cannot complete rollback.
-        assert!(!rollout_can_transition_rollback_required_to_rolled_back(evidence));
+        assert!(!rollout_can_transition_rollback_required_to_rolled_back(
+            evidence
+        ));
 
         evidence.rollback_reentry_ref = rollout_evidence_ref(20);
-        assert!(rollout_can_transition_rollback_required_to_rolled_back(evidence));
+        assert!(rollout_can_transition_rollback_required_to_rolled_back(
+            evidence
+        ));
     }
 
     #[test]
@@ -26777,10 +26730,14 @@ mod tests {
         let mut evidence = build_rollout_base();
         evidence.old_receipt_treatment = StorageIntentOldReceiptTreatment::RequireConvergence;
         evidence.replacement_receipt_set_ref = rollout_evidence_ref(40);
-        assert!(rollout_requires_replacement_receipts_for_old_generations(evidence));
+        assert!(rollout_requires_replacement_receipts_for_old_generations(
+            evidence
+        ));
 
         evidence.replacement_receipt_set_ref = StorageIntentEvidenceRef::default();
-        assert!(!rollout_requires_replacement_receipts_for_old_generations(evidence));
+        assert!(!rollout_requires_replacement_receipts_for_old_generations(
+            evidence
+        ));
     }
 
     #[test]
@@ -26819,10 +26776,7 @@ mod tests {
             StorageIntentPolicyChangeClass::Strengthen.as_str(),
             "strengthen"
         );
-        assert_eq!(
-            StorageIntentPolicyChangeClass::Weaken.as_str(),
-            "weaken"
-        );
+        assert_eq!(StorageIntentPolicyChangeClass::Weaken.as_str(), "weaken");
     }
 
     #[test]
@@ -27032,7 +26986,10 @@ mod tests {
         assert_eq!(DataShapeRefusalReason::from_discriminant(255), None);
     }
 
-    fn data_shape_evidence_ref(kind: StorageIntentEvidenceKind, id_byte: u8) -> StorageIntentEvidenceRef {
+    fn data_shape_evidence_ref(
+        kind: StorageIntentEvidenceKind,
+        id_byte: u8,
+    ) -> StorageIntentEvidenceRef {
         let mut id = [0_u8; 32];
         id[0] = id_byte;
         StorageIntentEvidenceRef {
@@ -27667,7 +27624,8 @@ mod tests {
     #[test]
     fn scrub_repair_requires_scrub_finding_and_repair_ticket() {
         let mut evidence = healthy_recovery_evidence();
-        evidence.scrub_finding_ref = evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 120);
+        evidence.scrub_finding_ref =
+            evidence_ref(StorageIntentEvidenceKind::ValidationArtifact, 120);
         evidence.repair_ticket_ref = ordering_ref(121);
         let result = recovery_evidence_supports_scrub_repair(evidence);
         assert!(result.satisfied);
@@ -28332,8 +28290,7 @@ mod tests {
         record.lifecycle_class = StorageIntentLifecycleClass::BookmarkOnlyNonretaining;
         record.anchor_kind = StorageIntentAnchorKind::Bookmark;
         record.flags = StorageIntentLifecycleFlags(
-            record.flags.0
-                | StorageIntentLifecycleFlags::BOOKMARK_NON_RETAINING_CONFIRMED,
+            record.flags.0 | StorageIntentLifecycleFlags::BOOKMARK_NON_RETAINING_CONFIRMED,
         );
         let result = lifecycle_bookmark_does_not_retain(record);
         assert!(result.satisfied);
@@ -28378,8 +28335,7 @@ mod tests {
         record.receive_base_generation = 2;
         record.refs.receive_base_ref = lifecycle_evidence_ref(214);
         record.flags = StorageIntentLifecycleFlags(
-            record.flags.0
-                | StorageIntentLifecycleFlags::RECEIVE_BASE_DEPENDENCIES_SATISFIED,
+            record.flags.0 | StorageIntentLifecycleFlags::RECEIVE_BASE_DEPENDENCIES_SATISFIED,
         );
         let result = lifecycle_receive_base_is_protected(record, false);
         assert!(result.satisfied);
@@ -28393,8 +28349,7 @@ mod tests {
         record.receive_base_generation = 2;
         record.refs.receive_base_ref = lifecycle_evidence_ref(215);
         record.flags = StorageIntentLifecycleFlags(
-            record.flags.0
-                | StorageIntentLifecycleFlags::RECEIVE_BASE_DEPENDENCIES_SATISFIED,
+            record.flags.0 | StorageIntentLifecycleFlags::RECEIVE_BASE_DEPENDENCIES_SATISFIED,
         );
         // Requires omitted content but none bound.
         let result = lifecycle_receive_base_is_protected(record, true);
@@ -28527,8 +28482,7 @@ mod tests {
                 | StorageIntentLifecycleFlags::AUTHORITATIVE_PROVENANCE,
         );
         assert!(flags.contains_all(
-            StorageIntentLifecycleFlags::EVIDENCE_PRESENT
-                | StorageIntentLifecycleFlags::FRESH
+            StorageIntentLifecycleFlags::EVIDENCE_PRESENT | StorageIntentLifecycleFlags::FRESH
         ));
         assert!(!flags.contains_all(StorageIntentLifecycleFlags::RECLAIM_RECEIPT_EARNED));
         assert!(flags.intersects(StorageIntentLifecycleFlags::FRESH));
@@ -28623,7 +28577,6 @@ mod tests {
         let result = lifecycle_dead_pending_is_not_free(record);
         assert!(result.satisfied);
     }
-
 
     // -------------------------------------------------------------------
     // Tenant isolation evidence model tests (issue #902)
@@ -28841,7 +28794,11 @@ mod tests {
         for r in &reasons {
             let disc = r.to_storage_intent_refusal().to_discriminant();
             let decoded = StorageIntentRefusalReason::from_discriminant(disc);
-            assert!(decoded.is_some(), "refusal roundtrip failed for {:?}", r.as_str());
+            assert!(
+                decoded.is_some(),
+                "refusal roundtrip failed for {:?}",
+                r.as_str()
+            );
             assert!(!matches!(decoded, Some(StorageIntentRefusalReason::None)));
         }
     }
@@ -28852,7 +28809,10 @@ mod tests {
         record.evidence_ref = StorageIntentEvidenceRef::default();
         let result = isolation_evidence_is_present(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::MissingBudgetOwnerEvidence);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MissingBudgetOwnerEvidence
+        );
     }
 
     #[test]
@@ -28861,7 +28821,10 @@ mod tests {
         record.evidence_ref.generation = 0;
         let result = isolation_evidence_is_present(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::StaleIsolationEvidence);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::StaleIsolationEvidence
+        );
     }
 
     #[test]
@@ -28873,7 +28836,10 @@ mod tests {
         record.budget_owner.policy_revision = StorageIntentPolicyRevision(0);
         let result = isolation_budget_owner_is_identified(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::MissingBudgetOwnerEvidence);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MissingBudgetOwnerEvidence
+        );
     }
 
     #[test]
@@ -28883,7 +28849,10 @@ mod tests {
         record.trust_evidence_ref = StorageIntentEvidenceRef::default();
         let result = isolation_trust_evidence_is_usable(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::MissingTenantDomainEvidence);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MissingTenantDomainEvidence
+        );
     }
 
     #[test]
@@ -28894,7 +28863,10 @@ mod tests {
         record.borrowing.outstanding_debt_bytes = 1000;
         let result = isolation_borrowing_is_legal(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::IllegalBudgetBorrowing);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::IllegalBudgetBorrowing
+        );
     }
 
     #[test]
@@ -28956,7 +28928,10 @@ mod tests {
         // exemption_evidence_ref is default (no id).
         let result = isolation_reserve_is_protected(record, false, false);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::MissingReserveExemption);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MissingReserveExemption
+        );
     }
 
     #[test]
@@ -29026,7 +29001,10 @@ mod tests {
         record.noisy_neighbor.queue_harm_entries = 10;
         let result = isolation_noisy_neighbor_is_below_threshold(record, 1000, 100);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::NoisyNeighborPressure);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::NoisyNeighborPressure
+        );
     }
 
     #[test]
@@ -29050,7 +29028,10 @@ mod tests {
         record.noisy_neighbor.queue_harm_entries = 200; // exceeds 100 threshold
         let result = isolation_noisy_neighbor_is_below_threshold(record, 1000, 100);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::NoisyNeighborPressure);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::NoisyNeighborPressure
+        );
     }
 
     #[test]
@@ -29075,10 +29056,8 @@ mod tests {
     fn starvation_overridden_with_temporal_evidence_passes() {
         let mut record = healthy_isolation_record();
         record.fair_share.starvation_state = StorageIntentStarvationState::Overridden;
-        record.temporal_evidence_ref = temporal_evidence_ref(
-            StorageIntentEvidenceKind::TemporalEvidence,
-            30,
-        );
+        record.temporal_evidence_ref =
+            temporal_evidence_ref(StorageIntentEvidenceKind::TemporalEvidence, 30);
         let result = isolation_starvation_is_resolved(record);
         assert!(result.satisfied);
     }
@@ -29090,7 +29069,10 @@ mod tests {
         record.temporal_evidence_ref = StorageIntentEvidenceRef::default();
         let result = isolation_starvation_is_resolved(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::StaleIsolationEvidence);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::StaleIsolationEvidence
+        );
     }
 
     #[test]
@@ -29159,7 +29141,10 @@ mod tests {
         record.trust_evidence_ref = StorageIntentEvidenceRef::default();
         let result = isolation_evidence_is_usable(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::MissingTenantDomainEvidence);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::MissingTenantDomainEvidence
+        );
     }
 
     #[test]
@@ -29262,7 +29247,10 @@ mod tests {
         }
     }
 
-    const fn governed_evidence_ref(id_byte: u8, kind: StorageIntentEvidenceKind) -> StorageIntentEvidenceRef {
+    const fn governed_evidence_ref(
+        id_byte: u8,
+        kind: StorageIntentEvidenceKind,
+    ) -> StorageIntentEvidenceRef {
         let mut id = [0_u8; 32];
         id[0] = id_byte;
         StorageIntentEvidenceRef {
@@ -29368,7 +29356,10 @@ mod tests {
         record.evidence_ref.kind = StorageIntentEvidenceKind::Unknown;
         let result = retention_evidence_is_present(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::UnknownEvidenceRetention);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnknownEvidenceRetention
+        );
     }
 
     #[test]
@@ -29377,7 +29368,10 @@ mod tests {
         record.retention_class = StorageIntentEvidenceRetentionClass::Unknown;
         let result = retention_evidence_is_present(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::UnknownRetentionClassForEvidence);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::UnknownRetentionClassForEvidence
+        );
     }
 
     #[test]
@@ -29390,64 +29384,92 @@ mod tests {
     #[test]
     fn retention_purge_blocked_by_live_receipt() {
         let mut record = healthy_retention_record();
-        record.refs.receipt_ref = governed_evidence_ref(10, StorageIntentEvidenceKind::PlacementReceipt);
+        record.refs.receipt_ref =
+            governed_evidence_ref(10, StorageIntentEvidenceKind::PlacementReceipt);
         let result = retention_purge_is_safe(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionLiveReceiptDependency);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionLiveReceiptDependency
+        );
     }
 
     #[test]
     fn retention_purge_blocked_by_live_decision_frontier() {
         let mut record = healthy_retention_record();
-        record.refs.decision_frontier_ref = governed_evidence_ref(11, StorageIntentEvidenceKind::DecisionFrontierEvidence);
+        record.refs.decision_frontier_ref =
+            governed_evidence_ref(11, StorageIntentEvidenceKind::DecisionFrontierEvidence);
         let result = retention_purge_is_safe(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionLiveDecisionDependency);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionLiveDecisionDependency
+        );
     }
 
     #[test]
     fn retention_purge_blocked_by_active_recovery_obligation() {
         let mut record = healthy_retention_record();
-        record.refs.recovery_obligation_ref = governed_evidence_ref(12, StorageIntentEvidenceKind::RecoveryDegradationEvidence);
+        record.refs.recovery_obligation_ref =
+            governed_evidence_ref(12, StorageIntentEvidenceKind::RecoveryDegradationEvidence);
         let result = retention_purge_is_safe(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionActiveRecoveryObligation);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionActiveRecoveryObligation
+        );
     }
 
     #[test]
     fn retention_purge_blocked_by_active_claim_dependency() {
         let mut record = healthy_retention_record();
-        record.refs.claim_ref = governed_evidence_ref(13, StorageIntentEvidenceKind::ClaimGateEvidence);
+        record.refs.claim_ref =
+            governed_evidence_ref(13, StorageIntentEvidenceKind::ClaimGateEvidence);
         let result = retention_purge_is_safe(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionActiveClaimDependency);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionActiveClaimDependency
+        );
     }
 
     #[test]
     fn retention_purge_blocked_by_active_audit_legal_hold() {
         let mut record = healthy_retention_record();
-        record.refs.audit_legal_hold_ref = governed_evidence_ref(14, StorageIntentEvidenceKind::TrustDomainEvidence);
+        record.refs.audit_legal_hold_ref =
+            governed_evidence_ref(14, StorageIntentEvidenceKind::TrustDomainEvidence);
         let result = retention_purge_is_safe(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionActiveAuditLegalHold);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionActiveAuditLegalHold
+        );
     }
 
     #[test]
     fn retention_purge_blocked_by_unresolved_cooldown() {
         let mut record = healthy_retention_record();
-        record.refs.cooldown_payback_ref = governed_evidence_ref(15, StorageIntentEvidenceKind::PredictionEvidence);
+        record.refs.cooldown_payback_ref =
+            governed_evidence_ref(15, StorageIntentEvidenceKind::PredictionEvidence);
         let result = retention_purge_is_safe(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionUnresolvedCooldown);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionUnresolvedCooldown
+        );
     }
 
     #[test]
     fn retention_purge_blocked_by_prediction_outcome_dependency() {
         let mut record = healthy_retention_record();
-        record.refs.prediction_outcome_ref = governed_evidence_ref(16, StorageIntentEvidenceKind::PredictionEvidence);
+        record.refs.prediction_outcome_ref =
+            governed_evidence_ref(16, StorageIntentEvidenceKind::PredictionEvidence);
         let result = retention_purge_is_safe(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionUnresolvedCooldown);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionUnresolvedCooldown
+        );
     }
 
     #[test]
@@ -29463,7 +29485,10 @@ mod tests {
         record.safe_purge_frontier = StorageIntentSafePurgeFrontier::default();
         let result = retention_safe_purge_frontier_is_reached(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionMissingPurgeFrontier);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionMissingPurgeFrontier
+        );
     }
 
     #[test]
@@ -29472,7 +29497,10 @@ mod tests {
         record.generation = 200; // above the sequence_frontier of 100
         let result = retention_safe_purge_frontier_is_reached(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionSafePurgeFrontierNotReached);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionSafePurgeFrontierNotReached
+        );
     }
 
     #[test]
@@ -29497,7 +29525,10 @@ mod tests {
         record.compaction_rule = StorageIntentEvidenceCompactionRule::HistogramSketchTopKSummary;
         let result = retention_compaction_preserves_refused_state(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionCompactionWouldLoseState);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionCompactionWouldLoseState
+        );
     }
 
     #[test]
@@ -29505,7 +29536,10 @@ mod tests {
         let record = healthy_retention_record();
         let result = retention_storage_budget_respects_authority(record, 10_000_000);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionCannotEvictAuthority);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionCannotEvictAuthority
+        );
     }
 
     #[test]
@@ -29514,7 +29548,10 @@ mod tests {
         record.retention_class = StorageIntentEvidenceRetentionClass::ShortLivedTelemetry;
         let result = retention_storage_budget_respects_authority(record, 10_000_000);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionStorageBudgetExhausted);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionStorageBudgetExhausted
+        );
     }
 
     #[test]
@@ -29523,14 +29560,18 @@ mod tests {
         record.compaction_rule = StorageIntentEvidenceCompactionRule::Tombstoned;
         let result = retention_compaction_preserves_proof_root(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionTombstoneWithoutProofRoot);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionTombstoneWithoutProofRoot
+        );
     }
 
     #[test]
     fn retention_tombstone_with_proof_root_passes() {
         let mut record = healthy_retention_record();
         record.compaction_rule = StorageIntentEvidenceCompactionRule::Tombstoned;
-        record.refs.proof_root_ref = governed_evidence_ref(20, StorageIntentEvidenceKind::EvidenceRetentionEvidence);
+        record.refs.proof_root_ref =
+            governed_evidence_ref(20, StorageIntentEvidenceKind::EvidenceRetentionEvidence);
         let result = retention_compaction_preserves_proof_root(record);
         assert!(result.satisfied);
     }
@@ -29541,14 +29582,18 @@ mod tests {
         record.compaction_rule = StorageIntentEvidenceCompactionRule::Superseded;
         let result = retention_compaction_preserves_proof_root(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionSupersededMissingReplacement);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionSupersededMissingReplacement
+        );
     }
 
     #[test]
     fn retention_superseded_with_replacement_passes() {
         let mut record = healthy_retention_record();
         record.compaction_rule = StorageIntentEvidenceCompactionRule::Superseded;
-        record.refs.superseding_evidence_ref = governed_evidence_ref(21, StorageIntentEvidenceKind::EvidenceRetentionEvidence);
+        record.refs.superseding_evidence_ref =
+            governed_evidence_ref(21, StorageIntentEvidenceKind::EvidenceRetentionEvidence);
         let result = retention_compaction_preserves_proof_root(record);
         assert!(result.satisfied);
     }
@@ -29563,10 +29608,14 @@ mod tests {
     #[test]
     fn retention_evidence_is_usable_fails_on_purge_blocked() {
         let mut record = healthy_retention_record();
-        record.refs.receipt_ref = governed_evidence_ref(10, StorageIntentEvidenceKind::PlacementReceipt);
+        record.refs.receipt_ref =
+            governed_evidence_ref(10, StorageIntentEvidenceKind::PlacementReceipt);
         let result = retention_evidence_is_usable(record);
         assert!(!result.satisfied);
-        assert_eq!(result.refusal, StorageIntentRefusalReason::EvidenceRetentionLiveReceiptDependency);
+        assert_eq!(
+            result.refusal,
+            StorageIntentRefusalReason::EvidenceRetentionLiveReceiptDependency
+        );
     }
 
     #[test]
@@ -29714,8 +29763,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     const META_POLICY_ID: StorageIntentPolicyId = StorageIntentPolicyId([0xAA_u8; 16]);
-    const META_EVIDENCE_ID: StorageIntentEvidenceId =
-        StorageIntentEvidenceId([0xBB_u8; 32]);
+    const META_EVIDENCE_ID: StorageIntentEvidenceId = StorageIntentEvidenceId([0xBB_u8; 32]);
 
     fn make_metadata_evidence() -> StorageIntentMetadataNamespaceEvidence {
         StorageIntentMetadataNamespaceEvidence {
@@ -30300,22 +30348,13 @@ mod tests {
                     StorageIntentEvidenceKind::TenantIsolationEvidence,
                     215,
                 ),
-                wear_cost_ref: evidence_ref(
-                    StorageIntentEvidenceKind::MediaCostWearLedger,
-                    216,
-                ),
-                trust_domain_ref: evidence_ref(
-                    StorageIntentEvidenceKind::TrustDomainEvidence,
-                    217,
-                ),
+                wear_cost_ref: evidence_ref(StorageIntentEvidenceKind::MediaCostWearLedger, 216),
+                trust_domain_ref: evidence_ref(StorageIntentEvidenceKind::TrustDomainEvidence, 217),
                 recovery_degradation_ref: evidence_ref(
                     StorageIntentEvidenceKind::RecoveryDegradationEvidence,
                     218,
                 ),
-                rollout_ref: evidence_ref(
-                    StorageIntentEvidenceKind::PolicyRolloutEvidence,
-                    219,
-                ),
+                rollout_ref: evidence_ref(StorageIntentEvidenceKind::PolicyRolloutEvidence, 219),
                 metadata_namespace_ref: evidence_ref(
                     StorageIntentEvidenceKind::MetadataNamespaceEvidence,
                     220,
@@ -30329,13 +30368,10 @@ mod tests {
                 has_refused_evidence: false,
             },
             decision_set: StorageIntentPreflightDecisionSet {
-                decision_refs: [
-                    evidence_ref(
-                        StorageIntentEvidenceKind::DecisionFrontierEvidence,
-                        230,
-                    );
-                    STORAGE_INTENT_PREFLIGHT_DECISION_REFS
-                ],
+                decision_refs: [evidence_ref(
+                    StorageIntentEvidenceKind::DecisionFrontierEvidence,
+                    230,
+                ); STORAGE_INTENT_PREFLIGHT_DECISION_REFS],
                 decision_len: 2,
                 summary: StorageIntentPreflightDecisionSummary {
                     legal_count: 2,
@@ -30403,30 +30439,20 @@ mod tests {
 
     #[test]
     fn static_policy_compile_does_not_involve_live_evidence() {
-        assert!(
-            !StorageIntentPreflightFidelityClass::StaticPolicyCompile
-                .involves_live_evidence()
-        );
+        assert!(!StorageIntentPreflightFidelityClass::StaticPolicyCompile.involves_live_evidence());
     }
 
     #[test]
     fn shadow_execution_involves_live_evidence() {
-        assert!(
-            StorageIntentPreflightFidelityClass::ShadowExecution
-                .involves_live_evidence()
-        );
+        assert!(StorageIntentPreflightFidelityClass::ShadowExecution.involves_live_evidence());
     }
 
     #[test]
     fn staged_preflight_reserves_budgets() {
         assert!(
-            StorageIntentPreflightFidelityClass::StagedPreflightReservedUnspent
-                .reserves_budgets()
+            StorageIntentPreflightFidelityClass::StagedPreflightReservedUnspent.reserves_budgets()
         );
-        assert!(
-            !StorageIntentPreflightFidelityClass::ShadowExecution
-                .reserves_budgets()
-        );
+        assert!(!StorageIntentPreflightFidelityClass::ShadowExecution.reserves_budgets());
     }
 
     #[test]
@@ -30453,54 +30479,24 @@ mod tests {
 
     #[test]
     fn safe_to_stage_permits_staging() {
-        assert!(
-            StorageIntentPreflightRecommendation::SafeToStage
-                .permits_staging()
-        );
-        assert!(
-            !StorageIntentPreflightRecommendation::Blocked
-                .permits_staging()
-        );
-        assert!(
-            !StorageIntentPreflightRecommendation::ShadowOnly
-                .permits_staging()
-        );
+        assert!(StorageIntentPreflightRecommendation::SafeToStage.permits_staging());
+        assert!(!StorageIntentPreflightRecommendation::Blocked.permits_staging());
+        assert!(!StorageIntentPreflightRecommendation::ShadowOnly.permits_staging());
     }
 
     #[test]
     fn blocked_refused_superseded_expired_are_terminal() {
-        assert!(
-            StorageIntentPreflightRecommendation::Blocked
-                .is_terminal()
-        );
-        assert!(
-            StorageIntentPreflightRecommendation::Refused
-                .is_terminal()
-        );
-        assert!(
-            StorageIntentPreflightRecommendation::Superseded
-                .is_terminal()
-        );
-        assert!(
-            StorageIntentPreflightRecommendation::Expired
-                .is_terminal()
-        );
-        assert!(
-            !StorageIntentPreflightRecommendation::SafeToStage
-                .is_terminal()
-        );
+        assert!(StorageIntentPreflightRecommendation::Blocked.is_terminal());
+        assert!(StorageIntentPreflightRecommendation::Refused.is_terminal());
+        assert!(StorageIntentPreflightRecommendation::Superseded.is_terminal());
+        assert!(StorageIntentPreflightRecommendation::Expired.is_terminal());
+        assert!(!StorageIntentPreflightRecommendation::SafeToStage.is_terminal());
     }
 
     #[test]
     fn shadow_only_is_degraded_recommendation() {
-        assert!(
-            StorageIntentPreflightRecommendation::ShadowOnly
-                .is_degraded()
-        );
-        assert!(
-            !StorageIntentPreflightRecommendation::SafeToStage
-                .is_degraded()
-        );
+        assert!(StorageIntentPreflightRecommendation::ShadowOnly.is_degraded());
+        assert!(!StorageIntentPreflightRecommendation::SafeToStage.is_degraded());
     }
 
     #[test]
@@ -30532,8 +30528,7 @@ mod tests {
         ];
         for &k in &kinds {
             let disc = k.to_discriminant();
-            let decoded =
-                StorageIntentPreflightActivationBlockerKind::from_discriminant(disc);
+            let decoded = StorageIntentPreflightActivationBlockerKind::from_discriminant(disc);
             assert_eq!(decoded, Some(k), "roundtrip failed for {:?}", k.as_str());
         }
     }
@@ -30568,8 +30563,7 @@ mod tests {
         ];
         for &d in &deltas {
             let disc = d.to_discriminant();
-            let decoded =
-                StorageIntentPreflightProjectedDeltaKind::from_discriminant(disc);
+            let decoded = StorageIntentPreflightProjectedDeltaKind::from_discriminant(disc);
             assert_eq!(decoded, Some(d), "roundtrip failed for {:?}", d.as_str());
         }
     }
@@ -30819,8 +30813,7 @@ mod tests {
         // simulation record carries a non-authority marker that denies
         // policy activation. The marker is the binding gate.
         let mut evidence = make_preflight_simulation_evidence();
-        evidence.fidelity =
-            StorageIntentPreflightFidelityClass::StagedPreflightReservedUnspent;
+        evidence.fidelity = StorageIntentPreflightFidelityClass::StagedPreflightReservedUnspent;
         assert!(evidence.non_authority.denies_policy_activation);
         assert!(preflight_simulation_is_non_authoritative(evidence));
         assert!(preflight_simulation_is_preview_only(evidence));
@@ -30880,8 +30873,7 @@ mod tests {
     #[test]
     fn reserved_but_unspent_preflight_simulation_has_authority_marker() {
         let mut evidence = make_preflight_simulation_evidence();
-        evidence.fidelity =
-            StorageIntentPreflightFidelityClass::StagedPreflightReservedUnspent;
+        evidence.fidelity = StorageIntentPreflightFidelityClass::StagedPreflightReservedUnspent;
         assert!(evidence.fidelity.reserves_budgets());
         // Even with reserved budgets, non-authority marker still holds.
         assert!(preflight_simulation_is_non_authoritative(evidence));
@@ -30906,5 +30898,4 @@ mod tests {
         evidence.blocker_len = 1;
         assert!(!preflight_simulation_has_no_blockers(evidence));
     }
-
 }

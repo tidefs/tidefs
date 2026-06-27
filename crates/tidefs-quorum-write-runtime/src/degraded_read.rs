@@ -430,9 +430,7 @@ mod tests {
         assert_eq!(healthy[0], MemberId::new(2));
 
         // Simulate loss of the local replica (node 1 goes down)
-        let degraded_health = vec![
-            (MemberId::new(2), CandidateHealthClass::Healthy, 0),
-        ];
+        let degraded_health = vec![(MemberId::new(2), CandidateHealthClass::Healthy, 0)];
         p.refresh_candidates(&degraded_health);
 
         assert_eq!(p.candidate_count(), 1);
@@ -457,9 +455,17 @@ mod tests {
         p.set_local_member(MemberId::new(10));
 
         let health = vec![
-            (MemberId::new(10), CandidateHealthClass::LaggedButUsable, 500),
+            (
+                MemberId::new(10),
+                CandidateHealthClass::LaggedButUsable,
+                500,
+            ),
             (MemberId::new(20), CandidateHealthClass::Healthy, 0),
-            (MemberId::new(30), CandidateHealthClass::LaggedButUsable, 100),
+            (
+                MemberId::new(30),
+                CandidateHealthClass::LaggedButUsable,
+                100,
+            ),
         ];
         p.refresh_candidates(&health);
 
@@ -468,14 +474,25 @@ mod tests {
         let by_class = p.candidates_by_class();
         // Local is always promoted to Local class regardless of input
         assert_eq!(by_class.get(&CandidateHealthClass::Local).unwrap().len(), 1);
-        assert_eq!(by_class.get(&CandidateHealthClass::Healthy).unwrap().len(), 1);
-        assert_eq!(by_class.get(&CandidateHealthClass::LaggedButUsable).unwrap().len(), 1);
+        assert_eq!(
+            by_class.get(&CandidateHealthClass::Healthy).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            by_class
+                .get(&CandidateHealthClass::LaggedButUsable)
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Candidates should be ordered: Local first, then Healthy, then Lagged
         let by_class = p.candidates_by_class();
         let locals = by_class.get(&CandidateHealthClass::Local).unwrap();
         let healthy = by_class.get(&CandidateHealthClass::Healthy).unwrap();
-        let lagged = by_class.get(&CandidateHealthClass::LaggedButUsable).unwrap();
+        let lagged = by_class
+            .get(&CandidateHealthClass::LaggedButUsable)
+            .unwrap();
         assert_eq!(locals.len(), 1);
         assert_eq!(healthy.len(), 1);
         assert_eq!(lagged.len(), 1);

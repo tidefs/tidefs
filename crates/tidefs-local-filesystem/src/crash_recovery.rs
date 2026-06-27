@@ -112,7 +112,9 @@ pub(crate) fn run_crash_recovery_explicit_error_case(
         let mut staging =
             CrashMatrixRawStagingAuthority::validation_only(&mut pool, root_authentication_key);
         for slot in 0..FILESYSTEM_ROOT_SLOT_COUNT {
-            staging.raw_store().put(root_slot_object_key(slot), b"invalid root slot bytes")?;
+            staging
+                .raw_store()
+                .put(root_slot_object_key(slot), b"invalid root slot bytes")?;
         }
     }
     pool.sync_all()?;
@@ -217,10 +219,8 @@ pub(crate) fn apply_crash_matrix_boundary(
     match boundary {
         CrashInjectionBoundary::NoCrash | CrashInjectionBoundary::AfterRootCommitSynced => {
             raw_staging.stage_content(staged, inode_id, bytes)?;
-            let observed = raw_staging.persist_until_boundary(
-                staged,
-                FilesystemCommitBoundary::RootCommitSynced,
-            )?;
+            let observed = raw_staging
+                .persist_until_boundary(staged, FilesystemCommitBoundary::RootCommitSynced)?;
             if observed != FilesystemCommitBoundary::RootCommitSynced {
                 return Err(FileSystemError::CorruptState {
                     reason: "crash matrix failed to reach root commit sync boundary",
@@ -278,10 +278,8 @@ pub(crate) fn apply_crash_matrix_boundary(
         }
         CrashInjectionBoundary::AfterRootCommitWritten => {
             raw_staging.stage_content(staged, inode_id, bytes)?;
-            let observed = raw_staging.persist_until_boundary(
-                staged,
-                FilesystemCommitBoundary::RootCommitWritten,
-            )?;
+            let observed = raw_staging
+                .persist_until_boundary(staged, FilesystemCommitBoundary::RootCommitWritten)?;
             if observed != FilesystemCommitBoundary::RootCommitWritten {
                 return Err(FileSystemError::CorruptState {
                     reason: "crash matrix failed to reach root commit write boundary",

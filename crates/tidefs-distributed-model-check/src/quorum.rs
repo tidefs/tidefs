@@ -103,9 +103,9 @@ impl QuorumWriteModel {
         }
 
         // 2. Lease check: coordinator must hold an active lease on this object.
-        let has_lease = coordinator_leases.iter().any(|l| {
-            l.object_key == request.object_key && l.granted && !l.revoked
-        });
+        let has_lease = coordinator_leases
+            .iter()
+            .any(|l| l.object_key == request.object_key && l.granted && !l.revoked);
         if !has_lease {
             return QuorumWriteOutcome::RefusedLeaseConflict {
                 write_id: request.write_id,
@@ -116,9 +116,15 @@ impl QuorumWriteModel {
 
         // 3. Quorum: count participants that are at or beyond the request epoch.
         let required = request.participants.len() / 2 + 1;
-        let acks = request.participants.iter().filter(|&&pid| {
-            participant_epochs.iter().any(|&(nid, ep)| nid == pid && ep >= request.epoch)
-        }).count();
+        let acks = request
+            .participants
+            .iter()
+            .filter(|&&pid| {
+                participant_epochs
+                    .iter()
+                    .any(|&(nid, ep)| nid == pid && ep >= request.epoch)
+            })
+            .count();
 
         let qs = QuorumWriteState {
             write_id: request.write_id,
@@ -126,7 +132,11 @@ impl QuorumWriteModel {
             coordinator: request.coordinator,
             participants: request.participants.clone(),
             epoch: request.epoch,
-            phase: if acks >= required { QuorumPhase::Committed } else { QuorumPhase::Prepared },
+            phase: if acks >= required {
+                QuorumPhase::Committed
+            } else {
+                QuorumPhase::Prepared
+            },
             acks_received: acks,
             quorum_size: required,
             committed: acks >= required,
@@ -151,6 +161,8 @@ impl QuorumWriteModel {
     /// Check if a write is committed.
     #[must_use]
     pub fn is_committed(&self, write_id: u64) -> bool {
-        self.writes.iter().any(|w| w.write_id == write_id && w.committed)
+        self.writes
+            .iter()
+            .any(|w| w.write_id == write_id && w.committed)
     }
 }

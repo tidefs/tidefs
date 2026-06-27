@@ -111,13 +111,8 @@ impl RelocationGovernor {
         // Look up or create anti-thrash state for this subject.
         let at_state = self.get_or_create_anti_thrash(subject_id);
 
-        let decision = evaluate_relocation_admission(
-            reason,
-            at_state,
-            heuristic_input,
-            gate_evidence,
-            now_ms,
-        );
+        let decision =
+            evaluate_relocation_admission(reason, at_state, heuristic_input, gate_evidence, now_ms);
 
         // If admitted, create an admission record.
         if decision.verdict.may_proceed() {
@@ -132,7 +127,10 @@ impl RelocationGovernor {
                 refusal_reasons: decision.hard_gates.refusal_reasons(),
                 anti_thrash_skip_reason: decision.anti_thrash.skip_reason(),
                 heuristic_summary: decision.heuristic.as_ref().map(|h| h.summary),
-                payback_window_ms: decision.heuristic.as_ref().and_then(|h| h.estimated_payback_ms),
+                payback_window_ms: decision
+                    .heuristic
+                    .as_ref()
+                    .and_then(|h| h.estimated_payback_ms),
                 payback_benefit_type: None,
             };
 
@@ -156,13 +154,7 @@ impl RelocationGovernor {
                 .anti_thrash
                 .skip_reason()
                 .unwrap_or("hard-gate-or-heuristic-refusal");
-            self.enter_cooldown_for_subject(
-                subject_id,
-                now_ms,
-                reason,
-                skip_reason,
-                false,
-            );
+            self.enter_cooldown_for_subject(subject_id, now_ms, reason, skip_reason, false);
         }
 
         decision
@@ -177,13 +169,13 @@ impl RelocationGovernor {
         reason: GovernorRelocationReason,
     ) {
         let at_state = self.get_or_create_anti_thrash(subject_id);
-        at_state.movement_debt.record_relocation(bytes, now_ms, reason);
+        at_state
+            .movement_debt
+            .record_relocation(bytes, now_ms, reason);
 
         // Remove from admitted subjects.
-        self.admitted_subjects.retain(|s| {
-            s.record.source_receipt_id != [0u8; 16]
-                || s.record.admission_id != 0
-        });
+        self.admitted_subjects
+            .retain(|s| s.record.source_receipt_id != [0u8; 16] || s.record.admission_id != 0);
         // In practice, match by admission_id; simplified for first slice.
         self.admitted_subjects.clear(); // stub
     }
@@ -294,10 +286,10 @@ impl Default for RelocationGovernor {
 
 #[cfg(test)]
 mod tests {
-    use crate::RelocationActionClass;
     use super::*;
     use crate::hard_gates::HardGateEvidence;
     use crate::heuristics::HeuristicInput;
+    use crate::RelocationActionClass;
 
     fn clean_evidence() -> HardGateEvidence {
         HardGateEvidence {
@@ -412,7 +404,10 @@ mod tests {
             [1u8; 16],
             [2u8; 16],
         );
-        assert!(d.verdict.may_proceed(), "should admit after cooldown expiry");
+        assert!(
+            d.verdict.may_proceed(),
+            "should admit after cooldown expiry"
+        );
     }
 
     #[test]

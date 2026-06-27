@@ -1557,8 +1557,7 @@ impl MembershipRuntime {
         proposal: &EpochTransitionProposal,
     ) -> bool {
         proposal.fence_token.is_some()
-            && self
-                .release_forced_fence_epoch_barrier(&proposal.members_removed, proposal.to_epoch)
+            && self.release_forced_fence_epoch_barrier(&proposal.members_removed, proposal.to_epoch)
     }
 
     fn release_forced_fence_epoch_barrier(
@@ -2466,7 +2465,10 @@ mod tests {
         let fenced = MemberId::new(2);
         rt.add_peer(fenced, MemberClass::Learner, 2);
 
-        let token = rt.fencing.manual_fence(fenced, rt.current_epoch().0).unwrap();
+        let token = rt
+            .fencing
+            .manual_fence(fenced, rt.current_epoch().0)
+            .unwrap();
         assert_eq!(token.value(), 1);
         assert!(rt.fencing.forced_fence_barrier_blocked());
         assert_eq!(rt.fencing.pending_epoch(), Some(EpochId::new(2)));
@@ -2491,7 +2493,10 @@ mod tests {
         );
 
         rt.fencing.clear_fence(fenced, token).unwrap();
-        let next_token = rt.fencing.manual_fence(fenced, rt.current_epoch().0).unwrap();
+        let next_token = rt
+            .fencing
+            .manual_fence(fenced, rt.current_epoch().0)
+            .unwrap();
         assert_eq!(next_token.value(), 2);
         assert!(rt.fencing.forced_fence_barrier_blocked());
         assert_eq!(rt.fencing.pending_epoch(), Some(EpochId::new(3)));
@@ -2504,7 +2509,10 @@ mod tests {
         let fenced = MemberId::new(2);
         rt.add_peer(fenced, MemberClass::Learner, 2);
 
-        let token = rt.fencing.manual_fence(fenced, rt.current_epoch().0).unwrap();
+        let token = rt
+            .fencing
+            .manual_fence(fenced, rt.current_epoch().0)
+            .unwrap();
         rt.initiate_epoch_transition(
             vec![],
             vec![fenced],

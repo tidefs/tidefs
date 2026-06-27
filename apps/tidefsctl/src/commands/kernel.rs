@@ -275,7 +275,10 @@ fn plain_lines(report: &KernelControlStatus) -> Vec<String> {
         format!("runtime_inventory_source: {RUNTIME_INVENTORY_SOURCE}"),
         format!("status_is_passive: {}", report.status_is_passive()),
         format!("status_is_passive_source: {PASSIVE_BOUNDARY_SOURCE}"),
-        format!("control_endpoint_opened: {}", report.control_endpoint_opened),
+        format!(
+            "control_endpoint_opened: {}",
+            report.control_endpoint_opened
+        ),
         format!("control_endpoint_opened_source: {PASSIVE_BOUNDARY_SOURCE}"),
         format!(
             "control_device_present: {}",
@@ -522,10 +525,7 @@ mod tests {
         assert_eq!(json["runtime_inventory"], RUNTIME_INVENTORY);
         assert_eq!(json["runtime_inventory_source"], RUNTIME_INVENTORY_SOURCE);
         assert_eq!(json["control_device_present_source"], DEVICE_PROBE_SOURCE);
-        assert_eq!(
-            json["control_device_character_source"],
-            DEVICE_PROBE_SOURCE
-        );
+        assert_eq!(json["control_device_character_source"], DEVICE_PROBE_SOURCE);
         assert_eq!(
             json["tidefs_owned_kthreads_source"],
             PASSIVE_BOUNDARY_SOURCE
