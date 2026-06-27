@@ -948,6 +948,12 @@ impl<S: ExtentStore> GeometryConversionJob<S> {
             };
         }
         let max_entries = self.max_entries_for_budget(budget);
+        if max_entries == 0 {
+            return StepResult {
+                checkpoint: self.make_checkpoint(),
+                is_complete: false,
+            };
+        }
         let pool_id = self.cursor.pool_id();
         let start_after = if self.cursor.last_converted_locator == 0 {
             None
@@ -1910,6 +1916,27 @@ mod tests {
         let r = job.step(tight_budget);
         assert!(!r.is_complete);
         assert!(job.cursor.entries_converted <= 5);
+    }
+
+    #[test]
+    fn tiny_byte_budget_does_not_false_complete() {
+        let mut store = MockStore::new(13);
+        store.add_entry(&vec![0u8; 1024], 2);
+        let mut job = GeometryConversionJob::new(
+            store,
+            ConversionScope::Pool(13),
+            DurabilityPolicy::Mirror { replica_count: 2 },
+            DurabilityPolicy::Mirror { replica_count: 3 },
+        );
+        let tiny_budget = WorkBudget {
+            max_items: 5,
+            max_bytes: 1,
+            max_ms: 0,
+        };
+        let result = job.step(tiny_budget);
+        assert!(!result.is_complete);
+        assert_eq!(job.cursor.entries_converted, 0);
+        assert_eq!(job.cursor.last_converted_locator, 0);
     }
 
     #[test]
