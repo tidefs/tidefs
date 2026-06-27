@@ -8,8 +8,8 @@ The namespace crate is the primary directory-entry primitive that the FUSE
 adapter and higher-level filesystem consumers call. It maps directory paths
 to inodes through the polymorphic directory index and provides entry types
 for crash-safe insert, lookup, and remove operations. Entry content hashing
-uses a fast non-cryptographic hash (fxhash) for in-memory lookup efficiency;
-durability and integrity are provided by the storage layer.
+uses `rustc-hash`'s fast non-cryptographic `FxHasher` for in-memory lookup
+efficiency; durability and integrity are provided by the storage layer.
 
 ## Architecture
 
@@ -22,7 +22,7 @@ FUSE handlers (tidefs-fuser)
     ┌────┴────────────────────────────┐
     │  entry.rs       insert.rs       │
     │  lookup.rs      remove.rs       │
-    │  (fxhash content hash, intent)  │
+    │  (FxHasher content hash, intent)│
     └────┬────────────────────────────┘
          │
          ▼
@@ -37,7 +37,7 @@ FUSE handlers (tidefs-fuser)
 | Module | Purpose |
 |--------|---------|
 | `lib.rs` | `Namespace` struct, inode table, `MemInodeTable`, path resolution, create/lookup/unlink/rename/hard-link/symlink operations |
-| `entry.rs` | `NamespaceEntry` with fxhash u64 content hash, `NamespaceEntryTombstone`, compute_entry_hash |
+| `entry.rs` | `NamespaceEntry` with `rustc_hash::FxHasher` u64 content hash, `NamespaceEntryTombstone`, compute_entry_hash |
 | `insert.rs` | `insert_entry()` and `insert_directory_entry()` with intent-log recording (Create, Mkdir, Symlink records) |
 | `lookup.rs` | `lookup_entry()` and `lookup_path()` with multi-component traversal, `.`/`..` support, and symlink expansion up to `MAX_SYMLINK_DEPTH` |
 | `remove.rs` | `remove_entry()` with intent-log recording (Unlink, Rmdir records) and `NamespaceEntryTombstone` creation |
@@ -48,7 +48,7 @@ FUSE handlers (tidefs-fuser)
 ## Content Hash
 
 Every `NamespaceEntry` carries a u64 content hash computed over
-`(parent, name, ino, kind)` using `fxhash::FxHasher`, a fast
+`(parent, name, ino, kind)` using `rustc_hash::FxHasher`, a fast
 non-cryptographic hash function. This enables:
 
 - **Tamper detection**: `entry.verify()` returns false if any field is
