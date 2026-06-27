@@ -13,7 +13,7 @@ reviewed_claim_ids = [
 validation_tier = "T4 source/model claims-gate review"
 source_model_evidence = true
 mounted_linux_runtime_evidence = false
-runtime_evidence_status = "no-accepted-t5-or-t6-runtime-artifacts"
+runtime_evidence_status = "source-model-review-has-no-runtime-evidence; external-t5-mounted-kernel-vfs-artifact-accepted; t6-full-kernel-no-daemon-artifact-missing"
 decision = "claim-remains-blocked-fail-closed"
 
 source_artifact = "validation/artifacts/kernel/teardown-race-proof-artifact.json"
@@ -37,8 +37,44 @@ forbidden_post_teardown_work_cases = [
   "teardown callback enqueue of normal deferred work",
 ]
 
-accepted_t5_mounted_kernel_artifacts = []
 accepted_t6_full_kernel_no_daemon_artifacts = []
+
+[[accepted_t5_mounted_kernel_artifacts]]
+issue = 1186
+pull_request = 1463
+artifact_path = "kernel-teardown-runtime.json"
+manifest_path = "evidence-manifest.json"
+workflow = "QEMU Smoke"
+workflow_run = "https://github.com/tidefs/tidefs/actions/runs/28298370275"
+workflow_job = "https://github.com/tidefs/tidefs/actions/runs/28298370275/job/83842228953"
+artifact_name = "qemu-smoke-kernel-teardown-validation"
+artifact_id = 7927197649
+head = "fd8eaeded36d49d70829e4812c44a48395c8061b"
+source_ref = "refs/heads/gpt1/issue-1186-kernel-cutover-fence-evidence"
+source_sha = "fd8eaeded36d49d70829e4812c44a48395c8061b"
+conclusion = "success"
+accepted = true
+validator = "tidefs-xtask validate-kernel-teardown-runtime-artifact"
+validator_summary = "status=pass fail_closed_count=0 phases=17 refusals=2 cutover_phases=6 cutover_fences=4 cutover_truth=1 target=kernel-teardown-mounted-vfs"
+guest_summary = "PASS=19 FAIL=0 BLOCKED=0 SKIP=0"
+content_digest = "blake3:14a96198bdbc5308cd86c4da79937750e220ada4f6bdc86279f42f973f976ef0"
+sha256_kernel_teardown_runtime = "c5085d8a3922d957b5fcc71805885956deb93e70507e6af7e8a1201d8e6a092a"
+sha256_evidence_manifest = "e0a6f1e14cd39c5b87aee63b7d8bb098e3127fcfb6cbdfcc09d2ab09f94a8d63"
+sha256_workqueue_trace = "3d44c94e6e5e19bc88c6be472f37f914c1c7411701e44ded3648e0668813b468"
+sha256_dmesg_callbacks = "6726be5b56ff5c8e423a54a3b685fb6349b459a5822b4efb670606e2f777f880"
+sha256_qemu_log = "cffa00f2f09c25677ad7fc7bb606c015cd29c2cddb6762428ec4e323d774794e"
+
+[[candidate_runtime_evidence]]
+tier = "T5 mounted-kernel-vfs"
+issue = 1186
+pull_request = 1463
+artifact_path = "kernel-teardown-runtime.json"
+workflow = "QEMU Smoke"
+workflow_run = "https://github.com/tidefs/tidefs/actions/runs/28298370275"
+head = "fd8eaeded36d49d70829e4812c44a48395c8061b"
+conclusion = "success"
+accepted = true
+reason = "current-head focused QEMU Smoke dispatch accepted the mounted-kernel-vfs cutover and teardown artifact; the validator reported status=pass fail_closed_count=0 phases=17 refusals=2 cutover_phases=6 cutover_fences=4 cutover_truth=1"
 
 [[candidate_runtime_evidence]]
 tier = "T5 mounted-kernel-vfs"
@@ -68,19 +104,18 @@ boundary_review = [
   "The receipt records source/model proof evidence for the kernel teardown token state machine only.",
   "The helper rejects modeled work once teardown begins and rejects stale token generations after final teardown increments the generation.",
   "The source proof artifact reports no explored schedule starts modeled work after final teardown.",
-  "The current T5 candidate mounted-kernel-vfs runtime artifact is not accepted because its current-head focused QEMU Smoke dispatch failed.",
+  "The current T5 mounted-kernel-vfs cutover and teardown runtime artifact from #1186 / PR #1463 is accepted as bounded mounted-kernel evidence for this claim.",
   "The current T6 candidate full-kernel/no-daemon runtime artifact is not accepted because its current-head focused QEMU Smoke dispatch failed.",
-  "This review does not exercise a mounted Linux kernel module, Linux workqueue execution, mounted filesystem I/O, QEMU, xfstests, mmap, syncfs, or crash/recovery runtime rows itself.",
+  "This source/model review does not itself exercise a mounted Linux kernel module, Linux workqueue execution, mounted filesystem I/O, QEMU, xfstests, mmap, syncfs, or crash/recovery runtime rows.",
 ]
 
 missing_runtime_evidence = [
-  "accepted T5 mounted-kernel teardown stress with Linux workqueue and callback activity tracing",
   "accepted T6 full-kernel/no-daemon teardown and recovery rows across the filesystem runtime",
 ]
 
 non_claims = [
   "This review does not validate mounted kernel I/O semantics.",
   "This review does not validate production kernel residency, crash recovery, mmap, writeback, syncfs, or unmount behavior.",
-  "This review does not accept the failed current-head T5 or T6 QEMU Smoke dispatches as claim evidence.",
+  "This review accepts only the bounded T5 mounted-kernel-vfs cutover and teardown artifact from #1186 / PR #1463; it does not validate T6 full-kernel/no-daemon teardown and recovery behavior.",
   "This review does not move kernel.teardown.no_work_after.v1 to validated status.",
 ]
