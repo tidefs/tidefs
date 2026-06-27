@@ -17,9 +17,9 @@ use tidefs_storage_intent_core::{
     PredictionConfidence, PrefetchResidencyCandidateClass, PrefetchResidencyDecisionOutcome,
     PrefetchResidencyDecisionRecord, PrefetchResidencyStateClass, StorageIntentActionClass,
     StorageIntentDomainId, StorageIntentEvidenceId, StorageIntentEvidenceKind,
-    StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef, StorageIntentObjectScope,
-    StorageIntentPolicyId, StorageIntentPolicyRevision, StorageIntentRefusalReason,
-    StorageMediaClass,
+    StorageIntentEvidenceQuerySnapshot, StorageIntentEvidenceRef, StorageIntentEvidenceRefs,
+    StorageIntentObjectScope, StorageIntentPolicyId, StorageIntentPolicyRevision,
+    StorageIntentRefusalReason, StorageMediaClass,
 };
 use tidefs_storage_intent_cost::{
     StorageIntentCostClass, StorageIntentCostEvidenceState, StorageIntentCostSnapshot,
@@ -940,12 +940,29 @@ impl PrefetchExecutorResultDetail {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorTerminalEvidenceCut {
+    pub evidence_query_snapshot_ref: StorageIntentEvidenceRef,
+    pub included_refs: StorageIntentEvidenceRefs,
+}
+
+impl Default for PrefetchExecutorTerminalEvidenceCut {
+    fn default() -> Self {
+        Self {
+            evidence_query_snapshot_ref: EMPTY_EVIDENCE_REF,
+            included_refs: StorageIntentEvidenceRefs::EMPTY,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct PrefetchExecutorTerminalUpdate {
     pub outcome: PrefetchExecutorOutcome,
     pub result_detail: PrefetchExecutorResultDetail,
     pub refusal: StorageIntentRefusalReason,
     pub handoff_target: PrefetchExecutorHandoffTarget,
     pub result_refusal_ref: StorageIntentEvidenceRef,
+    pub evidence_cut: PrefetchExecutorTerminalEvidenceCut,
 }
 
 impl Default for PrefetchExecutorTerminalUpdate {
@@ -956,6 +973,7 @@ impl Default for PrefetchExecutorTerminalUpdate {
             refusal: StorageIntentRefusalReason::None,
             handoff_target: PrefetchExecutorHandoffTarget::None,
             result_refusal_ref: EMPTY_EVIDENCE_REF,
+            evidence_cut: PrefetchExecutorTerminalEvidenceCut::default(),
         }
     }
 }
@@ -1523,7 +1541,9 @@ pub fn finalize_prefetch_execution(
         );
     }
 
-    if terminal_result_detail_lacks_feedback_evidence(update.result_detail) {
+    if terminal_update_refs_outside_evidence_cut(record, update)
+        || terminal_result_detail_lacks_feedback_evidence(record, update)
+    {
         return terminal(
             record,
             PrefetchExecutorOutcome::VerificationFailed,
@@ -1698,8 +1718,82 @@ fn terminal_result_detail_is_inconsistent(detail: PrefetchExecutorResultDetail) 
     }
 }
 
-fn terminal_result_detail_lacks_feedback_evidence(detail: PrefetchExecutorResultDetail) -> bool {
-    detail.has_feedback_payback_inputs() && !detail.has_feedback_evidence_root()
+fn terminal_result_detail_lacks_feedback_evidence(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    update.result_detail.has_feedback_payback_inputs()
+        && !terminal_result_detail_has_cut_feedback_root(record, update)
+}
+
+fn terminal_result_detail_has_cut_feedback_root(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    terminal_ref_in_cut(
+        record,
+        update.evidence_cut,
+        update.result_detail.attribution_ref,
+        StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+    ) || terminal_ref_in_cut(
+        record,
+        update.evidence_cut,
+        update.result_detail.retention_ref,
+        StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+    ) || terminal_ref_in_cut(
+        record,
+        update.evidence_cut,
+        update.result_detail.validation_ref,
+        StorageIntentEvidenceKind::ValidationArtifact,
+    )
+}
+
+fn terminal_update_refs_outside_evidence_cut(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    terminal_bound_ref_outside_cut(
+        record,
+        update.evidence_cut,
+        update.result_detail.attribution_ref,
+        StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+    ) || terminal_bound_ref_outside_cut(
+        record,
+        update.evidence_cut,
+        update.result_detail.retention_ref,
+        StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+    ) || terminal_bound_ref_outside_cut(
+        record,
+        update.evidence_cut,
+        update.result_detail.validation_ref,
+        StorageIntentEvidenceKind::ValidationArtifact,
+    ) || terminal_bound_ref_outside_cut(
+        record,
+        update.evidence_cut,
+        update.result_refusal_ref,
+        StorageIntentEvidenceKind::ResultRefusalEvidence,
+    )
+}
+
+fn terminal_bound_ref_outside_cut(
+    record: PrefetchExecutorRecord,
+    cut: PrefetchExecutorTerminalEvidenceCut,
+    evidence_ref: StorageIntentEvidenceRef,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    evidence_ref.is_bound() && !terminal_ref_in_cut(record, cut, evidence_ref, kind)
+}
+
+fn terminal_ref_in_cut(
+    record: PrefetchExecutorRecord,
+    cut: PrefetchExecutorTerminalEvidenceCut,
+    evidence_ref: StorageIntentEvidenceRef,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    evidence_ref.is_bound()
+        && evidence_ref.kind == kind
+        && cut.evidence_query_snapshot_ref == record.evidence_refs.evidence_query_snapshot_ref
+        && cut.included_refs.contains_ref(evidence_ref)
 }
 
 fn terminal_result_detail_exceeds_executor_limit(
@@ -2172,6 +2266,7 @@ mod tests {
     const SOURCE_PATH: StorageIntentEvidenceId = StorageIntentEvidenceId([19; 32]);
     const TARGET_DESTINATION: StorageIntentEvidenceId = StorageIntentEvidenceId([20; 32]);
     const OUTSIDE_CUT: StorageIntentEvidenceId = StorageIntentEvidenceId([21; 32]);
+    const RESULT_REFUSAL: StorageIntentEvidenceId = StorageIntentEvidenceId([22; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -2463,6 +2558,32 @@ mod tests {
             ),
             validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
             ..PrefetchExecutorResultDetail::default()
+        }
+    }
+
+    fn push_terminal_ref(
+        refs: &mut StorageIntentEvidenceRefs,
+        evidence_ref: StorageIntentEvidenceRef,
+    ) {
+        if evidence_ref.is_bound() {
+            refs.push(evidence_ref).unwrap();
+        }
+    }
+
+    fn terminal_evidence_cut(
+        record: PrefetchExecutorRecord,
+        detail: PrefetchExecutorResultDetail,
+        result_refusal_ref: StorageIntentEvidenceRef,
+    ) -> PrefetchExecutorTerminalEvidenceCut {
+        let mut included_refs = StorageIntentEvidenceRefs::EMPTY;
+        push_terminal_ref(&mut included_refs, detail.attribution_ref);
+        push_terminal_ref(&mut included_refs, detail.retention_ref);
+        push_terminal_ref(&mut included_refs, detail.validation_ref);
+        push_terminal_ref(&mut included_refs, result_refusal_ref);
+
+        PrefetchExecutorTerminalEvidenceCut {
+            evidence_query_snapshot_ref: record.evidence_refs.evidence_query_snapshot_ref,
+            included_refs,
         }
     }
 
@@ -3368,7 +3489,7 @@ mod tests {
         let detail = terminal_detail();
         let result_ref = evidence(
             StorageIntentEvidenceKind::ResultRefusalEvidence,
-            OUTSIDE_CUT,
+            RESULT_REFUSAL,
         );
         let completed = finalize_prefetch_execution(
             started,
@@ -3376,6 +3497,7 @@ mod tests {
                 outcome: PrefetchExecutorOutcome::Completed,
                 result_detail: detail,
                 result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut(started, detail, result_ref),
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
@@ -3442,6 +3564,90 @@ mod tests {
             PrefetchExecutorByteState::Refused
         );
         assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_rejects_feedback_root_outside_evidence_cut() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        let detail = terminal_detail();
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: StorageIntentEvidenceRefs::EMPTY,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_validates_result_refusal_ref_cut() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Refused,
+                result_refusal_ref: result_ref,
+                evidence_cut: PrefetchExecutorTerminalEvidenceCut {
+                    evidence_query_snapshot_ref: started.evidence_refs.evidence_query_snapshot_ref,
+                    included_refs: StorageIntentEvidenceRefs::EMPTY,
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+
+        let refused = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Refused,
+                result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    result_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(refused.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(refused.evidence_refs.result_refusal_ref, result_ref);
+        assert_record_has_no_authority_claims(refused);
     }
 
     #[test]
@@ -3565,11 +3771,13 @@ mod tests {
             PrefetchResidencyCandidateClass::BoundedReadahead,
         ));
 
+        let failed_detail = terminal_detail();
         let failed = finalize_prefetch_execution(
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::VerificationFailed,
-                result_detail: terminal_detail(),
+                result_detail: failed_detail,
+                evidence_cut: terminal_evidence_cut(started, failed_detail, EMPTY_EVIDENCE_REF),
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
@@ -3584,11 +3792,17 @@ mod tests {
         );
         assert_record_has_no_authority_claims(failed);
 
+        let handoff_without_target_detail = terminal_detail();
         let handoff_without_target = finalize_prefetch_execution(
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::HandoffRequired,
-                result_detail: terminal_detail(),
+                result_detail: handoff_without_target_detail,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    handoff_without_target_detail,
+                    EMPTY_EVIDENCE_REF,
+                ),
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
@@ -3597,12 +3811,14 @@ mod tests {
             PrefetchExecutorOutcome::Blocked
         );
 
+        let handoff_detail = terminal_detail();
         let handoff = finalize_prefetch_execution(
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::HandoffRequired,
-                result_detail: terminal_detail(),
+                result_detail: handoff_detail,
                 handoff_target: PrefetchExecutorHandoffTarget::Promotion,
+                evidence_cut: terminal_evidence_cut(started, handoff_detail, EMPTY_EVIDENCE_REF),
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
