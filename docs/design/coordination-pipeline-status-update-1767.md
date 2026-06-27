@@ -13,6 +13,19 @@ allocator, P8-03 distributed runtime) continue advancing
 strategy), #1753 (roadmap priorities update), #1833 (STATUS.md entry architecture)
 **Blocks**: All deferred cluster-service wire-up implementation issues
 
+> **Historical input (TFR-019 authority classification, GitHub issue #1174):**
+> This imported Forgejo-era #1767 coordination pipeline status snapshot records
+> retired design-spec metadata, `STATUS.md`/`FEATURE_MATRIX.md` references,
+> lane-health/status-record machinery, cluster-service implementation-status
+> statements, deferred-wire-up claims, active-lane gate language, and Forgejo
+> issue/scheduling concepts. Current TideFS coordination state and worker
+> scheduling authority live in GitHub issues and pull requests plus active repo
+> docs such as `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and
+> `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`; this file is not current policy,
+> automation behavior, implementation status, release-readiness evidence,
+> `STATUS.md` authority, `FEATURE_MATRIX.md` authority, lane-health authority,
+> worker scheduling authority, or product authority.
+
 ## Abstract
 
 This document records the coordination pipeline status update anchored at issue
