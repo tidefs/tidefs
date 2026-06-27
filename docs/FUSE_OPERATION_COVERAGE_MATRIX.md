@@ -99,7 +99,7 @@ left as a fuser-default ENOSYS stub.
 | rmdir | — | Removes empty directory entry; non-empty fails with ENOTEMPTY | ENOENT, ENOTEMPTY, EACCES, EBUSY |
 | symlink | target_bytes, name_bytes | Creates symlink inode with inline target; nlink=1 | EEXIST, ENOSPC, EACCES |
 | readlink | — | Returns symlink target bytes; must work on open handle | EINVAL (not a symlink) |
-| link | — | Creates hardlink entry; increments target nlink; dir targets rejected (EPERM) | EPERM, EEXIST, EMLINK, ENOSPC |
+| link | — | Creates hardlink entry; increments target nlink; dir targets rejected (EPERM) | EPERM, EACCES, EEXIST, EMLINK, ENOSPC |
 | rename | renameat2 flags: RENAME_NOREPLACE, RENAME_EXCHANGE | Cross-directory atomic rename; RENAME_WHITEOUT is unsupported and returns EINVAL | EEXIST, ENOENT, ENOTDIR, EISDIR, EINVAL, ENOTEMPTY |
 
 ## 2. Data operations
