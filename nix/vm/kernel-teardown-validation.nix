@@ -197,6 +197,47 @@ log_phase() {
   echo "[teardown-phase] $phase_name status=$status ts=$ts notes=$notes" >> /validation/phase_log.txt
 }
 
+log_cutover_phase() {
+  local phase_name="$1"
+  local status="$2"
+  local from_mode="$3"
+  local to_mode="$4"
+  local kernel_evidence="$5"
+  local notes="$6"
+  printf 'CUTOVER:%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$phase_name" "$status" "$from_mode" "$to_mode" "$kernel_evidence" "$notes"
+  printf '[cutover-phase] %s status=%s from=%s to=%s evidence=%s notes=%s\n' \
+    "$phase_name" "$status" "$from_mode" "$to_mode" "$kernel_evidence" "$notes" \
+    >> /validation/cutover_phase_log.txt
+}
+
+log_cutover_fence() {
+  local phase_name="$1"
+  local fence="$2"
+  local expected_state="$3"
+  local observed_result="$4"
+  local kernel_evidence="$5"
+  local no_forbidden_work="$6"
+  printf 'FENCE:%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$phase_name" "$fence" "$expected_state" "$observed_result" \
+    "$kernel_evidence" "$no_forbidden_work"
+  printf '[cutover-fence] %s fence=%s expected=%s observed=%s evidence=%s clean=%s\n' \
+    "$phase_name" "$fence" "$expected_state" "$observed_result" \
+    "$kernel_evidence" "$no_forbidden_work" \
+    >> /validation/cutover_fence_log.txt
+}
+
+log_cutover_truth() {
+  local operation="$1"
+  local expected="$2"
+  local observed="$3"
+  local verified="$4"
+  printf 'TRUTH:%s\t%s\t%s\t%s\n' "$operation" "$expected" "$observed" "$verified"
+  printf '[cutover-truth] %s expected=%s observed=%s verified=%s\n' \
+    "$operation" "$expected" "$observed" "$verified" \
+    >> /validation/cutover_truth_log.txt
+}
+
 pass() { PASSED=$((PASSED + 1)); echo "PASS: $*"; }
 fail() { FAILED=$((FAILED + 1)); echo "FAIL: $*"; }
 blocked() { BLOCKED=$((BLOCKED + 1)); echo "BLOCKED: $*"; }
@@ -313,6 +354,13 @@ fi
 
 if lsmod 2>/dev/null | grep -q tidefs_posix_vfs; then
   pass "module_visible"
+  log_cutover_phase \
+    "intent" \
+    "pass" \
+    "mode.kernel_cutover.userspace.m0" \
+    "mode.kernel_cutover.mixed_posix_read.m1" \
+    "module_visible" \
+    "mounted VFS cutover row selected after module load"
 else
   fail "module_visible" "module not in lsmod"
 fi
@@ -340,6 +388,36 @@ if command -v tidefsctl >/dev/null 2>&1; then
     SOUT=$(tidefsctl pool scan --devices "$POOL_DEV" 2>&1); SRC=$?
     if [ "$SRC" -eq 0 ] && echo "$SOUT" | grep -qi "label"; then
       pass "configured_pool_label_verified"
+      log_cutover_phase \
+        "dry_run_gate" \
+        "pass" \
+        "mode.kernel_cutover.userspace.m0" \
+        "mode.kernel_cutover.mixed_posix_read.m1" \
+        "configured_pool_label_verified" \
+        "pool label and kernel module prerequisites admitted"
+      log_cutover_fence \
+        "dry_run_gate" \
+        "admission" \
+        "admit mounted cutover only when module and pool label are ready" \
+        "admitted" \
+        "configured_pool_label_verified" \
+        "true"
+      # Arm kernel-owned trace evidence after admission and before commit.
+      setup_ftrace
+      log_cutover_phase \
+        "stage_fence_prepare" \
+        "pass" \
+        "mode.kernel_cutover.userspace.m0" \
+        "mode.kernel_cutover.mixed_posix_read.m1" \
+        "workqueue tracing enabled" \
+        "quiesce fence staged before mounted-kernel commit"
+      log_cutover_fence \
+        "stage_fence_prepare" \
+        "quiesce" \
+        "no mounted work starts before commit_transition" \
+        "trace armed before mount commit" \
+        "workqueue trace source present" \
+        "true"
       POOL_READY=1
     else
       fail "configured_pool_label_verified" "$SOUT"
@@ -354,6 +432,20 @@ fi
 if [ "$POOL_READY" -eq 1 ] && mount -t tidefs "$POOL_DEV" "$MNT" 2>/tmp/mount.err; then
   pass "configured_pool_mount"
   log_phase "mount" "pass" "configured pool mount ok"
+  log_cutover_phase \
+    "commit_transition" \
+    "pass" \
+    "mode.kernel_cutover.userspace.m0" \
+    "mode.kernel_cutover.mixed_posix_read.m1" \
+    "configured_pool_mount" \
+    "mounted kernel VFS path active"
+  log_cutover_fence \
+    "commit_transition" \
+    "stage" \
+    "mounted kernel work starts only after commit_transition" \
+    "mount completed before write workload" \
+    "configured_pool_mount" \
+    "true"
 else
   fail "configured_pool_mount" "$(cat /tmp/mount.err 2>/dev/null | head -1)"
   log_phase "mount" "fail" "$(cat /tmp/mount.err 2>/dev/null | head -1)"
@@ -363,8 +455,7 @@ fi
 # ── Phase: pre_teardown_io ──────────────────────────────────────────
 log_phase "pre_teardown_io" "start" "write and sync test data"
 
-# Enable ftrace before I/O
-setup_ftrace
+# Ftrace was armed during cutover fence staging before the mount commit.
 
 # Write test file
 if echo "teardown-test-data-$(date +%s)" > "$MNT/teardown_test.txt" 2>/tmp/write.err; then
@@ -384,17 +475,64 @@ if [ -f "$MNT/teardown_test.txt" ]; then
   CONTENT=$(cat "$MNT/teardown_test.txt" 2>/dev/null || echo "")
   if echo "$CONTENT" | grep -q "teardown-test-data"; then
     pass "readback_verify"
+    log_cutover_truth \
+      "mounted_readback" \
+      "teardown-test-data" \
+      "$CONTENT" \
+      "true"
   else
     fail "readback_verify" "unexpected content: $CONTENT"
+    log_cutover_truth \
+      "mounted_readback" \
+      "teardown-test-data" \
+      "$CONTENT" \
+      "false"
   fi
 else
   fail "readback_verify" "test file missing after write"
+  log_cutover_truth \
+    "mounted_readback" \
+    "teardown-test-data" \
+    "missing" \
+    "false"
 fi
 
 if ls "$MNT" >/dev/null 2>&1; then
   pass "readdir_before_teardown"
 else
   fail "readdir_before_teardown" "readdir failed"
+fi
+
+if [ "$FAILED" -eq 0 ]; then
+  log_cutover_phase \
+    "verify_truth" \
+    "pass" \
+    "mode.kernel_cutover.mixed_posix_read.m1" \
+    "mode.kernel_cutover.mixed_posix_read.m1" \
+    "readback_verify" \
+    "mounted kernel readback and readdir verified before teardown"
+  log_cutover_phase \
+    "close_or_reenter" \
+    "pass" \
+    "mode.kernel_cutover.mixed_posix_read.m1" \
+    "mode.kernel_cutover.mixed_posix_read.m1" \
+    "sync_after_write" \
+    "cutover fences closed before teardown begins"
+  log_cutover_fence \
+    "close_or_reenter" \
+    "commit" \
+    "cutover fence releases after truth verification" \
+    "readback and sync completed before teardown begin" \
+    "readback_verify" \
+    "true"
+else
+  log_cutover_phase \
+    "verify_truth" \
+    "fail" \
+    "mode.kernel_cutover.mixed_posix_read.m1" \
+    "mode.kernel_cutover.mixed_posix_read.m1" \
+    "readback_verify" \
+    "mounted kernel truth verification failed"
 fi
 
 log_phase "pre_teardown_io" "pass" "write sync readback ok"
@@ -579,6 +717,9 @@ INITSCRIPT
     # Extract phase log and guest-emitted trace snippets from QEMU output.
     grep '^PHASE:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^PHASE://' > "$OUTPUT_DIR/phase_log.txt" || true
     grep '\[teardown-phase\]' "$RUN_DIR/qemu.log" 2>/dev/null > "$OUTPUT_DIR/phase_log_raw.txt" || true
+    grep '^CUTOVER:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^CUTOVER://' > "$OUTPUT_DIR/cutover_phase_log.txt" || true
+    grep '^FENCE:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^FENCE://' > "$OUTPUT_DIR/cutover_fence_log.txt" || true
+    grep '^TRUTH:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^TRUTH://' > "$OUTPUT_DIR/cutover_truth_log.txt" || true
 
     cp "$RUN_DIR/qemu.log" "$OUTPUT_DIR/qemu.log"
 
@@ -605,7 +746,9 @@ INITSCRIPT
     extract_guest_artifact "dmesg_callbacks" "$CB_TRACE_PATH"
 
     TRACE_ERRORS_FILE="$OUTPUT_DIR/trace_artifact_errors.txt"
+    CUTOVER_ERRORS_FILE="$OUTPUT_DIR/cutover_artifact_errors.txt"
     : > "$TRACE_ERRORS_FILE"
+    : > "$CUTOVER_ERRORS_FILE"
     if [ ! -s "$OUTPUT_DIR/$WQ_TRACE_PATH" ] || grep -q "artifact source missing" "$OUTPUT_DIR/$WQ_TRACE_PATH" 2>/dev/null; then
       echo "trace artifact missing or empty: $WQ_TRACE_PATH" >> "$TRACE_ERRORS_FILE"
     fi
@@ -623,6 +766,26 @@ INITSCRIPT
     fi
     if [ ! -s "$OUTPUT_DIR/$CB_TRACE_PATH" ] || grep -q "artifact source missing" "$OUTPUT_DIR/$CB_TRACE_PATH" 2>/dev/null; then
       echo "trace artifact missing or empty: $CB_TRACE_PATH" >> "$TRACE_ERRORS_FILE"
+    fi
+
+    for required_cutover_phase in \
+      intent \
+      dry_run_gate \
+      stage_fence_prepare \
+      commit_transition \
+      verify_truth \
+      close_or_reenter; do
+      if ! awk -F '\t' -v phase="$required_cutover_phase" '$1 == phase { found=1 } END { exit(found ? 0 : 1) }' "$OUTPUT_DIR/cutover_phase_log.txt"; then
+        echo "cutover phase missing: $required_cutover_phase" >> "$CUTOVER_ERRORS_FILE"
+      fi
+    done
+    for required_cutover_fence in admission quiesce stage commit; do
+      if ! awk -F '\t' -v fence="$required_cutover_fence" '$2 == fence { found=1 } END { exit(found ? 0 : 1) }' "$OUTPUT_DIR/cutover_fence_log.txt"; then
+        echo "cutover fence observation missing: $required_cutover_fence" >> "$CUTOVER_ERRORS_FILE"
+      fi
+    done
+    if ! awk -F '\t' '$1 == "mounted_readback" && $4 == "true" { found=1 } END { exit(found ? 0 : 1) }' "$OUTPUT_DIR/cutover_truth_log.txt"; then
+      echo "cutover truth observation missing or failed: mounted_readback" >> "$CUTOVER_ERRORS_FILE"
     fi
 
     # ── Generate run identity ───────────────────────────────────────
@@ -645,9 +808,10 @@ INITSCRIPT
     DMESG_FINAL_OOPS=$(count_log_matches "Oops:" "$OUTPUT_DIR/qemu.log")
     DMESG_DANGER_COUNT=$(count_log_matches "WARNING:|BUG:|Oops:|lockdep:|KASAN:|KCSAN:|hung_task|Call Trace:|RIP:" "$OUTPUT_DIR/qemu.log")
     TRACE_ERROR_COUNT=$(count_log_matches "." "$TRACE_ERRORS_FILE")
+    CUTOVER_ERROR_COUNT=$(count_log_matches "." "$CUTOVER_ERRORS_FILE")
 
     # ── Determine overall status ─────────────────────────────────────
-    if [ "$FAIL_COUNT" -gt 0 ] || [ "$DMESG_DANGER_COUNT" -gt 0 ] || [ "$TRACE_ERROR_COUNT" -gt 0 ]; then
+    if [ "$FAIL_COUNT" -gt 0 ] || [ "$DMESG_DANGER_COUNT" -gt 0 ] || [ "$TRACE_ERROR_COUNT" -gt 0 ] || [ "$CUTOVER_ERROR_COUNT" -gt 0 ]; then
       TEARDOWN_STATUS="fail"
     elif [ "$BLOCKED_COUNT" -gt 0 ]; then
       TEARDOWN_STATUS="blocked"
@@ -662,6 +826,7 @@ INITSCRIPT
       {
         grep -E "^(FAIL|BLOCKED):" "$RUN_DIR/qemu.log" 2>/dev/null || true
         cat "$TRACE_ERRORS_FILE"
+        cat "$CUTOVER_ERRORS_FILE"
         if [ "$DMESG_DANGER_COUNT" -gt 0 ]; then
           echo "dmesg danger signals observed: WARNING=$DMESG_FINAL_WARN BUG=$DMESG_FINAL_BUG Oops=$DMESG_FINAL_OOPS total=$DMESG_DANGER_COUNT"
         fi
@@ -699,6 +864,58 @@ INITSCRIPT
       )"
     else
       PHASES_JSON="$("$JQ" -n '[]')"
+    fi
+
+    if [ -s "$OUTPUT_DIR/cutover_phase_log.txt" ]; then
+      CUTOVER_PHASES_JSON="$(
+        "$JQ" -R -s '
+          split("\n")
+          | map(select(length > 0) | split("\t") | {
+              phase: .[0],
+              status: .[1],
+              from_mode: .[2],
+              to_mode: .[3],
+              kernel_evidence: .[4],
+              notes: .[5]
+            })
+        ' "$OUTPUT_DIR/cutover_phase_log.txt"
+      )"
+    else
+      CUTOVER_PHASES_JSON="$("$JQ" -n '[]')"
+    fi
+
+    if [ -s "$OUTPUT_DIR/cutover_fence_log.txt" ]; then
+      CUTOVER_FENCE_JSON="$(
+        "$JQ" -R -s '
+          split("\n")
+          | map(select(length > 0) | split("\t") | {
+              phase: .[0],
+              fence: .[1],
+              expected_state: .[2],
+              observed_result: .[3],
+              kernel_evidence: .[4],
+              no_forbidden_work_observed: (.[5] == "true")
+            })
+        ' "$OUTPUT_DIR/cutover_fence_log.txt"
+      )"
+    else
+      CUTOVER_FENCE_JSON="$("$JQ" -n '[]')"
+    fi
+
+    if [ -s "$OUTPUT_DIR/cutover_truth_log.txt" ]; then
+      CUTOVER_TRUTH_JSON="$(
+        "$JQ" -R -s '
+          split("\n")
+          | map(select(length > 0) | split("\t") | {
+              operation: .[0],
+              expected: .[1],
+              observed: .[2],
+              verified: (.[3] == "true")
+            })
+        ' "$OUTPUT_DIR/cutover_truth_log.txt"
+      )"
+    else
+      CUTOVER_TRUTH_JSON="$("$JQ" -n '[]')"
     fi
 
     # Build refusal observations
@@ -739,7 +956,7 @@ INITSCRIPT
     UNMOUNT_OUTCOME="$(grep -Eq "^PASS: unmount_ok|^PASS: unmount_lazy" "$RUN_DIR/qemu.log" && echo "success" || echo "failed")"
     RMMOD_OUTCOME="$(grep -Eq "^PASS: rmmod_ok" "$RUN_DIR/qemu.log" && echo "success" || echo "failed")"
     RELOAD_OUTCOME="$(grep -Eq "^PASS: reload_remount" "$RUN_DIR/qemu.log" && echo "success" || echo "failed")"
-    REMAINING_WORK="$([ "$TEARDOWN_STATUS" = "pass" ] && echo "none observed" || echo "unknown; validation did not pass")"
+    REMAINING_WORK="$([ "$TEARDOWN_STATUS" = "pass" ] && echo "none" || echo "unknown; validation did not pass")"
 
     "$JQ" -n \
       --arg generated_by "kernel-teardown-validation" \
@@ -769,6 +986,9 @@ INITSCRIPT
       --arg reload_remount_probe "$RELOAD_OUTCOME" \
       --arg dmesg_state "$CLEANUP_DMESG" \
       --arg remaining_tidefs_work_observations "$REMAINING_WORK" \
+      --argjson cutover_phases "$CUTOVER_PHASES_JSON" \
+      --argjson cutover_fence_observations "$CUTOVER_FENCE_JSON" \
+      --argjson cutover_truth_observations "$CUTOVER_TRUTH_JSON" \
       --arg status "$TEARDOWN_STATUS" \
       --argjson fail_closed_reasons "$FAIL_REASONS_JSON" \
       '{
@@ -802,6 +1022,9 @@ INITSCRIPT
           dmesg_state: $dmesg_state,
           remaining_tidefs_work_observations: $remaining_tidefs_work_observations
         },
+        cutover_phases: $cutover_phases,
+        cutover_fence_observations: $cutover_fence_observations,
+        cutover_truth_observations: $cutover_truth_observations,
         status: $status,
         fail_closed_reasons: $fail_closed_reasons
       }' > "$OUTPUT_DIR/kernel-teardown-runtime.json"
@@ -813,7 +1036,7 @@ INITSCRIPT
     ARTIFACT_DIGEST="blake3:$("$B3SUM" "$OUTPUT_DIR/$ARTIFACT_PATH" | awk '{print $1}')"
     EVIDENCE_CLASS="runtime-kernel-teardown-no-work-after-artifact"
     SOURCE_LABEL="qemu-smoke-kernel-teardown-validation"
-    SCOPE="kernel-teardown-mounted-vfs source=qemu-smoke run=$RUN_ID ref=$SOURCE_REF sha=$SOURCE_SHA repo=$SOURCE_REPO"
+    SCOPE="kernel-cutover-teardown-mounted-vfs source=qemu-smoke run=$RUN_ID ref=$SOURCE_REF sha=$SOURCE_SHA repo=$SOURCE_REPO cutover_phases=intent,dry_run_gate,stage_fence_prepare,commit_transition,verify_truth,close_or_reenter"
 
     "$JQ" -n \
       --arg claim_id "kernel.teardown.no_work_after.v1" \
@@ -849,8 +1072,8 @@ INITSCRIPT
       VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
     fi
 
-    if [ "$TEARDOWN_STATUS" = "pass" ] && { [ "$FAIL_COUNT" -gt 0 ] || [ "$DMESG_DANGER_COUNT" -gt 0 ] || [ "$TRACE_ERROR_COUNT" -gt 0 ]; }; then
-      echo "VALIDATE FAIL: status=pass but fail/dmesg/trace counters are non-zero"
+    if [ "$TEARDOWN_STATUS" = "pass" ] && { [ "$FAIL_COUNT" -gt 0 ] || [ "$DMESG_DANGER_COUNT" -gt 0 ] || [ "$TRACE_ERROR_COUNT" -gt 0 ] || [ "$CUTOVER_ERROR_COUNT" -gt 0 ]; }; then
+      echo "VALIDATE FAIL: status=pass but fail/dmesg/trace/cutover counters are non-zero"
       VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
     fi
 

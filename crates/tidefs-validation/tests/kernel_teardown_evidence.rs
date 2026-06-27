@@ -63,6 +63,98 @@ fn minimal_pass_json() -> String {
             "dmesg_state": "no TideFS warnings",
             "remaining_tidefs_work_observations": "none"
         },
+        "cutover_phases": [
+            {
+                "phase": "intent",
+                "status": "completed",
+                "from_mode": "mode.kernel_cutover.userspace.m0",
+                "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                "kernel_evidence": "module_visible",
+                "notes": "mounted VFS cutover row selected"
+            },
+            {
+                "phase": "dry_run_gate",
+                "status": "completed",
+                "from_mode": "mode.kernel_cutover.userspace.m0",
+                "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                "kernel_evidence": "configured_pool_label_verified",
+                "notes": "pool label and module prerequisites admitted"
+            },
+            {
+                "phase": "stage_fence_prepare",
+                "status": "completed",
+                "from_mode": "mode.kernel_cutover.userspace.m0",
+                "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                "kernel_evidence": "workqueue tracing enabled",
+                "notes": "quiesce fence staged before mount commit"
+            },
+            {
+                "phase": "commit_transition",
+                "status": "completed",
+                "from_mode": "mode.kernel_cutover.userspace.m0",
+                "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                "kernel_evidence": "configured_pool_mount",
+                "notes": "mounted kernel VFS path active"
+            },
+            {
+                "phase": "verify_truth",
+                "status": "completed",
+                "from_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                "kernel_evidence": "readback_verify",
+                "notes": "mounted kernel readback verified"
+            },
+            {
+                "phase": "close_or_reenter",
+                "status": "completed",
+                "from_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                "kernel_evidence": "sync_after_write",
+                "notes": "cutover fences closed before teardown"
+            }
+        ],
+        "cutover_fence_observations": [
+            {
+                "phase": "dry_run_gate",
+                "fence": "admission",
+                "expected_state": "admit mounted cutover only when module and pool label are ready",
+                "observed_result": "admitted",
+                "kernel_evidence": "configured_pool_label_verified",
+                "no_forbidden_work_observed": true
+            },
+            {
+                "phase": "stage_fence_prepare",
+                "fence": "quiesce",
+                "expected_state": "no mounted work starts before the commit transition",
+                "observed_result": "trace armed before mount commit",
+                "kernel_evidence": "workqueue trace source present",
+                "no_forbidden_work_observed": true
+            },
+            {
+                "phase": "commit_transition",
+                "fence": "stage",
+                "expected_state": "mounted kernel work starts only after commit",
+                "observed_result": "mount completed and write followed commit",
+                "kernel_evidence": "configured_pool_mount",
+                "no_forbidden_work_observed": true
+            },
+            {
+                "phase": "close_or_reenter",
+                "fence": "commit",
+                "expected_state": "cutover fence releases after truth verification",
+                "observed_result": "readback and sync completed before teardown begin",
+                "kernel_evidence": "readback_verify",
+                "no_forbidden_work_observed": true
+            }
+        ],
+        "cutover_truth_observations": [
+            {
+                "operation": "mounted_readback",
+                "expected": "teardown-test-data",
+                "observed": "teardown-test-data",
+                "verified": true
+            }
+        ],
         "status": "pass",
         "fail_closed_reasons": []
     }"#.to_string()
@@ -79,6 +171,9 @@ fn no_daemon_pass_json() -> String {
         "target_id".into(),
         serde_json::Value::String(KERNEL_TEARDOWN_NO_WORK_AFTER_NO_DAEMON_TARGET_ID.into()),
     );
+    obj.remove("cutover_phases");
+    obj.remove("cutover_fence_observations");
+    obj.remove("cutover_truth_observations");
     serde_json::to_string_pretty(&value).unwrap()
 }
 
@@ -93,6 +188,9 @@ fn integration_pass_artifact_validates() {
     assert_eq!(summary.fail_closed_count, 0);
     assert_eq!(summary.phase_count, 9);
     assert_eq!(summary.refusal_observation_count, 1);
+    assert_eq!(summary.cutover_phase_count, 6);
+    assert_eq!(summary.cutover_fence_observation_count, 4);
+    assert_eq!(summary.cutover_truth_observation_count, 1);
     assert_eq!(summary.target_id, KERNEL_TEARDOWN_NO_WORK_AFTER_TARGET_ID);
     assert_eq!(summary.source_ref, "refs/heads/master");
 }
@@ -336,6 +434,47 @@ fn integration_empty_refusal_observations_fails() {
     assert!(
         msg.contains("refusal") || msg.contains("non-empty"),
         "should reject empty refusal observations: {msg}"
+    );
+}
+
+#[test]
+fn integration_post_final_new_work_fails() {
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    json_val
+        .as_object_mut()
+        .unwrap()
+        .get_mut("post_final_teardown_refusal_observations")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()[0]
+        .as_object_mut()
+        .unwrap()
+        .insert(
+            "new_work_enqueued_or_started".into(),
+            serde_json::Value::Bool(true),
+        );
+    let json = serde_json::to_string_pretty(&json_val).unwrap();
+    let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("new work after final teardown"),
+        "should reject observed post-final work: {msg}"
+    );
+}
+
+#[test]
+fn integration_mounted_kernel_cutover_fields_are_required() {
+    let mut json_val: serde_json::Value = serde_json::from_str(&minimal_pass_json()).unwrap();
+    let obj = json_val.as_object_mut().unwrap();
+    obj.remove("cutover_phases");
+    obj.remove("cutover_fence_observations");
+    obj.remove("cutover_truth_observations");
+    let json = serde_json::to_string_pretty(&json_val).unwrap();
+    let err = validate_kernel_teardown_no_work_after_artifact_json(&json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cutover_phases") && msg.contains("cutover_fence_observations"),
+        "mounted artifacts should require cutover fields: {msg}"
     );
 }
 
