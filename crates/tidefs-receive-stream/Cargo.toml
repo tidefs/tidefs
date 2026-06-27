@@ -18,10 +18,10 @@ crc32c = { version = "0.6", default-features = false }
 tidefs-binary_schema-core = { workspace = true }
 tidefs-binary_schema-checksum = { workspace = true }
 tidefs-local-object-store = { workspace = true }
+tidefs-send-stream = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tidefs-send-stream = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

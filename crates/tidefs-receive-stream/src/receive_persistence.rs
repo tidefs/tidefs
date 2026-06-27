@@ -31,6 +31,7 @@
 
 use crate::assembler::AssembledObject;
 use crate::dispatch::ReceiveDispatch;
+use crate::session::ReceiverRefusalReason;
 use tidefs_local_object_store::{ObjectKey, ObjectStore, StoreError};
 
 // ---------------------------------------------------------------------------
@@ -229,6 +230,24 @@ impl std::error::Error for ReceivePersistenceError {
 impl From<StoreError> for ReceivePersistenceError {
     fn from(e: StoreError) -> Self {
         Self::Store(e)
+    }
+}
+
+impl ReceivePersistenceError {
+    /// Return the stable receiver refusal/defer class for scheduler admission.
+    #[must_use]
+    pub const fn receiver_refusal_reason(&self) -> ReceiverRefusalReason {
+        match self {
+            Self::BaseRootNotPinned { .. }
+            | Self::DatasetLineageMismatch { .. }
+            | Self::DatasetLineageUnavailable { .. } => ReceiverRefusalReason::ReceiverMissingBase,
+            Self::ReceiveGenerationReplayed { .. } => {
+                ReceiverRefusalReason::ResumeCheckpointInvalid
+            }
+            Self::ContractNotValidated | Self::ContractRequired | Self::Store(_) => {
+                ReceiverRefusalReason::ReceiverRejectedPolicy
+            }
+        }
     }
 }
 
