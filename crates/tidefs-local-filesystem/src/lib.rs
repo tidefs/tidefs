@@ -5452,12 +5452,14 @@ impl LocalFileSystem {
         self.capacity_authority
             .refresh_committed_accounting(&self.state.space_accounting, phys);
 
-        let mut report = self.allocator_report()?;
+        let report = self.allocator_report()?;
         let ancestors = self.quota_ancestor_chain_for_parts(&[]);
-        report.reusable_free_bytes = self
+        let authority_free_bytes = self.capacity_authority.free_bytes();
+        let authority_available_bytes = self.capacity_authority.available_bytes();
+        let quota_limited_available_bytes = self
             .state
             .quota_table
-            .quota_limited_available(&ancestors, report.reusable_free_bytes);
+            .quota_limited_available(&ancestors, authority_available_bytes);
         // Derive block counters from the single production capacity authority.
         // This replaces the former SpaceBook/SpaceAccounting dual-query path.
         let cs = self.capacity_authority.derive_statfs(
@@ -5476,13 +5478,12 @@ impl LocalFileSystem {
         let free_blocks_limit = if grain_bytes == 0 {
             0
         } else {
-            self.capacity_authority.free_bytes() / grain_bytes
+            authority_free_bytes / grain_bytes
         };
         let avail_blocks_limit = if grain_bytes == 0 {
             0
         } else {
-            (self.capacity_authority.available_bytes() / grain_bytes)
-                .min(report.reusable_free_bytes / grain_bytes)
+            quota_limited_available_bytes / grain_bytes
         };
         let (blocks, bfree, bavail) =
             self.clamp_statfs_blocks(cs, total_bytes_limit, free_blocks_limit, avail_blocks_limit);
@@ -8111,14 +8112,15 @@ impl LocalFileSystem {
                 return Err(FileSystemError::from(decision));
             }
         }
-        // ENOSPC gate via the single production capacity authority.
-        // Capacity reservation: atomically reserve and commit bytes for
-        // fallocate, replacing the former check-then-record TOCTOU pattern.
-        // The reservation handle is immediately consumed so the mutable borrow
-        // on self is released before the fallocate body.
         if reserve_bytes > 0 {
             self.begin_mutation();
-            if self.check_enospc_with_hierarchy(reserve_bytes).is_err() {
+            let reservation_succeeded = self
+                .reserve_with_hierarchy(reserve_bytes)
+                .map(|handle| {
+                    handle.commit();
+                })
+                .is_ok();
+            if !reservation_succeeded {
                 self.rollback_mutation_delta();
                 return Err(FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
@@ -8128,7 +8130,6 @@ impl LocalFileSystem {
                     allocated: self.capacity_authority.used_bytes(),
                 });
             }
-            self.capacity_authority.record_allocation(reserve_bytes);
         }
         check_crash_hook(CrashInjectionPoint::OpAllocateBeforeSpaceUpdate);
         if reserve_bytes > 0 {
@@ -8152,7 +8153,7 @@ impl LocalFileSystem {
                 );
             }
             // Capacity reservation was committed inline before fallocate.
-            // On error paths the caller must rollback via capacity_authority.record_free.
+            // Later fallocate errors roll back through the mutation snapshot.
             {
                 let mut tracker = self.writeback_range_tracker.lock().expect("locked");
                 for (range_offset, range_length) in &reservation_ranges {
@@ -8793,13 +8794,16 @@ impl LocalFileSystem {
         if will_mutate_capacity_or_content {
             self.begin_mutation();
         }
-        // Capacity reservation: charge only holes that become allocated. Existing
-        // DATA and UNWRITTEN ranges already consume capacity.
+        // Capacity reservation: charge only holes that become allocated.
+        // Existing DATA and UNWRITTEN ranges already consume capacity.
         if newly_allocated_bytes > 0 {
-            if self
-                .check_enospc_with_hierarchy(newly_allocated_bytes)
-                .is_err()
-            {
+            let reservation_succeeded = self
+                .reserve_with_hierarchy(newly_allocated_bytes)
+                .map(|handle| {
+                    handle.commit();
+                })
+                .is_ok();
+            if !reservation_succeeded {
                 self.rollback_mutation_delta();
                 return Err(FileSystemError::NoSpace {
                     resource: LocalStorageResource::ContentBytes,
@@ -8809,8 +8813,6 @@ impl LocalFileSystem {
                     allocated: self.capacity_authority.used_bytes(),
                 });
             }
-            self.capacity_authority
-                .record_allocation(newly_allocated_bytes);
         }
 
         if data_bytes == 0 && !materialized_data {

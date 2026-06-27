@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
-//! Production capacity authority: single source of truth for filesystem
-//! used/free/reserved/pending byte counters.
+//! Production capacity authority for mounted capacity decisions.
 //!
 //! Reconstructed from committed-root state and pool geometry during mount
 //! recovery. Serves as the authoritative derivation source for FUSE statfs
 //! (via [`LocalFileSystem::statfs`]), kernel VFS statfs, object-store
 //! allocation, dataset quotas, block trim/discard, and ENOSPC enforcement.
 //!
-//! This authority is the mounted-filesystem façade over the committed
-//! `tidefs-space-accounting` counters. `SpaceBook` remains active for
-//! per-dataset write/delete auto-update tracking and persistence, but
-//! mounted ENOSPC and statfs decisions flow through
-//! [`tidefs_space_accounting::SpaceAccounting`].
+//! This authority is the mounted-filesystem facade over the committed
+//! `tidefs-space-accounting` counters plus transient in-flight holds.
+//! `SpaceBook` remains active for per-dataset write/delete auto-update
+//! tracking and persistence, but mounted ENOSPC and statfs decisions flow
+//! through [`tidefs_space_accounting::SpaceAccounting`] through this facade.
 //!
 //! # Relationship to existing layers
 //!
@@ -34,10 +33,11 @@
 //!
 //! # Single-Authority Chain
 //!
-//! Every filesystem statfs, quota, pool, and device counter derives from
-//! this one documented authority. The chain below is the result of the
-//! single-source audit: there are no remaining side-ledger or dual-query
-//! paths that bypass [`CapacityAuthority`] for capacity information.
+//! Mounted statfs and write admission derive from this documented facade.
+//! The chain below records the current runtime boundary: committed counters
+//! live in `SpaceAccounting`; transient reservations live here; allocator
+//! reports, `SpaceBook`, and physical pool counters are inputs, persistence,
+//! or projections rather than independent mounted availability authorities.
 //!
 //! ```text
 //! CapacityAuthority (single production source)
@@ -74,7 +74,8 @@
 //! `#[cfg(test)]` and excluded from the production mount path. The
 //! `pool_free_bytes_for_quota()` path previously queried the allocator
 //! report independently of the authority; the capacity-authority audit routes it
-//! through [`CapacityAuthority::free_bytes`]. The
+//! through [`CapacityAuthority::free_bytes`]. Runtime TFR-007 follow-ups still
+//! track the remaining projection and persistence bridges. The
 //! `derive_pool_physical_counters()` path previously built
 //! `PoolPhysicalCountersV1` from `allocator_policy.content_capacity_bytes`
 //! and the allocator report; both `phys_total_bytes`
@@ -146,12 +147,12 @@ const ENOSPC: u16 = 28;
 
 // ── CapacityAuthority ───────────────────────────────────────────────────
 
-/// Single production authority for filesystem capacity counters.
+/// Mounted authority facade for filesystem capacity decisions.
 ///
-/// All counters are atomic for thread-safe access from the FUSE dispatch
-/// path, the mount/recovery path, and background services. The authority
-/// is initialized during mount recovery and lives for the lifetime of the
-/// filesystem.
+/// The committed view is stored as `SpaceAccounting`. Atomic counters expose
+/// the mounted transient projection needed by the FUSE dispatch path,
+/// mount/recovery path, and background services. The authority is initialized
+/// during mount recovery and lives for the lifetime of the filesystem.
 #[derive(Debug)]
 pub struct CapacityAuthority {
     total_bytes: AtomicU64,

@@ -1378,6 +1378,59 @@ fn buffered_extension_beyond_dirty_range_still_checks_capacity() {
 }
 
 #[test]
+fn fallocate_and_zero_range_enospc_leave_authority_projection_stable() {
+    let root = temp_root("fallocate-zero-range-enospc-stable");
+    let data_len = content_chunk_size() as usize;
+    let mut fs =
+        LocalFileSystem::open_with_capacity(&root, StoreOptions::test_fast(), data_len as u64)
+            .expect("open fs");
+    fs.create_file("/full.bin", 0o600).expect("create full");
+    fs.write_file("/full.bin", 0, &vec![0x11; data_len])
+        .expect("fill capacity");
+    fs.fsync_all().expect("commit full file");
+
+    assert_eq!(fs.capacity_authority().reserved_bytes(), 0);
+    assert_eq!(fs.capacity_authority().pending_bytes(), 0);
+
+    fs.create_file("/prealloc.bin", 0o600)
+        .expect("create prealloc");
+    let statfs_before_fallocate = fs.statfs().expect("statfs before fallocate");
+    let err = fs
+        .fallocate_file("/prealloc.bin", 0, data_len as u64)
+        .expect_err("fallocate beyond full capacity must fail");
+    assert!(
+        matches!(err, FileSystemError::NoSpace { .. }),
+        "expected fallocate ENOSPC, got {err}",
+    );
+    assert_eq!(fs.capacity_authority().reserved_bytes(), 0);
+    assert_eq!(fs.capacity_authority().pending_bytes(), 0);
+    assert_eq!(
+        fs.statfs().expect("statfs after fallocate"),
+        statfs_before_fallocate
+    );
+
+    fs.create_file("/hole.bin", 0o600).expect("create sparse");
+    fs.truncate_file("/hole.bin", data_len as u64)
+        .expect("sparse truncate");
+    let statfs_before_zero_range = fs.statfs().expect("statfs before zero_range");
+    let err = fs
+        .zero_range("/hole.bin", 0, data_len as u64)
+        .expect_err("zero_range allocating a sparse hole must fail");
+    assert!(
+        matches!(err, FileSystemError::NoSpace { .. }),
+        "expected zero_range ENOSPC, got {err}",
+    );
+    assert_eq!(fs.capacity_authority().reserved_bytes(), 0);
+    assert_eq!(fs.capacity_authority().pending_bytes(), 0);
+    assert_eq!(
+        fs.statfs().expect("statfs after zero_range"),
+        statfs_before_zero_range
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn direct_write_superseding_buffered_dirty_bytes_releases_dirty_charge() {
     let root = temp_root("direct-supersedes-buffered-dirty");
     let data_len = content_chunk_size() as usize;
