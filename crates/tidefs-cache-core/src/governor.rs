@@ -274,6 +274,28 @@ pub struct GovernorPartitionPressureState {
     pub shared_unused_bytes: u64,
 }
 
+/// Read-only usage and pressure snapshot for one budget partition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GovernorPartitionUsageState {
+    /// Partition whose usage was sampled.
+    pub partition: BudgetPartitionKey,
+    /// Total bytes charged to this partition across all categories.
+    pub total_used: u64,
+    /// Per-category usage and pressure rows.
+    pub categories: [GovernorPartitionPressureState; 6],
+}
+
+impl GovernorPartitionUsageState {
+    /// Return this partition's pressure row for one category.
+    #[must_use]
+    pub fn pressure_for_category(
+        &self,
+        category: BudgetCategory,
+    ) -> GovernorPartitionPressureState {
+        self.categories[Governor::category_index(category)]
+    }
+}
+
 // ── Reclaim ladder state ─────────────────────────────────────────────────
 
 /// Governor reclaim ladder stage selected for a pressure snapshot.
@@ -1329,6 +1351,36 @@ impl Governor {
         states
     }
 
+    /// Return a read-only usage and pressure snapshot for one partition.
+    #[must_use]
+    pub fn partition_usage_state(
+        &self,
+        partition: BudgetPartitionKey,
+    ) -> GovernorPartitionUsageState {
+        let inner = self.inner.lock().unwrap();
+        Self::partition_usage_state_for_locked(&inner, partition)
+    }
+
+    /// Return usage snapshots for every active partition.
+    ///
+    /// The returned list is sorted by partition key so operator-visible
+    /// reports and tests do not depend on hash-map iteration order.
+    #[must_use]
+    pub fn partition_usage_states(&self) -> Vec<GovernorPartitionUsageState> {
+        let inner = self.inner.lock().unwrap();
+        let mut partitions = inner
+            .partitions
+            .iter()
+            .filter(|(_, state)| !state.is_empty())
+            .map(|(&partition, _)| partition)
+            .collect::<Vec<_>>();
+        partitions.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        partitions
+            .into_iter()
+            .map(|partition| Self::partition_usage_state_for_locked(&inner, partition))
+            .collect()
+    }
+
     /// Return whether auto-tune is enabled.
     #[must_use]
     pub fn auto_tune_enabled(&self) -> bool {
@@ -1549,6 +1601,22 @@ impl Governor {
             protected_limit: limit.protected_limit,
             soft_watermark,
             shared_unused_bytes: limit.shared_unused_bytes,
+        }
+    }
+
+    fn partition_usage_state_for_locked(
+        inner: &GovernorInner,
+        partition: BudgetPartitionKey,
+    ) -> GovernorPartitionUsageState {
+        let categories = std::array::from_fn(|idx| {
+            let category = Self::CATEGORIES[idx];
+            Self::partition_pressure_state_for_locked(inner, partition, idx, category)
+        });
+        let total_used = categories.iter().map(|state| state.used).sum();
+        GovernorPartitionUsageState {
+            partition,
+            total_used,
+            categories,
         }
     }
 
@@ -3475,6 +3543,89 @@ mod tests {
     }
 
     #[test]
+    fn partition_usage_snapshot_groups_all_categories_for_dataset() {
+        let g = Governor::new(GovernorConfig {
+            total_budget_bytes: 1000,
+            data_cache_fraction: 0.4,
+            meta_cache_fraction: 0.2,
+            dirty_bytes_fraction: 0.3,
+            inode_state_fraction: 0.05,
+            cluster_queues_fraction: 0.03,
+            misc_fraction: 0.02,
+            auto_tune: false,
+        })
+        .unwrap();
+        let first = partition_key(0x10);
+        let second = partition_key(0x30);
+
+        g.admit_for_partition(second, BudgetCategory::DataCache, 100)
+            .unwrap();
+        g.admit_for_partition(first, BudgetCategory::DataCache, 180)
+            .unwrap();
+        g.admit_for_partition(first, BudgetCategory::MetaCache, 60)
+            .unwrap();
+        g.transfer_for_partition(
+            first,
+            BudgetCategory::DataCache,
+            BudgetCategory::DirtyBytes,
+            80,
+        )
+        .unwrap();
+
+        let snapshot = g.partition_usage_state(first);
+        assert_eq!(snapshot.partition, first);
+        assert_eq!(snapshot.total_used, 240);
+        assert_eq!(
+            snapshot
+                .pressure_for_category(BudgetCategory::DataCache)
+                .used,
+            100
+        );
+        assert_eq!(
+            snapshot
+                .pressure_for_category(BudgetCategory::MetaCache)
+                .used,
+            60
+        );
+        assert_eq!(
+            snapshot
+                .pressure_for_category(BudgetCategory::DirtyBytes)
+                .used,
+            80
+        );
+        assert_eq!(
+            snapshot
+                .pressure_for_category(BudgetCategory::ClusterQueues)
+                .used,
+            0
+        );
+        assert_eq!(
+            snapshot
+                .categories
+                .iter()
+                .map(|category| category.used)
+                .sum::<u64>(),
+            snapshot.total_used
+        );
+
+        let active = g.partition_usage_states();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].partition, first);
+        assert_eq!(active[0].total_used, 240);
+        assert_eq!(active[1].partition, second);
+        assert_eq!(active[1].total_used, 100);
+
+        g.release_for_partition(first, BudgetCategory::DataCache, 100);
+        g.release_for_partition(first, BudgetCategory::MetaCache, 60);
+        g.release_for_partition(first, BudgetCategory::DirtyBytes, 80);
+        let active = g.partition_usage_states();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].partition, second);
+        assert_eq!(active[0].total_used, 100);
+        assert_eq!(g.partition_usage_state(first).total_used, 0);
+    }
+
+    #[test]
     fn share_unused_partition_policy_is_explicit_and_observable() {
         let g = Governor::new_with_partition_config(
             single_category_budget_config(BudgetCategory::DataCache, 1000),
@@ -3545,6 +3696,36 @@ mod tests {
         assert_eq!(states[1].shared_unused_bytes, 150);
         assert_eq!(states[1].soft_watermark, 280);
         assert_eq!(states[1].signal, BackpressureSignal::None);
+    }
+
+    #[test]
+    fn share_unused_partition_usage_snapshot_reports_live_borrow_headroom() {
+        let g = Governor::new_with_partition_config(
+            single_category_budget_config(BudgetCategory::DataCache, 1000),
+            GovernorPartitionConfig {
+                policy: BudgetPartitionPolicy::ShareUnused,
+                category_fraction: 0.25,
+                soft_fraction: 0.70,
+            },
+        )
+        .unwrap();
+        let first = partition_key(0x61);
+        let second = partition_key(0x62);
+
+        g.admit_for_partition(first, BudgetCategory::DataCache, 600)
+            .unwrap();
+        g.admit_for_partition(second, BudgetCategory::DataCache, 100)
+            .unwrap();
+
+        let snapshot = g.partition_usage_state(first);
+        let data = snapshot.pressure_for_category(BudgetCategory::DataCache);
+        assert_eq!(snapshot.total_used, 600);
+        assert_eq!(data.used, 600);
+        assert_eq!(data.protected_limit, 250);
+        assert_eq!(data.limit, 900);
+        assert_eq!(data.shared_unused_bytes, 650);
+        assert_eq!(data.soft_watermark, 630);
+        assert_eq!(data.signal, BackpressureSignal::None);
     }
 
     #[test]
