@@ -310,11 +310,10 @@ evidence_requirements = [
   { class = "claims-gate-review", path = "validation/artifacts/kernel/teardown-no-work-after-claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#909"] },
 ]
 blockers = [
-  "The recorded teardown proof review is bounded source/model evidence, not mounted Linux runtime evidence.",
-  "No accepted T5 mounted-kernel teardown artifact with Linux workqueue and callback activity tracing is registered for this claim.",
+  "The recorded teardown proof review is bounded source/model evidence; runtime acceptance is limited to the T5 mounted-kernel-vfs cutover and teardown artifact from #1186 / PR #1463.",
   "No accepted T6 full-kernel/no-daemon teardown and recovery artifact is registered for this claim.",
 ]
-generated_doc = "Blocked kernel no-work-after-teardown claim. TideFS has bounded source-model context-token and teardown race review evidence, but no accepted mounted Linux T5/T6 runtime artifact is registered yet, so product wording must not validate the claim."
+generated_doc = "Blocked kernel no-work-after-teardown claim. TideFS has bounded source-model context-token and teardown race review evidence plus an accepted T5 mounted-kernel-vfs cutover/teardown artifact, but no accepted T6 full-kernel/no-daemon runtime artifact is registered, so product wording must not validate the full claim."
 evidence_artifacts = [
   { class = "kernel-context-token-model", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json" },
   { class = "teardown-race-proof-artifact", path = "validation/artifacts/kernel/teardown-race-proof-artifact.json" },
