@@ -124,9 +124,8 @@ fn encode_full_changed_records_as_vfssend2(
 ///
 /// Object filtering is done at the VFSSEND1 export layer
 /// ([`crate::send_receive::export_incremental_changed_records`]), so the
-/// base-object-digest map passed to
-/// [`SendBuilder::incremental_from_base`] is empty while the lineage manifest
-/// still carries a pinned base-root identity.
+/// base-root authority carries only the committed-root identity while the
+/// per-object digest map remains empty.
 pub fn export_incremental_vfssend2_from_changed_records(
     export: &ChangedRecordExport,
     pool_id: Id128,
@@ -175,14 +174,7 @@ fn encode_incremental_changed_records_as_vfssend2(
         build_header_and_snapshots(export, pool_id, dataset_id, sender_authority)?;
     let header = header.incremental_from(from_snapshot_id);
 
-    let base_root = PinnedBaseRoot::new(
-        dataset_id,
-        from_snapshot_id,
-        changed_record_root_digest(dataset_id, from_snapshot_id, from_root),
-        BTreeMap::new(),
-        true,
-    );
-
+    let base_root = pinned_base_root_from_summary(dataset_id, from_snapshot_id, from_root);
     let builder =
         SendBuilder::incremental_from_base(header, snapshots, base_root).map_err(|e| {
             FileSystemError::LifecycleError {
@@ -239,6 +231,16 @@ fn changed_record_root_to_snapshot_delta(
     delta.removed_objects = BTreeSet::new();
 
     Ok(delta)
+}
+
+fn pinned_base_root_from_summary(
+    dataset_id: Id128,
+    root_id: Id128,
+    root: &CommittedRootSummary,
+) -> PinnedBaseRoot {
+    let root_commit = crate::root_commit_from_summary(root);
+    let root_digest = *blake3::hash(&crate::encoding::encode_root_commit(&root_commit)).as_bytes();
+    PinnedBaseRoot::new(dataset_id, root_id, root_digest, BTreeMap::new(), true)
 }
 
 fn changed_record_to_delta_object(
