@@ -387,6 +387,7 @@ pub enum SendRecordType {
     ResumeMarker = 0x000a,
     StreamEnd = 0x000b,
     LineageManifest = 0x000c,
+    SnapshotMutation = 0x000d,
 }
 
 impl TryFrom<u16> for SendRecordType {
@@ -406,6 +407,7 @@ impl TryFrom<u16> for SendRecordType {
             0x000a => Ok(Self::ResumeMarker),
             0x000b => Ok(Self::StreamEnd),
             0x000c => Ok(Self::LineageManifest),
+            0x000d => Ok(Self::SnapshotMutation),
             other => Err(SendStreamError::UnknownRecordType(other)),
         }
     }
@@ -482,6 +484,7 @@ pub enum SendRecordPayload {
     SnapshotEnd(SnapshotBoundary),
     ResumeMarker(ResumeMarker),
     StreamEnd(StreamEnd),
+    SnapshotMutation(SnapshotMutation),
 }
 
 impl SendRecordPayload {
@@ -500,6 +503,7 @@ impl SendRecordPayload {
             Self::SnapshotEnd(_) => SendRecordType::SnapshotEnd,
             Self::ResumeMarker(_) => SendRecordType::ResumeMarker,
             Self::StreamEnd(_) => SendRecordType::StreamEnd,
+            Self::SnapshotMutation(_) => SendRecordType::SnapshotMutation,
         }
     }
 
@@ -519,6 +523,7 @@ impl SendRecordPayload {
             Self::ObjectEnd(payload) => payload.encode_into(&mut out),
             Self::ResumeMarker(payload) => payload.encode_into(&mut out),
             Self::StreamEnd(payload) => payload.encode_into(&mut out),
+            Self::SnapshotMutation(payload) => payload.encode_into(&mut out)?,
         }
         Ok(out)
     }
@@ -550,6 +555,9 @@ impl SendRecordPayload {
             }
             SendRecordType::ResumeMarker => Self::ResumeMarker(ResumeMarker::decode(&mut decoder)?),
             SendRecordType::StreamEnd => Self::StreamEnd(StreamEnd::decode(&mut decoder)?),
+            SendRecordType::SnapshotMutation => {
+                Self::SnapshotMutation(SnapshotMutation::decode(&mut decoder)?)
+            }
         };
         decoder.finish()?;
         Ok(decoded)
@@ -835,6 +843,68 @@ impl SnapshotBoundary {
             snapshot_id: decoder.read_id128()?,
             commit_group: decoder.read_u64()?,
             name: decoder.read_len_prefixed_u16()?.to_vec(),
+        })
+    }
+}
+
+/// Snapshot-record mutation carried by a [`SnapshotDelta`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(u8)]
+pub enum SnapshotMutationKind {
+    Promote = 1,
+    Delete = 2,
+}
+
+impl TryFrom<u8> for SnapshotMutationKind {
+    type Error = SendStreamError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Promote),
+            2 => Ok(Self::Delete),
+            other => Err(SendStreamError::UnknownSnapshotMutationKind(other)),
+        }
+    }
+}
+
+/// Snapshot lifecycle mutation with the affected traversal-root identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotMutation {
+    pub kind: SnapshotMutationKind,
+    pub root_id: Id128,
+    pub snapshot_name: Vec<u8>,
+}
+
+impl SnapshotMutation {
+    #[must_use]
+    pub fn promote(root_id: Id128, snapshot_name: impl Into<Vec<u8>>) -> Self {
+        Self {
+            kind: SnapshotMutationKind::Promote,
+            root_id,
+            snapshot_name: snapshot_name.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn delete(root_id: Id128, snapshot_name: impl Into<Vec<u8>>) -> Self {
+        Self {
+            kind: SnapshotMutationKind::Delete,
+            root_id,
+            snapshot_name: snapshot_name.into(),
+        }
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), SendStreamError> {
+        out.push(self.kind as u8);
+        out.extend_from_slice(&self.root_id);
+        push_bytes_u16(out, &self.snapshot_name, "snapshot mutation name")
+    }
+
+    pub(crate) fn decode(decoder: &mut Decoder<'_>) -> Result<Self, SendStreamError> {
+        Ok(Self {
+            kind: SnapshotMutationKind::try_from(decoder.read_u8()?)?,
+            root_id: decoder.read_id128()?,
+            snapshot_name: decoder.read_len_prefixed_u16()?.to_vec(),
         })
     }
 }
@@ -1202,6 +1272,7 @@ pub struct SnapshotDelta {
     pub commit_group: u64,
     pub objects: Vec<DeltaObject>,
     pub removed_objects: BTreeSet<Bytes32>,
+    pub mutations: Vec<SnapshotMutation>,
 }
 
 impl SnapshotDelta {
@@ -1213,7 +1284,38 @@ impl SnapshotDelta {
             commit_group,
             objects: Vec::new(),
             removed_objects: BTreeSet::new(),
+            mutations: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn promote(
+        snapshot_id: Id128,
+        snapshot_name: impl Into<Vec<u8>>,
+        commit_group: u64,
+        root_id: Id128,
+    ) -> Self {
+        let snapshot_name = snapshot_name.into();
+        let mut delta = Self::new(snapshot_id, snapshot_name.clone(), commit_group);
+        delta
+            .mutations
+            .push(SnapshotMutation::promote(root_id, snapshot_name));
+        delta
+    }
+
+    #[must_use]
+    pub fn delete(
+        snapshot_id: Id128,
+        snapshot_name: impl Into<Vec<u8>>,
+        commit_group: u64,
+        root_id: Id128,
+    ) -> Self {
+        let snapshot_name = snapshot_name.into();
+        let mut delta = Self::new(snapshot_id, snapshot_name.clone(), commit_group);
+        delta
+            .mutations
+            .push(SnapshotMutation::delete(root_id, snapshot_name));
+        delta
     }
 }
 
@@ -1224,6 +1326,7 @@ pub struct SendStats {
     pub bytes_sent: u64,
     pub records_sent: u64,
     pub snapshots_sent: u32,
+    pub snapshot_mutations_sent: u64,
     pub resume_points: u64,
 }
 
@@ -1870,6 +1973,24 @@ impl SendBuilder {
             stats.records_sent += 1;
             stats.snapshots_sent += 1;
 
+            for mutation in snapshot.mutations {
+                records.push(SendRecord::new(SendRecordPayload::SnapshotMutation(
+                    mutation,
+                )));
+                stats.records_sent += 1;
+                stats.snapshot_mutations_sent += 1;
+                let object_index = stats.objects_sent;
+                maybe_checkpoint(
+                    &mut records,
+                    &mut stats,
+                    snapshot_index as u32,
+                    object_index,
+                    payload_bytes_since_checkpoint,
+                    checkpoint_interval,
+                )?;
+                payload_bytes_since_checkpoint = 0;
+            }
+
             for removed in snapshot.removed_objects {
                 records.push(SendRecord::new(SendRecordPayload::ObjectTruncate(
                     ObjectTruncate {
@@ -1958,7 +2079,10 @@ impl SendBuilder {
             stats.records_sent += 1;
         }
 
-        if stats.objects_sent == 0 && base_object_digests.is_some() {
+        if stats.objects_sent == 0
+            && stats.snapshot_mutations_sent == 0
+            && base_object_digests.is_some()
+        {
             return Err(SendStreamError::EmptyIncrementalDelta);
         }
 
@@ -1976,6 +2100,7 @@ pub struct ReceivedDataset {
     pub dataset_id: Id128,
     pub objects: BTreeMap<Bytes32, ReceivedObject>,
     pub snapshots: BTreeMap<Id128, ReceivedSnapshot>,
+    pub snapshot_mutations: Vec<SnapshotMutation>,
     pub directory_entries: BTreeMap<(Bytes32, Vec<u8>), Bytes32>,
 }
 
@@ -1987,6 +2112,7 @@ impl ReceivedDataset {
             dataset_id,
             objects: BTreeMap::new(),
             snapshots: BTreeMap::new(),
+            snapshot_mutations: Vec::new(),
             directory_entries: BTreeMap::new(),
         }
     }
@@ -2059,6 +2185,7 @@ pub struct ReceiveStats {
     pub objects_received: u64,
     pub bytes_received: u64,
     pub snapshots_received: u32,
+    pub snapshot_mutations_received: u64,
     pub resume_count: u64,
     pub validation_passed: bool,
 }
@@ -2248,6 +2375,27 @@ impl ReceiveBuilder {
                 self.dataset
                     .directory_entries
                     .remove(&(remove.directory_id, remove.name));
+                Ok(ReceiveProgress::Continue)
+            }
+            SendRecordPayload::SnapshotMutation(mutation) => {
+                if self.current_snapshot.is_none() {
+                    return Err(SendStreamError::ReceiveProtocol(
+                        "snapshot mutation outside a snapshot",
+                    ));
+                }
+                if self.open_object.is_some() {
+                    return Err(SendStreamError::ReceiveProtocol(
+                        "snapshot mutation inside an open object",
+                    ));
+                }
+                self.dataset.snapshot_mutations.push(mutation);
+                self.stats.snapshot_mutations_received = self
+                    .stats
+                    .snapshot_mutations_received
+                    .checked_add(1)
+                    .ok_or(SendStreamError::LengthOverflow(
+                        "receive snapshot mutation count",
+                    ))?;
                 Ok(ReceiveProgress::Continue)
             }
             SendRecordPayload::SnapshotEnd(boundary) => self.finish_snapshot(boundary),
@@ -2726,6 +2874,17 @@ fn target_root_digest_from_snapshots(
         hash_u64(&mut hasher, snapshot.commit_group);
         hash_bytes(&mut hasher, &snapshot.snapshot_name, "snapshot name")?;
 
+        hash_u64(&mut hasher, snapshot.mutations.len() as u64);
+        for mutation in &snapshot.mutations {
+            hasher.update(&[mutation.kind as u8]);
+            hasher.update(&mutation.root_id);
+            hash_bytes(
+                &mut hasher,
+                &mutation.snapshot_name,
+                "snapshot mutation name",
+            )?;
+        }
+
         let mut objects: Vec<&DeltaObject> = snapshot.objects.iter().collect();
         objects.sort_by_key(|object| object.object_id);
         hash_u64(&mut hasher, objects.len() as u64);
@@ -2961,6 +3120,7 @@ pub enum SendStreamError {
     InvalidHeader(&'static str),
     UnknownRecordType(u16),
     UnknownObjectKind(u8),
+    UnknownSnapshotMutationKind(u8),
     UnexpectedEof,
     TrailingBytes,
     MissingStreamEnd,
@@ -3016,6 +3176,9 @@ impl fmt::Display for SendStreamError {
                 write!(f, "unknown VFSSEND2 record type {record_type}")
             }
             Self::UnknownObjectKind(kind) => write!(f, "unknown VFSSEND2 object kind {kind}"),
+            Self::UnknownSnapshotMutationKind(kind) => {
+                write!(f, "unknown VFSSEND2 snapshot mutation kind {kind}")
+            }
             Self::UnexpectedEof => write!(f, "unexpected end of VFSSEND2 stream"),
             Self::TrailingBytes => write!(f, "trailing bytes in VFSSEND2 payload"),
             Self::MissingStreamEnd => write!(f, "VFSSEND2 stream is missing StreamEnd"),
@@ -3230,6 +3393,55 @@ mod tests {
             b"goodbye"
         );
         assert_eq!(received.snapshots.get(&id(3)).unwrap().object_ids.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_mutations_round_trip_without_object_payloads() {
+        let mut snapshot = SnapshotDelta::promote(id(3), "clone-a", 7, id(40));
+        snapshot
+            .mutations
+            .push(SnapshotMutation::delete(id(41), "old-snap"));
+
+        let builder = SendBuilder::full(header(), vec![snapshot]).unwrap();
+        assert_eq!(builder.stats().objects_sent, 0);
+        assert_eq!(builder.stats().snapshot_mutations_sent, 2);
+
+        let encoded = builder.encode().unwrap();
+        let received = ReceiveBuilder::new(id(2), &encoded)
+            .unwrap()
+            .finish_all()
+            .unwrap();
+
+        assert_eq!(
+            received.snapshot_mutations,
+            vec![
+                SnapshotMutation::promote(id(40), "clone-a"),
+                SnapshotMutation::delete(id(41), "old-snap"),
+            ]
+        );
+        assert_eq!(received.snapshots.get(&id(3)).unwrap().object_ids.len(), 0);
+    }
+
+    #[test]
+    fn mutation_only_incremental_is_not_empty() {
+        let mut base = BTreeMap::new();
+        base.insert(object_id(10), blake3_digest(b"base"));
+        let snapshot = SnapshotDelta::delete(id(3), "old-snap", 9, id(41));
+
+        let builder =
+            SendBuilder::incremental(header().incremental_from(id(1)), vec![snapshot], base)
+                .unwrap();
+
+        assert_eq!(builder.stats().objects_sent, 0);
+        assert_eq!(builder.stats().snapshot_mutations_sent, 1);
+        let received = ReceiveBuilder::new(id(2), &builder.encode().unwrap())
+            .unwrap()
+            .finish_all()
+            .unwrap();
+        assert_eq!(
+            received.snapshot_mutations,
+            vec![SnapshotMutation::delete(id(41), "old-snap")]
+        );
     }
 
     #[test]

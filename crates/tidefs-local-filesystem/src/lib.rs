@@ -471,8 +471,9 @@ pub use crate::fsck::{FsckCategory, FsckFinding, FsckReport, FsckSeverity};
 use crate::orphan_cleanup::OrphanCleanupStats;
 pub use crate::records::SnapshotKind;
 pub use crate::snapshot::{
-    BookmarkSummary, CloneSummary, HoldInfo, PromoteReport, SnapshotDescriptor,
-    SnapshotRetentionPolicy, SnapshotRetentionReport,
+    BookmarkSummary, CloneSummary, HoldInfo, PromoteReport, SnapshotDeletionDeferral,
+    SnapshotDescriptor, SnapshotMutationApplyReport, SnapshotRetentionPolicy,
+    SnapshotRetentionReport,
 };
 pub use crate::types::*;
 use tidefs_cleanup_engine::{CleanupEngine, JobExecutor};
