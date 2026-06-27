@@ -1523,6 +1523,15 @@ pub fn finalize_prefetch_execution(
         );
     }
 
+    if terminal_result_detail_lacks_feedback_evidence(update.result_detail) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::VerificationFailed,
+            PrefetchExecutorByteState::Refused,
+            StorageIntentRefusalReason::ValidationGateFailed,
+        );
+    }
+
     if update.outcome == PrefetchExecutorOutcome::HandoffRequired {
         if update.handoff_target == PrefetchExecutorHandoffTarget::None {
             return terminal(
@@ -1687,6 +1696,10 @@ fn terminal_result_detail_is_inconsistent(detail: PrefetchExecutorResultDetail) 
         Some(accounted_bytes) => accounted_bytes > detail.prefetched_bytes,
         None => true,
     }
+}
+
+fn terminal_result_detail_lacks_feedback_evidence(detail: PrefetchExecutorResultDetail) -> bool {
+    detail.has_feedback_payback_inputs() && !detail.has_feedback_evidence_root()
 }
 
 fn terminal_result_detail_exceeds_executor_limit(
@@ -3385,6 +3398,50 @@ mod tests {
         assert!(completed.result_detail.has_feedback_evidence_root());
         assert!(completed.is_non_authority_population());
         assert_record_has_no_authority_claims(completed);
+    }
+
+    #[test]
+    fn terminal_update_rejects_measured_result_without_feedback_root() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let measured_without_root = PrefetchExecutorResultDetail {
+            prefetched_bytes: 128 * 1024,
+            used_bytes: 96 * 1024,
+            unused_bytes: 16 * 1024,
+            expired_bytes: 16 * 1024,
+            latency_benefit_us: 900,
+            flash_write_bytes: 512,
+            waf_micros: 1_050_000,
+            ..PrefetchExecutorResultDetail::default()
+        };
+        assert!(measured_without_root.has_feedback_payback_inputs());
+        assert!(!measured_without_root.has_feedback_evidence_root());
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: measured_without_root,
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
     }
 
     #[test]
