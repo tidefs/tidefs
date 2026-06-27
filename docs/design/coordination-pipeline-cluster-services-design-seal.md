@@ -10,6 +10,15 @@ issues
 **Depends on**: N/A (this document seals the design phase)
 **Blocks**: All cluster-service wire-up implementation issues
 
+> **Authority note (TFR-019 / #1153)**: This file is classified as historical
+> input, not current TideFS cluster-service or distributed-membership
+> authority. The Forgejo #1738 "sealed", "design-sealed",
+> "implemented-source", "3-node cluster", `docs/STATUS.md`, and
+> `docs/FEATURE_MATRIX.md` wording below is retained only as design-lineage
+> context. Current multi-node, cluster-service, distributed-membership, and
+> product-readiness statements must be checked against live source, current
+> docs, and `validation/claims.toml`.
+
 ## Abstract
 
 This document seals the coordination pipeline design phase for TideFS cluster-wide

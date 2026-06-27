@@ -1307,6 +1307,27 @@ Issue #1267 records the current runtime-fed operator product-surface decision: n
   current pool import/export spec, product readiness, or broad pool lifecycle
   claim.
 
+- `TFR-019`/`TFR-017`: GitHub issue #1153 classifies
+  `docs/design/coordination-pipeline-cluster-services-design-seal.md` as
+  historical input after reviewing the documentation authority register, this
+  TFR-019/TFR-017 note set, the imported Forgejo #1738 seal, the sibling #1754
+  completion document, closed #931/#875/#928 and PR #930 claim-boundary
+  evidence, bounded source/doc searches, `crates/tidefs-membership-live/`,
+  `crates/tidefs-membership-epoch/`, `crates/tidefs-node-drain/`,
+  `validation/claims.toml`, and `docs/CLAIM_REGISTRY.md`. Live source contains
+  membership, epoch, and drain surfaces, but TFR-017 remains open before
+  multi-node or production cluster claims. The checked claim evidence keeps
+  `distributed.combined_safety.model.v1` planned for bounded source-model
+  invariants and `storage.intent.successor_comparator.v1` blocked for
+  comparator/product wording; it does not validate broad cluster-service,
+  distributed-membership, production distributed-runtime, multi-node, or
+  product-scale capability. The retained "sealed", "design-sealed",
+  "implemented-source", deleted `docs/STATUS.md`/`docs/FEATURE_MATRIX.md`, and
+  3-node cluster wording is historical design-lineage context only. A stronger
+  current-spec treatment would need a separate issue-scoped source and
+  claims-boundary review; the sibling completion document is not classified by
+  this slice.
+
 - `TFR-019`/`TFR-018`: the current xfstests harness authority slice repairs
   `xfstests-runner` as a diagnostic scoreboard wrapper, and sends output under
   runner help path no longer carries a bare `--per-test` command or duplicate
