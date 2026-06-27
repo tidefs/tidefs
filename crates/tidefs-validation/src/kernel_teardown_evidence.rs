@@ -500,10 +500,10 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
         if c.remaining_tidefs_work_observations.is_empty() {
             failures.push("cleanup_outcome.remaining_tidefs_work_observations is required".into());
         }
-        if c.remaining_tidefs_work_observations != "none" {
+        let remaining_work_observations = c.remaining_tidefs_work_observations.as_str();
+        if remaining_work_observations != "none" {
             failures.push(format!(
-                "cleanup_outcome.remaining_tidefs_work_observations must be `none`, got `{}`",
-                c.remaining_tidefs_work_observations
+                "cleanup_outcome.remaining_tidefs_work_observations must be `none`, got `{remaining_work_observations}`"
             ));
         }
     }
@@ -511,23 +511,18 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
     // --- mounted cutover transcript ---
     let is_mounted_kernel_vfs =
         artifact.target_id == KERNEL_TEARDOWN_NO_WORK_AFTER_MOUNTED_KERNEL_VFS_TARGET_ID;
-    if is_mounted_kernel_vfs {
-        if artifact.cutover_phases.is_empty() {
-            failures
-                .push("cutover_phases must be non-empty for mounted-kernel-vfs artifacts".into());
-        }
-        if artifact.cutover_fence_observations.is_empty() {
-            failures.push(
-                "cutover_fence_observations must be non-empty for mounted-kernel-vfs artifacts"
-                    .into(),
-            );
-        }
-        if artifact.cutover_truth_observations.is_empty() {
-            failures.push(
-                "cutover_truth_observations must be non-empty for mounted-kernel-vfs artifacts"
-                    .into(),
-            );
-        }
+    if is_mounted_kernel_vfs && artifact.cutover_phases.is_empty() {
+        failures.push("cutover_phases must be non-empty for mounted-kernel-vfs artifacts".into());
+    }
+    if is_mounted_kernel_vfs && artifact.cutover_fence_observations.is_empty() {
+        failures.push(
+            "cutover_fence_observations must be non-empty for mounted-kernel-vfs artifacts".into(),
+        );
+    }
+    if is_mounted_kernel_vfs && artifact.cutover_truth_observations.is_empty() {
+        failures.push(
+            "cutover_truth_observations must be non-empty for mounted-kernel-vfs artifacts".into(),
+        );
     }
 
     if !artifact.cutover_phases.is_empty() {
