@@ -415,6 +415,8 @@ impl PrefetchExecutorAntiWasteMask {
                 | Self::FAILED_PAYBACK.0
                 | Self::LOW_DWELL.0
                 | Self::COOLDOWN.0
+                | Self::UNKNOWN_WAF.0
+                | Self::UNKNOWN_EGRESS_OR_RESTORE_COST.0
                 | Self::PROTECTED_RESERVE_PRESSURE.0,
         )
     }
@@ -1283,10 +1285,7 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
             .cost_state
             .required
             .contains(PrefetchExecutorCostRequirementMask::FLASH_WRITES))
-        && (input.cost_state.unknown_waf
-            || input
-                .anti_waste
-                .intersects(PrefetchExecutorAntiWasteMask::UNKNOWN_WAF))
+        && input.cost_state.unknown_waf
     {
         return terminal(
             record,
@@ -1305,10 +1304,7 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
             .cost_state
             .required
             .contains(PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS))
-        && (input.cost_state.unknown_egress_or_restore_cost
-            || input
-                .anti_waste
-                .intersects(PrefetchExecutorAntiWasteMask::UNKNOWN_EGRESS_OR_RESTORE_COST))
+        && input.cost_state.unknown_egress_or_restore_cost
     {
         return terminal(
             record,
@@ -1846,7 +1842,9 @@ fn admission_refusal(admission: PrefetchExecutorAdmissionRecord) -> StorageInten
 }
 
 fn anti_waste_refusal(mask: PrefetchExecutorAntiWasteMask) -> StorageIntentRefusalReason {
-    if mask.intersects(PrefetchExecutorAntiWasteMask::NOISY_NEIGHBOR_PRESSURE) {
+    if mask.intersects(PrefetchExecutorAntiWasteMask::UNKNOWN_WAF) {
+        StorageIntentRefusalReason::FlashWearBudgetExceeded
+    } else if mask.intersects(PrefetchExecutorAntiWasteMask::NOISY_NEIGHBOR_PRESSURE) {
         StorageIntentRefusalReason::NoisyNeighborPressure
     } else if mask.intersects(PrefetchExecutorAntiWasteMask::FAILED_PAYBACK)
         || mask.intersects(PrefetchExecutorAntiWasteMask::LOW_DWELL)
@@ -2746,6 +2744,36 @@ mod tests {
     }
 
     #[test]
+    fn unknown_cost_anti_waste_drops_without_zero_cost_dispatch() {
+        let mut waf = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        waf.anti_waste = PrefetchExecutorAntiWasteMask::UNKNOWN_WAF;
+        let waf_record = evaluate_prefetch_execution(waf);
+        assert_eq!(waf_record.outcome, PrefetchExecutorOutcome::Dropped);
+        assert_eq!(
+            waf_record.refusal,
+            StorageIntentRefusalReason::FlashWearBudgetExceeded
+        );
+        assert!(!waf_record.can_satisfy_durable_sync());
+
+        let mut egress = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        egress.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut egress.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        egress.anti_waste = PrefetchExecutorAntiWasteMask::UNKNOWN_EGRESS_OR_RESTORE_COST;
+        let egress_record = evaluate_prefetch_execution(egress);
+        assert_eq!(egress_record.outcome, PrefetchExecutorOutcome::Dropped);
+        assert_eq!(
+            egress_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert!(!egress_record.can_publish_replacement_receipt());
+    }
+
+    #[test]
     fn missing_required_cost_class_is_not_zero_cost() {
         let mut input = admitted_input(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage);
         input.evidence_query_snapshot =
@@ -2898,7 +2926,7 @@ mod tests {
         );
         restore.cost_state.required =
             PrefetchExecutorCostRequirementMask::OBJECT_ARCHIVE_RESTORE_CALLS;
-        restore.anti_waste = PrefetchExecutorAntiWasteMask::UNKNOWN_EGRESS_OR_RESTORE_COST;
+        restore.cost_state.unknown_egress_or_restore_cost = true;
         let restore_record = evaluate_prefetch_execution(restore);
         assert_eq!(restore_record.outcome, PrefetchExecutorOutcome::Refused);
         assert_eq!(
