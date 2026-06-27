@@ -81,6 +81,8 @@ impl Drop for MountedVfs {
 }
 
 fn request_ctx() -> RequestCtx {
+    // SAFETY: `geteuid`/`getegid` read the current process credentials and do
+    // not require pointer, fd, or buffer invariants.
     let gid = unsafe { libc::getegid() } as u32;
     RequestCtx {
         uid: unsafe { libc::geteuid() } as u32,
@@ -143,6 +145,9 @@ fn copy_file_range_fd(
         .as_mut()
         .map_or(std::ptr::null_mut(), |offset| offset as *mut libc::loff_t);
 
+    // SAFETY: The file descriptors come from live `File` handles. Optional
+    // offsets point to stack locals alive for the call, or are null as allowed
+    // by copy_file_range.
     let result = unsafe {
         libc::copy_file_range(
             src.as_raw_fd(),

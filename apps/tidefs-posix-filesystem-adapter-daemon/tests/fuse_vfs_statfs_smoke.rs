@@ -37,8 +37,12 @@ fn statfs(path: &Path) -> io::Result<libc::statfs> {
     let cpath = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains nul byte"))?;
     let mut statfs = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `cpath` is a NUL-terminated path alive for the call, and
+    // `statfs` points to uninitialized output storage for libc to fill.
     let rc = unsafe { libc::statfs(cpath.as_ptr(), statfs.as_mut_ptr()) };
     if rc == 0 {
+        // SAFETY: statfs returned success, so libc initialized the output
+        // structure.
         Ok(unsafe { statfs.assume_init() })
     } else {
         Err(io::Error::last_os_error())
