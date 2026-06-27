@@ -367,6 +367,11 @@ impl PrefetchExecutorPressureMask {
     }
 
     #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[must_use]
     pub const fn intersects(self, other: Self) -> bool {
         (self.0 & other.0) != 0
     }
@@ -1364,6 +1369,15 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                     PrefetchExecutorByteState::Blocked,
                     runtime_dispatch_evidence_refusal(input, family),
                 )
+            } else if admitted_speculative_pressure_refusal(input.admission) as u16
+                != StorageIntentRefusalReason::None as u16
+            {
+                terminal(
+                    record,
+                    PrefetchExecutorOutcome::Refused,
+                    PrefetchExecutorByteState::Refused,
+                    admitted_speculative_pressure_refusal(input.admission),
+                )
             } else if !input.runtime_support.supports_family(family) {
                 terminal(
                     record,
@@ -1723,6 +1737,23 @@ const fn media_needs_transport_or_trust(media: StorageMediaClass) -> bool {
     )
 }
 
+fn admitted_speculative_pressure_refusal(
+    admission: PrefetchExecutorAdmissionRecord,
+) -> StorageIntentRefusalReason {
+    if !matches!(
+        admission.lane,
+        PrefetchExecutorSchedulerLane::Speculative | PrefetchExecutorSchedulerLane::Background
+    ) || admission.pressure.is_empty()
+        || admission.droppable
+        || admission.throttleable
+        || admission.expirable
+    {
+        return StorageIntentRefusalReason::None;
+    }
+
+    pressure_refusal(admission.pressure)
+}
+
 fn no_prefetch_decision(decision: PrefetchResidencyDecisionRecord) -> bool {
     matches!(
         decision.selected_candidate,
@@ -1853,6 +1884,32 @@ fn anti_waste_refusal(mask: PrefetchExecutorAntiWasteMask) -> StorageIntentRefus
         StorageIntentRefusalReason::MovementDebtNotPaidBack
     } else if mask.intersects(PrefetchExecutorAntiWasteMask::PROTECTED_RESERVE_PRESSURE) {
         StorageIntentRefusalReason::ProtectedReserveWouldBeBreached
+    } else {
+        StorageIntentRefusalReason::EvidenceNotUsable
+    }
+}
+
+fn pressure_refusal(pressure: PrefetchExecutorPressureMask) -> StorageIntentRefusalReason {
+    if pressure.intersects(PrefetchExecutorPressureMask::PROTECTED_RESERVE) {
+        StorageIntentRefusalReason::ProtectedReserveWouldBeBreached
+    } else if pressure.intersects(
+        PrefetchExecutorPressureMask::REPAIR
+            .union(PrefetchExecutorPressureMask::EVACUATION)
+            .union(PrefetchExecutorPressureMask::RECEIPT_RETIREMENT),
+    ) {
+        StorageIntentRefusalReason::RecoveryReserveExhausted
+    } else if pressure.intersects(PrefetchExecutorPressureMask::WEAR) {
+        StorageIntentRefusalReason::FlashWearBudgetExceeded
+    } else if pressure.intersects(
+        PrefetchExecutorPressureMask::EGRESS.union(PrefetchExecutorPressureMask::RESTORE_COST),
+    ) {
+        StorageIntentRefusalReason::OverBudget
+    } else if pressure.intersects(
+        PrefetchExecutorPressureMask::FOREGROUND_POSIX_SYNC
+            .union(PrefetchExecutorPressureMask::MEMORY)
+            .union(PrefetchExecutorPressureMask::P99_LATENCY),
+    ) {
+        StorageIntentRefusalReason::NoisyNeighborPressure
     } else {
         StorageIntentRefusalReason::EvidenceNotUsable
     }
@@ -2452,6 +2509,45 @@ mod tests {
         assert_eq!(
             record.refusal,
             StorageIntentRefusalReason::NoisyNeighborPressure
+        );
+    }
+
+    #[test]
+    fn pressured_speculative_admission_requires_cancellation_controls() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.admission = input
+            .admission
+            .with_speculative_controls(false, false, false);
+        input.admission.pressure = PrefetchExecutorPressureMask::P99_LATENCY;
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::NoisyNeighborPressure
+        );
+        assert!(!record.can_publish_replacement_receipt());
+        assert!(!record.can_satisfy_durable_sync());
+    }
+
+    #[test]
+    fn demand_admission_pressure_is_not_treated_as_droppable_speculation() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.admission.lane = PrefetchExecutorSchedulerLane::Demand;
+        input.admission = input
+            .admission
+            .with_speculative_controls(false, false, false);
+        input.admission.pressure = PrefetchExecutorPressureMask::P99_LATENCY;
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::CacheOnly
         );
     }
 
