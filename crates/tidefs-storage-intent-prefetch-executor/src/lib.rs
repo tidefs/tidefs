@@ -1065,7 +1065,27 @@ impl PrefetchExecutorRecord {
     }
 
     #[must_use]
+    pub const fn can_satisfy_durable_placement(self) -> bool {
+        false
+    }
+
+    #[must_use]
     pub const fn implies_latest_read_authority(self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn implies_ram_authority(self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn implies_geo_freshness_authority(self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn can_make_successor_comparator_claim(self) -> bool {
         false
     }
 
@@ -2218,6 +2238,17 @@ mod tests {
         }
     }
 
+    fn assert_record_has_no_authority_claims(record: PrefetchExecutorRecord) {
+        assert!(!record.can_publish_replacement_receipt());
+        assert!(!record.can_retire_source_receipt());
+        assert!(!record.can_satisfy_durable_sync());
+        assert!(!record.can_satisfy_durable_placement());
+        assert!(!record.implies_latest_read_authority());
+        assert!(!record.implies_ram_authority());
+        assert!(!record.implies_geo_freshness_authority());
+        assert!(!record.can_make_successor_comparator_claim());
+    }
+
     #[test]
     fn action_families_cover_required_candidates() {
         assert_eq!(
@@ -2414,10 +2445,37 @@ mod tests {
             PrefetchExecutorByteState::CacheOnlyTrial
         );
         assert!(record.is_non_authority_population());
-        assert!(!record.can_satisfy_durable_sync());
-        assert!(!record.can_publish_replacement_receipt());
-        assert!(!record.can_retire_source_receipt());
-        assert!(!record.implies_latest_read_authority());
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn staged_and_degraded_bytes_stay_read_source_candidates_only() {
+        let mut staged = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        staged.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut staged.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        let staged_record = evaluate_prefetch_execution(staged);
+        assert_eq!(staged_record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            staged_record.executor_byte_state,
+            PrefetchExecutorByteState::Staged
+        );
+        assert!(staged_record.is_non_authority_population());
+        assert_record_has_no_authority_claims(staged_record);
+
+        let degraded = admitted_input(PrefetchResidencyCandidateClass::DegradedReadPrefetch);
+        let degraded_record = evaluate_prefetch_execution(degraded);
+        assert_eq!(degraded_record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            degraded_record.executor_byte_state,
+            PrefetchExecutorByteState::DegradedVisible
+        );
+        assert!(degraded_record.is_non_authority_population());
+        assert_record_has_no_authority_claims(degraded_record);
     }
 
     #[test]
@@ -2482,8 +2540,7 @@ mod tests {
             record.evidence_refs.validation_ref,
             input.result_detail.validation_ref
         );
-        assert!(!record.can_satisfy_durable_sync());
-        assert!(!record.can_publish_replacement_receipt());
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
@@ -3066,9 +3123,7 @@ mod tests {
             record.handoff_target,
             PrefetchExecutorHandoffTarget::DurableResidencyChange
         );
-        assert!(!record.can_publish_replacement_receipt());
-        assert!(!record.can_retire_source_receipt());
-        assert!(!record.can_satisfy_durable_sync());
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
@@ -3083,6 +3138,6 @@ mod tests {
             PrefetchExecutorByteState::NoPrefetchEnforced
         );
         assert!(record.is_non_authority_population());
-        assert!(!record.can_satisfy_durable_sync());
+        assert_record_has_no_authority_claims(record);
     }
 }
