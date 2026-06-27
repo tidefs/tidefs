@@ -118,6 +118,8 @@ impl Drop for CapacityGuard {
 /// Apply an exclusive non-blocking `flock` to `fd`.
 /// Returns `true` if the lock was acquired.
 fn try_flock_exclusive(fd: i32) -> bool {
+    // SAFETY: callers pass an open queue-file descriptor; flock takes only the
+    // fd and scalar operation flags and does not retain borrowed memory.
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     ret == 0
 }

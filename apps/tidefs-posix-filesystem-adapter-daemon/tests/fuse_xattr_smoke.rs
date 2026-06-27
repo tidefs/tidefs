@@ -104,6 +104,8 @@ fn create_file(path: &Path, mode: u32, payload: &[u8]) -> File {
 }
 
 fn current_uid() -> u32 {
+    // SAFETY: `geteuid` reads the current process credentials and does not
+    // require pointer, fd, or buffer invariants.
     (unsafe { libc::geteuid() }) as u32
 }
 
@@ -117,6 +119,10 @@ fn xattr_name_cstr(name: &str) -> CString {
     CString::new(name).expect("xattr name contains nul byte")
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// call, and `value` must be readable for `value.len()` bytes.
 unsafe fn setxattr_sys(path: &CString, name: &CString, value: &[u8], flags: i32) -> io::Result<()> {
     let result = libc::setxattr(
         path.as_ptr(),
@@ -132,6 +138,10 @@ unsafe fn setxattr_sys(path: &CString, name: &CString, value: &[u8], flags: i32)
     }
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// call, and `buf` must be writable for `buf.len()` bytes.
 unsafe fn getxattr_sys(path: &CString, name: &CString, buf: &mut [u8]) -> io::Result<usize> {
     let result = libc::getxattr(
         path.as_ptr(),
@@ -146,6 +156,10 @@ unsafe fn getxattr_sys(path: &CString, name: &CString, buf: &mut [u8]) -> io::Re
     }
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// zero-length size query.
 unsafe fn getxattr_size(path: &CString, name: &CString) -> io::Result<usize> {
     let result = libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0);
     if result >= 0 {
@@ -155,6 +169,10 @@ unsafe fn getxattr_size(path: &CString, name: &CString) -> io::Result<usize> {
     }
 }
 
+/// # Safety
+///
+/// `path` must be a valid NUL-terminated C string alive for the call, and
+/// `buf` must be writable for `buf.len()` bytes.
 unsafe fn listxattr_sys(path: &CString, buf: &mut [u8]) -> io::Result<usize> {
     let result = libc::listxattr(
         path.as_ptr(),
@@ -168,6 +186,10 @@ unsafe fn listxattr_sys(path: &CString, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+/// # Safety
+///
+/// `path` must be a valid NUL-terminated C string alive for the zero-length
+/// listxattr size query.
 unsafe fn listxattr_size(path: &CString) -> io::Result<usize> {
     let result = libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0);
     if result >= 0 {
@@ -177,6 +199,10 @@ unsafe fn listxattr_size(path: &CString) -> io::Result<usize> {
     }
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// removexattr call.
 unsafe fn removexattr_sys(path: &CString, name: &CString) -> io::Result<()> {
     let result = libc::removexattr(path.as_ptr(), name.as_ptr());
     if result == 0 {
@@ -215,10 +241,14 @@ fn setxattr_getxattr_roundtrip() {
     let name_c = xattr_name_cstr("user.roundtrip");
     let value = b"mounted xattr roundtrip value";
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and `value` is readable
+    // for the setxattr call.
     unsafe {
         setxattr_sys(&path_c, &name_c, value, 0).expect("setxattr user.roundtrip");
     }
 
+    // SAFETY: the same live C strings are used for the size query and a buffer
+    // allocated exactly to the reported size.
     unsafe {
         let size = getxattr_size(&path_c, &name_c).expect("getxattr size query");
         assert_eq!(size, value.len());
@@ -240,11 +270,15 @@ fn setxattr_create_flag_succeeds() {
     let name_c = xattr_name_cstr("user.create");
     let value = b"created with XATTR_CREATE";
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and `value` is readable
+    // for the setxattr call.
     unsafe {
         setxattr_sys(&path_c, &name_c, value, libc::XATTR_CREATE)
             .expect("setxattr with XATTR_CREATE should succeed on new attr");
     }
 
+    // SAFETY: `path_c` and `name_c` remain live for the zero-length xattr size
+    // query.
     unsafe {
         let size = getxattr_size(&path_c, &name_c).expect("getxattr size after create");
         assert_eq!(size, value.len());
@@ -260,6 +294,8 @@ fn setxattr_create_flag_fails_on_existing() {
     let path_c = path_cstr(&path);
     let name_c = xattr_name_cstr("user.dup");
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and the static values
+    // are readable for the setxattr calls.
     unsafe {
         setxattr_sys(&path_c, &name_c, b"first", 0).expect("initial setxattr");
         let err = setxattr_sys(&path_c, &name_c, b"second", libc::XATTR_CREATE)
@@ -277,6 +313,8 @@ fn setxattr_replace_flag_succeeds() {
     let path_c = path_cstr(&path);
     let name_c = xattr_name_cstr("user.replace");
 
+    // SAFETY: `path_c` and `name_c` are live C strings. The static values are
+    // readable, and `buf` is valid writable storage for getxattr.
     unsafe {
         setxattr_sys(&path_c, &name_c, b"old", 0).expect("initial setxattr");
         setxattr_sys(&path_c, &name_c, b"new-value", libc::XATTR_REPLACE)
@@ -297,6 +335,8 @@ fn setxattr_replace_flag_fails_on_missing() {
     let path_c = path_cstr(&path);
     let name_c = xattr_name_cstr("user.never-set");
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and the static value is
+    // readable for the expected-failing setxattr call.
     unsafe {
         let err = setxattr_sys(&path_c, &name_c, b"value", libc::XATTR_REPLACE)
             .expect_err("XATTR_REPLACE on missing attr should fail");
@@ -313,6 +353,8 @@ fn setxattr_default_flag_overwrites() {
     let path_c = path_cstr(&path);
     let name_c = xattr_name_cstr("user.overwrite");
 
+    // SAFETY: `path_c` and `name_c` are live C strings. The static values are
+    // readable, and `buf` is valid writable storage for getxattr.
     unsafe {
         setxattr_sys(&path_c, &name_c, b"first", 0).expect("initial setxattr");
         setxattr_sys(&path_c, &name_c, b"second", 0).expect("overwrite with flag=0");
@@ -331,11 +373,15 @@ fn listxattr_returns_set_keys() {
 
     let path_c = path_cstr(&path);
 
+    // SAFETY: `path_c` and the temporary xattr-name C strings are live for each
+    // setxattr call, and the static values are readable.
     unsafe {
         setxattr_sys(&path_c, &xattr_name_cstr("user.a"), b"1", 0).expect("set user.a");
         setxattr_sys(&path_c, &xattr_name_cstr("user.b"), b"2", 0).expect("set user.b");
     }
 
+    // SAFETY: `path_c` remains live for listxattr, and `buf` is allocated to
+    // the size reported by the zero-length query.
     unsafe {
         let size = listxattr_size(&path_c).expect("listxattr size query");
         let mut buf = vec![0u8; size];
@@ -362,10 +408,14 @@ fn listxattr_size_query_returns_expected_length() {
 
     let path_c = path_cstr(&path);
 
+    // SAFETY: `path_c` and the temporary xattr-name C string are live for the
+    // setxattr call, and the static value is readable.
     unsafe {
         setxattr_sys(&path_c, &xattr_name_cstr("user.s1"), b"xyz", 0).expect("set user.s1");
     }
 
+    // SAFETY: `path_c` remains live for listxattr, and `buf` is allocated to
+    // the size reported by the zero-length query.
     unsafe {
         let size = listxattr_size(&path_c).expect("listxattr size=0 query");
         // "user.s1\0" = 8 bytes
@@ -386,6 +436,8 @@ fn removexattr_then_getxattr_returns_enodata() {
     let path_c = path_cstr(&path);
     let name_c = xattr_name_cstr("user.del");
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and the static value is
+    // readable for setxattr before the removexattr/getxattr checks.
     unsafe {
         setxattr_sys(&path_c, &name_c, b"value", 0).expect("set user.del");
         removexattr_sys(&path_c, &name_c).expect("remove user.del");
@@ -404,6 +456,8 @@ fn getxattr_missing_returns_enodata() {
     let path_c = path_cstr(&path);
     let name_c = xattr_name_cstr("user.never");
 
+    // SAFETY: `path_c` and `name_c` are live C strings for the expected-failing
+    // zero-length xattr size query.
     unsafe {
         let err =
             getxattr_size(&path_c, &name_c).expect_err("getxattr on never-set attr should fail");
@@ -420,6 +474,8 @@ fn removexattr_missing_returns_enodata() {
     let path_c = path_cstr(&path);
     let name_c = xattr_name_cstr("user.never-here");
 
+    // SAFETY: `path_c` and `name_c` are live C strings for the expected-failing
+    // removexattr call.
     unsafe {
         let err =
             removexattr_sys(&path_c, &name_c).expect_err("removexattr on missing attr should fail");
@@ -435,6 +491,8 @@ fn setxattr_on_nonexistent_file_returns_enoent() {
     let path_c = path_cstr(&bad_path);
     let name_c = xattr_name_cstr("user.test");
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and the static value is
+    // readable for the expected-failing setxattr call.
     unsafe {
         let err = setxattr_sys(&path_c, &name_c, b"value", 0)
             .expect_err("setxattr on missing file should fail");
@@ -470,6 +528,8 @@ fn xattr_survives_remount() {
 
         let path_c = path_cstr(&file_path);
         let name_c = xattr_name_cstr("user.persist");
+        // SAFETY: `path_c` and `name_c` are live C strings, and the static
+        // value is readable for the setxattr call before unmount.
         unsafe {
             setxattr_sys(&path_c, &name_c, b"survive-remount", 0).expect("setxattr before remount");
         }
@@ -494,6 +554,8 @@ fn xattr_survives_remount() {
         let path_c = path_cstr(&file_path);
         let name_c = xattr_name_cstr("user.persist");
 
+        // SAFETY: `path_c` and `name_c` are live C strings, and `buf` is valid
+        // writable storage for the bounded getxattr call.
         unsafe {
             let mut buf = vec![0u8; 64];
             let n = getxattr_sys(&path_c, &name_c, &mut buf).expect("getxattr after remount");
@@ -519,6 +581,8 @@ fn trusted_xattr_filtered_for_nonroot() {
 
     let uid = current_uid();
 
+    // SAFETY: `path_c` and both name C strings are live for the xattr calls;
+    // all static values are readable and list buffers are sized from queries.
     unsafe {
         // Always set a user.* xattr to have something visible.
         setxattr_sys(&path_c, &user_name, b"visible", 0).expect("set user.visible");
@@ -570,6 +634,8 @@ fn getxattr_buffer_too_small_returns_erange() {
     let name_c = xattr_name_cstr("user.erange");
     let value = b"a-value-longer-than-5-bytes";
 
+    // SAFETY: `path_c` and `name_c` are live C strings. `value` is readable for
+    // setxattr, and `small_buf` is valid writable storage for getxattr.
     unsafe {
         setxattr_sys(&path_c, &name_c, value, 0).expect("setxattr user.erange");
 
@@ -593,6 +659,8 @@ fn security_xattr_rejected_for_nonroot() {
 
     let uid = current_uid();
 
+    // SAFETY: `path_c` and `sec_name` are live C strings. Static values are
+    // readable, and `buf` is valid writable storage for the getxattr probe.
     unsafe {
         if uid == 0 {
             // Root may be able to set security.* depending on CAP_SYS_ADMIN

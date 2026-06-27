@@ -83,6 +83,10 @@ fn encoded_named_user_acl() -> Vec<u8> {
     ])
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// call, and `value` must be readable for `value.len()` bytes.
 unsafe fn setxattr_raw(path: &CString, name: &CString, value: &[u8], flags: i32) -> io::Result<()> {
     let rc = libc::setxattr(
         path.as_ptr(),
@@ -98,6 +102,10 @@ unsafe fn setxattr_raw(path: &CString, name: &CString, value: &[u8], flags: i32)
     }
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// zero-length size query.
 unsafe fn getxattr_size_raw(path: &CString, name: &CString) -> io::Result<usize> {
     let rc = libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0);
     if rc >= 0 {
@@ -107,6 +115,10 @@ unsafe fn getxattr_size_raw(path: &CString, name: &CString) -> io::Result<usize>
     }
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// call, and `buf` must be writable for `buf.len()` bytes.
 unsafe fn getxattr_raw(path: &CString, name: &CString, buf: &mut [u8]) -> io::Result<usize> {
     let rc = libc::getxattr(
         path.as_ptr(),
@@ -121,6 +133,10 @@ unsafe fn getxattr_raw(path: &CString, name: &CString, buf: &mut [u8]) -> io::Re
     }
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// removexattr call.
 unsafe fn removexattr_raw(path: &CString, name: &CString) -> io::Result<()> {
     let rc = libc::removexattr(path.as_ptr(), name.as_ptr());
     if rc == 0 {
@@ -261,10 +277,14 @@ fn system_posix_acl_access_set_get() {
     // Nontrivial ACL: includes a named user, so it cannot collapse to mode bits.
     let acl_value = encoded_named_user_acl();
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and `acl_value` is a
+    // readable encoded ACL buffer for the setxattr call.
     unsafe {
         setxattr_raw(&path_c, &name_c, &acl_value, 0).expect("set system.posix_acl_access");
     }
 
+    // SAFETY: the same live C strings are used for the xattr size query and a
+    // buffer allocated exactly to that reported size.
     unsafe {
         let size =
             getxattr_size_raw(&path_c, &name_c).expect("getxattr size for system.posix_acl_access");
@@ -291,11 +311,15 @@ fn system_posix_acl_default_on_directory() {
 
     let acl_value = encoded_minimal_acl(0o750);
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and `acl_value` is a
+    // readable encoded ACL buffer for the setxattr call.
     unsafe {
         setxattr_raw(&path_c, &name_c, &acl_value, 0)
             .expect("set system.posix_acl_default on directory");
     }
 
+    // SAFETY: the same live C strings are used for the xattr size query and a
+    // buffer allocated exactly to that reported size.
     unsafe {
         let size = getxattr_size_raw(&path_c, &name_c)
             .expect("getxattr size for system.posix_acl_default");
@@ -333,6 +357,8 @@ fn setxattr_e2big_oversized_value() {
     // 256 KiB value — far exceeds typical xattr size limits.
     let huge: Vec<u8> = vec![0xAA; 256 * 1024];
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and `huge` is readable
+    // for the attempted oversized setxattr call.
     unsafe {
         let result = setxattr_raw(&path_c, &name_c, &huge, 0);
         match result {
@@ -370,6 +396,8 @@ fn setxattr_enotsup_unsupported_namespace() {
     let path_c = path_cstr(&file_path);
     let name_c = xattr_name_cstr("tidefs.test"); // not a standard namespace
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and the static value
+    // slice is readable for the attempted setxattr call.
     unsafe {
         let result = setxattr_raw(&path_c, &name_c, b"value", 0);
         match result {
@@ -409,6 +437,8 @@ fn getxattr_erange_buffer_too_small_via_harness() {
 
     let value = b"a-value-exceeding-5-bytes";
 
+    // SAFETY: `path_c` and `name_c` are live C strings. `value` is readable for
+    // setxattr, and `small_buf` below is valid writable storage for getxattr.
     unsafe {
         setxattr_raw(&path_c, &name_c, value, 0).expect("set xattr for erange test");
 
@@ -478,6 +508,8 @@ fn fsync_crash_system_xattr_persists() {
     let name_c = xattr_name_cstr("system.posix_acl_access");
     let acl_value = encoded_named_user_acl();
 
+    // SAFETY: `path_c` and `name_c` are live C strings, and `acl_value` is a
+    // readable encoded ACL buffer for the setxattr call.
     unsafe {
         setxattr_raw(&path_c, &name_c, &acl_value, 0)
             .expect("set system.posix_acl_access before crash");
@@ -492,6 +524,8 @@ fn fsync_crash_system_xattr_persists() {
     let file_path2 = harness.mount_path().join("crash_xattr_sys.bin");
     let path_c2 = path_cstr(&file_path2);
 
+    // SAFETY: `path_c2` and `name_c` are live C strings, and the buffer is
+    // allocated to the kernel-reported xattr size before reading.
     unsafe {
         let size = getxattr_size_raw(&path_c2, &name_c)
             .expect("getxattr system.posix_acl_access after crash");

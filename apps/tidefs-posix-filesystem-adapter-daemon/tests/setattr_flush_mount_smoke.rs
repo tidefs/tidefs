@@ -124,6 +124,8 @@ fn path_cstring(path: &Path) -> CString {
 
 fn chown_path(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     let cpath = path_cstring(path);
+    // SAFETY: `cpath` is a NUL-terminated path alive for the call, and uid/gid
+    // are scalar ownership arguments selected by the test.
     let result = unsafe { libc::chown(cpath.as_ptr(), uid, gid) };
     if result == 0 {
         Ok(())
@@ -144,6 +146,8 @@ fn set_path_times(path: &Path, atime: libc::time_t, mtime: libc::time_t) -> io::
             tv_nsec: 0,
         },
     ];
+    // SAFETY: `cpath` is a NUL-terminated path alive for the call, and `times`
+    // is a two-element timespec array alive for utimensat.
     let result = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0) };
     if result == 0 {
         Ok(())
@@ -153,6 +157,8 @@ fn set_path_times(path: &Path, atime: libc::time_t, mtime: libc::time_t) -> io::
 }
 
 fn current_uid_gid() -> (u32, u32) {
+    // SAFETY: `geteuid`/`getegid` read the current process credentials and do
+    // not require pointer, fd, or buffer invariants.
     (
         unsafe { libc::geteuid() } as u32,
         unsafe { libc::getegid() } as u32,
@@ -346,6 +352,8 @@ fn setattr_permission_gate_denies_non_owner_chmod() {
     let path = mnt.path("/chmod-perm.txt");
     create_file(&path, 0o644, b"can_setattr gate test");
 
+    // SAFETY: `geteuid` reads the current process credentials and does not
+    // require pointer, fd, or buffer invariants.
     let original_uid = unsafe { libc::geteuid() };
     let non_owner_uid = if original_uid == 0 {
         65534
@@ -358,6 +366,8 @@ fn setattr_permission_gate_denies_non_owner_chmod() {
     }
 
     let cpath = path_cstring(&path);
+    // SAFETY: fork is used only by this permission-gate test. The child exits
+    // via `_exit`, while the parent waits for the exact child pid below.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let err = io::Error::last_os_error();
@@ -369,17 +379,29 @@ fn setattr_permission_gate_denies_non_owner_chmod() {
     }
 
     if pid == 0 {
+        // SAFETY: in the child process only, setreuid changes the effective and
+        // real uid to a scalar non-owner test identity before probing chmod.
         if unsafe { libc::setreuid(non_owner_uid, non_owner_uid) } != 0 {
+            // SAFETY: the child exits immediately without running parent test
+            // cleanup after reporting the setup failure.
             unsafe { libc::_exit(77) };
         }
+        // SAFETY: `cpath` is inherited across fork and remains a valid
+        // NUL-terminated path buffer in the child for the chmod call.
         if unsafe { libc::chmod(cpath.as_ptr(), 0o600) } == 0 {
+            // SAFETY: the child exits immediately after reporting unexpected
+            // chmod success to the parent via the exit status.
             unsafe { libc::_exit(1) };
         }
         let en = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        // SAFETY: the child exits immediately after encoding the chmod errno in
+        // its process status.
         unsafe { libc::_exit(if en == libc::EPERM { 0 } else { 2 }) };
     }
 
     let mut st: i32 = 0;
+    // SAFETY: `pid` names the forked child and `st` is valid wait status output
+    // storage for waitpid.
     assert!(unsafe { libc::waitpid(pid, &mut st as *mut i32, 0) } >= 0);
     match libc::WEXITSTATUS(st) {
         0 => {} // EPERM returned

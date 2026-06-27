@@ -40,6 +40,8 @@ fn mount_options() -> Vec<fuser::MountOption> {
 }
 
 fn request_ctx() -> RequestCtx {
+    // SAFETY: `geteuid`/`getegid` read the current process credentials and do
+    // not require pointer, fd, or buffer invariants.
     let gid = unsafe { libc::getegid() } as u32;
     RequestCtx {
         uid: unsafe { libc::geteuid() } as u32,
@@ -113,6 +115,8 @@ fn poll_fd(raw_fd: i32, events: i16, timeout_ms: i32) -> std::io::Result<libc::p
         events,
         revents: 0,
     };
+    // SAFETY: `pfd` is a valid single-element pollfd array owned by this stack
+    // frame, and `raw_fd` is supplied by the caller for observation only.
     let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
     if ret < 0 {
         Err(std::io::Error::last_os_error())
@@ -208,6 +212,9 @@ fn poll_closed_fd_returns_pollnval() {
         events: libc::POLLIN,
         revents: 0,
     };
+    // SAFETY: `pfd` is a valid single-element pollfd array. Polling a closed fd
+    // is intentional here and should report POLLNVAL rather than dereferencing
+    // memory through the fd value.
     let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
     assert!(ret >= 0, "poll should succeed even with a bad fd");
     assert_ne!(
@@ -261,6 +268,8 @@ fn poll_multiple_fds_returns_correct_counts() {
             revents: 0,
         },
     ];
+    // SAFETY: `pfds` is a two-element pollfd array with fds borrowed from live
+    // files for the duration of the call.
     let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 1000) };
     assert!(ret >= 0, "poll should succeed");
     assert_eq!(

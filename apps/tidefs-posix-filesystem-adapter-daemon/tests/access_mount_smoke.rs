@@ -38,6 +38,8 @@ fn mount_options() -> Vec<fuser::MountOption> {
 }
 
 fn request_ctx() -> RequestCtx {
+    // SAFETY: `geteuid`/`getegid` read the current process credentials and do
+    // not require pointer, fd, or buffer invariants.
     let gid = unsafe { libc::getegid() } as u32;
     RequestCtx {
         uid: unsafe { libc::geteuid() } as u32,
@@ -106,6 +108,8 @@ impl Drop for MountedVfs {
 fn access_path(path: &Path, mode: i32) -> io::Result<()> {
     let cpath = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains nul byte"))?;
+    // SAFETY: `cpath` is a NUL-terminated path buffer alive for the access
+    // call, and `mode` is supplied by the test as libc access flags.
     let result = unsafe { libc::access(cpath.as_ptr(), mode) };
     if result == 0 {
         Ok(())

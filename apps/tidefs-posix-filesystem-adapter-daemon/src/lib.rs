@@ -891,11 +891,16 @@ fn install_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<(), String> {
 
     static mut SHUTDOWN_PTR: Option<*const AtomicBool> = None;
 
+    // SAFETY: `shutdown` is held alive by the caller for the whole mounted
+    // session, and the signal handler only stores through the pointed atomic.
     unsafe {
         SHUTDOWN_PTR = Some(Arc::as_ptr(&shutdown));
     }
 
     extern "C" fn handle(_signum: libc::c_int) {
+        // SAFETY: `SHUTDOWN_PTR` is initialized before installing the handler
+        // and points at an `AtomicBool`; the handler performs only an atomic
+        // store through that stable pointer.
         unsafe {
             if let Some(ptr) = SHUTDOWN_PTR {
                 let flag: &AtomicBool = &*ptr;
@@ -904,13 +909,20 @@ fn install_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<(), String> {
         }
     }
 
+    // SAFETY: `libc::sigaction` is a plain old data C struct; zeroed storage is
+    // a valid starting point before the handler and mask fields are populated.
     let mut sa: libc::sigaction = unsafe { mem::zeroed() };
     sa.sa_sigaction = handle as usize;
+    // SAFETY: `sa.sa_mask` is a valid, initialized sigset_t field owned by this
+    // stack frame and may be filled by libc before the sigaction call.
     unsafe {
         libc::sigfillset(&mut sa.sa_mask);
     }
 
     for &signum in &[libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: `sa` points to a fully initialized sigaction struct, the old
+        // action pointer is null because the previous action is not needed, and
+        // `signum` is selected from valid process signal constants.
         let rc = unsafe { libc::sigaction(signum, &sa, ptr::null_mut()) };
         if rc != 0 {
             return Err(format!(
