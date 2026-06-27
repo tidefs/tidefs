@@ -43,16 +43,17 @@
 //! - Receive (VFSSEND2 → local-filesystem) is **not** yet bridged; tracked
 //!   by Review debt TFR-010 (historical issues #5949 / #6328).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tidefs_send_stream::{
-    Bytes32, DeltaObject, Id128, ObjectKind, SendBuilder, SendStreamHeader, SenderAuthority,
-    SnapshotDelta,
+    Bytes32, DeltaObject, Id128, ObjectKind, PinnedBaseRoot, SendBuilder, SendStreamHeader,
+    SenderAuthority, SnapshotDelta,
 };
 
 use crate::error::FileSystemError;
 use crate::types::{
     ChangedObjectRecord, ChangedRecordExport, ChangedRecordObjectRole, ChangedRecordRoot,
+    CommittedRootSummary,
 };
 
 /// Convert a VFSSEND1 [`ChangedRecordExport`] into a VFSSEND2-encoded stream.
@@ -109,7 +110,8 @@ fn encode_full_changed_records_as_vfssend2(
 ///
 /// Object filtering is done at the VFSSEND1 export layer
 /// ([`crate::send_receive::export_incremental_changed_records`]), so the
-/// base-object-digest map passed to [`SendBuilder::incremental`] is empty.
+/// base-root authority carries only the committed-root identity while the
+/// per-object digest map remains empty.
 pub fn export_incremental_vfssend2_from_changed_records(
     export: &ChangedRecordExport,
     pool_id: Id128,
@@ -158,9 +160,12 @@ fn encode_incremental_changed_records_as_vfssend2(
         build_header_and_snapshots(export, pool_id, dataset_id, sender_authority)?;
     let header = header.incremental_from(from_snapshot_id);
 
-    let builder = SendBuilder::incremental(header, snapshots, std::collections::BTreeMap::new())
-        .map_err(|e| FileSystemError::LifecycleError {
-            reason: format!("VFSSEND2 SendBuilder::incremental: {e}"),
+    let base_root = pinned_base_root_from_summary(dataset_id, from_snapshot_id, from_root);
+    let builder =
+        SendBuilder::incremental_from_base(header, snapshots, base_root).map_err(|e| {
+            FileSystemError::LifecycleError {
+                reason: format!("VFSSEND2 SendBuilder::incremental: {e}"),
+            }
         })?;
 
     builder
@@ -211,6 +216,16 @@ fn changed_record_root_to_snapshot_delta(root: &ChangedRecordRoot) -> crate::Res
     Ok(delta)
 }
 
+fn pinned_base_root_from_summary(
+    dataset_id: Id128,
+    root_id: Id128,
+    root: &CommittedRootSummary,
+) -> PinnedBaseRoot {
+    let root_commit = crate::root_commit_from_summary(root);
+    let root_digest = *blake3::hash(&crate::encoding::encode_root_commit(&root_commit)).as_bytes();
+    PinnedBaseRoot::new(dataset_id, root_id, root_digest, BTreeMap::new(), true)
+}
+
 fn changed_record_to_delta_object(
     record: &ChangedObjectRecord,
     birth_commit_group: u64,
@@ -250,7 +265,7 @@ fn make_snapshot_id(transaction_id: u64, generation: u64) -> Id128 {
 mod tests {
     use super::*;
     use crate::types::{ChangedRecordExport, ChangedRecordRoot, CommittedRootSummary};
-    use tidefs_local_object_store::{IntegrityDigest64, ObjectKey};
+    use tidefs_local_object_store::{IntegrityDigest64, ObjectKey, StoreOptions};
 
     fn make_test_root_summary(tx: u64, gen: u64) -> CommittedRootSummary {
         CommittedRootSummary {
@@ -270,6 +285,29 @@ mod tests {
             manifest_digest: None,
             root_authentication_code: None,
         }
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tidefs-vfssend2-bridge-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn setup_auth_env() {
+        std::env::set_var("TIDEFS_ROOT_AUTHENTICATION_KEY_HEX", "B".repeat(64));
+    }
+
+    fn root_id_from_summary(summary: &crate::types::SnapshotSummary) -> tidefs_send_stream::Id128 {
+        let mut id = [0u8; 16];
+        id[0..8].copy_from_slice(&summary.source_transaction_id.to_le_bytes());
+        id[8..16].copy_from_slice(&summary.source_generation.to_le_bytes());
+        id
     }
 
     #[test]
@@ -419,6 +457,39 @@ mod tests {
             crate::FileSystemError::LifecycleError { reason }
                 if reason.contains("sender authority")
         ));
+    }
+
+    #[test]
+    fn receive_bridge_applies_snapshot_mutation_stream() {
+        setup_auth_env();
+        let root = temp_dir("snapshot-mutation");
+        let mut fs = crate::LocalFileSystem::open_with_options(&root, StoreOptions::default())
+            .expect("open fs");
+        fs.create_snapshot("origin").expect("snapshot");
+        fs.create_clone("myclone", "origin").expect("clone");
+        let root_id = root_id_from_summary(&fs.snapshot_summary("myclone").expect("clone summary"));
+        let delta = tidefs_send_stream::SnapshotDelta::promote([3u8; 16], "myclone", 7, root_id);
+        let header = tidefs_send_stream::SendStreamHeader::new([1u8; 16], [2u8; 16], [3u8; 16]);
+        let stream = tidefs_send_stream::SendBuilder::full(header, vec![delta])
+            .expect("builder")
+            .encode()
+            .expect("encode");
+
+        let reports = receive_vfssend2_snapshot_mutations(&mut fs, &stream).expect("receive");
+
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            &reports[0],
+            crate::SnapshotMutationApplyReport::Promoted(report)
+                if report.name == "myclone" && report.previous_origin == "origin"
+        ));
+        let entry = fs
+            .list_snapshots_extended()
+            .into_iter()
+            .find(|entry| entry.name == "myclone")
+            .expect("promoted entry");
+        assert_eq!(entry.kind, crate::records::SnapshotKind::Snapshot);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -589,48 +660,7 @@ fn vfssend2_kind_to_role(
 pub fn receive_vfssend2_to_changed_records(
     stream_bytes: &[u8],
 ) -> crate::Result<crate::types::ChangedRecordExport> {
-    use tidefs_send_stream::{ReceiveBuilder, ReceiveProgress, SendStreamHeader};
-
-    let (header, _tail) = SendStreamHeader::decode(stream_bytes).map_err(|e| {
-        crate::FileSystemError::LifecycleError {
-            reason: format!("VFSSEND2 header decode: {e}"),
-        }
-    })?;
-    if !header.sender_authority.is_absent_local_only() {
-        return Err(crate::FileSystemError::LifecycleError {
-            reason: "VFSSEND2 sender authority is not accepted by the local-only receive bridge"
-                .into(),
-        });
-    }
-
-    let dataset_id = header.source_dataset_id;
-
-    let mut builder = ReceiveBuilder::new(dataset_id, stream_bytes).map_err(|e| {
-        crate::FileSystemError::LifecycleError {
-            reason: format!("VFSSEND2 ReceiveBuilder: {e}"),
-        }
-    })?;
-
-    loop {
-        match builder.next_record() {
-            Ok(ReceiveProgress::StreamComplete(stats)) => {
-                if !stats.validation_passed {
-                    return Err(crate::FileSystemError::LifecycleError {
-                        reason: "VFSSEND2 receive validation failed".into(),
-                    });
-                }
-                break;
-            }
-            Ok(_) => continue,
-            Err(e) => {
-                return Err(crate::FileSystemError::LifecycleError {
-                    reason: format!("VFSSEND2 receive record: {e}"),
-                });
-            }
-        }
-    }
-
-    let dataset = builder.staged_dataset();
+    let (header, dataset) = receive_vfssend2_dataset(stream_bytes)?;
     let mut records: Vec<crate::types::ChangedObjectRecord> = Vec::new();
 
     for object in dataset.objects.values() {
@@ -698,6 +728,68 @@ pub fn receive_vfssend2_to_changed_records(
             .flags
             .contains(tidefs_send_stream::StreamFlags::INCREMENTAL),
     })
+}
+
+/// Decode a VFSSEND2 stream and apply any snapshot-record mutations it carries.
+pub fn receive_vfssend2_snapshot_mutations(
+    fs: &mut crate::LocalFileSystem,
+    stream_bytes: &[u8],
+) -> crate::Result<Vec<crate::SnapshotMutationApplyReport>> {
+    let (_header, dataset) = receive_vfssend2_dataset(stream_bytes)?;
+    let mut reports = Vec::with_capacity(dataset.snapshot_mutations.len());
+    for mutation in &dataset.snapshot_mutations {
+        reports.push(fs.apply_vfssend2_snapshot_mutation(mutation)?);
+    }
+    Ok(reports)
+}
+
+fn receive_vfssend2_dataset(
+    stream_bytes: &[u8],
+) -> crate::Result<(
+    tidefs_send_stream::SendStreamHeader,
+    tidefs_send_stream::ReceivedDataset,
+)> {
+    use tidefs_send_stream::{ReceiveBuilder, ReceiveProgress, SendStreamHeader};
+
+    let (header, _tail) = SendStreamHeader::decode(stream_bytes).map_err(|e| {
+        crate::FileSystemError::LifecycleError {
+            reason: format!("VFSSEND2 header decode: {e}"),
+        }
+    })?;
+    if !header.sender_authority.is_absent_local_only() {
+        return Err(crate::FileSystemError::LifecycleError {
+            reason: "VFSSEND2 sender authority is not accepted by the local-only receive bridge"
+                .into(),
+        });
+    }
+
+    let dataset_id = header.source_dataset_id;
+    let mut builder = ReceiveBuilder::new(dataset_id, stream_bytes).map_err(|e| {
+        crate::FileSystemError::LifecycleError {
+            reason: format!("VFSSEND2 ReceiveBuilder: {e}"),
+        }
+    })?;
+
+    loop {
+        match builder.next_record() {
+            Ok(ReceiveProgress::StreamComplete(stats)) => {
+                if !stats.validation_passed {
+                    return Err(crate::FileSystemError::LifecycleError {
+                        reason: "VFSSEND2 receive validation failed".into(),
+                    });
+                }
+                break;
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                return Err(crate::FileSystemError::LifecycleError {
+                    reason: format!("VFSSEND2 receive record: {e}"),
+                });
+            }
+        }
+    }
+
+    Ok((header, builder.staged_dataset().clone()))
 }
 
 /// Auto-detect stream format and convert to [`ChangedRecordExport`].
