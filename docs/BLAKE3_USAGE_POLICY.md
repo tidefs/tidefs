@@ -205,9 +205,9 @@ Affected code:
 - `crates/tidefs-namespace/src/entry.rs` — `blake3::Hasher::new()` without
   domain separation
 
-**Fix**: Replace with `fxhash` or `ahash`. If the entries are later persisted
-through the local filesystem's BLAKE3-verified records, the storage layer
-provides integrity.
+**Fix**: Replace with `rustc-hash` or `ahash`. If the entries are later
+persisted through the local filesystem's BLAKE3-verified records, the storage
+layer provides integrity.
 
 ## 4. Enforcement
 
