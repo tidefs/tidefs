@@ -616,7 +616,8 @@ fn health_check_roundtrip_via_client() {
 
 use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
 
-const HEALTH_POOL_DEVICE_BYTES: u64 = 2_000_000;
+const HEALTH_POOL_DEVICE_BYTES: u64 =
+    tidefs_local_filesystem::DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES;
 
 fn create_importable_pool_device(path: &std::path::Path, pool_name: &str) {
     let f = std::fs::File::create(path).expect("create pool device");
