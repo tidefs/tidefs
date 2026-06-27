@@ -933,12 +933,14 @@ impl PrefetchExecutorResultDetail {
     #[must_use]
     pub const fn has_feedback_evidence_roots(self) -> bool {
         self.attribution_ref.is_bound()
-            && self.attribution_ref.kind
-                == StorageIntentEvidenceKind::MeasurementAttributionEvidence
+            && self.attribution_ref.kind as u16
+                == StorageIntentEvidenceKind::MeasurementAttributionEvidence as u16
             && self.retention_ref.is_bound()
-            && self.retention_ref.kind == StorageIntentEvidenceKind::EvidenceRetentionEvidence
+            && self.retention_ref.kind as u16
+                == StorageIntentEvidenceKind::EvidenceRetentionEvidence as u16
             && self.validation_ref.is_bound()
-            && self.validation_ref.kind == StorageIntentEvidenceKind::ValidationArtifact
+            && self.validation_ref.kind as u16
+                == StorageIntentEvidenceKind::ValidationArtifact as u16
     }
 }
 
@@ -3593,11 +3595,7 @@ mod tests {
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::Completed,
                 result_detail: partial_detail,
-                evidence_cut: terminal_evidence_cut(
-                    started,
-                    partial_detail,
-                    EMPTY_EVIDENCE_REF,
-                ),
+                evidence_cut: terminal_evidence_cut(started, partial_detail, EMPTY_EVIDENCE_REF),
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
@@ -3629,11 +3627,7 @@ mod tests {
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::Completed,
                 result_detail: wrong_kind_detail,
-                evidence_cut: terminal_evidence_cut(
-                    started,
-                    wrong_kind_detail,
-                    EMPTY_EVIDENCE_REF,
-                ),
+                evidence_cut: terminal_evidence_cut(started, wrong_kind_detail, EMPTY_EVIDENCE_REF),
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
