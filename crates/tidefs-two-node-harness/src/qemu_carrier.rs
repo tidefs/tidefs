@@ -27,6 +27,7 @@ const ACCEPT_RETRIES: usize = 100;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const ACK_PREFIX: &[u8] = b"state_transfer_ack";
+const QEMU_VALIDATION_CMDLINE_MARKER: &str = "tidefs.qemu_carrier_validation=1";
 
 /// Report emitted by a live TCP carrier state-transfer run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -395,18 +396,22 @@ fn format_transport_error(context: &str, error: TransportError) -> String {
 }
 
 fn detect_qemu_guest() -> bool {
-    const DMI_PATHS: &[&str] = &[
+    const SIGNAL_PATHS: &[&str] = &[
         "/sys/class/dmi/id/product_name",
         "/sys/class/dmi/id/sys_vendor",
         "/sys/class/dmi/id/board_vendor",
+        "/proc/cpuinfo",
+        "/proc/cmdline",
     ];
 
-    for path in DMI_PATHS {
+    // Minimal initramfs guests may not expose DMI or hypervisor CPU strings.
+    // The QEMU launcher adds a validation cmdline marker for that path.
+    for path in SIGNAL_PATHS {
         if file_contains_qemu_signal(path) {
             return true;
         }
     }
-    file_contains_qemu_signal("/proc/cpuinfo")
+    false
 }
 
 fn file_contains_qemu_signal(path: &str) -> bool {
@@ -418,4 +423,5 @@ fn file_contains_qemu_signal(path: &str) -> bool {
         || lower.contains("kvm")
         || lower.contains("bochs")
         || lower.contains("standard pc")
+        || lower.contains(QEMU_VALIDATION_CMDLINE_MARKER)
 }
