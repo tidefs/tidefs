@@ -9,10 +9,9 @@
 //! protocol crate. It converts [`ChangedRecordExport`] data into the
 //! [`tidefs_send_stream::SendBuilder`] stream format.
 //!
-//! The live storage-node daemon (`tidefs-storage-node`) does **not** yet
-//! use this bridge; its `Frame::Send`/`Frame::Receive` handlers still use
-//! VFSSEND1 [`ChangedRecordExport`] directly. When the daemon adopts this
-//! bridge, the send/receive authority consolidates to VFSSEND2.
+//! The live storage-node daemon (`tidefs-storage-node`) uses this bridge for
+//! `Frame::Send` exports. `Frame::Receive` remains on the VFSSEND1
+//! [`ChangedRecordExport`] path until the receive-side wiring lands.
 //!
 //! ## Conversion mapping
 //!
@@ -35,9 +34,10 @@
 //!   senders must attach [`SenderAuthority`] while converting to VFSSEND2, and
 //!   VFSSEND2 streams carrying sender authority are rejected by the current
 //!   receive-to-VFSSEND1 bridge until receive authorization is implemented.
-//! - The VFSSEND2 stream is **not** yet carried over transport; the
-//!   send-stream session adapter (`tidefs-send-stream` with `transport`
-//!   feature) handles network delivery separately (#6087).
+//! - Storage-node send responses can wrap VFSSEND2 bytes in
+//!   [`tidefs_send_stream::SendTransportBridge`] frames, while dedicated
+//!   sender lifecycle and resumable session negotiation remain separate
+//!   follow-up work.
 //! - Incremental send (VFSSEND2 `SendBuilder::incremental`) is bridged via
 //!   [`export_incremental_vfssend2_from_changed_records`].
 //! - Receive (VFSSEND2 → local-filesystem) is **not** yet bridged; tracked
