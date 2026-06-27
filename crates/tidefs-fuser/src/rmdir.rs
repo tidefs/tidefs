@@ -11,7 +11,9 @@
 //! - [`check_rmdir_readonly`]: reject read-only mounts; returns
 //!   `Ok(())` or a [`RmdirError`].
 //! - [`plan_rmdir`]: combined name validation, RO-mount guard, and
-//!   permission-stub returning `Ok(RmdirPlan)` or a [`RmdirError`].
+//!   parent permission check returning `Ok(RmdirPlan)` or a [`RmdirError`].
+//! - [`check_rmdir_parent_permission`]: verify write+execute permission on
+//!   the parent directory.
 //! - [`RmdirPlan`]: validated rmdir request ready for backend dispatch.
 //!
 //! # Usage
@@ -19,7 +21,10 @@
 //! ```rust,ignore
 //! use fuser::rmdir;
 //!
-//! let plan = rmdir::handle_rmdir(b"emptydir", false)?;
+//! let plan = rmdir::handle_rmdir(
+//!     b"emptydir", false,
+//!     0o300, 1000, 100, 1000, 100, &[], &mount_identity,
+//! )?;
 //! // dispatch plan.name to the backend...
 //! ```
 
@@ -63,9 +68,7 @@ pub enum RmdirError {
     NameTooLong,
     /// The filesystem is mounted read-only.
     ReadOnlyFilesystem,
-    /// Caller lacks write+search permission on the parent directory
-    /// (stub; wired when `tidefs-permission` integration lands —
-    /// see #5378).
+    /// Caller lacks write+execute permission on the parent directory.
     PermissionDenied,
     /// The directory is not empty.  POSIX `rmdir(2)` requires that
     /// only `"."` and `".."` remain.  This error is reported by the
@@ -175,22 +178,45 @@ pub fn check_rmdir_readonly(read_only: bool) -> Result<(), RmdirError> {
 }
 
 // ---------------------------------------------------------------------------
+// Permission check
+// ---------------------------------------------------------------------------
+
+/// Check that the caller has write and execute (search) permission
+/// on the parent directory for an rmdir operation.
+///
+/// POSIX requires directory write permission (to remove the entry) and
+/// execute/search permission (to traverse to the directory).
+pub fn check_rmdir_parent_permission(
+    parent_mode: u32,
+    parent_uid: u32,
+    parent_gid: u32,
+    caller_uid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
+) -> Result<(), RmdirError> {
+    crate::access::check_fuse_access(
+        parent_mode,
+        parent_uid,
+        parent_gid,
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        crate::access::ACCESS_WRITE | crate::access::ACCESS_EXECUTE,
+        mount_identity,
+    )
+    .map_err(|_e| RmdirError::PermissionDenied)
+}
+
+// ---------------------------------------------------------------------------
 // Combined validation (convenience)
 // ---------------------------------------------------------------------------
 
-/// Validate the rmdir name, enforce the read-only mount guard, and
-/// (in a future integration) check parent-directory write permission
-/// in one call.
+/// Validate the rmdir name, enforce the read-only mount guard, and check
+/// parent-directory write+execute permission in one call.
 ///
 /// Returns `Ok(`[`RmdirPlan`]`)` on success.  On failure returns a
 /// [`RmdirError`].
-///
-/// # Stub permission check
-///
-/// Permission checking for parent-directory write access is deferred to
-/// `tidefs-permission` integration (see #5378).  When wired, this
-/// function will also return [`RmdirError::PermissionDenied`] when the
-/// caller lacks write+search permission on the parent directory.
 ///
 /// # Directory-not-empty check
 ///
@@ -200,10 +226,29 @@ pub fn check_rmdir_readonly(read_only: bool) -> Result<(), RmdirError> {
 /// this check; it is the caller's responsibility to reject with
 /// `errno::ENOTEMPTY` after the backend reports the directory is
 /// non-empty.
-pub fn plan_rmdir(name: &[u8], read_only: bool) -> Result<RmdirPlan, RmdirError> {
+#[allow(clippy::too_many_arguments)]
+pub fn plan_rmdir(
+    name: &[u8],
+    read_only: bool,
+    parent_mode: u32,
+    parent_uid: u32,
+    parent_gid: u32,
+    caller_uid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
+) -> Result<RmdirPlan, RmdirError> {
     validate_rmdir_name(name)?;
     check_rmdir_readonly(read_only)?;
-    // Review debt TFR-016 (also see TFR-004): add tidefs-permission check_access(parent_dir, W_OK|X_OK)
+    check_rmdir_parent_permission(
+        parent_mode,
+        parent_uid,
+        parent_gid,
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        mount_identity,
+    )?;
     Ok(RmdirPlan {
         name: name.to_vec(),
     })
@@ -215,17 +260,21 @@ pub fn plan_rmdir(name: &[u8], read_only: bool) -> Result<RmdirPlan, RmdirError>
 
 /// Canonical dispatch entry-point for FUSE `rmdir` requests.
 ///
-/// Combines read-only mount guard and name validation into a single
+/// Combines read-only mount guard, name validation, and parent-directory
+/// permission checking into a single
 /// `Result<RmdirPlan, RmdirError>`.  This is the preferred entry point
 /// for daemon dispatch: it rejects read-only mounts early (EROFS),
-/// validates the directory name (EINVAL/ENAMETOOLONG), and returns a
-/// validated [`RmdirPlan`] ready for backend execution.
+/// validates the directory name (EINVAL/ENAMETOOLONG), checks parent
+/// write+execute permission (EACCES), and returns a validated [`RmdirPlan`]
+/// ready for backend execution.
 ///
 /// # Parameters
 ///
 /// - `name`: directory name to remove (must be non-empty, not `"."` or
 ///   `".."`, NUL-free, slash-free, and ≤ [`RMDIR_MAX_NAME_BYTES`]).
 /// - `read_only`: when `true`, the filesystem is mounted read-only.
+/// - parent/caller metadata: mode, uid/gid, supplementary groups, and mount
+///   identity used for the POSIX parent-directory permission check.
 ///
 /// # Errors
 ///
@@ -240,13 +289,36 @@ pub fn plan_rmdir(name: &[u8], read_only: bool) -> Result<RmdirPlan, RmdirError>
 /// # Examples
 ///
 /// ```rust,ignore
-/// let plan = rmdir::handle_rmdir(b"emptydir", false)?;
+/// let plan = rmdir::handle_rmdir(
+///     b"emptydir", false,
+///     0o300, 1000, 100, 1000, 100, &[], &mount_identity,
+/// )?;
 /// // dispatch plan.name to the backend...
 /// ```
 #[inline]
-pub fn handle_rmdir(name: &[u8], read_only: bool) -> Result<RmdirPlan, RmdirError> {
+#[allow(clippy::too_many_arguments)]
+pub fn handle_rmdir(
+    name: &[u8],
+    read_only: bool,
+    parent_mode: u32,
+    parent_uid: u32,
+    parent_gid: u32,
+    caller_uid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
+) -> Result<RmdirPlan, RmdirError> {
     check_rmdir_readonly(read_only)?;
     validate_rmdir_name(name)?;
+    check_rmdir_parent_permission(
+        parent_mode,
+        parent_uid,
+        parent_gid,
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        mount_identity,
+    )?;
     Ok(RmdirPlan {
         name: name.to_vec(),
     })
@@ -260,6 +332,37 @@ pub fn handle_rmdir(name: &[u8], read_only: bool) -> Result<RmdirPlan, RmdirErro
 mod tests {
     use super::*;
     use std::error::Error;
+
+    const VALID_MOUNT: tidefs_permission::MountIdentity =
+        tidefs_permission::MountIdentity::new([0x41; 16], 1);
+
+    fn plan_rmdir_for_owner(name: &[u8], read_only: bool) -> Result<RmdirPlan, RmdirError> {
+        plan_rmdir(
+            name,
+            read_only,
+            0o300,
+            1000,
+            100,
+            1000,
+            100,
+            &[],
+            &VALID_MOUNT,
+        )
+    }
+
+    fn handle_rmdir_for_owner(name: &[u8], read_only: bool) -> Result<RmdirPlan, RmdirError> {
+        handle_rmdir(
+            name,
+            read_only,
+            0o300,
+            1000,
+            100,
+            1000,
+            100,
+            &[],
+            &VALID_MOUNT,
+        )
+    }
 
     // -- validate_rmdir_name -------------------------------------------------
 
@@ -360,7 +463,7 @@ mod tests {
 
     #[test]
     fn plan_rmdir_valid_rw() {
-        let plan = plan_rmdir(b"emptydir", false);
+        let plan = plan_rmdir_for_owner(b"emptydir", false);
         assert!(plan.is_ok());
         let plan = plan.unwrap();
         assert_eq!(plan.name, b"emptydir");
@@ -368,42 +471,57 @@ mod tests {
 
     #[test]
     fn plan_rmdir_empty_name() {
-        assert_eq!(plan_rmdir(b"", false), Err(RmdirError::InvalidName));
+        assert_eq!(
+            plan_rmdir_for_owner(b"", false),
+            Err(RmdirError::InvalidName)
+        );
     }
 
     #[test]
     fn plan_rmdir_dot_name() {
-        assert_eq!(plan_rmdir(b".", false), Err(RmdirError::InvalidName));
+        assert_eq!(
+            plan_rmdir_for_owner(b".", false),
+            Err(RmdirError::InvalidName)
+        );
     }
 
     #[test]
     fn plan_rmdir_dotdot_name() {
-        assert_eq!(plan_rmdir(b"..", false), Err(RmdirError::InvalidName));
+        assert_eq!(
+            plan_rmdir_for_owner(b"..", false),
+            Err(RmdirError::InvalidName)
+        );
     }
 
     #[test]
     fn plan_rmdir_name_too_long() {
         let long = vec![b'a'; 256];
-        assert_eq!(plan_rmdir(&long, false), Err(RmdirError::NameTooLong));
+        assert_eq!(
+            plan_rmdir_for_owner(&long, false),
+            Err(RmdirError::NameTooLong)
+        );
     }
 
     #[test]
     fn plan_rmdir_nul_byte() {
         assert_eq!(
-            plan_rmdir(b"bad\0name", false),
+            plan_rmdir_for_owner(b"bad\0name", false),
             Err(RmdirError::InvalidName)
         );
     }
 
     #[test]
     fn plan_rmdir_slash() {
-        assert_eq!(plan_rmdir(b"a/b", false), Err(RmdirError::InvalidName));
+        assert_eq!(
+            plan_rmdir_for_owner(b"a/b", false),
+            Err(RmdirError::InvalidName)
+        );
     }
 
     #[test]
     fn plan_rmdir_ro_mount() {
         assert_eq!(
-            plan_rmdir(b"emptydir", true),
+            plan_rmdir_for_owner(b"emptydir", true),
             Err(RmdirError::ReadOnlyFilesystem)
         );
     }
@@ -411,13 +529,131 @@ mod tests {
     #[test]
     fn plan_rmdir_name_error_takes_priority_over_ro() {
         // Empty name on RO mount: InvalidName should win
-        assert_eq!(plan_rmdir(b"", true), Err(RmdirError::InvalidName));
+        assert_eq!(
+            plan_rmdir_for_owner(b"", true),
+            Err(RmdirError::InvalidName)
+        );
     }
 
     #[test]
     fn plan_rmdir_name_preserves_exact_bytes() {
-        let plan = plan_rmdir(b"MiXeDcAsE", false).unwrap();
+        let plan = plan_rmdir_for_owner(b"MiXeDcAsE", false).unwrap();
         assert_eq!(plan.name, b"MiXeDcAsE");
+    }
+
+    // -- parent permission ----------------------------------------------------
+
+    #[test]
+    fn parent_permission_group_write_exec_ok() {
+        assert_eq!(
+            check_rmdir_parent_permission(0o030, 1000, 200, 3000, 200, &[], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn parent_permission_missing_execute_rejected() {
+        assert_eq!(
+            check_rmdir_parent_permission(0o020, 1000, 200, 3000, 200, &[], &VALID_MOUNT),
+            Err(RmdirError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn plan_rmdir_parent_permission_denied() {
+        assert_eq!(
+            plan_rmdir(
+                b"emptydir",
+                false,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Err(RmdirError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn handle_rmdir_parent_permission_denied() {
+        assert_eq!(
+            handle_rmdir(
+                b"emptydir",
+                false,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Err(RmdirError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn handle_rmdir_root_bypasses_parent_mode_bits() {
+        let plan = handle_rmdir(
+            b"emptydir",
+            false,
+            0o000,
+            1000,
+            100,
+            0,
+            0,
+            &[],
+            &VALID_MOUNT,
+        )
+        .unwrap();
+        assert_eq!(plan.name, b"emptydir");
+    }
+
+    #[test]
+    fn rmdir_validation_errors_precede_permission_denial() {
+        assert_eq!(
+            plan_rmdir(b"", false, 0o000, 1000, 100, 2000, 200, &[], &VALID_MOUNT,),
+            Err(RmdirError::InvalidName)
+        );
+        assert_eq!(
+            handle_rmdir(b"", false, 0o000, 1000, 100, 2000, 200, &[], &VALID_MOUNT,),
+            Err(RmdirError::InvalidName)
+        );
+    }
+
+    #[test]
+    fn rmdir_read_only_precedes_permission_denial() {
+        assert_eq!(
+            plan_rmdir(
+                b"emptydir",
+                true,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Err(RmdirError::ReadOnlyFilesystem)
+        );
+        assert_eq!(
+            handle_rmdir(
+                b"emptydir",
+                true,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Err(RmdirError::ReadOnlyFilesystem)
+        );
     }
 
     // -- RmdirError ----------------------------------------------------------
@@ -468,7 +704,7 @@ mod tests {
 
     #[test]
     fn rmdir_plan_debug_includes_name() {
-        let plan = plan_rmdir(b"testdir", false).unwrap();
+        let plan = plan_rmdir_for_owner(b"testdir", false).unwrap();
         let dbg = format!("{plan:?}");
         // Vec<u8> debug prints as e.g. [116, 101, 115, 116, 100, 105, 114]
         assert!(dbg.contains("RmdirPlan"));
@@ -477,7 +713,7 @@ mod tests {
 
     #[test]
     fn rmdir_plan_clone_preserves_name() {
-        let plan = plan_rmdir(b"testdir", false).unwrap();
+        let plan = plan_rmdir_for_owner(b"testdir", false).unwrap();
         let clone = plan.clone();
         assert_eq!(plan.name, clone.name);
     }
@@ -493,67 +729,85 @@ mod tests {
 
     #[test]
     fn handle_rmdir_valid_rw() {
-        let plan = handle_rmdir(b"emptydir", false).unwrap();
+        let plan = handle_rmdir_for_owner(b"emptydir", false).unwrap();
         assert_eq!(plan.name, b"emptydir");
     }
 
     #[test]
     fn handle_rmdir_ro_mount_rejected() {
         assert_eq!(
-            handle_rmdir(b"emptydir", true),
+            handle_rmdir_for_owner(b"emptydir", true),
             Err(RmdirError::ReadOnlyFilesystem)
         );
     }
 
     #[test]
     fn handle_rmdir_empty_name() {
-        assert_eq!(handle_rmdir(b"", false), Err(RmdirError::InvalidName));
+        assert_eq!(
+            handle_rmdir_for_owner(b"", false),
+            Err(RmdirError::InvalidName)
+        );
     }
 
     #[test]
     fn handle_rmdir_dot_name() {
-        assert_eq!(handle_rmdir(b".", false), Err(RmdirError::InvalidName));
+        assert_eq!(
+            handle_rmdir_for_owner(b".", false),
+            Err(RmdirError::InvalidName)
+        );
     }
 
     #[test]
     fn handle_rmdir_dotdot_name() {
-        assert_eq!(handle_rmdir(b"..", false), Err(RmdirError::InvalidName));
+        assert_eq!(
+            handle_rmdir_for_owner(b"..", false),
+            Err(RmdirError::InvalidName)
+        );
     }
 
     #[test]
     fn handle_rmdir_name_too_long() {
         let long = vec![b'a'; 256];
-        assert_eq!(handle_rmdir(&long, false), Err(RmdirError::NameTooLong));
+        assert_eq!(
+            handle_rmdir_for_owner(&long, false),
+            Err(RmdirError::NameTooLong)
+        );
     }
     #[test]
     fn handle_rmdir_nul_byte() {
         assert_eq!(
-            handle_rmdir(b"bad\0name", false),
+            handle_rmdir_for_owner(b"bad\0name", false),
             Err(RmdirError::InvalidName)
         );
     }
 
     #[test]
     fn handle_rmdir_slash() {
-        assert_eq!(handle_rmdir(b"a/b", false), Err(RmdirError::InvalidName));
+        assert_eq!(
+            handle_rmdir_for_owner(b"a/b", false),
+            Err(RmdirError::InvalidName)
+        );
     }
 
     #[test]
     fn handle_rmdir_read_only_takes_priority() {
         // RO mount check runs first, so invalid name on RO returns RO error
-        assert_eq!(handle_rmdir(b"", true), Err(RmdirError::ReadOnlyFilesystem));
+        assert_eq!(
+            handle_rmdir_for_owner(b"", true),
+            Err(RmdirError::ReadOnlyFilesystem)
+        );
     }
 
     #[test]
     fn handle_rmdir_name_preserves_exact_bytes() {
-        let plan = handle_rmdir(b"MiXeDcAsE", false).unwrap();
+        let plan = handle_rmdir_for_owner(b"MiXeDcAsE", false).unwrap();
         assert_eq!(plan.name, b"MiXeDcAsE");
     }
 
     #[test]
     fn handle_rmdir_max_length_name() {
         let max = vec![b'a'; 255];
-        let plan = handle_rmdir(&max, false).unwrap();
+        let plan = handle_rmdir_for_owner(&max, false).unwrap();
         assert_eq!(plan.name.len(), 255);
     }
 
@@ -620,6 +874,9 @@ mod tests {
     #[test]
     fn plan_rmdir_invalid_name_on_ro_returns_name_error() {
         // A dot name on a RO mount should return InvalidName, not ReadOnlyFilesystem
-        assert_eq!(plan_rmdir(b".", true), Err(RmdirError::InvalidName));
+        assert_eq!(
+            plan_rmdir_for_owner(b".", true),
+            Err(RmdirError::InvalidName)
+        );
     }
 }

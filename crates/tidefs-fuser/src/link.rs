@@ -13,6 +13,8 @@
 //!   [`LinkError`].
 //! - [`plan_link_target`]: verify the target is not a directory and that
 //!   the link is on the same filesystem; returns `Ok(())` or a [`LinkError`].
+//! - [`check_link_parent_permission`]: verify write+execute permission on the
+//!   new-link parent directory.
 //! - [`compute_new_nlink`]: compute the post-link `nlink` with overflow
 //!   protection; returns `Ok(new_nlink)` or a [`LinkError`].
 //! - [`validate_link_request`]: combined pre-flight validation of name,
@@ -37,7 +39,10 @@
 //! assert_eq!(new_nlink, 2);
 //!
 //! // Or use the canonical dispatch entry point
-//! let new_nlink = link::handle_link(false, b"mylink", false, false, 1)?;
+//! let new_nlink = link::handle_link(
+//!     false, b"mylink", false, false, 1,
+//!     0o300, 1000, 100, 1000, 100, &[], &mount_identity,
+//! )?;
 //! assert_eq!(new_nlink, 2);
 //! ```
 
@@ -53,11 +58,9 @@ pub const LINK_MAX_NAME_BYTES: usize = 255;
 pub const LINK_MAX_NLINK: u32 = u32::MAX;
 
 // ---------------------------------------------------------------------------
-// LinkError — domain error type for link(2) operations
+// Permission check
 // ---------------------------------------------------------------------------
 
-/// Errors that can occur during link-name validation, target planning,
-/// or nlink computation.
 /// Check that the caller has write and execute (search) permission
 /// on the parent directory for a link operation.
 ///
@@ -84,6 +87,11 @@ pub fn check_link_parent_permission(
     )
     .map_err(|_e| LinkError::PermissionDenied)
 }
+
+// ---------------------------------------------------------------------------
+// LinkError — domain error type for link(2) operations
+// ---------------------------------------------------------------------------
+
 /// Errors that can occur during FUSE `link` (hard-link) request processing.
 ///
 /// Each variant maps to a POSIX errno via [`LinkError::to_errno`].
@@ -104,8 +112,7 @@ pub enum LinkError {
     CrossFilesystemLink,
     /// Hard-link count would overflow (reached [`LINK_MAX_NLINK`]).
     NlinkOverflow,
-    /// Caller lacks permission to create the hard link (stub; wired
-    /// when `tidefs-permission` integration lands — see #5378).
+    /// Caller lacks write+execute permission on the new-link parent directory.
     PermissionDenied,
     /// The filesystem is mounted read-only.  Mutating operations
     /// (including `link`) must be rejected with `EROFS`.
@@ -221,12 +228,6 @@ pub fn plan_link_name(name: &[u8]) -> Result<(), LinkError> {
 /// - [`LinkError::TargetIsDirectory`] when `target_is_dir` is `true`.
 /// - [`LinkError::CrossFilesystemLink`] when `cross_fs` is `true`.
 ///
-/// # Stub permission check
-///
-/// Permission checking is deferred to `tidefs-permission` integration
-/// (see #5378).  When wired, this function will also return
-/// [`LinkError::PermissionDenied`] when the caller lacks write+search
-/// permission on the parent directory.
 pub fn plan_link_target(target_is_dir: bool, cross_fs: bool) -> Result<(), LinkError> {
     if target_is_dir {
         return Err(LinkError::TargetIsDirectory);
@@ -234,8 +235,6 @@ pub fn plan_link_target(target_is_dir: bool, cross_fs: bool) -> Result<(), LinkE
     if cross_fs {
         return Err(LinkError::CrossFilesystemLink);
     }
-    // Review debt TFR-016 (also see TFR-004): integrate tidefs-permission check_access for parent
-    // directory write permission once the PermissionChecker lands.
     Ok(())
 }
 
@@ -301,8 +300,9 @@ pub fn check_link_readonly(read_only: bool) -> Result<(), LinkError> {
 
 /// Canonical FUSE dispatch entry point for `link` (opcode 15).
 ///
-/// Validates the new name, target admissibility, and nlink headroom,
-/// then returns the post-link `nlink` count on success.
+/// Validates the new name, target admissibility, nlink headroom, and
+/// new-link parent directory permissions, then returns the post-link
+/// `nlink` count on success.
 ///
 /// The caller is responsible for performing namespace insertion and
 /// intent-log recording using the returned `nlink` value.
@@ -312,19 +312,39 @@ pub fn check_link_readonly(read_only: bool) -> Result<(), LinkError> {
 /// ```rust,ignore
 /// use fuser::link;
 ///
-/// let new_nlink = link::handle_link(false, b"hardlink", false, false, 1)?;
+/// let new_nlink = link::handle_link(
+///     false, b"hardlink", false, false, 1,
+///     0o300, 1000, 100, 1000, 100, &[], &mount_identity,
+/// )?;
 /// assert_eq!(new_nlink, 2);
 /// ```
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn handle_link(
     read_only: bool,
     new_name: &[u8],
     target_is_dir: bool,
     cross_fs: bool,
     current_nlink: u32,
+    parent_mode: u32,
+    parent_uid: u32,
+    parent_gid: u32,
+    caller_uid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+    mount_identity: &tidefs_permission::MountIdentity,
 ) -> Result<u32, LinkError> {
     check_link_readonly(read_only)?;
     validate_link_request(new_name, target_is_dir, cross_fs, current_nlink)?;
+    check_link_parent_permission(
+        parent_mode,
+        parent_uid,
+        parent_gid,
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        mount_identity,
+    )?;
     compute_new_nlink(current_nlink)
 }
 
@@ -336,6 +356,32 @@ pub fn handle_link(
 mod tests {
     use super::*;
     use std::error::Error;
+
+    const VALID_MOUNT: tidefs_permission::MountIdentity =
+        tidefs_permission::MountIdentity::new([0x41; 16], 1);
+
+    fn handle_link_for_owner(
+        read_only: bool,
+        new_name: &[u8],
+        target_is_dir: bool,
+        cross_fs: bool,
+        current_nlink: u32,
+    ) -> Result<u32, LinkError> {
+        handle_link(
+            read_only,
+            new_name,
+            target_is_dir,
+            cross_fs,
+            current_nlink,
+            0o300,
+            1000,
+            100,
+            1000,
+            100,
+            &[],
+            &VALID_MOUNT,
+        )
+    }
 
     // -- validate_link_name --------------------------------------------------
 
@@ -598,11 +644,20 @@ mod tests {
 
     #[test]
     fn handle_link_valid_returns_new_nlink() {
-        assert_eq!(handle_link(false, b"hardlink", false, false, 1), Ok(2));
-        assert_eq!(handle_link(false, b"link2", false, false, 0), Ok(1));
-        assert_eq!(handle_link(false, b"link3", false, false, 41), Ok(42));
         assert_eq!(
-            handle_link(false, b"link4", false, false, u32::MAX - 1),
+            handle_link_for_owner(false, b"hardlink", false, false, 1),
+            Ok(2)
+        );
+        assert_eq!(
+            handle_link_for_owner(false, b"link2", false, false, 0),
+            Ok(1)
+        );
+        assert_eq!(
+            handle_link_for_owner(false, b"link3", false, false, 41),
+            Ok(42)
+        );
+        assert_eq!(
+            handle_link_for_owner(false, b"link4", false, false, u32::MAX - 1),
             Ok(u32::MAX)
         );
     }
@@ -610,7 +665,7 @@ mod tests {
     #[test]
     fn handle_link_directory_target_returns_eperm() {
         assert_eq!(
-            handle_link(false, b"hardlink", true, false, 1),
+            handle_link_for_owner(false, b"hardlink", true, false, 1),
             Err(LinkError::TargetIsDirectory)
         );
     }
@@ -618,7 +673,7 @@ mod tests {
     #[test]
     fn handle_link_cross_fs_returns_exdev() {
         assert_eq!(
-            handle_link(false, b"hardlink", false, true, 1),
+            handle_link_for_owner(false, b"hardlink", false, true, 1),
             Err(LinkError::CrossFilesystemLink)
         );
     }
@@ -626,11 +681,11 @@ mod tests {
     #[test]
     fn handle_link_invalid_name_returns_einval() {
         assert_eq!(
-            handle_link(false, b"", false, false, 1),
+            handle_link_for_owner(false, b"", false, false, 1),
             Err(LinkError::InvalidName)
         );
         assert_eq!(
-            handle_link(false, b".", false, false, 1),
+            handle_link_for_owner(false, b".", false, false, 1),
             Err(LinkError::InvalidName)
         );
     }
@@ -638,7 +693,7 @@ mod tests {
     #[test]
     fn handle_link_nlink_overflow_returns_emlink() {
         assert_eq!(
-            handle_link(false, b"hardlink", false, false, u32::MAX),
+            handle_link_for_owner(false, b"hardlink", false, false, u32::MAX),
             Err(LinkError::NlinkOverflow)
         );
     }
@@ -647,7 +702,7 @@ mod tests {
     fn handle_link_name_too_long_returns_ename_toolong() {
         let long = vec![b'a'; 256];
         assert_eq!(
-            handle_link(false, &long, false, false, 1),
+            handle_link_for_owner(false, &long, false, false, 1),
             Err(LinkError::NameTooLong)
         );
     }
@@ -656,13 +711,16 @@ mod tests {
     fn handle_link_zero_nlink_works() {
         // nlink can be zero (e.g. after unlink of last name but inode still
         // referenced via open fd); link bumps it to 1.
-        assert_eq!(handle_link(false, b"resurrect", false, false, 0), Ok(1));
+        assert_eq!(
+            handle_link_for_owner(false, b"resurrect", false, false, 0),
+            Ok(1)
+        );
     }
 
     #[test]
     fn handle_link_nlink_near_max_still_works() {
         assert_eq!(
-            handle_link(false, b"alias", false, false, u32::MAX - 1),
+            handle_link_for_owner(false, b"alias", false, false, u32::MAX - 1),
             Ok(u32::MAX)
         );
     }
@@ -687,21 +745,160 @@ mod tests {
     #[test]
     fn handle_link_read_only_rejected() {
         assert_eq!(
-            handle_link(true, b"hardlink", false, false, 1),
+            handle_link_for_owner(true, b"hardlink", false, false, 1),
             Err(LinkError::ReadOnlyFilesystem)
         );
     }
 
     #[test]
     fn handle_link_writable_allows() {
-        assert_eq!(handle_link(false, b"hardlink", false, false, 1), Ok(2));
+        assert_eq!(
+            handle_link_for_owner(false, b"hardlink", false, false, 1),
+            Ok(2)
+        );
     }
 
     #[test]
     fn handle_link_read_only_priority_over_name_error() {
         // EROFS must take priority over name validation errors.
         assert_eq!(
-            handle_link(true, b"", false, false, 1),
+            handle_link_for_owner(true, b"", false, false, 1),
+            Err(LinkError::ReadOnlyFilesystem)
+        );
+    }
+
+    // -- parent permission ----------------------------------------------------
+
+    #[test]
+    fn parent_permission_owner_write_exec_ok() {
+        assert_eq!(
+            check_link_parent_permission(0o300, 1000, 100, 1000, 100, &[], &VALID_MOUNT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn parent_permission_missing_write_rejected() {
+        assert_eq!(
+            check_link_parent_permission(0o100, 1000, 100, 1000, 100, &[], &VALID_MOUNT),
+            Err(LinkError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn handle_link_parent_permission_denied() {
+        assert_eq!(
+            handle_link(
+                false,
+                b"hardlink",
+                false,
+                false,
+                1,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Err(LinkError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn handle_link_root_bypasses_parent_mode_bits() {
+        assert_eq!(
+            handle_link(
+                false,
+                b"hardlink",
+                false,
+                false,
+                1,
+                0o000,
+                1000,
+                100,
+                0,
+                0,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn handle_link_validation_errors_precede_permission_denial() {
+        assert_eq!(
+            handle_link(
+                false,
+                b"",
+                false,
+                false,
+                1,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Err(LinkError::InvalidName)
+        );
+        assert_eq!(
+            handle_link(
+                false,
+                b"hardlink",
+                true,
+                false,
+                1,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Err(LinkError::TargetIsDirectory)
+        );
+        assert_eq!(
+            handle_link(
+                false,
+                b"hardlink",
+                false,
+                false,
+                u32::MAX,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
+            Err(LinkError::NlinkOverflow)
+        );
+    }
+
+    #[test]
+    fn handle_link_read_only_precedes_permission_denial() {
+        assert_eq!(
+            handle_link(
+                true,
+                b"hardlink",
+                false,
+                false,
+                1,
+                0o000,
+                1000,
+                100,
+                2000,
+                200,
+                &[],
+                &VALID_MOUNT,
+            ),
             Err(LinkError::ReadOnlyFilesystem)
         );
     }
