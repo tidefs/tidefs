@@ -458,7 +458,8 @@ log_phase "pre_teardown_io" "start" "write and sync test data"
 # Ftrace was armed during cutover fence staging before the mount commit.
 
 # Write test file
-if echo "teardown-test-data-$(date +%s)" > "$MNT/teardown_test.txt" 2>/tmp/write.err; then
+TEST_PAYLOAD="teardown-test-data-$(date +%s)"
+if echo "$TEST_PAYLOAD" > "$MNT/teardown_test.txt" 2>/tmp/write.err; then
   pass "write_test_file"
 else
   fail "write_test_file" "$(cat /tmp/write.err | head -1)"
@@ -473,18 +474,18 @@ fi
 # Verify readback
 if [ -f "$MNT/teardown_test.txt" ]; then
   CONTENT=$(cat "$MNT/teardown_test.txt" 2>/dev/null || echo "")
-  if echo "$CONTENT" | grep -q "teardown-test-data"; then
+  if [ "$CONTENT" = "$TEST_PAYLOAD" ]; then
     pass "readback_verify"
     log_cutover_truth \
       "mounted_readback" \
-      "teardown-test-data" \
+      "$TEST_PAYLOAD" \
       "$CONTENT" \
       "true"
   else
     fail "readback_verify" "unexpected content: $CONTENT"
     log_cutover_truth \
       "mounted_readback" \
-      "teardown-test-data" \
+      "$TEST_PAYLOAD" \
       "$CONTENT" \
       "false"
   fi
@@ -715,11 +716,11 @@ INITSCRIPT
     mkdir -p "$OUTPUT_DIR"
 
     # Extract phase log and guest-emitted trace snippets from QEMU output.
-    grep '^PHASE:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^PHASE://' > "$OUTPUT_DIR/phase_log.txt" || true
-    grep '\[teardown-phase\]' "$RUN_DIR/qemu.log" 2>/dev/null > "$OUTPUT_DIR/phase_log_raw.txt" || true
-    grep '^CUTOVER:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^CUTOVER://' > "$OUTPUT_DIR/cutover_phase_log.txt" || true
-    grep '^FENCE:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^FENCE://' > "$OUTPUT_DIR/cutover_fence_log.txt" || true
-    grep '^TRUTH:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/^TRUTH://' > "$OUTPUT_DIR/cutover_truth_log.txt" || true
+    grep '^PHASE:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/\r$//; s/^PHASE://' > "$OUTPUT_DIR/phase_log.txt" || true
+    grep '\[teardown-phase\]' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/\r$//' > "$OUTPUT_DIR/phase_log_raw.txt" || true
+    grep '^CUTOVER:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/\r$//; s/^CUTOVER://' > "$OUTPUT_DIR/cutover_phase_log.txt" || true
+    grep '^FENCE:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/\r$//; s/^FENCE://' > "$OUTPUT_DIR/cutover_fence_log.txt" || true
+    grep '^TRUTH:' "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/\r$//; s/^TRUTH://' > "$OUTPUT_DIR/cutover_truth_log.txt" || true
 
     cp "$RUN_DIR/qemu.log" "$OUTPUT_DIR/qemu.log"
 
@@ -920,7 +921,7 @@ INITSCRIPT
 
     # Build refusal observations
     REFUSAL_LINES="$OUTPUT_DIR/refusal_lines.txt"
-    grep -E "^(PASS|FAIL): refusal_" "$RUN_DIR/qemu.log" 2>/dev/null > "$REFUSAL_LINES" || true
+    grep -E "^(PASS|FAIL): refusal_" "$RUN_DIR/qemu.log" 2>/dev/null | sed 's/\r$//' > "$REFUSAL_LINES" || true
     if [ -s "$REFUSAL_LINES" ]; then
       REFUSAL_JSON="$(
         awk '
