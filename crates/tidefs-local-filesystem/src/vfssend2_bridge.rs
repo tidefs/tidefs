@@ -43,16 +43,17 @@
 //! - Receive (VFSSEND2 → local-filesystem) is **not** yet bridged; tracked
 //!   by Review debt TFR-010 (historical issues #5949 / #6328).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tidefs_send_stream::{
-    Bytes32, DeltaObject, Id128, ObjectKind, SendBuilder, SendStreamHeader, SenderAuthority,
-    SnapshotDelta,
+    Bytes32, DeltaObject, Id128, ObjectKind, PinnedBaseRoot, SendBuilder, SendStreamHeader,
+    SenderAuthority, SnapshotDelta,
 };
 
 use crate::error::FileSystemError;
 use crate::types::{
     ChangedObjectRecord, ChangedRecordExport, ChangedRecordObjectRole, ChangedRecordRoot,
+    CommittedRootSummary,
 };
 
 /// Convert a VFSSEND1 [`ChangedRecordExport`] into a VFSSEND2-encoded stream.
@@ -109,7 +110,9 @@ fn encode_full_changed_records_as_vfssend2(
 ///
 /// Object filtering is done at the VFSSEND1 export layer
 /// ([`crate::send_receive::export_incremental_changed_records`]), so the
-/// base-object-digest map passed to [`SendBuilder::incremental`] is empty.
+/// base-object-digest map passed to
+/// [`SendBuilder::incremental_from_base`] is empty while the lineage manifest
+/// still carries a pinned base-root identity.
 pub fn export_incremental_vfssend2_from_changed_records(
     export: &ChangedRecordExport,
     pool_id: Id128,
@@ -158,9 +161,19 @@ fn encode_incremental_changed_records_as_vfssend2(
         build_header_and_snapshots(export, pool_id, dataset_id, sender_authority)?;
     let header = header.incremental_from(from_snapshot_id);
 
-    let builder = SendBuilder::incremental(header, snapshots, std::collections::BTreeMap::new())
-        .map_err(|e| FileSystemError::LifecycleError {
-            reason: format!("VFSSEND2 SendBuilder::incremental: {e}"),
+    let base_root = PinnedBaseRoot::new(
+        dataset_id,
+        from_snapshot_id,
+        changed_record_root_digest(dataset_id, from_snapshot_id, from_root),
+        BTreeMap::new(),
+        true,
+    );
+
+    let builder =
+        SendBuilder::incremental_from_base(header, snapshots, base_root).map_err(|e| {
+            FileSystemError::LifecycleError {
+                reason: format!("VFSSEND2 SendBuilder::incremental: {e}"),
+            }
         })?;
 
     builder
@@ -244,6 +257,23 @@ fn make_snapshot_id(transaction_id: u64, generation: u64) -> Id128 {
     id[0..8].copy_from_slice(&transaction_id.to_le_bytes());
     id[8..16].copy_from_slice(&generation.to_le_bytes());
     id
+}
+
+fn changed_record_root_digest(
+    dataset_id: Id128,
+    snapshot_id: Id128,
+    root: &CommittedRootSummary,
+) -> Bytes32 {
+    let mut hasher = blake3::Hasher::new_derive_key("TideFS VFSSEND2 local root summary digest v1");
+    hasher.update(&dataset_id);
+    hasher.update(&snapshot_id);
+    hasher.update(&root.slot.to_le_bytes());
+    hasher.update(&root.transaction_id.to_le_bytes());
+    hasher.update(&root.generation.to_le_bytes());
+    hasher.update(&root.superblock_checksum.0.to_le_bytes());
+    hasher.update(&root.manifest_checksum.0.to_le_bytes());
+    hasher.update(&root.manifest_entry_count.to_le_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 #[cfg(test)]
@@ -462,12 +492,14 @@ mod tests {
             total_records: 1,
             payload_bytes: 4,
             production_fsck_required: false,
-            from_root: Some(from_summary),
+            from_root: Some(from_summary.clone()),
             incremental: true,
             placement_epoch: None,
         };
         let pool_id = [11u8; 16];
         let dataset_id = [22u8; 16];
+        let expected_from_snapshot_id =
+            make_snapshot_id(from_summary.transaction_id, from_summary.generation);
         let result = export_incremental_vfssend2_from_changed_records(&export, pool_id, dataset_id);
         assert!(result.is_ok(), "expected ok, got {result:?}");
         let encoded = result.unwrap();
@@ -477,6 +509,11 @@ mod tests {
             tidefs_send_stream::STREAM_MAGIC,
             "VFSSEND2 magic bytes must be present"
         );
+        let (header, _tail) = tidefs_send_stream::SendStreamHeader::decode(&encoded).unwrap();
+        assert!(header
+            .flags
+            .contains(tidefs_send_stream::StreamFlags::INCREMENTAL));
+        assert_eq!(header.from_snapshot_id, expected_from_snapshot_id);
     }
 
     #[test]
