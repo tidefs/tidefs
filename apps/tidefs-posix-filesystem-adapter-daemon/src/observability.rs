@@ -246,6 +246,68 @@ pub fn fuse_admission_reason_snapshot() -> FuseAdmissionReasonSnapshot {
     }
 }
 
+/// Reason class recorded when the FUSE prune-notify boundary cannot emit.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum FusePruneNotificationUnavailableReason {
+    /// The active fuser boundary has no `FUSE_NOTIFY_PRUNE`/equivalent sender.
+    FuserNotifyPruneUnsupported,
+    /// The boundary exists, but the kernel/user send failed for this candidate.
+    NotifySendFailed,
+}
+
+static FUSE_PRUNE_NOTIFICATION_SENT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FUSE_PRUNE_NOTIFICATION_ACKNOWLEDGED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FUSE_PRUNE_NOTIFICATION_UNAVAILABLE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FUSE_PRUNE_NOTIFICATION_UNSUPPORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FUSE_PRUNE_NOTIFICATION_SEND_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Point-in-time snapshot of governor-driven FUSE prune notification counters.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct FusePruneNotificationSnapshot {
+    pub sent: u64,
+    pub acknowledged: u64,
+    pub unavailable: u64,
+    pub unavailable_unsupported: u64,
+    pub unavailable_send_failed: u64,
+}
+
+/// Record one prune notification handed to the active FUSE boundary.
+pub fn record_fuse_prune_notification_sent() {
+    FUSE_PRUNE_NOTIFICATION_SENT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one prune notification accepted by the active FUSE boundary.
+pub fn record_fuse_prune_notification_acknowledged() {
+    FUSE_PRUNE_NOTIFICATION_ACKNOWLEDGED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one unavailable prune notification boundary or send result.
+pub fn record_fuse_prune_notification_unavailable(
+    reason: FusePruneNotificationUnavailableReason,
+) {
+    FUSE_PRUNE_NOTIFICATION_UNAVAILABLE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    match reason {
+        FusePruneNotificationUnavailableReason::FuserNotifyPruneUnsupported => {
+            FUSE_PRUNE_NOTIFICATION_UNSUPPORTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        FusePruneNotificationUnavailableReason::NotifySendFailed => {
+            FUSE_PRUNE_NOTIFICATION_SEND_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Return the current governor-driven FUSE prune notification counters.
+#[must_use]
+pub fn fuse_prune_notification_snapshot() -> FusePruneNotificationSnapshot {
+    FusePruneNotificationSnapshot {
+        sent: FUSE_PRUNE_NOTIFICATION_SENT_TOTAL.load(Ordering::Relaxed),
+        acknowledged: FUSE_PRUNE_NOTIFICATION_ACKNOWLEDGED_TOTAL.load(Ordering::Relaxed),
+        unavailable: FUSE_PRUNE_NOTIFICATION_UNAVAILABLE_TOTAL.load(Ordering::Relaxed),
+        unavailable_unsupported: FUSE_PRUNE_NOTIFICATION_UNSUPPORTED_TOTAL.load(Ordering::Relaxed),
+        unavailable_send_failed: FUSE_PRUNE_NOTIFICATION_SEND_FAILED_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shutdown summary emission
 // ---------------------------------------------------------------------------
