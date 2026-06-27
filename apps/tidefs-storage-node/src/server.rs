@@ -6101,8 +6101,9 @@ mod cluster_pool_handler_tests {
         ReplicaPlacementReceipt, ReplicatedReceiptId, ReplicatedSubjectId,
     };
 
-    /// Minimum device size for pool creation: 2 * 256KB labels + 8KB offset + 256KB commit region.
-    const DEVICE_BYTES: u64 = 2_000_000;
+    /// Keep regular-file test media at the development image size so the
+    /// object-store backend does not grow files after pool labels are written.
+    const DEVICE_BYTES: u64 = vfs::DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES;
 
     fn make_device(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
         let path = dir.path().join(name);
