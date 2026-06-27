@@ -940,6 +940,28 @@ impl PrefetchExecutorResultDetail {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorTerminalUpdate {
+    pub outcome: PrefetchExecutorOutcome,
+    pub result_detail: PrefetchExecutorResultDetail,
+    pub refusal: StorageIntentRefusalReason,
+    pub handoff_target: PrefetchExecutorHandoffTarget,
+    pub result_refusal_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for PrefetchExecutorTerminalUpdate {
+    fn default() -> Self {
+        Self {
+            outcome: PrefetchExecutorOutcome::Unknown,
+            result_detail: PrefetchExecutorResultDetail::default(),
+            refusal: StorageIntentRefusalReason::None,
+            handoff_target: PrefetchExecutorHandoffTarget::None,
+            result_refusal_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct PrefetchExecutorInput {
     pub decision: PrefetchResidencyDecisionRecord,
     pub evidence_query_snapshot: StorageIntentEvidenceQuerySnapshot,
@@ -1458,6 +1480,67 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
     }
 }
 
+#[must_use]
+pub fn finalize_prefetch_execution(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> PrefetchExecutorRecord {
+    if record.outcome != PrefetchExecutorOutcome::Started
+        || !terminal_update_outcome_allowed(update.outcome)
+    {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            StorageIntentRefusalReason::EvidenceNotUsable,
+        );
+    }
+
+    let mut record = record;
+    record.result_detail = update.result_detail;
+    record.evidence_refs.attribution_ref = update.result_detail.attribution_ref;
+    record.evidence_refs.retention_ref = update.result_detail.retention_ref;
+    record.evidence_refs.validation_ref = update.result_detail.validation_ref;
+    if update.result_refusal_ref.is_bound() {
+        record.evidence_refs.result_refusal_ref = update.result_refusal_ref;
+    }
+
+    if terminal_result_detail_is_inconsistent(update.result_detail) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::VerificationFailed,
+            PrefetchExecutorByteState::Refused,
+            StorageIntentRefusalReason::ValidationGateFailed,
+        );
+    }
+
+    if terminal_result_detail_exceeds_executor_limit(record, update.result_detail) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::OverBudget,
+            PrefetchExecutorByteState::Blocked,
+            StorageIntentRefusalReason::OverBudget,
+        );
+    }
+
+    if update.outcome == PrefetchExecutorOutcome::HandoffRequired {
+        if update.handoff_target == PrefetchExecutorHandoffTarget::None {
+            return terminal(
+                record,
+                PrefetchExecutorOutcome::Blocked,
+                PrefetchExecutorByteState::Blocked,
+                StorageIntentRefusalReason::EvidenceNotUsable,
+            );
+        }
+        record.handoff_target = update.handoff_target;
+    }
+
+    record.executor_byte_state = terminal_update_byte_state(record.executor_byte_state, update);
+    record.outcome = update.outcome;
+    record.refusal = terminal_update_refusal(update);
+    record
+}
+
 fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
     let family = if matches!(input.action_family, PrefetchExecutorActionFamily::Unknown) {
         PrefetchExecutorActionFamily::from_candidate(input.decision.selected_candidate)
@@ -1525,6 +1608,100 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
         },
         ..PrefetchExecutorRecord::default()
     }
+}
+
+fn terminal_update_outcome_allowed(outcome: PrefetchExecutorOutcome) -> bool {
+    matches!(
+        outcome,
+        PrefetchExecutorOutcome::Dropped
+            | PrefetchExecutorOutcome::Throttled
+            | PrefetchExecutorOutcome::Completed
+            | PrefetchExecutorOutcome::Stale
+            | PrefetchExecutorOutcome::TimedOut
+            | PrefetchExecutorOutcome::Refused
+            | PrefetchExecutorOutcome::DegradedVisible
+            | PrefetchExecutorOutcome::OverBudget
+            | PrefetchExecutorOutcome::VerificationFailed
+            | PrefetchExecutorOutcome::HandoffRequired
+            | PrefetchExecutorOutcome::Blocked
+            | PrefetchExecutorOutcome::Unavailable
+    )
+}
+
+fn terminal_update_byte_state(
+    prior: PrefetchExecutorByteState,
+    update: PrefetchExecutorTerminalUpdate,
+) -> PrefetchExecutorByteState {
+    match update.outcome {
+        PrefetchExecutorOutcome::Completed
+        | PrefetchExecutorOutcome::Dropped
+        | PrefetchExecutorOutcome::Throttled => prior,
+        PrefetchExecutorOutcome::DegradedVisible => PrefetchExecutorByteState::DegradedVisible,
+        PrefetchExecutorOutcome::Stale
+        | PrefetchExecutorOutcome::OverBudget
+        | PrefetchExecutorOutcome::Blocked => PrefetchExecutorByteState::Blocked,
+        PrefetchExecutorOutcome::TimedOut | PrefetchExecutorOutcome::Unavailable => {
+            PrefetchExecutorByteState::Unavailable
+        }
+        PrefetchExecutorOutcome::Refused | PrefetchExecutorOutcome::VerificationFailed => {
+            PrefetchExecutorByteState::Refused
+        }
+        PrefetchExecutorOutcome::HandoffRequired => PrefetchExecutorByteState::HandoffRequired,
+        PrefetchExecutorOutcome::Unknown | PrefetchExecutorOutcome::Started => {
+            PrefetchExecutorByteState::Blocked
+        }
+    }
+}
+
+fn terminal_update_refusal(update: PrefetchExecutorTerminalUpdate) -> StorageIntentRefusalReason {
+    if update.refusal != StorageIntentRefusalReason::None {
+        return update.refusal;
+    }
+
+    match update.outcome {
+        PrefetchExecutorOutcome::Completed
+        | PrefetchExecutorOutcome::DegradedVisible
+        | PrefetchExecutorOutcome::HandoffRequired => StorageIntentRefusalReason::None,
+        PrefetchExecutorOutcome::OverBudget => StorageIntentRefusalReason::OverBudget,
+        PrefetchExecutorOutcome::VerificationFailed => {
+            StorageIntentRefusalReason::ValidationGateFailed
+        }
+        PrefetchExecutorOutcome::Dropped
+        | PrefetchExecutorOutcome::Throttled
+        | PrefetchExecutorOutcome::Stale
+        | PrefetchExecutorOutcome::TimedOut
+        | PrefetchExecutorOutcome::Refused
+        | PrefetchExecutorOutcome::Blocked
+        | PrefetchExecutorOutcome::Unavailable
+        | PrefetchExecutorOutcome::Unknown
+        | PrefetchExecutorOutcome::Started => StorageIntentRefusalReason::EvidenceNotUsable,
+    }
+}
+
+fn terminal_result_detail_is_inconsistent(detail: PrefetchExecutorResultDetail) -> bool {
+    match detail
+        .used_bytes
+        .checked_add(detail.unused_bytes)
+        .and_then(|accounted_bytes| accounted_bytes.checked_add(detail.expired_bytes))
+    {
+        Some(accounted_bytes) => accounted_bytes > detail.prefetched_bytes,
+        None => true,
+    }
+}
+
+fn terminal_result_detail_exceeds_executor_limit(
+    record: PrefetchExecutorRecord,
+    detail: PrefetchExecutorResultDetail,
+) -> bool {
+    let byte_limit = match record.action_family {
+        PrefetchExecutorActionFamily::WanGeoDeltaPrefetch
+        | PrefetchExecutorActionFamily::ObjectArchiveRestoreStaging => record.max_staging_bytes,
+        _ => record.max_prefetch_window_bytes,
+    };
+
+    (byte_limit != 0 && detail.prefetched_bytes > byte_limit)
+        || (record.max_staging_bytes != 0
+            && detail.staging_capacity_bytes > record.max_staging_bytes)
 }
 
 fn terminal(
@@ -2247,6 +2424,33 @@ mod tests {
         assert!(!record.implies_ram_authority());
         assert!(!record.implies_geo_freshness_authority());
         assert!(!record.can_make_successor_comparator_claim());
+    }
+
+    fn terminal_detail() -> PrefetchExecutorResultDetail {
+        PrefetchExecutorResultDetail {
+            prefetched_bytes: 128 * 1024,
+            used_bytes: 96 * 1024,
+            unused_bytes: 16 * 1024,
+            expired_bytes: 16 * 1024,
+            latency_benefit_us: 900,
+            latency_harm_us: 7,
+            foreground_p99_disruption_us: 13,
+            queue_delay_us: 5,
+            flash_write_bytes: 512,
+            waf_micros: 1_050_000,
+            cpu_us: 33,
+            memory_bytes: 16 * 1024,
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            retention_ref: evidence(
+                StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+                RETENTION,
+            ),
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+            ..PrefetchExecutorResultDetail::default()
+        }
     }
 
     #[test]
@@ -3139,5 +3343,221 @@ mod tests {
         );
         assert!(record.is_non_authority_population());
         assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn terminal_update_completes_started_record_without_authority() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let detail = terminal_detail();
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            OUTSIDE_CUT,
+        );
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                result_refusal_ref: result_ref,
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
+        assert_eq!(completed.refusal, StorageIntentRefusalReason::None);
+        assert_eq!(completed.executor_byte_state, started.executor_byte_state);
+        assert_eq!(completed.result_detail, detail);
+        assert_eq!(
+            completed.evidence_refs.attribution_ref,
+            detail.attribution_ref
+        );
+        assert_eq!(completed.evidence_refs.retention_ref, detail.retention_ref);
+        assert_eq!(
+            completed.evidence_refs.validation_ref,
+            detail.validation_ref
+        );
+        assert_eq!(completed.evidence_refs.result_refusal_ref, result_ref);
+        assert!(completed.has_feedback_payback_inputs());
+        assert!(completed.result_detail.has_feedback_evidence_root());
+        assert!(completed.is_non_authority_population());
+        assert_record_has_no_authority_claims(completed);
+    }
+
+    #[test]
+    fn terminal_update_requires_started_record() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
+        input.admission = PrefetchExecutorAdmissionRecord::default();
+        let no_prefetch = evaluate_prefetch_execution(input);
+        assert_eq!(no_prefetch.outcome, PrefetchExecutorOutcome::Completed);
+
+        let blocked = finalize_prefetch_execution(
+            no_prefetch,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: terminal_detail(),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(blocked.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            blocked.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_eq!(
+            blocked.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+        assert_record_has_no_authority_claims(blocked);
+    }
+
+    #[test]
+    fn terminal_update_rejects_impossible_or_over_limit_byte_accounting() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+
+        let impossible = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: PrefetchExecutorResultDetail {
+                    prefetched_bytes: 4 * 1024,
+                    used_bytes: 4 * 1024,
+                    unused_bytes: 1024,
+                    validation_ref: evidence(
+                        StorageIntentEvidenceKind::ValidationArtifact,
+                        VALIDATION,
+                    ),
+                    ..PrefetchExecutorResultDetail::default()
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            impossible.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            impossible.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            impossible.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(impossible);
+
+        let mut unlimited = started;
+        unlimited.max_prefetch_window_bytes = u64::MAX;
+        let overflow = finalize_prefetch_execution(
+            unlimited,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: PrefetchExecutorResultDetail {
+                    prefetched_bytes: u64::MAX,
+                    used_bytes: u64::MAX,
+                    unused_bytes: 1,
+                    ..PrefetchExecutorResultDetail::default()
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            overflow.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            overflow.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            overflow.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(overflow);
+
+        let over_limit = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: PrefetchExecutorResultDetail {
+                    prefetched_bytes: started.max_prefetch_window_bytes + 1,
+                    ..PrefetchExecutorResultDetail::default()
+                },
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(over_limit.outcome, PrefetchExecutorOutcome::OverBudget);
+        assert_eq!(over_limit.refusal, StorageIntentRefusalReason::OverBudget);
+        assert_eq!(
+            over_limit.executor_byte_state,
+            PrefetchExecutorByteState::Blocked
+        );
+        assert_record_has_no_authority_claims(over_limit);
+    }
+
+    #[test]
+    fn terminal_update_projects_failure_and_handoff_without_receipt_power() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+
+        let failed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::VerificationFailed,
+                result_detail: terminal_detail(),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(failed.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            failed.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            failed.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(failed);
+
+        let handoff_without_target = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::HandoffRequired,
+                result_detail: terminal_detail(),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            handoff_without_target.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+
+        let handoff = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::HandoffRequired,
+                result_detail: terminal_detail(),
+                handoff_target: PrefetchExecutorHandoffTarget::Promotion,
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(handoff.outcome, PrefetchExecutorOutcome::HandoffRequired);
+        assert_eq!(
+            handoff.executor_byte_state,
+            PrefetchExecutorByteState::HandoffRequired
+        );
+        assert_eq!(
+            handoff.handoff_target,
+            PrefetchExecutorHandoffTarget::Promotion
+        );
+        assert_record_has_no_authority_claims(handoff);
     }
 }
