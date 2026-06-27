@@ -2,6 +2,7 @@
 use std::fmt;
 
 use tidefs_local_object_store::StoreError;
+use tidefs_receive_stream::ReceiverRefusalReason;
 use tidefs_storage_intent_read_serving::ReadServingDecisionRecord;
 use tidefs_types_space_accounting_core::AdmissionResult;
 use tidefs_types_vfs_core::{InodeId, NodeKind};
@@ -222,6 +223,11 @@ pub enum FileSystemError {
     StaleSenderGeneration {
         reason: &'static str,
     },
+    /// Distributed snapshot receive was refused/deferred with a stable
+    /// receiver-side reason that maps to the scheduler admission policy.
+    ReceiveStreamRefused {
+        reason: ReceiverRefusalReason,
+    },
     /// Local readback or degraded-read source selection could not verify
     /// the pool placement receipt for an object key because the pool is
     /// unavailable (I/O error, device fault, or pool not open).
@@ -426,6 +432,12 @@ impl fmt::Display for FileSystemError {
             Self::StaleSenderGeneration { reason } => {
                 write!(f, "stale sender generation: {reason}")
             }
+            Self::ReceiveStreamRefused { reason } => write!(
+                f,
+                "receive stream refused: {} (suggested action: {:?})",
+                reason.scheduler_policy_reason(),
+                reason.recovery_action()
+            ),
             Self::ReceiptAuthorityUnavailable { object_key, expected_generation } => {
                 write!(f, "placement receipt authority unavailable for object key {object_key:?}: expected generation {expected_generation}")
             }
@@ -469,6 +481,22 @@ impl FileSystemError {
                 ..
             }
         )
+    }
+
+    pub const fn receiver_refusal_reason(&self) -> Option<ReceiverRefusalReason> {
+        match self {
+            Self::ReceiveStreamRefused { reason } => Some(*reason),
+            Self::IncrementalReceiveBaseRootConflict { .. } => {
+                Some(ReceiverRefusalReason::ReceiverMissingBase)
+            }
+            Self::CrossPoolReceiveUnauthorized { .. }
+            | Self::CrossPoolReceiveAuthorizationMismatch { .. }
+            | Self::MalformedSenderAuthority { .. } => {
+                Some(ReceiverRefusalReason::ReceiverRejectedPolicy)
+            }
+            Self::StaleSenderGeneration { .. } => Some(ReceiverRefusalReason::SenderAuthorityStale),
+            _ => None,
+        }
     }
 }
 

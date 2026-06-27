@@ -31,6 +31,7 @@ pub mod assembler;
 pub mod decoder;
 pub mod dispatch;
 pub mod receive_persistence;
+pub mod session;
 
 use tidefs_binary_schema_core::{DomainTag, SchemaFamilyId, SchemaTypeId, SchemaVersion};
 
@@ -62,4 +63,12 @@ pub use decoder::{ChunkDecodeError, ChunkDecoder, FramedChunk};
 pub use dispatch::{receive_object, NoOpDispatch, ReceiveDispatch};
 pub use receive_persistence::{
     BaseRootPinLookup, ReceiveContract, ReceivePersistenceBridge, ReceivePersistenceError,
+};
+pub use session::{
+    decode_receive_checkpoint, encode_receive_checkpoint, ExpectedSenderAuthority,
+    InMemoryReceiveCheckpointStore, ReceiveCheckpointCodecError, ReceiveCheckpointStore,
+    ReceiveCheckpointStoreError, ReceiveSession, ReceiveSessionError, ReceiveSessionKey,
+    ReceiveSessionOutcome, ReceiverAdmission, ReceiverAuthorityView, ReceiverFeatureSupport,
+    ReceiverRecoveryAction, ReceiverRefusal, ReceiverRefusalEvidence, ReceiverRefusalReason,
+    StaticReceiverAuthorityView,
 };
