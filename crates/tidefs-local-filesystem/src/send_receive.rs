@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tidefs_extent_map::ExtentMap;
+use tidefs_local_object_store::pool::Pool;
 use tidefs_local_object_store::{
     checksum64, IntegrityDigest64, LocalObjectStore, ObjectKey, StoreError, StoreOptions,
 };
@@ -18,6 +19,7 @@ use tidefs_types_vfs_core::{InodeId, NodeKind};
 
 use crate::constants::*;
 use crate::content::*;
+use crate::dedup::DedupIndex;
 use crate::encoding::*;
 use crate::encoding::{decode_dedup_redirect, is_dedup_redirect};
 use crate::error::{
@@ -1395,9 +1397,54 @@ pub(crate) fn changed_record_payload(
         })
 }
 
-fn validate_incremental_target_content_objects(
+fn validate_incremental_content_entry_payload(
+    store: &LocalObjectStore,
+    entry: &TransactionManifestEntry,
+    missing_reason: &'static str,
+    checksum_reason: &'static str,
+) -> Result<()> {
+    let payload = store
+        .get(entry.object_key)?
+        .ok_or(FileSystemError::Decode {
+            object: "local filesystem incremental receive target",
+            reason: missing_reason,
+        })?;
+    if checksum64(&payload) != entry.checksum {
+        return Err(FileSystemError::Decode {
+            object: "local filesystem incremental receive target",
+            reason: checksum_reason,
+        });
+    }
+    Ok(())
+}
+
+fn validate_omitted_incremental_content_manifest(
+    store: &LocalObjectStore,
+    root: &PreparedChangedRecordRoot,
+    entry: &TransactionManifestEntry,
+) -> Result<()> {
+    let inode = root
+        .state
+        .inodes
+        .values()
+        .find(|inode| {
+            inode.is_file_like()
+                && content_object_key_for_version(inode.inode_id, inode.data_version)
+                    == entry.object_key
+        })
+        .ok_or(FileSystemError::Decode {
+            object: "local filesystem incremental receive target",
+            reason: "omitted content manifest has no matching file inode",
+        })?;
+
+    let _content = read_content_from_store(store, inode.inode_id, inode, true, None)?;
+    Ok(())
+}
+
+fn validate_incremental_content_objects(
     store: &LocalObjectStore,
     prepared: &PreparedChangedRecordExport,
+    omitted_only: bool,
 ) -> Result<()> {
     for root in &prepared.roots {
         let manifest_key = transaction_manifest_object_key(root.source_root.transaction_id);
@@ -1415,63 +1462,51 @@ fn validate_incremental_target_content_objects(
             .iter()
             .filter(|entry| manifest_role_is_content(entry.role))
         {
-            let payload = store
-                .get(entry.object_key)?
-                .ok_or(FileSystemError::Decode {
-                    object: "local filesystem incremental receive target",
-                    reason: "content object required by incoming manifest is missing from target",
-                })?;
-            if checksum64(&payload) != entry.checksum {
-                return Err(FileSystemError::Decode {
-                    object: "local filesystem incremental receive target",
-                    reason:
-                        "content object required by incoming manifest failed checksum validation",
-                });
+            let stream_carries_entry = root.records.contains_key(&entry.object_key);
+            if stream_carries_entry {
+                if omitted_only {
+                    continue;
+                }
+                validate_incremental_content_entry_payload(
+                    store,
+                    entry,
+                    "content object required by incoming manifest is missing from target",
+                    "content object required by incoming manifest failed checksum validation",
+                )?;
+                continue;
+            }
+
+            match entry.role {
+                TransactionManifestObjectRole::VersionedContent => {
+                    validate_omitted_incremental_content_manifest(store, root, entry)?;
+                }
+                TransactionManifestObjectRole::VersionedContentChunk => {
+                    validate_incremental_content_entry_payload(
+                        store,
+                        entry,
+                        "omitted content object required by incremental base is missing from target",
+                        "omitted content object required by incremental base failed checksum validation",
+                    )?;
+                }
+                _ => {}
             }
         }
     }
     Ok(())
 }
 
+fn validate_incremental_target_content_objects(
+    store: &LocalObjectStore,
+    prepared: &PreparedChangedRecordExport,
+) -> Result<()> {
+    validate_incremental_content_objects(store, prepared, false)
+}
+
 fn validate_incremental_omitted_content_objects(
     store: &LocalObjectStore,
     prepared: &PreparedChangedRecordExport,
 ) -> Result<()> {
-    for root in &prepared.roots {
-        let manifest_key = transaction_manifest_object_key(root.source_root.transaction_id);
-        let manifest_record = root
-            .records
-            .get(&manifest_key)
-            .ok_or(FileSystemError::Decode {
-                object: "local filesystem send/receive root",
-                reason: "incremental receive root is missing its transaction manifest record",
-            })?;
-        let manifest = decode_transaction_manifest(&manifest_record.payload)?;
-
-        for entry in manifest
-            .entries
-            .iter()
-            .filter(|entry| manifest_role_is_content(entry.role))
-        {
-            if root.records.contains_key(&entry.object_key) {
-                continue;
-            }
-            let payload = store
-                .get(entry.object_key)?
-                .ok_or(FileSystemError::Decode {
-                    object: "local filesystem incremental receive target",
-                    reason: "omitted content object required by incremental base is missing from target",
-                })?;
-            if checksum64(&payload) != entry.checksum {
-                return Err(FileSystemError::Decode {
-                    object: "local filesystem incremental receive target",
-                    reason:
-                        "omitted content object required by incremental base failed checksum validation",
-                });
-            }
-        }
-    }
-    Ok(())
+    validate_incremental_content_objects(store, prepared, true)
 }
 
 fn target_has_incremental_base_root_slot(
@@ -1612,6 +1647,48 @@ pub(crate) fn rewrite_snapshot_roots_for_import(
                 reason: "current snapshot root was not imported before the current root",
             });
         }
+    }
+    Ok(())
+}
+
+fn receive_completed_content_record_is_valid(
+    store: &LocalObjectStore,
+    record: &ChangedObjectRecord,
+) -> Result<bool> {
+    let Some(payload) = store.get(record.object_key)? else {
+        return Ok(false);
+    };
+    Ok(checksum64(&payload) == record.checksum)
+}
+
+fn normalize_received_content_receipts(
+    pool: &mut Pool,
+    state: &FileSystemState,
+    normalized_content: &mut BTreeSet<ObjectKey>,
+) -> Result<()> {
+    let mut dedup_index = DedupIndex::new();
+    for inode in state.inodes.values() {
+        if !inode.is_file_like() || inode.size == 0 {
+            continue;
+        }
+        let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
+        if !normalized_content.insert(content_key) {
+            continue;
+        }
+        // Decode imported bytes without trusting the sender's placement receipt,
+        // then rewrite once through the target pool so root manifests stay stable.
+        let content =
+            read_content_from_store(pool.raw_primary_store(), inode.inode_id, inode, true, None)?;
+        let mut store = pool.pool_store_mut();
+        write_chunked_content(
+            false,
+            &mut store,
+            inode,
+            &content,
+            &mut dedup_index,
+            None,
+            &state.content_compression_policy,
+        )?;
     }
     Ok(())
 }
@@ -1773,42 +1850,46 @@ pub(crate) fn receive_incremental_changed_records(
     // Prove base content first, then apply changed content and prove every
     // incoming manifest content reference before publishing a new root slot.
     let mut pool = LocalFileSystem::default_development_pool(root, &options, None, None)?;
-    let store = pool.raw_primary_store_mut();
 
     // When the merge plan is present, the target may not hold the base root;
     // base-state loading and omitted-content validation are skipped.  Object-
     // level import decisions come from the merge plan instead.
     let has_merge_plan = merge_plan.is_some();
-    if !has_merge_plan {
-        let base_root = root_commit_from_summary(&authorized_base);
-        let _base_state = load_state_from_transaction(store, &base_root, root_authentication_key)?;
-    }
+    {
+        let store = pool.raw_primary_store_mut();
+        if !has_merge_plan {
+            let base_root = root_commit_from_summary(&authorized_base);
+            let _base_state =
+                load_state_from_transaction(store, &base_root, root_authentication_key)?;
+        }
 
-    for root_rec in &prepared.roots {
-        for record in root_rec.records.values() {
-            if matches!(
-                record.role,
-                ChangedRecordObjectRole::VersionedContent
-                    | ChangedRecordObjectRole::VersionedContentChunk
-            ) {
-                // When a merge plan is present, consult it for per-object
-                // import decisions: skip objects marked KeepLocal so the
-                // target's existing version is preserved.
-                if !should_import_object(merge_plan, &record.object_key) {
-                    continue;
+        for root_rec in &prepared.roots {
+            for record in root_rec.records.values() {
+                if matches!(
+                    record.role,
+                    ChangedRecordObjectRole::VersionedContent
+                        | ChangedRecordObjectRole::VersionedContentChunk
+                ) {
+                    // When a merge plan is present, consult it for per-object
+                    // import decisions: skip objects marked KeepLocal so the
+                    // target's existing version is preserved.
+                    if !should_import_object(merge_plan, &record.object_key) {
+                        continue;
+                    }
+                    store.put(record.object_key, &record.payload)?;
                 }
-                store.put(record.object_key, &record.payload)?;
             }
         }
-    }
-    if !has_merge_plan {
-        validate_incremental_target_content_objects(store, &prepared)?;
+        if !has_merge_plan {
+            validate_incremental_target_content_objects(store, &prepared)?;
+        }
     }
 
     // Persist all roots (re-signing with the target's authentication key).
     let mut roots = prepared.roots.clone();
     roots.sort_by_key(|r| r.source_root.transaction_id);
     let mut imported_summaries = BTreeMap::new();
+    let mut normalized_content = BTreeSet::new();
     let mut selected_summary = None;
     let mut snapshot_catalog_entries = 0_usize;
 
@@ -1820,10 +1901,14 @@ pub(crate) fn receive_incremental_changed_records(
             &imported_summaries,
             identity == prepared.current_identity,
         )?;
-        let unsigned_root =
-            persist_transaction_objects(store, &state, root_rec.source_root.transaction_id)?;
+        normalize_received_content_receipts(&mut pool, &state, &mut normalized_content)?;
+        let unsigned_root = persist_transaction_objects(
+            pool.raw_primary_store_mut(),
+            &state,
+            root_rec.source_root.transaction_id,
+        )?;
         let signed_root = sign_root_commit(&unsigned_root, root_authentication_key)?;
-        store.put(
+        pool.raw_primary_store_mut().put(
             root_slot_object_key(signed_root.slot),
             &encode_root_commit(&signed_root),
         )?;
@@ -1834,8 +1919,11 @@ pub(crate) fn receive_incremental_changed_records(
         }
         imported_summaries.insert(identity, summary);
     }
-    store.sync_all()?;
-    let final_audit = crate::recovery::audit_recovery_store(store, root_authentication_key)?;
+    let final_audit = {
+        let store = pool.raw_primary_store_mut();
+        store.sync_all()?;
+        crate::recovery::audit_recovery_store(store, root_authentication_key)?
+    };
     drop(pool);
 
     let selected = selected_summary.ok_or(FileSystemError::CorruptState {
@@ -2102,46 +2190,54 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
     skip_keys: &BTreeSet<ObjectKey>,
 ) -> Result<(ChangedRecordImportReport, BTreeSet<ObjectKey>)> {
     let mut pool = LocalFileSystem::default_development_pool(staging_root, &options, None, None)?;
-    let store = pool.raw_primary_store_mut();
     let export_identity = compute_export_identity_from_prepared(&prepared);
 
     // Load any existing checkpoint and merge with caller-provided skip set.
     let mut completed = skip_keys.clone();
-    if let Some(existing_cp) = load_receive_checkpoint(store)? {
-        if existing_cp.export_identity == export_identity {
-            completed.extend(existing_cp.completed_keys);
-        }
-    }
-
-    // Phase 1: write content objects, skipping already-persisted keys.
     let mut newly_persisted = BTreeSet::new();
-    for root in &prepared.roots {
-        for record in root.records.values() {
-            if matches!(
-                record.role,
-                ChangedRecordObjectRole::VersionedContent
-                    | ChangedRecordObjectRole::VersionedContentChunk
-            ) && !completed.contains(&record.object_key)
-            {
+    {
+        let store = pool.raw_primary_store_mut();
+        if let Some(existing_cp) = load_receive_checkpoint(store)? {
+            if existing_cp.export_identity == export_identity {
+                completed.extend(existing_cp.completed_keys);
+            }
+        }
+
+        // Phase 1: write content objects, skipping only verified staged keys.
+        for root in &prepared.roots {
+            for record in root.records.values() {
+                if !matches!(
+                    record.role,
+                    ChangedRecordObjectRole::VersionedContent
+                        | ChangedRecordObjectRole::VersionedContentChunk
+                ) {
+                    continue;
+                }
+                if completed.contains(&record.object_key)
+                    && receive_completed_content_record_is_valid(store, record)?
+                {
+                    continue;
+                }
                 store.put(record.object_key, &record.payload)?;
                 completed.insert(record.object_key);
                 newly_persisted.insert(record.object_key);
             }
         }
-    }
 
-    // Persist checkpoint after all content objects are written.
-    let checkpoint = ReceiveCheckpoint {
-        export_identity,
-        total_records: prepared.total_records,
-        completed_keys: completed.clone(),
-    };
-    write_receive_checkpoint(store, &checkpoint)?;
+        // Persist checkpoint after all content objects are written.
+        let checkpoint = ReceiveCheckpoint {
+            export_identity,
+            total_records: prepared.total_records,
+            completed_keys: completed.clone(),
+        };
+        write_receive_checkpoint(store, &checkpoint)?;
+    }
 
     // Phase 2: persist transaction objects and roots.
     let mut roots = prepared.roots.clone();
     roots.sort_by_key(|r| r.source_root.transaction_id);
     let mut imported_summaries = BTreeMap::new();
+    let mut normalized_content = BTreeSet::new();
     let mut selected_summary = None;
     let mut snapshot_catalog_entries = 0_usize;
 
@@ -2153,10 +2249,14 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
             &imported_summaries,
             identity == prepared.current_identity,
         )?;
-        let unsigned_root =
-            persist_transaction_objects(store, &state, root.source_root.transaction_id)?;
+        normalize_received_content_receipts(&mut pool, &state, &mut normalized_content)?;
+        let unsigned_root = persist_transaction_objects(
+            pool.raw_primary_store_mut(),
+            &state,
+            root.source_root.transaction_id,
+        )?;
         let signed_root = sign_root_commit(&unsigned_root, root_authentication_key)?;
-        store.put(
+        pool.raw_primary_store_mut().put(
             root_slot_object_key(signed_root.slot),
             &encode_root_commit(&signed_root),
         )?;
@@ -2167,11 +2267,14 @@ pub(crate) fn receive_changed_records_into_staging_with_skip(
         }
         imported_summaries.insert(identity, summary);
     }
-    store.sync_all()?;
 
     // Remove the checkpoint now that all roots are persisted.
-    let _ = remove_receive_checkpoint(store);
-    let audit = crate::recovery::audit_recovery_store(store, root_authentication_key)?;
+    let audit = {
+        let store = pool.raw_primary_store_mut();
+        store.sync_all()?;
+        let _ = remove_receive_checkpoint(store);
+        crate::recovery::audit_recovery_store(store, root_authentication_key)?
+    };
     drop(pool);
 
     let selected = selected_summary.ok_or(FileSystemError::CorruptState {
@@ -2619,8 +2722,9 @@ mod tests {
         std::fs::create_dir_all(&staging).expect("create staging dir");
         let all_keys: BTreeSet<ObjectKey> = all_content.iter().map(|(k, _)| *k).collect();
         {
-            let mut store = LocalObjectStore::open_with_options(&staging, opts.clone())
-                .expect("open staging store");
+            let mut pool = LocalFileSystem::default_development_pool(&staging, &opts, None, None)
+                .expect("open staging pool");
+            let store = pool.raw_primary_store_mut();
             for (key, payload) in &all_content {
                 store.put(*key, payload).expect("put content");
             }
@@ -2629,7 +2733,7 @@ mod tests {
                 total_records: prepared.total_records,
                 completed_keys: all_keys.clone(),
             };
-            write_receive_checkpoint(&mut store, &cp).expect("write checkpoint");
+            write_receive_checkpoint(store, &cp).expect("write checkpoint");
             drop(store);
         }
 
