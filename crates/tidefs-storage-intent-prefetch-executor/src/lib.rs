@@ -931,10 +931,14 @@ impl PrefetchExecutorResultDetail {
     }
 
     #[must_use]
-    pub const fn has_feedback_evidence_root(self) -> bool {
+    pub const fn has_feedback_evidence_roots(self) -> bool {
         self.attribution_ref.is_bound()
-            || self.retention_ref.is_bound()
-            || self.validation_ref.is_bound()
+            && self.attribution_ref.kind
+                == StorageIntentEvidenceKind::MeasurementAttributionEvidence
+            && self.retention_ref.is_bound()
+            && self.retention_ref.kind == StorageIntentEvidenceKind::EvidenceRetentionEvidence
+            && self.validation_ref.is_bound()
+            && self.validation_ref.kind == StorageIntentEvidenceKind::ValidationArtifact
     }
 }
 
@@ -1723,10 +1727,10 @@ fn terminal_result_detail_lacks_feedback_evidence(
     update: PrefetchExecutorTerminalUpdate,
 ) -> bool {
     update.result_detail.has_feedback_payback_inputs()
-        && !terminal_result_detail_has_cut_feedback_root(record, update)
+        && !terminal_result_detail_has_cut_feedback_roots(record, update)
 }
 
-fn terminal_result_detail_has_cut_feedback_root(
+fn terminal_result_detail_has_cut_feedback_roots(
     record: PrefetchExecutorRecord,
     update: PrefetchExecutorTerminalUpdate,
 ) -> bool {
@@ -1735,12 +1739,12 @@ fn terminal_result_detail_has_cut_feedback_root(
         update.evidence_cut,
         update.result_detail.attribution_ref,
         StorageIntentEvidenceKind::MeasurementAttributionEvidence,
-    ) || terminal_ref_in_cut(
+    ) && terminal_ref_in_cut(
         record,
         update.evidence_cut,
         update.result_detail.retention_ref,
         StorageIntentEvidenceKind::EvidenceRetentionEvidence,
-    ) || terminal_ref_in_cut(
+    ) && terminal_ref_in_cut(
         record,
         update.evidence_cut,
         update.result_detail.validation_ref,
@@ -2865,7 +2869,7 @@ mod tests {
         assert_eq!(record.subject.dataset_id, DATASET);
         assert_eq!(record.result_detail, input.result_detail);
         assert!(record.has_feedback_payback_inputs());
-        assert!(record.result_detail.has_feedback_evidence_root());
+        assert!(record.result_detail.has_feedback_evidence_roots());
         assert_eq!(
             record.evidence_refs.attribution_ref,
             input.result_detail.attribution_ref
@@ -2889,7 +2893,7 @@ mod tests {
         let record = evaluate_prefetch_execution(input);
         assert_eq!(record.outcome, PrefetchExecutorOutcome::Completed);
         assert!(!record.has_feedback_payback_inputs());
-        assert!(!record.result_detail.has_feedback_evidence_root());
+        assert!(!record.result_detail.has_feedback_evidence_roots());
     }
 
     #[test]
@@ -3517,7 +3521,7 @@ mod tests {
         );
         assert_eq!(completed.evidence_refs.result_refusal_ref, result_ref);
         assert!(completed.has_feedback_payback_inputs());
-        assert!(completed.result_detail.has_feedback_evidence_root());
+        assert!(completed.result_detail.has_feedback_evidence_roots());
         assert!(completed.is_non_authority_population());
         assert_record_has_no_authority_claims(completed);
     }
@@ -3540,7 +3544,7 @@ mod tests {
             ..PrefetchExecutorResultDetail::default()
         };
         assert!(measured_without_root.has_feedback_payback_inputs());
-        assert!(!measured_without_root.has_feedback_evidence_root());
+        assert!(!measured_without_root.has_feedback_evidence_roots());
 
         let rejected = finalize_prefetch_execution(
             started,
@@ -3564,6 +3568,88 @@ mod tests {
             PrefetchExecutorByteState::Refused
         );
         assert_record_has_no_authority_claims(rejected);
+    }
+
+    #[test]
+    fn terminal_update_rejects_partial_or_wrong_kind_feedback_roots() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+
+        let partial_detail = PrefetchExecutorResultDetail {
+            attribution_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                ATTRIBUTION,
+            ),
+            prefetched_bytes: 128 * 1024,
+            used_bytes: 96 * 1024,
+            ..PrefetchExecutorResultDetail::default()
+        };
+        assert!(partial_detail.has_feedback_payback_inputs());
+        assert!(!partial_detail.has_feedback_evidence_roots());
+
+        let rejected_partial = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: partial_detail,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    partial_detail,
+                    EMPTY_EVIDENCE_REF,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            rejected_partial.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected_partial.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected_partial.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected_partial);
+
+        let wrong_kind_detail = PrefetchExecutorResultDetail {
+            validation_ref: evidence(
+                StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+                VALIDATION,
+            ),
+            ..terminal_detail()
+        };
+        assert!(!wrong_kind_detail.has_feedback_evidence_roots());
+
+        let rejected_wrong_kind = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: wrong_kind_detail,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    wrong_kind_detail,
+                    EMPTY_EVIDENCE_REF,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            rejected_wrong_kind.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected_wrong_kind.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected_wrong_kind.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected_wrong_kind);
     }
 
     #[test]
