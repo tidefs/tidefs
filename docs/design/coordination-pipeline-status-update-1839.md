@@ -11,13 +11,18 @@ containment strategy for coordinator-sourced issues
 **Depends on**: #1738 (design seal), #1838 (health advancement strategy), #1753 (roadmap priorities)
 **Blocks**: All deferred cluster-service wire-up implementation issues
 
-> Authority note (2026-06-22): this imported May 2026 status update is
-> retained as historical design input. It is not current coordination/status
-> authority. Current work state lives in GitHub issues and pull requests, the
-> issue/branch/worktree/PR workflow lives in `docs/GITHUB_PR_DEVELOPMENT.md`,
-> imported-document authority classification lives in
-> `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, and validated claim evidence
-> lives in `validation/claims.toml`.
+> **Historical input (TFR-019 authority classification, GitHub issue #1232):**
+> This imported Forgejo-era #1839 coordination pipeline status snapshot records
+> retired design-spec metadata, `STATUS.md`/`FEATURE_MATRIX.md` references,
+> lane-health/status-record machinery, cluster-service implementation-status
+> statements, deferred-wire-up claims, active-lane gate language, and Forgejo
+> issue/scheduling concepts. Current TideFS coordination state and worker
+> scheduling authority live in GitHub issues and pull requests plus active repo
+> docs such as `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and
+> `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`; this file is not current policy,
+> automation behavior, implementation status, release-readiness evidence,
+> `STATUS.md` authority, `FEATURE_MATRIX.md` authority, lane-health authority,
+> worker scheduling authority, or product authority.
 
 ## Abstract
 
