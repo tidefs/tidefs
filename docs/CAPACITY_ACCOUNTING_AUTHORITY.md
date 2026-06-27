@@ -30,7 +30,11 @@ write admission independently.
 
 The current source does not fully implement this decision. The implementation
 still bridges several ledgers, so TFR-007 remains open until the follow-up map
-below is closed or superseded.
+below is closed or superseded. Issue #1191 narrows this by moving the remaining
+mounted `fallocate_file` and `zero_range` allocation admissions onto the
+capacity reservation lifecycle and by making `LocalFileSystem::statfs()` treat
+allocator reports as projections instead of mutating them as availability
+mirrors.
 
 ## Evidence Reviewed
 
@@ -78,11 +82,9 @@ below is closed or superseded.
 - `apps/tidefsctl/`: `dataset list` reports `available` from
   `LocalFileSystem::statfs()` and leaves `used` unset; `dataset list-props`
   reports property metadata such as `space.quota`. It is a projection surface.
-- Current GitHub state: open PR #761 owns snapshot `statfs` exclusion in
-  `crates/tidefs-local-filesystem`, `crates/tidefs-space-accounting`, and
-  `crates/tidefs-types-space-accounting-core`; open PR #613 also touches
-  local-filesystem/object-store capacity paths. Runtime follow-ups that touch
-  those paths must sequence after those PRs or explicitly rebase around them.
+- Current GitHub state: PR #613 and PR #761 have merged, admitting issue #1191
+  as the runtime closeout slice for the remaining mounted local-filesystem and
+  accounting bridges.
 
 ## Surface Classification
 
@@ -179,8 +181,8 @@ This decision does not claim:
 - production quota hierarchy enforcement is complete;
 - every write/fallocate/truncate/unlink/copy/writeback path has been collapsed
   onto one implementation lifecycle;
-- snapshot quota policy or pinned-snapshot statfs behavior beyond the live #638
-  decision and open #649/#761 implementation;
+- snapshot quota policy or pinned-snapshot statfs behavior beyond the #638
+  decision and follow-up implementation work;
 - multi-pool, multi-device, or cluster-wide fairness;
 - block-export or ublk ENOSPC parity with mounted local filesystem behavior;
 - dedup physical-byte savings are already charged through mounted capacity;
@@ -193,18 +195,18 @@ This decision does not claim:
 ## Follow-Up Issue Map
 
 The rows below are intentionally non-overlapping by expected write set. Runtime
-rows that would touch the live #613 or #761 paths are gated until those PRs are
-closed or explicitly superseded, because both currently own local-filesystem
-capacity files.
+rows that would have overlapped #613 or #761 were gated until those PRs merged;
+issue #1191 is the admitted closeout slice for the remaining local-filesystem
+capacity paths.
 
 | Slice | Issue | Expected write set | Sequencing and acceptance |
 |---|---|---|---|
-| Scope overclaim cleanup | #857 | `crates/tidefs-block-allocator/README.md`, `crates/tidefs-block-allocator/src/lib.rs` docs/comments only | Narrow allocator wording to physical placement, transactional reservation/fencing, and lower free-space input. Do not touch `CapacityAuthority` source comments while #613/#761 own that file. |
+| Scope overclaim cleanup | #857 | `crates/tidefs-block-allocator/README.md`, `crates/tidefs-block-allocator/src/lib.rs` docs/comments only | Narrow allocator wording to physical placement, transactional reservation/fencing, and lower free-space input. |
 | Adapter facade retirement | #858 | `apps/tidefs-posix-filesystem-adapter-daemon/src/capacity/` and adapter tests that import it | Delete or further quarantine the test-only `CapacityFacade`, admission lifecycle, and tracker so release code cannot consume an adapter-local capacity API. |
 | Operator capacity projection | #859 | `apps/tidefsctl/src/commands/dataset.rs` and focused CLI tests/docs only | Make `dataset list` report authority-derived used/available fields instead of mixing `statfs` availability with unset `used`. |
 | Dataset quota input bridge | #860 | `crates/tidefs-dataset-properties/` plus focused property-resolution tests | Expose resolved `space.quota` as a typed authority input. Runtime enforcement in local filesystem/space-accounting is a separate gated row. |
-| Runtime authority closeout | Deferred until #613 and #761 are closed | `crates/tidefs-local-filesystem/src/capacity_authority.rs`, `crates/tidefs-local-filesystem/src/statfs.rs`, `crates/tidefs-local-filesystem/src/lib.rs`, `crates/tidefs-space-accounting/src/lib.rs`, `crates/tidefs-types-space-accounting-core/src/lib.rs`, `crates/tidefs-local-object-store/src/store.rs` | Collapse the remaining mounted bridges among quota table checks, allocator reports, `SpaceAccounting`, `SpaceBook`, obligation/reclaim deltas, and statfs clamps. Create/admit this issue only after current overlapping PR write sets are clear. |
-| Dedup delta producer integration | #790 | `crates/tidefs-dedup/` plus the minimal write-path consumer identified by #790 | Make dedup decisions publish committed logical/physical deltas or explicit reclaim obligations to the authority. If the consumer is a #613/#761 file, gate before editing. |
+| Runtime authority closeout | #1191 | `crates/tidefs-local-filesystem/src/capacity_authority.rs`, `crates/tidefs-local-filesystem/src/statfs.rs`, `crates/tidefs-local-filesystem/src/lib.rs`, `crates/tidefs-space-accounting/src/lib.rs`, `crates/tidefs-types-space-accounting-core/src/lib.rs`, `crates/tidefs-local-object-store/src/store.rs` | Collapse the remaining mounted bridges among quota table checks, allocator reports, `SpaceAccounting`, `SpaceBook`, obligation/reclaim deltas, and statfs clamps. |
+| Dedup delta producer integration | #790 | `crates/tidefs-dedup/` plus the minimal write-path consumer identified by #790 | Make dedup decisions publish committed logical/physical deltas or explicit reclaim obligations to the authority. |
 | Physical reclaim delta integration | #791 | `crates/tidefs-segment-cleaner/` plus the minimal reclaim/allocator consumer identified by #791 | Feed committed physical reclaim evidence into authority inputs without broadening into defrag, snapshot deadlists, or distributed rebuild. |
 | Example statfs projection cleanup | #785 | `crates/tidefs-fuser/examples/simple.rs` | Keep example statfs from teaching hardcoded placeholder accounting; consume real backing state or document a proper engine hook. |
 

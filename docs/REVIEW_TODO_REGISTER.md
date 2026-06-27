@@ -463,8 +463,18 @@ Important 2026-06-01 findings:
   delta producers, projections, or reporting consumers. The document also
   records explicit non-claims and a follow-up issue map for the non-overlapping
   implementation slices needed before TFR-007 can close, including #857, #858,
-  #859, #860, existing #790/#791/#785, and the gated runtime authority closeout
-  row that must wait for overlapping #613/#761 local-filesystem capacity paths.
+  #859, #860, existing #790/#791/#785, and the #1191 runtime authority closeout
+  row admitted after overlapping #613/#761 local-filesystem capacity paths
+  merged.
+- `TFR-007`: issue #1191 moves the remaining mounted
+  `LocalFileSystem::fallocate_file()` and `LocalFileSystem::zero_range()`
+  allocation admissions from check-then-`record_allocation()` to the
+  `CapacityAuthority` reservation lifecycle. `LocalFileSystem::statfs()` now
+  keeps allocator reports as inode/policy projections and computes quota
+  availability from authority-derived available bytes instead of mutating the
+  allocator report as an adapter-local availability mirror. TFR-007 remains
+  open for the broader follow-up map across reclaim/dedup obligations,
+  physical-pool projections, and store-layer `SpaceBook` persistence.
 - `TFR-007`: commit `5a01cc11` fixes one zero-range accounting leak.
   `LocalFileSystem::zero_range()` now charges `CapacityAuthority` and physical
   `SpaceAccounting` only for holes that become allocated. Existing DATA and
