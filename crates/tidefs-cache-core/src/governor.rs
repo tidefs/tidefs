@@ -1306,6 +1306,29 @@ impl Governor {
         Self::partition_pressure_state_for_locked(&inner, partition, idx, category)
     }
 
+    /// Return pressure snapshots for every active partition in one category.
+    ///
+    /// The returned list is sorted by partition key so operator-visible
+    /// reports and tests do not depend on hash-map iteration order.
+    #[must_use]
+    pub fn partition_pressure_states(
+        &self,
+        category: BudgetCategory,
+    ) -> Vec<GovernorPartitionPressureState> {
+        let inner = self.inner.lock().unwrap();
+        let idx = Self::category_index(category);
+        let mut states = inner
+            .partitions
+            .iter()
+            .filter(|(_, state)| state.categories[idx].used > 0)
+            .map(|(&partition, _)| {
+                Self::partition_pressure_state_for_locked(&inner, partition, idx, category)
+            })
+            .collect::<Vec<_>>();
+        states.sort_by(|left, right| left.partition.as_bytes().cmp(right.partition.as_bytes()));
+        states
+    }
+
     /// Return whether auto-tune is enabled.
     #[must_use]
     pub fn auto_tune_enabled(&self) -> bool {
@@ -3405,6 +3428,53 @@ mod tests {
     }
 
     #[test]
+    fn partition_pressure_snapshot_lists_active_category_partitions() {
+        let g = Governor::new(GovernorConfig {
+            total_budget_bytes: 2000,
+            data_cache_fraction: 0.5,
+            meta_cache_fraction: 0.5,
+            dirty_bytes_fraction: 0.0,
+            inode_state_fraction: 0.0,
+            cluster_queues_fraction: 0.0,
+            misc_fraction: 0.0,
+            auto_tune: false,
+        })
+        .unwrap();
+        let first = partition_key(0x10);
+        let second = partition_key(0x30);
+
+        g.admit_for_partition(second, BudgetCategory::DataCache, 125)
+            .unwrap();
+        g.admit_for_partition(first, BudgetCategory::MetaCache, 200)
+            .unwrap();
+        g.admit_for_partition(first, BudgetCategory::DataCache, 350)
+            .unwrap();
+
+        let data_states = g.partition_pressure_states(BudgetCategory::DataCache);
+        assert_eq!(data_states.len(), 2);
+        assert_eq!(data_states[0].partition, first);
+        assert_eq!(data_states[0].used, 350);
+        assert_eq!(data_states[0].limit, 500);
+        assert_eq!(data_states[0].signal, BackpressureSignal::SoftPressure);
+        assert_eq!(data_states[1].partition, second);
+        assert_eq!(data_states[1].used, 125);
+        assert_eq!(data_states[1].limit, 500);
+        assert_eq!(data_states[1].signal, BackpressureSignal::None);
+
+        let meta_states = g.partition_pressure_states(BudgetCategory::MetaCache);
+        assert_eq!(meta_states.len(), 1);
+        assert_eq!(meta_states[0].partition, first);
+        assert_eq!(meta_states[0].used, 200);
+
+        g.release_for_partition(first, BudgetCategory::DataCache, 350);
+        let data_states = g.partition_pressure_states(BudgetCategory::DataCache);
+        assert_eq!(data_states.len(), 1);
+        assert_eq!(data_states[0].partition, second);
+        assert_eq!(data_states[0].used, 125);
+        assert_eq!(g.partition_used(first, BudgetCategory::MetaCache), 200);
+    }
+
+    #[test]
     fn share_unused_partition_policy_is_explicit_and_observable() {
         let g = Governor::new_with_partition_config(
             single_category_budget_config(BudgetCategory::DataCache, 1000),
@@ -3438,6 +3508,43 @@ mod tests {
         assert_eq!(state.protected_limit, 250);
         assert_eq!(state.shared_unused_bytes, 750);
         assert_eq!(state.signal, BackpressureSignal::None);
+    }
+
+    #[test]
+    fn share_unused_partition_snapshot_reports_live_borrow_headroom() {
+        let g = Governor::new_with_partition_config(
+            single_category_budget_config(BudgetCategory::DataCache, 1000),
+            GovernorPartitionConfig {
+                policy: BudgetPartitionPolicy::ShareUnused,
+                category_fraction: 0.25,
+                soft_fraction: 0.70,
+            },
+        )
+        .unwrap();
+        let first = partition_key(0x61);
+        let second = partition_key(0x62);
+
+        g.admit_for_partition(first, BudgetCategory::DataCache, 600)
+            .unwrap();
+        g.admit_for_partition(second, BudgetCategory::DataCache, 100)
+            .unwrap();
+
+        let states = g.partition_pressure_states(BudgetCategory::DataCache);
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].partition, first);
+        assert_eq!(states[0].used, 600);
+        assert_eq!(states[0].protected_limit, 250);
+        assert_eq!(states[0].limit, 900);
+        assert_eq!(states[0].shared_unused_bytes, 650);
+        assert_eq!(states[0].soft_watermark, 630);
+        assert_eq!(states[0].signal, BackpressureSignal::None);
+        assert_eq!(states[1].partition, second);
+        assert_eq!(states[1].used, 100);
+        assert_eq!(states[1].protected_limit, 250);
+        assert_eq!(states[1].limit, 400);
+        assert_eq!(states[1].shared_unused_bytes, 150);
+        assert_eq!(states[1].soft_watermark, 280);
+        assert_eq!(states[1].signal, BackpressureSignal::None);
     }
 
     #[test]
