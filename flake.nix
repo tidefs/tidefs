@@ -158,6 +158,24 @@
             workspaceBins = [ "tidefs-storage-node" ];
           };
 
+          tidefsTwoNodeCarrierRuntime = import ./nix/packages/tidefs.nix {
+            inherit (pkgs) lib pkg-config;
+            inherit (pkgs) fuse3 rdma-core;
+            rustPlatform = rustPlatform;
+            src = tidefsWorkspaceSrc;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+            cargoBuildFlags = [
+              "-p" "tidefs-two-node-harness"
+              "--features" "qemu"
+              "--bin" "tidefs-two-node-qemu-carrier-validation"
+            ];
+            workspaceBins = [
+              "tidefs-two-node-qemu-carrier-validation"
+            ];
+          };
+
           tidefsUblkRuntime = import ./nix/packages/tidefs.nix {
             inherit (pkgs) lib pkg-config;
             inherit (pkgs) fuse3 rdma-core;
@@ -2845,6 +2863,11 @@ EOF
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
           };
+          twoNodeCarrierValidation = (import ./nix/vm/two-node-carrier-validation.nix {
+            inherit pkgs;
+            linuxKernel_7_0 = linuxKernel_7_0;
+            tidefsPackage = tidefsTwoNodeCarrierRuntime;
+          }).twoNodeCarrierValidation;
           kernelNoDaemonValidation = import ./nix/vm/kernel-no-daemon-validation.nix {
             inherit pkgs;
             linuxKernel_7_0 = linuxKernel_7_0;
@@ -3415,6 +3438,16 @@ EOF
             self.packages.${system}.ublkCompletionArtifactValidation
           ] ''
             exec ${self.packages.${system}.ublkCompletionArtifactValidation}/bin/tidefs-ublk-completion-artifact-validation "$@"
+          '';
+          two-node-carrier-validation = script "tidefs-two-node-carrier-validation" [
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.busybox
+            pkgs.cpio
+            pkgs.qemu
+            self.packages.${system}.twoNodeCarrierValidation
+          ] ''
+            exec ${self.packages.${system}.twoNodeCarrierValidation}/bin/tidefs-two-node-carrier-validation "$@"
           '';
           qemu-ublk-ext4-smoke = qemuSourceApp "tidefs-qemu-ublk-ext4-smoke";
           qemu-ublk-crash-consistency = qemuSourceApp "tidefs-qemu-ublk-crash-consistency";

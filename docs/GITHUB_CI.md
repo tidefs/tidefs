@@ -101,6 +101,12 @@ may use non-secret repository variables for scheduling gates, such as
   operations, and keep engine-backed storage checks in the longer filesystem
   lanes. Manual dispatch can select the default target, the mounted
   `kernel-mmap-validation` target, or both.
+- `Two-node carrier validation` is a manual `QEMU Smoke` target for
+  `tidefs-two-node-harness`. It runs `.#two-node-carrier-validation`, boots a
+  Linux 7.0 QEMU guest, executes the `qemu`-gated live TCP carrier
+  state-transfer scenario, and uploads `carrier-report.json`, `qemu.log`,
+  `summary.json`, and environment metadata under
+  `two-node-carrier-validation`.
 - `Kernel mmap validation` is a narrow manual self-hosted workflow for the
   mounted mmap/writeback QEMU row. It runs `.#kernel-mmap-validation` against
   the selected branch and uploads row artifacts under
