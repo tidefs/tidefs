@@ -2852,6 +2852,53 @@ fn strongest_backpressure(
     }
 }
 
+const MAX_PRUNE_CANDIDATES_PER_TICK: usize = 128;
+
+pub type FusePruneUnavailableReason = crate::observability::FusePruneNotificationUnavailableReason;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FusePruneNotifyBoundaryStatus {
+    Available,
+    Unavailable(FusePruneUnavailableReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FusePruneCandidate {
+    ino: u64,
+    lookup_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FusePruneNotifyTick {
+    boundary_status: FusePruneNotifyBoundaryStatus,
+    pressure: BackpressureSignal,
+    candidates_seen: usize,
+    sent: u64,
+    acknowledged: u64,
+    unavailable: u64,
+    rate_limited: usize,
+}
+
+trait FusePruneNotifySink: Send + Sync {
+    fn boundary_status(&self) -> FusePruneNotifyBoundaryStatus;
+    fn notify_prune(&self, ino: u64) -> Result<(), FusePruneUnavailableReason>;
+}
+
+#[derive(Debug)]
+struct UnsupportedFusePruneNotifySink;
+
+impl FusePruneNotifySink for UnsupportedFusePruneNotifySink {
+    fn boundary_status(&self) -> FusePruneNotifyBoundaryStatus {
+        FusePruneNotifyBoundaryStatus::Unavailable(
+            FusePruneUnavailableReason::FuserNotifyPruneUnsupported,
+        )
+    }
+
+    fn notify_prune(&self, _ino: u64) -> Result<(), FusePruneUnavailableReason> {
+        Err(FusePruneUnavailableReason::FuserNotifyPruneUnsupported)
+    }
+}
+
 /// FUSE filesystem adapter backed by a `VfsEngine`.
 pub struct FuseVfsAdapter {
     pub(crate) engine: Arc<Mutex<Box<dyn VfsEngineStatFs + Send>>>,
@@ -2861,6 +2908,8 @@ pub struct FuseVfsAdapter {
     lock_dispatch: DaemonLockDispatch,
     governor: Governor,
     fuse_admission_hard_policy: FuseAdmissionHardPolicy,
+    prune_notify_sink: Arc<dyn FusePruneNotifySink>,
+    prune_notify_rate_limit: usize,
     dentry_invalidations: Mutex<DentryInvalidationState>,
     data_cache_invalidations: Mutex<DataCacheInvalidationState>,
     negative_cache: Mutex<NegativeLookupCache>,
@@ -3007,6 +3056,8 @@ impl FuseVfsAdapter {
             lock_dispatch: DaemonLockDispatch::new(),
             governor,
             fuse_admission_hard_policy: FuseAdmissionHardPolicy::default(),
+            prune_notify_sink: Arc::new(UnsupportedFusePruneNotifySink),
+            prune_notify_rate_limit: MAX_PRUNE_CANDIDATES_PER_TICK,
             dentry_invalidations: Mutex::new(DentryInvalidationState::default()),
             data_cache_invalidations: Mutex::new(DataCacheInvalidationState::default()),
             negative_cache: Mutex::new(NegativeLookupCache::new(256, Duration::from_millis(250))),
@@ -3078,8 +3129,124 @@ impl FuseVfsAdapter {
         self.governor.clone()
     }
 
+    /// Return whether the active FUSE boundary can emit prune notifications.
+    #[must_use]
+    pub fn prune_notify_boundary_status(&self) -> FusePruneNotifyBoundaryStatus {
+        self.prune_notify_sink.boundary_status()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_prune_notify_sink(mut self, sink: Arc<dyn FusePruneNotifySink>) -> Self {
+        self.prune_notify_sink = sink;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_prune_notify_rate_limit(mut self, limit: usize) -> Self {
+        self.prune_notify_rate_limit = limit;
+        self
+    }
+
+    fn emit_governor_prune_notifications(&self) -> FusePruneNotifyTick {
+        use crate::observability::{
+            record_fuse_prune_notification_acknowledged, record_fuse_prune_notification_sent,
+            record_fuse_prune_notification_unavailable,
+        };
+
+        let pressure = self.governor.backpressure(BudgetCategory::InodeState);
+        let boundary_status = self.prune_notify_boundary_status();
+        let mut tick = FusePruneNotifyTick {
+            boundary_status,
+            pressure,
+            candidates_seen: 0,
+            sent: 0,
+            acknowledged: 0,
+            unavailable: 0,
+            rate_limited: 0,
+        };
+
+        if pressure == BackpressureSignal::None {
+            return tick;
+        }
+
+        let candidates = self.select_prune_notify_candidates();
+        tick.candidates_seen = candidates.len();
+        if candidates.len() > self.prune_notify_rate_limit {
+            tick.rate_limited = candidates.len() - self.prune_notify_rate_limit;
+        }
+
+        if let FusePruneNotifyBoundaryStatus::Unavailable(reason) = boundary_status {
+            record_fuse_prune_notification_unavailable(reason);
+            tick.unavailable = tick.unavailable.saturating_add(1);
+            return tick;
+        }
+
+        for candidate in candidates.into_iter().take(self.prune_notify_rate_limit) {
+            record_fuse_prune_notification_sent();
+            tick.sent = tick.sent.saturating_add(1);
+            match self.prune_notify_sink.notify_prune(candidate.ino) {
+                Ok(()) => {
+                    record_fuse_prune_notification_acknowledged();
+                    tick.acknowledged = tick.acknowledged.saturating_add(1);
+                }
+                Err(reason) => {
+                    record_fuse_prune_notification_unavailable(reason);
+                    tick.unavailable = tick.unavailable.saturating_add(1);
+                }
+            }
+        }
+
+        tick
+    }
+
+    fn select_prune_notify_candidates(&self) -> Vec<FusePruneCandidate> {
+        let refs = self
+            .forget_refcounts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&ino, &lookup_refs)| (ino, lookup_refs))
+            .collect::<Vec<_>>();
+        let lookup_counts = self.lookup_counts.lock().unwrap().clone();
+        let mut candidates = refs
+            .into_iter()
+            .filter(|&(_, lookup_refs)| lookup_refs > 0)
+            .filter(|&(ino, _)| self.inode_is_prune_notify_candidate(ino))
+            .map(|(ino, _)| FusePruneCandidate {
+                ino,
+                lookup_count: lookup_counts.get(&ino).copied().unwrap_or(0),
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| (candidate.lookup_count, candidate.ino));
+        candidates
+    }
+
+    fn inode_is_prune_notify_candidate(&self, ino: u64) -> bool {
+        if self.file_handles.lock().unwrap().open_ref_count(ino) != 0 {
+            return false;
+        }
+        if !self.lock_dispatch.is_empty() {
+            return false;
+        }
+        if self.inode_has_dirty_trackers(ino) || self.inode_has_dirty_page_cache_mirrors(ino) {
+            return false;
+        }
+        !self
+            .writeback_cache
+            .lock()
+            .unwrap()
+            .is_dirty(ino)
+            .unwrap_or(false)
+    }
+
     fn admit_fuse_request(&self, op: FuseAdmissionOp) -> Result<(), Errno> {
         use crate::observability::FuseAdmissionReason;
+
+        if self.governor.backpressure(BudgetCategory::InodeState) != BackpressureSignal::None {
+            let _ = self.emit_governor_prune_notifications();
+        }
 
         let signal = strongest_backpressure(
             self.governor.backpressure(op.category()),
@@ -11398,6 +11565,28 @@ mod tests {
         RENAME_EXCHANGE, RENAME_NOREPLACE, S_IFIFO, S_IFLNK, S_IFREG, XATTR_CREATE, XATTR_REPLACE,
     };
 
+    #[derive(Debug, Default)]
+    struct RecordingPruneNotifySink {
+        inodes: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl RecordingPruneNotifySink {
+        fn inodes(&self) -> Vec<u64> {
+            self.inodes.lock().unwrap().clone()
+        }
+    }
+
+    impl FusePruneNotifySink for RecordingPruneNotifySink {
+        fn boundary_status(&self) -> FusePruneNotifyBoundaryStatus {
+            FusePruneNotifyBoundaryStatus::Available
+        }
+
+        fn notify_prune(&self, ino: u64) -> Result<(), FusePruneUnavailableReason> {
+            self.inodes.lock().unwrap().push(ino);
+            Ok(())
+        }
+    }
+
     const VALID_MOUNT: MountIdentity = MountIdentity::new([0x41; 16], 1);
 
     fn test_attr(inode: u64, generation: u64) -> InodeAttr {
@@ -11819,6 +12008,111 @@ mod tests {
             .expect("admit through adapter handle");
 
         assert_eq!(governor.category_used(BudgetCategory::MetaCache), 17);
+    }
+
+    #[test]
+    fn prune_notify_default_boundary_records_unsupported_reason() {
+        let governor = governor_with_used(BudgetCategory::InodeState, 701);
+        let adapter = fresh_test_adapter().with_governor(governor);
+        adapter.bump_forget_refcount(42);
+        let before = crate::observability::fuse_prune_notification_snapshot();
+
+        let tick = adapter.emit_governor_prune_notifications();
+
+        assert_eq!(
+            tick.boundary_status,
+            FusePruneNotifyBoundaryStatus::Unavailable(
+                FusePruneUnavailableReason::FuserNotifyPruneUnsupported
+            )
+        );
+        assert_eq!(tick.pressure, BackpressureSignal::SoftPressure);
+        assert_eq!(tick.candidates_seen, 1);
+        assert_eq!(tick.sent, 0);
+        assert_eq!(tick.acknowledged, 0);
+        assert_eq!(tick.unavailable, 1);
+        let after = crate::observability::fuse_prune_notification_snapshot();
+        assert!(after.unavailable >= before.unavailable + 1);
+        assert!(after.unavailable_unsupported >= before.unavailable_unsupported + 1);
+    }
+
+    #[test]
+    fn prune_notify_supported_boundary_is_rate_limited_and_keeps_lookup_refs() {
+        let governor = governor_with_used(BudgetCategory::InodeState, 701);
+        let sink = Arc::new(RecordingPruneNotifySink::default());
+        let adapter = fresh_test_adapter()
+            .with_governor(governor)
+            .with_prune_notify_sink(sink.clone())
+            .with_prune_notify_rate_limit(2);
+        for ino in [30, 10, 20] {
+            adapter.bump_forget_refcount(ino);
+        }
+        adapter.lookup_counts.lock().unwrap().insert(30, 30);
+        adapter.lookup_counts.lock().unwrap().insert(10, 10);
+        adapter.lookup_counts.lock().unwrap().insert(20, 20);
+        let before = crate::observability::fuse_prune_notification_snapshot();
+
+        let tick = adapter.emit_governor_prune_notifications();
+
+        assert_eq!(
+            tick.boundary_status,
+            FusePruneNotifyBoundaryStatus::Available
+        );
+        assert_eq!(tick.pressure, BackpressureSignal::SoftPressure);
+        assert_eq!(tick.candidates_seen, 3);
+        assert_eq!(tick.rate_limited, 1);
+        assert_eq!(tick.sent, 2);
+        assert_eq!(tick.acknowledged, 2);
+        assert_eq!(sink.inodes(), vec![10, 20]);
+        let refs = adapter.forget_refcounts.lock().unwrap();
+        assert_eq!(refs.get(&10).copied(), Some(1));
+        assert_eq!(refs.get(&20).copied(), Some(1));
+        assert_eq!(refs.get(&30).copied(), Some(1));
+        drop(refs);
+        let after = crate::observability::fuse_prune_notification_snapshot();
+        assert!(after.sent >= before.sent + 2);
+        assert!(after.acknowledged >= before.acknowledged + 2);
+    }
+
+    #[test]
+    fn prune_notify_candidate_selection_skips_open_and_dirty_inodes() {
+        let governor = governor_with_used(BudgetCategory::InodeState, 701);
+        let sink = Arc::new(RecordingPruneNotifySink::default());
+        let adapter = fresh_test_adapter()
+            .with_governor(governor)
+            .with_prune_notify_sink(sink.clone());
+        for ino in [10, 20, 30] {
+            adapter.bump_forget_refcount(ino);
+        }
+        adapter.file_handles.lock().unwrap().inc_open_ref(10);
+        adapter
+            .dirty_state
+            .lock()
+            .unwrap()
+            .entry(20)
+            .or_default()
+            .mark_dirty(0, 1);
+
+        let tick = adapter.emit_governor_prune_notifications();
+
+        assert_eq!(tick.candidates_seen, 1);
+        assert_eq!(tick.sent, 1);
+        assert_eq!(tick.acknowledged, 1);
+        assert_eq!(sink.inodes(), vec![30]);
+    }
+
+    #[test]
+    fn prune_notify_admission_bridge_runs_on_inode_state_pressure() {
+        let governor = governor_with_used(BudgetCategory::InodeState, 701);
+        let sink = Arc::new(RecordingPruneNotifySink::default());
+        let adapter = fresh_test_adapter()
+            .with_governor(governor)
+            .with_prune_notify_sink(sink.clone());
+        adapter.bump_forget_refcount(42);
+
+        assert_eq!(adapter.admit_fuse_request(FuseAdmissionOp::Forget), Ok(()));
+
+        assert_eq!(sink.inodes(), vec![42]);
+        assert_eq!(adapter.forget_refcounts.lock().unwrap().get(&42), Some(&1));
     }
 
     fn root_dir_entry_names(
