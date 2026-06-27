@@ -10,8 +10,13 @@ the target, not a present-tense capability claim.
 This repository is the fresh TideFS tree on `master`; source paths, crates,
 binaries, and docs should use TideFS names.
 
-The primary remote is the private GitHub repository `tidefs/tidefs`. It stays
-private until the operator gives an explicit public-release go-ahead.
+The primary remote is the public repository `tidefs/tidefs` on GitHub; the
+operator approved making that main repository public on 2026-06-21. Public
+visibility is a read boundary only, not a product release: outsider interaction
+remains restricted by the documented public-read controls in `docs/GITHUB_CI.md`,
+and TideFS infrastructure, runner credentials, deployment keys, API tokens, TLS
+keys, and other secrets remain outside this repository. The companion
+`tidefs/tidefs-infra-configuration` repository remains private.
 
 ## Current Policy
 
