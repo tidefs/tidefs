@@ -196,7 +196,7 @@ INITSCRIPT
     timeout "$TIMEOUT_SEC" "$QEMU_BIN" \
       -kernel "$KERNEL_IMG" \
       -initrd "$WORK_DIR/initrd.img" \
-      -append "console=ttyS0 quiet init=/init" \
+      -append "console=ttyS0 quiet init=/init tidefs.qemu_carrier_validation=1" \
       -nographic \
       -m 768 \
       "''${QEMU_ACCEL[@]}" \
