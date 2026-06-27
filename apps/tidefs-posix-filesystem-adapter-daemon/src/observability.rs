@@ -282,9 +282,7 @@ pub fn record_fuse_prune_notification_acknowledged() {
 }
 
 /// Record one unavailable prune notification boundary or send result.
-pub fn record_fuse_prune_notification_unavailable(
-    reason: FusePruneNotificationUnavailableReason,
-) {
+pub fn record_fuse_prune_notification_unavailable(reason: FusePruneNotificationUnavailableReason) {
     FUSE_PRUNE_NOTIFICATION_UNAVAILABLE_TOTAL.fetch_add(1, Ordering::Relaxed);
     match reason {
         FusePruneNotificationUnavailableReason::FuserNotifyPruneUnsupported => {

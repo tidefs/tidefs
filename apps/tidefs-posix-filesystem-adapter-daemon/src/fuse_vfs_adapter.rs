@@ -2854,8 +2854,7 @@ fn strongest_backpressure(
 
 const MAX_PRUNE_CANDIDATES_PER_TICK: usize = 128;
 
-pub type FusePruneUnavailableReason =
-    crate::observability::FusePruneNotificationUnavailableReason;
+pub type FusePruneUnavailableReason = crate::observability::FusePruneNotificationUnavailableReason;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FusePruneNotifyBoundaryStatus {
@@ -3152,8 +3151,8 @@ impl FuseVfsAdapter {
 
     fn emit_governor_prune_notifications(&self) -> FusePruneNotifyTick {
         use crate::observability::{
-            record_fuse_prune_notification_acknowledged,
-            record_fuse_prune_notification_sent, record_fuse_prune_notification_unavailable,
+            record_fuse_prune_notification_acknowledged, record_fuse_prune_notification_sent,
+            record_fuse_prune_notification_unavailable,
         };
 
         let pressure = self.governor.backpressure(BudgetCategory::InodeState);
@@ -12054,7 +12053,10 @@ mod tests {
 
         let tick = adapter.emit_governor_prune_notifications();
 
-        assert_eq!(tick.boundary_status, FusePruneNotifyBoundaryStatus::Available);
+        assert_eq!(
+            tick.boundary_status,
+            FusePruneNotifyBoundaryStatus::Available
+        );
         assert_eq!(tick.pressure, BackpressureSignal::SoftPressure);
         assert_eq!(tick.candidates_seen, 3);
         assert_eq!(tick.rate_limited, 1);
