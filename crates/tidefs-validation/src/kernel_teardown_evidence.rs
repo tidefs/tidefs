@@ -73,6 +73,38 @@ pub struct CleanupOutcome {
     pub remaining_tidefs_work_observations: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CutoverPhase {
+    pub phase: String,
+    pub status: String,
+    pub from_mode: String,
+    pub to_mode: String,
+    pub kernel_evidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CutoverFenceObservation {
+    pub phase: String,
+    pub fence: String,
+    pub expected_state: String,
+    pub observed_result: String,
+    pub kernel_evidence: String,
+    pub no_forbidden_work_observed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CutoverTruthObservation {
+    pub operation: String,
+    pub expected: String,
+    pub observed: String,
+    pub verified: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Main artifact struct
 // ---------------------------------------------------------------------------
@@ -121,6 +153,16 @@ pub struct KernelTeardownNoWorkAfterV1 {
     // Cleanup outcome
     pub cleanup_outcome: CleanupOutcome,
 
+    // Mounted-kernel cutover/fence transcript. Existing non-cutover T6
+    // teardown rows may omit these fields; mounted-kernel-vfs rows must
+    // populate them and the validator fails closed when they are missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cutover_phases: Vec<CutoverPhase>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cutover_fence_observations: Vec<CutoverFenceObservation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cutover_truth_observations: Vec<CutoverTruthObservation>,
+
     // Overall status
     pub status: String,
 
@@ -138,6 +180,9 @@ pub struct KernelTeardownNoWorkAfterSummary {
     pub fail_closed_count: usize,
     pub phase_count: usize,
     pub refusal_observation_count: usize,
+    pub cutover_phase_count: usize,
+    pub cutover_fence_observation_count: usize,
+    pub cutover_truth_observation_count: usize,
     pub target_id: String,
     pub source_ref: String,
 }
@@ -184,6 +229,17 @@ const REQUIRED_PHASES: &[&str] = &[
     "module_unload",
     "reload_probe",
 ];
+
+const REQUIRED_MOUNTED_CUTOVER_PHASES: &[&str] = &[
+    "intent",
+    "dry_run_gate",
+    "stage_fence_prepare",
+    "commit_transition",
+    "verify_truth",
+    "close_or_reenter",
+];
+
+const REQUIRED_MOUNTED_CUTOVER_FENCES: &[&str] = &["admission", "quiesce", "stage", "commit"];
 
 const VALID_STATUSES: &[&str] = &["pass", "fail", "blocked", "no-result"];
 const VALID_TIER_TARGET_PAIRS: &[(&str, &str)] = &[
@@ -275,8 +331,14 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
     if artifact.source_ref.is_empty() {
         failures.push("source_ref is required".into());
     }
+    if artifact.source_ref == "unknown" {
+        failures.push("source_ref must identify the workflow source ref".into());
+    }
     if artifact.source_sha.is_empty() {
         failures.push("source_sha is required".into());
+    }
+    if artifact.source_sha == "unknown" {
+        failures.push("source_sha must identify the workflow source SHA".into());
     }
 
     // --- validation tier / target id ---
@@ -407,6 +469,16 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
                     "post_final_teardown_refusal_observations[{i}].observed_result is empty"
                 ));
             }
+            if !obs.expected_refusal {
+                failures.push(format!(
+                    "post_final_teardown_refusal_observations[{i}].expected_refusal must be true"
+                ));
+            }
+            if obs.new_work_enqueued_or_started {
+                failures.push(format!(
+                    "post_final_teardown_refusal_observations[{i}] observed new work after final teardown"
+                ));
+            }
         }
     }
 
@@ -427,6 +499,140 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
         }
         if c.remaining_tidefs_work_observations.is_empty() {
             failures.push("cleanup_outcome.remaining_tidefs_work_observations is required".into());
+        }
+        if c.remaining_tidefs_work_observations != "none" {
+            failures.push(format!(
+                "cleanup_outcome.remaining_tidefs_work_observations must be `none`, got `{}`",
+                c.remaining_tidefs_work_observations
+            ));
+        }
+    }
+
+    // --- mounted cutover transcript ---
+    let is_mounted_kernel_vfs =
+        artifact.target_id == KERNEL_TEARDOWN_NO_WORK_AFTER_MOUNTED_KERNEL_VFS_TARGET_ID;
+    if is_mounted_kernel_vfs {
+        if artifact.cutover_phases.is_empty() {
+            failures
+                .push("cutover_phases must be non-empty for mounted-kernel-vfs artifacts".into());
+        }
+        if artifact.cutover_fence_observations.is_empty() {
+            failures.push(
+                "cutover_fence_observations must be non-empty for mounted-kernel-vfs artifacts"
+                    .into(),
+            );
+        }
+        if artifact.cutover_truth_observations.is_empty() {
+            failures.push(
+                "cutover_truth_observations must be non-empty for mounted-kernel-vfs artifacts"
+                    .into(),
+            );
+        }
+    }
+
+    if !artifact.cutover_phases.is_empty() {
+        let seen: BTreeSet<&str> = artifact
+            .cutover_phases
+            .iter()
+            .map(|p| p.phase.as_str())
+            .collect();
+        if is_mounted_kernel_vfs {
+            for &required in REQUIRED_MOUNTED_CUTOVER_PHASES {
+                if !seen.contains(required) {
+                    failures.push(format!("required cutover phase `{required}` is missing"));
+                }
+            }
+        }
+        for (i, phase) in artifact.cutover_phases.iter().enumerate() {
+            if phase.phase.is_empty() {
+                failures.push(format!("cutover_phases[{i}].phase is empty"));
+            }
+            if phase.status.is_empty() {
+                failures.push(format!(
+                    "cutover_phases[{i}].status is empty (phase={})",
+                    phase.phase
+                ));
+            }
+            if phase.from_mode.is_empty() {
+                failures.push(format!(
+                    "cutover_phases[{i}].from_mode is empty (phase={})",
+                    phase.phase
+                ));
+            }
+            if phase.to_mode.is_empty() {
+                failures.push(format!(
+                    "cutover_phases[{i}].to_mode is empty (phase={})",
+                    phase.phase
+                ));
+            }
+            if phase.kernel_evidence.is_empty() {
+                failures.push(format!(
+                    "cutover_phases[{i}].kernel_evidence is empty (phase={})",
+                    phase.phase
+                ));
+            }
+        }
+    }
+
+    if !artifact.cutover_fence_observations.is_empty() {
+        let seen: BTreeSet<&str> = artifact
+            .cutover_fence_observations
+            .iter()
+            .map(|fence| fence.fence.as_str())
+            .collect();
+        if is_mounted_kernel_vfs {
+            for &required in REQUIRED_MOUNTED_CUTOVER_FENCES {
+                if !seen.contains(required) {
+                    failures.push(format!("required cutover fence `{required}` is missing"));
+                }
+            }
+        }
+        for (i, fence) in artifact.cutover_fence_observations.iter().enumerate() {
+            if fence.phase.is_empty() {
+                failures.push(format!("cutover_fence_observations[{i}].phase is empty"));
+            }
+            if fence.fence.is_empty() {
+                failures.push(format!("cutover_fence_observations[{i}].fence is empty"));
+            }
+            if fence.expected_state.is_empty() {
+                failures.push(format!(
+                    "cutover_fence_observations[{i}].expected_state is empty"
+                ));
+            }
+            if fence.observed_result.is_empty() {
+                failures.push(format!(
+                    "cutover_fence_observations[{i}].observed_result is empty"
+                ));
+            }
+            if fence.kernel_evidence.is_empty() {
+                failures.push(format!(
+                    "cutover_fence_observations[{i}].kernel_evidence is empty"
+                ));
+            }
+            if !fence.no_forbidden_work_observed {
+                failures.push(format!(
+                    "cutover_fence_observations[{i}] observed forbidden work"
+                ));
+            }
+        }
+    }
+
+    for (i, truth) in artifact.cutover_truth_observations.iter().enumerate() {
+        if truth.operation.is_empty() {
+            failures.push(format!(
+                "cutover_truth_observations[{i}].operation is empty"
+            ));
+        }
+        if truth.expected.is_empty() {
+            failures.push(format!("cutover_truth_observations[{i}].expected is empty"));
+        }
+        if truth.observed.is_empty() {
+            failures.push(format!("cutover_truth_observations[{i}].observed is empty"));
+        }
+        if !truth.verified {
+            failures.push(format!(
+                "cutover_truth_observations[{i}] did not verify the mounted-kernel truth"
+            ));
         }
     }
 
@@ -458,6 +664,9 @@ pub fn validate_kernel_teardown_no_work_after_artifact_json(
         fail_closed_count: artifact.fail_closed_reasons.len(),
         phase_count: artifact.teardown_phases.len(),
         refusal_observation_count: artifact.post_final_teardown_refusal_observations.len(),
+        cutover_phase_count: artifact.cutover_phases.len(),
+        cutover_fence_observation_count: artifact.cutover_fence_observations.len(),
+        cutover_truth_observation_count: artifact.cutover_truth_observations.len(),
         target_id: artifact.target_id,
         source_ref: artifact.source_ref,
     })
@@ -520,6 +729,98 @@ mod tests {
                 "dmesg_state": "no TideFS warnings",
                 "remaining_tidefs_work_observations": "none"
             },
+            "cutover_phases": [
+                {
+                    "phase": "intent",
+                    "status": "completed",
+                    "from_mode": "mode.kernel_cutover.userspace.m0",
+                    "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                    "kernel_evidence": "module_visible",
+                    "notes": "mounted VFS cutover row selected"
+                },
+                {
+                    "phase": "dry_run_gate",
+                    "status": "completed",
+                    "from_mode": "mode.kernel_cutover.userspace.m0",
+                    "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                    "kernel_evidence": "configured_pool_label_verified",
+                    "notes": "pool label and module prerequisites admitted"
+                },
+                {
+                    "phase": "stage_fence_prepare",
+                    "status": "completed",
+                    "from_mode": "mode.kernel_cutover.userspace.m0",
+                    "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                    "kernel_evidence": "workqueue tracing enabled",
+                    "notes": "quiesce fence staged before mount commit"
+                },
+                {
+                    "phase": "commit_transition",
+                    "status": "completed",
+                    "from_mode": "mode.kernel_cutover.userspace.m0",
+                    "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                    "kernel_evidence": "configured_pool_mount",
+                    "notes": "mounted kernel VFS path active"
+                },
+                {
+                    "phase": "verify_truth",
+                    "status": "completed",
+                    "from_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                    "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                    "kernel_evidence": "readback_verify",
+                    "notes": "mounted kernel readback verified"
+                },
+                {
+                    "phase": "close_or_reenter",
+                    "status": "completed",
+                    "from_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                    "to_mode": "mode.kernel_cutover.mixed_posix_read.m1",
+                    "kernel_evidence": "sync_after_write",
+                    "notes": "cutover fences closed before teardown"
+                }
+            ],
+            "cutover_fence_observations": [
+                {
+                    "phase": "dry_run_gate",
+                    "fence": "admission",
+                    "expected_state": "admit mounted cutover only when module and pool label are ready",
+                    "observed_result": "admitted",
+                    "kernel_evidence": "configured_pool_label_verified",
+                    "no_forbidden_work_observed": true
+                },
+                {
+                    "phase": "stage_fence_prepare",
+                    "fence": "quiesce",
+                    "expected_state": "no mounted work starts before the commit transition",
+                    "observed_result": "trace armed before mount commit",
+                    "kernel_evidence": "workqueue trace source present",
+                    "no_forbidden_work_observed": true
+                },
+                {
+                    "phase": "commit_transition",
+                    "fence": "stage",
+                    "expected_state": "mounted kernel work starts only after commit",
+                    "observed_result": "mount completed and write followed commit",
+                    "kernel_evidence": "configured_pool_mount",
+                    "no_forbidden_work_observed": true
+                },
+                {
+                    "phase": "close_or_reenter",
+                    "fence": "commit",
+                    "expected_state": "cutover fence releases after truth verification",
+                    "observed_result": "readback and sync completed before teardown begin",
+                    "kernel_evidence": "readback_verify",
+                    "no_forbidden_work_observed": true
+                }
+            ],
+            "cutover_truth_observations": [
+                {
+                    "operation": "mounted_readback",
+                    "expected": "teardown-test-data",
+                    "observed": "teardown-test-data",
+                    "verified": true
+                }
+            ],
             "status": "pass",
             "fail_closed_reasons": []
         }"#.to_string()
@@ -989,6 +1290,34 @@ mod tests {
                 dmesg_state: "clean".into(),
                 remaining_tidefs_work_observations: "none".into(),
             },
+            cutover_phases: REQUIRED_MOUNTED_CUTOVER_PHASES
+                .iter()
+                .map(|&p| CutoverPhase {
+                    phase: p.into(),
+                    status: "completed".into(),
+                    from_mode: "mode.kernel_cutover.userspace.m0".into(),
+                    to_mode: "mode.kernel_cutover.mixed_posix_read.m1".into(),
+                    kernel_evidence: "mounted kernel evidence".into(),
+                    notes: None,
+                })
+                .collect(),
+            cutover_fence_observations: REQUIRED_MOUNTED_CUTOVER_FENCES
+                .iter()
+                .map(|&f| CutoverFenceObservation {
+                    phase: "cutover".into(),
+                    fence: f.into(),
+                    expected_state: "no forbidden work".into(),
+                    observed_result: "clean".into(),
+                    kernel_evidence: "mounted kernel evidence".into(),
+                    no_forbidden_work_observed: true,
+                })
+                .collect(),
+            cutover_truth_observations: vec![CutoverTruthObservation {
+                operation: "mounted_readback".into(),
+                expected: "data".into(),
+                observed: "data".into(),
+                verified: true,
+            }],
             status: "pass".into(),
             fail_closed_reasons: vec![],
         };
