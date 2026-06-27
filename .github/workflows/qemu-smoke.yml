@@ -101,7 +101,8 @@ jobs:
           TIDEFS_TEARDOWN_OUTPUT_DIR: ${{ matrix.output_dir }}
           TIDEFS_NO_DAEMON_TEARDOWN_OUTPUT_DIR: ${{ matrix.output_dir }}
         run: |
-          export TIDEFS_GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          TIDEFS_GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export TIDEFS_GENERATED_AT
           timeout --foreground 7200s bash -lc '${{ matrix.command }}'
 
       - name: Write kernel-fsync evidence manifest (smoke)
