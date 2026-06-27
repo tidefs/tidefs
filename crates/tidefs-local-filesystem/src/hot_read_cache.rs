@@ -261,6 +261,14 @@ impl HotReadCache {
         }
     }
 
+    fn drop_unservable_entry(&mut self, entry: ArcResident) {
+        let len = entry.bytes.len() as u64;
+        self.resident_bytes = self.resident_bytes.saturating_sub(len);
+        self.release_budget(len);
+        self.poisoned_on_validate = self.poisoned_on_validate.saturating_add(1);
+        self.misses = self.misses.saturating_add(1);
+    }
+
     /// Resident entry capacity (count bound).
     fn entry_capacity(&self) -> usize {
         self.policy.max_entries
@@ -480,8 +488,7 @@ impl HotReadCache {
             let mut entry = self.t2.remove(idx);
             // P4-02: validate header before serving.
             if !entry.header.is_servable() {
-                self.poisoned_on_validate = self.poisoned_on_validate.saturating_add(1);
-                self.misses = self.misses.saturating_add(1);
+                self.drop_unservable_entry(entry);
                 return None;
             }
             entry.header.mark_hit(counter);
@@ -496,8 +503,7 @@ impl HotReadCache {
         if let Some(idx) = find_in_residents(&self.t1, &key) {
             let mut entry = self.t1.remove(idx);
             if !entry.header.is_servable() {
-                self.poisoned_on_validate = self.poisoned_on_validate.saturating_add(1);
-                self.misses = self.misses.saturating_add(1);
+                self.drop_unservable_entry(entry);
                 return None;
             }
             entry.header.mark_hit(counter);
@@ -784,7 +790,7 @@ impl HotReadCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_types_cache_lattice_core::{DirtyStateClass, PosixWritebackState};
+    use tidefs_types_cache_lattice_core::{DirtyStateClass, PoisonState, PosixWritebackState};
 
     fn policy() -> HotReadCachePolicy {
         HotReadCachePolicy {
@@ -862,6 +868,43 @@ mod tests {
             governor.partition_used(partition, BudgetCategory::DataCache),
             0
         );
+        assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
+    }
+
+    #[test]
+    fn poisoned_hot_read_lookup_releases_dataset_partition_budget() {
+        let governor = data_governor();
+        let partition = partition_key(0x33);
+        let mut cache = HotReadCache::new(policy());
+        cache.set_governor(governor.clone(), Some(partition));
+
+        let t1_data = b"poisoned t1 bytes";
+        let t1_key = key(1);
+        cache.admit(t1_key, t1_data);
+        cache.t1[0].header.poison(PoisonState::Corrupted);
+        assert!(cache.get(t1_key).is_none());
+        assert_eq!(
+            governor.partition_used(partition, BudgetCategory::DataCache),
+            0
+        );
+
+        let t2_data = b"poisoned t2 bytes";
+        let t2_key = key(2);
+        cache.admit(t2_key, t2_data);
+        assert_eq!(cache.get(t2_key).as_deref(), Some(t2_data.as_slice()));
+        assert_eq!(
+            governor.partition_used(partition, BudgetCategory::DataCache),
+            t2_data.len() as u64
+        );
+
+        cache.t2[0].header.poison(PoisonState::Corrupted);
+        assert!(cache.get(t2_key).is_none());
+        assert_eq!(
+            governor.partition_used(partition, BudgetCategory::DataCache),
+            0
+        );
+        assert_eq!(cache.report().resident_bytes, 0);
+        assert_eq!(cache.report().poisoned_on_validate, 2);
         assert_eq!(governor.category_used(BudgetCategory::DataCache), 0);
     }
 
