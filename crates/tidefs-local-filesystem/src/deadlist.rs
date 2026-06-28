@@ -191,7 +191,7 @@ impl LocalFileSystem {
         input: DeadlistDerivationInput,
     ) -> Result<DeadlistDerivationReport> {
         let root_authentication_key = self.root_authentication_key;
-        let mut store = self.store.raw_primary_store_mut();
+        let store = self.store.raw_primary_store_mut();
         derive_released_root_deadlist_candidates_with(input, |root| {
             object_keys_for_committed_root_summary(&mut *store, root, root_authentication_key)
         })
