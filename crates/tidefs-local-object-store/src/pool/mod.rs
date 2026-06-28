@@ -363,8 +363,8 @@ pub struct PoolStats {
 pub struct PoolReceiptBoundDeadObjectDrainStats {
     /// Number of writable pool devices whose dead-object queues were examined.
     pub devices_scanned: usize,
-    /// Number of receipt-authorized dead objects acknowledged.
-    pub objects_acked: usize,
+    /// Number of receipt-authorized dead objects examined.
+    pub objects_examined: usize,
     /// Number of segments identified as fully dead and freed.
     pub segments_reclaimed: u64,
     /// Number of dead-object records accounted as freed.
@@ -377,7 +377,7 @@ pub struct PoolReceiptBoundDeadObjectDrainStats {
 
 impl PoolReceiptBoundDeadObjectDrainStats {
     fn absorb_reclaim_stats(&mut self, stats: tidefs_reclaim::ReclaimConsumerStats) {
-        self.objects_acked += stats.entries_processed;
+        self.objects_examined += stats.entries_processed;
         self.segments_reclaimed += stats.segments_reclaimed;
         self.blocks_freed += stats.blocks_freed;
         self.reclaim_queue_depth += stats.reclaim_queue_depth;

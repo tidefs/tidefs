@@ -153,8 +153,8 @@ pub struct StorageNodeRelocationReadMapPublication {
 pub struct StorageNodeReceiptBoundDeadObjectDrainStats {
     /// Number of pool devices whose receipt-bound dead-object queues were scanned.
     pub devices_scanned: usize,
-    /// Number of receipt-authorized dead objects acknowledged by the drain.
-    pub objects_acked: usize,
+    /// Number of receipt-authorized dead objects examined by the drain.
+    pub objects_examined: usize,
     /// Number of segments identified as fully dead and freed.
     pub segments_reclaimed: u64,
     /// Number of dead-object records accounted as freed.
@@ -169,7 +169,7 @@ impl From<PoolReceiptBoundDeadObjectDrainStats> for StorageNodeReceiptBoundDeadO
     fn from(stats: PoolReceiptBoundDeadObjectDrainStats) -> Self {
         Self {
             devices_scanned: stats.devices_scanned,
-            objects_acked: stats.objects_acked,
+            objects_examined: stats.objects_examined,
             segments_reclaimed: stats.segments_reclaimed,
             blocks_freed: stats.blocks_freed,
             reclaim_queue_depth: stats.reclaim_queue_depth,
@@ -7975,8 +7975,8 @@ mod cluster_pool_handler_tests {
             replacement_receipt.receipt_generation + 1
         );
         assert_eq!(drain.drain_stats.devices_scanned, 2);
-        assert_eq!(drain.drain_stats.objects_acked, 2);
-        assert_eq!(drain.drain_stats.reclaim_queue_depth, 0);
+        assert_eq!(drain.drain_stats.objects_examined, 2);
+        assert_eq!(drain.drain_stats.reclaim_queue_depth, 2);
 
         let StoreBackend::PoolBacked(pool) = &mut backend else {
             unreachable!()
@@ -7987,9 +7987,9 @@ mod cluster_pool_handler_tests {
                 drain.stable_committed_txg,
                 16,
             )
-            .expect("second drain is idle");
-        assert_eq!(after.objects_acked, 0);
-        assert_eq!(after.reclaim_queue_depth, 0);
+            .expect("second drain keeps partially live segment entries");
+        assert_eq!(after.objects_examined, 2);
+        assert_eq!(after.reclaim_queue_depth, 2);
     }
 
     #[test]
@@ -8079,7 +8079,7 @@ mod cluster_pool_handler_tests {
                 16,
             )
             .expect("replacement generation is not yet stable");
-        assert_eq!(held.objects_acked, 0);
+        assert_eq!(held.objects_examined, 0);
         assert_eq!(held.reclaim_queue_depth, 2);
     }
 
