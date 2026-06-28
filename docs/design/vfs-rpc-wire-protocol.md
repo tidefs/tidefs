@@ -576,12 +576,14 @@ sources:
   `InlineOrBulk`, transport frame wrappers, client correlation, and a bounded
   dedup window. The repo has `tidefs-transport`, `tidefs-vfs-engine`, and
   transport-session models, but no `tidefs-bulk-service` crate yet.
-- Live GitHub state on 2026-06-28: searches for VFS_RPC, `tidefs-vfs-rpc`,
-  `BulkToken`, BULK/RDMA, cluster forwarding, VFS Engine forwarding, and
-  transport binding found #1518 as the only open VFS_RPC-specific issue. Open
-  PR file inspection found no PR touching this document,
-  `docs/design/cluster-bulk-plane-protocol.md`,
-  `docs/workspace-package-classification.md`, or `crates/tidefs-vfs-rpc`.
+- Live GitHub state on 2026-06-28: the initial overlap search for VFS_RPC,
+  `tidefs-vfs-rpc`, `BulkToken`, BULK/RDMA, cluster forwarding, VFS Engine
+  forwarding, and transport binding found #1518 as the only open
+  VFS_RPC-specific issue before this decision branch opened. The resulting
+  child map is #1521-#1524, with non-overlapping implementation/evidence write
+  sets for the transport adapter, VFS Engine bridge, BULK/RDMA handoff, and
+  validation records. Current open PR file inspection found only the #1525
+  decision PR touching this document or `docs/workspace-package-classification.md`.
 
 ### 12.2 Alternatives
 
