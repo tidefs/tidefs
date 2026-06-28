@@ -6077,9 +6077,9 @@ mod tests {
     };
     use tidefs_storage_intent_prefetch_executor::{
         PrefetchExecutorActionFamily, PrefetchExecutorAdmissionRecord, PrefetchExecutorCostState,
-        PrefetchExecutorInput, PrefetchExecutorMediaPath, PrefetchExecutorOutcome,
-        PrefetchExecutorRuntimeSupport, PrefetchExecutorRuntimeSupportMask,
-        PrefetchExecutorSchedulerLane,
+        PrefetchExecutorDispatchPlan, PrefetchExecutorInput, PrefetchExecutorMediaPath,
+        PrefetchExecutorOutcome, PrefetchExecutorRuntimeSupport,
+        PrefetchExecutorRuntimeSupportMask, PrefetchExecutorSchedulerLane,
     };
     use tidefs_types_vfs_core::{
         FileHandleId, FATTR_ATIME, FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE,
@@ -6213,6 +6213,16 @@ mod tests {
         );
         add_prefetch_family(
             &mut snapshot,
+            StorageIntentEvidenceKind::MediaCostWearLedger,
+            PREFETCH_COST,
+        );
+        add_prefetch_family(
+            &mut snapshot,
+            StorageIntentEvidenceKind::TenantIsolationEvidence,
+            PREFETCH_ISOLATION,
+        );
+        add_prefetch_family(
+            &mut snapshot,
             StorageIntentEvidenceKind::ActionExecutionEvidence,
             PREFETCH_ACTION,
         );
@@ -6318,6 +6328,14 @@ mod tests {
                 ),
                 ..PrefetchExecutorMediaPath::default()
             },
+            dispatch_plan: PrefetchExecutorDispatchPlan::bounded_range(
+                range_start,
+                range_len.max(1),
+                prefetch_evidence(
+                    StorageIntentEvidenceKind::ActionExecutionEvidence,
+                    PREFETCH_ACTION,
+                ),
+            ),
             cost_state: PrefetchExecutorCostState {
                 cost_ref: prefetch_evidence(
                     StorageIntentEvidenceKind::MediaCostWearLedger,

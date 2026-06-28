@@ -581,6 +581,150 @@ impl PrefetchExecutorRuntimeSupport {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchExecutorDispatchShape {
+    #[default]
+    Unknown = 0,
+    BoundedRange = 1,
+    StridedVectorRanges = 2,
+    MetadataNamespaceWalk = 3,
+    HotsetCacheTrial = 4,
+    ManifestIndexFanout = 5,
+    SnapshotCloneRanges = 6,
+    DegradedReconstructionRange = 7,
+    WanGeoDeltaRange = 8,
+    ObjectArchiveRestoreRange = 9,
+}
+
+impl_u8_canonical!(PrefetchExecutorDispatchShape, {
+    Unknown = 0 => "unknown",
+    BoundedRange = 1 => "bounded-range",
+    StridedVectorRanges = 2 => "strided-vector-ranges",
+    MetadataNamespaceWalk = 3 => "metadata-namespace-walk",
+    HotsetCacheTrial = 4 => "hotset-cache-trial",
+    ManifestIndexFanout = 5 => "manifest-index-fanout",
+    SnapshotCloneRanges = 6 => "snapshot-clone-ranges",
+    DegradedReconstructionRange = 7 => "degraded-reconstruction-range",
+    WanGeoDeltaRange = 8 => "wan-geo-delta-range",
+    ObjectArchiveRestoreRange = 9 => "object-archive-restore-range",
+});
+
+impl PrefetchExecutorDispatchShape {
+    #[must_use]
+    pub const fn for_action_family(family: PrefetchExecutorActionFamily) -> Self {
+        match family {
+            PrefetchExecutorActionFamily::BoundedSequentialReadahead => Self::BoundedRange,
+            PrefetchExecutorActionFamily::StridedVectorRangePrefetch => Self::StridedVectorRanges,
+            PrefetchExecutorActionFamily::MetadataNamespaceWalkPrefetch => {
+                Self::MetadataNamespaceWalk
+            }
+            PrefetchExecutorActionFamily::SmallRandomHotsetCacheTrial => Self::HotsetCacheTrial,
+            PrefetchExecutorActionFamily::ManifestIndexFanout => Self::ManifestIndexFanout,
+            PrefetchExecutorActionFamily::SnapshotCloneRepeatedRead => Self::SnapshotCloneRanges,
+            PrefetchExecutorActionFamily::DegradedReadReconstruction => {
+                Self::DegradedReconstructionRange
+            }
+            PrefetchExecutorActionFamily::WanGeoDeltaPrefetch => Self::WanGeoDeltaRange,
+            PrefetchExecutorActionFamily::ObjectArchiveRestoreStaging => {
+                Self::ObjectArchiveRestoreRange
+            }
+            PrefetchExecutorActionFamily::Unknown
+            | PrefetchExecutorActionFamily::ExplicitNoPrefetch
+            | PrefetchExecutorActionFamily::AuthorityChangingHandoff
+            | PrefetchExecutorActionFamily::Unsupported => Self::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub const fn matches_action_family(self, family: PrefetchExecutorActionFamily) -> bool {
+        self as u8 == Self::for_action_family(family) as u8
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchExecutorDispatchPlan {
+    pub shape: PrefetchExecutorDispatchShape,
+    pub range_start: u64,
+    pub range_bytes: u64,
+    pub stride_bytes: u64,
+    pub range_count: u32,
+    pub fanout_limit: u32,
+    pub namespace_depth_limit: u16,
+    pub expires_after_ms: u64,
+    pub plan_ref: StorageIntentEvidenceRef,
+}
+
+impl Default for PrefetchExecutorDispatchPlan {
+    fn default() -> Self {
+        Self {
+            shape: PrefetchExecutorDispatchShape::Unknown,
+            range_start: 0,
+            range_bytes: 0,
+            stride_bytes: 0,
+            range_count: 0,
+            fanout_limit: 0,
+            namespace_depth_limit: 0,
+            expires_after_ms: 0,
+            plan_ref: EMPTY_EVIDENCE_REF,
+        }
+    }
+}
+
+impl PrefetchExecutorDispatchPlan {
+    #[must_use]
+    pub const fn bounded_range(
+        range_start: u64,
+        range_bytes: u64,
+        plan_ref: StorageIntentEvidenceRef,
+    ) -> Self {
+        Self {
+            shape: PrefetchExecutorDispatchShape::BoundedRange,
+            range_start,
+            range_bytes,
+            stride_bytes: 0,
+            range_count: 1,
+            fanout_limit: 0,
+            namespace_depth_limit: 0,
+            expires_after_ms: 0,
+            plan_ref,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_shape(mut self, shape: PrefetchExecutorDispatchShape) -> Self {
+        self.shape = shape;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_stride(mut self, stride_bytes: u64, range_count: u32) -> Self {
+        self.stride_bytes = stride_bytes;
+        self.range_count = range_count;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_fanout_limit(mut self, fanout_limit: u32) -> Self {
+        self.fanout_limit = fanout_limit;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_namespace_depth_limit(mut self, namespace_depth_limit: u16) -> Self {
+        self.namespace_depth_limit = namespace_depth_limit;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_expires_after_ms(mut self, expires_after_ms: u64) -> Self {
+        self.expires_after_ms = expires_after_ms;
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct PrefetchExecutorCostState {
@@ -812,6 +956,7 @@ pub struct PrefetchExecutorEvidenceRefs {
     pub target_media_ref: StorageIntentEvidenceRef,
     pub source_path_ref: StorageIntentEvidenceRef,
     pub target_destination_ref: StorageIntentEvidenceRef,
+    pub dispatch_plan_ref: StorageIntentEvidenceRef,
     pub read_serving_boundary_ref: StorageIntentEvidenceRef,
     pub relocation_boundary_ref: StorageIntentEvidenceRef,
     pub result_refusal_ref: StorageIntentEvidenceRef,
@@ -991,6 +1136,7 @@ pub struct PrefetchExecutorInput {
     pub evidence_query_snapshot: StorageIntentEvidenceQuerySnapshot,
     pub admission: PrefetchExecutorAdmissionRecord,
     pub media_path: PrefetchExecutorMediaPath,
+    pub dispatch_plan: PrefetchExecutorDispatchPlan,
     pub cost_state: PrefetchExecutorCostState,
     pub result_detail: PrefetchExecutorResultDetail,
     pub runtime_support: PrefetchExecutorRuntimeSupport,
@@ -1010,6 +1156,7 @@ impl Default for PrefetchExecutorInput {
             evidence_query_snapshot: StorageIntentEvidenceQuerySnapshot::default(),
             admission: PrefetchExecutorAdmissionRecord::default(),
             media_path: PrefetchExecutorMediaPath::default(),
+            dispatch_plan: PrefetchExecutorDispatchPlan::default(),
             cost_state: PrefetchExecutorCostState::default(),
             result_detail: PrefetchExecutorResultDetail::default(),
             runtime_support: PrefetchExecutorRuntimeSupport::default(),
@@ -1045,6 +1192,7 @@ pub struct PrefetchExecutorRecord {
     pub target_media: StorageMediaClass,
     pub source_path_ref: StorageIntentEvidenceRef,
     pub target_destination_ref: StorageIntentEvidenceRef,
+    pub dispatch_plan: PrefetchExecutorDispatchPlan,
     pub freshness_rpo_floor_ms: u64,
     pub max_prefetch_window_bytes: u64,
     pub max_staging_bytes: u64,
@@ -1079,6 +1227,7 @@ impl Default for PrefetchExecutorRecord {
             target_media: StorageMediaClass::SystemRam,
             source_path_ref: EMPTY_EVIDENCE_REF,
             target_destination_ref: EMPTY_EVIDENCE_REF,
+            dispatch_plan: PrefetchExecutorDispatchPlan::default(),
             freshness_rpo_floor_ms: 0,
             max_prefetch_window_bytes: 0,
             max_staging_bytes: 0,
@@ -1468,9 +1617,26 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
                     StorageIntentRefusalReason::EvidenceNotUsable,
                 )
             } else {
-                record.executor_byte_state = byte_state_for_decision(input.decision, family);
-                record.outcome = PrefetchExecutorOutcome::Started;
-                record
+                let dispatch_plan_refusal = dispatch_plan_refusal(input, family);
+                if dispatch_plan_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+                    let outcome = if dispatch_plan_refusal as u16
+                        == StorageIntentRefusalReason::OverBudget as u16
+                    {
+                        PrefetchExecutorOutcome::OverBudget
+                    } else {
+                        PrefetchExecutorOutcome::Blocked
+                    };
+                    terminal(
+                        record,
+                        outcome,
+                        PrefetchExecutorByteState::Blocked,
+                        dispatch_plan_refusal,
+                    )
+                } else {
+                    record.executor_byte_state = byte_state_for_decision(input.decision, family);
+                    record.outcome = PrefetchExecutorOutcome::Started;
+                    record
+                }
             }
         }
         PrefetchExecutorAdmissionOutcome::Dropped => terminal(
@@ -1609,6 +1775,7 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
         target_media: input.decision.target_media,
         source_path_ref: input.media_path.source_path_ref,
         target_destination_ref: input.media_path.target_destination_ref,
+        dispatch_plan: input.dispatch_plan,
         freshness_rpo_floor_ms: input.freshness_rpo_floor_ms,
         max_prefetch_window_bytes: input.decision.max_prefetch_window_bytes,
         max_staging_bytes: input.decision.max_staging_bytes,
@@ -1631,6 +1798,7 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
             target_media_ref: input.decision.target_media_ref,
             source_path_ref: input.media_path.source_path_ref,
             target_destination_ref: input.media_path.target_destination_ref,
+            dispatch_plan_ref: input.dispatch_plan.plan_ref,
             read_serving_boundary_ref: input.decision.evidence_refs.read_serving_boundary_ref,
             relocation_boundary_ref: input.decision.evidence_refs.relocation_boundary_ref,
             result_refusal_ref: input.decision.evidence_refs.result_refusal_ref,
@@ -2007,6 +2175,140 @@ fn runtime_dispatch_evidence_refusal(
     }
 
     StorageIntentRefusalReason::None
+}
+
+fn dispatch_plan_refusal(
+    input: PrefetchExecutorInput,
+    family: PrefetchExecutorActionFamily,
+) -> StorageIntentRefusalReason {
+    if !family.can_start_runtime_dispatch() {
+        return StorageIntentRefusalReason::None;
+    }
+
+    let plan = input.dispatch_plan;
+    if !plan.shape.matches_action_family(family) || !dispatch_plan_has_shape_bounds(plan) {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+
+    if !snapshot_contains_fresh_ref(
+        input,
+        StorageIntentEvidenceKind::ActionExecutionEvidence,
+        plan.plan_ref,
+    ) {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
+
+    if !dispatch_plan_within_subject(plan, input.decision.scope) {
+        return StorageIntentRefusalReason::UnstableNamespaceIdentity;
+    }
+
+    if !dispatch_plan_within_executor_limits(plan, input.decision, family) {
+        return StorageIntentRefusalReason::OverBudget;
+    }
+
+    StorageIntentRefusalReason::None
+}
+
+fn dispatch_plan_has_shape_bounds(plan: PrefetchExecutorDispatchPlan) -> bool {
+    match plan.shape {
+        PrefetchExecutorDispatchShape::BoundedRange
+        | PrefetchExecutorDispatchShape::HotsetCacheTrial
+        | PrefetchExecutorDispatchShape::SnapshotCloneRanges
+        | PrefetchExecutorDispatchShape::DegradedReconstructionRange
+        | PrefetchExecutorDispatchShape::WanGeoDeltaRange
+        | PrefetchExecutorDispatchShape::ObjectArchiveRestoreRange => {
+            plan.range_bytes != 0
+                && plan.range_count == 1
+                && plan.stride_bytes == 0
+                && plan.fanout_limit == 0
+                && plan.namespace_depth_limit == 0
+        }
+        PrefetchExecutorDispatchShape::StridedVectorRanges => {
+            plan.range_bytes != 0
+                && plan.stride_bytes != 0
+                && plan.range_count > 1
+                && plan.fanout_limit == 0
+                && plan.namespace_depth_limit == 0
+        }
+        PrefetchExecutorDispatchShape::MetadataNamespaceWalk => {
+            plan.range_count <= 1
+                && plan.stride_bytes == 0
+                && (plan.range_bytes != 0
+                    || plan.fanout_limit != 0
+                    || plan.namespace_depth_limit != 0)
+        }
+        PrefetchExecutorDispatchShape::ManifestIndexFanout => {
+            plan.range_count <= 1
+                && plan.stride_bytes == 0
+                && plan.fanout_limit != 0
+                && (plan.range_bytes != 0 || plan.namespace_depth_limit != 0)
+        }
+        PrefetchExecutorDispatchShape::Unknown => false,
+    }
+}
+
+fn dispatch_plan_within_subject(
+    plan: PrefetchExecutorDispatchPlan,
+    subject: StorageIntentObjectScope,
+) -> bool {
+    if plan.range_bytes == 0 {
+        return true;
+    }
+
+    let Some(plan_end) = dispatch_plan_extent_end(plan) else {
+        return false;
+    };
+    let Some(subject_end) = subject.range_start.checked_add(subject.range_len) else {
+        return false;
+    };
+
+    plan.range_start >= subject.range_start && plan_end <= subject_end
+}
+
+fn dispatch_plan_within_executor_limits(
+    plan: PrefetchExecutorDispatchPlan,
+    decision: PrefetchResidencyDecisionRecord,
+    family: PrefetchExecutorActionFamily,
+) -> bool {
+    let Some(planned_bytes) = dispatch_plan_planned_bytes(plan) else {
+        return false;
+    };
+    if planned_bytes == 0 {
+        return true;
+    }
+
+    let byte_limit = match family {
+        PrefetchExecutorActionFamily::WanGeoDeltaPrefetch
+        | PrefetchExecutorActionFamily::ObjectArchiveRestoreStaging => decision.max_staging_bytes,
+        _ => decision.max_prefetch_window_bytes,
+    };
+
+    byte_limit == 0 || planned_bytes <= byte_limit
+}
+
+fn dispatch_plan_planned_bytes(plan: PrefetchExecutorDispatchPlan) -> Option<u64> {
+    let count = dispatch_plan_range_count(plan);
+    plan.range_bytes.checked_mul(count)
+}
+
+fn dispatch_plan_extent_end(plan: PrefetchExecutorDispatchPlan) -> Option<u64> {
+    let count = dispatch_plan_range_count(plan);
+    let last_start = if count <= 1 {
+        plan.range_start
+    } else {
+        let stride_span = plan.stride_bytes.checked_mul(count - 1)?;
+        plan.range_start.checked_add(stride_span)?
+    };
+
+    last_start.checked_add(plan.range_bytes)
+}
+
+fn dispatch_plan_range_count(plan: PrefetchExecutorDispatchPlan) -> u64 {
+    if plan.range_count == 0 {
+        1
+    } else {
+        u64::from(plan.range_count)
+    }
 }
 
 fn freshness_rpo_floor_refusal(
@@ -2551,6 +2853,40 @@ mod tests {
         }
     }
 
+    fn dispatch_plan(candidate: PrefetchResidencyCandidateClass) -> PrefetchExecutorDispatchPlan {
+        let family = PrefetchExecutorActionFamily::from_candidate(candidate);
+        let shape = PrefetchExecutorDispatchShape::for_action_family(family);
+        let plan_ref = evidence(StorageIntentEvidenceKind::ActionExecutionEvidence, ACTION);
+
+        match shape {
+            PrefetchExecutorDispatchShape::Unknown => PrefetchExecutorDispatchPlan::default(),
+            PrefetchExecutorDispatchShape::StridedVectorRanges => {
+                PrefetchExecutorDispatchPlan::bounded_range(4096, 4096, plan_ref)
+                    .with_shape(shape)
+                    .with_stride(4096, 2)
+            }
+            PrefetchExecutorDispatchShape::MetadataNamespaceWalk => {
+                PrefetchExecutorDispatchPlan::bounded_range(4096, 4096, plan_ref)
+                    .with_shape(shape)
+                    .with_fanout_limit(16)
+                    .with_namespace_depth_limit(2)
+            }
+            PrefetchExecutorDispatchShape::ManifestIndexFanout => {
+                PrefetchExecutorDispatchPlan::bounded_range(4096, 4096, plan_ref)
+                    .with_shape(shape)
+                    .with_fanout_limit(16)
+            }
+            PrefetchExecutorDispatchShape::BoundedRange
+            | PrefetchExecutorDispatchShape::HotsetCacheTrial
+            | PrefetchExecutorDispatchShape::SnapshotCloneRanges
+            | PrefetchExecutorDispatchShape::DegradedReconstructionRange
+            | PrefetchExecutorDispatchShape::WanGeoDeltaRange
+            | PrefetchExecutorDispatchShape::ObjectArchiveRestoreRange => {
+                PrefetchExecutorDispatchPlan::bounded_range(4096, 4096, plan_ref).with_shape(shape)
+            }
+        }
+    }
+
     fn admitted_input(candidate: PrefetchResidencyCandidateClass) -> PrefetchExecutorInput {
         let decision = decision(candidate);
         PrefetchExecutorInput {
@@ -2578,6 +2914,7 @@ mod tests {
                 ),
                 ..PrefetchExecutorMediaPath::default()
             },
+            dispatch_plan: dispatch_plan(candidate),
             cost_state: PrefetchExecutorCostState {
                 snapshot: StorageIntentCostSnapshot {
                     evidence_id: COST,
@@ -3197,6 +3534,153 @@ mod tests {
         );
         assert_eq!(
             record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn started_record_preserves_typed_dispatch_plan() {
+        let input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        let dispatch_plan = input.dispatch_plan;
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(record.dispatch_plan, dispatch_plan);
+        assert_eq!(
+            record.dispatch_plan.shape,
+            PrefetchExecutorDispatchShape::BoundedRange
+        );
+        assert_eq!(
+            record.evidence_refs.dispatch_plan_ref,
+            evidence(StorageIntentEvidenceKind::ActionExecutionEvidence, ACTION)
+        );
+    }
+
+    #[test]
+    fn runtime_dispatch_requires_typed_dispatch_plan() {
+        let mut missing_plan = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_plan.dispatch_plan = PrefetchExecutorDispatchPlan::default();
+        let missing_plan_record = evaluate_prefetch_execution(missing_plan);
+        assert_eq!(
+            missing_plan_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_plan_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut wrong_shape = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        wrong_shape.dispatch_plan = wrong_shape
+            .dispatch_plan
+            .with_shape(PrefetchExecutorDispatchShape::StridedVectorRanges)
+            .with_stride(4096, 2);
+        let wrong_shape_record = evaluate_prefetch_execution(wrong_shape);
+        assert_eq!(wrong_shape_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            wrong_shape_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut missing_ref = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_ref.dispatch_plan.plan_ref = EMPTY_EVIDENCE_REF;
+        let missing_ref_record = evaluate_prefetch_execution(missing_ref);
+        assert_eq!(missing_ref_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            missing_ref_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut outside_cut = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        outside_cut.dispatch_plan.plan_ref = evidence(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            OUTSIDE_CUT,
+        );
+        let outside_cut_record = evaluate_prefetch_execution(outside_cut);
+        assert_eq!(outside_cut_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            outside_cut_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn dispatch_plan_bounds_subject_and_executor_limit() {
+        let mut outside_subject = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        outside_subject.dispatch_plan.range_start =
+            outside_subject.decision.scope.range_start + outside_subject.decision.scope.range_len;
+        outside_subject.dispatch_plan.range_bytes = 1;
+        let outside_subject_record = evaluate_prefetch_execution(outside_subject);
+        assert_eq!(
+            outside_subject_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            outside_subject_record.refusal,
+            StorageIntentRefusalReason::UnstableNamespaceIdentity
+        );
+
+        let mut over_limit = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        over_limit.decision.max_prefetch_window_bytes = 1024;
+        let over_limit_record = evaluate_prefetch_execution(over_limit);
+        assert_eq!(
+            over_limit_record.outcome,
+            PrefetchExecutorOutcome::OverBudget
+        );
+        assert_eq!(
+            over_limit_record.refusal,
+            StorageIntentRefusalReason::OverBudget
+        );
+    }
+
+    #[test]
+    fn strided_vector_dispatch_requires_stride_and_count() {
+        let input = admitted_input(PrefetchResidencyCandidateClass::StridedVectorPrefetch);
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            record.dispatch_plan.shape,
+            PrefetchExecutorDispatchShape::StridedVectorRanges
+        );
+        assert_eq!(record.dispatch_plan.stride_bytes, 4096);
+        assert_eq!(record.dispatch_plan.range_count, 2);
+
+        let mut missing_stride =
+            admitted_input(PrefetchResidencyCandidateClass::StridedVectorPrefetch);
+        missing_stride.dispatch_plan.stride_bytes = 0;
+        let missing_stride_record = evaluate_prefetch_execution(missing_stride);
+        assert_eq!(
+            missing_stride_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_stride_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn metadata_namespace_dispatch_requires_bounded_walk_plan() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::MetadataNamespacePrefetch);
+        input.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::MetadataNamespaceEvidence));
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            record.dispatch_plan.shape,
+            PrefetchExecutorDispatchShape::MetadataNamespaceWalk
+        );
+        assert_eq!(record.dispatch_plan.fanout_limit, 16);
+        assert_eq!(record.dispatch_plan.namespace_depth_limit, 2);
+
+        let mut unbounded = input;
+        unbounded.dispatch_plan.range_bytes = 0;
+        unbounded.dispatch_plan.fanout_limit = 0;
+        unbounded.dispatch_plan.namespace_depth_limit = 0;
+        let unbounded_record = evaluate_prefetch_execution(unbounded);
+        assert_eq!(unbounded_record.outcome, PrefetchExecutorOutcome::Blocked);
+        assert_eq!(
+            unbounded_record.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
     }
