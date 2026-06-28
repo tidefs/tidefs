@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "offload.ready.non_authoritative.v1",
+  "evidence_class": "cpu-reference-backend",
+  "validation_tier": "cargo-unit",
+  "scope": "non-authoritative CPU reference checksum/parity/scrub kernels",
+  "artifact_path": "validation/artifacts/offload/cpu-reference-backend.toml",
+  "content_digest": "blake3:d2a2da97e7b7a7a4f1c5f7dc86de9ef99d07daa941355aa9ff70092af44d44aa",
+  "run_id": "deterministic-fixture:offload-cpu-reference-backend-v1",
+  "source_ref": "refs/heads/gpt0/issue-1486-offload-manifests",
+  "outcome": "pass",
+  "residual_risk": "No GPU/FPGA production acceleration, DMA, kernel, RDMA, SIMD, hardware equivalence, storage-runtime integration, or storage semantics authority is validated.",
+  "source": "tidefs-offload-core",
+  "generated_at": "2026-06-28T20:11:49Z",
+  "blocking_issues": []
+}
