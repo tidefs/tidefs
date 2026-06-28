@@ -303,6 +303,7 @@ mod constants;
 mod content;
 pub mod crash_hooks;
 mod crash_recovery;
+pub mod deadlist;
 mod dedup;
 mod dedup_refcount;
 pub mod dirty_page_tracker;
