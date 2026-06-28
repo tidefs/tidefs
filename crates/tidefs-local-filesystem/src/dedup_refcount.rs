@@ -80,6 +80,34 @@ use crate::types::ContentFingerprint;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DedupRefCount;
 
+/// Capacity-facing evidence from a durable dedup refcount decrement.
+///
+/// This is producer evidence only. A retained or reclaimable canonical object
+/// does not change mounted `statfs`/ENOSPC availability until a later
+/// capacity consumer observes committed space deltas or committed reclaim
+/// evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DedupRefCountCapacityEvidence {
+    /// The canonical object still has live redirect references.
+    Retained { live_redirects_after: u64 },
+    /// The last redirect was removed and the canonical object is reclaimable.
+    Reclaimable,
+    /// No live refcount existed, so no canonical lifetime claim was emitted.
+    RefusedNoLiveRefcount,
+}
+
+impl DedupRefCountCapacityEvidence {
+    #[must_use]
+    pub const fn canonical_reclaimable(self) -> bool {
+        matches!(self, Self::Reclaimable)
+    }
+
+    #[must_use]
+    pub const fn mounted_availability_delta_bytes(self) -> Option<i64> {
+        None
+    }
+}
+
 impl DedupRefCount {
     /// Read the current refcount. Returns 0 when no refcount entry exists.
     pub fn read(store: &LocalObjectStore, fingerprint: &ContentFingerprint) -> crate::Result<u64> {
@@ -121,6 +149,31 @@ impl DedupRefCount {
         Ok(new_count)
     }
 
+    /// Decrement the refcount by 1 and return typed capacity evidence.
+    ///
+    /// Refcount decrements are canonical-lifetime evidence only. They do not
+    /// publish mounted availability deltas by themselves.
+    pub fn decrement_with_capacity_evidence(
+        store: &mut LocalObjectStore,
+        fingerprint: &ContentFingerprint,
+    ) -> crate::Result<DedupRefCountCapacityEvidence> {
+        let current = Self::read(store, fingerprint)?;
+        if current == 0 {
+            return Ok(DedupRefCountCapacityEvidence::RefusedNoLiveRefcount);
+        }
+        let new_count = current.saturating_sub(1);
+        let key = object_keys::content_dedup_refcount_key(fingerprint);
+        if new_count == 0 {
+            let _ = store.delete(key);
+            Ok(DedupRefCountCapacityEvidence::Reclaimable)
+        } else {
+            store.put(key, &new_count.to_le_bytes())?;
+            Ok(DedupRefCountCapacityEvidence::Retained {
+                live_redirects_after: new_count,
+            })
+        }
+    }
+
     /// Decrement the refcount by 1.
     ///
     /// Returns `Ok(true)` when the count reaches zero — the caller must
@@ -131,19 +184,10 @@ impl DedupRefCount {
         store: &mut LocalObjectStore,
         fingerprint: &ContentFingerprint,
     ) -> crate::Result<bool> {
-        let current = Self::read(store, fingerprint)?;
-        if current == 0 {
-            return Ok(false);
-        }
-        let new_count = current.saturating_sub(1);
-        let key = object_keys::content_dedup_refcount_key(fingerprint);
-        if new_count == 0 {
-            let _ = store.delete(key);
-            Ok(true)
-        } else {
-            store.put(key, &new_count.to_le_bytes())?;
-            Ok(false)
-        }
+        let evidence = Self::decrement_with_capacity_evidence(store, fingerprint)?;
+        let mounted_availability_delta = evidence.mounted_availability_delta_bytes();
+        debug_assert_eq!(mounted_availability_delta, None);
+        Ok(evidence.canonical_reclaimable())
     }
 
     /// Delete a canonical dedup object and its refcount entry together.
@@ -158,5 +202,90 @@ impl DedupRefCount {
         let _ = store.delete(data_key);
         let _ = store.delete(ref_key);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tidefs_local_object_store::StoreOptions;
+
+    fn test_store() -> (tempfile::TempDir, LocalObjectStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+            .expect("open store");
+        (dir, store)
+    }
+
+    fn fingerprint(byte: u8) -> ContentFingerprint {
+        ContentFingerprint::from_bytes32([byte; 32])
+    }
+
+    #[test]
+    fn decrement_with_capacity_evidence_retains_live_canonical() {
+        let (_dir, mut store) = test_store();
+        let fp = fingerprint(0xA1);
+
+        DedupRefCount::init(&mut store, &fp).expect("init");
+        DedupRefCount::increment(&mut store, &fp).expect("increment");
+
+        let evidence =
+            DedupRefCount::decrement_with_capacity_evidence(&mut store, &fp).expect("decrement");
+
+        assert_eq!(
+            evidence,
+            DedupRefCountCapacityEvidence::Retained {
+                live_redirects_after: 1
+            }
+        );
+        assert_eq!(DedupRefCount::read(&store, &fp).expect("read"), 1);
+        assert_eq!(evidence.mounted_availability_delta_bytes(), None);
+    }
+
+    #[test]
+    fn decrement_with_capacity_evidence_reports_reclaimable_last_reference() {
+        let (_dir, mut store) = test_store();
+        let fp = fingerprint(0xB2);
+
+        DedupRefCount::init(&mut store, &fp).expect("init");
+
+        let evidence =
+            DedupRefCount::decrement_with_capacity_evidence(&mut store, &fp).expect("decrement");
+
+        assert_eq!(evidence, DedupRefCountCapacityEvidence::Reclaimable);
+        assert!(evidence.canonical_reclaimable());
+        assert_eq!(DedupRefCount::read(&store, &fp).expect("read"), 0);
+        assert_eq!(evidence.mounted_availability_delta_bytes(), None);
+    }
+
+    #[test]
+    fn decrement_with_capacity_evidence_refuses_missing_refcount() {
+        let (_dir, mut store) = test_store();
+        let fp = fingerprint(0xC3);
+
+        let evidence =
+            DedupRefCount::decrement_with_capacity_evidence(&mut store, &fp).expect("decrement");
+
+        assert_eq!(
+            evidence,
+            DedupRefCountCapacityEvidence::RefusedNoLiveRefcount
+        );
+        assert!(!evidence.canonical_reclaimable());
+        assert_eq!(evidence.mounted_availability_delta_bytes(), None);
+    }
+
+    #[test]
+    fn compatibility_decrement_preserves_bool_boundary() {
+        let (_dir, mut store) = test_store();
+        let retained = fingerprint(0xD4);
+        let reclaimable = fingerprint(0xE5);
+
+        DedupRefCount::init(&mut store, &retained).expect("init retained");
+        DedupRefCount::increment(&mut store, &retained).expect("increment retained");
+        DedupRefCount::init(&mut store, &reclaimable).expect("init reclaimable");
+
+        assert!(!DedupRefCount::decrement(&mut store, &retained).expect("decrement retained"));
+        assert!(DedupRefCount::decrement(&mut store, &reclaimable).expect("decrement last"));
+        assert!(!DedupRefCount::decrement(&mut store, &fingerprint(0xF6)).expect("decrement none"));
     }
 }

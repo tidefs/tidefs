@@ -185,6 +185,87 @@ impl RemoveConsumerOutcome {
     }
 }
 
+/// Capacity-facing canonical object state published by dedup producers.
+///
+/// This is evidence for later mounted capacity accounting. It is not a
+/// mounted `statfs` or ENOSPC authority by itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DedupCanonicalObligationState {
+    /// The canonical object is still live and must be retained.
+    Retained,
+    /// The canonical object has no live consumers and may be reclaimed by a
+    /// committed reclaim pipeline.
+    Reclaimable,
+}
+
+/// Typed dedup capacity evidence emitted by DDT/refcount producers.
+///
+/// The byte fields describe obligation evidence only. They deliberately do
+/// not mutate mounted availability; #1508 owns the later consumer wiring that
+/// converts committed space deltas or reclaim evidence into user-visible
+/// `statfs`/ENOSPC effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DedupCapacityEvidence {
+    pub canonical_locator: LocatorId,
+    pub canonical_state: DedupCanonicalObligationState,
+    pub logical_bytes_charged: u64,
+    pub physical_bytes_saved: u64,
+    pub physical_bytes_released: u64,
+}
+
+impl DedupCapacityEvidence {
+    #[must_use]
+    pub const fn mounted_availability_delta_bytes(&self) -> Option<i64> {
+        None
+    }
+
+    pub fn canonical_retained(
+        canonical_locator: LocatorId,
+        logical_bytes_charged: u64,
+        physical_bytes_saved: u64,
+    ) -> Result<Self, DedupCapacityEvidenceRefusal> {
+        if logical_bytes_charged == 0 {
+            return Err(DedupCapacityEvidenceRefusal::ZeroLogicalBytes);
+        }
+        Ok(Self {
+            canonical_locator,
+            canonical_state: DedupCanonicalObligationState::Retained,
+            logical_bytes_charged,
+            physical_bytes_saved,
+            physical_bytes_released: 0,
+        })
+    }
+
+    pub fn canonical_reclaimable(
+        canonical_locator: LocatorId,
+        physical_bytes_released: u64,
+    ) -> Result<Self, DedupCapacityEvidenceRefusal> {
+        if physical_bytes_released == 0 {
+            return Err(DedupCapacityEvidenceRefusal::ZeroPhysicalReleaseBytes);
+        }
+        Ok(Self {
+            canonical_locator,
+            canonical_state: DedupCanonicalObligationState::Reclaimable,
+            logical_bytes_charged: 0,
+            physical_bytes_saved: 0,
+            physical_bytes_released,
+        })
+    }
+}
+
+/// Refusal cases for capacity-facing dedup evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DedupCapacityEvidenceRefusal {
+    /// No DDT entry exists for the requested content hash.
+    MissingCanonical,
+    /// Retained-canonical evidence cannot prove a logical charge.
+    ZeroLogicalBytes,
+    /// Reclaimable-canonical evidence cannot prove released physical bytes.
+    ZeroPhysicalReleaseBytes,
+    /// The canonical object still has live references and is not reclaimable.
+    CanonicalStillRetained { refcount: u64 },
+}
+
 // ---------------------------------------------------------------------------
 // Dedup → reclaim queue bridge
 // ---------------------------------------------------------------------------
@@ -440,6 +521,41 @@ impl DedupTable {
     #[must_use]
     pub fn collect_dead_locators(outcomes: &[RemoveConsumerOutcome]) -> Vec<LocatorId> {
         outcomes.iter().filter_map(|o| o.dead_locator()).collect()
+    }
+
+    pub fn canonical_retained_capacity_evidence(
+        &self,
+        hash: &DedupHash,
+    ) -> Result<DedupCapacityEvidence, DedupCapacityEvidenceRefusal> {
+        let entry = self
+            .entries
+            .get(hash)
+            .ok_or(DedupCapacityEvidenceRefusal::MissingCanonical)?;
+        let saved = entry.logical_bytes.saturating_sub(entry.physical_bytes);
+        DedupCapacityEvidence::canonical_retained(
+            entry.canonical_locator(),
+            entry.logical_bytes,
+            saved,
+        )
+    }
+
+    pub fn canonical_reclaimable_capacity_evidence(
+        &self,
+        hash: &DedupHash,
+    ) -> Result<DedupCapacityEvidence, DedupCapacityEvidenceRefusal> {
+        let entry = self
+            .entries
+            .get(hash)
+            .ok_or(DedupCapacityEvidenceRefusal::MissingCanonical)?;
+        if entry.refcount != 1 {
+            return Err(DedupCapacityEvidenceRefusal::CanonicalStillRetained {
+                refcount: entry.refcount,
+            });
+        }
+        DedupCapacityEvidence::canonical_reclaimable(
+            entry.canonical_locator(),
+            entry.physical_bytes,
+        )
     }
 
     #[must_use]
@@ -1246,6 +1362,76 @@ mod tests {
         ddt.add_consumer(&hash, LocatorId(3), 8);
         assert_eq!(ddt.stats().bytes_saved, 16);
         assert_eq!(ddt.stats().total_refcount, 3);
+    }
+
+    #[test]
+    fn retained_capacity_evidence_reports_logical_charge_and_saved_bytes() {
+        let mut ddt = DedupTable::new();
+        let hash = DedupHash::compute(b"capacity evidence");
+        ddt.insert(hash, LocatorId(7), 4096, 4096).unwrap();
+        ddt.add_consumer(&hash, LocatorId(8), 4096);
+
+        let evidence = ddt.canonical_retained_capacity_evidence(&hash).unwrap();
+
+        assert_eq!(evidence.canonical_locator, LocatorId(7));
+        assert_eq!(
+            evidence.canonical_state,
+            DedupCanonicalObligationState::Retained
+        );
+        assert_eq!(evidence.logical_bytes_charged, 8192);
+        assert_eq!(evidence.physical_bytes_saved, 4096);
+        assert_eq!(evidence.physical_bytes_released, 0);
+        assert_eq!(evidence.mounted_availability_delta_bytes(), None);
+    }
+
+    #[test]
+    fn reclaimable_capacity_evidence_reports_released_physical_bytes() {
+        let mut ddt = DedupTable::new();
+        let hash = DedupHash::compute(b"reclaimable evidence");
+        ddt.insert(hash, LocatorId(9), 4096, 1024).unwrap();
+
+        let evidence = ddt.canonical_reclaimable_capacity_evidence(&hash).unwrap();
+
+        assert_eq!(evidence.canonical_locator, LocatorId(9));
+        assert_eq!(
+            evidence.canonical_state,
+            DedupCanonicalObligationState::Reclaimable
+        );
+        assert_eq!(evidence.logical_bytes_charged, 0);
+        assert_eq!(evidence.physical_bytes_saved, 0);
+        assert_eq!(evidence.physical_bytes_released, 1024);
+        assert_eq!(evidence.mounted_availability_delta_bytes(), None);
+    }
+
+    #[test]
+    fn capacity_evidence_refuses_missing_and_still_retained_canonicals() {
+        let mut ddt = DedupTable::new();
+        let missing = DedupHash::compute(b"missing");
+        assert_eq!(
+            ddt.canonical_retained_capacity_evidence(&missing),
+            Err(DedupCapacityEvidenceRefusal::MissingCanonical)
+        );
+
+        let hash = DedupHash::compute(b"still retained");
+        ddt.insert(hash, LocatorId(11), 4096, 4096).unwrap();
+        ddt.add_consumer(&hash, LocatorId(12), 4096);
+
+        assert_eq!(
+            ddt.canonical_reclaimable_capacity_evidence(&hash),
+            Err(DedupCapacityEvidenceRefusal::CanonicalStillRetained { refcount: 2 })
+        );
+    }
+
+    #[test]
+    fn capacity_evidence_constructors_refuse_unproven_byte_claims() {
+        assert_eq!(
+            DedupCapacityEvidence::canonical_retained(LocatorId(1), 0, 0),
+            Err(DedupCapacityEvidenceRefusal::ZeroLogicalBytes)
+        );
+        assert_eq!(
+            DedupCapacityEvidence::canonical_reclaimable(LocatorId(1), 0),
+            Err(DedupCapacityEvidenceRefusal::ZeroPhysicalReleaseBytes)
+        );
     }
 
     // ── DedupScanner ────────────────────────────────────────────────────
