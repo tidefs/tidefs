@@ -785,6 +785,19 @@ Important 2026-06-01 findings:
   every file starts with the expected TideFS SPDX header or one of the
   documented kernel `GPL-2.0` module markers. No open provenance item remains
   for this audit slice.
+- `TFR-014`: issue #1289 closes the current-tree licensing/provenance boundary.
+  The live evidence is issue #508/PR #521 for package metadata, Rust SPDX
+  headers, and `check-workspace-policy` gates, plus issue #690/PR #1178 for the
+  post-refresh manifest and Rust notice re-audit. `COPYING` and
+  `docs/LICENSING.md` record the `GPL-2.0-only WITH Linux-syscall-note` model
+  and the documented `fuser`, kernel-module, and VM-helper notice exceptions.
+  Future checked-in third-party imports, new package exceptions, or missing
+  file-local notices are covered by `check-workspace-policy`, while dependency
+  license drift is covered by ADR-0006, `deny.toml`, and the Dependency License
+  workflow. No residual TFR-014 blocker remains for current checked-in code;
+  future policy, dependency, provenance, or release-readiness changes must be
+  split into focused GitHub issues and PRs with their own write sets and
+  validation instead of reopening the closed broad audit.
 - `TFR-014`/`TFR-019`: the active repo rename surface is clean at the literal
   source level: the focused legacy-name scan over `/root/tidefs` reports no
   active hits outside excluded build output, lockfiles, and the vendored
