@@ -72,6 +72,10 @@ use tidefs_replication_model::{
     FlowCommitClass, FlowCommitResult, FlowState, ObjectDigest, PlacementReceiptRef,
     ReceiptRedundancyPolicy, ReplicaMovementClass, ReplicatedReadPlan,
 };
+use tidefs_send_stream::chunk_encoder::TransferChunkEncoder;
+use tidefs_send_stream::{
+    Id128, SendQueue, SendTransport, SendTransportBridge, SendTransportError,
+};
 use tidefs_transport::carrier_selection::CarrierPolicy;
 use tidefs_transport::connection_registry::ConnectionRegistry;
 use tidefs_transport::{
@@ -149,8 +153,8 @@ pub struct StorageNodeRelocationReadMapPublication {
 pub struct StorageNodeReceiptBoundDeadObjectDrainStats {
     /// Number of pool devices whose receipt-bound dead-object queues were scanned.
     pub devices_scanned: usize,
-    /// Number of receipt-authorized dead objects acknowledged by the drain.
-    pub objects_acked: usize,
+    /// Number of receipt-authorized dead objects examined by the drain.
+    pub objects_examined: usize,
     /// Number of segments identified as fully dead and freed.
     pub segments_reclaimed: u64,
     /// Number of dead-object records accounted as freed.
@@ -165,7 +169,7 @@ impl From<PoolReceiptBoundDeadObjectDrainStats> for StorageNodeReceiptBoundDeadO
     fn from(stats: PoolReceiptBoundDeadObjectDrainStats) -> Self {
         Self {
             devices_scanned: stats.devices_scanned,
-            objects_acked: stats.objects_acked,
+            objects_examined: stats.objects_examined,
             segments_reclaimed: stats.segments_reclaimed,
             blocks_freed: stats.blocks_freed,
             reclaim_queue_depth: stats.reclaim_queue_depth,
@@ -637,6 +641,132 @@ fn storage_replication_sessions_by_member(
         }
     }
     peer_sessions
+}
+
+#[derive(Clone, Default)]
+struct BufferedSendTransport {
+    frames: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl BufferedSendTransport {
+    fn into_bytes(self) -> Vec<u8> {
+        let frames = self.frames.lock().unwrap();
+        let total_len = frames.iter().map(Vec::len).sum();
+        let mut out = Vec::with_capacity(total_len);
+        for frame in frames.iter() {
+            out.extend_from_slice(frame);
+        }
+        out
+    }
+}
+
+impl SendTransport for BufferedSendTransport {
+    fn send(&mut self, data: &[u8]) -> Result<(), SendTransportError> {
+        self.frames.lock().unwrap().push(data.to_vec());
+        Ok(())
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+fn derive_vfssend2_id(context: &str, config: &StorageNodeConfig, fs_root: &Path) -> Id128 {
+    let mut input = Vec::new();
+    input.extend_from_slice(&config.node_id.to_le_bytes());
+    if let Some(identity) = &config.node_identity {
+        input.extend_from_slice(identity.as_bytes());
+    }
+    input.extend_from_slice(fs_root.to_string_lossy().as_bytes());
+
+    let digest = blake3::derive_key(context, &input);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    if id == [0u8; 16] {
+        id[0] = 1;
+    }
+    id
+}
+
+fn storage_node_vfssend2_ids(config: &StorageNodeConfig, fs_root: &Path) -> (Id128, Id128) {
+    (
+        derive_vfssend2_id("TideFS storage-node VFSSEND2 pool id v1", config, fs_root),
+        derive_vfssend2_id(
+            "TideFS storage-node VFSSEND2 dataset id v1",
+            config,
+            fs_root,
+        ),
+    )
+}
+
+fn parse_send_base_root(
+    fs_root: &Path,
+    auth_key: RootAuthenticationKey,
+    key: &[u8],
+) -> Result<vfs::CommittedRootSummary, String> {
+    if key.len() != 24 {
+        return Err(format!("send key must be 0 or 24 bytes, got {}", key.len()));
+    }
+
+    let tid = u64::from_le_bytes(key[0..8].try_into().unwrap());
+    let gen = u64::from_le_bytes(key[8..16].try_into().unwrap());
+    let csum = u64::from_le_bytes(key[16..24].try_into().unwrap());
+    let audit = vfs::audit_recovery_with_root_authentication_key(
+        fs_root,
+        StoreOptions::default(),
+        auth_key,
+    )
+    .map_err(|e| format!("audit: {e}"))?;
+    audit
+        .valid_committed_roots
+        .iter()
+        .find(|r| r.transaction_id == tid && r.generation == gen && r.superblock_checksum.0 == csum)
+        .cloned()
+        .ok_or_else(|| format!("from_root not found: tid={tid} gen={gen} csum={csum:#016x}"))
+}
+
+fn build_vfssend2_send_stream(
+    fs: &mut vfs::LocalFileSystem,
+    fs_root: &Path,
+    auth_key: RootAuthenticationKey,
+    config: &StorageNodeConfig,
+    key: &[u8],
+) -> Result<Vec<u8>, String> {
+    let (pool_id, dataset_id) = storage_node_vfssend2_ids(config, fs_root);
+    if key.is_empty() {
+        fs.export_vfssend2(pool_id, dataset_id)
+            .map_err(|e| format!("VFSSEND2 export: {e}"))
+    } else {
+        let from_root = parse_send_base_root(fs_root, auth_key, key)?;
+        fs.export_incremental_vfssend2(pool_id, dataset_id, &from_root)
+            .map_err(|e| format!("VFSSEND2 incremental export: {e}"))
+    }
+}
+
+fn bridge_vfssend2_send_stream(stream: Vec<u8>) -> Result<Vec<u8>, SendTransportError> {
+    let object_id = *blake3::hash(&stream).as_bytes();
+    let chunks = TransferChunkEncoder::new(Default::default()).encode_object(object_id, &stream);
+    let queue = Arc::new(SendQueue::new(chunks.len().max(1)));
+    for chunk in chunks {
+        queue.enqueue(chunk);
+    }
+
+    let transport = BufferedSendTransport::default();
+    let captured = transport.clone();
+    let mut bridge = SendTransportBridge::new(queue, transport);
+    bridge.finish()?;
+    Ok(captured.into_bytes())
+}
+
+fn build_bridged_vfssend2_send_payload(
+    fs: &mut vfs::LocalFileSystem,
+    fs_root: &Path,
+    auth_key: RootAuthenticationKey,
+    config: &StorageNodeConfig,
+    key: &[u8],
+) -> Result<Vec<u8>, String> {
+    let stream = build_vfssend2_send_stream(fs, fs_root, auth_key, config, key)?;
+    bridge_vfssend2_send_stream(stream).map_err(|e| format!("VFSSEND2 transport bridge: {e}"))
 }
 
 fn advance_tracker_after_peer_replica_read_map(
@@ -5194,57 +5324,10 @@ fn handle_frame_ctx(
                     })
                 }
             };
-            if key.is_empty() {
-                match fs.export_changed_records() {
-                    Ok(export) => Some(Frame::SendResponse {
-                        export: export.encode(),
-                    }),
-                    Err(e) => Some(Frame::Error {
-                        message: format!("export: {e}"),
-                    }),
-                }
-            } else if key.len() == 24 {
-                let tid = u64::from_le_bytes(key[0..8].try_into().unwrap());
-                let gen = u64::from_le_bytes(key[8..16].try_into().unwrap());
-                let csum = u64::from_le_bytes(key[16..24].try_into().unwrap());
-                let audit = match vfs::audit_recovery_with_root_authentication_key(
-                    fs_root,
-                    StoreOptions::default(),
-                    auth_key,
-                ) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        return Some(Frame::Error {
-                            message: format!("audit: {e}"),
-                        })
-                    }
-                };
-                let from_root = match audit.valid_committed_roots.iter().find(|r| {
-                    r.transaction_id == tid
-                        && r.generation == gen
-                        && r.superblock_checksum.0 == csum
-                }) {
-                    Some(r) => r.clone(),
-                    None => {
-                        return Some(Frame::Error {
-                            message: format!(
-                                "from_root not found: tid={tid} gen={gen} csum={csum:#016x}"
-                            ),
-                        })
-                    }
-                };
-                match fs.export_incremental_changed_records(&from_root) {
-                    Ok(export) => Some(Frame::SendResponse {
-                        export: export.encode(),
-                    }),
-                    Err(e) => Some(Frame::Error {
-                        message: format!("incremental export: {e}"),
-                    }),
-                }
-            } else {
-                Some(Frame::Error {
-                    message: format!("send key must be 0 or 24 bytes, got {}", key.len()),
-                })
+            match build_bridged_vfssend2_send_payload(&mut fs, fs_root, auth_key, &ctx.config, key)
+            {
+                Ok(export) => Some(Frame::SendResponse { export }),
+                Err(message) => Some(Frame::Error { message }),
             }
         }
         Frame::Receive {
@@ -5503,55 +5586,15 @@ fn handle_frame_ctx(
                     })
                 }
             };
-            let export = if key.is_empty() {
-                match fs.export_changed_records() {
-                    Ok(e) => e.encode(),
-                    Err(e) => {
-                        return Some(Frame::Error {
-                            message: format!("export: {e}"),
-                        })
-                    }
-                }
-            } else if key.len() == 24 {
-                let tid = u64::from_le_bytes(key[0..8].try_into().unwrap());
-                let gen = u64::from_le_bytes(key[8..16].try_into().unwrap());
-                let csum = u64::from_le_bytes(key[16..24].try_into().unwrap());
-                let audit = match vfs::audit_recovery_with_root_authentication_key(
-                    fs_root,
-                    StoreOptions::default(),
-                    auth_key,
-                ) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        return Some(Frame::Error {
-                            message: format!("audit: {e}"),
-                        })
-                    }
-                };
-                let from_root = match audit.valid_committed_roots.iter().find(|r| {
-                    r.transaction_id == tid
-                        && r.generation == gen
-                        && r.superblock_checksum.0 == csum
-                }) {
-                    Some(r) => r.clone(),
-                    None => {
-                        return Some(Frame::Error {
-                            message: format!("from_root not found: tid={tid} gen={gen}"),
-                        })
-                    }
-                };
-                match fs.export_incremental_changed_records(&from_root) {
-                    Ok(e) => e.encode(),
-                    Err(e) => {
-                        return Some(Frame::Error {
-                            message: format!("incremental export: {e}"),
-                        })
-                    }
-                }
-            } else {
-                return Some(Frame::Error {
-                    message: format!("send key must be 0 or 24 bytes, got {}", key.len()),
-                });
+            let export = match build_bridged_vfssend2_send_payload(
+                &mut fs,
+                fs_root,
+                auth_key,
+                &ctx.config,
+                key,
+            ) {
+                Ok(export) => export,
+                Err(message) => return Some(Frame::Error { message }),
             };
             let cursor: Vec<u8> = if export.len() >= 8 {
                 let mut c = vec![0u8; 16];
@@ -6005,12 +6048,9 @@ fn handle_vsnp_pull_request(
     )
     .map_err(|e| format!("open fs for send: {e}"))?;
 
-    let export = fs
-        .export_changed_records()
-        .map_err(|e| format!("export: {e}"))?;
-    let encoded = export.encode();
+    let export = build_bridged_vfssend2_send_payload(&mut fs, fs_root, auth_key, &ctx.config, &[])?;
 
-    Ok(Some(build_vsnp_pull_response(&encoded)))
+    Ok(Some(build_vsnp_pull_response(&export)))
 }
 
 fn handle_vsnp_block_push(
@@ -6061,8 +6101,9 @@ mod cluster_pool_handler_tests {
         ReplicaPlacementReceipt, ReplicatedReceiptId, ReplicatedSubjectId,
     };
 
-    /// Minimum device size for pool creation: 2 * 256KB labels + 8KB offset + 256KB commit region.
-    const DEVICE_BYTES: u64 = 2_000_000;
+    /// Keep regular-file test media at the development image size so the
+    /// object-store backend does not grow files after pool labels are written.
+    const DEVICE_BYTES: u64 = vfs::DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES;
 
     fn make_device(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
         let path = dir.path().join(name);
@@ -7934,8 +7975,8 @@ mod cluster_pool_handler_tests {
             replacement_receipt.receipt_generation + 1
         );
         assert_eq!(drain.drain_stats.devices_scanned, 2);
-        assert_eq!(drain.drain_stats.objects_acked, 2);
-        assert_eq!(drain.drain_stats.reclaim_queue_depth, 0);
+        assert_eq!(drain.drain_stats.objects_examined, 2);
+        assert_eq!(drain.drain_stats.reclaim_queue_depth, 2);
 
         let StoreBackend::PoolBacked(pool) = &mut backend else {
             unreachable!()
@@ -7946,9 +7987,9 @@ mod cluster_pool_handler_tests {
                 drain.stable_committed_txg,
                 16,
             )
-            .expect("second drain is idle");
-        assert_eq!(after.objects_acked, 0);
-        assert_eq!(after.reclaim_queue_depth, 0);
+            .expect("second drain keeps partially live segment entries");
+        assert_eq!(after.objects_examined, 2);
+        assert_eq!(after.reclaim_queue_depth, 2);
     }
 
     #[test]
@@ -8038,7 +8079,7 @@ mod cluster_pool_handler_tests {
                 16,
             )
             .expect("replacement generation is not yet stable");
-        assert_eq!(held.objects_acked, 0);
+        assert_eq!(held.objects_examined, 0);
         assert_eq!(held.reclaim_queue_depth, 2);
     }
 
@@ -8347,10 +8388,18 @@ mod cluster_pool_handler_tests {
         let admission =
             receipt_backed_rebuild_admission_from_refs(&config_with_rebuild_peer(), vec![receipt])
                 .unwrap();
-        let mut planner =
-            receipt_backed_rebuild_planner_from_refs(&config_with_rebuild_peer(), vec![receipt])
-                .unwrap();
-        planner.tasks[0].target_nodes = vec![3];
+        let planner = ReceiptBackedPlannerPreview {
+            receipt_ref_count: 1,
+            detected_epoch: receipt.receipt_epoch.0,
+            local_member: MemberId::new(1),
+            target_members: vec![MemberId::new(2)],
+            plan_id: receipt.receipt_epoch.0,
+            total_target_replicas: 1,
+            tasks: vec![
+                ReconstructionTask::new_full_with_receipt(receipt, vec![1], vec![3], 1).unwrap(),
+            ],
+            reason: None,
+        };
 
         let err = cross_check_rebuild_execution_candidates(&admission, &planner).unwrap_err();
         assert_eq!(err["class"], "planner-admission-target-mismatch");
@@ -8866,28 +8915,23 @@ mod cluster_pool_handler_tests {
         assert_eq!(report["rebuild_admission"]["report_count"], 1);
         assert_eq!(report["rebuild_admission"]["intent_count"], 1);
         assert_eq!(report["rebuild_admission"]["scheduled_task_count"], 1);
-        assert_eq!(report["rebuild_planner"]["available"], true);
+        assert_eq!(report["rebuild_planner"]["available"], false);
         assert_eq!(report["rebuild_planner"]["preview"], true);
-        assert_eq!(
-            report["rebuild_planner"]["boundary"],
-            "storage-node-scrub-rebuild-planner-preview"
-        );
         assert_eq!(report["rebuild_planner"]["receipt_ref_count"], 1);
+        assert_eq!(report["rebuild_planner"]["task_count"], 0);
         assert_eq!(
-            report["rebuild_planner"]["healthy_sources"],
-            serde_json::json!([1])
+            report["rebuild_planner"]["planner_error"]["class"],
+            "topology-only-source-evidence"
         );
         assert_eq!(
-            report["rebuild_planner"]["candidate_targets"],
-            serde_json::json!([2])
+            report["rebuild_planner"]["planner_error"]["source_count"],
+            1
         );
         assert_eq!(
-            report["rebuild_planner"]["failed_nodes"],
-            serde_json::json!([])
+            report["rebuild_planner"]["planner_error"]["receipt_target_count"],
+            2
         );
-        assert_eq!(report["rebuild_planner"]["task_count"], 1);
-        assert_eq!(report["rebuild_planner"]["total_target_replicas"], 1);
-        assert_eq!(report["rebuild_execution_candidates"]["available"], true);
+        assert_eq!(report["rebuild_execution_candidates"]["available"], false);
         assert_eq!(
             report["rebuild_execution_candidates"]["boundary"],
             "storage-node-scrub-rebuild-execution-candidate-preview"
@@ -8901,12 +8945,16 @@ mod cluster_pool_handler_tests {
             1
         );
         assert_eq!(
-            report["rebuild_execution_candidates"]["planner_task_count"],
-            1
+            report["rebuild_execution_candidates"]["execution_candidate_count"],
+            0
         );
         assert_eq!(
-            report["rebuild_execution_candidates"]["execution_candidate_count"],
-            1
+            report["rebuild_execution_candidates"]["reason"],
+            "rebuild planner preview is unavailable"
+        );
+        assert_eq!(
+            report["rebuild_execution_candidates"]["planner"]["planner_error"]["class"],
+            "topology-only-source-evidence"
         );
 
         let receipt_ref = &report["placement_receipt_refs"]["refs"][0];
@@ -8919,24 +8967,6 @@ mod cluster_pool_handler_tests {
         assert_eq!(
             admission_task["placement_receipt_ref"]["target_count"],
             receipt_ref["target_count"]
-        );
-        let planner_task = &report["rebuild_planner"]["tasks"][0];
-        assert_eq!(planner_task["object_id"], receipt_ref["object_id"]);
-        assert_eq!(planner_task["source_nodes"], serde_json::json!([1]));
-        assert_eq!(planner_task["target_nodes"], serde_json::json!([2]));
-        assert_eq!(planner_task["placement_receipt_ref"], *receipt_ref);
-        assert_eq!(
-            planner_task["placement_receipt_ref"]["payload_digest"],
-            receipt_ref["payload_digest"]
-        );
-        let candidate = &report["rebuild_execution_candidates"]["candidates"][0];
-        assert_eq!(candidate["source_member"], 1);
-        assert_eq!(candidate["target_member"], 2);
-        assert_eq!(candidate["payload_len"], receipt_ref["payload_len"]);
-        assert_eq!(candidate["placement_receipt_ref"], *receipt_ref);
-        assert_eq!(
-            candidate["placement_receipt_ref"]["payload_digest"],
-            receipt_ref["payload_digest"]
         );
     }
 

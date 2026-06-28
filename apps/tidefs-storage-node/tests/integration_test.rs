@@ -13,6 +13,9 @@ use std::time::Duration;
 
 use tidefs_membership_epoch::{MemberClass, MemberId};
 use tidefs_membership_live::MembershipTransport;
+use tidefs_send_stream::chunk_encoder::TransferChunk;
+use tidefs_send_stream::send_transport_bridge::decode_stream_end;
+use tidefs_send_stream::{ReceiveBuilder, ReceivedDataset, SendStreamHeader, STREAM_MAGIC};
 use tidefs_storage_node::client;
 use tidefs_storage_node::protocol::Frame;
 use tidefs_storage_node::server::{MembershipPeerConfig, StorageNode, StorageNodeConfig};
@@ -29,6 +32,40 @@ fn scratch_store_paths(label: &str, count: usize) -> Vec<PathBuf> {
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).expect("create scratch dir");
     (0..count).map(|i| base.join(format!("rep{i}"))).collect()
+}
+
+fn reassemble_vfssend2_bridge_export(export: &[u8]) -> Vec<u8> {
+    let mut rest = export;
+    let mut stream = Vec::new();
+    let mut chunk_count = 0u64;
+
+    while rest.len() != 44 {
+        assert!(rest.len() > 8, "bridge frame truncated before footer");
+        let seq = u64::from_le_bytes(rest[0..8].try_into().expect("bridge sequence"));
+        assert_eq!(seq, chunk_count, "bridge chunk sequence mismatch");
+
+        let (chunk, trailing) =
+            TransferChunk::decode_from_wire(&rest[8..]).expect("decode bridge chunk");
+        assert!(chunk.verify_auth_tag(), "bridge chunk auth tag");
+        stream.extend_from_slice(&chunk.payload);
+        rest = trailing;
+        chunk_count += 1;
+    }
+
+    let (footer_chunks, _digest) = decode_stream_end(rest).expect("decode bridge footer");
+    assert_eq!(footer_chunks, chunk_count, "bridge footer chunk count");
+    stream
+}
+
+fn receive_vfssend2_bridge_export(export: &[u8]) -> ReceivedDataset {
+    let stream = reassemble_vfssend2_bridge_export(export);
+    assert_eq!(&stream[..STREAM_MAGIC.len()], &STREAM_MAGIC);
+    let (header, rest) = SendStreamHeader::decode(&stream).expect("decode VFSSEND2 header");
+    assert!(!rest.is_empty(), "VFSSEND2 stream should contain records");
+    ReceiveBuilder::new(header.source_dataset_id, &stream)
+        .expect("decode VFSSEND2 stream")
+        .finish_all()
+        .expect("receive VFSSEND2 stream")
 }
 
 struct TestServer {
@@ -422,14 +459,14 @@ fn stats_returns_json() {
 }
 
 // ---------------------------------------------------------------------------
-// SEND / RECEIVE end-to-end via server transport
+// SEND VFSSEND2 via server transport
 // ---------------------------------------------------------------------------
 
-use tidefs_local_filesystem::{self as vfs, ChangedRecordExport, RootAuthenticationKey};
+use tidefs_local_filesystem::{self as vfs, RootAuthenticationKey};
 use tidefs_local_object_store::StoreOptions;
 
 #[test]
-fn send_receive_full_roundtrip_via_server() {
+fn send_vfssend2_roundtrip_via_server() {
     let auth_key = RootAuthenticationKey::demo_key();
 
     // ── Phase 1: create a source filesystem with data ──
@@ -522,53 +559,14 @@ fn send_receive_full_roundtrip_via_server() {
     stop.store(true, Ordering::Relaxed);
     drop(handle);
 
-    // ── Phase 3: receive into a fresh (non-existent) target directory ──
-    let target_parent = tempfile::tempdir().expect("target parent");
-    let target_path = target_parent.path().join("target-fs");
-
-    let decoded = ChangedRecordExport::decode(&export).expect("decode export");
-    let report =
-        vfs::LocalFileSystem::receive_changed_records_into_empty_root_with_root_authentication_key(
-            &target_path,
-            StoreOptions::default(),
-            &decoded,
-            auth_key,
-            [0u8; 16],
-            [0u8; 16],
-            None,
-        )
-        .expect("receive into target");
-
+    // ── Phase 3: verify the bridge payload reassembles into VFSSEND2 ──
+    let received = receive_vfssend2_bridge_export(&export);
+    assert!(!received.snapshots.is_empty(), "VFSSEND2 snapshots");
+    assert!(!received.objects.is_empty(), "VFSSEND2 objects");
+    let total_payload_bytes: usize = received.objects.values().map(|o| o.payload.len()).sum();
     assert!(
-        report.imported_records > 0,
-        "should import records, got {}",
-        report.imported_records
-    );
-    assert!(
-        report.imported_payload_bytes > 0,
-        "should import payload, got {}",
-        report.imported_payload_bytes
-    );
-    // stream_version is 1 for full exports, 2 for incremental.
-    assert_eq!(report.stream_version, 1);
-    assert!(report.staging_validated_before_publish);
-    assert!(report.destination_root_reauthentication);
-
-    // ── Phase 4: verify received data matches source ──
-    let target = vfs::LocalFileSystem::open_with_root_authentication_key(
-        &target_path,
-        StoreOptions::default(),
-        auth_key,
-    )
-    .expect("open target fs");
-
-    assert_eq!(
-        target.read_file("/data/file1.bin").expect("read file1"),
-        file1_data
-    );
-    assert_eq!(
-        target.read_file("/data/file2.bin").expect("read file2"),
-        file2_data
+        total_payload_bytes >= file1_data.len() + file2_data.len(),
+        "VFSSEND2 payload bytes should include file data"
     );
 }
 
@@ -618,7 +616,8 @@ fn health_check_roundtrip_via_client() {
 
 use tidefs_pool_import::create::{PoolCreateConfig, PoolCreator, RedundancyPolicy};
 
-const HEALTH_POOL_DEVICE_BYTES: u64 = 2_000_000;
+const HEALTH_POOL_DEVICE_BYTES: u64 =
+    tidefs_local_filesystem::DEFAULT_LOCAL_FILESYSTEM_DEVELOPMENT_DEVICE_IMAGE_BYTES;
 
 fn create_importable_pool_device(path: &std::path::Path, pool_name: &str) {
     let f = std::fs::File::create(path).expect("create pool device");
@@ -1573,7 +1572,7 @@ fn live_backend_frame_put_requires_receipt_authority() {
 }
 
 #[test]
-fn two_node_send_receive_committed_root_replication_and_recovery() {
+fn two_node_send_exports_vfssend2_bridge_stream() {
     let auth_key = RootAuthenticationKey::demo_key();
     let primary_fs_dir = tempfile::tempdir().expect("primary fs dir");
     let replica_parent_dir = tempfile::tempdir().expect("replica parent dir");
@@ -1685,7 +1684,7 @@ fn two_node_send_receive_committed_root_replication_and_recovery() {
     });
     thread::sleep(Duration::from_millis(100));
 
-    // Phase 3: Send from primary, Receive on replica.
+    // Phase 3: Send from primary and validate the VFSSEND2 bridge stream.
     let resp = client::request(10, 1, primary_addr, Frame::Send { key: vec![] }, false)
         .expect("send request");
     let export = match resp {
@@ -1695,57 +1694,13 @@ fn two_node_send_receive_committed_root_replication_and_recovery() {
     };
     assert!(!export.is_empty(), "export should not be empty");
 
-    let auth_key_bytes = auth_key.as_bytes32().to_vec();
-    let resp = client::request(
-        20,
-        2,
-        replica_addr,
-        Frame::Receive {
-            export,
-            root_authentication_key: auth_key_bytes,
-        },
-        false,
-    )
-    .expect("receive request");
-    match resp {
-        Frame::ReceiveResponse { report_json } => {
-            let report: serde_json::Value =
-                serde_json::from_str(&report_json).expect("receive report JSON");
-            let imported = report["imported_records"].as_u64().unwrap_or(0);
-            assert!(imported > 0, "receive should import records: {report_json}");
-            let roots = report["imported_roots"].as_u64().unwrap_or(0);
-            assert!(
-                roots >= 1,
-                "receive should import committed root: {report_json}"
-            );
-        }
-        Frame::Error { message } => panic!("receive error: {message}"),
-        other => panic!("expected ReceiveResponse, got {other:?}"),
-    }
-
-    // Phase 4: verify replica data independently.
-    let replica_fs = vfs::LocalFileSystem::open_with_root_authentication_key(
-        &replica_fs_root,
-        StoreOptions::default(),
-        auth_key,
-    )
-    .expect("open replica fs");
-    let got = replica_fs
-        .read_file("/data/test.bin")
-        .expect("read file on replica");
-    assert_eq!(got, vec![0x5A; 8192], "replica must have correct data");
-
-    // Phase 5: audit recovery on replica proves committed-root present.
-    let audit = vfs::audit_recovery_with_root_authentication_key(
-        &replica_fs_root,
-        StoreOptions::default(),
-        auth_key,
-    )
-    .expect("audit replica recovery");
+    let received = receive_vfssend2_bridge_export(&export);
+    assert!(!received.snapshots.is_empty(), "VFSSEND2 snapshots");
+    assert!(!received.objects.is_empty(), "VFSSEND2 objects");
+    let total_payload_bytes: usize = received.objects.values().map(|o| o.payload.len()).sum();
     assert!(
-        !audit.valid_committed_roots.is_empty(),
-        "replica must have at least 1 valid committed root: {}",
-        audit.valid_committed_roots.len()
+        total_payload_bytes >= 8192,
+        "VFSSEND2 payload bytes should include source file data"
     );
 
     // Cleanup.

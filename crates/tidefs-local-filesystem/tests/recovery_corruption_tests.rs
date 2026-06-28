@@ -20,9 +20,7 @@ use tidefs_local_filesystem::{
     transaction_inode_object_key, transaction_manifest_object_key, InodeRecord, LocalFileSystem,
     DEFAULT_DIRECTORY_PERMISSIONS, DEFAULT_FILE_PERMISSIONS,
 };
-use tidefs_local_object_store::{
-    segment_file_name, LocalObjectStore, ObjectKey, StoreOptions, RECORD_HEADER_LEN,
-};
+use tidefs_local_object_store::{LocalObjectStore, ObjectKey, StoreOptions, RECORD_HEADER_LEN};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -47,8 +45,20 @@ fn opts() -> StoreOptions {
     StoreOptions::test_fast()
 }
 
-fn seg_path(segments_dir: &Path, segment_id: u64) -> PathBuf {
-    segments_dir.join(segment_file_name(segment_id))
+fn fs_data_store(root: &Path) -> LocalObjectStore {
+    setup_auth_env();
+    let device_path = LocalFileSystem::default_development_device_path(root);
+    LocalObjectStore::open_block_device(&device_path, opts()).expect("open filesystem data store")
+}
+
+fn seg_path(store: &LocalObjectStore, segment_id: u64) -> PathBuf {
+    let root = store.root();
+    if root.is_file() || (root.exists() && !root.is_dir()) {
+        root.to_path_buf()
+    } else {
+        root.join("segments")
+            .join(tidefs_local_object_store::segment_file_name(segment_id))
+    }
 }
 
 /// Create a filesystem with stable data (survives corruption) and candidate
@@ -105,8 +115,8 @@ fn verify_recovery_handles_corruption(root: &Path, label: &str) {
 }
 
 /// Corrupt `len` bytes at `offset` in a segment file by flipping all bits.
-fn corrupt_segment_bytes(root: &Path, segment_id: u64, offset: u64, len: u64) {
-    let path = seg_path(&root.join("segments"), segment_id);
+fn corrupt_segment_bytes(store: &LocalObjectStore, segment_id: u64, offset: u64, len: u64) {
+    let path = seg_path(store, segment_id);
     let mut file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -128,7 +138,7 @@ fn corrupt_object_payload(store: &LocalObjectStore, key: ObjectKey) {
     let loc = store.location_of(key).expect("object location");
     let payload_start = loc.record_offset + RECORD_HEADER_LEN as u64;
     corrupt_segment_bytes(
-        store.root(),
+        store,
         loc.segment_id,
         payload_start,
         (loc.payload_len / 2).max(1),
@@ -165,40 +175,17 @@ fn recovery_after_segment_header_corruption() {
     let root = temp_root("seg-header");
     setup_fs_with_stable_and_candidate(&root);
 
-    // Corrupt the first segment file's magic/hash at offset 0.
-    let segments_dir = root.join("segments");
-    let _seg0 = segments_dir.join(segment_file_name(0));
-    // The first segment might not be 0; find any segment.
-    let mut seg_id: Option<u64> = None;
-    for entry in fs::read_dir(&segments_dir).expect("read segments dir") {
-        let entry = entry.expect("dir entry");
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.ends_with(".vlos") {
-            // Parse segment id from "segment-NNNN.vlos"
-            if let Some(id_str) = name_str.strip_prefix("segment-") {
-                if let Some(id_part) = id_str.strip_suffix(".vlos") {
-                    if let Ok(id) = u64::from_str_radix(id_part, 16) {
-                        seg_id = Some(id);
-                        break;
-                    }
-                }
-            }
+    let store = fs_data_store(&root);
+    let mut target = None;
+    for slot in 0..4_u64 {
+        if let Some(loc) = store.location_of(root_slot_object_key(slot)) {
+            target = Some((loc.segment_id, loc.record_offset));
+            break;
         }
     }
-    let seg_id = seg_id.expect("at least one segment file must exist");
-
-    // Corrupt the segment header magic bytes.
-    let path = seg_path(&segments_dir, seg_id);
-    let mut buf = vec![];
-    fs::File::open(&path)
-        .expect("open seg")
-        .read_to_end(&mut buf)
-        .expect("read seg");
-    if buf.len() >= 8 {
-        buf[0..8].copy_from_slice(b"CORRUPT!");
-    }
-    fs::write(&path, &buf).expect("rewrite corrupt segment");
+    let (segment_id, record_offset) = target.expect("at least one root slot record must exist");
+    corrupt_segment_bytes(&store, segment_id, record_offset, 8);
+    drop(store);
 
     // Recovery should fall back to the previous valid root.
     verify_recovery_handles_corruption(&root, "recovers");
@@ -211,8 +198,7 @@ fn recovery_after_transaction_manifest_corruption() {
     setup_fs_with_stable_and_candidate(&root);
 
     let cg_id = first_transaction_id(&root);
-    let opts = opts();
-    let store = LocalObjectStore::open_with_options(&root, opts).expect("open store");
+    let store = fs_data_store(&root);
     let manifest_key = transaction_manifest_object_key(cg_id);
 
     // Verify the key exists before corrupting.
@@ -233,8 +219,7 @@ fn recovery_after_inode_record_corruption() {
     let inode = inode_for_path(&root, "/data/candidate.txt");
     let cg_id = first_transaction_id(&root);
 
-    let opts = opts();
-    let store = LocalObjectStore::open_with_options(&root, opts).expect("open store");
+    let store = fs_data_store(&root);
 
     // Corrupt the transaction inode record.
     let key = transaction_inode_object_key(cg_id, inode.inode_id);
@@ -256,8 +241,7 @@ fn recovery_after_directory_entry_corruption() {
     let data_inode = inode_for_path(&root, "/data");
     let cg_id = first_transaction_id(&root);
 
-    let opts = opts();
-    let store = LocalObjectStore::open_with_options(&root, opts).expect("open store");
+    let store = fs_data_store(&root);
 
     let dir_key = transaction_directory_object_key(cg_id, data_inode.inode_id);
     if store.location_of(dir_key).is_some() {
@@ -274,8 +258,7 @@ fn recovery_after_root_slot_partial_write() {
     let root = temp_root("root-slot");
     setup_fs_with_stable_and_candidate(&root);
 
-    let opts = opts();
-    let store = LocalObjectStore::open_with_options(&root, opts).expect("open store");
+    let store = fs_data_store(&root);
 
     // Corrupt a root-slot object by truncating its payload.
     let mut corrupted_any = false;
@@ -285,7 +268,7 @@ fn recovery_after_root_slot_partial_write() {
             // Overwrite the root-slot payload with a shorter, garbage version.
             let payload_start = loc.record_offset + RECORD_HEADER_LEN as u64;
             corrupt_segment_bytes(
-                store.root(),
+                &store,
                 loc.segment_id,
                 payload_start,
                 16.min(loc.payload_len),
@@ -308,8 +291,7 @@ fn recovery_after_content_object_torn_write() {
     let inode = inode_for_path(&root, "/data/candidate.txt");
     let content_key = content_object_key_for_version(inode.inode_id, inode.data_version);
 
-    let opts = opts();
-    let store = LocalObjectStore::open_with_options(&root, opts).expect("open store");
+    let store = fs_data_store(&root);
 
     if store.location_of(content_key).is_some() {
         corrupt_object_payload(&store, content_key);

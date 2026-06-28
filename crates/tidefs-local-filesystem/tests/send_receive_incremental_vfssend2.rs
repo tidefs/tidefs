@@ -174,12 +174,21 @@ fn incremental_vfssend2_content_parity_with_vfssend1_import() {
 
     let base_snap = src.create_snapshot("base").expect("create base snapshot");
     let from_root = base_snap.source_root.clone();
+    let full_vfssend1 = src
+        .export_changed_records()
+        .expect("full baseline VFSSEND1 export");
 
     // Modify after snapshot
     src.write_file("/a.txt", 0, b"BBBB")
         .expect("overwrite a.txt");
     src.create_file("/b.txt", 0o644).expect("create b.txt");
     src.write_file("/b.txt", 0, b"CCCC").expect("write b.txt");
+    src.fsync_file("/a.txt").expect("fsync a.txt v2");
+    src.fsync_file("/b.txt").expect("fsync b.txt");
+
+    let _mod_snap = src
+        .create_snapshot("modified")
+        .expect("create modified snapshot");
 
     // -- Export VFSSEND2 incremental stream --
     let incr_vfssend2 = src
@@ -193,17 +202,6 @@ fn incremental_vfssend2_content_parity_with_vfssend1_import() {
     let incr_vfssend1 = src
         .export_incremental_changed_records(&from_root)
         .expect("incremental VFSSEND1 export");
-
-    // Export full VFSSEND1 (baseline state) for target setup
-    // Re-open a fresh source at baseline state by rolling back
-    // Actually, export the full baseline export and import it on target first
-    let full_vfssend1 = {
-        // Use a separate read-only view: export from the base snapshot root
-        // The export_changed_records gives the current state; instead,
-        // we'll create a fresh FS from base snapshot content.
-        // Simplest: create target directly from scratch, import full, then incremental
-        src.export_changed_records().expect("full VFSSEND1 export")
-    };
 
     // -- Target: import full, then incremental, then verify --
     let tgt_parent = temp_root("tgt-parity");
@@ -219,9 +217,6 @@ fn incremental_vfssend2_content_parity_with_vfssend1_import() {
 
     assert!(import_report.imported_roots > 0);
 
-    // Now open target and apply incremental
-    let tgt = LocalFileSystem::open(&tgt_root).expect("open target fs");
-
     let incr_import = LocalFileSystem::receive_incremental_changed_records(
         &tgt_root,
         StoreOptions::test_fast(),
@@ -232,7 +227,6 @@ fn incremental_vfssend2_content_parity_with_vfssend1_import() {
     assert!(incr_import.imported_roots > 0);
 
     // Re-open target to see imported state
-    drop(tgt);
     let tgt = LocalFileSystem::open(&tgt_root).expect("reopen target fs");
 
     // Verify content parity

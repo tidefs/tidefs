@@ -363,8 +363,8 @@ pub struct PoolStats {
 pub struct PoolReceiptBoundDeadObjectDrainStats {
     /// Number of writable pool devices whose dead-object queues were examined.
     pub devices_scanned: usize,
-    /// Number of receipt-authorized dead objects acknowledged.
-    pub objects_acked: usize,
+    /// Number of receipt-authorized dead objects examined.
+    pub objects_examined: usize,
     /// Number of segments identified as fully dead and freed.
     pub segments_reclaimed: u64,
     /// Number of dead-object records accounted as freed.
@@ -377,7 +377,7 @@ pub struct PoolReceiptBoundDeadObjectDrainStats {
 
 impl PoolReceiptBoundDeadObjectDrainStats {
     fn absorb_reclaim_stats(&mut self, stats: tidefs_reclaim::ReclaimConsumerStats) {
-        self.objects_acked += stats.entries_processed;
+        self.objects_examined += stats.entries_processed;
         self.segments_reclaimed += stats.segments_reclaimed;
         self.blocks_freed += stats.blocks_freed;
         self.reclaim_queue_depth += stats.reclaim_queue_depth;
@@ -1346,14 +1346,15 @@ impl Pool {
                 reason: "pool label DeviceLayoutV1 count does not match devices",
             });
         }
-        for ((device_config, device), layout) in config
+        let device_layouts = config
             .devices
             .iter()
             .zip(devices.iter())
             .zip(label_device_layouts.iter())
-        {
-            validate_imported_device_layout(device_config, device, layout)?;
-        }
+            .map(|((device_config, device), layout)| {
+                normalize_imported_device_layout(device_config, device, layout)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Build device-class-aware layout state.
         let media_classes: Vec<DeviceMediaClass> =
@@ -1375,8 +1376,6 @@ impl Pool {
 
         // Open the log device writer if an IntentLog device is present.
         let log_device = open_log_device_for_devices(&config.devices)?;
-
-        let device_layouts = label_device_layouts;
 
         let mut pool = Self {
             config,
@@ -4194,23 +4193,38 @@ fn label_file_path(device_root: &Path) -> PathBuf {
     device_root.join(".tidefs_label")
 }
 
-fn validate_imported_device_layout(
+fn normalize_imported_device_layout(
     device_config: &DeviceConfig,
     device: &Device,
     layout: &DeviceLayoutV1,
-) -> Result<()> {
-    validate_device_layout_policy_record(layout)?;
-    if device_config.backing.is_byte_addressable_pool_member()
-        && layout.device_size_bytes != device.store().capacity_bytes()
-    {
-        return Err(StoreError::InvalidOptions {
-            reason: "pool label DeviceLayoutV1 device size mismatch",
-        });
+) -> Result<DeviceLayoutV1> {
+    let policy = validate_device_layout_policy_record(layout)?;
+    if !device_config.backing.is_byte_addressable_pool_member() {
+        return Ok(*layout);
     }
-    Ok(())
+
+    let usable_capacity = device.store().capacity_bytes();
+    if layout.device_size_bytes == usable_capacity {
+        return Ok(*layout);
+    }
+
+    let raw_capacity = byte_addressable_device_raw_capacity(device_config)?;
+    if layout.device_size_bytes == raw_capacity {
+        // PoolCreator labels store the raw media length; Pool internals use
+        // the object store's usable span with the trailing label excluded.
+        return policy
+            .compute(usable_capacity)
+            .map_err(|_| StoreError::InvalidOptions {
+                reason: "pool label DeviceLayoutV1 record is invalid",
+            });
+    }
+
+    Err(StoreError::InvalidOptions {
+        reason: "pool label DeviceLayoutV1 device size mismatch",
+    })
 }
 
-fn validate_device_layout_policy_record(layout: &DeviceLayoutV1) -> Result<()> {
+fn validate_device_layout_policy_record(layout: &DeviceLayoutV1) -> Result<DeviceLayoutPolicy> {
     let policy = match layout.policy {
         DeviceLayoutPolicyDiscriminant::Slice0Small => DeviceLayoutPolicy::Slice0Small,
         DeviceLayoutPolicyDiscriminant::Auto => DeviceLayoutPolicy::Auto,
@@ -4231,7 +4245,22 @@ fn validate_device_layout_policy_record(layout: &DeviceLayoutV1) -> Result<()> {
             reason: "pool label DeviceLayoutV1 record does not match layout policy",
         });
     }
-    Ok(())
+    Ok(policy)
+}
+
+fn byte_addressable_device_raw_capacity(device_config: &DeviceConfig) -> Result<u64> {
+    let device_root = device_root_path(device_config);
+    let mut file = fs::File::open(&device_root).map_err(|source| StoreError::Io {
+        operation: "pool_open_device_raw_capacity_open",
+        path: device_root.clone(),
+        source,
+    })?;
+    file.seek(SeekFrom::End(0))
+        .map_err(|source| StoreError::Io {
+            operation: "pool_open_device_raw_capacity_seek_end",
+            path: device_root,
+            source,
+        })
 }
 
 fn pool_config_has_label_authority(config: &PoolConfig) -> bool {
@@ -6835,6 +6864,44 @@ mod tests {
             persisted_layout.device_size_bytes,
             "directory shim capacity is not a pool-label authority boundary"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn byte_addressable_pool_opens_raw_capacity_creator_layout() {
+        let root = temp_dir("byte-layout-raw-creator-capacity");
+        let _ = std::fs::remove_dir_all(&root);
+        let raw_device_bytes = 300 * 1024 * 1024;
+        let config = regular_file_pool_config(&root, "byte-layout-raw-creator", raw_device_bytes);
+        let options = test_options();
+
+        let pool = Pool::create(config.clone(), PoolProperties::default(), &options).unwrap();
+        let usable_device_bytes = pool.devices[0].store().capacity_bytes();
+        assert_ne!(usable_device_bytes, raw_device_bytes);
+        let raw_layout = DeviceLayoutPolicy::Slice0Small
+            .compute(raw_device_bytes)
+            .expect("raw-capacity creator layout");
+
+        let mut label_bytes = vec![0u8; pool_label::POOL_LABEL_SIZE];
+        let mut label_file = fs::File::open(device_root_path(&config.devices[0])).unwrap();
+        label_file.read_exact(&mut label_bytes).unwrap();
+        let mut label = pool_label::decode_label(&label_bytes).unwrap();
+        label.device_capacity_bytes = raw_device_bytes;
+        write_pool_label(
+            &config.devices[0],
+            label,
+            Some(&raw_layout),
+            "test_write_raw_capacity_creator_layout_label",
+        )
+        .unwrap();
+        drop(pool);
+
+        let reopened = Pool::open(config, PoolProperties::default(), &options).unwrap();
+        let expected_layout = DeviceLayoutPolicy::Slice0Small
+            .compute(usable_device_bytes)
+            .expect("usable-capacity pool layout");
+        assert_eq!(reopened.device_layouts()[0], expected_layout);
 
         let _ = std::fs::remove_dir_all(&root);
     }
