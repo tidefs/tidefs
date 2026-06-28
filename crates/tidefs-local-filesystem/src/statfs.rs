@@ -52,8 +52,10 @@ impl LocalFileSystem {
     ///
     /// Derives block counters from [`CapacityAuthority::derive_statfs`]
     /// which is the single production source for used/free/reserved/pending
-    /// byte counters. Inode counts are sourced from the pool object count
-    /// and the allocator policy inode ceiling.
+    /// byte counters. Lower physical-pool free, reclaimable, and watermark
+    /// fields are not POSIX statvfs availability claims; mounted statvfs
+    /// observes the sanitized authority projection. Inode counts are sourced
+    /// from the pool object count and the allocator policy inode ceiling.
     ///
     /// # Errors
     ///
@@ -103,7 +105,10 @@ impl LocalFileSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tidefs_space_accounting::{DatasetQuotaConfig, DatasetQuotaHierarchy};
+    use tidefs_space_accounting::{DatasetQuotaConfig, DatasetQuotaHierarchy, SpaceAccounting};
+    use tidefs_types_space_accounting_core::{
+        DatasetSpaceCountersV1, PoolPhysicalCountersV1, SpaceDomainId,
+    };
 
     /// Open a fresh filesystem rooted at a temporary directory.
     fn make_test_fs(__name: &str) -> (tempfile::TempDir, LocalFileSystem) {
@@ -242,5 +247,36 @@ mod tests {
         assert_eq!(st.blocks, quota_bytes / st.bsize);
         assert!(st.bfree <= st.blocks);
         assert!(st.bavail <= st.bfree);
+    }
+
+    #[test]
+    fn mounted_physical_pool_input_statvfs_ignores_stale_free_claims() {
+        let (_root, fs) = make_test_fs("sv_phys_free_non_claim");
+        let block_size = 4096;
+        let total = 32 * block_size;
+        let consumed = 24 * block_size;
+        let accounting = SpaceAccounting::new(
+            DatasetSpaceCountersV1 {
+                logical_used_bytes: consumed,
+                ..DatasetSpaceCountersV1::default()
+            },
+            SpaceDomainId::NONE,
+        );
+        let stale_pool_snapshot = PoolPhysicalCountersV1 {
+            phys_free_segments: u64::MAX,
+            phys_free_bytes: u64::MAX,
+            phys_reclaimable_bytes: u64::MAX,
+            phys_tail_reserved_segments: u64::MAX,
+            phys_total_segments: 1,
+            phys_total_bytes: total,
+        };
+
+        fs.capacity_authority()
+            .refresh_committed_accounting(&accounting, stale_pool_snapshot);
+        let st = fs.statvfs().expect("statvfs");
+
+        assert_eq!(st.blocks, total / st.bsize);
+        assert_eq!(st.bfree, (total - consumed) / st.bsize);
+        assert_eq!(st.bavail, st.bfree);
     }
 }

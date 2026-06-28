@@ -369,6 +369,14 @@ impl core::ops::AddAssign for SpaceDelta {
 /// These are *not* per-dataset; they reflect the pool's aggregate physical
 /// state.  The coupling rule (§4.2) separates logical ENOSPC from physical
 /// blocking/throttling.
+///
+/// Mounted capacity authority consumes a narrower projection of these fields:
+/// only `phys_total_bytes` is an admissible lower-layer capacity ceiling.
+/// `phys_free_bytes`, `phys_free_segments`, `phys_reclaimable_bytes`, and
+/// `phys_tail_reserved_segments` remain physical-pool pressure and observation
+/// inputs, not mounted statfs or write-admission availability claims. Use
+/// [`mounted_authority_projection`](Self::mounted_authority_projection) before
+/// feeding these counters into mounted `CapacityAuthority` / `SpaceAccounting`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PoolPhysicalCountersV1 {
     /// Immediately allocatable segments (from `SegmentFreeMap`).
@@ -386,6 +394,67 @@ pub struct PoolPhysicalCountersV1 {
 }
 
 impl PoolPhysicalCountersV1 {
+    /// Build the physical-pool projection admissible to mounted capacity.
+    ///
+    /// The mounted authority admits only `phys_total_bytes` from a lower
+    /// physical-pool report. Free, reclaimable, and cleaner-watermark fields
+    /// can be stale or producer-specific, so this projection recomputes mounted
+    /// free-space fields from committed logical consumption. A missing total
+    /// capacity (`phys_total_bytes == 0`) therefore fails closed as zero mounted
+    /// capacity.
+    ///
+    /// `phys_free_bytes` in the returned value intentionally carries the
+    /// absolute mounted capacity ceiling because `SpaceAccounting` consumes
+    /// that field as its physical-capacity bound. The committed counters
+    /// provide the consumed side of the mounted statfs/admission calculation.
+    #[must_use]
+    pub const fn mounted_authority_projection(
+        self,
+        committed_consumed_bytes: u64,
+        block_size_bytes: u64,
+    ) -> Self {
+        Self::mounted_authority_from_capacity(
+            self.phys_total_bytes,
+            committed_consumed_bytes,
+            block_size_bytes,
+        )
+    }
+
+    /// Build a mounted capacity projection from an admitted total-capacity
+    /// byte ceiling.
+    #[must_use]
+    pub const fn mounted_authority_from_capacity(
+        capacity_ceiling_bytes: u64,
+        committed_consumed_bytes: u64,
+        block_size_bytes: u64,
+    ) -> Self {
+        let consumed = if committed_consumed_bytes > capacity_ceiling_bytes {
+            capacity_ceiling_bytes
+        } else {
+            committed_consumed_bytes
+        };
+        let free_bytes = capacity_ceiling_bytes.saturating_sub(consumed);
+        let total_segments = if block_size_bytes == 0 {
+            0
+        } else {
+            capacity_ceiling_bytes / block_size_bytes
+        };
+        let free_segments = if block_size_bytes == 0 {
+            0
+        } else {
+            free_bytes / block_size_bytes
+        };
+
+        PoolPhysicalCountersV1 {
+            phys_free_segments: free_segments,
+            phys_free_bytes: capacity_ceiling_bytes,
+            phys_reclaimable_bytes: 0,
+            phys_tail_reserved_segments: 0,
+            phys_total_segments: total_segments,
+            phys_total_bytes: capacity_ceiling_bytes,
+        }
+    }
+
     /// Physical capacity (total minus tail reserve).
     #[must_use]
     pub const fn phys_usable_segments(self) -> u64 {
@@ -1370,6 +1439,47 @@ mod tests {
             ..Default::default()
         };
         assert!(!c.should_block_writes(10));
+    }
+
+    #[test]
+    fn mounted_physical_pool_input_admits_only_total_capacity() {
+        let total = 128 * 4096;
+        let consumed = 32 * 4096;
+        let stale_pool = PoolPhysicalCountersV1 {
+            phys_free_segments: u64::MAX,
+            phys_free_bytes: u64::MAX,
+            phys_reclaimable_bytes: u64::MAX,
+            phys_tail_reserved_segments: u64::MAX,
+            phys_total_segments: 1,
+            phys_total_bytes: total,
+        };
+
+        let projected = stale_pool.mounted_authority_projection(consumed, 4096);
+
+        assert_eq!(projected.phys_total_bytes, total);
+        assert_eq!(projected.phys_total_segments, 128);
+        assert_eq!(projected.phys_free_segments, 96);
+        assert_eq!(projected.phys_free_bytes, total);
+        assert_eq!(projected.phys_reclaimable_bytes, 0);
+        assert_eq!(projected.phys_tail_reserved_segments, 0);
+    }
+
+    #[test]
+    fn mounted_physical_pool_input_missing_total_fails_closed() {
+        let stale_pool = PoolPhysicalCountersV1 {
+            phys_free_segments: u64::MAX,
+            phys_free_bytes: u64::MAX,
+            phys_reclaimable_bytes: u64::MAX,
+            ..Default::default()
+        };
+
+        let projected = stale_pool.mounted_authority_projection(4096, 4096);
+
+        assert_eq!(projected.phys_total_bytes, 0);
+        assert_eq!(projected.phys_total_segments, 0);
+        assert_eq!(projected.phys_free_segments, 0);
+        assert_eq!(projected.phys_free_bytes, 0);
+        assert!(projected.should_block_writes(1));
     }
 
     // ── Admission control ──────────────────────────────────────────────
