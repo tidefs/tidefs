@@ -94,6 +94,8 @@ struct UmaskGuard {
 
 impl UmaskGuard {
     fn set(mask: libc::mode_t) -> Self {
+        // SAFETY: umask only updates the process mask from a scalar mode and
+        // returns the previous value for restoration.
         let previous = unsafe { libc::umask(mask) };
         Self { previous }
     }
@@ -101,6 +103,8 @@ impl UmaskGuard {
 
 impl Drop for UmaskGuard {
     fn drop(&mut self) {
+        // SAFETY: restoring the saved scalar umask value has no pointer or fd
+        // preconditions.
         unsafe {
             libc::umask(self.previous);
         }
@@ -110,6 +114,8 @@ impl Drop for UmaskGuard {
 fn mknod_fifo(path: &Path, mode: libc::mode_t) -> io::Result<()> {
     let cpath = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains nul byte"))?;
+    // SAFETY: `cpath` is a NUL-terminated path alive for the mknod call; FIFO
+    // creation passes a zero device id as required.
     let result = unsafe { libc::mknod(cpath.as_ptr(), libc::S_IFIFO | mode, 0) };
     if result == 0 {
         Ok(())

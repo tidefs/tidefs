@@ -120,6 +120,10 @@ fn xattr_name_cstr(name: &str) -> CString {
 
 // ── libc wrappers ────────────────────────────────────────────────────────
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// call, and `value` must be readable for `value.len()` bytes.
 unsafe fn setxattr_sys(path: &CString, name: &CString, value: &[u8], flags: i32) -> io::Result<()> {
     let rc = libc::setxattr(
         path.as_ptr(),
@@ -135,6 +139,10 @@ unsafe fn setxattr_sys(path: &CString, name: &CString, value: &[u8], flags: i32)
     }
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// call, and `buf` must be writable for `buf.len()` bytes.
 unsafe fn getxattr_sys(path: &CString, name: &CString, buf: &mut [u8]) -> io::Result<usize> {
     let rc = libc::getxattr(
         path.as_ptr(),
@@ -149,6 +157,10 @@ unsafe fn getxattr_sys(path: &CString, name: &CString, buf: &mut [u8]) -> io::Re
     }
 }
 
+/// # Safety
+///
+/// `path` and `name` must be valid NUL-terminated C strings alive for the
+/// zero-length size query.
 unsafe fn getxattr_size(path: &CString, name: &CString) -> io::Result<usize> {
     let rc = libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0);
     if rc >= 0 {
@@ -169,6 +181,8 @@ fn make_flock(typ: i16, start: i64, len: i64) -> libc::flock {
 }
 
 fn fcntl_setlk(fd: &impl AsRawFd, flock: &libc::flock) -> Result<(), i32> {
+    // SAFETY: `fd` is borrowed from a live file handle, and `flock` points to
+    // an initialized lock request for the duration of the call.
     let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETLK, flock) };
     if rc == -1 {
         Err(io::Error::last_os_error()
@@ -181,6 +195,8 @@ fn fcntl_setlk(fd: &impl AsRawFd, flock: &libc::flock) -> Result<(), i32> {
 
 fn fcntl_getlk(fd: &impl AsRawFd, flock: &libc::flock) -> Result<libc::flock, i32> {
     let mut query = *flock;
+    // SAFETY: `fd` is borrowed from a live file handle, and `query` is
+    // initialized output storage for F_GETLK.
     let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETLK, &mut query) };
     if rc == -1 {
         Err(io::Error::last_os_error()
@@ -228,6 +244,8 @@ fn system_xattr_namespace_diagnostic() {
     let path_c = path_cstr(&path);
 
     let sec_name = xattr_name_cstr("system.security.test");
+    // SAFETY: `path_c` and `sec_name` are live C strings, and the static value
+    // is readable for the diagnostic setxattr call.
     unsafe {
         match setxattr_sys(&path_c, &sec_name, b"ok", 0) {
             Ok(()) => eprintln!("DIAG: system.security.test accepted via FUSE"),
@@ -237,6 +255,8 @@ fn system_xattr_namespace_diagnostic() {
 
     let acl_name = xattr_name_cstr("system.posix_acl_access");
     let encoded = encode_posix_acl_xattr(&kernel_valid_acl(6, 0, 0));
+    // SAFETY: `path_c` and `acl_name` are live C strings, and `encoded` is
+    // readable for the diagnostic setxattr call.
     unsafe {
         match setxattr_sys(&path_c, &acl_name, &encoded, 0) {
             Ok(()) => eprintln!("DIAG: system.posix_acl_access accepted via FUSE"),
@@ -245,6 +265,8 @@ fn system_xattr_namespace_diagnostic() {
     }
 
     let def_name = xattr_name_cstr("system.posix_acl_default");
+    // SAFETY: `path_c` and `def_name` are live C strings, and `encoded` is
+    // readable for the diagnostic setxattr call.
     unsafe {
         match setxattr_sys(&path_c, &def_name, &encoded, 0) {
             Ok(()) => eprintln!("DIAG: system.posix_acl_default accepted via FUSE"),
@@ -265,6 +287,8 @@ fn user_xattr_roundtrip_sanity() {
     let name_c = xattr_name_cstr("user.sanity");
     let value = b"mounted xattr sanity check";
 
+    // SAFETY: `path_c` and `name_c` are live C strings. `value` is readable for
+    // setxattr, and the read buffer is sized from the getxattr size query.
     unsafe {
         setxattr_sys(&path_c, &name_c, value, 0).expect("setxattr");
         let size = getxattr_size(&path_c, &name_c).expect("size query");
@@ -281,6 +305,8 @@ fn setxattr_on_nonexistent_file_returns_enoent() {
     let bad_path = mnt.path("no_such_file.txt");
     let path_c = path_cstr(&bad_path);
     let name_c = xattr_name_cstr("user.test");
+    // SAFETY: `path_c` and `name_c` are live C strings, and the static value is
+    // readable for the expected-failing setxattr call.
     unsafe {
         let err = setxattr_sys(&path_c, &name_c, b"value", 0)
             .expect_err("setxattr on missing file should fail");
@@ -333,6 +359,8 @@ fn combined_xattr_and_locking_cycle() {
 
     let xattr_name = xattr_name_cstr("user.combined");
     let xattr_val = b"combined-xattr-value";
+    // SAFETY: `path_c` and `xattr_name` are live C strings, and `xattr_val` is
+    // readable for the setxattr call.
     unsafe {
         setxattr_sys(&path_c, &xattr_name, xattr_val, 0).expect("setxattr user.combined");
     }
@@ -345,6 +373,8 @@ fn combined_xattr_and_locking_cycle() {
     let write_lock = make_flock(libc::F_WRLCK as i16, 0, 50);
     fcntl_setlk(&file, &write_lock).expect("acquire write lock");
 
+    // SAFETY: `path_c` and `xattr_name` remain live C strings, and the read
+    // buffer is sized from the getxattr size query.
     unsafe {
         let size = getxattr_size(&path_c, &xattr_name).expect("getxattr size after lock");
         assert_eq!(size, xattr_val.len());
@@ -369,6 +399,8 @@ fn posix_acl_access_roundtrip_blocked_by_kernel() {
     let acl_name = xattr_name_cstr("system.posix_acl_access");
     let encoded = encode_posix_acl_xattr(&kernel_valid_acl(7, 0, 0));
 
+    // SAFETY: `path_c` and `acl_name` are live C strings. `encoded` is readable
+    // for setxattr, and any read buffer is sized from the getxattr size query.
     unsafe {
         match setxattr_sys(&path_c, &acl_name, &encoded, 0) {
             Ok(()) => {
@@ -400,6 +432,8 @@ fn posix_acl_default_roundtrip_blocked_by_kernel() {
     let acl_name = xattr_name_cstr("system.posix_acl_default");
     let encoded = encode_posix_acl_xattr(&kernel_valid_acl(7, 0, 5));
 
+    // SAFETY: `path_c` and `acl_name` are live C strings. `encoded` is readable
+    // for setxattr, and any read buffer is sized from the getxattr size query.
     unsafe {
         match setxattr_sys(&path_c, &acl_name, &encoded, 0) {
             Ok(()) => {

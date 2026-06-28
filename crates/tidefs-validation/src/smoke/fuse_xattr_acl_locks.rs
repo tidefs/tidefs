@@ -961,6 +961,8 @@ fn test_posix_acl_default_roundtrip(harness: &MountHarness) -> Result<(), String
         return Err("default ACL should be readable".into());
     }
     let mut buf = vec![0u8; size as usize];
+    // SAFETY: `path_c` and `name_c` remain live C strings, and `buf` is
+    // allocated to the size reported by the preceding getxattr query.
     let rc2 = unsafe {
         libc::getxattr(
             path_c.as_ptr(),

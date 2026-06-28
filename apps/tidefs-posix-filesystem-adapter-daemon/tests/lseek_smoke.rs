@@ -40,6 +40,8 @@ fn mount_options() -> Vec<fuser::MountOption> {
 }
 
 fn request_ctx() -> RequestCtx {
+    // SAFETY: `geteuid`/`getegid` read the current process credentials and do
+    // not require pointer, fd, or buffer invariants.
     let gid = unsafe { libc::getegid() } as u32;
     RequestCtx {
         uid: unsafe { libc::geteuid() } as u32,
@@ -164,6 +166,8 @@ fn open_readonly(path: &PathBuf) -> File {
 }
 
 fn lseek_fd_raw(file: &File, offset: libc::off_t, whence: i32) -> std::io::Result<u64> {
+    // SAFETY: `file.as_raw_fd()` is borrowed from a live `File`, and lseek
+    // takes only scalar offset/whence arguments.
     let result = unsafe { libc::lseek(file.as_raw_fd(), offset, whence) };
     if result < 0 {
         Err(std::io::Error::last_os_error())
@@ -293,6 +297,8 @@ fn lseek_after_write_close_reopen_reports_written_data() {
 
 // Helper: read from a raw file descriptor.
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: the caller supplies an open fd, and `buf` is valid writable
+    // storage for `buf.len()` bytes.
     let result = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     if result < 0 {
         Err(io::Error::last_os_error())

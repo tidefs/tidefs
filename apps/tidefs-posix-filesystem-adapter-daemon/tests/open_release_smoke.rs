@@ -48,6 +48,8 @@ fn mount_options() -> Vec<fuser::MountOption> {
 }
 
 fn request_ctx() -> RequestCtx {
+    // SAFETY: `geteuid`/`getegid` read the current process credentials and do
+    // not require pointer, fd, or buffer invariants.
     let gid = unsafe { libc::getegid() } as u32;
     RequestCtx {
         uid: unsafe { libc::geteuid() } as u32,
@@ -135,6 +137,8 @@ fn path_cstring(path: &Path) -> CString {
 }
 
 fn close_fd(fd: RawFd) -> io::Result<()> {
+    // SAFETY: ownership of `fd` is transferred to this helper, and callers do
+    // not use it after this close attempt.
     let result = unsafe { libc::close(fd) };
     if result < 0 {
         Err(io::Error::last_os_error())
@@ -144,6 +148,8 @@ fn close_fd(fd: RawFd) -> io::Result<()> {
 }
 
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: the caller supplies an open fd, and `buf` is valid writable
+    // storage for `buf.len()` bytes.
     let result = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     if result < 0 {
         Err(io::Error::last_os_error())
@@ -153,6 +159,8 @@ fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 fn write_fd(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
+    // SAFETY: the caller supplies an open fd, and `buf` is valid readable
+    // storage for `buf.len()` bytes.
     let result = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
     if result < 0 {
         Err(io::Error::last_os_error())
@@ -163,6 +171,8 @@ fn write_fd(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 
 fn open_dir_for_write(path: &Path) -> io::Result<RawFd> {
     let cpath = path_cstring(path);
+    // SAFETY: `cpath` is a NUL-terminated path alive for the open call. On
+    // success the returned fd is owned by the caller.
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
     if fd < 0 {
         Err(io::Error::last_os_error())

@@ -1100,6 +1100,8 @@ fn fsync_crash_power_loss_lazy_unmount_sigkill() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // SIGKILL the daemon to ensure it cannot do any last-minute flush.
+    // SAFETY: the harness owns the child daemon process and deliberately sends
+    // SIGKILL to its pid to simulate a crash boundary.
     unsafe {
         libc::kill(harness.daemon_pid() as i32, libc::SIGKILL);
     }
