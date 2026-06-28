@@ -4,14 +4,17 @@
 //! Validates the `tidefs-trace-oracle` crate and the golden trace corpus by
 //! running crate tests and replaying all pool traces from `traces/MANIFEST.json`.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tidefs_trace_oracle::artifact_manifest::{
     default_manifest_path, generated_at_now_utc, sanitize_artifact_id, ArtifactRunResult,
-    TraceArtifactManifest, TRACE_ARTIFACT_BACKEND_COMPARE,
+    RuntimeTraceArtifactMetadata, TraceArtifactManifest, TRACE_ARTIFACT_BACKEND_COMPARE,
 };
-use tidefs_trace_oracle::backend::{compare_model_and_runtime_trace, BACKEND_MODEL};
+use tidefs_trace_oracle::backend::{
+    compare_model_and_runtime_trace, TraceComparison, BACKEND_MODEL,
+};
 use tidefs_trace_oracle::manifest::{load_manifest, print_results, verify_trace_corpus};
 
 /// Run the full check-trace-oracle gate.
@@ -89,6 +92,13 @@ pub fn check_trace_oracle_current_workspace_with_args(
                     &trace_name,
                     requested_manifest_path,
                 );
+            }
+            "--runtime-compare-manifest" => {
+                let comparison = args.next().ok_or_else(|| {
+                    "--runtime-compare-manifest requires a comparison JSON path".to_string()
+                })?;
+                let options = parse_runtime_manifest_options(&mut args)?;
+                return write_runtime_compare_manifest(&repo_root, &comparison, options);
             }
             other => return Err(format!("unknown check-trace-oracle argument: {other}")),
         }
@@ -237,6 +247,64 @@ fn run_model_determinism_check(
     }
 }
 
+#[derive(Default, Debug)]
+struct RuntimeManifestOptions {
+    manifest_path: Option<PathBuf>,
+    trace_path_label: Option<String>,
+    trace_descriptor: Option<String>,
+    runtime_backend: Option<String>,
+    validation_tier: Option<String>,
+    ci_artifact_ref: Option<String>,
+    ci_run_url: Option<String>,
+    claims_covered: Vec<String>,
+    notes: Option<String>,
+}
+
+fn write_runtime_compare_manifest(
+    repo_root: &Path,
+    comparison_path: &str,
+    options: RuntimeManifestOptions,
+) -> Result<(), String> {
+    let comparison_path = resolve_repo_path(repo_root, comparison_path);
+    let contents = fs::read_to_string(&comparison_path)
+        .map_err(|e| format!("read {}: {e}", comparison_path.display()))?;
+    let comparison: TraceComparison = serde_json::from_str(&contents)
+        .map_err(|e| format!("parse {}: {e}", comparison_path.display()))?;
+    let trace_path_label = options
+        .trace_path_label
+        .unwrap_or_else(|| trace_path_label(repo_root, &comparison.trace_path));
+    let trace_descriptor = options
+        .trace_descriptor
+        .unwrap_or_else(|| trace_descriptor_from_label(&trace_path_label));
+    let metadata = RuntimeTraceArtifactMetadata {
+        runtime_backend: required_runtime_option(options.runtime_backend, "--runtime-backend")?,
+        validation_tier: required_runtime_option(options.validation_tier, "--validation-tier")?,
+        ci_artifact_ref: required_runtime_option(options.ci_artifact_ref, "--ci-artifact-ref")?,
+        ci_run_url: required_runtime_option(options.ci_run_url, "--ci-run-url")?,
+        claims_covered: options.claims_covered,
+        notes: options.notes.unwrap_or_default(),
+    };
+    let manifest = TraceArtifactManifest::runtime_comparison(
+        &comparison,
+        trace_path_label,
+        trace_descriptor.clone(),
+        metadata,
+        generated_at_now_utc(),
+    )
+    .map_err(|e| format!("runtime trace artifact manifest failed: {e}"))?;
+    let manifest_path = options.manifest_path.unwrap_or_else(|| {
+        default_manifest_path(repo_root, &trace_descriptor, TRACE_ARTIFACT_BACKEND_COMPARE)
+    });
+    manifest
+        .write_json_file(&manifest_path)
+        .map_err(|e| format!("write {}: {e}", manifest_path.display()))?;
+    println!("runtime comparison: {}", comparison_path.display());
+    println!("artifact manifest: {}", manifest_path.display());
+    println!("runtime evidence class: {}", manifest.evidence_class);
+    println!("runtime validation tier: {}", manifest.validation_tier);
+    Ok(())
+}
+
 fn parse_manifest_path(args: &mut impl Iterator<Item = String>) -> Result<Option<PathBuf>, String> {
     let mut manifest_path = None;
     while let Some(arg) = args.next() {
@@ -254,6 +322,96 @@ fn parse_manifest_path(args: &mut impl Iterator<Item = String>) -> Result<Option
         }
     }
     Ok(manifest_path)
+}
+
+fn parse_runtime_manifest_options(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<RuntimeManifestOptions, String> {
+    let mut options = RuntimeManifestOptions::default();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--manifest" => {
+                if options.manifest_path.is_some() {
+                    return Err("duplicate check-trace-oracle --manifest argument".into());
+                }
+                options.manifest_path = Some(PathBuf::from(take_arg(args, "--manifest")?));
+            }
+            "--trace-path-label" => {
+                set_runtime_option(
+                    &mut options.trace_path_label,
+                    take_arg(args, "--trace-path-label")?,
+                    "--trace-path-label",
+                )?;
+            }
+            "--trace-descriptor" => {
+                set_runtime_option(
+                    &mut options.trace_descriptor,
+                    take_arg(args, "--trace-descriptor")?,
+                    "--trace-descriptor",
+                )?;
+            }
+            "--runtime-backend" => {
+                set_runtime_option(
+                    &mut options.runtime_backend,
+                    take_arg(args, "--runtime-backend")?,
+                    "--runtime-backend",
+                )?;
+            }
+            "--validation-tier" => {
+                set_runtime_option(
+                    &mut options.validation_tier,
+                    take_arg(args, "--validation-tier")?,
+                    "--validation-tier",
+                )?;
+            }
+            "--ci-artifact-ref" => {
+                set_runtime_option(
+                    &mut options.ci_artifact_ref,
+                    take_arg(args, "--ci-artifact-ref")?,
+                    "--ci-artifact-ref",
+                )?;
+            }
+            "--ci-run-url" => {
+                set_runtime_option(
+                    &mut options.ci_run_url,
+                    take_arg(args, "--ci-run-url")?,
+                    "--ci-run-url",
+                )?;
+            }
+            "--claim" => options.claims_covered.push(take_arg(args, "--claim")?),
+            "--notes" => {
+                set_runtime_option(&mut options.notes, take_arg(args, "--notes")?, "--notes")?;
+            }
+            other => return Err(format!("unexpected check-trace-oracle argument: {other}")),
+        }
+    }
+    Ok(options)
+}
+
+fn take_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+    args.next()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn set_runtime_option(slot: &mut Option<String>, value: String, flag: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("duplicate check-trace-oracle {flag} argument"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn required_runtime_option(value: Option<String>, flag: &str) -> Result<String, String> {
+    value.ok_or_else(|| format!("--runtime-compare-manifest requires {flag}"))
+}
+
+fn resolve_repo_path(repo_root: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    }
 }
 
 fn trace_path_label(repo_root: &Path, trace_path: &Path) -> String {
@@ -287,5 +445,56 @@ fn find_repo_root() -> Result<PathBuf, String> {
         if !dir.pop() {
             return Err("could not find workspace root".into());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_manifest_options_require_unique_metadata() {
+        let args = vec![
+            "--runtime-backend".to_string(),
+            "mounted_userspace".to_string(),
+            "--runtime-backend".to_string(),
+            "qemu_guest".to_string(),
+        ];
+
+        let err = parse_runtime_manifest_options(&mut args.into_iter())
+            .expect_err("duplicate runtime backend must fail");
+
+        assert!(err.contains("duplicate check-trace-oracle --runtime-backend"));
+    }
+
+    #[test]
+    fn runtime_manifest_options_collect_claims() {
+        let args = vec![
+            "--runtime-backend".to_string(),
+            "mounted_userspace".to_string(),
+            "--validation-tier".to_string(),
+            "mounted-userspace".to_string(),
+            "--ci-artifact-ref".to_string(),
+            "trace-runtime".to_string(),
+            "--ci-run-url".to_string(),
+            "https://github.com/tidefs/tidefs/actions/runs/123".to_string(),
+            "--claim".to_string(),
+            "trace.runtime.compare.v1".to_string(),
+        ];
+
+        let options = parse_runtime_manifest_options(&mut args.into_iter()).unwrap();
+
+        assert_eq!(
+            options.runtime_backend.as_deref(),
+            Some("mounted_userspace")
+        );
+        assert_eq!(
+            options.validation_tier.as_deref(),
+            Some("mounted-userspace")
+        );
+        assert_eq!(
+            options.claims_covered,
+            vec!["trace.runtime.compare.v1".to_string()]
+        );
     }
 }

@@ -158,6 +158,12 @@ The model/runtime distinction is program law from
 - The trace was replayed through a mounted adapter with crash injection
   and recovery, or through a kernel-resident path with controlled fault
   injection.
+- Runtime classification is fail-closed: `tidefs-trace-oracle` only emits
+  `evidence_class: "runtime"` when the comparison event stream is labeled
+  with a mounted/runtime backend such as `mounted_userspace`, `qemu_guest`,
+  `mounted_kernel_vfs`, `kernel_block_io`, `full_kernel_no_daemon`, or
+  `multi_process_distributed`. Existing `local_runtime` comparison output
+  remains `harness-only`.
 - Validation tier must be one of the canonical runtime tiers such as
   `mounted-userspace`, `qemu-guest`, `mounted-kernel-vfs`,
   `kernel-block-io`, `full-kernel-no-daemon`, or
@@ -218,11 +224,16 @@ secrets or private runner state.
    appears in the run's artifact list (e.g. `trace-compare-smoke-churn-42`).
    It must not contain runner hostnames, internal IP addresses, internal
    filesystem paths outside the workspace, TLS keys, access tokens, or
-   repository secret values.
+   repository secret values. Runtime manifest emission accepts only a simple
+   artifact name made from ASCII letters, digits, `.`, `_`, and `-`; path
+   separators, parent-directory components, and token-shaped values fail
+   closed.
 
 2. `ci_run_url` must be the public URL of the GitHub Actions workflow run
    (e.g. `https://github.com/tidefs/tidefs/actions/runs/1234567890`). It
    must not point to internal runner dashboards or private infrastructure.
+   Runtime manifest emission accepts only the canonical
+   `https://github.com/tidefs/tidefs/actions/runs/<run-id>` form.
 
 3. The artifact manifest file itself must be stored in the repository or
    attached as a reviewable CI artifact. It must never contain secret
@@ -231,6 +242,27 @@ secrets or private runner state.
 4. The trace output file (JSONL) referenced by the manifest may also be
    stored as a CI artifact. Its digest in the manifest ties the reviewable
    manifest to the specific artifact bytes.
+
+5. Runtime manifests must use a reviewable trace path label such as
+   `traces/golden/smoke_churn/pool_trace.jsonl`; absolute runner paths,
+   parent-directory components, and token material fail closed.
+
+Mounted runtime rows that already have a serialized `TraceComparison` can
+write the manifest through:
+
+```sh
+cargo run -p tidefs-xtask -- check-trace-oracle \
+  --runtime-compare-manifest <comparison-json> \
+  --runtime-backend mounted_userspace \
+  --validation-tier mounted-userspace \
+  --ci-artifact-ref trace-compare-smoke-churn-42 \
+  --ci-run-url https://github.com/tidefs/tidefs/actions/runs/1234567890 \
+  --manifest <artifact-id>.manifest.json
+```
+
+That command validates the comparison event labels and CI metadata before it
+can emit a runtime-tier `TraceArtifactManifest`; it does not upgrade the
+ordinary `--compare-trace` local harness path.
 
 ### Example: Runtime Trace Artifact Manifest
 
