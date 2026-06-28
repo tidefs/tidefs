@@ -23,9 +23,17 @@ pub const VALIDATION_TIER_SOURCE_MODEL: &str = "source-model";
 pub const VALIDATION_TIER_HARNESS_ONLY: &str = "harness-only";
 pub const EVIDENCE_CLASS_MODEL_ONLY: &str = "model-only";
 pub const EVIDENCE_CLASS_HARNESS_ONLY: &str = "harness-only";
+pub const EVIDENCE_CLASS_RUNTIME: &str = "runtime";
+pub const RUNTIME_TRACE_BACKEND_MOUNTED_USERSPACE: &str = "mounted_userspace";
+pub const RUNTIME_TRACE_BACKEND_QEMU_GUEST: &str = "qemu_guest";
+pub const RUNTIME_TRACE_BACKEND_MOUNTED_KERNEL_VFS: &str = "mounted_kernel_vfs";
+pub const RUNTIME_TRACE_BACKEND_KERNEL_BLOCK_IO: &str = "kernel_block_io";
+pub const RUNTIME_TRACE_BACKEND_FULL_KERNEL_NO_DAEMON: &str = "full_kernel_no_daemon";
+pub const RUNTIME_TRACE_BACKEND_MULTI_PROCESS_DISTRIBUTED: &str = "multi_process_distributed";
 
 const MODEL_ONLY_NOTES: &str = "Model-only trace artifact. Validates deterministic contract replay through tidefs-model-core. Insufficient for runtime crash claims; runtime crash evidence requires a mounted backend with crash injection, recovery logs, and a CI artifact reference.";
 const HARNESS_ONLY_NOTES: &str = "Model/local-runtime comparison artifact from the local trace-oracle harness. This is harness-only tooling evidence, not mounted runtime or crash-safety evidence; runtime claim closure requires a future mounted crash/recovery artifact with a CI artifact reference.";
+const RUNTIME_NOTES: &str = "Runtime trace comparison artifact. The runtime event stream came from a mounted/runtime backend and carries GitHub Actions artifact metadata. Claim closure still requires a registered claim id and claims-gate review.";
 
 /// Top-level trace artifact manifest schema, version 1.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -73,6 +81,19 @@ pub struct TraceArtifactInputDescriptor {
     pub trace_schema: String,
     pub trace_version: u64,
     pub input: TraceArtifactInput,
+}
+
+/// Metadata required before a trace comparison can be classified as runtime evidence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RuntimeTraceArtifactMetadata {
+    pub runtime_backend: String,
+    pub validation_tier: String,
+    pub ci_artifact_ref: String,
+    pub ci_run_url: String,
+    #[serde(default)]
+    pub claims_covered: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
 }
 
 impl TraceArtifactManifest {
@@ -163,6 +184,65 @@ impl TraceArtifactManifest {
             ci_artifact_ref: None,
             ci_run_url: None,
             notes: HARNESS_ONLY_NOTES.into(),
+        })
+    }
+
+    /// Build a runtime comparison manifest from mounted/runtime backend events.
+    pub fn runtime_comparison(
+        comparison: &TraceComparison,
+        trace_path_label: impl Into<String>,
+        trace_descriptor: impl Into<String>,
+        runtime: RuntimeTraceArtifactMetadata,
+        generated_at: impl Into<String>,
+    ) -> Result<Self, TraceError> {
+        validate_runtime_metadata(&runtime)?;
+        validate_runtime_backend_events(comparison, &runtime.runtime_backend)?;
+        let trace_path_label = trace_path_label.into();
+        validate_runtime_trace_path_label(&trace_path_label)?;
+        let descriptor = describe_trace_input(
+            &comparison.trace_path,
+            trace_path_label,
+            trace_descriptor.into(),
+        )?;
+        let output_result = if comparison.passed() {
+            ArtifactRunResult::Pass
+        } else {
+            ArtifactRunResult::Fail
+        };
+        let notes = if runtime.notes.trim().is_empty() {
+            RUNTIME_NOTES.into()
+        } else {
+            runtime.notes
+        };
+        Ok(Self {
+            artifact_schema_version: TRACE_ARTIFACT_SCHEMA_VERSION,
+            trace_schema: descriptor.trace_schema,
+            trace_version: descriptor.trace_version,
+            request_contract_version: u64::from(TIDE_CONTRACT_VERSION_V1.raw()),
+            backend: TRACE_ARTIFACT_BACKEND_COMPARE.into(),
+            environment_model: "runtime".into(),
+            validation_tier: runtime.validation_tier,
+            evidence_class: EVIDENCE_CLASS_RUNTIME.into(),
+            generated_at: generated_at.into(),
+            generated_by: generated_by(),
+            input: descriptor.input,
+            output: TraceArtifactOutput {
+                events_digest_sha256: digest_backend_steps(
+                    comparison
+                        .model_events
+                        .iter()
+                        .chain(comparison.runtime_events.iter()),
+                )?,
+                final_fingerprint: final_backend_fingerprint(&comparison.runtime_events),
+                event_count: (comparison.model_events.len() + comparison.runtime_events.len())
+                    as u64,
+                mismatches: comparison.mismatches.len() as u64,
+                result: output_result.label().into(),
+            },
+            claims_covered: runtime.claims_covered,
+            ci_artifact_ref: Some(runtime.ci_artifact_ref),
+            ci_run_url: Some(runtime.ci_run_url),
+            notes,
         })
     }
 
@@ -322,6 +402,124 @@ fn required_meta_u64(args: &Value, key: &str) -> Result<u64, TraceError> {
         .ok_or_else(|| TraceError::Protocol(format!("trace_meta missing numeric {key}")))
 }
 
+fn validate_runtime_metadata(runtime: &RuntimeTraceArtifactMetadata) -> Result<(), TraceError> {
+    if !is_runtime_trace_backend(&runtime.runtime_backend) {
+        return Err(TraceError::Protocol(format!(
+            "runtime trace backend `{}` is not a mounted/runtime backend",
+            runtime.runtime_backend
+        )));
+    }
+    if !is_runtime_validation_tier(&runtime.validation_tier) {
+        return Err(TraceError::Protocol(format!(
+            "validation tier `{}` is not a runtime tier",
+            runtime.validation_tier
+        )));
+    }
+    if !is_safe_ci_artifact_ref(&runtime.ci_artifact_ref) {
+        return Err(TraceError::Protocol(
+            "runtime trace manifest requires a safe GitHub Actions artifact name".into(),
+        ));
+    }
+    if !is_safe_ci_run_url(&runtime.ci_run_url) {
+        return Err(TraceError::Protocol(
+            "runtime trace manifest requires a tidefs/tidefs GitHub Actions run URL".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_backend_events(
+    comparison: &TraceComparison,
+    runtime_backend: &str,
+) -> Result<(), TraceError> {
+    if comparison.runtime_events.is_empty() {
+        return Err(TraceError::Protocol(
+            "runtime trace manifest requires runtime backend events".into(),
+        ));
+    }
+    if comparison
+        .runtime_events
+        .iter()
+        .any(|event| event.backend != runtime_backend)
+    {
+        return Err(TraceError::Protocol(format!(
+            "runtime trace manifest requires all runtime events to use mounted/runtime backend `{runtime_backend}`"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_runtime_trace_path_label(trace_path_label: &str) -> Result<(), TraceError> {
+    if trace_path_label.trim().is_empty() {
+        return Err(TraceError::Protocol(
+            "runtime trace manifest requires a reviewable trace path label".into(),
+        ));
+    }
+    if trace_path_label.contains('\\') || trace_path_label.contains("..") {
+        return Err(TraceError::Protocol(
+            "runtime trace path label must not contain runner-local path components".into(),
+        ));
+    }
+    let path = Path::new(trace_path_label);
+    if path.is_absolute() {
+        return Err(TraceError::Protocol(
+            "runtime trace path label must be relative, not runner-local absolute path".into(),
+        ));
+    }
+    if trace_path_label.contains("ghp_") || trace_path_label.contains("github_pat") {
+        return Err(TraceError::Protocol(
+            "runtime trace path label must not contain token material".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_runtime_trace_backend(value: &str) -> bool {
+    matches!(
+        value,
+        RUNTIME_TRACE_BACKEND_MOUNTED_USERSPACE
+            | RUNTIME_TRACE_BACKEND_QEMU_GUEST
+            | RUNTIME_TRACE_BACKEND_MOUNTED_KERNEL_VFS
+            | RUNTIME_TRACE_BACKEND_KERNEL_BLOCK_IO
+            | RUNTIME_TRACE_BACKEND_FULL_KERNEL_NO_DAEMON
+            | RUNTIME_TRACE_BACKEND_MULTI_PROCESS_DISTRIBUTED
+    )
+}
+
+fn is_runtime_validation_tier(value: &str) -> bool {
+    matches!(
+        value,
+        "mounted-userspace"
+            | "qemu-guest"
+            | "mounted-kernel-vfs"
+            | "kernel-block-io"
+            | "full-kernel-no-daemon"
+            | "multi-process-distributed"
+    )
+}
+
+fn is_safe_ci_artifact_ref(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed == value
+        && trimmed.len() <= 128
+        && !trimmed.starts_with('.')
+        && !trimmed.contains("..")
+        && !trimmed.contains("ghp_")
+        && !trimmed.contains("github_pat")
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn is_safe_ci_run_url(value: &str) -> bool {
+    const PREFIX: &str = "https://github.com/tidefs/tidefs/actions/runs/";
+    value
+        .strip_prefix(PREFIX)
+        .filter(|run_id| !run_id.is_empty())
+        .is_some_and(|run_id| run_id.chars().all(|ch| ch.is_ascii_digit()))
+}
+
 fn digest_backend_steps<'a>(
     events: impl IntoIterator<Item = &'a BackendStep>,
 ) -> Result<String, TraceError> {
@@ -436,6 +634,32 @@ mod tests {
         path
     }
 
+    fn runtime_metadata() -> RuntimeTraceArtifactMetadata {
+        RuntimeTraceArtifactMetadata {
+            runtime_backend: RUNTIME_TRACE_BACKEND_MOUNTED_USERSPACE.into(),
+            validation_tier: "mounted-userspace".into(),
+            ci_artifact_ref: "trace-compare-smoke-churn-42".into(),
+            ci_run_url: "https://github.com/tidefs/tidefs/actions/runs/1234567890".into(),
+            claims_covered: vec!["trace.runtime.compare.v1".into()],
+            notes: String::new(),
+        }
+    }
+
+    fn runtime_comparison(trace_path: PathBuf, runtime_backend: &str) -> TraceComparison {
+        TraceComparison {
+            trace_path,
+            model_events: vec![
+                backend_step(BACKEND_MODEL, 0, None),
+                backend_step(BACKEND_MODEL, 1, Some("model-final")),
+            ],
+            runtime_events: vec![
+                backend_step(runtime_backend, 0, None),
+                backend_step(runtime_backend, 1, Some("runtime-final")),
+            ],
+            mismatches: Vec::new(),
+        }
+    }
+
     #[test]
     fn model_replay_manifest_populates_required_v1_fields() {
         let temp = TempDir::new().unwrap();
@@ -532,6 +756,125 @@ mod tests {
         assert_eq!(manifest.output.final_fingerprint, "runtime-final");
         assert_eq!(manifest.output.events_digest_sha256.len(), 64);
         assert!(manifest.notes.contains("not mounted runtime"));
+    }
+
+    #[test]
+    fn runtime_comparison_manifest_requires_mounted_backend_and_ci_refs() {
+        let temp = TempDir::new().unwrap();
+        let trace_path = write_minimal_trace(&temp, "runtime.jsonl");
+        let comparison = runtime_comparison(trace_path, RUNTIME_TRACE_BACKEND_MOUNTED_USERSPACE);
+
+        let manifest = TraceArtifactManifest::runtime_comparison(
+            &comparison,
+            "traces/runtime.jsonl",
+            "runtime_trace",
+            runtime_metadata(),
+            "2026-06-21T00:00:00Z",
+        )
+        .unwrap();
+
+        assert_eq!(manifest.backend, "compare");
+        assert_eq!(manifest.validation_tier, "mounted-userspace");
+        assert_eq!(manifest.evidence_class, "runtime");
+        assert_eq!(
+            manifest.ci_artifact_ref.as_deref(),
+            Some("trace-compare-smoke-churn-42")
+        );
+        assert_eq!(
+            manifest.ci_run_url.as_deref(),
+            Some("https://github.com/tidefs/tidefs/actions/runs/1234567890")
+        );
+        assert_eq!(
+            manifest.claims_covered,
+            vec!["trace.runtime.compare.v1".to_string()]
+        );
+        assert_eq!(manifest.output.result, "pass");
+        assert_eq!(manifest.output.final_fingerprint, "runtime-final");
+        assert!(manifest.notes.contains("mounted/runtime backend"));
+    }
+
+    #[test]
+    fn local_runtime_comparison_cannot_be_upgraded_to_runtime() {
+        let temp = TempDir::new().unwrap();
+        let trace_path = write_minimal_trace(&temp, "local.jsonl");
+        let comparison = runtime_comparison(trace_path, BACKEND_LOCAL_RUNTIME);
+
+        let err = TraceArtifactManifest::runtime_comparison(
+            &comparison,
+            "traces/local.jsonl",
+            "local_trace",
+            runtime_metadata(),
+            "2026-06-21T00:00:00Z",
+        )
+        .expect_err("local runtime harness must not become runtime evidence");
+
+        assert!(err
+            .to_string()
+            .contains("requires all runtime events to use mounted/runtime backend"));
+    }
+
+    #[test]
+    fn runtime_manifest_rejects_missing_runtime_metadata() {
+        let temp = TempDir::new().unwrap();
+        let trace_path = write_minimal_trace(&temp, "bad-metadata.jsonl");
+        let comparison = runtime_comparison(trace_path, RUNTIME_TRACE_BACKEND_MOUNTED_USERSPACE);
+        let mut metadata = runtime_metadata();
+        metadata.ci_artifact_ref = "/tmp/runner/trace-output".into();
+
+        let err = TraceArtifactManifest::runtime_comparison(
+            &comparison,
+            "traces/bad-metadata.jsonl",
+            "bad_metadata",
+            metadata,
+            "2026-06-21T00:00:00Z",
+        )
+        .expect_err("runner-local artifact paths must fail closed");
+
+        assert!(err
+            .to_string()
+            .contains("safe GitHub Actions artifact name"));
+    }
+
+    #[test]
+    fn runtime_manifest_rejects_runner_local_run_url() {
+        let temp = TempDir::new().unwrap();
+        let trace_path = write_minimal_trace(&temp, "bad-url.jsonl");
+        let comparison = runtime_comparison(trace_path, RUNTIME_TRACE_BACKEND_MOUNTED_USERSPACE);
+        let mut metadata = runtime_metadata();
+        metadata.ci_run_url = "https://ci1.internal/actions/runs/123".into();
+
+        let err = TraceArtifactManifest::runtime_comparison(
+            &comparison,
+            "traces/bad-url.jsonl",
+            "bad_url",
+            metadata,
+            "2026-06-21T00:00:00Z",
+        )
+        .expect_err("runner-local run URLs must fail closed");
+
+        assert!(err
+            .to_string()
+            .contains("tidefs/tidefs GitHub Actions run URL"));
+    }
+
+    #[test]
+    fn runtime_manifest_rejects_non_runtime_validation_tier() {
+        let temp = TempDir::new().unwrap();
+        let trace_path = write_minimal_trace(&temp, "bad-tier.jsonl");
+        let comparison = runtime_comparison(trace_path, RUNTIME_TRACE_BACKEND_MOUNTED_USERSPACE);
+        let mut metadata = runtime_metadata();
+        metadata.validation_tier = "harness-only".into();
+
+        let err = TraceArtifactManifest::runtime_comparison(
+            &comparison,
+            "traces/bad-tier.jsonl",
+            "bad_tier",
+            metadata,
+            "2026-06-21T00:00:00Z",
+        )
+        .expect_err("harness-only tier must not become runtime evidence");
+
+        assert!(err.to_string().contains("not a runtime tier"));
     }
 
     #[test]

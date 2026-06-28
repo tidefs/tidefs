@@ -2114,6 +2114,9 @@ fn print_help() {
     println!(
         "  check-trace-oracle --compare-trace <path> [--manifest <path>] compare model/local-runtime backends and write a manifest"
     );
+    println!(
+        "  check-trace-oracle --runtime-compare-manifest <comparison-json> --runtime-backend <backend> --validation-tier <tier> --ci-artifact-ref <name> --ci-run-url <url> [--manifest <path>] write a mounted/runtime trace manifest"
+    );
     println!("  check-crash-oracle       validate crash oracle crate and crash matrix artifact");
     println!("  check-contract-codecs    validate request contract codec golden vectors");
     println!(
