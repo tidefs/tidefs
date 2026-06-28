@@ -7046,8 +7046,13 @@ impl FuseVfsAdapter {
     }
 
     /// Invalidate daemon read-side caches after an engine mutation changes
-    /// visible file bytes without going through the kernel page cache.
-    fn invalidate_caches_after_engine_data_mutation(&self, ino: u64, offset: u64, length: u64) {
+    /// visible file bytes.
+    fn invalidate_daemon_caches_after_engine_data_mutation(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+    ) {
         if length == 0 {
             return;
         }
@@ -7063,6 +7068,15 @@ impl FuseVfsAdapter {
         self.invalidate_read_cache_entry(ino);
         self.invalidate_fuse_read_cache_range(ino, offset, length);
         self.invalidate_inode_metadata_after_engine_write(ino);
+    }
+
+    /// Invalidate daemon and kernel caches after an engine mutation changes
+    /// visible file bytes without going through the kernel page cache.
+    fn invalidate_caches_after_engine_data_mutation(&self, ino: u64, offset: u64, length: u64) {
+        if length == 0 {
+            return;
+        }
+        self.invalidate_daemon_caches_after_engine_data_mutation(ino, offset, length);
         self.try_inval_inode_range(ino, offset, length);
     }
 
@@ -7232,7 +7246,13 @@ impl FuseVfsAdapter {
         }
 
         let length = u64::from(written);
-        self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
+        // This path runs inside the kernel's FUSE WRITE request.  In
+        // writeback-cache mode the kernel can still hold the written page
+        // locked while the daemon replies, so a same-request notifier
+        // invalidation can wait on the page it is servicing.  The engine has
+        // already accepted the exact bytes from this request; refresh daemon
+        // caches/mirrors here and leave the kernel page cache alone.
+        self.invalidate_daemon_caches_after_engine_data_mutation(ino, offset, length);
         let has_dirty_overlap = self.dirty_trackers_overlap_range(ino, offset, length)
             || self.dirty_page_caches_overlap_range(ino, offset, length);
         if has_dirty_overlap {
@@ -42551,6 +42571,59 @@ mod tests {
             1,
             "syncfs must commit the clean write-through txg descriptor"
         );
+    }
+
+    #[test]
+    fn writeback_cached_clean_write_through_fences_daemon_read_cache() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-clean-write-through-read-cache.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let original = vec![0x21; 1024];
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, &original, &ctx)
+                .expect("seed original data");
+        }
+
+        let first = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0, original.len() as u32, None)
+            .expect("initial buffered read fills daemon cache");
+        assert_eq!(first, original);
+        let stale_snapshot = fixture.adapter.data_cache_generation_snapshot(ino, 0, 512);
+
+        let replacement = vec![0x62; 512];
+        let written = fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 0, &replacement, FUSE_WRITE_CACHE)
+            .expect("clean write-through writeback-cache write");
+        assert_eq!(written, replacement.len() as u32);
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 0, 512, stale_snapshot),
+            "clean write-through writes must fence overlapping daemon read-cache generations"
+        );
+
+        {
+            let mut cache = fixture.adapter.page_cache.lock().unwrap();
+            cache.insert(ino, original.clone());
+        }
+        fixture.adapter.record_read_cache_fill(ino, stale_snapshot);
+
+        let after = fixture
+            .adapter
+            .dispatch_read(&ctx, ino, adapter_fh, 0, original.len() as u32, None)
+            .expect("buffered read after stale daemon cache reinsertion");
+        assert_eq!(&after[..replacement.len()], replacement.as_slice());
+        assert_eq!(&after[replacement.len()..], &original[replacement.len()..]);
     }
 
     #[test]
