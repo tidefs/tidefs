@@ -611,27 +611,22 @@ Important 2026-06-01 findings:
   cross-references, cluster diagnostic/prototype separation, runtime validation,
   and any future production UAPI or ABI freeze.
 Issue #1267 records the current runtime-fed operator product-surface decision: no runtime-fed operator product surface exists, the P10-04 truth-surface law is missing from the repository, and no product carrier class is selectable until TFR-011 and TFR-017 close. The decision maps follow-ups for P10-04 disposition, TFR-011/TFR-017 closeout, and documentation cleanup.
-- `TFR-012`: Device lifecycle and media privacy remain incomplete. Pool-member
-  backing must be one byte-addressable media model: block devices for
-  production and regular files for hidden development mode. Directory
-  `LocalObjectStore` compatibility is not a valid pool-member device mode.
-  Segment free still performs best-effort hole punching in that compatibility
-  path, and that is not proven media erasure. The public `tidefsctl` parser now
-  rejects directory object-store handles for device removal/rebuild, but the
-  internal compatibility helper still imports labels, preloads all target
-  objects, maps object ids locally, depends on supplied surviving store
-  directories, maps synthetic device paths to directories, syncs survivors,
-  and anchors removal on the target store. That is not yet a
-  pool-authoritative add/remove/replace/remanence lifecycle. Issue #14 closes
-  the narrow invalid-media/discard capability bug, and issue #16 establishes
-  the explicit pool media contract: user pool-device admission rejects
-  directories, `DeviceConfig` carries the backing kind, byte-addressable file
-  and block devices share fixed-offset labels and single-segment object
-  storage, directory compatibility no longer advertises discard, non-zero
-  direct discard fails explicitly, and directory-only pool trim/free paths
-  report zero bytes discarded. TFR-012 remains open for real discard-capable
-  backing devices, segment-reclaim remanence, online replacement/removal
-  authority, and byte-device remanence policy.
+- `TFR-012`: Device lifecycle and media privacy remain incomplete.
+  `docs/DEVICE_LIFECYCLE_REMANENCE_AUTHORITY.md` records the current decision
+  boundary from issue #1276. Pool-member backing is byte-addressable media only:
+  production block devices or explicit regular-file images for hidden
+  development mode. Directory `LocalObjectStore` compatibility is not a valid
+  pool-member device mode, does not advertise discard, and reports zero bytes
+  discarded through compatibility-only trim/free paths. Current source has
+  placement-receipt-aware removal helpers, a mounted live-owner removal route,
+  replacement state, label topology fields, block-volume zero-visible
+  discard/write-zeroes models, segment hole-punching, capacity/reclaim hooks,
+  and transform wrappers that forward discard ranges, but these surfaces are not
+  yet one product authority for removal, replacement, discard, zeroing, or
+  remanence. The non-overlapping follow-up map is:
+  real byte-device discard capability; segment-reclaim remanence policy; online
+  removal authority closeout; online replacement and rebuild authority; zeroing
+  and media privacy policy; and focused device-lifecycle runtime validation.
 - `TFR-013`: stage words remain widespread; examples include CLI stubs,
   runners, old issue-era gate labels outside the first cleaned xtask gate set,
   and app/workspace classification docs that list deleted or quarantined
