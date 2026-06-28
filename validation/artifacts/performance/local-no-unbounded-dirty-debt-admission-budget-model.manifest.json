@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "perf.local.no_unbounded_dirty_debt.v1",
+  "evidence_class": "admission-budget-model",
+  "validation_tier": "source-model",
+  "scope": "source-model queue-root registry for local dirty write admission and budgeted queue accounting; not mounted runtime proof",
+  "artifact_path": "validation/performance/no-hidden-queues.toml",
+  "content_digest": "blake3:1d2b157248e32613cde2dc56a85d6a68ae2b51ae67e855fef3db55599ac56b6f",
+  "run_id": "deterministic-fixture:performance-no-hidden-queues-registry-v1",
+  "source_ref": "refs/heads/gpt4/issue-1485-performance-contract-manifests",
+  "outcome": "pass",
+  "residual_risk": "The registry is source-model evidence for the local dirty-write admission model. Mounted proof remains limited to the separate queue-depth runtime artifact.",
+  "source": "tidefs-performance-contract",
+  "generated_at": "2026-06-28T18:54:32Z",
+  "blocking_issues": []
+}

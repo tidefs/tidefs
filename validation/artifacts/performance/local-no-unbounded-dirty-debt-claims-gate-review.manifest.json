@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "perf.local.no_unbounded_dirty_debt.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "claims-gate source review of the local no-unbounded-dirty-debt evidence boundary for admission-budget, no-hidden-queue, and mounted FUSE queue-depth artifacts",
+  "artifact_path": "validation/artifacts/performance/claims-gate-review.toml",
+  "content_digest": "blake3:9bb5a06c61578d8fea51d0e89a333a6e9e66edc639a03abe0ab053c5c7db43ba",
+  "run_id": "deterministic-fixture:performance-claims-gate-review-issue-498-v1",
+  "source_ref": "refs/heads/gpt4/issue-1485-performance-contract-manifests",
+  "outcome": "pass",
+  "residual_risk": "The review validates only the bounded local dirty-write admission claim. It does not validate scheduler-wide dirty-debt coverage, scrub/read isolation, crash recovery, RDMA, distributed, kernel, or production performance readiness.",
+  "source": "claims-gate",
+  "generated_at": "2026-06-28T18:54:32Z",
+  "blocking_issues": []
+}

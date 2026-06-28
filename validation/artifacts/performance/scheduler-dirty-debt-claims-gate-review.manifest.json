@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "scheduler.dirty_debt.no_hidden.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "claims-gate source review of the performance runtime boundary and missing scheduler-wide dirty-debt evidence",
+  "artifact_path": "validation/artifacts/performance/claims-gate-review.toml",
+  "content_digest": "blake3:9bb5a06c61578d8fea51d0e89a333a6e9e66edc639a03abe0ab053c5c7db43ba",
+  "run_id": "deterministic-fixture:performance-claims-gate-review-issue-498-v1",
+  "source_ref": "refs/heads/gpt4/issue-1485-performance-contract-manifests",
+  "outcome": "pass",
+  "residual_risk": "The review confirms the local runtime boundary and records that scheduler-wide dirty-debt coverage remains outside the bounded local no-unbounded-dirty-debt claim.",
+  "source": "claims-gate",
+  "generated_at": "2026-06-28T18:54:32Z",
+  "blocking_issues": []
+}

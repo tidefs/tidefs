@@ -29,3 +29,10 @@ A receipt can say which workload, comparator or baseline policy, validation
 tier, and claim ids an artifact is meant to cover; it does not by itself prove
 that the runtime path met a performance budget or that hidden dirty work has
 been eliminated.
+
+`PerformanceReceipt::evidence_artifact_manifest` builds a borrowed version-2
+claim evidence manifest reference with the common `EvidenceArtifactManifest`
+field names consumed by `tidefs-validation`. The helper preserves the receipt's
+validation tier, so source-model, cargo-unit, and harness-only receipts remain
+lower-tier evidence. Mounted performance proof still requires an actual mounted
+runtime artifact from the relevant workflow.

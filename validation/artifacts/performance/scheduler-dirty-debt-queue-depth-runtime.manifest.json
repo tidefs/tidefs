@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "scheduler.dirty_debt.no_hidden.v1",
+  "evidence_class": "queue-depth-runtime-artifact",
+  "validation_tier": "mounted-userspace",
+  "scope": "bounded mounted FUSE dirty-write admission queue-depth snapshot from QEMU Smoke fuse-vm-test run 27857392701; not scheduler-wide dirty-debt proof",
+  "artifact_path": "validation/artifacts/performance/queue-depth-runtime.json",
+  "content_digest": "blake3:666ff0024fade0991cc395e4db7b2d19695a5f192e1871e946eec6f66696285c",
+  "run_id": "github-actions:27857392701/1",
+  "source_ref": "0fb49f422c3a38c80041e331d7724ea77514e68e",
+  "outcome": "pass",
+  "residual_risk": "The runtime row covers only the local mounted FUSE smoke-mount quick dirty-write workload. It does not prove scheduler-wide foreground/background dirty-debt coverage, scrub/read isolation, crash recovery, production performance, kernel, RDMA, distributed, or storage-engine behavior.",
+  "source": "qemu-smoke-fuse-vm-test",
+  "generated_at": "2026-06-28T18:54:32Z",
+  "blocking_issues": []
+}
