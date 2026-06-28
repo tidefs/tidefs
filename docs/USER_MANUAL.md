@@ -2,7 +2,9 @@
 
 This manual covers the current TideFS userspace filesystem. TideFS is under
 active development. The filesystem is functional for local experiments but is
-not yet production-ready or POSIX-complete.
+not yet production-ready or POSIX-complete. It is not a release-readiness,
+distributed-storage, kernelspace, RDMA, or OpenZFS/Ceph-class capability
+claim.
 
 Use this manual with:
 - `README.md` for repository scope, current policy, and readiness caveats
@@ -10,11 +12,34 @@ Use this manual with:
 - `docs/ARCHITECTURE.md` for system architecture and design rationale
 - `docs/POSIX_COMPLIANCE.md` for per-operation POSIX status
 - `docs/REVIEW_TODO_REGISTER.md` for current review debt and capability blockers
+- `docs/CLAIMS_GATE_POLICY.md` and `docs/UNRELEASED_AUTHORITY_POLICY.md` for
+  publishing-facing claim hygiene
+- `docs/RELEASE_READINESS_VERDICT_CONTRACT.md` and
+  `docs/PRODUCT_ADMISSION_PROOF_TRAINS.md` for release-readiness and
+  whole-product admission boundaries
+- `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` for the current operator
+  product-surface boundary
 - `docs/POSIX_SUBSET.md` for historical first-FUSE subset context
+
+## Current Capability Boundary
+
+The current reader-facing product surface is the local mounted userspace
+filesystem path. The operation list below summarizes behavior documented for
+that path; `docs/POSIX_COMPLIANCE.md` remains the per-operation authority for
+DONE, GAP, UNTEST, and NONE status.
+
+Capability outside that local mounted path remains constrained by the review
+register and claim-policy documents. In particular, TideFS does not currently
+claim a production release, a complete POSIX implementation, distributed
+storage behavior, a runtime-fed operator product surface, a product RDMA data
+path, or a production full-kernel/no-daemon storage path. Planning docs, CI
+artifacts, model evidence, issue closeout notes, and gate-local receipts are
+evidence inputs only; they do not become whole-product admission without the
+authority surfaces named above.
 
 ## What You Can Do
 
-The mounted filesystem supports:
+The mounted userspace filesystem documents support for:
 
 ### File Operations
 - Create, open, read, write, truncate, close
@@ -102,15 +127,19 @@ Use `/tmp/tidefs-mnt` with standard POSIX tools:
 
 ### Data Durability
 
-TideFS commits data in transaction groups (CommitGroup). An fsync or fdatasync call
-ensures the file's data and metadata are committed to stable storage before
-returning. After a clean unmount, all committed data persists. After a crash,
-committed CommitGroups are recovered; uncommitted data from the last CommitGroup may be lost.
+TideFS commits local data in transaction groups (CommitGroup). `fsync` and
+`fdatasync` are mounted userspace operations, and a clean unmount preserves
+committed CommitGroups. The integrated recovery, dirty-page writeback, mmap,
+and page-cache authority proof remains open under `docs/REVIEW_TODO_REGISTER.md`
+TFR-008, so this manual does not elevate those operations into a broader
+release or production durability claim.
 
 ### Snapshots
 
-Snapshots capture the filesystem state at a point in time. Snapshot data is
-previous snapshot state.
+Snapshots describe local point-in-time filesystem state. Snapshot retention,
+clone lineage, deadlists, and send/receive are still tracked as a broader
+storage-model boundary in `docs/REVIEW_TODO_REGISTER.md` TFR-010; this manual
+does not claim distributed snapshot shipping or network send/receive behavior.
 
 ### Space Management
 
@@ -121,19 +150,24 @@ writes return ENOSPC. fallocate can pre-allocate space with mode-zero.
 
 All data is content-addressed with BLAKE3-256 hashes. On every read, the
 hash is verified. Corruption is detected and logged (SuspectLog). The
-online verifier can scan all data for integrity without modifying it.
+online verifier can scan local data for integrity without modifying it; it is
+not automated self-healing.
 
 ### Encryption
 
-Per-object encryption is available using ChaCha20-Poly1305 AEAD with
-256-bit keys. Each object gets a unique random nonce. Encryption is
-transparent: put and get operations automatically encrypt and decrypt.
+Object-store transform paths include per-object encryption using
+ChaCha20-Poly1305 AEAD with 256-bit keys and unique random nonces. Mounted
+device-level encryption is not claimed by this manual; transform conformance
+remains governed by `docs/REVIEW_TODO_REGISTER.md` TFR-006 and
+`docs/TRANSFORM_PIPELINE_AUTHORITY.md`.
 
 ### Compression
 
-Per-object compression is available using zstd or LZ4. Objects smaller than
-64 bytes are stored uncompressed. Incompressible payloads fall back to
-uncompressed storage automatically.
+Object-store transform paths include per-object compression using zstd or LZ4.
+Objects smaller than 64 bytes are stored uncompressed, and incompressible
+payloads fall back to uncompressed storage. Mounted device-level compression is
+not claimed by this manual; use the same TFR-006 authority boundary as
+encryption.
 
 ## Known Limitations
 
@@ -144,11 +178,15 @@ operation status, use `docs/POSIX_COMPLIANCE.md`.
 Key product limitations:
 
 - No mmap support (database workloads, executable loading)
+- No complete POSIX or broad xfstests release gate
+- No mounted device-level compression/encryption product claim
 - No online device replacement
 - No separate intent log device (SLOG/LOG_DEVICE)
 - No key rotation for encryption
-- No network transport for send/receive
+- No distributed storage product claim, network transport for send/receive, or
+  product RDMA data path
+- No production full-kernel/no-daemon storage claim
+- No runtime-fed operator product surface
 - No automated self-healing (online verifier is read-only)
-- Broad xfstests coverage not yet runtime output at Tier 3
 
 See `docs/REVIEW_TODO_REGISTER.md` for the broader review-debt inventory.
