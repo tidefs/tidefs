@@ -38,6 +38,9 @@ Release readiness boundary and evidence inputs:
   release-readiness verdict boundary.
 - `docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md` describes the
   release-candidate evidence index as a gate input.
+- `docs/PRODUCT_ADMISSION_PROOF_TRAINS.md` maps product-admission proof trains
+  as a planning and review overlay, not as a release-readiness verdict or
+  product-admission claim.
 - `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md` defines the
   performance-budget gate and gate-local receipts.
 - `docs/GITHUB_CI.md` describes standing CI and release-candidate workflow
@@ -47,8 +50,9 @@ Release readiness boundary and evidence inputs:
 - `docs/UNRELEASED_AUTHORITY_POLICY.md` defines the unreleased-surface
   authority and compatibility guardrail.
 
-The evidence inputs, gate-local receipts, CI artifacts, and claims-gate results
-listed here do not combine into a product-admission decision on their own.
+The evidence inputs, proof-train map, gate-local receipts, CI artifacts, and
+claims-gate results listed here do not combine into a product-admission
+decision on their own.
 
 Key design, policy, and reference areas:
 
