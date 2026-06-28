@@ -35,9 +35,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = ["#286"] },
-  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = [] },
-  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#329"] },
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/model-crash-matrices.namespace-rename.manifest.json", blocking_issues = ["#286"] },
+  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.namespace-rename.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/claims-gate-review.namespace-rename.manifest.json", blocking_issues = ["#329"] },
 ]
 blockers = [
   "GitHub issue #286 model-first evidence is bounded to the executable model, not local runtime crash injection.",
@@ -84,10 +84,10 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", blocking_issues = [] },
-  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", blocking_issues = [] },
+  { class = "model-crash-matrix", path = "validation/artifacts/crash-oracle/model-crash-matrices.json", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/model-crash-matrices.local-vfs-rename.manifest.json", blocking_issues = [] },
+  { class = "runtime-namespace-crash-artifact", path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/crash-oracle/local-vfs-rename-crash-runtime.local-vfs-rename.manifest.json", blocking_issues = [] },
   { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", validation_tier = "cargo-unit", blocking_issues = ["#720"] },
-  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/crash-oracle/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/crash-oracle/claims-gate-review.local-vfs-rename.manifest.json", blocking_issues = [] },
 ]
 blockers = [
   "Rename directory-entry and orphan-index no-hidden-queue source/registry review receipt is recorded (#597), but active rename/orphan-index runtime admission proof remains pending (#720).",

@@ -2263,6 +2263,7 @@ dependencies = [
  "tidefs-intent-log",
  "tidefs-model-core",
  "tidefs-types-vfs-core",
+ "tidefs-validation",
 ]
 
 [[package]]
