@@ -1101,6 +1101,26 @@ struct WriteDispatchFlags {
     request_open: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelPageCacheInvalidation {
+    Notify,
+    SkipSameRequestWriteback,
+}
+
+impl KernelPageCacheInvalidation {
+    fn for_write_request(is_writeback_cached: bool) -> Self {
+        if is_writeback_cached {
+            Self::SkipSameRequestWriteback
+        } else {
+            Self::Notify
+        }
+    }
+
+    fn should_notify(self) -> bool {
+        matches!(self, Self::Notify)
+    }
+}
+
 impl InodeOpenState {
     fn observe(&mut self, handle: AdapterFileHandle) {
         let flags = handle.engine_handle.open_flags;
@@ -6759,6 +6779,9 @@ impl FuseVfsAdapter {
                                             written,
                                             written_data,
                                             write_flags,
+                                            KernelPageCacheInvalidation::for_write_request(
+                                                is_writeback_cached,
+                                            ),
                                         );
                                     }
                                     if post_write_attr.is_none()
@@ -6953,6 +6976,9 @@ impl FuseVfsAdapter {
                                         written,
                                         data,
                                         write_flags,
+                                        KernelPageCacheInvalidation::for_write_request(
+                                            is_writeback_cached,
+                                        ),
                                     );
                                 }
                                 if post_write_attr.is_none()
@@ -7113,6 +7139,7 @@ impl FuseVfsAdapter {
         written: u32,
         data: &[u8],
         write_flags: u32,
+        kernel_page_cache_invalidation: KernelPageCacheInvalidation,
     ) {
         // Submit dirty extent to the writeback scheduler for
         // later flush/fsync writeback.
@@ -7158,7 +7185,9 @@ impl FuseVfsAdapter {
         self.invalidate_read_cache_entry(ino);
         self.invalidate_fuse_read_cache_range(ino, offset, u64::from(written));
         self.invalidate_inode_metadata_after_engine_write(ino);
-        self.try_inval_inode_range(ino, offset, u64::from(written));
+        if kernel_page_cache_invalidation.should_notify() {
+            self.try_inval_inode_range(ino, offset, u64::from(written));
+        }
 
         // Mark dirty pages in the writeback PageCache so
         // flush/fsync can iterate them for writeback.
@@ -42624,6 +42653,77 @@ mod tests {
             .expect("buffered read after stale daemon cache reinsertion");
         assert_eq!(&after[..replacement.len()], replacement.as_slice());
         assert_eq!(&after[replacement.len()..], &original[replacement.len()..]);
+    }
+
+    #[test]
+    fn writeback_cached_dirty_write_policy_skips_same_request_kernel_invalidation() {
+        assert_eq!(
+            KernelPageCacheInvalidation::for_write_request(true),
+            KernelPageCacheInvalidation::SkipSameRequestWriteback
+        );
+        assert!(
+            !KernelPageCacheInvalidation::for_write_request(true).should_notify(),
+            "writeback-cache WRITE replies must not invalidate the same kernel page-cache range"
+        );
+        assert!(
+            KernelPageCacheInvalidation::for_write_request(false).should_notify(),
+            "non-writeback dirty writes keep kernel page-cache invalidation"
+        );
+    }
+
+    #[test]
+    fn writeback_cached_dirty_write_still_fences_daemon_caches_when_notify_skipped() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, _adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-dirty-write-daemon-fence.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let stale_snapshot = fixture.adapter.data_cache_generation_snapshot(ino, 0, 512);
+        let payload = vec![0xA5; 512];
+
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            fixture.adapter.mark_dirty_after_write(
+                &**engine,
+                &ctx,
+                &engine_fh,
+                ino,
+                0,
+                payload.len() as u32,
+                &payload,
+                FUSE_WRITE_CACHE,
+                KernelPageCacheInvalidation::SkipSameRequestWriteback,
+            );
+        }
+
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 0, 512, stale_snapshot),
+            "dirty writeback-cache writes must still fence daemon read-cache generations"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(true),
+            "dirty writeback-cache writes remain tracked for flush/fsync"
+        );
+        assert!(
+            !fixture
+                .adapter
+                .write_page_cache
+                .dirty_pages_for_inode(ino)
+                .is_empty(),
+            "dirty writeback-cache writes still dirty the adapter page mirror"
+        );
     }
 
     #[test]
