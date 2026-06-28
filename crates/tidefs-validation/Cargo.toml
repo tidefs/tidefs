@@ -19,6 +19,7 @@ exercising peer crates as they land.
 [[bin]]
 name = "receipt-bound-reclaim-validation"
 path = "src/bin/receipt_bound_reclaim_validation.rs"
+required-features = ["receipt-bound-physical-reclaim"]
 
 [features]
 default = []
@@ -50,6 +51,12 @@ transport = ["dep:tidefs-types-cache-lattice-core", "dep:tidefs-cache-core", "de
 
 # Cluster placement/heal validation.
 cluster-placement-heal = ["dep:tidefs-cluster"]
+
+# Receipt-bound reclaim runtime row that reaches the physical drain bridge.
+receipt-bound-physical-reclaim = [
+    "dep:tidefs-reclaim",
+    "dep:tidefs-segment-cleaner",
+]
 
 # Full FUSE userspace POSIX validation: VfsEngine, all POSIX adapter workers,
 # and every storage backend needed by the FUSE data path.
@@ -89,6 +96,7 @@ full = [
     "storage-core",
     "transport",
     "cluster-placement-heal",
+    "receipt-bound-physical-reclaim",
 ]
 
 [dependencies]
@@ -118,6 +126,7 @@ tidefs-local-filesystem = { workspace = true, optional = true }
 tidefs-intent-log = { workspace = true, optional = true }
 tidefs-reclaim = { workspace = true, optional = true }
 tidefs-reclaim-queue-core = { workspace = true }
+tidefs-segment-cleaner = { workspace = true, optional = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
 tidefs-namespace = { workspace = true, optional = true }
 tidefs-inode-attributes = { workspace = true, optional = true }

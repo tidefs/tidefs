@@ -59,13 +59,13 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let digest = blake3::hash(&artifact_json);
     let manifest = EvidenceManifest {
-        manifest_version: 2,
-        claim_id: "receipt-bound-reclaim.runtime-row.v1".to_string(),
+        manifest_version: 3,
+        claim_id: "receipt-bound-reclaim.physical-drain-runtime-row.v1".to_string(),
         evidence_class: "receipt-bound-reclaim-runtime-row".to_string(),
         validation_tier: "github-actions-runtime-harness".to_string(),
         source: workflow_name(),
         scope: format!(
-            "row={} issue=#999 parent=#676 disposition={} artifact={}",
+            "row={} issue=#1528 parent=#676 disposition={} artifact={}",
             evidence.row_id,
             evidence.parent_tracker_disposition,
             RECEIPT_BOUND_RECLAIM_ARTIFACT
@@ -75,7 +75,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         run_id: workflow_run_id(),
         source_ref: source_ref(),
         outcome: if evidence.passed { "pass" } else { "product-fail" }.to_string(),
-        residual_risk: "This row proves the receipt-bound dead-object queue gate and durable queue replay boundary only; it is not mounted FUSE, kernel, xfstests, RDMA, allocator, or segment-cleaner runtime evidence.".to_string(),
+        residual_risk: "This row proves the receipt-bound dead-object queue replay into the physical drain boundary with a SegmentFreer observer only; it is not mounted FUSE, kernel, xfstests, RDMA, whole allocator, or release-candidate evidence.".to_string(),
         generated_at: generated_at(),
         blocking_issues: Vec::new(),
     };
