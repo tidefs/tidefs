@@ -16,7 +16,7 @@ windows, a unified payload model (InlineOrBulkV1) that delegates large data to
 the BULK plane (#1229), and serializable handle encoding that makes in-process
 file/dir handles transferable across nodes.
 
-TFS_RPC is service_id `0x06` in the tidefs cluster service registry. It is the
+VFS_RPC is service_id `0x06` in the tidefs cluster service registry. It is the
 primary data-plane protocol: all POSIX filesystem operations that require
 cluster forwarding flow through this service.
 
@@ -556,7 +556,141 @@ Clients refresh on ESTALE response.
 
 ---
 
-## 12. Non-Claims
+## 12. Live Transport-Binding Decision (#1518)
+
+### 12.1 Evidence reviewed
+
+Issue #1518 reviewed the current VFS_RPC integration boundary from these
+sources:
+
+- Closed #836 and the `docs/workspace-package-classification.md` row: the
+  `tidefs-vfs-rpc` crate is current wire-protocol authority, but service
+  integration remains a follow-up claim.
+- This document, `docs/design/cluster-bulk-plane-protocol.md`, and TFR-017 in
+  `docs/REVIEW_TODO_REGISTER.md`: VFS_RPC carries control frames and
+  `InlineOrBulkV1` descriptors; BULK owns byte movement, credit accounting, and
+  RDMA scheduling; transport/cluster authority remains open before multi-node
+  product claims.
+- Source inspection: `crates/tidefs-vfs-rpc` implements service id `0x06`,
+  stable methods, request/response headers, credentials, transferable handles,
+  `InlineOrBulk`, transport frame wrappers, client correlation, and a bounded
+  dedup window. The repo has `tidefs-transport`, `tidefs-vfs-engine`, and
+  transport-session models, but no `tidefs-bulk-service` crate yet.
+- Live GitHub state on 2026-06-28: searches for VFS_RPC, `tidefs-vfs-rpc`,
+  `BulkToken`, BULK/RDMA, cluster forwarding, VFS Engine forwarding, and
+  transport binding found #1518 as the only open VFS_RPC-specific issue. Open
+  PR file inspection found no PR touching this document,
+  `docs/design/cluster-bulk-plane-protocol.md`,
+  `docs/workspace-package-classification.md`, or `crates/tidefs-vfs-rpc`.
+
+### 12.2 Alternatives
+
+1. **TCP-only VFS_RPC binding**. Bind service `0x06` directly to the existing
+   TCP-backed transport and carry every operation inline.
+
+   Rejected as the complete boundary. TCP is the right first transport substrate
+   for control/inline frames, but a pure TCP-only design either pushes large
+   file data through the control path or invents a second byte-mover outside
+   the BULK contract. It may be used only as the initial carrier for frames
+   whose payload fits `max_frame_bytes`.
+
+2. **VFS_RPC control path with BULK-plane data movement**.
+
+   Selected. The first live boundary is a VFS_RPC control/inline forwarding path
+   over the current transport envelope, with `InlineOrBulkV1` preserving the
+   explicit handoff to the BULK plane. Until #1523 lands a live BULK service
+   handoff, implementations must reject or defer `REQ_FLAG_BULK_PENDING` and
+   `RESP_FLAG_BULK` rather than treating missing byte movement as success.
+
+3. **RDMA-capable VFS_RPC/BULK boundary**.
+
+   Deferred. RDMA belongs behind BULK and transport/security/runtime evidence
+   gates: peer authentication, pinned-memory budgets, rkey/addr credit
+   lifecycle, abort cleanup, hardware/runtime validation, and TFR-017 transport
+   authority. No VFS_RPC implementation may claim RDMA readiness by selecting a
+   TCP fallback or by moving inline data only.
+
+### 12.3 Selected first implementation boundary
+
+The first implementation boundary is:
+
+- A transport adapter for VFS_RPC service `0x06` control frames (#1521).
+- A writer-side VFS Engine bridge for inline operations (#1522).
+- An explicit unsupported/deferred result for BULK descriptors until the
+  `InlineOrBulkV1`/`BulkToken` handoff is implemented (#1523).
+- Focused validation evidence for exactly the landed forwarding surface (#1524).
+
+This boundary is safe to implement because it does not require source behavior
+outside the VFS_RPC transport adapter and VFS Engine bridge, and it preserves
+BULK/RDMA as separate evidence-gated work. It is not safe to advertise as
+multi-node product readiness, release-candidate readiness, RDMA readiness, or
+storage semantics authority.
+
+### 12.4 Minimum forwarding contract
+
+The selected boundary requires the following contract before any forwarded
+operation reaches a writer-side engine:
+
+- **Writer discovery and lease input**: callers obtain the writer node,
+  dataset identity, and writer lease from membership/runtime authority before
+  emitting a VFS_RPC request. VFS_RPC consumes that input; it does not choose a
+  writer or originate a lease.
+- **Term/epoch handling**: every request carries the `(term, epoch)` from the
+  writer lease. The writer validates the tuple before side effects. Stale,
+  mismatched, or wrong-writer requests return `ESTALE` so the caller
+  re-resolves membership and retries as a new lease attempt.
+- **`op_id` dedup window**: the writer keeps the existing bounded per-peer
+  dedup cache. Retries of the same logical operation reuse `op_id`; completed
+  responses may be replayed with `RESP_FLAG_DEDUP_REPLAY`; entries are evicted
+  by the fixed window; `REQ_FLAG_NO_DEDUP` bypasses this cache only for
+  explicitly one-shot paths. A BULK failure before engine dispatch inserts no
+  success entry.
+- **Peer credentials**: the transport-authenticated peer identity must match
+  `VfsRpcCredentials.peer_id`. The credential `auth_tag` covers the peer,
+  `op_id`, and method payload; uid, gid, and supplementary groups become the
+  writer-side request context. Mismatch returns `EACCES`.
+- **Transferable handles**: a received file or directory handle must match the
+  local writer node, dataset, inode generation, handle cookie, and
+  authenticated peer. Wrong writer or generation returns `ESTALE`; unknown or
+  released cookies return `EBADF`; cross-peer handle use returns `EACCES`.
+- **`InlineOrBulkV1` handoff**: inline payloads stay inside VFS_RPC frames and
+  must fit `max_frame_bytes`. BULK payloads carry only a same-connection
+  `BulkToken` and length. WRITE with `REQ_FLAG_BULK_PENDING` waits for BULK
+  DONE before engine dispatch; READ with `RESP_FLAG_BULK` requires the writer
+  to create the BULK transfer and make the token readable by the requester.
+  Without a live BULK handoff, the VFS_RPC implementation must return an
+  explicit unsupported/deferred error rather than silently truncating,
+  inlining, or claiming success.
+
+### 12.5 Follow-up map
+
+- #1521, `vfs-rpc-transport-adapter`: owns service `0x06` transport wrapping,
+  dispatch registration, frame-size enforcement, session/peer errors, and
+  control/inline-only behavior.
+- #1522, `vfs-rpc-vfs-engine-bridge`: owns writer lease validation, VFS Engine
+  dispatch, per-peer dedup replay, credentials, and handle resolution for
+  inline operations.
+- #1523, `vfs-rpc-bulk-rdma-handoff`: owns the `InlineOrBulkV1`/`BulkToken`
+  handoff and keeps RDMA behind BULK, security, transport, memory-budget, and
+  runtime evidence gates.
+- #1524, `vfs-rpc-forwarding-validation`: owns focused evidence records and
+  workflow run URLs for the forwarding boundary after the implementation
+  issues land.
+
+### 12.6 Residual unknowns
+
+- The exact transport service-registration API may require a small adapter
+  module or a dispatch hook in `tidefs-transport`; #1521 owns that choice.
+- The VFS Engine bridge must map the VFS_RPC method catalog to the current
+  `VfsDispatch`/`VfsEngine` response types without changing storage semantics;
+  #1522 owns any method-level gaps.
+- A live BULK service API is absent in the current workspace; #1523 must either
+  introduce or identify that surface before VFS_RPC accepts BULK descriptors as
+  live.
+- RDMA runtime proof, partition recovery, cross-replica repair closure, and
+  distributed transaction authority remain outside this boundary under TFR-017.
+
+## 13. Non-Claims
 
 This design does not cover:
 
@@ -573,10 +707,20 @@ This design does not cover:
   0x30) is reserved for future capability negotiation.
 - **Compound operations**: multi-op transactions (e.g., RENAME + SETATTR) are
   deferred to a future design. VFS_RPC carries single operations only.
+- **RDMA readiness**: VFS_RPC does not claim RDMA transport readiness; RDMA is
+  gated by the BULK handoff and TFR-017 transport evidence.
+- **Multi-node product readiness**: a service `0x06` forwarding path is not a
+  complete clustered POSIX, placement, recovery, repair, or operator UAPI
+  claim.
+- **Release-candidate status**: this design and its follow-up issues do not
+  imply release-candidate readiness or broad runtime validation.
+- **Storage semantics authority**: VFS_RPC carries requests and responses; the
+  VFS Engine, storage, placement, recovery, and transaction layers retain
+  authority for filesystem semantics and durability.
 
 ---
 
-## 13. References
+## 14. References
 
 - `docs/design/on-media-format-strategy.md` — V1 format framework (#1220)
 - Issue #1213 — VFS Engine API contract
