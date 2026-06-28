@@ -13,6 +13,7 @@ OpenZFS/Ceph-class claims.
 | TFR-006 | Compression/encryption | Compression and encryption paths may bypass or duplicate raw object-store authority. | Use `docs/TRANSFORM_PIPELINE_AUTHORITY.md` as the #1063 boundary decision and close its non-overlapping follow-up map before claiming runtime conformance. |
 | TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Use `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` as the boundary decision and close the linked follow-up issue map. |
 | TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` for the integrated recovery/fsync/writeback/mmap durability boundary and follow-up map, and `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` for the invalidation trigger, stale-generation, and FUSE/kernel/cluster lease model; then prove and test the end-to-end durability and cache-coherency contract. |
+| TFR-009 | Kernel residency | Kernel-resident storage authority is tiered and not yet a production full-kernel/no-daemon claim. | Use `docs/KERNEL_RESIDENCY_AUTHORITY.md` as the boundary decision. `docs/KERNEL_RESIDENT_POOL_ENGINE_ARCHITECTURE.md` remains the target-architecture spec and evidence-tier map; close the follow-up implementation map before claiming kernel-resident storage authority. |
 | TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Use `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` for the local snapshot/clone/deadlist authority. Issue #1248 selected released-root derivation feeding the existing receipt-bound dead-object reclaim pipeline; implementation remains open under #1263, #1264, #1265, #1259, and #1266. Distributed snapshot shipping design is recorded in `docs/design/distributed-snapshot-shipping.md` (issue #1250); VFSSEND2 is the protocol foundation, section 7.2 records the initial scheduling/admission policy, and distributed deadlist triggers must call the #1248 derivation API rather than transmit deadlist entries. |
 | TFR-013 | Stub/placeholder stage | Several crates and docs still look like stage scaffolding rather than product behavior. | Classify placeholders explicitly and delete or implement them. |
 | TFR-014 | Licensing/provenance | Fresh TideFS import must preserve Linux-style GPLv2+syscall-note licensing and third-party provenance. | Audit all package metadata and file-local notices after rename. |
@@ -555,22 +556,15 @@ Important 2026-06-01 findings:
   non-claims and the follow-up implementation map for dirty lifecycle
   unification, local fsync/recovery ordering, FUSE projection, kmod projection,
   and claim-gate evidence.
-- `TFR-009`: Kernel residency is still a tiered bring-up, not terminal; TideFS
-  is not yet full-kernel. The kernel-resident architecture doc explicitly says the
-  current mounted operation slice uses a small fixed in-kernel namespace/data
-  table and is not the final object/extent/intent-log engine, page-cache
-  The block-kmod entrypoint opens a hard-coded `/dev/tidefs_pool_member`
-  backing path and wraps it in a local `PoolCoreOps` adapter that still says
-  it should be replaced by the canonical `KernelPoolCore` bridge. The
-  entrypoint now refuses to register `/dev/tidefs` when that pool-backed
-  backend is absent unless a Kbuild smoke job explicitly enables the
-  `tidefs_block_kmod_bringup_backend` cfg, so the old silent in-kernel-buffer
-  fallback no longer presents as production-shaped block authority. The common kmod
-  `VfsEngine` trait defaults still return `ENOSYS` for block read/write,
-  flush, discard, write-zeroes, and zero-range operations, while the Kbuild
-  `RawBlockFile` flush path is a no-op that relies on guest-side sync. That is
-  not yet one kernel-resident pool authority for VFS, block export, recovery,
-  writeback, and remanence.
+- `TFR-009`: `docs/KERNEL_RESIDENCY_AUTHORITY.md` records the authority
+  boundary decision for kernel residency. Kernel residency remains a tiered
+  bring-up, not terminal full-kernel storage authority. The fixed in-kernel
+  namespace/data table is not the final object/extent/intent-log engine;
+  page-cache/writeback authority remains at the TFR-008 boundary; block-kmod
+  bring-up is not a full block-volume product claim; and the accepted T5
+  mounted-kernel cutover/teardown artifact from #1186 / PR #1463 does not
+  satisfy the T6 full-kernel/no-daemon claim gate. The kernel-resident
+  architecture doc remains the target-architecture spec and evidence-tier map.
 - `TFR-010`: Snapshot lifecycle is not single-sourced. Basic create/delete,
   clone create/delete/promote, hold-protected retention pruning, and catalog
   listing now share the local `SnapshotRecord`, dataset catalog, and lifecycle
