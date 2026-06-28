@@ -217,9 +217,6 @@ fn incremental_vfssend2_content_parity_with_vfssend1_import() {
 
     assert!(import_report.imported_roots > 0);
 
-    // Now open target and apply incremental
-    let tgt = LocalFileSystem::open(&tgt_root).expect("open target fs");
-
     let incr_import = LocalFileSystem::receive_incremental_changed_records(
         &tgt_root,
         StoreOptions::test_fast(),
@@ -230,7 +227,6 @@ fn incremental_vfssend2_content_parity_with_vfssend1_import() {
     assert!(incr_import.imported_roots > 0);
 
     // Re-open target to see imported state
-    drop(tgt);
     let tgt = LocalFileSystem::open(&tgt_root).expect("reopen target fs");
 
     // Verify content parity
