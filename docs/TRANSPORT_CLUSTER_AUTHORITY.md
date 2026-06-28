@@ -33,7 +33,7 @@ the follow-up implementation issues that close the remaining TFR-017 gaps.
   #18 (placement receipt/rebuild), #632 (clustered POSIX mount boundary),
   #633 (clustered POSIX lock forwarding), #641 (replica-health admission
   snapshots), #646 (RDMA artifact manifests), #662 (cluster prototype
-  vs diagnostic separation).
+  vs diagnostic separation), #1282 (failed-quorum mutation evidence).
 
 ## Alternatives evaluated
 
@@ -166,8 +166,9 @@ that the cluster authority provides.
 ## Follow-up implementation issues
 
 This decision enables the sibling issues to proceed with clear
-boundaries. The following non-overlapping implementation issues close
-the remaining TFR-017 gaps named in the register notes.
+boundaries. The following non-overlapping implementation and decision
+boundaries close or preserve the remaining TFR-017 gaps named in the
+register notes.
 
 1. **Cross-replica scrub comparison authority** — owns the digest
    comparison and repair-source selection logic that the register
@@ -181,10 +182,13 @@ the remaining TFR-017 gaps named in the register notes.
    `crates/tidefs-storage-repair/`,
    `apps/tidefs-storage-node/src/`.
 
-3. **Distributed transaction authority** — owns the sent-but-
-   unacknowledged replica, replica inventory, and partition recovery
-   gaps named in the register. Write set:
-   `crates/tidefs-replicated-object-store/`.
+3. **Failed-quorum mutation evidence authority** — ADR-0008 selects a
+   typed unresolved-mutation and replica-inventory ledger before any
+   multi-node durability claim may consume failed-quorum mutation
+   evidence. Current rollback and compensating messages remain
+   best-effort mitigation only. The implementation write set starts in
+   `crates/tidefs-replicated-object-store/` and may add shared
+   replication-model types only through a separately scoped issue.
 
 4. **Cluster pool CLI/orchestrator alignment** — owns reconciling the
    orchestrator source (says live dispatch is not wired) with the
@@ -206,6 +210,9 @@ edits this decision record except to update the follow-up list.
 - TFR-017 remains open until the follow-up implementation issues
   above are resolved and cross-replica comparison, repair authority,
   and distributed transaction authority are proven end-to-end.
+- ADR-0008 does not close distributed transaction authority. It records
+  the required failed-quorum evidence boundary and preserves uncertainty
+  for future repair, recovery, validation, and claim-gate consumers.
 - This decision does not create present-tense product claims.
   It names authority boundaries; product claims require runtime
   validation evidence that does not yet exist for the remaining
