@@ -977,7 +977,9 @@ mod tests {
         let rec = GateRunner::build_current_head_receipt("d", se());
         assert!(rec.invariant_holds);
         assert_eq!(rec.summary.refused, REQUIRED_SUBJECTS.len());
-        assert!(rec.render_markdown().contains("Performance gate: NOT READY"));
+        assert!(rec
+            .render_markdown()
+            .contains("Performance gate: NOT READY"));
     }
     #[test]
     fn notes() {
