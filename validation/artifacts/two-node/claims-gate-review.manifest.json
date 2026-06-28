@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "non-claim:two-node-harness-manifest-boundary-review.v1",
+  "evidence_class": "two-node-manifest-boundary-review",
+  "validation_tier": "source-model",
+  "scope": "source inspection review for two-node harness EvidenceArtifactManifest adoption; records that no stable two-node claim id is registered yet and that this artifact is not claim closure",
+  "artifact_path": "validation/artifacts/two-node/claims-gate-review.toml",
+  "content_digest": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+  "run_id": "deterministic-fixture:issue-1487-two-node-manifest-boundary-review-v1",
+  "source_ref": "refs/heads/gpt2/issue-1487-two-node-harness-manifests",
+  "outcome": "skip",
+  "residual_risk": "Non-claim source review only. It does not validate multi-process distributed execution, RDMA, production cluster behavior, storage-node runtime behavior, release-candidate coverage, mounted runtime behavior, or OpenZFS/Ceph-class status.",
+  "source": "tidefs-two-node-harness",
+  "generated_at": "2026-06-28T21:30:36Z",
+  "blocking_issues": []
+}

@@ -1,0 +1,47 @@
+artifact_version = 1
+evidence_class = "two-node-manifest-boundary-review"
+source = "tidefs-two-node-harness"
+scope = "manifest-adoption-boundary-review"
+issue = 1487
+decision = "non-claim-manifest-support-until-stable-two-node-claim-id-exists"
+stable_claim_id_status = "not-registered-in-validation-claims-toml"
+claim_registry_update = "none"
+
+reviewed_sources = [
+  "#1274 unified manifest adoption map",
+  "#1066 verification evidence-chain design authority",
+  "#809/#810 unified evidence manifest schema and claims-gate consumer work",
+  "#835 two-node harness authority work",
+  "docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md",
+  "docs/CLAIMS_GATE_POLICY.md",
+  "docs/workspace-package-classification.md",
+  "crates/tidefs-validation/src/evidence_artifact_manifest.rs",
+  "crates/tidefs-two-node-harness/**",
+  "validation/claims.toml",
+]
+
+producer_support = [
+  "crates/tidefs-two-node-harness/src/artifact_manifest.rs emits v2-shaped EvidenceArtifactManifest JSON records without adding a tidefs-validation dependency cycle.",
+  "Deterministic two-node loopback artifacts are limited to validation_tier=harness-only and use explicit non-claim scopes unless a future claim requirement binds that tier.",
+  "QEMU TCP carrier artifacts require qemu_guest_detected=true and GitHub Actions run/artifact metadata before the producer will emit validation_tier=qemu-guest.",
+  "QEMU manifest inputs reject runner-local artifact paths and runner secret references; GitHub Actions run URL and artifact name are preserved in reviewable fields.",
+]
+
+accepted_non_claim_scopes = [
+  "non-claim:two-node.harness.deterministic-loopback.v1",
+  "non-claim:two-node.qemu-tcp-carrier.v1",
+]
+
+required_future_decision = [
+  "Create or update a claim-registry issue before binding two-node evidence to a stable claim id.",
+  "Decide whether deterministic two-node evidence is a harness-only evidence class, a source/model evidence class, or only supporting context for a broader distributed/runtime claim.",
+  "Keep QEMU TCP carrier evidence separate from RDMA, multi-process distributed, storage-node runtime, production cluster, and release-candidate claim classes unless those workflows produce fresh matching artifacts.",
+]
+
+non_claims = [
+  "This artifact does not upgrade any validation/claims.toml status.",
+  "This artifact does not assert a stable two-node claim id.",
+  "Deterministic loopback harness evidence does not satisfy multi-process distributed, RDMA, production cluster, storage-node runtime, mounted runtime, or release-candidate claims.",
+  "QEMU TCP carrier support in this slice does not by itself record a fresh GitHub Actions QEMU artifact.",
+  "This review does not validate OpenZFS/Ceph-class reliability, performance, or release readiness.",
+]
