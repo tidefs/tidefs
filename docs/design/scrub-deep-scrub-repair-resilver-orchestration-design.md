@@ -1994,7 +1994,7 @@ pub enum ResilverError {
 - `docs/design/background-service-framework-design.md`
 - `docs/design/end-to-end-checksum-architecture.md`
 - `docs/design/shard-groups-replicas-rebake-pathway.md`
-- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`
+- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 - `docs/LOCK_HIERARCHY_AND_CONCURRENCY_MODEL.md`
 - Existing code: `crates/tidefs-local-filesystem/src/scrub.rs` (612 lines)
 - Existing code: `crates/tidefs-local-filesystem/src/repair.rs` (633 lines)
