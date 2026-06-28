@@ -100,7 +100,7 @@ impl PerformanceMatrix {
     }
     /// True when at least one row has live-runtime measured validation.
     /// Subject-completeness alone (invariant_holds) is insufficient for
-    /// release readiness.
+    /// performance-gate readiness.
     pub fn has_runtime_validation(&self) -> bool {
         self.rows.iter().any(|r| r.is_release_validation())
     }

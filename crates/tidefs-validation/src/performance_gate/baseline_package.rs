@@ -837,8 +837,8 @@ mod tests {
         let receipt = build_receipt_from_baseline("/nonexistent", "abc", &env);
         // All required subjects filled => invariant holds
         assert!(receipt.invariant_holds);
-        // release_ready should be false (no runtime validation)
-        assert!(!receipt.release_ready);
+        // perf_gate_ready should be false (no runtime validation)
+        assert!(!receipt.perf_gate_ready);
     }
 }
 
