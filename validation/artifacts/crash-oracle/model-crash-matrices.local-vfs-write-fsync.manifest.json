@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "local.vfs.write_fsync_crash.v1",
+  "evidence_class": "model-crash-matrix",
+  "validation_tier": "source-model",
+  "scope": "local.vfs.write_fsync_crash.v1 source-model crash matrix boundary; model-only evidence, not mounted runtime proof",
+  "artifact_path": "validation/artifacts/crash-oracle/model-crash-matrices.json",
+  "content_digest": "blake3:1ade23434997e570d7625128171607188a2f7bade08778389950f95d79ef6aaf",
+  "run_id": "deterministic-fixture:crash-oracle-model-crash-matrices-v1",
+  "source_ref": "refs/heads/gpt3/issue-1484-crash-oracle-manifests",
+  "outcome": "pass",
+  "residual_risk": "The model crash matrix is source-model evidence only. Local write/fsync runtime closure still depends on the mounted-userspace runtime artifact for the bounded local VFS path.",
+  "source": "tidefs-crash-oracle",
+  "generated_at": "2026-06-28T18:27:07Z",
+  "blocking_issues": []
+}

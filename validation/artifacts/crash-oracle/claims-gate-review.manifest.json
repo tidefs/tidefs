@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.write_fsync.crash_safety.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "model-runtime-boundary-review for storage.write_fsync.crash_safety.v1",
+  "artifact_path": "validation/artifacts/crash-oracle/claims-gate-review.toml",
+  "content_digest": "blake3:b4c90e28953dc901d24020eb4310ef713b9ef91cd5f428d80d8fff4428321cbd",
+  "run_id": "deterministic-fixture:crash-oracle-claims-gate-review-v1",
+  "source_ref": "refs/heads/gpt3/issue-1484-crash-oracle-manifests",
+  "outcome": "pass",
+  "residual_risk": "This review records claim-boundary policy only. It does not create runtime evidence or close the registry blockers for broader storage crash-safety claims.",
+  "source": "claims-gate",
+  "generated_at": "2026-06-28T18:27:07Z",
+  "blocking_issues": []
+}

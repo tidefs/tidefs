@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "storage.write_fsync.crash_safety.v1",
+  "evidence_class": "runtime-crash-oracle",
+  "validation_tier": "mounted-userspace",
+  "scope": "bounded local VFS write -> fsync -> read -> crash/recover runtime path; not storage-wide crash-safety proof",
+  "artifact_path": "validation/artifacts/crash-oracle/local-vfs-write-fsync-runtime-crash.json",
+  "content_digest": "blake3:3fbb511eb2b0139eb780ec17d8e691cef104e32f68ab2db2cdc1fdce998e3b01",
+  "run_id": "deterministic-fixture:crash-oracle-local-vfs-write-fsync-runtime-v1",
+  "source_ref": "refs/heads/gpt3/issue-1484-crash-oracle-manifests",
+  "outcome": "pass",
+  "residual_risk": "The runtime artifact is bounded to the local VFS OpFsyncBeforeFlush path. It does not prove storage-wide, kernel, distributed, mmap/writeback, xfstests, RDMA, or production crash safety.",
+  "source": "tidefs-local-filesystem",
+  "generated_at": "2026-06-28T18:27:07Z",
+  "blocking_issues": []
+}

@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "local.vfs.rename_atomic_crash.v1",
+  "evidence_class": "claims-gate-review",
+  "validation_tier": "source-model",
+  "scope": "model-runtime-boundary-review for local.vfs.rename_atomic_crash.v1",
+  "artifact_path": "validation/artifacts/crash-oracle/claims-gate-review.toml",
+  "content_digest": "blake3:b4c90e28953dc901d24020eb4310ef713b9ef91cd5f428d80d8fff4428321cbd",
+  "run_id": "deterministic-fixture:crash-oracle-claims-gate-review-v1",
+  "source_ref": "refs/heads/gpt3/issue-1484-crash-oracle-manifests",
+  "outcome": "pass",
+  "residual_risk": "This source-model review confirms the bounded model/runtime boundary for the local VFS rename crash claim. It does not close the no-hidden-queue blocker.",
+  "source": "claims-gate",
+  "generated_at": "2026-06-28T18:27:07Z",
+  "blocking_issues": []
+}
