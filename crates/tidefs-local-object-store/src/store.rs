@@ -268,6 +268,51 @@ impl From<StoreError> for ReceiptBoundDeadObjectDrainError {
     }
 }
 
+/// Snapshot-deadlist object candidate accepted by the local object store.
+///
+/// This API is intentionally narrower than the persisted
+/// [`DeadObjectEntry`] format: snapshot/clone deletion derivation supplies
+/// only object identity plus commit-group metadata, and the object store turns
+/// it into receipt-bound reclaim work in
+/// `tidefs-dead-object-reclaim-queue`. No replacement receipt is accepted
+/// here; callers must publish committed receipt evidence through
+/// [`LocalObjectStore::publish_dead_object_replacement_receipt`] before
+/// physical reclaim can run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotDeadObjectCandidate {
+    pub object_id: ReclaimObjectKey,
+    pub dataset_uuid: [u8; 16],
+    pub death_commit_group: u64,
+    pub enqueued_at_txg: u64,
+}
+
+impl SnapshotDeadObjectCandidate {
+    #[must_use]
+    pub const fn new(
+        object_id: ReclaimObjectKey,
+        dataset_uuid: [u8; 16],
+        death_commit_group: u64,
+        enqueued_at_txg: u64,
+    ) -> Self {
+        Self {
+            object_id,
+            dataset_uuid,
+            death_commit_group,
+            enqueued_at_txg,
+        }
+    }
+
+    fn into_dead_object_entry(self) -> DeadObjectEntry {
+        DeadObjectEntry::new(
+            self.object_id,
+            self.dataset_uuid,
+            self.death_commit_group,
+            true,
+            self.enqueued_at_txg,
+        )
+    }
+}
+
 fn reclaim_receipt_replay_allocator_error(error: PoolAllocatorError) -> StoreError {
     match error {
         PoolAllocatorError::SegmentOutOfRange(_) => StoreError::InvalidOptions {
@@ -2964,6 +3009,48 @@ impl LocalObjectStore {
             self.snapshot_extent_pin_set_dirty = true;
         }
         removed
+    }
+
+    /// Persist one snapshot-deadlist candidate as receipt-bound reclaim work.
+    ///
+    /// The queued entry is immediately eligible by deadlist derivation, but it
+    /// carries no replacement/base receipt.  Therefore
+    /// [`drain_receipt_bound_dead_objects_at_stable_generation`](Self::drain_receipt_bound_dead_objects_at_stable_generation)
+    /// will keep it queued until
+    /// [`publish_dead_object_replacement_receipt`](Self::publish_dead_object_replacement_receipt)
+    /// attaches committed receipt evidence, and even then the snapshot extent
+    /// pin gate remains authoritative.
+    pub fn enqueue_snapshot_deadlist_candidate(
+        &mut self,
+        candidate: SnapshotDeadObjectCandidate,
+    ) -> Result<bool> {
+        self.enqueue_snapshot_deadlist_candidates(std::iter::once(candidate))
+            .map(|inserted| inserted != 0)
+    }
+
+    /// Persist snapshot-deadlist candidates as receipt-bound reclaim work.
+    ///
+    /// Returns the number of newly inserted object ids. Duplicate object ids
+    /// are treated as idempotent replay and do not rewrite the persisted queue.
+    pub fn enqueue_snapshot_deadlist_candidates<I>(&mut self, candidates: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = SnapshotDeadObjectCandidate>,
+    {
+        self.ensure_writable("enqueue_snapshot_deadlist_candidates")?;
+        let mut inserted = 0usize;
+        for candidate in candidates {
+            if self
+                .dead_object_reclaim_queue
+                .enqueue(candidate.into_dead_object_entry())
+            {
+                self.dead_object_reclaim_queue_dirty = true;
+                inserted += 1;
+            }
+        }
+        if self.dead_object_reclaim_queue_dirty {
+            self.sync_all()?;
+        }
+        Ok(inserted)
     }
 
     /// Enqueue one dead object whose old placement may be retired only after
@@ -8344,6 +8431,14 @@ mod reclaim_queue_production_tests {
         .with_replacement_receipt(dead_object_receipt(key, receipt_generation))
     }
 
+    fn snapshot_candidate(
+        key: ReclaimObjectKey,
+        death_commit_group: u64,
+        enqueued_at_txg: u64,
+    ) -> SnapshotDeadObjectCandidate {
+        SnapshotDeadObjectCandidate::new(key, [key.0[0]; 16], death_commit_group, enqueued_at_txg)
+    }
+
     fn receipt_replay_options() -> StoreOptions {
         let mut options = StoreOptions::test_fast();
         options.max_segment_bytes = 2048;
@@ -8462,6 +8557,194 @@ mod reclaim_queue_production_tests {
         ));
         assert!(store.dead_object_reclaim_queue.is_empty());
         assert!(!store.dead_object_reclaim_queue_dirty);
+    }
+
+    #[test]
+    fn snapshot_deadlist_candidate_persists_receiptless_work_across_reopen() {
+        let (mut store, dir) = temp_store();
+        let key = dead_object_key(0x55);
+        let candidate = snapshot_candidate(key, 5, 7);
+
+        assert!(store
+            .enqueue_snapshot_deadlist_candidate(candidate)
+            .expect("persist snapshot-deadlist candidate"));
+        assert!(!store
+            .enqueue_snapshot_deadlist_candidate(candidate)
+            .expect("duplicate snapshot-deadlist candidate is replay-safe"));
+        assert!(!store.dead_object_reclaim_queue_dirty);
+        assert!(store
+            .get_named(DEAD_OBJECT_RECLAIM_QUEUE_OBJECT_NAME)
+            .expect("read persisted dead-object queue")
+            .is_some());
+        drop(store);
+
+        let mut reopened =
+            LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+                .expect("reopen snapshot-deadlist work");
+        let entries = reopened.dead_object_reclaim_queue.all_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].object_id, key);
+        assert_eq!(entries[0].dataset_uuid, [0x55; 16]);
+        assert_eq!(entries[0].death_commit_group, 5);
+        assert_eq!(entries[0].enqueued_at_txg, 7);
+        assert!(entries[0].eligible);
+        assert_eq!(entries[0].replacement_receipt, None);
+        assert_eq!(
+            reopened
+                .dead_object_reclaim_queue
+                .receipt_bound_eligible_count_with_stable_generation(6, u64::MAX),
+            0
+        );
+
+        assert!(reopened
+            .publish_dead_object_replacement_receipt(&key, dead_object_receipt(key, 1))
+            .expect("publish candidate receipt"));
+        assert_eq!(
+            reopened
+                .dead_object_reclaim_queue
+                .receipt_bound_eligible_count_with_stable_generation(6, 1),
+            1
+        );
+        assert!(!reopened.dead_object_reclaim_queue_dirty);
+    }
+
+    #[test]
+    fn snapshot_deadlist_candidates_batch_persists_distinct_entries() {
+        let (mut store, dir) = temp_store();
+        let key_a = dead_object_key(0x56);
+        let key_b = dead_object_key(0x57);
+
+        assert_eq!(
+            store
+                .enqueue_snapshot_deadlist_candidates([
+                    snapshot_candidate(key_a, 10, 11),
+                    snapshot_candidate(key_b, 10, 11),
+                    snapshot_candidate(key_a, 10, 11),
+                ])
+                .expect("persist snapshot-deadlist candidates"),
+            2
+        );
+        assert!(!store.dead_object_reclaim_queue_dirty);
+        drop(store);
+
+        let reopened = LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+            .expect("reopen batched snapshot-deadlist work");
+        let entries = reopened.dead_object_reclaim_queue.all_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].object_id, key_a);
+        assert_eq!(entries[1].object_id, key_b);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.eligible && entry.replacement_receipt.is_none()));
+    }
+
+    #[test]
+    fn snapshot_deadlist_candidate_waits_for_receipt_before_physical_reclaim() {
+        let (mut store, _dir) = temp_store();
+        let key = ObjectKey::from_name(b"snapshot-deadlist/candidate/receipt-gate");
+
+        store.put(key, b"snapshot deadlist payload").expect("put");
+        let old_segment_id = store.index.get(&key).expect("location").segment_id;
+        assert!(store.delete(key).expect("delete"));
+
+        let reclaim_key = reclaim_key(key);
+        assert!(store
+            .enqueue_snapshot_deadlist_candidate(snapshot_candidate(reclaim_key, 0, 1))
+            .expect("enqueue snapshot-deadlist candidate"));
+
+        let held = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("receiptless snapshot-deadlist drain");
+        assert_eq!(held.entries_processed, 0);
+        assert_eq!(held.segments_reclaimed, 0);
+        assert_eq!(held.reclaim_queue_depth, 1);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        assert!(store.reclaim_receipts().is_empty());
+        assert!(
+            segment_path(&store.segments_dir, old_segment_id).exists(),
+            "receiptless snapshot-deadlist work must not free storage"
+        );
+
+        assert!(store
+            .publish_dead_object_replacement_receipt(
+                &reclaim_key,
+                dead_object_receipt(reclaim_key, 1),
+            )
+            .expect("publish snapshot-deadlist receipt"));
+        let freed = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("receipt-authorized snapshot-deadlist drain");
+        assert_eq!(freed.entries_processed, 1);
+        assert_eq!(freed.segments_reclaimed, 1);
+        assert_eq!(freed.blocks_freed, 1);
+        assert_eq!(freed.reclaim_queue_depth, 0);
+        assert!(store.dead_object_reclaim_queue.is_empty());
+        assert_eq!(store.reclaim_receipts().len(), 1);
+        assert!(
+            !segment_path(&store.segments_dir, old_segment_id).exists(),
+            "receipt-authorized snapshot-deadlist work frees only through the drain"
+        );
+    }
+
+    #[test]
+    fn snapshot_deadlist_candidate_respects_snapshot_extent_pin_gate() {
+        let (mut store, _dir) = temp_store();
+        let key = ObjectKey::from_name(b"snapshot-deadlist/candidate/pin-gate");
+        let snapshot_id = "dataset@snap-deadlist";
+
+        store
+            .put(key, b"snapshot pinned deadlist payload")
+            .expect("put");
+        let old_segment_id = store.index.get(&key).expect("location").segment_id;
+        assert!(store.delete(key).expect("delete"));
+        store
+            .rotate_segment()
+            .expect("separate dead extent from reclaim metadata");
+
+        let reclaim_key = reclaim_key(key);
+        assert!(store
+            .enqueue_snapshot_deadlist_candidate(snapshot_candidate(reclaim_key, 0, 1))
+            .expect("enqueue snapshot-deadlist candidate"));
+        store.pin_snapshot_extent(snapshot_id, reclaim_key);
+        assert!(store
+            .publish_dead_object_replacement_receipt(
+                &reclaim_key,
+                dead_object_receipt(reclaim_key, 1),
+            )
+            .expect("publish snapshot-deadlist receipt"));
+
+        let held = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("snapshot-pinned snapshot-deadlist drain");
+        assert_eq!(held.entries_processed, 1);
+        assert_eq!(held.segments_reclaimed, 0);
+        assert_eq!(held.gate_extents_denied, 1);
+        assert_eq!(held.gate_segments_skipped, 1);
+        assert_eq!(held.reclaim_queue_depth, 1);
+        assert_eq!(store.dead_object_reclaim_queue.len(), 1);
+        assert!(store.reclaim_receipts().is_empty());
+        assert!(
+            segment_path(&store.segments_dir, old_segment_id).exists(),
+            "snapshot extent pin must keep deadlist storage allocated"
+        );
+
+        assert_eq!(store.release_snapshot_extent_pins(snapshot_id), 1);
+        let freed = store
+            .drain_receipt_bound_dead_objects_at_stable_generation(1, 1, 16)
+            .expect("released snapshot-deadlist drain");
+        assert_eq!(freed.entries_processed, 1);
+        assert_eq!(freed.segments_reclaimed, 1);
+        assert_eq!(freed.reclaim_queue_depth, 0);
+        assert!(store.dead_object_reclaim_queue.is_empty());
+        assert_eq!(store.reclaim_receipts().len(), 1);
+        assert_eq!(
+            store.reclaim_receipts()[0].pin_clearance_epoch,
+            store.snapshot_extent_pin_set().epoch()
+        );
+        assert!(
+            !segment_path(&store.segments_dir, old_segment_id).exists(),
+            "released snapshot extent pin should allow receipt-bound reclaim"
+        );
     }
 
     #[test]
