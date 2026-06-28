@@ -2157,6 +2157,7 @@ dependencies = [
  "tidefs-cleanup-job-core",
  "tidefs-cleanup-queue-core",
  "tidefs-types-deferred-cleanup-core",
+ "tidefs-types-incremental-job-core",
 ]
 
 [[package]]
@@ -2278,6 +2279,7 @@ dependencies = [
 name = "tidefs-data-cleaner"
 version = "0.421.0"
 dependencies = [
+ "tidefs-cleanup-job-core",
  "tidefs-incremental-job-core",
  "tidefs-reclaim",
  "tidefs-reclaim-queue-core",
