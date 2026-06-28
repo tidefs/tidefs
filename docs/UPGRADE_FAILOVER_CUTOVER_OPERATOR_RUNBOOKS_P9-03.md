@@ -16,7 +16,7 @@ See also:
 - `docs/REPLICATION_REBUILD_RELOCATION_DATA_FLOWS_P8-03.md`
 - `docs/CLOCKS_TIMING_FENCES_DRIFT_ASSUMPTIONS_P8-04.md`
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
-- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`
+- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
 
 ## 1. Core result
@@ -54,7 +54,7 @@ This document governs:
 This document does **not** yet fully settle:
 - the exact automation engine that will drive these runbooks in production.
 
-The final secret/key storage mechanics are now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`, and the operator truth-surface law is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`.
+The final secret/key storage mechanics are now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`, and the operator truth-surface law is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270).
 That boundary is deliberate.
 `P9-03` fixes the legal runbook grammar.
 Later items may refine budget tuning, retention, and automation, but they may not invent a second rollout/failover language.
@@ -354,12 +354,12 @@ But the grounding rule is now explicit:
 
 ## 9. Boundary with remaining unresolved production items
 
-The adjacent `P9-04` secret and policy-storage law is now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`, the shared numeric KPI/SLO law is now explicit in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, the operator truth-surface law is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`, and the kernel helper split is now explicit in `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`.
+The adjacent `P9-04` secret and policy-storage law is now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`, the shared numeric KPI/SLO law is now explicit in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, the operator truth-surface law is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270), and the kernel helper split is now explicit in `docs/RUST_FOR_LINUX_CRATE_TRAIT_BOUNDARIES_P7-02.md`.
 The boundary is deliberate:
 - `P9-03` fixes how operators execute a move,
 - `P9-04` now fixes where long-lived secret material lives, how runtime leases work, and how secret material rotates or revokes,
 - `P10-03` now adds numeric floors to the same gates,
-- `P10-04` is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` and renders these results through shared `truth_view` truth surfaces and render receipts,
+- `P10-04` is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270) and renders these results through shared `truth_view` truth surfaces and render receipts,
 - `P7-02` now fixes the `kernel_boundary` crate split that future kernel-side runbook helpers must obey,
 
 ## 10. Records required by this law

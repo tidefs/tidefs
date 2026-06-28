@@ -14,7 +14,7 @@ See also:
 - `docs/DEBUGGING_WORKFLOWS.md`
 - `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`
 - `docs/WORKLOAD_SIGNATURE_MATERIALIZATION_PLANE_LAW.md`
-- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`
+- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 
 - `docs/TRANSPORT_SESSION_COHORT_GRAPH_P8-01.md`
 - `docs/MEMBERSHIP_PLACEMENT_FAILURE_DOMAIN_MODEL_P8-02.md`
@@ -252,7 +252,7 @@ When the cluster is under stress, the operator should be able to answer these qu
 If those questions cannot be answered from the live truth surfaces, the operator experience is incomplete.
 
 The typed truth surfaces that answer these questions are defined in:
-- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (truth-view law with mandatory surface classes, provenance/exactness/freshness rendering, and carrier verification),
+- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270; truth-view law with mandatory surface classes, provenance/exactness/freshness rendering, and carrier verification),
 - `docs/DISTRIBUTED_OPERATOR_TRUTH_SURFACES_OW307A.md` through `OW307E.md` (typed placement, health, rebuild, and risk records with deterministic demo rows and summary aggregation).
 
 ## 12. Bottom line

@@ -434,7 +434,8 @@ The auditor emits:
 - `last_error`: for debug/triage
 
 These feed into the structural observability framework
-(`docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`).
+(`docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`, missing from the
+repository; see #1270).
 
 ### 4.8 Tradeoffs
 

@@ -15,7 +15,7 @@ See also:
 - `docs/AUTHN_AUTHZ_OVERRIDE_AUDIT_MODEL_P9-02.md`
 - `docs/TRACES.md`
 - `docs/END_TO_END_PRODUCTION_BLUEPRINT.md`
-- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`
+- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
 
 ## 1. Core result
@@ -58,7 +58,7 @@ This document governs:
 - chaos-specific artifact classes and failure buckets,
 - and the gate effects for smoke, quick, release, cutover, rollback, and soak/disaster profiles.
 
-The adjacent secret/key-material lifecycle law is now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`, the numeric KPI/SLO law is now explicit in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, and the operator truth-surface law is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`. This document still settles the production campaign grammar that those later items must obey.
+The adjacent secret/key-material lifecycle law is now explicit in `docs/SECRETS_POLICY_STORAGE_KEY_HANDLING_LAW_P9-04.md`, the numeric KPI/SLO law is now explicit in `docs/PERFORMANCE_BUDGETS_SLO_REGRESSION_GATES_P10-03.md`, and the operator truth-surface law is now explicit in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270). This document still settles the production campaign grammar that those later items must obey.
 
 ## 3. Campaign family law
 

@@ -28,7 +28,8 @@ summarizes the rows it is given.
 ## Required Product Surface
 
 The production truth grammar is
-`docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`.
+`docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the
+repository; see #1270).
 
 For OW-307, a future closeout must prove that placement, health, rebuild, and
 risk data feed an operator-facing product surface through the same truth_view
@@ -41,7 +42,7 @@ law. The minimum product surface must include:
 | provenance, exactness, freshness | visible provenance/exactness/freshness state, including stale or degraded fields | OW-307E exposes deterministic non-live headers, but no live freshness budget or stale/refusal path exists for OW-307 product data |
 | product carrier | a CLI, API, dashboard, or archive-reader surface that renders the typed rows and summary without inventing a second grammar | the control-plane daemon prints bounded demo output only |
 | render proof | render bundle plus render receipt or stop ticket proving what the operator saw | no OW-307 product render receipt exists |
-| refusal behavior | stale, mixed-cut, conflicting-source, redaction-blocked, and missing-runtime cases degrade or refuse visibly | P10-04 requires this, but no OW-307 product refusal path exists |
+| refusal behavior | stale, mixed-cut, conflicting-source, redaction-blocked, and missing-runtime cases degrade or refuse visibly | P10-04 requires this (missing from the repository; see #1270), but no OW-307 product refusal path exists |
 
 ## Implementation Boundary
 
@@ -80,5 +81,6 @@ not close parent OW-307.
 
 - `nix develop --command cargo fmt --check`;
 - source-marker checks over this document, `docs/INDEX.md`, OW-307A/B/C docs,
-  and `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`;
+  and `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing
+  from the repository; see #1270);
 - `git diff --check`;

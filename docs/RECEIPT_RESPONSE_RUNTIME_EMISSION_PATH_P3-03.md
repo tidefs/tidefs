@@ -18,7 +18,7 @@ See also:
 - `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`
 - `docs/PUBLICATION_PIPELINE_RUNTIME_DECOMPOSITION_P3-02.md`
 - `docs/SHADOW_PILOT_RUNTIME_HOOKS_DIVERGENCE_SINKS_P3-04.md`
-- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`
+- `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270)
 - `docs/AUTHORITATIVE_DATA_STRUCTURES_ALGORITHMS.md`
 
 ## 1. Core result
@@ -93,7 +93,7 @@ It now consumes the explicit `memory_arena_0` memory-domain / arena / ownership-
 route/carrier law in `docs/CONTROL_PLANE_SERVICE_API_CLI_TOPOLOGY_P9-01.md`, the
 explicit `shadow_pilot_0` shadow-runtime law in
 `docs/SHADOW_PILOT_RUNTIME_HOOKS_DIVERGENCE_SINKS_P3-04.md`, the explicit `truth_view`
-truth-surface law in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md`,
+truth-surface law in `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` (missing from the repository; see #1270),
 The design rule-family to Rust-type map is now explicit in `docs/DOCTRINE_FAMILY_TO_RUST_TYPE_MAP_P2-01.md`, so Rust ids, owned structs, borrowed views, builders, collection wrappers, bridge mirrors, and `type_map` row ids are no longer allowed to drift from the declared design rule families. It now also consumes the explicit `workspace_layout` workspace-family / crate-service-boundary law in `docs/WORKSPACE_FAMILY_LAYOUT_CRATE_SERVICE_BOUNDARIES_P1-01.md`, so crate roots, service roots, dependency edges, and test/observe boundaries are no longer allowed to drift from the declared design rule and runtime laws. It now also consumes the explicit `linux_baseline` Linux 7.0 baseline contract in `docs/LINUX_7_0_BASELINE_CONTRACT_SUPPORTED_SUBSYSTEMS_P0-01.md`, so admitted host assumptions, subsystem floors, and explicit non-baseline cuts are no longer allowed to drift from the declared package/stage bindings. It now also consumes the explicit `product_variant` product-variant matrix in `docs/PRODUCT_VARIANT_MATRIX_P0-02.md`, so declared userspace-only, mixed-client-kernel, and optional later selected-domain kernel-authority rows are no longer allowed to drift from the declared host/package/stage bindings. It now also consumes the explicit `vfs_boundary_mirror` UAPI / FFI / canonical-schema boundary law in `docs/UAPI_FFI_CANONICAL_SCHEMA_BOUNDARY_RULES_P1-03.md`, so boundary mirrors, wire layouts, kernel-visible structs, `repr(C)` call frames, and conversion exactness are no longer allowed to drift from the declared design rule families. It now also consumes the explicit `seam_map` shared design rule-native seam-map law in `docs/SHARED_DOCTRINE_NATIVE_SEAM_MAP_P0-03.md`, so seam ownership, client/boundary bindings, kernel-promotion cuts, and anti-leak rules are no longer allowed to drift from the declared cross-system registry. It now also consumes the explicit `non_authority_deletion` non-authority / deletion law in `docs/NON_AUTHORITY_DELETION_LAW_P0-04.md`, so live archived residue, archive-only carriers, tombstone/delete bindings, and non-authority proof are no longer allowed to drift from the declared product boundary. They may **not** invent a second response authority, adapter-local status family, archive-local truth story, or render-time commit reinterpretation outside `response_registry`.
 
 ## 3. Repo anchor snapshot
