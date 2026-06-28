@@ -1390,17 +1390,6 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         );
     }
 
-    let freshness_rpo_refusal =
-        freshness_rpo_floor_refusal(input.evidence_query_snapshot, input.freshness_rpo_floor_ms);
-    if freshness_rpo_refusal as u16 != StorageIntentRefusalReason::None as u16 {
-        return terminal(
-            record,
-            PrefetchExecutorOutcome::Blocked,
-            PrefetchExecutorByteState::Blocked,
-            freshness_rpo_refusal,
-        );
-    }
-
     if initial_result_detail_lacks_feedback_evidence(input) {
         return terminal(
             record,
@@ -1423,6 +1412,17 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         record.executor_byte_state = PrefetchExecutorByteState::NoPrefetchEnforced;
         record.outcome = PrefetchExecutorOutcome::Completed;
         return record;
+    }
+
+    let freshness_rpo_refusal =
+        freshness_rpo_floor_refusal(input.evidence_query_snapshot, input.freshness_rpo_floor_ms);
+    if freshness_rpo_refusal as u16 != StorageIntentRefusalReason::None as u16 {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorByteState::Blocked,
+            freshness_rpo_refusal,
+        );
     }
 
     if authority_handoff_required(input.decision, family) {
