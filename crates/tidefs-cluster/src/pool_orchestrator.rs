@@ -12,8 +12,11 @@
 //! storage-node runtime authority, cluster status, or final distributed
 //! operator UAPI.  Live transport adapters provide delivery, while
 //! [`ChannelPoolTransport`](crate::channel_transport::ChannelPoolTransport)
-//! remains a harness transport for orchestrator tests.  TFR-017 remains open
-//! for end-to-end distributed authority beyond this crate-local boundary.
+//! remains a harness transport for orchestrator tests.  Successful create
+//! dispatch returns typed boundary evidence that callers must preserve in CLI
+//! output, so the live transport path is not mistaken for final distributed
+//! pool UAPI.  TFR-017 remains open for end-to-end distributed authority
+//! beyond this crate-local boundary.
 
 use std::collections::BTreeMap;
 
@@ -59,6 +62,74 @@ fn pool_message_kind(message: &ClusterPoolMessage) -> &'static str {
         ClusterPoolMessage::CatalogQueryResponse(_) => "catalog query response",
     }
 }
+
+// ---------------------------------------------------------------------------
+// PoolCreateDispatchEvidence — caller-visible create dispatch boundary
+// ---------------------------------------------------------------------------
+
+/// Typed evidence for the current cluster-pool create dispatch boundary.
+///
+/// The current path uses live transport sessions and per-node create
+/// responses, but the operator-facing surface remains a prototype boundary:
+/// it is not cluster status, membership, repair, or final distributed pool UAPI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolCreateDispatchEvidence {
+    /// Live `PoolTransport` dispatch whose operator UAPI remains prototype.
+    LiveTransportPrototypeUapi,
+}
+
+impl PoolCreateDispatchEvidence {
+    /// Boundary for the live transport path that is still prototype UAPI.
+    pub const fn live_transport_prototype_uapi() -> Self {
+        Self::LiveTransportPrototypeUapi
+    }
+
+    /// Operator-facing maturity class.
+    pub const fn surface_class(self) -> &'static str {
+        match self {
+            Self::LiveTransportPrototypeUapi => "prototype",
+        }
+    }
+
+    /// Dispatch route selected by the orchestrator/CLI boundary.
+    pub const fn routing(self) -> &'static str {
+        match self {
+            Self::LiveTransportPrototypeUapi => "live-transport-prototype-uapi",
+        }
+    }
+
+    /// Typed transport evidence expected from callers.
+    pub const fn transport_evidence(self) -> &'static str {
+        match self {
+            Self::LiveTransportPrototypeUapi => {
+                "typed PoolTransport delivery over live transport sessions"
+            }
+        }
+    }
+
+    /// Typed runtime evidence returned by target nodes.
+    pub const fn runtime_evidence(self) -> &'static str {
+        match self {
+            Self::LiveTransportPrototypeUapi => {
+                "per-node ClusterPoolCreateResponse quorum evidence"
+            }
+        }
+    }
+
+    /// Boundary that operator-facing callers must preserve.
+    pub const fn operator_uapi_boundary(self) -> &'static str {
+        match self {
+            Self::LiveTransportPrototypeUapi => concat!(
+                "not final distributed pool UAPI, not membership authority, ",
+                "and not repair authority"
+            ),
+        }
+    }
+}
+
+/// Current cluster-pool create dispatch evidence.
+pub const CLUSTER_POOL_CREATE_DISPATCH_EVIDENCE: PoolCreateDispatchEvidence =
+    PoolCreateDispatchEvidence::live_transport_prototype_uapi();
 
 // ---------------------------------------------------------------------------
 // Orchestration errors
@@ -110,6 +181,8 @@ pub struct CreateOutcome {
     pub succeeded: usize,
     /// Per-node results (node_id -> per-node device GUIDs).
     pub node_results: BTreeMap<u64, NodeCreateResult>,
+    /// Typed dispatch/runtime boundary evidence the caller must preserve.
+    pub dispatch_evidence: PoolCreateDispatchEvidence,
 }
 
 /// Result for a single node during pool creation.
@@ -324,6 +397,7 @@ impl ClusterPoolOrchestrator {
             total_nodes: total,
             succeeded,
             node_results,
+            dispatch_evidence: CLUSTER_POOL_CREATE_DISPATCH_EVIDENCE,
         }
     }
 
@@ -703,6 +777,21 @@ mod tests {
 
         assert_eq!(outcome.total_nodes, 3);
         assert_eq!(outcome.succeeded, 3);
+        assert_eq!(
+            outcome.dispatch_evidence,
+            CLUSTER_POOL_CREATE_DISPATCH_EVIDENCE
+        );
+        assert_eq!(
+            outcome.dispatch_evidence.routing(),
+            "live-transport-prototype-uapi"
+        );
+        assert!(
+            outcome
+                .dispatch_evidence
+                .runtime_evidence()
+                .contains("ClusterPoolCreateResponse"),
+            "create callers must receive typed runtime evidence wording"
+        );
         assert_eq!(transport.sent.borrow().len(), 3);
         for (node_id, message) in transport.sent.borrow().iter() {
             match message {
@@ -812,6 +901,10 @@ mod tests {
         assert_eq!(outcome.total_nodes, 3);
         assert_eq!(outcome.succeeded, 3);
         assert_eq!(outcome.pool_name, "clustertest");
+        assert_eq!(
+            outcome.dispatch_evidence,
+            PoolCreateDispatchEvidence::live_transport_prototype_uapi()
+        );
         assert!(ClusterPoolOrchestrator::check_create_quorum(outcome).is_ok());
     }
 
@@ -851,6 +944,10 @@ mod tests {
 
         assert_eq!(outcome.total_nodes, 3);
         assert_eq!(outcome.succeeded, 1);
+        assert_eq!(
+            outcome.dispatch_evidence.routing(),
+            "live-transport-prototype-uapi"
+        );
         assert!(outcome.node_results[&2].error.as_deref() == Some("device too small"));
         assert!(!outcome.node_results[&3].success);
         assert!(outcome.node_results[&3].error.as_deref() == Some("no response received"));
@@ -865,6 +962,7 @@ mod tests {
             total_nodes: 3,
             succeeded: 3,
             node_results: BTreeMap::new(),
+            dispatch_evidence: CLUSTER_POOL_CREATE_DISPATCH_EVIDENCE,
         };
         assert!(ClusterPoolOrchestrator::check_create_quorum(outcome).is_ok());
     }
@@ -884,6 +982,7 @@ mod tests {
                     error: Some("timeout".into()),
                 },
             )]),
+            dispatch_evidence: CLUSTER_POOL_CREATE_DISPATCH_EVIDENCE,
         };
         let err = ClusterPoolOrchestrator::check_create_quorum(outcome).unwrap_err();
         assert!(format!("{err}").contains("2/3"));
