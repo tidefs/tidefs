@@ -5598,6 +5598,7 @@ impl LocalFileSystem {
         if snapshot::remove_snapshot_record_catalog_entry(&mut self.dataset_catalog, &record)? {
             self.persist_dataset_catalog()?;
         }
+        self.enqueue_released_snapshot_deadlist(&record)?;
         Ok(summary)
     }
 
