@@ -463,9 +463,8 @@ Important 2026-06-01 findings:
   delta producers, projections, or reporting consumers. The document also
   records explicit non-claims and a follow-up issue map for the non-overlapping
   implementation slices needed before TFR-007 can close, including #857, #858,
-  #859, #860, existing #790/#791/#785, and the #1191 runtime authority closeout
-  row admitted after overlapping #613/#761 local-filesystem capacity paths
-  merged.
+  #859, #860, existing #790/#791/#785, the closed #1191 mounted admission/statfs
+  projection row, and the post-#1191 residual rows #1504 through #1508.
 - `TFR-007`: issue #1191 moves the remaining mounted
   `LocalFileSystem::fallocate_file()` and `LocalFileSystem::zero_range()`
   allocation admissions from check-then-`record_allocation()` to the
@@ -475,6 +474,19 @@ Important 2026-06-01 findings:
   allocator report as an adapter-local availability mirror. TFR-007 remains
   open for the broader follow-up map across reclaim/dedup obligations,
   physical-pool projections, and store-layer `SpaceBook` persistence.
+- `TFR-007`: issue #1467 inspected the post-#1191 residual ledgers and split
+  them into non-overlapping follow-up rows instead of treating them as one
+  runtime PR. #1504 owns the store-layer `SpaceBook` persistence/projection
+  boundary, #1505 owns typed physical-pool inputs, #1506 owns committed reclaim
+  evidence producers, #1507 owns dedup obligation evidence, and #1508 owns the
+  final mounted `LocalFileSystem::lib.rs` consumer wiring after those producer
+  boundaries are resolved. During the #1467 split, open PRs #1475 and #1491
+  both touched `crates/tidefs-local-filesystem/src/lib.rs`, so the final
+  consumer row is explicitly sequenced rather than edited here. TFR-007 remains
+  open; mounted `statfs`/`statvfs` and ENOSPC behavior must continue to flow
+  through `CapacityAuthority` / committed `SpaceAccounting`, not independent
+  store-layer, physical-pool, reclaim, dedup, adapter-local, or tool-local
+  mirrors.
 - `TFR-007`: commit `5a01cc11` fixes one zero-range accounting leak.
   `LocalFileSystem::zero_range()` now charges `CapacityAuthority` and physical
   `SpaceAccounting` only for holes that become allocated. Existing DATA and

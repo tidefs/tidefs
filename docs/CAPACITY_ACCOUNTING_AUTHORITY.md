@@ -196,8 +196,13 @@ This decision does not claim:
 
 The rows below are intentionally non-overlapping by expected write set. Runtime
 rows that would have overlapped #613 or #761 were gated until those PRs merged;
-issue #1191 is the admitted closeout slice for the remaining local-filesystem
-capacity paths.
+issue #1191 was the admitted mounted admission/statfs projection closeout slice.
+Issue #1467 inspected the post-#1191 residuals and split the remaining work
+instead of treating store persistence, physical pool projection, reclaim
+evidence, dedup obligations, and mounted consumer wiring as one runtime PR.
+The rows for #1504 through #1508 are the resulting non-overlapping closeout
+map; they keep TFR-007 open until they land, are superseded, or are explicitly
+recorded as non-claims.
 
 | Slice | Issue | Expected write set | Sequencing and acceptance |
 |---|---|---|---|
@@ -205,7 +210,12 @@ capacity paths.
 | Adapter facade retirement | #858 | `apps/tidefs-posix-filesystem-adapter-daemon/src/capacity/` and adapter tests that import it | Delete or further quarantine the test-only `CapacityFacade`, admission lifecycle, and tracker so release code cannot consume an adapter-local capacity API. |
 | Operator capacity projection | #859 | `apps/tidefsctl/src/commands/dataset.rs` and focused CLI tests/docs only | Make `dataset list` report authority-derived used/available fields instead of mixing `statfs` availability with unset `used`. |
 | Dataset quota input bridge | #860 | `crates/tidefs-dataset-properties/` plus focused property-resolution tests | Expose resolved `space.quota` as a typed authority input. Runtime enforcement in local filesystem/space-accounting is a separate gated row. |
-| Runtime authority closeout | #1191 | `crates/tidefs-local-filesystem/src/capacity_authority.rs`, `crates/tidefs-local-filesystem/src/statfs.rs`, `crates/tidefs-local-filesystem/src/lib.rs`, `crates/tidefs-space-accounting/src/lib.rs`, `crates/tidefs-types-space-accounting-core/src/lib.rs`, `crates/tidefs-local-object-store/src/store.rs` | Collapse the remaining mounted bridges among quota table checks, allocator reports, `SpaceAccounting`, `SpaceBook`, obligation/reclaim deltas, and statfs clamps. |
+| Runtime authority closeout | #1191 | `crates/tidefs-local-filesystem/src/capacity_authority.rs`, `crates/tidefs-local-filesystem/src/statfs.rs`, `crates/tidefs-local-filesystem/src/lib.rs`, `crates/tidefs-space-accounting/src/lib.rs`, `crates/tidefs-types-space-accounting-core/src/lib.rs`, `crates/tidefs-local-object-store/src/store.rs` | Closed by PR #1464 for the mounted `fallocate_file()` / `zero_range()` admission and statfs projection slice; post-#1191 residuals remain split below. |
+| Store `SpaceBook` persistence boundary | #1504 | `crates/tidefs-space-accounting/src/lib.rs`, `crates/tidefs-local-object-store/src/store.rs` | Make store-layer `SpaceBook` either a committed `SpaceAccounting` persistence/projection sink or a typed producer; mounted `statfs`/ENOSPC must not read an independent store availability mirror. |
+| Physical pool input projection | #1505 | `crates/tidefs-local-filesystem/src/capacity_authority.rs`, `crates/tidefs-local-filesystem/src/statfs.rs`, `crates/tidefs-types-space-accounting-core/src/lib.rs` | Define the physical pool counter fields that may constrain authority projections without independently deciding mounted admission or mounted `statfs`. |
+| Reclaim evidence producer integration | #1506 | `crates/tidefs-data-cleaner/`, `crates/tidefs-cleanup-engine/`, `crates/tidefs-cleanup-job-core/` | Publish committed reclaim evidence that the authority can consume later; estimated or scheduled cleanup remains a non-claim for mounted availability until committed deltas exist. |
+| Dedup obligation evidence integration | #1507 | `crates/tidefs-dedup/`, `crates/tidefs-local-filesystem/src/dedup_refcount.rs` | Type the dedup obligation evidence for retained, reclaimable, logically charged, physically saved, and physically released bytes without changing mounted write-path wiring. |
+| Mounted residual consumer wiring | #1508 | `crates/tidefs-local-filesystem/src/lib.rs` plus focused local-filesystem tests | Consume only the explicit inputs or recorded non-claims from #1504 through #1507. This row is sequenced after producer/projection rows and after live `lib.rs` ownership clears; #1467 observed active `lib.rs` PRs #1475 and #1491. |
 | Dedup delta producer integration | #790 | `crates/tidefs-dedup/` plus the minimal write-path consumer identified by #790 | Make dedup decisions publish committed logical/physical deltas or explicit reclaim obligations to the authority. |
 | Physical reclaim delta integration | #791 | `crates/tidefs-segment-cleaner/` plus the minimal reclaim/allocator consumer identified by #791 | Feed committed physical reclaim evidence into authority inputs without broadening into defrag, snapshot deadlists, or distributed rebuild. |
 | Example statfs projection cleanup | #785 | `crates/tidefs-fuser/examples/simple.rs` | Keep example statfs from teaching hardcoded placeholder accounting; consume real backing state or document a proper engine hook. |
