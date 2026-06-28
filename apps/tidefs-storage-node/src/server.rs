@@ -8388,10 +8388,18 @@ mod cluster_pool_handler_tests {
         let admission =
             receipt_backed_rebuild_admission_from_refs(&config_with_rebuild_peer(), vec![receipt])
                 .unwrap();
-        let mut planner =
-            receipt_backed_rebuild_planner_from_refs(&config_with_rebuild_peer(), vec![receipt])
-                .unwrap();
-        planner.tasks[0].target_nodes = vec![3];
+        let planner = ReceiptBackedPlannerPreview {
+            receipt_ref_count: 1,
+            detected_epoch: receipt.receipt_epoch.0,
+            local_member: MemberId::new(1),
+            target_members: vec![MemberId::new(2)],
+            plan_id: receipt.receipt_epoch.0,
+            total_target_replicas: 1,
+            tasks: vec![
+                ReconstructionTask::new_full_with_receipt(receipt, vec![1], vec![3], 1).unwrap(),
+            ],
+            reason: None,
+        };
 
         let err = cross_check_rebuild_execution_candidates(&admission, &planner).unwrap_err();
         assert_eq!(err["class"], "planner-admission-target-mismatch");
@@ -8907,28 +8915,23 @@ mod cluster_pool_handler_tests {
         assert_eq!(report["rebuild_admission"]["report_count"], 1);
         assert_eq!(report["rebuild_admission"]["intent_count"], 1);
         assert_eq!(report["rebuild_admission"]["scheduled_task_count"], 1);
-        assert_eq!(report["rebuild_planner"]["available"], true);
+        assert_eq!(report["rebuild_planner"]["available"], false);
         assert_eq!(report["rebuild_planner"]["preview"], true);
-        assert_eq!(
-            report["rebuild_planner"]["boundary"],
-            "storage-node-scrub-rebuild-planner-preview"
-        );
         assert_eq!(report["rebuild_planner"]["receipt_ref_count"], 1);
+        assert_eq!(report["rebuild_planner"]["task_count"], 0);
         assert_eq!(
-            report["rebuild_planner"]["healthy_sources"],
-            serde_json::json!([1])
+            report["rebuild_planner"]["planner_error"]["class"],
+            "topology-only-source-evidence"
         );
         assert_eq!(
-            report["rebuild_planner"]["candidate_targets"],
-            serde_json::json!([2])
+            report["rebuild_planner"]["planner_error"]["source_count"],
+            1
         );
         assert_eq!(
-            report["rebuild_planner"]["failed_nodes"],
-            serde_json::json!([])
+            report["rebuild_planner"]["planner_error"]["receipt_target_count"],
+            2
         );
-        assert_eq!(report["rebuild_planner"]["task_count"], 1);
-        assert_eq!(report["rebuild_planner"]["total_target_replicas"], 1);
-        assert_eq!(report["rebuild_execution_candidates"]["available"], true);
+        assert_eq!(report["rebuild_execution_candidates"]["available"], false);
         assert_eq!(
             report["rebuild_execution_candidates"]["boundary"],
             "storage-node-scrub-rebuild-execution-candidate-preview"
@@ -8942,12 +8945,16 @@ mod cluster_pool_handler_tests {
             1
         );
         assert_eq!(
-            report["rebuild_execution_candidates"]["planner_task_count"],
-            1
+            report["rebuild_execution_candidates"]["execution_candidate_count"],
+            0
         );
         assert_eq!(
-            report["rebuild_execution_candidates"]["execution_candidate_count"],
-            1
+            report["rebuild_execution_candidates"]["reason"],
+            "rebuild planner preview is unavailable"
+        );
+        assert_eq!(
+            report["rebuild_execution_candidates"]["planner"]["planner_error"]["class"],
+            "topology-only-source-evidence"
         );
 
         let receipt_ref = &report["placement_receipt_refs"]["refs"][0];
@@ -8960,24 +8967,6 @@ mod cluster_pool_handler_tests {
         assert_eq!(
             admission_task["placement_receipt_ref"]["target_count"],
             receipt_ref["target_count"]
-        );
-        let planner_task = &report["rebuild_planner"]["tasks"][0];
-        assert_eq!(planner_task["object_id"], receipt_ref["object_id"]);
-        assert_eq!(planner_task["source_nodes"], serde_json::json!([1]));
-        assert_eq!(planner_task["target_nodes"], serde_json::json!([2]));
-        assert_eq!(planner_task["placement_receipt_ref"], *receipt_ref);
-        assert_eq!(
-            planner_task["placement_receipt_ref"]["payload_digest"],
-            receipt_ref["payload_digest"]
-        );
-        let candidate = &report["rebuild_execution_candidates"]["candidates"][0];
-        assert_eq!(candidate["source_member"], 1);
-        assert_eq!(candidate["target_member"], 2);
-        assert_eq!(candidate["payload_len"], receipt_ref["payload_len"]);
-        assert_eq!(candidate["placement_receipt_ref"], *receipt_ref);
-        assert_eq!(
-            candidate["placement_receipt_ref"]["payload_digest"],
-            receipt_ref["payload_digest"]
         );
     }
 
