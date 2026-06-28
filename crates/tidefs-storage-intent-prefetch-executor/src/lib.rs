@@ -1945,6 +1945,12 @@ fn runtime_dispatch_evidence_refusal(
         return StorageIntentRefusalReason::MissingMediaCapabilityEvidence;
     }
 
+    if input.media_path.source_media != input.decision.source_media
+        || input.media_path.target_media != input.decision.target_media
+    {
+        return StorageIntentRefusalReason::PolicyConflict;
+    }
+
     if !input.media_path.source_path_ref.is_bound()
         || !input.media_path.target_destination_ref.is_bound()
     {
@@ -3251,6 +3257,39 @@ mod tests {
             missing_role_media_record.refusal,
             StorageIntentRefusalReason::MissingMediaCapabilityEvidence
         );
+    }
+
+    #[test]
+    fn runtime_dispatch_refuses_media_path_class_conflicts() {
+        let mut source_conflict = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        let expected_source = source_conflict.decision.source_media;
+        source_conflict.media_path.source_media = StorageMediaClass::NvmeFlash;
+        let source_conflict_record = evaluate_prefetch_execution(source_conflict);
+        assert_eq!(
+            source_conflict_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            source_conflict_record.refusal,
+            StorageIntentRefusalReason::PolicyConflict
+        );
+        assert_eq!(source_conflict_record.source_media, expected_source);
+        assert_record_has_no_authority_claims(source_conflict_record);
+
+        let mut target_conflict = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        let expected_target = target_conflict.decision.target_media;
+        target_conflict.media_path.target_media = StorageMediaClass::PersistentMemory;
+        let target_conflict_record = evaluate_prefetch_execution(target_conflict);
+        assert_eq!(
+            target_conflict_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            target_conflict_record.refusal,
+            StorageIntentRefusalReason::PolicyConflict
+        );
+        assert_eq!(target_conflict_record.target_media, expected_target);
+        assert_record_has_no_authority_claims(target_conflict_record);
     }
 
     #[test]
