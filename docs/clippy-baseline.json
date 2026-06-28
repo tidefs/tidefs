@@ -344,7 +344,7 @@
       "exit_code": 0
     },
     "tidefs-posix-filesystem-adapter-daemon": {
-      "warnings": 88,
+      "warnings": 89,
       "exit_code": 1
     },
     "tidefs-posix-filesystem-adapter-reply": {
