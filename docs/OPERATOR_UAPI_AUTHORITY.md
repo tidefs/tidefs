@@ -2,7 +2,7 @@
 
 Issue: #656
 Date: 2026-06-20
-Status: design decision for follow-up implementation and documentation slices
+Status: current pre-alpha boundary; TFR-011 one-boundary closeout complete
 
 This document records the operator-facing UAPI boundary for the current
 TideFS pre-alpha command surface. It decides how `tidefsctl` command classes,
@@ -16,11 +16,11 @@ claim release readiness.
 - `docs/REVIEW_TODO_REGISTER.md` TFR-011 records that CLI, FUSE, ublk,
   kernel UAPI, and docs can describe different truths. The current notes say
   issue #239 added a `tidefsctl` local-only admission table, issue #243 moved
-  FUSE cluster admission to typed mount authority, and issue #278 checked the
+  FUSE cluster admission to typed mount authority, issue #278 checked the
   preview UAPI doc, book chapter, operator-authz boundary, and claims gate
-  against the command classification/admission table. TFR-011 remains open
-  until operator surface, live-owner routing, cluster diagnostics/
-  authorization, and kernel UAPI authority are one reviewed boundary.
+  against the command classification/admission table, and issue #1278 closes
+  the current pre-alpha one-boundary decision after rechecking the #656
+  through #662 follow-up map.
 - `docs/REVIEW_TODO_REGISTER.md` TFR-019 records that imported documents are
   not release truth until classified as current policy, current spec,
   historical input, or delete candidate. The #337 note classifies the preview
@@ -28,6 +28,15 @@ claim release readiness.
   codec hooks; it explicitly does not close full-kernel, broader operator
   UAPI, kernel residency, storage authority, block-volume, xfstests,
   crash-recovery, distributed, or documentation drift debt.
+- Issue #1278 re-reviewed the live #656 through #662 follow-up state, the
+  #1267 product-surface decision, the checked preview-UAPI table, the
+  TFR-011/TFR-019 register notes, and the current command classification,
+  admission, live-owner, and cluster sources. It closes the TFR-011
+  one-boundary decision for the current pre-alpha operator surface because the
+  #657 through #662 follow-ups are closed and the live source/docs now share
+  the same boundary. Residual production ABI, distributed operator maturity,
+  runtime-fed remote policy authority, product-carrier, and broad
+  documentation-drift work remain outside TFR-011 and are mapped below.
 - `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` makes the authority rule explicit:
   imported documents are review inputs until classified. It classifies
   `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md` as current spec only for the
@@ -73,6 +82,58 @@ claim release readiness.
   `docs/security/operator-authz-boundary.md` already consume the command
   classification/admission table and reject unframed claims that cluster
   prototypes or development exercises are final distributed operator UAPI.
+
+## TFR-011 Closeout Review
+
+Issue #1278 performed the closeout review on 2026-06-28. The live GitHub
+states were:
+
+| Issue | State | Closeout significance |
+| --- | --- | --- |
+| [#656](https://github.com/tidefs/tidefs/issues/656) | Closed 2026-06-20 | Chose the code registry/admission/live-owner model for the current pre-alpha operator boundary. |
+| [#657](https://github.com/tidefs/tidefs/issues/657) | Closed 2026-06-21 | Enforced command registry and privileged-admission invariants. |
+| [#658](https://github.com/tidefs/tidefs/issues/658) | Closed 2026-06-21 | Decided claims-gate coverage; this decision artifact remains a non-publishing design record while scanned docs consume the command table. |
+| [#659](https://github.com/tidefs/tidefs/issues/659) | Closed 2026-06-21 | Audited live-owner routing and source-classified refusals. |
+| [#660](https://github.com/tidefs/tidefs/issues/660) | Closed 2026-06-21 | Cross-referenced this decision from the checked preview UAPI, book, and authz docs. |
+| [#661](https://github.com/tidefs/tidefs/issues/661) | Closed 2026-06-20 | Classified this decision in the documentation authority register and updated TFR-011/TFR-019 notes. |
+| [#662](https://github.com/tidefs/tidefs/issues/662) | Closed 2026-06-21 | Kept cluster pool prototypes and placement/heal exercises separate from public live-owner cluster status. |
+| [#1267](https://github.com/tidefs/tidefs/issues/1267) | Closed 2026-06-24 | Recorded that no runtime-fed operator product surface exists and mapped prerequisite follow-ups before any product carrier can be selected. |
+| [#1270](https://github.com/tidefs/tidefs/issues/1270) | Closed 2026-06-28 | Classified the missing P10-04 truth-surface law reference so product-surface citations cannot treat it as existing authority. |
+
+The current repo evidence matches those live states:
+
+- `COMMAND_SURFACES` in `apps/tidefsctl/src/commands/classification.rs`
+  remains the command class, routing, visibility, and summary authority.
+- `command_admission` in `apps/tidefsctl/src/commands/authz.rs` remains the
+  privileged-admission authority and checks that public operator mutations are
+  not silently unguarded.
+- `apps/tidefsctl/src/commands/live_owner.rs` routes imported-pool status to
+  the live owner when reachable and otherwise emits source-classified
+  fail-closed refusals instead of treating cached metadata as live truth.
+- `apps/tidefsctl/src/commands/cluster.rs` keeps `cluster pool create` as a
+  prototype, `cluster placement/heal exercise` as development diagnostics, and
+  `cluster status` as live-owner status that fails closed without live
+  evidence.
+- `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`,
+  `docs/book/chapters/10-tidefsctl.adoc`, and
+  `docs/security/operator-authz-boundary.md` consume the same checked command
+  classification/admission boundary without widening it into a production ABI
+  or final distributed operator UAPI.
+
+Decision: TFR-011's one public operator/UAPI boundary is complete for the
+current pre-alpha surface. The boundary is the checked `tidefsctl` command
+registry plus the privileged-admission registry, live-owner routing/refusal
+rules, source-classified diagnostics, explicit prototype/development classes,
+and the preview kernel/FUSE/ublk non-release framing recorded here.
+
+Residual work does not keep TFR-011 open:
+
+| Residual area | Mapping | Boundary |
+| --- | --- | --- |
+| Production Linux ioctl/statx/ublk/FUSE/kernel ABI freeze | Future issue-scoped ABI freeze decision and implementation proof | Not selected by TFR-011; this document remains pre-alpha and non-release. |
+| Distributed transport/cluster maturity | TFR-017, `docs/TRANSPORT_CLUSTER_AUTHORITY.md`, and focused follow-ups such as [#1282](https://github.com/tidefs/tidefs/issues/1282), [#1285](https://github.com/tidefs/tidefs/issues/1285), and [#1293](https://github.com/tidefs/tidefs/issues/1293) | Blocks multi-node/product claims and runtime-fed carriers, but not the TFR-011 command boundary. |
+| Runtime-fed product carrier selection | [#1267](https://github.com/tidefs/tidefs/issues/1267), `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`, and the P10-04 disposition closed by [#1270](https://github.com/tidefs/tidefs/issues/1270) | No CLI/API/dashboard/archive-reader carrier is selected here. |
+| Broad documentation authority drift | TFR-019 and `docs/DOCUMENTATION_AUTHORITY_REGISTER.md` | Imported docs still need classification before they can become current policy/spec. |
 
 ## Compared Authority Models
 
@@ -178,24 +239,24 @@ This decision defines the current operator boundary as follows.
   operator mutation remains local-only until a separate issue wires principal,
   session, authorization decision, audit, and live-owner routing into each
   privileged handler.
-- This decision does not close TFR-011, TFR-017, TFR-019, block-volume
-  runtime validation, FUSE runtime validation, xfstests, crash-recovery, RDMA,
-  or release claims.
+- This closeout closes only the current pre-alpha TFR-011 one-boundary
+  decision. It does not close TFR-017, TFR-019, block-volume runtime
+  validation, FUSE runtime validation, xfstests, crash-recovery, RDMA, release
+  claims, or future production UAPI/ABI freeze work.
 
-## Follow-Up Issue Map
+## Closed TFR-011 Follow-Up Map
 
-These follow-ups are intentionally non-overlapping. Each should cite this
-decision and keep its expected write set within the listed paths unless the
-issue body is updated before work starts.
+The original follow-ups were intentionally non-overlapping. As of the #1278
+closeout review, all #656-mapped TFR-011 follow-ups are closed:
 
-| Topic | Follow-up issue | Expected write set | Scope |
+| Topic | Follow-up issue | Closed state | Scope closed |
 | --- | --- | --- | --- |
-| Command-registry enforcement | [#657](https://github.com/tidefs/tidefs/issues/657) | `apps/tidefsctl/src/commands/classification.rs`, `apps/tidefsctl/src/commands/authz.rs`, `apps/tidefsctl/src/main.rs` | Strengthen registry/admission invariants and help rendering checks without changing command behavior. |
-| Doc and claims-gate coverage | [#658](https://github.com/tidefs/tidefs/issues/658) | `xtask/tidefs-xtask/src/claims.rs`, `docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, `docs/CLAIM_REGISTRY.md` | Decide whether this decision artifact should be scanned by the claims gate and update generated claim text if needed. |
-| Live-owner routing | [#659](https://github.com/tidefs/tidefs/issues/659) | `apps/tidefsctl/src/commands/live_owner.rs`, `apps/tidefsctl/src/commands/pool.rs`, `apps/tidefsctl/src/commands/device.rs`, `apps/tidefsctl/src/commands/block.rs`, `apps/tidefsctl/src/commands/dataset.rs`, `apps/tidefsctl/src/commands/snapshot.rs` | Audit live-owner routing and source-classified refusals for public operator commands. |
-| Preview-UAPI cross-references | [#660](https://github.com/tidefs/tidefs/issues/660) | `docs/PREVIEW_UAPI_ABI_BOUNDARY_OW202.md`, `docs/book/chapters/10-tidefsctl.adoc`, `docs/security/operator-authz-boundary.md` | Cross-reference this decision from the checked preview UAPI, book, and authz docs without widening the preview UAPI scope. |
-| Documentation-authority classification | [#661](https://github.com/tidefs/tidefs/issues/661) | `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`, `docs/REVIEW_TODO_REGISTER.md`, `docs/INDEX.md` | Classify this decision artifact and update TFR-011/TFR-019 notes after the decision lands. |
-| Cluster diagnostic/prototype separation | [#662](https://github.com/tidefs/tidefs/issues/662) | `apps/tidefsctl/src/commands/cluster.rs`, `crates/tidefs-cluster/src/pool_orchestrator.rs`, `apps/tidefs-storage-node/README.md`, `apps/tidefs-storage-node/src/authority_spine.rs` | Keep cluster pool prototype and placement/heal development diagnostics separate from public live-owner cluster status. |
+| Command-registry enforcement | [#657](https://github.com/tidefs/tidefs/issues/657) | Closed 2026-06-21 | Registry/admission invariants and help rendering checks. |
+| Doc and claims-gate coverage | [#658](https://github.com/tidefs/tidefs/issues/658) | Closed 2026-06-21 | Claims-gate coverage decision for this design artifact and generated claim text. |
+| Live-owner routing | [#659](https://github.com/tidefs/tidefs/issues/659) | Closed 2026-06-21 | Live-owner routing and source-classified refusals for public operator commands. |
+| Preview-UAPI cross-references | [#660](https://github.com/tidefs/tidefs/issues/660) | Closed 2026-06-21 | Preview UAPI, book, and authz cross-references without widening preview scope. |
+| Documentation-authority classification | [#661](https://github.com/tidefs/tidefs/issues/661) | Closed 2026-06-20 | Documentation authority classification for this decision. |
+| Cluster diagnostic/prototype separation | [#662](https://github.com/tidefs/tidefs/issues/662) | Closed 2026-06-21 | Cluster prototype and development-diagnostic separation from public live-owner status. |
 
 ## Validation For This Slice
 

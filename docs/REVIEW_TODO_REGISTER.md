@@ -14,7 +14,6 @@ OpenZFS/Ceph-class claims.
 | TFR-007 | Capacity/accounting | Allocation, quotas, statfs, reserves, and logical/physical accounting are split across crates. | Use `docs/CAPACITY_ACCOUNTING_AUTHORITY.md` as the boundary decision and close the linked follow-up issue map. |
 | TFR-008 | Recovery/fsync/writeback/mmap | Recovery, fsync, dirty-page writeback, mmap, and page-cache authority are not proven as one contract. | Use `docs/PAGE_CACHE_WRITEBACK_AUTHORITY.md` for the integrated recovery/fsync/writeback/mmap durability boundary and follow-up map, and `docs/PAGE_CACHE_INVALIDATION_AUTHORITY.md` for the invalidation trigger, stale-generation, and FUSE/kernel/cluster lease model; then prove and test the end-to-end durability and cache-coherency contract. |
 | TFR-010 | Snapshot/clone/send-receive/deadlist | Snapshot retention, deadlists, clone lineage, and send/receive are not one coherent storage model. | Use `docs/SNAPSHOT_CLONE_DEADLIST_AUTHORITY.md` for the local snapshot/clone/deadlist authority. Issue #1248 selected released-root derivation feeding the existing receipt-bound dead-object reclaim pipeline; implementation remains open under #1263, #1264, #1265, #1259, and #1266. Distributed snapshot shipping design is recorded in `docs/design/distributed-snapshot-shipping.md` (issue #1250); VFSSEND2 is the protocol foundation, section 7.2 records the initial scheduling/admission policy, and distributed deadlist triggers must call the #1248 derivation API rather than transmit deadlist entries. |
-| TFR-011 | Operator CLI/UAPI | CLI, FUSE, ublk, kernel UAPI, and docs can describe different truths. | Define one public operator/UAPI boundary and keep internal crates behind it. |
 | TFR-013 | Stub/placeholder stage | Several crates and docs still look like stage scaffolding rather than product behavior. | Classify placeholders explicitly and delete or implement them. |
 | TFR-014 | Licensing/provenance | Fresh TideFS import must preserve Linux-style GPLv2+syscall-note licensing and third-party provenance. | Audit all package metadata and file-local notices after rename. |
 | TFR-016 | Inline debt marker hygiene | Non-vendored source and active harness text still carried issue-era TODO/continuation wording. | Replace anonymous markers with register-addressed comments and treat old issue refs as historical context only. |
@@ -590,7 +589,15 @@ Important 2026-06-01 findings:
   design decision recorded in `docs/design/distributed-snapshot-shipping.md`
   (issue #1250); VFSSEND2 selected as protocol foundation, and section 7.2
   records the initial scheduling/admission policy from #1261.
-- `TFR-011`: Operator/UAPI authority is not yet one boundary.
+- `TFR-011`: Closed for the current pre-alpha operator/UAPI boundary by
+  GitHub issue #1278. The closed #656 decision and closed follow-ups #657,
+  #658, #659, #660, #661, and #662 establish one checked boundary for the
+  current public operator surface: `COMMAND_SURFACES` is the `tidefsctl`
+  command class/routing/help authority, `command_admission` is the privileged
+  admission authority, live-owner status routes fail closed with source
+  classification when no owner is reachable, and cluster pool prototypes plus
+  placement/heal exercises remain explicitly weaker than final distributed
+  operator UAPI.
   Commit `7dbb0759` removes the fake `pool list` parser surface instead of
   accepting a command whose handler only said scaffolding had been removed, and
   downgrades cluster placement/heal exercise wording to development
@@ -602,15 +609,25 @@ Important 2026-06-01 findings:
   validated `PoolLeaseToken` into daemon admission. Issue #278 gates the
   preview UAPI doc, tidefsctl book chapter, operator-authz boundary, and
   claims-gate policy against the exact command classification/admission table.
-  Issue #656 chooses the current pre-alpha operator boundary: the `tidefsctl`
-  command registry is the command-surface authority, admission stays in the
-  privileged-admission registry, live-owner routes must fail closed without live
-  evidence, and cluster prototypes/development diagnostics must not inherit
-  final operator-UAPI wording. TFR-011 remains open for the mapped follow-ups:
-  command-registry enforcement, live-owner routing audit, preview-UAPI
-  cross-references, cluster diagnostic/prototype separation, runtime validation,
-  and any future production UAPI or ABI freeze.
-Issue #1267 records the current runtime-fed operator product-surface decision: no runtime-fed operator product surface exists, the P10-04 truth-surface law is missing from the repository, and no product carrier class is selectable until TFR-011 and TFR-017 close. The decision maps follow-ups for P10-04 disposition, TFR-011/TFR-017 closeout, and documentation cleanup. Issue #1270 records the P10-04 disposition cleanup: `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` is an explicit missing authority reference, and P10-04 citations must note the absent document instead of treating it as existing authority.
+  `docs/OPERATOR_UAPI_AUTHORITY.md` now records the #1278 closeout review and
+  the live closed states of #656 through #662.
+  This closure is deliberately narrow: it is not a production Linux ioctl,
+  statx, ublk, FUSE, or kernel-module ABI freeze; not kernelspace readiness
+  evidence; not distributed operator maturity evidence; not runtime-fed remote
+  policy authority; and not a product-carrier or release-readiness claim.
+  Residual work is mapped outside TFR-011: TFR-017 remains open under
+  `docs/TRANSPORT_CLUSTER_AUTHORITY.md` and focused transport/cluster issues
+  such as #1282, #1285, and #1293; runtime-fed product-carrier selection
+  remains governed by `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md`; broad
+  imported-document classification remains TFR-019. Issue #1267 records the
+  current runtime-fed operator product-surface decision: no runtime-fed
+  operator product surface exists, no product carrier class is selectable
+  until the remaining prerequisite gates close, and no source marker,
+  deterministic demo row, screenshot, raw stdout, or historical blocker map is
+  product evidence. Issue #1270 records the P10-04 disposition cleanup:
+  `docs/DASHBOARDS_TRACES_OPERATOR_TRUTH_SURFACES_P10-04.md` is an explicit
+  missing authority reference, and P10-04 citations must note the absent
+  document instead of treating it as existing authority.
 - `TFR-012`: Device lifecycle and media privacy remain incomplete.
   `docs/DEVICE_LIFECYCLE_REMANENCE_AUTHORITY.md` records the current decision
   boundary from issue #1276. Pool-member backing is byte-addressable media only:
@@ -1228,9 +1245,13 @@ Issue #1267 records the current runtime-fed operator product-surface decision: n
   privileged-admission authorities, keeps diagnostics and prototypes scoped by
   their weaker classes/routing, and preserves non-claims for production ABI
   freeze, kernelspace readiness, distributed operator maturity, remote policy
-  authority, and release readiness. This reduces TFR-011/TFR-019 drift but does
-  not close the follow-up implementation, cross-reference, claims-gate, runtime
-  validation, or broad documentation-authority debt.
+  authority, and release readiness. GitHub issue #1278 later closes TFR-011's
+  current pre-alpha one-boundary decision after rechecking the closed #657
+  through #662 follow-ups, the #1267 product-surface decision, the checked
+  preview UAPI table, and the live command classification/admission/live-owner
+  sources. TFR-019 remains open for broad documentation-authority drift and for
+  imported docs that have not yet been classified as current policy, current
+  spec, historical input, missing, or delete candidate.
 - `TFR-019`: GitHub issue #512 extends documentation-authority coverage across
   the remaining high-impact imported design surface not covered by the #497
   slice: architecture/local-format references, block-volume and ublk adapter
