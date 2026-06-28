@@ -6,6 +6,8 @@ block-volume module, imported physical block devices, transaction/replay state,
 and kernel execution contexts into one design. It is not proof that the full
 kernel runtime, daemonless storage parity, crash recovery, object/extent replay,
 block-volume export, xfstests coverage, or production readiness exists today.
+Use `docs/KERNEL_RESIDENCY_AUTHORITY.md` for the TFR-009 authority boundary,
+explicit non-claims, tier upgrade gates, and follow-up implementation map.
 
 It consumes:
 
