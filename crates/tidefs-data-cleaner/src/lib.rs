@@ -50,6 +50,10 @@
 //! 4. Integration tests confirm end-to-end reclaim with crash-restart
 //!    resume.
 
+use tidefs_cleanup_job_core::{
+    CleanupReceiptValidationTier, CleanupWorkItemId, ReclaimEvidenceProducer,
+    ReclaimEvidenceRefusal, ReclaimEvidenceRefusalReason,
+};
 use tidefs_incremental_job_core::IncrementalJob;
 use tidefs_reclaim::SegmentLiveCounts;
 use tidefs_reclaim_queue_core::BPlusTreeReclaimQueue;
@@ -144,6 +148,29 @@ impl DataCleanerHandoff {
             DataCleanerHandoffState::Deadlist => true,
             DataCleanerHandoffState::Liveness { .. } => false,
         }
+    }
+
+    /// Explain why this handoff is not committed physical reclaim evidence.
+    ///
+    /// Data cleaner handoffs publish liveness/deadlist state for downstream
+    /// cleaner authorities. They do not prove that allocator blocks or object
+    /// store segments were physically released.
+    #[must_use]
+    pub const fn committed_reclaim_refusal(
+        self,
+        job_id: JobId,
+        estimated_bytes: u64,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> ReclaimEvidenceRefusal {
+        ReclaimEvidenceRefusal::new(
+            ReclaimEvidenceProducer::DataCleaner,
+            job_id,
+            CleanupWorkItemId::NONE,
+            ReclaimEvidenceRefusalReason::ModelOnlyDrain,
+            estimated_bytes,
+            1,
+            validation_tier,
+        )
     }
 }
 
@@ -278,6 +305,26 @@ impl DataCleanerService {
     #[must_use]
     pub fn stats(&self) -> DataCleanerStats {
         self.stats
+    }
+
+    /// Source evidence that current data-cleaner progress is model-only.
+    ///
+    /// Deadlist byte totals here remain estimates until a downstream cleaner
+    /// emits committed physical reclaim evidence.
+    #[must_use]
+    pub const fn reclaim_progress_refusal(
+        &self,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> ReclaimEvidenceRefusal {
+        ReclaimEvidenceRefusal::new(
+            ReclaimEvidenceProducer::DataCleaner,
+            self.job_id,
+            CleanupWorkItemId::NONE,
+            ReclaimEvidenceRefusalReason::ModelOnlyDrain,
+            self.stats.deadlist_bytes_estimate,
+            self.stats.deadlist_handoffs,
+            validation_tier,
+        )
     }
 
     /// Reference to the live-counts tracker.
@@ -626,7 +673,8 @@ mod tests {
             4096,
             Some(Box::new(MockResolver) as Box<dyn DataCleanerResolver>),
             Some(Box::new(sink.clone()) as Box<dyn DataCleanerHandoffSink>),
-        );
+        )
+        .with_job_id(JobId(9));
 
         let budget = WorkBudget {
             max_items: 10,
@@ -640,14 +688,38 @@ mod tests {
         assert_eq!(svc.stats().liveness_handoffs, 0);
         assert_eq!(svc.stats().deadlist_bytes_estimate, 3 * 4096);
         assert_eq!(svc.stats().segments_retained, 0);
+        let handoffs = sink.handoffs();
         assert_eq!(
-            sink.handoffs(),
+            handoffs,
             vec![
                 DataCleanerHandoff::deadlist(obj_key(1), 101, -1),
                 DataCleanerHandoff::deadlist(obj_key(2), 102, -1),
                 DataCleanerHandoff::deadlist(obj_key(3), 103, -1),
             ]
         );
+
+        let handoff_refusal = handoffs[0].committed_reclaim_refusal(
+            JobId(9),
+            4096,
+            CleanupReceiptValidationTier::CargoUnit,
+        );
+        assert_eq!(
+            handoff_refusal.producer,
+            ReclaimEvidenceProducer::DataCleaner
+        );
+        assert_eq!(
+            handoff_refusal.reason,
+            ReclaimEvidenceRefusalReason::ModelOnlyDrain
+        );
+        assert_eq!(handoff_refusal.estimated_bytes, 4096);
+        assert!(!handoff_refusal.is_committed_physical_reclaim());
+
+        let progress_refusal =
+            svc.reclaim_progress_refusal(CleanupReceiptValidationTier::CargoUnit);
+        assert_eq!(progress_refusal.job_id, JobId(9));
+        assert_eq!(progress_refusal.estimated_bytes, 3 * 4096);
+        assert_eq!(progress_refusal.units, 3);
+        assert!(!progress_refusal.is_committed_physical_reclaim());
     }
 
     #[test]

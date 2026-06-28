@@ -15,6 +15,12 @@
 
 use blake3;
 use std::collections::HashSet;
+use tidefs_cleanup_job_core::{
+    CleanupReceiptValidationTier, CleanupWorkItemId, CommittedReclaimEvidence,
+    ReclaimEvidenceError, ReclaimEvidenceProducer, ReclaimEvidenceRefusal,
+    ReclaimEvidenceRefusalReason,
+};
+use tidefs_types_incremental_job_core::JobId;
 
 const RECLAIM_DOMAIN: &str = "TideFS Reclaimer receipt v1";
 const RECEIPT_HASH_LEN: usize = 32;
@@ -41,6 +47,8 @@ pub enum ReclaimError {
     BlobTooShort { expected: usize, got: usize },
     /// BLAKE3 hash mismatch on receipt verification.
     HashMismatch,
+    /// Committed reclaim evidence could not be formed.
+    Evidence(ReclaimEvidenceError),
     /// The underlying block allocator returned an error.
     AllocatorError(String),
 }
@@ -53,6 +61,7 @@ impl std::fmt::Display for ReclaimError {
                 "reclaim receipt too short: expected {expected}B, got {got}B"
             ),
             Self::HashMismatch => f.write_str("reclaim receipt hash mismatch"),
+            Self::Evidence(err) => write!(f, "reclaim evidence error: {err}"),
             Self::AllocatorError(msg) => write!(f, "allocator error: {msg}"),
         }
     }
@@ -168,6 +177,26 @@ impl<B: BlockFreeBackend> Reclaimer<B> {
         count
     }
 
+    /// Explain why currently staged blocks are not availability evidence.
+    #[must_use]
+    pub fn queued_reclaim_refusal(
+        &self,
+        job_id: JobId,
+        work_item_id: CleanupWorkItemId,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> ReclaimEvidenceRefusal {
+        let units = self.staged.len() as u64;
+        ReclaimEvidenceRefusal::new(
+            ReclaimEvidenceProducer::CleanupEngine,
+            job_id,
+            work_item_id,
+            ReclaimEvidenceRefusalReason::QueuedOnly,
+            units.saturating_mul(self.block_size),
+            units,
+            validation_tier,
+        )
+    }
+
     /// Flush all staged blocks to the allocator in a single bulk call.
     ///
     /// Returns the number of blocks successfully freed.
@@ -176,17 +205,77 @@ impl<B: BlockFreeBackend> Reclaimer<B> {
     ///
     /// Returns [`ReclaimError::AllocatorError`] if the backend fails.
     pub fn flush(&mut self) -> Result<usize, ReclaimError> {
+        Ok(self.flush_staged()? as usize)
+    }
+
+    /// Flush staged blocks and return committed physical reclaim evidence.
+    ///
+    /// Staged blocks become evidence only after the backend reports a
+    /// successful physical free. Empty flushes and zero-byte releases produce
+    /// no evidence and must not be consumed as mounted availability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReclaimError::Evidence`] before calling the backend when the
+    /// requested evidence lacks stable identity, commit generation, or bytes.
+    /// Returns [`ReclaimError::AllocatorError`] if the backend fails.
+    pub fn flush_committed_evidence(
+        &mut self,
+        job_id: JobId,
+        work_item_id: CleanupWorkItemId,
+        commit_generation: u64,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> Result<Option<CommittedReclaimEvidence>, ReclaimError> {
+        if self.staged.is_empty() {
+            return Ok(None);
+        }
+        if job_id.is_none() {
+            return Err(ReclaimError::Evidence(ReclaimEvidenceError::MissingJobId));
+        }
+        if work_item_id.is_none() {
+            return Err(ReclaimError::Evidence(
+                ReclaimEvidenceError::MissingWorkItemId,
+            ));
+        }
+        if commit_generation == 0 {
+            return Err(ReclaimError::Evidence(
+                ReclaimEvidenceError::MissingCommitGeneration,
+            ));
+        }
+        if self.block_size == 0 {
+            return Err(ReclaimError::Evidence(
+                ReclaimEvidenceError::ZeroBytesReclaimed,
+            ));
+        }
+
+        let freed_count = self.flush_staged()?;
+        if freed_count == 0 {
+            return Ok(None);
+        }
+
+        CommittedReclaimEvidence::physical_release(
+            ReclaimEvidenceProducer::CleanupEngine,
+            job_id,
+            work_item_id,
+            commit_generation,
+            freed_count,
+            freed_count.saturating_mul(self.block_size),
+            validation_tier,
+        )
+        .map(Some)
+        .map_err(ReclaimError::Evidence)
+    }
+
+    fn flush_staged(&mut self) -> Result<u64, ReclaimError> {
         if self.staged.is_empty() {
             return Ok(0);
         }
-
         let batch: Vec<u64> = self.staged.iter().copied().collect();
         let freed_count = self
             .backend
             .free_blocks(&batch)
             .map_err(ReclaimError::AllocatorError)?;
 
-        let freed = freed_count as usize;
         self.freed.extend(&batch);
         self.staged.clear();
 
@@ -197,7 +286,7 @@ impl<B: BlockFreeBackend> Reclaimer<B> {
             .saturating_add(freed_count.saturating_mul(self.block_size));
         self.stats.batches_committed = self.stats.batches_committed.saturating_add(1);
 
-        Ok(freed)
+        Ok(freed_count)
     }
 
     /// Seal the current freed-set into a BLAKE3-verified receipt blob.
@@ -362,11 +451,97 @@ mod tests {
     }
 
     #[test]
+    fn queued_reclaim_refusal_is_not_committed_evidence() {
+        let backend = MockBackend::new();
+        let mut r = Reclaimer::new(backend, 4096);
+        r.stage_batch(&[100, 200]);
+
+        let refusal = r.queued_reclaim_refusal(
+            JobId(7),
+            CleanupWorkItemId(99),
+            CleanupReceiptValidationTier::SourceModel,
+        );
+
+        assert_eq!(refusal.producer, ReclaimEvidenceProducer::CleanupEngine);
+        assert_eq!(refusal.reason, ReclaimEvidenceRefusalReason::QueuedOnly);
+        assert_eq!(refusal.estimated_bytes, 8192);
+        assert_eq!(refusal.units, 2);
+        assert!(!refusal.is_committed_physical_reclaim());
+        assert_eq!(r.stats().blocks_freed, 0);
+    }
+
+    #[test]
+    fn flush_committed_evidence_reports_physical_release() {
+        let backend = MockBackend::new();
+        let mut r = Reclaimer::new(backend, 4096);
+        r.stage_batch(&[100, 200, 300]);
+
+        let evidence = r
+            .flush_committed_evidence(
+                JobId(7),
+                CleanupWorkItemId(99),
+                5,
+                CleanupReceiptValidationTier::CargoUnit,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(evidence.producer, ReclaimEvidenceProducer::CleanupEngine);
+        assert_eq!(evidence.job_id, JobId(7));
+        assert_eq!(evidence.work_item_id, CleanupWorkItemId(99));
+        assert_eq!(evidence.commit_generation, 5);
+        assert_eq!(evidence.units_reclaimed, 3);
+        assert_eq!(evidence.bytes_reclaimed, 12_288);
+        assert!(evidence.is_committed_physical_reclaim());
+        assert!(r.is_idle());
+    }
+
+    #[test]
+    fn flush_committed_evidence_refuses_missing_job_without_flushing() {
+        let backend = MockBackend::new();
+        let mut r = Reclaimer::new(backend, 4096);
+        r.stage(42);
+
+        let err = r
+            .flush_committed_evidence(
+                JobId::NONE,
+                CleanupWorkItemId(99),
+                5,
+                CleanupReceiptValidationTier::CargoUnit,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            ReclaimError::Evidence(ReclaimEvidenceError::MissingJobId)
+        );
+        assert_eq!(r.staged_count(), 1);
+        assert_eq!(r.stats().blocks_freed, 0);
+    }
+
+    #[test]
     fn flush_empty_is_noop() {
         let backend = MockBackend::new();
         let mut r = Reclaimer::new(backend, 4096);
         let freed = r.flush().unwrap();
         assert_eq!(freed, 0);
+        assert_eq!(r.stats().batches_committed, 0);
+    }
+
+    #[test]
+    fn flush_committed_evidence_empty_is_not_evidence() {
+        let backend = MockBackend::new();
+        let mut r = Reclaimer::new(backend, 4096);
+        let evidence = r
+            .flush_committed_evidence(
+                JobId(7),
+                CleanupWorkItemId(99),
+                5,
+                CleanupReceiptValidationTier::CargoUnit,
+            )
+            .unwrap();
+
+        assert!(evidence.is_none());
         assert_eq!(r.stats().batches_committed, 0);
     }
 
