@@ -1252,6 +1252,15 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         );
     }
 
+    if initial_result_detail_lacks_feedback_evidence(input) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::VerificationFailed,
+            PrefetchExecutorByteState::Refused,
+            StorageIntentRefusalReason::ValidationGateFailed,
+        );
+    }
+
     if decision_refused_or_needs_more_evidence(input.decision) {
         return terminal(
             record,
@@ -1732,6 +1741,27 @@ fn terminal_result_detail_lacks_feedback_evidence(
         && !terminal_result_detail_has_cut_feedback_roots(record, update)
 }
 
+fn initial_result_detail_lacks_feedback_evidence(input: PrefetchExecutorInput) -> bool {
+    input.result_detail.has_feedback_payback_inputs()
+        && !initial_result_detail_has_snapshot_feedback_roots(input)
+}
+
+fn initial_result_detail_has_snapshot_feedback_roots(input: PrefetchExecutorInput) -> bool {
+    snapshot_contains_typed_ref(
+        input,
+        input.result_detail.attribution_ref,
+        StorageIntentEvidenceKind::MeasurementAttributionEvidence,
+    ) && snapshot_contains_typed_ref(
+        input,
+        input.result_detail.retention_ref,
+        StorageIntentEvidenceKind::EvidenceRetentionEvidence,
+    ) && snapshot_contains_typed_ref(
+        input,
+        input.result_detail.validation_ref,
+        StorageIntentEvidenceKind::ValidationArtifact,
+    )
+}
+
 fn terminal_result_detail_has_cut_feedback_roots(
     record: PrefetchExecutorRecord,
     update: PrefetchExecutorTerminalUpdate,
@@ -2011,6 +2041,16 @@ fn snapshot_contains_ref(
         .evidence_query_snapshot
         .included_refs
         .contains_ref(evidence_ref)
+}
+
+fn snapshot_contains_typed_ref(
+    input: PrefetchExecutorInput,
+    evidence_ref: StorageIntentEvidenceRef,
+    kind: StorageIntentEvidenceKind,
+) -> bool {
+    evidence_ref.is_bound()
+        && evidence_ref.kind == kind
+        && snapshot_contains_ref(input, evidence_ref)
 }
 
 fn snapshot_contains_fresh_ref(
@@ -2593,6 +2633,15 @@ mod tests {
         }
     }
 
+    fn add_initial_feedback_roots(
+        snapshot: &mut StorageIntentEvidenceQuerySnapshot,
+        detail: PrefetchExecutorResultDetail,
+    ) {
+        push_terminal_ref(&mut snapshot.included_refs, detail.attribution_ref);
+        push_terminal_ref(&mut snapshot.included_refs, detail.retention_ref);
+        push_terminal_ref(&mut snapshot.included_refs, detail.validation_ref);
+    }
+
     #[test]
     fn action_families_cover_required_candidates() {
         assert_eq!(
@@ -2865,6 +2914,7 @@ mod tests {
             ),
             validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
         };
+        add_initial_feedback_roots(&mut input.evidence_query_snapshot, input.result_detail);
 
         let record = evaluate_prefetch_execution(input);
         assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
@@ -2883,6 +2933,47 @@ mod tests {
         assert_eq!(
             record.evidence_refs.validation_ref,
             input.result_detail.validation_ref
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn initial_feedback_detail_requires_evidence_roots() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.result_detail = PrefetchExecutorResultDetail {
+            prefetched_bytes: 4 * 1024,
+            used_bytes: 3 * 1024,
+            unused_bytes: 1024,
+            ..PrefetchExecutorResultDetail::default()
+        };
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn initial_feedback_roots_must_be_inside_evidence_snapshot() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.result_detail = terminal_detail();
+
+        let record = evaluate_prefetch_execution(input);
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
         );
         assert_record_has_no_authority_claims(record);
     }
