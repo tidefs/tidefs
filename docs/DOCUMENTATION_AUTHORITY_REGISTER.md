@@ -710,6 +710,23 @@ generated claim registries, or `validation/claims.toml`.
 |---|---|---|
 | `docs/design/coordination-pipeline-cluster-services-design-seal.md` | Historical input | Imported Forgejo-era #1738 design-phase seal for cluster-wide coordination services. It preserves the old layered inventory, service decomposition, deferral rationale, gate sketch, and design-lineage references as historical input. Its "sealed", "design-sealed", "implemented-source", "models implemented", "3-node cluster", `docs/STATUS.md`, and `docs/FEATURE_MATRIX.md` wording is stale coordination-pipeline status language, not current implementation status, release-readiness evidence, or product authority. Live source now contains membership, epoch, and drain surfaces in `tidefs-membership-live`, `tidefs-membership-epoch`, and `tidefs-node-drain`, but TFR-017 still leaves transport/cluster authority open before multi-node claims. The checked claim evidence records only a planned bounded distributed model-check claim (`distributed.combined_safety.model.v1`) for source-model invariants and blocked successor/comparator boundaries (`storage.intent.successor_comparator.v1`); it does not validate broad cluster-service, distributed-membership, production distributed-runtime, multi-node, or product-scale capability. The retained cluster-service and distributed-membership wording is non-claim historical design lineage under the #931/#875/#928/#930 boundary. The file is not current policy, current spec, implementation status, release-readiness evidence, or product authority. |
 
+### Coordination Pipeline Cluster Services Design Completion (TFR-019 / #1293)
+
+Classified for TFR-019 / GitHub issue #1293 on 2026-06-28 after reviewing this
+register's authority rule and review method, the TFR-017 and TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, the imported Forgejo #1754 completion document,
+`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`,
+`docs/TRANSPORT_CLUSTER_AUTHORITY.md`, the closed #1153 sibling issue and
+cluster-services design-seal row, live GitHub issue and pull-request state,
+bounded source/doc searches, plus `validation/claims.toml` and
+`docs/CLAIM_REGISTRY.md`. This slice does not edit product source, Cargo
+manifests, CI workflows, validation artifacts, generated claim registries,
+`validation/claims.toml`, or the sibling cluster-services design-seal document.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/design/coordination-pipeline-cluster-services-design-completion.md` | Historical input | Imported Forgejo-era #1754 design-phase completion note for cluster-wide coordination services. It preserves the old layer inventory, service data-structure sketches, bootstrap and cross-node state-machine algorithms, active implementation lane summaries, deferral rationale, closure checklist, residual-risk list, and Forgejo issue lineage as historical input. Its "design-sealed", "implemented-source", "active implementation lanes", "models implemented", "3-node cluster", "production distributed runtime", and deferred wire-up wording is stale coordination-pipeline status language, not current implementation status, release-readiness evidence, or product authority. Live source contains some transport, membership, drain, allocator, reclaim, and data-flow component crates, but `docs/TRANSPORT_CLUSTER_AUTHORITY.md` and TFR-017 still leave cross-replica comparison, repair authority, failed-quorum mutation evidence, cluster pool/orchestrator alignment, and RDMA validation gaps open before multi-node or production cluster claims. The checked claim evidence records only a planned bounded distributed model-check claim (`distributed.combined_safety.model.v1`) and blocked successor/comparator boundaries (`storage.intent.successor_comparator.v1`); it does not validate broad cluster-service, distributed-membership, transport, rebuild, placement, production distributed-runtime, multi-node, release-readiness, or product-scale capability. The retained completion and implementation-lane wording is non-claim historical design lineage. The file is not current policy, current spec, implementation status, release-readiness evidence, or product authority. |
+
 ### Pool Import/Export 7-Phase Implementation Plan (TFR-019 / #1152)
 
 Classified for TFR-019 / GitHub issue #1152 on 2026-06-26 after reviewing this

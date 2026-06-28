@@ -11,6 +11,15 @@ issues
 strategy), #1753 (roadmap priorities), #2054 (prior status update)
 **Blocks**: All deferred cluster-service wire-up implementation issues
 
+> **Authority note (TFR-019 / #1293)**: This file is classified as historical
+> input, not current TideFS cluster-service, distributed-membership, transport,
+> rebuild, placement, or release-readiness authority. The Forgejo #1754
+> "design-sealed", "implemented-source", "active implementation lanes",
+> "3-node cluster", and deferred wire-up wording below is retained only as
+> design-lineage context. Current cluster and transport statements must be
+> checked against live source, GitHub issue and pull-request state,
+> `docs/TRANSPORT_CLUSTER_AUTHORITY.md`, and the active claim registry.
+
 ## Abstract
 
 This document records the completion of the design phase for TideFS cluster-wide
