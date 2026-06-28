@@ -1241,12 +1241,6 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         );
     }
 
-    if family.is_negative_enforcement() || no_prefetch_decision(input.decision) {
-        record.executor_byte_state = PrefetchExecutorByteState::NoPrefetchEnforced;
-        record.outcome = PrefetchExecutorOutcome::Completed;
-        return record;
-    }
-
     let freshness_rpo_refusal =
         freshness_rpo_floor_refusal(input.evidence_query_snapshot, input.freshness_rpo_floor_ms);
     if freshness_rpo_refusal as u16 != StorageIntentRefusalReason::None as u16 {
@@ -1265,6 +1259,12 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
             PrefetchExecutorByteState::Refused,
             decision_refusal(input.decision),
         );
+    }
+
+    if family.is_negative_enforcement() || no_prefetch_decision(input.decision) {
+        record.executor_byte_state = PrefetchExecutorByteState::NoPrefetchEnforced;
+        record.outcome = PrefetchExecutorOutcome::Completed;
+        return record;
     }
 
     if authority_handoff_required(input.decision, family) {
@@ -3482,6 +3482,27 @@ mod tests {
             PrefetchExecutorByteState::NoPrefetchEnforced
         );
         assert!(record.is_non_authority_population());
+        assert_record_has_no_authority_claims(record);
+    }
+
+    #[test]
+    fn refused_no_prefetch_decision_does_not_complete_negative_enforcement() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
+        input.decision.outcome = PrefetchResidencyDecisionOutcome::NeedMoreEvidence;
+        input.decision.refusal = StorageIntentRefusalReason::EvidenceNotUsable;
+        input.admission = PrefetchExecutorAdmissionRecord::default();
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Refused);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
         assert_record_has_no_authority_claims(record);
     }
 
