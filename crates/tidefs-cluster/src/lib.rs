@@ -111,7 +111,8 @@ pub use pool_label_bridge::{BridgeError, CLUSTER_POOL_COMPAT, CLUSTER_POOL_INCOM
 pub use pool_lease_token::PoolLeaseToken;
 pub use pool_orchestrator::{
     ClusterPoolOrchestrator, CreateOutcome, ImportOutcome, NodeCreateResult, NodeImportResult,
-    OrchestratorError, PoolTransport,
+    OrchestratorError, PoolCreateDispatchEvidence, PoolTransport,
+    CLUSTER_POOL_CREATE_DISPATCH_EVIDENCE,
 };
 pub use pool_protocol::{
     CatalogEntryRow, CatalogQueryType, ClusterPoolCatalogDeltaRequest,

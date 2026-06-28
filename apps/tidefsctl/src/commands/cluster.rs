@@ -3,10 +3,10 @@
 //! development diagnostics.
 //!
 //! `cluster pool create` dispatches per-node create requests through
-//! live transport sessions.  Each target storage node writes real
-//! PoolLabelV1 labels on its assigned devices and returns per-device
-//! results.  The CLI aggregates responses, verifies quorum, and
-//! reports structured per-node outcomes.
+//! live transport sessions and carries typed per-node
+//! `ClusterPoolCreateResponse` evidence back to the caller.  The command is
+//! still prototype operator UAPI: it does not claim final distributed pool
+//! status, membership, repair, or transaction authority.
 //!
 //! Review debt TFR-017: import, lease ownership, and clustered mount remain
 //! historical POOLCLUSTER tracker work (#6605-#6610).
@@ -22,18 +22,25 @@ use clap::Subcommand;
 
 use tidefs_cluster::{
     ClusterPlacementPolicy, ClusterPoolConfig, ClusterPoolMessage, ClusterPoolOrchestrator,
-    FailureDomain, HealState, LossEvent, NodeDevice, PlacementHealCoordinator, PlacementMap,
-    PoolTransport,
+    CreateOutcome, FailureDomain, HealState, LossEvent, NodeCreateResult, NodeDevice,
+    OrchestratorError, PlacementHealCoordinator, PlacementMap, PoolCreateDispatchEvidence,
+    PoolTransport, CLUSTER_POOL_CREATE_DISPATCH_EVIDENCE,
 };
 use tidefs_membership_epoch::HealthClass;
 use tidefs_transport::{NodeInfo, SessionId, Transport, TransportAddr};
 
-const CLUSTER_POOL_CREATE_SURFACE_CLASS: &str = "prototype";
-const CLUSTER_POOL_CREATE_ROUTING: &str = "prototype-only";
-const CLUSTER_POOL_CREATE_BOUNDARY: &str = "not final distributed operator UAPI";
 const CLUSTER_EXERCISE_SURFACE_CLASS: &str = "development-diagnostic";
 const CLUSTER_EXERCISE_ROUTING: &str = "development-exercise";
-const CLUSTER_EXERCISE_BOUNDARY: &str = "not operator status or repair authority";
+const CLUSTER_EXERCISE_BOUNDARY: &str = concat!(
+    "development diagnostic only: not operator status, ",
+    "not final placement status, not repair authority, ",
+    "not membership authority, and not product-grade recovery closure"
+);
+const CLUSTER_EXERCISE_OPERATOR_STATUS: bool = false;
+const CLUSTER_EXERCISE_FINAL_PLACEMENT_STATUS: bool = false;
+const CLUSTER_EXERCISE_REPAIR_AUTHORITY: bool = false;
+const CLUSTER_EXERCISE_MEMBERSHIP_AUTHORITY: bool = false;
+const CLUSTER_EXERCISE_PRODUCT_RECOVERY_CLOSURE: bool = false;
 
 #[derive(Subcommand, Debug)]
 pub enum ClusterCommand {
@@ -336,6 +343,216 @@ fn format_cluster_redundancy(policy: ClusterPlacementPolicy) -> String {
     }
 }
 
+fn cluster_pool_create_evidence() -> PoolCreateDispatchEvidence {
+    CLUSTER_POOL_CREATE_DISPATCH_EVIDENCE
+}
+
+fn cluster_pool_create_node_results_json(
+    node_results: &BTreeMap<u64, NodeCreateResult>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut node_results_json = serde_json::Map::new();
+    for (&node_id, result) in node_results {
+        let device_hexes: Vec<String> = result.device_guids.iter().map(hex_guid).collect();
+        node_results_json.insert(
+            node_id.to_string(),
+            serde_json::json!({
+                "success": result.success,
+                "device_guids": device_hexes,
+                "error": result.error,
+            }),
+        );
+    }
+    node_results_json
+}
+
+fn cluster_pool_create_success_json(
+    outcome: &CreateOutcome,
+    canonical_redundancy: &str,
+    topology_generation: u64,
+) -> serde_json::Value {
+    let evidence = outcome.dispatch_evidence;
+    serde_json::json!({
+        "pool_name": outcome.pool_name,
+        "pool_guid": hex_guid(&outcome.pool_guid),
+        "total_nodes": outcome.total_nodes,
+        "succeeded": outcome.succeeded,
+        "node_results": cluster_pool_create_node_results_json(&outcome.node_results),
+        "redundancy": canonical_redundancy,
+        "topology_generation": topology_generation,
+        "surface_class": evidence.surface_class(),
+        "routing": evidence.routing(),
+        "transport_evidence": evidence.transport_evidence(),
+        "runtime_evidence": evidence.runtime_evidence(),
+        "operator_uapi_boundary": evidence.operator_uapi_boundary(),
+    })
+}
+
+fn cluster_pool_create_partial_failure_json(
+    error: &OrchestratorError,
+    outcome: &CreateOutcome,
+    canonical_redundancy: &str,
+    topology_generation: u64,
+) -> serde_json::Value {
+    let evidence = outcome.dispatch_evidence;
+    serde_json::json!({
+        "ok": false,
+        "command": "cluster pool create",
+        "error": error.to_string(),
+        "pool_name": outcome.pool_name,
+        "pool_guid": hex_guid(&outcome.pool_guid),
+        "total_nodes": outcome.total_nodes,
+        "succeeded": outcome.succeeded,
+        "node_results": cluster_pool_create_node_results_json(&outcome.node_results),
+        "redundancy": canonical_redundancy,
+        "topology_generation": topology_generation,
+        "surface_class": evidence.surface_class(),
+        "routing": evidence.routing(),
+        "transport_evidence": evidence.transport_evidence(),
+        "runtime_evidence": evidence.runtime_evidence(),
+        "operator_uapi_boundary": evidence.operator_uapi_boundary(),
+    })
+}
+
+fn format_cluster_pool_create_success(
+    outcome: &CreateOutcome,
+    canonical_redundancy: &str,
+    topology_generation: u64,
+) -> String {
+    use std::fmt::Write as _;
+
+    let evidence = outcome.dispatch_evidence;
+    let mut out = String::new();
+    writeln!(
+        &mut out,
+        "cluster pool prototype created through live transport: {}",
+        outcome.pool_name
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "  surface:        {}/{}",
+        evidence.surface_class(),
+        evidence.routing()
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "  transport:      {}",
+        evidence.transport_evidence()
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "  runtime:        {}",
+        evidence.runtime_evidence()
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "  boundary:       {}",
+        evidence.operator_uapi_boundary()
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "  pool GUID:      {}",
+        hex_guid(&outcome.pool_guid)
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "  nodes:          {}/{} succeeded",
+        outcome.succeeded, outcome.total_nodes
+    )
+    .unwrap();
+    writeln!(&mut out, "  redundancy:     {canonical_redundancy}").unwrap();
+    writeln!(&mut out, "  topology gen:   {topology_generation}").unwrap();
+
+    for (&node_id, result) in &outcome.node_results {
+        let status = if result.success { "OK" } else { "FAILED" };
+        let device_str: Vec<String> = result.device_guids.iter().map(hex_guid).collect();
+        writeln!(&mut out, "  node {node_id}: {status}").unwrap();
+        if result.success {
+            writeln!(&mut out, "    device guids:  {device_str:?}").unwrap();
+        }
+        if let Some(ref err) = result.error {
+            writeln!(&mut out, "    error:         {err}").unwrap();
+        }
+    }
+
+    out
+}
+
+fn format_cluster_pool_create_partial_failure(
+    error: &OrchestratorError,
+    outcome: &CreateOutcome,
+) -> String {
+    use std::fmt::Write as _;
+
+    let evidence = outcome.dispatch_evidence;
+    let mut out = String::new();
+    writeln!(
+        &mut out,
+        "tidefsctl: prototype cluster pool create through live transport partially failed: {error}"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "  surface:   {}/{}",
+        evidence.surface_class(),
+        evidence.routing()
+    )
+    .unwrap();
+    writeln!(&mut out, "  transport: {}", evidence.transport_evidence()).unwrap();
+    writeln!(&mut out, "  runtime:   {}", evidence.runtime_evidence()).unwrap();
+    writeln!(
+        &mut out,
+        "  boundary:  {}",
+        evidence.operator_uapi_boundary()
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "  nodes:     {}/{} succeeded",
+        outcome.succeeded, outcome.total_nodes
+    )
+    .unwrap();
+    for (&node_id, result) in &outcome.node_results {
+        let status = if result.success { "OK" } else { "FAILED" };
+        writeln!(&mut out, "  node {node_id}: {status}").unwrap();
+        if let Some(ref err) = result.error {
+            writeln!(&mut out, "    error: {err}").unwrap();
+        }
+    }
+    out
+}
+
+fn format_cluster_pool_create_failure(error: &OrchestratorError) -> String {
+    use std::fmt::Write as _;
+
+    let evidence = cluster_pool_create_evidence();
+    let mut out = String::new();
+    writeln!(
+        &mut out,
+        "tidefsctl: prototype cluster pool create through live transport failed: {error}"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "  surface:  {}/{}",
+        evidence.surface_class(),
+        evidence.routing()
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "  boundary: {}",
+        evidence.operator_uapi_boundary()
+    )
+    .unwrap();
+    out
+}
+
 // ---------------------------------------------------------------------------
 // TcpClusterTransport — PoolTransport backed by tidefs_transport sessions
 // ---------------------------------------------------------------------------
@@ -562,15 +779,19 @@ fn handle_cluster_pool_create(
     {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("tidefsctl: transport setup failed: {e}");
+            let error = OrchestratorError::Transport(format!("transport setup failed: {e}"));
+            eprint!("{}", format_cluster_pool_create_failure(&error));
             process::exit(1);
         }
     };
 
     // 7. Dispatch create requests through transport.
+    let evidence = cluster_pool_create_evidence();
     eprintln!(
-        "tidefsctl: dispatching prototype cluster pool create to {} node(s)...",
-        config.node_count()
+        "tidefsctl: dispatching prototype cluster pool create through {} to {} node(s); boundary: {}",
+        evidence.transport_evidence(),
+        config.node_count(),
+        evidence.operator_uapi_boundary()
     );
 
     let request_id = {
@@ -592,83 +813,46 @@ fn handle_cluster_pool_create(
     ) {
         Ok(outcome) => {
             if json {
-                let mut node_results_json = serde_json::Map::new();
-                for (&node_id, result) in &outcome.node_results {
-                    let device_hexes: Vec<String> =
-                        result.device_guids.iter().map(hex_guid).collect();
-                    node_results_json.insert(
-                        node_id.to_string(),
-                        serde_json::json!({
-                            "success": result.success,
-                            "device_guids": device_hexes,
-                            "error": result.error,
-                        }),
-                    );
-                }
-
-                let json_out = serde_json::json!({
-                    "pool_name": outcome.pool_name,
-                    "pool_guid": hex_guid(&outcome.pool_guid),
-                    "total_nodes": outcome.total_nodes,
-                    "succeeded": outcome.succeeded,
-                    "node_results": node_results_json,
-                    "redundancy": &canonical_redundancy,
-                    "topology_generation": config.topology_generation,
-                    "surface_class": CLUSTER_POOL_CREATE_SURFACE_CLASS,
-                    "routing": CLUSTER_POOL_CREATE_ROUTING,
-                    "operator_uapi_boundary": CLUSTER_POOL_CREATE_BOUNDARY,
-                });
+                let json_out = cluster_pool_create_success_json(
+                    &outcome,
+                    &canonical_redundancy,
+                    config.topology_generation,
+                );
                 println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
             } else {
-                println!("cluster pool prototype created: {}", outcome.pool_name);
-                println!(
-                    "  surface:        {}/{}",
-                    CLUSTER_POOL_CREATE_SURFACE_CLASS, CLUSTER_POOL_CREATE_ROUTING
+                print!(
+                    "{}",
+                    format_cluster_pool_create_success(
+                        &outcome,
+                        &canonical_redundancy,
+                        config.topology_generation
+                    )
                 );
-                println!("  boundary:       {CLUSTER_POOL_CREATE_BOUNDARY}");
-                println!("  pool GUID:      {}", hex_guid(&outcome.pool_guid));
-                println!(
-                    "  nodes:          {}/{} succeeded",
-                    outcome.succeeded, outcome.total_nodes
-                );
-                println!("  redundancy:     {canonical_redundancy}");
-                println!("  topology gen:   {}", config.topology_generation);
-
-                for (&node_id, result) in &outcome.node_results {
-                    let status = if result.success { "OK" } else { "FAILED" };
-                    let device_str: Vec<String> =
-                        result.device_guids.iter().map(hex_guid).collect();
-                    println!("  node {node_id}: {status}");
-                    if result.success {
-                        println!("    device guids:  {:?}", device_str);
-                    }
-                    if let Some(ref err) = result.error {
-                        println!("    error:         {err}");
-                    }
-                }
             }
         }
         Err(e) => {
             // When quorum fails, report per-node partial results.
-            if let tidefs_cluster::OrchestratorError::QuorumNotReached {
+            if let OrchestratorError::QuorumNotReached {
                 outcome: Some(outcome),
                 ..
             } = &e
             {
-                eprintln!("tidefsctl: prototype cluster pool create partially failed: {e}");
-                eprintln!(
-                    "  nodes: {}/{} succeeded",
-                    outcome.succeeded, outcome.total_nodes
-                );
-                for (&node_id, result) in &outcome.node_results {
-                    let status = if result.success { "OK" } else { "FAILED" };
-                    eprintln!("  node {node_id}: {status}");
-                    if let Some(ref err) = result.error {
-                        eprintln!("    error: {err}");
-                    }
+                if json {
+                    let json_out = cluster_pool_create_partial_failure_json(
+                        &e,
+                        outcome,
+                        &canonical_redundancy,
+                        config.topology_generation,
+                    );
+                    println!("{}", serde_json::to_string_pretty(&json_out).unwrap());
+                } else {
+                    eprint!(
+                        "{}",
+                        format_cluster_pool_create_partial_failure(&e, outcome)
+                    );
                 }
             } else {
-                eprintln!("tidefsctl: prototype cluster pool create failed: {e}");
+                eprint!("{}", format_cluster_pool_create_failure(&e));
             }
             process::exit(1);
         }
@@ -738,8 +922,11 @@ fn handle_placement_exercise(epoch: u64, json: bool) {
             "surface_class": CLUSTER_EXERCISE_SURFACE_CLASS,
             "routing": CLUSTER_EXERCISE_ROUTING,
             "authority_boundary": CLUSTER_EXERCISE_BOUNDARY,
-            "operator_status": false,
-            "repair_authority": false,
+            "operator_status": CLUSTER_EXERCISE_OPERATOR_STATUS,
+            "final_placement_status": CLUSTER_EXERCISE_FINAL_PLACEMENT_STATUS,
+            "repair_authority": CLUSTER_EXERCISE_REPAIR_AUTHORITY,
+            "membership_authority": CLUSTER_EXERCISE_MEMBERSHIP_AUTHORITY,
+            "product_recovery_closure": CLUSTER_EXERCISE_PRODUCT_RECOVERY_CLOSURE,
             "epoch": pm.epoch(),
             "member_count": pm.member_count(),
             "object_count": pm.object_count(),
@@ -765,6 +952,10 @@ fn handle_placement_exercise(epoch: u64, json: bool) {
         );
         println!("  surface:     {CLUSTER_EXERCISE_SURFACE_CLASS}/{CLUSTER_EXERCISE_ROUTING}");
         println!("  boundary:    {CLUSTER_EXERCISE_BOUNDARY}");
+        println!("  operator status: false");
+        println!("  placement status: false");
+        println!("  repair authority: false");
+        println!("  recovery closure: false");
         println!("  members:     {}", pm.member_count());
         println!("  objects:     {}", pm.object_count());
         println!("  replicas:    {}", pm.total_replicas());
@@ -843,8 +1034,11 @@ fn handle_heal_exercise(epoch: u64, lost_member: u64, json: bool) {
             "surface_class": CLUSTER_EXERCISE_SURFACE_CLASS,
             "routing": CLUSTER_EXERCISE_ROUTING,
             "authority_boundary": CLUSTER_EXERCISE_BOUNDARY,
-            "operator_status": false,
-            "repair_authority": false,
+            "operator_status": CLUSTER_EXERCISE_OPERATOR_STATUS,
+            "final_placement_status": CLUSTER_EXERCISE_FINAL_PLACEMENT_STATUS,
+            "repair_authority": CLUSTER_EXERCISE_REPAIR_AUTHORITY,
+            "membership_authority": CLUSTER_EXERCISE_MEMBERSHIP_AUTHORITY,
+            "product_recovery_closure": CLUSTER_EXERCISE_PRODUCT_RECOVERY_CLOSURE,
             "epoch": epoch,
             "lost_member": lost_member,
             "initial_state": format!("{:?}", HealState::Idle),
@@ -881,6 +1075,10 @@ fn handle_heal_exercise(epoch: u64, lost_member: u64, json: bool) {
             "  surface:            {CLUSTER_EXERCISE_SURFACE_CLASS}/{CLUSTER_EXERCISE_ROUTING}"
         );
         println!("  boundary:           {CLUSTER_EXERCISE_BOUNDARY}");
+        println!("  operator status:    false");
+        println!("  placement status:   false");
+        println!("  repair authority:   false");
+        println!("  recovery closure:   false");
         println!("  lost member:        {lost_member}");
         println!("  initial state:      {:?}", HealState::Idle);
         println!("  post-loss state:    {state:?}");
@@ -1216,11 +1414,26 @@ mod tests {
 
     #[test]
     fn cluster_output_boundary_labels_match_surface_roles() {
-        assert_eq!(CLUSTER_POOL_CREATE_SURFACE_CLASS, "prototype");
-        assert_eq!(CLUSTER_POOL_CREATE_ROUTING, "prototype-only");
+        let create_evidence = cluster_pool_create_evidence();
+        assert_eq!(create_evidence.surface_class(), "prototype");
+        assert_eq!(create_evidence.routing(), "live-transport-prototype-uapi");
         assert!(
-            CLUSTER_POOL_CREATE_BOUNDARY.contains("not final distributed operator UAPI"),
-            "cluster pool create output must stay prototype-framed"
+            create_evidence
+                .transport_evidence()
+                .contains("PoolTransport"),
+            "cluster pool create output must name typed transport evidence"
+        );
+        assert!(
+            create_evidence
+                .runtime_evidence()
+                .contains("ClusterPoolCreateResponse"),
+            "cluster pool create output must name typed runtime evidence"
+        );
+        assert!(
+            create_evidence
+                .operator_uapi_boundary()
+                .contains("not final distributed pool UAPI"),
+            "cluster pool create output must stay prototype-framed while using live dispatch"
         );
 
         assert_eq!(CLUSTER_EXERCISE_SURFACE_CLASS, "development-diagnostic");
@@ -1230,6 +1443,127 @@ mod tests {
                 && CLUSTER_EXERCISE_BOUNDARY.contains("repair authority"),
             "placement/heal exercise output must deny status and repair authority"
         );
+    }
+
+    fn sample_create_outcome(node_results: BTreeMap<u64, NodeCreateResult>) -> CreateOutcome {
+        CreateOutcome {
+            pool_guid: [0x11; 16],
+            pool_name: "tank".into(),
+            total_nodes: node_results.len(),
+            succeeded: node_results
+                .values()
+                .filter(|result| result.success)
+                .count(),
+            node_results,
+            dispatch_evidence: cluster_pool_create_evidence(),
+        }
+    }
+
+    #[test]
+    fn cluster_pool_create_success_output_names_live_transport_prototype_boundary() {
+        let outcome = sample_create_outcome(BTreeMap::from([(
+            1,
+            NodeCreateResult {
+                success: true,
+                device_guids: vec![[0x22; 16]],
+                error: None,
+            },
+        )]));
+
+        let text = format_cluster_pool_create_success(&outcome, "single", 7);
+        assert!(text.contains("cluster pool prototype created through live transport"));
+        assert!(text.contains("surface:        prototype/live-transport-prototype-uapi"));
+        assert!(text.contains("transport:      typed PoolTransport delivery"));
+        assert!(text.contains("runtime:        per-node ClusterPoolCreateResponse"));
+        assert!(text.contains("boundary:       not final distributed pool UAPI"));
+        assert!(text.contains("node 1: OK"));
+
+        let json = cluster_pool_create_success_json(&outcome, "single", 7);
+        assert_eq!(json["surface_class"], "prototype");
+        assert_eq!(json["routing"], "live-transport-prototype-uapi");
+        assert_eq!(
+            json["transport_evidence"],
+            "typed PoolTransport delivery over live transport sessions"
+        );
+        assert_eq!(
+            json["runtime_evidence"],
+            "per-node ClusterPoolCreateResponse quorum evidence"
+        );
+        assert_eq!(json["node_results"]["1"]["success"], true);
+    }
+
+    #[test]
+    fn cluster_pool_create_partial_failure_output_keeps_boundary() {
+        let outcome = sample_create_outcome(BTreeMap::from([
+            (
+                1,
+                NodeCreateResult {
+                    success: true,
+                    device_guids: vec![[0x33; 16]],
+                    error: None,
+                },
+            ),
+            (
+                2,
+                NodeCreateResult {
+                    success: false,
+                    device_guids: vec![],
+                    error: Some("device too small".into()),
+                },
+            ),
+        ]));
+        let error = OrchestratorError::QuorumNotReached {
+            succeeded: outcome.succeeded,
+            total: outcome.total_nodes,
+            outcome: Some(outcome.clone()),
+        };
+
+        let text = format_cluster_pool_create_partial_failure(&error, &outcome);
+        assert!(
+            text.contains("prototype cluster pool create through live transport partially failed")
+        );
+        assert!(text.contains("surface:   prototype/live-transport-prototype-uapi"));
+        assert!(text.contains("runtime:   per-node ClusterPoolCreateResponse"));
+        assert!(text.contains("boundary:  not final distributed pool UAPI"));
+        assert!(text.contains("node 2: FAILED"));
+        assert!(text.contains("device too small"));
+
+        let json = cluster_pool_create_partial_failure_json(&error, &outcome, "single", 7);
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["command"], "cluster pool create");
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("quorum not reached"));
+        assert_eq!(json["surface_class"], "prototype");
+        assert_eq!(json["routing"], "live-transport-prototype-uapi");
+        assert_eq!(
+            json["transport_evidence"],
+            "typed PoolTransport delivery over live transport sessions"
+        );
+        assert_eq!(
+            json["runtime_evidence"],
+            "per-node ClusterPoolCreateResponse quorum evidence"
+        );
+        assert!(json["operator_uapi_boundary"]
+            .as_str()
+            .unwrap()
+            .contains("not final distributed pool UAPI"));
+        assert_eq!(json["node_results"]["2"]["success"], false);
+        assert_eq!(json["node_results"]["2"]["error"], "device too small");
+    }
+
+    #[test]
+    fn cluster_exercise_refusals_deny_status_repair_and_recovery_authority() {
+        assert!(!CLUSTER_EXERCISE_OPERATOR_STATUS);
+        assert!(!CLUSTER_EXERCISE_FINAL_PLACEMENT_STATUS);
+        assert!(!CLUSTER_EXERCISE_REPAIR_AUTHORITY);
+        assert!(!CLUSTER_EXERCISE_MEMBERSHIP_AUTHORITY);
+        assert!(!CLUSTER_EXERCISE_PRODUCT_RECOVERY_CLOSURE);
+        assert!(CLUSTER_EXERCISE_BOUNDARY.contains("not operator status"));
+        assert!(CLUSTER_EXERCISE_BOUNDARY.contains("not final placement status"));
+        assert!(CLUSTER_EXERCISE_BOUNDARY.contains("not repair authority"));
+        assert!(CLUSTER_EXERCISE_BOUNDARY.contains("not product-grade recovery closure"));
     }
 
     // -- hex_guid tests --
