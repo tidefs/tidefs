@@ -557,39 +557,44 @@ evidence artifacts, validation-tier review, claim registry updates, and
 ## Follow-Up Implementation Issue Map
 
 The evidence-chain design recorded in this document defines a spine that
-existing and planned follow-up issues implement. Each follow-up has a
-non-overlapping write set and a named dependency on this design document.
+existing and planned follow-up issues implement. Issue #1274 refreshed the
+map on 2026-06-28 from live GitHub issue/PR state, closed #1066, closed
+#809/#810, `docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, and source
+inspection of the named producers. The live open issue search found no
+producer-specific manifest-adoption issue except #1274 itself before this
+refresh. The open PR file-set snapshot found no PR touching
+`docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`,
+`docs/CLAIMS_GATE_POLICY.md`, or `validation/claims.toml`; PR #1481 touches
+`crates/tidefs-validation/src/performance_gate/**`, so the performance child
+below avoids that path until the PR lands or a new non-overlapping split is
+recorded.
 
-### Existing Follow-Up Issues (already open)
+### Unified Manifest Adoption Coverage
 
-| Issue | Title | Write set | Depends on this design? |
+| Producer | Manifest authority | Live coverage from review | Current child or blocker |
+| --- | --- | --- | --- |
+| `tidefs-trace-oracle` | `TraceArtifactManifest` | Closed #731 emits schema-versioned model-only and harness-only trace manifests through `crates/tidefs-trace-oracle` and `xtask check-trace-oracle`. Runtime-tier mounted trace comparison remains separate because it needs real runtime backend execution and CI artifact references. | #1483 owns mounted/runtime `TraceArtifactManifest` integration. |
+| `tidefs-crash-oracle` | `EvidenceArtifactManifest` | Closed #818 established the crash-oracle authority surface. `validation/claims.toml` already names crash `manifest_path` entries for some requirements, but `validation/artifacts/crash-oracle/` currently contains JSON/TOML evidence without the corresponding v2 `.manifest.json` files. | #1484 owns crash-oracle `EvidenceArtifactManifest` adoption and the model/runtime manifest boundary. |
+| `tidefs-performance-contract` | `EvidenceArtifactManifest` | Closed #830 established the performance-contract authority surface. Performance artifacts and claim requirements still use plain registry/runtime records without claim-facing v2 manifests. | #1485 owns performance-contract `EvidenceArtifactManifest` adoption and avoids `performance_gate/**` while PR #1481 is open. |
+| `tidefs-offload-core` | `EvidenceArtifactManifest` | Closed #828 established offload-core authority. The crate has `OffloadExternalBackendConformanceManifest` and offload TOML artifacts, but no claim-facing v2 manifest wrapper or `manifest_path` entries in the offload claim requirements. | #1486 owns offload-core `EvidenceArtifactManifest` wrapping. |
+| `tidefs-env-fuse-model` | `EvidenceArtifactManifest` | Closed #811 committed `validation/artifacts/fuse/adapter-lifecycle-model.manifest.json` and wired the FUSE source-model claim requirement to that manifest path. | Covered; no #1274 child needed. |
+| `tidefs-env-ublk-model` | `EvidenceArtifactManifest` | Closed #811 committed qid/tag and started-export source-model manifests under `validation/artifacts/ublk/`. Open #1185 separately owns a claims-registry consistency repair for the started-export evidence class list. | Covered for producer adoption; #1185 remains a claim-registry blocker, not a new adoption child. |
+| `tidefs-distributed-model-check` | `EvidenceArtifactManifest` | Closed #811 committed `validation/artifacts/distributed/combined-safety-receipt.manifest.json` and wired the distributed source-model claim requirement to that manifest path. | Covered; no #1274 child needed. |
+| `tidefs-two-node-harness` | `EvidenceArtifactManifest` | Closed #835 established two-node harness authority, but there is no focused issue or committed v2 manifest path for deterministic harness or QEMU carrier evidence. | #1487 owns two-node harness `EvidenceArtifactManifest` adoption. |
+| Validation runtime artifacts | `EvidenceArtifactManifest` | Closed #809/#810 provide the shared v2 schema and claims-gate consumption. Closed #643, #644, and #646 cover xfstests, kernel-fsync, and RDMA workflow manifest lanes. Remaining producer-specific runtime artifacts are split through the crash, performance, offload, trace, and two-node children above. | Covered by the shared spine plus producer children; do not create one broad validation-runtime branch. |
+
+### Producer Child Issues Opened By #1274
+
+Each child below has a non-overlapping expected write set and records whether
+it uses `EvidenceArtifactManifest` or `TraceArtifactManifest`.
+
+| Issue | Producer | Manifest type | Expected write set boundary |
 | ---: | --- | --- | --- |
-| #809 | evidence-chain-format | Evidence manifest format, schema, and validation | Yes -- implements the unified manifest schema |
-| #810 | claims-gate-spine: consume unified evidence manifests | Claims-gate tooling consumes unified manifests | Yes -- consumes the evidence chain |
-| #811 | adapter-model-evidence-chain | Adapter model evidence manifests and claim binding | Yes -- adapter models produce unified evidence |
-| #818 | tidefs-crash-oracle: runtime release claims | Runtime crash-oracle artifacts for release claims | Yes -- crash evidence feeds the chain |
-| #820 | tidefs-distributed-model-check: release claims | Distributed safety evidence for release claims | Yes -- distributed evidence feeds the chain |
-| #821 | tidefs-env-fuse-model: runtime release claims | FUSE env model runtime evidence | Yes -- adapter evidence feeds the chain |
-| #822 | tidefs-env-ublk-model: runtime release claims | uBLK env model runtime evidence | Yes -- adapter evidence feeds the chain |
-| #827 | tidefs-model-core: release claims | Model-core evidence for release claims | Yes -- model evidence feeds the chain |
-| #828 | tidefs-offload-core: release claims | Offload-core evidence for release claims | Yes -- offload evidence feeds the chain |
-| #830 | tidefs-performance-contract: release claims | Performance-contract runtime evidence | Yes -- performance evidence feeds the chain |
-| #835 | tidefs-two-node-harness: release claims | Two-node harness evidence for release claims | Yes -- harness evidence feeds the chain |
-
-### New Follow-Up Issues Needed
-
-These gaps were identified during the #1066 survey. Each should become a
-prepared GitHub issue with acceptance criteria, expected write set, and
-non-overlap constraints before implementation begins.
-
-| Proposed issue | Area | Expected write set | Evidence tier | Rationale |
-| --- | --- | --- | --- | --- |
-| Trace-oracle runtime artifact integration | `tidefs-trace-oracle` | `crates/tidefs-trace-oracle/`, `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`, `validation/claims.toml`, `validation/artifacts/trace-oracle/` | `mounted-userspace` | The trace oracle has model and harness-only comparison artifacts. Runtime trace comparison through a mounted backend with CI artifact references (as described in `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`) requires a dedicated issue to wire mounted-backend replay, capture CI artifact refs, and produce runtime-tier `TraceArtifactManifest` entries. |
-| Unified manifest adoption coordination | Evidence chain | `docs/NEXTGEN_VERIFICATION_PERFORMANCE_OFFLOAD_PLAN.md`, `docs/CLAIMS_GATE_POLICY.md`, `validation/claims.toml`, per-producer child issue map only | `source-model` coordination | Each evidence producer crate must adopt `EvidenceArtifactManifest` (or `TraceArtifactManifest` for trace-oracle) as its canonical output. This coordination issue must split per-crate adoption into child issues rather than editing every producer crate in one broad branch. |
-| Crash-oracle model-to-runtime bridge | `tidefs-crash-oracle` | `crates/tidefs-crash-oracle/`, `validation/claims.toml`, `validation/artifacts/crash-oracle/` | `source-model` plus `mounted-userspace` | The crash oracle has separate model and runtime report paths. The evidence chain needs an explicit bridge document or artifact that pairs a model crash matrix with its corresponding runtime crash report, proving the model boundary correctly predicted runtime behavior. |
-| Performance-contract runtime evidence class | `tidefs-performance-contract` | `crates/tidefs-performance-contract/`, `crates/tidefs-validation/src/performance_gate.rs`, `validation/claims.toml`, `validation/artifacts/performance/` | `mounted-userspace` or higher | The performance contract currently has `harness-only` oracle outcomes. A distinct evidence class for `runtime-admission-budget` is needed before performance isolation claims can advance beyond harness-only. |
-| Offload accelerator conformance vectors | `tidefs-offload-core` | `crates/tidefs-offload-core/`, `validation/claims.toml`, `validation/artifacts/offload/` | `harness-only` per accelerator until runtime integration exists | Future GPU, FPGA, DMA, RDMA, and kernel-integrated offload paths need conformance vectors that mirror the CPU reference path. This issue defines the evidence class and artifact schema for non-CPU offload validation. |
-| Adapter model lifecycle coverage expansion | `tidefs-env-fuse-model`, `tidefs-env-ublk-model` | `crates/tidefs-env-fuse-model/`, `crates/tidefs-env-ublk-model/`, `validation/claims.toml` | `source-model` | Both adapter models cover a bounded set of operations and lifecycles. The follow-up expands coverage to the full FUSE and uBLK operation sets specified in the request contract, with named-gap allowlisting for unsupported operations. |
+| #1483 | `tidefs-trace-oracle` runtime traces | `TraceArtifactManifest` | `crates/tidefs-trace-oracle/**`, `xtask/tidefs-xtask/src/trace_oracle.rs`, `docs/TRACE_ORACLE_ARTIFACT_SCHEMA.md`, `validation/claims.toml`, `validation/artifacts/trace-oracle/**`, and `.github/workflows/**` only for a focused trace-runtime artifact lane. |
+| #1484 | `tidefs-crash-oracle` crash artifacts | `EvidenceArtifactManifest` | `crates/tidefs-crash-oracle/**`, `validation/artifacts/crash-oracle/**`, and `validation/claims.toml` only for crash manifest paths, blockers, and evidence-class consistency. |
+| #1485 | `tidefs-performance-contract` performance evidence | `EvidenceArtifactManifest` | `crates/tidefs-performance-contract/**`, `validation/artifacts/performance/**`, and `validation/claims.toml` only for performance manifest paths, blockers, and evidence-class consistency. It must not edit `crates/tidefs-validation/src/performance_gate/**` while PR #1481 remains open. |
+| #1486 | `tidefs-offload-core` offload evidence | `EvidenceArtifactManifest` | `crates/tidefs-offload-core/**`, `validation/artifacts/offload/**`, and `validation/claims.toml` only for offload manifest paths, blockers, and evidence-class consistency. |
+| #1487 | `tidefs-two-node-harness` harness evidence | `EvidenceArtifactManifest` | `crates/tidefs-two-node-harness/**`, `validation/artifacts/two-node/**`, `validation/claims.toml`, and `.github/workflows/**` only for a focused two-node/QEMU manifest artifact lane. |
 
 ### Issue Creation Protocol
 
@@ -603,9 +608,10 @@ New follow-up issues must:
 - Be prepared (acceptance criteria, behavior, write set, validation tier)
   before implementation starts.
 
-Issue creation is out of scope for this design slice. The map above is the
-authoritative follow-up list. Workers picking up these follow-ups should
-create the GitHub issues using the protocol defined here.
+Issue #1274 created #1483 through #1487 to close the current manifest adoption
+map. Future workers should update the relevant child issue first if live
+issue/PR state changes its write set or if implementation proves a producer
+needs a different manifest boundary.
 
 ## Design Decision Record
 
@@ -620,9 +626,10 @@ decisions recorded:
    producers (see Evidence Producer and Consumer Map above).
 3. **Evidence consumers**: Seven consumers/aggregators identified, with
    `validation/claims.toml` as the authoritative registry.
-4. **Follow-up map**: Six new follow-up issue areas identified; eleven
-   existing follow-up issues (#809 through #835 range) are confirmed as
-   consumers of this design.
+4. **Follow-up map**: Issue #1274 refreshed the manifest adoption map on
+   2026-06-28. Closed #809/#810 provide the shared manifest spine, closed
+   #811 and related workflow issues cover several producers, and #1483
+   through #1487 own the remaining producer-specific manifest adoption gaps.
 5. **Non-claims**: The non-claims section is preserved and extended with
    explicit boundaries for each producer crate:
    - `tidefs-model-core` does not claim runtime storage correctness.
