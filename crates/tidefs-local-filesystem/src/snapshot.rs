@@ -15,6 +15,7 @@
 //! while TFR-010 still tracks the unfinished deadlist, send/receive, and
 //! reclaim authority model.
 
+use crate::deadlist::DeadlistReleasedRoot;
 use crate::error::FileSystemError;
 use crate::helpers::snapshot_name_bytes;
 use crate::records::{SnapshotKind, SnapshotRecord};
@@ -26,6 +27,7 @@ use tidefs_dataset_lifecycle::{
     BlockPointer, DatasetCatalog, DatasetFlags, DatasetId, DatasetType, SyncGuarantee,
     TraversalRoot, TraversalRootType,
 };
+use tidefs_local_object_store::SnapshotDeadObjectCandidate;
 
 // ---------------------------------------------------------------------------
 // Public summary types
@@ -370,6 +372,59 @@ impl LocalFileSystem {
         Ok(())
     }
 
+    pub(crate) fn enqueue_released_snapshot_deadlist(
+        &mut self,
+        record: &SnapshotRecord,
+    ) -> Result<()> {
+        if !snapshot_record_retains_data(record) {
+            return Ok(());
+        }
+
+        let snapshot_id = snapshot_record_display_name(record);
+        let released_traversal_root = snapshot_record_traversal_root(record);
+        if self
+            .lifecycle
+            .gc_pin_set()
+            .pin_count(released_traversal_root)
+            > 0
+        {
+            return self.release_snapshot_extent_pins_after_deadlist_queue(&snapshot_id);
+        }
+
+        let deletion_generation = self.state.generation;
+        let dataset_uuid = self.mounted_dataset_id();
+        let released = DeadlistReleasedRoot::snapshot_or_clone(record.root.clone());
+        let report =
+            self.derive_released_root_deadlist_candidates_against_local_live_roots(released)?;
+
+        if !report.candidates.is_empty() {
+            let candidates = report.candidates.iter().map(|candidate| {
+                SnapshotDeadObjectCandidate::new(
+                    candidate.reclaim_object_key(),
+                    dataset_uuid,
+                    deletion_generation,
+                    deletion_generation,
+                )
+            });
+            self.store
+                .raw_primary_store_mut()
+                .enqueue_snapshot_deadlist_candidates(candidates)?;
+        }
+
+        self.release_snapshot_extent_pins_after_deadlist_queue(&snapshot_id)
+    }
+
+    fn release_snapshot_extent_pins_after_deadlist_queue(
+        &mut self,
+        snapshot_id: &str,
+    ) -> Result<()> {
+        let store = self.store.raw_primary_store_mut();
+        if store.release_snapshot_extent_pins(snapshot_id) > 0 {
+            store.sync_all()?;
+        }
+        Ok(())
+    }
+
     /// Create a writable clone from a source snapshot.
     ///
     /// The clone shares blocks with the origin snapshot. Writes to the clone
@@ -497,6 +552,7 @@ impl LocalFileSystem {
         let summary = self.commit_mutation(record.summary())?;
         self.unpin_snapshot_record_root(&record);
         self.remove_snapshot_record_catalog_entry(&record)?;
+        self.enqueue_released_snapshot_deadlist(&record)?;
         Ok(summary)
     }
 
@@ -1069,8 +1125,12 @@ fn sort_snapshot_summaries(summaries: &mut [SnapshotSummary]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::env;
+    use tidefs_reclaim_queue_core::DeadObjectReclaimQueue;
+    use tidefs_recovery_loop::RecoveryPolicy;
     use tidefs_types_dataset_lifecycle_core::TraversalRootType;
+    use tidefs_types_reclaim_queue_core::ObjectKey as ReclaimObjectKey;
 
     fn setup_auth_env() {
         env::set_var("TIDEFS_ROOT_AUTHENTICATION_KEY_HEX", "A".repeat(64));
@@ -1129,6 +1189,50 @@ mod tests {
             BlockPointer(summary.source_transaction_id),
             summary.source_generation,
         )
+    }
+
+    fn receipt_bound_dead_object_queue_keys(fs: &LocalFileSystem) -> BTreeSet<ReclaimObjectKey> {
+        receipt_bound_dead_object_queue_keys_from_store(fs.store.raw_primary_store())
+    }
+
+    fn receipt_bound_dead_object_queue_keys_from_store(
+        store: &tidefs_local_object_store::LocalObjectStore,
+    ) -> BTreeSet<ReclaimObjectKey> {
+        let Some(bytes) = store
+            .get_named(b"tidefs-dead-object-reclaim-queue")
+            .expect("read persisted dead-object queue")
+        else {
+            return BTreeSet::new();
+        };
+        DeadObjectReclaimQueue::decode(&bytes)
+            .expect("decode persisted dead-object queue")
+            .all_entries()
+            .into_iter()
+            .map(|entry| entry.object_id)
+            .collect()
+    }
+
+    fn receipt_bound_dead_object_queue_keys_from_default_pool(
+        dir: &std::path::Path,
+    ) -> BTreeSet<ReclaimObjectKey> {
+        use tidefs_local_object_store::StoreOptions;
+        setup_auth_env();
+        let pool =
+            LocalFileSystem::default_development_pool(dir, &StoreOptions::default(), None, None)
+                .expect("reopen default development pool");
+        receipt_bound_dead_object_queue_keys_from_store(pool.raw_primary_store())
+    }
+
+    fn receipt_bound_dead_object_queue_depth(fs: &LocalFileSystem) -> usize {
+        receipt_bound_dead_object_queue_keys(fs).len()
+    }
+
+    fn persisted_dead_object_queue_exists(fs: &LocalFileSystem) -> bool {
+        fs.store
+            .raw_primary_store()
+            .get_named(b"tidefs-dead-object-reclaim-queue")
+            .expect("read persisted dead-object queue")
+            .is_some()
     }
 
     fn catalog_clone_flag(fs: &LocalFileSystem, name: &str) -> bool {
@@ -1195,6 +1299,159 @@ mod tests {
         // Clone gone but snapshot remains
         assert!(fs.delete_snapshot("snap1").is_ok());
         assert_eq!(snapshot_catalog_pin_count(&fs), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_deadlist_snapshot_delete_enqueues_candidates_and_persists_work() {
+        let dir = temp_dir();
+
+        let delete_enqueued_queue_keys = {
+            let mut fs = new_fs(&dir);
+            seed_file(&mut fs, "/old.txt", b"snapshot-only data");
+            fs.sync_all().expect("sync before snapshot");
+
+            fs.create_snapshot("dead-snap").expect("snapshot");
+
+            let pinned_extent = ReclaimObjectKey([0xA5; 32]);
+            fs.store
+                .raw_primary_store_mut()
+                .pin_snapshot_extent("dead-snap", pinned_extent);
+            assert!(fs
+                .store
+                .raw_primary_store()
+                .snapshot_extent_pin_set()
+                .is_pinned(&pinned_extent));
+            let before_delete_queue_keys = receipt_bound_dead_object_queue_keys(&fs);
+
+            let summary = fs.delete_snapshot("dead-snap").expect("delete snapshot");
+            assert_eq!(summary.name, "dead-snap");
+            assert!(!fs.dataset_catalog().contains("root@dead-snap"));
+            assert_eq!(snapshot_catalog_pin_count(&fs), 0);
+            let after_delete_queue_keys = receipt_bound_dead_object_queue_keys(&fs);
+            let delete_enqueued_queue_keys = after_delete_queue_keys
+                .difference(&before_delete_queue_keys)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert!(
+                !delete_enqueued_queue_keys.is_empty(),
+                "snapshot deletion must enqueue released-root candidates"
+            );
+            assert!(persisted_dead_object_queue_exists(&fs));
+            assert!(!fs
+                .store
+                .raw_primary_store()
+                .snapshot_extent_pin_set()
+                .is_pinned(&pinned_extent));
+            // Simulate crash-after-queue-sync: close handles without letting
+            // Drop::do_commit() run a clean-close background reclaim tick.
+            fs.stop_background_scheduler();
+            fs.recovery_policy = RecoveryPolicy::ReadOnly;
+            drop(fs);
+            delete_enqueued_queue_keys
+        };
+
+        {
+            let reopened_queue_keys = receipt_bound_dead_object_queue_keys_from_default_pool(&dir);
+            let missing_queue_keys = delete_enqueued_queue_keys
+                .difference(&reopened_queue_keys)
+                .copied()
+                .collect::<Vec<_>>();
+            assert!(
+                missing_queue_keys.is_empty(),
+                "snapshot-deadlist work must survive store reopen; missing candidates: {missing_queue_keys:?}"
+            );
+        }
+
+        {
+            let mut reopened = reopen_fs(&dir);
+            reopened.stop_background_scheduler();
+            assert!(!reopened.dataset_catalog().contains("root@dead-snap"));
+            assert_eq!(snapshot_catalog_pin_count(&reopened), 0);
+            assert!(persisted_dead_object_queue_exists(&reopened));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_deadlist_origin_delete_with_live_clone_skips_shared_root() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        seed_file(&mut fs, "/base.txt", b"shared clone root");
+        fs.sync_all().expect("sync before snapshot");
+        fs.create_snapshot("origin").expect("snapshot");
+        fs.create_clone("live-clone", "origin").expect("clone");
+        let baseline_queue_depth = receipt_bound_dead_object_queue_depth(&fs);
+        assert_eq!(snapshot_catalog_pin_count(&fs), 2);
+
+        let deleted = fs.delete_snapshot("origin").expect("delete origin");
+        assert_eq!(deleted.name, "origin");
+        assert!(!fs.dataset_catalog().contains("root@origin"));
+        assert!(fs.dataset_catalog().contains("root@live-clone"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 1);
+        assert_eq!(
+            receipt_bound_dead_object_queue_depth(&fs),
+            baseline_queue_depth
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_deadlist_clone_delete_enqueues_last_shared_root() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        seed_file(&mut fs, "/base.txt", b"clone final root");
+        fs.sync_all().expect("sync before snapshot");
+        fs.create_snapshot("origin").expect("snapshot");
+        fs.create_clone("final-clone", "origin").expect("clone");
+        let baseline_queue_depth = receipt_bound_dead_object_queue_depth(&fs);
+
+        fs.delete_snapshot("origin").expect("delete origin first");
+        assert_eq!(
+            receipt_bound_dead_object_queue_depth(&fs),
+            baseline_queue_depth
+        );
+
+        let deleted = fs.delete_clone("final-clone").expect("delete clone");
+        assert_eq!(deleted.name, "final-clone");
+        assert!(!fs.dataset_catalog().contains("root@final-clone"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 0);
+        assert!(
+            receipt_bound_dead_object_queue_depth(&fs) > baseline_queue_depth,
+            "last shared-root delete must enqueue released-root candidates"
+        );
+        assert!(persisted_dead_object_queue_exists(&fs));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_deadlist_held_snapshot_refusal_does_not_enqueue() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        seed_file(&mut fs, "/held.txt", b"held snapshot");
+        fs.sync_all().expect("sync before snapshot");
+        fs.create_snapshot("held").expect("snapshot");
+        fs.hold_snapshot("held").expect("hold snapshot");
+        let baseline_queue_depth = receipt_bound_dead_object_queue_depth(&fs);
+
+        let err = fs.delete_snapshot("held").expect_err("held delete refused");
+        assert!(matches!(
+            err,
+            FileSystemError::SnapshotHeld { hold_count: 1, .. }
+        ));
+        assert!(fs.dataset_catalog().contains("root@held"));
+        assert_eq!(snapshot_catalog_pin_count(&fs), 1);
+        assert_eq!(
+            receipt_bound_dead_object_queue_depth(&fs),
+            baseline_queue_depth
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
