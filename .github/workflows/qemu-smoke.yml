@@ -78,7 +78,7 @@ jobs:
             output_dir: /tmp/tidefs-validation/ublk
           - id: receipt-bound-reclaim-runtime
             name: receipt-bound-reclaim-runtime
-            command: nix develop .#ci --command cargo run --locked -p tidefs-validation --bin receipt-bound-reclaim-validation -- --row receipt-bound-obsolete-location-trim --output-dir /tmp/tidefs-validation/receipt-bound-reclaim-runtime
+            command: nix develop .#ci --command cargo run --locked -p tidefs-validation --features receipt-bound-physical-reclaim --bin receipt-bound-reclaim-validation -- --row receipt-bound-obsolete-location-trim --output-dir /tmp/tidefs-validation/receipt-bound-reclaim-runtime
             output_dir: /tmp/tidefs-validation/receipt-bound-reclaim-runtime
 
     steps:

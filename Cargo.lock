@@ -3883,6 +3883,7 @@ dependencies = [
  "tidefs-posix-semantics",
  "tidefs-reclaim",
  "tidefs-reclaim-queue-core",
+ "tidefs-segment-cleaner",
  "tidefs-send-stream",
  "tidefs-space-accounting",
  "tidefs-trace-oracle",
