@@ -5510,7 +5510,7 @@ fn write_throttle_does_not_block_fitting_writes() {
 }
 
 // ---------------------------------------------------------------------------
-// Automatic space accounting via current_dataset_id context
+// Test-only automatic space accounting via current_dataset_id context
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -5534,7 +5534,7 @@ mod space_accounting_auto_tests {
         store.set_current_dataset_id(DS1);
         assert_eq!(store.current_dataset_id(), Some(DS1));
 
-        // put() auto-increments bytes_used via space_book.record_write().
+        // Test builds can auto-increment bytes_used via space_book.record_write().
         let _key_a = store.put(ObjectKey::from_name("a"), b"hello").unwrap().key;
         let _key_b = store.put(ObjectKey::from_name("b"), b"world!").unwrap().key;
 
@@ -5542,6 +5542,48 @@ mod space_accounting_auto_tests {
         assert!(usage.bytes_used > 0);
         // The dataset should be dirty (not yet persisted).
         assert!(store.space_accounting_dirty());
+    }
+
+    #[test]
+    fn committed_sync_overwrites_test_only_auto_context_before_persist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        {
+            let mut store =
+                LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+                    .expect("open store");
+            store.set_current_dataset_id(DS1);
+            store
+                .put(ObjectKey::from_name("raw-fixture"), b"raw fixture bytes")
+                .unwrap();
+
+            let raw_usage = store.space_book.get_dataset_usage(DS1).unwrap();
+            assert!(raw_usage.bytes_used > 0);
+            assert_ne!(raw_usage.bytes_used, 12_345);
+
+            store.sync_dataset_counters(DS1, 12_345, 678);
+            let committed_usage = store.get_dataset_usage(DS1).unwrap();
+            assert_eq!(committed_usage.bytes_used, 12_345);
+            assert_eq!(committed_usage.bytes_reserved, 678);
+
+            let persisted = store.persist_space_accounting().unwrap();
+            assert_eq!(persisted, 1);
+            assert!(
+                !store.space_accounting_dirty(),
+                "space accounting persistence must flush the committed snapshot"
+            );
+            store.sync_all().unwrap();
+        }
+
+        {
+            let mut store =
+                LocalObjectStore::open_with_options(dir.path(), StoreOptions::test_fast())
+                    .expect("reopen store");
+            assert_eq!(store.load_space_accounting().unwrap(), 1);
+            let usage = store.get_dataset_usage(DS1).unwrap();
+            assert_eq!(usage.bytes_used, 12_345);
+            assert_eq!(usage.bytes_reserved, 678);
+        }
     }
 
     #[test]

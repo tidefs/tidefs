@@ -52,13 +52,13 @@ pub use tidefs_types_space_accounting_core::{
 // StatfsResult — derived filesystem statistics for statfs(2)
 // ---------------------------------------------------------------------------
 
-/// Result of [`SpaceAccounting::statfs()`] ready for FUSE `statfs` or
-/// kernel `kstatfs`.
+/// Result of [`SpaceAccounting::statfs()`] for local projections.
 ///
 /// Mounted local-filesystem statfs currently reports through
 /// [`tidefs_local_filesystem::capacity_authority::CapacityStatfs`].
 /// This type is retained for crate-local tests and SpaceBook fallback while
-/// TFR-007 capacity unification remains open.
+/// TFR-007 capacity unification remains open; it is not the mounted
+/// `statfs`/ENOSPC authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatfsResult {
     /// Optimal transfer block size (f_bsize / f_frsize).
@@ -651,11 +651,14 @@ impl Default for SpaceAccounting {
 // SpaceBook — multi-dataset space accounting with dirty-flag persistence
 // ---------------------------------------------------------------------------
 
-/// Multi-dataset space accounting book.
+/// Multi-dataset committed-accounting projection book.
 ///
-/// Manages a per-dataset [`SpaceAccounting`] cache, tracks dirty datasets
-/// for deferred persistence, and exposes query APIs for pool-level and
-/// per-dataset usage.
+/// Manages a per-dataset [`SpaceAccounting`] cache, tracks committed counter
+/// snapshots that need deferred persistence, and exposes query APIs for
+/// pool-level and per-dataset usage. In the mounted local-filesystem stack,
+/// [`SpaceAccounting`] remains the commit authority: the object-store book is
+/// populated from absolute committed counters and then flushed as a persistence
+/// and projection sink, not as an independent mounted availability mirror.
 #[derive(Clone, Debug)]
 pub struct SpaceBook {
     datasets: HashMap<[u8; 16], SpaceAccounting>,
@@ -708,8 +711,11 @@ impl SpaceBook {
             .or_insert_with(SpaceAccounting::empty)
     }
 
-    /// Record a write of `bytes` to the dataset, incrementing usage.
+    /// Record a standalone write of `bytes` to the dataset, incrementing usage.
     ///
+    /// This helper is for raw-store producer tests and standalone store-local
+    /// accounting. Mounted filesystems persist committed counters through
+    /// [`set_committed_usage_dirty`](Self::set_committed_usage_dirty) instead.
     /// Marks the dataset dirty for deferred persistence.
     pub fn record_write(
         &mut self,
@@ -723,8 +729,11 @@ impl SpaceBook {
         Ok(())
     }
 
-    /// Record a deletion of `bytes` from the dataset, decrementing usage.
+    /// Record a standalone deletion of `bytes` from the dataset.
     ///
+    /// This helper is for raw-store producer tests and standalone store-local
+    /// accounting. Mounted filesystems persist committed counters through
+    /// [`set_committed_usage_dirty`](Self::set_committed_usage_dirty) instead.
     /// Marks the dataset dirty for deferred persistence.
     pub fn record_delete(
         &mut self,
@@ -822,14 +831,17 @@ impl SpaceBook {
         self.datasets.insert(record.dataset_id, restored);
     }
 
-    /// Set absolute usage counters for a dataset and mark it dirty.
+    /// Set absolute committed usage counters for a dataset and mark it dirty.
     ///
     /// Used to bridge the engine's [`SpaceAccounting`] to the [`SpaceBook`]
-    /// at commit time. The dataset is immediately marked dirty so
-    /// [`persist_space_accounting`] will flush it on the next sync.
-    ///
-    /// [`persist_space_accounting`]: crate::LocalObjectStore::persist_space_accounting
-    pub fn set_usage_dirty(&mut self, dataset_id: [u8; 16], logical_used: u64, reserved: u64) {
+    /// at commit time. The dataset is immediately marked dirty so the object
+    /// store will flush it on the next sync.
+    pub fn set_committed_usage_dirty(
+        &mut self,
+        dataset_id: [u8; 16],
+        logical_used: u64,
+        reserved: u64,
+    ) {
         let acct = self.get_or_create(dataset_id);
         let mut counters = *acct.counters();
         counters.logical_used_bytes = logical_used;
@@ -839,11 +851,12 @@ impl SpaceBook {
         self.dirty.insert(dataset_id);
     }
 
-    /// Compute statfs(2) fields for a dataset from its [`SpaceAccounting`].
+    /// Compute projection statfs(2) fields for a dataset.
     ///
     /// Propagates the SpaceBook-level pool counters into the dataset's
     /// [`SpaceAccounting`] before deriving the statfs result so that
-    /// physical capacity bounds are current.
+    /// physical capacity bounds are current. Mounted local-filesystem statfs
+    /// and ENOSPC decisions do not consume this independent projection.
     ///
     /// Returns `None` when the dataset has never been recorded in this book.
     #[must_use]
@@ -5760,10 +5773,10 @@ mod tests {
     }
 
     #[test]
-    fn space_book_set_usage_dirty_sets_counters() {
+    fn space_book_set_committed_usage_dirty_sets_counters() {
         let mut book = SpaceBook::new();
         let did = [1u8; 16];
-        book.set_usage_dirty(did, 4096, 1024);
+        book.set_committed_usage_dirty(did, 4096, 1024);
         assert!(book.has_dirty());
         assert_eq!(book.dirty_count(), 1);
         let usage = book.get_dataset_usage(did).unwrap();
@@ -5772,14 +5785,14 @@ mod tests {
     }
 
     #[test]
-    fn space_book_set_usage_dirty_overwrites_existing() {
+    fn space_book_set_committed_usage_dirty_overwrites_existing() {
         let mut book = SpaceBook::new();
         let did = [1u8; 16];
         book.record_write(did, 1000).unwrap();
         let _ = book.flush_dirty();
 
         // Overwrite with completely new values.
-        book.set_usage_dirty(did, 5000, 200);
+        book.set_committed_usage_dirty(did, 5000, 200);
         assert!(book.has_dirty());
         let usage = book.get_dataset_usage(did).unwrap();
         assert_eq!(usage.bytes_used, 5000);
@@ -5787,11 +5800,11 @@ mod tests {
     }
 
     #[test]
-    fn space_book_set_usage_dirty_then_flush_roundtrip() {
+    fn space_book_set_committed_usage_dirty_then_flush_roundtrip() {
         let mut book = SpaceBook::new();
         book.set_txg(7);
         let did = [1u8; 16];
-        book.set_usage_dirty(did, 8192, 512);
+        book.set_committed_usage_dirty(did, 8192, 512);
 
         let records = book.flush_dirty();
         assert_eq!(records.len(), 1);

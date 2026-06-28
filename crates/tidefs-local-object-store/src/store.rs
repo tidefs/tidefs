@@ -73,9 +73,9 @@ use tidefs_reclaim::{
 use tidefs_reclaim_queue_core::{
     BPlusTreeReclaimQueue, DeadObjectReclaimQueue, SegmentLivenessQueue,
 };
-use tidefs_space_accounting::{
-    DatasetSpaceUsage, Error as SpaceAccountingError, PoolCounters, SpaceBook, StatfsResult,
-};
+#[cfg(test)]
+use tidefs_space_accounting::Error as SpaceAccountingError;
+use tidefs_space_accounting::{DatasetSpaceUsage, PoolCounters, SpaceBook, StatfsResult};
 use tidefs_spacemap_allocator::{SegmentFreeMap, SpaceMapCheckpointV1};
 use tidefs_types_extent_map_core::{ExtentMapEntryV2, ExtentMapOps, LocatorId};
 use tidefs_types_reclaim_queue_core::{
@@ -484,11 +484,14 @@ pub struct LocalObjectStore {
     /// Set via StoreOptions on open; can be changed at runtime via
     /// [`set_durability_layout`].
     pub(crate) durability_layout: Option<DurabilityLayoutV1>,
-    /// Multi-dataset space accounting book with dirty-flag persistence.
+    /// Multi-dataset committed-counter projection with dirty-flag persistence.
     pub(crate) space_book: SpaceBook,
-    /// Current dataset context for automatic space accounting.
-    /// Set by the caller before issuing writes. Writes and deletes
-    /// will automatically update the SpaceBook for this dataset.
+    /// Test-only dataset context for raw-store SpaceBook producer fixtures.
+    ///
+    /// Production mounted accounting is committed by the filesystem through
+    /// `sync_dataset_counters`; store writes and deletes must not update an
+    /// independent mounted capacity mirror.
+    #[cfg(test)]
     pub(crate) current_dataset_id: Option<[u8; 16]>,
     /// Per-object BLAKE3 domain-separated checksums for read-path verification.
     /// Computed on every `put` and persisted within the transaction group commit.
@@ -1598,6 +1601,7 @@ impl LocalObjectStore {
             compression_stats: CompressionStats::default(),
             durability_layout: None,
             space_book: SpaceBook::default(),
+            #[cfg(test)]
             current_dataset_id: None,
             checksums: BTreeMap::new(),
             block_device_mode: true,
@@ -1896,6 +1900,7 @@ impl LocalObjectStore {
             compression_stats: CompressionStats::default(),
             durability_layout,
             space_book: SpaceBook::new(),
+            #[cfg(test)]
             current_dataset_id: None,
             checksums: BTreeMap::new(),
             block_device_mode: false,
@@ -3581,16 +3586,10 @@ impl LocalObjectStore {
                         .apply_delta(location.segment_id, 1);
                 }
 
-                // Auto-update space accounting: overwrite replaces old data.
+                // Test-only raw-store accounting fixtures can model overwrite.
                 if !internal_metadata {
-                    if let Some(ds_id) = self.current_dataset_id {
-                        if old_loc.payload_len > 0 {
-                            let _ = self.space_book.record_delete(ds_id, old_loc.payload_len);
-                        }
-                        if payload_len > 0 {
-                            let _ = self.space_book.record_write(ds_id, payload_len);
-                        }
-                    }
+                    self.record_test_current_dataset_delete(old_loc.payload_len);
+                    self.record_test_current_dataset_write(payload_len);
                 }
             }
         } else if track_liveness && !internal_metadata {
@@ -3601,12 +3600,8 @@ impl LocalObjectStore {
                 .live_counts_mut()
                 .apply_delta(location.segment_id, 1);
 
-            // Auto-update space accounting for new objects.
-            if let Some(ds_id) = self.current_dataset_id {
-                if payload_len > 0 {
-                    let _ = self.space_book.record_write(ds_id, payload_len);
-                }
-            }
+            // Test-only raw-store accounting fixtures can model new objects.
+            self.record_test_current_dataset_write(payload_len);
         }
         self.history.entry(key).or_default().push(location);
         self.index.insert(key, location);
@@ -4081,12 +4076,8 @@ impl LocalObjectStore {
             self.segment_liveness
                 .record_delete(loc.segment_id, loc.payload_len);
 
-            // Auto-update space accounting for deletions.
-            if let Some(ds_id) = self.current_dataset_id {
-                if loc.payload_len > 0 {
-                    let _ = self.space_book.record_delete(ds_id, loc.payload_len);
-                }
-            }
+            // Test-only raw-store accounting fixtures can model deletions.
+            self.record_test_current_dataset_delete(loc.payload_len);
         }
 
         self.index.remove(&key);
@@ -5448,15 +5439,50 @@ impl LocalObjectStore {
         }
         Ok(())
     }
+
+    fn record_test_current_dataset_write(&mut self, bytes: u64) {
+        #[cfg(test)]
+        {
+            if bytes == 0 {
+                return;
+            }
+            if let Some(dataset_id) = self.current_dataset_id {
+                let _ = self.space_book.record_write(dataset_id, bytes);
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = bytes;
+        }
+    }
+
+    fn record_test_current_dataset_delete(&mut self, bytes: u64) {
+        #[cfg(test)]
+        {
+            if bytes == 0 {
+                return;
+            }
+            if let Some(dataset_id) = self.current_dataset_id {
+                let _ = self.space_book.record_delete(dataset_id, bytes);
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = bytes;
+        }
+    }
+
     // ── Space accounting API ─────────────────────────────────────────
 
-    /// Record a logical write of `bytes` to `dataset_id`, incrementing
-    /// per-dataset usage counter. Marks the dataset dirty for deferred
-    /// persistence.
+    /// Record a test-only raw-store write of `bytes` to `dataset_id`.
     ///
-    /// The caller (filesystem layer) must supply the owning dataset ID.
-    /// Returns `Err(SpaceAccountingError::QuotaExceeded)` when the write
-    /// would exceed the dataset's quota ceiling.
+    /// Production mounted filesystems commit absolute engine
+    /// [`SpaceAccounting`] counters through [`sync_dataset_counters`]; this
+    /// helper is retained for lower-level SpaceBook producer tests only.
+    ///
+    /// [`SpaceAccounting`]: tidefs_space_accounting::SpaceAccounting
+    /// [`sync_dataset_counters`]: Self::sync_dataset_counters
+    #[cfg(test)]
     pub fn record_dataset_write(
         &mut self,
         dataset_id: [u8; 16],
@@ -5465,12 +5491,15 @@ impl LocalObjectStore {
         self.space_book.record_write(dataset_id, bytes)
     }
 
-    /// Record a logical deletion of `bytes` from `dataset_id`, decrementing
-    /// per-dataset usage counter. Marks the dataset dirty for deferred
-    /// persistence.
+    /// Record a test-only raw-store deletion of `bytes` from `dataset_id`.
     ///
-    /// Returns `Err(SpaceAccountingError::CounterUnderflow)` when the
-    /// deletion would underflow the counter (no-op, counter unchanged).
+    /// Production mounted filesystems commit absolute engine
+    /// [`SpaceAccounting`] counters through [`sync_dataset_counters`]; this
+    /// helper is retained for lower-level SpaceBook producer tests only.
+    ///
+    /// [`SpaceAccounting`]: tidefs_space_accounting::SpaceAccounting
+    /// [`sync_dataset_counters`]: Self::sync_dataset_counters
+    #[cfg(test)]
     pub fn record_dataset_delete(
         &mut self,
         dataset_id: [u8; 16],
@@ -5492,11 +5521,13 @@ impl LocalObjectStore {
         self.space_book.get_pool_usage()
     }
 
-    /// Compute statfs(2) fields for a dataset from the store-layer
+    /// Compute projection statfs(2) fields for a dataset from the store-layer
     /// [`SpaceBook`].
     ///
     /// Propagates SpaceBook-level pool counters before deriving the result.
-    /// Returns `None` when the dataset has never been recorded.
+    /// Mounted local-filesystem `statfs`/`statvfs` and ENOSPC do not read this
+    /// independent projection; they use the engine capacity authority. Returns
+    /// `None` when the dataset has never been recorded.
     #[must_use]
     pub fn statfs_for_dataset(&mut self, dataset_id: [u8; 16]) -> Option<StatfsResult> {
         self.space_book.statfs_for_dataset(dataset_id)
@@ -5510,7 +5541,7 @@ impl LocalObjectStore {
         self.space_book.update_pool_counters(counters);
     }
 
-    /// Set absolute usage counters for a dataset and mark it dirty.
+    /// Set absolute committed usage counters for a dataset and mark it dirty.
     ///
     /// Bridges the engine-layer [`tidefs_space_accounting::SpaceAccounting`]
     /// to the store-layer [`tidefs_space_accounting::SpaceBook`] at
@@ -5523,7 +5554,7 @@ impl LocalObjectStore {
         reserved: u64,
     ) {
         self.space_book
-            .set_usage_dirty(dataset_id, logical_used, reserved);
+            .set_committed_usage_dirty(dataset_id, logical_used, reserved);
     }
 
     /// Whether any datasets have dirty space accounting counters awaiting
@@ -5533,26 +5564,28 @@ impl LocalObjectStore {
         self.space_book.has_dirty()
     }
 
-    /// Set the dataset context for automatic space accounting.
+    /// Set the test-only dataset context for raw-store accounting fixtures.
     ///
-    /// After this call, every write (`put`) and delete will automatically
-    /// update the SpaceBook for this dataset via `record_write` and
-    /// `record_delete`.  The context persists across multiple operations
-    /// until cleared.
+    /// In production builds this API is absent and `put`/`delete` do not
+    /// mutate `SpaceBook`; mounted persistence uses committed snapshots via
+    /// [`sync_dataset_counters`](Self::sync_dataset_counters).
+    #[cfg(test)]
     pub fn set_current_dataset_id(&mut self, dataset_id: [u8; 16]) {
         self.current_dataset_id = Some(dataset_id);
     }
 
-    /// Clear the current dataset context.
+    /// Clear the test-only dataset context.
     ///
-    /// Subsequent writes and deletes will not auto-update any dataset's
-    /// space accounting until `set_current_dataset_id` is called again.
+    /// Subsequent test writes and deletes will not update any dataset's raw
+    /// fixture accounting until `set_current_dataset_id` is called again.
+    #[cfg(test)]
     pub fn clear_current_dataset_id(&mut self) {
         self.current_dataset_id = None;
     }
 
-    /// Return the current dataset context, if set.
+    /// Return the test-only dataset context, if set.
     #[must_use]
+    #[cfg(test)]
     pub fn current_dataset_id(&self) -> Option<[u8; 16]> {
         self.current_dataset_id
     }
@@ -5571,21 +5604,35 @@ impl LocalObjectStore {
         }
 
         let mut hex_ids: Vec<String> = Vec::with_capacity(count);
-        for rec in &records {
-            let hex = rec
-                .dataset_id
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            hex_ids.push(hex.clone());
-            let key_name = format!("__space_acct_{hex}");
-            let payload = rec.to_bytes().to_vec();
-            let _ = self.put_named(key_name.as_bytes(), &payload)?;
+        #[cfg(test)]
+        let saved_current_dataset_id = self.current_dataset_id.take();
+
+        let result = (|| -> Result<()> {
+            for rec in &records {
+                let hex = rec
+                    .dataset_id
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                hex_ids.push(hex.clone());
+                let key_name = format!("__space_acct_{hex}");
+                let payload = rec.to_bytes().to_vec();
+                let _ = self.put_named(key_name.as_bytes(), &payload)?;
+            }
+
+            // These are persistence metadata writes, not raw fixture writes.
+            let manifest: Vec<u8> = hex_ids.join("\n").into_bytes();
+            let _ = self.put_named(b"__space_acct_manifest", &manifest)?;
+
+            Ok(())
+        })();
+
+        #[cfg(test)]
+        {
+            self.current_dataset_id = saved_current_dataset_id;
         }
 
-        // Write a manifest so recovery can find all records by name.
-        let manifest: Vec<u8> = hex_ids.join("\n").into_bytes();
-        let _ = self.put_named(b"__space_acct_manifest", &manifest)?;
+        result?;
 
         Ok(count)
     }
