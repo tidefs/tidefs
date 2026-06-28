@@ -1935,13 +1935,19 @@ fn runtime_dispatch_evidence_refusal(
         input.media_path.media_capability_ref,
         input.decision.evidence_refs.media_capability_ref,
     );
-    if !input.decision.source_media_ref.is_bound()
-        || !input.decision.target_media_ref.is_bound()
-        || !media_capability_ref.is_bound()
-        || !snapshot_contains_ref(input, input.decision.source_media_ref)
-        || !snapshot_contains_ref(input, input.decision.target_media_ref)
-        || !snapshot_contains_ref(input, media_capability_ref)
-    {
+    if !snapshot_contains_fresh_ref(
+        input,
+        StorageIntentEvidenceKind::MediaCapabilityEvidence,
+        input.decision.source_media_ref,
+    ) || !snapshot_contains_fresh_ref(
+        input,
+        StorageIntentEvidenceKind::MediaCapabilityEvidence,
+        input.decision.target_media_ref,
+    ) || !snapshot_contains_fresh_ref(
+        input,
+        StorageIntentEvidenceKind::MediaCapabilityEvidence,
+        media_capability_ref,
+    ) {
         return StorageIntentRefusalReason::MissingMediaCapabilityEvidence;
     }
 
@@ -1951,14 +1957,27 @@ fn runtime_dispatch_evidence_refusal(
         return StorageIntentRefusalReason::PolicyConflict;
     }
 
+    if !snapshot_contains_fresh_ref(
+        input,
+        StorageIntentEvidenceKind::ReadFreshnessEvidence,
+        input.decision.evidence_refs.read_serving_boundary_ref,
+    ) {
+        return StorageIntentRefusalReason::EvidenceNotUsable;
+    }
     if !input.media_path.source_path_ref.is_bound()
         || !input.media_path.target_destination_ref.is_bound()
     {
         return StorageIntentRefusalReason::UnstableNamespaceIdentity;
     }
-    if !snapshot_contains_ref(input, input.media_path.source_path_ref)
-        || !snapshot_contains_ref(input, input.media_path.target_destination_ref)
-    {
+    if !snapshot_contains_fresh_ref(
+        input,
+        StorageIntentEvidenceKind::ReadFreshnessEvidence,
+        input.media_path.source_path_ref,
+    ) || !snapshot_contains_fresh_ref(
+        input,
+        StorageIntentEvidenceKind::ActionExecutionEvidence,
+        input.media_path.target_destination_ref,
+    ) {
         return StorageIntentRefusalReason::EvidenceNotUsable;
     }
 
@@ -1967,14 +1986,22 @@ fn runtime_dispatch_evidence_refusal(
             input.media_path.transport_path_ref,
             input.decision.evidence_refs.transport_budget_ref,
         );
-        if !transport_path_ref.is_bound() || !snapshot_contains_ref(input, transport_path_ref) {
+        if !snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::TransportPathEvidence,
+            transport_path_ref,
+        ) {
             return StorageIntentRefusalReason::EvidenceNotUsable;
         }
         let trust_domain_ref = first_bound(
             input.media_path.trust_domain_ref,
             input.decision.evidence_refs.trust_domain_ref,
         );
-        if !trust_domain_ref.is_bound() || !snapshot_contains_ref(input, trust_domain_ref) {
+        if !snapshot_contains_fresh_ref(
+            input,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            trust_domain_ref,
+        ) {
             return StorageIntentRefusalReason::StaleTrustEvidence;
         }
     }
@@ -3211,6 +3238,69 @@ mod tests {
             outside_cut_record.refusal,
             StorageIntentRefusalReason::EvidenceNotUsable
         );
+
+        let mut wrong_source_kind =
+            admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        wrong_source_kind.media_path.source_path_ref =
+            wrong_source_kind.media_path.target_destination_ref;
+        let wrong_source_kind_record = evaluate_prefetch_execution(wrong_source_kind);
+        assert_eq!(
+            wrong_source_kind_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            wrong_source_kind_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut wrong_target_kind =
+            admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        wrong_target_kind.media_path.target_destination_ref =
+            wrong_target_kind.media_path.source_path_ref;
+        let wrong_target_kind_record = evaluate_prefetch_execution(wrong_target_kind);
+        assert_eq!(
+            wrong_target_kind_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            wrong_target_kind_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+    }
+
+    #[test]
+    fn admitted_runtime_dispatch_requires_read_serving_boundary_ref() {
+        let mut missing_boundary =
+            admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        missing_boundary
+            .decision
+            .evidence_refs
+            .read_serving_boundary_ref = EMPTY_EVIDENCE_REF;
+        let missing_boundary_record = evaluate_prefetch_execution(missing_boundary);
+        assert_eq!(
+            missing_boundary_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            missing_boundary_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut wrong_boundary_kind =
+            admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        wrong_boundary_kind
+            .decision
+            .evidence_refs
+            .read_serving_boundary_ref = wrong_boundary_kind.media_path.target_destination_ref;
+        let wrong_boundary_kind_record = evaluate_prefetch_execution(wrong_boundary_kind);
+        assert_eq!(
+            wrong_boundary_kind_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            wrong_boundary_kind_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
     }
 
     #[test]
@@ -3255,6 +3345,34 @@ mod tests {
         );
         assert_eq!(
             missing_role_media_record.refusal,
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        );
+
+        let mut wrong_source_kind =
+            admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        wrong_source_kind.decision.source_media_ref = wrong_source_kind.media_path.source_path_ref;
+        let wrong_source_kind_record = evaluate_prefetch_execution(wrong_source_kind);
+        assert_eq!(
+            wrong_source_kind_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            wrong_source_kind_record.refusal,
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        );
+
+        let mut wrong_role_kind = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        wrong_role_kind.media_path.media_capability_ref =
+            wrong_role_kind.media_path.source_path_ref;
+        wrong_role_kind.decision.evidence_refs.media_capability_ref =
+            wrong_role_kind.media_path.source_path_ref;
+        let wrong_role_kind_record = evaluate_prefetch_execution(wrong_role_kind);
+        assert_eq!(
+            wrong_role_kind_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            wrong_role_kind_record.refusal,
             StorageIntentRefusalReason::MissingMediaCapabilityEvidence
         );
     }
@@ -3336,6 +3454,53 @@ mod tests {
         );
         assert_eq!(
             missing_trust_record.refusal,
+            StorageIntentRefusalReason::StaleTrustEvidence
+        );
+
+        let mut wrong_transport_kind =
+            admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        wrong_transport_kind.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut wrong_transport_kind.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        wrong_transport_kind.media_path.transport_path_ref =
+            wrong_transport_kind.media_path.source_path_ref;
+        wrong_transport_kind
+            .decision
+            .evidence_refs
+            .transport_budget_ref = wrong_transport_kind.media_path.source_path_ref;
+        let wrong_transport_kind_record = evaluate_prefetch_execution(wrong_transport_kind);
+        assert_eq!(
+            wrong_transport_kind_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            wrong_transport_kind_record.refusal,
+            StorageIntentRefusalReason::EvidenceNotUsable
+        );
+
+        let mut wrong_trust_kind =
+            admitted_input(PrefetchResidencyCandidateClass::ObjectArchiveRestoreStage);
+        wrong_trust_kind.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut wrong_trust_kind.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        wrong_trust_kind.media_path.trust_domain_ref = wrong_trust_kind.media_path.source_path_ref;
+        wrong_trust_kind.decision.evidence_refs.trust_domain_ref =
+            wrong_trust_kind.media_path.source_path_ref;
+        let wrong_trust_kind_record = evaluate_prefetch_execution(wrong_trust_kind);
+        assert_eq!(
+            wrong_trust_kind_record.outcome,
+            PrefetchExecutorOutcome::Blocked
+        );
+        assert_eq!(
+            wrong_trust_kind_record.refusal,
             StorageIntentRefusalReason::StaleTrustEvidence
         );
     }
