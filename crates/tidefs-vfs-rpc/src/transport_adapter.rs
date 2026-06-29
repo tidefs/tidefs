@@ -124,12 +124,18 @@ struct PendingTransportRequest {
     retries: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PendingTransportKey {
+    peer: PeerId,
+    op_id: OpId,
+}
+
 /// VFS_RPC transport-envelope adapter.
 #[derive(Clone, Debug)]
 pub struct VfsRpcTransportAdapter {
     config: VfsRpcTransportAdapterConfig,
     sessions: TransportSessionSet,
-    pending: BTreeMap<OpId, PendingTransportRequest>,
+    pending: BTreeMap<PendingTransportKey, PendingTransportRequest>,
 }
 
 impl VfsRpcTransportAdapter {
@@ -173,8 +179,12 @@ impl VfsRpcTransportAdapter {
         reject_request_bulk(request)?;
         let session_id = self.healthy_session_for(peer)?;
         let outbound = self.wrap_request_for_session(peer, session_id, request, context)?;
+        let key = PendingTransportKey {
+            peer,
+            op_id: request.header.op_id,
+        };
         self.pending.insert(
-            request.header.op_id,
+            key,
             PendingTransportRequest {
                 peer,
                 session_id,
@@ -274,14 +284,14 @@ impl VfsRpcTransportAdapter {
     /// Mark retryable requests whose retry timer has elapsed.
     pub fn retry_due(&mut self, now: Instant) -> Vec<VfsRpcRetrySignal> {
         let mut due = Vec::new();
-        for (op_id, pending) in &mut self.pending {
+        for (key, pending) in &mut self.pending {
             if now.saturating_duration_since(pending.last_attempt_at) >= self.config.retry_after {
                 pending.last_attempt_at = now;
                 pending.retries = pending.retries.saturating_add(1);
                 due.push(VfsRpcRetrySignal {
                     peer: pending.peer,
                     session_id: pending.session_id,
-                    op_id: *op_id,
+                    op_id: key.op_id,
                     method: pending.method,
                     retries: pending.retries,
                     retry_after: self.config.retry_after,
@@ -293,12 +303,12 @@ impl VfsRpcTransportAdapter {
 
     /// Expire requests that exceeded the configured request timeout.
     pub fn expire_timed_out(&mut self, now: Instant) -> Vec<VfsRpcTimeoutSignal> {
-        let expired: Vec<OpId> = self
+        let expired: Vec<PendingTransportKey> = self
             .pending
             .iter()
-            .filter_map(|(op_id, pending)| {
+            .filter_map(|(key, pending)| {
                 if now.saturating_duration_since(pending.sent_at) >= self.config.request_timeout {
-                    Some(*op_id)
+                    Some(*key)
                 } else {
                     None
                 }
@@ -306,12 +316,12 @@ impl VfsRpcTransportAdapter {
             .collect();
 
         let mut signals = Vec::with_capacity(expired.len());
-        for op_id in expired {
-            if let Some(pending) = self.pending.remove(&op_id) {
+        for key in expired {
+            if let Some(pending) = self.pending.remove(&key) {
                 signals.push(VfsRpcTimeoutSignal {
                     peer: pending.peer,
                     session_id: pending.session_id,
-                    op_id,
+                    op_id: key.op_id,
                     method: pending.method,
                     timeout: self.config.request_timeout,
                 });
@@ -402,11 +412,17 @@ impl VfsRpcTransportAdapter {
         session_id: SessionId,
         response: &VfsRpcResponse,
     ) -> Result<(), VfsRpcTransportAdapterError> {
-        let pending = *self.pending.get(&response.header.op_id).ok_or(
-            VfsRpcTransportAdapterError::UnknownResponse {
-                op_id: response.header.op_id,
-            },
-        )?;
+        let key = PendingTransportKey {
+            peer,
+            op_id: response.header.op_id,
+        };
+        let pending =
+            *self
+                .pending
+                .get(&key)
+                .ok_or(VfsRpcTransportAdapterError::UnknownResponse {
+                    op_id: response.header.op_id,
+                })?;
         if pending.peer != peer || pending.session_id != session_id {
             return Err(VfsRpcTransportAdapterError::ResponsePeerMismatch {
                 op_id: response.header.op_id,
@@ -424,7 +440,7 @@ impl VfsRpcTransportAdapter {
                 },
             ));
         }
-        self.pending.remove(&response.header.op_id);
+        self.pending.remove(&key);
         Ok(())
     }
 }
@@ -846,6 +862,68 @@ mod tests {
             }
             other => panic!("expected response, got {other:?}"),
         }
+        assert_eq!(adapter.pending_len(), 0);
+    }
+
+    #[test]
+    fn response_completion_keys_op_id_by_peer() {
+        let peer_a = PeerId(9);
+        let peer_b = PeerId(10);
+        let session_a = SessionId::new(33);
+        let session_b = SessionId::new(34);
+        let now = Instant::now();
+        let mut sessions = healthy_sessions(peer_a, session_a);
+        sessions.add_binding(peer_b.0, session_b);
+        sessions.mark_healthy(session_b);
+        let mut adapter =
+            VfsRpcTransportAdapter::new(VfsRpcTransportAdapterConfig::default(), sessions);
+        let request = VfsRpcRequest::new(
+            OpId(7),
+            2,
+            3,
+            0,
+            VfsRpcRequestPayload::Lookup {
+                parent: InodeId(1),
+                name: b"name".to_vec(),
+            },
+            None,
+        )
+        .expect("request");
+
+        adapter
+            .begin_request(peer_a, &request, now, VfsRpcEnvelopeContext::default())
+            .expect("begin peer a");
+        adapter
+            .begin_request(peer_b, &request, now, VfsRpcEnvelopeContext::default())
+            .expect("begin peer b");
+        assert_eq!(adapter.pending_len(), 2);
+
+        let response =
+            VfsRpcResponse::error(OpId(7), VfsRpcMethod::Lookup, Errno::ENOENT).expect("response");
+        let outbound_a = adapter
+            .wrap_response_for_session(
+                peer_a,
+                session_a,
+                &response,
+                VfsRpcEnvelopeContext::default(),
+            )
+            .expect("wrap peer a response");
+        adapter
+            .unwrap_inbound(now, &outbound_a.envelope, &outbound_a.payload)
+            .expect("unwrap peer a response");
+        assert_eq!(adapter.pending_len(), 1);
+
+        let outbound_b = adapter
+            .wrap_response_for_session(
+                peer_b,
+                session_b,
+                &response,
+                VfsRpcEnvelopeContext::default(),
+            )
+            .expect("wrap peer b response");
+        adapter
+            .unwrap_inbound(now, &outbound_b.envelope, &outbound_b.payload)
+            .expect("unwrap peer b response");
         assert_eq!(adapter.pending_len(), 0);
     }
 
