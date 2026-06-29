@@ -578,6 +578,65 @@ larger than this documentation-authority cleanup.
 | `docs/design/v1-locator-table-inline-hash.md` | Historical input | Imported V1 locator-table inline-hash design that names `crates/tidefs-locator-table`. Promotion would require a focused locator-table source, validation, and claims-gate review. |
 | `docs/design/workload-adaptive-recordsize-and-extent-shaping.md` | Historical input | Imported workload-adaptive recordsize/extent-shaping design. It contains policy and performance implications that need storage allocator, extent, and claims evidence before becoming current authority. |
 
+### Background Service Framework Scheduler Authority (TFR-019 / #1537)
+
+Classified for TFR-019 / GitHub issue #1537 on 2026-06-29 after reviewing this
+register's authority rule and review method, the TFR-019 notes in
+`docs/REVIEW_TODO_REGISTER.md`, `docs/WHOLE_REPO_REVIEW.md`, the root
+background-service redirect, every tracked
+`docs/design/background-service-framework-*.md` file, live scheduler source in
+`crates/tidefs-background-scheduler/src/lib.rs`,
+`crates/tidefs-background-scheduler/src/scheduler.rs`,
+`crates/tidefs-background-scheduler/src/scheduling.rs`, and
+`crates/tidefs-background-scheduler/src/multi_threaded.rs`,
+`validation/claims.toml`, and `docs/CLAIM_REGISTRY.md`.
+
+Selected alternative: keep the imported background-service framework design
+family as historical input and retarget the reader-facing redirect/design entry
+points to this authority boundary. The live `tidefs-background-scheduler` source
+does contain a narrow source-matched scheduler contract: `ServicePriority`,
+`ServiceBudget`, `TickReport`, `CycleReport`, `BackgroundService`,
+`IncrementalJobAdapter`, `BackgroundScheduler::{register, submit, poll,
+run_cycle, tick_if_idle}`, durable dispatch registration helpers, the
+`scheduling.rs` lane queue and `Schedulable`/`PollResult` contract, and the
+feature-gated `multi_threaded.rs` scheduler types. That contract is current
+source behavior, not a promotion of the imported design documents to current
+spec.
+
+The checked claims surface does not validate broader runtime or product wording.
+`validation/claims.toml` and generated `docs/CLAIM_REGISTRY.md` still keep
+`scheduler.dirty_debt.no_hidden.v1` blocked, scrub foreground-read protection
+planned, and storage-intent successor/comparator wording blocked. This slice
+therefore does not claim production scheduler readiness, no-hidden-queue
+closure, FUSE-loop integration, lower latency, stronger crash recovery, operator
+visibility, release readiness, or superiority over OpenZFS, Ceph, DRBD, or local
+filesystems. Forgejo issue closeout, `Maturity:` status, phase-completion,
+implementation-status, multi-threaded-runtime, and product-comparison wording in
+the files below remain historical lineage only.
+
+Future promotion beyond the source API must be split by non-overlapping write
+sets: scheduler API/reference wording belongs to the scheduler crate or a new
+focused scheduler-authority doc; FUSE-loop integration belongs to the POSIX/FUSE
+runtime paths; no-hidden-queue and foreground-read claims belong to
+`validation/claims.toml` plus validation artifacts; multi-threaded runtime
+claims belong to `crates/tidefs-background-scheduler/src/multi_threaded.rs` plus
+focused runtime evidence; product-comparison claims remain under the #875
+claim/comparator evidence path.
+
+| Path | State | Classification note |
+|---|---|---|
+| `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md` | Historical input | Redirect into the imported background-service design lineage. It now points readers at this register boundary; it is not current scheduler/runtime authority, phase-completion evidence, FUSE-loop proof, no-hidden-queue proof, release readiness, or product-comparison permission. |
+| `docs/design/background-service-framework-canonical-consolidation.md` | Historical input | Imported Forgejo-era consolidation note. It remains lineage for background-service review, but its design-spec and consolidation-status wording does not override the live `tidefs-background-scheduler` source contract or current claims gate. |
+| `docs/design/background-service-framework-coordination-confirmed.md` | Historical input | Imported coordination-confirmed note with sealed-design and implementation-status framing. It is not current scheduler/runtime authority or proof that no further design or runtime evidence is required. |
+| `docs/design/background-service-framework-design-1803.md` | Historical input | Imported background-service design iteration. It is useful design context for the scheduler trait/priority/budget review but is not current service-contract authority. |
+| `docs/design/background-service-framework-design-1962.md` | Historical input | Imported self-contained background-service design summary that points at the old Forgejo consolidation lineage. It was not previously classified in the #689 table; this slice preserves it as historical input, not current architecture, runtime, or product-status authority. |
+| `docs/design/background-service-framework-design-enhanced.md` | Historical input | Imported enhanced design variant. Source review in this slice does not validate its lifecycle, starvation, backpressure, observability, or implementation-status claims, so it remains review material. |
+| `docs/design/background-service-framework-design-spec.md` | Historical input | Imported design-spec/roadmap variant. The live scheduler source supports only the narrow API behavior named above; the broader roadmap, phase, runtime, and claims wording remains unpromoted. |
+| `docs/design/background-service-framework-design.md` | Historical input | Focused imported design entry point. It now carries an authority note; its scheduler API examples may inform source navigation, but its canonical-design, Maturity, phase-completion, FUSE integration, performance, crash-recovery, observability, and incumbent-comparison wording is not current product proof. |
+| `docs/design/background-service-framework-multithread-design.md` | Historical input | Imported multi-threaded design. `multi_threaded.rs` exposes feature-gated scheduler types, but this slice did not validate production multi-core runtime behavior, work stealing, cross-partition delivery, or operator-visible concurrency claims. |
+| `docs/design/background-service-framework-phases-5-10-wire-up-tracking-coordination-seal.md` | Historical input | Imported coordination-seal tracking note for phases 5-10. Its phase-closeout and sealed-design wording is historical planning state, not current implementation status. |
+| `docs/design/background-service-framework-phases-5-10-wire-up-tracking.md` | Historical input | Imported phase-tracking specification for phases 5-10. It remains useful follow-up planning input, but FUSE integration, derived catalog, data cleaner, segment cleaner, compaction, and runtime validation claims require separate source/validation slices. |
+
 ### Derived-Views Architectural Pillar (TFR-019 / #1240)
 
 Classified for TFR-019 / GitHub issue #1240 on 2026-06-24 after reviewing this
