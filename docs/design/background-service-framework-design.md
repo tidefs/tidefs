@@ -1,5 +1,14 @@
 # Background Service Framework Design (#1592, #1674, #1673, #1877, #1859, #1858, #1980, #1991, #2028, #2001, #2067)
 
+> **Authority note (TFR-019 / GitHub issue #1537):** this imported Forgejo-era
+> design remains historical input under `docs/DOCUMENTATION_AUTHORITY_REGISTER.md`.
+> The current source-matched scheduler contract is limited to the
+> `crates/tidefs-background-scheduler/` APIs and behavior reviewed in that
+> register entry. The `Maturity:`, issue-closeout, phase-completion,
+> FUSE-integration, runtime-readiness, performance, crash-recovery,
+> observability, and incumbent-comparison wording below is design lineage, not
+> current product or runtime proof.
+
 Maturity: **design-spec** for the unified background service framework: tick-driven
 scheduler, per-tick budget enforcement, 5-stage priority dispatch, round-robin
 fairness, validity-token stale-task prevention, derived catalog lifecycle, incremental
