@@ -10,10 +10,10 @@ This is not a production-readiness claim. TideFS remains a pre-alpha filesystem/
 
 | Counted set | Value |
 | --- | ---: |
-| Workspace packages | 165 |
+| Workspace packages | 166 |
 | Explicitly excluded package roots | 5 |
-| Discovered package manifests | 170 |
-| Classified package roots | 170 |
+| Discovered package manifests | 171 |
+| Classified package roots | 171 |
 
 ## TFR-002 Category Mapping
 
@@ -25,7 +25,7 @@ root.
 
 | TFR-002 category | Current roles | Count | Boundary |
 | --- | --- | ---: | --- |
-| `product` | `product-code`, `adapter-operator` | 143 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
+| `product` | `product-code`, `adapter-operator` | 144 | Shipped or planned-to-ship libraries, binaries, adapters, kernel surfaces, and operator entrypoints. |
 | `harness` | `policy-tooling`, `proof-harness`, `standalone-fuzz` | 25 | Repo policy tooling, CI/developer support, demos, validation harnesses, model/oracle crates, and excluded fuzz harnesses. |
 | `third-party` | `vendored-third-party` | 1 | Vendored or forked upstream code carried with separate provenance. |
 | `delete` | `scaffold-transitional`, `archive-delete-candidate` | 0 | No current package root is classified for deletion. Both roles are retired and rejected by `check-workspace-policy`; any future dead-scaffolding candidate must reference TFR-002/TFR-013 evidence and an issue-backed delete/archive plan. |
@@ -89,6 +89,7 @@ one-line justification. The table keeps the five machine-checked columns so
 | `crates/tidefs-block-volume-adapter-core` | `tidefs-block-volume-adapter-core` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
 | `crates/tidefs-block-volume-adapter-ublk-control-runtime` | `tidefs-block-volume-adapter-ublk-control-runtime` | `workspace-member` | `adapter-operator` | current adapter/operator surface; capability claims remain behind focused validation. |
 | `crates/tidefs-btree` | `tidefs-btree` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
+| `crates/tidefs-bulk-service` | `tidefs-bulk-service` | `workspace-member` | `product-code` | BULK service_id 0x07 state-machine surface for connection-scoped TCP_STREAM BulkToken transfers; RDMA, transport dispatcher, VFS_RPC adapter integration, and multi-node readiness remain separately gated. |
 | `crates/tidefs-cache-coherency` | `tidefs-cache-coherency` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-cache-core` | `tidefs-cache-core` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |
 | `crates/tidefs-checksum-tree` | `tidefs-checksum-tree` | `workspace-member` | `product-code` | current product component; capability claims remain limited by the review register. |

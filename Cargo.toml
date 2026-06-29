@@ -95,6 +95,7 @@ members = [
   "crates/tidefs-block-volume-adapter-core",
   "crates/tidefs-env-ublk-model",
   "crates/tidefs-block-volume-adapter-ublk-control-runtime",
+  "crates/tidefs-bulk-service",
   "crates/tidefs-ublk-abi",
   "crates/tidefs-local-object-store",
   "crates/tidefs-local-filesystem",
@@ -214,6 +215,7 @@ tidefs-block-volume-adapter-core = { path = "crates/tidefs-block-volume-adapter-
 tidefs-block-volume-adapter-daemon = { path = "apps/tidefs-block-volume-adapter-daemon" }
 tidefs-block-volume-adapter-ublk-control-runtime = { path = "crates/tidefs-block-volume-adapter-ublk-control-runtime" }
 tidefs-btree = { path = "crates/tidefs-btree" }
+tidefs-bulk-service = { path = "crates/tidefs-bulk-service" }
 tidefs-cache-coherency = { path = "crates/tidefs-cache-coherency" }
 tidefs-cache-core = { path = "crates/tidefs-cache-core" }
 tidefs-checksum-tree = { path = "crates/tidefs-checksum-tree" }

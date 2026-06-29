@@ -678,30 +678,31 @@ connection, a previous connection incarnation, or a completed/aborted transfer
 is invalid. VFS_RPC MUST NOT treat `kind=BULK` as live unless the local BULK
 service can look up the token in that same connection's transfer table.
 
-Current source status for the #1523 evidence pass, inspected at default-branch
-commit `6027445fe`:
+Current source status for the #1523 evidence pass:
 
 - `crates/tidefs-vfs-rpc/src/lib.rs` defines `InlineOrBulk::Bulk { token, len }`
   plus `REQ_FLAG_BULK_PENDING` and `RESP_FLAG_BULK`.
-- There is no `crates/tidefs-bulk-service/` workspace package, public
+- `crates/tidefs-bulk-service/` provides the BULK-owned `service_id = 0x07`
   `BulkService`/`BulkToken`/`BulkOffer` API, connection-scoped transfer table,
-  TCP_STREAM byte mover, or VFS_RPC handoff callback.
+  TCP_STREAM credit/data/DONE/ABORT state machine, CRC32C DONE verification,
+  and failed-transfer discard behavior. The crate is a service surface for a
+  future transport dispatcher; it is not a multi-node product-readiness claim.
 - `apps/tidefs-storage-node/src/protocol.rs` is still an object-store tag
   protocol, not a cluster service_id `0x07` BULK dispatcher.
 - `crates/tidefs-transport/src/boundedness.rs` exposes generic bulk-token
-  limits and a default bulk deadline for transport boundedness, but no current
-  source binds those limits to a live service_id `0x07` state machine.
+  limits and a default bulk deadline for transport boundedness, and the BULK
+  service consumes those bounds for TCP_STREAM transfer admission.
 
-Until that service surface exists, VFS_RPC endpoints may reject BULK
-descriptors as unsupported. They must not silently downgrade RDMA-capable BULK
-offers to TCP, claim RDMA readiness, or treat moved bytes as storage semantics
-authority.
+Until transport dispatch and the VFS_RPC handoff adapter consume that service
+surface, VFS_RPC endpoints may reject BULK descriptors as unsupported. They
+must not silently downgrade RDMA-capable BULK offers to TCP, claim RDMA
+readiness, or treat moved bytes as storage semantics authority.
 
-The remaining implementation blocker is therefore a BULK-owned service surface
-that can create and look up connection-scoped TCP_STREAM transfers by
-`BulkToken`, drive OFFER/ACCEPT/CREDIT/DONE/ABORT ordering, report timeout or
-ABORT completion to the waiting VFS_RPC operation, and discard failed-transfer
-bytes before any VFS Engine call observes them.
+The remaining implementation blocker is therefore transport/VFS_RPC integration
+that can dispatch service_id `0x07` frames to the BULK service, bind the
+transport-authenticated peer identity to the same connection that carries the
+VFS_RPC frame, and report timeout or ABORT completion to the waiting VFS_RPC
+operation before any VFS Engine call observes failed-transfer bytes.
 
 #### 12.1.1 WRITE with BULK
 
