@@ -1724,6 +1724,7 @@ pub fn finalize_prefetch_execution(
 
     if terminal_update_refs_outside_evidence_cut(record, update)
         || terminal_result_detail_lacks_feedback_evidence(record, update)
+        || terminal_update_lacks_result_refusal_evidence(record, update)
     {
         return terminal(
             record,
@@ -1907,6 +1908,19 @@ fn terminal_result_detail_lacks_feedback_evidence(
 ) -> bool {
     update.result_detail.has_feedback_payback_inputs()
         && !terminal_result_detail_has_cut_feedback_roots(record, update)
+}
+
+fn terminal_update_lacks_result_refusal_evidence(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    terminal_update_refusal(update) != StorageIntentRefusalReason::None
+        && !terminal_ref_in_cut(
+            record,
+            update.evidence_cut,
+            update.result_refusal_ref,
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+        )
 }
 
 fn initial_result_detail_lacks_feedback_evidence(input: PrefetchExecutorInput) -> bool {
@@ -4531,6 +4545,49 @@ mod tests {
     }
 
     #[test]
+    fn terminal_update_requires_result_refusal_root_for_refusal_outcomes() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+
+        for outcome in [
+            PrefetchExecutorOutcome::Dropped,
+            PrefetchExecutorOutcome::Throttled,
+            PrefetchExecutorOutcome::Stale,
+            PrefetchExecutorOutcome::TimedOut,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorOutcome::OverBudget,
+            PrefetchExecutorOutcome::VerificationFailed,
+            PrefetchExecutorOutcome::Blocked,
+            PrefetchExecutorOutcome::Unavailable,
+        ] {
+            let rejected = finalize_prefetch_execution(
+                started,
+                PrefetchExecutorTerminalUpdate {
+                    outcome,
+                    evidence_cut: terminal_evidence_cut(
+                        started,
+                        PrefetchExecutorResultDetail::default(),
+                        EMPTY_EVIDENCE_REF,
+                    ),
+                    ..PrefetchExecutorTerminalUpdate::default()
+                },
+            );
+
+            assert_eq!(
+                rejected.outcome,
+                PrefetchExecutorOutcome::VerificationFailed,
+                "outcome {outcome:?} did not require result/refusal evidence"
+            );
+            assert_eq!(
+                rejected.refusal,
+                StorageIntentRefusalReason::ValidationGateFailed
+            );
+            assert_record_has_no_authority_claims(rejected);
+        }
+    }
+
+    #[test]
     fn terminal_update_requires_started_record() {
         let mut input = admitted_input(PrefetchResidencyCandidateClass::NoPrefetch);
         input.decision.outcome = PrefetchResidencyDecisionOutcome::NoAction;
@@ -4652,12 +4709,17 @@ mod tests {
         ));
 
         let failed_detail = terminal_detail();
+        let failed_result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
         let failed = finalize_prefetch_execution(
             started,
             PrefetchExecutorTerminalUpdate {
                 outcome: PrefetchExecutorOutcome::VerificationFailed,
                 result_detail: failed_detail,
-                evidence_cut: terminal_evidence_cut(started, failed_detail, EMPTY_EVIDENCE_REF),
+                result_refusal_ref: failed_result_ref,
+                evidence_cut: terminal_evidence_cut(started, failed_detail, failed_result_ref),
                 ..PrefetchExecutorTerminalUpdate::default()
             },
         );
