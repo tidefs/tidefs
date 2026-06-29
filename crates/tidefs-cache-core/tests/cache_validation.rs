@@ -164,7 +164,12 @@ mod page_state_machine {
         assert!(h.is_dirty(), "dirty retained after failed writeback");
         assert!(!h.is_writeback(), "writeback cleared after failure");
         assert!(!h.is_pinned(), "pin cleared after failure");
-        assert_eq!(h.flags(), page_flags::DIRTY);
+        assert!(h.has_writeback_error(), "writeback error retained");
+        assert_eq!(h.flags() & page_flags::DIRTY, page_flags::DIRTY);
+        assert_eq!(
+            h.flags() & page_flags::WRITEBACK_ERROR,
+            page_flags::WRITEBACK_ERROR
+        );
         drop(h);
     }
 
@@ -188,13 +193,13 @@ mod page_state_machine {
     // ── 1h. Illegal / rejected transitions ──────────────────────────
 
     #[test]
-    fn start_writeback_on_clean_page_succeeds() {
+    fn start_writeback_on_clean_page_fails() {
         let cache = new_cache(10);
         insert_one(&cache, 9, 0);
-        assert!(cache.start_writeback(9, 0));
+        assert!(!cache.start_writeback(9, 0));
         let h = cache.lookup(9, 0).unwrap();
-        assert!(h.is_writeback());
-        assert!(h.is_pinned());
+        assert!(!h.is_writeback());
+        assert!(!h.is_pinned());
         assert!(!h.is_dirty());
         drop(h);
     }
@@ -655,7 +660,8 @@ mod lru_ordering {
         insert_one(&cache, 3, 0);
 
         // Pin page 1 (oldest) via start_writeback
-        cache.start_writeback(1, 0);
+        cache.mark_dirty(1, 0);
+        assert!(cache.start_writeback(1, 0));
 
         // Insert 4: should skip pinned 1, evict 2 (oldest clean unpinned)
         cache.insert(4, 0).unwrap();
@@ -675,8 +681,10 @@ mod lru_ordering {
         insert_one(&cache, 2, 0);
 
         // Pin both
-        cache.start_writeback(1, 0);
-        cache.start_writeback(2, 0);
+        cache.mark_dirty(1, 0);
+        cache.mark_dirty(2, 0);
+        assert!(cache.start_writeback(1, 0));
+        assert!(cache.start_writeback(2, 0));
 
         // Both pages are pinned — insert should fail
         let err = cache.insert(3, 0).unwrap_err();
@@ -691,8 +699,9 @@ mod lru_ordering {
         insert_one(&cache, 2, 0);
 
         // Pin 1 via writeback, then complete it
-        cache.start_writeback(1, 0);
-        cache.complete_writeback(1, 0, true);
+        cache.mark_dirty(1, 0);
+        assert!(cache.start_writeback(1, 0));
+        assert!(cache.complete_writeback(1, 0, true));
 
         // Now 1 is unpinned and clean. Insert 3 should evict the LRU.
         cache.insert(3, 0).unwrap();
@@ -775,6 +784,7 @@ mod pin_lifecycle {
     fn start_writeback_pins_page() {
         let cache = new_cache(10);
         insert_one(&cache, 1, 0);
+        cache.mark_dirty(1, 0);
         assert!(cache.start_writeback(1, 0));
         let h = cache.lookup(1, 0).unwrap();
         assert!(h.is_pinned());
@@ -796,7 +806,8 @@ mod pin_lifecycle {
         insert_one(&cache, 2, 0);
 
         // Pin 1 via writeback
-        cache.start_writeback(1, 0);
+        cache.mark_dirty(1, 0);
+        assert!(cache.start_writeback(1, 0));
 
         // Insert 3: must evict 2 (clean, not pinned), not 1
         cache.insert(3, 0).unwrap();
@@ -813,7 +824,8 @@ mod pin_lifecycle {
         insert_one(&cache, 3, 0);
 
         // Pin 1 (oldest)
-        cache.start_writeback(1, 0);
+        cache.mark_dirty(1, 0);
+        assert!(cache.start_writeback(1, 0));
 
         // evict_one should skip 1 and evict 2
         let evicted = cache.evict_one().unwrap();
@@ -827,7 +839,8 @@ mod pin_lifecycle {
     fn complete_writeback_unpins() {
         let cache = new_cache(10);
         insert_one(&cache, 1, 0);
-        cache.start_writeback(1, 0);
+        cache.mark_dirty(1, 0);
+        assert!(cache.start_writeback(1, 0));
         assert!(cache.complete_writeback(1, 0, true));
         let h = cache.lookup(1, 0).unwrap();
         assert!(!h.is_pinned(), "page unpinned after complete_writeback");
@@ -838,7 +851,8 @@ mod pin_lifecycle {
     fn abort_writeback_unpins() {
         let cache = new_cache(10);
         insert_one(&cache, 1, 0);
-        cache.start_writeback(1, 0);
+        cache.mark_dirty(1, 0);
+        assert!(cache.start_writeback(1, 0));
         assert!(cache.abort_writeback(1, 0));
         let h = cache.lookup(1, 0).unwrap();
         assert!(!h.is_pinned(), "page unpinned after abort_writeback");
@@ -849,8 +863,9 @@ mod pin_lifecycle {
     fn complete_writeback_unpins_even_on_failure() {
         let cache = new_cache(10);
         insert_one(&cache, 1, 0);
-        cache.start_writeback(1, 0);
-        cache.complete_writeback(1, 0, false);
+        cache.mark_dirty(1, 0);
+        assert!(cache.start_writeback(1, 0));
+        assert!(cache.complete_writeback(1, 0, false));
         let h = cache.lookup(1, 0).unwrap();
         assert!(!h.is_pinned(), "page unpinned even on failed writeback");
         drop(h);
@@ -886,6 +901,7 @@ mod pin_lifecycle {
     fn double_start_writeback_fails() {
         let cache = new_cache(10);
         insert_one(&cache, 1, 0);
+        cache.mark_dirty(1, 0);
         assert!(cache.start_writeback(1, 0));
         assert!(!cache.start_writeback(1, 0));
     }

@@ -10,7 +10,9 @@
 //! methods while holding a PageHandle, as that would deadlock on the
 //! internal mutex.
 
-use tidefs_cache_core::page_cache::{page_flags, InsertError, PageCache, PageKey};
+use tidefs_cache_core::page_cache::{
+    page_flags, InsertError, PageCache, PageKey, PageLifecycleState,
+};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -250,6 +252,58 @@ fn start_writeback_twice_fails() {
 
     assert!(cache.start_writeback(8, 0));
     assert!(!cache.start_writeback(8, 0));
+}
+
+#[test]
+fn writeback_requires_dirty_page() {
+    let cache = new_cache(10);
+    cache.insert(9, 0).unwrap();
+
+    assert!(
+        !cache.start_writeback(9, 0),
+        "clean pages must not enter writeback-pending state"
+    );
+    let h = cache.lookup(9, 0).unwrap();
+    assert_eq!(h.lifecycle_state(), PageLifecycleState::Clean);
+}
+
+#[test]
+fn writeback_failure_poisons_page_until_retry_success() {
+    let cache = new_cache(10);
+    cache.insert(10, 0).unwrap();
+    cache.mark_dirty(10, 0);
+    assert!(cache.start_writeback(10, 0));
+
+    assert!(cache.complete_writeback(10, 0, false));
+    {
+        let h = cache.lookup(10, 0).unwrap();
+        assert!(h.is_dirty());
+        assert!(h.has_writeback_error());
+        assert_eq!(h.lifecycle_state(), PageLifecycleState::ErrorPoisoned);
+    }
+    assert_eq!(
+        cache.invalidate_range(10, 0, PAGE_SIZE as u64),
+        0,
+        "poisoned dirty page must be preserved by invalidation"
+    );
+    assert!(
+        cache.evict_one().is_none(),
+        "poisoned dirty page must not be evicted as clean"
+    );
+
+    assert!(cache.start_writeback(10, 0));
+    {
+        let h = cache.lookup(10, 0).unwrap();
+        assert!(h.has_writeback_error());
+        assert_eq!(h.lifecycle_state(), PageLifecycleState::WritebackPending);
+    }
+    assert!(cache.complete_writeback(10, 0, true));
+    {
+        let h = cache.lookup(10, 0).unwrap();
+        assert!(!h.is_dirty());
+        assert!(!h.has_writeback_error());
+        assert_eq!(h.lifecycle_state(), PageLifecycleState::Clean);
+    }
 }
 
 // ── Group 4: concurrent access ────────────────────────────────────
