@@ -574,8 +574,8 @@ Important 2026-06-01 findings:
   namespace/data table is not the final object/extent/intent-log engine;
   page-cache/writeback authority remains at the TFR-008 boundary; block-kmod
   bring-up is not a full block-volume product claim; and the accepted T5
-  mounted-kernel cutover/teardown artifact from #1186 / PR #1463 does not
-  satisfy the T6 full-kernel/no-daemon claim gate. The kernel-resident
+  mounted-kernel cutover/teardown artifact from #1186 / PR #1463 is T5
+  evidence only, not full-kernel/no-daemon evidence for T6. The kernel-resident
   architecture doc remains the target-architecture spec and evidence-tier map.
 - `TFR-010`: Snapshot lifecycle is not single-sourced. Basic create/delete,
   clone create/delete/promote, hold-protected retention pruning, and catalog
