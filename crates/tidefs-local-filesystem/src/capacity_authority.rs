@@ -57,8 +57,10 @@
 //! │   Wire: quota_table.check_delta(..., pool_free) at every mutation point
 //! │
 //! ├── Pool physical counters (PoolPhysicalCountersV1)
-//! │   via derive_pool_physical_counters() -> capacity_authority
+//! │   via mounted_authority_projection() -> capacity_authority
 //! │   Wire: statfs() refresh and commit_space_delta() persistence
+//! │   Contract: only phys_total_bytes is an admitted mounted capacity input;
+//! │   physical free/reclaimable/watermark fields are lower-layer observations.
 //! │
 //! └── Transaction rollback
 //!     via snapshot_for_rollback() / restore_from_snapshot()
@@ -76,10 +78,12 @@
 //! report independently of the authority; the capacity-authority audit routes it
 //! through [`CapacityAuthority::free_bytes`]. Runtime TFR-007 follow-ups still
 //! track the remaining projection and persistence bridges. The
-//! `derive_pool_physical_counters()` path previously built
-//! `PoolPhysicalCountersV1` from `allocator_policy.content_capacity_bytes`
-//! and the allocator report; both `phys_total_bytes`
-//! and `phys_free_bytes` derive from [`CapacityAuthority`].
+//! `derive_pool_physical_counters()` path previously mixed
+//! `allocator_policy.content_capacity_bytes` with allocator free reports.
+//! Mounted refresh now consumes the sanitized
+//! `PoolPhysicalCountersV1::mounted_authority_projection()`: the lower
+//! physical-pool report may bound `phys_total_bytes`, while mounted free bytes
+//! and admission remain derived from committed accounting plus transient holds.
 
 //! # Production Call Graph
 //!
@@ -255,20 +259,11 @@ impl CapacityAuthority {
     }
 
     fn pool_counters_for_capacity(total_bytes: u64, consumed_bytes: u64) -> PoolPhysicalCountersV1 {
-        let block_size = StatfsResult::DEFAULT_BLOCK_SIZE;
-        let free_bytes = total_bytes.saturating_sub(consumed_bytes.min(total_bytes));
-        PoolPhysicalCountersV1 {
-            phys_free_segments: free_bytes / block_size,
-            // SpaceAccounting::phys_capacity_bytes currently uses
-            // phys_free_bytes as the absolute admission/statfs ceiling.
-            // Feed it the mounted capacity ceiling here; committed counters
-            // provide the consumption side of the calculation.
-            phys_free_bytes: total_bytes,
-            phys_reclaimable_bytes: 0,
-            phys_tail_reserved_segments: 0,
-            phys_total_segments: total_bytes / block_size,
-            phys_total_bytes: total_bytes,
-        }
+        PoolPhysicalCountersV1::mounted_authority_from_capacity(
+            total_bytes,
+            consumed_bytes,
+            StatfsResult::DEFAULT_BLOCK_SIZE,
+        )
     }
 
     /// Refresh the committed accounting mirror without changing the local
@@ -280,8 +275,10 @@ impl CapacityAuthority {
     ) {
         let mut committed = accounting.clone();
         let consumed = committed.counters().total_consumed_bytes();
-        let total = pool.phys_total_bytes;
-        committed.update_pool_counters(Self::pool_counters_for_capacity(total, consumed));
+        let mounted_pool =
+            pool.mounted_authority_projection(consumed, StatfsResult::DEFAULT_BLOCK_SIZE);
+        let total = mounted_pool.phys_total_bytes;
+        committed.update_pool_counters(mounted_pool);
         self.total_bytes.store(total, Ordering::Release);
         self.used_bytes
             .store(consumed.min(total), Ordering::Release);
@@ -1028,6 +1025,64 @@ mod tests {
         assert_eq!(s.free_blocks, (total - used) / u64::from(block_size));
         assert!(a.check_enospc(total - used).is_ok());
         assert_eq!(a.check_enospc(total - used + 1), Err(Errno(ENOSPC)));
+    }
+
+    #[test]
+    fn mounted_physical_pool_input_rejects_stale_free_claim() {
+        let block_size: u32 = 4096;
+        let total = 100 * 1024 * 1024;
+        let used = 80 * 1024 * 1024;
+        let counters = DatasetSpaceCountersV1 {
+            logical_used_bytes: used,
+            ..DatasetSpaceCountersV1::default()
+        };
+        let accounting = SpaceAccounting::new(counters, SpaceDomainId::NONE);
+        let a = CapacityAuthority::new(total, 0, block_size, 0);
+        let stale_pool_snapshot = PoolPhysicalCountersV1 {
+            phys_free_segments: u64::MAX,
+            phys_free_bytes: u64::MAX,
+            phys_reclaimable_bytes: u64::MAX,
+            phys_tail_reserved_segments: u64::MAX,
+            phys_total_segments: 1,
+            phys_total_bytes: total,
+        };
+
+        a.refresh_committed_accounting(&accounting, stale_pool_snapshot);
+
+        let free = total - used;
+        let s = a.derive_statfs(1000, 900, 255);
+        assert_eq!(a.free_bytes(), free);
+        assert_eq!(a.available_bytes(), free);
+        assert_eq!(s.free_blocks, free / u64::from(block_size));
+        assert!(a.check_enospc(free).is_ok());
+        assert_eq!(a.check_enospc(free + 1), Err(Errno(ENOSPC)));
+    }
+
+    #[test]
+    fn mounted_physical_pool_input_missing_total_fails_closed() {
+        let block_size: u32 = 4096;
+        let accounting =
+            SpaceAccounting::new(DatasetSpaceCountersV1::default(), SpaceDomainId::NONE);
+        let a = CapacityAuthority::new(100 * 1024 * 1024, 0, block_size, 0);
+        let missing_total_snapshot = PoolPhysicalCountersV1 {
+            phys_free_segments: u64::MAX,
+            phys_free_bytes: u64::MAX,
+            phys_reclaimable_bytes: u64::MAX,
+            phys_total_segments: u64::MAX,
+            phys_total_bytes: 0,
+            phys_tail_reserved_segments: 0,
+        };
+
+        a.refresh_committed_accounting(&accounting, missing_total_snapshot);
+
+        let s = a.derive_statfs(1000, 900, 255);
+        assert_eq!(a.total_bytes(), 0);
+        assert_eq!(a.free_bytes(), 0);
+        assert_eq!(a.available_bytes(), 0);
+        assert_eq!(s.total_blocks, 0);
+        assert_eq!(s.free_blocks, 0);
+        assert_eq!(s.avail_blocks, 0);
+        assert_eq!(a.check_enospc(1), Err(Errno(ENOSPC)));
     }
 
     #[test]
