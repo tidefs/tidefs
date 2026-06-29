@@ -95,12 +95,21 @@ may use non-secret repository variables for scheduling gates, such as
 - `Nix Checks` runs on self-hosted TideFS runners and builds pure check
   derivations plus the core Nix packages.
 - `QEMU Smoke` runs outside-sandbox kernel runtime rows on self-hosted
-  TideFS runners with KVM and FUSE access. Pushes to `master` run the default
-  `kmod-xfstests-smoke` target: load `tidefs_posix_vfs.ko`, mount the explicit
-  bootstrap VFS root, exercise supported directory/symlink/readdir/statfs
-  operations, and keep engine-backed storage checks in the longer filesystem
-  lanes. Manual dispatch can select the default target, the mounted
-  `kernel-mmap-validation` target, or both.
+  TideFS runners with KVM and FUSE access. Pushes to `master` run only the
+  standing `kmod-xfstests-smoke` target: load `tidefs_posix_vfs.ko`, mount the
+  explicit bootstrap VFS root, exercise supported
+  directory/symlink/readdir/statfs operations, and keep engine-backed storage
+  checks in the longer filesystem lanes. Manual `workflow_dispatch` exposes a
+  `target` choice for `kmod-xfstests-smoke`, `kernel-fsync-validation`,
+  `kernel-mmap-validation`, `kernel-teardown-validation`,
+  `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
+  `fuse-vm-test`, `qemu-ublk-smoke`, `receipt-bound-reclaim-runtime`, and
+  `all`; the full dispatch contract and artifact boundaries live in
+  `docs/QEMU_SMOKE_CONTRACT.md`. The QEMU Smoke
+  `kernel-fsync-validation` and `kernel-mmap-validation` rows are focused
+  runtime evidence surfaces. Dedicated workflows with the same flake refs remain
+  separate validation lanes when an issue tier requires standalone fsync/mmap
+  evidence, serial concurrency, or richer manifests.
 - `Two-node carrier validation` is a manual `QEMU Smoke` target for
   `tidefs-two-node-harness`. It runs `.#two-node-carrier-validation`, boots a
   Linux 7.0 QEMU guest, executes the `qemu`-gated live TCP carrier
