@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "offload.ready.non_authoritative.v1",
+  "evidence_class": "external-backend-conformance-manifest",
+  "validation_tier": "cargo-unit",
+  "scope": "non-authoritative external backend conformance manifest compared to CPU reference",
+  "artifact_path": "validation/artifacts/offload/external-backend-conformance-manifest.toml",
+  "content_digest": "blake3:c4a3287aafb53e18696a4ba052260f3bc9e2416547e9b8734c397f64b730285b",
+  "run_id": "deterministic-fixture:offload-external-backend-conformance-manifest-v1",
+  "source_ref": "refs/heads/gpt0/issue-1486-offload-manifests",
+  "outcome": "pass",
+  "residual_risk": "No GPU/FPGA production acceleration, DMA, kernel, RDMA, SIMD, hardware equivalence, storage-runtime integration, or storage semantics authority is validated.",
+  "source": "tidefs-offload-core",
+  "generated_at": "2026-06-28T20:11:49Z",
+  "blocking_issues": []
+}

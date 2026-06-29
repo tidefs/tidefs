@@ -15,6 +15,41 @@ pub use tidefs_types_vfs_core::{
 };
 
 pub const OFFLOAD_READY_NON_AUTHORITATIVE_CLAIM: &str = "offload.ready.non_authoritative.v1";
+pub const OFFLOAD_EVIDENCE_MANIFEST_VERSION: u32 = 2;
+pub const OFFLOAD_EVIDENCE_DIGEST_ALGORITHM: &str = "blake3";
+pub const OFFLOAD_EVIDENCE_SOURCE: &str = "tidefs-offload-core";
+pub const OFFLOAD_EVIDENCE_RESIDUAL_RISK: &str = "No GPU/FPGA production acceleration, DMA, kernel, RDMA, SIMD, hardware equivalence, storage-runtime integration, or storage semantics authority is validated.";
+
+pub const OFFLOAD_CPU_REFERENCE_BACKEND_EVIDENCE_CLASS: &str = "cpu-reference-backend";
+pub const OFFLOAD_DESCRIPTOR_COMPLETION_EVIDENCE_CLASS: &str = "descriptor-completion-validation";
+pub const OFFLOAD_CLAIMS_GATE_REVIEW_EVIDENCE_CLASS: &str = "claims-gate-review";
+pub const OFFLOAD_EXTERNAL_BACKEND_CONFORMANCE_EVIDENCE_CLASS: &str =
+    "external-backend-conformance-manifest";
+
+pub const OFFLOAD_CPU_REFERENCE_BACKEND_ARTIFACT_PATH: &str =
+    "validation/artifacts/offload/cpu-reference-backend.toml";
+pub const OFFLOAD_DESCRIPTOR_COMPLETION_ARTIFACT_PATH: &str =
+    "validation/artifacts/offload/descriptor-completion-validation.toml";
+pub const OFFLOAD_CLAIMS_GATE_REVIEW_ARTIFACT_PATH: &str =
+    "validation/artifacts/offload/claims-gate-review.toml";
+pub const OFFLOAD_EXTERNAL_BACKEND_CONFORMANCE_ARTIFACT_PATH: &str =
+    "validation/artifacts/offload/external-backend-conformance-manifest.toml";
+
+pub const OFFLOAD_CPU_REFERENCE_BACKEND_MANIFEST_PATH: &str =
+    "validation/artifacts/offload/cpu-reference-backend.manifest.json";
+pub const OFFLOAD_DESCRIPTOR_COMPLETION_MANIFEST_PATH: &str =
+    "validation/artifacts/offload/descriptor-completion-validation.manifest.json";
+pub const OFFLOAD_CLAIMS_GATE_REVIEW_MANIFEST_PATH: &str =
+    "validation/artifacts/offload/claims-gate-review.manifest.json";
+pub const OFFLOAD_EXTERNAL_BACKEND_CONFORMANCE_MANIFEST_PATH: &str =
+    "validation/artifacts/offload/external-backend-conformance-manifest.manifest.json";
+
+pub const OFFLOAD_EVIDENCE_CLASSES: [OffloadEvidenceClass; 4] = [
+    OffloadEvidenceClass::CpuReferenceBackend,
+    OffloadEvidenceClass::DescriptorCompletionValidation,
+    OffloadEvidenceClass::ClaimsGateReview,
+    OffloadEvidenceClass::ExternalBackendConformanceManifest,
+];
 
 pub const OFFLOAD_DESC_V1_ENCODED_LEN: usize = 128;
 pub const OFFLOAD_COMPLETION_V1_ENCODED_LEN: usize = 96;
@@ -184,6 +219,150 @@ pub enum OffloadStatus {
     BufferMismatch = 4,
     KernelFailed = 5,
     Unsupported = 6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OffloadEvidenceValidationTier {
+    CargoUnit,
+    SourceModel,
+}
+
+impl OffloadEvidenceValidationTier {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CargoUnit => "cargo-unit",
+            Self::SourceModel => "source-model",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OffloadEvidenceClass {
+    CpuReferenceBackend,
+    DescriptorCompletionValidation,
+    ClaimsGateReview,
+    ExternalBackendConformanceManifest,
+}
+
+impl OffloadEvidenceClass {
+    #[must_use]
+    pub const fn evidence_class(self) -> &'static str {
+        match self {
+            Self::CpuReferenceBackend => OFFLOAD_CPU_REFERENCE_BACKEND_EVIDENCE_CLASS,
+            Self::DescriptorCompletionValidation => OFFLOAD_DESCRIPTOR_COMPLETION_EVIDENCE_CLASS,
+            Self::ClaimsGateReview => OFFLOAD_CLAIMS_GATE_REVIEW_EVIDENCE_CLASS,
+            Self::ExternalBackendConformanceManifest => {
+                OFFLOAD_EXTERNAL_BACKEND_CONFORMANCE_EVIDENCE_CLASS
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn artifact_path(self) -> &'static str {
+        match self {
+            Self::CpuReferenceBackend => OFFLOAD_CPU_REFERENCE_BACKEND_ARTIFACT_PATH,
+            Self::DescriptorCompletionValidation => OFFLOAD_DESCRIPTOR_COMPLETION_ARTIFACT_PATH,
+            Self::ClaimsGateReview => OFFLOAD_CLAIMS_GATE_REVIEW_ARTIFACT_PATH,
+            Self::ExternalBackendConformanceManifest => {
+                OFFLOAD_EXTERNAL_BACKEND_CONFORMANCE_ARTIFACT_PATH
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn manifest_path(self) -> &'static str {
+        match self {
+            Self::CpuReferenceBackend => OFFLOAD_CPU_REFERENCE_BACKEND_MANIFEST_PATH,
+            Self::DescriptorCompletionValidation => OFFLOAD_DESCRIPTOR_COMPLETION_MANIFEST_PATH,
+            Self::ClaimsGateReview => OFFLOAD_CLAIMS_GATE_REVIEW_MANIFEST_PATH,
+            Self::ExternalBackendConformanceManifest => {
+                OFFLOAD_EXTERNAL_BACKEND_CONFORMANCE_MANIFEST_PATH
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn validation_tier(self) -> OffloadEvidenceValidationTier {
+        match self {
+            Self::ClaimsGateReview => OffloadEvidenceValidationTier::SourceModel,
+            Self::CpuReferenceBackend
+            | Self::DescriptorCompletionValidation
+            | Self::ExternalBackendConformanceManifest => OffloadEvidenceValidationTier::CargoUnit,
+        }
+    }
+
+    #[must_use]
+    pub const fn scope(self) -> &'static str {
+        match self {
+            Self::CpuReferenceBackend => {
+                "non-authoritative CPU reference checksum/parity/scrub kernels"
+            }
+            Self::DescriptorCompletionValidation => {
+                "non-authoritative offload descriptor, completion, and lease validation"
+            }
+            Self::ClaimsGateReview => {
+                "source review of the non-authoritative offload claim boundary"
+            }
+            Self::ExternalBackendConformanceManifest => {
+                "non-authoritative external backend conformance manifest compared to CPU reference"
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn residual_risk(self) -> &'static str {
+        OFFLOAD_EVIDENCE_RESIDUAL_RISK
+    }
+}
+
+/// Validate the offload-specific metadata that surrounds a claim-facing v2 evidence manifest.
+///
+/// The shared `EvidenceArtifactManifest` schema owns serialization, digest,
+/// source-ref, and blocking-issue validation. This helper keeps
+/// `tidefs-offload-core` as the producer authority for which offload evidence
+/// classes may be wrapped for claim closure.
+///
+/// # Errors
+///
+/// Returns [`OffloadValidationError`] when the wrapper leaves the
+/// non-authoritative offload claim or maps an offload evidence class to the
+/// wrong artifact path or validation tier.
+pub fn validate_offload_evidence_manifest_fields(
+    claim_id: &str,
+    evidence_class: &str,
+    validation_tier: &str,
+    artifact_path: &str,
+) -> Result<OffloadEvidenceClass, OffloadValidationError> {
+    if claim_id != OFFLOAD_READY_NON_AUTHORITATIVE_CLAIM {
+        return Err(OffloadValidationError::InvalidEvidenceManifestField {
+            field: OffloadEvidenceManifestField::ClaimId,
+        });
+    }
+
+    let mut matched = None;
+    for class in OFFLOAD_EVIDENCE_CLASSES {
+        if class.evidence_class() == evidence_class {
+            matched = Some(class);
+            break;
+        }
+    }
+    let class = matched.ok_or(OffloadValidationError::InvalidEvidenceManifestField {
+        field: OffloadEvidenceManifestField::EvidenceClass,
+    })?;
+
+    if class.validation_tier().label() != validation_tier {
+        return Err(OffloadValidationError::InvalidEvidenceManifestField {
+            field: OffloadEvidenceManifestField::ValidationTier,
+        });
+    }
+    if class.artifact_path() != artifact_path {
+        return Err(OffloadValidationError::InvalidEvidenceManifestField {
+            field: OffloadEvidenceManifestField::ArtifactPath,
+        });
+    }
+
+    Ok(class)
 }
 
 impl OffloadStatus {
@@ -1199,6 +1378,9 @@ pub enum OffloadValidationError {
         reference: OffloadStatus,
         backend: OffloadStatus,
     },
+    InvalidEvidenceManifestField {
+        field: OffloadEvidenceManifestField,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1275,6 +1457,14 @@ pub enum OffloadSliceField {
 pub enum OffloadConformanceManifestField {
     Claim,
     BackendName,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OffloadEvidenceManifestField {
+    ClaimId,
+    EvidenceClass,
+    ValidationTier,
+    ArtifactPath,
 }
 
 #[must_use]
@@ -1572,6 +1762,88 @@ mod tests {
             validation_tier: OffloadConformanceValidationTier::CpuEquivalent,
             authority_scope: OffloadConformanceAuthorityScope::NonAuthoritativeOnly,
         }
+    }
+
+    #[test]
+    fn offload_evidence_manifest_specs_cover_claim_facing_artifacts() {
+        for class in OFFLOAD_EVIDENCE_CLASSES {
+            assert_eq!(
+                validate_offload_evidence_manifest_fields(
+                    OFFLOAD_READY_NON_AUTHORITATIVE_CLAIM,
+                    class.evidence_class(),
+                    class.validation_tier().label(),
+                    class.artifact_path()
+                ),
+                Ok(class)
+            );
+            assert!(class
+                .manifest_path()
+                .starts_with("validation/artifacts/offload/"));
+            assert!(class.manifest_path().ends_with(".manifest.json"));
+            assert!(class
+                .residual_risk()
+                .contains("storage semantics authority"));
+            assert!(class
+                .residual_risk()
+                .contains("GPU/FPGA production acceleration"));
+        }
+    }
+
+    #[test]
+    fn offload_evidence_manifest_specs_reject_wrong_claim_or_mapping() {
+        assert_eq!(
+            validate_offload_evidence_manifest_fields(
+                "storage.authority.invalid",
+                OFFLOAD_CPU_REFERENCE_BACKEND_EVIDENCE_CLASS,
+                OffloadEvidenceValidationTier::CargoUnit.label(),
+                OFFLOAD_CPU_REFERENCE_BACKEND_ARTIFACT_PATH,
+            ),
+            Err(OffloadValidationError::InvalidEvidenceManifestField {
+                field: OffloadEvidenceManifestField::ClaimId,
+            })
+        );
+
+        assert_eq!(
+            validate_offload_evidence_manifest_fields(
+                OFFLOAD_READY_NON_AUTHORITATIVE_CLAIM,
+                OFFLOAD_CPU_REFERENCE_BACKEND_EVIDENCE_CLASS,
+                OffloadEvidenceValidationTier::SourceModel.label(),
+                OFFLOAD_CPU_REFERENCE_BACKEND_ARTIFACT_PATH,
+            ),
+            Err(OffloadValidationError::InvalidEvidenceManifestField {
+                field: OffloadEvidenceManifestField::ValidationTier,
+            })
+        );
+
+        assert_eq!(
+            validate_offload_evidence_manifest_fields(
+                OFFLOAD_READY_NON_AUTHORITATIVE_CLAIM,
+                OFFLOAD_CPU_REFERENCE_BACKEND_EVIDENCE_CLASS,
+                OffloadEvidenceValidationTier::CargoUnit.label(),
+                OFFLOAD_DESCRIPTOR_COMPLETION_ARTIFACT_PATH,
+            ),
+            Err(OffloadValidationError::InvalidEvidenceManifestField {
+                field: OffloadEvidenceManifestField::ArtifactPath,
+            })
+        );
+    }
+
+    #[test]
+    fn external_backend_conformance_remains_nested_under_claim_wrapper() {
+        let wrapper_class = validate_offload_evidence_manifest_fields(
+            OFFLOAD_READY_NON_AUTHORITATIVE_CLAIM,
+            OFFLOAD_EXTERNAL_BACKEND_CONFORMANCE_EVIDENCE_CLASS,
+            OffloadEvidenceValidationTier::CargoUnit.label(),
+            OFFLOAD_EXTERNAL_BACKEND_CONFORMANCE_ARTIFACT_PATH,
+        )
+        .expect("claim-facing wrapper fields");
+
+        assert_eq!(
+            wrapper_class,
+            OffloadEvidenceClass::ExternalBackendConformanceManifest
+        );
+        validate_external_backend_conformance_manifest(cpu_equivalent_manifest())
+            .expect("nested conformance manifest");
     }
 
     #[test]

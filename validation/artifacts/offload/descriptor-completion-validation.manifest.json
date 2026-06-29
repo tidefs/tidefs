@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "offload.ready.non_authoritative.v1",
+  "evidence_class": "descriptor-completion-validation",
+  "validation_tier": "cargo-unit",
+  "scope": "non-authoritative offload descriptor, completion, and lease validation",
+  "artifact_path": "validation/artifacts/offload/descriptor-completion-validation.toml",
+  "content_digest": "blake3:ebabf1ee0f1fc65ecdf973bd3e92da4adc27a31b653ba4bcab62d189cba0d50c",
+  "run_id": "deterministic-fixture:offload-descriptor-completion-validation-v1",
+  "source_ref": "refs/heads/gpt0/issue-1486-offload-manifests",
+  "outcome": "pass",
+  "residual_risk": "No GPU/FPGA production acceleration, DMA, kernel, RDMA, SIMD, hardware equivalence, storage-runtime integration, or storage semantics authority is validated.",
+  "source": "tidefs-offload-core",
+  "generated_at": "2026-06-28T20:11:49Z",
+  "blocking_issues": []
+}

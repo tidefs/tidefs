@@ -190,23 +190,26 @@ evidence_artifacts = []
 [[claims]]
 id = "offload.ready.non_authoritative.v1"
 status = "validated"
-scope = "non-authoritative offload descriptor, CPU reference backend, and completion validation"
+scope = "non-authoritative offload descriptor, CPU reference backend, completion validation, and external-backend conformance manifest integrity"
 required_evidence_classes = [
   "cpu-reference-backend",
   "descriptor-completion-validation",
   "claims-gate-review",
+  "external-backend-conformance-manifest",
 ]
 evidence_requirements = [
-  { class = "cpu-reference-backend", path = "validation/artifacts/offload/cpu-reference-backend.toml", validation_tier = "cargo-unit", blocking_issues = [] },
-  { class = "descriptor-completion-validation", path = "validation/artifacts/offload/descriptor-completion-validation.toml", validation_tier = "cargo-unit", blocking_issues = [] },
-  { class = "claims-gate-review", path = "validation/artifacts/offload/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
+  { class = "cpu-reference-backend", path = "validation/artifacts/offload/cpu-reference-backend.toml", validation_tier = "cargo-unit", manifest_path = "validation/artifacts/offload/cpu-reference-backend.manifest.json", blocking_issues = [] },
+  { class = "descriptor-completion-validation", path = "validation/artifacts/offload/descriptor-completion-validation.toml", validation_tier = "cargo-unit", manifest_path = "validation/artifacts/offload/descriptor-completion-validation.manifest.json", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/offload/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/offload/claims-gate-review.manifest.json", blocking_issues = [] },
+  { class = "external-backend-conformance-manifest", path = "validation/artifacts/offload/external-backend-conformance-manifest.toml", validation_tier = "cargo-unit", manifest_path = "validation/artifacts/offload/external-backend-conformance-manifest.manifest.json", blocking_issues = [] },
 ]
 blockers = []
-generated_doc = "Validated non-authoritative offload claim for v1 descriptor validation, CPU reference checksum/parity/scrub kernels, buffer-lease matching, and completion validation. This does not validate GPU/FPGA production acceleration, DMA, kernel, RDMA, storage-runtime integration, or hardware equivalence."
+generated_doc = "Validated non-authoritative offload claim for v1 descriptor validation, CPU reference checksum/parity/scrub kernels, buffer-lease matching, completion validation, and external-backend conformance manifest integrity. This does not validate GPU/FPGA production acceleration, DMA, kernel, RDMA, SIMD, storage-runtime integration, storage semantics authority, or hardware equivalence."
 evidence_artifacts = [
   { class = "cpu-reference-backend", path = "validation/artifacts/offload/cpu-reference-backend.toml" },
   { class = "descriptor-completion-validation", path = "validation/artifacts/offload/descriptor-completion-validation.toml" },
   { class = "claims-gate-review", path = "validation/artifacts/offload/claims-gate-review.toml" },
+  { class = "external-backend-conformance-manifest", path = "validation/artifacts/offload/external-backend-conformance-manifest.toml" },
 ]
 
 [[claims]]

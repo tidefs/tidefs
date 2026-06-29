@@ -146,6 +146,7 @@ const MODEL_CRASH_MATRIX_EVIDENCE_CLASS: &str = "model-crash-matrix";
 const RUNTIME_CRASH_ORACLE_EVIDENCE_CLASS: &str = "runtime-crash-oracle";
 const RUNTIME_NAMESPACE_CRASH_ARTIFACT_EVIDENCE_CLASS: &str = "runtime-namespace-crash-artifact";
 const CLAIMS_GATE_REVIEW_EVIDENCE_CLASS: &str = "claims-gate-review";
+const DETERMINISTIC_FIXTURE_RUN_ID_PREFIX: &str = "deterministic-fixture:";
 const CRASH_MODEL_MATRIX_PATH: &str = "validation/artifacts/crash-oracle/model-crash-matrices.json";
 const CRASH_CLAIMS_GATE_REVIEW_PATH: &str =
     "validation/artifacts/crash-oracle/claims-gate-review.toml";
@@ -1331,24 +1332,61 @@ fn validate_manifest_matches_requirement(
         ));
     }
     if enforce_freshness {
-        if !is_full_hex_sha(&manifest.source_ref) {
+        status =
+            validate_manifest_source_ref(root, claim, manifest_path, manifest, status, details);
+    }
+
+    status
+}
+
+fn validate_manifest_source_ref(
+    root: &Path,
+    claim: &ClaimRecord,
+    manifest_path: &str,
+    manifest: &EvidenceArtifactManifest,
+    mut status: EvidenceClassStatus,
+    details: &mut Vec<String>,
+) -> EvidenceClassStatus {
+    if manifest
+        .run_id
+        .starts_with(DETERMINISTIC_FIXTURE_RUN_ID_PREFIX)
+    {
+        if !is_full_hex_sha(&manifest.source_ref) && !is_reviewable_source_ref(&manifest.source_ref)
+        {
             status = worse_evidence_status(status, EvidenceClassStatus::Stale);
             details.push(format!(
-                "claim `{}` evidence manifest `{manifest_path}` source_ref `{}` is not a full commit SHA for claim closure",
+                "claim `{}` evidence manifest `{manifest_path}` deterministic fixture source_ref `{}` is not a full commit SHA or refs/... source ref",
                 claim.id, manifest.source_ref
             ));
-        } else if let Some(head) = current_git_head(root) {
-            if !manifest.source_ref.eq_ignore_ascii_case(&head) {
-                status = worse_evidence_status(status, EvidenceClassStatus::Stale);
-                details.push(format!(
-                    "claim `{}` evidence manifest `{manifest_path}` source_ref `{}` does not match current HEAD `{head}`",
-                    claim.id, manifest.source_ref
-                ));
-            }
+        }
+        return status;
+    }
+
+    if !is_full_hex_sha(&manifest.source_ref) {
+        status = worse_evidence_status(status, EvidenceClassStatus::Stale);
+        details.push(format!(
+            "claim `{}` evidence manifest `{manifest_path}` source_ref `{}` is not a full commit SHA for claim closure",
+            claim.id, manifest.source_ref
+        ));
+    } else if let Some(head) = current_git_head(root) {
+        if !manifest.source_ref.eq_ignore_ascii_case(&head) {
+            status = worse_evidence_status(status, EvidenceClassStatus::Stale);
+            details.push(format!(
+                "claim `{}` evidence manifest `{manifest_path}` source_ref `{}` does not match current HEAD `{head}`",
+                claim.id, manifest.source_ref
+            ));
         }
     }
 
     status
+}
+
+fn is_reviewable_source_ref(source_ref: &str) -> bool {
+    source_ref.starts_with("refs/")
+        && !source_ref.contains('$')
+        && !source_ref.contains('`')
+        && !source_ref.contains("..")
+        && !source_ref.chars().any(char::is_whitespace)
 }
 
 fn worse_evidence_status(
@@ -3428,7 +3466,7 @@ mod tests {
             Vec::new(),
         );
 
-        let receipt = build_claim_validation_receipt(&temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
         assert_eq!(receipt.status, ClaimReceiptStatus::Pass);
         let evidence = receipt
             .required_evidence
@@ -3457,13 +3495,94 @@ mod tests {
             Some("Fixture proves manifest gate behavior only.")
         );
         assert!(evidence.details.is_empty(), "{:?}", evidence.details);
-        assert!(validate_claim_record(&temp.path(), SystemTime::UNIX_EPOCH, &claim).is_empty());
+        assert!(validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &claim).is_empty());
 
         let summary = render_claim_validation_summary(&receipt);
         assert!(summary.contains("manifest_path: evidence/summary.manifest.json"));
         assert!(summary.contains("run_id: fixture-run-810/1"));
         assert!(summary.contains(&format!("source_ref: {MANIFEST_FIXTURE_SOURCE_REF}")));
         assert!(summary.contains("residual_risk: Fixture proves manifest gate behavior only."));
+    }
+
+    #[test]
+    fn validate_claim_accepts_deterministic_fixture_source_ref() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact_body = "deterministic fixture evidence body";
+        write_artifact(temp.path(), "evidence/summary.txt", artifact_body);
+        write_manifest_fixture_with_run_id_and_source_ref(
+            temp.path(),
+            "evidence/summary.manifest.json",
+            "example.manifest.validated.v1",
+            "cargo-fixture",
+            "evidence/summary.txt",
+            artifact_body,
+            ValidationStatus::Pass,
+            Vec::new(),
+            "deterministic-fixture:example-manifest-v1",
+            "refs/heads/gpt2/issue-811-model-evidence-manifests",
+        );
+        let claim = manifest_fixture_claim(
+            "example.manifest.validated.v1",
+            ClaimStatus::Validated,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Pass);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("manifest-backed evidence receipt");
+        assert_eq!(
+            evidence.run_id.as_deref(),
+            Some("deterministic-fixture:example-manifest-v1")
+        );
+        assert_eq!(
+            evidence.source_ref.as_deref(),
+            Some("refs/heads/gpt2/issue-811-model-evidence-manifests")
+        );
+        assert!(evidence.details.is_empty(), "{:?}", evidence.details);
+        assert!(validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &claim).is_empty());
+    }
+
+    #[test]
+    fn validate_claim_rejects_unqualified_deterministic_fixture_source_ref() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact_body = "deterministic fixture evidence body";
+        write_artifact(temp.path(), "evidence/summary.txt", artifact_body);
+        write_manifest_fixture_with_run_id_and_source_ref(
+            temp.path(),
+            "evidence/summary.manifest.json",
+            "example.manifest.validated.v1",
+            "cargo-fixture",
+            "evidence/summary.txt",
+            artifact_body,
+            ValidationStatus::Pass,
+            Vec::new(),
+            "deterministic-fixture:example-manifest-v1",
+            "branch-name-is-not-a-source-ref",
+        );
+        let claim = manifest_fixture_claim(
+            "example.manifest.validated.v1",
+            ClaimStatus::Validated,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
+        let evidence = receipt
+            .required_evidence
+            .iter()
+            .find(|evidence| evidence.class == "cargo-fixture")
+            .expect("manifest-backed evidence receipt");
+        assert_eq!(evidence.status, EvidenceClassStatus::Stale);
+        assert!(evidence
+            .details
+            .iter()
+            .any(|detail| detail.contains("deterministic fixture source_ref")));
     }
 
     #[test]
@@ -3476,7 +3595,7 @@ mod tests {
             vec!["#810".to_string()],
         );
 
-        let receipt = build_claim_validation_receipt(&temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
         assert_eq!(receipt.status, ClaimReceiptStatus::Blocked);
         let evidence = receipt
             .required_evidence
@@ -3507,7 +3626,7 @@ mod tests {
             Vec::new(),
         );
 
-        let receipt = build_claim_validation_receipt(&temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
         assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
         let evidence = receipt
             .required_evidence
@@ -3520,7 +3639,7 @@ mod tests {
             .iter()
             .any(|detail| detail.contains("malformed or unsupported")));
 
-        let failures = validate_claim_record(&temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        let failures = validate_claim_record(temp.path(), SystemTime::UNIX_EPOCH, &claim);
         assert!(failures
             .iter()
             .any(|failure| failure.contains("malformed or unsupported")));
@@ -3553,7 +3672,7 @@ mod tests {
             Vec::new(),
         );
 
-        let receipt = build_claim_validation_receipt(&temp.path(), SystemTime::UNIX_EPOCH, &claim);
+        let receipt = build_claim_validation_receipt(temp.path(), SystemTime::UNIX_EPOCH, &claim);
         assert_eq!(receipt.status, ClaimReceiptStatus::Fail);
         let evidence = receipt
             .required_evidence
@@ -3932,6 +4051,33 @@ const UNGUARDED_COMMANDS: &[&str] = &["pool scan", "diag"];
         blocking_issues: Vec<BlockingIssueRef>,
         source_ref: &str,
     ) {
+        write_manifest_fixture_with_run_id_and_source_ref(
+            root,
+            manifest_path,
+            claim_id,
+            evidence_class,
+            artifact_path,
+            artifact_body,
+            outcome,
+            blocking_issues,
+            "fixture-run-810/1",
+            source_ref,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_manifest_fixture_with_run_id_and_source_ref(
+        root: &Path,
+        manifest_path: &str,
+        claim_id: &str,
+        evidence_class: &str,
+        artifact_path: &str,
+        artifact_body: &str,
+        outcome: ValidationStatus,
+        blocking_issues: Vec<BlockingIssueRef>,
+        run_id: &str,
+        source_ref: &str,
+    ) {
         let manifest = EvidenceArtifactManifest {
             manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
             claim_id: claim_id.to_string(),
@@ -3940,7 +4086,7 @@ const UNGUARDED_COMMANDS: &[&str] = &["pool scan", "diag"];
             scope: "manifest-backed cargo fixture".to_string(),
             artifact_path: artifact_path.to_string(),
             content_digest: content_digest_for_bytes(artifact_body.as_bytes()),
-            run_id: "fixture-run-810/1".to_string(),
+            run_id: run_id.to_string(),
             source_ref: source_ref.to_string(),
             outcome,
             residual_risk: "Fixture proves manifest gate behavior only.".to_string(),
