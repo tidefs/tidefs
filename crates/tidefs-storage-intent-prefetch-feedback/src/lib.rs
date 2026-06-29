@@ -71,6 +71,12 @@ pub const STORAGE_INTENT_PREFETCH_FEEDBACK_VERSION: u16 = 1;
 pub const STORAGE_INTENT_PREFETCH_FEEDBACK_SPEC: &str =
     "tidefs-storage-intent-prefetch-feedback-v1-issue-975";
 
+/// Maximum number of records reduced into one model-only learning checkpoint.
+pub const PREFETCH_FEEDBACK_LEARNING_WINDOW_MAX_RECORDS: usize = 16;
+
+/// Minimum repeated positive records before a window can stay confidence-positive.
+pub const PREFETCH_FEEDBACK_SUSTAINED_MIN_POSITIVE_RECORDS: u16 = 2;
+
 const EMPTY_EVIDENCE_REF: StorageIntentEvidenceRef = StorageIntentEvidenceRef {
     kind: StorageIntentEvidenceKind::Unknown,
     id: StorageIntentEvidenceId::ZERO,
@@ -622,6 +628,59 @@ impl PrefetchFeedbackPaybackEvidence {
         self.latency_harm_us > self.latency_avoided_us
             || self.foreground_p99_disruption_us > self.latency_avoided_us
     }
+
+    /// Saturating counter addition for bounded learning-window summaries.
+    #[must_use]
+    pub const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            bytes_prefetched: self.bytes_prefetched.saturating_add(other.bytes_prefetched),
+            bytes_used: self.bytes_used.saturating_add(other.bytes_used),
+            bytes_unused: self.bytes_unused.saturating_add(other.bytes_unused),
+            bytes_expired: self.bytes_expired.saturating_add(other.bytes_expired),
+            latency_avoided_us: self
+                .latency_avoided_us
+                .saturating_add(other.latency_avoided_us),
+            latency_harm_us: self.latency_harm_us.saturating_add(other.latency_harm_us),
+            foreground_p50_disruption_us: self
+                .foreground_p50_disruption_us
+                .saturating_add(other.foreground_p50_disruption_us),
+            foreground_p95_disruption_us: self
+                .foreground_p95_disruption_us
+                .saturating_add(other.foreground_p95_disruption_us),
+            foreground_p99_disruption_us: self
+                .foreground_p99_disruption_us
+                .saturating_add(other.foreground_p99_disruption_us),
+            queue_delay_us: self.queue_delay_us.saturating_add(other.queue_delay_us),
+            flash_write_bytes: self
+                .flash_write_bytes
+                .saturating_add(other.flash_write_bytes),
+            pmem_write_bytes: self.pmem_write_bytes.saturating_add(other.pmem_write_bytes),
+            waf_micros: self.waf_micros.saturating_add(other.waf_micros),
+            ram_pressure_bytes: self
+                .ram_pressure_bytes
+                .saturating_add(other.ram_pressure_bytes),
+            cache_index_write_bytes: self
+                .cache_index_write_bytes
+                .saturating_add(other.cache_index_write_bytes),
+            predictor_metadata_write_bytes: self
+                .predictor_metadata_write_bytes
+                .saturating_add(other.predictor_metadata_write_bytes),
+            wan_bytes: self.wan_bytes.saturating_add(other.wan_bytes),
+            egress_cost_microunits: self
+                .egress_cost_microunits
+                .saturating_add(other.egress_cost_microunits),
+            restore_cost_microunits: self
+                .restore_cost_microunits
+                .saturating_add(other.restore_cost_microunits),
+            staging_capacity_bytes: self
+                .staging_capacity_bytes
+                .saturating_add(other.staging_capacity_bytes),
+            cpu_us: self.cpu_us.saturating_add(other.cpu_us),
+            memory_bytes: self.memory_bytes.saturating_add(other.memory_bytes),
+            protected_reserve_pressure: self.protected_reserve_pressure
+                || other.protected_reserve_pressure,
+        }
+    }
 }
 
 /// Evidence references retained by the feedback record.
@@ -806,6 +865,706 @@ impl PrefetchFeedbackRecord {
             StorageIntentMeasurementAttributionUseMask::SUPPORT_PUBLIC_OR_COMPARATOR_CLAIM,
         ) && self.retention_state.has_authority_proof_root()
     }
+}
+
+/// Sustained learning-window state for a checkpoint summary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchFeedbackLearningWindowState {
+    /// No records were reduced.
+    #[default]
+    Empty = 0,
+    /// The window is scoped but does not have enough repeated evidence.
+    NeedMoreEvidence = 1,
+    /// Repeated positive records in one exact envelope can keep confidence raised.
+    SustainedPositiveBounded = 2,
+    /// The window must cool down before future authority-positive use.
+    Cooldown = 3,
+    /// The window should prefer demotion or no-prefetch candidates.
+    Demotion = 4,
+    /// The window was reset by stale, mismatched, or unusable evidence.
+    Reset = 5,
+    /// The window is refused as authority-positive evidence.
+    Refused = 6,
+}
+
+impl_u8_canonical!(PrefetchFeedbackLearningWindowState, {
+    Empty = 0 => "empty",
+    NeedMoreEvidence = 1 => "need-more-evidence",
+    SustainedPositiveBounded = 2 => "sustained-positive-bounded",
+    Cooldown = 3 => "cooldown",
+    Demotion = 4 => "demotion",
+    Reset = 5 => "reset",
+    Refused = 6 => "refused",
+});
+
+/// Typed reason a learning window cannot stay authority-positive.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchFeedbackLearningRefusal {
+    /// The window is not refused.
+    #[default]
+    None = 0,
+    UnboundScope = 1,
+    SinglePositiveRecord = 2,
+    LowSample = 3,
+    NeutralRecord = 4,
+    MismatchedScope = 5,
+    MismatchedEvidenceEnvelope = 6,
+    StaleEvidence = 7,
+    WrongDatasetPolicy = 8,
+    WrongMediaTopology = 9,
+    MissingRetentionEvidence = 10,
+    MissingCostWear = 11,
+    UnknownMaterializationCost = 12,
+    ComparatorConfounded = 13,
+    ShadowOnly = 14,
+    RefusedRecord = 15,
+    OnePassScan = 16,
+    PhaseChanged = 17,
+    Wasteful = 18,
+    OverBudget = 19,
+    ForegroundHarm = 20,
+    Contradicted = 21,
+    NonAuthorityRecord = 22,
+    SchedulerNotPresent = 23,
+    ExecutorNotPresent = 24,
+}
+
+impl_u8_canonical!(PrefetchFeedbackLearningRefusal, {
+    None = 0 => "none",
+    UnboundScope = 1 => "unbound-scope",
+    SinglePositiveRecord = 2 => "single-positive-record",
+    LowSample = 3 => "low-sample",
+    NeutralRecord = 4 => "neutral-record",
+    MismatchedScope = 5 => "mismatched-scope",
+    MismatchedEvidenceEnvelope = 6 => "mismatched-evidence-envelope",
+    StaleEvidence = 7 => "stale-evidence",
+    WrongDatasetPolicy = 8 => "wrong-dataset-policy",
+    WrongMediaTopology = 9 => "wrong-media-topology",
+    MissingRetentionEvidence = 10 => "missing-retention-evidence",
+    MissingCostWear = 11 => "missing-cost-wear",
+    UnknownMaterializationCost = 12 => "unknown-materialization-cost",
+    ComparatorConfounded = 13 => "comparator-confounded",
+    ShadowOnly = 14 => "shadow-only",
+    RefusedRecord = 15 => "refused-record",
+    OnePassScan = 16 => "one-pass-scan",
+    PhaseChanged = 17 => "phase-changed",
+    Wasteful = 18 => "wasteful",
+    OverBudget = 19 => "over-budget",
+    ForegroundHarm = 20 => "foreground-harm",
+    Contradicted = 21 => "contradicted",
+    NonAuthorityRecord = 22 => "non-authority-record",
+    SchedulerNotPresent = 23 => "scheduler-not-present",
+    ExecutorNotPresent = 24 => "executor-not-present",
+});
+
+/// Evidence envelope that must stay identical across a sustained-positive window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchFeedbackLearningEnvelope {
+    pub scope: PrefetchFeedbackScopeKey,
+    pub executor_state: PrefetchFeedbackExecutorOutcomeState,
+    pub attribution_state: PrefetchFeedbackAttributionState,
+    pub retention_state: PrefetchFeedbackRetentionState,
+    pub scheduler_state: PrefetchFeedbackSchedulerState,
+    pub materialization_cost_state: PrefetchFeedbackMaterializationCostState,
+    pub evidence_refs: PrefetchFeedbackEvidenceRefs,
+}
+
+impl PrefetchFeedbackLearningEnvelope {
+    /// Build the comparable evidence envelope from a feedback record.
+    #[must_use]
+    pub const fn from_record(record: PrefetchFeedbackRecord) -> Self {
+        Self {
+            scope: record.scope,
+            executor_state: record.executor_state,
+            attribution_state: record.attribution_state,
+            retention_state: record.retention_state,
+            scheduler_state: record.scheduler_state,
+            materialization_cost_state: record.materialization_cost_state,
+            evidence_refs: record.evidence_refs,
+        }
+    }
+
+    /// Returns true when this record has the required positive authority refs bound.
+    #[must_use]
+    pub const fn has_authority_positive_refs(self) -> bool {
+        self.evidence_refs.executor_outcome_ref.is_bound()
+            && self.evidence_refs.attribution_ref.is_bound()
+            && self.evidence_refs.retention_ref.is_bound()
+            && self.evidence_refs.service_objective_ref.is_bound()
+            && self.evidence_refs.evidence_query_snapshot_ref.is_bound()
+            && self.evidence_refs.decision_frontier_ref.is_bound()
+            && self.evidence_refs.scheduler_admission_ref.is_bound()
+            && self.evidence_refs.cost_wear_ref.is_bound()
+            && self.evidence_refs.source_media_ref.is_bound()
+            && self.evidence_refs.target_media_ref.is_bound()
+            && self.evidence_refs.source_path_ref.is_bound()
+            && self.evidence_refs.target_destination_ref.is_bound()
+            && self.evidence_refs.transport_path_ref.is_bound()
+            && self.evidence_refs.allowed_use_ref.is_bound()
+    }
+
+    /// Returns true when a record is in the same sustained-feedback envelope.
+    #[must_use]
+    pub fn matches_record(self, record: PrefetchFeedbackRecord) -> bool {
+        let other = Self::from_record(record);
+        self.scope == other.scope
+            && self.executor_state == other.executor_state
+            && self.attribution_state == other.attribution_state
+            && self.retention_state == other.retention_state
+            && self.scheduler_state == other.scheduler_state
+            && self.materialization_cost_state == other.materialization_cost_state
+            && learning_evidence_refs_match(self.evidence_refs, other.evidence_refs)
+    }
+}
+
+/// Bounded checkpoint emitted by the learning-window reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct PrefetchFeedbackLearningCheckpoint {
+    pub version: u16,
+    pub state: PrefetchFeedbackLearningWindowState,
+    pub refusal_state: PrefetchFeedbackLearningRefusal,
+    pub refusal: StorageIntentRefusalReason,
+    pub scope: PrefetchFeedbackScopeKey,
+    pub envelope: PrefetchFeedbackLearningEnvelope,
+    pub records_seen: u16,
+    pub matched_records: u16,
+    pub beneficial_records: u16,
+    pub conservative_records: u16,
+    pub payback: PrefetchFeedbackPaybackEvidence,
+    pub previous_confidence: PredictionConfidence,
+    pub next_confidence: PredictionConfidence,
+    pub confidence_update: PrefetchFeedbackConfidenceUpdate,
+    pub adjustments: PrefetchFeedbackAdjustmentMask,
+    pub allowed_uses: StorageIntentMeasurementAttributionUseMask,
+    pub cooldown_ms: u64,
+    pub dwell_extension_ms: u64,
+}
+
+impl Default for PrefetchFeedbackLearningCheckpoint {
+    fn default() -> Self {
+        Self {
+            version: STORAGE_INTENT_PREFETCH_FEEDBACK_VERSION,
+            state: PrefetchFeedbackLearningWindowState::Empty,
+            refusal_state: PrefetchFeedbackLearningRefusal::None,
+            refusal: StorageIntentRefusalReason::None,
+            scope: PrefetchFeedbackScopeKey::default(),
+            envelope: PrefetchFeedbackLearningEnvelope::default(),
+            records_seen: 0,
+            matched_records: 0,
+            beneficial_records: 0,
+            conservative_records: 0,
+            payback: PrefetchFeedbackPaybackEvidence::default(),
+            previous_confidence: PredictionConfidence::Unknown,
+            next_confidence: PredictionConfidence::Unknown,
+            confidence_update: PrefetchFeedbackConfidenceUpdate::None,
+            adjustments: PrefetchFeedbackAdjustmentMask::EMPTY,
+            allowed_uses: StorageIntentMeasurementAttributionUseMask::NON_AUTHORITY_SAFE,
+            cooldown_ms: 0,
+            dwell_extension_ms: 0,
+        }
+    }
+}
+
+impl PrefetchFeedbackLearningCheckpoint {
+    /// Returns true when repeated evidence can keep confidence raised.
+    #[must_use]
+    pub const fn may_keep_confidence_raised(self) -> bool {
+        matches!(
+            self.state,
+            PrefetchFeedbackLearningWindowState::SustainedPositiveBounded
+        ) && self
+            .allowed_uses
+            .contains_all(StorageIntentMeasurementAttributionUseMask::TRAIN_CONFIDENCE_UPWARD)
+    }
+
+    /// Returns true when repeated evidence can close payback for this exact envelope.
+    #[must_use]
+    pub const fn may_close_payback(self) -> bool {
+        matches!(
+            self.state,
+            PrefetchFeedbackLearningWindowState::SustainedPositiveBounded
+        ) && self
+            .allowed_uses
+            .contains_all(StorageIntentMeasurementAttributionUseMask::CLOSE_PAYBACK)
+    }
+
+    /// Learning checkpoints never publish replacement receipts.
+    #[must_use]
+    pub const fn can_publish_replacement_receipt(self) -> bool {
+        false
+    }
+
+    /// Learning checkpoints never retire source receipts.
+    #[must_use]
+    pub const fn can_retire_source_receipt(self) -> bool {
+        false
+    }
+
+    /// Learning checkpoints do not spend flash movement budget by themselves.
+    #[must_use]
+    pub const fn can_spend_extra_flash_movement_budget(self) -> bool {
+        false
+    }
+
+    /// Learning checkpoints cannot support public or comparator claims by themselves.
+    #[must_use]
+    pub const fn may_support_public_or_comparator_claim(self) -> bool {
+        false
+    }
+}
+
+/// Reduce feedback records into a bounded model-only learning checkpoint.
+#[must_use]
+pub fn reduce_prefetch_feedback_learning_window(
+    records: &[PrefetchFeedbackRecord],
+) -> PrefetchFeedbackLearningCheckpoint {
+    let mut checkpoint = PrefetchFeedbackLearningCheckpoint::default();
+    if records.is_empty() {
+        return checkpoint;
+    }
+
+    for (index, record) in records
+        .iter()
+        .take(PREFETCH_FEEDBACK_LEARNING_WINDOW_MAX_RECORDS)
+        .copied()
+        .enumerate()
+    {
+        checkpoint.records_seen = saturating_inc_u16(checkpoint.records_seen);
+        checkpoint.payback = checkpoint.payback.saturating_add(record.payback);
+        checkpoint.previous_confidence =
+            max_confidence(checkpoint.previous_confidence, record.previous_confidence);
+        checkpoint.next_confidence =
+            max_confidence(checkpoint.next_confidence, record.next_confidence);
+
+        if index == 0 {
+            checkpoint.scope = record.scope;
+            checkpoint.envelope = PrefetchFeedbackLearningEnvelope::from_record(record);
+        } else if record.scope != checkpoint.scope {
+            return finish_conservative_learning_window(
+                checkpoint,
+                record,
+                PrefetchFeedbackLearningRefusal::MismatchedScope,
+            );
+        }
+
+        checkpoint.matched_records = saturating_inc_u16(checkpoint.matched_records);
+        let refusal = learning_refusal_for_record(record);
+        if !matches!(refusal, PrefetchFeedbackLearningRefusal::None) {
+            return finish_conservative_learning_window(checkpoint, record, refusal);
+        }
+
+        if index > 0 && !checkpoint.envelope.matches_record(record) {
+            return finish_conservative_learning_window(
+                checkpoint,
+                record,
+                PrefetchFeedbackLearningRefusal::MismatchedEvidenceEnvelope,
+            );
+        }
+
+        checkpoint.beneficial_records = saturating_inc_u16(checkpoint.beneficial_records);
+    }
+
+    if checkpoint.beneficial_records >= PREFETCH_FEEDBACK_SUSTAINED_MIN_POSITIVE_RECORDS {
+        return finish_sustained_positive_learning_window(checkpoint);
+    }
+
+    finish_need_more_learning_evidence(
+        checkpoint,
+        PrefetchFeedbackLearningRefusal::SinglePositiveRecord,
+    )
+}
+
+fn finish_sustained_positive_learning_window(
+    mut checkpoint: PrefetchFeedbackLearningCheckpoint,
+) -> PrefetchFeedbackLearningCheckpoint {
+    checkpoint.state = PrefetchFeedbackLearningWindowState::SustainedPositiveBounded;
+    checkpoint.refusal_state = PrefetchFeedbackLearningRefusal::None;
+    checkpoint.refusal = StorageIntentRefusalReason::None;
+    checkpoint.confidence_update = PrefetchFeedbackConfidenceUpdate::CapAtCurrent;
+    checkpoint.adjustments = PrefetchFeedbackAdjustmentMask::PAYBACK_CANDIDATE;
+    checkpoint.allowed_uses = sustained_learning_allowed_uses();
+    checkpoint.cooldown_ms = 0;
+    checkpoint.dwell_extension_ms = 0;
+    checkpoint
+}
+
+fn finish_need_more_learning_evidence(
+    mut checkpoint: PrefetchFeedbackLearningCheckpoint,
+    refusal: PrefetchFeedbackLearningRefusal,
+) -> PrefetchFeedbackLearningCheckpoint {
+    checkpoint.state = PrefetchFeedbackLearningWindowState::NeedMoreEvidence;
+    checkpoint.refusal_state = refusal;
+    checkpoint.refusal = StorageIntentRefusalReason::None;
+    checkpoint.confidence_update = PrefetchFeedbackConfidenceUpdate::None;
+    checkpoint.next_confidence = checkpoint.previous_confidence;
+    checkpoint.adjustments = PrefetchFeedbackAdjustmentMask::NEED_MORE_EVIDENCE;
+    checkpoint.allowed_uses = StorageIntentMeasurementAttributionUseMask::NON_AUTHORITY_SAFE;
+    checkpoint
+}
+
+fn finish_conservative_learning_window(
+    mut checkpoint: PrefetchFeedbackLearningCheckpoint,
+    record: PrefetchFeedbackRecord,
+    refusal: PrefetchFeedbackLearningRefusal,
+) -> PrefetchFeedbackLearningCheckpoint {
+    checkpoint.conservative_records = saturating_inc_u16(checkpoint.conservative_records);
+    checkpoint.state = state_for_learning_refusal(refusal);
+    checkpoint.refusal_state = refusal;
+    checkpoint.refusal = if record.refusal != StorageIntentRefusalReason::None {
+        record.refusal
+    } else {
+        refusal_reason_for_learning(refusal)
+    };
+    checkpoint.allowed_uses = StorageIntentMeasurementAttributionUseMask::NON_AUTHORITY_SAFE;
+    checkpoint.confidence_update = confidence_update_for_learning_refusal(refusal);
+    checkpoint.next_confidence =
+        apply_confidence_update(checkpoint.previous_confidence, checkpoint.confidence_update);
+    checkpoint.adjustments = record
+        .adjustments
+        .union(adjustments_for_learning_refusal(refusal));
+    checkpoint.cooldown_ms = record.cooldown_ms;
+    if checkpoint
+        .adjustments
+        .intersects(PrefetchFeedbackAdjustmentMask::COOLDOWN)
+        && checkpoint.cooldown_ms == 0
+    {
+        checkpoint.cooldown_ms = 1;
+    }
+    checkpoint.dwell_extension_ms = record.dwell_extension_ms;
+    checkpoint
+}
+
+fn learning_refusal_for_record(record: PrefetchFeedbackRecord) -> PrefetchFeedbackLearningRefusal {
+    if !record.scope.is_bound() {
+        return PrefetchFeedbackLearningRefusal::UnboundScope;
+    }
+    if !matches!(
+        record.executor_state,
+        PrefetchFeedbackExecutorOutcomeState::Present
+    ) {
+        return match record.executor_state {
+            PrefetchFeedbackExecutorOutcomeState::Stale => {
+                PrefetchFeedbackLearningRefusal::StaleEvidence
+            }
+            PrefetchFeedbackExecutorOutcomeState::Unavailable => {
+                PrefetchFeedbackLearningRefusal::ExecutorNotPresent
+            }
+            PrefetchFeedbackExecutorOutcomeState::Blocked
+            | PrefetchFeedbackExecutorOutcomeState::Refused => {
+                PrefetchFeedbackLearningRefusal::RefusedRecord
+            }
+            PrefetchFeedbackExecutorOutcomeState::Present => PrefetchFeedbackLearningRefusal::None,
+        };
+    }
+    if !matches!(
+        record.scheduler_state,
+        PrefetchFeedbackSchedulerState::Present
+    ) {
+        return PrefetchFeedbackLearningRefusal::SchedulerNotPresent;
+    }
+    if !record.retention_state.has_authority_proof_root() {
+        return PrefetchFeedbackLearningRefusal::MissingRetentionEvidence;
+    }
+    match record.materialization_cost_state {
+        PrefetchFeedbackMaterializationCostState::UnknownConservative => {
+            return PrefetchFeedbackLearningRefusal::UnknownMaterializationCost;
+        }
+        PrefetchFeedbackMaterializationCostState::OverBudget => {
+            return PrefetchFeedbackLearningRefusal::OverBudget;
+        }
+        PrefetchFeedbackMaterializationCostState::Refused => {
+            return PrefetchFeedbackLearningRefusal::MissingCostWear;
+        }
+        PrefetchFeedbackMaterializationCostState::KnownCharged => {}
+    }
+    match record.attribution_state {
+        PrefetchFeedbackAttributionState::Unavailable
+        | PrefetchFeedbackAttributionState::InsufficientSample => {
+            return PrefetchFeedbackLearningRefusal::LowSample;
+        }
+        PrefetchFeedbackAttributionState::Confounded => {
+            return PrefetchFeedbackLearningRefusal::ComparatorConfounded;
+        }
+        PrefetchFeedbackAttributionState::Stale => {
+            return PrefetchFeedbackLearningRefusal::StaleEvidence;
+        }
+        PrefetchFeedbackAttributionState::Contradicted => {
+            return PrefetchFeedbackLearningRefusal::Contradicted;
+        }
+        PrefetchFeedbackAttributionState::ShadowOnly => {
+            return PrefetchFeedbackLearningRefusal::ShadowOnly;
+        }
+        PrefetchFeedbackAttributionState::Refused => {
+            return PrefetchFeedbackLearningRefusal::RefusedRecord;
+        }
+        PrefetchFeedbackAttributionState::Attributable
+        | PrefetchFeedbackAttributionState::PartiallyAttributableWithBounds => {}
+    }
+    match record.verdict {
+        PrefetchFeedbackVerdict::Beneficial => {}
+        PrefetchFeedbackVerdict::Neutral => {
+            return PrefetchFeedbackLearningRefusal::NeutralRecord;
+        }
+        PrefetchFeedbackVerdict::InsufficientSample => {
+            return PrefetchFeedbackLearningRefusal::LowSample;
+        }
+        PrefetchFeedbackVerdict::Wasteful => {
+            return PrefetchFeedbackLearningRefusal::Wasteful;
+        }
+        PrefetchFeedbackVerdict::OverBudget => {
+            return PrefetchFeedbackLearningRefusal::OverBudget;
+        }
+        PrefetchFeedbackVerdict::HarmfulToForeground => {
+            return PrefetchFeedbackLearningRefusal::ForegroundHarm;
+        }
+        PrefetchFeedbackVerdict::Contradicted => {
+            return PrefetchFeedbackLearningRefusal::Contradicted;
+        }
+        PrefetchFeedbackVerdict::PhaseChanged => {
+            return PrefetchFeedbackLearningRefusal::PhaseChanged;
+        }
+        PrefetchFeedbackVerdict::OnePassScan => {
+            return PrefetchFeedbackLearningRefusal::OnePassScan;
+        }
+        PrefetchFeedbackVerdict::WrongDatasetPolicy => {
+            return PrefetchFeedbackLearningRefusal::WrongDatasetPolicy;
+        }
+        PrefetchFeedbackVerdict::WrongMediaTopology => {
+            return PrefetchFeedbackLearningRefusal::WrongMediaTopology;
+        }
+        PrefetchFeedbackVerdict::StaleEvidence => {
+            return PrefetchFeedbackLearningRefusal::StaleEvidence;
+        }
+        PrefetchFeedbackVerdict::MissingCostWear => {
+            return PrefetchFeedbackLearningRefusal::MissingCostWear;
+        }
+        PrefetchFeedbackVerdict::ComparatorConfounded => {
+            return PrefetchFeedbackLearningRefusal::ComparatorConfounded;
+        }
+        PrefetchFeedbackVerdict::ShadowOnly => {
+            return PrefetchFeedbackLearningRefusal::ShadowOnly;
+        }
+        PrefetchFeedbackVerdict::Refused => {
+            return PrefetchFeedbackLearningRefusal::RefusedRecord;
+        }
+    }
+    if !PrefetchFeedbackLearningEnvelope::from_record(record).has_authority_positive_refs() {
+        return PrefetchFeedbackLearningRefusal::MismatchedEvidenceEnvelope;
+    }
+    if !record.payback.has_cost_or_pressure() {
+        return PrefetchFeedbackLearningRefusal::MissingCostWear;
+    }
+    if !record.payback.looks_beneficial() {
+        return PrefetchFeedbackLearningRefusal::LowSample;
+    }
+    if !record.may_train_confidence_upward() || !record.may_close_payback() {
+        return PrefetchFeedbackLearningRefusal::NonAuthorityRecord;
+    }
+    PrefetchFeedbackLearningRefusal::None
+}
+
+const fn state_for_learning_refusal(
+    refusal: PrefetchFeedbackLearningRefusal,
+) -> PrefetchFeedbackLearningWindowState {
+    match refusal {
+        PrefetchFeedbackLearningRefusal::None => {
+            PrefetchFeedbackLearningWindowState::SustainedPositiveBounded
+        }
+        PrefetchFeedbackLearningRefusal::SinglePositiveRecord
+        | PrefetchFeedbackLearningRefusal::LowSample
+        | PrefetchFeedbackLearningRefusal::NeutralRecord
+        | PrefetchFeedbackLearningRefusal::NonAuthorityRecord => {
+            PrefetchFeedbackLearningWindowState::NeedMoreEvidence
+        }
+        PrefetchFeedbackLearningRefusal::Wasteful
+        | PrefetchFeedbackLearningRefusal::OverBudget
+        | PrefetchFeedbackLearningRefusal::ForegroundHarm
+        | PrefetchFeedbackLearningRefusal::MissingCostWear
+        | PrefetchFeedbackLearningRefusal::UnknownMaterializationCost => {
+            PrefetchFeedbackLearningWindowState::Cooldown
+        }
+        PrefetchFeedbackLearningRefusal::OnePassScan
+        | PrefetchFeedbackLearningRefusal::PhaseChanged
+        | PrefetchFeedbackLearningRefusal::Contradicted => {
+            PrefetchFeedbackLearningWindowState::Demotion
+        }
+        PrefetchFeedbackLearningRefusal::UnboundScope
+        | PrefetchFeedbackLearningRefusal::MismatchedScope
+        | PrefetchFeedbackLearningRefusal::MismatchedEvidenceEnvelope
+        | PrefetchFeedbackLearningRefusal::StaleEvidence
+        | PrefetchFeedbackLearningRefusal::WrongDatasetPolicy
+        | PrefetchFeedbackLearningRefusal::WrongMediaTopology => {
+            PrefetchFeedbackLearningWindowState::Reset
+        }
+        PrefetchFeedbackLearningRefusal::MissingRetentionEvidence
+        | PrefetchFeedbackLearningRefusal::ComparatorConfounded
+        | PrefetchFeedbackLearningRefusal::ShadowOnly
+        | PrefetchFeedbackLearningRefusal::RefusedRecord
+        | PrefetchFeedbackLearningRefusal::SchedulerNotPresent
+        | PrefetchFeedbackLearningRefusal::ExecutorNotPresent => {
+            PrefetchFeedbackLearningWindowState::Refused
+        }
+    }
+}
+
+const fn confidence_update_for_learning_refusal(
+    refusal: PrefetchFeedbackLearningRefusal,
+) -> PrefetchFeedbackConfidenceUpdate {
+    match refusal {
+        PrefetchFeedbackLearningRefusal::None
+        | PrefetchFeedbackLearningRefusal::SinglePositiveRecord
+        | PrefetchFeedbackLearningRefusal::NeutralRecord => PrefetchFeedbackConfidenceUpdate::None,
+        PrefetchFeedbackLearningRefusal::UnboundScope
+        | PrefetchFeedbackLearningRefusal::MismatchedScope
+        | PrefetchFeedbackLearningRefusal::MismatchedEvidenceEnvelope
+        | PrefetchFeedbackLearningRefusal::WrongDatasetPolicy
+        | PrefetchFeedbackLearningRefusal::WrongMediaTopology
+        | PrefetchFeedbackLearningRefusal::MissingRetentionEvidence
+        | PrefetchFeedbackLearningRefusal::RefusedRecord
+        | PrefetchFeedbackLearningRefusal::SchedulerNotPresent
+        | PrefetchFeedbackLearningRefusal::ExecutorNotPresent => {
+            PrefetchFeedbackConfidenceUpdate::Refused
+        }
+        PrefetchFeedbackLearningRefusal::LowSample
+        | PrefetchFeedbackLearningRefusal::StaleEvidence
+        | PrefetchFeedbackLearningRefusal::MissingCostWear
+        | PrefetchFeedbackLearningRefusal::UnknownMaterializationCost
+        | PrefetchFeedbackLearningRefusal::ComparatorConfounded
+        | PrefetchFeedbackLearningRefusal::ShadowOnly
+        | PrefetchFeedbackLearningRefusal::OnePassScan
+        | PrefetchFeedbackLearningRefusal::PhaseChanged
+        | PrefetchFeedbackLearningRefusal::Wasteful
+        | PrefetchFeedbackLearningRefusal::OverBudget
+        | PrefetchFeedbackLearningRefusal::ForegroundHarm
+        | PrefetchFeedbackLearningRefusal::Contradicted
+        | PrefetchFeedbackLearningRefusal::NonAuthorityRecord => {
+            PrefetchFeedbackConfidenceUpdate::LowerOneStep
+        }
+    }
+}
+
+const fn refusal_reason_for_learning(
+    refusal: PrefetchFeedbackLearningRefusal,
+) -> StorageIntentRefusalReason {
+    match refusal {
+        PrefetchFeedbackLearningRefusal::None
+        | PrefetchFeedbackLearningRefusal::SinglePositiveRecord
+        | PrefetchFeedbackLearningRefusal::LowSample
+        | PrefetchFeedbackLearningRefusal::NeutralRecord
+        | PrefetchFeedbackLearningRefusal::ComparatorConfounded
+        | PrefetchFeedbackLearningRefusal::ShadowOnly
+        | PrefetchFeedbackLearningRefusal::OnePassScan
+        | PrefetchFeedbackLearningRefusal::PhaseChanged
+        | PrefetchFeedbackLearningRefusal::Wasteful
+        | PrefetchFeedbackLearningRefusal::ForegroundHarm
+        | PrefetchFeedbackLearningRefusal::Contradicted
+        | PrefetchFeedbackLearningRefusal::NonAuthorityRecord => StorageIntentRefusalReason::None,
+        PrefetchFeedbackLearningRefusal::OverBudget => StorageIntentRefusalReason::OverBudget,
+        PrefetchFeedbackLearningRefusal::UnboundScope
+        | PrefetchFeedbackLearningRefusal::MismatchedScope
+        | PrefetchFeedbackLearningRefusal::WrongDatasetPolicy => {
+            StorageIntentRefusalReason::WrongDomain
+        }
+        PrefetchFeedbackLearningRefusal::WrongMediaTopology
+        | PrefetchFeedbackLearningRefusal::MismatchedEvidenceEnvelope => {
+            StorageIntentRefusalReason::MissingMediaCapabilityEvidence
+        }
+        PrefetchFeedbackLearningRefusal::StaleEvidence
+        | PrefetchFeedbackLearningRefusal::MissingRetentionEvidence
+        | PrefetchFeedbackLearningRefusal::MissingCostWear
+        | PrefetchFeedbackLearningRefusal::UnknownMaterializationCost
+        | PrefetchFeedbackLearningRefusal::RefusedRecord
+        | PrefetchFeedbackLearningRefusal::SchedulerNotPresent
+        | PrefetchFeedbackLearningRefusal::ExecutorNotPresent => {
+            StorageIntentRefusalReason::EvidenceNotUsable
+        }
+    }
+}
+
+const fn adjustments_for_learning_refusal(
+    refusal: PrefetchFeedbackLearningRefusal,
+) -> PrefetchFeedbackAdjustmentMask {
+    match state_for_learning_refusal(refusal) {
+        PrefetchFeedbackLearningWindowState::Empty
+        | PrefetchFeedbackLearningWindowState::SustainedPositiveBounded => {
+            PrefetchFeedbackAdjustmentMask::EMPTY
+        }
+        PrefetchFeedbackLearningWindowState::NeedMoreEvidence => {
+            PrefetchFeedbackAdjustmentMask::NEED_MORE_EVIDENCE
+        }
+        PrefetchFeedbackLearningWindowState::Cooldown => PrefetchFeedbackAdjustmentMask::COOLDOWN
+            .union(PrefetchFeedbackAdjustmentMask::SHORTEN_WINDOW)
+            .union(PrefetchFeedbackAdjustmentMask::TYPED_REFUSAL),
+        PrefetchFeedbackLearningWindowState::Demotion => {
+            PrefetchFeedbackAdjustmentMask::LOWER_ACTION_CLASS
+                .union(PrefetchFeedbackAdjustmentMask::DEMOTION_CANDIDATE)
+                .union(PrefetchFeedbackAdjustmentMask::COOLDOWN)
+                .union(PrefetchFeedbackAdjustmentMask::EXPLICIT_NO_PREFETCH)
+        }
+        PrefetchFeedbackLearningWindowState::Reset
+        | PrefetchFeedbackLearningWindowState::Refused => {
+            PrefetchFeedbackAdjustmentMask::TYPED_REFUSAL
+                .union(PrefetchFeedbackAdjustmentMask::COOLDOWN)
+        }
+    }
+}
+
+const fn sustained_learning_allowed_uses() -> StorageIntentMeasurementAttributionUseMask {
+    StorageIntentMeasurementAttributionUseMask::NON_AUTHORITY_SAFE
+        .union(StorageIntentMeasurementAttributionUseMask::TRAIN_CONFIDENCE_UPWARD)
+        .union(StorageIntentMeasurementAttributionUseMask::CLOSE_PAYBACK)
+}
+
+fn learning_evidence_refs_match(
+    left: PrefetchFeedbackEvidenceRefs,
+    right: PrefetchFeedbackEvidenceRefs,
+) -> bool {
+    same_learning_ref(left.retention_ref, right.retention_ref)
+        && same_learning_ref(left.service_objective_ref, right.service_objective_ref)
+        && same_learning_ref(
+            left.evidence_query_snapshot_ref,
+            right.evidence_query_snapshot_ref,
+        )
+        && same_learning_ref(left.decision_frontier_ref, right.decision_frontier_ref)
+        && same_learning_ref(left.scheduler_admission_ref, right.scheduler_admission_ref)
+        && same_learning_ref(left.cost_wear_ref, right.cost_wear_ref)
+        && same_optional_learning_ref(left.egress_restore_cost_ref, right.egress_restore_cost_ref)
+        && same_learning_ref(left.source_media_ref, right.source_media_ref)
+        && same_learning_ref(left.target_media_ref, right.target_media_ref)
+        && same_learning_ref(left.source_path_ref, right.source_path_ref)
+        && same_learning_ref(left.target_destination_ref, right.target_destination_ref)
+        && same_learning_ref(left.transport_path_ref, right.transport_path_ref)
+        && same_optional_learning_ref(left.comparator_ref, right.comparator_ref)
+        && same_learning_ref(left.allowed_use_ref, right.allowed_use_ref)
+}
+
+const fn same_learning_ref(
+    left: StorageIntentEvidenceRef,
+    right: StorageIntentEvidenceRef,
+) -> bool {
+    evidence_ref_equal(left, right)
+}
+
+const fn same_optional_learning_ref(
+    left: StorageIntentEvidenceRef,
+    right: StorageIntentEvidenceRef,
+) -> bool {
+    (!left.is_bound() && !right.is_bound())
+        || (left.is_bound() && right.is_bound() && evidence_ref_equal(left, right))
+}
+
+const fn saturating_inc_u16(value: u16) -> u16 {
+    value.saturating_add(1)
+}
+
+fn max_confidence(left: PredictionConfidence, right: PredictionConfidence) -> PredictionConfidence {
+    left.max(right)
 }
 
 /// Reduce executor and attribution records into a conservative feedback summary.
@@ -2013,6 +2772,221 @@ mod tests {
         );
         assert!(record.cooldown_ms > 0);
         assert!(!record.can_retire_source_receipt());
+    }
+
+    #[test]
+    fn repeated_beneficial_records_keep_only_bounded_sustained_positive_state() {
+        let record = evaluate_prefetch_feedback(admissible_input());
+
+        let checkpoint = reduce_prefetch_feedback_learning_window(&[record, record]);
+
+        assert_eq!(
+            checkpoint.state,
+            PrefetchFeedbackLearningWindowState::SustainedPositiveBounded
+        );
+        assert_eq!(checkpoint.records_seen, 2);
+        assert_eq!(checkpoint.matched_records, 2);
+        assert_eq!(checkpoint.beneficial_records, 2);
+        assert_eq!(checkpoint.conservative_records, 0);
+        assert_eq!(
+            checkpoint.confidence_update,
+            PrefetchFeedbackConfidenceUpdate::CapAtCurrent
+        );
+        assert_eq!(checkpoint.next_confidence, PredictionConfidence::High);
+        assert!(checkpoint.may_keep_confidence_raised());
+        assert!(checkpoint.may_close_payback());
+        assert!(checkpoint
+            .adjustments
+            .contains_all(PrefetchFeedbackAdjustmentMask::PAYBACK_CANDIDATE));
+        assert!(!checkpoint.adjustments.intersects(
+            PrefetchFeedbackAdjustmentMask::PROMOTION_CANDIDATE
+                .union(PrefetchFeedbackAdjustmentMask::MOVEMENT_DEBT_CANDIDATE),
+        ));
+        assert!(!checkpoint.allowed_uses.contains_all(
+            StorageIntentMeasurementAttributionUseMask::SPEND_EXTRA_FLASH_MOVEMENT_BUDGET,
+        ));
+        assert!(!checkpoint.allowed_uses.contains_all(
+            StorageIntentMeasurementAttributionUseMask::SUPPORT_PUBLIC_OR_COMPARATOR_CLAIM,
+        ));
+        assert!(!checkpoint.can_publish_replacement_receipt());
+        assert!(!checkpoint.can_retire_source_receipt());
+        assert!(!checkpoint.can_spend_extra_flash_movement_budget());
+        assert!(!checkpoint.may_support_public_or_comparator_claim());
+    }
+
+    #[test]
+    fn single_beneficial_record_needs_more_window_evidence() {
+        let record = evaluate_prefetch_feedback(admissible_input());
+
+        let checkpoint = reduce_prefetch_feedback_learning_window(&[record]);
+
+        assert_eq!(
+            checkpoint.state,
+            PrefetchFeedbackLearningWindowState::NeedMoreEvidence
+        );
+        assert_eq!(
+            checkpoint.refusal_state,
+            PrefetchFeedbackLearningRefusal::SinglePositiveRecord
+        );
+        assert_eq!(
+            checkpoint.confidence_update,
+            PrefetchFeedbackConfidenceUpdate::None
+        );
+        assert_eq!(checkpoint.next_confidence, PredictionConfidence::Medium);
+        assert!(!checkpoint.may_keep_confidence_raised());
+        assert!(!checkpoint.may_close_payback());
+        assert!(checkpoint
+            .adjustments
+            .contains_all(PrefetchFeedbackAdjustmentMask::NEED_MORE_EVIDENCE));
+    }
+
+    #[test]
+    fn mismatched_scope_and_evidence_envelopes_do_not_aggregate() {
+        let record = evaluate_prefetch_feedback(admissible_input());
+        let mut wrong_scope = record;
+        wrong_scope.scope.budget_owner = domain(77);
+
+        let scope_checkpoint = reduce_prefetch_feedback_learning_window(&[record, wrong_scope]);
+
+        assert_eq!(
+            scope_checkpoint.state,
+            PrefetchFeedbackLearningWindowState::Reset
+        );
+        assert_eq!(
+            scope_checkpoint.refusal_state,
+            PrefetchFeedbackLearningRefusal::MismatchedScope
+        );
+        assert!(!scope_checkpoint.may_keep_confidence_raised());
+        assert!(!scope_checkpoint.may_close_payback());
+
+        let mut wrong_envelope = record;
+        wrong_envelope.evidence_refs.target_media_ref =
+            evidence(StorageIntentEvidenceKind::MediaCapabilityEvidence, 99);
+
+        let envelope_checkpoint =
+            reduce_prefetch_feedback_learning_window(&[record, wrong_envelope]);
+
+        assert_eq!(
+            envelope_checkpoint.state,
+            PrefetchFeedbackLearningWindowState::Reset
+        );
+        assert_eq!(
+            envelope_checkpoint.refusal_state,
+            PrefetchFeedbackLearningRefusal::MismatchedEvidenceEnvelope
+        );
+        assert!(!envelope_checkpoint.may_keep_confidence_raised());
+        assert!(!envelope_checkpoint.may_close_payback());
+    }
+
+    #[test]
+    fn low_sample_and_confounded_records_break_positive_window() {
+        let record = evaluate_prefetch_feedback(admissible_input());
+
+        let mut low_sample = admissible_input();
+        low_sample.attribution_state = PrefetchFeedbackAttributionState::InsufficientSample;
+        low_sample.attribution.verdict =
+            StorageIntentMeasurementAttributionVerdict::InsufficientSample;
+        let low_sample_record = evaluate_prefetch_feedback(low_sample);
+
+        let low_sample_checkpoint =
+            reduce_prefetch_feedback_learning_window(&[record, low_sample_record]);
+
+        assert_eq!(
+            low_sample_checkpoint.state,
+            PrefetchFeedbackLearningWindowState::NeedMoreEvidence
+        );
+        assert_eq!(
+            low_sample_checkpoint.refusal_state,
+            PrefetchFeedbackLearningRefusal::LowSample
+        );
+        assert!(!low_sample_checkpoint.may_keep_confidence_raised());
+        assert!(!low_sample_checkpoint.may_close_payback());
+
+        let mut confounded = admissible_input();
+        confounded.attribution_state = PrefetchFeedbackAttributionState::Confounded;
+        confounded.attribution.verdict = StorageIntentMeasurementAttributionVerdict::Confounded;
+        let confounded_record = evaluate_prefetch_feedback(confounded);
+
+        let confounded_checkpoint =
+            reduce_prefetch_feedback_learning_window(&[record, confounded_record]);
+
+        assert_eq!(
+            confounded_checkpoint.state,
+            PrefetchFeedbackLearningWindowState::Refused
+        );
+        assert_eq!(
+            confounded_checkpoint.refusal_state,
+            PrefetchFeedbackLearningRefusal::ComparatorConfounded
+        );
+        assert!(!confounded_checkpoint.may_keep_confidence_raised());
+        assert!(!confounded_checkpoint.may_close_payback());
+    }
+
+    #[test]
+    fn wasteful_records_cool_down_learning_window() {
+        let record = evaluate_prefetch_feedback(admissible_input());
+        let mut wasteful = admissible_input();
+        wasteful.executor.result_detail.used_bytes = 0;
+        wasteful.executor.result_detail.unused_bytes =
+            wasteful.executor.result_detail.prefetched_bytes;
+        wasteful.executor.result_detail.latency_benefit_us = 1000;
+        wasteful.executor.anti_waste = PrefetchExecutorAntiWasteMask::FAILED_PAYBACK;
+        let wasteful_record = evaluate_prefetch_feedback(wasteful);
+
+        let checkpoint = reduce_prefetch_feedback_learning_window(&[record, wasteful_record]);
+
+        assert_eq!(
+            checkpoint.state,
+            PrefetchFeedbackLearningWindowState::Cooldown
+        );
+        assert_eq!(
+            checkpoint.refusal_state,
+            PrefetchFeedbackLearningRefusal::Wasteful
+        );
+        assert_eq!(
+            checkpoint.confidence_update,
+            PrefetchFeedbackConfidenceUpdate::LowerOneStep
+        );
+        assert!(checkpoint.cooldown_ms > 0);
+        assert!(!checkpoint.may_keep_confidence_raised());
+        assert!(!checkpoint.may_close_payback());
+    }
+
+    #[test]
+    fn missing_retention_or_cost_blocks_checkpoint_authority_positive_state() {
+        let record = evaluate_prefetch_feedback(admissible_input());
+        let mut missing_retention = record;
+        missing_retention.retention_state = PrefetchFeedbackRetentionState::Unavailable;
+
+        let retention_checkpoint = reduce_prefetch_feedback_learning_window(&[missing_retention]);
+
+        assert_eq!(
+            retention_checkpoint.state,
+            PrefetchFeedbackLearningWindowState::Refused
+        );
+        assert_eq!(
+            retention_checkpoint.refusal_state,
+            PrefetchFeedbackLearningRefusal::MissingRetentionEvidence
+        );
+        assert!(!retention_checkpoint.may_keep_confidence_raised());
+        assert!(!retention_checkpoint.may_close_payback());
+
+        let mut unknown_cost = record;
+        unknown_cost.materialization_cost_state =
+            PrefetchFeedbackMaterializationCostState::UnknownConservative;
+
+        let cost_checkpoint = reduce_prefetch_feedback_learning_window(&[unknown_cost]);
+
+        assert_eq!(
+            cost_checkpoint.state,
+            PrefetchFeedbackLearningWindowState::Cooldown
+        );
+        assert_eq!(
+            cost_checkpoint.refusal_state,
+            PrefetchFeedbackLearningRefusal::UnknownMaterializationCost
+        );
+        assert!(!cost_checkpoint.may_keep_confidence_raised());
+        assert!(!cost_checkpoint.may_close_payback());
     }
 
     #[test]
