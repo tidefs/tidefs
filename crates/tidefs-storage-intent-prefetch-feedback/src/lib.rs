@@ -1129,9 +1129,12 @@ pub fn reduce_prefetch_feedback_learning_window(
         return checkpoint;
     }
 
-    let mut index = 0;
-    while index < records.len() && index < PREFETCH_FEEDBACK_LEARNING_WINDOW_MAX_RECORDS {
-        let record = records[index];
+    for (index, record) in records
+        .iter()
+        .take(PREFETCH_FEEDBACK_LEARNING_WINDOW_MAX_RECORDS)
+        .copied()
+        .enumerate()
+    {
         checkpoint.records_seen = saturating_inc_u16(checkpoint.records_seen);
         checkpoint.payback = checkpoint.payback.saturating_add(record.payback);
         checkpoint.previous_confidence =
@@ -1156,18 +1159,15 @@ pub fn reduce_prefetch_feedback_learning_window(
             return finish_conservative_learning_window(checkpoint, record, refusal);
         }
 
-        if index > 0 {
-            if !checkpoint.envelope.matches_record(record) {
-                return finish_conservative_learning_window(
-                    checkpoint,
-                    record,
-                    PrefetchFeedbackLearningRefusal::MismatchedEvidenceEnvelope,
-                );
-            }
+        if index > 0 && !checkpoint.envelope.matches_record(record) {
+            return finish_conservative_learning_window(
+                checkpoint,
+                record,
+                PrefetchFeedbackLearningRefusal::MismatchedEvidenceEnvelope,
+            );
         }
 
         checkpoint.beneficial_records = saturating_inc_u16(checkpoint.beneficial_records);
-        index += 1;
     }
 
     if checkpoint.beneficial_records >= PREFETCH_FEEDBACK_SUSTAINED_MIN_POSITIVE_RECORDS {
