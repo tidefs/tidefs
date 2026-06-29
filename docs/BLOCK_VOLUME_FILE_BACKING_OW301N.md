@@ -24,6 +24,11 @@ backing file:
 - refuse invalid geometry, out-of-bounds ranges, unsupported discard, and
   misaligned payloads without claiming a live block device.
 
+The discard/write-zeroes contract here is zero-visible readback through the
+block-volume file-image model. It is not pool-device media-remanence evidence:
+hole punching may be ignored or reinterpreted by the host filesystem, and
+zero-fill fallback only defines bytes read through this file image.
+
 This command does not open `/dev/ublk-control`. It does not create
 `/dev/ublkcN` or `/dev/ublkbN`, process io_uring queues, issue ublk fetch or
 commit commands, run fio, run mkfs/mount, or prove guest-filesystem behavior.
@@ -59,3 +64,5 @@ This remains below OW-301 and PC-012. It is not a kernel ublk runtime and does n
 
 This is not a ublk daemon, not a Linux block device, not a `/dev/ublk-control`
 runtime, not `/dev/ublkcN` command execution, not io_uring queue execution.
+It is also not a secure erase, cryptographic erase, decommissioning, or
+backing-media privacy claim.
