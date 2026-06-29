@@ -640,7 +640,7 @@
       "exit_code": 0
     },
     "tidefs-vfs-rpc": {
-      "warnings": 9,
+      "warnings": 35,
       "exit_code": 0
     },
     "tidefs-witness-set": {
