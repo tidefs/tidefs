@@ -2084,6 +2084,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidefs-bulk-service"
+version = "0.421.0"
+dependencies = [
+ "crc32c",
+ "tidefs-transport",
+]
+
+[[package]]
 name = "tidefs-cache-coherency"
 version = "0.421.0"
 
