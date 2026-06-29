@@ -6694,7 +6694,7 @@ impl FuseVfsAdapter {
                 mut fallback_to_release,
                 sparse_zero_noop,
                 post_write_attr,
-                clean_write_through_recorded,
+                clean_write_through_pending,
             ) = {
                 let e = self.engine.lock().unwrap();
                 let fallback_open_flags = {
@@ -6763,12 +6763,10 @@ impl FuseVfsAdapter {
                                             u64::from(written),
                                         );
                                     } else if clean_writeback_write_through && !sparse_zero_noop {
-                                        self.record_clean_write_through_after_write(
-                                            ino,
-                                            effective_offset as u64,
-                                            written,
-                                            written_data,
-                                        )?;
+                                        // Clean write-through mirror refreshes run after the
+                                        // engine mutex is released so cached FUSE WRITE replies do
+                                        // not hold lower VFS authority while touching adapter
+                                        // caches and dirty trackers.
                                     } else if !sparse_zero_noop {
                                         self.mark_dirty_after_write(
                                             &**e,
@@ -6805,7 +6803,7 @@ impl FuseVfsAdapter {
                         Err(errno) => Err(errno),
                     }
                 };
-                let clean_write_through_recorded = matches!(
+                let clean_write_through_pending = matches!(
                     &result,
                     Ok(written) if *written > 0 && clean_writeback_write_through && !sparse_zero_noop
                 );
@@ -6815,7 +6813,7 @@ impl FuseVfsAdapter {
                     fallback_efh,
                     sparse_zero_noop,
                     post_write_attr,
-                    clean_write_through_recorded,
+                    clean_write_through_pending,
                 )
             };
             let written = match write_result {
@@ -6828,6 +6826,28 @@ impl FuseVfsAdapter {
                     return Err(errno);
                 }
             };
+            if written > 0 && clean_write_through_pending {
+                let written_len = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                let Some(written_data) = data.get(..written_len) else {
+                    if let Some(fallback) = fallback_to_release.take() {
+                        let e = self.engine.lock().unwrap();
+                        let _ = e.release(&fallback);
+                    }
+                    return Err(Errno::EIO);
+                };
+                if let Err(errno) = self.record_clean_write_through_after_write(
+                    ino,
+                    effective_offset as u64,
+                    written,
+                    written_data,
+                ) {
+                    if let Some(fallback) = fallback_to_release.take() {
+                        let e = self.engine.lock().unwrap();
+                        let _ = e.release(&fallback);
+                    }
+                    return Err(errno);
+                }
+            }
             if let Some(attr) = post_write_attr {
                 self.sync_namespace_attrs_after_engine_write(ino, &attr);
             }
@@ -6866,7 +6886,7 @@ impl FuseVfsAdapter {
                 // Direct I/O conflict guard: clear stale cached dirty ranges
                 // covered by this authoritative direct write, so later
                 // writeback cannot replay old page-cache bytes over it.
-                if clean_write_through_recorded {
+                if clean_write_through_pending {
                     // The write-through helper already refreshed clean cache
                     // mirrors and left dirty trackers empty.
                 } else if posix_direct_io {
@@ -7071,9 +7091,29 @@ impl FuseVfsAdapter {
         self.invalidate_caches_after_engine_data_mutation(ino, offset, length);
     }
 
-    /// Invalidate daemon read-side caches after an engine mutation changes
-    /// visible file bytes.
-    fn invalidate_daemon_caches_after_engine_data_mutation(
+    /// Fence daemon read-side caches after an engine mutation changes visible
+    /// file bytes.
+    fn fence_daemon_read_caches_after_engine_data_mutation(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+    ) {
+        if length == 0 {
+            return;
+        }
+        self.data_cache_invalidations
+            .lock()
+            .unwrap()
+            .invalidate_range(ino, offset, length);
+        self.invalidate_read_cache_entry(ino);
+        self.invalidate_fuse_read_cache_range(ino, offset, length);
+        self.invalidate_inode_metadata_after_engine_write(ino);
+    }
+
+    /// Invalidate daemon page-cache mirrors after an engine mutation changes
+    /// visible file bytes and no caller-provided payload can refresh them.
+    fn invalidate_daemon_page_cache_mirrors_after_engine_data_mutation(
         &self,
         ino: u64,
         offset: u64,
@@ -7083,17 +7123,31 @@ impl FuseVfsAdapter {
             return;
         }
         let end = offset.saturating_add(length);
-        self.data_cache_invalidations
-            .lock()
-            .unwrap()
-            .invalidate_range(ino, offset, length);
+        let writeback_cache_aliases_write_page_cache = self
+            .writeback_page_cache
+            .as_ref()
+            .is_some_and(|wb_cache| Arc::ptr_eq(wb_cache, &self.write_page_cache));
         if let Some(ref wb_cache) = self.writeback_page_cache {
             wb_cache.invalidate_range(ino, offset, end);
         }
-        self.write_page_cache.invalidate_range(ino, offset, end);
-        self.invalidate_read_cache_entry(ino);
-        self.invalidate_fuse_read_cache_range(ino, offset, length);
-        self.invalidate_inode_metadata_after_engine_write(ino);
+        if !writeback_cache_aliases_write_page_cache {
+            self.write_page_cache.invalidate_range(ino, offset, end);
+        }
+    }
+
+    /// Invalidate daemon read-side caches and clean page-cache mirrors after an
+    /// engine mutation changes visible file bytes.
+    fn invalidate_daemon_caches_after_engine_data_mutation(
+        &self,
+        ino: u64,
+        offset: u64,
+        length: u64,
+    ) {
+        if length == 0 {
+            return;
+        }
+        self.fence_daemon_read_caches_after_engine_data_mutation(ino, offset, length);
+        self.invalidate_daemon_page_cache_mirrors_after_engine_data_mutation(ino, offset, length);
     }
 
     /// Invalidate daemon and kernel caches after an engine mutation changes
@@ -7281,7 +7335,7 @@ impl FuseVfsAdapter {
         // invalidation can wait on the page it is servicing.  The engine has
         // already accepted the exact bytes from this request; refresh daemon
         // caches/mirrors here and leave the kernel page cache alone.
-        self.invalidate_daemon_caches_after_engine_data_mutation(ino, offset, length);
+        self.fence_daemon_read_caches_after_engine_data_mutation(ino, offset, length);
         let has_dirty_overlap = self.dirty_trackers_overlap_range(ino, offset, length)
             || self.dirty_page_caches_overlap_range(ino, offset, length);
         if has_dirty_overlap {
@@ -42653,6 +42707,84 @@ mod tests {
             .expect("buffered read after stale daemon cache reinsertion");
         assert_eq!(&after[..replacement.len()], replacement.as_slice());
         assert_eq!(&after[replacement.len()..], &original[replacement.len()..]);
+    }
+
+    #[test]
+    fn writeback_cached_clean_write_through_patches_resident_clean_mirror() {
+        let fixture = adapter_fixture_with_writeback_cache();
+        let ctx = root_ctx();
+        let (inode, adapter_fh, engine_fh) = create_adapter_file_handle(
+            &fixture.adapter,
+            &ctx,
+            b"wb-clean-write-through-page-cache.bin",
+            libc::O_RDWR as u32,
+        );
+        let ino = inode.get();
+        let page_size = fixture.adapter.write_page_cache.page_size();
+        let mut expected = vec![0x31; page_size];
+        {
+            let engine = fixture.adapter.engine.lock().unwrap();
+            engine
+                .write(&engine_fh, 0, &expected, &ctx)
+                .expect("seed original page");
+        }
+        fixture
+            .adapter
+            .write_page_cache
+            .insert(ino, 0)
+            .expect("insert resident clean mirror");
+        {
+            let mut page = fixture
+                .adapter
+                .write_page_cache
+                .lookup(ino, 0)
+                .expect("lookup resident clean mirror");
+            page.data_mut().copy_from_slice(&expected);
+            assert!(!page.is_dirty());
+        }
+        let stale_snapshot = fixture
+            .adapter
+            .data_cache_generation_snapshot(ino, 1024, 512);
+
+        let replacement = vec![0x84; 512];
+        let written = fixture
+            .adapter
+            .dispatch_write(&ctx, ino, adapter_fh, 1024, &replacement, FUSE_WRITE_CACHE)
+            .expect("clean write-through writeback-cache write");
+        assert_eq!(written, replacement.len() as u32);
+        expected[1024..1024 + replacement.len()].copy_from_slice(&replacement);
+
+        assert!(
+            !fixture
+                .adapter
+                .data_cache_snapshot_still_current(ino, 1024, 512, stale_snapshot),
+            "clean write-through writes must still fence daemon read-cache generations"
+        );
+        let page = fixture
+            .adapter
+            .write_page_cache
+            .lookup(ino, 0)
+            .expect("resident clean mirror should be patched, not evicted");
+        assert_eq!(page.data(), expected.as_slice());
+        assert!(!page.is_dirty());
+        assert!(
+            fixture
+                .adapter
+                .write_page_cache
+                .dirty_pages_for_inode(ino)
+                .is_empty(),
+            "clean write-through writes must not create dirty page mirrors"
+        );
+        assert_eq!(
+            fixture
+                .adapter
+                .writeback_cache
+                .lock()
+                .unwrap()
+                .is_dirty(ino),
+            Some(false),
+            "clean write-through writes must leave the inode reclaim cache clean"
+        );
     }
 
     #[test]
