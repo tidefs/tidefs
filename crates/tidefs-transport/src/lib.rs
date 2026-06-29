@@ -249,6 +249,7 @@ pub mod connection_registry;
 pub mod connection_retry;
 pub mod connection_state;
 pub mod connection_telemetry;
+pub mod control_service_dispatch;
 pub mod correlation_frame;
 pub mod cross_session_scheduler;
 pub mod dedup_filter;
@@ -469,6 +470,11 @@ pub use compression::{
 pub use connection_init::{
     ConnectionInitError, ConnectionInitState, HandshakeInitiator, HandshakeMessage,
     HandshakeResponder, HANDSHAKE_PROTOCOL_VERSION,
+};
+pub use control_service_dispatch::{
+    ControlServiceDispatch, ControlServiceDispatchError, ControlServiceDispatchOutcome,
+    ControlServiceFrame, ControlServiceHandler, CONTROL_SERVICE_ENDPOINT_FAMILY,
+    CONTROL_SERVICE_FRAME_HEADER_LEN, CONTROL_SERVICE_LANE, CONTROL_SERVICE_MESSAGE_FAMILY,
 };
 pub use correlation_frame::{
     decode_correlation_frame, encode_correlation_request, encode_correlation_response,
