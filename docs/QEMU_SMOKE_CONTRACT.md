@@ -33,6 +33,12 @@ timeout.  The concurrency group
 `qemu-smoke-${{ github.event.pull_request.number || github.ref }}` uses
 `cancel-in-progress: true` for the workflow as a whole, so a new
 dispatch for the same ref cancels a still-running earlier one.
+Manual `workflow_dispatch` accepts these `target` choices:
+`kmod-xfstests-smoke`, `kernel-fsync-validation`,
+`kernel-mmap-validation`, `kernel-teardown-validation`,
+`kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
+`fuse-vm-test`, `qemu-ublk-smoke`, `receipt-bound-reclaim-runtime`, and
+`all`.
 
 ### Runner Labels
 
@@ -114,7 +120,19 @@ and serial concurrency.
 | Evidence class     | T6 full-kernel-no-daemon teardown (zero userspace daemons, post-final refusal probes, no-daemon crash/recovery cycles) |
 | Artifacts          | `kernel-teardown-runtime.json`, `evidence-manifest.json` |
 
-### 6. `fuse-vm-test`
+### 6. `two-node-carrier-validation`
+
+| Field              | Value |
+|--------------------|-------|
+| Dispatch           | manual `workflow_dispatch` only |
+| Nix flake ref      | `.#two-node-carrier-validation` |
+| Command arguments  | `--timeout 600 --validation-dir /tmp/tidefs-validation/two-node-carrier-validation` |
+| Output directory   | `/tmp/tidefs-validation/two-node-carrier-validation` |
+| Uploaded artifact  | `qemu-smoke-two-node-carrier-validation` (7-day retention) |
+| Evidence class     | two-node QEMU carrier state-transfer scenario |
+| Artifacts          | `carrier-report.json`, `qemu.log`, `summary.json`, environment metadata |
+
+### 7. `fuse-vm-test`
 
 | Field              | Value |
 |--------------------|-------|
@@ -125,7 +143,7 @@ and serial concurrency.
 | Uploaded artifact  | `qemu-smoke-fuse-vm-test` (7-day retention) |
 | Evidence class     | FUSE VM test with queue-depth measurement |
 
-### 7. `qemu-ublk-smoke`
+### 8. `qemu-ublk-smoke`
 
 | Field              | Value |
 |--------------------|-------|
@@ -136,51 +154,74 @@ and serial concurrency.
 | Uploaded artifact  | `qemu-smoke-qemu-ublk-smoke` (7-day retention) |
 | Evidence class     | ublk completion artifact validation |
 
-### 8. `all`
+### 9. `receipt-bound-reclaim-runtime`
 
 | Field              | Value |
 |--------------------|-------|
 | Dispatch           | manual `workflow_dispatch` only |
-| Effect             | Runs every matrix entry (targets 1–7) concurrently (`fail-fast: false`) |
+| Command            | `nix develop .#ci --command cargo run --locked -p tidefs-validation --bin receipt-bound-reclaim-validation -- --row receipt-bound-obsolete-location-trim --output-dir /tmp/tidefs-validation/receipt-bound-reclaim-runtime` |
+| Output directory   | `/tmp/tidefs-validation/receipt-bound-reclaim-runtime` |
+| Uploaded artifact  | `qemu-smoke-receipt-bound-reclaim-runtime` (7-day retention) |
+| Evidence class     | receipt-bound reclaim runtime row for obsolete-location trim gating |
+| Artifacts          | `receipt-bound-reclaim-runtime.json`, `evidence-manifest.json` |
+
+### 10. `all`
+
+| Field              | Value |
+|--------------------|-------|
+| Dispatch           | manual `workflow_dispatch` only |
+| Effect             | Runs every matrix entry (targets 1-9) concurrently (`fail-fast: false`) |
 
 ## Evidence Limits
 
-QEMU Smoke artifacts are **not** xfstests, RDMA, release-candidate, or
-broad filesystem-correctness evidence unless the issue or PR validation
-tier explicitly says so and the relevant dedicated workflow (e.g.
+QEMU Smoke artifacts are **not** xfstests, RDMA, release-candidate,
+broad filesystem-correctness, product-readiness, or
+performance-comparator evidence unless the issue or PR validation tier
+explicitly says so and the relevant dedicated workflow (e.g.
 `xfstests.yml`, `rdma.yml`, `release-candidate.yml`) is also dispatched.
 
 - `kmod-xfstests-smoke` exercises basic VFS operations; it does not run
   xfstests test cases.
 - `kernel-fsync-validation` and `kernel-mmap-validation` exercise
-  specific kernel rows; they are not broad kernel-validation-matrix
-  coverage.
+  specific QEMU Smoke runtime rows; the standalone workflows with the same
+  flake refs remain separate validation lanes when an issue tier requires
+  them.
 - `kernel-teardown-validation` and
   `kernel-no-daemon-teardown-validation` exercise lifecycle teardown;
   they do not claim general kernel stability or production readiness.
+- `two-node-carrier-validation` exercises one live carrier state-transfer
+  scenario; it is not a distributed-system correctness or recovery proof.
 - `fuse-vm-test` measures queue depth under a FUSE VM workload; it is
   not a filesystem stress or correctness run.
 - `qemu-ublk-smoke` validates ublk completion artifacts; it is not a
   block-storage correctness or performance benchmark.
+- `receipt-bound-reclaim-runtime` proves the receipt-bound dead-object
+  queue gate and durable queue replay boundary only; it is not mounted
+  FUSE, kernel, xfstests, RDMA, allocator, segment-cleaner, or parent
+  tracker closure evidence.
 
-## Follow-Up Notes (documentation mismatches, not source changes)
+## Follow-Up Notes (dispatch and evidence boundaries)
 
-These mismatches between `docs/GITHUB_CI.md`, the workflow YAML, and the
-flake outputs are recorded for follow-up but are **not** fixed in this
-slice:
+These notes summarize the current source-inspected dispatch surface. They
+are documentation boundaries, not requests for workflow or runtime changes.
 
-1. **GITHUB_CI.md dispatch description is stale.**  The doc says manual
-   QEMU Smoke dispatch can select "the default target, the mounted
-   `kernel-mmap-validation` target, or both."  The workflow YAML
-   actually exposes 7 individual targets plus `all`.
+1. **Manual dispatch surface.**  Manual QEMU Smoke dispatch can select
+   `kmod-xfstests-smoke`, `kernel-fsync-validation`,
+   `kernel-mmap-validation`, `kernel-teardown-validation`,
+   `kernel-no-daemon-teardown-validation`, `two-node-carrier-validation`,
+   `fuse-vm-test`, `qemu-ublk-smoke`, `receipt-bound-reclaim-runtime`, or
+   `all`.  Pushes to `master` still run only `kmod-xfstests-smoke`.
 
-2. **GITHUB_CI.md omits three targets.**  `kernel-fsync-validation`,
-   `fuse-vm-test`, and `qemu-ublk-smoke` are valid QEMU Smoke dispatch
-   options but are not mentioned in the QEMU Smoke section of
-   `docs/GITHUB_CI.md`.
-
-3. **Dual-surface targets.**  `kernel-fsync-validation` and
+2. **Dual-surface targets.**  `kernel-fsync-validation` and
    `kernel-mmap-validation` exist both as QEMU Smoke matrix targets and
-   as separate dedicated workflows with different concurrency behaviour
-   and, for fsync, a richer evidence manifest.  The documentation does
-   not explain when to prefer one surface over the other.
+   as separate dedicated workflows with different concurrency behavior
+   and, for fsync, a richer evidence manifest.  The QEMU Smoke rows are
+   focused runtime evidence surfaces; standalone workflows or other
+   validation lanes remain separate when an issue validation tier requires
+   them.
+
+3. **Receipt-bound reclaim row.**  `receipt-bound-reclaim-runtime` is a
+   QEMU Smoke matrix target that runs the validation binary through
+   `nix develop .#ci --command cargo run`; it does not have a same-named
+   flake app and does not widen the evidence boundary beyond the focused
+   receipt-bound runtime row.
