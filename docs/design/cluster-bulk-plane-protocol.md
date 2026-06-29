@@ -11,11 +11,14 @@
 
 This document defines the Cluster BULK Plane: a shared byte-transfer layer that
 provides bounded, credit-scheduled bulk data movement between cluster nodes. The
-protocol runs as service_id `0x07` on the tidefs cluster transport (#1210) and
-supports TCP streaming and RDMA direct-memory modes under a unified
-OFFER/ACCEPT/CREDIT/DONE/ABORT state machine. Higher-level services (VFS_RPC,
-COMMIT_GROUP, BLOCK_EXPORT) never invent their own byte-mover; they speak only in terms
-of `BulkOffer` and `BulkToken`.
+protocol runs as service_id `0x07` on the tidefs cluster transport (#1210). The
+first live implementation target is TCP_STREAM under a unified
+OFFER/ACCEPT/CREDIT/DONE/ABORT state machine. RDMA direct-memory modes remain
+disabled design entries until the transport, security, memory-accounting,
+credit-lifecycle, abort-cleanup, and runtime-validation gates in §9.3 are all
+satisfied. Higher-level services (VFS_RPC, COMMIT_GROUP, BLOCK_EXPORT) never
+invent their own byte-mover; they speak only in terms of `BulkOffer` and
+`BulkToken`.
 
 ---
 
@@ -107,9 +110,13 @@ OfferV1:
 transfers on this connection. The sender is responsible for not reusing a
 `stream_id` until the previous transfer with that id has reached DONE or ABORT.
 
-**mode negotiation**: The receiver may reject an unsupported mode via ACCEPT
-with `result=MODE_UNSUPPORTED`. Senders SHOULD fall back from RDMA_WRITE →
-RDMA_READ → TCP_STREAM.
+**mode negotiation**: TCP_STREAM is the baseline mode. The receiver may reject
+an unsupported mode via ACCEPT with `result=MODE_UNSUPPORTED`. A sender may
+request RDMA_WRITE or RDMA_READ only when the connection has explicit
+RDMA-capable policy and evidence. If RDMA is unavailable, a new TCP_STREAM
+transfer is valid only when the higher-level service allows an explicit
+downgrade and records that downgrade as TCP evidence. Silent RDMA → TCP
+demotion is not RDMA success.
 
 **priority semantics**: Priority affects credit scheduling order (see §7). It
 does not guarantee preemption of in-progress credits.
@@ -523,16 +530,30 @@ Note: RDMA_READ inverts the usual "sender pays" assumption. The receiver
 initiates data movement, which may be desirable when the receiver has more
 available CPU/PCIe bandwidth than the sender.
 
-### 9.3 Security gating
+### 9.3 RDMA admission gates
 
-RDMA modes are gated by the security model (#1227):
+RDMA modes are disabled by default. A live BULK service MUST NOT advertise or
+ACCEPT RDMA_WRITE or RDMA_READ until all of these gates have executable
+evidence on the selected connection:
 
-- RDMA_WRITE requires the sender to have `RDMA_WRITE` permission on the
-  receiver's memory region.
-- RDMA_READ requires the sender to have `RDMA_READ` permission and the
-  receiver to trust the sender's memory registration.
-- On untrusted networks or when security mode is `strict`, RDMA modes are
-  disabled and all bulk transfers fall back to TCP_STREAM.
+- transport peer security binds the authenticated peer identity to the transport
+  session and rejects untrusted peers before any rkey/addr is shared;
+- pinned-memory accounting charges every registered byte to the daemon budget
+  and refuses new grants before `max_pinned_bytes` can be exceeded;
+- rkey/addr credits are single-transfer, single-connection grants that are
+  invalidated on DONE, ABORT, timeout, or connection teardown;
+- ABORT cleanup drains or revokes all outstanding RDMA work requests and unpins
+  memory before a token can be retired or a stream_id can be reused;
+- hardware or software-RDMA runtime validation covers successful transfer,
+  refused fallback, abort cleanup, and connection-loss cleanup.
+
+RDMA_WRITE requires the sender to have RDMA_WRITE permission on the receiver's
+memory region. RDMA_READ requires the sender to have RDMA_READ permission and
+the receiver to trust the sender's memory registration. On untrusted networks,
+strict security mode, missing pin accounting, missing cleanup evidence, or
+missing runtime validation, the only admissible live BULK mode is TCP_STREAM.
+If a higher layer requested RDMA, refusing RDMA or explicitly starting a new
+TCP_STREAM transfer is TCP evidence, not RDMA readiness.
 
 ---
 
@@ -650,15 +671,81 @@ most once (or that higher layers handle idempotency).
 VFS_RPC uses `InlineOrBulkV1` to decide whether payload data travels inline
 (within the VFS_RPC frame) or via BULK:
 
-- **WRITE with BULK**: Client sends WRITE RPC with `kind=BULK` and
-  `REQ_FLAG_BULK_PENDING`. Client then sends OFFER to BULK service.
-  Writer waits for BULK DONE before processing WRITE.
-- **READ with BULK**: Writer sends response with `kind=BULK` and
-  `RESP_FLAG_BULK`. Writer then sends OFFER to BULK service.
-  Client pulls data via BULK.
+The `BulkToken` from VFS_RPC's `InlineOrBulkV1` is connection-scoped. The
+VFS_RPC frame and every BULK frame that mentions the token MUST use the same
+authenticated transport connection and peer identity. A token from another
+connection, a previous connection incarnation, or a completed/aborted transfer
+is invalid. VFS_RPC MUST NOT treat `kind=BULK` as live unless the local BULK
+service can look up the token in that same connection's transfer table.
 
-The `BulkToken` from VFS_RPC's `InlineOrBulkV1` is the same token used in
-the same connection as the VFS_RPC message.
+Current source status for the #1523 evidence pass:
+
+- `crates/tidefs-vfs-rpc/src/lib.rs` defines `InlineOrBulk::Bulk { token, len }`
+  plus `REQ_FLAG_BULK_PENDING` and `RESP_FLAG_BULK`.
+- There is no `crates/tidefs-bulk-service/` workspace package, public
+  `BulkService`/`BulkToken`/`BulkOffer` API, connection-scoped transfer table,
+  TCP_STREAM byte mover, or VFS_RPC handoff callback.
+- `apps/tidefs-storage-node/src/protocol.rs` is still an object-store tag
+  protocol, not a cluster service_id `0x07` BULK dispatcher.
+
+Until that service surface exists, VFS_RPC endpoints may reject BULK
+descriptors as unsupported. They must not silently downgrade RDMA-capable BULK
+offers to TCP, claim RDMA readiness, or treat moved bytes as storage semantics
+authority.
+
+#### 12.1.1 WRITE with BULK
+
+The minimal live WRITE handoff is:
+
+1. The client chooses the VFS_RPC `op_id` for the logical WRITE. Retries of the
+   same logical WRITE reuse this `op_id`.
+2. On the same transport connection, the client sends a BULK OFFER in
+   TCP_STREAM mode with metadata naming VFS_RPC, method WRITE, `op_id`, transfer
+   direction `write_upload`, and the intended byte length.
+3. The writer ACCEPTs the OFFER, reserves a connection-scoped transfer slot, and
+   returns a fresh `BulkToken`.
+4. The client sends the VFS_RPC WRITE request with
+   `InlineOrBulkV1 { kind: BULK, bulk_token, bulk_len }` and
+   `REQ_FLAG_BULK_PENDING`.
+5. The client drives CREDIT/data chunks and then DONE for the accepted token.
+   The writer does not call the VFS Engine and does not populate the VFS_RPC
+   dedup cache until DONE verifies the expected length and checksum.
+6. After DONE verifies, the writer processes the WRITE exactly once and caches
+   the VFS_RPC response under `(peer_identity, op_id)`.
+
+If OFFER, CREDIT, data transfer, or DONE fails, either side may send ABORT. The
+writer discards every buffered byte for that token, releases credits, and
+returns `ETIMEDOUT` if a VFS_RPC request is already waiting. Connection loss is
+an implicit ABORT. Failed-transfer bytes never reach the VFS Engine and never
+produce a success response in the dedup cache.
+
+A retry after ABORT or timeout uses the same VFS_RPC `op_id` and a fresh
+`stream_id`/`BulkToken`. If the original WRITE already completed and the
+response is in the dedup cache, the writer replays the cached response and
+sends ABORT for any still-active extra transfer token for that duplicate
+`op_id`.
+
+#### 12.1.2 READ with BULK
+
+The minimal live READ handoff is:
+
+1. The client sends the VFS_RPC READ request with its `op_id`.
+2. If the writer's response exceeds the inline threshold, the writer sends a
+   BULK OFFER in TCP_STREAM mode on the same transport connection with metadata
+   naming VFS_RPC, method READ, `op_id`, transfer direction `read_download`, and
+   the response length.
+3. The client ACCEPTs the OFFER and returns a fresh `BulkToken`.
+4. The writer sends the VFS_RPC response with
+   `InlineOrBulkV1 { kind: BULK, bulk_token, bulk_len }` and `RESP_FLAG_BULK`.
+   The response is a pending descriptor; the client does not expose read bytes
+   until the matching BULK transfer reaches DONE.
+5. The writer drives CREDIT/data chunks and then DONE. The client verifies the
+   expected length and checksum before completing the READ to its caller.
+
+If the transfer aborts or times out, the client discards partial bytes and
+retries the READ operation. A replayed READ response MUST NOT reuse an old
+completed `BulkToken`; the writer either sends inline data or creates a fresh
+BULK transfer for the retry under the same VFS_RPC `op_id`.
 
 ### 12.2 COMMIT_GROUP replication
 
