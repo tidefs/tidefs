@@ -678,7 +678,8 @@ connection, a previous connection incarnation, or a completed/aborted transfer
 is invalid. VFS_RPC MUST NOT treat `kind=BULK` as live unless the local BULK
 service can look up the token in that same connection's transfer table.
 
-Current source status for the #1523 evidence pass:
+Current source status for the #1523 evidence pass, inspected at default-branch
+commit `6027445fe`:
 
 - `crates/tidefs-vfs-rpc/src/lib.rs` defines `InlineOrBulk::Bulk { token, len }`
   plus `REQ_FLAG_BULK_PENDING` and `RESP_FLAG_BULK`.
@@ -687,11 +688,20 @@ Current source status for the #1523 evidence pass:
   TCP_STREAM byte mover, or VFS_RPC handoff callback.
 - `apps/tidefs-storage-node/src/protocol.rs` is still an object-store tag
   protocol, not a cluster service_id `0x07` BULK dispatcher.
+- `crates/tidefs-transport/src/boundedness.rs` exposes generic bulk-token
+  limits and a default bulk deadline for transport boundedness, but no current
+  source binds those limits to a live service_id `0x07` state machine.
 
 Until that service surface exists, VFS_RPC endpoints may reject BULK
 descriptors as unsupported. They must not silently downgrade RDMA-capable BULK
 offers to TCP, claim RDMA readiness, or treat moved bytes as storage semantics
 authority.
+
+The remaining implementation blocker is therefore a BULK-owned service surface
+that can create and look up connection-scoped TCP_STREAM transfers by
+`BulkToken`, drive OFFER/ACCEPT/CREDIT/DONE/ABORT ordering, report timeout or
+ABORT completion to the waiting VFS_RPC operation, and discard failed-transfer
+bytes before any VFS Engine call observes them.
 
 #### 12.1.1 WRITE with BULK
 
@@ -719,6 +729,10 @@ returns `ETIMEDOUT` if a VFS_RPC request is already waiting. Connection loss is
 an implicit ABORT. Failed-transfer bytes never reach the VFS Engine and never
 produce a success response in the dedup cache.
 
+If the VFS_RPC request deadline or the transport's configured bulk deadline
+fires before DONE verifies the token, the waiting side sends or records ABORT
+with reason `TIMEOUT`, retires the token, and treats the operation as failed.
+
 A retry after ABORT or timeout uses the same VFS_RPC `op_id` and a fresh
 `stream_id`/`BulkToken`. If the original WRITE already completed and the
 response is in the dedup cache, the writer replays the cached response and
@@ -743,9 +757,9 @@ The minimal live READ handoff is:
    expected length and checksum before completing the READ to its caller.
 
 If the transfer aborts or times out, the client discards partial bytes and
-retries the READ operation. A replayed READ response MUST NOT reuse an old
-completed `BulkToken`; the writer either sends inline data or creates a fresh
-BULK transfer for the retry under the same VFS_RPC `op_id`.
+retries the READ operation under the same VFS_RPC `op_id`. A replayed READ
+response MUST NOT reuse an old completed `BulkToken`; the writer either sends
+inline data or creates a fresh BULK transfer for the retry.
 
 ### 12.2 COMMIT_GROUP replication
 
