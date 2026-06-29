@@ -20,6 +20,7 @@ on:
           - fuse-vm-test
           - qemu-ublk-smoke
           - receipt-bound-reclaim-runtime
+          - scrub-foreground-read-runtime
           - all
 
 permissions:
@@ -80,6 +81,10 @@ jobs:
             name: receipt-bound-reclaim-runtime
             command: nix develop .#ci --command cargo run --locked -p tidefs-validation --features receipt-bound-physical-reclaim --bin receipt-bound-reclaim-validation -- --row receipt-bound-obsolete-location-trim --output-dir /tmp/tidefs-validation/receipt-bound-reclaim-runtime
             output_dir: /tmp/tidefs-validation/receipt-bound-reclaim-runtime
+          - id: scrub-foreground-read-runtime
+            name: scrub-foreground-read-runtime
+            command: nix run .#scrub-foreground-read-runtime -- --row scrub-foreground-read-runtime --output-dir /tmp/tidefs-validation/scrub-foreground-read-runtime
+            output_dir: /tmp/tidefs-validation/scrub-foreground-read-runtime
 
     steps:
       - name: Checkout
@@ -89,6 +94,9 @@ jobs:
       - name: Host preflight
         if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == matrix.id)) || (github.event_name != 'workflow_dispatch' && matrix.id == 'kmod-xfstests-smoke') }}
         run: |
+          if [[ '${{ matrix.id }}' == 'scrub-foreground-read-runtime' ]]; then
+            exit 0
+          fi
           test -c /dev/kvm
           test -c /dev/fuse
 

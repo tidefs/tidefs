@@ -3427,6 +3427,19 @@ EOF
             exec ${pkgs.bash}/bin/bash nix/tidefs-validation.sh "$@"
           '';
           qemu-smoke = qemuSourceApp "tidefs-qemu-smoke";
+          scrub-foreground-read-runtime = script "tidefs-scrub-foreground-read-runtime" [
+            rustToolchain
+            pkgs.pkg-config
+            pkgs.fuse3
+            pkgs.bash
+            pkgs.coreutils
+            self.packages.${system}.tidefsFuseRuntime
+          ] ''
+            export PKG_CONFIG_PATH="${pkgs.fuse3.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.fuse3 ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export TIDEFS_DAEMON_BIN="${self.packages.${system}.tidefsFuseRuntime}/bin/tidefs-posix-filesystem-adapter-daemon"
+            exec cargo run --locked -p tidefs-validation --bin scrub_foreground_read_validation -- "$@"
+          '';
           fuse-vm-test = qemuSourceApp "tidefs-fuse-vm-test";
           fuse-fio-benchmark = qemuSourceApp "run-fuse-qemu-fio-baseline.sh";
           qemu-ublk-smoke = script "tidefs-qemu-ublk-smoke" [

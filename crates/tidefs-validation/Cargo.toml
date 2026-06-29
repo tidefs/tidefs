@@ -21,6 +21,10 @@ name = "receipt-bound-reclaim-validation"
 path = "src/bin/receipt_bound_reclaim_validation.rs"
 required-features = ["receipt-bound-physical-reclaim"]
 
+[[bin]]
+name = "scrub_foreground_read_validation"
+path = "src/bin/scrub_foreground_read_validation.rs"
+
 [features]
 default = []
 
@@ -150,6 +154,9 @@ tidefs-posix-filesystem-adapter-daemon = { workspace = true, optional = true }
 tidefs-posix-filesystem-adapter-workers-io = { workspace = true, optional = true }
 tidefs-posix-filesystem-adapter-workers-locks = { workspace = true, optional = true }
 tidefs-send-stream = { workspace = true, optional = true }
+tidefs-performance-contract = { workspace = true }
+tidefs-scrub-core = { workspace = true }
+
 [lib]
 path = "src/lib.rs"
 
