@@ -3429,6 +3429,7 @@ EOF
           qemu-smoke = qemuSourceApp "tidefs-qemu-smoke";
           scrub-foreground-read-runtime = script "tidefs-scrub-foreground-read-runtime" [
             rustToolchain
+            pkgs.stdenv.cc
             pkgs.pkg-config
             pkgs.fuse3
             pkgs.bash
