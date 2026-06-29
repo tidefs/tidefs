@@ -25,7 +25,7 @@ use tidefs_local_object_store::{LocalObjectStore, ObjectKey};
 use tidefs_types_vfs_core::InodeId;
 
 use crate::dirty_page_tracker::DirtyPageTracker;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct FsyncCoordinator {
@@ -243,33 +243,44 @@ impl WritebackDaemon {
             return;
         }
         let selected = self.config.policy.select_pages(&dirty_ranges);
-        let mut flushed: BTreeSet<(InodeId, u64)> = BTreeSet::new();
-        {
-            let c = self.fsync_coordinator.lock().expect("poisoned");
-            for (ino, r) in &selected {
+        for (ino, r) in &selected {
+            {
+                let c = self.fsync_coordinator.lock().expect("poisoned");
                 if c.is_fsync_active(*ino) {
                     continue;
                 }
-                match self.page_provider.read_range(*ino, r.offset, r.length) {
-                    Err(e) => {
-                        eprintln!("wb rd err ino={} off={}: {}", ino.0, r.offset, e);
-                        continue;
-                    }
-                    Ok(d) => {
-                        if let Err(e) = self.flush_target.flush_range(*ino, r.offset, &d) {
-                            eprintln!("wb flush err ino={} off={}: {}", ino.0, r.offset, e);
-                            continue;
-                        }
-                    }
-                }
-                flushed.insert((*ino, r.offset));
             }
-        }
-        let mut t = self.tracker.lock().expect("poisoned");
-        for (ino, ranges) in &dirty_ranges {
-            for r in ranges {
-                if !flushed.contains(&(*ino, r.offset)) {
-                    t.mark_dirty(*ino, r.offset, r.length);
+            let started = {
+                let mut t = self.tracker.lock().expect("poisoned");
+                t.start_writeback_range(*ino, r.offset, r.length)
+            };
+            if !started {
+                continue;
+            }
+            let data = match self.page_provider.read_range(*ino, r.offset, r.length) {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("wb rd err ino={} off={}: {}", ino.0, r.offset, e);
+                    self.tracker
+                        .lock()
+                        .expect("poisoned")
+                        .record_writeback_error(*ino, r.offset, r.length, e);
+                    continue;
+                }
+            };
+            match self.flush_target.flush_range(*ino, r.offset, &data) {
+                Ok(()) => {
+                    self.tracker
+                        .lock()
+                        .expect("poisoned")
+                        .complete_writeback_success(*ino, r.offset, r.length);
+                }
+                Err(e) => {
+                    eprintln!("wb flush err ino={} off={}: {}", ino.0, r.offset, e);
+                    self.tracker
+                        .lock()
+                        .expect("poisoned")
+                        .record_writeback_error(*ino, r.offset, r.length, e);
                 }
             }
         }
@@ -985,6 +996,19 @@ mod tests {
     /// in the tracker for retry (not lost).
     #[test]
     fn dirty_page_retained_after_flush_error() {
+        struct FailingFlushTarget;
+
+        impl FlushTarget for FailingFlushTarget {
+            fn flush_range(
+                &mut self,
+                _inode: InodeId,
+                _offset: u64,
+                _data: &[u8],
+            ) -> Result<(), String> {
+                Err("injected flush failure".to_string())
+            }
+        }
+
         let ino = id(400);
         let tracker = Arc::new(Mutex::new(make_tracker_with_dirty(ino, 0, 4096)));
 
@@ -992,29 +1016,27 @@ mod tests {
         assert!(tracker.lock().unwrap().is_dirty(ino));
         assert_eq!(tracker.lock().unwrap().dirty_inode_count(), 1);
 
-        // Simulate a daemon tick that collects dirty ranges.
-        // In the current implementation, tick() collects all dirty
-        // ranges before flushing, so the tracker is emptied regardless
-        // of flush success. This test documents that behavior.
-
-        // Collect dirty ranges (simulating tick start).
-        let dirty_ranges = {
-            let mut t = tracker.lock().unwrap();
-            t.collect_dirty_ranges()
+        let config = WritebackConfig {
+            interval: Duration::from_secs(5),
+            policy: crate::writeback::WritebackPolicy::new(Duration::from_secs(0), 512, 8),
         };
-        assert_eq!(dirty_ranges.len(), 1);
-
-        // After collect_dirty_ranges, the tracker is emptied.
-        // This means errors during flush lose dirty tracking —
-        // a known limitation tracked by Review debt TFR-008.
-        assert_eq!(
-            tracker.lock().unwrap().dirty_inode_count(),
-            0,
-            "KNOWN LIMITATION: tracker is emptied during collect, before flush"
+        let mut daemon = WritebackDaemon::new(
+            config,
+            Arc::clone(&tracker),
+            Arc::new(StubDataProvider),
+            Box::new(FailingFlushTarget),
         );
 
-        // Re-mark dirty to simulate the retry path.
-        tracker.lock().unwrap().mark_dirty(ino, 0, 4096);
-        assert!(tracker.lock().unwrap().is_dirty(ino));
+        daemon.tick();
+
+        let lock = tracker.lock().unwrap();
+        assert!(lock.is_dirty(ino), "failed range must remain non-clean");
+        let ranges = lock.dirty_ranges(ino).expect("poisoned range retained");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].lifecycle_state(),
+            crate::dirty_page_tracker::DirtyLifecycleState::ErrorPoisoned
+        );
+        assert_eq!(ranges[0].writeback_error(), Some("injected flush failure"));
     }
 }
