@@ -427,8 +427,8 @@ fn build_scrub_activity() -> ScrubActivityEvidence {
         background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
         scrub_units_requested: SCRUB_UNITS_REQUESTED,
         scrub_unit_bytes: SCRUB_UNIT_BYTES,
-        pending_units_before_read,
-        pending_units_after_read,
+        pending_units_before_read: pending_before_read,
+        pending_units_after_read: pending_after_read,
         max_scrub_queue_depth: oracle.max_scrub_queue_depth,
         scrub_admitted_by_service_curve: oracle.scrub_admitted,
         scrub_deferred_by_service_curve: oracle.scrub_deferred,
@@ -617,7 +617,7 @@ impl ForegroundReadEvidence {
 fn wait_for_fuse_mount(harness: &MountHarness) -> Result<i64, String> {
     let started = Instant::now();
     let timeout = Duration::from_secs(MOUNT_READY_TIMEOUT_SECS);
-    let mut last_status = "statfs not attempted".to_string();
+    let mut last_status: String;
     loop {
         match harness.statfs() {
             Ok(stats) => {
