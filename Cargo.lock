@@ -3934,6 +3934,7 @@ dependencies = [
 name = "tidefs-vfs-rpc"
 version = "0.421.0"
 dependencies = [
+ "tidefs-transport",
  "tidefs-types-vfs-core",
 ]
 
