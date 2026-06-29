@@ -8,9 +8,15 @@
   "content_digest": "blake3:1ade23434997e570d7625128171607188a2f7bade08778389950f95d79ef6aaf",
   "run_id": "deterministic-fixture:crash-oracle-model-crash-matrices-v1",
   "source_ref": "refs/heads/gpt3/issue-1484-crash-oracle-manifests",
-  "outcome": "pass",
+  "outcome": "skip",
   "residual_risk": "The model crash matrix is source-model evidence only. It does not prove mounted namespace runtime atomicity, orphan-index admission, or production crash safety.",
   "source": "tidefs-crash-oracle",
   "generated_at": "2026-06-28T18:27:07Z",
-  "blocking_issues": []
+  "blocking_issues": [
+    {
+      "repo": "tidefs/tidefs",
+      "number": 286,
+      "reason": "model-first evidence is bounded to the executable model and does not close namespace-wide runtime scope"
+    }
+  ]
 }
