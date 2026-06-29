@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "perf.local.no_unbounded_dirty_debt.v1",
+  "evidence_class": "no-hidden-queue-gate",
+  "validation_tier": "cargo-unit",
+  "scope": "cargo-unit queue-root registry evidence for check-no-hidden-queues over local dirty write admission and budgeted queue accounting; not mounted runtime proof",
+  "artifact_path": "validation/performance/no-hidden-queues.toml",
+  "content_digest": "blake3:1d2b157248e32613cde2dc56a85d6a68ae2b51ae67e855fef3db55599ac56b6f",
+  "run_id": "deterministic-fixture:performance-no-hidden-queues-registry-v1",
+  "source_ref": "refs/heads/gpt4/issue-1485-performance-contract-manifests",
+  "outcome": "pass",
+  "residual_risk": "The no-hidden-queue gate is cargo-unit/source registry evidence. It does not by itself validate mounted userspace, kernel, distributed, RDMA, or production performance behavior.",
+  "source": "tidefs-xtask",
+  "generated_at": "2026-06-28T18:54:32Z",
+  "blocking_issues": []
+}

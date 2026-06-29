@@ -109,9 +109,9 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", validation_tier = "source-model", blocking_issues = ["#287"] },
-  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#498"] },
-  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#287", "#498"] },
+  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/performance/scheduler-dirty-debt-admission-budget-model.manifest.json", blocking_issues = ["#287"] },
+  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", manifest_path = "validation/artifacts/performance/scheduler-dirty-debt-queue-depth-runtime.manifest.json", blocking_issues = ["#498"] },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", manifest_path = "validation/artifacts/performance/scheduler-dirty-debt-claims-gate-review.manifest.json", blocking_issues = ["#287", "#498"] },
 ]
 blockers = [
   "GitHub issue #287 owns performance-contract work classes and no-hidden-queue gates.",
@@ -152,10 +152,10 @@ required_evidence_classes = [
   "claims-gate-review",
 ]
 evidence_requirements = [
-  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", validation_tier = "source-model", blocking_issues = ["#308"] },
-  { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", validation_tier = "cargo-unit", blocking_issues = ["#308"] },
-  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", blocking_issues = ["#498"] },
-  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = ["#498"] },
+  { class = "admission-budget-model", path = "validation/performance/no-hidden-queues.toml", validation_tier = "source-model", blocking_issues = [] },
+  { class = "no-hidden-queue-gate", path = "validation/performance/no-hidden-queues.toml", validation_tier = "cargo-unit", blocking_issues = [] },
+  { class = "queue-depth-runtime-artifact", path = "validation/artifacts/performance/queue-depth-runtime.json", validation_tier = "mounted-userspace", blocking_issues = [] },
+  { class = "claims-gate-review", path = "validation/artifacts/performance/claims-gate-review.toml", validation_tier = "source-model", blocking_issues = [] },
 ]
 blockers = []
 generated_doc = "Validated bounded local no-unbounded-dirty-debt claim. TideFS has admission-budget model evidence, no-hidden-queue gate evidence, mounted FUSE queue-depth runtime evidence, and claims-gate review evidence for the local smoke-mount quick workload. This does not validate scheduler-wide dirty-debt coverage, scrub/read isolation, crash recovery, or production performance readiness."

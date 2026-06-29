@@ -511,6 +511,151 @@ impl<'a> PerformanceReceipt<'a> {
         }
         Ok(())
     }
+
+    /// Build a v2 claim evidence manifest reference for this receipt.
+    ///
+    /// The returned value uses the same field names as
+    /// `tidefs-validation`'s `EvidenceArtifactManifest` without making this
+    /// no_std contract crate depend on the validation crate. The validation
+    /// tier is taken from the receipt, so source/model receipts cannot be
+    /// wrapped as mounted runtime evidence by this helper.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evidence_artifact_manifest(
+        &self,
+        claim_id: &'a str,
+        evidence_class: &'a str,
+        artifact_path: &'a str,
+        content_digest: &'a str,
+        run_id: &'a str,
+        source_ref: &'a str,
+        outcome: EvidenceOutcome,
+        residual_risk: &'a str,
+        source: &'a str,
+        generated_at: &'a str,
+        blocking_issues: &'a [BlockingIssueRef<'a>],
+    ) -> Result<EvidenceArtifactManifestRef<'a>, PerformanceReceiptValidationError> {
+        self.validate()?;
+        if !self.claim_ids.contains(&claim_id) {
+            return Err(PerformanceReceiptValidationError::ManifestClaimNotCovered);
+        }
+        for (field, value) in [
+            (EvidenceManifestField::ClaimId, claim_id),
+            (EvidenceManifestField::EvidenceClass, evidence_class),
+            (
+                EvidenceManifestField::Scope,
+                self.workload.scope.description,
+            ),
+            (EvidenceManifestField::ArtifactPath, artifact_path),
+            (EvidenceManifestField::RunId, run_id),
+            (EvidenceManifestField::SourceRef, source_ref),
+            (EvidenceManifestField::ResidualRisk, residual_risk),
+            (EvidenceManifestField::Source, source),
+            (EvidenceManifestField::GeneratedAt, generated_at),
+        ] {
+            if is_blank(value) {
+                return Err(PerformanceReceiptValidationError::MissingManifestField(
+                    field,
+                ));
+            }
+        }
+        if !is_blake3_content_digest(content_digest) {
+            return Err(PerformanceReceiptValidationError::InvalidManifestContentDigest);
+        }
+
+        Ok(EvidenceArtifactManifestRef {
+            manifest_version: EVIDENCE_ARTIFACT_MANIFEST_VERSION,
+            claim_id,
+            evidence_class,
+            validation_tier: self.validation_tier,
+            scope: self.workload.scope.description,
+            artifact_path,
+            content_digest,
+            run_id,
+            source_ref,
+            outcome,
+            residual_risk,
+            source,
+            generated_at,
+            blocking_issues,
+        })
+    }
+}
+
+/// Version of the shared claim evidence manifest shape emitted by this crate.
+pub const EVIDENCE_ARTIFACT_MANIFEST_VERSION: u32 = 2;
+
+/// Borrowed v2 claim evidence manifest reference for performance receipts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct EvidenceArtifactManifestRef<'a> {
+    pub manifest_version: u32,
+    pub claim_id: &'a str,
+    pub evidence_class: &'a str,
+    pub validation_tier: ValidationTier,
+    pub scope: &'a str,
+    pub artifact_path: &'a str,
+    pub content_digest: &'a str,
+    pub run_id: &'a str,
+    pub source_ref: &'a str,
+    pub outcome: EvidenceOutcome,
+    pub residual_risk: &'a str,
+    pub source: &'a str,
+    pub generated_at: &'a str,
+    pub blocking_issues: &'a [BlockingIssueRef<'a>],
+}
+
+/// Evidence outcome labels accepted by the shared manifest validator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+#[non_exhaustive]
+pub enum EvidenceOutcome {
+    Pass,
+    ProductFail,
+    HarnessFail,
+    EnvironmentRefusal,
+    Skip,
+}
+
+impl EvidenceOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::ProductFail => "product-fail",
+            Self::HarnessFail => "harness-fail",
+            Self::EnvironmentRefusal => "environment-refusal",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+/// Blocking issue reference carried by v2 evidence manifests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct BlockingIssueRef<'a> {
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub repo: Option<&'a str>,
+    pub number: u64,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub reason: Option<&'a str>,
+}
+
+/// Required common manifest field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+#[non_exhaustive]
+pub enum EvidenceManifestField {
+    ClaimId,
+    EvidenceClass,
+    Scope,
+    ArtifactPath,
+    RunId,
+    SourceRef,
+    ResidualRisk,
+    Source,
+    GeneratedAt,
 }
 
 /// Part of a receipt that named an unknown resource domain.
@@ -537,6 +682,9 @@ pub enum PerformanceReceiptValidationError {
     EmptyMeasurementVector,
     BudgetDecisionWithoutPolicy,
     MissingClaimIds,
+    ManifestClaimNotCovered,
+    MissingManifestField(EvidenceManifestField),
+    InvalidManifestContentDigest,
 }
 
 /// Per-tick service envelope for one work class.
@@ -1252,6 +1400,13 @@ fn is_blank(value: &str) -> bool {
         .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
 }
 
+fn is_blake3_content_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("blake3:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::oracle::{
@@ -1504,6 +1659,110 @@ mod tests {
         assert_eq!(err, PerformanceReceiptValidationError::MissingClaimIds);
     }
 
+    #[test]
+    fn performance_receipt_builds_v2_manifest_reference() {
+        let manifest = valid_receipt()
+            .evidence_artifact_manifest(
+                "perf.local.no_unbounded_dirty_debt.v1",
+                "no-hidden-queue-gate",
+                "validation/performance/no-hidden-queues.toml",
+                "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+                "deterministic-fixture:performance-contract-no-hidden-queues-v1",
+                "refs/heads/gpt4/issue-1485-performance-contract-manifests",
+                EvidenceOutcome::Pass,
+                "Cargo-unit queue registry evidence only; no mounted runtime proof.",
+                "tidefs-performance-contract",
+                "2026-06-28T20:00:00Z",
+                &[],
+            )
+            .expect("manifest reference");
+
+        assert_eq!(manifest.manifest_version, 2);
+        assert_eq!(manifest.claim_id, "perf.local.no_unbounded_dirty_debt.v1");
+        assert_eq!(manifest.evidence_class, "no-hidden-queue-gate");
+        assert_eq!(manifest.validation_tier, ValidationTier::CargoUnit);
+        assert_eq!(manifest.outcome, EvidenceOutcome::Pass);
+    }
+
+    #[test]
+    fn manifest_reference_rejects_uncovered_claim_id() {
+        let err = valid_receipt()
+            .evidence_artifact_manifest(
+                "scheduler.dirty_debt.no_hidden.v1",
+                "no-hidden-queue-gate",
+                "validation/performance/no-hidden-queues.toml",
+                "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+                "deterministic-fixture:performance-contract-no-hidden-queues-v1",
+                "refs/heads/gpt4/issue-1485-performance-contract-manifests",
+                EvidenceOutcome::Pass,
+                "Cargo-unit queue registry evidence only; no mounted runtime proof.",
+                "tidefs-performance-contract",
+                "2026-06-28T20:00:00Z",
+                &[],
+            )
+            .expect_err("uncovered claim id");
+        assert_eq!(
+            err,
+            PerformanceReceiptValidationError::ManifestClaimNotCovered
+        );
+    }
+
+    #[test]
+    fn manifest_reference_rejects_invalid_digest() {
+        let err = valid_receipt()
+            .evidence_artifact_manifest(
+                "perf.local.no_unbounded_dirty_debt.v1",
+                "no-hidden-queue-gate",
+                "validation/performance/no-hidden-queues.toml",
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "deterministic-fixture:performance-contract-no-hidden-queues-v1",
+                "refs/heads/gpt4/issue-1485-performance-contract-manifests",
+                EvidenceOutcome::Pass,
+                "Cargo-unit queue registry evidence only; no mounted runtime proof.",
+                "tidefs-performance-contract",
+                "2026-06-28T20:00:00Z",
+                &[],
+            )
+            .expect_err("invalid digest");
+        assert_eq!(
+            err,
+            PerformanceReceiptValidationError::InvalidManifestContentDigest
+        );
+    }
+
+    #[test]
+    fn source_model_receipt_keeps_source_model_manifest_tier() {
+        let receipt = PerformanceReceipt::new(
+            "performance.local.admission-budget.receipt.v1",
+            WorkloadEnvelope::new(
+                NO_STD_SCOPE,
+                WorkClass::ForegroundWrite,
+                NO_STD_ENVIRONMENT,
+                &RECEIPT_DOMAINS,
+            ),
+            MeasurementVector::new(&RECEIPT_MEASUREMENTS),
+            NO_STD_DECISION,
+            ValidationTier::SourceModel,
+            &RECEIPT_CLAIMS,
+        );
+        let manifest = receipt
+            .evidence_artifact_manifest(
+                "perf.local.no_unbounded_dirty_debt.v1",
+                "admission-budget-model",
+                "validation/performance/no-hidden-queues.toml",
+                "blake3:2222222222222222222222222222222222222222222222222222222222222222",
+                "deterministic-fixture:performance-contract-admission-budget-v1",
+                "refs/heads/gpt4/issue-1485-performance-contract-manifests",
+                EvidenceOutcome::Pass,
+                "Source-model admission budget evidence only; no mounted runtime proof.",
+                "tidefs-performance-contract",
+                "2026-06-28T20:00:00Z",
+                &[],
+            )
+            .expect("source model manifest");
+        assert_eq!(manifest.validation_tier, ValidationTier::SourceModel);
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn performance_receipt_serialization_is_deterministic() {
@@ -1512,6 +1771,48 @@ mod tests {
             json,
             r#"{"id":"performance.local.writeback.receipt.v1","workload":{"scope":{"id":"workload.local.writeback.flush","description":"local writeback flush envelope"},"work_class":"ForegroundWrite","environment_profile":{"id":"env.local-ci.nix"},"resource_domains":[{"name":"dirty-bytes"},{"name":"queue-slots"}]},"measurement_vector":{"points":[{"name":"queued_dirty_bytes","resource_domain":{"name":"dirty-bytes"},"value":4096,"unit":"bytes"},{"name":"queue_slots","resource_domain":{"name":"queue-slots"},"value":4,"unit":"count"}]},"budget_decision":{"outcome":"pass","comparator":{"id":"budget.local.writeback.absolute","kind":"absolute-ceiling"},"baseline_policy":null},"validation_tier":"cargo-unit","claim_ids":["perf.local.no_unbounded_dirty_debt.v1"]}"#
         );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn performance_manifest_reference_serializes_common_v2_fields() {
+        let manifest = valid_receipt()
+            .evidence_artifact_manifest(
+                "perf.local.no_unbounded_dirty_debt.v1",
+                "no-hidden-queue-gate",
+                "validation/performance/no-hidden-queues.toml",
+                "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+                "deterministic-fixture:performance-contract-no-hidden-queues-v1",
+                "refs/heads/gpt4/issue-1485-performance-contract-manifests",
+                EvidenceOutcome::Pass,
+                "Cargo-unit queue registry evidence only; no mounted runtime proof.",
+                "tidefs-performance-contract",
+                "2026-06-28T20:00:00Z",
+                &[],
+            )
+            .expect("manifest reference");
+        let value = serde_json::to_value(manifest).expect("manifest json value");
+
+        for field in [
+            "manifest_version",
+            "claim_id",
+            "evidence_class",
+            "validation_tier",
+            "scope",
+            "artifact_path",
+            "content_digest",
+            "run_id",
+            "source_ref",
+            "outcome",
+            "residual_risk",
+            "source",
+            "generated_at",
+            "blocking_issues",
+        ] {
+            assert!(value.get(field).is_some(), "missing field {field}");
+        }
+        assert_eq!(value["validation_tier"], "cargo-unit");
+        assert_eq!(value["outcome"], "pass");
     }
 
     #[test]

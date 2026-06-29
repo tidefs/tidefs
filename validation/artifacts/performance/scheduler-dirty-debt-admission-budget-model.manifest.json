@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "claim_id": "scheduler.dirty_debt.no_hidden.v1",
+  "evidence_class": "admission-budget-model",
+  "validation_tier": "source-model",
+  "scope": "source-model queue-root registry for performance-contract admission and budgeted queue accounting; not mounted runtime proof and not scheduler-wide dirty-debt closure",
+  "artifact_path": "validation/performance/no-hidden-queues.toml",
+  "content_digest": "blake3:1d2b157248e32613cde2dc56a85d6a68ae2b51ae67e855fef3db55599ac56b6f",
+  "run_id": "deterministic-fixture:performance-no-hidden-queues-registry-v1",
+  "source_ref": "refs/heads/gpt4/issue-1485-performance-contract-manifests",
+  "outcome": "pass",
+  "residual_risk": "The registry is source-model performance-contract evidence only. It does not prove that foreground and background dirty work cannot hide outside budgeted queues at runtime.",
+  "source": "tidefs-performance-contract",
+  "generated_at": "2026-06-28T18:54:32Z",
+  "blocking_issues": []
+}
