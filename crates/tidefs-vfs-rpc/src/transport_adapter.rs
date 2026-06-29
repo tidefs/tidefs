@@ -20,7 +20,7 @@ use tidefs_types_vfs_core::Errno;
 use crate::{
     InlineOrBulk, OpId, PeerId, VfsRpcError, VfsRpcMessageKind, VfsRpcRequest,
     VfsRpcRequestPayload, VfsRpcResponse, VfsRpcResponsePayload, VfsRpcTransportFrame,
-    REQ_FLAG_BULK_PENDING, RESP_FLAG_BULK, VFS_RPC_SERVICE_ID,
+    REQ_FLAG_BULK_PENDING, RESP_FLAG_BULK,
 };
 
 /// Endpoint family selected for VFS_RPC control/inline frames.
@@ -725,7 +725,7 @@ impl std::error::Error for VfsRpcTransportAdapterError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DatasetId, VfsRpcCredentials, VfsRpcMethod};
+    use crate::{DatasetId, VfsRpcCredentials, VfsRpcMethod, VFS_RPC_SERVICE_ID};
     use tidefs_transport::TransportError;
     use tidefs_types_vfs_core::InodeId;
 
