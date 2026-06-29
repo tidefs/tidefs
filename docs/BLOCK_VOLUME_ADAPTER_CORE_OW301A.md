@@ -17,6 +17,9 @@ the block-volume laws that a later userspace `ublk` adapter must preserve:
   dirty epochs;
 - explicit out-of-bounds, misaligned-range, and unsupported-discard refusals.
 
+The core discard/write-zeroes model is a logical block-volume data-semantics
+contract. It does not prove pool-device discard/TRIM capability, backing-media
+remanence behavior, secure erase, or cryptographic erase.
 
 The implementation-tracked non-release tests cover:
 
@@ -44,4 +47,5 @@ block-volume adapter family member before any Linux export surface is admitted.
 
 ## Non-Claims
 
-durability claim.
+This is not a durability, pool-device discard, media remanence, secure erase,
+cryptographic erase, live ublk, or Linux block-device runtime claim.

@@ -636,20 +636,24 @@ Important 2026-06-01 findings:
   document instead of treating it as existing authority.
 - `TFR-012`: Device lifecycle and media privacy remain incomplete.
   `docs/DEVICE_LIFECYCLE_REMANENCE_AUTHORITY.md` records the current decision
-  boundary from issue #1276. Pool-member backing is byte-addressable media only:
+  boundary from issue #1276, with issue #1536 adding the zero-visible versus
+  media-privacy boundary. Pool-member backing is byte-addressable media only:
   production block devices or explicit regular-file images for hidden
   development mode. Directory `LocalObjectStore` compatibility is not a valid
   pool-member device mode, does not advertise discard, and reports zero bytes
   discarded through compatibility-only trim/free paths. Current source has
   placement-receipt-aware removal helpers, a mounted live-owner removal route,
   replacement state, label topology fields, block-volume zero-visible
-  discard/write-zeroes models, segment hole-punching, capacity/reclaim hooks,
-  and transform wrappers that forward discard ranges, but these surfaces are not
-  yet one product authority for removal, replacement, discard, zeroing, or
-  remanence. The non-overlapping follow-up map is:
+  discard/write-zeroes models, label-area zeroing for explicit destroy paths,
+  segment hole-punching, capacity/reclaim hooks, and transform wrappers that
+  forward discard ranges, but these surfaces are not yet one product authority
+  for removal, replacement, discard, zeroing, cryptographic erase, secure erase,
+  decommissioning, or remanence. The non-overlapping follow-up map is:
   real byte-device discard capability; segment-reclaim remanence policy; online
   removal authority closeout; online replacement and rebuild authority; zeroing
-  and media privacy policy; and focused device-lifecycle runtime validation.
+  and media privacy policy; cryptographic erase/key-lifecycle semantics only
+  through a separate transform/key-lifecycle issue; and focused device-lifecycle
+  runtime validation.
 - `TFR-013`: stage words remain widespread; examples include CLI stubs,
   runners, old issue-era gate labels outside the first cleaned xtask gate set,
   and app/workspace classification docs that list deleted or quarantined

@@ -674,7 +674,11 @@ ranges to the store's discard path. Compression and encryption wrappers forward
 discard ranges unchanged and say transforms do not affect TRIM byte ranges;
 that needs a privacy contract, because discard observability and remanence are
 different for plaintext, encrypted, compressed, regular-file-backed
-development pools, and block-device-backed production pools.
+development pools, and block-device-backed production pools. Issue #1536
+records the zeroing/media-privacy decision boundary: zero-visible
+block-volume/file-image reads, filesystem zero-range behavior, label-area
+zeroing, discard acceptance, cryptographic erase, secure erase, and
+decommissioning readiness are separate semantics.
 
 `tidefsctl device remove` now imports pool config from labels and persists
 updated survivor labels, which is progress. The flow still opens a target
