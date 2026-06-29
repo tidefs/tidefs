@@ -252,8 +252,9 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
     let mount_f_type = match wait_for_fuse_mount(&harness) {
         Ok(f_type) => f_type,
         Err(error) => {
+            environment.environment_refusal = Some(fuse_mount_unavailable_reason(&error));
             return base_evidence(
-                ValidationStatus::HarnessFail,
+                ValidationStatus::EnvironmentRefusal,
                 command,
                 generated_at,
                 run_id,
@@ -642,6 +643,10 @@ fn wait_for_fuse_mount(harness: &MountHarness) -> Result<i64, String> {
     }
 }
 
+fn fuse_mount_unavailable_reason(error: &str) -> String {
+    format!("FUSE mount unavailable for mounted-userspace validation: {error}")
+}
+
 fn deterministic_payload(bytes: usize) -> Vec<u8> {
     (0..bytes)
         .map(|index| ((index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u8)
@@ -702,4 +707,53 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     }
     let text = String::from_utf8(output.stdout).ok()?;
     Some(text.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuse_mount_unavailable_records_environment_refusal() {
+        let service_curve = build_service_curve();
+        let mount_error =
+            "mount path /tmp/tidefs/mnt did not become a FUSE filesystem; statfs_type=0xef53";
+        let environment = RuntimeEnvironmentEvidence {
+            host: "linux x86_64 kernel=test".to_string(),
+            dev_fuse_present: true,
+            daemon_bin: Some("/nix/store/test/bin/tidefs-posix-filesystem-adapter-daemon".into()),
+            environment_refusal: Some(fuse_mount_unavailable_reason(mount_error)),
+        };
+
+        let evidence = base_evidence(
+            ValidationStatus::EnvironmentRefusal,
+            "scrub_foreground_read_validation --row scrub-foreground-read-runtime".to_string(),
+            "2026-06-29T17:30:00Z".to_string(),
+            "test-run/1".to_string(),
+            "test-sha".to_string(),
+            environment,
+            None,
+            ForegroundReadEvidence::not_run_with_failure(
+                service_curve.max_foreground_read_wait_ticks,
+                mount_error,
+            ),
+            build_scrub_activity(),
+            service_curve,
+        );
+
+        assert_eq!(evidence.outcome, ValidationStatus::EnvironmentRefusal);
+        assert!(evidence
+            .environment
+            .environment_refusal
+            .as_deref()
+            .expect("refusal reason")
+            .contains("FUSE mount unavailable"));
+        assert!(evidence
+            .foreground_read
+            .failures
+            .iter()
+            .any(|failure| failure.contains("statfs_type=0xef53")));
+        assert_eq!(evidence.runtime_source.exit_status, 0);
+        assert!(evidence.assert_no_product_or_harness_failure().is_ok());
+    }
 }
