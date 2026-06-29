@@ -18,6 +18,8 @@ use tidefs_types_vfs_core::{
     InodeAttr, InodeFlags, InodeId, NodeKind, PosixAttrs, RenameFlags, SetAttr, StatFs,
 };
 
+pub mod transport_adapter;
+
 /// Stable VFS_RPC service id in the cluster service registry.
 pub const VFS_RPC_SERVICE_ID: u8 = 0x06;
 
