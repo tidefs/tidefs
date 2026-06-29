@@ -112,7 +112,7 @@
       "exit_code": 0
     },
     "tidefs-crash-oracle": {
-      "warnings": 12,
+      "warnings": 23,
       "exit_code": 0
     },
     "tidefs-data-cleaner": {
