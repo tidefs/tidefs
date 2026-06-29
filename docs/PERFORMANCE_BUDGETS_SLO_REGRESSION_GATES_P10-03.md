@@ -1109,7 +1109,7 @@ P10 numeric budget classes (section 4.4) and relative regression locks
   with open budget buckets).  The markdown render includes this metric.
 - `GateReceiptRow` surfaces `budget_buckets` as a list of label strings.
 
-### 12.12.5 Gate receipt rendering and release-ready gating (issue #6161 step 5)
+### 12.12.5 Gate receipt rendering and performance-gate readiness (issue #6161 step 5)
 
 The complete enforcement chain feeds into a single `GateReceipt` that can
 be inspected through `render_markdown()`:
@@ -1118,13 +1118,14 @@ be inspected through `render_markdown()`:
   with summary metrics (total, runtime_pass, code_only_pass, failed, refused,
   budget decision, artifacts_satisfied, budget_buckets), comparator runs
   (ref_id, executed, KPI count, blocker), and notes.
-- **`release_ready`**: Now requires all four gates:
+- **`perf_gate_ready`**: Now requires all four performance-gate conditions:
   1. Subject completeness (`invariant_holds`)
+  2. At least one runtime validation row
   3. Zero artifact gap (all live-runtime rows satisfy artifact requirements)
   4. Zero budget gap (no budget violations on any row)
-  A receipt with open artifact or budget gaps is `NOT READY` regardless of
-  pass counts.
-  **Scope note**: This `release_ready` field is a performance-gate-local receipt
+  A receipt with open artifact or budget gaps renders `Performance gate: NOT READY`
+  regardless of pass counts.
+  **Scope note**: This `perf_gate_ready` field is a performance-gate-local receipt
   scoped to the `performance_budget_0` matrix rows only. It is not a whole-product
   release-readiness verdict. The release-readiness boundary, including the
   evidence families a verdict must consume and explicit non-claims, is defined in

@@ -224,7 +224,7 @@ fn main() {
                         );
                     } else {
                         eprintln!(
-                            "perf-gate receipt written to {}: rows={} passed={} failed={} refused={} skipped={} artifact_gap={} budget_gap={} release_ready={}",
+                            "perf-gate receipt written to {}: rows={} passed={} failed={} refused={} skipped={} artifact_gap={} budget_gap={} perf_gate_ready={}",
                             receipt_path.display(),
                             receipt.summary.total,
                             receipt.summary.passed,
@@ -233,7 +233,7 @@ fn main() {
                             receipt.summary.skipped,
                             receipt.summary.artifact_gap,
                             receipt.summary.budget_gap,
-                            receipt.release_ready,
+                            receipt.perf_gate_ready,
                         );
                     }
                 }
@@ -256,7 +256,7 @@ fn main() {
                 exit_code = 1;
             }
 
-            if !receipt.release_ready {
+            if !receipt.perf_gate_ready {
                 let mut reasons: Vec<String> = Vec::new();
                 if receipt.summary.artifact_gap > 0 {
                     reasons.push(format!(
@@ -277,11 +277,11 @@ fn main() {
                     reasons.push("no runtime validation rows passed".into());
                 }
                 let reason_str = if reasons.is_empty() {
-                    "no release-ready conditions met".into()
+                    "no performance-gate readiness conditions met".into()
                 } else {
                     reasons.join("; ")
                 };
-                eprintln!("PERF GATE FAIL: not release-ready — {reason_str}");
+                eprintln!("PERF GATE FAIL: performance gate not ready — {reason_str}");
                 if exit_code == 0 {
                     exit_code = 1;
                 }

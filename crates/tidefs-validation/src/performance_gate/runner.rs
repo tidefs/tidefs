@@ -54,7 +54,7 @@ pub struct GateReceipt {
     pub rows: Vec<GateReceiptRow>,
     pub comparator_runs: Vec<ComparatorRun>,
     pub summary: ReceiptSummary,
-    pub release_ready: bool,
+    pub perf_gate_ready: bool,
     pub invariant_holds: bool,
     pub missing_subjects: Vec<String>,
     pub notes: Vec<String>,
@@ -90,10 +90,10 @@ pub struct ReceiptSummary {
 impl GateReceipt {
     /// Render this receipt as a complete markdown performance gate report.
     /// Surfaces measurement sources, artifacts, comparators, budget buckets,
-    /// and release readiness in a single view.
+    /// and performance-gate readiness in a single view.
     pub fn render_markdown(&self) -> String {
         let mut md = String::new();
-        let release_label = if self.release_ready {
+        let perf_gate_label = if self.perf_gate_ready {
             "READY"
         } else {
             "NOT READY"
@@ -109,10 +109,7 @@ impl GateReceipt {
 ",
             self.commit_sha, self.generated_at
         ));
-        md.push_str(&format!(
-            "**Release ready**: {release_label}
-"
-        ));
+        md.push_str(&format!("Performance gate: {perf_gate_label}\n"));
         md.push_str(&format!(
             "**Subject completeness**: {}
 ",
@@ -583,7 +580,7 @@ impl GateRunner {
         let ih = ms.is_empty();
         let artifact_gap = s.artifact_gap;
         let budget_gap = s.budget_gap;
-        let release_ready =
+        let perf_gate_ready =
             m.has_runtime_validation() && ih && artifact_gap == 0 && budget_gap == 0;
         let rows: Vec<GateReceiptRow> = self
             .entries
@@ -634,7 +631,7 @@ impl GateRunner {
                     .filter(|e| !e.budget_buckets.is_empty())
                     .count(),
             },
-            release_ready,
+            perf_gate_ready,
             invariant_holds: ih,
             missing_subjects: ms,
             notes: self.notes,
@@ -980,6 +977,9 @@ mod tests {
         let rec = GateRunner::build_current_head_receipt("d", se());
         assert!(rec.invariant_holds);
         assert_eq!(rec.summary.refused, REQUIRED_SUBJECTS.len());
+        assert!(rec
+            .render_markdown()
+            .contains("Performance gate: NOT READY"));
     }
     #[test]
     fn notes() {

@@ -173,7 +173,7 @@ pub struct ConsolidatedMatrix {
     pub rows: Vec<ConsolidatedRow>,
     pub missing_subjects: Vec<String>,
     pub invariant_holds: bool,
-    pub release_ready: bool,
+    pub perf_gate_ready: bool,
     pub degradation_summary: Option<DegradationSummary>,
 }
 
@@ -250,7 +250,7 @@ impl ConsolidatedMatrix {
             });
         }
 
-        let release_ready = invariant
+        let perf_gate_ready = invariant
             && lanes.iter().all(|l| l.runtime_pass > 0)
             && rows.iter().any(|r| {
                 r.status == RowStatus::Pass && r.measurement_source == MeasurementSource::Measured
@@ -265,7 +265,7 @@ impl ConsolidatedMatrix {
             missing_subjects: missing,
             invariant_holds: invariant,
             degradation_summary: None,
-            release_ready,
+            perf_gate_ready,
         }
     }
 
@@ -382,7 +382,7 @@ impl ConsolidatedMatrix {
 
     /// Render the consolidated matrix as markdown.
     pub fn render_markdown(&self) -> String {
-        let release_label = if self.release_ready {
+        let perf_gate_label = if self.perf_gate_ready {
             "READY"
         } else {
             "NOT READY"
@@ -390,12 +390,12 @@ impl ConsolidatedMatrix {
         let mut o = format!(
             "# Performance Comparator Matrix (Consolidated) — {}\n\n\
              **Commit**: `{}` | **Generated**: {}\n\n\
-             **Release ready**: {}\n\n\
+             Performance gate: {}\n\n\
              **Subject completeness**: {}\n\n",
             self.matrix_ref,
             self.commit_sha,
             self.generated_at,
-            release_label,
+            perf_gate_label,
             if self.invariant_holds { "yes" } else { "no" },
         );
 
@@ -571,7 +571,7 @@ mod tests {
         let cm = ConsolidatedMatrix::empty("abc123", "2026-05-22T00:00:00Z");
         assert_eq!(cm.rows.len(), REQUIRED_SUBJECTS.len());
         assert!(cm.invariant_holds);
-        assert!(!cm.release_ready);
+        assert!(!cm.perf_gate_ready);
         let lane_labels: Vec<&str> = cm.lanes.iter().map(|l| l.lane.label()).collect();
         assert!(lane_labels.contains(&"userspace"));
         assert!(lane_labels.contains(&"storage"));
@@ -583,6 +583,7 @@ mod tests {
     fn consolidated_markdown_renders() {
         let cm = ConsolidatedMatrix::empty("abc123", "2026-05-22T00:00:00Z");
         let md = cm.render_markdown();
+        assert!(md.contains("Performance gate: NOT READY"));
         assert!(md.contains("NOT READY"));
         assert!(md.contains("USERSPACE"));
         assert!(md.contains("STORAGE"));
