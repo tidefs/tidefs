@@ -18,6 +18,13 @@ use std::time::Duration;
 
 use tidefs_transport::{bulk_deadline_default, BULK_CHUNK_SIZE_DEFAULT, MAX_INFLIGHT_BULK_TOKENS};
 
+pub mod vfs_rpc_handoff;
+
+pub use vfs_rpc_handoff::{
+    VfsRpcBulkAbort, VfsRpcBulkCompletion, VfsRpcBulkDescriptor, VfsRpcBulkHandoff,
+    VfsRpcBulkHandoffError,
+};
+
 /// Stable transport service id for the BULK plane.
 pub const BULK_SERVICE_ID: u8 = 0x07;
 /// Current BULK service API version.
