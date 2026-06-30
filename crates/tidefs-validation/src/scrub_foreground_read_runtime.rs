@@ -574,7 +574,6 @@ fn run_foreground_read(
                 max_read_latency_micros = max_read_latency_micros.max(elapsed);
                 total_read_latency_micros += elapsed;
                 let digest = digest_hex(&read_back);
-                last_read_digest = Some(digest.clone());
                 if read_back == payload {
                     read_successes += 1;
                     correctness_checks += 1;
@@ -583,6 +582,7 @@ fn run_foreground_read(
                         "iteration {iteration}: digest mismatch expected={expected_digest} actual={digest}"
                     ));
                 }
+                last_read_digest = Some(digest);
             }
             Err(error) => {
                 let elapsed = started.elapsed().as_micros();
