@@ -689,8 +689,10 @@ Current source status for the #1523 evidence pass:
   binds WRITE/READ metadata, `op_id`, `BulkToken`, and descriptor length before
   completed bytes may be consumed. It also exposes a typed BULK wire codec for
   OFFER/ACCEPT/CREDIT/DONE/ABORT frames carried as `service_id = 0x07` DATA
-  service frames. The crate is a service surface for transport integration; it
-  is not a multi-node product-readiness claim.
+  service frames, plus a `BulkDataServiceHandler` that maps receiver-side
+  OFFER/CREDIT/DONE/ABORT frames onto the state machine under the
+  authenticated transport session id. The crate is a service surface for
+  transport integration; it is not a multi-node product-readiness claim.
 - `apps/tidefs-storage-node/src/protocol.rs` is still an object-store tag
   protocol, not a cluster service_id `0x07` BULK dispatcher.
 - `crates/tidefs-transport/src/boundedness.rs` exposes generic bulk-token
@@ -699,7 +701,10 @@ Current source status for the #1523 evidence pass:
 - `crates/tidefs-transport/src/data_service_dispatch.rs` provides the generic
   DATA-endpoint service-id frame wrapper and registry for
   `EndpointFamily::Data`, `MessageFamily::StateTransfer`, and the Demand lane.
-  It does not register BULK into a live receive loop by itself.
+  It also provides a session-aware `MessageDispatch` adapter and receive-loop
+  registration helper that require the already-authenticated `SessionId` and
+  an explicit reply sink before DATA service replies can leave the receive
+  path.
 
 Until transport dispatch and the VFS_RPC transport adapter wire this BULK-side
 helper into service_id `0x06` request/response handling, VFS_RPC endpoints may
@@ -718,12 +723,17 @@ Post-codec source status, inspected on 2026-06-30:
 
 - The live BULK crate exports the TCP_STREAM state machine and VFS_RPC handoff
   helper plus `src/protocol.rs`, which encodes/decodes `service_id = 0x07`
-  DATA service frames without binding a live runtime dispatcher.
+  DATA service frames. `src/data_service.rs` provides the receiver-side DATA
+  service handler for OFFER, CREDIT, DONE, and ABORT. Sender-side
+  ACCEPT/CREDIT_GRANT coordination and the raw TCP_STREAM byte handoff remain
+  outside this receiver-side handler.
 - `crates/tidefs-transport/src/control_service_dispatch.rs` remains the
   control-lane service-id path. `crates/tidefs-transport/src/data_service_dispatch.rs`
-  is the DATA-endpoint service-id wrapper/registry and must be bound to an
-  authenticated `TransferBulk` data session before it counts as live transport
-  dispatch.
+  is the DATA-endpoint service-id wrapper/registry with a receive-loop
+  registration hook. Production callers must still bind that hook to an
+  authenticated `TransferBulk` data session, a reply sink, and the BULK
+  handler instance for the connection before VFS_RPC can rely on service_id
+  `0x07` progress.
 - `crates/tidefs-vfs-rpc/src/transport_adapter.rs` still rejects
   `REQ_FLAG_BULK_PENDING`, `RESP_FLAG_BULK`, and `InlineOrBulk::Bulk` with
   `BulkUnsupported`. Removing that rejection requires a VFS_RPC transport

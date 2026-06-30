@@ -1,0 +1,405 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
+//! Transport DATA-service handler for BULK `service_id = 0x07` frames.
+//!
+//! The handler binds an authenticated transport `SessionId` to the BULK
+//! connection id and drives the TCP_STREAM state machine for
+//! OFFER/CREDIT/DONE/ABORT frames. It does not make VFS_RPC descriptor
+//! acceptance or RDMA carriers live by itself.
+
+use std::sync::Mutex;
+
+use tidefs_transport::{
+    DataServiceDispatchError, DataServiceDispatchOutcome, DataServiceFrame, DataServiceHandler,
+    SessionId,
+};
+
+use crate::{
+    AbortedBulkTransfer, BulkAbortFrame, BulkAcceptFrame, BulkCreditGrantFrame,
+    BulkCreditRequestFrame, BulkCreditResult, BulkDoneFrame, BulkError, BulkFrame,
+    BulkProtocolError, BulkService, BulkToken, CompletedBulkTransfer, ConnectionId, StreamId,
+    BULK_SERVICE_ID,
+};
+
+/// BULK service-id handler suitable for registration in `DataServiceDispatch`.
+pub struct BulkDataServiceHandler {
+    service: Mutex<BulkService>,
+    completed: Mutex<Vec<CompletedBulkTransfer>>,
+    aborted: Mutex<Vec<AbortedBulkTransfer>>,
+}
+
+impl BulkDataServiceHandler {
+    #[must_use]
+    pub fn new(service: BulkService) -> Self {
+        Self {
+            service: Mutex::new(service),
+            completed: Mutex::new(Vec::new()),
+            aborted: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Write an already-granted TCP_STREAM chunk into BULK reassembly state.
+    pub fn write_tcp_chunk(
+        &self,
+        connection_id: ConnectionId,
+        token: BulkToken,
+        chunk_seq: u32,
+        offset: u64,
+        payload: &[u8],
+    ) -> Result<(), BulkError> {
+        self.service.lock().unwrap().write_tcp_chunk(
+            connection_id,
+            token,
+            chunk_seq,
+            offset,
+            payload,
+        )
+    }
+
+    #[must_use]
+    pub fn active_transfer_count(&self, connection_id: ConnectionId) -> usize {
+        self.service
+            .lock()
+            .unwrap()
+            .active_transfer_count(connection_id)
+    }
+
+    #[must_use]
+    pub fn pinned_bytes(&self, connection_id: ConnectionId) -> u64 {
+        self.service.lock().unwrap().pinned_bytes(connection_id)
+    }
+
+    #[must_use]
+    pub fn drain_completed(&self) -> Vec<CompletedBulkTransfer> {
+        std::mem::take(&mut *self.completed.lock().unwrap())
+    }
+
+    #[must_use]
+    pub fn drain_aborted(&self) -> Vec<AbortedBulkTransfer> {
+        std::mem::take(&mut *self.aborted.lock().unwrap())
+    }
+}
+
+impl DataServiceHandler for BulkDataServiceHandler {
+    fn handle_data_service_frame(
+        &self,
+        session_id: SessionId,
+        frame: DataServiceFrame,
+    ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+        let connection_id = session_id.0;
+        match BulkFrame::from_data_service_frame(frame).map_err(reject_protocol)? {
+            BulkFrame::Offer(frame) => self.handle_offer(connection_id, frame),
+            BulkFrame::CreditRequest(frame) => self.handle_credit(connection_id, frame),
+            BulkFrame::Done(frame) => self.handle_done(connection_id, frame),
+            BulkFrame::Abort(frame) => self.handle_abort(connection_id, frame),
+            BulkFrame::Accept(_) | BulkFrame::CreditGrant(_) => Err(reject_reason(
+                "BULK response frames require a sender-side coordinator",
+            )),
+        }
+    }
+}
+
+impl BulkDataServiceHandler {
+    fn handle_offer(
+        &self,
+        connection_id: ConnectionId,
+        frame: crate::BulkOfferFrame,
+    ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+        let accept = self
+            .service
+            .lock()
+            .unwrap()
+            .offer(frame.into_offer(connection_id));
+        reply(BulkFrame::Accept(BulkAcceptFrame::from(accept)))
+    }
+
+    fn handle_credit(
+        &self,
+        connection_id: ConnectionId,
+        frame: BulkCreditRequestFrame,
+    ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+        let mut service = self.service.lock().unwrap();
+        ensure_stream_token(&service, connection_id, frame.stream_id, frame.token)?;
+        let grant = match service.credit(connection_id, frame.token, frame.chunk_seq, frame.len) {
+            Ok(grant) => BulkCreditGrantFrame {
+                stream_id: grant.stream_id,
+                chunk_seq: grant.chunk_seq,
+                result: BulkCreditResult::Granted,
+                offset: grant.offset,
+                rdma: None,
+            },
+            Err(err) => BulkCreditGrantFrame {
+                stream_id: frame.stream_id,
+                chunk_seq: frame.chunk_seq,
+                result: credit_error_result(&err),
+                offset: 0,
+                rdma: None,
+            },
+        };
+        reply(BulkFrame::CreditGrant(grant))
+    }
+
+    fn handle_done(
+        &self,
+        connection_id: ConnectionId,
+        frame: BulkDoneFrame,
+    ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+        let completed = {
+            let mut service = self.service.lock().unwrap();
+            ensure_stream_token(&service, connection_id, frame.stream_id, frame.token)?;
+            service
+                .done(
+                    connection_id,
+                    frame.token,
+                    frame.total_transferred,
+                    frame.checksum32,
+                )
+                .map_err(reject_bulk)?
+        };
+        self.completed.lock().unwrap().push(completed);
+        Ok(DataServiceDispatchOutcome::Consumed)
+    }
+
+    fn handle_abort(
+        &self,
+        connection_id: ConnectionId,
+        frame: BulkAbortFrame,
+    ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+        let aborted = {
+            let mut service = self.service.lock().unwrap();
+            ensure_stream_token(&service, connection_id, frame.stream_id, frame.token)?;
+            service
+                .abort(connection_id, frame.token, frame.reason)
+                .map_err(reject_bulk)?
+        };
+        self.aborted.lock().unwrap().push(aborted);
+        Ok(DataServiceDispatchOutcome::Consumed)
+    }
+}
+
+fn ensure_stream_token(
+    service: &BulkService,
+    connection_id: ConnectionId,
+    stream_id: StreamId,
+    token: BulkToken,
+) -> Result<(), DataServiceDispatchError> {
+    match service.stream_id_for_token(connection_id, token) {
+        Some(actual) if actual == stream_id => Ok(()),
+        Some(actual) => Err(reject_reason(format!(
+            "BULK stream/token mismatch: frame stream {stream_id}, token stream {actual}"
+        ))),
+        None => Err(reject_bulk(BulkError::UnknownToken)),
+    }
+}
+
+fn credit_error_result(error: &BulkError) -> BulkCreditResult {
+    match error {
+        BulkError::NoCredits | BulkError::TooManyPendingCredits { .. } => BulkCreditResult::Wait,
+        _ => BulkCreditResult::Rejected,
+    }
+}
+
+fn reply(frame: BulkFrame) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+    Ok(DataServiceDispatchOutcome::Reply(
+        frame.to_data_service_frame().map_err(reject_protocol)?,
+    ))
+}
+
+fn reject_protocol(error: BulkProtocolError) -> DataServiceDispatchError {
+    reject_reason(error.to_string())
+}
+
+fn reject_bulk(error: BulkError) -> DataServiceDispatchError {
+    reject_reason(error.to_string())
+}
+
+fn reject_reason(reason: impl Into<String>) -> DataServiceDispatchError {
+    DataServiceDispatchError::HandlerRejected {
+        service_id: BULK_SERVICE_ID,
+        reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        BulkAbortReason, BulkAcceptResult, BulkMetadata, BulkMode, BulkOfferFrame, BulkPriority,
+        BulkServiceConfig,
+    };
+
+    fn service() -> BulkService {
+        BulkService::new(BulkServiceConfig {
+            receiver_node_id: 42,
+            max_pinned_bytes: 64,
+            max_transfer_len: 64,
+            max_chunk: 8,
+            max_pending_credits_per_stream: 2,
+            ..BulkServiceConfig::default()
+        })
+    }
+
+    fn offer_frame(stream_id: StreamId, total_len: u64) -> BulkFrame {
+        BulkFrame::Offer(BulkOfferFrame {
+            stream_id,
+            total_len,
+            mode: BulkMode::TcpStream,
+            priority: BulkPriority::Bulk,
+            metadata: BulkMetadata::vfs_rpc_write_upload(99),
+        })
+    }
+
+    fn handle_reply(
+        handler: &BulkDataServiceHandler,
+        session_id: SessionId,
+        frame: BulkFrame,
+    ) -> BulkFrame {
+        let data_frame = frame.to_data_service_frame().expect("data frame");
+        match handler
+            .handle_data_service_frame(session_id, data_frame)
+            .expect("handler")
+        {
+            DataServiceDispatchOutcome::Reply(reply) => {
+                BulkFrame::from_data_service_frame(reply).expect("reply")
+            }
+            DataServiceDispatchOutcome::Consumed => panic!("expected reply"),
+        }
+    }
+
+    #[test]
+    fn handles_offer_credit_done_for_authenticated_session() {
+        let handler = BulkDataServiceHandler::new(service());
+        let session_id = SessionId::new(7);
+
+        let accept = handle_reply(&handler, session_id, offer_frame(11, 5));
+        let token = match accept {
+            BulkFrame::Accept(frame) => {
+                assert_eq!(frame.result, BulkAcceptResult::Accepted);
+                assert_eq!(frame.stream_id, 11);
+                frame.token.expect("token")
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        let grant = handle_reply(
+            &handler,
+            session_id,
+            BulkFrame::CreditRequest(BulkCreditRequestFrame {
+                stream_id: 11,
+                token,
+                chunk_seq: 0,
+                len: 5,
+            }),
+        );
+        let grant = match grant {
+            BulkFrame::CreditGrant(frame) => {
+                assert_eq!(frame.result, BulkCreditResult::Granted);
+                assert_eq!(frame.offset, 0);
+                frame
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        assert_eq!(handler.active_transfer_count(session_id.0), 1);
+        assert_eq!(handler.pinned_bytes(session_id.0), 5);
+        handler
+            .write_tcp_chunk(session_id.0, token, grant.chunk_seq, grant.offset, b"hello")
+            .expect("chunk");
+
+        let done = BulkFrame::Done(BulkDoneFrame {
+            stream_id: 11,
+            token,
+            total_transferred: 5,
+            checksum32: crc32c::crc32c(b"hello"),
+        })
+        .to_data_service_frame()
+        .expect("done frame");
+        assert_eq!(
+            handler
+                .handle_data_service_frame(session_id, done)
+                .expect("done"),
+            DataServiceDispatchOutcome::Consumed
+        );
+
+        let completed = handler.drain_completed();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].connection_id, session_id.0);
+        assert_eq!(completed[0].stream_id, 11);
+        assert_eq!(completed[0].bytes, b"hello");
+        assert_eq!(handler.active_transfer_count(session_id.0), 0);
+    }
+
+    #[test]
+    fn rdma_offer_returns_mode_unsupported_without_live_claim() {
+        let handler = BulkDataServiceHandler::new(service());
+        let accept = handle_reply(
+            &handler,
+            SessionId::new(7),
+            BulkFrame::Offer(BulkOfferFrame {
+                stream_id: 12,
+                total_len: 5,
+                mode: BulkMode::RdmaWrite,
+                priority: BulkPriority::Bulk,
+                metadata: BulkMetadata::Opaque(b"rdma".to_vec()),
+            }),
+        );
+
+        match accept {
+            BulkFrame::Accept(frame) => {
+                assert_eq!(frame.result, BulkAcceptResult::ModeUnsupported);
+                assert!(frame.token.is_none());
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn abort_discards_transfer_and_records_event() {
+        let handler = BulkDataServiceHandler::new(service());
+        let session_id = SessionId::new(8);
+        let accept = handle_reply(&handler, session_id, offer_frame(13, 5));
+        let token = match accept {
+            BulkFrame::Accept(frame) => frame.token.expect("token"),
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        let abort = BulkFrame::Abort(BulkAbortFrame {
+            stream_id: 13,
+            token,
+            reason: BulkAbortReason::Timeout,
+        })
+        .to_data_service_frame()
+        .expect("abort");
+        assert_eq!(
+            handler
+                .handle_data_service_frame(session_id, abort)
+                .expect("abort"),
+            DataServiceDispatchOutcome::Consumed
+        );
+
+        let aborted = handler.drain_aborted();
+        assert_eq!(aborted.len(), 1);
+        assert_eq!(aborted[0].connection_id, session_id.0);
+        assert_eq!(aborted[0].stream_id, 13);
+        assert_eq!(aborted[0].reason, BulkAbortReason::Timeout);
+        assert_eq!(handler.active_transfer_count(session_id.0), 0);
+    }
+
+    #[test]
+    fn response_frames_are_rejected_without_sender_coordinator() {
+        let handler = BulkDataServiceHandler::new(service());
+        let frame = BulkFrame::Accept(BulkAcceptFrame {
+            stream_id: 11,
+            result: BulkAcceptResult::Rejected,
+            token: None,
+            max_chunk: 0,
+            retry_after_us: 0,
+        })
+        .to_data_service_frame()
+        .expect("accept");
+
+        let err = handler
+            .handle_data_service_frame(SessionId::new(7), frame)
+            .unwrap_err();
+        assert!(err.to_string().contains("sender-side coordinator"));
+    }
+}

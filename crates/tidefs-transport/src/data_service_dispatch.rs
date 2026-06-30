@@ -12,6 +12,9 @@ use std::sync::{Arc, RwLock};
 
 use tidefs_types_transport_session::EndpointFamily;
 
+use crate::dispatch::{
+    DecodedMessage, DispatchError, MessageDispatch, MessageHandler as FamilyMessageHandler,
+};
 use crate::envelope::MessageFamily;
 use crate::lane_demux::LaneClass;
 use crate::types::SessionId;
@@ -104,6 +107,15 @@ pub trait DataServiceHandler: Send + Sync {
     ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError>;
 }
 
+/// Outbound sink for DATA service replies produced by receive-side handlers.
+pub trait DataServiceReplySink: Send + Sync {
+    fn send_data_service_reply(
+        &self,
+        session_id: SessionId,
+        frame: DataServiceFrame,
+    ) -> Result<(), DataServiceDispatchError>;
+}
+
 /// Registry keyed by service id for DATA service frames.
 #[derive(Clone, Default)]
 pub struct DataServiceDispatch {
@@ -153,15 +165,91 @@ impl DataServiceDispatch {
     }
 }
 
+/// [`MessageDispatch`] handler that routes StateTransfer DATA frames by service id.
+pub struct DataServiceMessageHandler {
+    dispatch: DataServiceDispatch,
+    reply_sink: Arc<dyn DataServiceReplySink>,
+}
+
+impl DataServiceMessageHandler {
+    #[must_use]
+    pub fn new(dispatch: DataServiceDispatch, reply_sink: Arc<dyn DataServiceReplySink>) -> Self {
+        Self {
+            dispatch,
+            reply_sink,
+        }
+    }
+}
+
+impl FamilyMessageHandler for DataServiceMessageHandler {
+    fn handle(&self, msg: DecodedMessage) -> Result<(), DispatchError> {
+        if msg.family != DATA_SERVICE_MESSAGE_FAMILY {
+            return Err(DispatchError::HandlerError(Box::new(
+                DataServiceDispatchError::WrongMessageFamily {
+                    expected: DATA_SERVICE_MESSAGE_FAMILY,
+                    actual: msg.family,
+                },
+            )));
+        }
+        let session_id = msg.session_id.ok_or_else(|| {
+            DispatchError::HandlerError(Box::new(DataServiceDispatchError::MissingSessionId))
+        })?;
+
+        match self
+            .dispatch
+            .dispatch(session_id, &msg.payload)
+            .map_err(|err| DispatchError::HandlerError(Box::new(err)))?
+        {
+            DataServiceDispatchOutcome::Consumed => Ok(()),
+            DataServiceDispatchOutcome::Reply(frame) => self
+                .reply_sink
+                .send_data_service_reply(session_id, frame)
+                .map_err(|err| DispatchError::HandlerError(Box::new(err))),
+        }
+    }
+}
+
+/// Register DATA service dispatch on the transport StateTransfer receive path.
+pub fn register_data_service_dispatch(
+    message_dispatch: &MessageDispatch,
+    dispatch: DataServiceDispatch,
+    reply_sink: Arc<dyn DataServiceReplySink>,
+) {
+    message_dispatch.register(
+        DATA_SERVICE_MESSAGE_FAMILY,
+        Box::new(DataServiceMessageHandler::new(dispatch, reply_sink)),
+    );
+}
+
 /// Errors from DATA service dispatch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataServiceDispatchError {
-    FrameTooShort { got: usize },
+    FrameTooShort {
+        got: usize,
+    },
     FrameLengthOverflow,
-    FrameLengthMismatch { expected: usize, actual: usize },
-    BodyTooLarge { len: usize },
-    HandlerNotFound { service_id: u8 },
-    HandlerRejected { service_id: u8, reason: String },
+    FrameLengthMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    BodyTooLarge {
+        len: usize,
+    },
+    HandlerNotFound {
+        service_id: u8,
+    },
+    HandlerRejected {
+        service_id: u8,
+        reason: String,
+    },
+    MissingSessionId,
+    WrongMessageFamily {
+        expected: MessageFamily,
+        actual: MessageFamily,
+    },
+    ReplyRejected {
+        reason: String,
+    },
 }
 
 impl fmt::Display for DataServiceDispatchError {
@@ -189,6 +277,14 @@ impl fmt::Display for DataServiceDispatchError {
                     f,
                     "data service handler {service_id:#04x} rejected frame: {reason}"
                 )
+            }
+            Self::MissingSessionId => f.write_str("DATA service frame missing session id"),
+            Self::WrongMessageFamily { expected, actual } => write!(
+                f,
+                "DATA service frame arrived on {actual}, expected {expected}"
+            ),
+            Self::ReplyRejected { reason } => {
+                write!(f, "DATA service reply sink rejected frame: {reason}")
             }
         }
     }
@@ -258,6 +354,39 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ReplyingHandler;
+
+    impl DataServiceHandler for ReplyingHandler {
+        fn handle_data_service_frame(
+            &self,
+            _session_id: SessionId,
+            frame: DataServiceFrame,
+        ) -> Result<DataServiceDispatchOutcome, DataServiceDispatchError> {
+            Ok(DataServiceDispatchOutcome::Reply(DataServiceFrame::new(
+                frame.service_id,
+                frame.message_type | 0x40,
+                b"reply".to_vec(),
+            )))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingReplySink {
+        replies: Mutex<Vec<(SessionId, DataServiceFrame)>>,
+    }
+
+    impl DataServiceReplySink for RecordingReplySink {
+        fn send_data_service_reply(
+            &self,
+            session_id: SessionId,
+            frame: DataServiceFrame,
+        ) -> Result<(), DataServiceDispatchError> {
+            self.replies.lock().unwrap().push((session_id, frame));
+            Ok(())
+        }
+    }
+
     #[test]
     fn dispatch_routes_by_service_id() {
         let dispatch = DataServiceDispatch::new();
@@ -288,6 +417,49 @@ mod tests {
             dispatch.dispatch(SessionId::new(1), &payload).unwrap_err(),
             DataServiceDispatchError::HandlerNotFound { service_id: 0x07 }
         );
+    }
+
+    #[test]
+    fn message_handler_routes_state_transfer_with_session_and_reply() {
+        let data_dispatch = DataServiceDispatch::new();
+        data_dispatch.register(0x07, Arc::new(ReplyingHandler));
+        let reply_sink = Arc::new(RecordingReplySink::default());
+        let handler = DataServiceMessageHandler::new(data_dispatch, reply_sink.clone());
+
+        let payload = DataServiceFrame::new(0x07, 0x00, b"offer".to_vec())
+            .encode()
+            .expect("encode");
+        handler
+            .handle(
+                DecodedMessage::new(DATA_SERVICE_MESSAGE_FAMILY, payload)
+                    .with_session_id(SessionId::new(42)),
+            )
+            .expect("handle");
+
+        assert_eq!(
+            reply_sink.replies.lock().unwrap().as_slice(),
+            &[(
+                SessionId::new(42),
+                DataServiceFrame::new(0x07, 0x40, b"reply".to_vec())
+            )]
+        );
+    }
+
+    #[test]
+    fn message_handler_requires_receive_loop_session_identity() {
+        let data_dispatch = DataServiceDispatch::new();
+        data_dispatch.register(0x07, Arc::new(RecordingHandler::default()));
+        let reply_sink = Arc::new(RecordingReplySink::default());
+        let handler = DataServiceMessageHandler::new(data_dispatch, reply_sink);
+        let payload = DataServiceFrame::new(0x07, 0x00, b"offer".to_vec())
+            .encode()
+            .expect("encode");
+
+        let err = handler
+            .handle(DecodedMessage::new(DATA_SERVICE_MESSAGE_FAMILY, payload))
+            .unwrap_err();
+        assert!(matches!(err, DispatchError::HandlerError(_)));
+        assert!(err.to_string().contains("missing session id"));
     }
 
     #[test]

@@ -18,9 +18,11 @@ use std::time::Duration;
 
 use tidefs_transport::{bulk_deadline_default, BULK_CHUNK_SIZE_DEFAULT, MAX_INFLIGHT_BULK_TOKENS};
 
+pub mod data_service;
 pub mod protocol;
 pub mod vfs_rpc_handoff;
 
+pub use data_service::BulkDataServiceHandler;
 pub use protocol::{
     BulkAbortFrame, BulkAcceptFrame, BulkCreditGrantFrame, BulkCreditRequestFrame,
     BulkCreditResult, BulkDoneFrame, BulkFrame, BulkFrameKind, BulkMethod, BulkOfferFrame,
@@ -520,6 +522,19 @@ impl BulkService {
         self.connections
             .get(&connection_id)
             .map_or(0, |connection| connection.pinned_bytes)
+    }
+
+    #[must_use]
+    pub fn stream_id_for_token(
+        &self,
+        connection_id: ConnectionId,
+        token: BulkToken,
+    ) -> Option<StreamId> {
+        self.connections
+            .get(&connection_id)?
+            .token_index
+            .get(&token)
+            .copied()
     }
 
     fn accept_reject(&self, stream_id: StreamId, result: BulkAcceptResult) -> BulkAccept {
