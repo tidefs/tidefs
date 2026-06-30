@@ -3456,6 +3456,7 @@ dependencies = [
  "tidefs-local-object-store",
  "tidefs-transport",
  "tidefs-types-dataset-feature-flags-core",
+ "tidefs-types-transport-session",
  "tokio",
 ]
 
