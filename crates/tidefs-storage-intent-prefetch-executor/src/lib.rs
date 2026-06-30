@@ -1614,6 +1614,15 @@ pub fn evaluate_prefetch_execution(input: PrefetchExecutorInput) -> PrefetchExec
         }
     }
 
+    if !action_family_matches_decision(input) {
+        return terminal(
+            record,
+            PrefetchExecutorOutcome::Refused,
+            PrefetchExecutorByteState::Refused,
+            StorageIntentRefusalReason::PolicyConflict,
+        );
+    }
+
     if !required_families_fresh(input.evidence_query_snapshot, family) {
         return terminal(
             record,
@@ -2664,6 +2673,12 @@ fn evidence_ref_matches_snapshot(
         && evidence_ref.id == snapshot.snapshot_id
         && evidence_ref.generation > 0
         && evidence_ref.version > 0
+}
+
+fn action_family_matches_decision(input: PrefetchExecutorInput) -> bool {
+    matches!(input.action_family, PrefetchExecutorActionFamily::Unknown)
+        || input.action_family
+            == PrefetchExecutorActionFamily::from_candidate(input.decision.selected_candidate)
 }
 
 fn required_families_fresh(
@@ -3952,6 +3967,79 @@ mod tests {
             ),
             PrefetchExecutorActionFamily::ExplicitNoPrefetch
         );
+    }
+
+    #[test]
+    fn caller_action_family_cannot_override_selected_candidate() {
+        let mut forced_negative = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        forced_negative.action_family = PrefetchExecutorActionFamily::ExplicitNoPrefetch;
+
+        let forced_negative_record = evaluate_prefetch_execution(forced_negative);
+
+        assert_eq!(
+            forced_negative_record.outcome,
+            PrefetchExecutorOutcome::Refused
+        );
+        assert_eq!(
+            forced_negative_record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            forced_negative_record.refusal,
+            StorageIntentRefusalReason::PolicyConflict
+        );
+        assert_eq!(
+            forced_negative_record.selected_candidate,
+            PrefetchResidencyCandidateClass::BoundedReadahead
+        );
+        assert_eq!(
+            forced_negative_record.action_family,
+            PrefetchExecutorActionFamily::ExplicitNoPrefetch
+        );
+        assert_record_has_no_authority_claims(forced_negative_record);
+
+        let mut wrong_positive =
+            admitted_input(PrefetchResidencyCandidateClass::StridedVectorPrefetch);
+        wrong_positive.action_family = PrefetchExecutorActionFamily::BoundedSequentialReadahead;
+
+        let wrong_positive_record = evaluate_prefetch_execution(wrong_positive);
+
+        assert_eq!(
+            wrong_positive_record.outcome,
+            PrefetchExecutorOutcome::Refused
+        );
+        assert_eq!(
+            wrong_positive_record.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_eq!(
+            wrong_positive_record.refusal,
+            StorageIntentRefusalReason::PolicyConflict
+        );
+        assert_record_has_no_authority_claims(wrong_positive_record);
+    }
+
+    #[test]
+    fn matching_caller_action_family_keeps_decision_authority() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::BoundedReadahead);
+        input.action_family = PrefetchExecutorActionFamily::BoundedSequentialReadahead;
+
+        let record = evaluate_prefetch_execution(input);
+
+        assert_eq!(record.outcome, PrefetchExecutorOutcome::Started);
+        assert_eq!(
+            record.executor_byte_state,
+            PrefetchExecutorByteState::CacheOnly
+        );
+        assert_eq!(
+            record.action_family,
+            PrefetchExecutorActionFamily::BoundedSequentialReadahead
+        );
+        assert_eq!(
+            record.selected_candidate,
+            PrefetchResidencyCandidateClass::BoundedReadahead
+        );
+        assert_record_has_no_authority_claims(record);
     }
 
     #[test]
