@@ -12633,7 +12633,11 @@ impl LocalFileSystem {
     /// pool-free mirror.
     fn derive_pool_physical_counters(&self) -> PoolPhysicalCountersV1 {
         let total_bytes = self.capacity_authority.total_bytes();
-        let consumed_bytes = self.state.space_accounting.counters().total_consumed_bytes();
+        let consumed_bytes = self
+            .state
+            .space_accounting
+            .counters()
+            .total_consumed_bytes();
         PoolPhysicalCountersV1::mounted_authority_from_capacity(
             total_bytes,
             consumed_bytes,
