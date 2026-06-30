@@ -472,9 +472,9 @@ pub use crate::fsck::{FsckCategory, FsckFinding, FsckReport, FsckSeverity};
 use crate::orphan_cleanup::OrphanCleanupStats;
 pub use crate::records::SnapshotKind;
 pub use crate::snapshot::{
-    BookmarkSummary, CloneSummary, HoldInfo, PromoteReport, SnapshotDeletionDeferral,
-    SnapshotDescriptor, SnapshotMutationApplyReport, SnapshotRetentionPolicy,
-    SnapshotRetentionReport,
+    BookmarkSummary, CloneSummary, HoldInfo, PromoteReport, SnapshotDeletionDeadlistDeferral,
+    SnapshotDeletionDeferral, SnapshotDescriptor, SnapshotMutationApplyReport,
+    SnapshotRetentionPolicy, SnapshotRetentionReport,
 };
 pub use crate::types::*;
 use tidefs_cleanup_engine::{CleanupEngine, JobExecutor};
@@ -5566,7 +5566,10 @@ impl LocalFileSystem {
         Ok(result)
     }
 
-    pub fn delete_snapshot(&mut self, name: impl AsRef<str>) -> Result<SnapshotSummary> {
+    pub(crate) fn delete_snapshot_without_deadlist(
+        &mut self,
+        name: impl AsRef<str>,
+    ) -> Result<(SnapshotSummary, SnapshotRecord)> {
         let name = snapshot_name_bytes(name.as_ref())?;
         let record = self.state.snapshots.get(&name).cloned().ok_or_else(|| {
             FileSystemError::SnapshotNotFound {
@@ -5599,6 +5602,11 @@ impl LocalFileSystem {
         if snapshot::remove_snapshot_record_catalog_entry(&mut self.dataset_catalog, &record)? {
             self.persist_dataset_catalog()?;
         }
+        Ok((summary, record))
+    }
+
+    pub fn delete_snapshot(&mut self, name: impl AsRef<str>) -> Result<SnapshotSummary> {
+        let (summary, record) = self.delete_snapshot_without_deadlist(name)?;
         self.enqueue_released_snapshot_deadlist(&record)?;
         Ok(summary)
     }
