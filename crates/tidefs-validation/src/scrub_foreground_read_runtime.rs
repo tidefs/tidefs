@@ -202,36 +202,40 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
 
     if !dev_fuse_present {
         environment.environment_refusal = Some("missing /dev/fuse".to_string());
-        return base_evidence(
-            ValidationStatus::EnvironmentRefusal,
+        return base_evidence(BaseEvidenceInput {
+            outcome: ValidationStatus::EnvironmentRefusal,
             command,
             generated_at,
             run_id,
             source_ref,
             environment,
-            None,
-            ForegroundReadEvidence::not_run(service_curve.max_foreground_read_wait_ticks),
-            scrub_model,
+            mount: None,
+            foreground_read: ForegroundReadEvidence::not_run(
+                service_curve.max_foreground_read_wait_ticks,
+            ),
+            scrub_activity: scrub_model,
             service_curve,
-        );
+        });
     }
 
     let daemon_path = match daemon_bin_result {
         Ok(path) => path,
         Err(error) => {
             environment.environment_refusal = Some(error.to_string());
-            return base_evidence(
-                ValidationStatus::EnvironmentRefusal,
+            return base_evidence(BaseEvidenceInput {
+                outcome: ValidationStatus::EnvironmentRefusal,
                 command,
                 generated_at,
                 run_id,
                 source_ref,
                 environment,
-                None,
-                ForegroundReadEvidence::not_run(service_curve.max_foreground_read_wait_ticks),
-                scrub_model,
+                mount: None,
+                foreground_read: ForegroundReadEvidence::not_run(
+                    service_curve.max_foreground_read_wait_ticks,
+                ),
+                scrub_activity: scrub_model,
                 service_curve,
-            );
+            });
         }
     };
 
@@ -243,18 +247,20 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         Ok(harness) => harness,
         Err(error) => {
             environment.environment_refusal = Some(format!("mount harness refused: {error}"));
-            return base_evidence(
-                ValidationStatus::EnvironmentRefusal,
+            return base_evidence(BaseEvidenceInput {
+                outcome: ValidationStatus::EnvironmentRefusal,
                 command,
                 generated_at,
                 run_id,
                 source_ref,
                 environment,
-                None,
-                ForegroundReadEvidence::not_run(service_curve.max_foreground_read_wait_ticks),
-                scrub_model,
+                mount: None,
+                foreground_read: ForegroundReadEvidence::not_run(
+                    service_curve.max_foreground_read_wait_ticks,
+                ),
+                scrub_activity: scrub_model,
                 service_curve,
-            );
+            });
         }
     };
 
@@ -262,21 +268,21 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         Ok(f_type) => f_type,
         Err(error) => {
             environment.environment_refusal = Some(fuse_mount_unavailable_reason(&error));
-            return base_evidence(
-                ValidationStatus::EnvironmentRefusal,
+            return base_evidence(BaseEvidenceInput {
+                outcome: ValidationStatus::EnvironmentRefusal,
                 command,
                 generated_at,
                 run_id,
                 source_ref,
                 environment,
-                None,
-                ForegroundReadEvidence::not_run_with_failure(
+                mount: None,
+                foreground_read: ForegroundReadEvidence::not_run_with_failure(
                     service_curve.max_foreground_read_wait_ticks,
                     error,
                 ),
-                scrub_model,
+                scrub_activity: scrub_model,
                 service_curve,
-            );
+            });
         }
     };
 
@@ -297,18 +303,18 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         ValidationStatus::ProductFail
     };
 
-    base_evidence(
+    base_evidence(BaseEvidenceInput {
         outcome,
         command,
         generated_at,
         run_id,
         source_ref,
         environment,
-        Some(mount),
+        mount: Some(mount),
         foreground_read,
-        scrub_model,
+        scrub_activity: scrub_model,
         service_curve,
-    )
+    })
 }
 
 pub fn build_evidence_manifest(
@@ -340,7 +346,7 @@ pub fn build_evidence_manifest(
     }
 }
 
-fn base_evidence(
+struct BaseEvidenceInput {
     outcome: ValidationStatus,
     command: String,
     generated_at: String,
@@ -351,7 +357,21 @@ fn base_evidence(
     foreground_read: ForegroundReadEvidence,
     scrub_activity: ScrubActivityEvidence,
     service_curve: ServiceCurveEvidence,
-) -> ScrubForegroundReadRuntimeEvidence {
+}
+
+fn base_evidence(input: BaseEvidenceInput) -> ScrubForegroundReadRuntimeEvidence {
+    let BaseEvidenceInput {
+        outcome,
+        command,
+        generated_at,
+        run_id,
+        source_ref,
+        environment,
+        mount,
+        foreground_read,
+        scrub_activity,
+        service_curve,
+    } = input;
     let workload_ran = foreground_read.workload_ran;
     let passed = outcome == ValidationStatus::Pass
         && foreground_read.passed
@@ -767,21 +787,22 @@ mod tests {
             environment_refusal: Some(fuse_mount_unavailable_reason(mount_error)),
         };
 
-        let evidence = base_evidence(
-            ValidationStatus::EnvironmentRefusal,
-            "scrub_foreground_read_validation --row scrub-foreground-read-runtime".to_string(),
-            "2026-06-29T17:30:00Z".to_string(),
-            "test-run/1".to_string(),
-            "test-sha".to_string(),
+        let evidence = base_evidence(BaseEvidenceInput {
+            outcome: ValidationStatus::EnvironmentRefusal,
+            command: "scrub_foreground_read_validation --row scrub-foreground-read-runtime"
+                .to_string(),
+            generated_at: "2026-06-29T17:30:00Z".to_string(),
+            run_id: "test-run/1".to_string(),
+            source_ref: "test-sha".to_string(),
             environment,
-            None,
-            ForegroundReadEvidence::not_run_with_failure(
+            mount: None,
+            foreground_read: ForegroundReadEvidence::not_run_with_failure(
                 service_curve.max_foreground_read_wait_ticks,
                 mount_error,
             ),
-            build_scrub_activity(),
+            scrub_activity: build_scrub_activity(),
             service_curve,
-        );
+        });
 
         assert_eq!(evidence.outcome, ValidationStatus::EnvironmentRefusal);
         assert!(evidence
