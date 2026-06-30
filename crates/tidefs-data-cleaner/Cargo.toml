@@ -15,6 +15,7 @@ description = "DataCleaner incremental background job: drains refcount deltas in
 [dependencies]
 tidefs-types-incremental-job-core = { workspace = true }
 tidefs-incremental-job-core = { workspace = true }
+tidefs-cleanup-job-core = { workspace = true }
 tidefs-types-reclaim-queue-core = { workspace = true }
 tidefs-reclaim-queue-core = { workspace = true }
 tidefs-reclaim = { workspace = true }

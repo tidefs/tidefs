@@ -28,6 +28,7 @@
 //! receipts and mounted runtime artifacts; by themselves they do not claim
 //! crash recovery or mounted cleanup correctness.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use tidefs_types_deferred_cleanup_core::CleanupWorkItemV1;
 use tidefs_types_incremental_job_core::{
@@ -140,6 +141,26 @@ impl CleanupJob {
     #[must_use]
     pub fn stats(&self) -> CleanupJobStats {
         self.stats
+    }
+
+    /// Source evidence that the job has only model/progress reclaim state.
+    ///
+    /// The estimate is useful operator progress, but it is not committed
+    /// physical reclaim evidence and must not feed mounted availability.
+    #[must_use]
+    pub fn reclaim_progress_refusal(
+        &self,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> ReclaimEvidenceRefusal {
+        ReclaimEvidenceRefusal::new(
+            ReclaimEvidenceProducer::CleanupJob,
+            self.job_id,
+            CleanupWorkItemId::NONE,
+            ReclaimEvidenceRefusalReason::CleanupProgressOnly,
+            self.stats.bytes_freed_estimate,
+            self.stats.items_completed,
+            validation_tier,
+        )
     }
 
     /// Number of pending work items (not yet processed).
@@ -264,7 +285,6 @@ impl IncrementalJob for CleanupJob {
 // CleanupTask trait and job-execution framework
 // ---------------------------------------------------------------------------
 
-use serde::{Deserialize, Serialize};
 use std::collections::{BinaryHeap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -408,6 +428,238 @@ impl CleanupReceiptArtifactDigest {
     fn is_empty(&self) -> bool {
         self.algorithm.trim().is_empty() || self.hex.trim().is_empty()
     }
+}
+
+/// Producer that reported committed physical reclaim evidence or a refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReclaimEvidenceProducer {
+    /// `tidefs-cleanup-engine` block reclaimer.
+    CleanupEngine,
+    /// `tidefs-data-cleaner` liveness/deadlist handoff producer.
+    DataCleaner,
+    /// `tidefs-cleanup-job-core` cleanup job progress model.
+    CleanupJob,
+}
+
+impl ReclaimEvidenceProducer {
+    /// Human-readable label used for JSON serialization.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CleanupEngine => "cleanup-engine",
+            Self::DataCleaner => "data-cleaner",
+            Self::CleanupJob => "cleanup-job",
+        }
+    }
+}
+
+impl fmt::Display for ReclaimEvidenceProducer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Typed committed physical reclaim progress.
+///
+/// These records mean a producer observed a successful physical release at a
+/// commit boundary. Later capacity-accounting consumers may translate this
+/// evidence into authority-owned deltas; the producer record itself does not
+/// mutate mounted `statfs`, ENOSPC, or quota availability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommittedReclaimEvidence {
+    /// Producer crate that observed the committed release.
+    pub producer: ReclaimEvidenceProducer,
+    /// Stable cleanup job identity that owned the release.
+    pub job_id: JobId,
+    /// Stable cleanup work item identity covered by the release.
+    pub work_item_id: CleanupWorkItemId,
+    /// Monotonic commit/TXG generation that made the release durable.
+    pub commit_generation: u64,
+    /// Physical units released, such as allocator blocks.
+    pub units_reclaimed: u64,
+    /// Physical bytes released.
+    pub bytes_reclaimed: u64,
+    /// Validation tier backing this evidence.
+    pub validation_tier: CleanupReceiptValidationTier,
+}
+
+impl CommittedReclaimEvidence {
+    /// Build committed physical reclaim evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReclaimEvidenceError`] when the record lacks stable identity,
+    /// a non-zero commit generation, or a non-zero physical release.
+    pub fn physical_release(
+        producer: ReclaimEvidenceProducer,
+        job_id: JobId,
+        work_item_id: CleanupWorkItemId,
+        commit_generation: u64,
+        units_reclaimed: u64,
+        bytes_reclaimed: u64,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> Result<Self, ReclaimEvidenceError> {
+        validate_committed_reclaim_context(
+            job_id,
+            work_item_id,
+            commit_generation,
+            units_reclaimed,
+            bytes_reclaimed,
+        )?;
+        Ok(Self {
+            producer,
+            job_id,
+            work_item_id,
+            commit_generation,
+            units_reclaimed,
+            bytes_reclaimed,
+            validation_tier,
+        })
+    }
+
+    /// Returns `true` because this is committed physical reclaim evidence.
+    #[must_use]
+    pub const fn is_committed_physical_reclaim(&self) -> bool {
+        true
+    }
+
+    /// Serialize this evidence as deterministic compact JSON.
+    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// Reason a producer refused to publish committed reclaim evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReclaimEvidenceRefusalReason {
+    /// The producer has only an estimate.
+    EstimatedOnly,
+    /// Reclaim is queued or staged but not physically released.
+    QueuedOnly,
+    /// The producer has cleanup progress counters, not a committed release.
+    CleanupProgressOnly,
+    /// The producer drained model/liveness state without releasing blocks.
+    ModelOnlyDrain,
+    /// A physical-release path completed without reporting released bytes.
+    NoCommittedPhysicalRelease,
+}
+
+/// Typed refusal that explains why a producer cannot increase availability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReclaimEvidenceRefusal {
+    /// Producer that refused to publish committed evidence.
+    pub producer: ReclaimEvidenceProducer,
+    /// Job identity available to the refusing producer.
+    pub job_id: JobId,
+    /// Work-item identity available to the refusing producer, or `NONE`.
+    pub work_item_id: CleanupWorkItemId,
+    /// Why this is not committed physical reclaim evidence.
+    pub reason: ReclaimEvidenceRefusalReason,
+    /// Producer-local estimated bytes, when available.
+    pub estimated_bytes: u64,
+    /// Queued, staged, or progress units covered by this refusal.
+    pub units: u64,
+    /// Validation tier backing this refusal.
+    pub validation_tier: CleanupReceiptValidationTier,
+}
+
+impl ReclaimEvidenceRefusal {
+    /// Build a reclaim evidence refusal.
+    #[must_use]
+    pub const fn new(
+        producer: ReclaimEvidenceProducer,
+        job_id: JobId,
+        work_item_id: CleanupWorkItemId,
+        reason: ReclaimEvidenceRefusalReason,
+        estimated_bytes: u64,
+        units: u64,
+        validation_tier: CleanupReceiptValidationTier,
+    ) -> Self {
+        Self {
+            producer,
+            job_id,
+            work_item_id,
+            reason,
+            estimated_bytes,
+            units,
+            validation_tier,
+        }
+    }
+
+    /// Returns `false` because refusals never authorize mounted availability.
+    #[must_use]
+    pub const fn is_committed_physical_reclaim(&self) -> bool {
+        false
+    }
+
+    /// Serialize this refusal as deterministic compact JSON.
+    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// Error returned when committed reclaim evidence is malformed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReclaimEvidenceError {
+    /// Committed evidence must name a real job.
+    MissingJobId,
+    /// Committed evidence must name covered work.
+    MissingWorkItemId,
+    /// Commit generation must be non-zero.
+    MissingCommitGeneration,
+    /// Physical release unit count must be non-zero.
+    ZeroUnitsReclaimed,
+    /// Physical released bytes must be non-zero.
+    ZeroBytesReclaimed,
+}
+
+impl fmt::Display for ReclaimEvidenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingJobId => f.write_str("committed reclaim evidence is missing a job id"),
+            Self::MissingWorkItemId => {
+                f.write_str("committed reclaim evidence is missing a work item id")
+            }
+            Self::MissingCommitGeneration => {
+                f.write_str("committed reclaim evidence is missing a commit generation")
+            }
+            Self::ZeroUnitsReclaimed => {
+                f.write_str("committed reclaim evidence has zero reclaimed units")
+            }
+            Self::ZeroBytesReclaimed => {
+                f.write_str("committed reclaim evidence has zero reclaimed bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReclaimEvidenceError {}
+
+fn validate_committed_reclaim_context(
+    job_id: JobId,
+    work_item_id: CleanupWorkItemId,
+    commit_generation: u64,
+    units_reclaimed: u64,
+    bytes_reclaimed: u64,
+) -> Result<(), ReclaimEvidenceError> {
+    if job_id.is_none() {
+        return Err(ReclaimEvidenceError::MissingJobId);
+    }
+    if work_item_id.is_none() {
+        return Err(ReclaimEvidenceError::MissingWorkItemId);
+    }
+    if commit_generation == 0 {
+        return Err(ReclaimEvidenceError::MissingCommitGeneration);
+    }
+    if units_reclaimed == 0 {
+        return Err(ReclaimEvidenceError::ZeroUnitsReclaimed);
+    }
+    if bytes_reclaimed == 0 {
+        return Err(ReclaimEvidenceError::ZeroBytesReclaimed);
+    }
+    Ok(())
 }
 
 /// Cleanup job receipt state.
@@ -1818,6 +2070,42 @@ mod tests {
     }
 
     #[test]
+    fn committed_reclaim_evidence_json_is_deterministic() {
+        let evidence = CommittedReclaimEvidence::physical_release(
+            ReclaimEvidenceProducer::CleanupEngine,
+            JobId(7),
+            CleanupWorkItemId(99),
+            4,
+            3,
+            12_288,
+            CleanupReceiptValidationTier::CargoUnit,
+        )
+        .unwrap();
+
+        assert!(evidence.is_committed_physical_reclaim());
+        assert_eq!(
+            evidence.to_json_string().unwrap(),
+            r#"{"producer":"cleanup-engine","job_id":7,"work_item_id":99,"commit_generation":4,"units_reclaimed":3,"bytes_reclaimed":12288,"validation_tier":"cargo-unit"}"#
+        );
+    }
+
+    #[test]
+    fn committed_reclaim_evidence_rejects_non_committed_release() {
+        let err = CommittedReclaimEvidence::physical_release(
+            ReclaimEvidenceProducer::CleanupEngine,
+            JobId(7),
+            CleanupWorkItemId(99),
+            4,
+            3,
+            0,
+            CleanupReceiptValidationTier::CargoUnit,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ReclaimEvidenceError::ZeroBytesReclaimed);
+    }
+
+    #[test]
     fn cleanup_job_receipt_sequence_accepts_retry_then_completion() {
         let receipts = vec![
             CleanupJobReceipt::admitted(
@@ -2206,6 +2494,24 @@ mod tests {
         job.step(WorkBudget::UNBOUNDED);
         assert_eq!(job.stats().items_completed, 3);
         assert_eq!(job.stats().bytes_freed_estimate, 4096 + 8192 + 16384);
+    }
+
+    #[test]
+    fn cleanup_job_progress_refuses_committed_reclaim_evidence() {
+        let items: Vec<CleanupWorkItemV1> = vec![make_item(1, WorkItemKind::UnlinkFree, 4096)];
+        let mut job = CleanupJob::new(items).with_job_id(JobId(11));
+        job.step(WorkBudget::UNBOUNDED);
+
+        let refusal = job.reclaim_progress_refusal(CleanupReceiptValidationTier::CargoUnit);
+        assert_eq!(refusal.producer, ReclaimEvidenceProducer::CleanupJob);
+        assert_eq!(refusal.job_id, JobId(11));
+        assert_eq!(
+            refusal.reason,
+            ReclaimEvidenceRefusalReason::CleanupProgressOnly
+        );
+        assert_eq!(refusal.estimated_bytes, 4096);
+        assert_eq!(refusal.units, 1);
+        assert!(!refusal.is_committed_physical_reclaim());
     }
 
     #[test]

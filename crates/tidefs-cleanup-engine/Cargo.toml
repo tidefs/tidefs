@@ -16,6 +16,7 @@ description = "CleanupEngine: BLAKE3-verified deferred cleanup execution with pr
 tidefs-cleanup-queue-core = { workspace = true }
 tidefs-cleanup-job-core = { workspace = true }
 tidefs-types-deferred-cleanup-core = { workspace = true }
+tidefs-types-incremental-job-core = { workspace = true }
 blake3 = { version = "1", default-features = false }
 
 [lib]
