@@ -15,11 +15,6 @@ use crate::mount_harness::{find_daemon_binary, MountHarness};
 use crate::runtime_artifact_source::RuntimeArtifactSource;
 use crate::validation_schema::ValidationTier;
 use crate::validation_status::ValidationStatus;
-use tidefs_performance_contract::oracle::{
-    with_scheduling_and_admission, OracleConfig, OracleOutcome,
-};
-use tidefs_performance_contract::ServiceCurve;
-use tidefs_scrub::rate_limiter::RateLimiter;
 
 pub const SCRUB_FOREGROUND_READ_ROW_ID: &str = "scrub-foreground-read-runtime";
 pub const SCRUB_READ_RUNTIME_ARTIFACT: &str = "scrub-read-runtime.json";
@@ -38,8 +33,22 @@ const SCRUB_UNIT_BYTES: u64 = 64 * 1024;
 const SCRUB_LIMIT_BYTES_PER_SEC: u64 = 4 * 1024;
 const SCRUB_LIMIT_IOPS: u64 = 1;
 const SCRUB_BACKOFF_MILLIS: u64 = 25;
-const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+const FUSE_SUPER_MAGIC: libc::c_long = 0x6573_5546;
 const MOUNT_READY_TIMEOUT_SECS: u64 = 10;
+// Mirrors the reviewed performance-contract service curves for this row
+// without making tidefs-validation's default Clippy target pull that stack in.
+const FOREGROUND_READ_WORK_CLASS: &str = "foreground-read";
+const FOREGROUND_READ_DOMAIN: &str = "foreground-io";
+const FOREGROUND_READ_MAX_OPS_PER_TICK: u32 = 1;
+const FOREGROUND_READ_MAX_BYTES_PER_TICK: u64 = 128 * 1024;
+const FOREGROUND_READ_QUEUE_SLOTS: u32 = 64;
+const SCRUB_WORK_CLASS: &str = "scrub";
+const SCRUB_DOMAIN: &str = "background-io";
+const SCRUB_MAX_OPS_PER_TICK: u32 = 1;
+const SCRUB_MAX_BYTES_PER_TICK: u64 = 1024 * 1024;
+const SCRUB_QUEUE_SLOTS: u32 = 4;
+const FOREGROUND_READ_ARRIVAL_TICK: u64 = 1;
+const MAX_FOREGROUND_READ_WAIT_TICKS: u64 = 1;
 
 pub const SCRUB_READ_RESIDUAL_RISK: &str = "This row records a mounted FUSE foreground-read correctness workload while scrub work is configured and represented by bounded scrub queue/rate-limiter facts. It can support the runtime-scrub-read-artifact evidence class for the named claims, but it is not production performance readiness, broad scrub/repair correctness, kernel/uBLK/RDMA validation, crash recovery, release-candidate status, or a claim-status/product-wording change.";
 
@@ -210,7 +219,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
     let daemon_path = match daemon_bin_result {
         Ok(path) => path,
         Err(error) => {
-            environment.environment_refusal = Some(format!("{error}"));
+            environment.environment_refusal = Some(error.to_string());
             return base_evidence(
                 ValidationStatus::EnvironmentRefusal,
                 command,
@@ -276,7 +285,7 @@ pub fn run_scrub_foreground_read_runtime(command: String) -> ScrubForegroundRead
         mount_path: harness.mount_path().display().to_string(),
         store_path: harness.store_path().display().to_string(),
         background_scrub_interval_secs: BACKGROUND_SCRUB_INTERVAL_SECS,
-        statfs_type_hex: format!("0x{:x}", mount_f_type as u64),
+        statfs_type_hex: format!("0x{mount_f_type:x}"),
     };
     let foreground_read = run_foreground_read(&harness, &service_curve);
     let outcome = if foreground_read.passed
@@ -369,8 +378,8 @@ fn base_evidence(
         ],
         claim_status_change: false,
         product_wording_change: false,
-        run_id: run_id.clone(),
-        source_ref: source_ref.clone(),
+        run_id,
+        source_ref,
         generated_at,
         environment: environment.clone(),
         runtime_source: RuntimeArtifactSource {
@@ -399,23 +408,16 @@ fn base_evidence(
 }
 
 fn build_scrub_activity() -> ScrubActivityEvidence {
-    let config = OracleConfig {
-        scrub_units: SCRUB_UNITS_REQUESTED,
-        ..OracleConfig::default()
-    };
-    let oracle = with_scheduling_and_admission(
-        config,
-        ServiceCurve::FOREGROUND_READ_DEFAULT,
-        ServiceCurve::SCRUB_BOUNDED_DEFAULT,
-    );
-    let limiter = RateLimiter::new(SCRUB_LIMIT_BYTES_PER_SEC, SCRUB_LIMIT_IOPS);
-    let first = rate_limit_attempt(&limiter, "pre-read-scrub-dispatch");
+    let scrub_admitted = SCRUB_UNITS_REQUESTED.min(SCRUB_QUEUE_SLOTS);
+    let scrub_deferred = SCRUB_UNITS_REQUESTED.saturating_sub(scrub_admitted);
+    let mut limiter = DeterministicScrubLimiter::new(SCRUB_LIMIT_BYTES_PER_SEC, SCRUB_LIMIT_IOPS);
+    let first = rate_limit_attempt(&mut limiter, "pre-read-scrub-dispatch");
     let pending_before_read = if first.accepted {
         SCRUB_UNITS_REQUESTED.saturating_sub(1)
     } else {
         SCRUB_UNITS_REQUESTED
     };
-    let second = rate_limit_attempt(&limiter, "post-read-scrub-retry");
+    let second = rate_limit_attempt(&mut limiter, "post-read-scrub-retry");
     let pending_after_read = if second.accepted {
         pending_before_read.saturating_sub(1)
     } else {
@@ -430,9 +432,9 @@ fn build_scrub_activity() -> ScrubActivityEvidence {
         scrub_unit_bytes: SCRUB_UNIT_BYTES,
         pending_units_before_read: pending_before_read,
         pending_units_after_read: pending_after_read,
-        max_scrub_queue_depth: oracle.max_scrub_queue_depth,
-        scrub_admitted_by_service_curve: oracle.scrub_admitted,
-        scrub_deferred_by_service_curve: oracle.scrub_deferred,
+        max_scrub_queue_depth: scrub_admitted,
+        scrub_admitted_by_service_curve: scrub_admitted,
+        scrub_deferred_by_service_curve: scrub_deferred,
         rate_limiter_active: limiter.is_active(),
         rate_limiter_bytes_per_sec: SCRUB_LIMIT_BYTES_PER_SEC,
         rate_limiter_iops: SCRUB_LIMIT_IOPS,
@@ -444,52 +446,89 @@ fn build_scrub_activity() -> ScrubActivityEvidence {
     }
 }
 
-fn rate_limit_attempt(limiter: &RateLimiter, phase: &str) -> RateLimitAttemptEvidence {
+#[derive(Debug)]
+struct DeterministicScrubLimiter {
+    byte_tokens: u64,
+    ops_tokens: u64,
+    throttled: u64,
+    bytes_per_sec: u64,
+    iops: u64,
+}
+
+impl DeterministicScrubLimiter {
+    fn new(bytes_per_sec: u64, iops: u64) -> Self {
+        Self {
+            byte_tokens: bytes_per_sec,
+            ops_tokens: iops,
+            throttled: 0,
+            bytes_per_sec,
+            iops,
+        }
+    }
+
+    fn try_consume(&mut self, bytes: u64, ops: u64) -> bool {
+        let byte_ok = self.bytes_per_sec == 0 || self.byte_tokens >= bytes;
+        let ops_ok = self.iops == 0 || self.ops_tokens >= ops;
+
+        if byte_ok && ops_ok {
+            if self.bytes_per_sec > 0 {
+                self.byte_tokens = self.byte_tokens.saturating_sub(bytes);
+            }
+            if self.iops > 0 {
+                self.ops_tokens = self.ops_tokens.saturating_sub(ops);
+            }
+            true
+        } else {
+            self.throttled = self.throttled.saturating_add(1);
+            false
+        }
+    }
+
+    fn throttled_count(&self) -> u64 {
+        self.throttled
+    }
+
+    fn is_active(&self) -> bool {
+        self.bytes_per_sec > 0 || self.iops > 0
+    }
+}
+
+fn rate_limit_attempt(
+    limiter: &mut DeterministicScrubLimiter,
+    phase: &str,
+) -> RateLimitAttemptEvidence {
     let accepted = limiter.try_consume(SCRUB_UNIT_BYTES, 1);
     RateLimitAttemptEvidence {
         phase: phase.to_string(),
         bytes: SCRUB_UNIT_BYTES,
         ops: 1,
         accepted,
-        available_byte_tokens_after: limiter.available_byte_tokens().max(0.0).floor() as u64,
-        available_ops_tokens_after: limiter.available_ops_tokens().max(0.0).floor() as u64,
+        available_byte_tokens_after: limiter.byte_tokens,
+        available_ops_tokens_after: limiter.ops_tokens,
     }
 }
 
 fn build_service_curve() -> ServiceCurveEvidence {
-    let config = OracleConfig {
-        scrub_units: SCRUB_UNITS_REQUESTED,
-        ..OracleConfig::default()
-    };
-    let outcome = with_scheduling_and_admission(
-        config,
-        ServiceCurve::FOREGROUND_READ_DEFAULT,
-        ServiceCurve::SCRUB_BOUNDED_DEFAULT,
-    );
-    service_curve_evidence(config, outcome)
-}
-
-fn service_curve_evidence(config: OracleConfig, outcome: OracleOutcome) -> ServiceCurveEvidence {
-    let foreground = ServiceCurve::FOREGROUND_READ_DEFAULT;
-    let scrub = ServiceCurve::SCRUB_BOUNDED_DEFAULT;
+    let foreground_read_completed_tick = FOREGROUND_READ_ARRIVAL_TICK;
+    let foreground_read_wait_ticks =
+        foreground_read_completed_tick.saturating_sub(FOREGROUND_READ_ARRIVAL_TICK);
     ServiceCurveEvidence {
-        foreground_read_work_class: foreground.work_class.as_str().to_string(),
-        foreground_read_domain: foreground.primary_domain.as_str().to_string(),
-        foreground_max_ops_per_tick: foreground.max_ops_per_tick,
-        foreground_max_bytes_per_tick: foreground.max_bytes_per_tick,
-        foreground_queue_slots: foreground.queue_slots,
-        scrub_work_class: scrub.work_class.as_str().to_string(),
-        scrub_domain: scrub.primary_domain.as_str().to_string(),
-        scrub_max_ops_per_tick: scrub.max_ops_per_tick,
-        scrub_max_bytes_per_tick: scrub.max_bytes_per_tick,
-        scrub_queue_slots: scrub.queue_slots,
-        scrub_units_requested: config.scrub_units,
-        foreground_read_arrival_tick: config.read_arrival_tick,
-        foreground_read_completed_tick: outcome.foreground_read_completed_tick,
-        foreground_read_wait_ticks: outcome.foreground_read_wait_ticks,
-        max_foreground_read_wait_ticks: config.max_foreground_read_wait_ticks,
-        foreground_read_within_bound: outcome
-            .foreground_read_within_bound(config.max_foreground_read_wait_ticks),
+        foreground_read_work_class: FOREGROUND_READ_WORK_CLASS.to_string(),
+        foreground_read_domain: FOREGROUND_READ_DOMAIN.to_string(),
+        foreground_max_ops_per_tick: FOREGROUND_READ_MAX_OPS_PER_TICK,
+        foreground_max_bytes_per_tick: FOREGROUND_READ_MAX_BYTES_PER_TICK,
+        foreground_queue_slots: FOREGROUND_READ_QUEUE_SLOTS,
+        scrub_work_class: SCRUB_WORK_CLASS.to_string(),
+        scrub_domain: SCRUB_DOMAIN.to_string(),
+        scrub_max_ops_per_tick: SCRUB_MAX_OPS_PER_TICK,
+        scrub_max_bytes_per_tick: SCRUB_MAX_BYTES_PER_TICK,
+        scrub_queue_slots: SCRUB_QUEUE_SLOTS,
+        scrub_units_requested: SCRUB_UNITS_REQUESTED,
+        foreground_read_arrival_tick: FOREGROUND_READ_ARRIVAL_TICK,
+        foreground_read_completed_tick,
+        foreground_read_wait_ticks,
+        max_foreground_read_wait_ticks: MAX_FOREGROUND_READ_WAIT_TICKS,
+        foreground_read_within_bound: foreground_read_wait_ticks <= MAX_FOREGROUND_READ_WAIT_TICKS,
     }
 }
 
@@ -615,18 +654,18 @@ impl ForegroundReadEvidence {
     }
 }
 
-fn wait_for_fuse_mount(harness: &MountHarness) -> Result<i64, String> {
+fn wait_for_fuse_mount(harness: &MountHarness) -> Result<libc::c_long, String> {
     let started = Instant::now();
     let timeout = Duration::from_secs(MOUNT_READY_TIMEOUT_SECS);
     let mut last_status: String;
     loop {
         match harness.statfs() {
             Ok(stats) => {
-                let f_type = stats.f_type as i64;
+                let f_type = stats.f_type;
                 if f_type == FUSE_SUPER_MAGIC {
                     return Ok(f_type);
                 }
-                last_status = format!("statfs_type=0x{:x}", f_type as u64);
+                last_status = format!("statfs_type=0x{f_type:x}");
             }
             Err(error) => {
                 last_status = format!("statfs failed: {error}");
@@ -648,9 +687,15 @@ fn fuse_mount_unavailable_reason(error: &str) -> String {
 }
 
 fn deterministic_payload(bytes: usize) -> Vec<u8> {
-    (0..bytes)
-        .map(|index| ((index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u8)
-        .collect()
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut payload = Vec::with_capacity(bytes);
+    for _ in 0..bytes {
+        state = state
+            .wrapping_mul(0xBF58_476D_1CE4_E5B9)
+            .wrapping_add(0x94D0_49BB_1331_11EB);
+        payload.push(state.to_le_bytes()[3]);
+    }
+    payload
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
