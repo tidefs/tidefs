@@ -111,23 +111,11 @@ stay out of this coordination slice:
   `docs/design/deferred-cleanup-background-service-scheduling.md`.
 
 Bounded source/doc inspection for this coordination slice also found older
-status/matrix references outside the #1015-#1025 child map. Already-classified
-historical-input examples, including
-`docs/design/2159-milestone-targets-velocity-update.md`,
-`docs/design/coordination-review-roadmap-priorities-update-1953.md`,
-`docs/design/openzfs-ceph-successor-claim.md`, and
-`docs/design/production-erasure-coding-crush-placement-g4-pillar.md`, remain
-historical input under their existing rows. The
-`docs/design/coordination-pipeline-cluster-services-design-seal.md` leftover is
-classified below by #1153, and the
-`docs/design/1971-pool-import-export-7-phase-implementation-plan.md` leftover is
-classified below by #1152. The
-`docs/design/coordination-pipeline-status-update-1767.md` leftover is classified
-below by #1174, and the
-`docs/design/coordination-pipeline-status-update-1839.md` leftover is classified
-below by #1232. The
-`docs/design/coordination-pipeline-status-update-1915.md` status/matrix leftover
-is classified below by #1233.
+status/matrix references outside the #1015-#1025 child map. Issue #1586 later
+deleted the already-classified Forgejo-era coordination health, status-update,
+roadmap, and cluster-services seal/closeout snapshots. Git history and #1586
+retain the exact path lineage; current repo docs must not cite those deleted
+snapshots as authority.
 
 #952 must remain open until #1015 through #1025 are closed and a current guard
 run or equivalent source inspection shows no remaining blocking live-doc drift
@@ -135,146 +123,15 @@ for this issue family.
 
 ## Classified Authority Slices
 
-### Coordination Pipeline Health Strategy Authority
+### Retired Coordination Snapshot Deletions (TFR-019 / #1586)
 
-Classified for TFR-019 / GitHub issue #1164 on 2026-06-23 after reviewing the
-authority rule and #952 status/matrix leftover list in this register,
-`docs/REVIEW_TODO_REGISTER.md` TFR-019 notes,
-`docs/design/coordination-pipeline-health-advancement-strategy.md`,
-`docs/INDEX.md`, and `docs/GITHUB_PR_DEVELOPMENT.md`.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/coordination-pipeline-health-advancement-strategy.md` | Historical input | Imported Forgejo-era coordination-health design. It preserves old issue labels, lane/blocking fields, health-score and dashboard models, and deleted status/matrix references only as historical design context. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current automation policy, implementation status, release-readiness evidence, or worker scheduling authority. |
-
-### Coordination Status Update Architecture (TFR-019 / #1165)
-
-Classified for TFR-019 / GitHub issue #1165 on 2026-06-23 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported status-update architecture doc,
-`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and bounded lineage references
-from the numbered status-update snapshots. This slice does not classify the
-numbered snapshots, does not promote any current automation claim, and does not
-change Codex Nexus or worker scheduling policy.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/coordination-pipeline-status-update.md` | Historical input | Imported Forgejo #1833 design for serialized `STATUS.md` coordination updates, `FEATURE_MATRIX.md` synchronization, lane summaries, health scoring, and Forgejo label-driven generation. Useful lineage for retired status-update architecture, but current TideFS coordination lives in GitHub issues and pull requests plus the active repo documentation entry points. It is not current automation policy, implementation status, release-readiness evidence, worker scheduling authority, `STATUS.md` authority, `FEATURE_MATRIX.md` authority, lane-health authority, or issue-label authority. |
-
-
-### Coordination Pipeline Status Update 1767 Snapshot (TFR-019 / #1174)
-
-Classified for TFR-019 / GitHub issue #1174 on 2026-06-27 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported 1767 status-update snapshot,
-`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, the already-classified #1165
-status-update-architecture row, closed lineage issues #952 and #1165, and
-bounded chronology references from the main `coordination-pipeline-status-update.md`
-architecture document and neighboring numbered status-update snapshots. This slice
-classifies exactly the numbered 1767 snapshot and does not newly classify or alter
-the -1839, -1915, -1954, -2054, or other #952 leftovers, promote any current
-automation claim, or change Codex Nexus or worker scheduling policy.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/coordination-pipeline-status-update-1767.md` | Historical input | Imported Forgejo-era #1767 coordination pipeline status snapshot from May 2026. It records design-spec metadata, `STATUS.md`/`FEATURE_MATRIX.md` references, lane-health/status-record machinery, cluster-service implementation-status statements, deferred-wire-up claims, active-lane gate language, and Forgejo issue/scheduling concepts that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current policy, automation behavior, implementation status, release-readiness evidence, worker scheduling authority, `STATUS.md` authority, `FEATURE_MATRIX.md` authority, lane-health authority, or product authority. |
-
-
-### Coordination Pipeline Status Update 1839 Snapshot (TFR-019 / #1232)
-
-Classified for TFR-019 / GitHub issue #1232 on 2026-06-27 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported 1839 status-update snapshot,
-`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, closed lineage issues #952,
-#1164, and #1165, the already-classified #1174 1767-snapshot, #1234
-1954-snapshot, and #1236 2054-snapshot rows, bounded lineage from the main
-`coordination-pipeline-status-update.md` architecture document, and live issue
-#1233 for the intentionally separate 1915 slice. This slice classifies exactly
-the numbered 1839 snapshot and does not classify the -1915 sibling or alter the
--1767, -1954, -2054, #1164 health-strategy, or #1165 architecture
-classifications, promote any current automation claim, or change Codex Nexus or
-worker scheduling policy.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/coordination-pipeline-status-update-1839.md` | Historical input | Imported Forgejo-era #1839 coordination pipeline status snapshot from May 2026. It records design-phase closure for cluster-wide services, three active implementation lanes, deferred wire-up dependencies, proliferation containment strategy, design-spec metadata, lane-health/status-record machinery, cluster-service implementation-status statements, Forgejo issue/scheduling concepts, and `STATUS.md`/`FEATURE_MATRIX.md` references that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current policy, automation behavior, implementation status, release-readiness evidence, worker scheduling authority, `STATUS.md` authority, `FEATURE_MATRIX.md` authority, lane-health authority, or product authority. |
-
-
-### Coordination Pipeline Status Update 1915 Snapshot (TFR-019 / #1233)
-
-Classified for TFR-019 / GitHub issue #1233 on 2026-06-27 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported 1915 status-update snapshot,
-`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, closed lineage issues
-#952/#1164/#1165, the already-classified #1174, #1232, #1234, and #1236
-status-update snapshot rows, and bounded chronology from the main
-`coordination-pipeline-status-update.md` architecture document and neighboring
-numbered snapshots. This slice classifies exactly the numbered 1915 snapshot
-and does not alter the -1767, -1839, -1954, or -2054 snapshots, the #1164
-health-strategy classification, or the #1165 status-update-architecture
-classification, and it does not promote any current automation claim or change
-Codex Nexus or worker scheduling policy.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/coordination-pipeline-status-update-1915.md` | Historical input | Imported Forgejo-era #1915 coordination pipeline status snapshot from May 2026. It records design-spec metadata, `STATUS.md`/`FEATURE_MATRIX.md` references, lane-health and velocity-assessment machinery, coordinator-proliferation language, cluster-service implementation-status statements, deferred-wire-up claims, and Forgejo issue/scheduling concepts that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current policy, automation behavior, implementation status, release-readiness evidence, worker scheduling authority, `STATUS.md` authority, `FEATURE_MATRIX.md` authority, lane-health authority, or product authority. |
-
-
-### Coordination Pipeline Status Update 1954 Snapshot (TFR-019 / #1234)
-
-Classified for TFR-019 / GitHub issue #1234 on 2026-06-23 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported 1954 status-update snapshot,
-`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, the already-classified #1164
-health-strategy and #1165 status-update-architecture rows, and bounded lineage
-from the main `coordination-pipeline-status-update.md` architecture document.
-This slice classifies exactly the numbered 1954 snapshot and does not classify
-the -1767, -1839, or -1915 snapshots, promote any current automation
-claim, or change Codex Nexus or worker scheduling policy.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/coordination-pipeline-status-update-1954.md` | Historical input | Imported Forgejo-era #1954 coordination pipeline status snapshot from May 2026. It records lane-health machinery, coordinator-proliferation language, cluster-service implementation-status statements, deferred-wire-up claims, Forgejo API queries, and `STATUS.md`/`FEATURE_MATRIX.md` cross-document consistency contracts that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current automation policy, implementation status, release-readiness evidence, or worker scheduling authority. |
-
-
-### Coordination Pipeline Status Update 2054 Snapshot (TFR-019 / #1236)
-
-Classified for TFR-019 / GitHub issue #1236 on 2026-06-23 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported 2054 status-update snapshot,
-`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, the already-classified #1164
-health-strategy, #1165 status-update-architecture, and #1234 1954-snapshot
-rows, and bounded lineage from the main
-`coordination-pipeline-status-update.md` architecture document. The pre-existing
-"Historical input" header annotation added by #1049 is preserved as-is because
-it matches the register classification. This slice classifies exactly the
-numbered 2054 snapshot and does not classify the -1767, -1839, or -1915
-snapshots, promote any current automation claim, or change Codex Nexus or
-worker scheduling policy.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/coordination-pipeline-status-update-2054.md` | Historical input | Imported Forgejo-era #2054 coordination pipeline status snapshot from May 2026. It records design-phase closure for cluster-wide services, three active implementation lanes, deferred wire-up dependencies, coordinator-proliferation containment strategy, design-spec metadata, and `STATUS.md`/`FEATURE_MATRIX.md` references that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current automation policy, implementation status, release-readiness evidence, or worker scheduling authority.
-
-
-### Coordination Review Roadmap Priorities Update (TFR-019 / #1238)
-
-Classified for TFR-019 / GitHub issue #1238 on 2026-06-23 after reviewing this
-register's authority rule and review method, the TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported roadmap priorities update document,
-`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, the already-classified #1164
-health-strategy, #1165 status-update-architecture, #1234 1954-snapshot, and
-#1236 2054-snapshot rows, and bounded lineage references from the
-`coordination-pipeline-status-update.md` architecture document and the
-`coordination-review-roadmap-priorities-update-1953.md` already-classified
-historical-input entry. This slice classifies exactly the roadmap priorities
-update file and does not classify the -1953 sibling, other coordination-pipeline
-snapshots, promote any current automation claim, or change Codex Nexus or worker
-scheduling policy.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/coordination-review-roadmap-priorities-update.md` | Historical input | Imported Forgejo-era #1914 (superseding #1753) coordination pipeline health review from June 2026. It records lane-health machinery, active-lane status statements, coordinator-proliferation audit data, priority-ordering data structures and scheduling algorithms, deferred-wire-up claims, Forgejo issue references (#1914, #1753, #1738, #1903, #1644, #1923), design-spec metadata, and `STATUS.md`/`FEATURE_MATRIX.md` references that are all retired Forgejo-era artifacts. Current TideFS coordination authority remains GitHub issue and pull-request state plus `docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`, and this register; this file is not current policy, automation behavior, implementation status, release-readiness evidence, worker scheduling authority, or product authority. |
+Issue #1586 deleted the already-classified Forgejo-era coordination health,
+status-update, and roadmap snapshot files that had been covered by #1164,
+#1165, #1174, #1232, #1233, #1234, #1236, and #1238. Their historical
+classification evidence remains in git history and the closed issues; this
+register intentionally does not keep live per-file rows for deleted documents.
+Current coordination authority remains GitHub issue and pull-request state plus
+the active repo documentation entry points.
 
 ### Request Contract Authority (TFR-019 / #1136)
 
@@ -585,16 +442,13 @@ larger than this documentation-authority cleanup.
 | `docs/design/2068-shard-groups-replicas-rebake-pathway-design.md` | Historical input | Imported rebake-pathway refinement whose production-depth flow claims exceed the current validation register. It remains design input for future rebake authority work. |
 | `docs/design/METADATA_ENGINE_PARALLELISM_DESIGN.md` | Historical input | Imported metadata-engine parallelism design with broad scheduling and correctness implications. It needs dedicated engine/source review before any current-spec promotion. |
 | `docs/design/background-service-framework-canonical-consolidation.md` | Historical input | Imported background-service consolidation note in a larger duplicate lineage. Current `tidefs-background-scheduler` source exists, but this closeout/consolidation document was not reconciled with live scheduler authority. |
-| `docs/design/background-service-framework-coordination-confirmed.md` | Historical input | Imported coordination-confirmed background-service note. It records old planning state, not current scheduler/runtime authority. |
 | `docs/design/background-service-framework-design-1803.md` | Historical input | Imported background-service design iteration. It remains lineage material for scheduler review and is not current service-contract authority. |
 | `docs/design/background-service-framework-design-enhanced.md` | Historical input | Imported enhanced background-service design. Current scheduler behavior and claims evidence were not audited against the enhancement set in this slice. |
 | `docs/design/background-service-framework-design-spec.md` | Historical input | Imported background-service design-spec variant. It is not authoritative over the current scheduler without a focused `tidefs-background-scheduler` source and claims review. |
 | `docs/design/background-service-framework-design.md` | Historical input | Imported background-service framework design referenced by multiple old distributed-service docs. It remains useful design context, not current runtime authority. |
 | `docs/design/background-service-framework-multithread-design.md` | Historical input | Imported multithreaded background-service design. It must be reconciled with current scheduler source and validation before being used as a current concurrency contract. |
-| `docs/design/background-service-framework-phases-5-10-wire-up-tracking-coordination-seal.md` | Historical input | Imported coordination-seal tracking note for background-service phases. It is old planning closeout material, not a current implementation-status record. |
 | `docs/design/background-service-framework-phases-5-10-wire-up-tracking.md` | Historical input | Imported phase-tracking note for background-service wire-up. It remains historical input until live source and validation are checked against the phase claims. |
 | `docs/design/bounded-cluster-membership-state.md` | Historical input | Imported bounded-membership state design. Current distributed membership authority is only whatever later scoped rows classify; this file is not current cluster-service evidence. |
-| `docs/design/coordination-review-roadmap-priorities-update-1953.md` | Historical input | Imported roadmap/priorities update. It is planning context and must not be treated as current policy, spec, or implementation evidence. |
 | `docs/design/deterministic-trace-oracle-system.md` | Historical input | Imported deterministic trace-oracle design. It may inform future validation tooling, but this slice did not promote any trace-oracle claim or scanned claims-gate surface. |
 | `docs/design/device-layout-policies-adaptive-segment-sizing.md` | Historical input | Imported adaptive segment-sizing/device-layout policy design. It needs storage allocator/device-layout source and evidence review before it can constrain current behavior. |
 | `docs/design/directory-change-streams-namespace-event-protocol.md` | Historical input | Imported directory change-stream protocol design. Current namespace event behavior and claims coverage were not audited here, so it remains design input. |
@@ -662,14 +516,12 @@ claim/comparator evidence path.
 |---|---|---|
 | `docs/BACKGROUND_SERVICE_FRAMEWORK_DESIGN.md` | Historical input | Redirect into the imported background-service design lineage. It now points readers at this register boundary; it is not current scheduler/runtime authority, phase-completion evidence, FUSE-loop proof, no-hidden-queue proof, release readiness, or product-comparison permission. |
 | `docs/design/background-service-framework-canonical-consolidation.md` | Historical input | Imported Forgejo-era consolidation note. It remains lineage for background-service review, but its design-spec and consolidation-status wording does not override the live `tidefs-background-scheduler` source contract or current claims gate. |
-| `docs/design/background-service-framework-coordination-confirmed.md` | Historical input | Imported coordination-confirmed note with sealed-design and implementation-status framing. It is not current scheduler/runtime authority or proof that no further design or runtime evidence is required. |
 | `docs/design/background-service-framework-design-1803.md` | Historical input | Imported background-service design iteration. It is useful design context for the scheduler trait/priority/budget review but is not current service-contract authority. |
 | `docs/design/background-service-framework-design-1962.md` | Historical input | Imported self-contained background-service design summary that points at the old Forgejo consolidation lineage. It was not previously classified in the #689 table; this slice preserves it as historical input, not current architecture, runtime, or product-status authority. |
 | `docs/design/background-service-framework-design-enhanced.md` | Historical input | Imported enhanced design variant. Source review in this slice does not validate its lifecycle, starvation, backpressure, observability, or implementation-status claims, so it remains review material. |
 | `docs/design/background-service-framework-design-spec.md` | Historical input | Imported design-spec/roadmap variant. The live scheduler source supports only the narrow API behavior named above; the broader roadmap, phase, runtime, and claims wording remains unpromoted. |
 | `docs/design/background-service-framework-design.md` | Historical input | Focused imported design entry point. It now carries an authority note; its scheduler API examples may inform source navigation, but its canonical-design, Maturity, phase-completion, FUSE integration, performance, crash-recovery, observability, and incumbent-comparison wording is not current product proof. |
 | `docs/design/background-service-framework-multithread-design.md` | Historical input | Imported multi-threaded design. `multi_threaded.rs` exposes feature-gated scheduler types, but this slice did not validate production multi-core runtime behavior, work stealing, cross-partition delivery, or operator-visible concurrency claims. |
-| `docs/design/background-service-framework-phases-5-10-wire-up-tracking-coordination-seal.md` | Historical input | Imported coordination-seal tracking note for phases 5-10. Its phase-closeout and sealed-design wording is historical planning state, not current implementation status. |
 | `docs/design/background-service-framework-phases-5-10-wire-up-tracking.md` | Historical input | Imported phase-tracking specification for phases 5-10. It remains useful follow-up planning input, but FUSE integration, derived catalog, data cleaner, segment cleaner, compaction, and runtime validation claims require separate source/validation slices. |
 
 ### Derived-Views Architectural Pillar (TFR-019 / #1240)
@@ -786,40 +638,14 @@ CI workflows, validation artifacts, or `validation/claims.toml`.
 |---|---|---|
 | `docs/design/1813-pool-import-export-device-topology-management-design.md` | Historical input | Imported Forgejo-era #1813 design iteration for pool import/export and online device topology management. It preserves the PoolLabelV1 data structure design, import/export protocol algorithms, device failure state machine, and 7-phase implementation plan as historical design lineage. Its "design-sealed" and "frozen" language, Forgejo issue references, and phase-status claims (Phases 2–5 and 7 marked "deferred to wire-up") are stale: live source in `tidefs-local-object-store/src/pool_importer.rs`, `pool_exporter.rs`, and `device_manager.rs` implements pool import/export and device topology management referencing `docs/POOL_IMPORT_EXPORT_DEVICE_TOPOLOGY_DESIGN.md` as its design authority. The PoolLabelV1 on-device label format is implemented in `tidefs-types-pool-label-core/lib.rs`. The ZFS/Ceph prior-art comparison table in §10 is incumbent-comparison context preserved as historical design input under the #931/#934 cluster boundary; it is not a current capability, availability, durability, or product claim. No `validation/claims.toml` entries exist for pool import/export, device topology, hot-spare, evacuation, or cluster-aware pool ownership. The file is not current policy, current spec, implementation status, or product authority. |
 
-### Coordination Pipeline Cluster Services Design Seal (TFR-019 / #1153)
+### Retired Cluster Services Closeout Deletions (TFR-019 / #1586)
 
-Classified for TFR-019 / GitHub issue #1153 on 2026-06-27 after reviewing this
-register's authority rule and review method, the #952 status/matrix leftover
-list, the TFR-017 and TFR-019 notes in `docs/REVIEW_TODO_REGISTER.md`, the
-imported Forgejo #1738 seal document, the sibling #1754 completion document as
-nearby lineage, closed #931 incumbent-comparison audit guidance, closed #875
-claim-boundary guidance, closed #928 comparator evidence guidance, PR #930,
-bounded source/doc searches, live source in `crates/tidefs-membership-live/`,
-`crates/tidefs-membership-epoch/`, and `crates/tidefs-node-drain/`, plus
-`validation/claims.toml` and `docs/CLAIM_REGISTRY.md`. This slice does not
-edit product source, Cargo manifests, CI workflows, validation artifacts,
-generated claim registries, or `validation/claims.toml`.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/coordination-pipeline-cluster-services-design-seal.md` | Historical input | Imported Forgejo-era #1738 design-phase seal for cluster-wide coordination services. It preserves the old layered inventory, service decomposition, deferral rationale, gate sketch, and design-lineage references as historical input. Its "sealed", "design-sealed", "implemented-source", "models implemented", "3-node cluster", `docs/STATUS.md`, and `docs/FEATURE_MATRIX.md` wording is stale coordination-pipeline status language, not current implementation status, release-readiness evidence, or product authority. Live source now contains membership, epoch, and drain surfaces in `tidefs-membership-live`, `tidefs-membership-epoch`, and `tidefs-node-drain`, but TFR-017 still leaves transport/cluster authority open before multi-node claims. The checked claim evidence records only a planned bounded distributed model-check claim (`distributed.combined_safety.model.v1`) for source-model invariants and blocked successor/comparator boundaries (`storage.intent.successor_comparator.v1`); it does not validate broad cluster-service, distributed-membership, production distributed-runtime, multi-node, or product-scale capability. The retained cluster-service and distributed-membership wording is non-claim historical design lineage under the #931/#875/#928/#930 boundary. The file is not current policy, current spec, implementation status, release-readiness evidence, or product authority. |
-
-### Coordination Pipeline Cluster Services Design Completion (TFR-019 / #1293)
-
-Classified for TFR-019 / GitHub issue #1293 on 2026-06-28 after reviewing this
-register's authority rule and review method, the TFR-017 and TFR-019 notes in
-`docs/REVIEW_TODO_REGISTER.md`, the imported Forgejo #1754 completion document,
-`docs/INDEX.md`, `docs/GITHUB_PR_DEVELOPMENT.md`,
-`docs/TRANSPORT_CLUSTER_AUTHORITY.md`, the closed #1153 sibling issue and
-cluster-services design-seal row, live GitHub issue and pull-request state,
-bounded source/doc searches, plus `validation/claims.toml` and
-`docs/CLAIM_REGISTRY.md`. This slice does not edit product source, Cargo
-manifests, CI workflows, validation artifacts, generated claim registries,
-`validation/claims.toml`, or the sibling cluster-services design-seal document.
-
-| Path | State | Classification note |
-|---|---|---|
-| `docs/design/coordination-pipeline-cluster-services-design-completion.md` | Historical input | Imported Forgejo-era #1754 design-phase completion note for cluster-wide coordination services. It preserves the old layer inventory, service data-structure sketches, bootstrap and cross-node state-machine algorithms, active implementation lane summaries, deferral rationale, closure checklist, residual-risk list, and Forgejo issue lineage as historical input. Its "design-sealed", "implemented-source", "active implementation lanes", "models implemented", "3-node cluster", "production distributed runtime", and deferred wire-up wording is stale coordination-pipeline status language, not current implementation status, release-readiness evidence, or product authority. Live source contains some transport, membership, drain, allocator, reclaim, and data-flow component crates, but `docs/TRANSPORT_CLUSTER_AUTHORITY.md` and TFR-017 still leave cross-replica comparison, repair authority, failed-quorum mutation evidence, cluster pool/orchestrator alignment, and RDMA validation gaps open before multi-node or production cluster claims. The checked claim evidence records only a planned bounded distributed model-check claim (`distributed.combined_safety.model.v1`) and blocked successor/comparator boundaries (`storage.intent.successor_comparator.v1`); it does not validate broad cluster-service, distributed-membership, transport, rebuild, placement, production distributed-runtime, multi-node, release-readiness, or product-scale capability. The retained completion and implementation-lane wording is non-claim historical design lineage. The file is not current policy, current spec, implementation status, release-readiness evidence, or product authority. |
+Issue #1586 deleted the already-classified Forgejo-era cluster-services seal and
+completion closeout notes covered by #1153 and #1293. The source and claim
+boundary findings remain unchanged: TFR-017 still blocks broad multi-node or
+production cluster claims, and the deleted closeout notes are not current
+policy, current spec, implementation status, release-readiness evidence, or
+product authority.
 
 ### Pool Import/Export 7-Phase Implementation Plan (TFR-019 / #1152)
 

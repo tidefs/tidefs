@@ -475,8 +475,7 @@ cargo test -p tidefs-background-scheduler -- --test-threads=1
   `docs/design/background-service-framework-phases-5-10-wire-up-tracking.md`
 - [#1983] Canonical consolidation →
   `docs/design/background-service-framework-canonical-consolidation.md`
-- [#1992] Coordination seal →
-  `docs/design/background-service-framework-coordination-confirmed.md`
+- [#1992] Retired coordination seal, removed by #1586
 - [#1962] This document — self-contained design summary
 - `crates/tidefs-background-scheduler/src/lib.rs` — scheduler implementation (1,410 lines)
 - `crates/tidefs-types-incremental-job-core/src/lib.rs` — types and traits (1,691 lines)
