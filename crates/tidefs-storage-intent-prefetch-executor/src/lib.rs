@@ -919,6 +919,86 @@ impl_u8_canonical!(PrefetchExecutorHandoffTarget, {
     ReceiptPublication = 5 => "receipt-publication",
 });
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[repr(u8)]
+pub enum PrefetchExecutorInterruptionClass {
+    #[default]
+    None = 0,
+    InterruptedStaging = 1,
+    WanStall = 2,
+    CacheEviction = 3,
+    CrashRestartReplay = 4,
+    RuntimeAbort = 5,
+}
+
+impl_u8_canonical!(PrefetchExecutorInterruptionClass, {
+    None = 0 => "none",
+    InterruptedStaging = 1 => "interrupted-staging",
+    WanStall = 2 => "wan-stall",
+    CacheEviction = 3 => "cache-eviction",
+    CrashRestartReplay = 4 => "crash-restart-replay",
+    RuntimeAbort = 5 => "runtime-abort",
+});
+
+impl PrefetchExecutorInterruptionClass {
+    #[must_use]
+    pub const fn requires_terminal_evidence(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    #[must_use]
+    pub const fn terminal_evidence_kind(self) -> StorageIntentEvidenceKind {
+        StorageIntentEvidenceKind::ActionExecutionEvidence
+    }
+
+    #[must_use]
+    pub const fn is_compatible_with_outcome(self, outcome: PrefetchExecutorOutcome) -> bool {
+        match self {
+            Self::None => true,
+            Self::InterruptedStaging => matches!(
+                outcome,
+                PrefetchExecutorOutcome::Stale
+                    | PrefetchExecutorOutcome::TimedOut
+                    | PrefetchExecutorOutcome::VerificationFailed
+                    | PrefetchExecutorOutcome::Blocked
+                    | PrefetchExecutorOutcome::Unavailable
+            ),
+            Self::WanStall => matches!(
+                outcome,
+                PrefetchExecutorOutcome::Throttled
+                    | PrefetchExecutorOutcome::TimedOut
+                    | PrefetchExecutorOutcome::Blocked
+                    | PrefetchExecutorOutcome::Unavailable
+            ),
+            Self::CacheEviction => matches!(
+                outcome,
+                PrefetchExecutorOutcome::Dropped
+                    | PrefetchExecutorOutcome::Stale
+                    | PrefetchExecutorOutcome::VerificationFailed
+                    | PrefetchExecutorOutcome::Unavailable
+            ),
+            Self::CrashRestartReplay => matches!(
+                outcome,
+                PrefetchExecutorOutcome::Completed
+                    | PrefetchExecutorOutcome::Stale
+                    | PrefetchExecutorOutcome::TimedOut
+                    | PrefetchExecutorOutcome::VerificationFailed
+                    | PrefetchExecutorOutcome::Blocked
+                    | PrefetchExecutorOutcome::Unavailable
+            ),
+            Self::RuntimeAbort => matches!(
+                outcome,
+                PrefetchExecutorOutcome::Dropped
+                    | PrefetchExecutorOutcome::Refused
+                    | PrefetchExecutorOutcome::VerificationFailed
+                    | PrefetchExecutorOutcome::Blocked
+                    | PrefetchExecutorOutcome::Unavailable
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct PrefetchExecutorMediaPath {
@@ -971,6 +1051,7 @@ pub struct PrefetchExecutorEvidenceRefs {
     pub retention_ref: StorageIntentEvidenceRef,
     pub attribution_ref: StorageIntentEvidenceRef,
     pub validation_ref: StorageIntentEvidenceRef,
+    pub interruption_ref: StorageIntentEvidenceRef,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1163,6 +1244,8 @@ pub struct PrefetchExecutorTerminalUpdate {
     pub result_detail: PrefetchExecutorResultDetail,
     pub refusal: StorageIntentRefusalReason,
     pub handoff_target: PrefetchExecutorHandoffTarget,
+    pub interruption: PrefetchExecutorInterruptionClass,
+    pub interruption_ref: StorageIntentEvidenceRef,
     pub result_refusal_ref: StorageIntentEvidenceRef,
     pub evidence_cut: PrefetchExecutorTerminalEvidenceCut,
 }
@@ -1174,6 +1257,8 @@ impl Default for PrefetchExecutorTerminalUpdate {
             result_detail: PrefetchExecutorResultDetail::default(),
             refusal: StorageIntentRefusalReason::None,
             handoff_target: PrefetchExecutorHandoffTarget::None,
+            interruption: PrefetchExecutorInterruptionClass::None,
+            interruption_ref: EMPTY_EVIDENCE_REF,
             result_refusal_ref: EMPTY_EVIDENCE_REF,
             evidence_cut: PrefetchExecutorTerminalEvidenceCut::default(),
         }
@@ -1254,6 +1339,7 @@ pub struct PrefetchExecutorRecord {
     pub outcome: PrefetchExecutorOutcome,
     pub refusal: StorageIntentRefusalReason,
     pub handoff_target: PrefetchExecutorHandoffTarget,
+    pub interruption: PrefetchExecutorInterruptionClass,
     pub evidence_refs: PrefetchExecutorEvidenceRefs,
 }
 
@@ -1289,6 +1375,7 @@ impl Default for PrefetchExecutorRecord {
             outcome: PrefetchExecutorOutcome::Unknown,
             refusal: StorageIntentRefusalReason::None,
             handoff_target: PrefetchExecutorHandoffTarget::None,
+            interruption: PrefetchExecutorInterruptionClass::None,
             evidence_refs: PrefetchExecutorEvidenceRefs::default(),
         }
     }
@@ -1754,6 +1841,10 @@ pub fn finalize_prefetch_execution(
     if update.result_refusal_ref.is_bound() {
         record.evidence_refs.result_refusal_ref = update.result_refusal_ref;
     }
+    record.interruption = update.interruption;
+    if update.interruption_ref.is_bound() {
+        record.evidence_refs.interruption_ref = update.interruption_ref;
+    }
 
     if terminal_result_detail_is_inconsistent(update.result_detail) {
         return terminal(
@@ -1776,6 +1867,8 @@ pub fn finalize_prefetch_execution(
     if terminal_update_refs_outside_evidence_cut(record, update)
         || terminal_result_detail_lacks_feedback_evidence(record, update)
         || terminal_update_lacks_result_refusal_evidence(record, update)
+        || terminal_update_lacks_interruption_evidence(record, update)
+        || terminal_update_has_inconsistent_interruption(update)
         || terminal_result_detail_lacks_charge_evidence(record, update)
     {
         return terminal(
@@ -1870,6 +1963,7 @@ fn base_record(input: PrefetchExecutorInput) -> PrefetchExecutorRecord {
             retention_ref: input.result_detail.retention_ref,
             attribution_ref: input.result_detail.attribution_ref,
             validation_ref: input.result_detail.validation_ref,
+            interruption_ref: EMPTY_EVIDENCE_REF,
         },
         ..PrefetchExecutorRecord::default()
     }
@@ -1973,6 +2067,28 @@ fn terminal_update_lacks_result_refusal_evidence(
             update.result_refusal_ref,
             StorageIntentEvidenceKind::ResultRefusalEvidence,
         )
+}
+
+fn terminal_update_lacks_interruption_evidence(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    if !update.interruption.requires_terminal_evidence() {
+        return update.interruption_ref.is_bound();
+    }
+
+    !terminal_ref_in_cut(
+        record,
+        update.evidence_cut,
+        update.interruption_ref,
+        update.interruption.terminal_evidence_kind(),
+    )
+}
+
+fn terminal_update_has_inconsistent_interruption(update: PrefetchExecutorTerminalUpdate) -> bool {
+    !update
+        .interruption
+        .is_compatible_with_outcome(update.outcome)
 }
 
 fn terminal_result_detail_lacks_charge_evidence(
@@ -2128,6 +2244,11 @@ fn terminal_update_refs_outside_evidence_cut(
         update.evidence_cut,
         update.result_refusal_ref,
         StorageIntentEvidenceKind::ResultRefusalEvidence,
+    ) || terminal_bound_ref_outside_cut(
+        record,
+        update.evidence_cut,
+        update.interruption_ref,
+        StorageIntentEvidenceKind::ActionExecutionEvidence,
     )
 }
 
@@ -2800,6 +2921,7 @@ mod tests {
     const TARGET_DESTINATION: StorageIntentEvidenceId = StorageIntentEvidenceId([20; 32]);
     const OUTSIDE_CUT: StorageIntentEvidenceId = StorageIntentEvidenceId([21; 32]);
     const RESULT_REFUSAL: StorageIntentEvidenceId = StorageIntentEvidenceId([22; 32]);
+    const INTERRUPTION: StorageIntentEvidenceId = StorageIntentEvidenceId([23; 32]);
 
     fn evidence(
         kind: StorageIntentEvidenceKind,
@@ -3152,11 +3274,26 @@ mod tests {
         detail: PrefetchExecutorResultDetail,
         result_refusal_ref: StorageIntentEvidenceRef,
     ) -> PrefetchExecutorTerminalEvidenceCut {
+        terminal_evidence_cut_with_interruption(
+            record,
+            detail,
+            result_refusal_ref,
+            EMPTY_EVIDENCE_REF,
+        )
+    }
+
+    fn terminal_evidence_cut_with_interruption(
+        record: PrefetchExecutorRecord,
+        detail: PrefetchExecutorResultDetail,
+        result_refusal_ref: StorageIntentEvidenceRef,
+        interruption_ref: StorageIntentEvidenceRef,
+    ) -> PrefetchExecutorTerminalEvidenceCut {
         let mut included_refs = StorageIntentEvidenceRefs::EMPTY;
         push_terminal_ref(&mut included_refs, detail.attribution_ref);
         push_terminal_ref(&mut included_refs, detail.retention_ref);
         push_terminal_ref(&mut included_refs, detail.validation_ref);
         push_terminal_ref(&mut included_refs, result_refusal_ref);
+        push_terminal_ref(&mut included_refs, interruption_ref);
         let required = detail.charge_requirements();
         if !required.is_empty() {
             push_terminal_ref(&mut included_refs, record.evidence_refs.cost_wear_ref);
@@ -4822,6 +4959,157 @@ mod tests {
         assert_eq!(refused.outcome, PrefetchExecutorOutcome::Refused);
         assert_eq!(refused.evidence_refs.result_refusal_ref, result_ref);
         assert_record_has_no_authority_claims(refused);
+    }
+
+    #[test]
+    fn terminal_update_records_interruption_evidence_without_authority() {
+        let detail = terminal_detail();
+        let started = evaluate_prefetch_execution(admitted_charged_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+            detail,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let interruption_ref = evidence(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            INTERRUPTION,
+        );
+        let completed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                result_detail: detail,
+                interruption: PrefetchExecutorInterruptionClass::CrashRestartReplay,
+                interruption_ref,
+                evidence_cut: terminal_evidence_cut_with_interruption(
+                    started,
+                    detail,
+                    EMPTY_EVIDENCE_REF,
+                    interruption_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(completed.outcome, PrefetchExecutorOutcome::Completed);
+        assert_eq!(completed.refusal, StorageIntentRefusalReason::None);
+        assert_eq!(
+            completed.interruption,
+            PrefetchExecutorInterruptionClass::CrashRestartReplay
+        );
+        assert_eq!(completed.evidence_refs.interruption_ref, interruption_ref);
+        assert_eq!(completed.executor_byte_state, started.executor_byte_state);
+        assert_record_has_no_authority_claims(completed);
+    }
+
+    #[test]
+    fn terminal_update_requires_interruption_ref_inside_terminal_cut() {
+        let mut input = admitted_input(PrefetchResidencyCandidateClass::WanGeoDeltaPrefetch);
+        input.evidence_query_snapshot =
+            snapshot(Some(StorageIntentEvidenceKind::TransportPathEvidence));
+        add_fresh(
+            &mut input.evidence_query_snapshot,
+            StorageIntentEvidenceKind::TrustDomainEvidence,
+            TRUST,
+        );
+        let started = evaluate_prefetch_execution(input);
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
+        let interruption_ref = evidence(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            INTERRUPTION,
+        );
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::TimedOut,
+                interruption: PrefetchExecutorInterruptionClass::WanStall,
+                interruption_ref,
+                result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    result_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(rejected);
+
+        let accepted = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::TimedOut,
+                interruption: PrefetchExecutorInterruptionClass::WanStall,
+                interruption_ref,
+                result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut_with_interruption(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    result_ref,
+                    interruption_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(accepted.outcome, PrefetchExecutorOutcome::TimedOut);
+        assert_eq!(
+            accepted.interruption,
+            PrefetchExecutorInterruptionClass::WanStall
+        );
+        assert_eq!(accepted.evidence_refs.interruption_ref, interruption_ref);
+        assert_record_has_no_authority_claims(accepted);
+    }
+
+    #[test]
+    fn terminal_update_rejects_incompatible_interruption_outcome() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        assert_eq!(started.outcome, PrefetchExecutorOutcome::Started);
+
+        let interruption_ref = evidence(
+            StorageIntentEvidenceKind::ActionExecutionEvidence,
+            INTERRUPTION,
+        );
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::Completed,
+                interruption: PrefetchExecutorInterruptionClass::WanStall,
+                interruption_ref,
+                evidence_cut: terminal_evidence_cut_with_interruption(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    EMPTY_EVIDENCE_REF,
+                    interruption_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_record_has_no_authority_claims(rejected);
     }
 
     #[test]
