@@ -25,6 +25,15 @@ Stable claim ids live in `validation/claims.toml`. That registry records the
 claim status, scope, required evidence classes, current blockers, and the text
 that may appear in generated claim documentation.
 
+The same registry records generated product-admission gates. Those gates are
+the product-spine map for local pool/device lifecycle, mounted POSIX behavior,
+crash recovery, integrity/scrub/rebuild, snapshots/reclaim, capacity,
+page-cache/writeback, block-device export, kernel residency, distributed mode,
+operator truth, and aggregate proof packets. Each gate must point at registered
+claim ids and only at evidence classes required by those claims; otherwise the
+claims gate fails. A blocked gate is a non-claim boundary, not a product-shape
+promise.
+
 The generated claim document is `docs/CLAIM_REGISTRY.md`. It is checked by
 `cargo run -p tidefs-xtask -- check-claims-gate`; manual edits to that document
 must fail unless they match the registry-derived output exactly.
@@ -60,6 +69,13 @@ The publishing-facing successor and comparator boundary is split in
 The OpenZFS/Ceph successor claim remains a blocked publishing boundary unless
 the exact local, distributed, and umbrella claim ids validate with current
 evidence.
+
+The generated product-admission gates in `docs/CLAIM_REGISTRY.md` name the
+only registry-backed path by which successor/comparator wording can consume
+product-spine evidence. A design document, proof-train label, implementation
+issue, CI workflow, benchmark row, or gate-local receipt may inform one of
+those gates, but it cannot bypass the referenced claim ids or the
+release-readiness verdict boundary.
 
 Until the matching split claim id and the umbrella boundary validate with
 current evidence manifests, TideFS docs, release notes, generated claim text,

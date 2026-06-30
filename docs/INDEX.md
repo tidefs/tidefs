@@ -35,9 +35,9 @@ Release readiness boundary and evidence inputs:
   release-readiness verdict boundary.
 - `docs/RELEASE_CANDIDATE_EVIDENCE_CONTRACT.md` describes the
   release-candidate evidence index as a gate input.
-- `docs/PRODUCT_ADMISSION_PROOF_TRAINS.md` maps product-admission proof trains
-  as a planning and review overlay, not as a release-readiness verdict or
-  product-admission claim.
+- `docs/CLAIM_REGISTRY.md` is generated from `validation/claims.toml` and
+  records the registry-backed product-admission gates and claim ids that bound
+  successor/comparator wording.
 - The current performance-gate implementation lives under
   `crates/tidefs-validation/src/performance_gate/`; the old P10-03 document is
   historical input unless a focused source-backed spec replaces it.
@@ -53,9 +53,9 @@ Release readiness boundary and evidence inputs:
   guardrail for operator surfaces, wire/control paths, durable records, and
   evidence artifacts.
 
-The evidence inputs, proof-train map, gate-local receipts, CI artifacts, and
-claims-gate results listed here do not combine into a product-admission
-decision on their own.
+The evidence inputs, generated product-admission gates, gate-local receipts,
+CI artifacts, and claims-gate results listed here do not combine into a
+product-admission decision on their own.
 
 Current authority families:
 

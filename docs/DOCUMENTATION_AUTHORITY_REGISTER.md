@@ -88,6 +88,22 @@ not validate `storage.local.successor_comparator.v1`,
 `storage.intent.successor_comparator.v1`, declare release or production
 readiness, classify every imported document, or close TFR-019.
 
+## Product Admission Overlay Fold-Down (#1594)
+
+Issue #1594 moves the product-spine admission map into
+`validation/claims.toml` and the generated `docs/CLAIM_REGISTRY.md`. The
+deleted `docs/PRODUCT_ADMISSION_PROOF_TRAINS.md` was a planning overlay whose
+useful gate shape is now registry-backed by claim ids, evidence classes,
+authority paths, admission rules, and explicit blockers. Keep the deleted-path
+lineage in git, the issue, and the PR rather than preserving a live duplicate
+status document.
+
+This fold-down does not validate local or distributed successor/comparator
+claims, create a release-readiness verdict, promote proof-train labels into
+product proof, or close TFR-019. Product-facing wording must still route
+through the generated claim registry, `docs/CLAIMS_GATE_POLICY.md`, current
+evidence manifests, and `docs/RELEASE_READINESS_VERDICT_CONTRACT.md`.
+
 ## Doc-Authority Drift Cleanup Coordination (#952)
 
 Recorded on 2026-06-22 for the `check-doc-authority-drift` follow-up from PR

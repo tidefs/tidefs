@@ -15,8 +15,8 @@ Use this manual with:
 - `docs/CLAIMS_GATE_POLICY.md` and `docs/UNRELEASED_AUTHORITY_POLICY.md` for
   publishing-facing claim hygiene
 - `docs/RELEASE_READINESS_VERDICT_CONTRACT.md` and
-  `docs/PRODUCT_ADMISSION_PROOF_TRAINS.md` for release-readiness and
-  whole-product admission boundaries
+  generated `docs/CLAIM_REGISTRY.md` product-admission gates for
+  release-readiness and whole-product admission boundaries
 - `docs/OPERATOR_PRODUCT_SURFACE_DECISION.md` for the current operator
   product-surface boundary
 - `docs/POSIX_SUBSET.md` for historical first-FUSE subset context
