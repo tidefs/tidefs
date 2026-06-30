@@ -1868,6 +1868,7 @@ pub fn finalize_prefetch_execution(
     if terminal_update_refs_outside_evidence_cut(record, update)
         || terminal_result_detail_lacks_feedback_evidence(record, update)
         || terminal_update_lacks_result_refusal_evidence(record, update)
+        || terminal_update_lacks_verification_evidence(record, update)
         || terminal_update_lacks_interruption_evidence(record, update)
         || terminal_update_has_inconsistent_interruption(update)
         || terminal_update_lacks_handoff_boundary_evidence(record, update)
@@ -2070,6 +2071,19 @@ fn terminal_update_lacks_result_refusal_evidence(
             update.evidence_cut,
             update.result_refusal_ref,
             StorageIntentEvidenceKind::ResultRefusalEvidence,
+        )
+}
+
+fn terminal_update_lacks_verification_evidence(
+    record: PrefetchExecutorRecord,
+    update: PrefetchExecutorTerminalUpdate,
+) -> bool {
+    update.outcome == PrefetchExecutorOutcome::VerificationFailed
+        && !terminal_ref_in_cut(
+            record,
+            update.evidence_cut,
+            update.result_detail.validation_ref,
+            StorageIntentEvidenceKind::ValidationArtifact,
         )
 }
 
@@ -5376,6 +5390,67 @@ mod tests {
         assert_eq!(refused.outcome, PrefetchExecutorOutcome::Refused);
         assert_eq!(refused.evidence_refs.result_refusal_ref, result_ref);
         assert_record_has_no_authority_claims(refused);
+    }
+
+    #[test]
+    fn terminal_update_requires_validation_artifact_for_verification_failed() {
+        let started = evaluate_prefetch_execution(admitted_input(
+            PrefetchResidencyCandidateClass::BoundedReadahead,
+        ));
+        let result_ref = evidence(
+            StorageIntentEvidenceKind::ResultRefusalEvidence,
+            RESULT_REFUSAL,
+        );
+
+        let rejected = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::VerificationFailed,
+                result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut(
+                    started,
+                    PrefetchExecutorResultDetail::default(),
+                    result_ref,
+                ),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(
+            rejected.outcome,
+            PrefetchExecutorOutcome::VerificationFailed
+        );
+        assert_eq!(
+            rejected.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(
+            rejected.executor_byte_state,
+            PrefetchExecutorByteState::Refused
+        );
+        assert_record_has_no_authority_claims(rejected);
+
+        let detail = PrefetchExecutorResultDetail {
+            validation_ref: evidence(StorageIntentEvidenceKind::ValidationArtifact, VALIDATION),
+            ..PrefetchExecutorResultDetail::default()
+        };
+        let failed = finalize_prefetch_execution(
+            started,
+            PrefetchExecutorTerminalUpdate {
+                outcome: PrefetchExecutorOutcome::VerificationFailed,
+                result_detail: detail,
+                result_refusal_ref: result_ref,
+                evidence_cut: terminal_evidence_cut(started, detail, result_ref),
+                ..PrefetchExecutorTerminalUpdate::default()
+            },
+        );
+        assert_eq!(failed.outcome, PrefetchExecutorOutcome::VerificationFailed);
+        assert_eq!(
+            failed.refusal,
+            StorageIntentRefusalReason::ValidationGateFailed
+        );
+        assert_eq!(failed.evidence_refs.validation_ref, detail.validation_ref);
+        assert_eq!(failed.evidence_refs.result_refusal_ref, result_ref);
+        assert_record_has_no_authority_claims(failed);
     }
 
     #[test]
