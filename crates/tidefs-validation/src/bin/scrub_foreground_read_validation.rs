@@ -25,11 +25,10 @@ fn main() {
 fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args(env::args().skip(1))?;
     if args.row != SCRUB_FOREGROUND_READ_ROW_ID {
-        return Err(format!(
-            "unsupported row '{}'; expected '{}'",
-            args.row, SCRUB_FOREGROUND_READ_ROW_ID
-        )
-        .into());
+        let row = &args.row;
+        return Err(
+            format!("unsupported row '{row}'; expected '{SCRUB_FOREGROUND_READ_ROW_ID}'").into(),
+        );
     }
 
     fs::create_dir_all(&args.output_dir)?;
@@ -44,12 +43,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&manifest_path, manifest.to_json_pretty()?)?;
 
     evidence.assert_no_product_or_harness_failure()?;
-    println!(
-        "scrub foreground-read row '{}' outcome={:?}; artifact={}",
-        evidence.row_id,
-        evidence.outcome,
-        artifact_path.display()
-    );
+    let row_id = &evidence.row_id;
+    let outcome = evidence.outcome;
+    let artifact = artifact_path.display();
+    println!("scrub foreground-read row '{row_id}' outcome={outcome:?}; artifact={artifact}");
     Ok(())
 }
 
