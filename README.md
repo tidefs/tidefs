@@ -28,6 +28,10 @@ keys, and other secrets remain outside this repository. The companion
 - Unreleased internal surfaces must follow
   `docs/UNRELEASED_AUTHORITY_POLICY.md`: choose current authority instead of
   preserving pre-release paths as legacy compatibility or migration debt.
+- Control formats and JSON usage must follow
+  `docs/CONTROL_FORMAT_AND_JSON_POLICY.md`: JSON is acceptable for explicit
+  evidence, diagnostics, support, trace, and expert export surfaces, not as the
+  default operator UX, hot-path protocol, or durable product format.
 - Mounted device-level compression and encryption are blocked behind
   `docs/MOUNTED_TRANSFORM_AUTHORITY_RAW_STORE_INVENTORY.md`; lower object-store
   wrappers are not an end-to-end mounted filesystem claim.
