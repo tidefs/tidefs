@@ -82,11 +82,26 @@ pub struct SnapshotDeletionDeferral {
     pub hold_tag: Option<String>,
 }
 
+/// Deadlist derivation failure recorded after a received delete committed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotDeletionDeadlistDeferral {
+    pub name: String,
+    pub root_id: Vfssend2Id128,
+    pub kind: SnapshotKind,
+    pub source_transaction_id: u64,
+    pub source_generation: u64,
+    pub reason: String,
+}
+
 /// Result of applying a received VFSSEND2 snapshot-record mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SnapshotMutationApplyReport {
     Promoted(PromoteReport),
     Deleted(SnapshotSummary),
+    DeletedWithDeferredDeadlist {
+        summary: SnapshotSummary,
+        deadlist: SnapshotDeletionDeadlistDeferral,
+    },
     DeleteDeferred(SnapshotDeletionDeferral),
 }
 
@@ -551,7 +566,10 @@ impl LocalFileSystem {
     /// Unlike ZFS (where deleting an origin snapshot that has clones requires
     /// promotion), TideFS clones are independent snapshot entries. Deleting a
     /// clone only removes the clone entry — the origin is unaffected.
-    pub fn delete_clone(&mut self, name: impl AsRef<str>) -> Result<SnapshotSummary> {
+    pub(crate) fn delete_clone_without_deadlist(
+        &mut self,
+        name: impl AsRef<str>,
+    ) -> Result<(SnapshotSummary, SnapshotRecord)> {
         let name = name.as_ref();
         let name_bytes = snapshot_name_bytes(name)?;
         let record = self
@@ -587,6 +605,11 @@ impl LocalFileSystem {
         let summary = self.commit_mutation(record.summary())?;
         self.unpin_snapshot_record_root(&record);
         self.remove_snapshot_record_catalog_entry(&record)?;
+        Ok((summary, record))
+    }
+
+    pub fn delete_clone(&mut self, name: impl AsRef<str>) -> Result<SnapshotSummary> {
+        let (summary, record) = self.delete_clone_without_deadlist(name)?;
         self.enqueue_released_snapshot_deadlist(&record)?;
         Ok(summary)
     }
@@ -667,6 +690,28 @@ impl LocalFileSystem {
         })
     }
 
+    fn finish_received_snapshot_deletion(
+        &mut self,
+        summary: SnapshotSummary,
+        record: &SnapshotRecord,
+        mutation: &SnapshotMutation,
+    ) -> SnapshotMutationApplyReport {
+        match self.enqueue_released_snapshot_deadlist(record) {
+            Ok(()) => SnapshotMutationApplyReport::Deleted(summary),
+            Err(err) => SnapshotMutationApplyReport::DeletedWithDeferredDeadlist {
+                summary,
+                deadlist: SnapshotDeletionDeadlistDeferral {
+                    name: snapshot_record_display_name(record),
+                    root_id: mutation.root_id,
+                    kind: record.kind,
+                    source_transaction_id: record.root.transaction_id,
+                    source_generation: record.root.generation,
+                    reason: err.to_string(),
+                },
+            },
+        }
+    }
+
     /// Apply a VFSSEND2 snapshot-record mutation through the local lifecycle.
     pub fn apply_vfssend2_snapshot_mutation(
         &mut self,
@@ -689,8 +734,8 @@ impl LocalFileSystem {
                     "snapshot root",
                 )?;
                 let result = match record.kind {
-                    SnapshotKind::Snapshot => self.delete_snapshot(&name),
-                    SnapshotKind::Clone => self.delete_clone(&name),
+                    SnapshotKind::Snapshot => self.delete_snapshot_without_deadlist(&name),
+                    SnapshotKind::Clone => self.delete_clone_without_deadlist(&name),
                     SnapshotKind::Bookmark => {
                         return Err(FileSystemError::Unsupported {
                             operation: "apply VFSSEND2 snapshot deletion",
@@ -699,7 +744,11 @@ impl LocalFileSystem {
                     }
                 };
                 match result {
-                    Ok(summary) => Ok(SnapshotMutationApplyReport::Deleted(summary)),
+                    Ok((summary, deleted_record)) => Ok(self.finish_received_snapshot_deletion(
+                        summary,
+                        &deleted_record,
+                        mutation,
+                    )),
                     Err(FileSystemError::SnapshotHeld {
                         name,
                         hold_count,
@@ -1749,6 +1798,58 @@ mod tests {
         }
         assert!(fs.list_clones().is_empty());
         assert!(fs.snapshot_summary("origin").is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vfssend2_deletion_mutation_records_deadlist_failure_without_blocking_receive() {
+        let dir = temp_dir();
+        let mut fs = new_fs(&dir);
+
+        seed_file(&mut fs, "/retained.bin", b"deadlist receive trigger");
+        fs.create_snapshot("released").expect("snapshot");
+        let root_id = record_root_id(&fs, "released");
+        let released = fs
+            .snapshot_summary("released")
+            .expect("released snapshot summary");
+        fs.store
+            .put(
+                tidefs_local_object_store::DeviceIoClass::Data,
+                crate::object_keys::transaction_manifest_object_key(released.source_transaction_id),
+                b"corrupt released root manifest",
+            )
+            .expect("corrupt released root manifest");
+
+        let report = fs
+            .apply_vfssend2_snapshot_mutation(&SnapshotMutation::delete(root_id, "released"))
+            .expect("receive delete should not fail on deadlist derivation");
+
+        match report {
+            SnapshotMutationApplyReport::DeletedWithDeferredDeadlist { summary, deadlist } => {
+                assert_eq!(summary.name, "released");
+                assert_eq!(deadlist.name, "released");
+                assert_eq!(deadlist.root_id, root_id);
+                assert_eq!(deadlist.kind, SnapshotKind::Snapshot);
+                assert_eq!(
+                    deadlist.source_transaction_id,
+                    released.source_transaction_id
+                );
+                assert_eq!(deadlist.source_generation, released.source_generation);
+                assert!(
+                    deadlist.reason.contains("manifest")
+                        || deadlist.reason.contains("Decode")
+                        || deadlist.reason.contains("decode"),
+                    "deadlist failure should record the derivation error, got {}",
+                    deadlist.reason
+                );
+            }
+            other => panic!("expected deferred deadlist report, got {other:?}"),
+        }
+        assert!(matches!(
+            fs.snapshot_summary("released"),
+            Err(FileSystemError::SnapshotNotFound { .. })
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
